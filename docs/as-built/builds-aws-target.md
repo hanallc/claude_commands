@@ -625,7 +625,7 @@ A successful regional read removes previous prices for types or zones absent fro
 The snapshot does not change `controller.json`.
 
 `spot_table.spot_tables` reads only the local snapshot, cost ledger and configuration.
-It is the one source of the AWS prices page; no terminal output remains.
+It is the one source of the price tables of the AWS page; no terminal output remains.
 The user, 2026-11-15, removed the `/aws_prices` command and its `deploy.py spot-table` output because the page shows the prices.
 It gives two price tables: the standard types, then the GPU types.
 Each has candidate regions as rows and machine types as columns.
@@ -672,9 +672,15 @@ A cell is `<billed>/<box> (<gap>)`, such as `9.2/8.8 (4%)`, with `over` when `ho
 A type and region without a bill read shows `not billed`. Only types with hours have a row.
 An unreadable cost ledger shows a note in place of the billed hours.
 
-The AWS prices page shows the same tables, published by `aws_page.publish`.
-The hourly buildlog run publishes it. After each push to main, `.claude/config/post_push.sh` publishes it again
+The AWS page shows the same tables, published by `aws_page.publish`.
+The user renamed it from AWS prices to AWS on 2026-11-15, because it holds spend, prices and quotas.
+The published file stays `aws_prices.html`, so older links still open it.
+A Spend card at the top shows today, yesterday and the month to date, with the month forecast below them.
+`spend.read_spend` and `spend.month_spend` give these numbers; `/aws_spend` reads the same functions, so both show the same values.
+The day is the UTC day. The hourly buildlog run publishes the page, so the spend is current to the last hour.
+After each push to main, `.claude/config/post_push.sh` publishes it again
 when the push changes the page code and the pushing checkout is at the pushed commit, as the promotion step's ~/.claude is.
+The Prices and Quotas sections follow the Spend card.
 The user asked for these page changes on 2026-11-14 through builds:
 1. A switch above the two price cards shows `Spot price` or `Cost per gate`; the user asked for it on 2026-11-15 through builds.
    `Cost per gate` shows a second switch, `Merge gates`, `Targeted runs` or `Both`, and it sets both cards.
@@ -686,9 +692,13 @@ The user asked for these page changes on 2026-11-14 through builds:
    A white box marks the lowest and the highest cell of each type column, in both themes; the user asked for it on 2026-11-15 through builds.
    The box is 1 px white inside a 1 px dark edge, which keeps it visible on the light page. Equal cells all have the box.
    A column with only two values has no box, because the colors already show which is which.
-   The lowest and the highest cell of each table have only a 2 px gold outline (`--extreme`, `#f5b400`), the same in both themes.
-   The user asked for it on 2026-11-15 through builds. A legend line above the cards explains the colors.
-   A legend line under each price card that has a box names both outlines.
+   The cheapest cell of each table is bold on a gold background (`--cheapest`), with dark text and a 2 px white outline (`--mark-edge`).
+   The most expensive cell of each table is bold on a black background (`--dearest`) with white text and the same white outline.
+   Both are the same in both themes, and they replace the scale color and the box of that cell.
+   The user asked for them on 2026-11-15 through builds, because bold alone did not make the cheapest cell stand out.
+   The user asked for the white outline on the gold cell too, so both table marks match.
+   A legend line above the cards explains the colors.
+   A legend line under each price card that has a mark names the box, the gold cell and the black cell.
    Builds removed the vCPU group mark on 2026-11-15.
 3. Each standard and GPU table is its own card. The two cards sit side by side and stack below 760 px.
    The content fills the window width, less a 16 px gutter on each side; the user asked for it on 2026-11-15 through builds.
@@ -707,7 +717,7 @@ A region filter at the top of the page shows all regions by default; the user as
    `None` at the end clears every region, so one click then shows only that region; the user asked for it on 2026-11-15 through builds.
    With no region chosen, each card says `No region chosen.` A reload with no region saved shows every region.
 2. Every section follows it: tables with a region column drop the other columns, and tables with a region row drop the other rows.
-3. The colors and both outlines use only the chosen regions. `Table.values` holds the number of each cell.
+3. The colors, the box and the table marks use only the chosen regions. `Table.values` holds the number of each cell.
    One region shows no color and no box.
 4. The cheapest line names the cheapest estimate in the chosen regions (`RunCosts.estimates`, cheapest first).
 5. A snapshot line for one region shows only when that region is chosen.
@@ -730,7 +740,7 @@ It compares the billed Spot hours with the recorded box hours for each type, reg
    Billed hours with no box hours are also over.
 `run_cost.day_hours_checks` gives one `HoursCheck` per type, region and day in the window.
 Days run from the window start day up to, but not including, the end day, like the bill split.
-`run_cost.hours_checks` sums the days with a bill read for each type and region, for the billed hours table on the AWS prices page.
+`run_cost.hours_checks` sums the days with a bill read for each type and region, for the billed hours table on the AWS page.
 `HoursCheck` holds `billed_hours`, `box_hours`, `hours_gap_ratio` and `hours_gap_over`.
 Without a bill read, `billed_hours` and `hours_gap_ratio` are `None`, and `box_hours` counts every day.
 `aws_target.hourly` checks the last `run_cost_days` days after its price read.
@@ -800,7 +810,7 @@ Refusals count the zone and quota codes below over the last `run_cost_days` days
 Expected box time is the median box time, launch to finish, for the type, region and mode over the last `run_cost_days` days.
 A region without its own runs uses the type's runs in all regions; a type without runs uses all runs of the mode.
 Without any runs, it uses `lifetime_minutes`.
-The AWS prices page shows the same expected cost and refusals per launch, without the remote transfer and regional delay.
+The AWS page shows the same expected cost and refusals per launch, without the remote transfer and regional delay.
 Its expected cost includes the unmeasured seconds.
 `remote_region_transfer_usd=0.00015` applies when the region differs from the home region.
 Local measurements cover 692 gates with a source bundle, request, and result.

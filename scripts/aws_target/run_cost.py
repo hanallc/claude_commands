@@ -24,7 +24,7 @@ NO_MODE = ''
 class RunScope:
     """The run kinds that one cost table counts."""
     name: str
-    # The filter label on the AWS prices page.
+    # The filter label on the AWS page.
     label: str
     # One run of this scope, as the table headers and sentences name it.
     noun: str
