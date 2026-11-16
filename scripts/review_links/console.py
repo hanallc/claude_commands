@@ -448,6 +448,15 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
   phone.addEventListener('change', () => collapse(phone.matches || desktopCollapsed));
   document.getElementById('nav-dismiss').addEventListener('click', () => collapse(true, true));
   document.addEventListener('keydown', event => { if (event.key === 'Escape') collapse(true, true); });
+  // Space outside a control goes to the open page, so a page such as Builds can pause without a click in its frame first.
+  document.addEventListener('keydown', event => {
+    if (event.code !== 'Space' || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
+    if (event.target.closest?.('input, textarea, select, button, summary, [contenteditable]')) return;
+    const frame = [...frames.values()].find(candidate => !candidate.hidden);
+    if (!frame) return;
+    event.preventDefault();
+    frame.contentWindow.postMessage('console-space', location.origin);
+  });
   select(new URL(location.href).searchParams.get('page'));
   let rebuildTimer;
   async function loadRebuilds() {

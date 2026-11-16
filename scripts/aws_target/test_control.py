@@ -436,6 +436,23 @@ class ControlTests(CostFixture):
                 self.assertEqual({cell for row in gpu.rows for cell in row[1:]}, {spot_table.NOT_SOLD})
                 self.assertEqual({value for row in gpu.values for value in row}, {None})
 
+    def test_a_type_without_runs_borrows_the_times_of_its_vcpu_count(self) -> None:
+        home = self.regions[0]
+        events: list[dict[str, object]] = []
+        for attempt, size, box_s in (('eight', 'c7a.8xlarge', 240), ('four', 'c7a.4xlarge', 420)):
+            row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': 'merge-gate', 'region': home}
+            events.extend(({**row, 'time': self.clock.now - 3600 - box_s, 'result': 'launched'},
+                           {**row, 'time': self.clock.now - 3600, 'result': 'finished', 'gate_s': box_s - 60}))
+        end = datetime.fromtimestamp(self.clock.now, UTC)
+        evidence = run_cost.run_evidence(events, end - timedelta(days=7), end, home)
+        # Not the median of all types (330 s): the same vCPU count runs at the same speed.
+        own, elsewhere, same = run_cost.BoxTimeSource.OWN, run_cost.BoxTimeSource.OTHER_REGIONS, run_cost.BoxTimeSource.SAME_VCPUS
+        for size, region, times, source in (('c7a.8xlarge', home, [240], own), ('c7a.8xlarge', 'elsewhere', [240], elsewhere),
+                                            ('m7a.8xlarge', home, [240], same), ('m7a.4xlarge', home, [420], same),
+                                            ('m7a.2xlarge', home, [], same), ('unknown', home, [], same)):
+            with self.subTest(size=size, region=region):
+                self.assertEqual(evidence.box_seconds(size, region, ('merge-gate',)), ([Decimal(time) for time in times], source))
+
     def test_page_holds_the_tables_as_data_and_its_link_needs_the_page(self) -> None:
         self.assertEqual(self.snapshot(), 0)
         folder = self.root / 'page'
@@ -509,7 +526,7 @@ class ControlTests(CostFixture):
         self.assertEqual(data['tiles'][0]['note'], 'UTC 2026-01-15, estimate of the $35.00 daily limit. 5 gate runs.')
         self.assertEqual(data['tiles'][1]['note'], 'UTC 2026-01-14, provisional bill of the $35.00 daily limit. 7 gate runs.')
         self.assertEqual(data['tiles'][2]['note'], 'UTC 2026-01, of the $400.00 monthly limit.')
-        # The page and /aws_spend share one month calculation.
+        # The page and the buildlog report share one month calculation.
         self.assertEqual(data['forecast'], 'Month forecast: $57.00 at $3.00 a day, the average of the last 2 billed days. '
                          + '32-CPU gate compute is 67% of the spend on those days.')
         no_bill = aws_page.spend_data(spend.Spend(read.days[:1], Decimal(35), Decimal(400)), now, 2)

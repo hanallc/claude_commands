@@ -40,6 +40,10 @@
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 __PAGE_FRAME_STYLE__
 .num { font-variant-numeric: tabular-nums; }
+.paused-badge { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 9; display: inline-flex; gap: 8px; align-items: center;
+  padding: 4px 14px; border: 1px solid var(--cap); border-radius: 999px; background: var(--card); color: var(--cap); font-weight: 600; pointer-events: none; }
+.paused-badge[hidden] { display: none; }
+.paused-badge .pb { width: 10px; height: 11px; border-left: 3px solid currentColor; border-right: 3px solid currentColor; }
 .card, :root.layout-measuring .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 14px; margin: 0 0 16px; }
 .answer { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; margin-bottom: 6px; }
 .answer .big { font-size: 2.6rem; font-weight: 700; line-height: 1; letter-spacing: -0.02em; }
@@ -48,7 +52,7 @@ __PAGE_FRAME_STYLE__
 .answer .cap-value { color: var(--cap); font-weight: 600; font-variant-numeric: tabular-nums; cursor: help; }
 .answer .room-why { flex-basis: 100%; font-weight: 600; }
 .answer .last-reading { flex-basis: 100%; color: var(--ink-2); font-weight: 600; }
-.ram-disagree { margin: 10px 0 0; font-weight: 600; }
+.ram-disagree, .ram-missing { margin: 10px 0 0; font-weight: 600; }
 .swap-reserve { margin: 10px 0 0; font-weight: 600; cursor: help; }
 .hatch { background: repeating-linear-gradient(135deg, var(--res-a) 0 3px, var(--res-b) 3px 6px); }
 :root { --amt: 7rem; --gap: 10px; --details: 0px; }
@@ -132,8 +136,6 @@ summary .chev { flex: none; width: 14px; color: var(--ink-3); transition: transf
 details[open] > summary .chev { transform: rotate(90deg); }
 summary .name { font-weight: 600; }
 summary .v { margin-left: auto; padding-left: 12px; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
-.why { color: var(--ink-2); font-size: 0.9rem; padding: 0 6px 8px 50px; }
-.why p { margin: 4px 0; }
 .sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; flex: none; }
 .sw.used { background: var(--used); }
 .sw.tools { background: var(--tools); }
@@ -336,7 +338,6 @@ body.queue-unavailable .card { display: none; }
   .walk { gap: 10px; }
 }
 @media (max-width: 560px) {
-  .why { padding-left: 28px; }
   .answer .big { font-size: 2.2rem; }
 }
 .brace[hidden], .cap-value[hidden], .bar-wrap[hidden], .scale[hidden], .bar > div[hidden] { display: none; }
@@ -368,6 +369,7 @@ body.queue-unavailable .card { display: none; }
   <p class="error" id="mac-idle-alert" role="status" hidden></p>
   __PAGE_TITLE__
   <div class="queue-error" id="queue-error" role="status"></div>
+  <div class="paused-badge" id="paused" role="status" hidden><span class="pb"></span>Paused · press space to resume</div>
   <div class="pressure"><a class="pill" id="pill" href="#swap" data-tip="pill"><span class="pd"></span><span id="pill-t">pressure –</span></a></div>
 
   <section class="card targets" id="targets" aria-label="Target availability" hidden></section>
@@ -382,6 +384,7 @@ body.queue-unavailable .card { display: none; }
     </div>
 
     <p class="ram-disagree" id="ram-disagree" hidden>RAM readings do not agree: the named parts exceed the total.</p>
+    <p class="ram-missing" id="ram-missing" hidden></p>
     <div class="bar-wrap" id="barwrap" role="img" aria-label="Build memory bar">
       <div class="brace l1" id="b-builds" data-tip="g-builds"><span class="brace-label"><span class="bn">builds </span><b id="bv-builds"></b></span></div>
       <div class="brace l1 free" id="b-free" data-tip="g-free"><span class="brace-label"><span class="bn">free RAM </span><b id="bv-free"></b></span></div>
@@ -408,7 +411,7 @@ body.queue-unavailable .card { display: none; }
     </div>
     <div class="scale num" id="scale"><div class="ticks" id="ticks-top" data-tip="budget"></div></div>
 
-    <details class="legend-box" open>
+    <details class="legend-box">
       <summary><span class="chev">▶</span><span class="name">Legend</span></summary>
     <div class="legend">
      <div class="legend-col">
@@ -445,16 +448,6 @@ body.queue-unavailable .card { display: none; }
       <div class="row" data-tip="unattributed"><span class="sw unattributed"></span><span class="name">Not attributed</span><span class="v num" id="v-unattributed">–</span></div>
      </div>
     </div>
-      <details class="room-explainer">
-        <summary><span class="chev">▶</span><span class="name">How free is worked out</span></summary>
-        <div class="why">
-          <p class="num">Free = max(0, Free RAM − Safety net − Swap coming back − Build reserved)</p>
-          <p class="num" id="room-equation"></p>
-          <p>A step starts when the memory it needs fits in free and memory pressure is none.</p>
-          <p>Displayed amounts are rounded.</p>
-          <p id="ram-missing" hidden></p>
-        </div>
-      </details>
     </details>
   </section>
 
@@ -813,9 +806,17 @@ function stepTooltip(key, data) {
           ...earlier.map(term => field(term.label, `${(term.tenths / 10).toFixed(1)} GiB`)),
           field(result.label, `${free.toFixed(1)} GiB`, 'sum')]));
       }
-      const needTenths = Math.round(row.need * 10), freeTenths = Math.round(free * 10);
+      const freeTenths = Math.round(free * 10);
+      const needTenths = Math.round(row.need * 10);
       const need = [field('Needs', `${(needTenths / 10).toFixed(1)} GiB`)];
-      if (!row.head_room?.rows?.length) need.push(field('Free', `${(freeTenths / 10).toFixed(1)} GiB`));
+      if (!row.head_room?.rows?.length) {
+        // Free matches the page's Free row. The step's own room differs when the head and held slots
+        // get memory first, or when an earlier step gives back memory it held.
+        const pageTenths = Math.max(0, Math.round(queueCapMemory(data).free / GIB * 10));
+        need.push(field('Free', `${(pageTenths / 10).toFixed(1)} GiB`));
+        if (pageTenths > freeTenths) need.push(field('− Kept for other steps', `${((pageTenths - freeTenths) / 10).toFixed(1)} GiB`));
+        if (freeTenths > pageTenths) need.push(field('+ Given back by other steps', `${((freeTenths - pageTenths) / 10).toFixed(1)} GiB`));
+      }
       if (needTenths > freeTenths) need.push(field('Short by', `${((needTenths - freeTenths) / 10).toFixed(1)} GiB`));
       rows.push(...groupRows(need));
     }
@@ -941,10 +942,6 @@ function memoryText(text) {
 function reserveDescription(description, needed, covered) {
   return description + (needed > covered ? ` Needs ${ramAmount(needed)}; free RAM covers ${ramAmount(covered)}.` : "");
 }
-function roomEquation(r) {
-  const terms = [r.available_bytes, r.safety_target_bytes, r.swap_target_bytes, r.build_target_bytes].map(bytes => f1(bytes / GIB));
-  return `= max(0, ${terms.join(" − ")}) = ${ramAmount(r.room_bytes)}`;
-}
 function ago(then, now) {
   const m = Math.max(0, Math.round((now - then) / 60));
   if (m < 1) return "<1 min";
@@ -1009,7 +1006,6 @@ function render(d) {
   renderTargets(d.targets || []);
   const shown = shownReading(d), amounts = shown.ram;
   const r = d.ram;
-  $("room-equation").textContent = roomEquation(amounts);
   $("ram-missing").textContent = r.missing.length ? `Missing readings: ${r.missing.join("; ")}.` : "";
   $("ram-missing").hidden = !r.missing.length;
   document.body.classList.remove("queue-unavailable");
@@ -1671,14 +1667,32 @@ function esc(s) {
 }
 
 const consoleHidden = () => window.frameElement?.hidden === true;
+// Space pauses the reads and keeps the page controls active.
+let paused = false;
+function setPaused(on) {
+  paused = on;
+  $("paused").hidden = !on;
+  pageRefresh.abandon();
+  pageRefresh.restart();
+  if (!on) { void pageRefresh.refresh(true); void reloadWhenPageChanges(); }
+}
+addEventListener("keydown", event => {
+  if (event.code !== "Space" || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
+  // Space activates a focused control.
+  if (event.target.closest?.("input, textarea, select, button, summary, [contenteditable]")) return;
+  event.preventDefault();
+  setPaused(!paused);
+});
 async function tick(supersede=false,current=()=>true) {
+  if (consoleHidden() || paused) return;
   const r = await fetch(`memory.json?t=${Date.now()}`, { cache: "no-store" });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const d = await r.json();
-  if (!current()) return;
+  if (!current() || paused) return;
   if (!d.ok || d.error) throw new Error(d.error || "The queue did not answer.");
   render(d);
   if (d.report_version !== reportVersion) await loadReport(d.report_version,current);
+  if (!current() || paused) return;
   const lv=level(latest);
   $("pill").className=`pill ${lv}`;
   $("pill-t").textContent=({ok:"no memory pressure",warn:"memory pressure near limit",
@@ -1691,21 +1705,22 @@ async function loadReport(version,current) {
   try {
     const r = await fetch(`report.json?v=${encodeURIComponent(version)}`, { cache: "no-store" });
     if (!r.ok) return;
-    const report=await r.json();if(!current()) return;
+    const report=await r.json();if(!current() || paused) return;
     renderReport(report);reportVersion = version;
   } catch (e) { /* The next reading tries again. */ }
 }
 let pageStamp = null;
 async function reloadWhenPageChanges() {
-  if (consoleHidden()) return;
+  if (consoleHidden() || paused) return;
   try {
     const r = await fetch(location.pathname, { method: "HEAD", cache: "no-store" });
     const stamp = r.headers.get("Last-Modified");
+    if (paused) return;
     if (pageStamp && stamp && stamp !== pageStamp) location.reload();
     pageStamp = stamp || pageStamp;
   } catch (e) { /* The reading status already reports a lost server. */ }
 }
-const pageRefresh=createPageRefresh(tick,()=>SECONDS);
+const pageRefresh=createPageRefresh(tick,()=>paused ? 0 : SECONDS,()=>paused ? 'Press space to resume.' : '');
 void pageRefresh.refresh();
 reloadWhenPageChanges();
 setInterval(reloadWhenPageChanges, 30000);
@@ -1713,6 +1728,7 @@ addEventListener("message", event => {
   if (event.source === parent && event.origin === location.origin && event.data === "console-shown") {
     reloadWhenPageChanges();
   }
+  if (event.source === parent && event.origin === location.origin && event.data === "console-space") setPaused(!paused);
 });
 </script>
 </body>

@@ -1779,7 +1779,7 @@ process.stdout.write(JSON.stringify({
         cases: tuple[tuple[admission_records.WaitReason, str], ...] = (
             (admission_records.NeedsMemory(need=4 * gib, free=gib), "memory"),
             (admission_records.BehindHead("first", 0, "fixture"), "its turn"),
-            (admission_records.TokenWaitingWaiter(0), "its turn"),
+            (admission_records.TokenWaitingWaiter(0), "Cargo token"),
             (admission_records.StartSpacingWait(0), "its turn"),
             (admission_records.MemoryPressure(1.0), "memory pressure"),
             (admission_records.GpuSlotWait(1, 1), "GPU slot"),

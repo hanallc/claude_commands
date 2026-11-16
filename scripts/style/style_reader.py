@@ -450,6 +450,8 @@ def _build(folder: Path, tree: str) -> Path | ReaderSourceChanged:
 
 def reader_binary() -> Path:
     """Resolve the source stamp and install one matching binary under the build lock."""
+    if binary := os.environ.get("STYLE_READER_BINARY"):
+        return Path(binary)
     try:
         tree = _source_tree()
         folder = style_config.reader_install_folder()

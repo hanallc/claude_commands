@@ -440,6 +440,32 @@ The page uses `page_frame.createPageRefresh` and `page_refresh_seconds`, with th
 Refresh retains the filters and scroll position, skips active saves, and refuses older responses after a newer response or save.
 New ready answers mark the navigation entry as new until the user visits the page.
 
+### Investigations page
+
+`/console/investigations.html` reads every owner's investigation folder, including owners without a current staff row.
+The console places Investigations between Images and Questions with the Lucide `search` icon.
+Each card shows its title, question, answer when present, and the source, date and time as aligned footer lines.
+The source uses the current staff name, or the fixed staff id when the staff row is absent.
+A unit source shows its parent showrunner name and unit name.
+The date and time show the filed time in the user's zone.
+Question and answer text use the Questions page's paragraph and list helper.
+
+The Owner menu lists All and the owners with records, in name order.
+The Show menu lists Not read, Answer ready, Waiting, Read and All.
+Not read is the default.
+The address retains both filters.
+Ready answers appear first, newest answer first.
+Waiting questions follow, oldest filed first.
+Read answers appear last, newest read first.
+
+Only answer-ready cards show Mark read.
+The signed form posts to the server, which calls `investigation.mark_read`.
+A successful save removes the card from the Not read view without a document reload.
+A failed save retains the card and displays the error.
+The page uses `page_frame.createPageRefresh` and `page_refresh_seconds`, with the same visibility rules as Questions.
+Refresh retains the filters and scroll position, skips active saves, and refuses older responses after a newer response or save.
+New ready answers mark the navigation entry as new until the user visits the page.
+
 ### Images page
 
 `/console/images.html` shows registered images with their instructions, oldest first.

@@ -59,9 +59,16 @@ tbody tr:hover td { background: var(--hover); }
 .slots td:first-child, .slots td.use { white-space: normal; overflow-wrap: break-word; }
 .slots .tag { white-space: nowrap; }
 .slots .narrow { display: none; margin-top: 2px; font-family: system-ui, sans-serif; }
-.slots tr.group th { padding-top: 14px; color: var(--ink); white-space: normal; }
-.slots tr.group th span { color: var(--ink-3); font-weight: 400; margin-left: 8px; }
-.slots tr.group:hover th { background: none; }
+/* A repository is a band that opens and closes; its slots sit indented below it. */
+.slots tr.group th { padding: 7px 10px 7px 6px; border-top: 4px solid var(--card); background: color-mix(in srgb, var(--accent) 12%, var(--card));
+  background-clip: padding-box; color: var(--ink); white-space: normal; cursor: pointer; }
+.slots tr.group:hover th { background-color: color-mix(in srgb, var(--accent) 18%, var(--card)); }
+.slots tr.group .name { font-weight: 700; }
+.slots tr.group .sum { color: var(--ink-2); font-weight: 400; margin-left: 8px; }
+.slots tr.group .folder { display: inline-flex; margin-right: 6px; color: var(--accent); vertical-align: -2px; }
+.slots tr.group .folder svg { width: 15px; height: 15px; }
+.slots tbody td:first-child { padding-left: 26px; }
+[aria-expanded]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .sessions col.size { width: 80px; } .sessions col.share { width: 18%; } .sessions col.state { width: 96px; }
 .sessions td.held { white-space: normal; overflow-wrap: anywhere; }
 .share i { display: block; height: 8px; min-width: 2px; border-radius: 3px; background: var(--accent); opacity: 0.7; }
@@ -70,8 +77,10 @@ tbody tr:hover td { background: var(--hover); }
 .tag.go { border-color: color-mix(in srgb, var(--floor) 60%, transparent); color: var(--floor); }
 .tree col.place { width: 50%; } .tree col.size { width: 78px; } .tree col.pct { width: 84px; }
 .tree tr[aria-expanded] > td { cursor: pointer; }
-.tree tr[aria-expanded]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.tree .twist { display: inline-block; width: 14px; text-indent: 0; color: var(--ink-3); font-family: system-ui, sans-serif; }
+.twist { display: inline-flex; width: 14px; text-indent: 0; color: var(--ink-3); vertical-align: -2px; }
+.twist svg { width: 14px; height: 14px; }
+.slots .twist { width: 18px; }
+tr[aria-expanded="true"] .twist svg { transform: rotate(90deg); }
 .walk { position: relative; height: 10px; }
 .walk .span { position: absolute; top: 0; bottom: 0; background: var(--track); border-radius: 3px; }
 .walk .span.inner { background: var(--band); }
@@ -98,12 +107,20 @@ tbody tr:hover td { background: var(--hover); }
 <main>
   __PAGE_TITLE__
   <div class="grid" id="drives"></div>
-  <div class="grid" id="cards"></div>
+  <div class="grid" id="cards">
+    <section class="card" id="slots" hidden></section>
+    <section class="card" id="sessions" hidden></section>
+  </div>
 </main>
 <script id="disks-settings" type="application/json">__DISKS_SETTINGS__</script>
 <script>
 const GIB = 1024 ** 3;
 const SLIDER_STEPS = 1000;
+// Lucide 0.468.0 icons (ISC license): the chevron turns down on an open row; the folder marks a repository.
+const icon = path => '<svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor"'
+  + ` stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="${path}"/></svg>`;
+const CHEVRON = icon("m9 18 6-6-6-6");
+const FOLDER = icon("M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z");
 
 function size(bytes) {
   const gib = bytes / GIB;
@@ -201,9 +218,9 @@ function esc(text) {
   return String(text).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"})[c]);
 }
 
-// The Slots card: each repository's slots with size, last use and holder. A slot below the measure's
-// least folder shows as below it; a slot on no measured drive shows no size.
-function slotsHtml(report, keepBytes, now) {
+// The Slots card: one band per repository; an open band lists its slots with size, last use and holder.
+// A slot below the measure's least folder shows as below it; a slot on no measured drive shows no size.
+function slotsHtml(report, keepBytes, now, opened) {
   const slotSize = bytes => bytes == null ? "—" : keepBytes && bytes < keepBytes ? `&lt; ${size(keepBytes)}` : size(bytes);
   const total = rows => rows.some(row => row.size != null) ? rows.reduce((sum, row) => sum + (row.size || 0), 0) : null;
   const lastUsed = row => row.used_by ? "now" : row.last_used == null ? "—" : age(Math.max(0, now - row.last_used));
@@ -224,8 +241,10 @@ function slotsHtml(report, keepBytes, now) {
   const groups = report.groups.map(group => {
     const count = group.maximum ? `${group.slots.length} of ${group.maximum} slots`
       : `${group.slots.length} slot${group.slots.length === 1 ? "" : "s"}`;
-    return `<tr class="group"><th colspan="4">${esc(group.repository)}<span>${count} · ${slotSize(total(group.slots))}</span></th></tr>`
-      + group.slots.map(slotRow).join("");
+    const open = opened.has(group.repository);
+    return `<tr class="group" tabindex="0" aria-expanded="${open}" data-group="${esc(group.repository)}"><th colspan="4">`
+      + `<span class="twist">${CHEVRON}</span><span class="folder">${FOLDER}</span><span class="name">${esc(group.repository)}</span>`
+      + `<span class="sum">${count} · ${slotSize(total(group.slots))}</span></th></tr>` + (open ? group.slots.map(slotRow).join("") : "");
   }).join("");
   const body = groups ? `<table class="slots"><colgroup><col><col class="size"><col class="used"><col class="use"></colgroup>`
     + `<thead><tr><th>Slot</th><th class="n">Size</th><th>Last used</th><th class="wide">Used by</th></tr></thead><tbody>${groups}</tbody></table>`
@@ -260,6 +279,8 @@ const settings = JSON.parse(document.getElementById("disks-settings").textConten
 const DATA_FILE = "disks.json";
 const MEASURE = "measure";
 const states = new Map();
+const openGroups = new Set();
+const driveViews = new Map();
 let data = null;
 let slotReport = null;
 let sessionReport = null;
@@ -275,7 +296,7 @@ function walk(row, scale) {
 function rowHtml(row, scale) {
   // The twist hangs to the left, so a wrapped name lines up with its first line.
   const indent = `style="padding-left:${row.depth * 16 + 14}px;text-indent:-14px"`;
-  const twist = row.kind === "open" ? "▾" : row.kind === "shut" ? "▸" : "";
+  const twist = row.kind === "open" || row.kind === "shut" ? CHEVRON : "";
   const toggle = row.kind === "open" || row.kind === "shut"
     ? ` tabindex="0" aria-expanded="${row.kind === "open"}" data-path="${esc(row.path)}"` : "";
   const place = row.kind === "other" ? `<td class="dim" ${indent}>` : `<td class="path" ${indent} title="${esc(row.path)}">`;
@@ -286,8 +307,7 @@ function rowHtml(row, scale) {
 
 function stateFor(drive, range) {
   if (!states.has(drive.mount)) {
-    const largest = [...drive.tree.children].sort((a, b) => b.size - a.size)[0];
-    states.set(drive.mount, {limit: startLimit(range, settings), opened: new Set(largest ? [topPath(drive.mount, largest.name)] : [])});
+    states.set(drive.mount, {limit: startLimit(range, settings), opened: new Set()});
   }
   return states.get(drive.mount);
 }
@@ -305,61 +325,95 @@ function headHtml(drive) {
   return html;
 }
 
-function renderDrive(card, drive) {
-  if (!drive.tree) {
-    card.innerHTML = headHtml(drive) + `<p class="problem">No folder sizes: ${esc(drive.error || "the measure gave no folders")}.</p>`;
-    return;
-  }
-  const range = sliderRange(drive.tree, settings), state = stateFor(drive, range);
-  const rows = treeRows(drive.tree, drive.mount, state, data.keep_bytes);
-  card.innerHTML = headHtml(drive)
-    + `<label class="limit">Name folders of at least<span class="range"><span class="end">${size(range.min)}</span>`
-    + `<input type="range" min="0" max="${SLIDER_STEPS}" value="${toSlider(state.limit, range)}"${range.max > range.min ? "" : " disabled"}>`
-    + `<span class="end">${size(range.max)}</span><output>${size(state.limit)}</output></span></label>`
-    + `<table class="tree"><colgroup><col class="place"><col class="size"><col class="pct"><col class="walk"></colgroup>`
-    + `<thead><tr><th>Place</th><th class="n">Size</th><th class="n pct">Of parent</th><th aria-label="Place in the drive"></th></tr></thead>`
-    + `<tbody>${rows.map(row => rowHtml(row, drive.tree.size)).join("")}</tbody></table>`;
-  const slider = card.querySelector("input");
-  slider.addEventListener("input", () => {
-    state.limit = fromSlider(Number(slider.value), range);
-    renderDrive(card, drive);
-    card.querySelector("input").focus();
+// A row that opens and closes answers a click, Enter and space.
+function onToggle(root, selector, toggle) {
+  root.addEventListener("click", event => {
+    const row = event.target.closest(selector);
+    if (row) toggle(row);
   });
-  const toggle = path => {
-    if (!state.opened.delete(path)) state.opened.add(path);
-    renderDrive(card, drive);
-    card.querySelector(`tr[data-path="${CSS.escape(path)}"]`)?.focus();
+  root.addEventListener("keydown", event => {
+    const row = event.target.closest(selector);
+    if (row && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); toggle(row); }
+  });
+}
+
+// Write a part's rows again; the row that held the focus keeps it.
+function refill(part, attribute, html) {
+  const focused = part.contains(document.activeElement) ? document.activeElement.closest(`[${attribute}]`)?.getAttribute(attribute) : null;
+  part.innerHTML = html;
+  if (focused != null) part.querySelector(`[${attribute}="${CSS.escape(focused)}"]`)?.focus();
+}
+
+// A drive card is built once and kept across new data. A slider step, a toggle or new data changes only the head,
+// the slider ends, the value and the rows, so a drag and the focus go on.
+function driveView(card) {
+  let drive = null, range = null, state = null, slider = null;
+  const fill = () => {
+    card.querySelector("output").textContent = size(state.limit);
+    refill(card.querySelector("tbody"), "data-path",
+           treeRows(drive.tree, drive.mount, state, data.keep_bytes).map(row => rowHtml(row, drive.tree.size)).join(""));
   };
-  card.querySelectorAll("tr[data-path]").forEach(row => {
-    row.addEventListener("click", () => toggle(row.dataset.path));
-    row.addEventListener("keydown", event => {
-      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggle(row.dataset.path); }
+  const build = () => {
+    card.innerHTML = `<div class="top"></div><label class="limit">Name folders of at least<span class="range">`
+      + `<span class="end low"></span><input type="range" min="0" max="${SLIDER_STEPS}"><span class="end high"></span><output></output></span></label>`
+      + `<table class="tree"><colgroup><col class="place"><col class="size"><col class="pct"><col class="walk"></colgroup>`
+      + `<thead><tr><th>Place</th><th class="n">Size</th><th class="n pct">Of parent</th><th aria-label="Place in the drive"></th></tr></thead>`
+      + `<tbody></tbody></table>`;
+    slider = card.querySelector("input");
+    slider.addEventListener("input", () => {
+      state.limit = fromSlider(Number(slider.value), range);
+      fill();
     });
-  });
+    onToggle(card.querySelector("tbody"), "tr[data-path]", row => {
+      if (!state.opened.delete(row.dataset.path)) state.opened.add(row.dataset.path);
+      fill();
+    });
+  };
+  return next => {
+    drive = next;
+    if (!drive.tree) {
+      card.innerHTML = headHtml(drive) + `<p class="problem">No folder sizes: ${esc(drive.error || "the measure gave no folders")}.</p>`;
+      slider = null;
+      return;
+    }
+    if (!slider) build();
+    range = sliderRange(drive.tree, settings);
+    state = stateFor(drive, range);
+    card.querySelector(".top").innerHTML = headHtml(drive);
+    card.querySelector(".end.low").textContent = size(range.min);
+    card.querySelector(".end.high").textContent = size(range.max);
+    slider.disabled = range.max <= range.min;
+    slider.value = String(toSlider(state.limit, range));
+    fill();
+  };
+}
+
+function renderSlots() {
+  const card = document.getElementById("slots");
+  card.hidden = !slotReport;
+  if (slotReport) refill(card, "data-group", slotsHtml(slotReport, data ? data.keep_bytes : 0, Date.now() / 1000, openGroups));
 }
 
 function renderCards() {
-  const cards = document.getElementById("cards"), keepBytes = data ? data.keep_bytes : 0;
-  cards.replaceChildren();
-  const add = html => {
-    const card = document.createElement("section");
-    card.className = "card";
-    card.innerHTML = html;
-    cards.append(card);
-  };
-  if (slotReport) add(slotsHtml(slotReport, keepBytes, Date.now() / 1000));
-  if (sessionReport) add(sessionsHtml(sessionReport, keepBytes, settings.sessions_shown));
+  renderSlots();
+  const card = document.getElementById("sessions");
+  card.hidden = !sessionReport;
+  if (sessionReport) card.innerHTML = sessionsHtml(sessionReport, data ? data.keep_bytes : 0, settings.sessions_shown);
 }
 
+// New data keeps each drive card, so a refresh does not end a drag; a changed drive list builds the cards again.
 function render() {
   const grid = document.getElementById("drives");
-  grid.replaceChildren();
-  for (const drive of data.drives) {
-    const card = document.createElement("section");
-    card.className = "card";
-    grid.append(card);
-    renderDrive(card, drive);
+  if (data.drives.map(drive => drive.mount).join("\n") !== [...driveViews.keys()].join("\n")) {
+    driveViews.clear();
+    grid.replaceChildren(...data.drives.map(drive => {
+      const card = document.createElement("section");
+      card.className = "card";
+      driveViews.set(drive.mount, driveView(card));
+      return card;
+    }));
   }
+  for (const drive of data.drives) driveViews.get(drive.mount)(drive);
   renderCards();
 }
 
@@ -400,6 +454,10 @@ async function loadDisks(supersede=false,current=()=>true){
  }
  if(data) return {readAt:data.measured_at,renderSeconds:data.render_seconds,failure};
 }
+onToggle(document.getElementById("slots"), "tr[data-group]", row => {
+  if (!openGroups.delete(row.dataset.group)) openGroups.add(row.dataset.group);
+  renderSlots();
+});
 __PAGE_REFRESH_SCRIPT__
 const pageRefresh=createPageRefresh(loadDisks,()=>settings.poll_seconds);
 void pageRefresh.refresh();

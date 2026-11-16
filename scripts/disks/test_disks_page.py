@@ -117,15 +117,22 @@ class DisksPageTests(unittest.TestCase):
                  "deleted_tonight": True}]},
             {"repository": "<b>", "maximum": None, "slots": [
                 {"name": "x-slot1", "number": 1, "size": None, "last_used": None, "used_by": None, "deleted_tonight": False}]}]}
-        html = cast(str, self.run_page(f"slotsHtml({json.dumps(report)}, {KEEP}, {now})"))
-        rows = cast(list[str], re.findall(r"<tr[^>]*>(.*?)</tr>", re.sub(r'<div class="narrow">.*?</div>', "", html)))
-        cells = ["|".join(part for part in re.split(r"<[^>]+>", row) if part) for row in rows[1:]]
-        self.assertEqual(cells, ["hana|2 of 8 slots · 70 GiB", "hana-slot1|70 GiB|now|fps|report (builds)",
+        def cells(opened: list[str]) -> tuple[str, list[str]]:
+            html = cast(str, self.run_page(f"slotsHtml({json.dumps(report)}, {KEEP}, {now}, new Set({json.dumps(opened)}))"))
+            rows = cast(list[str], re.findall(r"<tr[^>]*>(.*?)</tr>", re.sub(r'<div class="narrow">.*?</div>', "", html)))
+            return html, ["|".join(part for part in re.split(r"<[^>]+>", row) if part) for row in rows[1:]]
+
+        # The card starts with one band per repository; an open band lists its slots.
+        self.assertEqual(cells([])[1], ["hana|2 of 8 slots · 70 GiB", "&lt;b&gt;|1 slot · —"])
+        html, shown = cells(["hana", "<b>"])
+        self.assertEqual(shown, ["hana|2 of 8 slots · 70 GiB", "hana-slot1|70 GiB|now|fps|report (builds)",
                                  "hana-slot2|&lt; 256 MiB|9 days ago|deleted tonight", "&lt;b&gt;|1 slot · —",
                                  "x-slot1|—|—|—"])
+        self.assertEqual(re.findall(r'aria-expanded="(\w+)" data-group="([^"]*)"', cells(["hana"])[0]),
+                         [("true", "hana"), ("false", "&lt;b&gt;")])
         self.assertEqual(re.findall(r'<div class="narrow">(.*?)</div>', html), [
             '<span class="tag run">fps</span><span class="dim">report (builds)</span>', '<span class="tag go">deleted tonight</span>'])
-        empty = cast(str, self.run_page(f"slotsHtml({json.dumps({'root': '/s', 'groups': []})}, {KEEP}, {now})"))
+        empty = cast(str, self.run_page(f"slotsHtml({json.dumps({'root': '/s', 'groups': []})}, {KEEP}, {now}, new Set())"))
         self.assertIn("No slots yet.", empty)
 
     def test_the_sessions_card_names_the_largest_sessions_then_adds_up_the_rest(self) -> None:
@@ -160,6 +167,56 @@ class DisksPageTests(unittest.TestCase):
             _ = (folder / disks_page.DATA_FILE).write_text("[]")
             self.assertIsNone(disks_page.measured_at(folder))
         self.assertEqual(launches, ["missing", "old"])
+
+    def test_a_slider_step_a_toggle_and_new_data_keep_the_card_so_a_drag_goes_on(self) -> None:
+        # The browser ends a drag when the slider it moves leaves the page.
+        result = cast(dict[str, object], self.run_drive("""
+            const card = new Element();
+            data = {keep_bytes: KEEP};
+            const drive = {mount: "/build", tree: input.tree, total: 200 * GIB, used: 100 * GIB, free: 100 * GIB, floor: null};
+            const update = driveView(card);
+            update(drive);
+            const slider = card.querySelector("input"), body = () => card.querySelector("tbody");
+            const rows = () => body().innerHTML.split("<tr").length - 1;
+            const shut = rows();
+            body().fire("click", {target: {closest: () => ({dataset: {path: "/build/cargo"}})}});
+            const opened = rows();
+            slider.value = "0";
+            slider.fire("input");
+            update({...drive, free: 90 * GIB});
+            result = {writes: card.writes, sameSlider: card.querySelector("input") === slider, output: card.querySelector("output").textContent,
+                      rows: [shut, opened, rows()]};
+        """))
+        self.assertEqual(result, {"writes": 1, "sameSlider": True, "output": "1.0 GiB", "rows": [4, 7, 9]})
+
+    def run_drive(self, script: str) -> object:
+        """Run driveView on a fake document: each element counts its innerHTML writes and keeps its listeners."""
+        html = Path(disks_page.__file__).with_name(disks_page.PAGE_NAME).read_text()
+        functions = html[html.index("const GIB ="):html.index("function renderSlots")]
+        fake = ("""
+            const input = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            const KEEP = input.keep;
+            class Element {
+              constructor() { this.listeners = {}; this.parts = new Map(); this.html = ""; this.writes = 0; this.textContent = ""; this.value = ""; }
+              set innerHTML(html) { this.html = html; this.writes += 1; this.parts.clear(); }
+              get innerHTML() { return this.html; }
+              querySelector(selector) { if (!this.parts.has(selector)) this.parts.set(selector, new Element()); return this.parts.get(selector); }
+              querySelectorAll() { return []; }
+              contains() { return false; }
+              addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener); }
+              fire(type, event = {}) { for (const listener of this.listeners[type] || []) listener(event); }
+              focus() {}
+            }
+            const document = {activeElement: null, getElementById: () => ({textContent: JSON.stringify(input.settings)})};
+            const CSS = {escape: text => text};
+            let result = null;
+        """)
+        javascript = fake + functions + script + "\nprocess.stdout.write(JSON.stringify(result));\n"
+        executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
+        completed = subprocess.run([executable, "-e", javascript], input=json.dumps({"tree": TREE, "settings": SETTINGS, "keep": KEEP}),
+                                   text=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        return cast(object, json.loads(completed.stdout))
 
     def rows(self, limit: int, opened: list[str]) -> list[dict[str, object]]:
         return cast(list[dict[str, object]], self.run_page(
