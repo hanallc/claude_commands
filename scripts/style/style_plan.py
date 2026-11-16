@@ -1315,7 +1315,7 @@ def widen(repo: Path, ticket_id: str, paths: tuple[str, ...], reason: str, by: s
 def run_verification_step(repo: Path, stage: str, package: str) -> subprocess.CompletedProcess[bytes]:
     """Run one verify.sh stage for the package, or for the workspace when the package is ""."""
     return subprocess.run(["bash", str(Path.home() / ".claude/scripts/direct/verify.sh"), stage, *([package] if package else [])],
-                          cwd=repo, check=False)
+                          cwd=repo, check=False, pass_fds=copies.COMMAND_LOCKS.get())
 
 
 @dataclass(frozen=True)

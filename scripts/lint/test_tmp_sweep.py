@@ -38,7 +38,7 @@ from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import herdr
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import write_config_fixture
 
 DAY = 86_400
 LIVE_SESSION = "11111111-2222-3333-4444-555555555555"
@@ -120,7 +120,7 @@ class TmpSweepCase(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "NOTIFIER_SESSIONS_DIR": str(registry), "SHUTDOWN_STATE_DIR": str(base / "shutdown"),
             "BUILDLOG_DIR": str(base / "buildlog"),
-            **config_environment(base / "config"),
+            **copies_environment(base),
         })))
         self.addCleanup(self.pane_world.process_directory.cleanup)
         pane_patches = [
@@ -1507,7 +1507,7 @@ from scripts.copies import copies
 source = Path(sys.argv[1])
 with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source)) as tree:
     (tree / "untracked").write_text("test output\\n")
-    print(tree.parent, flush=True)
+    print(tree, flush=True)
     signal.pause()
 '''
         environment = {**os.environ, **copies_environment(self.tmp.parent / "fresh-settings"),
@@ -1536,14 +1536,15 @@ with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source
                         child.kill()
                         _, errors = child.communicate(timeout=30)
                     self.assertEqual(child.returncode, -signal.SIGKILL, errors)
-                checkout = folder / "checkout"
+                checkout = folder
                 self.assertEqual((checkout / "file").read_text(), "working edit\n")
                 self.assertEqual((checkout / "untracked").read_text(), "test output\n")
-                self.assertTrue(folder.is_relative_to(self.tmp))
+                self.assertTrue(folder.is_relative_to(self.tmp.parent / "fresh-settings/slots"))
                 self.assertFalse((folder / copy_record.RECORD).exists())
                 result = self.sweep()
                 self.assertTrue(folder.exists())
-                self.assertIn(str(folder), result.kept[tmp_sweep.UNSAVED_WORK])
+                self.assertNotIn(str(folder), [entry["path"] for entry in result.deleted])
+                self.assertEqual(build_folders.build_folder_state(folder), "free")
 
     def git(self, repo: Path, *arguments: str) -> None:
         _ = subprocess.run(["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@test",

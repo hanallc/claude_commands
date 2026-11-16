@@ -142,6 +142,7 @@ SWAP_OWNER_SLICES: dict[str, SwapCategory] = {"app-agents.slice": "agents", "ses
                                               "system.slice": "system", "hana.slice": "ci", "hana-ci.slice": "ci"}
 SwapPool = Literal["outside", "builds_ci"]
 SWAP_POOLS: tuple[SwapPool, ...] = ("outside", "builds_ci")
+SWAP_RETURN_NOTE = "The reserve uses swap-in measured within the recent window."
 BUILD_RESERVED_NOTE = "Build reserved is memory that running builds used at their next points in earlier runs."
 BUILDS_CI_SLICES = frozenset({"builds.slice", "hana.slice", "hana-ci.slice"})
 SwapRowKind = Literal["owner", "ungrouped", "unattributed", "difference", "smaller", "total"]
@@ -463,7 +464,16 @@ def head_room(check: admission_records.RoomCheck,
     if ahead > 0:
         rows.append({"label": "− Held for builds ahead in line", "gib": gib(ahead)})
     rows.append({"label": "= Free for builds", "gib": gib(free)})
-    return {"unavailable": "", "rows": rows, "note": " ".join(filter(None, (BUILD_RESERVED_NOTE, basis)))}
+    uncovered = (f"Running builds need {gib(ram['build_target_bytes']):.1f} GiB reserved. "
+                 + f"Free RAM covers {gib(ram['build_covered_bytes']):.1f} GiB of it."
+                 if ram["build_target_bytes"] > ram["build_covered_bytes"] else "")
+    swap = (" ".join(filter(None, (
+        f"Swap coming back needs {gib(ram['swap_target_bytes']):.1f} GiB.",
+        f"Free RAM covers {gib(ram['swap_covered_bytes']):.1f} GiB of it."
+        if ram["swap_target_bytes"] > ram["swap_covered_bytes"] else "", SWAP_RETURN_NOTE)))
+            if room.agent_swap_demand else "")
+    return {"unavailable": "", "rows": rows,
+            "note": " ".join(filter(None, (BUILD_RESERVED_NOTE, uncovered, swap, basis)))}
 
 
 def cap_unavailable_reason(cap: admission_records.CapUnavailable) -> str:
@@ -1991,8 +2001,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                   if row.get("machine") == machine and not row["ci"] and isinstance(row["pid"], int)}
     if isinstance(holders, TokenHolders):
         counts = tokens_by_run(holders, set(token_rows))
-        for pid, row in token_rows.items():
-            row["tokens"] = counts.get(pid, 0)
+        # steve lists each connected process, holders of 0 included; a step with no line keeps the dash.
+        for pid, held in counts.items():
+            token_rows[pid]["tokens"] = held
     waiters: list[MemoryWaitRow] = []
     checks = {row.waiter.pid: row.room for row in explanation.line.steps}
     if isinstance(explanation.head, admission_records.HeadExplanation):

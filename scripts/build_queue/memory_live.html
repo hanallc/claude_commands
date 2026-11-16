@@ -322,6 +322,8 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 .track .b.roomb { background: var(--room); }
 .track .b.waitb { background: transparent; border: 2px dashed var(--ink-3); }
 .walk.has-cap .track .b.waitb { border-right: 0; border-radius: 3px 0 0 3px; }
+.track .b.over-cap { border-radius: 3px 0 0 3px; box-shadow: inset -3px 0 0 var(--cap); }
+.walk-sum.over-cap { color: var(--cap); font-weight: 600; }
 .track:hover .b { filter: brightness(1.12); }
 .walk-axis { font-size: 0.75rem; color: var(--ink-2); margin-top: 4px; }
 .walk-axis .ticks { position: relative; height: 16px; }
@@ -534,8 +536,8 @@ const TIPS = {
     "RAM that the desktop session uses, so the mouse and keyboard stay responsive.",
     optional(d.ram.desktop_protection_bytes, `The system never takes back the first ${ramAmount(d.ram.desktop_protection_bytes)}.`))),
   swap: (d) => [`Swap coming back · ${ramAmount(d.ram.swap_covered_bytes)}`, lines(
-    "Empty RAM the queue holds for memory in swap, mostly agents' memory.",
-    "That memory can come back into RAM at any time.",
+    "Empty RAM the queue holds for recent swap-in.",
+    "The reserve uses swap-in within the configured window, limited to swap outside builds and CI.",
     `Swap coming back: ${ramAmount(d.ram.swap_target_bytes)}.`,
     optional(d.ram.swap_missing_bytes, `Free RAM does not cover ${ramAmount(d.ram.swap_missing_bytes)} of it.`))],
   agents: (d) => measuredTip("Agents", d.ram.agents_bytes,
@@ -671,9 +673,11 @@ function level(d) {
 }
 Object.assign(TIPS, {
   pill: (d) => [`Memory pressure · ${({ ok: "none", warn: "near a limit", hold: "queue holds", neutral: "stall not recorded" })[level(d)]}`, `Pressure means the system waits for memory. Above a limit, the queue starts no new step. Click to see swap and the pressure checks.`],
-  walksum: (d) => [!hasCap(d) ? `Taken · ${f1(d.taken)} GiB · cap unavailable` : `Taken · ${f1(d.taken)} of ${f1(d.cap)} GiB`, !hasCap(d) ? d.cap_text : lines(
-    `Builds: ${ramAmount(legendBytes(d.ram, "builds"))}.`, `+ Build reserved: ${ramAmount(d.ram.build_covered_bytes)}.`,
-    `= Taken: ${f1(d.taken)} GiB.`, `The rest of the queue cap is free: ${ramAmount(d.ram.room_bytes)}.`)],
+  walksum: (d) => [!hasCap(d) ? `Taken · ${f1(d.taken)} GiB · cap unavailable` : `Taken · ${f1(claimedGib(d))} of ${f1(d.cap)} GiB`, !hasCap(d) ? d.cap_text : lines(
+    `Builds: ${ramAmount(legendBytes(d.ram, "builds"))}.`, `+ Build reserved: ${ramAmount(d.ram.build_covered_bytes + overCapBytes(d))}.`,
+    `= Taken: ${f1(claimedGib(d))} GiB.`, overCapBytes(d) > 0
+      ? `That is ${ramAmount(overCapBytes(d))} over the ${f1(d.cap)} GiB queue cap, so nothing is free.`
+      : `The rest of the queue cap is free: ${ramAmount(d.ram.room_bytes)}.`)],
   tokens: (d) => d.tokens?.kind !== "TokenPool" ? ["Tokens · unavailable", d.tokens?.reason || "The feed sent no token pool reading."]
     : [`Tokens · ${d.tokens.total} total, ${d.tokens.free} free`, lines(
       "A token lets a natedev build run one more job at the same time.",
@@ -816,6 +820,10 @@ function renderTargets(rows) {
 }
 function recorded(value) { return typeof value === "number"; }
 function hasCap(d) { return recorded(d.cap); }
+// Build reserves that do not fit under the queue cap; the cap holds only the covered part.
+function overCapBytes(d) { return hasCap(d) && recorded(d.ram.build_missing_bytes) ? Math.max(0, d.ram.build_missing_bytes) : 0; }
+// Taken counts each full build reserve, so over the cap it reads more than the cap.
+function claimedGib(d) { return d.taken + overCapBytes(d) / GIB; }
 function useValue(row) { return recorded(row.used) ? row.used : 0; }
 function visibleDetail(row) {
   if (row.ci) {
@@ -1328,7 +1336,10 @@ function renderWalk(d) {
   $("ticks").style.width = `${axisEnd / scale * 100}%`;
   $("ticks").innerHTML = lowerTicks.join("");
   $("ticks-top").innerHTML = ticks.join("");
-  $("walk-sum").textContent = !hasCap(d) ? `${f1(d.taken)} GiB taken · cap unavailable` : `${f1(d.taken)} of ${f1(d.cap)} GiB taken`;
+  const overCap = overCapBytes(d);
+  $("walk-sum").textContent = !hasCap(d) ? `${f1(d.taken)} GiB taken · cap unavailable`
+    : `${f1(claimedGib(d))} of ${f1(d.cap)} GiB taken${overCap > 0 ? ` · ${ramAmount(overCap)} over cap` : ""}`;
+  $("walk-sum").classList.toggle("over-cap", overCap > 0);
   $("walk-tokens").textContent = tokenPoolText(d.tokens);
   fitLabels();
 }
@@ -1485,6 +1496,12 @@ function placeMemoryBars(d) {
   const end = roomAt + room;
   const box = (left, size, className, tip = "") => size > 0
     ? `<div class="b ${className}" ${tip ? `data-tip="${tip}"` : ""} style="left:${left}px;width:${size}px"></div>` : "";
+  // A local bar stops at the cap line; a bar that the cap cuts shows a cap-colored end.
+  const chartEdge = !hasCap(d) ? width : progressEnd;
+  const capBox = (left, size, className) => {
+    const drawn = Math.min(size, chartEdge - left);
+    return box(left, drawn, drawn < size ? `${className} over-cap` : className);
+  };
   function placeAmounts(row, amounts) {
     const container = row.querySelector(".amounts");
     container.innerHTML = amounts.map(amount => `<span class="bar-amount ${amount.kind}" data-start="${amount.left}" style="left:${amount.left}px">${esc(amount.text || memoryAmount(amount.value))}</span>`).join("");
@@ -1494,7 +1511,7 @@ function placeMemoryBars(d) {
   let usedAt = tools, reservedAt = reserveAt;
   const toolsRow = document.querySelector(".wrow.tools");
   if (toolsRow) {
-    toolsRow.querySelector(".track").innerHTML = box(0, tools, "seg-tools");
+    toolsRow.querySelector(".track").innerHTML = capBox(0, tools, "seg-tools");
     placeAmounts(toolsRow, [{kind: "used-amount", left: 0, value: r.build_tools_bytes / GIB}]);
   }
   const reserveScale = r.build_target_bytes > 0 ? reserved / (r.build_target_bytes / GIB) : 0;
@@ -1511,13 +1528,13 @@ function placeMemoryBars(d) {
     } else if (run.kind === "cloud" && recorded(run.used)) {
       bars = box(0, Math.min(row.querySelector(".track").clientWidth, run.used * unit), "seg-remote");
     } else if (run.ci) {
-      bars = box(used, ciWidth, "seg-ci");
+      bars = capBox(used, ciWidth, "seg-ci");
       if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: used, value: run.used});
     } else if (run.kind !== "cloud") {
       const useWidth = Math.max(0, useValue(run) * unit);
       const reserveWidth = Math.max(0, Math.min(run.reserved * reserveScale, roomAt - reservedAt));
       const drawnUse = useWidth > 0 ? Math.max(3, useWidth) : 0;
-      bars = box(usedAt, drawnUse, "seg-used") + box(reservedAt, reserveWidth, "hatch");
+      bars = capBox(usedAt, drawnUse, "seg-used") + capBox(reservedAt, reserveWidth, "hatch");
       if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: usedAt, value: run.used});
       if (run.reserved > 0) amounts.push({kind: "reserved-amount", left: reservedAt, value: run.reserved});
       usedAt += useWidth;
@@ -1539,7 +1556,7 @@ function placeMemoryBars(d) {
   }
   const roomTrack = document.querySelector(".wrow.room .track");
   if (roomTrack) {
-    roomTrack.innerHTML = box(roomAt, room, "roomb");
+    roomTrack.innerHTML = capBox(roomAt, room, "roomb");
     roomTrack.closest(".wrow").querySelector(".room-value")?.remove();
     roomTrack.closest(".wrow").querySelector(".row-heading").insertAdjacentHTML("beforeend",
       `<span class="room-value">${memoryAmount(d.room)}</span>`);
@@ -1548,8 +1565,10 @@ function placeMemoryBars(d) {
   for (const row of document.querySelectorAll(".wrow.wait")) {
     const waiter = d.waiters[Number(row.dataset.tip.split(":")[1])];
     if (waiter.kind === "cloud") continue;
-    const waitWidth = Math.min(end, waiter.need * unit);
-    const waitAt = !hasCap(d) ? roomAt : end - waitWidth;
+    // With a cap, a wait bar ends at the room end or the cap line, whichever is first, and never passes it.
+    const waitEnd = !hasCap(d) ? end : Math.min(end, chartEdge);
+    const waitWidth = Math.min(waitEnd, waiter.need * unit);
+    const waitAt = !hasCap(d) ? roomAt : waitEnd - waitWidth;
     const drawnWidth = !hasCap(d) ? Math.max(0, Math.min(waitWidth, end - waitAt)) : waitWidth;
     row.querySelector(".track").innerHTML = box(waitAt, drawnWidth, "waitb");
     placeAmounts(row, drawnWidth > 0 ? [{kind: "need-amount", left: waitAt, value: waiter.need}] : []);

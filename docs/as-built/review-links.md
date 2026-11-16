@@ -244,8 +244,15 @@ Each change can hold one image id in its optional `Image` cell.
 It adds the `Image` column when needed and deletes the old image after writing the row.
 `change_review.py image --image <png>` registers a screenshot for a checkpoint line.
 `image --output <text file>` renders dark terminal output with headless Chrome in a temporary browser profile.
+It measures the wrapped text height before capture and uses that height for the image.
+The image height has a 160-pixel minimum because Chrome clips shorter screenshots.
+The image height has a 4096-pixel limit.
 The action prints the id for a final ` | image <id>` field, after optional ` | after <step>`.
 The parser accepts twelve lowercase hexadecimal characters.
+The commit hook requires an image on each visible Change-Review line through `change_review.problem`.
+Merge checks require the image for commits dated at or after 2026-11-16 00:00 EST, using the Git committer time (`%ct`).
+Malformed lines remain invalid at every date.
+Merged history remains readable without an image.
 `list-ready` and `live` leave the cell empty and print one line when the image is missing.
 
 Both review pages use `change_page.change_content` and `CHANGE_IMAGE_STYLE` for the thumbnail.

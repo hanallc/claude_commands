@@ -22,6 +22,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.copies import copies
+from scripts.copies.copies_test_support import copies_environment
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib import build_folders, cargo_output, copy_record, scratch, session_folder
 from scripts.lint import sweep
@@ -53,10 +54,13 @@ class ScratchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(mock.patch.dict(os.environ, {
+            **copies_environment(self.base),
             "HOME": str(self.base),
             copy_record.ROOT_ENV: str(self.base / "scratch"), scratch.VISIBLE_ROOT_ENV: str(self.base / "repro"),
             scratch.HOLDS_ENV: str(self.base / "holds.json"), copy_record.COPIES_ENV: str(self.base / "copies"),
-            "CODEX_THREAD_ID": MAKER_ID, "STAFF_FILE": str(self.base / "staff.json")}))
+            "CODEX_THREAD_ID": MAKER_ID, "STAFF_FILE": str(self.base / "staff.json"),
+            # An absent session root: a run without the test-run folder must not reach the live root.
+            session_folder.ROOT_ENV: str(self.base / "session")}))
         _ = staff.ensure("showrunner", name="maker", runtime_id=MAKER_ID)
         def registered_plan(unit: str) -> Path:
             return self.base / "registered-plans" / f"{unit}.md"
@@ -229,7 +233,8 @@ class ScratchTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HOME": str(self.base)}):
             with copies.standing("style", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
                 target = (checkout / "target").resolve()
-            self.assertFalse(checkout.exists())
+            self.assertTrue(checkout.exists())
+            self.assertEqual(build_folders.build_folder_state(checkout), "free")
             # Supply build output, but let copies supply every cache marker.
             fingerprint = target / "debug" / ".fingerprint" / "sample-0123456789abcdef"
             fingerprint.mkdir(parents=True)
