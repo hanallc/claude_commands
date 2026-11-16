@@ -138,7 +138,7 @@ class MemoryWindowTests(unittest.TestCase):
         start, end = datetime.fromisoformat(START_UTC), datetime.fromisoformat(END_UTC)
         configuration = admission_records.read_memory_config()
         inputs = admission_records.QueueInputs([], (), (), admission_records.HostMemory(30 * GIB, 60 * GIB),
-            admission_records.NoPressureHold(), admission_records.ReadyToStart(), admission_records.NoHeadAdmissionOverride(), start.timestamp())
+            admission_records.NoPressureHold(), admission_records.ReadyToStart(), start.timestamp())
         directory = self.root / "admission"
         directory.mkdir(parents=True)
         queue_snapshot.write_queue_snapshot(directory, inputs, configuration.policy)

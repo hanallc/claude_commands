@@ -302,7 +302,8 @@ Partial logs cannot complete a gate.
 A dead instance without a final result permits local fallback.
 A remote test failure remains red and never starts a local retry.
 
-The route imports the explicit buildlog record once by its identity under the real remote host.
+The route imports the explicit buildlog record once by its identity into the one AWS place, `aws`.
+The record keeps the box host name in `host`.
 It uses `scripts/test_times/gate_record.py` for module measurements.
 It adds no gate host to the build-target registry or peer sync service.
 The synchronous caller receives the existing `GateRun` shape and exit behavior.

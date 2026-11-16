@@ -174,7 +174,7 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
         try:
             with validation_log.open("w", encoding="utf-8") as output:
                 result = subprocess.run(argv, cwd=checkout, stdout=output, stderr=subprocess.STDOUT,
-                                        text=True, check=False)
+                                        text=True, check=False, pass_fds=copies.COMMAND_LOCKS.get())
             if result.returncode:
                 detail = f"exit {result.returncode}, no step named"
                 with validation_log.open(encoding="utf-8", errors="replace") as output:

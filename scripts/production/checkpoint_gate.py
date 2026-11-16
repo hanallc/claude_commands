@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict, cast
 
+from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.message import session_send
@@ -115,7 +116,7 @@ def test_steps(production: ProductionDocument, paths: tuple[str, ...],
 
 def run_test_command(command: list[str], folder: Path, *, raise_start_errors: bool = False) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(command, cwd=folder, capture_output=True, text=True, check=False)
+        return subprocess.run(command, cwd=folder, capture_output=True, text=True, check=False, pass_fds=copies.COMMAND_LOCKS.get())
     except OSError as error:
         if raise_start_errors:
             raise

@@ -13,7 +13,7 @@ from enum import StrEnum
 from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
-from scripts.buildlog import costs, index, moments
+from scripts.buildlog import cost_actions, costs, index, moments
 from scripts.lib.user_zone import user_zone
 from scripts.buildlog.costs import CostUnavailable as CostUnavailable
 
@@ -56,12 +56,6 @@ class ChartSet:
 
 
 @dataclass(frozen=True)
-class CostAction:
-    text: str
-    owner: str
-
-
-@dataclass(frozen=True)
 class WindowMatchesRecent:
     pass
 
@@ -80,7 +74,10 @@ class TopCost:
     cause: costs.Cause
     recent: ChartCost
     window: WindowValue
-    action: CostAction
+    # One value for each whole day of the recent window, oldest first.
+    days: tuple[ChartCost, ...]
+    share: cost_actions.LargestShare | cost_actions.NoShare
+    action: cost_actions.CostAction
 
 
 @dataclass(frozen=True)
@@ -102,16 +99,8 @@ class IndexUnavailable:
     reason: str
 
 
-COST_KEYS: dict[costs.Cause, str] = {
-    "Memory wait": "MEMORY_WAIT",
-    "Cold rebuilds": "COLD_REBUILDS",
-    "Reruns after a pass": "RERUNS_AFTER_A_PASS",
-    "Failed runs": "FAILED_RUNS",
-    "Cancelled CI": "CANCELLED_CI",
-    "Mac idle while natedev waits": "MAC_IDLE_WHILE_NATEDEV_WAITS",
-}
-
-CAUSES = tuple(COST_KEYS)
+CAUSES: tuple[costs.Cause, ...] = ("Memory wait", "Cold rebuilds", "Reruns after a pass", "Failed runs",
+                                   "Cancelled CI", "Mac idle while natedev waits")
 
 
 def with_first_sources(reading: costs.CostReading) -> costs.CostReading:
@@ -186,7 +175,9 @@ def chart_series(reading: costs.CostReading, start: datetime, end: datetime, zon
         daily = costs.CostReading(tuple(contributions[position]), tuple(observations[position]),
                                   tuple(spans[position]), tuple(phases[position]), reading.coverage, reading.first_sources)
         buckets.append(build_bucket(daily, low, high, thin=low != full_low or high != full_high))
-    machines = sorted(set(configured) | set(reading.first_sources))
+    # A source folder with no step in the window is no chart machine: each cloud gate host has its own folder.
+    machines = sorted(set(configured) | {item.machine for item in reading.observations}
+                      | {item.machine for item in reading.contributions})
     if reading.idle_spans and "mac" not in machines:
         machines.append("mac")
     return ChartSet(start, end, str(zone), tuple(buckets), tuple(sorted(machines)), moments.MOMENTS)
@@ -246,6 +237,26 @@ def known_seconds(value: ChartCost) -> float | None:
     return None
 
 
+@dataclass(frozen=True)
+class DailyRange:
+    """The lowest and highest day of a cost, in hours."""
+    low_hours: float
+    high_hours: float
+
+
+class RangeUnavailable(StrEnum):
+    """A day is not fully measured, so a range would hide the unknown part."""
+    VALUE = "range unavailable"
+
+
+def daily_range(days: tuple[ChartCost, ...]) -> DailyRange | RangeUnavailable:
+    """The range of the days, only when every day is measured."""
+    measured = [day.seconds for day in days if isinstance(day, MeasuredCost)]
+    if not measured or len(measured) != len(days):
+        return RangeUnavailable.VALUE
+    return DailyRange(min(measured) / 3600, max(measured) / 3600)
+
+
 def window_value(recent: ChartCost, window: ChartCost, recent_days: int, days: int) -> WindowValue:
     """Compare daily costs and preserve unavailable comparison values."""
     recent_seconds = known_seconds(recent)
@@ -271,8 +282,6 @@ def page_data(days: int, n: int = 3) -> PageData | IndexUnavailable:
     recent_days = settings.whole("TOP_COST_RECENT_DAYS")
     if recent_days > days:
         raise conf.Unusable(f"TOP_COST_RECENT_DAYS={recent_days} exceeds the page days ({days})")
-    actions = {cause: CostAction(settings.text("COST_ACTION_" + key), settings.text("COST_OWNER_" + key))
-               for cause, key in COST_KEYS.items()}
     zone = user_zone()
     end = datetime.now(zone)
     start = end - timedelta(days=days)
@@ -283,11 +292,16 @@ def page_data(days: int, n: int = 3) -> PageData | IndexUnavailable:
         series = chart_series(reading, start, end, zone, record.configured_targets())
         recent = build_bucket(reading, recent_start, end)
         window = build_bucket(reading, start, end)
+        slices = [build_bucket(reading, recent_start + timedelta(days=day), recent_start + timedelta(days=day + 1))
+                  for day in range(recent_days)]
         rows: list[TopCost] = []
         for row in recent.costs.ranked[:max(0, n)]:
             value = cost_value(recent, row.machine, row.cause)
             comparison = window_value(value, cost_value(window, row.machine, row.cause), recent_days, days)
-            rows.append(TopCost(row.machine, row.cause, value, comparison, actions[row.cause]))
+            rows.append(TopCost(row.machine, row.cause, value, comparison,
+                                tuple(cost_value(day, row.machine, row.cause) for day in slices),
+                                cost_actions.largest_share(reading, row.machine, row.cause, recent_start, end),
+                                cost_actions.cost_action(connection, reading, row.machine, row.cause, recent_start, end)))
         top = TopCosts(recent_start, end, recent_days, tuple(rows) if rows else NoDataYet.VALUE)
         return PageData(series, top)
 
@@ -314,12 +328,16 @@ def chart_data(series: ChartSet) -> dict[str, object]:
     buckets: list[dict[str, object]] = []
     for bucket in series.buckets:
         hana = [phase for phase in bucket.costs.phases if moments.hana_name(phase.working_dir) and phase.host == "natedev"]
-        durations = [phase.wall_s for phase in hana if isinstance(phase.wall_s, float)]
-        phase: dict[str, object] = {"finished": len(hana), "valid": len(durations), "missing": len(hana)-len(durations)}
+        durations = [phase.active_s for phase in hana if isinstance(phase.active_s, float)]
+        unrecorded = sum(isinstance(item.active_s, moments.WaitsNotRecorded) for item in hana)
+        phase: dict[str, object] = {"finished": len(hana), "valid": len(durations), "missing": len(hana)-len(durations),
+                                    "unrecorded": unrecorded}
         if durations:
             phase.update(state="measured", median=moments.nearest_rank(durations, 50), p90=moments.nearest_rank(durations, 90))
         else:
-            phase.update(state="unavailable", reason="no valid durations" if hana else "no finished phases")
+            phase.update(state="unavailable", reason=(
+                "phases ended before waits were recorded" if unrecorded
+                else "no valid durations" if hana else "no finished phases"))
         rows: list[dict[str, object]] = []
         days = (bucket.end-bucket.start).total_seconds()/86400
         for machine in series.machines:

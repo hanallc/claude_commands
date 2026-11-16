@@ -70,6 +70,7 @@ class CliArguments(argparse.Namespace):
         self.recovery_fd: int = -1
         self.probe_marks_file: str = ""
         self.recover_only: bool = False
+        self.no_probe: bool = False
         self.mac_only: bool = False
         self.remote_kinds_file: str = ""
         self.session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION
@@ -121,6 +122,9 @@ def parser() -> argparse.ArgumentParser:
     _ = commands.add_parser("submitting-session")
     source = commands.add_parser("source-key")
     _ = source.add_argument("--repo-root", required=True)
+    backoff = commands.add_parser("probe-backoff")
+    _ = backoff.add_argument("--target", required=True)
+    _ = backoff.add_argument("--no-probe", action="store_true")
     status = commands.add_parser("status")
     _ = status.add_argument("--probe", action="store_true")
     eligible = commands.add_parser("eligible", aliases=["constraints"])
@@ -160,6 +164,7 @@ from scripts.build_targets.target_config import (
     LocalRequired,
     Routing,
     SshTarget,
+    WRITES_TREE,
     read_targets,
 )
 from scripts.direct.step_selection import Pinned, ROUTED, TargetSelection
@@ -330,13 +335,11 @@ def step_routing_rule(kind: CommandKind, routing: Routing = ANY_ELIGIBLE_TARGET,
                       ) -> AnyTarget | NatedevOnly:
     """Choose the run location for each step before target admission."""
     if writes_tree:
-        return NatedevOnly("step writes the tree")
+        return NatedevOnly(WRITES_TREE.reason)
     if isinstance(routing, LocalRequired):
         return NatedevOnly(routing.reason)
     if isinstance(selection, Pinned):
         return AnyTarget()
-    if kind == "build":
-        return NatedevOnly("makes natedev artifacts")
     if kind == "final":
         return NatedevOnly("full gate runs on natedev")
     return AnyTarget()
@@ -564,6 +567,22 @@ def command_recover_probe(args: CliArguments) -> int:
         except offload.OffloadInterrupted as interrupted:
             return 128 + interrupted.signal_number
 
+    return 0
+
+
+def command_probe_backoff(name: str, *, probe: bool) -> int:
+    """Exit 0 when the target has no retry backoff or answers one probe; exit 1 otherwise."""
+    from scripts.build_targets import target_config
+    from scripts.mac_test import eligibility, offload
+
+    if not isinstance(eligibility.read_backoff(time.time(), name), eligibility.ActiveBackoff):
+        return 0
+    if not probe:
+        return 1
+    config = eligibility.read_config(target_config.configured_ssh_target(name).settings)
+    if isinstance(offload.probe_reachability(offload.ProcessController(), config), offload.UnreachableHost):
+        return 1
+    offload.record_reachable(name)
     return 0
 
 
@@ -1388,6 +1407,8 @@ def main() -> int:
     args = parser().parse_args(namespace=CliArguments())
     if args.command == "recover-probe":
         return command_recover_probe(args)
+    if args.command == "probe-backoff":
+        return command_probe_backoff(args.target, probe=not args.no_probe)
     if args.command == "source-key":
         from scripts.buildlog import treekey
 
