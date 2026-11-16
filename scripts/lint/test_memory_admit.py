@@ -58,6 +58,59 @@ from scripts.message.roster import UnitLabels
 READY_FOR_ADMISSION = admission_records.ReadyForAdmission()
 
 
+class AppMemoryTests(unittest.TestCase):
+    def test_unowned_app_slice_subtracts_its_owned_scope(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(step="app")
+            sidecar = fixture.scope(request.owner,
+                folder="builds.slice/builds-appfixture.slice/app-fixture.scope",
+                current=4 * GIB, anonymous=2 * GIB, swap=GIB)
+            parent = Path(sidecar.read_text()).parent
+            _ = (parent / "cgroup.procs").write_text("")
+            _ = (parent / "memory.current").write_text(str(7 * GIB))
+            _ = (parent / "memory.swap.current").write_text(str(2 * GIB))
+            _ = (parent / "memory.stat").write_text(f"anon {5 * GIB}\nshmem 0\ninactive_file 0\n")
+            row = fixture_reservation(request.owner.pid, 6 * GIB, step="app")
+            row["start_time"] = request.owner.start_time
+            row["sidecar"] = str(sidecar)
+            unowned, = gate.unowned_slice_memory([row], fixture.proc.processes(), fixture.proc.path)
+            self.assertEqual(unowned.bytes, 3 * GIB)
+            self.assertEqual(unowned.anonymous, admission_records.AnonymousRunUse(3 * GIB))
+            self.assertEqual(unowned.swap_bytes, GIB)
+
+    def test_app_uses_the_configured_first_peak(self) -> None:
+        with AdmissionFixture() as fixture:
+            profile = gate.app_profile(fixture.root / "hana", fixture.root, NOW, fixture.root)
+            self.assertEqual(profile.step, "app")
+            self.assertEqual(profile.peak.bytes, 6 * GIB)
+            self.assertEqual(profile.peak.source, "fallback")
+
+    def test_app_uses_the_largest_of_ten_recent_runs(self) -> None:
+        with AdmissionFixture() as fixture:
+            binary = fixture.root / "debug/hana"
+            rows = [{"host": store.host_name(), "repo": str(binary), "step": "app",
+                     "anon_peak_bytes": value, "ended_at": (NOW - timedelta(seconds=index)).isoformat()}
+                    for index, value in enumerate([3, 7, 4, 2, 1, 6, 5, 4, 3, 2, 99])]
+            rows.extend({**rows[0], "anon_peak_bytes": 100, "repo": str(fixture.root / "release/hana")} for _ in range(2))
+            _ = (fixture.state_dir / "anon_peaks.jsonl").write_text("\n".join(json.dumps(row) for row in rows))
+            profile = gate.app_profile(binary, fixture.root, NOW, fixture.state_dir.parent)
+            self.assertEqual(profile.peak.bytes, 7)
+            self.assertEqual(profile.peak.count, 10)
+
+    def test_app_peak_includes_swap(self) -> None:
+        with AdmissionFixture() as fixture:
+            scope = fixture.root / "scope"
+            scope.mkdir()
+            _ = (scope / "memory.peak").write_text("7")
+            _ = (scope / "memory.swap.peak").write_text("5")
+            maximum = fixture.root / "peak"
+            gate.sample_app_peak(scope, maximum)
+            self.assertEqual(maximum.read_text(), "12\n")
+            _ = (scope / "memory.peak").write_text("1")
+            gate.sample_app_peak(scope, maximum)
+            self.assertEqual(maximum.read_text(), "12\n")
+
+
 class SnapshotCompatibilityTests(unittest.TestCase):
     def test_older_record_uses_field_default(self) -> None:
         self.assertEqual(codec.parse_snapshot_value(

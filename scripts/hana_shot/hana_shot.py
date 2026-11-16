@@ -38,7 +38,9 @@ from types import FrameType
 from typing import IO, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, override
 
 from scripts.lib import conf, process_group, scratch
+from scripts.build_queue import admission_records, app_gate
 from scripts.lib.conf import UseConfiguredValue
+from scripts.lib.atomic_file import write_text_atomic
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # Wakes the remote display and holds it until the run closes this shell's stdin; -t ends it if that never comes.
@@ -460,6 +462,23 @@ class LaunchState(TypedDict):
     binary: str
     started: str
     uncommitted_paths: NotRequired[list[str]]
+    process_group: NotRequired[int]
+    pid_start: NotRequired[str]
+
+
+@dataclass(frozen=True)
+class QueuedAppStart:
+    """The app must receive admission before its readiness deadline starts."""
+    pid_file: Path
+    save_identity: Callable[[], None]
+
+
+@dataclass(frozen=True)
+class DirectAppStart:
+    """The app starts without a separate admission wait."""
+
+
+DIRECT_APP_START = DirectAppStart()
 
 
 @dataclass(frozen=True)
@@ -2233,6 +2252,9 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
             command = [direnv, "exec", str(root), *command]
         if sys.platform == "darwin":
             print("hana_shot: macOS ignores XDG_CONFIG_HOME; this Hana reads your real config", file=sys.stderr)
+        app_pid = launch_folder / "app.pid"
+        if sys.platform == "linux":
+            command = app_gate.command(executable, root, purpose.strip(), owner, app_pid, command)
         process: subprocess.Popen[bytes] | None = None
         try:
             with log.open("wb") as handle:
@@ -2240,6 +2262,10 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
                     command, cwd=root, stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT,
                     start_new_session=True,
                 )
+            if sys.platform == "linux":
+                launcher_start = admission_records.process_start_time(process.pid)
+                if launcher_start is not None:
+                    write_text_atomic(app_pid.with_suffix(".owner"), f"{process.pid} {launcher_start}\n")
             state: LaunchState = {
                 "pid": process.pid,
                 "port": port,
@@ -2256,21 +2282,48 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
             start = time.monotonic()
             from scripts.buildlog import record
             _ = record.launch(state_path, root)
-            wait_ready(Brp(port, settings=hana_shot_settings), process, log)
+            def save_app_identity() -> None:
+                state["process_group"] = state["pid"]
+                state["pid"] = int(app_pid.read_text().strip())
+                identity_file = app_pid.with_suffix(".start")
+                if identity_file.exists():
+                    state["pid_start"] = identity_file.read_text().strip()
+                _write_launch_state(state_path, state)
+
+            wait_ready(Brp(port, settings=hana_shot_settings), process, log,
+                       start=QueuedAppStart(app_pid, save_app_identity) if sys.platform == "linux" else DirectAppStart())
             print(f"hana_shot: Hana pid {process.pid} ready on port {port} in {time.monotonic() - start:.1f} s (log {log})", file=sys.stderr)
             _ = cleanup.pop_all()
             return state, process
         except BaseException:
             if process is not None:
-                shutdown(port, process, hana_shot_settings=hana_shot_settings)
+                shutdown(port, process, app_scope=app_pid.with_suffix(".cgroup") if sys.platform == "linux" else NoAppScope(),
+                         hana_shot_settings=hana_shot_settings)
             raise
 
 
-def wait_ready(brp: Brp, process: subprocess.Popen[bytes], log: Path) -> None:
+def wait_ready(brp: Brp, process: subprocess.Popen[bytes], log: Path, *,
+               start: QueuedAppStart | DirectAppStart = DIRECT_APP_START) -> None:
     hana_shot_settings = brp.settings
     ready_seconds = hana_shot_settings.number("ready_seconds")
     poll_seconds = hana_shot_settings.number("poll_seconds")
     warm_frame_ms = hana_shot_settings.number("warm_frame_ms")
+    if isinstance(start, QueuedAppStart):
+        last_reason = ""
+        while not start.pid_file.exists():
+            exited = process.poll() is not None
+            status_file = start.pid_file.with_suffix(".status")
+            try:
+                reason = status_file.read_text().strip()
+            except FileNotFoundError:
+                reason = ""
+            if reason and reason != last_reason:
+                print(reason, file=sys.stderr, flush=True)
+                last_reason = reason
+            if exited:
+                raise Failure(last_reason or f"App admission exited with {process.returncode}; see {log}")
+            time.sleep(poll_seconds)
+        start.save_identity()
     deadline = time.monotonic() + ready_seconds
     while True:
         if process.poll() is not None:
@@ -2310,7 +2363,16 @@ def same_binary(pid: int, binary: str) -> bool:
     return binary.encode() in cmdline.read_bytes()
 
 
+@dataclass(frozen=True)
+class NoAppScope:
+    """The caller has no saved app scope."""
+
+
+NO_APP_SCOPE = NoAppScope()
+
+
 def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
+    app_scope: Path | NoAppScope = NO_APP_SCOPE,
     hana_shot_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> None:
     """Stop a launched Hana, show any panic lines from its log, and remove its scratch."""
@@ -2341,7 +2403,29 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
         shutdown_answered = True
     except Failure:
         pass
-    if not isinstance(launch_record, WholeLaunchRecord) and process is not None:
+    if isinstance(launch_record, WholeLaunchRecord):
+        recorded_scope = Path(launch_record.state["scratch"]) / "app.cgroup"
+        if recorded_scope.exists() or recorded_scope.with_suffix(".owner").exists():
+            app_scope = recorded_scope
+    if isinstance(app_scope, Path):
+        if shutdown_answered:
+            deadline = time.monotonic() + shutdown_seconds
+            while time.monotonic() < deadline:
+                if isinstance(launch_record, WholeLaunchRecord) and "pid_start" in launch_record.state:
+                    state = launch_record.state
+                    if admission_records.process_start_time(state["pid"]) != state["pid_start"]:
+                        break
+                elif process is not None:
+                    if process.poll() is not None:
+                        break
+                elif not isinstance(launch_record, WholeLaunchRecord) or not process_alive(launch_record.state["pid"]):
+                    break
+                time.sleep(poll_seconds)
+        if process is None:
+            app_gate.stop_app_scope(app_scope, signal_grace_seconds)
+        else:
+            app_gate.stop_app_scope(app_scope, signal_grace_seconds, fallback_launcher=process)
+    elif not isinstance(launch_record, WholeLaunchRecord) and process is not None:
         # A state-write failure can leave only the process owned by this launch.
         try:
             _ = process.wait(timeout=shutdown_seconds)
@@ -2358,23 +2442,38 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
                 pass
     if isinstance(launch_record, WholeLaunchRecord):
         state = launch_record.state
-        pid = process.pid if process is not None else state["pid"]
-        deadline = time.monotonic() + shutdown_seconds
-        while time.monotonic() < deadline:
-            if process is not None:
-                if process.poll() is not None:
-                    break
-            elif not process_alive(pid):
-                break
-            time.sleep(poll_seconds)
-        else:
-            if process is not None or same_binary(pid, state["binary"]):
-                for signal_number in (signal.SIGTERM, signal.SIGKILL):
-                    try:
-                        process_group.send_process_group(pid, signal_number)
-                    except ProcessLookupError:
+        if isinstance(app_scope, NoAppScope):
+            pid = process.pid if process is not None else state["pid"]
+            deadline = time.monotonic() + shutdown_seconds
+            while time.monotonic() < deadline:
+                if "pid_start" in state:
+                    app_alive = admission_records.process_start_time(state["pid"]) == state["pid_start"]
+                    if not app_alive and (process is None or process.poll() is not None):
                         break
-                    time.sleep(signal_grace_seconds)
+                elif process is not None:
+                    if process.poll() is not None:
+                        break
+                elif not process_alive(pid):
+                    break
+                time.sleep(poll_seconds)
+            else:
+                identified = (admission_records.process_start_time(state["pid"]) == state["pid_start"]
+                              if "pid_start" in state else process is not None or same_binary(pid, state["binary"]))
+                if identified:
+                    for signal_number in (signal.SIGTERM, signal.SIGKILL):
+                        try:
+                            if "pid_start" in state and admission_records.process_start_time(state["pid"]) != state["pid_start"]:
+                                break
+                            if "process_group" in state:
+                                try:
+                                    os.kill(state["pid"], signal_number)
+                                except ProcessLookupError:
+                                    pass
+                            process_group.send_process_group(state.get("process_group", pid), signal_number)
+                        except ProcessLookupError:
+                            if "pid_start" not in state:
+                                break
+                        time.sleep(signal_grace_seconds)
         lines = panic_lines(Path(state["log"]), hana_shot_settings=hana_shot_settings)
         if lines:
             print(f"hana_shot: Hana on port {port} logged a panic:", file=sys.stderr)

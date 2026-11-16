@@ -29,6 +29,7 @@ import zlib
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog import store
+from scripts.build_queue import admission_records, app_gate
 from scripts.hana_shot import hana_shot
 from scripts.lib import conf, process_group
 from scripts.lib import scratch as scratch_folders
@@ -961,6 +962,10 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
 
         def start_stub(command: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
             self.assertEqual(command[-1], str(self.executable))
+            if sys.platform == "linux":
+                self.assertEqual(Path(command[1]).name, "app_gate.py")
+                self.assertEqual(command[command.index("--purpose") + 1], "launch warning")
+                self.assertEqual(command[command.index("--owner") + 1], "window-unit")
             self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
             self.assertIn("HANA_TEST_PURPOSE=launch warning", command)
             self.assertIn("HANA_TEST_OWNER=window-unit", command)
@@ -1034,6 +1039,251 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         ):
             state, _ = hana_shot.launch(self.port, str(self.root), str(self.executable), purpose=LAUNCH_RECORDING_PURPOSE, owner=owner)
         return state
+
+    def test_queue_time_does_not_consume_the_readiness_deadline(self) -> None:
+        folder = self.scratch / "queued-launch"
+        folder.mkdir()
+        clock = [0.0]
+        ticks = [0]
+        process = cast(subprocess.Popen[bytes], mock.Mock(pid=424242, poll=mock.Mock(return_value=None)))
+        diagnostics = io.StringIO()
+        _ = (folder / "app.status").write_text("waiting for memory: fixture needs 6 GiB")
+
+        def tick(seconds: float) -> None:
+            ticks[0] += 1
+            clock[0] += seconds
+            if ticks[0] == 1:
+                clock[0] += 1000
+            elif ticks[0] == 2:
+                _ = (folder / "app.start").write_text("123")
+                _ = (folder / "app.pid").write_text("424243")
+            else:
+                saved = cast(dict[str, object], json.loads(self.state_path.read_text()))
+                self.assertEqual(saved["pid"], 424243)
+                self.assertEqual(saved["pid_start"], "123")
+                _ = (folder / "hana.log").write_text(hana_shot.READY_LOG_LINE)
+
+        with (
+            mock.patch.object(hana_shot, "port_answers", return_value=False),
+            mock.patch.object(hana_shot, "uncommitted_build_paths", return_value=[]),
+            mock.patch.object(scratch_folders, "new", return_value=folder),
+            mock.patch.object(subprocess, "Popen", return_value=process),
+            mock.patch.object(hana_shot.Brp, "diagnostics", return_value={"frame_time_ms": {"current": 1}}),
+            mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+            mock.patch.object(time, "sleep", side_effect=tick),
+            mock.patch.object(hana_shot, "shutdown"),
+            redirect_stderr(diagnostics),
+        ):
+            state, _ = hana_shot.launch(self.port, str(self.root), str(self.executable), purpose="queue wait", owner="fixture")
+        self.assertEqual(state["pid"], 424243)
+        self.assertEqual(state.get("process_group"), 424242)
+        self.assertEqual(state.get("pid_start"), "123")
+        self.assertIn("waiting for memory: fixture needs 6 GiB", diagnostics.getvalue())
+        self.assertEqual(ticks[0], 3)
+
+    def test_admission_refusal_reports_its_reason(self) -> None:
+        folder = self.scratch / "refused-launch"
+        folder.mkdir()
+        _ = (folder / "app.status").write_text("app_gate: fixture policy refuses this app")
+        process = cast(subprocess.Popen[bytes], mock.Mock(pid=424242, poll=mock.Mock(return_value=2)))
+        with (
+            mock.patch.object(hana_shot, "port_answers", return_value=False),
+            mock.patch.object(hana_shot, "uncommitted_build_paths", return_value=[]),
+            mock.patch.object(scratch_folders, "new", return_value=folder),
+            mock.patch.object(subprocess, "Popen", return_value=process),
+            mock.patch.object(hana_shot, "shutdown"),
+            self.assertRaisesRegex(hana_shot.Failure, "fixture policy refuses this app"),
+        ):
+            _ = hana_shot.launch(self.port, str(self.root), str(self.executable), purpose="refusal", owner="fixture")
+
+    def test_forced_shutdown_reaches_the_app_and_supervisor_group(self) -> None:
+        folder = self.scratch / "forced-launch"
+        folder.mkdir()
+        _ = (folder / "hana.log").write_text("")
+        _ = self.state_path.write_text(json.dumps({"pid": 424243, "process_group": 424242,
+            "binary": str(self.executable), "log": str(folder / "hana.log"), "scratch": str(folder)}))
+        with (
+            mock.patch.object(hana_shot.Brp, "call", return_value={}),
+            mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 1000.0]),
+            mock.patch.object(time, "sleep"),
+            mock.patch.object(hana_shot, "process_alive", return_value=True),
+            mock.patch.object(hana_shot, "same_binary", return_value=True),
+            mock.patch.object(process_group, "send_process_group") as groups,
+            mock.patch.object(os, "kill") as apps,
+        ):
+            hana_shot.shutdown(self.port)
+        self.assertEqual(groups.call_args_list, [mock.call(424242, signal.SIGTERM), mock.call(424242, signal.SIGKILL)])
+        self.assertEqual(apps.call_args_list, [mock.call(424243, signal.SIGTERM), mock.call(424243, signal.SIGKILL)])
+
+    def test_exited_supervisor_does_not_hide_the_saved_live_app(self) -> None:
+        folder = self.scratch / "orphaned-app"
+        folder.mkdir()
+        _ = (folder / "hana.log").write_text("")
+        _ = self.state_path.write_text(json.dumps({"pid": 424243, "pid_start": "123", "process_group": 424242,
+            "binary": str(self.executable), "log": str(folder / "hana.log"), "scratch": str(folder)}))
+        supervisor = cast(subprocess.Popen[bytes], mock.Mock(pid=424242, poll=mock.Mock(return_value=0)))
+        with (
+            mock.patch.object(hana_shot.Brp, "call", side_effect=hana_shot.Failure("BRP unavailable")),
+            mock.patch.object(admission_records, "process_start_time", return_value="123") as identity,
+            mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 1000.0]),
+            mock.patch.object(time, "sleep"),
+            mock.patch.object(process_group, "send_process_group") as groups,
+            mock.patch.object(os, "kill") as apps,
+        ):
+            hana_shot.shutdown(self.port, supervisor)
+        self.assertIn(mock.call(424243), identity.call_args_list)
+        self.assertEqual(apps.call_args_list, [mock.call(424243, signal.SIGTERM), mock.call(424243, signal.SIGKILL)])
+        self.assertEqual(groups.call_args_list, [mock.call(424242, signal.SIGTERM), mock.call(424242, signal.SIGKILL)])
+        self.assertFalse(self.state_path.exists())
+        self.assertFalse(folder.exists())
+
+    def test_scope_shutdown_waits_for_the_app_after_brp_answers(self) -> None:
+        folder = self.scratch / "graceful-app"
+        folder.mkdir()
+        _ = (folder / "hana.log").write_text("")
+        scope_file = folder / "app.cgroup"
+        _ = scope_file.write_text(str(self.scratch / "app.scope"))
+        _ = self.state_path.write_text(json.dumps({"pid": 424243, "pid_start": "123",
+            "binary": str(self.executable), "log": str(folder / "hana.log"), "scratch": str(folder)}))
+        clock = [0.0]
+        ticks = [0]
+
+        def tick(seconds: float) -> None:
+            clock[0] += seconds
+            ticks[0] += 1
+
+        def identity(pid: int) -> str | None:
+            self.assertEqual(pid, 424243)
+            return "123" if ticks[0] < 2 else None
+
+        def stop(path: Path, grace_seconds: float) -> None:
+            self.assertEqual(path, scope_file)
+            self.assertGreater(grace_seconds, 0)
+            self.assertEqual(ticks[0], 2, "The app did not receive its normal shutdown grace period.")
+
+        with (
+            mock.patch.object(hana_shot.Brp, "call", return_value={}),
+            mock.patch.object(admission_records, "process_start_time", side_effect=identity),
+            mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+            mock.patch.object(time, "sleep", side_effect=tick),
+            mock.patch.object(app_gate, "stop_app_scope", side_effect=stop) as cleanup,
+        ):
+            hana_shot.shutdown(self.port)
+        cleanup.assert_called_once()
+
+    def test_interrupt_before_launcher_identity_publication_stops_the_known_child(self) -> None:
+        folder = self.scratch / "interrupted-launch"
+        folder.mkdir()
+        signalled = mock.Mock()
+        process = cast(subprocess.Popen[bytes], mock.Mock(
+            pid=424242, poll=mock.Mock(return_value=None), send_signal=signalled))
+
+        def interrupt(pid: int) -> str | None:
+            self.assertEqual(pid, 424242)
+            self.assertFalse((folder / "app.owner").exists())
+            self.assertFalse((folder / "app.cgroup").exists())
+            self.assertFalse(self.state_path.exists())
+            raise KeyboardInterrupt()
+
+        with (
+            mock.patch.object(hana_shot, "port_answers", return_value=False),
+            mock.patch.object(hana_shot.Brp, "call", side_effect=hana_shot.Failure("BRP unavailable")),
+            mock.patch.object(hana_shot, "uncommitted_build_paths", return_value=[]),
+            mock.patch.object(scratch_folders, "new", return_value=folder),
+            mock.patch.object(subprocess, "Popen", return_value=process),
+            mock.patch.object(admission_records, "process_start_time", side_effect=interrupt) as capture,
+            mock.patch.object(time, "sleep"),
+            mock.patch.object(process_group, "send_process_group") as groups,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            _ = hana_shot.launch(self.port, str(self.root), str(self.executable), purpose="early cancel")
+        capture.assert_called_once_with(424242)
+        self.assertEqual(signalled.call_args_list,
+            [mock.call(signal.SIGTERM), mock.call(signal.SIGKILL)])
+        groups.assert_not_called()
+        self.assertFalse(folder.exists())
+
+    def test_launch_record_failure_stops_every_known_scope_member(self) -> None:
+        folder = self.scratch / "unrecorded-app"
+        folder.mkdir()
+        scope = self.scratch / "unrecorded.scope"
+        scope.mkdir()
+        _ = (scope / "cgroup.procs").write_text("424244")
+        _ = (scope / "cgroup.kill").write_text("0")
+        scope_file = folder / "app.cgroup"
+        _ = scope_file.write_text(str(scope))
+        process = cast(subprocess.Popen[bytes], mock.Mock(pid=424242, poll=mock.Mock(return_value=0)))
+        with (
+            mock.patch.object(hana_shot, "port_answers", return_value=False),
+            mock.patch.object(hana_shot.Brp, "call", side_effect=hana_shot.Failure("BRP unavailable")),
+            mock.patch.object(hana_shot, "uncommitted_build_paths", return_value=[]),
+            mock.patch.object(scratch_folders, "new", return_value=folder),
+            mock.patch.object(subprocess, "Popen", return_value=process),
+            mock.patch.object(hana_shot, "_write_launch_state", side_effect=OSError("record write failed")),
+            mock.patch.object(admission_records, "process_start_time", return_value="123"),
+            mock.patch.object(time, "sleep"),
+            mock.patch.object(process_group, "send_process_group") as groups,
+            mock.patch.object(os, "kill") as terminate,
+            self.assertRaisesRegex(OSError, "record write failed"),
+        ):
+            _ = hana_shot.launch(self.port, str(self.root), str(self.executable), purpose="record failure")
+        self.assertIn(mock.call(424244, signal.SIGTERM), terminate.call_args_list)
+        self.assertIn(mock.call(424242, signal.SIGKILL), terminate.call_args_list)
+        self.assertEqual((scope / "cgroup.kill").read_text(), "1")
+        groups.assert_not_called()
+        self.assertFalse(folder.exists())
+
+    def test_shutdown_kills_scope_members_after_hana_exits_during_grace(self) -> None:
+        folder = self.scratch / "scope-descendants"
+        folder.mkdir()
+        scope = self.scratch / "app.scope"
+        scope.mkdir()
+        _ = (scope / "cgroup.kill").write_text("0")
+        _ = (scope / "cgroup.procs").write_text("424244")
+        _ = (folder / "app.cgroup").write_text(str(scope))
+        _ = (folder / "hana.log").write_text("")
+        _ = self.state_path.write_text(json.dumps({"pid": 424243, "pid_start": "123", "process_group": 424242,
+            "binary": str(self.executable), "log": str(folder / "hana.log"), "scratch": str(folder)}))
+        app_live = [True]
+
+        def grace(seconds: float) -> None:
+            self.assertGreater(seconds, 0)
+            self.assertTrue(self.state_path.exists(), "The launch record must remain until the scope stops.")
+            app_live[0] = False
+
+        def app_identity(pid: int) -> str | None:
+            return "123" if app_live[0] and pid == 424243 else None
+
+        with (
+            mock.patch.object(hana_shot.Brp, "call", side_effect=hana_shot.Failure("BRP unavailable")),
+            mock.patch.object(admission_records, "process_start_time", side_effect=app_identity),
+            mock.patch.object(time, "monotonic", side_effect=[0.0, 1000.0]),
+            mock.patch.object(time, "sleep", side_effect=grace),
+            mock.patch.object(process_group, "send_process_group"),
+            mock.patch.object(os, "kill"),
+        ):
+            hana_shot.shutdown(self.port)
+        self.assertFalse(app_live[0])
+        self.assertEqual((scope / "cgroup.kill").read_text(), "1", "A descendant survives Hana's exit.")
+        self.assertFalse(self.state_path.exists())
+        self.assertFalse(folder.exists())
+
+    def test_shutdown_does_not_signal_a_reused_app_pid(self) -> None:
+        folder = self.scratch / "reused-app"
+        folder.mkdir()
+        _ = (folder / "hana.log").write_text("")
+        _ = self.state_path.write_text(json.dumps({"pid": 424243, "pid_start": "123", "process_group": 424242,
+            "binary": str(self.executable), "log": str(folder / "hana.log"), "scratch": str(folder)}))
+        supervisor = cast(subprocess.Popen[bytes], mock.Mock(pid=424242, poll=mock.Mock(return_value=0)))
+        with (
+            mock.patch.object(hana_shot.Brp, "call", side_effect=hana_shot.Failure("BRP unavailable")),
+            mock.patch.object(admission_records, "process_start_time", return_value="124"),
+            mock.patch.object(process_group, "send_process_group") as groups,
+            mock.patch.object(os, "kill") as apps,
+        ):
+            hana_shot.shutdown(self.port, supervisor)
+        apps.assert_not_called()
+        groups.assert_not_called()
 
     def test_explicit_launch_owner_takes_precedence_over_the_callers_unit(self) -> None:
         self.stop_fake_listener()

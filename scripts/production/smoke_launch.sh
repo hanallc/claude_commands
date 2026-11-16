@@ -72,10 +72,9 @@ BIN="$TARGET_DIR/debug/hana"
 
 HANA_PID=""
 cleanup() {
-    if [[ -n "$HANA_PID" ]] && kill -0 "$HANA_PID" 2>/dev/null; then
-        "$LIB/py" "$LIB/process_group.py" "$HANA_PID" TERM 2>/dev/null || true
-        sleep "$SIGNAL_GRACE_SECONDS"
-        "$LIB/py" "$LIB/process_group.py" "$HANA_PID" KILL 2>/dev/null || true
+    "$LIB/py" "$LIB/../build_queue/app_gate.py" stop --scope-file "$SCRATCH/app.cgroup" \
+        --grace "$SIGNAL_GRACE_SECONDS"
+    if [[ -n "$HANA_PID" ]]; then
         wait "$HANA_PID" 2>/dev/null || true
     fi
     rm -rf "$SCRATCH"
@@ -84,14 +83,35 @@ SCRATCH="$(mktemp -d)"
 trap cleanup EXIT
 mkdir "$SCRATCH/xdg"
 
-# setsid gives the app its own process group, so cleanup reaches every child.
+# The saved scope lets cleanup stop children after the supervisor exits.
 # The binary runs directly, so BEVY_ASSET_ROOT replaces cargo's
 # CARGO_MANIFEST_DIR for asset lookup.
 log "launch: port $PORT, config $SCRATCH/xdg"
-setsid direnv exec "$CHECKOUT" env XDG_CONFIG_HOME="$SCRATCH/xdg" BRP_EXTRAS_PORT="$PORT" \
+setsid "$LIB/py" "$LIB/../build_queue/app_gate.py" --binary "$BIN" --repo "$CHECKOUT" \
+    --purpose "$HANA_TEST_PURPOSE" --owner "$HANA_TEST_OWNER" --pid-file "$SCRATCH/app.pid" -- \
+    direnv exec "$CHECKOUT" env XDG_CONFIG_HOME="$SCRATCH/xdg" BRP_EXTRAS_PORT="$PORT" \
     HANA_TEST_PURPOSE="$HANA_TEST_PURPOSE" HANA_TEST_OWNER="$HANA_TEST_OWNER" \
     BEVY_ASSET_ROOT="$CHECKOUT/crates/hana" RUST_BACKTRACE=1 "$BIN" >>"$LOG" 2>&1 &
 HANA_PID=$!
+
+last_reason=""
+show_admission_status() {
+    if [[ -r "$SCRATCH/app.status" ]]; then
+        reason="$(<"$SCRATCH/app.status")"
+        if [[ "$reason" != "$last_reason" ]]; then
+            log "$reason"
+            last_reason="$reason"
+        fi
+    fi
+}
+until [[ -s "$SCRATCH/app.pid" ]]; do
+    show_admission_status
+    if ! kill -0 "$HANA_PID" 2>/dev/null; then
+        show_admission_status
+        fail "${last_reason:-app admission exited; see $LOG}"
+    fi
+    sleep "$POLL_SECONDS"
+done
 
 deadline=$((SECONDS + READY_SECONDS))
 until brp rpc.discover >/dev/null 2>&1; do

@@ -185,6 +185,72 @@ from scripts.build_queue.step_estimator import (
     OutcomeNotRecorded,
 )
 
+APP_KIND = "app"
+APP_HISTORY_RUNS = 10
+
+
+def app_profile(binary: Path, worktree: Path, now: datetime, root: Path) -> records.StepProfile:
+    """Use the largest recent peak for this binary path and build profile."""
+    key = str(binary.resolve())
+    cutoff = now - timedelta(days=step_estimator.HISTORY_DAYS)
+    peaks: list[tuple[datetime, int]] = []
+    for row in store.locked_rows(root / "admission/anon_peaks.jsonl"):
+        if row.get("step") != APP_KIND or row.get("repo") != key or row.get("host") != store.host_name():
+            continue
+        ended, peak = row.get("ended_at"), row.get("anon_peak_bytes")
+        if not isinstance(ended, str) or not isinstance(peak, int) or peak <= 0:
+            continue
+        at = datetime.fromtimestamp(step_estimator.epoch(ended), now.tzinfo)
+        if cutoff <= at <= now:
+            peaks.append((at, peak))
+    recent = sorted(peaks, reverse=True)[:APP_HISTORY_RUNS]
+    peak = (records.ExpectedPeak(max(value for _, value in recent), "measured", len(recent)) if recent else
+            records.ExpectedPeak(records.read_memory_config().program_first_peaks[APP_KIND], "fallback", 0))
+    return records.StepProfile(key, APP_KIND, str(worktree.resolve()), peak, estimated_at=now.timestamp())
+
+
+def app_peak_directory(scope: Path) -> Path:
+    """Use the retained slice counters for a new app scope."""
+    parent = scope.parent
+    return parent if parent.name.startswith("builds-app") and parent.suffix == ".slice" else scope
+
+
+def retire_app_scope(sidecar: Path) -> None:
+    """Stop an empty app slice after the service saves its final peak."""
+    try:
+        scope = Path(sidecar.read_text().strip())
+    except FileNotFoundError:
+        return
+    owner_file = sidecar.with_suffix(".owner")
+    if owner_file.exists():
+        pid, start = owner_file.read_text().split()
+        if records.process_start_time(int(pid)) == start:
+            return
+    counters = app_peak_directory(scope)
+    if counters != scope:
+        if scope_members(counters):
+            return
+        _ = subprocess.run(["systemctl", "--user", "--no-block", "stop", counters.name],
+                           check=True, capture_output=True, text=True)
+    sidecar.unlink(missing_ok=True)
+    owner_file.unlink(missing_ok=True)
+
+
+def sample_app_peak(scope: Path, maximum: Path) -> None:
+    """Save the scope RAM peak plus its swap peak before the scope disappears."""
+    counters = app_peak_directory(scope)
+    try:
+        peak = int((counters / "memory.peak").read_text()) + int((counters / "memory.swap.peak").read_text())
+    except FileNotFoundError:
+        return
+    try:
+        previous = int(maximum.read_text())
+    except FileNotFoundError:
+        previous = 0
+    if peak > previous:
+        write_text_atomic(maximum, f"{peak}\n")
+
+
 MERGE_GATE_TESTS = "tests"
 MERGE_GATE_TYPES = "types"
 
@@ -2488,8 +2554,11 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
     path.with_suffix(".wave").unlink(missing_ok=True)
     if row["sidecar"]:
         sidecar = Path(row["sidecar"])
-        for sample in (progress.progress_path(sidecar, "json"), progress.progress_path(sidecar, "log"),
-                       Path(str(sidecar) + ".cloud.json"), sidecar):
+        samples = (progress.progress_path(sidecar, "json"), progress.progress_path(sidecar, "log"),
+                   Path(str(sidecar) + ".cloud.json"))
+        if row["step"] != APP_KIND:
+            samples += (sidecar,)
+        for sample in samples:
             try:
                 sample.unlink(missing_ok=True)
             except PermissionError:
@@ -2760,14 +2829,14 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
             swapped = working_set.swap_bytes
             members = scope_members(child)
             scoped = [process_memory(PopulatedStepScope(scope), proc)
-                      for scope in owned_scope_roots(owned, child)] if required else []
+                      for scope in owned_scope_roots(owned, child)]
             scoped_pids = {pid for memory in scoped if isinstance(memory.anonymous_source, ScopeSource)
                            for pid in memory.anonymous_source.members}
             duplicate = process_memory((members & tree_pids) - scoped_pids, proc)
             duplicate_use = (duplicate.anonymous.bytes if required
                 and isinstance(duplicate.anonymous, AnonymousRunUse) else duplicate.bytes)
-            duplicate_use += sum(memory.anonymous.bytes for memory in scoped
-                                 if isinstance(memory.anonymous, AnonymousRunUse))
+            duplicate_use += sum(memory.anonymous.bytes if required and isinstance(memory.anonymous, AnonymousRunUse)
+                                 else memory.bytes for memory in scoped)
             amount = max(0, amount - duplicate_use)
             anonymous = swap_backed_use_less(working_set.anonymous,
                                              (duplicate.anonymous, *(memory.anonymous for memory in scoped)))

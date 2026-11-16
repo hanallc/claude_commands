@@ -20,6 +20,7 @@ import errno
 import os
 from pathlib import Path
 import stat
+import shutil
 import select
 import signal
 import socket
@@ -59,6 +60,115 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, In
 
 def setUpModule() -> None:
     forbid_real_sender()
+
+
+class AppTests(unittest.TestCase):
+    def test_app_hold_survives_its_launcher(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(step="app")
+            app = fixture.proc.spawn()
+            sidecar = fixture.scope(request.owner, members=(app.pid,))
+            scope = Path(sidecar.read_text())
+            _ = (scope / "memory.peak").write_text("7")
+            _ = (scope / "memory.swap.peak").write_text("5")
+            request = replace(request, sidecar=str(sidecar))
+            admitted = only_admitted(fixture.server.handle_request(request))
+            fixture.end_owner(request.owner)
+            self.assertIn(request.episode, fixture.server.reservations)
+            self.assertEqual(fixture.server.reservations[request.episode].need, admitted.need)
+            _ = (scope / "cgroup.procs").write_text("")
+            fixture.end_owner(app)
+            _ = fixture.run_pass()
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            self.assertFalse(sidecar.exists())
+            history = list(store.locked_rows(fixture.state_dir / "anon_peaks.jsonl"))
+            self.assertEqual(history[-1]["anon_peak_bytes"], 12)
+
+    def test_app_and_supervisor_exit_preserve_the_final_slice_peak(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(step="app")
+            sidecar = fixture.scope(request.owner, folder="builds-appfixture.slice/app.scope")
+            scope = Path(sidecar.read_text())
+            counters = scope.parent
+            for directory in (scope, counters):
+                _ = (directory / "memory.peak").write_text("11")
+                _ = (directory / "memory.swap.peak").write_text("3")
+            request = replace(request, sidecar=str(sidecar))
+            grant = only_admitted(fixture.server.handle_request(request))
+            gate.sample_app_peak(scope, Path(grant.max_path))
+            _ = (counters / "memory.peak").write_text("110")
+            _ = (counters / "memory.swap.peak").write_text("7")
+            shutil.rmtree(scope)
+            with mock.patch.object(subprocess, "run") as stop_slice:
+                fixture.end_owner(request.owner)
+            history = list(store.locked_rows(fixture.state_dir / "anon_peaks.jsonl"))
+            self.assertEqual(history[-1]["anon_peak_bytes"], 117)
+            stop_slice.assert_called_once_with(["systemctl", "--user", "--no-block", "stop", counters.name],
+                                               check=True, capture_output=True, text=True)
+            self.assertFalse(sidecar.exists())
+
+    def test_slice_cleanup_waits_for_the_supervisor_after_finalization(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(step="app")
+            original = fixture.scope(request.owner, folder="builds-appfixture.slice/app.scope")
+            scope = Path(original.read_text())
+            counters = scope.parent
+            _ = (counters / "cgroup.procs").write_text("")
+            _ = (counters / "memory.peak").write_text("110")
+            _ = (counters / "memory.swap.peak").write_text("7")
+            directory = fixture.state_dir / "app-scopes"
+            directory.mkdir()
+            sidecar = directory / "retired.cgroup"
+            _ = sidecar.write_text(str(scope))
+            request = replace(request, sidecar=str(sidecar))
+            grant = only_admitted(fixture.server.handle_request(request))
+            with mock.patch.object(subprocess, "run") as stop_slice:
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("release", grant.reservation, 0)), [wire.Ok()])
+                stop_slice.assert_not_called()
+                self.assertTrue(sidecar.exists())
+                self.assertEqual(list(store.locked_rows(fixture.state_dir / "anon_peaks.jsonl"))[-1]["anon_peak_bytes"], 117)
+                shutil.rmtree(scope)
+                _ = fixture.run_pass()
+                stop_slice.assert_called_once_with(["systemctl", "--user", "--no-block", "stop", counters.name],
+                                                   check=True, capture_output=True, text=True)
+            self.assertFalse(sidecar.exists())
+
+    def test_nested_app_scope_is_subtracted_from_its_unowned_slice(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(step="app")
+            sidecar = fixture.scope(request.owner,
+                folder="builds.slice/builds-appfixture.slice/app-fixture.scope",
+                current=4 * GIB, anonymous=2 * GIB, swap=GIB)
+            scope = Path(sidecar.read_text())
+            parent = scope.parent
+            _ = (parent / "cgroup.procs").write_text("")
+            _ = (parent / "memory.current").write_text(str(7 * GIB))
+            _ = (parent / "memory.swap.current").write_text(str(2 * GIB))
+            _ = (parent / "memory.stat").write_text(f"anon {5 * GIB}\nshmem 0\ninactive_file 0\n")
+            request = replace(request, sidecar=str(sidecar))
+            _ = only_admitted(fixture.server.handle_request(request))
+            _ = fixture.run_pass()
+            inputs = fixture.server.last_inputs
+            assert isinstance(inputs, records.QueueInputs)
+            unowned, = [step.measured for step in inputs.running
+                if isinstance(step.measured, records.UnownedSliceMemory) and step.measured.cgroup == str(parent)]
+            self.assertEqual(unowned.bytes, 3 * GIB)
+            self.assertEqual(unowned.anonymous, records.AnonymousRunUse(3 * GIB))
+            self.assertEqual(unowned.swap_bytes, GIB)
+
+    def test_app_release_records_its_scope_peak(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(step="app")
+            sidecar = fixture.scope(request.owner)
+            scope = Path(sidecar.read_text())
+            _ = (scope / "memory.peak").write_text("11")
+            _ = (scope / "memory.swap.peak").write_text("3")
+            request = replace(request, sidecar=str(sidecar))
+            admitted = only_admitted(fixture.server.handle_request(request))
+            self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("app-release", admitted.reservation, 0)), [wire.Ok()])
+            self.assertEqual(fixture.server.reservations, {})
+            history = list(store.locked_rows(fixture.state_dir / "anon_peaks.jsonl"))
+            self.assertEqual(history[-1]["anon_peak_bytes"], 14)
 
 
 class PlacementStatusTests(unittest.TestCase):

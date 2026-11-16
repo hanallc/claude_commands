@@ -554,6 +554,22 @@ process.stdout.write(JSON.stringify({
         self.assertNotIn("steps wait", page)
         self.assertNotIn("step waits", page)
 
+    def test_app_hold_shows_its_purpose(self) -> None:
+        with AdmissionFixture() as fixture, fixture.loop_turn():
+            request = fixture.request(step="app")
+            request = replace(request, identity=replace(request.identity, name="feature owner", step="app · hana · feature"))
+            grant = only_admitted(fixture.server.handle_request(request))
+            _ = fixture.run_pass()
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            with mock.patch.object(admission_client, "view", return_value=reply.reading):
+                page = memory_feed.reading()
+            row = cast(memory_feed.RunRow, next(row for row in page["walk"] if row["pid"] == request.owner.pid))
+            self.assertEqual(row["name"], "app · hana · feature")
+            self.assertEqual(row["detail"], "feature owner")
+            self.assertTrue(row["queued"])
+            fixture.release(grant)
+
     def test_parentless_owner_keeps_its_name_and_uses_the_repository_for_steps(self) -> None:
         reading = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
         labels = {step.session_id: unit_labels.UnitLabels("solo")

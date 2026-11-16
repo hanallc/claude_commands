@@ -20,10 +20,8 @@ tool = value.get("tool_input", {})
 if not isinstance(tool, dict):
     tool = {}
 app = tool.get("target_name", tool.get("app", ""))
-env = tool.get("env", {})
-purpose = env.get("HANA_TEST_PURPOSE", "") if isinstance(env, dict) else ""
-if value.get("tool_name") == "mcp__brp__brp_launch" and app == "hana" and not (isinstance(purpose, str) and purpose.strip()):
-    print("Hana launch needs env.HANA_TEST_PURPOSE: name the feature under test")
+if value.get("tool_name") == "mcp__brp__brp_launch" and app == "hana":
+    print("Hana needs an app memory hold. Use hana_shot.py launch --purpose <feature> (sets env.HANA_TEST_PURPOSE).")
 ' 2>/dev/null)" || launch_fields=""
 session_id="${launch_fields%%$'\n'*}"
 if [[ "$launch_fields" == *$'\n'* ]]; then

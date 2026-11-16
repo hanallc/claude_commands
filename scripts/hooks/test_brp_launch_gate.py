@@ -117,7 +117,7 @@ class BrpLaunchGateTests(unittest.TestCase):
         hook_input: dict[str, object] = {
             "tool_name": "mcp__brp__brp_launch",
             "tool_input": tool_input if tool_input is not None else {
-                "target_name": "hana", "env": {"HANA_TEST_PURPOSE": "memory launch admission"},
+                "target_name": "other-app", "env": {},
             },
         }
         if include_session:
@@ -166,12 +166,14 @@ class BrpLaunchGateTests(unittest.TestCase):
         self.assertIn("HANA_TEST_PURPOSE", response["hookSpecificOutput"]["permissionDecisionReason"])
         self.assertNotIn("memory wait reached", result.stderr)
 
-    def test_hana_with_a_purpose_reaches_memory_wait(self) -> None:
+    def test_hana_with_a_purpose_requires_the_app_memory_gate(self) -> None:
         self.use_memory_wait_stub("printf 'labelled Hana reached memory wait\\n' >&2\nreturn 0")
         result = self.run_hook(tool_input={"target_name": "hana", "env": {"HANA_TEST_PURPOSE": "CI icon"}})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "labelled Hana reached memory wait\n")
+        response = cast(HookResponse, json.loads(result.stdout))
+        self.assertEqual(response["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("hana_shot.py launch --purpose <feature>", response["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertEqual(result.stderr, "")
 
     def test_another_app_needs_no_hana_purpose(self) -> None:
         self.use_memory_wait_stub("printf 'other app reached memory wait\\n' >&2\nreturn 0")

@@ -1900,6 +1900,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         name = names.for_owner(step.step, unit if unit != "—" else "", identity.role,
             ci=bool(ci_label), current_name=step_text(step, names, labels=labels)) if step is not None else identity.session or hold.memory.owner
         detail = unit if step is not None else SWAP_NAMES["between"]
+        if step is not None and step.step.startswith("app · "):
+            name = step.step
+            detail = step.session_name
         use = gib(hold.memory.use.bytes) if isinstance(hold.memory.use, admission_records.AnonymousRunUse) else hold.memory.use
         run = hold.memory.run
         pid = (metadata.run.pid if isinstance(metadata.run, LiveBuildRun) else metadata.pid) if metadata is not None else (

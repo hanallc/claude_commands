@@ -1859,7 +1859,7 @@ class AdmissionServer:
             required = not isinstance(state, NotServiceSlice)
             if not required and memory.cgroup in owned:
                 continue
-            scoped = [scope_memory[scope] for scope in gate.owned_scope_roots(scope_memory, Path(memory.cgroup))] if required else []
+            scoped = [scope_memory[scope] for scope in gate.owned_scope_roots(scope_memory, Path(memory.cgroup))]
             scoped_pids = {pid for reading in scoped if isinstance(reading.anonymous_source, records.ScopeSource)
                            for pid in reading.anonymous_source.members}
             duplicate = [evidence.scope_process_memory[pid]
@@ -1867,7 +1867,8 @@ class AdmissionServer:
                          if pid in evidence.scope_process_memory]
             use = sum(item.anonymous.bytes if required and isinstance(item.anonymous, records.AnonymousRunUse)
                       else item.bytes for item in duplicate)
-            use += sum(item.anonymous.bytes for item in scoped if isinstance(item.anonymous, records.AnonymousRunUse))
+            use += sum(item.anonymous.bytes if required and isinstance(item.anonymous, records.AnonymousRunUse)
+                       else item.bytes for item in scoped)
             workers = evidence.scope_workers.get(memory.cgroup, frozenset())
             job = (gate.service_job_state(workers, dict(evidence.processes), tree_pids | scoped_pids,
                     [waiting.row for waiting in self.waiters.values()],
@@ -2099,9 +2100,17 @@ class AdmissionServer:
                 self._send(item.connection, self._placement_reply(item.request,
                     self.local_hold_holders.get(item.request.episode, placement.ResourceHolderUnknown())))
 
+    def _retire_app_slices(self) -> None:
+        """Retain counters until each reservation completes finalization."""
+        active = {record.sidecar for record in self.reservations.values() if record.sidecar}
+        for sidecar in (self.state_dir / "app-scopes").glob("*.cgroup"):
+            if str(sidecar) not in active:
+                gate.retire_app_scope(sidecar)
+
     def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
               ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
         self.last_pass_started = self.clock.monotonic()
+        self._retire_app_slices()
         self._advance_repository_slots()
         self._prune_runs()
         self.configuration = configuration
@@ -2514,6 +2523,13 @@ class AdmissionServer:
         self.reservations[episode] = record
         self.persist()
         row = reservation_row(record)
+        if record.step == gate.APP_KIND and record.sidecar:
+            try:
+                scope = Path(record.sidecar).read_text().strip()
+                if scope:
+                    gate.sample_app_peak(Path(scope), Path(record.path).with_suffix(".max"))
+            except FileNotFoundError:
+                pass
         if isinstance(ending, (OwnerExited, NotEnding)):
             lifetime = self._lifetime(record)
             if isinstance(lifetime, gate.PopulatedStepScope):
@@ -2535,6 +2551,8 @@ class AdmissionServer:
         _ = gate.finalize_reservation(path, row, outcome, datetime.fromtimestamp(ended_at, UTC), status,
             intents=StateIntents(self.reservations, self._advance_build_history, episode, self.persist, self.fault, self.places),
             end_kind=end_kind)
+        if record.step == gate.APP_KIND and record.sidecar:
+            gate.retire_app_scope(Path(record.sidecar))
         if (isinstance(record.place, wire.LocalPlace) and isinstance(record.run, wire.RunIdentity)
                 and self._run_alive(record.run)
                 and isinstance(self.last_usable_configuration, records.MemoryConfig)):
