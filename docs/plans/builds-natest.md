@@ -4444,3 +4444,27 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The ordinary lint path checks only, as before.
 - `test_verify_lint_taplo` checks each lint path with a misformatted `.claude/config/release.toml`.
 - Commit 27e978424.
+
+### Phase 313 — test_mac_run checks the task-end and scratch-clone cases with one full run each  · status: done
+**Depends on:** Phase 312
+**Owner:** natest (builds gave a go on 11-16 at 06:15 EST).
+
+#### Work Order
+
+**Goal:** two loops in `scripts/production/test_mac_run.py` start fewer full `mac_run.sh` chains. Each keeps one full run; the other cases check the same facts through `cleanup_mac_run` in `mac_run.sh`, called with `shell_test_support.shell_functions`.
+
+**Measure:** `module_cost.py --tests 20 --commands 12` at 42424a60f: the module uses 33.2 CPU s on natedev (AWS median 37.6). `test_task_end_requires_confirmed_exit_and_failed_stops_keep_the_checkout` runs 3 full chains (3.9 s). `test_scratch_clone_launch_keeps_purpose_and_owner` runs 2 (2.8 s). Target: about 4 CPU s less.
+
+**Spec:**
+1. Keep the first case of each loop as a full `self.mac_run` run, with every assertion.
+2. Task end: check the other two cases (stop status 23 with no confirm; status 0 with no confirm) through `cleanup_mac_run` with `on_mac` stubbed to the same replies. Assert: no `scratch.py end` call, the checkout path and "kept checkout" in stderr. A fact that only the full run shows (claim held, claim released) keeps its source in the full case.
+3. Scratch clone: keep one full run. Move the second case only when its facts (purpose and owner words) come from a function the test can call; otherwise keep it and say why.
+4. No production change. Add no test method; remove no assertion.
+
+**Files:** `scripts/production/test_mac_run.py` only.
+
+**Workers:** 1 writer; one test file.
+
+**Constraints from prior phases:** Phase 311 shape: one end-to-end run per test, direct calls for the other cases. No signal handlers, masks or dispositions; do not change any trap.
+
+**Acceptance gate:** `production/test_mac_run` passes on natedev 3 times; basedpyright adds no finding; a paired `module_cost.py` in one copy (swap the test file, warm-up round) shows the CPU cut; trial merges with origin/main and the open unit branches are clean.
