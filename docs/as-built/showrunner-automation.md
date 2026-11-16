@@ -755,6 +755,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `since` uses the user zone. `by` uses the caller's staff name.
     Staff row copies retain the hold fields.
   - **Phase productions:** The count line, status table, Progress bar, legend, and ETA cells retain their existing behavior.
+    The top table names its session column `Director`; its census status values remain unchanged.
     `table()` creates one unit block from the same cached plan and run records that supply the bar.
     `UnitTaskFacts` retains the plan source, plan phases, and scoped run attempts.
     `PlanSource` distinguishes absent, unavailable, readable empty, and readable populated plans.
@@ -793,6 +794,18 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `SentCommit` retains the checkpoint's `timestamp_epoch`, or `CheckpointTimeUnrecorded` when the event has no time.
     A checkpoint outside the line uses `Checkpoint <9 hash characters> at <time>; not in <production>'s merge line`.
     Without a production name, the text ends with `not in the merge line`.
+    A finished phase counts as merged through checkpoint ancestry, a successful result for its unit and phase, or a matching merge subject.
+    A successful result for the exact checkpoint hash counts, with or without a valid result time.
+    Other evidence needs a result time or merge commit time at or after the latest checkpoint time, when recorded.
+    Without a checkpoint time, the merge subject must name a prefix of the checkpoint hash, in any letter case.
+    The board ignores an invalid result time.
+    `waits_on.merged_phase_subject` requires the subject prefix `Merge <unit> phase <phase> (<hash>)`.
+    `waits_on.landed_phases` reads these subjects once per render.
+    Merged phases omit their checkpoint rows and older failed results.
+    Their rows use normal merge states when the checkpoints are in the merge line or currently merge.
+    `completed_unit_phases` supplies these checkpoints without a unit wait and excludes activity records after phase completion.
+    Carried work uses `merges with <owner> <name>`; queue work uses the production from its merge-line label.
+    Without a recorded owner, carried work uses `merges with <name>`.
     A second phase in the same merge names the first phase by ID (`Merges with phase 40`).
     A phase's shrink and repair items have no separate rows.
     The phase's live state takes priority over older failures from those items.
@@ -810,6 +823,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A local dependency uses its ID, with `phase` before a numeric ID.
     An external dependency uses `<unit> phase <id>` without its title.
     A bare commit dependency uses `After commit <first 9 hash characters>; <short state>`.
+    A missing commit uses `not on main yet`; other missing dependencies retain `dependency not found locally`.
     A git ref that is not hexadecimal, with or without `/`, uses `After branch <name>; <short state>`.
     A recorded phase ID keeps its phase form, even when it contains only hexadecimal characters.
     Recorded unit waits and plan `waits_for` conditions retain their text.

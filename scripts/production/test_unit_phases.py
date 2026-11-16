@@ -24,7 +24,7 @@ from typing import NamedTuple, cast, override
 from unittest.mock import Mock, patch
 
 
-from scripts.production import census, land_queue, land_runs, live_units, unit_queue
+from scripts.production import census, display_cells, land_queue, land_runs, live_units, unit_queue
 from scripts.accounts import session_state
 from scripts.lib import unit_runs
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
@@ -271,11 +271,32 @@ class UnitPhasesTests(unittest.TestCase):
                 status = "idle" if isinstance(session, unit_lookup.LiveClaude) else "exited"
                 self.assertEqual(rendered.splitlines(), [
                     "working 0 · waiting to merge 0 · waiting on other work 0 · idle 1 · 1 units", "",
-                    "| Unit | Status |", "| --- | --- |", f"| namecheck | {status} |", "",
+                    "| Unit | Director |", "| --- | --- |", f"| namecheck | {status} |", "",
                     "**namecheck** — idle", "",
                     "| Item | Work | State |", "| --- | --- | --- |",
                     "| Now | Not recorded | Director's current step not recorded |",
                     "| Next | Not recorded | The director has not chosen the next task |"])
+
+    def test_top_table_names_the_director_and_keeps_its_status_values(self) -> None:
+        member = self.member("director")
+        _ = self.write_run(member, "director", [("work", "Check delivery")], [
+            self.phase_event("activity_started", "work", activity_text="checks delivery")])
+        for status in ("idle", "busy"):
+            with self.subTest(status=status):
+                rendered = self.blocks([member], {}, statuses=[status])
+                self.assertIn("| Unit | Director |", rendered)
+                self.assertIn(f"| director | {status} |", rendered)
+                self.assertIn("**director** — working", rendered)
+                self.assertNotIn("| Status |", rendered)
+
+    def test_narrow_director_column_keeps_the_recorded_status_word(self) -> None:
+        for title in ("Director", "Status"):
+            with self.subTest(title=title):
+                _, rows = display_cells.wrapped(
+                    ("Unit", title, "Progress", "Phase", "ETA Next", "ETA Plan"),
+                    [("admin-console", "unreadable", "🟩" * 20, "restart-record-replace", "23:55", "23:55")], 40)
+                self.assertTrue(rows)
+                self.assertEqual([row[1] for row in rows if row[1]], ["unreadable"])
 
     def test_blocks_keep_full_text_at_each_width(self) -> None:
         member = self.member("wide")
@@ -655,7 +676,8 @@ class UnitPhasesTests(unittest.TestCase):
                   "c" * 9: land_queue.Place(2, "show images", "shells images")}
         carrier = {"c" * 40: land_queue.Place(3, "show batch", "builder carrier")}
         views: list[tuple[land_queue.LandView, str]] = [
-            (land_queue.LandView({}, land_queue.NoLine(), {}, frozenset(), {}), "Merge position not recorded"),
+            (land_queue.LandView({}, land_queue.NoLine(), {}, frozenset(), {}),
+             "Checkpoint ccccccccc at time not recorded; not in sdlc's merge line"),
             (land_queue.LandView({"c" * 9: "shells images"}, {}, {}, frozenset(), {}), "sdlc merges it now"),
             (land_queue.LandView({"d" * 40: "other first"}, {}, {}, frozenset(), {}),
              "Checkpoint ccccccccc at time not recorded; not in sdlc's merge line"),
@@ -718,6 +740,199 @@ class UnitPhasesTests(unittest.TestCase):
                                        now=now, zone=ZoneInfo("UTC"), on_main=lambda _: False)
         self.assertEqual(result.entries, (unit_phases.WorkItem("Acctload",
                          "Checkpoint e34ccac01 at 17:20; not in the merge line"),))
+
+    def test_finished_checkpoints_remain_visible_until_they_merge(self) -> None:
+        member = self.member("finished")
+        base = self.repository()
+        commit = commit_repository(self.root, "Finished delivery", allow_empty=True)
+        now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
+        at = now - 600
+        empty = land_queue.LandView({}, {}, {}, frozenset(), {})
+        merged: land_runs.LandResult = {"commit": commit, "production": "sdlc", "unit": "finished", "phase": "delivery",
+            "landed": True, "step": "", "state": "", "detail": "", "time": "2026-11-15T17:55:00+00:00"}
+        cases = (
+            ("outside", empty, f"Checkpoint {commit[:9]} at 17:50; not in sdlc's merge line"),
+            ("unused", empty._replace(line=land_queue.NoLine()),
+             f"Checkpoint {commit[:9]} at 17:50; not in sdlc's merge line"),
+            ("in line", empty._replace(line={commit: land_queue.Place(2, "sdlc batch", "finished delivery")}),
+             "2nd in sdlc's merge line"),
+            ("running", empty._replace(running={commit: "finished delivery"}), "sdlc merges it now"),
+            ("merged", empty._replace(results={commit: merged}), ""),
+            ("on main", empty, ""))
+        for name, view, expected in cases:
+            for later_activity in (False, True):
+                with self.subTest(state=name, later_activity=later_activity):
+                    tail = [self.phase_event("checkpoint", "delivery", checkpoint_commit=base if name == "on main" else commit,
+                                              timestamp_epoch=at),
+                            self.phase_event("phase_finished", "delivery", status="completed", timestamp_epoch=at + 60)]
+                    if later_activity:
+                        tail.append(self.phase_event("activity_started", "delivery", activity_text="writes the phase report"))
+                    if name in ("merged", "on main"):
+                        tail.append({"event_type": "wait_started", "wait_scope": "unit", "target_work": "delivery",
+                            "wait_id": "hold", "wait_by": "sdlc", "wait_reason": "the user approves delivery",
+                            "wait_kind": "WaitingForUser", "wait_started_epoch": at + 120})
+                    path = self.write_run(member, "finished", [("delivery", "Completed delivery")], tail)
+                    with (patch.object(land_queue, "land_view", return_value=view),
+                          patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads):
+                        rendered = self.blocks([member], {})
+                    rows = detail_rows(rendered, member.name)
+                    if expected:
+                        self.assertIn(("Now", "Completed delivery (delivery)", expected), rows)
+                        self.assertIn("**finished** — waiting to merge", rendered)
+                    else:
+                        self.assertNotIn("Completed delivery (delivery)", [row.work for row in rows])
+                    self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
+
+    def test_finished_phases_use_merge_subjects_and_results_with_other_hashes(self) -> None:
+        member = self.member("finished")
+        _ = self.repository()
+        _ = self.git("switch", "-q", "-c", "checkpoint")
+        checkpoint = commit_repository(self.root, "Recorded checkpoint", allow_empty=True)
+        _ = self.git("switch", "-q", "main")
+        for phase in ("subject", "failed", "misleading"):
+            _ = self.git("switch", "-q", "-c", phase)
+            published = commit_repository(self.root, "Published delivery", allow_empty=True)
+            _ = self.git("switch", "-q", "main")
+            title = f"Merge finished phase {phase} ({published[:9]}) into sdlc"
+            if phase == "misleading":
+                title = "Revert " + title
+            _ = self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "merge", "-q", "--no-ff",
+                         "-m", title, phase)
+        _ = self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.assertFalse(waits_on.on_main(self.root, checkpoint))
+        phases = [(phase, phase.capitalize() + " delivery") for phase in ("subject", "failed", "result", "waiting", "misleading")]
+        tail = [event for phase, _ in phases for event in (
+            self.phase_event("checkpoint", phase, checkpoint_commit=checkpoint, timestamp_epoch=1_794_761_400),
+            self.phase_event("phase_finished", phase, status="completed"))]
+        path = self.write_run(member, "merged-other-hashes", phases, tail)
+        other = self.member("outside")
+        other_path = self.write_run(other, "unmerged-other-unit", [("subject", "Other delivery")], [
+            self.phase_event("checkpoint", "subject", checkpoint_commit=checkpoint),
+            self.phase_event("phase_finished", "subject", status="completed")])
+        failed: land_runs.LandResult = {"commit": "a" * 40, "production": "sdlc", "unit": "finished", "phase": "failed",
+            "landed": False, "step": "tests", "state": "failed", "detail": "old merge failure", "time": "2026-11-15T17:50:00+00:00"}
+        landed: land_runs.LandResult = {**failed, "commit": "b" * 40, "phase": "result", "landed": True}
+        newer_failure: land_runs.LandResult = {**failed, "commit": "c" * 40, "phase": "result", "time": "2026-11-15T17:55:00+00:00"}
+        view = land_queue.LandView({}, {}, {row["commit"]: row for row in (failed, landed, newer_failure)}, frozenset(), {})
+        with (patch.object(land_queue, "land_view", return_value=view),
+              patch.object(waits_on, "landed_phases", wraps=waits_on.landed_phases) as subjects,
+              patch.object(waits_on, "landed_phase", wraps=waits_on.landed_phase) as individual,
+              patch.object(waits_on, "on_main", wraps=waits_on.on_main) as ancestry,
+              patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads):
+            rendered = self.blocks([member, other], {})
+        work = [row.work for row in detail_rows(rendered, member.name)]
+        for phase in ("subject", "failed", "result"):
+            self.assertNotIn(phase.capitalize() + f" delivery ({phase})", work)
+        self.assertIn("Waiting delivery (waiting)", work)
+        self.assertIn("Misleading delivery (misleading)", work)
+        self.assertIn("Other delivery (subject)", [row.work for row in detail_rows(rendered, other.name)])
+        self.assertNotIn("old merge failure", rendered)
+        self.assertEqual(subjects.call_count, 1)
+        self.assertEqual(individual.call_count, 0)
+        self.assertEqual(ancestry.call_count, 1)
+        self.assertCountEqual([call.args[0] for call in reads.call_args_list], [path, other_path])
+
+    def test_earlier_merges_do_not_hide_a_later_finished_attempt(self) -> None:
+        member = self.member("finished")
+        _ = self.repository()
+        _ = self.git("switch", "-q", "-c", "checkpoint")
+        checkpoint = commit_repository(self.root, "Later checkpoint", allow_empty=True)
+        _ = self.git("switch", "-q", "main")
+        _ = self.git("switch", "-q", "-c", "published")
+        published = commit_repository(self.root, "Earlier delivery", allow_empty=True)
+        _ = self.git("switch", "-q", "main")
+        merge_date = "2026-11-15T18:00:00+00:00"
+        merge_at = datetime.fromisoformat(merge_date).timestamp()
+        with patch.dict(os.environ, {"GIT_COMMITTER_DATE": merge_date}):
+            _ = self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "merge", "-q", "--no-ff",
+                         "-m", f"Merge finished phase subject ({published[:9]}) into sdlc", "published")
+        _ = self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        landed: land_runs.LandResult = {"commit": published, "production": "sdlc", "unit": member.name,
+            "phase": "result", "landed": True, "step": "push", "state": "done", "detail": "", "time": merge_date}
+        for evidence in ("subject", "result"):
+            for offset in (-1, 0, 1, unit_phases.CheckpointTimeUnrecorded()):
+                with self.subTest(evidence=evidence, checkpoint_offset=offset):
+                    checkpoint_time: dict[str, object] = ({} if isinstance(offset, unit_phases.CheckpointTimeUnrecorded)
+                                                          else {"timestamp_epoch": merge_at + offset})
+                    old_failure: land_runs.LandResult = {**landed, "commit": "f" * 40, "phase": evidence,
+                        "landed": False, "detail": "old failed attempt", "time": "2026-11-15T17:50:00+00:00"}
+                    results = {old_failure["commit"]: old_failure}
+                    if evidence == "result":
+                        results[landed["commit"]] = landed
+                    view = land_queue.LandView({}, {checkpoint: land_queue.Place(2, "sdlc pending", f"finished {evidence}")},
+                                               results, frozenset(), {})
+                    path = self.write_run(member, "latest-attempt", [(evidence, "Delivery")], [
+                        self.phase_event("checkpoint", evidence, checkpoint_commit=published, timestamp_epoch=merge_at - 600),
+                        self.phase_event("phase_finished", evidence, status="completed"),
+                        self.phase_event("phase_started", evidence, phase_instance_id="new-attempt", phase_title="Delivery"),
+                        self.phase_event("checkpoint", evidence, phase_instance_id="new-attempt",
+                                         checkpoint_commit=checkpoint, **checkpoint_time),
+                        self.phase_event("phase_finished", evidence, phase_instance_id="new-attempt", status="completed")])
+                    with (patch.object(land_queue, "land_view", return_value=view),
+                          patch.object(waits_on, "landed_phases", wraps=waits_on.landed_phases) as subjects,
+                          patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads):
+                        rendered = self.blocks([member], {})
+                    rows = detail_rows(rendered, member.name)
+                    current = ("Now", f"Delivery ({evidence})", "2nd in sdlc's merge line")
+                    if isinstance(offset, unit_phases.CheckpointTimeUnrecorded) or offset > 0:
+                        self.assertIn(current, rows)
+                        self.assertIn("**finished** — waiting to merge", rendered)
+                    else:
+                        self.assertNotIn(f"Delivery ({evidence})", [row.work for row in rows])
+                    self.assertNotIn("old failed attempt", rendered)
+                    self.assertEqual(subjects.call_count, 1)
+                    self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
+
+    def test_undated_checkpoints_require_the_merged_checkpoint_hash(self) -> None:
+        member = self.member("finished")
+        _ = self.repository()
+        checkpoint = "a" * 40
+        _ = self.write_run(member, "undated-checkpoint", [("delivery", "Delivery")], [
+            self.phase_event("checkpoint", "delivery", checkpoint_commit=checkpoint),
+            self.phase_event("phase_finished", "delivery", status="completed")])
+        for evidence in ("subject-prefix", "subject-full", "result-exact", "result-untimed", "result-prefix", "ancestry"):
+            with self.subTest(evidence=evidence):
+                subjects: dict[tuple[str, str], waits_on.PhaseMerge] = {}
+                results: dict[str, land_runs.LandResult] = {}
+                if evidence.startswith("subject"):
+                    subjects[(member.name, "delivery")] = waits_on.PhaseMerge(
+                        "b" * 40, 10, checkpoint[:9] if evidence == "subject-prefix" else checkpoint)
+                if evidence.startswith("result"):
+                    commit = checkpoint[:9] if evidence == "result-prefix" else checkpoint
+                    results[commit] = {"commit": commit, "production": "sdlc", "unit": member.name,
+                        "phase": "delivery", "landed": True, "step": "push", "state": "done", "detail": "",
+                        "time": "invalid" if evidence == "result-untimed" else "1970-01-01T00:00:10+00:00"}
+                view = land_queue.LandView({}, {checkpoint: land_queue.Place(2, "sdlc pending", "finished delivery")},
+                                           results, frozenset(), {})
+                with (patch.object(land_queue, "land_view", return_value=view),
+                      patch.object(waits_on, "landed_phases", return_value=subjects),
+                      patch.object(waits_on, "on_main", return_value=evidence == "ancestry")):
+                    rendered = self.blocks([member], {})
+                rows = detail_rows(rendered, member.name)
+                if evidence == "result-prefix":
+                    self.assertIn(("Now", "Delivery (delivery)", "2nd in sdlc's merge line"), rows)
+                else:
+                    self.assertNotIn("Delivery (delivery)", [row.work for row in rows])
+
+    def test_invalid_result_times_from_another_unit_do_not_stop_the_board(self) -> None:
+        member = self.member("waiting")
+        _ = self.repository()
+        _ = self.write_run(member, "waiting-checkpoint", [("delivery", "Delivery")], [
+            self.phase_event("checkpoint", "delivery", checkpoint_commit="a" * 40),
+            self.phase_event("phase_finished", "delivery", status="completed")])
+        path = land_runs.results_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        invalid_times: tuple[object, ...] = (None, 42, [], {}, "", "invalid")
+        for recorded in invalid_times:
+            with self.subTest(recorded=recorded):
+                row: dict[str, object] = {"commit": "b" * 40, "production": "sdlc", "unit": "other", "phase": "delivery",
+                    "landed": True, "step": "push", "state": "done", "detail": "", "time": recorded}
+                _ = path.write_text(json.dumps(row) + "\n")
+                self.assertIn("b" * 40, land_runs.last_results())
+                rendered = self.blocks([member], {})
+                self.assertIn(("Now", "Delivery (delivery)",
+                    "Checkpoint aaaaaaaaa at time not recorded; not in sdlc's merge line"), detail_rows(rendered, member.name))
+                self.assertIn("**waiting** — waiting to merge", rendered)
 
     def test_eta_uses_the_latest_promise_and_local_calendar_time(self) -> None:
         member = self.member("eta")
@@ -1225,7 +1440,8 @@ class UnitPhasesTests(unittest.TestCase):
                         self.assertIn((work, f"Checkpoint {commit[:9]} at time not recorded; not in sdlc's merge line"),
                                       [(row.work, row.state) for row in rows if row.item in ("Now", "Also")])
                 elif name == "unused":
-                    self.assertIn(("Now", "First work (a)", "Merge position not recorded"), rows)
+                    self.assertIn(("Now", "First work (a)",
+                                   f"Checkpoint {first[:9]} at time not recorded; not in sdlc's merge line"), rows)
                 else:
                     self.assertEqual(sum("sdlc merges it now" == row.state for row in rows), 1)
                     self.assertTrue(any(row.work == "Second work (b)" and row.state == "Merges with a"
@@ -1563,7 +1779,7 @@ class UnitPhasesTests(unittest.TestCase):
         table_end = max(index for index, line in enumerate(lines) if line.startswith("| "))
         self.assertEqual(lines[:table_end + 1], [
             "working 0 · waiting to merge 0 · waiting on other work 0 · idle 1 · 1 units", "",
-            "| Unit | Status |", "| --- | --- |", "| member | exited |", "",
+            "| Unit | Director |", "| --- | --- |", "| member | exited |", "",
             "**member** — idle", "",
             "| Item | Work | State |", "| --- | --- | --- |",
             "| Now | Not recorded | Director's current step not recorded |",
@@ -1734,7 +1950,7 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertEqual(reads - 1, 1, "Read the run events once after the header read.")
         self.assertEqual(output.getvalue().splitlines(), [
             "working 0 · waiting to merge 0 · waiting on other work 0 · idle 0 · unknown 2 · 2 units", "",
-            "| Unit | Status | Progress | Phase | ETA Next |", "| --- | --- | --- | --- | --- |",
+            "| Unit | Director | Progress | Phase | ETA Next |", "| --- | --- | --- | --- | --- |",
             "| one | exited | 🟨⬜ | 1 | no ETA stated |", "| two | exited | 🟨⬜ | 1 | no ETA stated |", "",
             "Progress: 🟩 done · 🟨 open · ⬜ not started", "",
             "**one** — unknown", "",
@@ -1856,7 +2072,7 @@ class UnitPhasesTests(unittest.TestCase):
                 tickets.assert_not_called()
                 self.assertEqual(output.getvalue(),
                     "working 0 · waiting to merge 0 · waiting on other work 0 · idle 1 · 1 units\n\n"
-                    + "| Unit | Status |\n| --- | --- |\n| a | idle |\n\n"
+                    + "| Unit | Director |\n| --- | --- |\n| a | idle |\n\n"
                     + "**a** — idle\n\n| Item | Work | State |\n| --- | --- | --- |\n"
                     + "| Now | Not recorded | Director's current step not recorded |\n"
                     + "| Next | Not recorded | The director has not chosen the next task |\n")
