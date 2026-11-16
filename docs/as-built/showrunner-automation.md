@@ -490,6 +490,81 @@ The [launch receipt contract](build-followups-fn-length-hook.md#production-launc
 
 - `produce.md` names each subcommand in `<LoadProduction/>`, `<OpenMergeBranch/>`, `<PromoteMain/>` and `<Wrap/>` and keeps the close-out approvals, the live smoke verdict and the CI, smoke and mirror text.
 
+### The List: `the_list.py`
+
+The List keeps one Markdown record at `<SHOWRUNNER_STATE_DIR>/<producer staff id>/list/L<n>.md`.
+The default root is `~/.local/state/showrunner`.
+The command requires the current `morty` producer row; its fixed staff ID selects the producer folder.
+The item's `owner` field names its showrunner.
+`nate` and `Not recorded` identify items without an assigned showrunner.
+The store context selects the producer folder; records do not repeat the producer ID.
+`record_store.NumberedRecords` supplies the folder, number allocation, frontmatter, file lock, and atomic replacement for both stores.
+Both stores use `file_lock.exclusive` and the shared `record_store.state_root` function.
+`update_registration` also uses this root function.
+Investigations retain their existing format and command behavior.
+
+`ListItem` stores the number, title, owner, unit, state, next check, ETA, unread time, and parked time.
+It also stores dependencies, related numbers, requester, opened time, updated time, closed time, and closing words.
+The body stores the next step, latest status, evidence, completion condition, and log.
+Length fields preserve headings and line endings inside each text section.
+The log keeps dated changes in file order, newest last, with the source on each line.
+The Added line preserves initial field values, including state, ETA, next step, and latest status.
+Quoted log values preserve line endings as JSON escapes.
+
+States are `New`, `Working`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`, `Paused`, and `Closed`.
+Parking sets a time without changing the state.
+ETA accepts an offset ISO time, two such times separated by `/`, or `Not asked`, `Pending`, `Paused`, or `Delivered`.
+ETA also accepts a text description when a time or status cannot express the estimate.
+The `eta_kind` field marks text descriptions as `text` and other estimates as `time or status`.
+The store validates text descriptions as one nonempty line and never parses them as times or ranges.
+Next check accepts a time or a text condition.
+Unknown opened and updated times remain empty.
+Time fields accept offset ISO times; a date alone uses midnight in the user's configured time zone.
+An empty optional time removes that time.
+
+1. Add an item with `the_list.py add --owner <showrunner staff id> --title <text> --source <source>`.
+2. Preserve an existing item number with `add --number <n>`.
+3. Change fields with `update --id L<n> --source <source>` and the corresponding field options.
+4. Park or unpark an item with `park --id L<n> --until <time-or-empty> --source <source>`.
+5. Close an item with `close --id L<n> --words <closing words> --source <source>`.
+6. Restore a Closed item as New with `reopen --id L<n> --source <source>`.
+7. Clear its unread time with `mark-read --id L<n> --source <source>`.
+8. Print the table with `list`; include parked items with `--include-parked`, or all records with `--all`.
+
+Add and update accept `--unit`, `--state`, `--next-check`, `--eta`, and `--requested-by nate|dwight`.
+They also accept `--next-step`, `--latest-status`, `--evidence`, and `--done-when`.
+`--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
+Either option with no values clears its field.
+References use numbers in the same producer folder.
+Add and update check references when they set dependency or related fields.
+The store refuses missing references, self-dependencies, and dependency cycles.
+Other changes, including mark-read, do not read referenced records.
+Closing a prerequisite preserves its dependents' conditions.
+
+Closed records remain on disk with their time and closing words.
+Automatic numbering includes invalid records and Closed records.
+An explicit number must name an unused path.
+Exact repeated operations change nothing.
+Other updates append a log line and mark the item unread; mark-read clears the unread time without sending a message.
+Update and park refuse Closed items until reopen restores them.
+The table uses `# | Owner | Item | State | Next step | ETA | Update`.
+It sorts Waiting for nate first, unread items second, and next check times third.
+State cells include the check time and identify overdue checks.
+Future parked items and Closed items remain hidden by default.
+
+`load`, `records`, `table`, and the write functions share this store with future console callers.
+`records` watches the folder and record paths, reports invalid records, and preserves their files.
+`create_records` validates a complete typed batch before writing into an empty list folder.
+It checks forward references and cycles under the same lock as other writes.
+The one-off converter lives outside the repository and uses this API.
+It preserves item numbers, source sections, and each item's JSON data in Evidence.
+Removed items become Closed records with their recorded removal times and words.
+A completed apply run records source and record hashes; an exact rerun prints `unchanged`.
+A partial apply run refuses another apply run.
+The converter reads question counts but does not create items from them.
+Morty writes items only through `the_list.py`; the old source files remain read-only.
+The page and feedback delivery belong to later phases.
+
 ### Investigations: `investigation.py`
 
 An investigation records an answer that the user wants a session to find.
@@ -851,12 +926,17 @@ An unstaffed session requires an explicit native id and an explicit unit name.
   - **Merge and wait facts:** Each merge phase has its title in Work.
     State names the live merge rank, the production that merges it, or the short failure cause.
     An open sent phase with a successful final merge state has no merge row and contributes no pending merge.
+    A checkpoint on main has no merge row even when its phase remains open.
     `SentCommit` retains the checkpoint's `timestamp_epoch`, or `CheckpointTimeUnrecorded` when the event has no time.
     A checkpoint outside the line uses `Checkpoint <9 hash characters> at <time>; not in <production>'s merge line`.
     Without a production name, the text ends with `not in the merge line`.
     A finished phase counts as merged through checkpoint ancestry, a successful result for its unit and phase, or a matching merge subject.
     A finished phase also counts as merged when main has a non-merge commit with the same author time and subject as its checkpoint.
     The board reads main's non-merge commits once per render and caches each unresolved checkpoint's identity check.
+    The production document's `Showrunner checkout` supplies the repository for main and carried-commit checks.
+    A named phase dependency uses its owning production's checkout.
+    The board caches repository evidence and shares copied-checkpoint decisions with dependencies.
+    Exact successful results and matching merge subjects resolve open checkpoints before additional Git checks.
     An unreadable checkpoint stays unmerged.
     A successful result for the exact checkpoint hash counts, with or without a valid result time.
     Other evidence needs a result time or merge commit time at or after the latest checkpoint time, when recorded.
