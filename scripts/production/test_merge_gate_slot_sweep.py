@@ -33,8 +33,8 @@ class NightlySlotSweepTests(unittest.TestCase):
                     self.assertTrue(options["check"])
                     if argv[1].endswith("mac_queue_run.py"):
                         events.append("Mac")
-                        self.assertEqual(list(argv[2:10]),
-                                         ["--kind", "run", "--what", "Sweep Mac build slots", "--package", "claude", "--", "/bin/zsh"])
+                        self.assertEqual(list(argv[2:9]),
+                                         ["--kind", "run", "--what", "Sweep Mac build slots", "--package=claude", "--", "/bin/zsh"])
                     else:
                         self.assertTrue(argv[1].endswith("send.py"))
                         self.assertEqual(list(argv[2:6]), ["--to", "builds", "--from", "nightly"])

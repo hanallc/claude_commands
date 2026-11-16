@@ -839,15 +839,28 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         with quota_alert.state_file() as state:
             self.assertFalse(state.get("no_worker_mode", False))
 
-    def test_credits_off_with_a_failed_workers_move_stops_the_codex_workers_once(self) -> None:
+    def test_credits_off_with_a_failed_workers_move_keeps_workers_when_another_account_has_capacity(self) -> None:
         _ = self.note(1, "off")
         self.swap.side_effect = accounts.AccountsError("server could not stop")
         with mock.patch.object(socket, "gethostname", return_value=role_map.ROLE_MAP_HOST):
             for minute in (0, 2, 30):
                 _ = self.alert(self.now + timedelta(minutes=minute), spare_left=50)
-        self.assertEqual(self.worker_mode_texts(), [conf.read("accounts").text("no_worker_mode_on")])
-        self.assertEqual(self.broadcasts.stops, [["worker_capacity.py", "stop"]])
+        self.assertEqual(self.worker_mode_texts(), [])
+        self.assertEqual(self.broadcasts.stops, [])
+        with quota_alert.state_file() as state:
+            self.assertFalse(state.get("no_worker_mode", False))
         self.assertEqual(quota_alert.registry_assignments()["direct"], "claude")
+
+    def test_failed_credits_off_move_keeps_workers_when_another_account_can_pay(self) -> None:
+        _ = self.note(1, "off")
+        self.swap.side_effect = accounts.AccountsError("server could not stop")
+        with mock.patch.object(socket, "gethostname", return_value=role_map.ROLE_MAP_HOST):
+            for minute in (0, 2):
+                _ = self.alert(self.now + timedelta(minutes=minute), spare_accounts=((2, 0, "166"),))
+        self.swap.assert_called_once()
+        self.assertEqual((self.worker_mode_texts(), self.broadcasts.stops), ([], []))
+        with quota_alert.state_file() as state:
+            self.assertFalse(state.get("no_worker_mode", False))
 
     def test_refused_account_takes_work_again_when_credits_are_on_and_a_newer_reading_shows_a_balance(self) -> None:
         accounts_conf = conf.read("accounts")

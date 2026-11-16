@@ -2103,6 +2103,8 @@ def return_fix(
 
     The worktree receives the files only when its tree key still equals the key
     the copy sent. Any other worktree keeps its own edits, and natedev repairs it.
+    In a repository that cargo-berth configures, only the paths that this
+    worktree's reservations hold are written (fix_return.hold_filter).
     """
     from scripts.mac_test import floor_claims
 
@@ -2155,6 +2157,8 @@ def report_fix(result: FixResult) -> None:
         print("mac_test: the Mac fix pass passed and changed no file")
     elif isinstance(result, (fix_return.FixRefused, fix_return.FixFailed)):
         print(f"mac_test: the Mac fix pass passed, but no file was written: {result.reason}; natedev repairs the tree")
+    for line in fix_return.withheld_lines(result):
+        print(f"mac_test: {line}")
 
 
 def extended_regex_literal(text: str) -> str:

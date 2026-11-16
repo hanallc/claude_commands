@@ -160,6 +160,7 @@ from scripts.build_targets.target_config import (
     LocalRequired,
     Routing,
     SshTarget,
+    WRITES_TREE,
     read_targets,
 )
 from scripts.direct.step_selection import Pinned, ROUTED, TargetSelection
@@ -330,7 +331,7 @@ def step_routing_rule(kind: CommandKind, routing: Routing = ANY_ELIGIBLE_TARGET,
                       ) -> AnyTarget | NatedevOnly:
     """Choose the run location for each step before target admission."""
     if writes_tree:
-        return NatedevOnly("step writes the tree")
+        return NatedevOnly(WRITES_TREE.reason)
     if isinstance(routing, LocalRequired):
         return NatedevOnly(routing.reason)
     if isinstance(selection, Pinned):

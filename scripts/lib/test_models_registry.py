@@ -15,6 +15,9 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
+from scripts.lib import main_push_lock, models_registry
+from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
+
 FIXTURE = Path(__file__).with_name("test_models_registry.conf")
 
 
@@ -151,6 +154,30 @@ def claude_catalog_environment(directory: Path, targets: Mapping[str, str]) -> d
     _ = claude.write_text("#!/bin/sh\nprintf '%s\\n' '2.1.319 (Claude Code)'\n")
     claude.chmod(0o755)
     return {"CLAUDE_CONFIG_DIR": str(directory), "PATH": str(binaries) + os.pathsep + os.environ.get("PATH", "")}
+
+
+class RegistryPublicationTests(ScriptRepositoryTestCase):
+    def test_registry_publication_runs_the_hook_with_the_landed_commit_under_the_lock(self) -> None:
+        self.seed()
+        path = self.write(self.repo / "config/models.conf", "[fixture]\nmodel=old\n")
+        _ = self.git("add", "config/models.conf")
+        _ = self.git("commit", "-m", "seed registry")
+        _ = self.git("push", "origin", "main")
+        log = self.root / "hook-log"
+        _ = self.write(self.repo / ".claude/config/post_push.sh",
+                       f'printf "%s\\n" "$LANDED_SHA" > "{log}"\n')
+        _ = self.write(self.remote / "hooks/pre-receive",
+                       f'#!/bin/sh\nif flock -n "{self.repo}/.git/main-push.lock" true; then exit 93; fi\n')
+        (self.remote / "hooks/pre-receive").chmod(0o755)
+        before = path.read_text()
+        with patch.dict(os.environ, {**self.environment, "MODELS_CONFIG_PUBLISH": "1"}, clear=True), \
+                patch.object(models_registry, "DEFAULT_PATH", path):
+            result = models_registry.store_registry(path, before, before.replace("old", "new"), "fixture")
+        landed = self.git("rev-parse", "origin/main").stdout.strip()
+        self.assertEqual(result, "[fixture]\nmodel=new\n")
+        self.assertEqual(log.read_text(), landed + "\n")
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), landed)
+        self.assertTrue((self.repo / ".git" / main_push_lock.RECORD_NAME).is_file())
 
 
 class LaunchSettingsTests(unittest.TestCase):

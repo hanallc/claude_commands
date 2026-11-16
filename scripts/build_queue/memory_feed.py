@@ -52,12 +52,13 @@ from scripts.build_queue.queue_view import reason_phrase
 from scripts.lib.build_steps import StepNames, read_step_names
 from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeProcesses
 from scripts.build_queue import admission_records, target_availability
+from scripts.build_targets import target_config
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
 from scripts.lib import build_slots, conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
-from scripts.review_links import page_frame, review_link
+from scripts.review_links import console_theme, page_frame, review_link
 
 if TYPE_CHECKING:
     from scripts.mac_test import claim_state
@@ -240,7 +241,7 @@ def page_link() -> int:
 
 def publish_page(configuration: FeedConfiguration) -> None:
     """Publish the repository page with the configured refresh interval."""
-    source = Path(__file__).with_name("memory_live.html").read_text(encoding="utf-8")
+    source = console_theme.with_theme(Path(__file__).with_name("memory_live.html").read_text(encoding="utf-8"))
     page = (source.replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(configuration.interval_seconds))
             .replace("__PAGE_FRAME_STYLE__", page_frame.STYLE))
     write_text_atomic(configuration.output_folder / "memory_live.html", page, new_file_mode=0o644)
@@ -341,6 +342,7 @@ class RowQueueNotes(TypedDict):
     priority_text: NotRequired[str]
     ci_label: NotRequired[str]
     runs_on: NotRequired[str]
+    mac_state: NotRequired[str]
     runner: NotRequired[unit_labels.Runner]
     worker: NotRequired[str]
 
@@ -360,6 +362,45 @@ def local_runs_on(mac: target_availability.TargetFit | target_availability.NoMac
     if isinstance(mac, target_availability.FitUnreadable):
         return "natedev only (Mac state unknown)"
     return "natedev only"
+
+
+# A run that asks for natedev: the plain words of the local caller route.
+RUN_ASKS_TEXT = "the run asks for it"
+
+
+def step_runs_on(route: target_config.StepRoute, routes: target_availability.MacRoutes, step: str, folder: str,
+                 package: str | admission_records.PackageNotRecorded) -> str:
+    """Name the targets that can take a natedev queue step: a route that limits the step first, else the Mac routes."""
+    if isinstance(route, target_config.LocalRequired):
+        return f"natedev only ({RUN_ASKS_TEXT if route == target_config.LOCAL_CALLER else route.reason})"
+    if mac_only_route(route, routes):
+        return "Mac only"
+    if isinstance(route, target_config.PinnedTarget):
+        return route.target + " only"
+    return local_runs_on(routes.fit(step, folder, package))
+
+
+class TargetNotes(TypedDict):
+    runs_on: str
+    mac_state: NotRequired[str]
+
+
+def target_notes(route: target_config.StepRoute, routes: target_availability.MacRoutes, step: str, folder: str,
+                 package: str | admission_records.PackageNotRecorded) -> TargetNotes:
+    """The step's "can run on" text, and for a Mac-only step what holds the Mac, for every row that shows them."""
+    notes: TargetNotes = {"runs_on": step_runs_on(route, routes, step, folder, package)}
+    if mac_only_route(route, routes) and (holds := routes.holds(folder)):
+        notes["mac_state"] = holds
+    return notes
+
+
+NO_TARGET_NOTES: TargetNotes = {"runs_on": ""}
+
+
+def mac_only_route(route: target_config.StepRoute, routes: target_availability.MacRoutes) -> bool:
+    """A Mac-only step, or a step pinned to the Mac target."""
+    return isinstance(route, target_config.MacOnly) or (isinstance(route, target_config.PinnedTarget)
+                                                        and routes.is_mac(route.target))
 
 
 CLOUD_RUNS_ON = "AWS (natedev only when AWS cannot start the gate)"
@@ -1594,8 +1635,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "started_at": metadata.started_at if metadata is not None else 0,
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ())),
                      "queued": True, "keep_text": run_keep_text(hold, steps_by_owner.get(hold.memory.owner, ())), "group": "", "ci": False, "parts": [],
-                     "runs_on": local_runs_on(routes.fit(step.step, step.folder, step.package))
-                        if step is not None and not ci_label else ""})
+                     **(target_notes(step.route, routes, step.step, step.folder, step.package)
+                        if step is not None and not ci_label else NO_TARGET_NOTES)})
     groups: dict[str, list[RunRow]] = {}
     remote_groups: set[str] = set()
     for entry in explanation.running:
@@ -1691,8 +1732,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         "need": gib(waiter.need), "since": waiter.since,
                         "reason": reason,
                         "fits": need <= captured.signed_room,
-                        "runs_on": "" if ci_label else local_runs_on(
-                            routes.fit(waiter.step, waiter.folder, waiter.package))})
+                        **(NO_TARGET_NOTES if ci_label else target_notes(
+                            waiter.route, routes, waiter.step, waiter.folder, waiter.package))})
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
     if mac_status:

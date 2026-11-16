@@ -28,7 +28,7 @@ from typing import cast, override
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
 from scripts.production import change_review
-from scripts.review_links import change_browser, change_page, console, serve
+from scripts.review_links import accounts_page, change_browser, change_page, console, serve
 from scripts.lib import atomic_file, conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -214,6 +214,151 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(reply.status, 200)
         self.assertEqual(reply.content_type, "image/png")
         self.assertEqual(reply.body, image)
+
+    def test_accounts_route_renders_per_request_and_reports_a_failed_read(self) -> None:
+        with (patch.object(accounts_page, "render_with_facts", side_effect=OSError("staff file absent")),
+              redirect_stderr(StringIO()) as error):
+            reply = self.request(accounts_page.PAGE_PATH)
+        self.assertEqual(reply.status, 503)
+        self.assertIn(b"The Accounts page is not available.", reply.body)
+        self.assertNotIn(b"staff file absent", reply.body)
+        self.assertIn("review-links accounts: staff file absent", error.getvalue())
+        with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b"<p>board</p>", 0.5, 100)) as render:
+            reply = self.request(accounts_page.PAGE_PATH)
+        self.assertEqual((reply.status, reply.content_type, reply.body), (200, "text/html; charset=utf-8", b"<p>board</p>"))
+        render.assert_called_once_with()
+
+    def test_accounts_cache_keeps_the_page_during_one_render_and_after_a_failure(self) -> None:
+        cache = serve.AccountsPageCache()
+        first = accounts_page.AccountsRender(b'<p data-load-time>first</p>', 0.25, 100)
+        with patch.object(accounts_page, "render_with_facts", return_value=first):
+            kept = cache.get()
+        for fail in (False, True):
+            with self.subTest(failed_render=fail):
+                entered, release = threading.Event(), threading.Event()
+
+                def render() -> accounts_page.AccountsRender:
+                    entered.set()
+                    if not release.wait(TEST_HANG_GUARD_SECS):
+                        raise OSError("the test did not release the render")
+                    if fail:
+                        raise OSError("no stored data")
+                    return accounts_page.AccountsRender(b'<p data-load-time>second</p>', 0.75, 200)
+
+                before = tuple(cache.recent_times)
+                with patch.object(accounts_page, "render_with_facts", side_effect=render) as child, redirect_stderr(StringIO()) as errors:
+                    try:
+                        self.assertEqual(cache.get(), kept)
+                        self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                        self.assertEqual(cache.get(), kept)
+                        child.assert_called_once_with()
+                        self.assertEqual(tuple(cache.recent_times), before)
+                    finally:
+                        release.set()
+                        with cache.condition:
+                            self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+                    if fail:
+                        self.assertEqual(cache.page, kept)
+                        self.assertEqual(tuple(cache.recent_times), before)
+                    else:
+                        self.assertIn(b">second</p>", cache.page)
+                        self.assertIn(b'data-render-median="0.500000"', cache.page)
+                        kept = cache.page
+                if fail:
+                    self.assertEqual(errors.getvalue(), "review-links accounts: no stored data\n")
+
+    def test_accounts_first_request_waits_for_its_render(self) -> None:
+        cache = serve.AccountsPageCache()
+        entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+        replies: list[bytes] = []
+
+        def render() -> accounts_page.AccountsRender:
+            entered.set()
+            if not release.wait(TEST_HANG_GUARD_SECS):
+                raise OSError("the test did not release the render")
+            return accounts_page.AccountsRender(b"first page", 0.5, 100)
+
+        def request() -> None:
+            replies.append(cache.get())
+            returned.set()
+
+        with patch.object(accounts_page, "render_with_facts", side_effect=render) as child:
+            threads = [threading.Thread(target=request)]
+            try:
+                for thread in threads:
+                    thread.start()
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                self.assertFalse(returned.is_set())
+            finally:
+                release.set()
+                for thread in threads:
+                    thread.join(TEST_HANG_GUARD_SECS)
+                    self.assertFalse(thread.is_alive())
+            self.assertEqual(replies, [b"first page"])
+            child.assert_called_once_with()
+
+    def test_accounts_cache_keeps_only_the_last_ten_successful_render_times(self) -> None:
+        cache = serve.AccountsPageCache()
+        for seconds in range(1, 13):
+            with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b'<p data-load-time></p>', seconds, seconds+100)):
+                _ = cache.replace()
+        self.assertEqual(tuple(cache.recent_times), tuple(range(3, 13)))
+        self.assertIn(b'data-render-seconds="12.000000"', cache.page)
+        self.assertIn(b'data-render-finished="112.000000"', cache.page)
+        self.assertIn(b'data-render-median="7.500000"', cache.page)
+        self.assertIn(b'data-render-count="10"', cache.page)
+
+    def test_accounts_first_render_failure_reaches_every_waiter(self) -> None:
+        entered, release, waiters_ready = threading.Event(), threading.Event(), threading.Event()
+        waiting: set[str] = set()
+
+        class WaiterCondition(threading.Condition):
+            @override
+            def __enter__(self) -> bool:
+                acquired = super().__enter__()
+                name = threading.current_thread().name
+                if name.startswith("accounts-waiter-"):
+                    waiting.add(name)
+                    if len(waiting) == 2:
+                        waiters_ready.set()
+                return acquired
+
+        cache = serve.AccountsPageCache(condition=WaiterCondition())
+        failures: list[str] = []
+
+        def render() -> accounts_page.AccountsRender:
+            entered.set()
+            if not release.wait(TEST_HANG_GUARD_SECS):
+                raise OSError("the test did not release the render")
+            raise OSError("the first render timed out")
+
+        def request() -> None:
+            try:
+                _ = cache.get()
+            except OSError as error:
+                failures.append(str(error))
+
+        first = threading.Thread(target=request)
+        waiters = [threading.Thread(target=request, name=f"accounts-waiter-{index}") for index in range(2)]
+        with patch.object(accounts_page, "render_with_facts", side_effect=render) as child:
+            try:
+                first.start()
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                for waiter in waiters:
+                    waiter.start()
+                self.assertTrue(waiters_ready.wait(TEST_HANG_GUARD_SECS))
+            finally:
+                release.set()
+                for thread in (first, *waiters):
+                    if thread.ident is not None:
+                        thread.join(TEST_HANG_GUARD_SECS)
+                        self.assertFalse(thread.is_alive())
+            self.assertEqual(failures, ["the first render timed out"] * 3)
+            child.assert_called_once_with()
+        self.assertEqual(tuple(cache.recent_times), ())
+        with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b"retry page", 0.5, 100)) as retry:
+            self.assertEqual(cache.get(), b"retry page")
+            retry.assert_called_once_with()
 
     def test_inaccessible_sweep_entries_do_not_prevent_bind_or_other_links(self) -> None:
         session = self.root / "manual"

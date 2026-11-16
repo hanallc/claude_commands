@@ -4328,10 +4328,39 @@ class StatusAccountDocument(TypedDict):
     credits_in_use: bool
 
 
+BoardTone = Literal["default", "success", "error", "warning", "inactive"]
+
+
+class BoardSpan(TypedDict):
+    """One styled piece of a board cell; the console Accounts page draws it as it is."""
+    text: str
+    tone: BoardTone
+    kind: Literal["fact", "bold"]
+
+
+class BoardColumn(TypedDict):
+    key: str
+    heading: str
+    align: Literal["left", "right"]
+
+
+class BoardRow(TypedDict):
+    """The cells of one table line."""
+    cells: dict[str, list[BoardSpan]]
+
+
+class Board(TypedDict):
+    """The rows hold the reset text for one local day; a reader draws them again from stale_at, an ISO UTC time."""
+    columns: list[BoardColumn]
+    rows: list[BoardRow]
+    stale_at: str
+
+
 class StatusDocument(TypedDict):
     upcoming_moves: list[str]
     session_inputs: list[str]
     accounts: list[StatusAccountDocument]
+    board: Board
     problems: list[str]
 
 
@@ -4440,6 +4469,88 @@ def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime, *, acc
         if row.tool == "claude" and isinstance(row.login_ends_at, agent_accounts.LoginEndKnown) else NO_VALUE)
 
 
+COUNT_COLUMNS = ("busy", "idle", "paused", "exited", "total")
+BOARD_COLUMNS: tuple[BoardColumn, ...] = (
+    BoardColumn(key="dot", heading="", align="left"), BoardColumn(key="label", heading="account", align="left"),
+    BoardColumn(key="left", heading="left", align="right"), BoardColumn(key="roles", heading="role", align="left"),
+    *(BoardColumn(key=key, heading=key, align="right") for key in COUNT_COLUMNS),
+    BoardColumn(key="resets", heading="resets", align="right"), BoardColumn(key="credits", heading="credits", align="right"),
+    BoardColumn(key="enabled", heading="enabled", align="left"),
+)
+
+
+def _span(text: str, tone: BoardTone = "default", kind: Literal["fact", "bold"] = "fact") -> BoardSpan:
+    return BoardSpan(text=text, tone=tone, kind=kind)
+
+
+def _read_ok(row: StatusRow, reading: StatusReading, *, account_config: conf.ConfigRead) -> bool:
+    return (isinstance(row.read_at, datetime) and not _reading_is_old(row.read_at, reading.checked_at, account_config=account_config)
+            and row.on_credits != "stale"
+            and row.read_outcome in (agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD))
+
+
+def _reset_text(at: datetime | StatusUnavailable, zone: tzinfo, now: datetime) -> str:
+    """The clock today, the weekday and clock within six days, or the day and month."""
+    if isinstance(at, StatusUnavailable):
+        return ""
+    local = at.astimezone(zone)
+    days = abs((local.date() - now.astimezone(zone).date()).days)
+    if days > 6:
+        return f"{local.day} {local:%b}"
+    return f"{local:%H:%M}" if days == 0 else f"{local:%a %H:%M}"
+
+
+def _count_cells(count: RoleSessionCounts | NoRoleCount | None) -> dict[str, str]:
+    if not isinstance(count, RoleSessionCounts):
+        return {key: "" for key in COUNT_COLUMNS}
+    return {"busy": str(count.busy), "idle": str(count.idle), "paused": str(count.paused),
+            "exited": str(count.exited), "total": str(count.total)}
+
+
+def _account_board_rows(row: StatusRow, reading: StatusReading, *, account_config: conf.ConfigRead) -> list[BoardRow]:
+    weekly = row.weekly_left_percent
+    known = not isinstance(weekly, (StatusUnavailable, WeeklyNotReadSince))
+    tone: BoardTone = "default" if not known else "error" if weekly < 10 else "warning" if weekly < 25 else "default"
+    left = f"{round(weekly)}%" if known else "—"
+    reset = _reset_text(row.resets_at, reading.zone, reading.checked_at)
+    balance = ("" if isinstance(row.credits, StatusUnavailable) else "unlimited" if row.credits == "unlimited"
+               else f"{row.credits:,.0f}")
+    dot: BoardTone = "success" if _read_ok(row, reading, account_config=account_config) else "error"
+    roles = [f"{role} ✓" if role in row.selected_roles else role for role in row.roles] or [""]
+    lines: list[BoardRow] = []
+    for index, role in enumerate(roles):
+        first = index == 0
+        counts = _count_cells(row.role_counts[index] if index < len(row.role_counts) else None)
+        cells = {"dot": [_span("●", dot)] if first else [], "label": [_span(row.label, kind="bold")] if first else [],
+                 "left": [_span(left, tone)] if first else [], "roles": [_span(role)],
+                 **{key: [_span(value)] for key, value in counts.items()},
+                 "resets": [_span(reset)] if first else [], "credits": [_span(balance)] if first else [],
+                 "enabled": [_span("yes" if row.use_credits else "")] if first else []}
+        lines.append(BoardRow(cells=cells))
+    return lines
+
+
+def status_board(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> Board:
+    """The accounts board: one line per role of each account, then the total line."""
+    account_config = read_account_settings(account_config)
+    rows = sorted(reading.rows, key=lambda row: row.label.casefold())
+    # The reset text changes at the next local midnight.
+    today = reading.checked_at.astimezone(reading.zone).date()
+    stale_at = datetime.combine(today + timedelta(days=1), datetime.min.time(), reading.zone).astimezone(timezone.utc).isoformat()
+    if not rows:
+        return Board(columns=list(BOARD_COLUMNS), rows=[], stale_at=stale_at)
+    lines = [line for row in rows for line in _account_board_rows(row, reading, account_config=account_config)]
+    known = [count for row in rows for count in row.role_counts if isinstance(count, RoleSessionCounts)]
+    total = {"busy": str(sum(count.busy for count in known)), "idle": str(sum(count.idle for count in known)),
+             "paused": str(sum(count.paused for count in known)), "exited": str(sum(count.exited for count in known)),
+             "total": str(sum(count.total for count in known))}
+    empty: list[BoardSpan] = []
+    lines.append(BoardRow(cells={"dot": empty, "label": [_span("total", kind="bold")], "left": empty, "roles": empty,
+                                 **{key: [_span(value)] for key, value in total.items()},
+                                 "resets": empty, "credits": empty, "enabled": empty}))
+    return Board(columns=list(BOARD_COLUMNS), rows=lines, stale_at=stale_at)
+
+
 def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:
     account_config = read_account_settings(account_config)
     accounts: list[StatusAccountDocument] = []
@@ -4457,12 +4568,11 @@ def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRea
             credits=None if isinstance(row.credits, StatusUnavailable) else row.credits,
             use_credits=row.use_credits,
             read_at=None if isinstance(row.read_at, StatusUnavailable) else row.read_at.astimezone(timezone.utc).isoformat(),
-            read_ok=isinstance(row.read_at, datetime) and not _reading_is_old(row.read_at, reading.checked_at, account_config=account_config)
-            and row.on_credits != "stale" and row.read_outcome in (
-                agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD),
+            read_ok=_read_ok(row, reading, account_config=account_config),
             credits_in_use=row.on_credits == "yes")
         accounts.append(item)
-    return json.dumps(StatusDocument(upcoming_moves=list(reading.upcoming_moves), session_inputs=list(reading.session_inputs), accounts=accounts, problems=[note.removeprefix("* ") for note in reading.notes]))
+    return json.dumps(StatusDocument(upcoming_moves=list(reading.upcoming_moves), session_inputs=list(reading.session_inputs), accounts=accounts,
+                                     board=status_board(reading, account_config=account_config), problems=[note.removeprefix("* ") for note in reading.notes]))
 
 
 ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage", "credits", "legacy", "unnoted", "test login", "access", "identity", "signed out", "wrong login", "unreadable note", "note", "state", "check", "role", "unclassified", "mcp servers"]
@@ -5560,15 +5670,20 @@ def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
     return MachineSessionCounts(machine=machine, at=stamp, accounts=checked)
 
 
+def _session_counts_failure() -> Path:
+    return _session_counts_cache().with_name("peer_session_counts_failed.json")
+
+
 def _fetch_session_counts() -> int:
-    """Fetch only the other machine's local counts through the shared transport."""
+    """Fetch the other machine's counts; a failed read keeps the last good copy for its age limit."""
     try:
         machine = remote.other_machine()
         text = role_map.ssh_role_map(("session-counts-read",), machine=machine)
         _ = _decode_session_counts(text, machine)
         atomic_file.write_text_atomic(_session_counts_cache(), text)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        atomic_file.write_text_atomic(_session_counts_cache(), json.dumps({"unavailable": True}))
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        atomic_file.write_text_atomic(_session_counts_failure(), json.dumps({
+            "at": datetime.now(timezone.utc).isoformat(), "reason": f"{type(error).__name__}: {error}"}))
         return 1
     return 0
 
@@ -5607,10 +5722,7 @@ def _machine_role_counts(
     except (OSError, ValueError):
         peer_accounts = {}
         available = False
-    started = _start_session_counts_fetch()
-    available = available and started
-    if not available:
-        peer_accounts = {}
+    _ = _start_session_counts_fetch()
     counted: list[StatusRow] = []
     for row in rows:
         local_counts = {role: RoleSessionCountsDocument(busy=count.busy,

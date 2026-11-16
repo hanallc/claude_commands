@@ -973,11 +973,12 @@ INFER_PROFILE_AT_USE = InferProfileAtUse()
 
 def step_identity(step: str, worktree: str) -> wire.Identity:
     from scripts.build_queue import admission_records as records
-    from scripts.production import staff
 
     identity = records.waiter_identity(step, worktree)
     if not identity["session_id"] and (reference := os.environ.get("BUILDLOG_OWNER_STAFF_ID", "")):
         # Resolve the recorded staff owner only when the caller has no session identity.
+        from scripts.production import staff
+
         try:
             member = staff.snapshot().by_id(staff.StaffId(reference))
         except staff.StaffUnreadable:
@@ -1198,7 +1199,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
         # A Mac-only step is pinned to the Mac, so the routing rule lets a build leave natedev.
         selection = (step_selection.Pinned(args.target) if args.target else
                      step_selection.Pinned("mac") if args.mac_only else step_selection.ROUTED)
-        routing = target_config.LocalRequired("local caller") if args.local_only else target_config.ANY_ELIGIBLE_TARGET
+        routing = target_config.LOCAL_CALLER if args.local_only else target_config.ANY_ELIGIBLE_TARGET
         kind = args.kind or local.profile.step
         if kind == "nextest":
             kind = "test"
@@ -1222,7 +1223,9 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             local=wire.LocalAdmissionContext(local.argv, local.cwd, local.sidecar, local.call,
                 local.test_width, local.fresh_test, local.token_back_at), prerequisite=prerequisite,
             purpose=placement.SpeculativeCopy(args.parent_episode, args.call_started)
-                if args.parent_episode else placement.NormalStep())
+                if args.parent_episode else placement.NormalStep(),
+            route=target_config.step_route(local=args.local_only, mac_only=args.mac_only, target=args.target,
+                                           writes_tree=args.writes_tree))
         if already_queued:
             _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex, episode, owner, prerequisite))
         while True:

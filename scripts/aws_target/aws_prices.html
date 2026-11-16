@@ -5,50 +5,30 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AWS prices</title>
 <style>
+/*__CONSOLE_THEME__*/
 :root {
-  color-scheme: light;
-  --bg: #f6f5f2; --card: #fcfcfb; --line: #dcdad4; --hover: #efede8;
-  --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #66645f; --accent: #2a78d6; --room: #1baf7a; --edge: rgb(0 0 0 / 0.18);
   /* The color scale of a price column, as in a spreadsheet: the cheapest, the median and the most expensive. */
   --scale-low: #57bb8a; --scale-mid: #ffffff; --scale-high: #e67c73;
   --box: #ffffff; --box-edge: rgb(0 0 0 / 0.45); --extreme: #f5b400;
 }
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    color-scheme: dark;
-    --bg: #121211; --card: #1a1a19; --line: #34332f; --hover: #242422;
-    --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f; --accent: #3987e5; --room: #199e70; --edge: rgb(0 0 0 / 0.6);
-    --scale-low: #23664a; --scale-mid: var(--card); --scale-high: #8f3b35;
-  }
+  :root:not([data-theme="light"]) { --scale-low: #23664a; --scale-mid: var(--card); --scale-high: #8f3b35; }
 }
-:root[data-theme="dark"] {
-  color-scheme: dark;
-  --bg: #121211; --card: #1a1a19; --line: #34332f; --hover: #242422;
-  --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f; --accent: #3987e5; --room: #199e70; --edge: rgb(0 0 0 / 0.6);
-  --scale-low: #23664a; --scale-mid: var(--card); --scale-high: #8f3b35;
-}
-* { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-__PAGE_FRAME_STYLE__
+:root[data-theme="dark"] { --scale-low: #23664a; --scale-mid: var(--card); --scale-high: #8f3b35; }
 /* The content fills the window, so the region filter fits on one row; the user likes dense pages. */
-h2 { font-size: 1.05rem; margin: 0 0 4px; }
+__PAGE_FRAME_STYLE__
 h2 .unit { font-size: 0.82rem; font-weight: 400; color: var(--ink-3); }
 .status { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font-size: 0.88rem; margin: 0 0 16px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--room); flex: none; }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 14px; margin: 0 0 16px; }
 .card-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; }
-.note { color: var(--ink-2); font-size: 0.86rem; margin: 6px 0 0; max-width: 78ch; }
 .answer { font-size: 1.05rem; font-weight: 600; margin: 12px 0 0; }
-/* A wide table scrolls inside its card: the first column stays, and a shadow marks more columns at the right edge. */
-.scroll { overflow-x: auto;
-  background: linear-gradient(to left, var(--card) 40%, transparent) right / 36px 100% no-repeat local,
-              radial-gradient(farthest-side at 100% 50%, var(--edge), transparent) right / 14px 100% no-repeat scroll; }
 table { border-collapse: collapse; font-size: 0.86rem; margin-top: 6px; min-width: 100%; }
 th, td { text-align: left; padding: 5px 6px 5px 18px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 thead th { white-space: normal; vertical-align: bottom; }
 /* A header wraps only between words, never at the hyphen of a region name. */
 thead th span { white-space: nowrap; }
 tbody th.group { color: var(--ink); padding-top: 16px; }
+/* The first column stays while a wide table scrolls. */
 th:first-child, td:first-child { padding-left: 0; position: sticky; left: 0; z-index: 1; background: var(--card); }
 .scroll.overflows th:first-child, .scroll.overflows td:first-child { padding-right: 12px; box-shadow: inset -1px 0 var(--line); }
 th { color: var(--ink-2); font-weight: 600; }
@@ -83,15 +63,17 @@ td.extreme { box-shadow: inset 0 0 0 2px var(--extreme); }
 .filter button + button { border-left: 1px solid var(--line); }
 .filter button[aria-pressed="true"] { background: var(--accent); color: #fff; }
 .filter button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-/* The region filter stays at the top of the view while the page scrolls. */
-.regions { position: sticky; top: 0; z-index: 3; display: flex; align-items: baseline; gap: 8px; background: var(--bg);
-  padding: 8px 0 12px; margin: 0 0 4px; border-bottom: 1px solid var(--line); }
-.regions-label { color: var(--ink-2); font-size: 0.86rem; font-weight: 600; flex: none; }
+/* The geography and region filters stay at the top of the view while the page scrolls. */
+.regions { position: sticky; top: 0; z-index: 3; display: grid; grid-template-columns: max-content minmax(0, 1fr);
+  align-items: baseline; gap: 6px 8px; background: var(--bg); padding: 8px 0 12px; margin: 0 0 4px; border-bottom: 1px solid var(--line); }
+.regions-label { color: var(--ink-2); font-size: 0.86rem; font-weight: 600; }
 .chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .chips button { font: inherit; font-size: 0.84rem; color: var(--ink-2); background: var(--card); border: 1px solid var(--line);
   border-radius: 999px; padding: 3px 6px; cursor: pointer; }
 .chips button:hover { background: var(--hover); }
 .chips button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+/* A geography with some of its regions chosen. */
+.chips button[aria-pressed="mixed"] { background: color-mix(in srgb, var(--accent) 22%, var(--card)); border-color: var(--accent); color: var(--ink); }
 .chips button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .chips .all { font-weight: 600; }
 </style>
@@ -101,6 +83,8 @@ td.extreme { box-shadow: inset 0 0 0 2px var(--extreme); }
 <h1 class="page-title">AWS prices</h1>
 <div class="status"><span class="dot" aria-hidden="true"></span><span id="published"></span></div>
 <nav class="regions" aria-label="Regions to show">
+  <span class="regions-label" id="geographies-label">Geography</span>
+  <div class="chips" role="group" aria-labelledby="geographies-label" id="geographies"></div>
   <span class="regions-label" id="regions-label">Regions</span>
   <div class="chips" role="group" aria-labelledby="regions-label" id="regions"></div>
 </nav>
@@ -395,31 +379,56 @@ for (const group of scopeFilters) {
   for (const costs of data.runs) group.appendChild(button(costs.label, "scope", costs.scope, showScope));
 }
 
-// The region filter: all regions by default, any combination. None clears every region, so one click then shows only that one.
-const chips = document.getElementById("regions");
-const allChip = element("button", "All", "all");
-allChip.type = "button";
-chips.appendChild(allChip);
-const regionChips = data.regions.map(region => {
-  const chip = element("button", region);
-  chip.type = "button";
-  chip.dataset.region = region;
-  chips.appendChild(chip);
-  return chip;
-});
-const noneChip = element("button", "None", "all");
-noneChip.type = "button";
-chips.appendChild(noneChip);
+// The region filter: all regions by default, any combination. "none" clears every region, so one click then shows only that one.
+// The geography row above it groups the regions by the first word of their names, in the order of the region list.
+function chipRow(id, labels) {
+  const row = document.getElementById(id);
+  const chip = (label, className) => {
+    const button = element("button", label, className);
+    button.type = "button";
+    row.appendChild(button);
+    return button;
+  };
+  const all = chip("all", "all");
+  const each = labels.map(label => chip(label));
+  const none = chip("none", "all");
+  return {all, each, none};
+}
+const geographyOf = region => region.split("-", 1)[0];
+const geographies = [...new Set(data.regions.map(geographyOf))];
+const geographyRow = chipRow("geographies", geographies);
+const regionRow = chipRow("regions", data.regions);
+const regionChips = regionRow.each;
+regionChips.forEach((chip, index) => { chip.dataset.region = data.regions[index]; });
+// A geography is pressed when all its regions are chosen, and mixed when some are.
+function geographyState(geography) {
+  const regions = data.regions.filter(region => geographyOf(region) === geography);
+  const chosen = regions.filter(region => shown.has(region)).length;
+  return chosen === regions.length ? "true" : chosen ? "mixed" : "false";
+}
 function showRegions(next) {
   shown = next;
-  allChip.setAttribute("aria-pressed", String(shown.size === data.regions.length));
-  noneChip.setAttribute("aria-pressed", String(shown.size === 0));
+  for (const row of [geographyRow, regionRow]) {
+    row.all.setAttribute("aria-pressed", String(shown.size === data.regions.length));
+    row.none.setAttribute("aria-pressed", String(shown.size === 0));
+  }
+  geographyRow.each.forEach((chip, index) => chip.setAttribute("aria-pressed", geographyState(geographies[index])));
   for (const chip of regionChips) chip.setAttribute("aria-pressed", String(shown.has(chip.dataset.region)));
   draw();
   remember(REGIONS_KEY, JSON.stringify([...shown]));
 }
-allChip.addEventListener("click", () => showRegions(new Set(data.regions)));
-noneChip.addEventListener("click", () => showRegions(new Set()));
+for (const row of [geographyRow, regionRow]) {
+  row.all.addEventListener("click", () => showRegions(new Set(data.regions)));
+  row.none.addEventListener("click", () => showRegions(new Set()));
+}
+// A geography chip chooses all its regions, or clears them when all are already chosen.
+geographyRow.each.forEach((chip, index) => chip.addEventListener("click", () => {
+  const geography = geographies[index];
+  const next = new Set(shown);
+  const choose = geographyState(geography) !== "true";
+  for (const region of data.regions) if (geographyOf(region) === geography) { if (choose) next.add(region); else next.delete(region); }
+  showRegions(next);
+}));
 for (const chip of regionChips) {
   chip.addEventListener("click", () => {
     const next = new Set(shown);

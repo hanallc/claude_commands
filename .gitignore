@@ -12,6 +12,8 @@
 !keybindings.json
 !.claude/
 !.claude/settings.local.json
+!.claude/config/
+!.claude/config/post_push.sh
 !commands/
 !commands/**
 !config/
@@ -28,6 +30,11 @@ docs/plans/*-log.md
 !scripts/**
 !shared/
 !shared/**
+!Cargo.toml
+!Cargo.lock
+!taplo.toml
+!rust/
+!rust/**
 !templates/
 !templates/**
 !mods/

@@ -229,7 +229,7 @@ A failed load changes nothing; the next interval tries again.
 Button borders use light and dark colors with at least 3:1 contrast against the button fill and page background.
 The page shows one card at a time.
 The compact **Showrunner:** menu starts with **All (n)** and then lists each showrunner with its waiting count.
-All is the default and includes every showrunner in the existing item order.
+All is the default and lists each root showrunner's queue in turn.
 The menu keeps the existing showrunner order.
 The menu stays on one line at phone and desktop widths.
 The URL fragment records the showrunner and card.
@@ -244,8 +244,15 @@ Each change can hold one image id in its optional `Image` cell.
 It adds the `Image` column when needed and deletes the old image after writing the row.
 `change_review.py image --image <png>` registers a screenshot for a checkpoint line.
 `image --output <text file>` renders dark terminal output with headless Chrome in a temporary browser profile.
+It measures the wrapped text height before capture and uses that height for the image.
+The image height has a 160-pixel minimum because Chrome clips shorter screenshots.
+The image height has a 4096-pixel limit.
 The action prints the id for a final ` | image <id>` field, after optional ` | after <step>`.
 The parser accepts twelve lowercase hexadecimal characters.
+The commit hook requires an image on each visible Change-Review line through `change_review.problem`.
+Merge checks require the image for commits dated at or after 2026-11-16 00:00 EST, using the Git committer time (`%ct`).
+Malformed lines remain invalid at every date.
+Merged history remains readable without an image.
 `list-ready` and `live` leave the cell empty and print one line when the image is missing.
 
 Both review pages use `change_page.change_content` and `CHANGE_IMAGE_STYLE` for the thumbnail.
@@ -262,6 +269,9 @@ A row without an image retains its text width and position.
 It stores a single image or a before and after pair with one record.
 `image_store.read_record` checks the optional `before` and `feedback_at` fields.
 Change images live in `change-images/<id>/`, separate from the Images page's `images/` store.
+`| image <id>` accepts an id from either store.
+`change_review._row_image` copies an Images page file into the change store and puts the new id in the row.
+It copies the after image for a pair. The source stays in the Images page store until its owner deletes it.
 `change_review.record_verdict` clears the cell and deletes its image for landing and return verdicts.
 The snapshot sweep skips both image stores during normal snapshot deletion.
 It deletes change images only when no To review row names them and their age exceeds `change_image_unclaimed_days`.
@@ -282,8 +292,8 @@ A question filed with parts (`ask --ask`) shows each part as its own section:
 A question stored as one text, from before the parts form, shows in sections too:
 
 1. It uses `reviewed` when that field exists. Otherwise, it uses `question`.
-2. The title uses the first reviewed line or the first raw question sentence ending with `?`.
-3. The body excludes the title. Context paragraphs remain separate, and `- ` lines form a list.
+2. The title uses the first reviewed line when that line contains `?`. Otherwise, it uses that line's first sentence. For raw text, the title uses the first sentence that ends with `?`.
+3. For reviewed text, the body starts with the rest of the first line and excludes the title. Context paragraphs remain separate, and `- ` lines form a list.
 4. A raw question stored on one line shows each context sentence as a separate paragraph.
 5. **Items** holds runs marked `1)` `2)`, `1.` `2.`, `(1)` `(2)` or `(a)` `(b)`, in order.
 6. **Choices** uses numbered choices or labeled choices after `Choices:` as radio items.
@@ -295,6 +305,9 @@ In all question text, each `http` or `https` address is a link that opens in the
 A right click can open it in a new tab.
 In all question text, a span in backticks shows as code, and an address in a code span is not a link.
 An item that is only one backtick span, such as a command, shows as a code block.
+A fenced block or a backtick-only line after an item ending with `:` stays inside that item.
+The code block gets no separate number in either the parts form or the one-text form.
+Numbers inside code do not affect the item numbers.
 The form of a new question is in `~/.claude/docs/question_template.md`.
 The answer box has the label **Your answer** and this help line: `A choice fills this. Edit it or write your own. Nothing sends until you press Answer.`
 Three buttons share one row below the box: **Answer**, **Followup** and **Skip**.
@@ -329,6 +342,37 @@ Recovery sends only answers with `saved: true` whose canonical question record i
 Recovery clears an intent for an open question.
 For a closed question without `saved: true`, recovery clears the intent and prints `answer save state unknown; not sent`.
 Answers to questions and changes both post to `changes.html`.
+
+### Accounts page
+
+Hana console, Accounts (`/console/accounts.html`) shows the accounts board.
+The console lists it as **Accounts**, with the Lucide `users` icon.
+The server keeps the last good page and its render times under one lock.
+The first request waits for a render in a child process (`accounts_page.py`).
+A later request returns the kept page at once and starts one background render.
+A request during a render returns the kept page and starts no second render.
+Only requests start renders.
+The child keeps the status read's stderr capture away from the server's request log.
+`accounts_page_seconds` in `config/review_links.conf` limits each render.
+A failed or late first render gives 503 with **The Accounts page is not available.**
+A failed background render keeps the last good page and writes one line to stderr.
+Failed renders add no render time.
+
+- The table comes from `accounts.status_board()`: the board columns, rows, total row and tones.
+- The upcoming moves and the problems follow the table.
+- The page reads the stored usage only, as `accounts.py status --stored` does.
+
+The page reads its color tokens and base type from `console_theme.py`, and its main column and title from `page_frame.STYLE`.
+It refreshes every 15 seconds through `page_refresh_seconds` while the page is visible.
+It also refreshes when the console shows it again and when the tab becomes visible.
+Changes, Images and Accounts use the same refresh helper in `page_frame.py`.
+Images has no interval timer.
+
+The line under the Accounts title shows the data age in whole seconds and the browser wait in seconds.
+It then shows the last render time and the median of at most 10 successful renders.
+The browser computes the data age from the render finish time and clamps negative ages to zero.
+The browser measures the first wait from request start to response end in its navigation entry.
+For a refresh, it measures the wait around `fetch` and the response body read.
 
 ### Images page
 
@@ -549,9 +593,17 @@ The selected type tab joins the content panel.
 Its keyboard focus outline stays inside the tab edges.
 Builds rows can remain in the natedev list while the builds filter shows them.
 
-Each showrunner group orders its prepared change rows with `urgency.queue_order`, the same order that `/next change` uses.
-The page keeps row entries during ordering and does not format the text that `/next` prints.
-The existing urgency order, pin, dependencies, and moved rows determine its order.
+Each showrunner view uses `next_item.change_queue` and `urgency.queue_order`, as `/next change` does without `--all-below`.
+The page shares its list reads and staff routing with `change_review.change_queue`.
+All lists each root's `/next change --all-below` order in turn through `urgency.queue_order`.
+It keeps each root queue's pin, moved rows, and dependencies.
+The page reads `changes_first_root` from `config/review_links.conf` at each render.
+The named root goes first, and other roots follow by name.
+The default is `natedev`.
+A name outside the live roots leaves the root order unchanged.
+Rows outside these queues go last.
+The server supplies each view's order for the first card, waiting list, and Skip for now.
+The browser uses these orders without sorting rows.
 Queue keys and prerequisites retain their list-based IDs.
 The `change` line and `/next` show the responsible showrunner's ID, such as `sdlc/C1514`.
 The shared staff resolver supplies the prefix used by the showrunner filter.
@@ -1007,18 +1059,23 @@ The page, the footer and `/next` use these same folder readers.
 
 
 Changes, Questions, and Images share one motion helper.
-A different Changes or Questions card fades out for 120ms, then fades in for 180ms with a 4px upward move.
+A different Changes or Questions card fades out for 180ms, then fades in for 270ms with a 4px upward move.
 A new switch completes the active switch first.
 The first load and an update that keeps the same card do not fade.
 A new card above the viewport scrolls into view smoothly.
-Image links scroll smoothly to their image, then reveal it over 180ms with a 4px upward move.
+Image links scroll smoothly to their image, then reveal it over 270ms with a 4px upward move.
 Other image cards stay visible.
-An image fades before removal, and the cards below close the gap over 180ms.
+An image fades before removal, and the cards below close the gap over 270ms.
 Reduced motion disables fades and uses instant scrolling.
 
-Questions and Changes show a Lucide copy button inside the top right of each code block.
-The command item renderer emits the button with the code block.
-Plain proof text keeps its `<pre>` block without a copy button.
+Question items and change rows show a Lucide copy button inside the top right of each code block.
+Both Changes views recognize fenced code blocks and lines that contain only one backtick span.
+This applies to How to check, Proof, Question, Feedback, and Answer.
+The shared renderer emits each code block with its button.
+Plain text uses `<p>` blocks without a box or a copy button.
+The paragraph style preserves line breaks, including a two-line check without code.
+The renderer removes blank lines at each text part's edges.
+Code blocks and paragraphs use the same 16px margin.
 Inline code keeps its current style.
 The button copies the code text without the button or its label.
 The button shows a check and the label “Copied” for two seconds after success.

@@ -4,6 +4,8 @@ description: Add a change for the user to check to the top-level showrunner's ch
 
 # Change review
 
+Each action refuses an option it does not read.
+
 ## Bare command
 
 For `/change_review` with no action:
@@ -55,8 +57,8 @@ first row, with its frontmatter.
 Every write sets the list's `date_modified` and adds the production's doc to
 its `productions`, so the list's frontmatter names every production it holds.
 
-Every write commits the list itself when it sits in a git repository, so never
-commit it by hand. A `written but not committed` warning needs nothing: the
+Every write commits the list through Git plumbing without an index refresh.
+Do not commit the list by hand. A `written but not committed` warning needs nothing: the
 write stands and the next write commits it. The vault's Templater must exclude
 the change-review folder, since its creation trigger rewrites a new list within
 half a second and can drop a row; the vault owner sets Excluded folders →
@@ -73,7 +75,7 @@ carries: a showrunner's own change, a fix outside a run, or a change nobody
 sees in the app, such as a table's columns or a status line.
 
 ```sh
-… add [--production <name>] --change "<what changed for you>" --check "<how to try it: where and what to type>" --see "<what you see>" [--merged <hash>] [--urgency <level>] [--due <ISO>] [--after C<n>] [--image <png>]
+… add [--production <name>] --change "<what changed for you>" --check "<how to try it: where and what to type>" --see "<what you see>" [--merged <hash>] [--urgency <level>] [--due <ISO>] [--after C<n>] [--image <png> | --output <text file>]
 ```
 
 `--urgency` is `blocks` (work stops until the user checks it), `soon` (with
@@ -93,9 +95,13 @@ user's zone, then the commit: `2026-11-13 16:20 · 31770c75`. It prints the new 
 
 ## Change images
 
-Attach one image wherever possible. A line without an image stays valid.
+Every change review carries one image: a dark mode shot at desktop width, or `image --output <text file>` for terminal output.
+The commit hook requires a final ` | image <id>` field on each visible Change-Review line.
+Merge checks require that field for commits dated at or after 2026-11-16 00:00 EST, using the Git committer time.
 Use `add --image <png>` to attach an existing screenshot to a manual row.
 Use `edit --row <id> --image <png>` to attach or replace an image on an existing row.
+Use `add --output <text file>` or `edit --row <id> --output <text file>` to attach rendered text.
+Pass one of `--image` and `--output`. Other actions refuse these options except `image`.
 An image replacement deletes the old image after the row is written.
 For a checkpoint, register the image first:
 
@@ -118,6 +124,9 @@ Press Escape or click the zoom to return.
 Shift-click or use the right-click menu to open the full image in a new tab.
 A landing or return verdict deletes the image and clears its cell.
 Change images use `change-images/` and never appear on the Images page.
+`| image <id>` accepts a change image id or an Images page id.
+An Images page id copies its file into `change-images/` and uses the new id in the row.
+For a pair, it copies the after image. The source stays on the Images page.
 The server deletes unclaimed images after `change_image_unclaimed_days`, which starts at 14 days.
 
 ## list-ready and live
@@ -157,6 +166,7 @@ what the person sees:
 ```sh
 … edit [--production <name>] --row <id> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
 … edit [--production <name>] --row <id> --image <png>
+… edit [--production <name>] --row <id> --output <text file>
 ```
 
 Pass the displayed ID, such as `sdlc/C9`.
@@ -164,9 +174,39 @@ The prefix names the responsible showrunner, even when another showrunner's list
 Commands also accept the list-based ID and a bare row number with the selected list.
 Pass `--list <path>` when the displayed ID matches several lists.
 The row keeps its id, its Merged cell and its place. It prints the new row.
-Add `--image <png>` to the text edit to attach or replace the image.
-With only `--image`, the row keeps all other cells.
+Add `--image <png>` or `--output <text file>` to a text edit to attach or replace the image.
+With only an image option, the row keeps all other cells.
 With any text option, pass all three text options.
+
+## batch
+
+Apply several edits and verdicts with one folder lock and one commit:
+
+```sh
+… batch --file <json>
+```
+
+The file contains an array of items:
+
+```json
+[
+  {"op": "edit", "production": "hana", "row": "hana/C1", "change": "New text", "check": "Open the page", "see": "The result"},
+  {"op": "edit", "production": "hana", "row": "hana/C2", "image": "/path/shot.png"},
+  {"op": "verdict", "production": "hana", "row": "hana/C3", "verdict": "works"}
+]
+```
+
+Each item can set `list` to the path accepted by `--list`.
+All lists must be in one folder.
+Each row can appear only once per list in a batch.
+A repeated row reports `batch item <j>: row <id> is already item <i>` before any list write.
+After a partial write, repeat the batch to finish the remaining writes and commit all target lists.
+An edit with only `image` or `output` keeps the row text.
+Use `output` for a rendered text file. Do not combine it with `image`.
+An edit with text needs `change`, `check`, and `see`.
+An invalid item reports its zero-based index and leaves all lists unchanged.
+The command applies items in array order and prints each single command's output.
+Image removal and verdict scratch removal follow the writes, outside the lock.
 
 ## show
 
@@ -237,6 +277,14 @@ These rows hide all showrunner actions, including Send feedback.
 The server refuses question and feedback requests without saving.
 Its count covers all page lists, including independent production roots.
 Menu options with waiting changes precede empty options in alphabetical order.
+Each showrunner view follows `/next change` for that production, with its pin and moved rows.
+All lists each root's `/next change --all-below` order in turn, with each root's pin and moved rows.
+The page reads `changes_first_root` from `config/review_links.conf` at each render.
+The named root goes first, and other roots follow by name.
+The default is `natedev`.
+A name outside the live roots leaves the root order unchanged.
+Rows outside these queues go last.
+The first card and Skip for now follow the selected view's order.
 Keyboard focus keeps its visible outline.
 Answers save in the background.
 Works and Does not work open the next waiting change at once, before the server answers.
@@ -285,7 +333,9 @@ A nonblocking lock prevents two renders from sending one alert at once.
 The router records acceptance only after the sender accepts or queues the alert.
 Do not ask for a batch size or take page answers in chat.
 
-The diagnostic command `show [--production <name>]` still prints the current row and count.
+The diagnostic command `show [--production <name>]` prints the current row and count.
+Use `show --row <id>` to print a selected row, with the same ID rules as `edit --row`.
+A row absent from the list gives an error.
 
 The list keeps the order of `/next` (`commands/next.md`): the row `show`
 printed stays first until its verdict. When the user calls a row important,

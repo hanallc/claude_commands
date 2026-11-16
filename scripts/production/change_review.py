@@ -1,7 +1,7 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Read unit commit trailers and write change review rows.
 
-A visible trailer has three fields, optional after <step>, and optional last image <id>.
+A visible trailer requires three fields and a final image <id>, with optional after <step> before the image.
 An invisible change uses Change-Review: none — <reason>.
 Every supplied review line must parse, whatever the commit subject.
 Only checkpoints that change more than Markdown require a review line.
@@ -29,11 +29,13 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from enum import Enum
+from functools import cached_property
 from pathlib import Path
 from typing import TypeVar, cast
 
@@ -67,11 +69,13 @@ IMAGE = "Image"
 KIND = "Kind"
 REVIEW_KINDS = ("See in action", "Read only")
 NOT_YET = "not yet"
-FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see> [| after <step>] [| image <id>]"
+FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see> [| after <step>] | image <id>"
 SEPARATOR = " | "
 SHORT = 8
 # Commits made before the rule landed carry no line and are not read: 2026-10-15 00:00 EDT.
 CHECKED_FROM = 1792036800
+# Commits made before the image rule landed need no image: 2026-11-16 00:00 EST.
+IMAGES_CHECKED_FROM = 1794805200
 LANDED = "2026-10-15"
 # Scan only merges made after the readiness rule starts.
 READY_FROM = "2026-11-06"
@@ -156,6 +160,7 @@ class Commit:
     subject: str
     message: str
     files: tuple[str, ...]
+    timestamp: int
     ancestry: Mapping[str, tuple[str, ...]] = field(default_factory=dict[str, tuple[str, ...]], repr=False, compare=False)
 
 
@@ -199,15 +204,19 @@ def needs_trailer(subject: str, files: tuple[str, ...]) -> bool:
     return subject.startswith("checkpoint(") and not (files and all(name.endswith(".md") for name in files))
 
 
-def problem(subject: str, message: str, files: tuple[str, ...]) -> str:
+def problem(subject: str, message: str, files: tuple[str, ...], *, timestamp: int = IMAGES_CHECKED_FROM) -> str:
     """Why a commit's message fails the rule, or the empty string."""
     found = entries(message)
     if not found and needs_trailer(subject, files):
         return f"no {TRAILER} line: add `{TRAILER}: {FORM}` or `{TRAILER}: none — <why nothing visible changes>`"
     bad = [item.text for item in found if isinstance(item, Malformed)]
     if bad:
-        return (f"{TRAILER} line {bad[0]!r} needs three parts split by {SEPARATOR.strip()!r}, optionally followed by ` | after <step>` and then ` | image <12-hex id>`: "
+        return (f"{TRAILER} line {bad[0]!r} needs three parts split by {SEPARATOR.strip()!r}, optional ` | after <step>`, and required ` | image <12-hex id>`: "
                 + f"`{TRAILER}: {FORM}`, or `{TRAILER}: none — <why nothing visible changes>`")
+    for line, item in zip(_LINE.finditer(message), found):
+        if timestamp >= IMAGES_CHECKED_FROM and isinstance(item, Visible) and not item.image:
+            return (f"{TRAILER} line {line.group(0)!r} has no image: register one with change_review.py image --image <png> "
+                    + "(or --output <text file> for terminal output), then end the line with | image <id>")
     return ""
 
 
@@ -295,7 +304,7 @@ def unit_commits(repo: Path, checkpoint: str, previous: str, merge_branch: str,
         if int(stamp) < checked_from:
             continue
         if len(parents) < 2:
-            commits.append(Commit(sha, message.partition("\n")[0], message, _files(repo, sha), ancestry))
+            commits.append(Commit(sha, message.partition("\n")[0], message, _files(repo, sha), int(stamp), ancestry))
         elif reason := merge_review_problem(message, is_merge=True):
             raise ChangeReviewError(f"{sha[:SHORT]}: {reason}. Make the merge again without the lines")
     return commits
@@ -307,9 +316,10 @@ def missing(commits: list[Commit]) -> list[str]:
     A pushed commit cannot be amended, so a later checkpoint carries the lines for one that missed them.
     """
     covered = [found.group("sha") for commit in commits if entries(commit.message)
-               and not problem(commit.subject, commit.message, commit.files) for found in _COVERS.finditer(commit.message)]
+               and not problem(commit.subject, commit.message, commit.files, timestamp=commit.timestamp)
+               for found in _COVERS.finditer(commit.message)]
     return [f"{commit.sha[:SHORT]} {commit.subject}: {reason}" for commit in commits
-            if (reason := problem(commit.subject, commit.message, commit.files))
+            if (reason := problem(commit.subject, commit.message, commit.files, timestamp=commit.timestamp))
             and not any(commit.sha.startswith(sha) for sha in covered)]
 
 
@@ -342,12 +352,13 @@ def visible(commits: list[Commit]) -> list[Visible]:
     return [item for _, item in _checkpoint_entries(commits)]
 
 
-def _line_value(doc: Path, *, sources: list[Path] | None = None) -> str | None:
+def _line_value(doc: Path, *, sources: list[Path] | None = None,
+                lines: list[str] | None = None) -> str | None:
     """The path the doc's Change review line names: its first `quoted` part, else the words before
     any ` — ` note. None when the doc has no line."""
     if sources is not None:
         sources.append(doc)
-    for line in doc.read_text(encoding="utf-8").splitlines():
+    for line in doc.read_text(encoding="utf-8").splitlines() if lines is None else lines:
         if line.startswith(LIST_HEADER):
             value = line.removeprefix(LIST_HEADER).strip()
             quoted = re.match(r"`([^`]+)`", value)
@@ -548,40 +559,65 @@ def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], 
         lines = text.splitlines(keepends=True)
         result = write(lines)
         if lines == text.splitlines(keepends=True):
-            _commit(path, what(result), report_warning=report_warning)
+            _commit([path], f"{_owner(path)} {what(result)}", report_warning=report_warning)
             return result
         _sort(path, lines)
         _stamp(path, lines, production, day)
         write_text_atomic(path, "".join(lines))
-        _commit(path, what(result), report_warning=report_warning)
+        _commit([path], f"{_owner(path)} {what(result)}", report_warning=report_warning)
         return result
 
 
-def _commit(path: Path, what: str, *, report_warning: Callable[[str], None] = _print_warning) -> None:
-    """Commit the list alone when it is in a Git repository. Push nothing.
+def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str], None] = _print_warning) -> None:
+    """Commit only the lists through Git plumbing, without refreshing the index."""
+    folder = paths[0].parent
 
-    `--only` with one path commits the file's whole content. It keeps every other change where it was, staged or not.
-    A refusal, such as another Git process holding `index.lock`, gives one warning through `report_warning` and keeps the write.
-    The next write's commit includes this write too.
-    """
+    def git(*arguments: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", "-C", str(folder), "--literal-pathspecs", *arguments],
+                              capture_output=True, text=True, check=False, env=env)
 
-    def git(*arguments: str) -> subprocess.CompletedProcess[str]:
-        # Literal pathspecs: a list name could hold glob characters.
-        return subprocess.run(["git", "-C", str(path.parent), "--literal-pathspecs", *arguments],
-                              capture_output=True, text=True, check=False)
+    def checked(*arguments: str, env: dict[str, str] | None = None) -> str:
+        result = git(*arguments, env=env)
+        if result.returncode:
+            reason = next(iter((result.stderr or result.stdout).strip().splitlines()), f"git {arguments[0]} failed")
+            raise ChangeReviewError(reason)
+        return result.stdout.strip()
 
     if git("rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
         return
-    if not git("status", "--porcelain", "--", path.name).stdout.strip():
-        return
-    steps = [] if git("ls-files", "--", path.name).stdout.strip() else [["add", "--intent-to-add", "--", path.name]]
-    steps.append(["commit", "--quiet", "--only", "-m", f"change-review: {_owner(path)} {what}", "--", path.name])
-    for step in steps:
-        done = git(*step)
-        if done.returncode:
-            reason = next(iter((done.stderr or done.stdout).strip().splitlines()), f"git {step[0]} failed")
-            report_warning(f"change review: {path} written but not committed: {reason}; the next write commits it")
-            return
+    try:
+        root = Path(checked("rev-parse", "--show-toplevel"))
+        folder = root
+        blobs = [(str(path.resolve().relative_to(root)),
+                  checked("hash-object", "-w", "--path", str(path.resolve().relative_to(root)), "--", str(path.resolve())))
+                 for path in paths]
+        subject = f"change-review: {what}"
+        with tempfile.NamedTemporaryFile(delete=False) as temporary:
+            index = Path(temporary.name)
+        try:
+            index.unlink()
+            environment = {**os.environ, "GIT_INDEX_FILE": str(index)}
+            for attempt in range(5):
+                head = git("rev-parse", "--verify", "-q", "HEAD").stdout.strip()
+                _ = checked("read-tree", head if head else "--empty", env=environment)
+                for name, blob in blobs:
+                    _ = checked("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}", env=environment)
+                tree = checked("write-tree", env=environment)
+                if head and tree == checked("rev-parse", head + "^{tree}"):
+                    return
+                for name, blob in blobs:
+                    _ = checked("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}")
+                commit = checked("commit-tree", tree, *(["-p", head] if head else []), "-m", subject)
+                updated = git("update-ref", "-m", subject, "HEAD", commit, head or "0" * len(commit))
+                if not updated.returncode:
+                    return
+                if attempt == 4 or git("rev-parse", "--verify", "-q", "HEAD").stdout.strip() == head:
+                    raise ChangeReviewError(updated.stderr.strip() or "git update-ref failed")
+        finally:
+            index.unlink(missing_ok=True)
+    except (ChangeReviewError, OSError) as error:
+        reason = str(error).splitlines()[0]
+        report_warning(f"change review: {paths[0]} written but not committed: {reason}; the next write commits it")
 
 
 def _table(path: Path, lines: list[str], section: str) -> tuple[list[str], int, int]:
@@ -783,6 +819,8 @@ def image_path(identity: str) -> str:
 def _row_image(identity: str, row: str) -> str:
     if not identity or image_path(identity):
         return identity
+    if copied := image_store.copy_page_image(identity):
+        return copied
     print(f"change review: no image {identity}; row {row} has no image")
     return ""
 
@@ -853,16 +891,24 @@ def pending(path: Path) -> list[dict[str, str]]:
 
 
 def scope_list(doc: Path, *, record: staff.StaffSnapshot | None = None,
-               sources: list[Path] | None = None) -> Path:
+               sources: list[Path] | None = None, prepared: PreparedChangeLists | None = None) -> Path:
     """The list that takes the production's rows: the one its Change review line names, else its root's."""
 
-    if doc.is_file() and (value := _line_value(doc, sources=sources)):
+    if prepared is not None:
+        record = prepared.routing.record
+    lines = prepared.routing.document_lines.get(doc, []) if prepared is not None else None
+    if doc.is_file() and (value := _line_value(doc, sources=sources, lines=lines)):
         return Path(value).expanduser()
     record = staff.snapshot() if record is None else record
     name = unit_lookup.doc_owner(doc, record).name
     if not doc.is_file():
         return list_file(name, sources=sources)
     root = showrunner_tree.root_of(name, record=record)
+    if prepared is not None:
+        for owner in (name, root):
+            if owner in prepared.routing.list_paths:
+                return prepared.routing.list_paths[owner]
+        raise ChangeReviewError(f"{doc} has no `{LIST_HEADER}` line")
     try:
         return (production_list(name, record=record) if sources is None
                 else production_list(name, record=record, sources=sources))
@@ -884,6 +930,20 @@ class ScopedReviewEntry:
     review_list: ProductionReviewList
     entry: urgency.Entry[dict[str, str]]
     owner: change_routing.ChangeOwner
+
+
+@dataclass(frozen=True)
+class PreparedChangeLists:
+    """Share the page's list reads and staff routing with the change queues."""
+
+    snapshots: dict[Path, ReviewListSnapshot]
+    routing: change_routing.StaffRouting
+
+    @cached_property
+    def routed(self) -> list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]:
+        names = {path.name for path in change_routing.review_root().glob(".review-link-delivery-*")}
+        lists = {path: ProductionReviewList(path, _owner(path)) for path in self.snapshots}
+        return _route_review_snapshots(lists, self.snapshots, self.routing, names)
 
 
 def scope_lists(path: Path, doc: Path, below: bool = False, *,
@@ -925,6 +985,13 @@ def _routed_review_entries(path: Path, doc: Path, below: bool, record: staff.Sta
     routing = change_routing.StaffRouting(record, documents, sources=sources)
     names = {path.name for path in issues.source_paths(
         change_routing.review_root(sources=sources), ".review-link-delivery-*", sources=sources)}
+    return _route_review_snapshots(listed, snapshots, routing, names, sources=sources)
+
+
+def _route_review_snapshots(listed: dict[Path, ProductionReviewList], snapshots: dict[Path, ReviewListSnapshot],
+                            routing: change_routing.StaffRouting, names: set[str], *,
+                            sources: list[Path] | None = None) -> list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]:
+    """Route waiting rows from one set of list reads."""
     routed: list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]] = []
     for source, snapshot in snapshots.items():
         rows = change_routing.waiting_rows(source, snapshot.pending, names, sources=sources)
@@ -948,13 +1015,23 @@ def review_scope(doc: Path, below: bool, record: staff.StaffSnapshot) -> set[str
     return scope
 
 
-def scoped_review_entries(path: Path, doc: Path, below: bool = False) -> list[ScopedReviewEntry]:
+def scoped_review_entries(path: Path, doc: Path, below: bool = False, *,
+                          prepared: PreparedChangeLists | None = None) -> list[ScopedReviewEntry]:
     """Use the same staff tab as the change page."""
-    record = staff.snapshot()
+    record = staff.snapshot() if prepared is None else prepared.routing.record
     scope = review_scope(doc, below, record)
     grouped: dict[Path, tuple[ProductionReviewList, list[dict[str, str]]]] = {}
     owners: dict[tuple[Path, str], change_routing.ChangeOwner] = {}
-    for review_list, owner, row in _routed_review_entries(path, doc, below, record):
+    if prepared is None:
+        routed = _routed_review_entries(path, doc, below, record)
+    else:
+        lists = dict.fromkeys(item.path.absolute() for item in scope_lists(path, doc, below, record=record))
+        lists.update(dict.fromkeys(source.absolute() for source in prepared.snapshots))
+        by_list: dict[Path, list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]] = {}
+        for item in prepared.routed:
+            by_list.setdefault(item[0].path.absolute(), []).append(item)
+        routed = [item for source in lists for item in by_list.get(source, [])]
+    for review_list, owner, row in routed:
         if owner.tab in scope:
             if review_list.path not in grouped:
                 grouped[review_list.path] = (review_list, [])
@@ -978,10 +1055,11 @@ def scope_rows(path: Path, doc: Path, below: bool = False) -> list[dict[str, str
     return [row.entry.item for row in scoped_review_entries(path, doc, below)]
 
 
-def scope_entries(path: Path, doc: Path, below: bool = False) -> list[urgency.Entry[dict[str, str]]]:
+def scope_entries(path: Path, doc: Path, below: bool = False, *,
+                  prepared: PreparedChangeLists | None = None) -> list[urgency.Entry[dict[str, str]]]:
     """Show the responsible showrunner while retaining list-based queue keys and prerequisites."""
     entries: list[urgency.Entry[dict[str, str]]] = []
-    for scoped in scoped_review_entries(path, doc, below):
+    for scoped in scoped_review_entries(path, doc, below, prepared=prepared):
         entry = scoped.entry
         prefix = (f"{_owner(scoped.review_list.path)}/"
                   if scoped.review_list.path.absolute() != path.absolute() else "")
@@ -1006,7 +1084,8 @@ class ChangeQueue:
     entries: list[urgency.Entry[dict[str, str]]]
 
 
-def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False) -> ChangeQueue:
+def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False, *,
+                 prepared: PreparedChangeLists | None = None) -> ChangeQueue:
     """The same change rows and pin for /next and change_review show."""
     if isinstance(scope, WholeReviewList):
         routing = review_routing((path,))
@@ -1015,10 +1094,10 @@ def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False)
             "#": display_id(entry.item, routing.owner(entry.item, path).tab)},
             after=prerequisite_key(entry.after, path, path)) for entry in entries])
 
-    record = staff.snapshot()
+    record = staff.snapshot() if prepared is None else prepared.routing.record
     name = unit_lookup.doc_owner(scope, record).name
     name = queue(path) if name == showrunner_tree.root_of(name, record=record) else f"{queue(path)}-{name}"
-    return ChangeQueue(urgency.scope_queue(name, below), scope_entries(path, scope, below))
+    return ChangeQueue(urgency.scope_queue(name, below), scope_entries(path, scope, below, prepared=prepared))
 
 
 def row_production(production: Path, record: staff.StaffSnapshot) -> str:
@@ -1225,16 +1304,16 @@ def merge_commits(repo: Path, merge: str, *, excluded_refs: Sequence[str] = ()) 
     parents = _git(repo, "rev-list", "--parents", "-n", "1", merge, "--").split()[1:]
     if len(parents) < 2:
         return []
-    records = _git(repo, "log", "--topo-order", "--format=%x1e%H %P%x1f%B", parents[1], f"^{parents[0]}",
+    records = _git(repo, "log", "--topo-order", "--format=%x1e%H %ct %P%x1f%B", parents[1], f"^{parents[0]}",
                    *(f"^{ref}" for ref in excluded_refs), "--")
     commits: list[Commit] = []
     ancestry: dict[str, tuple[str, ...]] = {}
     for record in records.split("\x1e")[1:]:
         header, message = record.split("\x1f", 1)
-        sha, *parents = header.split()
+        sha, stamp, *parents = header.split()
         ancestry[sha] = tuple(parents)
         if len(parents) < 2:
-            commits.append(Commit(sha, message.split("\n", 1)[0], message, (), ancestry))
+            commits.append(Commit(sha, message.split("\n", 1)[0], message, (), int(stamp), ancestry))
     return commits
 
 
@@ -1430,8 +1509,15 @@ class KeepRowText:
     """Keep the current Change and How to check cells."""
 
 
-def edit_row(path: Path, row: str, item: Visible | KeepRowText, day: date, production: Path,
-             *, image: str = "") -> str:
+@dataclass(frozen=True)
+class RowWrite[Result]:
+    """A row mutation and its work after the list lock is released."""
+
+    write: Callable[[list[str]], Result]
+    after: Callable[[], None]
+
+
+def _edit_write(path: Path, row: str, item: Visible | KeepRowText, image: str) -> RowWrite[str]:
     """Edit the selected text and image cells without changing the row's identity or position."""
     removed_image = ""
 
@@ -1452,9 +1538,19 @@ def edit_row(path: Path, row: str, item: Visible | KeepRowText, day: date, produ
         lines[index] = written + "\n"
         return written
 
-    written = _edit(path, production, day, write, lambda _: f"edit {row}")
-    if removed_image:
-        image_store.remove_change(change_routing.review_root(), removed_image)
+    def after() -> None:
+        if removed_image:
+            image_store.remove_change(change_routing.review_root(), removed_image)
+
+    return RowWrite(write, after)
+
+
+def edit_row(path: Path, row: str, item: Visible | KeepRowText, day: date, production: Path,
+             *, image: str = "") -> str:
+    """Edit a row and remove its previous image after the write."""
+    change = _edit_write(path, row, item, image)
+    written = _edit(path, production, day, change.write, lambda _: f"edit {row}")
+    change.after()
     return written
 
 
@@ -1506,10 +1602,9 @@ def row_merge(cells: dict[str, str]) -> RecordedMerge | MergeNotRecorded:
     return RecordedMerge(text) if text else MergeNotRecorded()
 
 
-def record_verdict(
-    path: Path, row: str, verdict: str, day: date, production: Path, *,
-    report_warning: Callable[[str], None] = _print_warning,
-) -> VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict:
+def _verdict_write(
+    path: Path, row: str, verdict: str, day: date,
+) -> RowWrite[VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict]:
     """Record a verdict once. Retain its merge and the result of an earlier write."""
     removed_image = ""
 
@@ -1555,9 +1650,21 @@ def record_verdict(
                                                    "Merged": cells.get("Merged", "")})])
         return VerdictRecorded(row_merge(cells))
 
-    result = _edit(path, production, day, write, lambda _: f"verdict {row}", report_warning=report_warning)
-    if removed_image:
-        image_store.remove_change(change_routing.review_root(), removed_image)
+    def after() -> None:
+        if removed_image:
+            image_store.remove_change(change_routing.review_root(), removed_image)
+
+    return RowWrite(write, after)
+
+
+def record_verdict(
+    path: Path, row: str, verdict: str, day: date, production: Path, *,
+    report_warning: Callable[[str], None] = _print_warning,
+) -> VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict:
+    """Record a verdict once and remove its image after the write."""
+    change = _verdict_write(path, row, verdict, day)
+    result = _edit(path, production, day, change.write, lambda _: f"verdict {row}", report_warning=report_warning)
+    change.after()
     return result
 
 
@@ -1662,6 +1769,13 @@ def save_verdict(path: Path, row: str, verdict: str, production: Path) -> Verdic
     shown = row_display_id(path, local_row)
     warnings: list[str] = []
     result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append)
+    return _verdict_output(path, local_row, shown, verdict, result, warnings)
+
+
+def _verdict_output(path: Path, local_row: str, shown: str, verdict: str,
+                    result: VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict,
+                    warnings: list[str]) -> VerdictSaved | VerdictRefused:
+    """Make verdict output and end the row's scratch folders after its write."""
     lines: list[str] = []
     if isinstance(result, VerdictConflict):
         reason = (f'change review: {shown} has the verdict "{result.recorded}" from {result.day}; '
@@ -1935,6 +2049,7 @@ class CommandLine(argparse.Namespace):
     hold: list[str] | None = None
     image: str = ""
     output: str = ""
+    file: str = ""
 
 
 def _list(options: CommandLine) -> Path:
@@ -1951,10 +2066,13 @@ def _visible(options: CommandLine) -> Visible:
     return Visible(change, options.check.strip(), options.see.strip())
 
 
-def _register_image(image: str) -> str:
-    """Register a file and report store failures as command errors."""
+def _register_image(image: str, output: str) -> str:
+    """Register an image or rendered output and report store failures."""
+    if bool(image) == bool(output):
+        raise ChangeReviewError("image needs one of --image or --output")
     try:
-        return image_store.register_change(Path(image).expanduser())
+        return (image_store.register_change(Path(image).expanduser()) if image
+                else image_store.register_output(Path(output).expanduser()))
     except (ValueError, subprocess.SubprocessError) as error:
         raise ChangeReviewError(str(error)) from error
 
@@ -2041,16 +2159,161 @@ def _backfill_targets(options: CommandLine) -> tuple[list[Path], list[Path]]:
     return documents, lists
 
 
+@dataclass(frozen=True)
+class BatchWrite:
+    """One checked item whose mutation returns its work after the lock."""
+
+    index: int
+    path: Path
+    row: str
+    production: Path
+    write: Callable[[list[str]], Callable[[], list[str]]]
+
+
+def _batch_item(value: object, index: int, day: date) -> BatchWrite:
+    if not isinstance(value, dict):
+        raise ChangeReviewError("expected an object")
+    fields = cast(dict[str, object], value)
+
+    def text(name: str, *, required: bool = False) -> str:
+        if required and name not in fields:
+            raise ChangeReviewError(f"missing {name}")
+        item = fields.get(name, "")
+        if not isinstance(item, str):
+            raise ChangeReviewError(f"{name} must be text")
+        return item
+
+    operation, production, row = text("op", required=True), text("production", required=True), text("row", required=True)
+    options = CommandLine(production=production, row=row, list=text("list"))
+    target = _row_option(options)
+    path = target.path.resolve()
+    doc = production_doc(production)
+    if operation == "edit":
+        options.change, options.check, options.see = text("change"), text("check"), text("see")
+        options.image, options.output = text("image"), text("output")
+        item = (KeepRowText() if (options.image or options.output) and not any((options.change, options.check, options.see))
+                else _visible(options))
+        image = _register_image(options.image, options.output) if options.image or options.output else ""
+        change = _edit_write(path, target.row, item, image)
+
+        def edit(lines: list[str]) -> Callable[[], list[str]]:
+            written = change.write(lines)
+            columns, _, _ = _table(path, lines, SECTION)
+            cells = dict(zip(columns, _cells(written)))
+
+            def after() -> list[str]:
+                change.after()
+                final_columns, _, _ = _table(path, lines, SECTION)
+                return [_row(path, final_columns, {**dict.fromkeys(final_columns, ""), **cells})]
+
+            return after
+
+        return BatchWrite(index, path, target.row, doc, edit)
+    if operation == "verdict":
+        if text("image") or text("output"):
+            raise ChangeReviewError("verdict does not accept image or output")
+        verdict = _words("verdict", text("verdict", required=True))
+        change_verdict = _verdict_write(path, target.row, verdict, day)
+        shown = row_display_id(path, target.row)
+
+        def record(lines: list[str]) -> Callable[[], list[str]]:
+            result = change_verdict.write(lines)
+            if isinstance(result, VerdictConflict):
+                raise ChangeReviewError(f'{target.row} has the verdict "{result.recorded}" from {result.day}')
+
+            def after() -> list[str]:
+                change_verdict.after()
+                return _verdict_output(path, target.row, shown, verdict, result, []).lines
+
+            return after
+
+        return BatchWrite(index, path, target.row, doc, record)
+    raise ChangeReviewError("op must be edit or verdict")
+
+
+def batch(file: Path) -> list[str]:
+    """Apply checked items under one folder lock and commit all target lists once."""
+    try:
+        values = cast(object, json.loads(file.read_text(encoding="utf-8")))
+    except ValueError as error:
+        raise ChangeReviewError(f"batch: {error}") from error
+    if not isinstance(values, list):
+        raise ChangeReviewError("batch: expected a JSON array")
+    day = today()
+    items: list[BatchWrite] = []
+    rows: dict[tuple[Path, str], int] = {}
+    for index, value in enumerate(cast(list[object], values)):
+        try:
+            item = _batch_item(value, index, day)
+            key = (item.path, item.row)
+            if key in rows:
+                raise ChangeReviewError(f"row {item.row} is already item {rows[key]}")
+            rows[key] = index
+            items.append(item)
+        except (ChangeReviewError, OSError, ValueError) as error:
+            raise ChangeReviewError(f"batch item {index}: {error}") from error
+    if not items:
+        return []
+    if len({item.path.parent for item in items}) != 1:
+        raise ChangeReviewError("batch: all lists must be in one folder")
+    items[0].path.parent.mkdir(parents=True, exist_ok=True)
+    after: list[Callable[[], list[str]]] = []
+    with _list_lock(items[0].path):
+        original: dict[Path, str] = {}
+        lines_by_path: dict[Path, list[str]] = {}
+        for item in items:
+            try:
+                if item.path not in original:
+                    original[item.path] = read(item.path)
+                    lines_by_path[item.path] = original[item.path].splitlines(keepends=True)
+                after.append(item.write(lines_by_path[item.path]))
+            except (ChangeReviewError, OSError) as error:
+                raise ChangeReviewError(f"batch item {item.index}: {error}") from error
+        changed = {path: lines for path, lines in lines_by_path.items()
+                   if lines != original[path].splitlines(keepends=True)}
+        for path, lines in changed.items():
+            _sort(path, lines)
+            for production in dict.fromkeys(item.production for item in items if item.path == path):
+                _stamp(path, lines, production, day)
+        for path, lines in changed.items():
+            write_text_atomic(path, "".join(lines))
+        owners: dict[str, int] = {}
+        for item in items:
+            owner = _owner(item.path)
+            owners[owner] = owners.get(owner, 0) + 1
+        counts = ", ".join(f"{owner} {count}" for owner, count in owners.items())
+        _commit(list(lines_by_path), f"batch {len(items)} writes ({counts})")
+    return [line for finish in after for line in finish()]
+
+
+ACTION_OPTIONS: dict[str, tuple[str, ...]] = {
+    "image": ("image", "output"),
+    "add": ("repo", "merged", "list", "production", "change", "check", "see", "urgency", "due", "after", "image", "output", "hold"),
+    "batch": ("file",),
+    "edit": ("list", "production", "row", "change", "check", "see", "image", "output"),
+    "show": ("list", "production", "row"),
+    "mark-important": ("list", "production", "row"),
+    "set-kind": ("list", "production", "row", "kind"),
+    "verdict": ("list", "production", "row", "verdict"),
+    "list-path": ("production",),
+    "showrunner": ("production",),
+    "backfill-production": ("list", "write"),
+    "list-ready": ("repo", "production", "merge_branch", "list"),
+    "live": ("repo", "production", "merge_branch", "list", "merged", "step"),
+    "check": ("repo", "checkpoint", "previous", "merge_branch"),
+}
+
+
 def _run(options: CommandLine) -> int:
+    for name, value in cast(dict[str, object], vars(options)).items():
+        default = "." if name == "repo" else None if name == "hold" else False if name == "write" else ""
+        if name != "action" and value != default and name not in ACTION_OPTIONS[options.action]:
+            raise ChangeReviewError(f"{options.action} does not accept --{name.replace('_', '-')}")
+    if options.image and options.output:
+        raise ChangeReviewError("image needs one of --image or --output")
     match options.action:
         case "image":
-            if bool(options.image) == bool(options.output):
-                raise ChangeReviewError("image needs one of --image or --output")
-            try:
-                identity = (image_store.register_change(Path(options.image).expanduser()) if options.image
-                            else image_store.register_output(Path(options.output).expanduser()))
-            except (ValueError, subprocess.SubprocessError) as error:
-                raise ChangeReviewError(str(error)) from error
+            identity = _register_image(options.image, options.output)
             print(identity)
             print(f"Put `| image {identity}` at the end of the Change-Review line.")
         case "add":
@@ -2060,8 +2323,8 @@ def _run(options: CommandLine) -> int:
                 _require_main(repo, merged)
             path = _list(options)
             item, rank = _visible(options), _rank_option(options, path)
-            if options.image:
-                item = replace(item, image=_register_image(options.image))
+            if options.image or options.output:
+                item = replace(item, image=_register_image(options.image, options.output))
             record = staff.snapshot()
             stamp = now()
             rows = append_rows(path, [item], stamp.date(), merged, production_doc(options.production), rank,
@@ -2070,13 +2333,23 @@ def _run(options: CommandLine) -> int:
             print(row)
             for line in hold_for_row(path, row, options.hold or []):
                 print(line)
+        case "batch":
+            for line in batch(Path(options.file).expanduser()):
+                print(line)
         case "edit":
             target = _row_option(options)
-            edited_item = (KeepRowText() if options.image and not any((options.change, options.check, options.see))
+            edited_item = (KeepRowText() if (options.image or options.output) and not any((options.change, options.check, options.see))
                            else _visible(options))
-            image = _register_image(options.image) if options.image else ""
+            image = _register_image(options.image, options.output) if options.image or options.output else ""
             print(edit_row(target.path, target.row, edited_item, today(), production_doc(options.production), image=image))
         case "show":
+            if options.row:
+                target = _row_option(options)
+                selected = next((row for row in review_rows(target.path) if row["#"] == target.row), None)
+                if selected is None:
+                    raise RowNotListed(f"{options.row} is not on the list to review")
+                print(describe(selected | {"#": row_display_id(target.path, target.row)}))
+                return 0
             # One row only: the user asks for the next one when they want it (user, 2026-10-20).
             if options.list and not options.production:
                 waiting = change_queue(_list(options), WholeReviewList.ALL_ROWS)
@@ -2144,10 +2417,10 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     _ = parser.add_argument("action", choices=("check", "list-ready", "live", "add", "edit", "show", "verdict",
                                                    "mark-important", "set-kind", "list-path", "showrunner",
-                                                   "backfill-production", "image"))
+                                                   "backfill-production", "image", "batch"))
     _ = parser.add_argument("--repo", default=".")
     for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "step", "change", "check", "see",
-                 "row", "verdict", "production", "urgency", "due", "after", "kind", "image", "output"):
+                 "row", "verdict", "production", "urgency", "due", "after", "kind", "image", "output", "file"):
         _ = parser.add_argument(f"--{name}", default="")
     _ = parser.add_argument("--write", action="store_true")
     _ = parser.add_argument("--hold", action="append")

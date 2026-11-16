@@ -648,6 +648,11 @@ def run_is_live(run: RunRecord) -> bool:
     return "remote_host" in run or process_identity.process_start(run["pid"]) == process_identity.Started(run["proc_start"])
 
 
+def claim_owner(run: RunRecord) -> tuple[claim_state.ClaimIdentity, int, str, str]:
+    """The fields that name a claim's owner; the claim watcher changes none of them."""
+    return claim_state.claim_identity(run), run["pid"], run["proc_start"], run["since"]
+
+
 def run_is_kept(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
     return "remote_host" in run and process_identity.process_start(run["pid"]) != process_identity.Started(run["proc_start"])
 
@@ -1469,9 +1474,7 @@ def watch_claim(
         current = read_run(claim.path)
         if isinstance(current, NoRun):
             return False
-        if (current["pid"], current["proc_start"], current["since"]) != (
-            run["pid"], run["proc_start"], run["since"],
-        ):
+        if claim_owner(current) != claim_owner(run):
             return True
         if not run_is_live(current):
             return False
@@ -2137,9 +2140,11 @@ def release_exact_claims(
             if "dispatch_start_settled=" + offload.pending_start_key(identity) not in observed.output.splitlines():
                 return ClaimReleaseRefused("the remote start fence remains unconfirmed")
         with nullcontext() if provider_lock_held else locked(paths.lock):
-            if read_run(path) != record:
+            # The claim watcher rewrites its own fields during the settle; only a new owner refuses.
+            current = read_run(path)
+            if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
                 return ClaimReleaseRefused("the exact claim changed during cleanup")
-            transfers.extend(record.get("transfers", []))
+            transfers.extend(current.get("transfers", []))
             pending.unlink(missing_ok=True)
             path.unlink(missing_ok=True)
     with nullcontext() if provider_lock_held else locked(paths.lock):

@@ -101,7 +101,7 @@ Loop/verbose only:
 
    <what the phase built>
 
-   Change-Review: <what changed for you> | <how to try it: where and what to type> | <what you see>
+   Change-Review: <what changed for you> | <how to try it: where and what to type> | <what you see> | image <id>
    Claude-Session: <session url>
    ```
 
@@ -160,20 +160,22 @@ Loop/verbose only:
    directory, path or command.
 
    Every `checkpoint(...)` commit that changes more than Markdown carries
-   `Change-Review: <what changed for you> | <how to try it: where and what to type> | <what you see>`, one line per visible change, or
+   `Change-Review: <what changed for you> | <how to try it: where and what to type> | <what you see> | image <id>`, one line per visible change, or
    `Change-Review: none — <why nothing visible changes>`. Write each line for a
    person with no context. "Where" names the machine (natedev or the Mac) and
    the session (a terminal, a showrunner session, a unit session, any Claude
    session). Example:
-   `Change-Review: The Units table shows each unit's phase | In a showrunner session on natedev, type /showrunner:units | Each row has a Phase column`.
+   `Change-Review: The Units table shows each unit's phase | In a showrunner session on natedev, type /showrunner:units | Each row has a Phase column | image <id>`.
    A line without all three parts is refused.
    Add ` | after <step>` as a fourth field when the change needs a rebuild, restart or deploy.
-   Before the checkpoint, attach one image wherever possible.
+   Before the checkpoint, attach one image. Every change review carries one.
    Use one dark mode screenshot at desktop width, or `change_review.py image --output <text file>` for a terminal change.
    Register a screenshot with `change_review.py image --image <png>`.
    Add ` | image <id>` last, after ` | after <step>` when present.
-   This step is optional. A line without an image stays valid.
-   Example: `Change-Review: The service shows review links | Open the review page | The links appear | after restart`.
+   Use a change image id or an Images page id. A pair supplies its after image.
+   The commit hook refuses a visible line without an image.
+   Merge checks require the image for commits dated at or after 2026-11-16 00:00 EST, using the Git committer time.
+   Example: `Change-Review: The service shows review links | Open the review page | The links appear | after restart | image <id>`.
    The session that completes the step runs the printed `change_review.py live --merged <hash> --step <step> --repo <checkout> --production <showrunner>` command.
    A change the user can check outside the app counts as visible too: a
    table's columns, a status line, a command's output.

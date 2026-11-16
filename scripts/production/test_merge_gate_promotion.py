@@ -21,7 +21,7 @@ from scripts.production.staff_test_support import isolated_staff_file
 from scripts.agents import remote
 from scripts.production.gate_modules import GateRefused
 from scripts.production.merge_gate_test_support import MergeGateFixture, wait_for_file
-from scripts.lib import waiting_rows
+from scripts.lib import land_main, waiting_rows
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.main_push_lock_test_support import publish_after_contender
 
@@ -45,7 +45,7 @@ class MergeGatePromotionTests(MergeGateFixture):
     def test_failed_main_push_leaves_rows_unlisted_until_promote_only_succeeds(self) -> None:
         review, _ = self.review_list()
         before = review.read_bytes()
-        checkpoint = self.checkpoint_commit("checkpoint(fixture): ready\n\nChange-Review: Published | Read | Ready")
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): ready\n\nChange-Review: Published | Read | Ready | image 012345abcdef")
         hook = self.origin / "hooks/pre-receive"
         self.write(hook, '#!/bin/sh\nwhile read old new ref; do\n'
                    + ' if [ "$ref" = refs/heads/main ]; then exit 1; fi\ndone\n')
@@ -68,7 +68,7 @@ class MergeGatePromotionTests(MergeGateFixture):
     def test_failed_mac_pull_leaves_rows_unlisted_until_the_next_good_promotion(self) -> None:
         review, _ = self.review_list()
         before = review.read_bytes()
-        checkpoint = self.checkpoint_commit("checkpoint(fixture): live\n\nChange-Review: Installed | Read | Live")
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): live\n\nChange-Review: Installed | Read | Live | image 012345abcdef")
         self.write(self.state / "mac-answer", "ff_rc=1\nfixture-head\n")
         failed = self.run_gate("--promote", "--production", "fixture-showrunner", checkpoint=checkpoint)
         self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
@@ -118,7 +118,9 @@ sys.meta_path.insert(0, NoRepositoryModules())
                                        ssh="fake-ssh", mac_repo="~/fixture", mac_host="fixture")
         for failure in (subprocess.TimeoutExpired("fake-ssh", 25), GateRefused("interrupted by SIGTERM"), KeyboardInterrupt()):
             with self.subTest(failure=type(failure).__name__), mock.patch.dict(os.environ, self.environment), mock.patch.object(merge_gate, "wait_for_release_lock"), mock.patch.object(
-                    merge_gate, "checked_git", side_effect=["main", "", self.base, self.base, self.base, "", self.base]) as checked, mock.patch.object(
+                    merge_gate, "checked_git", side_effect=["main", "", self.base, self.base, self.base, self.base]), mock.patch.object(
+                    land_main, "land", return_value=land_main.Landed(
+                        self.base, "main", land_main.Pushed(), land_main.HookAbsent())) as landed, mock.patch.object(
                     waiting_rows, "move_to"), mock.patch.object(
                     merge_gate, "git", return_value=subprocess.CompletedProcess([], 0, "", "")), mock.patch.object(
                     merge_gate, "promotion_edit_conflict", return_value=""), mock.patch.object(
@@ -128,19 +130,12 @@ sys.meta_path.insert(0, NoRepositoryModules())
                                                             SubprocessError=subprocess.SubprocessError)):
                 with self.assertRaisesRegex(GateRefused, f"main promoted to {self.base}; Mac fast-forward failed"):
                     merge_gate.promote(args)
-            self.assertIn(mock.call(self.main, "push", "origin", "main"), checked.call_args_list)
+            landed.assert_called_once_with(self.main, self.base)
 
     def test_promotion_retries_its_recorded_fast_forward_after_push_failure(self) -> None:
         args = self.publish_for_promotion()
-        checked = merge_gate.checked_git
-
-        def stop_at_push(repo: Path, *arguments: str) -> str:
-            if arguments == ("push", "origin", "main"):
-                raise GateRefused("injected push failure")
-            return checked(repo, *arguments)
-
         with mock.patch.dict(os.environ, self.environment), mock.patch.object(
-                merge_gate, "checked_git", side_effect=stop_at_push):
+                land_main, "land", side_effect=land_main.LandError("injected push failure")):
             with self.assertRaisesRegex(GateRefused, "injected push failure"):
                 merge_gate.promote(args)
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
@@ -152,15 +147,8 @@ sys.meta_path.insert(0, NoRepositoryModules())
 
     def test_promotion_rejects_an_unrecorded_commit_with_the_same_tree(self) -> None:
         args = self.publish_for_promotion()
-        checked = merge_gate.checked_git
-
-        def stop_at_push(repo: Path, *arguments: str) -> str:
-            if arguments == ("push", "origin", "main"):
-                raise KeyboardInterrupt()
-            return checked(repo, *arguments)
-
         with mock.patch.dict(os.environ, self.environment), mock.patch.object(
-                merge_gate, "checked_git", side_effect=stop_at_push):
+                land_main, "land", side_effect=KeyboardInterrupt()):
             with self.assertRaises(KeyboardInterrupt):
                 merge_gate.promote(args)
         _ = self.git(self.main, "commit", "--allow-empty", "-m", "unrelated local commit")

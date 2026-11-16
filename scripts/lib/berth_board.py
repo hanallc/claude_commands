@@ -49,15 +49,30 @@ class Reservation:
 
 @dataclass(frozen=True)
 class Board:
+    """The reservations; configured is False for a repository that berth does not configure."""
+
     entries: tuple[Reservation, ...]
+    configured: bool = True
 
     def reservations(self) -> tuple[Reservation, ...]:
         return self.entries
 
 
+# cargo-berth's message for a repository where `cargo-berth init` never ran,
+# such as a fresh clone. Its envelope has no other field for this case.
+LEDGER_NOT_INITIALIZED = "the cargo-berth ledger is not initialized"
+
+
 @dataclass(frozen=True)
 class BoardUnavailable:
+    """No board; ledger_missing is True when the repository has no ledger yet."""
+
     reason: str
+    ledger_missing: bool = False
+
+
+class LedgerMissing(ValueError):
+    """The repository has no cargo-berth ledger, so it has no reservations."""
 
 
 def _object(value: object) -> dict[str, object]:
@@ -126,9 +141,10 @@ def _parse_board(value: object) -> Board:
         raise ValueError("not a cargo-berth board envelope")
     payload = _object(envelope["payload"])
     if envelope.get("status") == "ledger_unreadable":
-        raise ValueError(envelope.get("message") or "cargo-berth ledger unreadable")
+        message = str(envelope.get("message") or "cargo-berth ledger unreadable")
+        raise (LedgerMissing if LEDGER_NOT_INITIALIZED in message else ValueError)(message)
     if envelope.get("status") == "unconfigured" and payload.get("kind") == "no_facts":
-        return Board(())
+        return Board((), configured=False)
     if payload.get("kind") != "board":
         raise ValueError("envelope contains no board facts")
     fields = _object(payload["data"])
@@ -181,5 +197,7 @@ def read_board(repo: Path) -> Board | BoardUnavailable:
             return BoardUnavailable(result.stderr.strip() or f"cargo-berth returned no board (exit {result.returncode})")
         value = cast(object, json.loads(result.stdout))
         return _parse_board(value)
+    except LedgerMissing as error:
+        return BoardUnavailable(str(error), ledger_missing=True)
     except (OSError, ValueError, KeyError, TypeError) as error:
         return BoardUnavailable(str(error))

@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 from scripts.lib import conf, urgency
 from scripts.lib.user_zone import shown_time
-from scripts.production import change_review, change_routing, staff, update_registration
+from scripts.production import change_review, change_routing, next_item, staff, update_registration
 from scripts.production.production_doc import Production, read_production
 from scripts.production.issues import frontmatter
 from scripts.production.change_routing import UnavailableProduction
@@ -72,6 +72,7 @@ def question_order(questions: list[WaitingQuestion]) -> list[WaitingQuestion]:
 class PreparedReviews:
     changes: tuple[WaitingChange, ...]
     queues: dict[str, change_review.ChangeQueue]
+    orders: dict[str, tuple[str, ...]]
     questions: tuple[WaitingQuestion, ...]
     question_tabs: tuple[str, ...]
     record: staff.StaffSnapshot
@@ -140,17 +141,56 @@ def row_token(browser: ReviewBrowser, key: str) -> str:
     return hmac.new(browser.token.encode(), key.encode(), hashlib.sha256).hexdigest()
 
 
-def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> PreparedReviews:
+def change_orders(grouped: dict[str, list[WaitingChange]], source: change_review.PreparedChangeLists, first_root: str
+                  ) -> tuple[dict[str, change_review.ChangeQueue], dict[str, tuple[str, ...]]]:
+    """Use each /next queue in turn for All and each showrunner's queue for its view."""
+    routing = source.routing
+    waiting = {item.key: item for items in grouped.values() for item in items if item.waiting}
+    queues: dict[str, change_review.ChangeQueue] = {}
+    orders: dict[str, tuple[str, ...]] = {}
+    roots: dict[str, tuple[Path, next_item.Queue]] = {}
+    for tab in sorted(grouped):
+        runner = routing.runners_by_name.get(tab)
+        doc = routing.production_by_runner.get(runner.id) if runner is not None else None
+        if runner is None or doc is None:
+            queues[tab] = change_review.ChangeQueue("", [])
+            orders[tab] = tuple(item.key for item in grouped[tab] if item.waiting)
+            continue
+        path = change_review.scope_list(doc, prepared=source)
+        queue = change_review.change_queue(path, doc, prepared=source)
+        queues[tab] = queue
+        prefix = path.stem.removeprefix(change_review.PREFIX) + "/"
+        ordered = urgency.queue_order(next_item.change_queue(doc, prepared=queue).entries, queue.name)
+        orders[tab] = tuple(key for entry in ordered
+                            if (key := entry.key if "/" in entry.key else prefix + entry.key) in waiting
+                            and waiting[key].tab == tab)
+        if not isinstance(runner.parent, staff.ReportsTo) or runner.parent.id not in routing.runners:
+            roots[runner.name] = (path, next_item.change_queue(doc, below=True, prepared=source))
+    all_keys: dict[str, None] = {}
+    for name in sorted(roots, key=lambda name: (name != first_root, name)):
+        path, queue = roots[name]
+        prefix = path.stem.removeprefix(change_review.PREFIX) + "/"
+        for entry in urgency.queue_order(queue.entries, queue.name):
+            key = entry.key if "/" in entry.key else prefix + entry.key
+            if key in waiting:
+                all_keys[key] = None
+    orders[""] = tuple(all_keys) + tuple(key for key in waiting if key not in all_keys)
+    queues = dict(sorted(queues.items(), key=lambda item: (not any(change.waiting for change in grouped[item[0]]), item[0])))
+    return queues, orders
+
+
+def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus, *,
+            settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> PreparedReviews:
+    if isinstance(settings, conf.UseConfiguredValue):
+        settings = conf.read("review_links")
     delivery = status.read_view()
     snapshots = {path: change_review.review_snapshot(path)
                  for path in sorted(change_review.lists_directory().glob(change_review.PREFIX + "*.md"))}
     routing = change_page.list_routing(snapshots)
     grouped: dict[str, list[WaitingChange]] = {path.stem.removeprefix(change_review.PREFIX): [] for path in snapshots}
     grouped.update({runner.name: [] for runner in routing.runners.values()})
-    defaults: dict[str, Path] = {}
     for path, snapshot in snapshots.items():
         fallback = path.stem.removeprefix(change_review.PREFIX)
-        defaults[fallback] = path
         for row in snapshot.pending:
             assignment = routing.owner_and_production(path, row)
             owner = assignment.owner
@@ -163,38 +203,11 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
             grouped.setdefault(tab, []).append(WaitingChange(
                 key, tab, page, row, slots,
                 owner.note if isinstance(owner, change_routing.UnroutedChange) else ""))
-    queues: dict[str, change_review.ChangeQueue] = {}
-    changes: list[WaitingChange] = []
-    for tab, items in sorted(grouped.items()):
-        if not items:
-            queues[tab] = change_review.ChangeQueue("", [])
-            continue
-        page = items[0].page
-        runner = next((runner for runner in routing.runners.values() if runner.name == tab), None)
-        root = runner
-        while root is not None:
-            parent = root.parent
-            if not isinstance(parent, staff.ReportsTo) or parent.id not in routing.runners:
-                break
-            root = routing.runners[parent.id]
-        current = (defaults.get(root.name) if root is not None else None) or routing.list_paths.get(tab) or defaults.get(tab, page.review_list)
-        name = change_review.queue(current)
-        if runner is not None and isinstance(runner.parent, staff.ReportsTo) and isinstance(page, change_page.AssignedReviewPage):
-            name += "-" + runner.name
-        entries: list[urgency.Entry[dict[str, str]]] = []
-        by_key: dict[str, WaitingChange] = {}
-        for item in items:
-            key = item.row["#"] if item.page.review_list == current else item.key
-            by_key[key] = item
-            if item.waiting:
-                entry = change_review.row_entries([item.row])[0]
-                after = change_review.prerequisite_key(entry.after, item.page.review_list, current)
-                entries.append(replace(entry, key=key, item=item.row | {"#": key}, after=after))
-        prepared = change_review.ChangeQueue(name, entries)
-        changes.extend(by_key[entry.key] for entry in urgency.queue_order(prepared.entries, prepared.name))
-        changes.extend(item for item in items if not item.waiting)
-        queues[tab] = prepared
-    queues = dict(sorted(queues.items(), key=lambda item: not item[1].entries))
+    queues, orders = change_orders(grouped, change_review.PreparedChangeLists(snapshots, routing),
+                                  settings.text("changes_first_root"))
+    by_key = {item.key: item for items in grouped.values() for item in items}
+    changes = [by_key[key] for key in orders[""]]
+    changes.extend(item for item in by_key.values() if not item.waiting)
     identities = update_registration.QuestionStaff.for_record(routing.record)
     questions: list[WaitingQuestion] = []
     for document, lines in routing.document_lines.items():
@@ -218,7 +231,7 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
     questions = question_order(questions)
     question_tabs = tuple(sorted(set(queues) | {item.tab for item in questions},
                                  key=lambda tab: (not any(item.tab == tab for item in questions), tab)))
-    return PreparedReviews(tuple(changes), queues, tuple(questions), question_tabs, routing.record)
+    return PreparedReviews(tuple(changes), queues, orders, tuple(questions), question_tabs, routing.record)
 
 
 def section(change: WaitingChange, feedback_rows: int) -> str:
@@ -230,7 +243,7 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
                   + f'data-pending="{str(change.waiting).lower()}"')
     if isinstance(page, UnavailableProduction):
         content = f'''<h1>{html.escape(row.get('Change', ''))}</h1>
-<h2>Proof</h2>{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
+<h2>Proof</h2>{change_page.review_html(row.get(change_review.CHECK, ''))}
 {anomaly}{change_page.question_html(change.question)}<p>{html.escape(page.reason)}</p>
 {change_page.change_details(row, shown)}'''
     else:
@@ -240,7 +253,7 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
         saved = f'<p>{html.escape(text)}</p>' if text else ""
         content = f'''<h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
-{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
+{change_page.review_html(row.get(change_review.CHECK, ''))}
 {anomaly}{change_page.question_html(change.question)}{saved}<p role="status" data-save-state></p>{form}
 {change_page.change_details(row, shown)}'''
     return f'<section {attributes}>' + change_page.change_content(row, content) + '</section>'
@@ -268,9 +281,12 @@ def numbered_run(text: str) -> tuple[str, list[str], str]:
 
     Return the text before the run, the items and the text after a blank line in the last item."""
     best: list[re.Match[str]] = []
+    code_blocks = list(page_frame.CODE_BLOCK.finditer(text))
     for style in ITEM_MARKS:
         run: list[re.Match[str]] = []
         for mark in style.finditer(text):
+            if any(block.start() <= mark.start() < block.end() for block in code_blocks):
+                continue
             value = mark[1]
             if not run and value in ("1", "a"):
                 run.append(mark)
@@ -282,22 +298,38 @@ def numbered_run(text: str) -> tuple[str, list[str], str]:
         return text, [], ""
     ends = [mark.start() for mark in best[1:]] + [len(text)]
     items = [text[mark.end():end].strip() for mark, end in zip(best, ends)]
-    last = BLANK_LINE.split(items[-1], maxsplit=1)
-    items[-1] = last[0]
-    return text[:best[0].start()].strip(), [item.rstrip(";,").strip() for item in items], last[1] if len(last) > 1 else ""
+    last = items[-1]
+    blocks = list(page_frame.CODE_BLOCK.finditer(last))
+    trailing = ""
+    for blank in BLANK_LINE.finditer(last):
+        if any(block.start() <= blank.start() < block.end()
+               or block.start() == blank.end() and last[:blank.start()].rstrip().endswith(":") for block in blocks):
+            continue
+        items[-1], trailing = last[:blank.start()], last[blank.end():]
+        break
+    return text[:best[0].start()].strip(), [item.rstrip(";,").strip() for item in items], trailing
 
 
 def item_html(entry: str) -> str:
-    """Show an item that is one backtick span, such as a command, as a code block."""
-    whole = change_page.CODE_SPAN.fullmatch(entry.strip())
+    """Show a code block alone or after an item's text that ends with a colon."""
+    whole = page_frame.CODE_BLOCK.fullmatch(entry.strip())
     if whole is not None:
-        return ('<div class="code-block"><pre><code>' + html.escape(whole.group(1))
-                + '</code></pre>' + page_frame.COPY_BUTTON + '</div>')
+        return page_frame.code_block_html(whole)
+    for block in page_frame.CODE_BLOCK.finditer(entry):
+        before, after = entry[:block.start()].rstrip(), entry[block.end():].strip()
+        if before.endswith(":"):
+            return item_html(before) + item_html(block[0]) + (item_html(after) if after else "")
     return "<br>".join(change_page.inline_html(line) for line in entry.splitlines())
 
 
 def item_list(items: list[str]) -> str:
-    return '<h2>Items</h2><ol class="question-items">' + "".join(f"<li>{item_html(entry)}</li>" for entry in items) + "</ol>"
+    entries: list[str] = []
+    for entry in items:
+        if entries and entries[-1].rstrip().endswith(":") and page_frame.CODE_BLOCK.fullmatch(entry.strip()) is not None:
+            entries[-1] += "\n" + entry
+        else:
+            entries.append(entry)
+    return '<h2>Items</h2><ol class="question-items">' + "".join(f"<li>{item_html(entry)}</li>" for entry in entries) + "</ol>"
 
 
 def choice_list(choices: list[str]) -> str:
@@ -319,7 +351,10 @@ def question_text(item: update_registration.OutstandingItem) -> tuple[str, str]:
     text = item.get("reviewed", item.get("question", item["text"])).strip()
     if "reviewed" in item:
         title, _, context = text.partition("\n")
-        return title.strip(), context.strip()
+        if "?" in title:
+            return title.strip(), context.strip()
+        first = SENTENCE_END.split(title, maxsplit=1)
+        return first[0], "\n\n".join(part for part in (*first[1:], context.strip()) if part)
     question = SENTENCE_END.split(text[:text.index("?") + 1])[-1] if "?" in text else ""
     if question:
         before, _, after = text.partition(question)
@@ -493,7 +528,7 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
     settings = conf.read("review_links")
     feedback_rows = settings.whole("feedback_rows")
     refresh_seconds = settings.number("page_refresh_seconds")
-    prepared = prepare(browser, status)
+    prepared = prepare(browser, status, settings=settings)
     kind = browser.kind
     names = prepared.queues if kind == "changes" else prepared.question_tabs
     menus: list[str] = []
@@ -510,6 +545,8 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
                + '<div data-showrunner-filter><label for="review-showrunner">Showrunner:</label>'
                + '<select id="review-showrunner" aria-label="Showrunner"><option value="">All</option></select></div>'
                + '<template data-runner-options>' + ''.join(menus) + '</template>'
+               + '<script type="application/json" data-change-orders>'
+               + json.dumps(prepared.orders if kind == "changes" else {}).replace('<', '\\u003c') + '</script>'
                + '<p hidden role="status" data-save-notice></p>' + cards
                + '<p hidden data-empty></p><div class="navigation"><button type="button" data-next hidden>Skip for now</button></div>'
                + '<noscript>Enable JavaScript to review items and use Skip for now.</noscript></div>'
@@ -659,14 +696,20 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
     return change_page.MessageDelivery(page, page.rows[0], (recipient,), message, attempt, (question.owner,)), answer
 
 
-SCRIPT = page_frame.MOTION_SCRIPT + r'''
+SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + r'''
 const motion=createCardMotion();
 let content=document.querySelector('[data-review-content]');
-let rows,runnerOptions,showrunners,runnerMenu,next,empty,saveNotice;
-let shownPage=content.outerHTML, heldPage=null, newestRequest=0, activeLoads=0, activeSaves=0, refreshTimer;
+let rows,viewOrders,runnerOptions,showrunners,runnerMenu,next,empty,saveNotice;
+let shownPage=content.outerHTML, heldPage=null, newestRequest=0, activeLoads=0, activeSaves=0;
 const remembered=new Map(), kind=content.dataset.kind; let current=null, tab='', navigation=0, shownHash='';
+function ordersFor(page,cards){
+ const byKey=new Map(cards.map(row=>[row.dataset.key,row]));
+ return new Map(Object.entries(JSON.parse(page.querySelector('[data-change-orders]').textContent))
+  .map(([view,keys])=>[view,keys.map(key=>byKey.get(key)).filter(Boolean)]));
+}
 function bindPage(){
  rows=[...content.querySelectorAll('section[data-key]')];
+ viewOrders=ordersFor(content,rows);
  runnerOptions=[...content.querySelector('[data-runner-options]').content.children];
  showrunners=content.querySelector('[data-showrunner-filter]');runnerMenu=showrunners.querySelector('select');
  next=content.querySelector('[data-next]');empty=content.querySelector('[data-empty]');
@@ -686,7 +729,8 @@ function bindPage(){
   if(box && form.querySelector('[data-needs-text]')){box.addEventListener('input',needsText);needsText();}
  });
 }
-function waiting(){return rows.filter(r=>(tab==='' || r.dataset.tab===tab) && r.dataset.pending==='true');}
+function viewRows(){return viewOrders.get(tab) || rows.filter(r=>tab==='' || r.dataset.tab===tab);}
+function waiting(){return viewRows().filter(r=>r.dataset.pending==='true');}
 function show(){
  const previous=current;
  const place=new URLSearchParams(location.hash.slice(1));
@@ -721,8 +765,8 @@ function show(){
 function clearNotice(){saveNotice.hidden=true;saveNotice.textContent='';}
 function go(key){navigation++;clearNotice();location.hash=new URLSearchParams({showrunner:tab,row:key || ''});show();}
 function advance(row){
- const at=rows.indexOf(row), candidates=waiting();
- const following=candidates.find(r=>rows.indexOf(r)>at) || candidates[0];
+ const ordered=viewRows(), at=ordered.indexOf(row), candidates=waiting();
+ const following=candidates.find(r=>ordered.indexOf(r)>at) || candidates[0];
  go(following?.dataset.key || ''); }
 async function save(row,form,outcome){
  if(form.dataset.saving==='true') return;
@@ -764,7 +808,7 @@ async function save(row,form,outcome){
  }finally{
   form.dataset.saving='false';activeSaves--;
   // Read after the save, so an older response cannot restore the saved item.
-  if(saved){await motion.settled();heldPage=null;newestRequest++;refreshPage(true);}
+  if(saved){await motion.settled();heldPage=null;newestRequest++;pageRefresh.refresh(true);}
   else applyHeldPage();
  }
 }
@@ -784,8 +828,10 @@ function applyHeldPage(){
  const fieldRow=focused?.closest('[data-key]')?.dataset.key;
  const fieldName=focused?.matches('textarea,input[type=text]') ? focused.name : '';
  const selection=[focused?.selectionStart,focused?.selectionEnd,focused?.selectionDirection];
- const previous=rows.indexOf(current),following=rows.slice(previous+1).map(row=>row.dataset.key);
- const candidates=[...fresh.querySelectorAll('section[data-key]')].filter(row=>(tab==='' || row.dataset.tab===tab) && row.dataset.pending==='true');
+ const ordered=viewRows(), previous=ordered.indexOf(current),following=ordered.slice(previous+1).map(row=>row.dataset.key);
+ const freshRows=[...fresh.querySelectorAll('section[data-key]')];
+ const candidates=(ordersFor(fresh,freshRows).get(tab) || freshRows.filter(row=>tab==='' || row.dataset.tab===tab))
+  .filter(row=>row.dataset.pending==='true');
  const keep=candidates.find(row=>row.dataset.key===current?.dataset.key);
  const chosen=keep || following.map(key=>candidates.find(row=>row.dataset.key===key)).find(Boolean) || candidates[0];
  const notice=saveNotice.hidden ? '' : saveNotice.textContent;
@@ -798,12 +844,10 @@ function applyHeldPage(){
  if(controlId) content.querySelector('#'+controlId)?.focus({preventScroll:true});
  const field=rows.find(row=>row.dataset.key===fieldRow)?.querySelector('[name="'+fieldName+'"]');
  if(field && !field.closest('section').hidden){field.focus({preventScroll:true});field.setSelectionRange(...selection);}
- window.scrollTo({left,top,behavior:'instant'});scheduleRefresh();
+ window.scrollTo({left,top,behavior:'instant'});pageRefresh.restart();
 }
-// A console frame that another page covers is hidden and loads no update.
-const paused=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;
 async function refreshPage(supersede=false){
- if(paused() || (activeLoads && !supersede)) return;
+ if(activeLoads && !supersede) return;
  const request=++newestRequest;
  activeLoads++;
  try{
@@ -815,15 +859,10 @@ async function refreshPage(supersede=false){
  }catch(error){}
  finally{activeLoads--;}
 }
-function scheduleRefresh(){
- clearInterval(refreshTimer);
- if(document.visibilityState==='visible') refreshTimer=setInterval(refreshPage,Number(content.dataset.refreshSeconds)*1000);
-}
+const pageRefresh=createPageRefresh(refreshPage,()=>content.dataset.refreshSeconds);
 document.addEventListener('input',()=>applyHeldPage());
-document.addEventListener('visibilitychange',()=>{scheduleRefresh();if(document.visibilityState==='visible') refreshPage(true);});
-window.addEventListener('message',event=>{if(event.source===parent && event.origin===location.origin && event.data==='console-shown') refreshPage(true);});
 window.addEventListener('hashchange',()=>{if(location.hash!==shownHash){navigation++;clearNotice();}show();});
-bindPage();show();scheduleRefresh();
+bindPage();show();
 '''
 SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE
                                           + page_frame.COPY_SCRIPT + page_frame.COPY_STYLE + page_frame.COPY_BUTTON)
