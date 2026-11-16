@@ -105,35 +105,48 @@ def legacy_pressure_shape(record: dict[str, object]) -> dict[str, object]:
 
 
 GPU_SLOT_SUFFIX = "_gpu_slot"
+NATEDEV_HOLD_SUFFIX = "_natedev_hold"
+LEGACY_WAIT_SUFFIXES = (GPU_SLOT_SUFFIX, NATEDEV_HOLD_SUFFIX)
 
 
 @lru_cache(maxsize=None)
 def wait_reason_fields(schema: type) -> frozenset[str]:
-    """Name the fields that accept a wait behind the head, so an older client reads a GPU slot wait there."""
+    """Name the fields that accept a wait behind the head, so an older client reads a newer wait there."""
     return frozenset(name for name, hint in snapshot_fields(schema).items()
                      if any(getattr(variant, "__name__", "") == "BehindHead" for variant in cast(tuple[object, ...], get_args(hint))))
 
 
 def legacy_wait_shape(schema: type, record: dict[str, object]) -> dict[str, object]:
-    """Older clients at 7fdfd9a6a have no GPU slot wait, so they read it as a wait behind the slot."""
+    """Write each newer wait as a wait behind the head, with the newer wait beside it.
+
+    Clients at 7fdfd9a6a have no GPU slot wait. The CI client pinned at bbc8803f4 has no natedev hold wait,
+    and it refuses its step on a wait that it cannot read.
+    """
     shaped = dict(record)
     for key in wait_reason_fields(schema):
         item = record.get(key)
-        if isinstance(item, dict) and cast(dict[str, object], item).get("kind") == "GpuSlotWait":
-            wait = cast(dict[str, object], item)
-            shaped[key] = {"kind": "BehindHead", "head_name": f"the GPU test slot ({wait['used']} of {wait['slots']} in use)",
-                           "joined_at": 0.0, "head_session_id": ""}
-            shaped[key + GPU_SLOT_SUFFIX] = wait
+        if not isinstance(item, dict):
+            continue
+        wait = cast(dict[str, object], item)
+        if wait.get("kind") == "GpuSlotWait":
+            head, suffix = f"the GPU test slot ({wait['used']} of {wait['slots']} in use)", GPU_SLOT_SUFFIX
+        elif wait.get("kind") == "NatedevHeld":
+            head, suffix = f"the natedev hold by {wait['holder']} for {wait['purpose']}", NATEDEV_HOLD_SUFFIX
+        else:
+            continue
+        shaped[key] = {"kind": "BehindHead", "head_name": head, "joined_at": 0.0, "head_session_id": ""}
+        shaped[key + suffix] = wait
     return shaped
 
 
 def current_wait_shape(record: dict[str, object]) -> dict[str, object]:
-    """Restore each GPU slot wait that the writer kept beside its older shape."""
+    """Restore each newer wait that the writer kept beside its older shape."""
     shaped = dict(record)
     for key, item in record.items():
-        if key.endswith(GPU_SLOT_SUFFIX) and key.removesuffix(GPU_SLOT_SUFFIX) in record:
-            shaped[key.removesuffix(GPU_SLOT_SUFFIX)] = item
-            del shaped[key]
+        for suffix in LEGACY_WAIT_SUFFIXES:
+            if key.endswith(suffix) and key.removesuffix(suffix) in record:
+                shaped[key.removesuffix(suffix)] = item
+                del shaped[key]
     return shaped
 
 
@@ -167,14 +180,42 @@ def snapshot_value(value: object) -> object:
     return convert(value)
 
 
+EXACT_SCALARS: tuple[object, ...] = (str, int, bool)
+
+
+@lru_cache(maxsize=None)
+def exact_scalars(schema: object) -> frozenset[object]:
+    """Name the scalar types that a schema takes unchanged by exact type; a float still needs its finite check."""
+    if schema in EXACT_SCALARS:
+        return frozenset({schema})
+    origin = get_origin(schema)
+    variants = cast(tuple[object, ...], get_args(schema))
+    if (origin is UnionType or origin is LITERAL_UNION_ORIGIN) and Path not in variants:
+        return frozenset(variant for variant in variants if variant in EXACT_SCALARS)
+    return frozenset()
+
+
+def parse_scalar(value: object, schema: type) -> object:
+    """Accept a value of the scalar type, or an int for a float; refuse a value that is not finite."""
+    valid = type(value) is schema or schema is float and type(value) is int
+    if not valid or isinstance(value, (int, float)) and not math.isfinite(value):
+        raise ValueError("invalid snapshot scalar")
+    return value
+
+
 def parse_snapshot_value(value: object, schema: object) -> object:
     """Validate the wire shape against the same domain fields that the writer serializes."""
+    if schema is str or schema is int or schema is float or schema is bool:
+        # Profile records hold millions of scalars; this check comes before the typing lookups.
+        return parse_scalar(value, schema)
     origin, args = get_origin(schema), cast(tuple[object, ...], get_args(schema))
     if schema is object:
         return value
     if origin is NotRequired:
         return parse_snapshot_value(value, args[0])
     if origin is UnionType or origin is LITERAL_UNION_ORIGIN:
+        if type(value) in exact_scalars(schema):
+            return value
         for variant in args:
             try:
                 return parse_snapshot_value(value, variant)
@@ -189,11 +230,6 @@ def parse_snapshot_value(value: object, schema: object) -> object:
         if value is not None:
             raise ValueError("invalid snapshot null")
         return None
-    if schema is str or schema is int or schema is float or schema is bool:
-        valid = (type(value) is schema or schema is float and type(value) is int)
-        if not valid or isinstance(value, (int, float)) and not math.isfinite(value):
-            raise ValueError("invalid snapshot scalar")
-        return value
     if schema is Path:
         return Path(cast(str, parse_snapshot_value(value, str)))
     if origin in (list, tuple, frozenset, Sequence):
@@ -201,7 +237,8 @@ def parse_snapshot_value(value: object, schema: object) -> object:
             raise ValueError("invalid snapshot sequence")
         items = cast(list[object], value)
         if origin in (list, frozenset, Sequence) or len(args) == 2 and args[1] is Ellipsis:
-            parsed = [parse_snapshot_value(item, args[0]) for item in items]
+            exact = exact_scalars(args[0])
+            parsed = [item if type(item) in exact else parse_snapshot_value(item, args[0]) for item in items]
         else:
             if len(items) != len(args):
                 raise ValueError("invalid snapshot tuple")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lib.berth_test_support import write_unconfigured_berth
 from scripts.lib.checkout_test_support import write_python_tool, write_stdlib_tool
 
 from scripts.build_queue.admission_test_support import caller_admission
@@ -250,6 +251,7 @@ if __name__ == "__main__":
 ''')
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_shell(bin_directory / name, "exit 99\n")
+        write_unconfigured_berth(bin_directory)
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git", "cgroup"):
             (self.root / directory).mkdir()
         seed_interpreter_cache(self.root / "cache")

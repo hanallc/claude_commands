@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
-from scripts.direct import plan_history
+from scripts.direct import phase_waits, plan_history
 from scripts.production import staff
 
 
@@ -28,9 +28,10 @@ class PhaseOpen(NamedTuple):
 
 
 class PhaseSent(NamedTuple):
-    """The phase sent a checkpoint that is not on main."""
+    """The phase sent a commit that is not on main, with its recorded unit wait."""
 
     commit: str
+    wait: phase_waits.UnitWait | phase_waits.NoUnitWait = phase_waits.NO_UNIT_WAIT
 
 
 class PhaseNotStarted(NamedTuple):
@@ -88,7 +89,10 @@ def phase_state(repo: Path, member: staff.StaffRow, phase: str, read_run: RunRea
     for event in reversed(events):
         commit = event.get("checkpoint_commit")
         if event.get("phase_instance_id") == instance and event.get("event_type") == "checkpoint" and isinstance(commit, str) and commit:
-            return OnMain(commit) if on_main(repo, commit) else PhaseSent(commit)
+            if on_main(repo, commit):
+                return OnMain(commit)
+            wait = next((wait for wait in phase_waits.unit_waits(events) if wait.target == phase), phase_waits.NO_UNIT_WAIT)
+            return PhaseSent(commit, wait)
     eta = next((event.get("eta_at") for event in reversed(events)
                 if event.get("event_type") == "eta_stated" and event.get("eta_phase_id") == phase), None)
     return PhaseOpen(float(eta) if isinstance(eta, int | float) and not isinstance(eta, bool) else None)

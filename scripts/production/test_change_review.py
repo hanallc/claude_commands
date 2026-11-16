@@ -21,7 +21,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, datetime
 from dataclasses import replace
 from pathlib import Path
-from typing import cast, override
+from typing import TextIO, cast, override
 from unittest import mock
 
 
@@ -208,6 +208,64 @@ class ProducerFixture(unittest.TestCase):
         return self.git("rev-parse", "HEAD")
 
 class ProducerWriterTests(ProducerFixture):
+    def test_output_capture_adds_an_image_to_add_edit_and_batch_rows(self) -> None:
+        output = self.root / "output.txt"
+        _ = output.write_text("All checks passed\n", encoding="utf-8")
+        binaries = self.root / "bin"
+        binaries.mkdir()
+        chrome = binaries / "google-chrome"
+        _ = chrome.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nimport sys\n"
+            + "shot = next(arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--screenshot='))\n"
+            + "Path(shot).write_bytes(b'fixture rendered output')\n", encoding="utf-8")
+        chrome.chmod(0o755)
+        identities: list[str] = []
+        with mock.patch.dict(os.environ, {"PATH": f"{binaries}{os.pathsep}{os.environ['PATH']}"}):
+            for operation in ("add", "edit", "batch"):
+                with self.subTest(operation=operation):
+                    if operation == "add":
+                        code, _, errors = run("add", "--production", "top", "--change", "Output proof",
+                                              "--check", "Read", "--see", "All checks passed", "--output", str(output))
+                    elif operation == "edit":
+                        code, _, errors = run("edit", "--production", "top", "--row", "C1", "--output", str(output))
+                    else:
+                        batch = self.root / "output-batch.json"
+                        _ = batch.write_text(json.dumps([{"op": "edit", "production": "top", "row": "C1",
+                            "list": str(self.listing), "output": str(output)}]), encoding="utf-8")
+                        code, _, errors = run("batch", "--file", str(batch))
+                    self.assertEqual((code, errors), (0, ""))
+                    row = change_review.pending(self.listing)[0]
+                    identity = row[change_review.IMAGE]
+                    self.assertNotIn(identity, identities)
+                    identities.append(identity)
+                    self.assertEqual((row["Change"], row[change_review.CHECK]),
+                                     ("Output proof", "Read. You see: All checks passed"))
+                    self.assertTrue(image_store.change_image(self.root / "links", identity))
+                    folder = self.root / "links" / image_store.CHANGE_FOLDER / identity
+                    record = image_store.read_record(folder)
+                    self.assertEqual((folder / record["file"]).read_bytes(), b"fixture rendered output")
+            for identity in identities[:-1]:
+                self.assertFalse((self.root / "links" / image_store.CHANGE_FOLDER / identity).exists())
+
+    def test_conflicting_or_unsupported_image_options_write_nothing(self) -> None:
+        _ = self.listing.write_text(LIST, encoding="utf-8")
+        for arguments, rejected_option in (
+            (("add", "--change", "Conflicting", "--check", "Read", "--see", "Proof", "--image", "X", "--output", "Y"), "image"),
+            (("edit", "--row", "C76", "--image", "X", "--output", "Y"), "image"),
+            (("show", "--image", "X"), "--image"),
+            (("show", "--output", "Y"), "--output"),
+            (("verdict", "--row", "C76", "--verdict", "works", "--output", "Y"), "--output"),
+            (("verdict", "--row", "C76", "--verdict", "works", "--change", "Ignored"), "--change"),
+        ):
+            with self.subTest(arguments=arguments):
+                before = self.listing.read_bytes(), self.listing.stat().st_mtime_ns
+                code, printed, errors = run(*arguments, "--production", "top", "--list", str(self.listing))
+                self.assertEqual(code, 1)
+                self.assertEqual(printed, "")
+                self.assertIn(rejected_option, errors)
+                if rejected_option.startswith("--"):
+                    self.assertIn(f"{arguments[0]} does not accept {rejected_option}", errors)
+                self.assertEqual((self.listing.read_bytes(), self.listing.stat().st_mtime_ns), before)
+
     def test_image_commands_report_store_errors(self) -> None:
         commands = (("image", "--image", "invalid.txt"),
             ("add", "--repo", str(self.repo), "--production", "top", "--change", "Preview",
@@ -2092,6 +2150,20 @@ class ActionTest(unittest.TestCase):
         self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
         self.assertEqual(run("show", "--list", str(self.fresh)), (0, "nothing to review\n", ""))
         self.assertFalse(self.fresh.parent.exists())
+        for row, expected_code, expected_text in (
+            ("C77", 0, "change-review/C77 Fonts redraw"),
+            ("C999", 1, "C999 is not on the list to review"),
+        ):
+            with self.subTest(row=row):
+                code, output, error = run("show", "--production", DOC, "--list", str(self.path), "--row", row)
+                self.assertEqual(code, expected_code)
+                self.assertIn(expected_text, output if code == 0 else error)
+                if code == 0:
+                    self.assertNotIn("C76", output)
+                    self.assertEqual(error, "")
+                else:
+                    self.assertEqual(output, "")
+                self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
 
     def test_the_most_urgent_row_shows_first_and_the_shown_row_stays_until_its_verdict(self) -> None:
         def add(*rank: str) -> str:
@@ -2485,6 +2557,281 @@ class CommitTest(unittest.TestCase):
         self.assertIn("| C1 | D |", self.git("show", "HEAD:change-review/change-review - hana.md"))
         self.assertEqual(self.git("status", "--porcelain"), "")
 
+    def test_an_edit_does_not_filter_other_modified_files(self) -> None:
+        _ = change_review.append_rows(self.path, [GRID], date(2026, 11, 15), "", PRODUCTION,
+                                      record=staff.snapshot())
+        calls = self.repo.parent / "filter-calls"
+        script = self.repo.parent / "count-filter.py"
+        _ = script.write_text(
+            "import pathlib, sys\n"
+            + f"with pathlib.Path({str(calls)!r}).open('a') as output:\n    output.write('filter\\n')\n"
+            + "sys.stdout.buffer.write(sys.stdin.buffer.read())\n",
+            encoding="utf-8",
+        )
+        _ = self.git("config", "filter.x.clean", shlex.join([sys.executable, str(script)]))
+        _ = (self.repo / ".gitattributes").write_text(
+            "*.md filter=x\nchange-review/** -filter\n", encoding="utf-8",
+        )
+        issues = self.repo / "issues"
+        issues.mkdir()
+        for index in range(20):
+            _ = (issues / f"issue-{index}.md").write_text("before\n", encoding="utf-8")
+        _ = self.git("add", ".gitattributes", "issues")
+        _ = self.git("commit", "-m", "Filtered issues")
+        for path in sorted(issues.iterdir()):
+            relative = path.relative_to(self.repo).as_posix()
+            blob = self.git("rev-parse", f"HEAD:{relative}")
+            _ = self.git("update-index", "--cacheinfo", f"100644,{blob},{relative}")
+            _ = path.write_text("before\nuser edit\n", encoding="utf-8")
+        _ = calls.write_text("", encoding="utf-8")
+
+        result = run("edit", "--production", DOC, "--list", str(self.path), "--row", "C1",
+                     "--change", "Changed", "--check", "Read", "--see", "Proof")
+
+        self.assertEqual((result[0], result[2]), (0, ""))
+        self.assertEqual(calls.read_text(), "")
+        self.assertEqual(self.last(), ("change-review: hana edit C1", [self.path.relative_to(self.repo).as_posix()]))
+        self.assertIn("| C1 | Changed |", self.git("show", f"HEAD:{self.path.relative_to(self.repo).as_posix()}"))
+        for path in issues.iterdir():
+            self.assertEqual(path.read_text(), "before\nuser edit\n")
+            self.assertEqual(self.git("show", f"HEAD:{path.relative_to(self.repo).as_posix()}"), "before")
+
+    def test_a_list_commit_applies_the_filter_for_its_repository_path(self) -> None:
+        script = self.repo.parent / "clean-list.py"
+        _ = script.write_text(
+            "import sys\n"
+            + "sys.stdout.write(sys.stdin.read().replace('Unclean fixture', 'Clean fixture'))\n",
+            encoding="utf-8",
+        )
+        _ = self.git("config", "filter.list-clean.clean", shlex.join([sys.executable, str(script)]))
+        _ = (self.repo / ".gitattributes").write_text(
+            "/change-review/*.md filter=list-clean\n", encoding="utf-8",
+        )
+        _ = self.git("add", ".gitattributes")
+        _ = self.git("commit", "-m", "Configure the list filter")
+        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path),
+                             "--change", "Unclean fixture", "--check", "Read", "--see", "Proof"),
+                         (0, "C1\n", ""))
+        saved = self.path.read_text(encoding="utf-8")
+        self.assertIn("| C1 | Unclean fixture |", saved)
+        committed = self.git("show", f"HEAD:{self.path.relative_to(self.repo).as_posix()}")
+        self.assertEqual(committed, saved.replace("Unclean fixture", "Clean fixture").strip())
+
+    def test_an_edit_retries_on_the_new_head_after_a_ref_race(self) -> None:
+        _ = change_review.append_rows(self.path, [GRID], date(2026, 11, 15), "", PRODUCTION,
+                                      record=staff.snapshot())
+        previous = self.git("rev-parse", "HEAD")
+        tree = self.git("rev-parse", "HEAD^{tree}")
+        real_run = subprocess.run
+        competing: list[str] = []
+
+        def move_head(command: list[str], *, capture_output: bool = False, text: bool = False,
+                      check: bool = False, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if "update-ref" in command and not competing:
+                commit = real_run(["git", "-C", str(self.repo), "commit-tree", tree, "-p", previous,
+                                   "-m", "Timer commit"], capture_output=True, text=True, check=True).stdout.strip()
+                _ = real_run(["git", "-C", str(self.repo), "update-ref", "HEAD", commit, previous],
+                             capture_output=True, text=True, check=True)
+                competing.append(commit)
+            return real_run(command, capture_output=capture_output, text=text, check=check, env=env)
+
+        with mock.patch.object(subprocess, "run", side_effect=move_head):
+            result = run("edit", "--production", DOC, "--list", str(self.path), "--row", "C1",
+                         "--change", "After the timer", "--check", "Read", "--see", "Proof")
+
+        self.assertEqual((result[0], result[2]), (0, ""))
+        self.assertEqual(len(competing), 1)
+        self.assertEqual(self.git("rev-parse", "HEAD^"), competing[0])
+        self.assertEqual(self.git("rev-list", "--count", f"{previous}..HEAD"), "2")
+        self.assertEqual(self.git("log", "-2", "--format=%s").splitlines(),
+                         ["change-review: hana edit C1", "Timer commit"])
+        self.assertIn("| C1 | After the timer |", self.git("show", f"HEAD:{self.path.relative_to(self.repo).as_posix()}"))
+
+    def test_a_new_list_creates_the_first_commit_on_an_unborn_branch(self) -> None:
+        _ = self.git("checkout", "--orphan", "first-list")
+        _ = self.git("rm", "--cached", "note.md")
+
+        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path),
+                             "--change", "First", "--check", "Read", "--see", "Proof"), (0, "C1\n", ""))
+
+        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+        self.assertEqual(self.git("rev-list", "--parents", "-1", "HEAD").split(), [self.git("rev-parse", "HEAD")])
+        self.assertEqual(self.last(), ("change-review: hana add C1", [self.path.relative_to(self.repo).as_posix()]))
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD"), self.path.relative_to(self.repo).as_posix())
+
+    def batch_lists(self) -> tuple[Path, Path]:
+        paths = self.path, self.path.with_name("change-review - natedev.md")
+        for path in paths:
+            _ = change_review.append_rows(path, [Visible(f"Original {index}", "Read", "Proof")
+                for index in range(1, 16)], date(2026, 11, 15), "", PRODUCTION, record=staff.snapshot())
+        return paths
+
+    def run_batch(self, items: list[object]) -> tuple[int, str, str]:
+        path = self.repo.parent / "batch.json"
+        _ = path.write_text(json.dumps(items), encoding="utf-8")
+        return run("batch", "--file", str(path))
+
+    def test_a_batch_writes_two_lists_with_one_lock_and_commit(self) -> None:
+        with mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.repo.parent / "links")}):
+            paths = self.batch_lists()
+            image = self.repo.parent / "shot.png"
+            _ = image.write_bytes(b"fixture image")
+            old_images: list[str] = []
+            for path in paths:
+                for row in ("C2", "C4"):
+                    old_image = image_store.register_change(image)
+                    old_images.append(old_image)
+                    _ = change_review.edit_row(path, row, change_review.KeepRowText(), date(2026, 11, 15),
+                                               PRODUCTION, image=old_image)
+            items: list[object] = []
+            for path in paths:
+                for index in range(1, 16):
+                    item: dict[str, object] = {"production": DOC, "list": str(path), "row": f"C{index}"}
+                    if index % 5 in (0, 4):
+                        item.update(op="verdict", verdict="works" if index % 5 == 0 else "not works")
+                    else:
+                        item["op"] = "edit"
+                        if index % 5 != 2:
+                            item.update(change=f"Edited {index}", check="Open", see=f"Result {index}")
+                        if index % 5 in (2, 3):
+                            item["image"] = str(image)
+                    items.append(item)
+            previous = self.git("rev-parse", "HEAD")
+            remove_image = image_store.remove_change
+            flock = fcntl.flock
+            folder = self.path.parent.stat()
+            folder_locks: list[int] = []
+
+            def track_lock(descriptor: int | TextIO, operation: int) -> None:
+                number = descriptor if isinstance(descriptor, int) else descriptor.fileno()
+                target = os.fstat(number)
+                if operation == fcntl.LOCK_EX and (target.st_dev, target.st_ino) == (folder.st_dev, folder.st_ino):
+                    folder_locks.append(number)
+                flock(descriptor, operation)
+
+            def remove_after_write(root: Path, identity: str) -> None:
+                descriptor = os.open(self.path.parent, os.O_RDONLY)
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.assertEqual(self.git("rev-list", "--count", f"{previous}..HEAD"), "1")
+                    self.assertNotIn(identity, "".join(path.read_text() for path in paths))
+                    remove_image(root, identity)
+                finally:
+                    os.close(descriptor)
+
+            with (mock.patch.object(fcntl, "flock", side_effect=track_lock),
+                  mock.patch.object(image_store, "remove_change", side_effect=remove_after_write)):
+                code, output, errors = self.run_batch(items)
+
+            self.assertEqual((code, errors), (0, ""))
+            self.assertEqual(len(folder_locks), 1)
+            self.assertEqual(len(output.splitlines()), 30)
+            self.assertEqual(self.git("rev-list", "--count", f"{previous}..HEAD"), "1")
+            subject, changed = self.last()
+            self.assertEqual(subject, "change-review: batch 30 writes (hana 15, natedev 15)")
+            self.assertEqual(set(changed), {path.relative_to(self.repo).as_posix() for path in paths})
+            for identity in old_images:
+                self.assertEqual(image_store.change_image(self.repo.parent / "links", identity), "")
+            for path in paths:
+                pending = {row["#"]: row for row in change_review.pending(path)}
+                reviewed = {row["#"]: row for row in change_review.review_rows(path) if row.get("Verdict")}
+                self.assertEqual(len(pending), 9)
+                self.assertEqual(len(reviewed), 6)
+                self.assertEqual(self.git("show", f"HEAD:{path.relative_to(self.repo).as_posix()}"), path.read_text().strip())
+                for index in range(1, 16):
+                    row = f"C{index}"
+                    if index % 5 in (0, 4):
+                        self.assertEqual(reviewed[row]["Verdict"], "works" if index % 5 == 0 else "not works")
+                    else:
+                        self.assertEqual(pending[row]["Change"], f"Original {index}" if index % 5 == 2 else f"Edited {index}")
+                        self.assertEqual(pending[row][change_review.CHECK], "Read. You see: Proof" if index % 5 == 2
+                                         else f"Open. You see: Result {index}")
+                        self.assertIn(next(line for line in path.read_text().splitlines() if line.startswith(f"| {row} |")), output)
+                        if index % 5 in (2, 3):
+                            self.assertTrue(image_store.change_image(self.repo.parent / "links", pending[row][change_review.IMAGE]))
+
+    def test_a_bad_batch_item_keeps_all_lists_and_git_unchanged(self) -> None:
+        paths = self.batch_lists()
+        _ = change_review.record_verdict(paths[1], "C2", "works", date(2026, 11, 15), PRODUCTION)
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        head = self.git("rev-parse", "HEAD")
+        for failure in ("missing row", "verdict conflict", "invalid item", "partial text", "duplicate row"):
+            with self.subTest(failure=failure):
+                bad: object
+                if failure == "missing row":
+                    bad = {"op": "verdict", "production": DOC, "list": str(paths[1]), "row": "C999", "verdict": "works"}
+                elif failure == "verdict conflict":
+                    bad = {"op": "verdict", "production": DOC, "list": str(paths[1]), "row": "C2", "verdict": "not works"}
+                elif failure == "partial text":
+                    bad = {"op": "edit", "production": DOC, "list": str(paths[1]), "row": "C1", "change": "Incomplete"}
+                elif failure == "duplicate row":
+                    bad = {"op": "verdict", "production": DOC, "list": str(paths[0]), "row": "C1", "verdict": "works"}
+                else:
+                    bad = {"op": "unknown", "production": DOC, "list": str(paths[1]), "row": "C1"}
+                code, output, errors = self.run_batch([
+                    {"op": "edit", "production": DOC, "list": str(paths[0]), "row": "C1",
+                     "change": "Must stay in memory", "check": "Read", "see": "Proof"}, bad,
+                ])
+                self.assertEqual(code, 1)
+                self.assertEqual(output, "")
+                self.assertIn("batch item 1", errors)
+                if failure == "duplicate row":
+                    self.assertIn("batch item 1: row C1 is already item 0", errors)
+                self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+                self.assertEqual(self.git("rev-parse", "HEAD"), head)
+                self.assertEqual(self.git("diff", "--cached", "--name-only"), "")
+
+    def test_a_batch_rerun_finishes_after_the_second_list_write_stops(self) -> None:
+        paths = self.batch_lists()
+        before = {path: path.read_bytes() for path in paths}
+        head = self.git("rev-parse", "HEAD")
+        items: list[object] = [
+            {"op": "verdict", "production": DOC, "list": str(paths[0]), "row": "C1", "verdict": "works"},
+            {"op": "edit", "production": DOC, "list": str(paths[1]), "row": "C1",
+             "change": "Recovered edit", "check": "Read", "see": "Proof"},
+        ]
+        from scripts.lib.atomic_file import write_text_atomic
+
+        def stop_second_list(path: Path, text: str) -> None:
+            if path == paths[1]:
+                raise KeyboardInterrupt("Stopped before the second list write")
+            write_text_atomic(path, text)
+
+        with (mock.patch.object(change_review, "write_text_atomic", side_effect=stop_second_list),
+              self.assertRaises(KeyboardInterrupt)):
+            _ = self.run_batch(items)
+        self.assertNotEqual(paths[0].read_bytes(), before[paths[0]])
+        self.assertEqual(paths[1].read_bytes(), before[paths[1]])
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        saved = paths[0].read_bytes(), paths[0].stat().st_mtime_ns
+        code, output, errors = self.run_batch(items)
+        self.assertEqual((code, errors), (0, ""))
+        self.assertIn("already has this verdict", output)
+        self.assertIn("Recovered edit", output)
+        self.assertEqual((paths[0].read_bytes(), paths[0].stat().st_mtime_ns), saved)
+        self.assertEqual(self.git("rev-list", "--count", f"{head}..HEAD"), "1")
+        self.assertEqual(set(self.last()[1]), {path.relative_to(self.repo).as_posix() for path in paths})
+        for path in paths:
+            self.assertEqual(self.git("show", f"HEAD:{path.relative_to(self.repo).as_posix()}"), path.read_text().strip())
+
+    def test_a_batch_refuses_lists_in_different_folders_before_locking(self) -> None:
+        paths = self.batch_lists()
+        moved = paths[1].parent / "separate" / paths[1].name
+        moved.parent.mkdir()
+        _ = paths[1].rename(moved)
+        targets = paths[0], moved
+        before = {path: path.read_bytes() for path in targets}
+        head = self.git("rev-parse", "HEAD")
+        code, output, errors = self.run_batch([
+            {"op": "verdict", "production": DOC, "list": str(path), "row": "C1", "verdict": "works"}
+            for path in targets
+        ])
+        self.assertEqual(code, 1)
+        self.assertEqual(output, "")
+        self.assertIn("folder", errors)
+        self.assertEqual({path: path.read_bytes() for path in targets}, before)
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+
     def test_another_staged_file_stays_staged_and_uncommitted(self) -> None:
         _ = (self.repo / "note.md").write_text("staged edit\n", encoding="utf-8")
         _ = (self.repo / "draft.md").write_text("new\n", encoding="utf-8")
@@ -2518,6 +2865,27 @@ class CommitTest(unittest.TestCase):
         committed = self.git("show", "HEAD:change-review/change-review - hana.md")
         self.assertIn("| C1 | A |", committed)
         self.assertIn("| C2 | C |", committed)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        items: list[object] = [{"op": "edit", "production": DOC, "list": str(self.path), "row": "C1",
+                                "change": "Batch edit", "check": "Read", "see": "Proof"}]
+        head = self.git("rev-parse", "HEAD")
+        _ = lock.write_text("", encoding="utf-8")
+        code, output, error = self.run_batch(items)
+        self.assertEqual(code, 0)
+        self.assertIn("Batch edit", output)
+        self.assertIn("written but not committed", error)
+        self.assertIn("index.lock", error)
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertIn("| C1 | Batch edit |", self.path.read_text(encoding="utf-8"))
+        saved = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        lock.unlink()
+        code, output, error = self.run_batch(items)
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("Batch edit", output)
+        self.assertEqual((self.path.read_bytes(), self.path.stat().st_mtime_ns), saved)
+        self.assertEqual(self.git("rev-list", "--count", f"{head}..HEAD"), "1")
+        committed = self.git("show", "HEAD:change-review/change-review - hana.md")
+        self.assertIn("| C1 | Batch edit |", committed)
         self.assertEqual(self.git("status", "--porcelain"), "")
 
 

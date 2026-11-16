@@ -98,7 +98,7 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
                       + f"{ordinal(joined)} of the steps waiting now."),))
         add()
         add((Span("Waits on", bold=True),))
-        if not isinstance(checks, admission_records.ReadingUnavailable):
+        if not isinstance(checks, (admission_records.ReadingUnavailable, admission_records.NatedevHeld)):
             add((Span("  "), *order_check(model, position)), 4)
         # Frees when shows the head's expired estimate.
         if position != 1 and isinstance(step.reason, admission_records.EstimateExpired):

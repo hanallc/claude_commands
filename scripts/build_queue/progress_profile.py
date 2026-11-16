@@ -8,6 +8,7 @@ import json
 import math
 from pathlib import Path
 import re
+import time
 from typing import cast
 
 from scripts.lib.atomic_file import atomic_sample
@@ -17,8 +18,34 @@ from scripts.build_queue.snapshot_codec import parse_snapshot_value, snapshot_va
 
 
 @dataclass(frozen=True)
+class TokenWait:
+    """A test step built its tests and waits for jobserver tokens to run them."""
+    tokens: int
+
+
+@dataclass(frozen=True)
+class NoTokenWait:
+    pass
+
+
+@dataclass(frozen=True)
 class NoCounter:
     reason: str = "no current counter"
+    # The counter union stays stable for pinned clients; a token wait is this optional field.
+    token_wait: TokenWait | NoTokenWait = NoTokenWait()
+
+
+TOKEN_WAIT_REASON = "waiting for jobserver tokens"
+TOKEN_WAIT_LINE = re.compile(r"\bnextest: waiting for (\d+) more jobserver tokens\b")
+
+
+def token_wait(counter: ProgressCounter | NoCounter) -> TokenWait | NoTokenWait:
+    return counter.token_wait if isinstance(counter, NoCounter) else NoTokenWait()
+
+
+def token_wait_line(tokens: int) -> str:
+    """Print the wait line that CounterParser reads as a token wait."""
+    return f"nextest: waiting for {tokens} more jobserver tokens"
 
 
 @dataclass(frozen=True)
@@ -208,7 +235,12 @@ class CounterParser:
                 match = TEST_START.search(frame)
                 starting = True
             if match is None:
-                if PHASE_END.search(frame):
+                wait = TOKEN_WAIT_LINE.search(frame)
+                if wait is not None:
+                    self.current = NoCounter(TOKEN_WAIT_REASON, TokenWait(int(wait[1])))
+                    self.previous_kind = ""
+                elif PHASE_END.search(frame) or frame.strip() and isinstance(token_wait(self.current), TokenWait):
+                    # The first line after the wait line reports the tokens taken.
                     self.current = NoCounter("phase ended or waiting")
                     self.previous_kind = ""
                 continue
@@ -360,6 +392,30 @@ def read_profile_record(path: Path) -> RecordedProfile | NoMatchingProfile:
     return NoMatchingProfile()
 
 
+@dataclass(frozen=True)
+class HistoryEntry:
+    """Keep only what the history merge reads; a peak process list can hold megabytes."""
+    profile: ProgressProfile
+    at: float
+
+
+def read_history_entry(path: Path) -> HistoryEntry | NoMatchingProfile:
+    """Read a record's profile and time without the peak process list."""
+    try:
+        raw = cast(object, json.loads(path.read_text()))
+        if isinstance(raw, dict):
+            envelope = cast(dict[str, object], raw)
+            record = envelope.get("record")
+            if envelope.get("measurement") == "attributed_anonymous" and isinstance(record, dict):
+                fields = cast(dict[str, object], record)
+                if fields.get("kind") == "RecordedProfile":
+                    return HistoryEntry(cast(ProgressProfile, parse_snapshot_value(fields.get("profile"), ProgressProfile)),
+                                        cast(float, parse_snapshot_value(fields.get("at"), float)))
+    except (OSError, ValueError, TypeError):
+        pass
+    return NoMatchingProfile()
+
+
 def read_profile(path: Path, cutoff: float) -> ProgressProfile | NoMatchingProfile:
     record = read_profile_record(path)
     return record.profile if isinstance(record, RecordedProfile) and record.at >= cutoff else NoMatchingProfile()
@@ -486,12 +542,12 @@ class MergedHistory:
 class ProfileHistory:
     root: Path
     recorders: dict[tuple[str, str], PendingProfile] = field(default_factory=dict)
-    cached: dict[Path, RecordedProfile | NoMatchingProfile] = field(default_factory=dict)
+    cached: dict[Path, HistoryEntry | NoMatchingProfile] = field(default_factory=dict)
     merged: dict[str, MergedHistory] = field(default_factory=dict)
 
-    def _record(self, path: Path) -> RecordedProfile | NoMatchingProfile:
+    def _record(self, path: Path) -> HistoryEntry | NoMatchingProfile:
         if path not in self.cached:
-            self.cached[path] = read_profile_record(path)
+            self.cached[path] = read_history_entry(path)
         return self.cached[path]
 
     def _history(self, key: str, cutoff: float, rank: int, share_percent: int) -> MergedHistory:
@@ -502,7 +558,7 @@ class ProfileHistory:
             if path.suffix not in (".json", ".active"):
                 continue
             record = self._record(path)
-            if not isinstance(record, RecordedProfile) or record.at < cutoff:
+            if not isinstance(record, HistoryEntry) or record.at < cutoff:
                 path.unlink(missing_ok=True)
                 _ = self.cached.pop(path, None)
                 continue
@@ -513,16 +569,20 @@ class ProfileHistory:
         self.merged[key] = history
         return history
 
-    def prune(self, cutoff: float, *, rank: int | ConfiguredProfileRank = CONFIGURED_PROFILE_RANK,
+    def prune(self, cutoff: float, sweep_seconds: float, *, rank: int | ConfiguredProfileRank = CONFIGURED_PROFILE_RANK,
               share_percent: int | ConfiguredPeakShare = CONFIGURED_PEAK_SHARE) -> None:
+        """Refresh stale histories until the sweep time ends; a restart reads all records over several passes."""
         selected_rank = profile_rank(rank)
         selected_share = peak_share_percent(share_percent)
+        deadline = time.monotonic() + sweep_seconds
         for directory in self.root.glob("*"):
             if directory.is_dir():
                 history = self.merged.get(directory.name)
                 if (history is None or history.oldest < cutoff or history.rank != selected_rank
                         or history.share_percent != selected_share):
                     _ = self._history(directory.name, cutoff, selected_rank, selected_share)
+                    if time.monotonic() >= deadline:
+                        return
 
     def matching(self, key: str, cutoff: float, *, rank: int | ConfiguredProfileRank = CONFIGURED_PROFILE_RANK,
                  share_percent: int | ConfiguredPeakShare = CONFIGURED_PEAK_SHARE
@@ -579,7 +639,7 @@ class ProfileHistory:
             identity = (episode, key)
             pending = self.recorders.get(identity)
             record = (RecordedProfile(pending.recorder.profile(), at, pending.reading_source, pending.peak_processes)
-                      if pending is not None else self._record(active))
+                      if pending is not None else read_profile_record(active))
             if isinstance(record, RecordedProfile):
                 save_profile(active.with_suffix(".json"), record.profile, at,
                     reading_source=record.reading_source, peak_processes=record.peak_processes)
