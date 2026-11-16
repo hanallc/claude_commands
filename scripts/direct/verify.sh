@@ -2617,7 +2617,7 @@ placement_once() {
     elif [[ "${STEP_FORCE_MAC:-0}" != 0 ]]; then
         placement_args+=(--target mac)
     fi
-    [[ "${LOCAL_ONLY:-0}" == 0 ]] || placement_args+=(--local-only)
+    [[ "${LOCAL_ONLY:-0}" == 0 ]] || placement_args+=(--local-only --local-reason "$LOCAL_REASON")
     [[ "${STEP_WRITES_TREE:-0}" == 0 ]] || placement_args+=(--writes-tree)
     [[ "${MAC_ONLY:-0}" == 0 ]] || placement_args+=(--mac-only)
     # A builtin wait lets the parent handle TERM during a service outage.

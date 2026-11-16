@@ -1836,6 +1836,27 @@ try {
         await writeFile(join(folder,'macroute-dark-desktop.png'),Buffer.from(routeShot.data,'base64'));
         comparisons.push({routeLines});
 
+        const localReason = 'it edits the merged checkout on natedev with mend and fmt, and the push goes from there';
+        for (const theme of ['light','dark']) {
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
+          for (const width of [390,900,1400]) {
+            await call('Emulation.setDeviceMetricsOverride',{width,height:1100,deviceScaleFactor:1,mobile:false});
+            await navigate('memory_live.html');
+            await show(readings.macroute_reason);
+            await evaluate(`showTip('wait:2',${width/2},420)`);
+            const tip = await evaluate(`(() => {
+              const node=document.querySelector('#tip'), rect=node.getBoundingClientRect();
+              return {text:node.innerText,left:rect.left,right:rect.right,scroll:node.scrollWidth,client:node.clientWidth};
+            })()`);
+            assert.ok(tip.text.includes('natedev only ('+localReason+')'),tip.text);
+            assert.ok(tip.text.includes('Mac: no, '+localReason),tip.text);
+            assert.ok(tip.left>=0 && tip.right<=width && tip.scroll<=tip.client,JSON.stringify(tip));
+            comparisons.push({localReason:true,theme,width,...tip});
+          }
+        }
+        const reasonShot=await call('Page.captureScreenshot',{format:'png'});
+        await writeFile(join(folder,'direct-cargo-local-reason-dark-desktop.png'),Buffer.from(reasonShot.data,'base64'));
+
         await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,
           failures:failures.map(({cards,...state})=>state)},null,2)+'\n');
         console.log(JSON.stringify({pass:true,views:proofs.length,...(callerFolder ? {output:folder} : {})}));

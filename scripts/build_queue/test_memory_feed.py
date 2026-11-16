@@ -26,7 +26,7 @@ from unittest import mock
 
 from scripts.buildlog import charts, cost_actions, costs, moments
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view, target_availability
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, target_availability
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
 from scripts.build_targets import build_targets, target_config, targets
@@ -1415,14 +1415,15 @@ process.stdout.write(JSON.stringify({
             self.assertEqual(memory_feed.target_notes(target_config.MAC_ONLY, routes, "nextest", "/r", "p"),
                              {"runs_on": "Mac only", "targets": ["mac"], "mac_text": "Mac: no block or claim recorded"})
 
-    def macroute_page(self) -> memory_feed.MemoryPage:
+    def macroute_page(self, *, local_reason: str = "") -> memory_feed.MemoryPage:
         """Build three rows from their recorded placement routes."""
         from scripts.build_targets import targets
         from scripts.build_targets.target_config import SshTarget
         from scripts.mac_test import eligibility
 
         reading = queued_reading(captured_reading(), ("build", "mend", "direct"))
-        routes = (target_config.ANY_ELIGIBLE_TARGET, target_config.WRITES_TREE, admission_records.DIRECT_CARGO)
+        routes = (target_config.ANY_ELIGIBLE_TARGET, target_config.WRITES_TREE,
+                  target_config.LocalRequired(local_reason) if local_reason else admission_records.DIRECT_CARGO)
         rows = tuple(replace(row, pid=8100 + index, step=step, route=route)
                      for index, (row, step, route) in enumerate(zip(
                          reading.view.waiting[:3], ("build", "mend", "build"), routes, strict=True)))
@@ -1434,6 +1435,31 @@ process.stdout.write(JSON.stringify({
               mock.patch.object(target_availability, "read_snapshots", return_value=snapshots),
               mock.patch.object(build_targets, "step_policy", return_value=eligibility.KnownRepository("handler", "/r"))):
             return memory_feed.reading()
+
+    def test_direct_request_reason_reaches_the_waiter_page(self) -> None:
+        for reason in ("", "it edits the merged checkout on natedev with mend and fmt, and the push goes from there"):
+            with self.subTest(reason=reason), AdmissionFixture() as fixture:
+                _ = fixture.occupy_host()
+                original = fixture.request(step="check")
+                fixture.free(0)
+                with (mock.patch.dict(os.environ, {"BUILD_QUEUE_LOCAL_REASON": reason}),
+                      mock.patch.object(admission_client, "CLOCK", fixture.clock),
+                      mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
+                          original.profile, step_estimator.ReusableEstimate()))):
+                    request = admission_client.step_request(list(original.argv), original.cwd, original.owner,
+                        original.since, original.sidecar, original.episode)
+                with fixture.loop_turn():
+                    replies = fixture.server.handle_request(wire.parse_request(wire.encode_request(request)))
+                    self.assertTrue(any(isinstance(reply, wire.Wait) for reply in replies), repr(replies))
+                    reply, = fixture.server.handle_request(wire.ViewRequest())
+                    assert isinstance(reply, wire.ViewReply)
+                    reading = reply.reading
+                with mock.patch.object(admission_client, "view", return_value=reading):
+                    page = memory_feed.reading()
+                row, = page["waiters"]
+                expected = reason or admission_records.DIRECT_CARGO.reason
+                self.assertEqual(row.get("runs_on"), f"natedev only ({expected})")
+                self.assertEqual(row.get("mac_text"), f"Mac: no, {expected}")
 
     def test_queued_tooltips_use_the_verify_route_or_the_direct_command_reason(self) -> None:
         page = self.macroute_page()
@@ -2238,6 +2264,8 @@ def write_browser_fixture(folder: Path) -> None:
         pages["step_unknown"] = json.loads(memory_feed.page_json(fixture.owner_machine_page(
             unit_labels.UnitLabels("unknown", "—", "owner not recorded"))))
         pages["macroute"] = json.loads(memory_feed.page_json(fixture.macroute_page()))
+        pages["macroute_reason"] = json.loads(memory_feed.page_json(fixture.macroute_page(
+            local_reason="it edits the merged checkout on natedev with mend and fmt, and the push goes from there")))
         for name, reading in readings.items():
             with mock.patch.object(admission_client, "view", return_value=reading):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
