@@ -92,10 +92,13 @@ READ_CHANGE_LISTS = ReadChangeLists()
 
 
 def change_queue(doc: Path, below: bool = False, *,
-                 prepared: change_review.ChangeQueue | ReadChangeLists = READ_CHANGE_LISTS) -> Queue:
+                 prepared: change_review.ChangeQueue | change_review.PreparedChangeLists | ReadChangeLists = READ_CHANGE_LISTS) -> Queue:
     """The production's current and earlier change rows, and with `below` each lower one's."""
-    queue = (change_review.change_queue(change_review.scope_list(doc), doc, below)
-             if isinstance(prepared, ReadChangeLists) else prepared)
+    if isinstance(prepared, change_review.PreparedChangeLists):
+        queue = change_review.change_queue(change_review.scope_list(doc, prepared=prepared), doc, below, prepared=prepared)
+    else:
+        queue = (change_review.change_queue(change_review.scope_list(doc), doc, below)
+                 if isinstance(prepared, ReadChangeLists) else prepared)
     return Queue(queue.name, _as_text(queue.entries, lambda entry: change_review.describe(entry.item)))
 
 
