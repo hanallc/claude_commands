@@ -20,12 +20,11 @@ This plan has nine phases and an estimate of **64 worker hours**.
    Human names have the form `<showrunner>-<unit>/<work>-<purpose>`.
    The work is a phase ID or a short name from the maker.
    Never infer ownership from a path.
-2. **D2 — Repository slots.** Every repository task uses a configured, fixed slot pool for its machine and repository.
+2. **D2 — Repository slots.** Every repository task uses a slot pool for its machine and repository.
+   The pool grows on demand to a configured maximum (the user, 2026-11-15); a run takes the lowest free number.
    Each slot has stable source and Cargo target paths.
    Taking a slot resets its source and retains its target.
-   Returning a slot preserves affinity for its previous task.
    Convert the Mac, AWS, and natedev gate caches into these slots.
-   Mac hana has exactly two slots, as the user approved.
 3. **D3 — Visible leases.** Each lease records the showrunner, unit, and purpose.
    The build queue page shows those fields for every occupied slot.
 4. **D4 — Size limits.** Each slot has a configured size limit.
@@ -57,15 +56,24 @@ This plan has nine phases and an estimate of **64 worker hours**.
    Pass the descriptor to the working process and its children.
    A held lock proves ownership; metadata only supplies attribution.
 4. Serialize acquisition, rescue, source reset, target removal, and folder deletion under that lock.
+   Python callers pass the held lease descriptor to build and test children.
+   Slot recovery removes a stale index lock under the lease.
+   Slot acquisition replaces target symlinks with directories inside the slot.
+   Explicit Cargo output settings remain unchanged.
+   Nested slots replace only defaults inherited from an enclosing slot.
    Preserve commits, refs, staged changes, unstaged changes, untracked source, ignored source, conflicts, and nested repository work.
    Publish the rescue objects under a unique `refs/rescue/<name>` in the source repository.
    Verify the rescue before deletion; retain the folder when rescue fails.
+   Workspace removal exports clean local branches, tags, and every stash reflog entry before it deletes private Git metadata.
+   When no local source remains, export the rescue into a sibling bare repository named `<workspace-root>-rescues.git`.
+   Incomplete slot recovery retains repositories with a different object store.
    Generated Cargo target data does not need a source snapshot.
    An ignore rule alone does not identify generated data.
-5. Use one fixed pool for each machine and repository identity.
+5. Use one pool for each machine and repository name (the user, 2026-11-15).
+   The pool word is the repository name from the origin URL, with no exception table. A repository with no origin uses its main checkout folder name.
    Different worktrees of one source repository share that pool.
-   Prefer the task's previous free slot, then another free slot.
-   Use existing admission behavior when all slots are held; never create an overflow slot.
+   A run takes the lowest free number. When all slots are held, the pool makes the next number, up to the pool's maximum.
+   At the maximum, the run waits in the build queue.
 6. Measure the complete slot size when taking the slot.
    Rescue before resetting source or removing an over-limit target.
    Remove the target once, then run one cold build.
@@ -100,7 +108,8 @@ The user approved the slot values on 2026-11-12 (relayed by builds). On 2026-11-
 
 The values live in `config/build_folders.conf` as `slots.<machine>.<repository>.count` and `slots.<machine>.<repository>.max_bytes`.
 They change only through /tune and apply at the next slot take, with no deploy.
-`roots.slots.<machine>` keeps a suitable existing root. Existing `roots.*`, `names.*`, `patterns.*` and `prefixes.*` settings stay.
+`roots.slots.<machine>` keeps a suitable existing root. Existing `names.*` and `patterns.*` settings stay.
+The cutover on Thu 11-19 deletes `copies.root`, `roots.scratch*`, `roots.copies*` and the `prefixes.*` keys. The delete of `copies.root` needs a separate go from the user.
 Missing required capacity values stop admission with a named config error.
 Tests use explicit private values under the same schema; they do not set production limits.
 The private-config helper supplies test roots and values, not another allocation API or fixture registry.
@@ -159,7 +168,7 @@ Coordinate shared files through sdlc; phase ownership does not transfer file own
 | --- | --- | --- | ---: | --- |
 | bf1 | Maker and process lock; landed | devtools; queue reviews B files | 6 | None |
 | 2 | Rescue and legacy collector protection | queue; resources and devtools own collector edits | 8 | bf1 |
-| 3 | Slots, limits, affinity, and queue fields | queue; resources wires capacity | 10 | 2; values measured again on `/build` and approved |
+| 3 | Slots, limits, and queue fields | queue; resources wires capacity | 10 | 2; values measured again on `/build` and approved |
 | 4 | Gate caches become slots | queue and aws | 8 | 3 |
 | 5 | Other repository callers | verify, style, and devtools | 8 | 4 |
 | 6 | One-offs and review folders | devtools; builds owners edit B files | 6 | 5 |
@@ -167,6 +176,29 @@ Coordinate shared files through sdlc; phase ownership does not transfer file own
 | 8 | Stall watch and alarm-only sweep | resources and devtools | 6 | 7 |
 | 9 | Test run folders; runs beside Phase 2 | devtools | 4 | bf1 |
 | **Total** | | | **64** | |
+
+### Schedule to the cutover (queue, 2026-11-15 22:33 EST)
+
+The dates are the earliest when each phase starts the hour the phase before it merges. A phase with no owner run has no real start yet.
+
+| Step | Owner unit | Kind | Start | ETA | Assigned |
+| --- | --- | --- | --- | --- | --- |
+| Phase 4 with slot limits (batch656, `e75b8ec06`) | queue | Code that merges | done 11-15 | merges Mon 11-16, after batch648 | yes |
+| Phase 5 — other repository callers | verify (`verify.sh`, mirrors), style (style callers), devtools (unit and recovery worktrees) | Code that merges | Mon 11-16 | Tue 11-17 evening | **no** |
+| Phase 6 — one-offs and review folders | devtools; queue, verify and report edit their B files | Code that merges | Tue 11-17 | Wed 11-18 midday | **no** |
+| Phase 7 — remaining fixtures and source test | devtools; each builds unit migrates its own fixtures | Code that merges, one dispatch for each owner and folder | Wed 11-18 | Thu 11-19 morning | **no** |
+| Phase 8 — stall watch and alarm-only sweep | resources (sweep and alarm), devtools (stall watch, folder audit) | Code that merges | Thu 11-19 | Thu 11-19 evening | **no** |
+| Gate folders delete | resources | One-time run on natedev: deletes each `~/worktrees/gates` folder whose lock has no holder | Thu 11-19 | Thu 11-19 | named here only; not in the resources plan |
+| `copies.root` delete | queue (owns `config/copies.conf`) | Code that merges | Thu 11-19, after the user's separate go | Thu 11-19 | yes; waits for the user's go |
+| Other config key delete | queue (owns `config/build_folders.conf`) | Code that merges: deletes `roots.scratch*`, `roots.copies*`, `prefixes.*` | after Phase 8 merges | Fri 11-20 at the earliest | yes, after Phase 8 |
+
+On `e75b8ec06`, code outside tests still reads each key the cutover deletes:
+
+1. `roots.scratch*` and `roots.copies*`: `scratch.py`, `copy_record.py`, `tmp_sweep.py`, `pre-tool-use-scratch-guard.py`, `shot_report/transcripts.py`. Phases 6 to 8 move them.
+2. `prefixes.*`: `build_folders.py`, `style/crate_run.py`, `style/style_footprint.py`, `step_estimator.py`, `aws_target/ledger.py`, `pre-tool-use-build-hold-guard.py`. Phases 5 and 7 move them.
+3. `copies.root`: no reader. `copies.gates_root()` returns the slot root since Phase 4. Only the user's separate go holds this delete.
+
+So the delete of `roots.scratch*`, `roots.copies*` and `prefixes.*` cannot run on Thu 11-19. The gate folders delete and the `copies.root` delete depend on Phase 4 alone. They stay on Thu 11-19.
 
 Run the phases in this order.
 Migrate adjacent fixtures with their callers during Phases 4–6.
@@ -275,26 +307,38 @@ Require both collectors to retain that folder.
 Check the lock across judgment and deletion to prevent a race with acquisition.
 Run maker, scratch, temporary sweep, and folder audit tests before Phase 3 activates leases.
 
-## Phase 3 — Slots, limits, affinity, and queue fields
+## Phase 3 — Slots, limits, and queue fields
 
-**Goal:** Implement D2–D4 through the maker and existing queue page.
+**Goal:** Implement D2–D4 through the maker and existing queue page, with the user's slot rules of 2026-11-15.
 **Owner units:** queue implements slots and queue fields; resources wires capacity.
 **Estimate:** 10 worker hours.
-**Depends on:** Phase 2; values measured again on `/build` and approved; user go before production activation.
-**Files:** Maker/config files and the Phase 3 queue/target inventory row with adjacent tests.
+**Depends on:** Phase 2 collector guards; the rescue function (built as bf3r, because Phase 2 left it unbuilt); user go before production activation.
+**Files:** Maker/config files, `scripts/lib/git_rescue.py`, and the Phase 3 queue/target inventory row with adjacent tests.
 
-1. Define fixed pools by machine and repository identity.
-2. Keep source and target paths stable; reset source and retain target at acquisition.
-3. Preserve task affinity and select only free slots under their locks.
-4. Use existing admission behavior when the pool is full.
-5. Check complete slot size and remove an over-limit target once before a cold build.
-6. Publish showrunner, unit, purpose, and machine beside each occupied slot on the existing queue page.
-7. Write the approved count and size values (see Configuration and decisions) into config/build_folders.conf.
-8. Provide one small private-config helper for tests that call the maker directly.
+The user's rules (2026-11-15, relayed by builds):
 
-**Acceptance gate:** Test full pools, affinity, source reset, target retention, and one cold rebuild after target removal.
-Require missing approved capacity keys to stop admission.
-Verify Mac hana has exactly two slots.
+1. A slot is `/build/slot/<repo>-slot<N>` on natedev and `~/build/slot/<repo>-slot<N>` on the Mac. Its Cargo output is `/build/cargo/<repo>-slot<N>`.
+2. The repo word is the repository name from the origin URL for every repository, with no exception table.
+3. Every pool grows on demand. A run takes the lowest free number. When all slots are busy, the pool makes the next number, up to a maximum for each pool. At the maximum, the run waits in the build queue.
+4. Once a night, a slot unused for 7 days is deleted with its Cargo output. The maximum for each pool and the 7 days are config values.
+5. A slot reset uses git and rewrites only the files that changed. It never deletes and copies.
+6. The holder and the purpose show on the queue page and in the lease, never in the path.
+
+Steps:
+
+1. bf3r: `git_rescue.rescue()` saves all Git work in a slot under `refs/rescue/<name>` in the source repository and verifies the ref.
+2. A slot is a detached `git worktree` of the repository's main checkout, so a commit needs no fetch and the source keeps its objects.
+3. Take: lock the lowest free number; make the next number up to `slots.<machine>.<repo>.max`; a repository with no key uses `slots.<machine>.default_max` (1) and prints one line with the /tune key. No pool waits forever.
+4. Reset: rescue, then `git checkout --force --detach <commit>` and a git clean of untracked files. The Cargo output stays.
+5. Size: above `slots.<machine>.<repo>.max_bytes`, delete the Cargo output once and print one line with the slot and its size.
+6. Lease: showrunner, unit, purpose, machine, commit, pid, start time and last use.
+7. Nightly: rescue, then delete each slot unused for `slots.unused_days` days, with its Cargo output.
+8. The Builds page Running table shows the slot number in a Slot column after vCPU (the user, 2026-11-15). The unit column already names the holder. The lock, not the lease, proves a holder.
+9. One small private-config helper for tests that call the maker directly.
+
+`/build/slot` needs a nixos tmpfiles line and a user rebuild; that line is part of the migration item. Until then, tests and proof point `roots.slots.<machine>` at a test root. Merge gates, targeted tests and copies.py clones move to slots in Phase 4.
+
+**Acceptance gate:** Test the lowest free number, growth to the maximum, the wait at the maximum, the default maximum, source reset with only changed files rewritten, Cargo output retention, one delete above the size limit, the 7-day delete with rescue, and a failed rescue that keeps the slot.
 Verify queue attribution for every held slot without using metadata as proof of life.
 Use isolated config values for tests; require user go before any production pool activates.
 
@@ -313,6 +357,14 @@ Devtools owns production gate adapters.
 4. Pass the lease descriptor into local and remote working processes.
 5. Route destructive cache operations through rescue under the lease lock.
 6. Migrate adjacent gate fixtures through the maker and private config.
+7. Make `copies.standing()` and the gate pool take slots inside `copies.py`. Its callers, including style sync and the toolchain trial, stop writing under `~/worktrees/gates` with no caller change.
+   `copies.workspace()` does not take a slot: it is a named, editable checkout on a branch, and a slot reset would destroy its edits. It becomes an editable maker folder under `roots.workspace`.
+   `copies.clone()` keeps its return-a-path API, so it cannot hold a slot lease. It becomes a maker folder outside `~/worktrees/gates`; its callers move to slots in Phase 5 (builds agreed 2026-11-15).
+   A full pool waits in the build queue for at most `slots.wait_seconds`, and the run shows in the Queued table.
+8. Point the read-only `copies.gates_root()` users (`rust_release.py` disk check, `lint/sweep.py` floor roots) at the slot root. Delete the `copies.root` key only after the user's separate go.
+9. Add a test that no test writes under the live slot or gate roots.
+
+Resources deletes `~/worktrees/gates` on cutover day, after Phase 4 is on main. It deletes each gate folder only when its lock has no holder.
 
 **Acceptance gate:** Run copies, production gate, and affected Mac/AWS tests using isolated transports.
 Verify cache reuse, revision reset, full-pool admission, cancellation, and lock release after failure.

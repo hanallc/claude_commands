@@ -76,6 +76,7 @@ class NoSavedAlert:
 
 @dataclass(frozen=True)
 class UnreadableAlert:
+    """The reason explains why the idle alert cannot be read."""
     reason: str
 
 

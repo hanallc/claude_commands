@@ -31,7 +31,7 @@ from typing import cast
 from scripts.lib import conf
 from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import queue_place as shell_place
-from scripts.build_queue import admission_records as records, admission_service as service, queue_evidence, step_estimator
+from scripts.build_queue import admission_records as records, admission_service as service, step_estimator
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
 from scripts.build_queue.admission_test_support import (
     AdmissionFixture, Exchange, GIB, ScriptedTransport, ScriptSocket, TimedChunk, only_admitted, reply_bytes,
@@ -747,7 +747,7 @@ class ClientTests(unittest.TestCase):
     def test_priority_commands_from_any_session_send_the_actor(self) -> None:
         for claude, codex, actor in (("ordinary-session", "codex-session", "ordinary-session"),
                                       ("", "codex-session", "codex-session"), ("", "", "user")):
-            for argv in (("priority-set", "unit"), ("priority-clear",), ("admit-head", "urgent")):
+            for argv in (("priority-set", "unit"), ("priority-clear",)):
                 with self.subTest(actor=actor, argv=argv), \
                      mock.patch.dict(os.environ), \
                      mock.patch.object(client, "_mutation", return_value=wire.Ok()) as mutation, \
@@ -760,9 +760,9 @@ class ClientTests(unittest.TestCase):
                         os.environ["CODEX_THREAD_ID"] = codex
                     self.assertEqual(client.main(list(argv)), 0)
                     mutation.assert_called_once()
-                    request = cast(wire.PrioritySetRequest | wire.PriorityClearRequest | wire.AdmitHeadRequest,
+                    request = cast(wire.PrioritySetRequest | wire.PriorityClearRequest,
                                    mutation.call_args.args[0])
-                    self.assertIsInstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest, wire.AdmitHeadRequest))
+                    self.assertIsInstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest))
                     self.assertEqual(request.actor, actor)
 
     def test_unusable_config_exits_with_checker_failure_and_names_the_key(self) -> None:
@@ -818,9 +818,7 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(records.pressure_text(pressure),
                              "memory pressure: condition not recorded by service; full avg10 8.0; "
                              + "some avg10 15.0; swap 80.0% used")
-            self.assertEqual(queue_evidence.pressure_text(pressure, waits[0].snapshot.policy),
-                             "memory pressure: full avg10 8.0%, some avg10 15.0%, swap used 80.0%; "
-                             + "condition not recorded by service")
+
 
 
     def test_hold_after_grant_releases_before_waiting_and_uses_a_new_episode(self) -> None:
@@ -895,28 +893,41 @@ class ClientTests(unittest.TestCase):
             self.assertNotIn("BUILDLOG_MEM_OUTCOME=Granted", shell_state.read_text())
 
     def test_cli_refresh_uses_step_estimate_and_keeps_the_episode_and_first_since(self) -> None:
-        with AdmissionFixture() as fixture:
-            original = fixture.request()
-            updated = replace(original.profile, estimated_at=fixture.clock.now() + 1)
-            transport = self.use_transport(fixture, Exchange(reply_bytes(EXPIRED), reply_bytes(GRANTED)))
-            estimates = [step_estimator.StepEstimate(original.profile, records.FreshTest()),
-                         step_estimator.StepEstimate(updated, step_estimator.ReusableEstimate())]
-            with mock.patch.object(step_estimator, "step_estimate", side_effect=estimates) as estimate, \
-                 mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
-                 redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
-                status = shell_place.main(["admit", "--pid", str(original.owner.pid), "--since", str(original.since),
-                                      "--", "cargo", "nextest", "run"])
-            self.assertEqual(status, 0)
-            self.assertEqual(estimate.call_count, 2)
-            self.assertEqual(len(transport.attempts), 1)
-            first, second = transport.requests
-            assert isinstance(first, wire.AdmitRequest)
-            assert isinstance(second, wire.AdmitRequest)
-            self.assertEqual((first.episode, first.since, first.owner), (second.episode, second.since, second.owner))
-            self.assertEqual(first.since, original.since)
-            self.assertTrue(first.fresh_test)
-            self.assertFalse(second.fresh_test)
-            self.assertEqual(second.profile, updated)
+        for caller in ("verify.sh", "ci_cargo_front.py"):
+            with self.subTest(caller=caller), AdmissionFixture() as fixture:
+                original = fixture.request()
+                runner_request = fixture.service_request(owner=original.owner)
+                updated = replace(original.profile, estimated_at=fixture.clock.now() + 1)
+                transport = self.use_transport(fixture, Exchange(reply_bytes(EXPIRED), reply_bytes(GRANTED)))
+                estimates = [step_estimator.StepEstimate(original.profile, records.FreshTest()),
+                             step_estimator.StepEstimate(updated, step_estimator.ReusableEstimate())]
+                with mock.patch.object(step_estimator, "step_estimate", side_effect=estimates) as estimate, \
+                     mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
+                     redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+                    if caller == "verify.sh":
+                        status = shell_place.main(["admit", "--pid", str(original.owner.pid), "--since", str(original.since),
+                                                  "--", "cargo", "nextest", "run"])
+                        self.assertEqual(status, 0)
+                        self.assertEqual(estimate.call_count, 2)
+                    else:
+                        # The CI front uses this path through held_reservation.
+                        self.assertEqual(shell_place.request_place(runner_request, client.WaitOutput()), GRANTED)
+                        estimate.assert_not_called()
+                self.assertEqual(len(transport.attempts), 1)
+                first, second = transport.requests
+                if caller == "verify.sh":
+                    assert isinstance(first, wire.AdmitRequest)
+                    assert isinstance(second, wire.AdmitRequest)
+                    self.assertEqual((first.episode, first.since, first.owner), (second.episode, second.since, second.owner))
+                    self.assertEqual(first.since, original.since)
+                    self.assertTrue(first.fresh_test)
+                    self.assertFalse(second.fresh_test)
+                    self.assertEqual(second.profile, updated)
+                else:
+                    assert isinstance(first, wire.ServiceEstimateRequest)
+                    self.assertEqual(first, runner_request)
+                    self.assertEqual(second, first)
+                self.doCleanups()
 
     def test_build_generation_precedes_history_and_survives_transport_reconnect(self) -> None:
         for expired_cache in (False, True):
@@ -1139,7 +1150,6 @@ class ClientTests(unittest.TestCase):
         mutations: dict[str, Callable[[], object]] = {
             "release": lambda: client.release("stem", 137, records.read_memory_config()),
             "width": lambda: client.width("stem", 3),
-            "admit-head": lambda: client.admit_head("urgent", "director"),
             "priority-set": lambda: client.priority_set("unit", "urgent", "director"),
             "priority-clear": lambda: client.priority_clear("director"),
             "priority-clear-unit": lambda: client.priority_clear("director", "demo"),
@@ -1965,7 +1975,7 @@ class ClientTests(unittest.TestCase):
     def test_mutations_resend_the_same_request_id_after_transport_closes(self) -> None:
         mutations: tuple[Callable[[], object], ...] = (
             lambda: client.release("stem", 137, records.read_memory_config()), lambda: client.width("stem", 3),
-            lambda: client.admit_head("urgent", "director"))
+            lambda: client.priority_set("unit", "urgent", "director"))
         for mutation in mutations:
             with self.subTest(mutation=mutation), AdmissionFixture() as fixture:
                 transport = self.use_transport(fixture, Exchange(b""), Exchange(reply_bytes(wire.Ok())))

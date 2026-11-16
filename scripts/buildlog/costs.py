@@ -8,6 +8,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Literal, cast
 from pathlib import Path
 
@@ -119,11 +120,38 @@ def idle_seconds(events: list[tuple[float, int, int]]) -> float:
 
 
 @dataclass(frozen=True)
+class StepKind:
+    """A step program in one repository, such as hana nextest."""
+    repo: str
+    step: str
+
+    @property
+    def name(self) -> str:
+        return f"{self.repo} {self.step}" if self.repo else self.step
+
+
+def repository_name(folder: str | None, identity: str | None) -> str:
+    """The repository's name: the last part of its origin URL, else its folder name.
+
+    A verify gate copy has its own folder, such as checkout, and the origin of the repository it copies.
+    """
+    if identity and identity.startswith("https://"):
+        return identity.rsplit("/", 1)[-1]
+    return folder or ""
+
+
+class NoStep(StrEnum):
+    """A CI run or a gate run pays its cost without a build step."""
+    VALUE = "no step"
+
+
+@dataclass(frozen=True)
 class CostContribution:
     at: float
     machine: str
     cause: Cause
     seconds: float | CostUnavailable
+    kind: StepKind | NoStep
 
 
 @dataclass(frozen=True)
@@ -149,8 +177,13 @@ class IndexedMonthlySource:
 
 
 def indexed_monthly_sources(connection: sqlite3.Connection) -> tuple[IndexedMonthlySource, ...]:
-    """Keep nonempty indexed sources, including missing or incomplete files."""
+    """Keep nonempty indexed sources, including missing or incomplete files.
+
+    A file of cloud gate runs is the AWS place, also when an older import named it after its box.
+    """
     rows = cast(list[tuple[str, int]], connection.execute("SELECT path, offset FROM files").fetchall())
+    cloud_gate_files = {path for (path,) in cast(list[tuple[str]], connection.execute(
+        "SELECT DISTINCT src FROM gate_runs WHERE source = ?", (store.CLOUD_GATE_SOURCE,)).fetchall())}
     sources: list[IndexedMonthlySource] = []
     legacy_hosts: dict[str, str] = {}
     for name, offset in rows:
@@ -166,7 +199,8 @@ def indexed_monthly_sources(connection: sqlite3.Connection) -> tuple[IndexedMont
             complete = (store.root()/path).stat().st_size == offset
         except OSError:
             complete = False
-        machine = "CI" if path.parent.name == "ci" else machine_name(None, path.parent.name, legacy_hosts)
+        machine = ("CI" if path.parent.name == "ci" else store.CLOUD_GATE_PLACE if name in cloud_gate_files
+                   else machine_name(None, path.parent.name, legacy_hosts))
         sources.append(IndexedMonthlySource(machine, low.timestamp(), high.timestamp(), complete, name))
     return tuple(sources)
 
@@ -281,7 +315,8 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
         )
     rows = cast(Sequence[tuple[str | None, str | None, str, float | None, float | None, int | None,
                                int | None, str | None, str | None, str | None, str | None,
-                               str | None, float, int, str | None, str | None, str | None, float | None, str | None]],
+                               str | None, float, int, str | None, str | None, str | None, float | None, str | None,
+                               str | None]],
         connection.execute(
             "WITH window_steps AS MATERIALIZED (SELECT id,target,host,session,step FROM steps WHERE "
             + moments.window_bounds("started_at") + ")" + context_sql
@@ -289,7 +324,7 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
             + " SELECT target, host, step, duration_s, mem_wait_s, status, crates_compiled, session,"
             + " worktree, repo, build_base, tree_key, unixepoch(started_at, 'subsec'),"
             + " CASE WHEN unixepoch(started_at,'subsec') >= :lower_epoch THEN (" + index.COUNTED_FAILURE + ") ELSE 0 END,"
-            + " c.mac,c.mac_reason,c.local_reason,c.mac_s,c.outcome"
+            + " c.mac,c.mac_reason,c.local_reason,c.mac_s,c.outcome,repo_identity"
             + " FROM steps LEFT JOIN"
             + " (SELECT id,mac,mac_reason,local_reason,mac_s,outcome FROM main.calls) c"
             + " ON c.id = steps.call_id AND unixepoch(started_at,'subsec') >= :lower_epoch"
@@ -299,19 +334,20 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
     observations: list[SourceObservation] = []
     sessions: dict[tuple[str, str], tuple[moments.PreviousNextest, moments.RecordedBuildTree | moments.UnrecordedIdentity]] = {}
     intervals: list[tuple[float, int, int]] = []
-    for target, host, kind, duration, wait, status, crates, session, worktree, repo, base, tree, at, failed, mac, reason, local_reason, mac_s, outcome_text in rows:
+    for target, host, kind, duration, wait, status, crates, session, worktree, repo, base, tree, at, failed, mac, reason, local_reason, mac_s, outcome_text, identity in rows:
         machine = machine_name(target, host, legacy_hosts)
         seconds, wait_s = max(0.0, duration or 0.0), max(0.0, wait or 0.0)
         selected = lower <= at < upper
+        step_kind = StepKind(repository_name(repo, identity), kind)
         if selected:
             observations.append(SourceObservation(at, machine))
             if kind != "launch":
                 wait_value = CostUnavailable("memory wait not recorded") if wait is None else wait_s
-                contributions.append(CostContribution(at, machine, "Memory wait", wait_value))
+                contributions.append(CostContribution(at, machine, "Memory wait", wait_value, step_kind))
             if crates is not None and crates >= moments.COLD_BUILD_MIN_CRATES:
-                contributions.append(CostContribution(at, machine, "Cold rebuilds", seconds))
+                contributions.append(CostContribution(at, machine, "Cold rebuilds", seconds, step_kind))
             if failed:
-                contributions.append(CostContribution(at, machine, "Failed runs", seconds))
+                contributions.append(CostContribution(at, machine, "Failed runs", seconds, step_kind))
         if machine == "mac" and seconds and at < upper and at + seconds > lower:
             intervals.extend(((max(lower, at), 0, 1), (min(upper, at + seconds), 0, -1)))
         if machine == "natedev" and wait_s and at > lower and at - wait_s < upper:
@@ -325,7 +361,7 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
         preceding = sessions.get((machine, session))
         if (selected and preceding is not None
                 and moments.passed_tree_rerun(preceding[0], moments.nextest_outcome(status), at - wait_s, preceding[1], key)):
-            contributions.append(CostContribution(at, machine, "Reruns after a pass", seconds))
+            contributions.append(CostContribution(at, machine, "Reruns after a pass", seconds, step_kind))
         sessions[machine, session] = (moments.previous_nextest(at, duration, moments.nextest_outcome(status)), key)
     timeline = [(at, wait, run, 0, 0) for at, wait, run in intervals]
     if idle_seconds(intervals) > 0:
@@ -340,8 +376,19 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
     for conclusion, seconds, at in ci_rows:
         observations.append(SourceObservation(at, "CI"))
         if conclusion in ("cancelled", "failure"):
-            contributions.append(CostContribution(at, "CI", "Cancelled CI" if conclusion == "cancelled" else "Failed runs", max(0, seconds)))
+            contributions.append(CostContribution(at, "CI", "Cancelled CI" if conclusion == "cancelled" else "Failed runs", max(0, seconds),
+                                                 NoStep.VALUE))
     sources = indexed_monthly_sources(connection)
+    # A gate run is a recorded event of the place that holds its file; AWS records nothing else.
+    source_machines = {source.path: source.machine for source in sources}
+    gate_rows = cast(Sequence[tuple[str, int | None, float | None, float]], connection.execute(
+        "SELECT src, status, wall_s, unixepoch(started_at,'subsec') FROM gate_runs WHERE "
+        + moments.window_bounds("started_at"), parameters).fetchall())
+    for src, status, wall, at in gate_rows:
+        machine = source_machines.get(src) or machine_name(None, Path(src).parent.name, legacy_hosts)
+        observations.append(SourceObservation(at, machine))
+        if status:
+            contributions.append(CostContribution(at, machine, "Failed runs", max(0.0, wall or 0.0), NoStep.VALUE))
     coverage = source_coverage(sources, observations)
     first_sources = first_source_times(connection, sources)
     return CostReading(tuple(contributions), tuple(observations), sweep_idle(timeline, coverage),

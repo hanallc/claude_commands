@@ -169,6 +169,7 @@ def local_targets() -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class LocalStepIdentity:
+    """The identity holds target and host names for local step classification."""
     targets: tuple[str, ...]
     hosts: tuple[str, ...]
 
@@ -249,23 +250,24 @@ class LaunchStep(GitFacts):
 
 @dataclass(frozen=True)
 class InvalidLaunchState:
-    pass
+    """The saved launch state is invalid."""
 
 
 @dataclass(frozen=True)
 class PublishedLaunch:
+    """The publication result reports a new launch row and an unknown worktree."""
     added: bool
     unknown_worktree: bool
 
 
 @dataclass(frozen=True)
 class NoHeldLog:
-    pass
+    """The step has no retained log."""
 
 
 @dataclass(frozen=True)
 class NoPeakFile:
-    pass
+    """The step has no peak memory file."""
 
 
 @dataclass(frozen=True)
@@ -283,6 +285,7 @@ class PendingStep:
 
 @dataclass(frozen=True)
 class PublishedStep:
+    """The publication result reports whether a step row was added."""
     added: bool
 
 
@@ -565,12 +568,13 @@ def tree_facts(start: str | None, end: str | None) -> dict[str, object]:
 
 @dataclass(frozen=True)
 class SentTreeKey:
+    """The value identifies the source tree sent to the remote host."""
     value: str
 
 
 @dataclass(frozen=True)
 class NoSentTreeKey:
-    pass
+    """The remote step has no recorded source tree key."""
 
 
 def sent_tree_key() -> SentTreeKey | NoSentTreeKey:
@@ -581,12 +585,13 @@ def sent_tree_key() -> SentTreeKey | NoSentTreeKey:
 
 @dataclass(frozen=True)
 class SentRepositoryIdentity:
+    """The value identifies the repository sent to the remote host."""
     value: str
 
 
 @dataclass(frozen=True)
 class NoSentRepositoryIdentity:
-    pass
+    """The remote step has no recorded source repository identity."""
 
 
 def sent_repository_identity() -> SentRepositoryIdentity | NoSentRepositoryIdentity:
@@ -600,9 +605,17 @@ def _log_relative_path(host: str, epoch: float, record_id: str) -> str:
 
 
 def keep_log(data: bytes, host: str, epoch: float, record_id: str) -> str:
+    return _keep_compressed(data, _log_relative_path(host, epoch, record_id))
+
+
+def keep_result(data: bytes, host: str, epoch: float, record_id: str) -> str:
+    """Keep a cloud gate result beside its gate run record."""
+    return _keep_compressed(data, f"{host}/{store.RESULTS_DIR}/{store.month(epoch)}/{record_id}.json.gz")
+
+
+def _keep_compressed(data: bytes, relative: str) -> str:
     import gzip
 
-    relative = _log_relative_path(host, epoch, record_id)
     target = store.root() / relative
     if target.is_file():
         _sync_directory(target.parent)
@@ -628,11 +641,13 @@ def pending_steps_root() -> Path:
 
 @dataclass(frozen=True)
 class ReservedTestPhaseRecord(TestPhaseRecord):
+    """The test phase evidence includes its admission reservation identifier."""
     reservation_id: str
 
 
 @dataclass(frozen=True)
 class ChargedTestPhaseRecord(ReservedTestPhaseRecord):
+    """The reserved test phase evidence includes its completed memory charge."""
     charge: TestPhaseChargeUse
 
 
@@ -1189,6 +1204,7 @@ def ssh_attempt(attempt: SshAttempt) -> None:
 
 @dataclass(frozen=True)
 class AttemptResult:
+    """The attempt result holds repository, slot, outcome, completion, and cleanup evidence."""
     repo_identity: str
     slot: int
     outcome: str
@@ -1246,15 +1262,6 @@ def hold_event(args: list[str]) -> None:
     store.append_line(store.host_file(host, instant.timestamp()), record)
 
 
-def head_admission(action: Literal["set", "admitted", "lapsed"], unit: str, step: str,
-                   need: int, free: int, reserve: int, why: str, set_by: str, at: float) -> None:
-    host = store.host_name()
-    store.append_line(store.host_file(host, at), {
-        "kind": "head_admission", "v": RECORD_VERSION,
-        "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
-        "action": action, "unit": unit, "step": step, "need": need, "free": free,
-        "reserve": reserve, "why": why, "set_by": set_by,
-    })
 
 
 def queue_priority(action: Literal["set", "clear"], unit: str,

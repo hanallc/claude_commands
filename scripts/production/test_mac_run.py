@@ -21,6 +21,7 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.cli_fixture import ImmutableGitSeed
 
@@ -694,32 +695,58 @@ class MacRunTests(unittest.TestCase):
                 self.assert_claim_released()
 
     def test_task_end_requires_confirmed_exit_and_failed_stops_keep_the_checkout(self) -> None:
-        for stop_status, confirm in ((0, "1"), (23, "0"), (0, "0")):
+        result = self.mac_run()
+        events = self.events()
+        stop = [event for event in events if event["command"] == "ssh"
+                and "hana_instances.py stop-checkout " in event["args"][-1]]
+        self.assertEqual(len(stop), 1, events)
+        self.assertTrue(stop[0]["claimed"])
+        words = shlex.split(stop[0]["args"][-1])
+        self.assertEqual(words[words.index("stop-checkout") + 1].rstrip(";"),
+                         self.environment["MAC_RUN_CHECKOUT"])
+        ended = [event for event in events if event["command"] == "ssh"
+                 and "scratch.py end --task " in event["args"][-1]]
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(ended), 1, events)
+        self.assertLess(events.index(stop[0]), events.index(ended[0]))
+        self.assertTrue(ended[0]["claimed"])
+        self.assert_claim_released()
+
+        program = shell_functions(SCRIPT, "cleanup_mac_run") + r'''
+clone=$1
+clone_arg=${(q)clone}
+clone_task=$2
+argv_file=$3
+bundle=''
+on_mac() {
+    printf '%s\0' "$1" >> "$MAC_RUN_STUB_STATE/cleanup-commands"
+    return "$MAC_RUN_CLEANUP_STATUS"
+}
+cleanup_mac_run
+'''
+        commands_path = self.stub_state / "cleanup-commands"
+        for stop_status, confirm in ((23, "0"), (0, "0")):
             with self.subTest(stop_status=stop_status, confirm=confirm):
-                self.clear_events()
-                (self.stub_state / "checkout-clear").unlink(missing_ok=True)
-                result = self.mac_run(extra={"MAC_RUN_CLEANUP_STATUS": str(stop_status),
-                                             "MAC_RUN_CONFIRM_STOP": confirm})
-                events = self.events()
-                stop = [event for event in events if event["command"] == "ssh"
-                        and "hana_instances.py stop-checkout " in event["args"][-1]]
-                self.assertEqual(len(stop), 1, events)
-                self.assertTrue(stop[0]["claimed"])
-                words = shlex.split(stop[0]["args"][-1])
+                commands_path.unlink(missing_ok=True)
+                result = subprocess.run(
+                    ["zsh", "-f", "-c", program, "cleanup-test",
+                     self.environment["MAC_RUN_CHECKOUT"], f"gate:mac-run-{SHA}-123",
+                     str(self.stub_state / "cleanup-argv")],
+                    cwd=self.root,
+                    env={**self.environment, "MAC_RUN_CLEANUP_STATUS": str(stop_status)},
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+                )
+                commands = commands_path.read_text().split("\0")[:-1]
+                stops = [command for command in commands if "hana_instances.py stop-checkout " in command]
+                self.assertEqual(len(stops), 1, commands)
+                words = shlex.split(stops[0])
                 self.assertEqual(words[words.index("stop-checkout") + 1].rstrip(";"),
                                  self.environment["MAC_RUN_CHECKOUT"])
-                ended = [event for event in events if event["command"] == "ssh"
-                         and "scratch.py end --task " in event["args"][-1]]
-                if stop_status == 0 and confirm == "1":
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertEqual(len(ended), 1, events)
-                    self.assertLess(events.index(stop[0]), events.index(ended[0]))
-                    self.assertTrue(ended[0]["claimed"])
-                else:
-                    self.assertEqual(ended, [], events)
-                    self.assertIn(self.environment["MAC_RUN_CHECKOUT"], result.stderr)
-                    self.assertIn("kept checkout", result.stderr.lower())
-                self.assert_claim_released()
+                ends = [command for command in commands if "scratch.py end --task " in command]
+                self.assertEqual(ends, [], commands)
+                self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+                self.assertIn(self.environment["MAC_RUN_CHECKOUT"], result.stderr)
+                self.assertIn("kept checkout", result.stderr.lower())
 
     def clone_registry_records(self, config: str) -> list[dict[str, object]]:
         with mock.patch.dict(os.environ, {"COPIES_CONFIG": config}):
@@ -739,7 +766,10 @@ class MacRunTests(unittest.TestCase):
         remote.mkdir()
         local_environment = copies_environment(local)
         remote_environment = copies_environment(remote)
-        self.environment.update({key: value for key, value in local_environment.items() if key != "HOME"})
+        _ = shutil.copy2(Path(local_environment["CONF_DIR"]) / "build_folders.conf",
+                         Path(self.environment["CONF_DIR"]) / "build_folders.conf")
+        self.environment.update({key: value for key, value in local_environment.items()
+                                 if key not in ("HOME", "CONF_DIR")})
         self.environment.update({
             "MAC_RUN_SHA": head, "MAC_RUN_REAL_COPIES": "1", "MAC_RUN_REAL_PATH": os.environ["PATH"],
             "MAC_RUN_REMOTE_COPIES_CONFIG": remote_environment["COPIES_CONFIG"],

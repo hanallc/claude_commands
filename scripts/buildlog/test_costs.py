@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 import os
 import io
@@ -19,6 +20,7 @@ from scripts.buildlog import cli
 from scripts.buildlog import index
 from scripts.buildlog import moments
 from scripts.buildlog import record
+from scripts.buildlog import store
 from scripts.buildlog import test_moments as fixtures
 from scripts.buildlog.test_index import Record, call, ci_job, ci_run
 from scripts.buildlog.test_holds import hold_event
@@ -50,7 +52,8 @@ class CostTests(unittest.TestCase):
             finish = fixtures.START.timestamp() + number + 10
             common: Record = {"phase_instance_id": f"phase-{number}", "working_dir": directory}
             events.extend(({**common, "event_type": "phase_started", "timestamp_epoch": finish - seconds},
-                           {**common, "event_type": "phase_finished", "timestamp_epoch": finish, "status": "completed", "phase_started_at": finish - seconds}))
+                           {**common, "event_type": "phase_finished", "timestamp_epoch": finish, "status": "completed", "phase_started_at": finish - seconds,
+                            "phase_active_seconds": seconds}))
         self.fixture.progress(events)
 
     def test_first_source_uses_a_recorded_event_instead_of_a_month_boundary(self) -> None:
@@ -75,13 +78,31 @@ class CostTests(unittest.TestCase):
             reading = costs.read_costs(connection, fixtures.START, fixtures.END)
         self.assertNotIn("aws", reading.first_sources)
 
+    def test_cloud_gate_files_count_as_one_aws_machine(self) -> None:
+        started = (fixtures.START + timedelta(seconds=10)).isoformat()
+        for folder, status in (("box-one.fixture.internal", 1), ("box-two.fixture.internal", 0), ("aws", 1)):
+            path = self.fixture.fixture.root/folder/"2026-10.jsonl"
+            path.parent.mkdir(parents=True)
+            _ = path.write_text(json.dumps({
+                "kind": "gate_run", "v": record.RECORD_VERSION, "id": f"gate-{folder}", "host": folder,
+                "started_at": started, "ended_at": started, "wall_s": 600, "status": status,
+                "source": store.CLOUD_GATE_SOURCE, "suites": [], "modules": []}) + "\n")
+        with closing(self.fixture.connection(fixtures.build("local", 10, target="natedev"))) as connection:
+            reading = costs.read_costs(connection, fixtures.START, fixtures.END)
+        self.assertEqual(set(reading.first_sources) - {"natedev"}, {"aws"})
+        # Gate runs are the AWS place's only events, so they observe it and count its failed runs.
+        self.assertIn("aws", {observation.machine for observation in reading.observations})
+        result = costs.aggregate_costs(reading, fixtures.START, fixtures.END)
+        self.assertEqual([(row.machine, row.cause, row.seconds) for row in result.ranked if row.machine == "aws"],
+                         [("aws", "Failed runs", 1200)])
+
     def test_phase_score_uses_matched_wall_time_and_nearest_rank_p90(self) -> None:
         self.progress([("/r/hana", 60), ("/r/hana", 120), ("/r/tool-based-ui", 180), ("/r/other", 240)])
         with closing(self.fixture.connection()) as connection:
             result = costs.collect_costs(connection, fixtures.START, fixtures.END)
-        durations = [phase.wall_s for phase in result.phases if isinstance(phase.wall_s, float)]
-        hana = [phase.wall_s for phase in result.phases
-                if moments.hana_name(phase.working_dir) and isinstance(phase.wall_s, float)]
+        durations = [phase.active_s for phase in result.phases if isinstance(phase.active_s, float)]
+        hana = [phase.active_s for phase in result.phases
+                if moments.hana_name(phase.working_dir) and isinstance(phase.active_s, float)]
         self.assertEqual((len(hana), moments.nearest_rank(hana, 50), moments.nearest_rank(hana, 90)), (3, 120, 180))
         self.assertEqual((len(durations), moments.nearest_rank(durations, 50), moments.nearest_rank(durations, 90)), (4, 120, 240))
         self.assertEqual(len(result.phases), 4)
@@ -92,12 +113,13 @@ class CostTests(unittest.TestCase):
         self.fixture.progress([event, event, {**event, "phase_instance_id": "outside", "timestamp_epoch": fixtures.END.timestamp()}])
         phases = costs.finished_phases(fixtures.START, fixtures.END)
         self.assertEqual(len(phases), 1)
-        self.assertIsInstance(phases[0].wall_s, moments.PhaseStartUnavailable)
+        self.assertIsInstance(phases[0].active_s, moments.PhaseStartUnavailable)
 
-    def test_finish_wall_time_needs_no_start_event_or_event_field_substring(self) -> None:
+    def test_finish_time_needs_no_start_event_or_event_field_substring(self) -> None:
         self.fixture.progress([
             {"event_type": "phase_finished", "phase_instance_id": "kept", "working_dir": "/r/hana",
-             "timestamp_epoch": fixtures.START.timestamp() + 10, "phase_started_at": fixtures.START.timestamp() - 3590},
+             "timestamp_epoch": fixtures.START.timestamp() + 10, "phase_started_at": fixtures.START.timestamp() - 3590,
+             "phase_active_seconds": 3600},
             {"event_type": "unrelated", "phase_started_at": 1, "phase_instance_id": "noise"},
         ])
         self.fixture.progress([
@@ -106,7 +128,7 @@ class CostTests(unittest.TestCase):
         ], filename="old.jsonl")
         phases = costs.finished_phases(fixtures.START, fixtures.END)
         self.assertEqual(len(phases), 1)
-        self.assertEqual(phases[0].wall_s, 3600)
+        self.assertEqual(phases[0].active_s, 3600)
 
     def test_costs_rank_all_hosts_and_divide_by_all_finished_phases(self) -> None:
         self.progress([("/r/hana", 60), ("/r/other", 120)])

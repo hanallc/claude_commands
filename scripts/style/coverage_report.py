@@ -152,7 +152,7 @@ def resolve_rule(name: str, progress: tuple[style_ledger.RuleCounts, ...]) -> st
 
 
 def workspace(ledger: style_ledger.Ledger, tip: str) -> tuple[rules.WorkspaceMember, ...]:
-    entries = style_ledger.tree_entries(ledger.repo, tip)
+    entries = ledger.tree_entries(tip)
     blobs = {path: entry.object for path, entry in entries.items()
              if entry.kind == "blob" and PurePosixPath(path).name == "Cargo.toml"}
     manifests = {path: content.decode(errors="replace") for path, content in style_ledger.blob_contents(ledger.repo, blobs)}
