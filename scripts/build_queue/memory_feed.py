@@ -342,6 +342,9 @@ class HeadRoom(TypedDict):
 
 
 class RowQueueNotes(TypedDict):
+    key: NotRequired[str]
+    # True on the step the queue admits next; only that step shows its room.
+    first_in_line: NotRequired[bool]
     head_room: NotRequired[HeadRoom]
     priority_text: NotRequired[str]
     priority_entries: NotRequired[list[admission_records.PriorityEntry]]
@@ -510,8 +513,17 @@ class RunRow(RowQueueNotes):
     ci: bool
     parts: list[GroupPart]
     ci_runners: NotRequired[list[CIRunner]]
+    ci_cgroup: NotRequired[str]
     need: NotRequired[float]
     need_part: NotRequired[bool]
+
+
+def step_key(row: RunRow | WaitRow | MacBuildRow | MacReadingUnavailableRow | CloudWorkRow) -> str:
+    """Keep a process identity across changes to memory, labels, and queue order."""
+    # An idle or unreadable CI row has no pid or start time; its cgroup tells two CI rows apart.
+    identity = [row.get("machine") or "natedev", row.get("kind", "local"), row["pid"],
+                row.get("started_at", row.get("since", 0)), row.get("group", ""), row.get("ci_cgroup", "")]
+    return hashlib.sha256(json.dumps(codec.snapshot_value(identity)).encode()).hexdigest()[:24]
 
 
 class SwapMember(TypedDict):
@@ -663,7 +675,7 @@ class ReportCost(TypedDict):
 
 @dataclass(frozen=True)
 class ReportSections:
-    charts: dict[str, object]
+    days: int
     top: tuple[ReportCost, ...]
     start: str
     end: str
@@ -874,7 +886,7 @@ def build_ci_row(used: float, now: float,
             "pid": pid, "detail": detail, "used": used,
             "counted": 0.0, "reserved": 0.0, "started_at": busy[0]["started_at"] if busy else 0,
             "queued": False, "keep_text": "\n".join(lines), "group": "", "ci": True, "parts": [],
-            "ci_runners": runners, "admitted": admitted,
+            "ci_runners": runners, "ci_cgroup": str(cgroup), "admitted": admitted,
             "progress": {"kind": "NoProgress", "reason": "no admission counter"}}
 
 
@@ -1240,7 +1252,7 @@ def token_wait_stage(pool: TokenPool | TokenPoolUnavailable) -> str:
 
 
 def report_reading(days: int) -> ReportSections | charts.IndexUnavailable:
-    """Read both report sections from one provider result."""
+    """Read the top costs from one provider result."""
     try:
         recent_days = conf.read("buildlog").whole("TOP_COST_RECENT_DAYS")
         if days < recent_days:
@@ -1261,7 +1273,7 @@ def report_reading(days: int) -> ReportSections | charts.IndexUnavailable:
                              "share": cost_actions.share_text(row.share),
                              "action": cost_actions.action_text(row.action)})
         zone = user_zone()
-        return ReportSections(charts.chart_data(report.charts), tuple(rows), top.start.astimezone(zone).isoformat(),
+        return ReportSections(days, tuple(rows), top.start.astimezone(zone).isoformat(),
                               top.end.astimezone(zone).isoformat(), top.recent_days, str(zone))
     except (OSError, ValueError, RuntimeError) as error:
         return charts.IndexUnavailable(str(error))
@@ -2108,9 +2120,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             head_pid = head.run.pid if isinstance(head.run, LiveBuildRun) else head.pid
         for waiting_row in waiting_rows:
             if waiting_row["pid"] == head_pid:
+                waiting_row["first_in_line"] = True
                 if isinstance(explanation.head, admission_records.HeadExplanation) and explanation.head.decision.state == "hold":
                     waiting_row["head_room"] = head_room(explanation.head.room, explanation.room, ram)
                 break
+    for step_row in (*work_rows, *waiting_rows):
+        step_row["key"] = step_key(step_row)
     pressure = explanation.decided_from.pressure
     policy = explanation.policy.pressure
     # Without the recorded builds and CI swap, the page reads host swap now instead of failing.
