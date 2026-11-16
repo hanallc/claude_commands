@@ -21,7 +21,6 @@ import os
 from pathlib import Path
 import re
 import shutil
-import socket
 import stat
 import subprocess
 import sys
@@ -39,6 +38,7 @@ from scripts.lib.copy_record import (
     RepositoryScope as RepositoryScope,
     ALL_REPOSITORIES as ALL_REPOSITORIES,
 )
+from scripts.buildlog.store import host_name
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
@@ -1066,7 +1066,8 @@ def list_trees() -> None:
     staff_names = ListStaffNames()
     print("number\towner\trepository\thost\tpath\tsession\tcommit\tstate\tholder_pid\ttarget")
     number = 0
-    host = socket.gethostname()
+    # A slot lease names its machine by the short host name; a record without one uses the same name.
+    host = host_name()
     for record_path in sorted(root.glob("*-slot*.lease.json")):
         tree = record_path.with_name(record_path.name.removesuffix(".lease.json"))
         if not tree.is_dir():
