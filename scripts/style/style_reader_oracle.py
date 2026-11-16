@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 import re
 import subprocess
 import sys
 from typing import BinaryIO, NotRequired, Protocol, TypedDict, cast
 
-from scripts.style import declarations, style_footprint, style_plan
+from scripts.style import declarations, style_footprint, style_plan, style_ledger
 
 
 type Json = str | int | bool | None | list[Json] | dict[str, Json]
+
+# The oracle calls the Python source function without adding another public ledger API.
+python_code_identity = cast(Callable[[bytes], style_ledger.RustCode | style_ledger.NotTokenized],
+                            getattr(style_ledger, "_rust_code"))
 
 
 class ModuleMove(TypedDict):
@@ -117,6 +122,19 @@ def name_site_value(file: declarations.DeclaredFile) -> Json:
         readings.append("unreadable" if isinstance(sites, declarations.UnreadableBody)
                         else {"sites": [[start, end] for start, end in sites.sites]})
     return readings
+
+
+def body_token_value(file: declarations.DeclaredFile, text: str) -> Json:
+    """Match the normalized body tokens that the declaration reader shares."""
+    normalized = "\n".join(file.source_lines)
+    original = text.startswith(normalized) and not text[len(normalized):].strip("\n")
+    reading = style_footprint.tokenized_text(text if original else normalized)
+    if any(token.kind == "unknown" for token in reading.tokens):
+        return "unreadable"
+    if original:
+        return "original"
+    return [{"value": token.value, "kind": token.kind, "line": line, "start": start}
+            for token, line, start in zip(reading.tokens, reading.lines, reading.starts, strict=True)]
 
 
 def module_scan_value(reading: style_plan.ModuleDeclarationText) -> Json:
@@ -249,21 +267,24 @@ def answer(request: Request) -> None:
             facts = sorted(set(request["facts"])) if blob in rust_blobs else []
             try:
                 text = data.decode("utf-8")
+                valid_utf8 = True
             except UnicodeError:
-                for fact in facts:
-                    if fact == "names" and request.get("name_word_class") == "ascii":
-                        raw_words = cast(list[bytes], re.findall(rb"[A-Za-z0-9_]+", data))
-                        ascii_words: list[Json] = [word.decode("ascii") for word in sorted(set(raw_words))]
-                        emit(blob, fact, ascii_words)
-                    else:
-                        emit(blob, fact, None, unreadable="not_utf8")
-                for query in queried.get(blob, []):
-                    emit(blob, "module_sites", None, unreadable="not_utf8", path=query["path"])
-                continue
+                text = data.decode("utf-8", errors="replace")
+                valid_utf8 = False
             file = declarations.read_declarations(text) if {"declarations", "name_sites"} & set(facts) else None
             for fact in facts:
                 value: Json
+                if not valid_utf8 and (fact in {"lines", "rust_code"}
+                                       or fact == "names" and request.get("name_word_class") != "ascii"):
+                    emit(blob, fact, None, unreadable="not_utf8")
+                    continue
                 match fact:
+                    case "rust_code":
+                        reading_code = python_code_identity(data)
+                        if isinstance(reading_code, style_ledger.NotTokenized):
+                            emit(blob, fact, None, unreadable="token_spans")
+                            continue
+                        value = reading_code.digest.hex()
                     case "tokens":
                         reading = style_footprint.tokenized_text(text)
                         value = [{"value": token.value, "kind": token.kind, "line": line, "start": start}
@@ -272,7 +293,8 @@ def answer(request: Request) -> None:
                         value = len(text.replace("\r\n", "\n").replace("\r", "\n").splitlines())
                     case "names":
                         if request.get("name_word_class") == "ascii":
-                            value = sorted(set(re.findall(r"[A-Za-z0-9_]+", text)))
+                            raw_words = cast(list[bytes], re.findall(rb"[A-Za-z0-9_]+", data))
+                            value = [word.decode("ascii") for word in sorted(set(raw_words))]
                         else:
                             words = subprocess.run(
                                 ["git", "-C", str(repository), "grep", "-a", "-h", "-o", "-E",
@@ -291,7 +313,12 @@ def answer(request: Request) -> None:
                     case "declarations" | "name_sites":
                         if file is None:
                             raise RuntimeError("the declaration reading is missing")
-                        value = declaration_value(file) if fact == "declarations" else name_site_value(file)
+                        if fact == "declarations":
+                            declared = cast(dict[str, Json], declaration_value(file))
+                            declared["body_tokens"] = body_token_value(file, text)
+                            value = declared
+                        else:
+                            value = name_site_value(file)
                     case _:
                         raise ValueError(f"unknown fact {fact}")
                 emit(blob, fact, value)

@@ -52,6 +52,7 @@ from scripts.style.approved_renames import (BindingProof, AppliedInCode, Applied
                               file_rename, inline_modules)
 from scripts.style import rules, style_config
 from scripts.style import style_ledger
+from scripts.style import style_reader
 from scripts.style.refill_findings import FindingFootprint, decode_proof, encode_proof, proof_types
 from scripts.style.style_ledger import publication_lock, publication_path
 from scripts.style import approved_renames
@@ -1146,6 +1147,30 @@ def module_declaration_text(text: str) -> ModuleDeclarationText | UnreadableDecl
                                                               if word == "mod" and index in starts
                                                               and words[index + 2:index + 3] == (";",)}))
     return ModuleDeclarationText(words, starts, modules, declarations)
+
+
+def reader_module_declaration_text(facts: style_reader.BlobFacts) -> ModuleDeclarationText | UnreadableDeclarationText:
+    """Restore module syntax from shared reader tokens without scanning source."""
+    reading = facts.module_scan()
+    if isinstance(reading, style_reader.UnreadableFact):
+        return UnreadableDeclarationText()
+    words = plain_words(facts.tokens())
+    starts = style_footprint.code_item_starts(words)
+    modules = inline_modules(words, starts)
+    declarations: list[ModuleDeclaration] = []
+    for row in reading.declarations:
+        location: DefaultModulePath | LiteralModulePath | UncertainDeclarationPath
+        if isinstance(row.path, str):
+            location = LiteralModulePath(row.path)
+        elif row.path == style_reader.ModulePathForm.DEFAULT:
+            location = DefaultModulePath()
+        else:
+            location = UncertainDeclarationPath()
+        scope = next((enclosing(modules, index) for index, word in enumerate(words)
+                      if word == "mod" and words[index + 1:index + 2] == (row.name,)
+                      and tuple(module.name for module in enclosing(modules, index)) == row.scope), ())
+        declarations.append(ModuleDeclaration(row.name, scope, location))
+    return ModuleDeclarationText(words, starts, modules, tuple(declarations))
 
 
 def declares_module(repo: Path, path: str, text: str | ModuleDeclarationText | UnreadableDeclarationText, file: str) -> bool:
@@ -2867,10 +2892,16 @@ class EditedFiles:
         """Keep one declaration scan for each blob read during this refill."""
         self.required_blobs.add(blob)
         if blob not in self.declarations:
-            self.declarations[blob] = self.ledger.finding_source_fact(
-                "footprint_modules", blob, lambda: module_declaration_text(self.texts[blob]),
-                lambda source: cast(ModuleDeclarationText | UnreadableDeclarationText,
-                                    decode_proof(source, proof_types(globals(), vars(approved_renames)))))
+            if self.ledger.reader_source == style_config.ReaderSource.RUST:
+                try:
+                    self.declarations[blob] = reader_module_declaration_text(self.ledger.blob_facts(blob))
+                except style_reader.ReaderError as error:
+                    raise style_ledger.CheckCouldNotRun(str(error)) from error
+            else:
+                self.declarations[blob] = self.ledger.finding_source_fact(
+                    "footprint_modules", blob, lambda: module_declaration_text(self.texts[blob]),
+                    lambda source: cast(ModuleDeclarationText | UnreadableDeclarationText,
+                                        decode_proof(source, proof_types(globals(), vars(approved_renames)))))
         return self.declarations[blob]
 
     def uncertain(self, finding: style_ledger.HeldFinding) -> tuple[str, ...]:
@@ -2989,10 +3020,58 @@ class EditedFiles:
         for moved, files in declaring.items():
             for file in files:
                 movers[file].append(moved)
-        readings = {(path, text): dict(zip(file_moves, module_site_readings(self.repo, path, text, tuple(file_moves)), strict=True))
-                    for (path, text), file_moves in movers.items()}
+        if self.ledger.reader_source == style_config.ReaderSource.RUST:
+            readings = self._reader_module_sites(movers)
+        else:
+            readings = {(path, text): dict(zip(file_moves, module_site_readings(self.repo, path, text, tuple(file_moves)), strict=True))
+                        for (path, text), file_moves in movers.items()}
         for moved, files in declaring.items():
             self.readings[moved] = tuple((file[0], readings[file][moved]) for file in files)
+
+    def _reader_module_sites(self, movers: Mapping[tuple[str, str], list[FileRename]]
+                             ) -> dict[tuple[str, str], dict[FileRename, ModuleSiteReading | NoRenamedText | UncertainModulePath]]:
+        """Read every required module query in one request without saved blob facts."""
+        blobs = {text: blob for blob, text in self.texts.items()}
+        queries: list[style_reader.ModuleQuery] = []
+        requested: dict[tuple[str, str], tuple[FileRename, ...]] = {}
+        readings: dict[tuple[str, str], dict[FileRename, ModuleSiteReading | NoRenamedText | UncertainModulePath]] = {}
+        for (path, text), moves in movers.items():
+            selected: list[FileRename] = []
+            contexts: list[style_reader.ModuleMove] = []
+            readings[path, text] = {}
+            for moved in moves:
+                root = crate_root(self.repo, moved.old)
+                if isinstance(root, NoCrateRoot):
+                    readings[path, text][moved] = NoRenamedText()
+                    continue
+                module = style_footprint.crate_module(moved.old, root)
+                if isinstance(module, style_footprint.OutsideCrate):
+                    readings[path, text][moved] = NoRenamedText()
+                    continue
+                library = crate_library(self.repo, root)
+                contexts.append(style_reader.ModuleMove(
+                    moved.old, moved.new, style_footprint.crate_module(path, root), module[:-1],
+                    library.name if isinstance(library, Library) else style_reader.NoCrateLibrary()))
+                selected.append(moved)
+            if contexts:
+                query = style_reader.ModuleQuery(blobs[text], path, tuple(contexts))
+                queries.append(query)
+                requested[query.blob, query.path] = tuple(selected)
+        if queries:
+            try:
+                answers = style_reader.read_module_sites(self.repo, queries)
+            except style_reader.ReaderError as error:
+                raise style_ledger.CheckCouldNotRun(str(error)) from error
+            for (blob, path), answer in answers.items():
+                text = self.texts[blob]
+                requested_moves = requested[blob, path]
+                values = (tuple(style_reader.ModuleSiteRefusal.NO_RENAMED_TEXT for _ in requested_moves)
+                          if isinstance(answer, style_reader.UnreadableFact) else answer)
+                for moved, value in zip(requested_moves, values, strict=True):
+                    readings[path, text][moved] = (
+                        ModuleSiteReading(value) if isinstance(value, bool) else
+                        UncertainModulePath() if value == style_reader.ModuleSiteRefusal.UNCERTAIN_MODULE_PATH else NoRenamedText())
+        return readings
 
     def _declaring_files(self, moved: FileRename) -> tuple[tuple[str, str], ...]:
         root = crate_root(self.repo, moved.old)
@@ -3715,6 +3794,19 @@ def family_idle_reason(family: rules.Family, result: PhaseWritten | NoAvailableW
     else:
         reason = "no available work"
     return FamilyIdleReason(family, reason)
+
+
+def count_refill(ledger: style_ledger.Ledger, unit: str, branch: str, plan: Path, repo: Path,
+                 doc: Path, text: str, scope: PilotScope, busy: BusyFiles, first_files: frozenset[str],
+                 definitions: Mapping[str, rules.Rule], changes: MainChanges | UnknownMainChanges,
+                 predecessor: WaitingCheckpoint | NoCheckpointBlock) -> (BuildableFindings | PhaseWritten | NoAvailableWork |
+                 WaitingForStructure | MergeStyleBranchFirst | UnitNeedsSyncedTip | WaitingForSync | WaitingForMerge):
+    """Count buildable work for the unit's assigned families without publishing tickets or decisions."""
+    config = style_config.config_for_unit(unit, ledger.staff_resolver().record)
+    families = config.assignment(ledger.unit_name(unit)).families
+    return _select_phase(ledger, unit, branch, plan, repo, doc, text, scope, busy, first_files,
+                         definitions, changes, predecessor, family=min(families, key=family_rank),
+                         families=families, selection=FamilySelection.COUNT)
 
 
 def select_family_work(ledger: style_ledger.Ledger, unit: str, branch: str, plan: Path, repo: Path,
