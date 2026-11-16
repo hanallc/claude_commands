@@ -518,6 +518,23 @@ raise SystemExit(renumber.main())
         self.assertEqual(result.returncode, 0, msg=result.stderr)
 
         self.assertIn(" M issues/issue.md", self._vault_status())
+        self.assertNotIn("index refresh failed", self.fixture.event_log.read_text())
+
+    def test_a_current_index_is_left_alone(self) -> None:
+        issue = self._make_filtered_git_vault()
+        self._install_ranking_stubs(issue, rank="900005")
+        first = self.run_in_repo("bash", str(self.fixture.watcher))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(self._vault_status(), "")
+        index = self.fixture.root / ".git" / "index"
+        before = index.stat().st_mtime_ns
+
+        second = self.run_in_repo("bash", str(self.fixture.watcher))
+        self.assertEqual(second.returncode, 0, second.stderr)
+
+        self.assertEqual(index.stat().st_mtime_ns, before)
+        self.assertIn("vault git index already current", self.fixture.event_log.read_text())
+        self.assertEqual(self._vault_status(), "")
 
     def test_index_refresh_skipped_when_no_filter_configured(self) -> None:
         issue = self._make_filtered_git_vault()

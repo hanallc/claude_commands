@@ -166,7 +166,7 @@ settled_state_is_current() {
 refresh_vault_git_index() {
     local configured
     local path
-    local -a pathspec=("$VAULT_ISSUES_PATHSPEC")
+    local -a pathspec=()
 
     [[ -d "$VAULT_DIR/.git" ]] || return 0
     command -v git >/dev/null 2>&1 || return 0
@@ -180,14 +180,35 @@ refresh_vault_git_index() {
         return 0
     fi
 
+    # ONLY THE NOTES WHOSE STAT DATA MOVED. `git diff-files` compares stat data
+    # alone and runs no filter, so it costs milliseconds. A note it does not list
+    # already has a current index entry, and renormalizing it changes nothing.
+    # Renormalizing every note instead put all of them through the Python clean
+    # filter on each pass: 45 to 105 seconds of .git/index.lock every 15 minutes
+    # on the Mac, with no ranking change at all. natedev's hourly vault sync
+    # commits in the same checkout, met that lock, and stopped (2026-11-16 16:11).
+    local -a stale=()
+    while IFS= read -r -d '' path; do
+        stale+=("$path")
+    done < <(
+        git -C "$VAULT_DIR" diff-files --name-only -z -- "$VAULT_ISSUES_PATHSPEC" 2>/dev/null
+    )
+    if (( ${#stale[@]} == 0 )); then
+        log "vault git index already current; no refresh needed"
+        return 0
+    fi
+
     while IFS= read -r -d '' path; do
         pathspec+=(":(exclude,literal)$path")
     done < <(
         git -C "$VAULT_DIR" diff --name-only -z -- "$VAULT_ISSUES_PATHSPEC" 2>/dev/null
     )
+    for path in "${stale[@]}"; do
+        pathspec+=(":(literal)$path")
+    done
 
     if git -C "$VAULT_DIR" add --renormalize -- "${pathspec[@]}" >> "$EVENT_LOG" 2>&1; then
-        log "refreshed vault git index after ranking writes; real edits left alone=$(( ${#pathspec[@]} - 1 ))"
+        log "refreshed vault git index after ranking writes; stale entries=${#stale[@]}"
     else
         log "warning: vault git index refresh failed; status may report ranking churn"
     fi
