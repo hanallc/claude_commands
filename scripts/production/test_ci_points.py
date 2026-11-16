@@ -7,6 +7,7 @@ import json
 import os
 import re
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -280,8 +281,14 @@ class CiPointsTests(unittest.TestCase):
         validate = self.bin / "validate_and_push.sh"
         self.env["CI_POINTS_VALIDATE_SCRIPT"] = str(validate)
         scripts = SCRIPT.parents[1] / "validate_and_push"
-        for name in ("validate_and_push.sh", "push_direct.sh", "post_push_hook.sh"):
+        for name in ("validate_and_push.sh", "push_direct.sh"):
             _ = shutil.copy2(scripts / name, self.bin / name)
+        library = self.bin.parent / "lib"
+        shim = library / "py"
+        self.write(shim, f'#!/bin/sh\nexec {shlex.quote(str(scripts.parent / "lib/py"))} "$@"\n')
+        shim.chmod(0o755)
+        for name in ("land_main.py", "main_push_lock.py"):
+            _ = shutil.copy2(scripts.parent / "lib" / name, library / name)
         self.write(self.bin / "run_validation.sh", '''#!/bin/sh
 set -eu
 "$TEST_PYTHON" - <<'PY'

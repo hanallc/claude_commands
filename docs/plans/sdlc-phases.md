@@ -377,7 +377,7 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 
 **Ruled out:** a class-wide platform pin in `setUp` (most `NativePaneSessionTests` tests do not fake `/proc`).
 
-### Phase 40 — Every main push lands through one function, and the post-push hook runs after each one  · status: todo
+### Phase 40 — Every main push lands through one function, and the post-push hook runs after each one  · status: done
 **Depends on:** none
 
 #### Work Order
