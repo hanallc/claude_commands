@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from contextvars import copy_context
 from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 import io
@@ -1446,6 +1446,43 @@ class StandingTests(unittest.TestCase):
             self.assertEqual(self.git(tree, "status", "--porcelain"), "")
         self.assertEqual({key: value for key, value in self.snapshot(self.source).items() if not key.startswith(".git/")}, before)
         self.assertEqual((self.source / ".git/index").read_bytes(), source_index)
+
+    def test_apply_changes_refuses_an_untracked_nested_repository(self) -> None:
+        nested = self.source / "nested"
+        nested.mkdir()
+        _ = self.git(nested, "init", "--quiet")
+        _ = (nested / "file").write_text("nested source\n")
+        _ = self.git(nested, "add", ".")
+        _ = self.git(nested, "commit", "-qm", "nested source")
+        with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
+            with self.assertRaisesRegex(copies.PreparationError, "NestedRepository: nested"):
+                copies.apply_changes(tree, self.source, self.head)
+            self.assertFalse((tree / "nested").exists())
+
+    def test_apply_changes_error_names_untracked_files(self) -> None:
+        _ = (self.source / "untracked.txt").write_text("new source\n")
+        with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
+            with mock.patch.object(copies, "staged_tree", side_effect=copies.PreparationError("fixture failure")):
+                with self.assertRaisesRegex(copies.PreparationError, "files: untracked.txt; fixture failure"):
+                    copies.apply_changes(tree, self.source, self.head)
+
+    def test_private_capture_timeout_exits_three_and_names_changed_files(self) -> None:
+        _ = (self.source / "tracked.txt").write_text("changed source\n")
+        _ = (self.source / "untracked.txt").write_text("new source\n")
+        real_run = cast(Callable[..., object], subprocess.run)
+        for step in ("add", "write-tree"):
+            with self.subTest(step=step):
+                def timeout_capture(arguments: list[str], **options: object) -> object:
+                    if arguments[:3] == ["git", "-C", str(self.source)] and arguments[3] == step:
+                        raise subprocess.TimeoutExpired(arguments, float(self.settings["git_timeout_seconds"]))
+                    return real_run(arguments, **options)
+                with mock.patch("scripts.copies.copies.subprocess.run", side_effect=timeout_capture):
+                    result = self.run_cli("--apply-uncommitted", str(self.source))
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertIn("tracked.txt", result.stderr)
+                self.assertIn("untracked.txt", result.stderr)
+                arguments = "add --all -- ." if step == "add" else "write-tree"
+                self.assertIn(f"git {arguments} in {self.source}: timed out after 10 seconds", result.stderr)
 
     def test_merge_fetches_source_ref_and_creates_a_merge_commit(self) -> None:
         incoming = self.incoming()
