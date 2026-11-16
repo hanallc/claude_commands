@@ -30,7 +30,7 @@ import time
 from typing import Literal, TypedDict, cast
 from uuid import uuid4
 
-from scripts.lib import main_push_lock
+from scripts.lib import land_main, main_push_lock
 from scripts.lib import process_group
 
 from scripts.copies import copies
@@ -210,7 +210,7 @@ def selected_paths(repo: Path, names: list[str], config: FastTrackLimits) -> lis
 
 def patch_for(runner: GitRunner, repo: Path, paths: list[str]) -> bytes:
     """Use a private index to include new files without changing the director's index."""
-    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track-index"])) as temporary:
+    with build_folders.tool_folder("fast-track-index") as temporary:
         environment = {**os.environ, "GIT_INDEX_FILE": str(temporary / "index"),
                        "GIT_LITERAL_PATHSPECS": "1"}
         _ = runner.git(repo, "read-tree", "HEAD", environment=environment)
@@ -458,7 +458,7 @@ def fast_check(runner: GitRunner, repo: Path, paths: list[str], config: FastTrac
             modules.update(p.relative_to(repo) for p in (repo / path.parent).glob(pattern))
     environment = {key: value for key, value in os.environ.items()
                    if key not in ("PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY", "STAFF_OPERATION_FD")}
-    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track-check"])) as temporary:
+    with build_folders.tool_folder("fast-track-check") as temporary:
         for number, module in enumerate(sorted(modules)):
             root = temporary / str(number)
             root.mkdir()
@@ -498,7 +498,7 @@ def select_patch(runner: GitRunner, repo: Path, paths: list[str]) -> Generator[S
         patch = patch_for(runner, repo, paths)
         if runner.git(repo, "rev-parse", "HEAD").strip() != head:
             raise Refused("HEAD changed while selecting the patch; retry the command")
-        with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track-restore-index"])) as temporary:
+        with build_folders.tool_folder("fast-track-restore-index") as temporary:
             environment = {**os.environ, "GIT_INDEX_FILE": str(temporary / "index")}
             _ = runner.git(repo, "read-tree", head, environment=environment)
             if patch:
@@ -763,7 +763,7 @@ def push_patch(runner: GitRunner, repo: Path, production: str, unit: str, why: s
                selection: SelectedPatch, config: FastTrackLimits, settings_read: conf.ConfigRead) -> str:
     patch = selection.patch
     digest = hashlib.sha256(patch).hexdigest()
-    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track"])) as temporary:
+    with build_folders.tool_folder("fast-track") as temporary:
         fetch_main(runner, repo, settings_read)
         with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource("origin/main")) as copy:
             _ = runner.git(copy, "remote", "set-url", "origin", runner.git(repo, "remote", "get-url", "origin").strip())
@@ -789,17 +789,18 @@ def push_patch(runner: GitRunner, repo: Path, production: str, unit: str, why: s
                         _ = runner.git(copy, "fetch", "origin", "main")
                         if runner.git(copy, "rev-parse", "origin/main").strip() != base:
                             continue
-                        result = runner.run(copy, "push", "origin", "HEAD:main")
+                        landed = land_main.land(copy, commit)
+                        print(land_main.hook_report(landed.hook), flush=True)
                 except checkpoint_gate.Stop as error:
                     raise Refused(str(error)) from error
-                if result.returncode:
+                except land_main.LandError as error:
                     # A writer outside the shared lock can move origin during push.
                     _ = runner.git(copy, "fetch", "origin", "main")
                     if not is_on_main(runner, copy, commit):
                         _ = reconcile(runner, repo, unit, settings_read=settings_read)
                         if runner.git(copy, "rev-parse", "origin/main").strip() != base:
                             continue
-                        raise Refused(failure_detail(result))
+                        raise Refused(str(error)) from error
                 try:
                     _ = reconcile(runner, repo, unit, finish=True, paths=tuple(paths), published_commit=commit, settings_read=settings_read)
                 except (Refused, OSError, ValueError, KeyError) as error:

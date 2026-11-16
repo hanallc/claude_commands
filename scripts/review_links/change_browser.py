@@ -230,7 +230,7 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
                   + f'data-pending="{str(change.waiting).lower()}"')
     if isinstance(page, UnavailableProduction):
         content = f'''<h1>{html.escape(row.get('Change', ''))}</h1>
-<h2>Proof</h2>{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
+<h2>Proof</h2>{change_page.review_html(row.get(change_review.CHECK, ''))}
 {anomaly}{change_page.question_html(change.question)}<p>{html.escape(page.reason)}</p>
 {change_page.change_details(row, shown)}'''
     else:
@@ -240,7 +240,7 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
         saved = f'<p>{html.escape(text)}</p>' if text else ""
         content = f'''<h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
-{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
+{change_page.review_html(row.get(change_review.CHECK, ''))}
 {anomaly}{change_page.question_html(change.question)}{saved}<p role="status" data-save-state></p>{form}
 {change_page.change_details(row, shown)}'''
     return f'<section {attributes}>' + change_page.change_content(row, content) + '</section>'
@@ -268,9 +268,12 @@ def numbered_run(text: str) -> tuple[str, list[str], str]:
 
     Return the text before the run, the items and the text after a blank line in the last item."""
     best: list[re.Match[str]] = []
+    code_blocks = list(page_frame.CODE_BLOCK.finditer(text))
     for style in ITEM_MARKS:
         run: list[re.Match[str]] = []
         for mark in style.finditer(text):
+            if any(block.start() <= mark.start() < block.end() for block in code_blocks):
+                continue
             value = mark[1]
             if not run and value in ("1", "a"):
                 run.append(mark)
@@ -282,21 +285,38 @@ def numbered_run(text: str) -> tuple[str, list[str], str]:
         return text, [], ""
     ends = [mark.start() for mark in best[1:]] + [len(text)]
     items = [text[mark.end():end].strip() for mark, end in zip(best, ends)]
-    last = BLANK_LINE.split(items[-1], maxsplit=1)
-    items[-1] = last[0]
-    return text[:best[0].start()].strip(), [item.rstrip(";,").strip() for item in items], last[1] if len(last) > 1 else ""
+    last = items[-1]
+    blocks = list(page_frame.CODE_BLOCK.finditer(last))
+    trailing = ""
+    for blank in BLANK_LINE.finditer(last):
+        if any(block.start() <= blank.start() < block.end()
+               or block.start() == blank.end() and last[:blank.start()].rstrip().endswith(":") for block in blocks):
+            continue
+        items[-1], trailing = last[:blank.start()], last[blank.end():]
+        break
+    return text[:best[0].start()].strip(), [item.rstrip(";,").strip() for item in items], trailing
 
 
 def item_html(entry: str) -> str:
-    """Show an item that is one backtick span, such as a command, as a code block."""
-    whole = change_page.CODE_SPAN.fullmatch(entry.strip())
+    """Show a code block alone or after an item's text that ends with a colon."""
+    whole = page_frame.CODE_BLOCK.fullmatch(entry.strip())
     if whole is not None:
-        return f"<pre><code>{html.escape(whole.group(1))}</code></pre>"
+        return page_frame.code_block_html(whole)
+    for block in page_frame.CODE_BLOCK.finditer(entry):
+        before, after = entry[:block.start()].rstrip(), entry[block.end():].strip()
+        if before.endswith(":"):
+            return item_html(before) + item_html(block[0]) + (item_html(after) if after else "")
     return "<br>".join(change_page.inline_html(line) for line in entry.splitlines())
 
 
 def item_list(items: list[str]) -> str:
-    return '<h2>Items</h2><ol class="question-items">' + "".join(f"<li>{item_html(entry)}</li>" for entry in items) + "</ol>"
+    entries: list[str] = []
+    for entry in items:
+        if entries and entries[-1].rstrip().endswith(":") and page_frame.CODE_BLOCK.fullmatch(entry.strip()) is not None:
+            entries[-1] += "\n" + entry
+        else:
+            entries.append(entry)
+    return '<h2>Items</h2><ol class="question-items">' + "".join(f"<li>{item_html(entry)}</li>" for entry in entries) + "</ol>"
 
 
 def choice_list(choices: list[str]) -> str:
@@ -318,7 +338,10 @@ def question_text(item: update_registration.OutstandingItem) -> tuple[str, str]:
     text = item.get("reviewed", item.get("question", item["text"])).strip()
     if "reviewed" in item:
         title, _, context = text.partition("\n")
-        return title.strip(), context.strip()
+        if "?" in title:
+            return title.strip(), context.strip()
+        first = SENTENCE_END.split(title, maxsplit=1)
+        return first[0], "\n\n".join(part for part in (*first[1:], context.strip()) if part)
     question = SENTENCE_END.split(text[:text.index("?") + 1])[-1] if "?" in text else ""
     if question:
         before, _, after = text.partition(question)
@@ -658,7 +681,8 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
     return change_page.MessageDelivery(page, page.rows[0], (recipient,), message, attempt, (question.owner,)), answer
 
 
-SCRIPT = r'''
+SCRIPT = page_frame.MOTION_SCRIPT + r'''
+const motion=createCardMotion();
 let content=document.querySelector('[data-review-content]');
 let rows,runnerOptions,showrunners,runnerMenu,next,empty,saveNotice;
 let shownPage=content.outerHTML, heldPage=null, newestRequest=0, activeLoads=0, activeSaves=0, refreshTimer;
@@ -686,6 +710,7 @@ function bindPage(){
 }
 function waiting(){return rows.filter(r=>(tab==='' || r.dataset.tab===tab) && r.dataset.pending==='true');}
 function show(){
+ const previous=current;
  const place=new URLSearchParams(location.hash.slice(1));
  const requested=place.has('row') ? place.get('row') : initial;
  tab=place.get('showrunner') || '';
@@ -700,10 +725,15 @@ function show(){
  empty.hidden=current!==null;
  empty.textContent=kind==='questions' ? (pending.length ? 'No questions for this showrunner.' : 'No questions to answer.') :
   (pending.length ? 'No changes for this showrunner.' : 'No changes to review.');
- rows.forEach(r=>r.hidden=r!==current);
+ const target=current, cards=rows;
+ const navigationTarget=target?.querySelector('form:not([hidden]) .answer-actions') || content.querySelector('.navigation');
+ const reveal=()=>{cards.forEach(row=>row.hidden=row!==target);navigationTarget.append(next);};
+ if(previous && previous.dataset.key!==target?.dataset.key && previous.isConnected)
+  void motion.switchCard(previous,target,reveal);
+ else if(previous!==target){motion.finish();reveal();}
+ else if(!previous) reveal();
  // A question has its own Skip, which the server keeps.
  next.hidden=kind==='questions' || !waiting().some(r=>r!==current);
- (current?.querySelector('form:not([hidden]) .answer-actions') || content.querySelector('.navigation')).append(next);
  if(current) remembered.set(tab,current.dataset.key);
  // The default place, All with no card, keeps a plain URL.
  history.replaceState(null,'',tab || current ? '#'+new URLSearchParams({showrunner:tab,row:current?.dataset.key || ''}) : location.pathname+location.search);
@@ -725,9 +755,10 @@ async function save(row,form,outcome){
  form.querySelectorAll('button[name=outcome]').forEach(b=>b.setAttribute('aria-pressed',String(b.value===outcome)));
  state.textContent='Saving'; row.dataset.saveState='saving';
  const moveOn=notice=>{
-  row.dataset.pending='false';form.hidden=true;
+  row.dataset.pending='false';
   if(current===row && (tab==='' || tab===row.dataset.tab) && navigation===position){advance(row);saveNotice.textContent=notice;saveNotice.hidden=false;}
   else show();
+  motion.settled().then(()=>{if(row.dataset.pending==='false') form.hidden=true;});
  };
  // Works and Does not work show the next change at once; a failed save puts the change back.
  const early=kind!=='questions' && (outcome==='works' || outcome==='not works');
@@ -755,7 +786,7 @@ async function save(row,form,outcome){
  }finally{
   form.dataset.saving='false';activeSaves--;
   // Read after the save, so an older response cannot restore the saved item.
-  if(saved){heldPage=null;newestRequest++;refreshPage(true);}
+  if(saved){await motion.settled();heldPage=null;newestRequest++;refreshPage(true);}
   else applyHeldPage();
  }
 }
@@ -780,6 +811,7 @@ function applyHeldPage(){
  const keep=candidates.find(row=>row.dataset.key===current?.dataset.key);
  const chosen=keep || following.map(key=>candidates.find(row=>row.dataset.key===key)).find(Boolean) || candidates[0];
  const notice=saveNotice.hidden ? '' : saveNotice.textContent;
+ motion.finish();
  shownPage=fresh.outerHTML;content.replaceWith(fresh);content=fresh;bindPage();
  content.querySelectorAll('details').forEach(detail=>detail.open=opened.has(detailKey(detail)));
  history.replaceState(null,'','#'+new URLSearchParams({showrunner:tab,row:chosen?.dataset.key || ''}));
@@ -815,4 +847,5 @@ window.addEventListener('message',event=>{if(event.source===parent && event.orig
 window.addEventListener('hashchange',()=>{if(location.hash!==shownHash){navigation++;clearNotice();}show();});
 bindPage();show();scheduleRefresh();
 '''
-SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE)
+SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE
+                                          + page_frame.COPY_SCRIPT + page_frame.COPY_STYLE + page_frame.COPY_BUTTON)

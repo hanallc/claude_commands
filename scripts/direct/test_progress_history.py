@@ -2124,6 +2124,31 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertEqual(self.read_events(name), before)
         self.assertEqual((session / "turn_wait.json").read_bytes(), marker)
 
+    def test_a_pause_without_a_supplier_waits_and_leaves_active_phase_time(self) -> None:
+        name = "pause-turn-wait"
+        session = self.covered_wait_phase(name)
+        self.enterContext(patch.dict(os.environ, {"UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0", "UNIT_SYNC_WRITES": "0"}))
+        pause = "blocked: your pause of all hana work; the showrunner sends the resume word"
+        self.assertTrue(progress_history.record_turn_wait(session, "director", pause))
+        _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=1100)
+        events = self.read_events(name)
+        wait = next(event for event in events if event.get("event_type") == "wait_started")
+        # This run has no showrunner, so the pause waits on the user.
+        self.assertEqual(wait["wait_kind"], "WaitingForUser")
+        finished = next(event for event in events if event.get("event_type") == "phase_finished")
+        self.assertEqual((finished["phase_elapsed_seconds"], finished["phase_active_seconds"]), (90, 10))
+
+    def test_paused_seconds_count_overlapping_user_and_supplier_waits_once(self) -> None:
+        def wait(kind: str, begin: float, end: float, instance: str = "phase") -> dict[str, object]:
+            return {"event_type": "wait_finished", "wait_kind": kind, "phase_instance_id": instance,
+                    "wait_started_epoch": begin, "wait_end": {"epoch": end}}
+        waits: list[dict[str, object]] = [wait("WaitingForUser", 90, 130), wait("WaitingForSupplier", 120, 150),
+                 {"event_type": "wait_started", "wait_kind": "WaitingForSupplier", "phase_instance_id": "phase",
+                  "wait_started_epoch": 190},
+                 wait("WaitingForMemoryOrSlot", 160, 180), wait("WaitingForUser", 100, 200, "other")]
+        # Spans 100-150 and 190-200 lie in the phase; the memory wait and the other phase do not count.
+        self.assertEqual(progress_history._paused_seconds(waits, "phase", 100, 200, 400), 60)  # pyright: ignore[reportPrivateUsage]
+
     def test_pending_forward_preserves_body_whitespace_and_ignores_the_record_counter(self) -> None:
         name = "pending-exact-body"
         session, _, prompt = self.forwarded_supplier_wait(name, "\nThe checkpoint is merged.\n\n")
@@ -2764,7 +2789,7 @@ with patch.object(fcntl, "flock", admission):
         holds.mkdir()
         _ = (holds / member.id).write_text(json.dumps({"holder": member.name, "for": "history checks",
             "since": datetime.now(UTC).isoformat(), "release_eta": "unknown"}))
-        script = shell_functions(SCRIPT.with_name("verify.sh"), "phase_wait_holder_flags")
+        script = shell_functions(SCRIPT.with_name("verify.sh"), "verify_helper", "phase_wait_holder_flags")
         script += '\nPY=$1 PHASE_WAIT_RECORDER=$2 BUILD_HOLD_DIR=$3\nphase_wait_holder_flags hold\n'
         environment = {**os.environ, "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "",
                        "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "", "PLAN_DELEGATE_BOARD_DIR": "",
@@ -3008,6 +3033,57 @@ with patch.object(fcntl, "flock", admission):
             self.assertEqual(end, {"state": "Finished", "at": datetime.fromtimestamp(1025 + index * 10, UTC).isoformat(timespec="milliseconds"),
                                    "epoch": 1025 + index * 10})
             self.assertEqual(wait["wait_started_epoch"], 1020 + index * 10)
+
+        for active_phase, finish in ((False, "finish-wait"), (True, "start-phase")):
+            with self.subTest(active_phase=active_phase, finish=finish):
+                name = "unit-wait-active" if active_phase else "unit-wait-no-phase"
+                target_session = self.start_run(name, 1000)
+                if active_phase:
+                    self.start_phase_and_pass(target_session, 1005)
+                before = self.read_events(name)
+                for flags, missing in (
+                        (("--reason", "the user approves the release"), "--by"),
+                        (("--by", "the user"), "--reason")):
+                    refused = self.run_failing_command("start-wait", "--session-dir", str(target_session),
+                        "--kind", "WaitingForUser", "--target", "30", *flags, at=1015)
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertEqual(len(refused.stderr.strip().splitlines()), 1)
+                    self.assertIn(missing, refused.stderr)
+                    self.assertEqual(self.read_events(name), before)
+                wait_id = self.run_command("start-wait", "--session-dir", str(target_session),
+                    "--kind", "WaitingForUser", "--target", "30", "--by", "the user",
+                    "--reason", "the user approves the release", "--owner-session", "director", at=1020)
+                started = self.read_events(name)[-1]
+                self.assertEqual((started["event_type"], started["wait_id"], started["wait_scope"],
+                                  started["target_work"], started["wait_by"], started["wait_reason"]),
+                                 ("wait_started", wait_id, "unit", "30", "the user", "the user approves the release"))
+                self.assertEqual(started["wait_attribution"], {"state": "UnitTarget"})
+                self.assertEqual((started["wait_kind"], started["wait_started_epoch"], started["owner_session"]),
+                                 ("WaitingForUser", 1020, "director"))
+                for field in ("phase_id", "phase_instance_id", "pass_instance_id"):
+                    self.assertFalse(started.get(field), field)
+                self.assertFalse(any(event["event_type"] == "wait_not_recorded" for event in self.read_events(name)))
+                wait_ids = [wait_id]
+                if finish == "start-phase":
+                    wait_ids.append(self.run_command("start-wait", "--session-dir", str(target_session),
+                        "--kind", "WaitingForUser", "--target", "30", "--by", "sdlc",
+                        "--reason", "the user approves board-reasons", at=1025))
+                    _ = self.run_command("start-phase", "--session-dir", str(target_session),
+                        "--phase-id", "31", "--phase-title", "Other work", at=1030)
+                    self.assertFalse(any(event["event_type"] == "wait_finished" and event.get("wait_id") == wait_id
+                                         for event in self.read_events(name)))
+                    _ = self.run_command("start-phase", "--session-dir", str(target_session),
+                        "--phase-id", "30", "--phase-title", "Target work", at=1040)
+                else:
+                    _ = self.run_command("finish-wait", "--session-dir", str(target_session), "--wait-id", wait_id, at=1040)
+                ended = [event for event in self.read_events(name) if event["event_type"] == "wait_finished"]
+                self.assertCountEqual([event["wait_id"] for event in ended], wait_ids)
+                for event in ended:
+                    self.assertEqual(event["wait_end"],
+                        {"state": "Finished", "at": "1970-01-01T00:17:20.000+00:00", "epoch": 1040})
+                report = cast(dict[str, object], json.loads(self.run_command(
+                    "waits", "--session-dir", str(target_session), at=1050)))
+                self.assertEqual(report["missing_n"], 0)
 
     def test_explicit_and_account_probe_sessions_write_no_wait(self) -> None:
         session = self.covered_wait_phase("wait-probes")
@@ -8992,8 +9068,7 @@ class StaffProgressHistoryTests(StaffTestCase):
         finished["history_file"] = str(history)
         write(run, finished)
         preserved = [(file.read_bytes(), file.stat().st_mtime_ns) for file in (path, history)]
-        with patch.object(progress_history, "SESSION_ROOTS", (self.root,)):
-            self.assertEqual(progress_history.move_run(history, second, first, "another-branch"), [])
+        self.assertEqual(progress_history.move_run(history, second, first, "another-branch"), [])
         self.assertEqual([(file.read_bytes(), file.stat().st_mtime_ns) for file in (path, history)], preserved)
 
     def test_plan_history_finds_folderless_runs_after_the_staff_folder_changes(self) -> None:

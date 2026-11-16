@@ -120,7 +120,7 @@ def prepare_shell(root: Path, cache: Path, selector: str, timeout_s: float) -> S
             return ShellEnvironment(key, exports, destination / 'inputs')
         if not destination.exists():
             with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-                    build_folders.FOLDER_PREFIXES["linux-cache-stage"].format(owner=key), build_folders.ExplicitBuildParent(cache))) as stage:
+                    f".{key}.", build_folders.ExplicitBuildParent(cache))) as stage:
                 inputs = stage / 'inputs'
                 inputs.mkdir()
                 for path in shell_inputs(root):
@@ -706,7 +706,7 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
                           if target == (mirror / 'target').resolve() else '')
     print(f'linux_runner: mirror={mirror} shell_key={shell.key}', flush=True)
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-            build_folders.FOLDER_PREFIXES["linux-step"], build_folders.ExplicitBuildParent(mirror))) as step_directory:
+            ".linux-step-", build_folders.ExplicitBuildParent(mirror))) as step_directory:
         started = step_directory / 'started'
         toolchain_environment = step_directory / 'toolchain'
         _ = toolchain_environment.write_text('')

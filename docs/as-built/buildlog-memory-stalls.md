@@ -231,7 +231,8 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
 
 ## Build cost definitions
 
-Phase wall time is the phase finish time minus `phase_started_at`.
+Phase time is `phase_active_seconds`: the finish time minus `phase_started_at`, less the waits for the user or a supplier.
+A finish without `phase_active_seconds` has no phase time. Its day reads `phases ended before waits were recorded`.
 The phase finish time selects the window. Cost categories can overlap.
 
 Memory wait is the recorded wait time. A cold rebuild compiles at least 50 crates.

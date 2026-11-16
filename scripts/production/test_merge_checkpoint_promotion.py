@@ -26,7 +26,7 @@ from scripts.agents import pane_record
 from zoneinfo import ZoneInfo
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib import main_publish
+from scripts.lib import land_main, main_publish
 from scripts.message import sessions
 
 from scripts.production.merge_checkpoint import promote, request_from
@@ -52,6 +52,23 @@ def setUpModule() -> None:
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def test_hook_failure_warns_without_stopping_either_promotion_path(self) -> None:
+        for advances in (False, True):
+            with self.subTest(advances=advances):
+                if advances:
+                    self.write(self.checkout, "README.md", "advanced\n")
+                    _ = self.git("commit", "-am", "advance production", cwd=self.checkout)
+                    _ = self.git("push", "origin", "production", cwd=self.checkout)
+                tip = self.git("rev-parse", "HEAD", cwd=self.checkout)
+                output = StringIO()
+                with mock.patch.dict(os.environ, self.env), redirect_stdout(output), mock.patch.object(
+                        land_main, "land", return_value=land_main.Landed(
+                            tip, "main", land_main.Pushed(), land_main.HookFailed(9, "retry"))):
+                    result = merge_checkpoint.promote_local_checkout(self.promote, "production", tip)
+                self.assertIsInstance(result, merge_checkpoint.PromotionAdvanced if advances
+                                      else merge_checkpoint.PromotionAlreadyAtTip)
+                self.assertIn("post-push: warning — post-push hook: failed (exit 9); rerun: retry", output.getvalue())
+
     def assert_completed_handoff_preserves_published_tip(self, *, with_review: bool) -> None:
         review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
         if with_review:

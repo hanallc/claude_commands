@@ -179,8 +179,8 @@ def notify(repo_dir: Path, branch: str, tip: str) -> None:
 
 
 def lint_prefix() -> str:
-    """Read the current prefix for style lint folders."""
-    return build_folders.FOLDER_PREFIXES["style-sync-lint"]
+    """Name the start of each style lint folder; its sweep finds stopped runs by it."""
+    return "style-sync-lint-"
 
 
 def lint_temp_parent() -> Path:

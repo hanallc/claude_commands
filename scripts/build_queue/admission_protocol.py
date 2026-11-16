@@ -116,6 +116,7 @@ Profile = records.StepProfile | records.ProgramProfile
 
 @dataclass(frozen=True)
 class CloudRow:
+    """The cloud queue row holds caller identity, placement, progress, and wait state."""
     owner: Owner
     identity: Identity
     place: CloudPlace
@@ -138,6 +139,7 @@ class RepositorySlotRow:
 
 @dataclass(frozen=True)
 class CloudQueueRead(records.QueueRead):
+    """The queue reading includes cloud rows, slot capacity, and stale push counts."""
     cloud: tuple[CloudRow, ...] = ()
     cloud_slots: int = 0
     cloud_gate_stale_pushes: int = field(kw_only=True)
@@ -146,17 +148,20 @@ class CloudQueueRead(records.QueueRead):
 
 @dataclass(frozen=True)
 class ViewReply:
+    """The reply holds the local or cloud queue reading."""
     reading: records.QueueRead | CloudQueueRead
 
 
 @dataclass(frozen=True)
 class ExplainReply:
+    """The reply holds the queue explanation and configuration diagnostics."""
     explanation: records.QueueExplanation
     diagnostics: tuple[records.ConfigurationDiagnostic, ...] = ()
 
 
 @dataclass(frozen=True)
 class MineReply:
+    """The reply holds the queue reading requested by a session."""
     reading: records.QueueRead | CloudQueueRead
 
 

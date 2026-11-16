@@ -18,7 +18,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Literal, NamedTuple, cast, final
 
-from scripts.lib import conf_reads, git_index, main_publish, main_push_lock, registry_rows, waiting_rows
+from scripts.lib import conf_reads, git_index, land_main, main_publish, main_push_lock, registry_rows, waiting_rows
 from scripts.lib.registry_rows import parse_registry as parse_registry
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import write_text_atomic
@@ -378,8 +378,8 @@ def _publish(repo: Path, path: Path, changes: list[registry_rows.RowChange], des
     for attempt in range(3):
         commit = _registry_commit(repo, base, contents, description)
         try:
-            _ = _git(repo, "push", "origin", f"{commit}:refs/heads/{branch}")
-        except OSError as error:
+            landed = land_main.land(repo, commit, branch)
+        except (OSError, land_main.LandError) as error:
             last_error = str(error)
             try:
                 remote = _fetch(repo, branch)
@@ -409,6 +409,8 @@ def _publish(repo: Path, path: Path, changes: list[registry_rows.RowChange], des
                 if registry_text(path) != contents:
                     write_text_atomic(path, contents)
             continue
+        if isinstance(landed.hook, land_main.HookFailed):
+            print(land_main.hook_report(landed.hook), file=sys.stderr)
         try:
             plan = _preflight_fast_forward(repo, commit, replace_registry=True)
         except OSError as error:

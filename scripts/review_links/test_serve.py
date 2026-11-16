@@ -28,7 +28,7 @@ from typing import cast, override
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
 from scripts.production import change_review
-from scripts.review_links import change_browser, change_page, console, serve
+from scripts.review_links import accounts_page, change_browser, change_page, console, serve
 from scripts.lib import atomic_file, conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -142,6 +142,22 @@ class ReviewLinksServerTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_the_disks_measure_answers_at_once_with_the_measure_state_the_slots_and_the_sessions(self) -> None:
+        from scripts.disks import disks_page, sessions, slots
+
+        _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
+        _ = self.enterContext(patch.object(disks_page, "output_folder", return_value=self.root / "disks"))
+        start = self.enterContext(patch.object(disks_page, "start_measure", return_value=disks_page.MeasureStart.STARTED))
+        report: slots.SlotReport = {"root": "/build/slot", "groups": []}
+        _ = self.enterContext(patch.object(slots, "slot_report", return_value=report))
+        folders: sessions.SessionReport = {"root": "/session", "sessions": []}
+        _ = self.enterContext(patch.object(sessions, "session_report", return_value=folders))
+        answer = b'{"state": "started", "slots": {"root": "/build/slot", "groups": []}, "sessions": {"root": "/session", "sessions": []}}'
+        self.assertEqual(self.post("/disks/measure", ""), (200, answer))
+        self.assertEqual(start.call_count, 1)
+        self.assertNotEqual(self.post("/other/measure", "")[0], 200)
+        self.assertEqual(start.call_count, 1)
+
     def test_console_news_records_the_open_page_and_names_pages_with_new_items(self) -> None:
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "REVIEW_LINKS_ROOT": str(self.root), "REVIEW_LINKS_HOST": "127.0.0.1",
@@ -214,6 +230,19 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(reply.status, 200)
         self.assertEqual(reply.content_type, "image/png")
         self.assertEqual(reply.body, image)
+
+    def test_accounts_route_renders_per_request_and_reports_a_failed_read(self) -> None:
+        with patch.object(accounts_page, "render", return_value=b"<p>board</p>") as render:
+            reply = self.request(accounts_page.PAGE_PATH)
+        self.assertEqual((reply.status, reply.content_type, reply.body), (200, "text/html; charset=utf-8", b"<p>board</p>"))
+        render.assert_called_once_with()
+        with (patch.object(accounts_page, "render", side_effect=OSError("staff file absent")),
+              redirect_stderr(StringIO()) as error):
+            reply = self.request(accounts_page.PAGE_PATH)
+        self.assertEqual(reply.status, 503)
+        self.assertIn(b"The Accounts page is not available.", reply.body)
+        self.assertNotIn(b"staff file absent", reply.body)
+        self.assertIn("review-links accounts: staff file absent", error.getvalue())
 
     def test_inaccessible_sweep_entries_do_not_prevent_bind_or_other_links(self) -> None:
         session = self.root / "manual"

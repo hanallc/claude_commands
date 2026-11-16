@@ -122,7 +122,7 @@ def main() -> int:
     if not command:
         parser.error("supply a command after --")
     with main_push_lock(args.checkout, Path(command[0]).name):
-        result = subprocess.run(command, check=False)
+        result = subprocess.run(command, check=False, env=held_environment(args.checkout))
     return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
 

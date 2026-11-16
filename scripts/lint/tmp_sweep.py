@@ -129,7 +129,6 @@ SESSION_ENTRY_MIN_BYTES = GIB
 RUN_INTERVAL_SECONDS = HOUR_SECONDS
 LOG_KEEP_SECONDS = 7 * 24 * HOUR_SECONDS
 TMP_ROOT = "/tmp/claude"
-RUN_ROOTS = tuple(str(root) for root in unit_runs.run_roots())
 # Each Claude session's TMPDIR is SESSION_TEMP_ROOT/<session id> (hooks/session-start-temp-root.py),
 # and each run's is <run folder>/RUN_TEMP_NAME; the entries in both are judged with the 4 h rule.
 class SessionTemporaryRoot(Protocol):

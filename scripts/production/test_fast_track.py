@@ -122,8 +122,10 @@ for argument do
             -*) ;;
             *) operation=$argument ;;
         esac
-    elif [ "$argument" = HEAD:main ]; then
-        destination=main
+    else
+        case "$argument" in
+            HEAD:main|*:refs/heads/main) destination=main ;;
+        esac
     fi
 done
 '''
@@ -218,7 +220,7 @@ if is_fetch and (armed.exists() or plan["point"] == "before-push"):
     sys.stderr.write(result.stderr)
     sys.exit(result.returncode)
 result = subprocess.run([*git, *args], check=False, timeout=__HANG_GUARD__)
-if "push" in args and "HEAD:main" in args and result.returncode == 0:
+if "push" in args and any(arg == "HEAD:main" or arg.endswith(":refs/heads/main") for arg in args) and result.returncode == 0:
     armed.touch()
 sys.exit(result.returncode)
 '''.replace("__HANG_GUARD__", str(TEST_HANG_GUARD_SECS))

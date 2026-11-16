@@ -2099,6 +2099,7 @@ class ClaimsReleased:
 
 @dataclass(frozen=True)
 class ClaimReleaseRefused:
+    """The reason explains why the claim release was refused."""
     reason: str
 
 

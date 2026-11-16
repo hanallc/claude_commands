@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import threading
+from collections.abc import Mapping
 from enum import Enum
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -28,9 +29,10 @@ from urllib.parse import parse_qs, unquote, urlsplit
 # Detect file changes before the first stamp, including changes during imports.
 STARTED_NS = time.time_ns()
 
+from scripts.disks import disks_page, sessions, slots
 from scripts.lib import conf
 from scripts.production import change_routing, change_review
-from scripts.review_links import branch_page, change_page, change_browser, console, image_store, images
+from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, image_store, images
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
@@ -200,6 +202,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                              + "style-src 'unsafe-inline'; frame-src 'self'; frame-ancestors 'self'; base-uri 'none'")
             self.end_headers()
             return BytesIO(content)
+        if route.path == accounts_page.PAGE_PATH:
+            try:
+                content = accounts_page.render()
+            except (OSError, ValueError) as error:
+                print(f"review-links accounts: {error}", file=sys.stderr)
+                self.html_response(503, change_page.document("<p>The Accounts page is not available.</p>"))
+                return None
+            self.html_response(200, content)
+            return None
         if route.path == images.PAGE_PATH:
             try:
                 content = images.render(root)
@@ -359,6 +370,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         if urlsplit(self.path).path == f"/{change_page.CONSOLE_FOLDER}/{console.NEWS_NAME}":
             self.news_post()
+            return
+        if self.is_disks_measure():
+            self.disks_measure_post()
             return
         try:
             branches = branch_page.page_at(server.root, self.path)
@@ -527,11 +541,42 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         self.json_response(200, {"new": list(fresh)})
 
+    def is_disks_measure(self) -> bool:
+        """Whether the request posts to the measure name beside the Disks page."""
+        path = urlsplit(self.path).path
+        if not path.endswith("/" + disks_page.MEASURE_NAME):
+            return False
+        try:
+            return path == disks_page.measure_path(cast(ReviewLinksServer, self.server).root)
+        except (OSError, ValueError) as error:
+            print(f"review-links disks: {error}", file=sys.stderr)
+            return False
+
+    def disks_measure_post(self) -> None:
+        """Start a Disks page measure in the background and answer at once with the slots and sessions in use now."""
+        now = time.time()
+        try:
+            started = disks_page.start_measure(now)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            self.browser_failure(503, "The measure could not start.", error)
+            return
+        try:
+            report = slots.slot_report(now)
+        except (OSError, ValueError) as error:
+            print(f"review-links disks slots: {error}", file=sys.stderr)
+            report = None
+        try:
+            folders = sessions.session_report()
+        except (OSError, ValueError) as error:
+            print(f"review-links disks sessions: {error}", file=sys.stderr)
+            folders = None
+        self.json_response(200, {"state": started.value, "slots": report, "sessions": folders})
+
     def browser_failure(self, status: int, reason: str, error: Exception) -> None:
         print(f"review-links browser answer: {error}", file=sys.stderr)
         self.json_response(status, {"reason": reason})
 
-    def json_response(self, status: int, fields: dict[str, str] | dict[str, list[str]]) -> None:
+    def json_response(self, status: int, fields: Mapping[str, object]) -> None:
         content = json.dumps(fields).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
