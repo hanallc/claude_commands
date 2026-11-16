@@ -217,20 +217,18 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus, *,
                 continue
             owner = routing.runners.get(question.owner)
             tab = owner.name if owner is not None else "unrouted"
-            asker = routing.record.by_id(question.asker)
             questions.append(WaitingQuestion("question/" + question.owner + "/" + question.path.name,
-                tab, question, document, question.owner, asker.name if asker is not None else str(question.asker)))
+                tab, question, document, question.owner, change_page.source_name(routing.record, question.asker)))
     known = {item.record.path for item in questions}
     for question in update_registration.unowned_question_records(identities):
         if question.status != "open" or "followup" in question.item or question.path in known:
             continue
-        asker = routing.record.by_id(question.asker)
         owner = routing.record.by_id(question.owner)
         producer = owner is not None and owner.kind == "producer"
         questions.append(WaitingQuestion("question/" + question.owner + "/" + question.path.name,
             owner.name if producer and owner is not None else "unrouted", question,
             owner if producer and owner is not None else update_registration.QuestionOwnerUnavailable(question.path), question.owner,
-            asker.name if asker is not None else str(question.asker)))
+            change_page.source_name(routing.record, question.asker)))
     questions = question_order(questions)
     question_tabs = tuple(sorted(set(queues) | {item.tab for item in questions},
                                  key=lambda tab: (not any(item.tab == tab for item in questions), tab)))
@@ -441,6 +439,15 @@ def question_parts(item: update_registration.OutstandingItem) -> tuple[str, str]
 ANSWER_HELP = "A choice fills this. Edit it or write your own. Nothing sends until you press Answer."
 
 
+def question_details(question: WaitingQuestion) -> str:
+    """Show the source and the filed time under the question's buttons."""
+    filed = datetime.fromisoformat(question.record.item["since"])
+    lines = (("source", question.asker), ("date", filed.strftime("%Y-%m-%d")), ("time", filed.strftime("%H:%M")))
+    return ('<dl class="change-details">'
+            + ''.join(f'<dt>{label}:</dt><dd>{html.escape(value)}</dd>' for label, value in lines)
+            + '</dl>')
+
+
 def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback_rows: int) -> str:
     key = html.escape(question.key)
     body, choices = question_parts(question.record.item)
@@ -460,7 +467,7 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
     return f'''<section hidden data-type="questions" data-key="{key}" data-tab="{html.escape(question.tab)}" data-pending="true">
 <h1>{html.escape(title)}</h1>
 {body}{shown_choices}
-<p>Asked by {html.escape(question.asker)}</p><p role="status" data-save-state></p>{form}</section>'''
+<p role="status" data-save-state></p>{form}{question_details(question)}</section>'''
 
 
 @dataclass(frozen=True)

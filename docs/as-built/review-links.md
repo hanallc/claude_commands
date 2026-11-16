@@ -284,7 +284,13 @@ A producer's question appears in its current staff name's filter with the same a
 Producer questions use `<SHOWRUNNER_STATE_DIR>/<producer staff id>/questions` without a production document.
 A question without a staff owner appears under **Owner unavailable**.
 The reader also scans question folders under the showrunner state root when their owners leave staff.
-Owned cards show the title before the filed text, choices, and **Asked by <session>**.
+Cards show the title before the filed text and choices.
+Under the buttons, aligned footer lines show `source:`, `date:` and `time:`, in the same form as Changes.
+The source uses the asker's current staff name.
+For a unit, the source is `<parent showrunner name> · <unit name>`.
+The footer reads `since`, which the question record always keeps in the user zone.
+It shows the date as YYYY-MM-DD and the time as HH:MM.
+Cards in **Owner unavailable** show the footer without an answer form.
 They have no separate Question label.
 A question filed with parts (`ask --ask`) shows each part as its own section:
 - the one-line ask in bold, when it differs from the title in more than case and a final `?` or `.`;

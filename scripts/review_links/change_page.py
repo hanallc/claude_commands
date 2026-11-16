@@ -519,6 +519,15 @@ def change_details(row: dict[str, str], key: str) -> str:
             + "</dl>")
 
 
+def source_name(members: staff.StaffSnapshot, owner: staff.StaffId) -> str:
+    """Include the parent showrunner in a unit's source line."""
+    member = members.by_id(owner)
+    if member is None:
+        return str(owner)
+    parent = members.parent_of(member) if member.kind == "unit" else None
+    return f"{parent.name} · {member.name}" if parent is not None else member.name
+
+
 def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
     feedback_rows = conf.read("review_links").whole("feedback_rows")
     return document(f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>' + answer_form(page, notice, feedback_rows))
