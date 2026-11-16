@@ -25,7 +25,7 @@ import unittest
 from typing import Literal, cast, override
 from unittest import mock
 
-from scripts.buildlog import charts, cost_actions, costs, moments
+from scripts.buildlog import charts, cost_actions, costs
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, target_availability
 from scripts.build_queue.test_queue_view import cloud_reading
@@ -78,24 +78,14 @@ def queued_reading(reading: admission_records.QueueRead, units: tuple[str, ...])
     return with_queue_priority(current, units) if units else current
 
 
-def report_fixture(*, empty: bool = False, unrecorded: bool = False, startless: bool = False) -> charts.PageData:
+def report_fixture(*, empty: bool = False) -> charts.PageData:
     end = datetime(2026, 11, 8, tzinfo=UTC)
-    start = end - timedelta(days=7)
-    ranked = () if empty else (costs.RankedCost("fixture", "Memory wait", 120),)
-    # Two phase times keep the median and the p90 points apart, so the page proof reads one point alone.
-    phases = () if empty else tuple(moments.ProgressFinish(end.timestamp() - 1, f"fixture-phase-{seconds}",
-        "/fixture/hana", "natedev", moments.WaitsNotRecorded() if unrecorded else moments.PhaseStartUnavailable() if startless
-        else seconds) for seconds in (600.0, 6000.0))
-    build_costs = costs.BuildCosts(start, end, phases, ranked, costs.MacIdleEstimate(0, 0, 0, 0, 0))
-    bucket = charts.DailyBucket(start, end, False, build_costs, frozenset({"fixture"}),
-        {} if empty else {"fixture": start.timestamp()})
     rows = charts.NoDataYet.VALUE if empty else (charts.TopCost("fixture", "Memory wait",
         charts.MeasuredCost(120), charts.WindowDiffers(charts.MeasuredCost(240)),
         (charts.MeasuredCost(30), charts.MeasuredCost(60), charts.MeasuredCost(30)),
         cost_actions.LargestShare(costs.StepKind("fixture", "nextest"), 0.75),
         cost_actions.LowerMemoryPeak(costs.StepKind("fixture", "nextest"), 12.4, 3 << 30)),)
-    return charts.PageData(charts.ChartSet(start, end, "UTC", (bucket,), ("fixture",), ()),
-        charts.TopCosts(end - timedelta(days=3), end, 3, rows))
+    return charts.PageData(charts.TopCosts(end - timedelta(days=3), end, 3, rows))
 
 
 def reservation_reading(*, project: str = "fixture-project") -> admission_records.QueueRead:
@@ -430,6 +420,20 @@ class MemoryFeedTests(unittest.TestCase):
               mock.patch.object(os, "cpu_count", return_value=4)):
             page = memory_feed.reading()
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+        rows = [*page["walk"], *page["waiters"]]
+        keys = [row.get("key") for row in rows]
+        self.assertEqual(len(set(keys)), len(rows))
+        for row in reversed(rows):
+            original = row.get("key")
+            cast(dict[str, object], cast(object, row))["name"] = "changed owner label"
+            self.assertEqual(memory_feed.step_key(row), original)
+        # Two CI rows with no runner differ only by their cgroup.
+        with tempfile.TemporaryDirectory() as folder:
+            ci_keys = set[str]()
+            for name in ("hana-linux-1.slice", "hana-linux-2.slice"):
+                (cgroup := Path(folder) / name).mkdir()
+                ci_keys.add(memory_feed.step_key(memory_feed.build_ci_row(0.0, 0.0, cgroup)))
+        self.assertEqual(len(ci_keys), 2)
         html = self.expected_page()
         functions = html[html.index("function field("):html.index("const tip =")]
         constants = html[html.index("const f1 ="):html.index("function setSeg(")]
@@ -445,8 +449,8 @@ function fitLabels() {}
 const data = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 renderWalk(data);
 process.stdout.write(JSON.stringify({
-  walk:data.walk.map((row,index)=>tipText('row:'+index,data)),
-  waiters:data.waiters.map((row,index)=>tipText('wait:'+index,data)),
+  walk:data.walk.map(row=>tipText('row:'+row.key,data)),
+  waiters:data.waiters.map(row=>tipText('wait:'+row.key,data)),
   table:$("walk").innerHTML}));
 """
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
@@ -457,8 +461,8 @@ process.stdout.write(JSON.stringify({
         tips = {key: cast(list[list[str]], rendered[key]) for key in ("walk", "waiters")}
         table = cast(str, rendered["table"])
         matches = cast(list[tuple[str, str, str]],
-            re.findall(r'<tr[^>]*data-tip="(row|wait):([0-9]+)"[^>]*>(.*?)</tr>', table, flags=re.S))
-        cells = {f"{kind}:{index}": body for kind, index, body in matches}
+            re.findall(r'<tr[^>]*data-tip="(row|wait):([^"]+)"[^>]*>(.*?)</tr>', table, flags=re.S))
+        cells = {f"{kind}:{key}": body for kind, key, body in matches}
         for collection, kind in (("walk", "row"), ("waiters", "wait")):
             rows = cast(list[dict[str, object]], payload[collection])
             local_position = 0
@@ -469,7 +473,7 @@ process.stdout.write(JSON.stringify({
                     local_position += 1
                 with self.subTest(kind=kind, pid=row["pid"]):
                     text = "\n".join(tips[collection][index])
-                    cell = cells[f"{kind}:{index}"]
+                    cell = cells[f"{kind}:{row['key']}"]
                     progress = cast(dict[str, object], row.get("progress", {}))
                     place = (str(progress.get("phase", "—")) if kind == "row" else
                              "cloud" if row.get("kind") == "cloud" else str(local_position))
@@ -1772,6 +1776,18 @@ process.stdout.write(JSON.stringify({
                 first = page["waiters"][0]
                 self.assertEqual((first.get("place"), first.get("why")),
                                  (1, "memory"))
+                self.assertEqual([row.get("first_in_line", False) for row in page["waiters"]],
+                                 [index == 0 for index in range(len(page["waiters"]))])
+        # The step the queue admits next shows its room, even when another step is ahead of it in the list.
+        last = reading.view.waiting[-1]
+        head = admission_records.HeadExplanation(last, admission_records.NeedSourceNotRecorded(),
+            admission_records.AdmissionDecision("hold", 0, 0, 0, 0), room,
+            admission_records.FreeCheck(30 * gib, 20 * gib, 0, 0, 0, True), False, cause=admission_records.NeedsMemory())
+        with mock.patch.object(admission_client, "view", return_value=replace(reading, explanation=replace(reading.explanation, head=head))):
+            page = memory_feed.reading()
+        last_pid = last.run.pid if isinstance(last.run, LiveBuildRun) else last.pid
+        self.assertEqual([row.get("first_in_line", False) for row in page["waiters"]],
+                         [row["pid"] == last_pid for row in page["waiters"]])
 
     def test_each_wait_reason_says_why_in_the_same_form(self) -> None:
         gib = admission_records.GIB
@@ -2387,7 +2403,7 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(run_row["used"], missing)
         self.assertIn("RunUseUnavailable", memory_feed.page_json(page))
 
-    def test_one_report_call_supplies_both_sections(self) -> None:
+    def test_one_report_call_supplies_top_costs(self) -> None:
         with (mock.patch.object(charts, "page_data", return_value=report_fixture()) as provider,
               mock.patch.object(admission_client, "view", return_value=captured_reading())):
             report = memory_feed.report_reading(7)
@@ -2584,8 +2600,6 @@ def write_browser_fixture(folder: Path) -> None:
             pages["mac_idle"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         (fixture.root / "mac-idle" / "alert.json").unlink()
         for name, report in (("empty_report", report_fixture(empty=True)),
-                             ("unrecorded_report", report_fixture(unrecorded=True)),
-                             ("startless_report", report_fixture(startless=True)),
                              ("missing_report", charts.IndexUnavailable("private index is missing"))):
             with (mock.patch.object(charts, "page_data", return_value=report),
                   mock.patch.object(admission_client, "view", return_value=base)):
