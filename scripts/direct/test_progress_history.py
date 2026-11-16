@@ -5467,7 +5467,7 @@ with patch.object(fcntl, "flock", admission):
             at = started_at + 700 + offset
             self.run_board(
                 session_dir, "post", workers[lens], "register",
-                f"{lens} review up; mesh=none; role=review", at=at,
+                f"{lens} review up; role=review", at=at,
             )
             self.start_slot_pass(session_dir, workers[lens], "review", at, called_model=f"gpt-{lens}")
         self.team_slot = ""
