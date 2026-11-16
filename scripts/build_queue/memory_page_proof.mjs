@@ -1600,7 +1600,7 @@ try {
             'and the 9.8 GiB of swap coming back. Those three are outside the cap.',
             rows:[{label:'Queue cap',gib:17.1},{label:'− Builds',gib:1.5},{label:'− Build reserved',gib:8.5},
             {label:'= Free for builds',gib:7.1}],note:'Build reserved is memory that running builds used at their next points in earlier runs. '+
-            'Other programs have 9.8 GiB in swap. It can come back into RAM when they run, so it is outside the cap.'};
+            'The queue holds 9.8 GiB for swap coming back. The reserve uses swap-in measured within the recent window.'};
           const behind={...owner,name:'trunk nextest',unit:'trunk',detail:'trunk',pid:4243,need:2.0,
             reason:'behind #1: the first step in line gets memory first',runs_on:'natedev or Mac'};
           const head={...owner,place:1,why:'only 7.1 GiB is free for builds. It starts when 16.3 GiB is free.'};

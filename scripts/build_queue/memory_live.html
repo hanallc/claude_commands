@@ -531,8 +531,8 @@ const TIPS = {
     "RAM that the desktop session uses, so the mouse and keyboard stay responsive.",
     optional(d.ram.desktop_protection_bytes, `The system never takes back the first ${ramAmount(d.ram.desktop_protection_bytes)}.`))),
   swap: (d) => [`Swap coming back · ${ramAmount(d.ram.swap_covered_bytes)}`, lines(
-    "Empty RAM the queue holds for memory in swap, mostly agents' memory.",
-    "That memory can come back into RAM at any time.",
+    "Empty RAM the queue holds for recent swap-in.",
+    "The reserve uses swap-in within the configured window, limited to swap outside builds and CI.",
     `Swap coming back: ${ramAmount(d.ram.swap_target_bytes)}.`,
     optional(d.ram.swap_missing_bytes, `Free RAM does not cover ${ramAmount(d.ram.swap_missing_bytes)} of it.`))],
   agents: (d) => measuredTip("Agents", d.ram.agents_bytes,

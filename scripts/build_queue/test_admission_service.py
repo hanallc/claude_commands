@@ -1205,6 +1205,61 @@ class LocalHoldPlacementTests(unittest.TestCase):
                         self.assertIn(f"CI {'running' if pid == 111 else 'queued'}: CI runner job-{pid} since ", lines)
 
 
+class SwapInReadingsTests(unittest.TestCase):
+    def test_system_readings_publish_one_window_total_for_snapshot_readers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = fake_memory_readings(root, available_kib=20 * records.GIB // 1024,
+                                                swap_total_kib=16 * records.GIB // 1024,
+                                                swap_free_kib=8 * records.GIB // 1024)
+            with mock.patch.dict(os.environ, environment):
+                reader = service.SystemReadings()
+                with mock.patch.object(time, "monotonic", return_value=0):
+                    first = reader.host()
+                assert isinstance(first, records.HostMemory)
+                self.assertEqual(first.swap_in_window_bytes, 0)
+                pages = records.GIB // int(os.sysconf("SC_PAGE_SIZE"))
+                _ = (root / "vmstat").write_text(f"pswpin {pages}\n")
+                with mock.patch.object(time, "monotonic", return_value=100):
+                    host = reader.host()
+                assert isinstance(host, records.HostMemory)
+                self.assertEqual(host.swap_in_window_bytes, records.GIB)
+                inputs = records.QueueInputs((), (), (), host, records.NoPressureHold(), records.ReadyToStart(), 100)
+                policy = admission_policy_fixture()
+                queue_snapshot.write_queue_snapshot(root, inputs, policy)
+                snapshot = queue_snapshot.read_queue_snapshot(root)
+                assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+                self.assertEqual(snapshot.inputs.host, host)
+                room = gate.inputs_room(snapshot.inputs, snapshot.policy)
+                assert isinstance(room, records.MemoryRoom)
+                self.assertEqual(room.agent_swap_demand, records.GIB)
+                self.assertEqual(room.cap, 16 * records.GIB)
+                _ = (root / "meminfo").write_text("MemAvailable: 10485760 kB\nMemTotal: 67108864 kB\n"
+                                                   + "SwapTotal: 16777216 kB\nSwapFree: 8388608 kB\n")
+                with mock.patch.object(time, "monotonic", return_value=101):
+                    current = reader.host()
+                room = gate.memory_room(current, (), policy)
+                assert isinstance(room, records.MemoryRoom)
+                self.assertEqual(room.cap, 6 * records.GIB)
+
+    def test_system_readings_refuse_missing_and_unreadable_vmstat(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.dict(os.environ, fake_memory_readings(root)):
+                reader = service.SystemReadings()
+                path = root / "vmstat"
+                path.unlink()
+                for is_directory in (False, True):
+                    with self.subTest(is_directory=is_directory):
+                        if is_directory:
+                            path.mkdir()
+                        reading = reader.host()
+                        self.assertIsInstance(reading, records.ReadingUnavailable)
+                        assert isinstance(reading, records.ReadingUnavailable)
+                        self.assertIn("swap-in reading unavailable", reading.reason)
+                        self.assertIn(str(path), reading.reason)
+
+
 class FixedSystemReader:
     """Publish private evidence without an operating-system reader."""
     def __init__(self, latest: service.SystemEvidence) -> None:

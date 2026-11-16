@@ -45,7 +45,7 @@ def room_text(room: admission_records.MemoryRoom | admission_records.ReadingUnav
         if missing:
             calculation += f": swap-backed use unavailable for {missing}"
         calculation += f"; free {gib(room.available)}"
-    swapped = f" − {gib(room.agent_swap_demand)} swapped outside builds" if room.agent_swap_demand else ""
+    swapped = f" − {gib(room.agent_swap_demand)} swap coming back" if room.agent_swap_demand else ""
     text = (f"{calculation} "
             f"− safety {gib(room.safety)}{swapped}; kept aside {gib(room.kept)}; room {gib(room.room)}")
     if room.shortfall:

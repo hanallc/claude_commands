@@ -142,7 +142,7 @@ SWAP_OWNER_SLICES: dict[str, SwapCategory] = {"app-agents.slice": "agents", "ses
                                               "system.slice": "system", "hana.slice": "ci", "hana-ci.slice": "ci"}
 SwapPool = Literal["outside", "builds_ci"]
 SWAP_POOLS: tuple[SwapPool, ...] = ("outside", "builds_ci")
-SWAP_RETURN_NOTE = "It can come back into RAM when they run, so it is outside the cap."
+SWAP_RETURN_NOTE = "The reserve uses swap-in measured within the recent window."
 BUILD_RESERVED_NOTE = "Build reserved is memory that running builds used at their next points in earlier runs."
 BUILDS_CI_SLICES = frozenset({"builds.slice", "hana.slice", "hana-ci.slice"})
 SwapRowKind = Literal["owner", "ungrouped", "unattributed", "difference", "smaller", "total"]
@@ -463,7 +463,10 @@ def head_room(check: admission_records.RoomCheck,
     uncovered = (f"Running builds need {gib(ram['build_target_bytes']):.1f} GiB reserved. "
                  + f"Free RAM covers {gib(ram['build_covered_bytes']):.1f} GiB of it."
                  if ram["build_target_bytes"] > ram["build_covered_bytes"] else "")
-    swap = (f"Other programs have {gib(room.agent_swap_demand):.1f} GiB in swap. {SWAP_RETURN_NOTE}"
+    swap = (" ".join(filter(None, (
+        f"Swap coming back needs {gib(ram['swap_target_bytes']):.1f} GiB.",
+        f"Free RAM covers {gib(ram['swap_covered_bytes']):.1f} GiB of it."
+        if ram["swap_target_bytes"] > ram["swap_covered_bytes"] else "", SWAP_RETURN_NOTE)))
             if room.agent_swap_demand else "")
     return {"cap_text": cap_text, "rows": rows,
             "note": " ".join(filter(None, (BUILD_RESERVED_NOTE, uncovered, swap, basis)))}

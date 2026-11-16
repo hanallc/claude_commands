@@ -20,6 +20,20 @@ This work also hardened the example-test guard, Cargo token recovery, CI queue a
 
 ## How it works
 
+The admission service keeps `/proc/vmstat` `pswpin` samples in memory.
+`agent_swap_window_seconds=600` sets the sample window.
+The window total is the newest page count minus the oldest page count inside the window, multiplied by the page size.
+The first sample establishes the baseline.
+The reserve cannot exceed current swap outside builds and CI.
+`agent_swap_share_percent` applies to that amount.
+Idle swap with no swap-in needs no reserve.
+An unreadable or missing `pswpin` reading returns `ReadingUnavailable` and stops new admissions.
+The service publishes `HostMemory.swap_in_window_bytes` in its existing queue snapshot.
+The feed, evidence text, and CLI use that snapshot and the shared `memory_room` calculation.
+The page keeps `agent_swap_demand` and `swap_covered_bytes` as its reserve fields.
+Each new host reading still reads `MemAvailable`.
+The pressure limits remain unchanged.
+
 The service measures each handled request's wall time and process CPU time.
 The measurements include configuration recovery for the logging threshold.
 `request_slow_seconds=0.25` sets the logging threshold in `config/build_admission.conf`.
