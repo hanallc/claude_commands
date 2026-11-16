@@ -690,10 +690,11 @@ The user asked for these page changes on 2026-11-14 through builds:
    A white box marks the lowest and the highest cell of each type column, in both themes; the user asked for it on 2026-11-15 through builds.
    The box is 1 px white inside a 1 px dark edge, which keeps it visible on the light page. Equal cells all have the box.
    A column with only two values has no box, because the colors already show which is which.
-   The cheapest cell of each table is bold on a gold background (`--cheapest`), with dark text.
-   The most expensive cell of each table is bold on a black background (`--dearest`) with white text and a 2 px white outline.
+   The cheapest cell of each table is bold on a gold background (`--cheapest`), with dark text and a 2 px white outline (`--mark-edge`).
+   The most expensive cell of each table is bold on a black background (`--dearest`) with white text and the same white outline.
    Both are the same in both themes, and they replace the scale color and the box of that cell.
    The user asked for them on 2026-11-15 through builds, because bold alone did not make the cheapest cell stand out.
+   The user asked for the white outline on the gold cell too, so both table marks match.
    A legend line above the cards explains the colors.
    A legend line under each price card that has a mark names the box, the gold cell and the black cell.
    Builds removed the vCPU group mark on 2026-11-15.
