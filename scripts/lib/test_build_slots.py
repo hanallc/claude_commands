@@ -17,7 +17,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib import build_folders, build_slots, git_rescue
+from scripts.lib import build_folders, build_slots, git_rescue, process_group
 from scripts.lib.build_slots_test_support import UseDefaultMaximum, private_slot_config
 from scripts.lib.descendants import adopt_descendants
 from scripts.lib.git_test_support import commit_repository
@@ -464,7 +464,7 @@ print(json.dumps({'descendant': child.pid, 'group': os.getpgrp(), 'held': held})
         with self.assertRaises(ProcessLookupError):
             os.kill(int(report["descendant"]), 0)
         with self.assertRaises(ProcessLookupError):
-            os.killpg(int(report["group"]), 0)
+            process_group.send_process_group(int(report["group"]), 0)
         with self.take() as reused:
             self.assertEqual(reused.path, self.slot_root / "widget-slot1")
 

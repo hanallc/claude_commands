@@ -25,6 +25,7 @@ import tempfile
 import time
 from typing import TYPE_CHECKING, Literal, cast, override
 
+from scripts.lib import process_group
 from scripts.lib.boot_identity import boot_identity
 
 if TYPE_CHECKING:
@@ -696,12 +697,12 @@ def run_build_command(command: Sequence[str], *, path: Path, environment: Mappin
         if sys.platform == "darwin":
             # A descendant outside the group still holds the slot if it inherits the lock descriptor.
             try:
-                os.killpg(child.pid, signal.SIGKILL)
+                process_group.send_process_group(child.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             while True:
                 try:
-                    os.killpg(child.pid, 0)
+                    process_group.send_process_group(child.pid, 0)
                 except ProcessLookupError:
                     break
                 time.sleep(0.01)

@@ -730,7 +730,7 @@ exec(compile(program, '<remote-probe>', 'exec'))
         entries = {key.removeprefix("allow.") for key in settings if key.startswith("allow.")}
         self.assertEqual(entries, {"copies/copies.py", "production/add_unit.py", "agents/shutdown.py",
             "style/add_style.py", "worktree/make_worktree.sh", "worktree/worktrees.py",
-            "bevy_migration_plan/bevy_migration_ensure_repo.sh"})
+            "bevy_migration_plan/bevy_migration_ensure_repo.sh", "lib/build_folders.py"})
 
 if __name__ == "__main__":
     _ = unittest.main()
