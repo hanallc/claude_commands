@@ -1361,7 +1361,7 @@ PINNED_TARGET="" STEP_FORCE_MAC=0
 PLACEMENT_STEP_NUMBER=0 PLACEMENT_EPISODE="" PLACEMENT_COMMAND=()
 PLACEMENT_ASSIGNMENT_FILE="" PLACEMENT_GRANT_FILE="" PLACEMENT_PROVIDER=""
 PLACEMENT_SINCE="" PLACEMENT_SOURCE_KEY="" PLACEMENT_SESSION=""
-LOCAL_RELEASE_WAIT_SCRIPT=${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$TEST_REAL_DIRECT/local_release_wait.py}
+LOCAL_RELEASE_WAIT_SCRIPT=${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$HOME/.claude/scripts/direct/local_release_wait.py}
 STEP_RECORD_ACTIVE=0 STEP_WRITES_TREE=0 STEP_RUNS_ON=any_target
 STEP_TARGET_TABLE=$(printf 'mac\teligible\t-\t%s\tmacos' "$MAC_TEST_CONFIG")
 TREE_WATCH_PID="" TREE_WATCH_DIR="" RUN_STEP_PID="" RUN_LOG=""
@@ -1490,7 +1490,7 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
             holders = Path(self.environment["BUILD_HOLD_DIR"])
             _ = build_hold.start_hold(holders, build_hold.HolderIdentity("hana", "hana"), "render checks", build_hold.NoReleaseEta(), datetime.now().astimezone())
             cycle = build_hold.read_cycle()
-            assert cycle is not None
+            assert not isinstance(cycle, build_hold.NoCycle)
             return self.root / "release" / cycle["id"] / "cycle.json"
 
     def control_routing_clock(self) -> Path:

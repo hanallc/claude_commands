@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET as DEFAULT_ADMISSION_SOCKET
 from typing import TYPE_CHECKING, TypeVar, cast
 
 from scripts.build_queue import snapshot_codec as codec
@@ -564,7 +565,7 @@ T = TypeVar("T")
 def admission_socket_path() -> Path:
     from scripts.build_hold.override_guard import refuse_overrides
     refuse_overrides(Path(__file__).with_name("admission_protocol.py"), "build_queue/admission_protocol.py")
-    return Path(os.environ.get("ADMISSION_SOCKET") or "/run/build-admission/build-admission.sock")
+    return Path(os.environ.get("ADMISSION_SOCKET") or DEFAULT_ADMISSION_SOCKET)
 
 
 def encode_record(value: object) -> str:

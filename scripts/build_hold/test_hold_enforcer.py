@@ -21,7 +21,7 @@ from typing import Literal, cast, override
 from unittest import mock
 
 from scripts.build_hold.owning_session import OwningSession
-from scripts.build_hold import build_hold, hold_enforcer
+from scripts.build_hold import build_hold, hold_enforcer, override_guard
 from scripts.agents import detached_runs
 from scripts.build_targets import target_config
 from scripts.mac_test import claim_state
@@ -548,8 +548,14 @@ class HoldEnforcerTests(unittest.TestCase):
                          argv=("python3", "detached_runs.py", "supervise", str(record)))
         holder, = build_hold.natedev_holds(self.holders).in_force
         record_build = hold_enforcer.record_build
-        for outcome in ("record failure", "identity change", "no command group", "stopped"):
+        for outcome in ("shared holders", "shared releases", "shared run record",
+                        "record failure", "identity change", "no command group", "stopped"):
             with self.subTest(outcome=outcome):
+                record = (self.root / ".local/state/build-hold-enforcer/run.json"
+                          if outcome == "shared run record" else self.root / "detached-run.json")
+                record.parent.mkdir(parents=True, exist_ok=True)
+                _ = self.process(100, "python3", start=10_000,
+                                 argv=("python3", "detached_runs.py", "supervise", str(record)))
                 # The command leads its own group; a record without one has not started its command.
                 command = {} if outcome == "no command group" else {"command_group": 10, "command_started": "11000"}
                 _ = record.write_text(json.dumps({"pid": 100, "status": "running", **command}))
@@ -581,12 +587,32 @@ class HoldEnforcerTests(unittest.TestCase):
                     self.assertEqual([row["stopped_run"] for row in self.rows() if row["action"] == "stopped"],
                                      [{"pid": 10, "proc_start": "11000"}])
                     cycle = build_hold.read_cycle()
-                    assert cycle is not None
+                    assert not isinstance(cycle, build_hold.NoCycle)
                     self.assertIn("gate-owner", cycle["recipients"])
 
                 with mock.patch.object(hold_enforcer, "record_build", side_effect=save_stop), \
                      mock.patch.object(detached_runs, "write_text_atomic", side_effect=save_reason):
-                    if outcome == "record failure":
+                    if outcome.startswith("shared"):
+                        before = record.read_bytes()
+                        rows = self.rows()
+                        environment = ({"BUILD_HOLD_DIR": str(self.root / ".local/state/build-hold")}
+                                       if outcome == "shared holders" else
+                                       {"BUILD_HOLD_RELEASE_DIR": str(self.root / ".local/state/build-hold-release")}
+                                       if outcome == "shared releases" else {})
+                        with mock.patch.object(override_guard, "user_home", return_value=self.root), \
+                             mock.patch.dict(os.environ, environment), \
+                             self.assertRaises(override_guard.SharedStateWriteRefused):
+                            _ = hold_enforcer.stop_waiting_run(
+                                run, holder, table, self.proc, signal_group=signal_group,
+                                signal_process=lambda pid, signum: signals.append((pid, signum)),
+                                supervisor_args=lambda pid, proc_root: ("python3", "detached_runs.py", "supervise", str(record)),
+                            )
+                        self.assertEqual(events, [])
+                        self.assertEqual(signals, [])
+                        self.assertEqual(record.read_bytes(), before)
+                        self.assertEqual(self.rows(), rows)
+                        continue
+                    elif outcome == "record failure":
                         with self.assertRaisesRegex(OSError, "private stop record is full"):
                             _ = hold_enforcer.stop_waiting_run(
                                 run, holder, table, self.proc, signal_group=signal_group,
@@ -827,7 +853,7 @@ class HoldEnforcerTests(unittest.TestCase):
                              + "You get a notice at the release; run it again then.\n")
             self.assertEqual(self.rows()[0]["action"], "stopped")
             cycle = build_hold.read_cycle()
-            assert cycle is not None
+            assert not isinstance(cycle, build_hold.NoCycle)
             self.assertIn("other", cycle["recipients"])
             sent.append((pid, signum))
             if signum == signal.SIGTERM and pid != 30:

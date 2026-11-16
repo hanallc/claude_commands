@@ -26,7 +26,7 @@ from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_targets import build_targets
 from scripts.lib import process_start as process_identity
 
-from scripts.build_hold import build_hold
+from scripts.build_hold import build_hold, override_guard
 from scripts.build_hold import owning_session as session_owner
 from scripts.mac_test import eligibility, claim_state, mac_test, offload
 from scripts.build_queue import placement
@@ -1031,7 +1031,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
                     output, errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                     self.assertEqual(process.returncode, 0, output + errors)
                 cycle = build_hold.read_cycle()
-                assert cycle is not None
+                assert not isinstance(cycle, build_hold.NoCycle)
                 self.assertEqual(cycle["entries"], [])
             finally:
                 for process in processes:
@@ -1125,7 +1125,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         self.assertEqual(self.sleeps, 1)
         self.assertIn("verify.sh: the Mac is free: leaving natedev's hold wait to run there.", errors)
         cycle = build_hold.read_cycle()
-        assert cycle is not None
+        assert not isinstance(cycle, build_hold.NoCycle)
         self.assertEqual(cycle["entries"], [])
         self.assertTrue((self.root / "wait-seconds").read_text().strip())
 
@@ -1192,7 +1192,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
     def test_damaged_cycle_waits_for_unlink_then_passes_without_a_holder(self) -> None:
         self.begin_hold()
         cycle = build_hold.read_cycle()
-        assert cycle is not None
+        assert not isinstance(cycle, build_hold.NoCycle)
         path = self.root / "release" / cycle["id"] / "cycle.json"
         _ = path.write_text("{broken")
 
@@ -1244,8 +1244,22 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             self.assertEqual(build_targets.command_check_local(), 10)
         cycle = build_hold.read_cycle()
-        assert cycle is not None
+        assert not isinstance(cycle, build_hold.NoCycle)
         self.assertEqual(cycle["entries"], [])
+
+        home = self.root / "guard-home"
+        shared = home / ".local/state/build-hold"
+        shared.parent.mkdir(parents=True)
+        shared.symlink_to(self.holders, target_is_directory=True)
+        before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(override_guard, "user_home", return_value=home), \
+             mock.patch.object(sys, "argv", [build_targets.__file__, "check-local", "--session", "waiting-session"]), \
+             redirect_stdout(output), redirect_stderr(errors):
+            code = build_targets.main()
+        self.assertEqual(code, 2)
+        self.assertIn(str(home / ".claude/scripts/build_hold/build_hold.py"), output.getvalue() + errors.getvalue())
+        self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
 
     def check_launch(self, session_id: str) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
@@ -1258,7 +1272,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
                                   "render checks", build_hold.NoReleaseEta(), NOW)
         cycle = build_hold.read_cycle()
-        assert cycle is not None
+        assert not isinstance(cycle, build_hold.NoCycle)
         cycle_file = self.root / "release" / cycle["id"] / "cycle.json"
         current = self.root / "release" / "current"
         holder_file = build_hold.holder_path(self.holders, "holder-session")
@@ -1507,7 +1521,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
             for _ in range(2):
                 self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 10)
         cycle = build_hold.read_cycle()
-        assert cycle is not None
+        assert not isinstance(cycle, build_hold.NoCycle)
         self.assertEqual(cycle["entries"], [])
         self.assertFalse((self.root / "registration").exists())
 

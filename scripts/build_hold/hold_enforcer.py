@@ -26,6 +26,8 @@ from typing import Literal, cast
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import build_hold
+from scripts.build_hold import override_guard
+from scripts.build_hold.shared_state_defaults import DEFAULT_ENFORCER_DIRECTORY as DEFAULT_STATE_DIRECTORY
 from scripts.buildlog.parse import CARGO_BUILD_VERBS, cargo_subcommand
 from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
 
@@ -362,6 +364,9 @@ def stop_waiting_run(
     supervisor_args: Callable[[int, Path], tuple[str, ...]] = supervisor_args,
 ) -> StoppedRun | RunIdentityChanged:
     """Check process identities before TERM and record each stopped gate."""
+    override_guard.require_shared_state_write(
+        Path(__file__), "build_hold/hold_enforcer.py", proc_root, build_hold.holder_directory(),
+        build_hold.release_directory(), state_directory(), store.root())
     from scripts.agents import detached_runs
 
     process = run.process
@@ -375,6 +380,7 @@ def stop_waiting_run(
     if isinstance(detached, DetachedRunChanged):
         return RunIdentityChanged(run)
     if isinstance(detached, DetachedRun):
+        override_guard.require_shared_state_write(Path(__file__), "build_hold/hold_enforcer.py", detached.path)
         supervisor = detached.supervisor.identity
         if isinstance(keeping_holder(detached.supervisor, build_hold.audit_ancestors(detached.supervisor, processes),
                                      processes, holders), build_hold.Holder):
@@ -545,7 +551,7 @@ def keeping_holder(
 
 
 def state_directory() -> Path:
-    return Path(os.environ.get("BUILD_HOLD_ENFORCER_DIR", str(Path.home() / ".local/state/build-hold-enforcer")))
+    return Path(os.environ.get("BUILD_HOLD_ENFORCER_DIR", str(Path.home() / DEFAULT_STATE_DIRECTORY)))
 
 
 def clear_cutoff_path(key: str, since: datetime) -> Path:
@@ -602,6 +608,7 @@ def record_clear_cutoff(identity: build_hold.HolderIdentity, since: datetime) ->
     """Save the boot-relative cutoff before publishing the clear hold."""
     before = time.clock_gettime_ns(time.CLOCK_BOOTTIME) * os.sysconf("SC_CLK_TCK") // 1_000_000_000
     path = clear_cutoff_path(identity.key, since)
+    override_guard.require_shared_state_write(Path(__file__), "build_hold/hold_enforcer.py", path)
     write_text_atomic(path, json.dumps({"boot_id": boot_identity(), "before": before}) + "\n")
 
 
@@ -1021,6 +1028,9 @@ def run(
     send: Callable[[str, str], build_hold.HolderMessageSent | build_hold.HolderMessageFailed] = build_hold.send_holder_message,
     clock: Callable[[], datetime] = utc_now,
 ) -> int:
+    override_guard.require_shared_state_write(
+        Path(__file__), "build_hold/hold_enforcer.py", proc_root, holder_directory, directory,
+        build_hold.release_directory(), store.root())
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / "run.lock").open("a+") as lock:
         try:
@@ -1117,6 +1127,9 @@ def main(arguments: list[str]) -> int:
             return 0
         return run(proc_root, build_hold.holder_directory(), state_directory(),
                    uid=os.getuid(), enforcer_pid=os.getpid(), stopper=StopBuildsAndTests(proc_root))
+    except override_guard.SharedStateWriteRefused as error:
+        print(f"hold enforcer: {error}", file=sys.stderr)
+        return 2
     except (OSError, ValueError) as error:
         print(f"hold enforcer: {error}", file=sys.stderr)
         return 1

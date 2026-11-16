@@ -35,6 +35,7 @@ from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, Li
 from scripts.lint.build_shape import (BuildShape, recorded_build_shape)
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET
+from scripts.build_hold.override_guard import require_shared_state_write
 from scripts.lib import conf
 
 from scripts.lib.test_phase import (
@@ -332,6 +333,7 @@ def finish_priority_transition(priority: QueuePriority) -> None:
     transition = priority.transition
     if isinstance(transition, SettledPriority):
         return
+    require_shared_state_write(Path(__file__), "lint/memory_admit.py", store.root())
     record.queue_priority(transition.action, transition.unit, transition.why,
                           transition.set_by, transition.at, transition_id=transition.id, start=transition.month_row_end)
 
@@ -1405,6 +1407,7 @@ def token_gap_recorded(rows: Iterator[dict[str, object]], event: dict[str, objec
 def append_queue_time(directory: Path, event: dict[str, object], now: float) -> None:
     """Append under the history lock; a token gap can be retried after a stop."""
     path = directory / "queue_times.jsonl"
+    require_shared_state_write(Path(__file__), "lint/memory_admit.py", path)
     with store.locked_append(path) as handle:
         with closing(queue_times_backward(handle)) as rows:
             last = next(rows, cast(dict[str, object], {}))
@@ -2414,6 +2417,12 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
     """Save the peak before removing evidence; the service owns reservation state."""
     maximum = path.with_suffix(".max")
     history_path = path.parent / "anon_peaks.jsonl"
+    targets = [path, maximum, path.with_suffix(".wave"), history_path, path.parent / "queue_times.jsonl"]
+    if row["sidecar"]:
+        sidecar = Path(row["sidecar"])
+        targets.extend((progress.progress_path(sidecar, "json"), progress.progress_path(sidecar, "log"),
+                        Path(str(sidecar) + ".cloud.json"), sidecar))
+    require_shared_state_write(Path(__file__), "lint/memory_admit.py", *targets)
     recovering = "finalization" in row
     if not recovering:
         try:

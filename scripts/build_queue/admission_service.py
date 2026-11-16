@@ -45,6 +45,7 @@ from scripts.build_queue import queue_snapshot, slot_wait
 from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
 from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
+from scripts.build_hold import override_guard
 
 from scripts.buildlog import store
 from scripts.lib import test_phase
@@ -1050,12 +1051,46 @@ def finalization_outcome(ending: ReleaseStatus | OwnerExited | NotEnding | Token
     return step_estimator.OwnerGone(), gate.OUTCOME_NOT_RECORDED, gate.StepEnd()
 
 
+@dataclass(frozen=True)
+class ServiceStateWrites:
+    """Validate the service directory and each mutation target before publication."""
+    directory: Path
+
+    def require(self, *paths: Path) -> None:
+        targets = paths or (self.directory, self.directory / "state.json",
+                            self.directory / "queue.json", self.directory / "progress_profiles")
+        override_guard.require_shared_state_write(
+            Path(__file__), "build_queue/admission_service.py", *targets)
+
+    def register(self, record: ReservationRecord) -> None:
+        """Check each saved or new reservation before it enters service state."""
+        path = Path(record.path)
+        targets = [path, path.with_suffix(".max"), path.with_suffix(".wave"),
+                   path.parent / "anon_peaks.jsonl", path.parent / "queue_times.jsonl"]
+        if record.sidecar:
+            sidecar = Path(record.sidecar)
+            targets.extend((sidecar, progress.progress_path(sidecar, "json"), progress.progress_path(sidecar, "log"),
+                            Path(str(sidecar) + ".cloud.json")))
+        self.require(*targets)
+
+
+@dataclass(frozen=True)
+class RegisteredServiceWrites:
+    """The service checked its reservations when they entered state."""
+    writes: ServiceStateWrites
+
+
 class StateIntents:
     """Persist finalization before history; remove the entry only after history."""
     def __init__(self, reservations: dict[str, ReservationRecord],
                  advance_generation: Callable[[], None], episode: str,
                  persist: Callable[[], None], fault: Callable[[str], None],
-                 places: dict[str, WaiterPlace]) -> None:
+                 places: dict[str, WaiterPlace], writes: ServiceStateWrites | RegisteredServiceWrites) -> None:
+        boundary = writes.writes if isinstance(writes, RegisteredServiceWrites) else writes
+        selected = (reservations[episode],) if isinstance(writes, RegisteredServiceWrites) else reservations.values()
+        boundary.require(*(Path(record.path) for record in selected),
+                         *(Path(record.sidecar) for record in selected if record.sidecar))
+        self.writes: ServiceStateWrites = boundary
         self.reservations: dict[str, ReservationRecord] = reservations
         self.places: dict[str, WaiterPlace] = places
         self.advance_generation: Callable[[], None] = advance_generation
@@ -1063,7 +1098,13 @@ class StateIntents:
         self.persist: Callable[[], None] = persist
         self.fault: Callable[[str], None] = fault
 
+    def _require_record(self) -> None:
+        record = self.reservations[self.episode]
+        paths = (Path(record.path), Path(record.sidecar)) if record.sidecar else (Path(record.path),)
+        self.writes.require(*paths)
+
     def save(self, row: records.Reservation, intent: records.FinalizationIntent) -> None:
+        self._require_record()
         record = self.reservations[self.episode]
         if record.reservation_id != row.get("reservation_id"):
             raise ValueError("finalization reservation changed")
@@ -1072,10 +1113,12 @@ class StateIntents:
         self.fault("after_finalization_intent")
 
     def published(self, row: records.Reservation) -> None:
+        self._require_record()
         if row["step"] == "build":
             self.advance_generation()
 
     def clear(self, row: records.Reservation) -> None:
+        self._require_record()
         if self.reservations[self.episode].reservation_id != row.get("reservation_id"):
             raise ValueError("finalization reservation changed")
         self.fault("after_history_append")
@@ -1134,6 +1177,8 @@ class AdmissionServer:
                  fault: Callable[[str], None] = _no_fault, socket_path: Path | None = None,
                  capture_root: Path = CARGO_CAPTURE_ROOT,
                  host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] | None = None) -> None:
+        self.writes: ServiceStateWrites = ServiceStateWrites(state_dir)
+        self.writes.require()
         self.state_dir: Path = state_dir
         self.clock: Clock = clock
         self.readings: Readings = readings
@@ -1248,6 +1293,7 @@ class AdmissionServer:
         transition = self.priority.transition
         if isinstance(transition, records.SettledPriority):
             return
+        self.writes.require(store.root())
         gate.finish_priority_transition(self.priority)
         self.priority = (records.QueuePriority(self.priority.entries) if self.priority.entries
                          else records.NO_QUEUE_PRIORITY)
@@ -1258,6 +1304,8 @@ class AdmissionServer:
         path = self.state_dir / "state.json"
         if path.exists():
             state = read_state(self.state_dir)
+            for record in state.reservations.values():
+                self.writes.register(record)
             self.reservations, self.places = state.reservations, state.places
             self.ledger = ReplayLedger(state.ledger)
             self.spacing, self.priority = state.spacing, state.priority
@@ -2312,6 +2360,7 @@ class AdmissionServer:
                 profile.repository.key if isinstance(profile.repository, records.RepositoryIdentity) else "",
                 profile.scope, step_estimator.test_package(list(request.argv)), tuple(step_estimator.test_filters(list(request.argv))),
                 shape, run=request.run, place=request.place)
+            self.writes.register(record)
             if not cloud:
                 record = self._freeze_test_phase_need(record, config, share_percent)
             result = self.last_result
@@ -2360,7 +2409,8 @@ class AdmissionServer:
             row_waiter["token_left_at"] = ending.left_at
             self.places[_place_key(record.owner, row_waiter["since"])] = waiter_place(row_waiter, record.episode)
         _ = gate.finalize_reservation(path, row, outcome, datetime.fromtimestamp(ended_at, UTC), status,
-            intents=StateIntents(self.reservations, self._advance_build_history, episode, self.persist, self.fault, self.places),
+            intents=StateIntents(self.reservations, self._advance_build_history, episode, self.persist, self.fault,
+                                self.places, RegisteredServiceWrites(self.writes)),
             end_kind=end_kind)
         if (isinstance(record.place, wire.LocalPlace) and isinstance(record.run, wire.RunIdentity)
                 and self._run_alive(record.run)
@@ -3714,6 +3764,7 @@ done
                           else select.EPOLLIN | select.EPOLLOUT)
 
     def start(self) -> None:
+        self.writes.require(self.socket_path)
         if not isinstance(self.listener, NoConnection):
             return
         inherited = int(os.environ.get("LISTEN_FDS") or "0")
@@ -4247,13 +4298,18 @@ def drain_check(directory: Path, *, service: bool, include_gate_callers: bool, p
 
 def export_priority(directory: Path) -> None:
     """Export the drained priority and retire the service state before rollback."""
+    writes = ServiceStateWrites(directory)
+    writes.require()
     if drain_check(directory, service=True, include_gate_callers=True, proc=SystemProc()):
         raise ValueError("service is not drained; priority was not exported")
     try:
         state = read_state(directory)
     except FileNotFoundError:
         return
+    for record in state.reservations.values():
+        writes.register(record)
     def persist() -> None:
+        writes.require()
         write_text_atomic(directory / "state.json", wire.encode_record(state))
     def advance_generation() -> None:
         nonlocal state
@@ -4264,7 +4320,7 @@ def export_priority(directory: Path) -> None:
         try:
             _ = gate.finalize_reservation(Path(record.path), reservation_row(record), outcome,
                 datetime.now(UTC), status, intents=StateIntents(state.reservations,
-                    advance_generation, episode, persist, _no_fault, state.places),
+                    advance_generation, episode, persist, _no_fault, state.places, writes),
                 end_kind=end_kind)
         except Exception as error:
             raise ValueError(f"cannot finalize reservation {record.reservation_id}: {error}; service state kept") from error
@@ -4291,24 +4347,28 @@ def main() -> int:
         # argparse skips a default when the namespace already has the attribute.
         state_dir: Path = default_state_dir
     args = parser.parse_args(namespace=Arguments())
-    if args.command == "drain-check":
-        return drain_check(args.state_dir, service=args.service,
-                           include_gate_callers=args.state_dir == default_state_dir, proc=SystemProc())
-    if args.command == "state-check":
-        return state_check(args.state_dir)
-    if args.command == "export-priority":
-        export_priority(args.state_dir)
-        return 0
-    server = AdmissionServer(args.state_dir, SystemClock(), SystemReadings(), SystemProc())
     try:
-        server.serve_forever()
-    finally:
-        server.close()
-    if server.replace_in_place:
-        # The new code takes the same socket without the systemd restart delay; a failed start restarts as before.
-        os.set_inheritable(LISTEN_FD, True)
-        os.execv(sys.executable, sys.orig_argv)
-    return 0
+        if args.command == "drain-check":
+            return drain_check(args.state_dir, service=args.service,
+                               include_gate_callers=args.state_dir == default_state_dir, proc=SystemProc())
+        if args.command == "state-check":
+            return state_check(args.state_dir)
+        if args.command == "export-priority":
+            export_priority(args.state_dir)
+            return 0
+        server = AdmissionServer(args.state_dir, SystemClock(), SystemReadings(), SystemProc())
+        try:
+            server.serve_forever()
+        finally:
+            server.close()
+        if server.replace_in_place:
+            # The new code takes the same socket without the systemd restart delay; a failed start restarts as before.
+            os.set_inheritable(LISTEN_FD, True)
+            os.execv(sys.executable, sys.orig_argv)
+        return 0
+    except override_guard.SharedStateWriteRefused as error:
+        print(str(error), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

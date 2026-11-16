@@ -99,7 +99,7 @@ class VerifyMacLifecycleTests(VerifyMacOffloadFixture):
             _ = build_hold.start_hold(Path(self.environment["BUILD_HOLD_DIR"]), build_hold.HolderIdentity("hana", "hana"),
                                       "render checks", build_hold.NoReleaseEta(), datetime.now().astimezone())
             cycle = build_hold.read_cycle()
-            assert cycle is not None
+            assert not isinstance(cycle, build_hold.NoCycle)
         cycle_path = self.root / "release" / cycle["id"] / "cycle.json"
 
         admission = caller_admission(self, self.root, self.environment)

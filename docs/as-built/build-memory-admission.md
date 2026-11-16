@@ -20,6 +20,45 @@ This work also hardened the example-test guard, Cargo token recovery, CI queue a
 
 ## How it works
 
+### Installed writers and private test state
+
+Only the installed scripts under `~/.claude/scripts` may change shared build state.
+Checkout scripts may change private test directories.
+`override_guard.shared_state_access()` checks the actual paths, including paths reached through symbolic links.
+`SharedStateWriteRefused` stops an imported mutation before it writes shared state.
+The CLI prints the refusal and returns status 2.
+The installed scripts retain their environment override refusal.
+
+`AdmissionServer` validates its state directory before restoration.
+`ServiceStateWrites.register()` checks saved paths during restoration and new paths when a reservation enters state.
+These checks include maximum, wave, history, lifecycle, and sidecar paths.
+Later requests and passes reuse this validation.
+`StateIntents` uses this same boundary.
+`export_priority()` checks its directory and saved reservation paths separately.
+Cancellation recovery retains its saved time and queue identity.
+The client still obtains its initial estimate through `step_estimate()`.
+The estimate cache has no writer.
+
+`release_lock()` validates both hold directories before it creates the lock.
+It yields `ReleaseLockHeld`, bound to those directories and the open lock.
+Receipt migration and damaged record recovery require this capability.
+The helpers do not acquire another lock.
+`cycle_path()` and `read_cycle()` return `NoCycle` when no current cycle exists.
+Hold status reads records without a lock or a mutation capability.
+The hold stop guards the real process root and hold, release, and enforcer directories before any signal or record write.
+The stop still targets the command group and preserves supervisor result delivery.
+
+Shell callers use the installed admission, hold, target, release wait, and detached run helpers.
+Existing test overrides remain available.
+Top-level recipient registration and unit retirement use the installed hold writer.
+`merge_gate.py` already runs from the installed copy; its hold reader remains unchanged.
+
+Service waiters retain `repository_name` separately from `step`.
+Reservations retain `repo` separately from `step`.
+Queue queries use these recorded fields without a repository prefix parser or a required live `.waiting` file.
+This rule changes no Builds page layout.
+The guard obtains each shared root from its owner's default.
+
 The admission service keeps `/proc/vmstat` `pswpin` samples in memory.
 `agent_swap_window_seconds=600` sets the sample window.
 The window total is the newest page count minus the oldest page count inside the window, multiplied by the page size.

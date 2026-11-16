@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from scripts.buildlog import repository
+from scripts.build_queue.admission_test_support import install_private_admission_helpers
 from scripts.lib import test_phase
 
 from scripts.build_queue import admission_records, snapshot_codec as codec, step_estimator
@@ -4111,6 +4112,7 @@ class LiveMemoryTripwireTests(MemoryQueueFixture):
     def test_shell_refuses_live_meminfo_or_pressure_and_records_one_reading(self) -> None:
         for reading in ("/proc/meminfo", "/proc/pressure/memory"):
             with self.subTest(reading=reading), AdmissionFixture() as fixture:
+                install_private_admission_helpers(fixture.root)
                 os.environ["BUILDLOG_LIVE_MEMORY_TRIPWIRE"] = str(self.record)
                 self.record.unlink(missing_ok=True)
                 with self.assertRaises(gate.LiveMemoryReading) as raised:
@@ -5015,6 +5017,7 @@ class ShellTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.admission = self.enterContext(AdmissionFixture())
+        install_private_admission_helpers(self.admission.root)
         self.admission.clock.epoch = time.time()
         _ = self.enterContext(self.admission.serving())
 
@@ -5331,6 +5334,8 @@ class QueueLeaveTests(unittest.TestCase):
         scripts = self.root / ".claude/scripts"
         (scripts / "lib").mkdir(parents=True)
         (scripts / "buildlog").mkdir()
+        for name in ("lint", "build_hold", "build_queue", "build_targets"):
+            (scripts / name).symlink_to(Path(__file__).resolve().parents[1] / name, target_is_directory=True)
         py = scripts / "lib/py"
         _ = py.write_text((Path(__file__).resolve().parents[1] / "lib/py").read_text())
         py.chmod(0o755)
