@@ -62,11 +62,17 @@ The command works with **zero config** by convention. It auto-detects:
 - Version files: `{crate_dir}/Cargo.toml`
 - Changelogs: `{crate_dir}/CHANGELOG.md`
 - Published READMEs: determined per-crate from `Cargo.toml` `readme` field or `{crate_dir}/README.md` auto-discovery
-- GitHub repo via `gh repo view`
+- GitHub release repository: `github_release_repo` from `release.toml`, else origin's repository when it is public (STEP 1)
 
 **Optional config** at `.claude/config/release.toml` for projects that need overrides:
 
 ```toml
+# The GitHub repository (owner/name) that gets the GitHub release.
+# Required when origin is private: a release never goes to a private origin.
+# When it is not origin, the release tag must be on it before STEP 8
+# (for hana, its post_publish hook pushes the tag to the public mirror).
+github_release_repo = "natepiano/bevy_hana"
+
 # Post-release install verification (binary crates only).
 # In single-package mode the crate released is the crate verified, and this
 # value is only an on-switch — a multi-binary workspace has no one fixed crate.
@@ -126,16 +132,16 @@ All scriptable steps use shell scripts. The agent orchestrates script execution 
 - `validate_version.sh` — format, collision, and gap checking ⊘
 - `next_patch_version.sh` — next patch on the current branch's line, for `/release patch` ⊘
 - `pre_release_checks.sh` — git status, clippy, build, test, fmt ⊘ (deliberately ignores `config/lint.conf`; a check turned off with `/lint_config` still runs here, because a release gate that silently no-ops is worse than a noisy one). Takes an optional `--package <name>` to scope the compile-and-test gate to one crate
-- `create_release_branch.sh` — branch creation
+- `create_release_branch.sh` — branch creation; a rerun reuses a release branch at `HEAD` and refuses one at another commit
 - `bump_versions.sh` — update [package] version fields
 - `resolve_path_pins.sh` — resolve each path-only workspace dep to its latest published version and detect unpublished local changes ⊘
 - `pin_path_deps.sh` — pin path-only workspace deps to published versions for publish; `--restore` undoes an uncommitted dry-run pin
 - `finalize_changelogs.sh` — replace [Unreleased] with version header
-- `publish_crate.sh` — dry-run and publish a single crate ⊘
+- `publish_crate.sh` — dry-run and publish a single crate; a version already on crates.io prints `already published` and is skipped ⊘
 - `update_workspace_deps.sh` — update internal cross-crate versions in root `Cargo.toml` `[workspace.dependencies]`; between publish phases with explicit names ⊘, or with `--edit-only --auto` (self-discovering, no crates.io wait, no commit) when bumping versions in STEP 4 and STEP 11
 - `push_release.sh` — tag, push branch, push tag ⊘
 - `verify_published.sh` — check each crate has the exact version published and not yanked ⊘
-- `create_github_release.sh` — create GitHub release ⊘
+- `create_github_release.sh` — create the GitHub release on `${GITHUB_REPO}` from a tag already there; an existing release prints `already released` ⊘
 - `restore_unreleased.sh` — add [Unreleased] sections back to changelogs
 
 **Project-specific scripts** in each project's `.claude/scripts/release/` — referenced by config `post_script` fields.
@@ -348,18 +354,26 @@ Same sequence as normal mode, but every "on main" step runs on `${BASE_BRANCH}` 
 
 **Otherwise, extract version from `$ARGUMENTS`** (strip `dry-run` if present).
 
+**Detect a resume.** Read the version at `HEAD` from the `Cargo.toml` of `${PACKAGE}` when it is set, else of the primary crate. When it equals `${VERSION}`, STEP 4 already ran, and this run resumes a failed release:
+1. Set `${RESUME_FLAG}` to `--resume`. Otherwise it is empty.
+2. Skip STEPs 2–4. Their work is in the version commit.
+3. In normal and isolated mode, check out the release branch at STEP 5 when it exists. `create_release_branch.sh` then reuses it.
+4. Run every later step. Each one skips work that is done: `publish_crate.sh` prints `already published`, `push_release.sh` reuses its tag, `create_github_release.sh` prints `already released`, and `restore_unreleased.sh` keeps an `[Unreleased]` section that is present.
+
+Start a resume from `${BASE_BRANCH}`, or from the hotfix branch in hotfix mode. STEP 1's stale release-branch warning does not apply to a resume.
+
 **Run version validation** (with `dangerouslyDisableSandbox: true`):
 ```bash
-~/.claude/scripts/release/validate_version.sh ${VERSION} ${ALL_CRATE_NAMES}
+~/.claude/scripts/release/validate_version.sh ${VERSION} ${RESUME_FLAG} ${ALL_CRATE_NAMES}
 ```
 
-→ Report the script output to the user. Stop if validation fails.
+→ Report the script output to the user. Stop if validation fails. With `--resume`, a version already on crates.io passes; without it, that version stops the release.
 </ArgumentValidation>
 
 <ProjectDiscovery>
 ## STEP 1: Project Discovery
 
-**Read optional config** from `.claude/config/release.toml` if it exists. Store any `install_verify`, `install_verify_script`, `workspace_publish`, `publish_phases`, `publish_path_pins`, and `judgment_checks` settings.
+**Read optional config** from `.claude/config/release.toml` if it exists. Store any `github_release_repo`, `install_verify`, `install_verify_script`, `workspace_publish`, `publish_phases`, `publish_path_pins`, and `judgment_checks` settings.
 
 **If config sets both `workspace_publish = true` and `[[publish_phases]]`**, STOP with a clear error: the two are mutually exclusive — `workspace_publish` is for workspaces whose members publish together with no between-phase scripts or dep rewrites; `[[publish_phases]]` is for ordered chains that need them.
 
@@ -384,10 +398,14 @@ Same sequence as normal mode, but every "on main" step runs on `${BASE_BRANCH}` 
   - Published README: Check `{dir}/Cargo.toml` for explicit `readme` field → resolve path relative to crate dir. Otherwise `{dir}/README.md` if it exists. Only these ship to crates.io.
 - Root README (`README.md`): tracked separately as **project README** — not published to crates.io for workspace projects. Only included in STEP 3 if it contains hardcoded version references.
 
-**Detect GitHub repo**:
-```bash
-git remote get-url origin | sed 's|.*github.com[:/]||;s|\.git$||'
-```
+**Choose the GitHub release repository** and set `${GITHUB_REPO}`:
+1. When config sets `github_release_repo` (`owner/name`), use it.
+2. Otherwise read origin's repository:
+   ```bash
+   git remote get-url origin | sed 's|.*github.com[:/]||;s|\.git$||'
+   ```
+   Then run `gh repo view <that repo> --json isPrivate -q .isPrivate` (sandbox off). When it prints `false`, use origin's repository.
+3. When origin is private and config has no `github_release_repo`, STOP with: "origin is private; add `github_release_repo = \"owner/name\"` to `.claude/config/release.toml` to name the public repository for the GitHub release." A GitHub release never goes to a private origin.
 
 **Detect release mode** from current branch:
 ```bash
@@ -765,6 +783,8 @@ NOTES_EOF
 ~/.claude/scripts/release/create_github_release.sh ${VERSION} ${GITHUB_REPO} ${PROJECT_NAME} "$NOTES_FILE" ${DRY_RUN_FLAG} ${PACKAGE_FLAG}
 ```
 → This must use `dangerouslyDisableSandbox: true`. Report the script output to the user.
+
+`${GITHUB_REPO}` is the repository STEP 1 chose. The script creates the release only from a tag that is already on that repository (`gh release create --verify-tag`). When `${GITHUB_REPO}` is not origin, the tag gets there from the project's own push (hana's `post_publish` hook). A missing tag stops this step with `ERROR: tag <tag> is not on <repo>`; push the tag to that repository, then run the step again. A release that already exists for the tag prints `already released` and the step passes, so a rerun is safe.
 </CreateGitHubRelease>
 
 <PostReleaseVerification>
