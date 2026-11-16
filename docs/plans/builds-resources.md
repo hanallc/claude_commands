@@ -2681,3 +2681,32 @@ The cutover removal commit deletes the script after the run.
 
 - Removed 2026-11-16 before it reached main: queue's app memory gate (`scripts/build_queue/app_gate.py`) holds each `hana_shot.py launch` app's measured memory in the memory queue, so one way limits app launches. `config/hana_shot.conf` has no `local_app_cap` key.
 - `same_binary` stays: it matches the recorded binary as one whole argument of the pid (`/proc/<pid>/cmdline` on Linux, `ps -ww -p <pid> -o command=` on macOS). A reused pid that runs another program, a path prefix, or a process that exits during the read gives `False`, so `shutdown` signals no reused Mac pid. The `shutdown` test in `LaunchRecordRecoveryTests` covers it.
+
+### Phase 133 — Each gate slot lease names the work it gates  · status: done
+**Source:** builds showrunner 2026-11-16 08:5x, for the cargo-liner showrunner's cargo-tile: every `/build/slot/*.lease.json` reads `"work": "gate", "purpose": "gate"` (for example `/build/slot/hana-slot1.lease.json`), so cargo-tile cannot say which work holds a slot.
+
+#### Work Order
+
+**Goal:** a gate's slot lease names the gated work in `purpose`, for example `gate · handler phase 27 · census --json bound`.
+
+**Spec:**
+1. `copies.standing` (`scripts/copies/copies.py:996`) calls `build_slots.take_slot(..., work="gate", purpose="gate", ...)` at `copies.py:1028`. Keep `work="gate"`. Pass a specific `purpose` instead of `"gate"`.
+2. Take the purpose from the gated commit's own record, not from a new caller argument: the subject of the gated source revision `base`. With `MergeRevision`, `base` is still the gated work: `merge.revision` is the production merge branch it merges onto (`waiting.scratch_test`), so it does not name the work.
+3. Format: a subject `<kind>(<slug>): phase <N> — <title>` gives `gate · <slug> phase <N> · <title>`. Any other subject gives `gate · <subject>`. A subject that Git cannot read gives `gate`.
+4. Keep the staff id in `unit` and the field name `purpose`. `scripts/disks/slots.py` and cargo-tile do not change.
+5. The identical nested proof reuse path (`ACTIVE_GATES`) does not take a slot and does not change.
+6. Add no signal handler, mask or disposition.
+
+**Files:**
+- `scripts/copies/copies.py` — the purpose from the gated commit's subject.
+- `scripts/copies/test_copies.py` — rows in the existing lease test (`self.lease(tree)["unit"]`, near line 188).
+- `docs/as-built/copies.md` — the lease purpose rule.
+- `scripts/lib/build_folders.py` — a slot path checks only its path components; the lease labels (`purpose` can hold a `/`) are not path components (review finding, round 1).
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — `scripts/copies/copies.py`, `docs/as-built/copies.md`.
+- `test` — `scripts/copies/test_copies.py`, from the Spec alone.
+
+**State:** the lease file field `purpose` for gate slots. No config key.
+
+**Acceptance gate:** rows in the existing lease test: a `checkpoint(<slug>): phase <N> — <title>` commit gives `gate · <slug> phase <N> · <title>`; a plain subject gives `gate · <subject>`; a `MergeRevision` gate names the source revision's subject, not the merge branch's; `unit` stays the staff id and `work` stays `gate`. Run `scripts.copies.test_copies`, `scripts.lib.test_build_slots` and `scripts.disks.test_slots` if it exists; basedpyright 0/0 on the changed files.
