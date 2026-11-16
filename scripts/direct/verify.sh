@@ -1786,6 +1786,7 @@ RUN_LOG_PIDS=()
 VERDICT_KEY=""
 VERDICT_TREE_KEY=""
 CLIPPY_FIX_LIMIT_REACHED=0
+PLACEMENT_FAILED=0
 RUN_STARTED=0
 CALL_NOTED=0
 TOKEN_WAIT_S=0
@@ -2618,6 +2619,18 @@ PLACEMENT_GRANT_FILE=""
 PLACEMENT_PROVIDER=""
 MAC_BACKOFF_PROBED=0
 
+# A placement that fails before its step starts leaves the run without a
+# verdict. 78 (wait) and the left-queue status are not failures. A refusal (2)
+# prints its own reason; any other status is a crash of the placement tooling.
+placement_failed() {
+    case "$1" in
+        78|"$LINT_LEFT_QUEUE_STATUS") return 0 ;;
+        2) ;;
+        *) printf 'verify.sh: step placement failed with status %s before the step started; this is a tooling failure, not a result of the tree\n' "$1" >&2 ;;
+    esac
+    PLACEMENT_FAILED=1
+}
+
 placement_once() {
     local token=none reply line route="" status=0 monitor=0
     local LINT_QUEUE_LEAVE_HOOK="" BUILDLOG_MAC_IDLE_HOOK=""
@@ -2690,11 +2703,18 @@ placement_once() {
             *) route=$line ;;
         esac
     done <<< "$reply"
-    (( status == 0 )) || return "$status"
+    if (( status != 0 )); then
+        placement_failed "$status"
+        return "$status"
+    fi
     IFS=$'\t' read -r PLACEMENT_PROVIDER STEP_ASSIGNED_TARGET STEP_ASSIGNED_HOST STEP_ASSIGNED_SLOT \
         PLACEMENT_EPISODE PLACEMENT_ATTEMPT <<< "$route"
     local metadata
-    metadata=$(verify_helper "$BUILD_TARGETS_SCRIPT" assigned-info --assignment-file "$PLACEMENT_ASSIGNMENT_FILE") || return $?
+    metadata=$(verify_helper "$BUILD_TARGETS_SCRIPT" assigned-info --assignment-file "$PLACEMENT_ASSIGNMENT_FILE") || {
+        status=$?
+        placement_failed "$status"
+        return "$status"
+    }
     IFS=$'\t' read -r STEP_ASSIGNED_SETTINGS STEP_ASSIGNED_PLATFORM PLACEMENT_SESSION <<< "$metadata"
     return 0
 }
@@ -3098,11 +3118,12 @@ record_mac_pass() {
 }
 
 # A failed lint is the tree's own answer unless the run never reached a
-# verdict: a usage or tooling error (2), the sandbox (3), or a kill. A fix pass
-# that still changes the tree at the limit can leave more fixes for the next call.
+# verdict: a usage or tooling error (2), the sandbox (3), a kill, or a step
+# placement that failed before its step started. A fix pass that still changes
+# the tree at the limit can leave more fixes for the next call.
 lint_failure_is_the_tree() {
     [[ "$CMD" == lint ]] || return 1
-    (( CLIPPY_FIX_LIMIT_REACHED == 0 )) || return 1
+    (( CLIPPY_FIX_LIMIT_REACHED == 0 && PLACEMENT_FAILED == 0 )) || return 1
     (( EXIT_STATUS != 2 && EXIT_STATUS != 3 && EXIT_STATUS < 128 )) || return 1
     (( ${RUN_LAST_ATTEMPT_KILLED:-0} == 0 ))
 }
