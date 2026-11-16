@@ -2680,3 +2680,4 @@ The cutover removal commit deletes the script after the run.
 #### As built
 
 - Removed 2026-11-16 before it reached main: queue's app memory gate (`scripts/build_queue/app_gate.py`) holds each `hana_shot.py launch` app's measured memory in the memory queue, so one way limits app launches. `config/hana_shot.conf` has no `local_app_cap` key.
+- `same_binary` stays: it matches the recorded binary as one whole argument of the pid (`/proc/<pid>/cmdline` on Linux, `ps -ww -p <pid> -o command=` on macOS). A reused pid that runs another program, a path prefix, or a process that exits during the read gives `False`, so `shutdown` signals no reused Mac pid. The `shutdown` test in `LaunchRecordRecoveryTests` covers it.
