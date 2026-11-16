@@ -2573,6 +2573,109 @@ The "unowned processes" rename moved to Phase 44e on 2026-11-11, because 44e rew
 
 **Gotchas:** never take `record_lock` twice in one process: `flock` on a second open file blocks the same process. The deploy stop script keeps its own refusal as the last guard.
 
+### Phase 44am — A first build takes a size from its crate, not a fixed 12 GiB  · status: todo
+**Depends on:** the slots work (`docs/plans/build-folders.md` Phase 4) in this worktree. builds agreed on 2026-11-15.
+
+Cause, from builds' live check of C1619 (a one-file hello-world crate, `cargo build` on natedev at 20:07 EST, 2026-11-15): the step waited at place 20 with "build needs 12.0 GiB". A step with no peak history takes `program_first_peak_gib.cargo=12` from `config/build_admission.conf` (`admission_client.py:1031`, `admission_service.py:3422`). That one value applies to every cargo build. It does not look at the crate.
+
+Goal: a cargo step with no peak history takes a first need from its crate size. The progress profile corrects it after the first run.
+
+Rules (builds, 2026-11-15):
+1. Read the crate size from its `Cargo.lock` package count. A crate with no `Cargo.lock` counts its dependencies after `cargo` writes the lock, or uses the floor.
+2. First need = floor + package count × GiB per package, at most `program_first_peak_gib.cargo`.
+3. The floor and the GiB per package are new keys in `config/build_admission.conf`, not values in code. Set their first values from the recorded peaks of small and large crates in the buildlog.
+4. `program_first_peak_gib.cargo=12` stays unchanged as the ceiling.
+5. A step with peak history keeps its history need.
+
+**Proof:** a row that fails without the change (a one-file crate with no history gets the floor, not 12 GiB), a row for a large crate that reaches the ceiling, and a row for a step with history. The wait line and the Builds page show the new need.
+
+### Phase 44an — A step held on natedev says why, in its caller's words  · status: todo
+**Depends on:** the queue + macroute merge (1be2f8932). The user asked on 2026-11-15 at 20:08 EST.
+
+The user: "it sure would be useful to show this information instead of natedev only, makes natedev artifacts - that doesn't help me at all". The step was cargo-liner's pre-merge check: `validate_ci.sh` `run_self_mend` runs `cargo build -p cargo-mend` on the merged main checkout, then `mend --fix` and `fmt` edit those files, and the push goes out from that checkout. The Mac has no copy of the unpushed tree.
+
+After 1be2f8932 a direct cargo command shows "a direct cargo command runs where it starts" (`admission_records.DIRECT_CARGO`), and `verify.sh --local "<reason>"` shows "the run asks for it", because the placement request carries only `--local-only`. Neither text says why.
+
+Goal: every step held on natedev shows its caller's reason on the Builds page and in the wait line.
+1. A caller states its reason once. A direct cargo command reads it from an environment variable that the queue client records in the waiter route as `LocalRequired(<reason>)`.
+2. `verify.sh --local "<reason>"` carries the reason text to the placement route.
+3. `validate_ci.sh` sets the reason for its mend build, mend fix and fmt steps: they edit the merged checkout on natedev, and the push goes from there.
+4. A step with no stated reason keeps the current text.
+
+**Proof:** a row that fails without the change (a direct cargo command with the reason set shows that reason), a `verify.sh --local` row, and a page shot of the cargo-liner pre-merge row.
+
+### Phase 44ao — Every tooltip in the memory section follows dwight's design  · status: todo
+**Depends on:** 44an. The user rejected the 44an tooltip on 2026-11-15: "no sentences. labels that have numeric values should show values right aligned". dwight wrote the design: `~/rust/hanadocs/dwight/builds-tooltip-design-2026-11-15.md`, with the mock and CSS in `~/rust/hanadocs/dwight/tools/builds-tooltip-mock-2026-11-15.html`.
+
+Goal: each tooltip is one two-column grid. Labels start at the left edge and values end at the right edge. No sentences, notes, colons or periods.
+
+**Proof:** dark desktop shots of the six tooltips in the mock. Each passes the design's done check.
+
+### Phase 44ap — Build folders Phase 6: queue files make their temporary folders through the maker  · status: todo
+**Depends on:** bf4 and the limits on main (batch656). builds assigned it on 2026-11-15. Plan: `build-folders.md` Phase 6.
+
+Goal: each file-only temporary folder in a queue file comes from `scripts/lib/build_folders.py`, with a lease. Repository content uses a slot.
+1. `scripts/build_queue/ci_cargo_front.py:139` `tempfile.TemporaryDirectory`.
+2. `scripts/build_queue/memory_page_proof.mjs:24` and `:122` `mkdtemp` (proof folder and Chrome profile).
+3. `scripts/build_queue/queue_place.py:373` folder creation.
+4. `scripts/copies/copies.py:596` clone stage folder.
+5. The adjacent tests of these files.
+
+**Proof:** each changed caller's test modules; a killed run leaves no folder after its lock is free.
+
+### Phase 44aq — Build folders Phase 7: queue fixtures make their folders through the maker  · status: todo
+**Depends on:** 44ap. Plan: `build-folders.md` Phase 7.
+
+Goal: no queue fixture calls bare `mkdtemp`, `git clone` or `git worktree add`. `TemporaryDirectory` as a context manager stays.
+1. `scripts/build_queue/queue_fixture.py`.
+2. The remaining fixtures under `scripts/build_queue` and `scripts/copies`. The audit command is in `build-folders.md` Phase 7.
+
+**Proof:** the affected fixture modules, and devtools' source test on these folders when it exists.
+
+### Phase 44ar — Cutover: delete the old folder keys  · status: todo
+**Depends on:** the user's go for each deleted key. For the keys other than `copies.root`, also build-folders Phase 8 on main.
+
+1. When Phase 8 is on main, send builds the exact key list and the commit. builds files one question to the user for all the deletes.
+2. Delete `root` from `config/copies.conf` after the user's go. No code reads it since Phase 4.
+3. Delete `roots.scratch*`, `roots.copies*` and `prefixes.*` from `config/build_folders.conf` after the user's go. First prove with a search that no code outside tests reads them.
+
+**Proof:** the config and caller test modules; the search output.
+
+### Phase 44av — The queue cap counts only swap that comes back into RAM  · status: todo
+**Depends on:** nothing; it goes ahead of 44an. builds approved it on 2026-11-15 23:5x EST. ETA 2026-11-16 02:30 EST.
+**Cause:** `memory_room` in `scripts/lint/memory_admit.py` counts all swap outside builds as demand (`agent_swap_share_percent=100`, from builds-resources phase 120). Idle session swap stays in swap, but the cap holds RAM for all of it. On 11-15 at 23:38 EST, 11 GiB was kept aside, the cap was 11.6 GiB with 26 GiB free, and 18 steps waited. In 15 s, only 46 MiB came back into RAM.
+
+1. Demand is the largest swap-in amount (`pswpin` in `/proc/vmstat`) over a window, at most the swap now outside builds. `agent_swap_share_percent` applies to that amount.
+2. A new key in `config/build_admission.conf` gives the window, start 600 s.
+3. The Builds page reads the same number for `Swap coming back`.
+4. Keep the #70 lesson: a real burst is new RAM use, and each admission reads `MemAvailable`. The pressure limits stay.
+
+**Proof:** idle swap gives no demand; a swap-in burst gives demand for the window; the cap never goes past `MemAvailable` minus safety; the feed and page tests agree.
+**Restart:** after it merges, the admission service restarts when no gate is mid-step. The hash message carries the steps.
+
+### Phase 44as — Every Hana app launch on natedev goes through the memory gate  · status: todo
+**Depends on:** bf4 and 44an. builds approved this plan on 2026-11-15 (#70 closed). ETA 2026-11-16 18:00 EST.
+**Cause:** at 16:03 EST on 11-15, eight research subagents each ran `hana_shot.py launch` (ports 15820 to 15827). That path has no memory gate. Host swap reached 36.6 GiB.
+**Rule:** the promise is the app's measured memory. A launch that skips the gate is the defect. resources adds the interim cap on `hana_shot` launches (step 0).
+
+1. Add an app kind to `memory_admit`. The app runs in its own scope. The hold lasts until the app exits.
+2. The promise is the measured peak of earlier runs of the same binary profile: cgroup `memory.peak` plus swap, the largest of the last runs. A new config key gives the start value.
+3. Make one wrapper command for an app launch. Name it in the hash message to builds; the hana showrunner moves the hana repo scripts to it.
+4. Route `hana_shot.py launch` and `smoke_launch.sh` through the wrapper.
+5. The BRP hook refuses a Hana `brp_launch` and names `hana_shot.py launch`, until Phase 44au.
+
+**Proof:** admission tests for the app kind; a launch test for each path; a live launch on natedev shows its hold on the Builds page.
+
+### Phase 44at — The Builds page shows a Hana app that runs without an admission  · status: todo
+**Depends on:** 44as. ETA 2026-11-17 12:00 EST.
+1. The memory feed finds Hana processes with no admission.
+2. The Builds page shows each one, and the feed alerts its session once.
+
+### Phase 44au — bevy_brp_mcp launches through the app gate  · status: todo
+**Depends on:** 44as. Repository `~/rust/bevy_brp`; it has no production, and the fix goes where the cause lives.
+1. Add a launch command prefix to bevy_brp_mcp, so `brp_launch` runs the app through the wrapper.
+2. Remove the refusal in the BRP hook that 44as adds.
+
 ### Phase 45 — Merge gates take their route from the queue  · status: todo
 **Depends on:** 44 and aws-unit's repair of the uncertain cloud launch. Checkpoint 3 of section 8 in `docs/plans/builds-queue-placement.md`. `merge_gate --tests-only` takes the same queue route as a full gate and keeps its exit codes. Tell the sdlc showrunner before this phase edits `merge_gate.py`, because natest phase 119 changed `run_gate_suites`. Phase 119 is at 14581684f on builds-natest: merge builds first, keep its selection lines before the `cloud.route` call, and keep its empty-selection result. Tell the sdlc showrunner when this phase is on main. The Work Order follows at phase start.
 
