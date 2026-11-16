@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from scripts.build_queue import admission_records
+from scripts.build_queue import app_gate, admission_records
 
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
 from scripts.build_queue import admission_protocol as wire
 from scripts.lint import memory_admit as gate
 from unittest.mock import patch
+import time
+from scripts.buildlog import store
+from scripts.lib import conf
 
 import json
 import os
@@ -132,6 +135,7 @@ class BrpLaunchGateTests(unittest.TestCase):
         lint = self.root / "lint"
         hooks.mkdir()
         lint.mkdir()
+        (self.root / "build_queue").symlink_to(HOOK.parent.parent / "build_queue", target_is_directory=True)
         (self.root / "lib").symlink_to(HOOK.parent.parent / "lib", target_is_directory=True)
         self.hook = hooks / HOOK.name
         _ = self.hook.write_text(HOOK.read_text())
@@ -388,6 +392,77 @@ class BrpLaunchGateTests(unittest.TestCase):
         self.assertNotIn("waiting for memory", result.stderr)
         self.assertEqual(self.cycle_file.read_bytes(), before)
 
+    def test_enabled_hana_hook_requires_a_grant_and_bounds_its_wait(self) -> None:
+        for outcome, check_seconds in (("grant", 0.1), ("refuse", 0.1), ("wait-limit", 0.1), ("wait-limit-slow", 0.25)):
+            with self.subTest(outcome=outcome, check_seconds=check_seconds):
+                workspace = self.root / outcome
+                (workspace / "crates/hana").mkdir(parents=True)
+                now = [0.0]
+                settings = conf.ConfigRead("private", self.root / "private.conf", {
+                    "brp_adopt_wait_seconds": conf.Setting("1", "# range: 0..900", 1),
+                    "brp_adopt_handoff_seconds": conf.Setting("2", "# range: 0..300", 2),
+                    "brp_adopt_check_seconds": conf.Setting(str(check_seconds), "# range: 0.05..5", 3),
+                }, False)
+                directories: list[Path] = []
+
+                def start(launch: app_gate.AdoptLaunch, directory: Path, wait: float, handoff: float) -> None:
+                    self.assertEqual((launch.instances, wait, handoff), (2, 1, 2))
+                    self.assertEqual(launch.binary, workspace / "target/debug/hana")
+                    directories.append(directory)
+                    _ = (directory / "status").write_text("queue place 4: need exceeds room")
+                    if outcome == "grant":
+                        _ = (directory / "granted").write_text("reservation")
+                    if outcome == "refuse":
+                        _ = (directory / "refused").write_text("fixture policy refuses this app")
+
+                def tick(seconds: float) -> None:
+                    self.assertAlmostEqual(seconds, min(check_seconds, 1 - now[0]))
+                    now[0] += seconds
+
+                with (patch.object(app_gate, "BRP_ADOPTION_ENABLED", True),
+                      patch.object(app_gate, "start_adopter", side_effect=start),
+                      patch.object(conf, "read", return_value=settings),
+                      patch.object(store, "root", return_value=self.root / "buildlog"),
+                      patch.object(time, "monotonic", side_effect=lambda: now[0]),
+                      patch.object(time, "sleep", side_effect=tick)):
+                    reason = app_gate.pre_launch({"tool_use_id": outcome, "cwd": str(workspace),
+                        "tool_input": {"target_name": "hana", "instance_count": 2,
+                                       "env": {"HANA_TEST_PURPOSE": "feature"}}})
+                if outcome == "grant":
+                    self.assertEqual(reason, "")
+                elif outcome == "refuse":
+                    self.assertEqual(reason, "fixture policy refuses this app")
+                else:
+                    self.assertIn("queue place 4: need exceeds room", reason)
+                    self.assertTrue((directories[0] / "cancel").exists())
+                    self.assertLessEqual(now[0], 1 + check_seconds)
+
+    def test_post_hook_rejects_missing_or_malformed_results_without_losing_the_hold(self) -> None:
+        for index, response in enumerate((None, {}, {"instances": []}, {"instances": [{"pid": "bad"}]})):
+            tool_id = f"post-{index}"
+            with patch.object(store, "root", return_value=self.root / "buildlog"):
+                directory = app_gate.adoption_path(tool_id)
+            directory.mkdir(parents=True)
+            result = subprocess.run(["bash", str(HOOK.with_name("post-tool-use-brp-launch-hold.sh"))],
+                input=json.dumps({"tool_use_id": tool_id, "tool_response": response}), env=self.environment,
+                text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertIsInstance(app_gate.read_handoff(directory), app_gate.FailedHandoff)
+
+    def test_post_handoff_saves_live_identities_and_accepts_already_ended_pids(self) -> None:
+        for ended in (False, True):
+            with self.subTest(ended=ended), patch.object(store, "root", return_value=self.root / "buildlog"):
+                tool_id = f"handoff-{ended}"
+                directory = app_gate.adoption_path(tool_id)
+                directory.mkdir(parents=True)
+                _ = (directory / "app.adopt").write_text(json.dumps({"owner_pid": 100, "owner_start": "owner", "processes": {}}))
+                processes = {} if ended else {101: gate.ProcessIdentity(1, "start"), 102: gate.ProcessIdentity(101, "child")}
+                with patch.object(gate, "process_table", return_value=processes):
+                    app_gate.publish_handoff({"tool_use_id": tool_id, "tool_response": {"instances": [{"pid": 101}]}}, self.root / "proc")
+                handoff = app_gate.read_handoff(directory)
+                self.assertEqual(handoff, app_gate.AdoptedProcesses(() if ended else (wire.Owner(101, "start"), wire.Owner(102, "child"))))
+
     def test_settings_registers_hook_with_long_enough_timeout(self) -> None:
         settings = cast(dict[str, object], json.loads(SETTINGS.read_text()))
         hooks = cast(dict[str, list[dict[str, object]]], settings["hooks"])
@@ -397,6 +472,12 @@ class BrpLaunchGateTests(unittest.TestCase):
         self.assertEqual(len(commands), 1)
         self.assertIn("pre-tool-use-brp-launch-gate.sh", cast(str, commands[0]["command"]))
         self.assertGreater(cast(int, commands[0]["timeout"]), 900)
+        settings = cast(dict[str, object], json.loads(SETTINGS.read_text()))
+        hooks = cast(dict[str, list[dict[str, object]]], settings["hooks"])
+        post = [entry for entry in hooks["PostToolUse"] if entry.get("matcher") == "mcp__brp__brp_launch"]
+        self.assertEqual(len(post), 1)
+        post_commands = cast(list[dict[str, object]], post[0]["hooks"])
+        self.assertIn("post-tool-use-brp-launch-hold.sh", str(post_commands[0]["command"]))
 
 
 if __name__ == "__main__":

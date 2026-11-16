@@ -106,6 +106,25 @@ class UnadmittedAppTests(unittest.TestCase):
         self.assertEqual(len(self.scan((reservation,)).apps), 3)
         self.assertEqual(len(self.scan().apps), 3)
 
+    def test_adopted_processes_need_a_live_holder_and_an_active_reservation(self) -> None:
+        _ = self.process(100, name="python3", start="100")
+        _ = self.process(101, start="101")
+        _ = self.process(102, parent=101, start="102")
+        _ = self.process(103, start="103")
+        sidecar = self.root / "app.cgroup"
+        _ = sidecar.write_text("")
+        manifest = sidecar.with_suffix(".adopt")
+        _ = manifest.write_text(json.dumps({"owner_pid": 100, "owner_start": "100", "processes": {"101": "101"}}))
+        reservation = fixture_reservation(100, 4096, step="app")
+        reservation["sidecar"] = str(sidecar)
+        self.assertEqual([app.pid for app in self.scan((reservation,)).apps], [103])
+        self.assertEqual([app.pid for app in self.scan().apps], [101, 103])
+        write_process(self.proc, 100, start="999")
+        self.assertCountEqual([app.pid for app in self.scan((reservation,)).apps], [101, 103])
+        write_process(self.proc, 100, start="100")
+        write_process(self.proc, 101, start="998")
+        self.assertCountEqual([app.pid for app in self.scan((reservation,)).apps], [101, 103])
+
     def test_children_belong_to_the_first_hana_tree(self) -> None:
         _ = self.process(101, used=1024, swap=2048)
         _ = self.process(102, parent=101, used=3072, swap=4096)

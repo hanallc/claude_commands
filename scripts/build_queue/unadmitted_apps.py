@@ -57,18 +57,42 @@ class NoAppAlerts:
 NO_APP_ALERTS = NoAppAlerts()
 
 
-def admitted_scopes(directory: Path, cgroup_root: Path) -> tuple[str, ...]:
+@dataclass(frozen=True)
+class AppAdmissions:
+    scopes: tuple[str, ...]
+    processes: frozenset[int]
+
+
+def adopted_processes(sidecar: Path, processes: dict[int, gate.ProcessIdentity]) -> set[int]:
+    """Read adopted identities only while their exact holder remains alive."""
+    try:
+        manifest = cast(dict[str, object], json.loads(sidecar.with_suffix(".adopt").read_text()))
+        owner, start = manifest.get("owner_pid"), manifest.get("owner_start")
+        roots = manifest.get("processes")
+        identity = processes.get(owner) if type(owner) is int else None
+        if identity is not None and identity.start == start and isinstance(roots, dict):
+            identities = {int(pid): value for pid, value in cast(dict[str, object], roots).items()
+                          if pid.isdecimal() and isinstance(value, str)}
+            return gate.process_tree(identities, processes)
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return set()
+
+
+def admitted_scopes(directory: Path, cgroup_root: Path,
+                    processes: dict[int, gate.ProcessIdentity]) -> AppAdmissions:
     """Read active app scopes from the durable admission state."""
     try:
         value = cast(object, json.loads((directory / "state.json").read_text()))
     except FileNotFoundError:
-        return ()
+        return AppAdmissions((), frozenset())
     if not isinstance(value, dict):
         raise ValueError("admission state must be an object")
     reservations = cast(dict[str, object], value).get("reservations")
     if not isinstance(reservations, dict):
         raise ValueError("admission reservations must be an object")
     scopes: list[str] = []
+    adopted: set[int] = set()
     for reservation in cast(dict[str, object], reservations).values():
         if not isinstance(reservation, dict):
             raise ValueError("admission reservation must be an object")
@@ -78,13 +102,14 @@ def admitted_scopes(directory: Path, cgroup_root: Path) -> tuple[str, ...]:
         sidecar = row.get("sidecar")
         if not isinstance(sidecar, str):
             raise ValueError("app admission sidecar must be a path")
+        adopted.update(adopted_processes(Path(sidecar), processes))
         try:
             scope = Path(Path(sidecar).read_text().strip())
             if scope.name.startswith("app-") and scope.suffix == ".scope":
                 scopes.append("/" + scope.relative_to(cgroup_root).as_posix())
         except (OSError, ValueError):
             continue
-    return tuple(scopes)
+    return AppAdmissions(tuple(scopes), frozenset(adopted))
 
 
 def scan(proc: Path, admission_directory: Path, cgroup_root: Path) -> AppScan:
@@ -109,7 +134,7 @@ def scan(proc: Path, admission_directory: Path, cgroup_root: Path) -> AppScan:
     if not binaries:
         return AppScan((), live_keys)
     # The admission grant precedes app startup, so read admissions after the process scan.
-    admitted = admitted_scopes(admission_directory, cgroup_root)
+    admitted = admitted_scopes(admission_directory, cgroup_root, processes)
     identities = gate.QueueIdentityReader(processes, proc)
     try:
         boot = float(next(line.split()[1] for line in (proc / "stat").read_text().splitlines()
@@ -131,7 +156,7 @@ def scan(proc: Path, admission_directory: Path, cgroup_root: Path) -> AppScan:
                           if line.startswith("0::"))
         except (OSError, StopIteration):
             cgroup = ""
-        if any(cgroup == scope or cgroup.startswith(scope + "/") for scope in admitted):
+        if pid in admitted.processes or any(cgroup == scope or cgroup.startswith(scope + "/") for scope in admitted.scopes):
             continue
         caller = identities.identity(pid, {"start_time": processes[pid].start})
         explicit = environment_values(proc / str(pid) / "environ", ("HANA_TEST_OWNER",)).get("HANA_TEST_OWNER", "").strip()

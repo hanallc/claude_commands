@@ -18,7 +18,7 @@ import subprocess
 import sys
 import uuid
 from collections import deque
-from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -234,6 +234,35 @@ def retire_app_scope(sidecar: Path) -> None:
                            check=True, capture_output=True, text=True)
     sidecar.unlink(missing_ok=True)
     owner_file.unlink(missing_ok=True)
+    sidecar.with_suffix(".adopt").unlink(missing_ok=True)
+
+
+def retire_brp_hold(directory: Path, owner_live: Callable[[int, str], bool]) -> None:
+    """Remove BRP hold files after both owners exit and reservation finalization completes."""
+    markers = (directory / "holder.owner", directory / "hook.owner")
+    found = False
+    for marker in markers:
+        try:
+            pid, start = marker.read_text().split()
+        except FileNotFoundError:
+            continue
+        except ValueError:
+            return
+        found = True
+        if not pid.isdecimal() or owner_live(int(pid), start):
+            return
+    if not found:
+        return
+    for name in ("app.cgroup", "app.adopt", "app.owner", "status", "refused", "granted", "released",
+                 "cancel", "handoff.json", "holder.log", "hook.owner", "holder.owner"):
+        (directory / name).unlink(missing_ok=True)
+    try:
+        directory.rmdir()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        if error.errno != errno.ENOTEMPTY:
+            raise
 
 
 def sample_app_peak(scope: Path, maximum: Path) -> None:

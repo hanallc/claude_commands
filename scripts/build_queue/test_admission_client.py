@@ -1192,6 +1192,61 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(errors.getvalue(), "")
                 self.doCleanups()
 
+    def test_checked_socket_wait_preserves_split_replies_and_restores_service_timing(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            encoded = reply_bytes(GRANTED)
+            split = len(encoded) // 2
+            transport = self.use_transport(fixture,
+                Exchange(encoded[:split], TimeoutError(), encoded[split:]), Exchange(reply_bytes(GRANTED)))
+            checks: list[float] = []
+            with client.checked_socket_wait(lambda: checks.append(fixture.clock.monotonic()), 0.1), \
+                    redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(client.admit(request, lambda _reply: None, lambda: request), GRANTED)
+            self.assertEqual(errors.getvalue(), "")
+            self.assertAlmostEqual(fixture.clock.monotonic(), 0.1)
+            self.assertGreaterEqual(len(checks), 4)
+            self.assertTrue(all(timeout <= 0.1 for timeout in transport.timeouts))
+            checked_count = len(checks)
+            boundary = len(transport.timeouts)
+            self.assertEqual(client.admit(request, lambda _reply: None, lambda: request), GRANTED)
+            self.assertEqual(len(checks), checked_count)
+            self.assertTrue(all(timeout == records.read_memory_config().silence_seconds
+                for timeout in transport.timeouts[boundary:]))
+            self.assertEqual(transport.requests, [request, request])
+
+    def test_checked_socket_wait_releases_a_grant_at_the_deadline_without_caller_checks(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            transport = self.use_transport(fixture,
+                Exchange(TimedChunk(0.1, reply_bytes(GRANTED))), Exchange(reply_bytes(wire.Ok())))
+
+            def check() -> None:
+                if fixture.clock.monotonic() >= 0.1:
+                    raise RuntimeError("caller deadline")
+
+            with client.checked_socket_wait(check, 0.1), self.assertRaisesRegex(RuntimeError, "caller deadline"):
+                _ = client.admit(request, lambda _reply: None, lambda: request, _attempt=check)
+            self.assertEqual(len(transport.requests), 2)
+            release = transport.requests[1]
+            assert isinstance(release, wire.ReleaseRequest)
+            self.assertEqual(release.reservation, GRANTED.reservation)
+            self.assertEqual(release.status, 1)
+            self.assertEqual(transport.timeouts[-1], GRANTED.cleanup_timing.silence_seconds)
+
+    def test_owner_exit_cancellation_does_not_wait_for_release_of_a_late_grant(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            transport = self.use_transport(fixture, Exchange(TimedChunk(0.1, reply_bytes(GRANTED))))
+
+            def check() -> None:
+                if fixture.clock.monotonic() >= 0.1:
+                    raise client.OwnerExitCancellation("caller exits")
+
+            with client.checked_socket_wait(check, 0.1), self.assertRaisesRegex(client.OwnerExitCancellation, "caller exits"):
+                _ = client.admit(request, lambda _reply: None, lambda: request, _attempt=check)
+            self.assertEqual(transport.requests, [request])
+
     def test_split_reply_survives_a_silence_timeout(self) -> None:
         mutations: dict[str, Callable[[], object]] = {
             "release": lambda: client.release("stem", 137, records.read_memory_config()),

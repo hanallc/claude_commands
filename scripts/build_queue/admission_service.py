@@ -460,7 +460,6 @@ class ReservationEvidence:
 def raw_reservation_memory(record: ReservationRecord, row: records.Reservation,
                            lifetime: gate.StepLifetime, processes: dict[int, gate.ProcessIdentity],
                            proc: Path) -> records.StepMemory:
-    _ = record
     if isinstance(lifetime, gate.EndedStep):
         return records.GoneMemory()
     if isinstance(lifetime, gate.PopulatedStepScope):
@@ -470,6 +469,12 @@ def raw_reservation_memory(record: ReservationRecord, row: records.Reservation,
             identity = processes.get(row["pid"])
             if identity is None or identity.start != row["start_time"]:
                 return records.GoneMemory()
+    if record.step == gate.APP_KIND and record.sidecar:
+        from scripts.build_queue.unadmitted_apps import adopted_processes
+
+        members = gate.process_tree({row["pid"]: row["start_time"]}, processes)
+        members.update(adopted_processes(Path(record.sidecar), processes))
+        return gate.process_memory(members, proc) if members else records.GoneMemory()
     return gate.tree_memory(row["pid"], row["start_time"], processes, proc)
 
 
@@ -1759,6 +1764,8 @@ class AdmissionServer:
         if isinstance(self.system_reader, NoSystemReader):
             def direct_memory(record: ReservationRecord, row: records.Reservation, lifetime: gate.StepLifetime,
                               processes: dict[int, gate.ProcessIdentity], proc: Path) -> records.StepMemory:
+                if record.step == gate.APP_KIND:
+                    return raw_reservation_memory(record, row, lifetime, processes, proc)
                 return (records.GoneMemory() if isinstance(lifetime, gate.EndedStep) else
                     self.readings.reservation(Path(record.path), row, datetime.fromtimestamp(now, UTC),
                                               processes, proc, config.policy))
@@ -1836,6 +1843,7 @@ class AdmissionServer:
         owned: set[str] = set()
         scopes: dict[str, str] = {}
         scope_memory: dict[Path, records.MeasuredMemory] = {}
+        app_pids: set[int] = set()
         active = {row.get("reservation_id", "") for row in rows}
         for record in self.reservations.values():
             if isinstance(record.place, wire.CloudPlace) and record.sidecar:
@@ -1846,6 +1854,10 @@ class AdmissionServer:
                 if scope:
                     owned.add(scope)
             captured = evidence.reservations.get(record.episode)
+            if (record.step == gate.APP_KIND and record.reservation_id in active and captured is not None
+                    and isinstance(captured.memory, records.MeasuredMemory)
+                    and isinstance(captured.memory.anonymous_source, records.ProcessSource)):
+                app_pids.update(process.pid for process in captured.memory.anonymous_source.processes)
             if captured is not None and captured.scope:
                 owned.add(captured.scope)
                 scopes[record.reservation_id] = captured.scope
@@ -1853,6 +1865,7 @@ class AdmissionServer:
                     scope_memory[Path(captured.scope)] = captured.memory
         roots = {row["pid"]: row["start_time"] for row in rows if not scopes.get(row.get("reservation_id", ""))}
         tree_pids = gate.process_tree(roots, dict(evidence.processes))
+        tree_pids.update(app_pids)
         result: list[records.UnownedSliceMemory] = []
         for memory in evidence.unowned:
             state = records.recorded_service_state(memory)
@@ -2106,6 +2119,10 @@ class AdmissionServer:
         for sidecar in (self.state_dir / "app-scopes").glob("*.cgroup"):
             if str(sidecar) not in active:
                 gate.retire_app_scope(sidecar)
+        for directory in (self.state_dir / "brp-holds").glob("*"):
+            if str(directory / "app.cgroup") not in active:
+                gate.retire_brp_hold(directory,
+                    lambda pid, start: self.proc.owner_start(pid) == LiveOwnerIdentity(start))
 
     def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
               ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:

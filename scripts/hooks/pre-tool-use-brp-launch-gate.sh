@@ -11,7 +11,8 @@ print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
       "permissionDecision": "deny", "permissionDecisionReason": sys.argv[1]}}))
 PY_DENY
 }
-launch_fields="$("$hook_dir/../lib/py" -c '
+payload="$(cat)"
+launch_fields="$(printf '%s' "$payload" | "$hook_dir/../lib/py" -c '
 import json, sys
 value = json.load(sys.stdin)
 session = value.get("session_id", "")
@@ -21,12 +22,13 @@ if not isinstance(tool, dict):
     tool = {}
 app = tool.get("target_name", tool.get("app", ""))
 if value.get("tool_name") == "mcp__brp__brp_launch" and app == "hana":
-    print("Hana needs an app memory hold. Use hana_shot.py launch --purpose <feature> (sets env.HANA_TEST_PURPOSE).")
+    print("hana")
 ' 2>/dev/null)" || launch_fields=""
 session_id="${launch_fields%%$'\n'*}"
 if [[ "$launch_fields" == *$'\n'* ]]; then
-    deny "${launch_fields#*$'\n'}"
-    exit 0
+    export CLAUDE_CODE_SESSION_ID="$session_id"
+    printf '%s' "$payload" | "$hook_dir/../lib/py" "$hook_dir/../build_queue/app_gate.py" hook-pre
+    exit $?
 fi
 export CLAUDE_CODE_SESSION_ID="$session_id"
 source "$hook_dir/../lint/memory_gate.sh"

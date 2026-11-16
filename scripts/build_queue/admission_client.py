@@ -6,7 +6,8 @@ except FileNotFoundError:
     pass
 
 import argparse
-from contextlib import nullcontext
+from collections.abc import Generator
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -72,6 +73,58 @@ class _QueueUnreachable(Exception):
     pass
 
 
+class OwnerExitCancellation(Exception):
+    """The caller exits so the service can reclaim its admission episode."""
+
+
+@dataclass(frozen=True)
+class ServiceWaitTiming:
+    """Use the service timing without caller cancellation checks."""
+
+    def check(self) -> None:
+        pass
+
+    def timeout(self, seconds: float) -> float:
+        return seconds
+
+    def pause(self, seconds: float) -> None:
+        CLOCK.sleep(seconds)
+
+
+@dataclass(frozen=True)
+class CheckedSocketWait:
+    """Check the caller deadline and cancellation between bounded socket reads."""
+    check: Callable[[], None]
+    interval: float
+
+    def timeout(self, seconds: float) -> float:
+        return min(seconds, self.interval)
+
+    def pause(self, seconds: float) -> None:
+        deadline = CLOCK.monotonic() + seconds
+        self.check()
+        while CLOCK.monotonic() < deadline:
+            CLOCK.sleep(self.timeout(deadline - CLOCK.monotonic()))
+            self.check()
+
+
+SERVICE_WAIT_TIMING = ServiceWaitTiming()
+_SOCKET_WAIT: ContextVar[ServiceWaitTiming | CheckedSocketWait] = ContextVar("socket_wait", default=SERVICE_WAIT_TIMING)
+
+
+@contextmanager
+def checked_socket_wait(check: Callable[[], None], interval: float) -> Generator[None]:
+    """Apply caller checks to acquisition reads without changing cleanup timing."""
+    if interval <= 0 or not math.isfinite(interval):
+        raise ValueError("socket check interval must be finite and positive")
+    check()
+    token = _SOCKET_WAIT.set(CheckedSocketWait(check, interval))
+    try:
+        yield
+    finally:
+        _SOCKET_WAIT.reset(token)
+
+
 def _whole_seconds(key: str, fallback: int) -> int:
     raw = os.environ.get(key, str(fallback))
     return int(raw) if raw.isdecimal() else fallback
@@ -95,10 +148,19 @@ def _remaining_seconds(deadline: float) -> float:
     return left
 
 
-def _line(connection: socket.socket, pending: bytearray, deadline: float) -> bytes:
+def _line(connection: socket.socket, pending: bytearray, deadline: float,
+          wait: ServiceWaitTiming | CheckedSocketWait = SERVICE_WAIT_TIMING) -> bytes:
     while b"\n" not in pending:
-        connection.settimeout(_remaining_seconds(deadline))
-        chunk = connection.recv(65536)
+        wait.check()
+        connection.settimeout(wait.timeout(_remaining_seconds(deadline)))
+        try:
+            chunk = connection.recv(65536)
+        except TimeoutError:
+            if isinstance(wait, ServiceWaitTiming):
+                raise
+            wait.check()
+            _ = _remaining_seconds(deadline)
+            continue
         if not chunk:
             raise TransportUnavailable("closed connection")
         pending.extend(chunk)
@@ -454,6 +516,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
              configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming
              ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization | wire.RepositorySlotReady | wire.RepositorySlotExpired | status_wire.PlacementStatusReply:
     first = request
+    wait = SERVICE_WAIT_TIMING if isinstance(first, wire.ReleaseRequest) else _SOCKET_WAIT.get()
     placement_control = _waits_for_live_service(first)
     leave_interval = (configuration.running_pass_seconds if not isinstance(configuration, (wire.AcquisitionTiming, wire.CleanupTiming))
                       else configuration.reconnect_seconds)
@@ -503,10 +566,10 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
             timeout = configuration.silence_seconds
             if generation_query:
                 timeout = min(timeout, configuration.reconnect_seconds)
-            timeout = retry.bound(timeout)
+            timeout = wait.timeout(retry.bound(timeout))
             active_channel, channel = channel, None
             with nullcontext(active_channel.connection) if active_channel is not None else _connect(timeout) as connection:
-                send_timeout = retry.bound(timeout)
+                send_timeout = wait.timeout(retry.bound(timeout))
                 if active_channel is not None or send_timeout < timeout:
                     connection.settimeout(send_timeout)
                 connection.sendall(wire.encode_request(request).encode())
@@ -517,7 +580,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         deadline = min(deadline, CLOCK.monotonic() + configuration.reconnect_seconds)
                     try:
                         line = _line(connection, pending, min(deadline, retry.deadline, retry.next_leave,
-                                                             retry.unreachable_deadline))
+                                                             retry.unreachable_deadline), wait)
                     except TimeoutError:
                         if CLOCK.monotonic() >= retry.next_leave:
                             if retry.left_queue():
@@ -596,6 +659,8 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                                     break
                             else:
                                 attempt()
+                        except OwnerExitCancellation:
+                            raise
                         except BaseException:
                             if isinstance(reply, wire.Admitted):
                                 _ = release(reply.reservation, 1, reply.cleanup_timing)
@@ -634,7 +699,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                                 request = replace(_refreshed(first, estimate, channel=EstimateConnection(connection, pending)),
                                                   code_version=LOADED_ADMISSION_CODE_VERSION)
                                 refresh_pending = False
-                            except (_QueueLeft, _QueueUnreachable, OSError, TransportUnavailable):
+                            except (_QueueLeft, _QueueUnreachable, OwnerExitCancellation, OSError, TransportUnavailable):
                                 raise
                             except Exception as error:
                                 raise CheckerFailure(str(error)) from error
@@ -655,7 +720,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 if retry.left_queue():
                     return LeftQueue()
                 delay = min(configuration.reconnect_seconds, failure_limit - (CLOCK.monotonic() - failed_since))
-                CLOCK.sleep(retry.bound(delay))
+                wait.pause(retry.bound(delay))
                 if retry.left_queue():
                     return LeftQueue()
                 if CLOCK.monotonic() >= retry.deadline:
@@ -667,7 +732,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     request = replace(_refreshed(first, refresh), code_version=LOADED_ADMISSION_CODE_VERSION)
                     refresh_pending = False
                     break
-                except (_QueueLeft, _QueueUnreachable):
+                except (_QueueLeft, _QueueUnreachable, OwnerExitCancellation):
                     raise
                 except Exception as refresh_error:
                     reason = str(refresh_error) or "checker returned an error"
@@ -695,7 +760,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 reason = "no socket" if isinstance(error, FileNotFoundError) else "connect refused" if isinstance(error, ConnectionRefusedError) else str(error)
                 print(f"admission service unavailable: {reason}; waiting again", file=sys.stderr)
                 retry.last_outage_line = CLOCK.monotonic()
-            CLOCK.sleep(retry.bound(configuration.reconnect_seconds))
+            wait.pause(retry.bound(configuration.reconnect_seconds))
 
 
 def _unreachable_duration(seconds: float) -> str:
@@ -722,7 +787,7 @@ def _first_request_wait[Request, Reply](launching: bool, refresh: Callable[[], R
     try:
         try:
             request = refresh()
-        except (_QueueLeft, _QueueUnreachable):
+        except (_QueueLeft, _QueueUnreachable, OwnerExitCancellation):
             raise
         except Exception as error:
             return _refused(str(error) or "checker returned an error", checker=True)

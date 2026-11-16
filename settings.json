@@ -251,13 +251,23 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "mcp__brp__brp_launch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/hooks/post-tool-use-brp-launch-hold.sh\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
         "hooks": [
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/berth/install/hooks/berth_post_bash.sh\""
           }
-        ]
+        ],
+        "matcher": "Bash"
       },
       {
         "hooks": [

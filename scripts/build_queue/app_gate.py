@@ -7,19 +7,23 @@ except FileNotFoundError:
     pass
 
 import argparse
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import os
+import hashlib
+import json
 from pathlib import Path
 import subprocess
 import signal
 import sys
 import time
 import uuid
-from typing import override
+from typing import cast, override
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_records as records, queue_place
 from scripts.buildlog import store
+from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lint import memory_admit as gate
 
@@ -159,14 +163,7 @@ def supervise(binary: Path, repository: Path, purpose: str, owner_name: str, pid
     directory.mkdir(parents=True, exist_ok=True)
     sidecar = directory / (scope.name + ".cgroup")
     write_text_atomic(sidecar, str(scope) + "\n")
-    identity = client.step_identity(f"app · {binary.name} · {purpose}", str(repository))
-    identity = wire.Identity(identity.session_id, owner_name or identity.name, identity.step,
-                             identity.folder, identity.unit)
-
-    def refresh() -> wire.AdmitRequest:
-        profile = gate.app_profile(binary, repository, datetime.now(UTC), store.root())
-        return wire.AdmitRequest(episode, owner, tuple(arguments), str(repository), since,
-            str(sidecar), identity, records.NoCallRecord(), records.NoTestWidth(), profile, False)
+    refresh = app_request(binary, repository, purpose, owner_name, sidecar, owner, episode, since, tuple(arguments))
 
     interval = records.read_memory_config().program_sample_seconds
     output = AppWaitOutput(status_file=pid_file.with_suffix(".status"))
@@ -215,8 +212,354 @@ def supervise(binary: Path, repository: Path, purpose: str, owner_name: str, pid
             gate.sample_app_peak(hold.scope, Path(hold.grant.max_path))
             time.sleep(interval)
         gate.sample_app_peak(hold.scope, Path(hold.grant.max_path))
-        _ = queue_place.release_place(hold.grant.reservation, status, hold.grant.cleanup_timing)
-        gate.retire_app_scope(hold.sidecar)
+        release_app(hold, status)
+
+
+# Keep MCP Hana launches refused until the live admission proof is approved.
+BRP_ADOPTION_ENABLED = False
+PROC = Path("/proc")
+
+
+def app_request(binary: Path, repository: Path, purpose: str, owner_name: str, sidecar: Path,
+                owner: wire.Owner, episode: str, since: float, arguments: tuple[str, ...], instances: int = 1
+                ) -> Callable[[], wire.AdmitRequest]:
+    """Use the same app profile and owner for both launch routes."""
+    identity = client.step_identity(f"app · {binary.name} · {purpose}", str(repository))
+    identity = wire.Identity(identity.session_id, owner_name or identity.name, identity.step,
+                             identity.folder, identity.unit)
+
+    def refresh() -> wire.AdmitRequest:
+        profile = gate.app_profile(binary, repository, datetime.now(UTC), store.root())
+        profile = replace(profile, peak=replace(profile.peak, bytes=profile.peak.bytes * instances))
+        return wire.AdmitRequest(episode, owner, arguments, str(repository), since,
+            str(sidecar), identity, records.NoCallRecord(), records.NoTestWidth(), profile, False)
+
+    return refresh
+
+
+def release_app(hold: AppHold, status: int, *, instances: int = 1) -> None:
+    """Release the existing app reservation and retire its sidecar."""
+    if instances > 1:
+        maximum = Path(hold.grant.max_path)
+        try:
+            peak = int(maximum.read_text())
+        except FileNotFoundError:
+            pass
+        else:
+            write_text_atomic(maximum, f"{peak // instances}\n")
+    _ = queue_place.release_place(hold.grant.reservation, status, hold.grant.cleanup_timing)
+    gate.retire_app_scope(hold.sidecar)
+
+
+@dataclass(frozen=True)
+class AdoptLaunch:
+    binary: Path
+    repository: Path
+    purpose: str
+    instances: int
+
+
+@dataclass(frozen=True)
+class AwaitingHandoff:
+    pass
+
+
+@dataclass(frozen=True)
+class FailedHandoff:
+    reason: str
+
+
+@dataclass(frozen=True)
+class AdoptedProcesses:
+    owners: tuple[wire.Owner, ...]
+
+
+def object_value(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("expected an object")
+    return cast(dict[str, object], value)
+
+
+def adoption_path(tool_use_id: str) -> Path:
+    if not tool_use_id:
+        raise ValueError("BRP launch has no tool_use_id")
+    key = hashlib.sha256(tool_use_id.encode()).hexdigest()
+    return store.root() / "admission/brp-holds" / key
+
+
+def read_handoff(directory: Path) -> AwaitingHandoff | FailedHandoff | AdoptedProcesses:
+    try:
+        row = object_value(cast(object, json.loads((directory / "handoff.json").read_text())))
+        reason = row.get("error")
+        if isinstance(reason, str):
+            return FailedHandoff(reason)
+        values = row.get("owners")
+        if not isinstance(values, list):
+            raise ValueError("handoff owners must be a list")
+        owners: list[wire.Owner] = []
+        for value in cast(list[object], values):
+            owner = object_value(value)
+            pid, start = owner.get("pid"), owner.get("start_time")
+            if type(pid) is not int or pid <= 0 or not isinstance(start, str) or not start:
+                raise ValueError("invalid handoff process identity")
+            owners.append(wire.Owner(pid, start))
+        return AdoptedProcesses(tuple(owners))
+    except FileNotFoundError:
+        return AwaitingHandoff()
+    except (ValueError, TypeError) as error:
+        return FailedHandoff(str(error))
+
+
+def publish_handoff(payload: dict[str, object], proc: Path = PROC) -> None:
+    """Save identities at handoff, before a reused PID can name another app."""
+    tool_id = payload.get("tool_use_id")
+    if not isinstance(tool_id, str):
+        return
+    directory = adoption_path(tool_id)
+    if not directory.is_dir() or (directory / "cancel").exists() or (directory / "released").exists():
+        return
+    try:
+        response = object_value(payload.get("tool_response"))
+        # MCP can return its structured result inside text content.
+        if "instances" not in response and isinstance(response.get("content"), list):
+            content = cast(list[object], response["content"])
+            texts = [object_value(item).get("text") for item in content]
+            text = next((item for item in texts if isinstance(item, str)), "")
+            response = object_value(cast(object, json.loads(text)))
+        instances = response.get("instances")
+        if not isinstance(instances, list) or not instances:
+            raise ValueError("BRP launch returned no instances")
+        pids: list[int] = []
+        for instance in cast(list[object], instances):
+            pid = object_value(instance).get("pid")
+            if type(pid) is not int or pid <= 0:
+                raise ValueError("BRP launch returned an invalid pid")
+            pids.append(pid)
+        processes = gate.process_table(proc)
+        owners: list[dict[str, int | str]] = []
+        for pid in pids:
+            identity = processes.get(pid)
+            if identity is not None:
+                owners.append({"pid": pid, "start_time": identity.start})
+        roots = {int(owner["pid"]): str(owner["start_time"]) for owner in owners}
+        owners = [{"pid": pid, "start_time": processes[pid].start}
+                  for pid in sorted(gate.process_tree(roots, processes))]
+        result: dict[str, object] = {"owners": owners}
+        manifest = object_value(cast(object, json.loads((directory / "app.adopt").read_text())))
+        manifest["processes"] = {str(owner["pid"]): owner["start_time"] for owner in owners}
+        write_text_atomic(directory / "app.adopt", json.dumps(manifest))
+    except (OSError, ValueError, TypeError) as error:
+        result = {"error": str(error)}
+    write_text_atomic(directory / "handoff.json", json.dumps(result))
+
+
+class AdoptionWaitEnded(client.OwnerExitCancellation):
+    """The adoption wait reached its deadline or received a cancellation."""
+
+
+@dataclass
+class AdoptWaitOutput(AppWaitOutput):
+    directory: Path = field(default_factory=Path)
+    deadline: float = 0.0
+
+    def check(self) -> None:
+        if time.monotonic() >= self.deadline or (self.directory / "cancel").exists():
+            reason = "launch wait limit reached" if time.monotonic() >= self.deadline else "launch cancelled"
+            raise AdoptionWaitEnded(f"{reason}; queue place {self.last_position}: " +
+                                    ("; ".join(self.last_reasons) or "waiting for memory admission"))
+
+    @override
+    def __call__(self, reply: wire.Wait) -> None:
+        super().__call__(reply)
+        self.status(f"queue place {self.last_position}: " + "; ".join(self.last_reasons))
+        self.check()
+
+
+def adopt(launch: AdoptLaunch, directory: Path, wait_seconds: float, handoff_seconds: float,
+          *, proc: Path = PROC) -> int:
+    """Own an app hold while MCP launches and runs its process trees."""
+    pid = os.getpid()
+    start = records.process_start_time(pid)
+    if start is None:
+        raise OSError("adopt owner has exited")
+    directory.mkdir(parents=True, exist_ok=True)
+    # The service retains this cleanup record until the holder and hook exit.
+    write_text_atomic(directory / "holder.owner", f"{pid} {start}\n")
+    sidecar = directory / "app.cgroup"
+    write_text_atomic(sidecar, "")
+    write_text_atomic(sidecar.with_suffix(".adopt"), json.dumps({"owner_pid": pid,
+        "owner_start": start, "processes": {}}))
+    output = AdoptWaitOutput(status_file=directory / "status", directory=directory,
+                             deadline=time.monotonic() + wait_seconds)
+    refresh = app_request(launch.binary, launch.repository, launch.purpose, "", sidecar,
+        wire.Owner(pid, start), directory.name, time.time(), (str(launch.binary),), launch.instances)
+    try:
+        check_seconds = conf.read("build_admission").number("brp_adopt_check_seconds")
+        with client.checked_socket_wait(output.check, check_seconds):
+            reply = queue_place.request_place(queue_place.RefreshedRequest(refresh), output, before_check=output.check)
+    except (AdoptionWaitEnded, wire.AdmissionUnavailable, OSError, ValueError) as error:
+        output.status(f"app_gate: {error}")
+        write_text_atomic(directory / "refused", str(error))
+        return 2
+    if not isinstance(reply, wire.Admitted):
+        reason = reply.reason if isinstance(reply, wire.Refused) else "left the admission queue"
+        write_text_atomic(directory / "refused", reason)
+        return 2
+    hold = AppHold(reply, directory, sidecar)
+    status = 1
+    owner_exit = False
+    try:
+        output.check()
+        write_text_atomic(directory / "granted", reply.reservation)
+        deadline = time.monotonic() + handoff_seconds
+        interval = records.read_memory_config().program_sample_seconds
+        while True:
+            handoff = read_handoff(directory)
+            if not isinstance(handoff, AwaitingHandoff):
+                break
+            if time.monotonic() >= deadline or (directory / "cancel").exists():
+                raise AdoptionWaitEnded("launch handoff wait ended before process identities arrived")
+            time.sleep(min(interval, max(0, deadline - time.monotonic())))
+        if isinstance(handoff, FailedHandoff):
+            output.status(handoff.reason)
+            return 2
+        tracked = {owner.pid: owner.start_time for owner in handoff.owners}
+        while tracked:
+            try:
+                processes = gate.process_table(proc)
+            except OSError as error:
+                output.status(f"app process scan failed; retaining memory hold: {error}")
+                time.sleep(interval)
+                continue
+            members = gate.process_tree(tracked, processes)
+            tracked = {member: processes[member].start for member in members}
+            try:
+                write_text_atomic(sidecar.with_suffix(".adopt"), json.dumps({"owner_pid": pid,
+                    "owner_start": start, "processes": tracked}))
+                memory = gate.process_memory(members, proc)
+                peak = memory.bytes + memory.swap_bytes
+                maximum = Path(reply.max_path)
+                previous = int(maximum.read_text()) if maximum.exists() else 0
+                if peak > previous:
+                    write_text_atomic(maximum, f"{peak}\n")
+            except (OSError, ValueError) as error:
+                output.status(f"app sample failed; retaining memory hold: {error}")
+            if tracked:
+                time.sleep(interval)
+        status = 0
+        return status
+    except AdoptionWaitEnded as error:
+        owner_exit = True
+        output.status(str(error))
+        write_text_atomic(directory / "refused", str(error))
+        return 2
+    except (OSError, ValueError) as error:
+        output.status(str(error))
+        write_text_atomic(directory / "refused", str(error))
+        return 2
+    finally:
+        # The service reclaims cancelled holds after fresh evidence confirms the holder exit.
+        if not owner_exit:
+            release_app(hold, status, instances=launch.instances)
+            sidecar.with_suffix(".adopt").unlink(missing_ok=True)
+            write_text_atomic(directory / "released", "done")
+
+
+def start_adopter(launch: AdoptLaunch, directory: Path, wait_seconds: float, handoff_seconds: float) -> None:
+    """Detach the holder from the hook."""
+    child = os.fork()
+    if child == 0:
+        try:
+            _ = os.setsid()
+            if os.fork() != 0:
+                os._exit(0)
+            with open(os.devnull, "rb") as source, (directory / "holder.log").open("ab", buffering=0) as log:
+                _ = os.dup2(source.fileno(), 0)
+                _ = os.dup2(log.fileno(), 1)
+                _ = os.dup2(log.fileno(), 2)
+            os._exit(adopt(launch, directory, wait_seconds, handoff_seconds))
+        except BaseException as error:
+            write_text_atomic(directory / "refused", str(error))
+            os._exit(2)
+    _ = os.waitpid(child, 0)
+
+
+def pre_launch(payload: dict[str, object]) -> str:
+    """Return a refusal reason, or an empty reason after a memory grant."""
+    if not BRP_ADOPTION_ENABLED:
+        return "Hana needs an app memory hold. Use hana_shot.py launch --purpose <feature> (sets env.HANA_TEST_PURPOSE)."
+    tool = object_value(payload.get("tool_input"))
+    environment = object_value(tool.get("env", {}))
+    purpose = environment.get("HANA_TEST_PURPOSE")
+    if not isinstance(purpose, str) or not purpose.strip():
+        return "Set env.HANA_TEST_PURPOSE to the feature under test."
+    count = tool.get("instance_count", 1)
+    if type(count) is not int or count < 1:
+        return "instance_count must be a positive integer"
+    root = Path(str(tool.get("path", payload.get("cwd", Path.cwd())))).expanduser().resolve()
+    root = next((parent for parent in (root, *root.parents) if (parent / "crates/hana").is_dir()), root)
+    if not (root / "crates/hana").is_dir():
+        return "Pass path to a Hana workspace for memory admission."
+    profile = tool.get("profile", "debug")
+    if profile not in ("debug", "release"):
+        return "Use a debug or release Hana profile for memory admission."
+    launch = AdoptLaunch(root / "target" / str(profile) / "hana", root, purpose, count)
+    tool_id = payload.get("tool_use_id")
+    if not isinstance(tool_id, str):
+        return "BRP launch has no tool_use_id"
+    directory = adoption_path(tool_id)
+    directory.mkdir(parents=True, exist_ok=False)
+    hook_start = records.process_start_time(os.getpid())
+    if hook_start is None:
+        return "BRP hook owner has exited"
+    write_text_atomic(directory / "hook.owner", f"{os.getpid()} {hook_start}\n")
+    settings = conf.read("build_admission")
+    wait_seconds = settings.number("brp_adopt_wait_seconds")
+    check_seconds = settings.number("brp_adopt_check_seconds")
+    handoff_seconds = settings.number("brp_adopt_handoff_seconds")
+    if not 0 < wait_seconds <= 900 or not 0 < handoff_seconds <= 300:
+        return "BRP adoption time limits are outside their allowed ranges"
+    deadline = time.monotonic() + wait_seconds
+    start_adopter(launch, directory, wait_seconds, handoff_seconds)
+    while time.monotonic() < deadline:
+        if (directory / "refused").exists():
+            return (directory / "refused").read_text()
+        if (directory / "granted").exists() and not (directory / "released").exists():
+            return ""
+        if (directory / "released").exists():
+            return "The app memory holder ended before the MCP launch could start."
+        time.sleep(min(check_seconds, max(0, deadline - time.monotonic())))
+    write_text_atomic(directory / "cancel", "hook wait limit reached")
+    try:
+        reason = (directory / "status").read_text().strip()
+    except FileNotFoundError:
+        reason = "queue place unknown: admission service has not answered"
+    return f"Hana launch wait limit reached; {reason}"
+
+
+def hook_main(event: str) -> int:
+    try:
+        payload = object_value(cast(object, json.load(sys.stdin)))
+        if event == "post":
+            publish_handoff(payload)
+            return 0
+        reason = pre_launch(payload)
+    except (OSError, ValueError, conf.Unusable) as error:
+        if event == "post":
+            return 0
+        reason = str(error)
+    if reason:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+            "permissionDecision": "deny", "permissionDecisionReason": reason}}))
+    return 0
+
+
+class AdoptArguments(argparse.Namespace):
+    directory: Path = Path()
+    binary: Path = Path()
+    repo: Path = Path()
+    purpose: str = ""
+    instances: int = 1
 
 
 class StopArguments(argparse.Namespace):
@@ -236,6 +579,21 @@ class AppArguments(argparse.Namespace):
 
 def main(arguments: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if arguments is None else arguments
+    if arguments[:1] == ["adopt"]:
+        parser = argparse.ArgumentParser(description="Hold memory for an MCP app launch.")
+        _ = parser.add_argument("--directory", type=Path, required=True)
+        _ = parser.add_argument("--binary", type=Path, required=True)
+        _ = parser.add_argument("--repo", type=Path, required=True)
+        _ = parser.add_argument("--purpose", required=True)
+        _ = parser.add_argument("--instances", type=int, default=1)
+        options = parser.parse_args(arguments[1:], namespace=AdoptArguments())
+        if options.instances < 1:
+            parser.error("instances must be positive")
+        settings = conf.read("build_admission")
+        return adopt(AdoptLaunch(options.binary, options.repo, options.purpose, options.instances),
+            options.directory, settings.number("brp_adopt_wait_seconds"), settings.number("brp_adopt_handoff_seconds"))
+    if arguments[:1] in (["hook-pre"], ["hook-post"]):
+        return hook_main("pre" if arguments[0] == "hook-pre" else "post")
     if arguments[:1] == ["stop"]:
         return stop_main(arguments[1:])
     parser = argparse.ArgumentParser(description=__doc__)
