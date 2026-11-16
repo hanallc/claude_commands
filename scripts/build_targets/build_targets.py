@@ -70,6 +70,7 @@ class CliArguments(argparse.Namespace):
         self.recovery_fd: int = -1
         self.probe_marks_file: str = ""
         self.recover_only: bool = False
+        self.no_probe: bool = False
         self.mac_only: bool = False
         self.remote_kinds_file: str = ""
         self.session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION
@@ -121,6 +122,9 @@ def parser() -> argparse.ArgumentParser:
     _ = commands.add_parser("submitting-session")
     source = commands.add_parser("source-key")
     _ = source.add_argument("--repo-root", required=True)
+    backoff = commands.add_parser("probe-backoff")
+    _ = backoff.add_argument("--target", required=True)
+    _ = backoff.add_argument("--no-probe", action="store_true")
     status = commands.add_parser("status")
     _ = status.add_argument("--probe", action="store_true")
     eligible = commands.add_parser("eligible", aliases=["constraints"])
@@ -160,6 +164,7 @@ from scripts.build_targets.target_config import (
     LocalRequired,
     Routing,
     SshTarget,
+    WRITES_TREE,
     read_targets,
 )
 from scripts.direct.step_selection import Pinned, ROUTED, TargetSelection
@@ -215,7 +220,7 @@ def running_job_text(job: RunningJob,
 def format_state(name: str, state: TargetState,
                  labels: Mapping[RunningJob | Held, roster.UnitLabels] = _NO_UNIT_LABELS) -> str:
     from scripts.build_targets.targets import (
-        ExpiresAt, Free, ReleaseEstimated, Running, StateUnreadable, Unreachable,
+        ExpiresAt, Free, ReleaseEstimated, ReleaseOverdue, Running, StateUnreadable, Unreachable,
     )
 
     name = display_field(name)
@@ -234,6 +239,8 @@ def format_state(name: str, state: TargetState,
         line += f" until {local_time(state.end.when)}"
     elif isinstance(state.end, ReleaseEstimated):
         line += f" release expected {local_time(state.end.when)}"
+    elif isinstance(state.end, ReleaseOverdue):
+        line += f" release overdue since {local_time(state.end.when)}"
     reason = display_field(state.reason)
     return f"{line} — {reason}" if reason else line
 
@@ -330,13 +337,11 @@ def step_routing_rule(kind: CommandKind, routing: Routing = ANY_ELIGIBLE_TARGET,
                       ) -> AnyTarget | NatedevOnly:
     """Choose the run location for each step before target admission."""
     if writes_tree:
-        return NatedevOnly("step writes the tree")
+        return NatedevOnly(WRITES_TREE.reason)
     if isinstance(routing, LocalRequired):
         return NatedevOnly(routing.reason)
     if isinstance(selection, Pinned):
         return AnyTarget()
-    if kind == "build":
-        return NatedevOnly("makes natedev artifacts")
     if kind == "final":
         return NatedevOnly("full gate runs on natedev")
     return AnyTarget()
@@ -564,6 +569,22 @@ def command_recover_probe(args: CliArguments) -> int:
         except offload.OffloadInterrupted as interrupted:
             return 128 + interrupted.signal_number
 
+    return 0
+
+
+def command_probe_backoff(name: str, *, probe: bool) -> int:
+    """Exit 0 when the target has no retry backoff or answers one probe; exit 1 otherwise."""
+    from scripts.build_targets import target_config
+    from scripts.mac_test import eligibility, offload
+
+    if not isinstance(eligibility.read_backoff(time.time(), name), eligibility.ActiveBackoff):
+        return 0
+    if not probe:
+        return 1
+    config = eligibility.read_config(target_config.configured_ssh_target(name).settings)
+    if isinstance(offload.probe_reachability(offload.ProcessController(), config), offload.UnreachableHost):
+        return 1
+    offload.record_reachable(name)
     return 0
 
 
@@ -1151,28 +1172,12 @@ def command_register_local(_call_id: str, *, pid: int,
 
 def tell_wait_holder(holder: build_hold.Holder, line: str, caller: str) -> None:
     """Tell the holder about unresolved ownership without ending the wait."""
-    import subprocess
-
     from scripts.build_hold import build_hold
-    from scripts.lib import conf
-    from scripts.lib.process_failure import failure_detail
-    from scripts.message import session_send
 
-    try:
-        with conf.diagnostics(report=False):
-            timeout = conf.read("build_targets").number("hold_sender_timeout_seconds")
-        result = subprocess.run(session_send.send_argv("--to", build_hold.holder_address(holder.key), "--text", line),
-                                capture_output=True, text=True, errors="replace", timeout=timeout)
-    except subprocess.TimeoutExpired as error:
-        reason = f"send timed out after {error.timeout:g} seconds"
-    except (OSError, conf.Unusable) as error:
-        reason = str(error)
-    else:
-        if result.returncode == 0:
-            return
-        reason = failure_detail(result)
-    print(f"{speaker(caller)}: could not tell {display_field(holder.name)}: {display_field(reason)}",
-          file=sys.stderr, flush=True)
+    result = build_hold.send_holder_message(holder.key, line)
+    if isinstance(result, build_hold.HolderMessageFailed):
+        print(f"{speaker(caller)}: could not tell {display_field(holder.name)}: {display_field(result.reason)}",
+              file=sys.stderr, flush=True)
 
 
 def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", caller: str = "",
@@ -1388,6 +1393,8 @@ def main() -> int:
     args = parser().parse_args(namespace=CliArguments())
     if args.command == "recover-probe":
         return command_recover_probe(args)
+    if args.command == "probe-backoff":
+        return command_probe_backoff(args.target, probe=not args.no_probe)
     if args.command == "source-key":
         from scripts.buildlog import treekey
 

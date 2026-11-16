@@ -182,7 +182,7 @@ def start(root: Path, baseline: str, phase_dir: Path, prompt: Path, pass_name: s
         safe_name = re.sub(r"[^A-Za-z0-9_.-]", "", pass_name) or "pass"
         # The review worker and finish command read these files after prepare exits.
         directory = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-            build_folders.FOLDER_PREFIXES["style-review"].format(owner=safe_name), build_folders.ExplicitBuildParent(parent)))
+            f"{safe_name}-", build_folders.ExplicitBuildParent(parent)))
         write_text_atomic(directory / "owner.json", json.dumps({
             "pid": pid, "started": started, "dispatch": pass_name,
         }))

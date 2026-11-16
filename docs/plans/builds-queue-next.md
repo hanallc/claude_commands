@@ -2,6 +2,13 @@
 
 ## Items to consider
 
+- [ ] **Name the rust-analyzer scope row in the queue view**
+  - Target: the queue view rows for `builds.slice` scopes (`scripts/build_queue/admission_service.py` and the Builds page reader). The resources unit's memory bar phase reads the same row.
+  - Why needed: rust-analyzer from Zed now runs in a `builds.slice` scope (#93 land 1). The queue view calls its row `unowned`, so the page and the memory bar do not show what it is.
+  - Completion condition: the row says rust-analyzer with its project folder. The memory bar shows it in the builds block. The resources unit agrees the label first.
+  - Order: after #93 lands 1-3 land.
+  - Revealed by: builds showrunner, 2026-11-14, after the Zed proof. builds asked for it, so it needs no other approval.
+
 - [ ] **Derive the admission code version from imports**
   - Target: `scripts/build_queue/admission_code.py` (`ADMISSION_CODE_PATHS`) and its readers in `test_admission_protocol.py` and `test_admission_service.py`.
   - Why needed: `ADMISSION_CODE_PATHS` is a hand list of the files that make the admission code version. It drifts each time an import moves. natest Phase 22 adds `buildlog/repository.py` by hand because `record.py` now imports it.

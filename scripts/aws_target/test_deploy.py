@@ -1726,10 +1726,18 @@ sys.exit(7)
                              for name, row in resources.items()))
         self.assertNotIn('GateBucket', resources)
         self.assertNotIn('GateProfile', resources)
-        for name, key in (('GateExpiryRole', 'RoleName'), ('GateExpiryFunction', 'FunctionName')):
+        gate = conf.read_or_repository('cloud_gate')
+        regions = {*gate.words('regions'), *gate.words('spot_candidate_regions')}
+        limits = (('GateSecurityGroup', 'GroupName', 255), ('GateLaunchTemplate', 'LaunchTemplateName', 128),
+                  ('GateExpiryRole', 'RoleName', 64), ('GateExpiryFunction', 'FunctionName', 64),
+                  ('GateExpiryLog', 'LogGroupName', 512), ('GateExpirySchedule', 'Name', 64))
+        for name, key, limit in limits:
             properties = ledger.mapping(ledger.mapping(resources[name])['Properties'])
             value = ledger.text(ledger.mapping(properties[key]), 'Fn::Sub')
-            self.assertLessEqual(len(value.replace('${DeploymentId}', 'f' * 32).replace('${AWS::Region}', 'us-west-2')), 64)
+            for region in regions:
+                with self.subTest(name=name, region=region):
+                    named = value.replace('${DeploymentId}', 'f' * 32).replace('${AWS::Region}', region)
+                    self.assertLessEqual(len(named), limit)
 
     def regional_stack_fixture(self, stack: dict[str, str]) -> tuple[deploy.Deployment, list[list[str]], aws_target.AwsCli]:
         """A regional stack in the state stack['status']; an empty status means the stack does not exist yet.

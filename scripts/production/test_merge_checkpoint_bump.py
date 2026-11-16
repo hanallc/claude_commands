@@ -11,6 +11,7 @@ from typing import Literal, cast, final
 from unittest import mock
 
 from scripts.production import merge_checkpoint
+from scripts.lib import build_folders
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.message import sessions
 from scripts.production import staff
@@ -60,7 +61,8 @@ class CheckpointBumpTests(MergeCheckpointFixture):
         cache = (run.checkout / "target").resolve()
         self.release_bump_gate()
         self.wait_bump_gate_exit(run)
-        self.assertFalse(run.checkout.exists(), "The checkout must end with its gate")
+        self.assertTrue(run.checkout.exists())
+        self.assertEqual(build_folders.build_folder_state(run.checkout), "free")
         self.assertTrue(cache.is_dir(), "The cache must remain after its gate")
 
     def test_bump_without_a_build_cache_delivers_the_result_and_removes_its_copy(self) -> None:
@@ -72,11 +74,12 @@ class CheckpointBumpTests(MergeCheckpointFixture):
         tip = self.assert_pushed(checkpoint)
         run, = self.wait_bump_gate_runs(1)
         self.assertNotEqual(run.checkout, self.checkout)
-        self.assertTrue((run.checkout / ".git").is_dir())
+        self.assertTrue((run.checkout / ".git").is_file())
         self.assertEqual(run.head, tip)
         self.release_bump_gate()
         self.wait_bump_gate_exit(run)
-        self.assertFalse(run.checkout.exists())
+        self.assertTrue(run.checkout.exists())
+        self.assertEqual(build_folders.build_folder_state(run.checkout), "free")
         self.assertEqual(self.bump_gate_record(tip)["result"], "green")
         notice, = self.bump_notices()
         self.assertEqual(self.notice_recipient(notice), "showrunner")
@@ -122,9 +125,9 @@ class CheckpointBumpTests(MergeCheckpointFixture):
         run = self.wait_bump_gate_runs(1)[0]
         self.assertEqual((run.head, run.origin), (tip, tip))
         self.assertNotEqual(run.checkout, self.checkout)
-        self.assertTrue((run.checkout / ".git").is_dir(), "the gate needs a clone, not a worktree pointer or export")
-        alternates = run.checkout / ".git/objects/info/alternates"
-        self.assertEqual(alternates.read_text().strip(), self.git("rev-parse", "--path-format=absolute", "--git-path", "objects"))
+        self.assertTrue((run.checkout / ".git").is_file())
+        self.assertEqual(self.git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=run.checkout),
+                         self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
         self.assertEqual(run.branch, "", "the clone must have a detached HEAD")
         self.assertEqual(run.session, run.gate_pid, "the gate must run in its own session")
         self.assertTrue(run.stdin_closed)
@@ -327,9 +330,9 @@ class CheckpointBumpTests(MergeCheckpointFixture):
         log = self.notice_log(self.notice_text(notices[0]))
         self.assertIn("fixture send failed", log.read_text())
 
-    def test_clone_failure_before_the_first_step_is_red_for_both_recipients(self) -> None:
+    def test_slot_failure_before_the_first_step_is_red_for_both_recipients(self) -> None:
         self.prepare_bump_gate()
-        self.refuse_bump_clone()
+        self.refuse_bump_slot()
         checkpoint = self.checkpoint()
         result = self.run_checkpoint(checkpoint, "--bump")
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
@@ -344,8 +347,8 @@ class CheckpointBumpTests(MergeCheckpointFixture):
         for notice in notices:
             text = self.notice_text(notice)
             self.assertIn(tip, text)
-            self.assertIn("clone", text)
-            self.assertIn("fixture clone refused", self.notice_log(text).read_text())
+            self.assertIn("slot", text)
+            self.assertIn("fixture slot refused", self.notice_log(text).read_text())
 
     def test_launcher_failure_is_red_and_does_not_stop_promotion(self) -> None:
         self.prepare_bump_gate()

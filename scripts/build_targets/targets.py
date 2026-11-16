@@ -44,6 +44,11 @@ class ReleaseEstimated:
 
 
 @dataclass(frozen=True)
+class ReleaseOverdue:
+    when: datetime
+
+
+@dataclass(frozen=True)
 class UntilReleased:
     pass
 
@@ -59,7 +64,7 @@ class AwaitingBlockRemoval:
     requested_expiry: datetime | ExpiryNotRecorded = ExpiryNotRecorded()
 
 
-HoldEnd = ExpiresAt | ReleaseEstimated | UntilReleased | AwaitingBlockRemoval
+HoldEnd = ExpiresAt | ReleaseEstimated | ReleaseOverdue | UntilReleased | AwaitingBlockRemoval
 
 
 @dataclass(frozen=True)
@@ -213,9 +218,12 @@ def local_hold_states() -> tuple[TargetState, ...]:
         holds = build_hold.natedev_holds(build_hold.holder_directory())
         if not holds.in_force:
             return (Free(),)
+        now = utc_now()
         return tuple(Held(holder.name, holder.purpose,
             holder.since if holder.start_recorded else StartNotRecorded(),
-            ReleaseEstimated(holder.release.at) if isinstance(holder.release, build_hold.KnownReleaseEta) else UntilReleased(),
+            (ReleaseOverdue(holder.release.at) if build_hold.release_overdue(holder.release, now)
+             else ReleaseEstimated(holder.release.at))
+            if isinstance(holder.release, build_hold.KnownReleaseEta) else UntilReleased(),
             HolderSession(build_hold.holder_session(holder.key))) for holder in holds.in_force)
     except build_hold.ReleaseRecordReadError as error:
         return (StateUnreadable(build_hold.release_record_error_line(error)),)
@@ -284,6 +292,8 @@ def end_text(end: HoldEnd, zone: tzinfo) -> str:
         return "until " + clock(end.when, zone)
     if isinstance(end, ReleaseEstimated):
         return "expected release " + clock(end.when, zone)
+    if isinstance(end, ReleaseOverdue):
+        return "release overdue since " + clock(end.when, zone)
     if isinstance(end, AwaitingBlockRemoval):
         expiry = end.requested_expiry
         return "awaiting unblock" + (f"; requested expiry was {clock(expiry, zone)}" if isinstance(expiry, datetime) else "")

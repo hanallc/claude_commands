@@ -21,6 +21,7 @@ from dataclasses import replace
 from typing import cast, final
 from unittest import mock
 from scripts.style import rules
+from scripts.style import style_config
 from scripts.style import style_ledger
 from scripts.style import style_reader
 from scripts.style import style_plan
@@ -898,8 +899,9 @@ class StyleLedgerTicketsTests(LedgerTestCase):
             for failure, command in (("exit", "exit 7"), ("reply", "printf 'invalid JSON\\n'")):
                 _ = executable.write_text(f"#!/bin/sh\n{command}\n")
                 executable.chmod(0o700)
-                with style_reader.use_client(style_reader.ReaderClient(executable)), style_ledger.Ledger(
-                        self.repo, self.root / "reader-failure.sqlite", git_cache=cache) as ledger:
+                with (mock.patch.object(style_config, "refill_reader", return_value=style_config.ReaderSource.RUST),
+                      style_reader.use_client(style_reader.ReaderClient(executable)),
+                      style_ledger.Ledger(self.repo, self.root / "reader-failure.sqlite", git_cache=cache) as ledger):
                     before = self.ledger_contents(ledger)
                     operations: tuple[tuple[str, Callable[[], object]], ...] = (
                         ("tip", lambda: read_tip(self.repo, self.initial_tip)),

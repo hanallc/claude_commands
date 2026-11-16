@@ -145,7 +145,8 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
         sidecar.chmod(0o644)
         request = wire.ServiceEstimateRequest(client.request_id(), wire.Owner(pid, start), tuple(argv), os.getcwd(),
             client.CLOCK.now(), str(sidecar), repository, worktree,
-            os.environ.get("RUNNER_NAME", ""), os.environ.get("GITHUB_JOB", ""), test_width)
+            os.environ.get("RUNNER_NAME", ""), os.environ.get("GITHUB_JOB", ""), test_width,
+            route=records.direct_cargo_route())
         with ExitStack() as reservation:
             try:
                 held = reservation.enter_context(queue_place.held_reservation(request))

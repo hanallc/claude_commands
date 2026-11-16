@@ -44,6 +44,12 @@ from scripts.style.style_proposals import FilingResult
 from scripts.production.staff_test_support import isolated_staff_file, recorded_unit, fixture_member, fixture_runtime_id
 from scripts.production import staff, unit_names
 
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
+
 # Each crate declares the new name of the fixture rename, so a merge finds it applied, and still declares
 # Size and Rate, so the renames of those variants are not applied.
 APPLIED = "pub enum Kind { Count, Size, Rate }\n"

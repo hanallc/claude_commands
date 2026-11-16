@@ -785,25 +785,22 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         self.assertEqual(self.kind_output("check"),
                          "any_target\nnatedev\teligible\t-\t-\t-\n"
                          + f"other\texcluded\toff\t{other_settings}\tmacos\nmac\teligible\t-\t{self.settings}\tmacos\n")
-        self.assertEqual(self.kind_output("build"),
-                         "natedev_only makes natedev artifacts\nnatedev\teligible\t-\t-\t-\n"
-                         + f"other\texcluded\tmakes natedev artifacts\t{other_settings}\tmacos\n"
-                         + f"mac\texcluded\tmakes natedev artifacts\t{self.settings}\tmacos\n")
+        self.assertEqual(self.kind_output("build", "portable"),
+                         "any_target\nnatedev\teligible\t-\t-\t-\n"
+                         + f"other\texcluded\toff\t{other_settings}\tmacos\n"
+                         + f"mac\teligible\t-\t{self.settings}\tmacos\n")
 
-    def test_local_only_configuration_keeps_artifact_and_gate_reasons(self) -> None:
+    def test_local_only_configuration_keeps_build_and_gate_routes(self) -> None:
         _ = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
-        for kind, reason in (("build", "makes natedev artifacts"),
-                             ("final", "full gate runs on natedev")):
+        for kind, reason in (("build", "any_target"),
+                             ("final", "natedev_only full gate runs on natedev")):
             with self.subTest(kind=kind):
-                self.assertEqual(self.kind_output(kind), f"natedev_only {reason}\nnatedev\teligible\t-\t-\t-\n")
+                self.assertEqual(self.kind_output(kind), f"{reason}\nnatedev\teligible\t-\t-\t-\n")
 
-    def test_kind_answers_allow_portable_judgments_and_keep_artifacts_local(self) -> None:
-        for kind in ("check", "doc", "lint", "test", "example"):
+    def test_kind_answers_allow_portable_steps_and_keep_the_gate_local(self) -> None:
+        for kind in ("check", "doc", "lint", "test", "example", "build"):
             with self.subTest(kind=kind):
                 self.assertEqual(self.kind_answer(kind, "portable"), "any_target\n")
-        for kind in ("build",):
-            with self.subTest(kind=kind):
-                self.assertEqual(self.kind_answer(kind), "natedev_only makes natedev artifacts\n")
         self.assertEqual(self.kind_answer("final"), "natedev_only full gate runs on natedev\n")
 
     def test_workspace_linux_only_member_refuses_workspace_verbs_but_not_other_package_tests(self) -> None:
@@ -818,7 +815,7 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         # Only the Mac compiles macOS code, so check, lint and doc ignore linux_only for every selection.
         _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers=["crates/*"]\n')
         cases: tuple[tuple[build_targets.StepKind, bool], ...] = (
-            ("check", True), ("lint", True), ("doc", True), ("test", False))
+            ("check", True), ("lint", True), ("doc", True), ("test", False), ("build", False))
         selections: tuple[TargetSelection, ...] = (ROUTED, Pinned("mac"))
         for kind, compiles in cases:
             for package in ("linux-part", "portable", ""):

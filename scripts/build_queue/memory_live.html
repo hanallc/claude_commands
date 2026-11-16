@@ -14,7 +14,7 @@
   --machine-mac: var(--machine-mac-light); --machine-aws: var(--machine-aws-light);
   --other: #a3a19b; --free: #e7e5df; --floor: #eda100;
   --agents: #7f6fc4; --desktop: #78756e;
-  --ci: #1c5aa8; --programs: #8796ab; --kernel: #3e4a5c; --cache: #d6d4ce; --unattributed: #b9b7b1;
+  --tools: #7a9cc4; --ci: #1c5aa8; --programs: #8796ab; --kernel: #3e4a5c; --cache: #d6d4ce; --unattributed: #b9b7b1;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -24,7 +24,7 @@
     --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
     --other: #5c5b57; --free: #2a2a28; --floor: #c98500;
     --agents: #9585e0; --desktop: #8a877f;
-    --ci: #2563b8; --programs: #5a6a80; --kernel: #2b3442; --cache: #3c3c39; --unattributed: #6c6b66;
+    --tools: #4a6f99; --ci: #2563b8; --programs: #5a6a80; --kernel: #2b3442; --cache: #3c3c39; --unattributed: #6c6b66;
   }
 }
 :root[data-theme="dark"] {
@@ -34,7 +34,7 @@
   --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
   --other: #5c5b57; --free: #2a2a28; --floor: #c98500;
   --agents: #9585e0; --desktop: #8a877f;
-  --ci: #2563b8; --programs: #5a6a80; --kernel: #2b3442; --cache: #3c3c39; --unattributed: #6c6b66;
+  --tools: #4a6f99; --ci: #2563b8; --programs: #5a6a80; --kernel: #2b3442; --cache: #3c3c39; --unattributed: #6c6b66;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
@@ -45,6 +45,10 @@ __PAGE_FRAME_STYLE__
 #status { flex: 1 1 12rem; min-width: 0; }
 .status.is-stale { position: sticky; top: 0; z-index: 5; background: var(--bg); }
 .dot.stale { background: var(--cap); }
+.paused-badge { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 9; display: inline-flex; gap: 8px; align-items: center;
+  padding: 4px 14px; border: 1px solid var(--cap); border-radius: 999px; background: var(--card); color: var(--cap); font-weight: 600; pointer-events: none; }
+.paused-badge[hidden] { display: none; }
+.paused-badge .pb { width: 10px; height: 11px; border-left: 3px solid currentColor; border-right: 3px solid currentColor; }
 .card, :root.layout-measuring .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 14px; margin: 0 0 16px; }
 .answer { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; margin-bottom: 6px; }
 .answer .big { font-size: 2.6rem; font-weight: 700; line-height: 1; letter-spacing: -0.02em; }
@@ -53,11 +57,11 @@ __PAGE_FRAME_STYLE__
 .answer .cap-value { color: var(--cap); font-weight: 600; font-variant-numeric: tabular-nums; cursor: help; }
 .answer .room-why { flex-basis: 100%; font-weight: 600; }
 .answer .last-reading { flex-basis: 100%; color: var(--ink-2); font-weight: 600; }
-.ram-disagree { margin: 10px 0 0; font-weight: 600; }
+.ram-disagree, .ram-missing { margin: 10px 0 0; font-weight: 600; }
 .swap-reserve { margin: 10px 0 0; font-weight: 600; cursor: help; }
 .hatch { background: repeating-linear-gradient(135deg, var(--res-a) 0 3px, var(--res-b) 3px 6px); }
 :root { --amt: 7rem; --gap: 10px; --details: 0px; }
-.bar-wrap { position: relative; padding-top: 24px; margin-top: 10px; margin-left: calc(var(--amt) + var(--gap)); margin-right: var(--details); }
+.bar-wrap { position: relative; padding: 52px 0 26px; margin-top: 10px; margin-left: calc(var(--amt) + var(--gap)); margin-right: var(--details); }
 .bar { display: flex; gap: 0; height: 44px; }
 .bar > div { height: 100%; border-radius: 2px; min-width: 0; transition: flex-basis 0.6s ease; position: relative; display: flex; align-items: center; justify-content: center; overflow: hidden; }
 .lbl { flex: none; font-size: 0.85rem; font-weight: 700; font-variant-numeric: tabular-nums; padding: 1px 6px; border-radius: 5px; background: color-mix(in srgb, var(--card) 82%, transparent); color: var(--ink); white-space: nowrap; pointer-events: none; transition: opacity 0.2s ease; }
@@ -70,11 +74,8 @@ __PAGE_FRAME_STYLE__
 .bar > div:first-child { border-radius: 4px 2px 2px 4px; }
 .bar > div:last-child { border-radius: 2px 4px 4px 2px; }
 .seg-used { background: var(--used); }
+.seg-tools { background: var(--tools); }
 .seg-room { background: var(--room); }
-/* Build tools and builds outside the queue: the queued builds color, lighter, outside the cap. */
-.seg-tools { background: color-mix(in srgb, var(--used) 50%, var(--card)); }
-/* Queued and CI use above the cap: the shortfall look. */
-.seg-over { background: var(--free); box-shadow: inset 0 0 0 1px var(--ink-2); }
 .seg-ci { background: var(--ci); border-left: 1px solid var(--card); }
 .seg-programs { background: var(--programs); }
 .seg-kernel { background: var(--kernel); }
@@ -86,36 +87,51 @@ __PAGE_FRAME_STYLE__
 .hatch-swap { background: repeating-linear-gradient(135deg, var(--agents) 0 3px, var(--free) 3px 6px); }
 .bar > div { cursor: help; }
 .bar > div:hover { filter: brightness(1.12); }
-.mark { position: absolute; top: 18px; bottom: -6px; width: 15px; margin-left: -7px; cursor: help; transition: left 0.6s ease; }
-.mark::before { content: ""; position: absolute; left: 6px; top: 0; bottom: 0; border-left: 3px solid var(--cap); }
-.mark-label { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; font-size: 0.8rem; font-weight: 600; color: var(--cap); cursor: help; transition: left 0.6s ease; }
-.legend .row { display: grid; grid-template-columns: 12px minmax(0, 1fr) max-content; gap: 8px; align-items: center; padding: 3px 4px; border-radius: 6px; cursor: help; }
+.brace { position: absolute; border: 2px solid var(--ink-3); border-bottom: none; border-radius: 6px 6px 0 0; color: var(--ink-2); font-size: 0.8rem; line-height: 20px; text-align: center; white-space: nowrap; overflow: hidden; cursor: help; }
+.brace.l1 { top: 0; height: 50px; }
+.brace.l2 { top: 26px; height: 24px; }
+.brace.cap { top: auto; bottom: 0; height: 24px; border: 2px solid var(--cap); border-top: none; border-radius: 0 0 6px 6px; color: var(--cap); line-height: 18px; }
+.brace.free { border-color: var(--room); color: var(--room); }
+.brace.reserved { border-color: var(--res-a); color: var(--res-a); }
+.brace b { font-weight: 700; font-variant-numeric: tabular-nums; }
+.brace .brace-label { display: inline-block; }
+.brace .brace-label.hide { visibility: hidden; }
+.legend .row { display: grid; grid-template-columns: 12px minmax(0, 1fr) max-content; gap: 0 8px; align-items: center; padding: 3px 4px; border-radius: 6px; cursor: help; }
+.legend .row .note { grid-column: 2 / -1; color: var(--ink-3); font-size: 0.8rem; line-height: 1.3; }
+.legend .row.in { padding-left: 24px; }
+.legend .group-head { display: flex; gap: 8px; padding: 3px 4px; border-bottom: 1px solid var(--line); margin-bottom: 2px; cursor: help; }
+.legend .group-head .v { margin-left: auto; }
+.legend-col { display: grid; gap: 14px; }
+@media (max-width: 720px) { .legend-col { display: contents; } .legend .cap-group { order: 1; } }
+.brace .brace-label.stack b { display: block; }
+.brace .brace-label.bare .bn { display: none; }
+.legend .row.total { border-top: 1px solid var(--line); border-radius: 0 0 6px 6px; margin-top: 2px; }
 .legend .row[hidden] { display: none; }
 .legend .row:hover { background: var(--free); }
 .legend .row .name { font-weight: 600; }
 .legend .row .v { text-align: right; padding-left: 12px; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
-.legend .row[data-tip="progress"] { display: flex; flex-wrap: wrap; }
 .legend .row[data-tip="room"] .name { white-space: nowrap; }
-#tip { white-space: pre-line; position: fixed; z-index: 10; max-width: 300px; padding: 8px 10px; border-radius: 8px; background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.4; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; box-shadow: 0 4px 14px rgb(0 0 0 / 0.2); }
+#tip { position: fixed; z-index: 10; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; }
 #tip.on { opacity: 1; }
-#tip .mac-tip-fields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 16px; margin: 6px 0 0; white-space: normal; }
-#tip .mac-tip-fields dt { text-align: left; }
-#tip .mac-tip-fields dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
-#tip .identity { display: grid; grid-template-columns: max-content max-content minmax(0, 1fr); gap: 2px 0; margin: 6px 0; white-space: normal; }
-#tip:has(.identity) { max-width: min(calc(100vw - 20px), 24rem); }
-#tip .identity dd { margin: 0; overflow-wrap: anywhere; }
-#tip .identity dd.colon { padding: 0 8px 0 2px; }
-#tip .mac-note { display: block; margin-top: 6px; white-space: nowrap; }
-#tip:has(.mac-note) { width: max-content; max-width: min(calc(100vw - 20px), 34rem); }
+.tip { display: grid; grid-template-columns: max-content 1fr; column-gap: 0; row-gap: 2px; margin: 0;
+  width: max-content; min-width: 15rem; max-width: 24rem; padding: 10px 12px; border-radius: 8px;
+  background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.45; }
+.tip dt { text-align: left; white-space: nowrap; }
+.tip dd { margin: 0; padding-left: 24px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tip .title { font-weight: 700; padding-bottom: 4px; }
+.tip .caption { grid-column: 1 / -1; margin-top: -4px; padding: 0 0 4px; text-align: left; opacity: 0.7; }
+.tip .group { margin-top: 6px; padding-top: 6px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); }
+.tip .sum { font-weight: 700; }
+.tip .long { grid-column: 1 / -1; padding-left: 0; text-align: left; white-space: normal; opacity: 0.7; }
+#tip > .tip { max-width: min(24rem, calc(100vw - 16px)); }
 .seg-remote { background: var(--remote-memory); }
 .machine[data-machine="natedev"] { color: var(--machine-natedev); }
 .machine[data-machine="mac"] { color: var(--machine-mac); }
 .machine[data-machine="aws"] { color: var(--machine-aws); }
-#tip b { display: block; margin-bottom: 2px; }
 .scale { margin-right: var(--details); margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
 .ticks { position: relative; height: 16px; }
 .ticks span { position: absolute; transform: translateX(-50%); }
-.legend { margin: 10px 0 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 17rem), 1fr)); gap: 0 28px; }
+.legend { margin: 10px 0 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 17rem), 1fr)); gap: 14px 28px; align-items: start; }
 .legend .row:focus-visible { outline: 2px solid var(--used); }
 details { border-radius: 6px; }
 summary { list-style: none; cursor: pointer; display: flex; gap: 8px; align-items: center; padding: 5px 0; border-radius: 6px; }
@@ -125,11 +141,9 @@ summary .chev { flex: none; width: 14px; color: var(--ink-3); transition: transf
 details[open] > summary .chev { transform: rotate(90deg); }
 summary .name { font-weight: 600; }
 summary .v { margin-left: auto; padding-left: 12px; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
-.why { color: var(--ink-2); font-size: 0.9rem; padding: 0 6px 8px 50px; }
-.why p { margin: 4px 0; }
 .sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; flex: none; }
 .sw.used { background: var(--used); }
-.sw.tools { background: color-mix(in srgb, var(--used) 50%, var(--card)); }
+.sw.tools { background: var(--tools); }
 .sw.ci { background: var(--ci); }
 .sw.res { background: repeating-linear-gradient(135deg, var(--res-a) 0 2px, var(--res-b) 2px 4px); }
 .sw.room { background: var(--room); }
@@ -205,6 +219,10 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .error { color: var(--cap); font-weight: 600; }
 .walk-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
 .walk-sum { margin-left: auto; color: var(--ink-2); font-size: 0.86rem; }
+.walk-tokens { display: flex; align-items: baseline; gap: 6px; color: var(--ink-2); font-size: 0.86rem; }
+.walk-tokens dl { display: grid; grid-template-columns: repeat(2, max-content); gap: 0 6px; margin: 0; }
+.walk-tokens dt { text-align: left; }
+.walk-tokens dd { margin: 0; text-align: right; }
 .walk { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
 .walk-chart { margin-right: var(--details); }
 .walk-chart { min-width: 0; position: relative; }
@@ -244,11 +262,13 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-table tr.queue-head th { color: var(--ink-2); font-weight: 600; vertical-align: bottom; }
 .walk-table .duration { width: var(--duration); min-width: var(--duration); }
 .walk-table .machine { width: var(--machine); min-width: var(--machine); }
-.walk-table .duration, .walk-table .pid, .walk-table .vcpus { font-variant-numeric: tabular-nums; }
-.walk-table .duration, .walk-table .pid, .walk-table .vcpus { text-align: right; }
+.walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .slot, .walk-table .tokens { font-variant-numeric: tabular-nums; }
+.walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .slot, .walk-table .tokens { text-align: right; }
 .walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
-.walk-table th.duration, .walk-table th.done, .walk-table th.pid, .walk-table th.vcpus { text-align: left; }
+.walk-table th.duration, .walk-table th.done, .walk-table th.pid, .walk-table th.vcpus, .walk-table th.slot, .walk-table th.tokens { text-align: left; }
 .walk-table .cell-text { display: block; max-width: 8rem; overflow: hidden; text-overflow: ellipsis; }
+/* A waiting step's targets wrap inside the Target column, so a queued row never moves the table columns. */
+.walk-table .wait-target { display: block; width: 0; min-width: 100%; white-space: normal; }
 .walk-table .unit .cell-text { max-width: none; }
 .walk.beside .walk-table { position: absolute; top: 0; left: var(--table-left); }
 .walk.beside .walk-chart .queue-head { max-width: calc(var(--table-left) - 16px); }
@@ -261,7 +281,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 }
 .walk.beside .wrow.room::before, .walk.beside .wrow.wait-first::before { top: var(--divider-top, 0px); }
 .walk.stacked .step { display: table-cell; }
-/* The stacked chart above the table shows the next step room, so the table leaves out its empty row. */
+/* The stacked chart above the table shows free, so the table leaves out its empty row. */
 .walk.stacked .walk-table tr.room { display: none; }
 .walk.stacked .walk-table tr.queue-head > * { border-top: 1px solid var(--line); }
 .walk.stacked .walk-table { width: 100%; overflow-x: auto; }
@@ -270,18 +290,20 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk.measuring .step { display: none; }
 .walk.measuring .walk-table .cell-text { max-width: 8rem; }
 /* A stacked table wider than the card shows each step on two lines: Step, Stage and Done, then the other columns. */
-.walk.compact .walk-table table { display: grid; grid-template-columns: auto auto auto minmax(auto, 1fr) auto; column-gap: 12px; width: 100%; }
+.walk.compact .walk-table table { display: grid; grid-template-columns: auto auto auto minmax(auto, 1fr) auto auto auto; column-gap: 12px; width: 100%; }
 .walk.compact .walk-table thead, .walk.compact .walk-table tbody { display: contents; }
 .walk.compact .walk-table tr { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-content: center; row-gap: 2px; height: auto; padding: 4px 0; }
 .walk.compact .walk-table th, .walk.compact .walk-table td { width: auto; padding: 0; white-space: normal; overflow-wrap: break-word; }
 .walk.compact .walk-table .step { grid-area: 1 / 1 / 2 / 3; contain: inline-size; }
-.walk.compact .walk-table .place { grid-area: 1 / 3 / 2 / 5; contain: inline-size; }
-.walk.compact .walk-table .done { grid-area: 1 / 5; }
+.walk.compact .walk-table .place { grid-area: 1 / 3 / 2 / 7; contain: inline-size; }
+.walk.compact .walk-table .done { grid-area: 1 / 7; }
 .walk.compact .walk-table .duration { grid-area: 2 / 1; min-width: var(--duration); text-align: left; }
 .walk.compact .walk-table .unit { grid-area: 2 / 2; }
 .walk.compact .walk-table .pid { grid-area: 2 / 3; text-align: left; }
 .walk.compact .walk-table .machine { grid-area: 2 / 4; }
 .walk.compact .walk-table .vcpus { grid-area: 2 / 5; }
+.walk.compact .walk-table .slot { grid-area: 2 / 6; }
+.walk.compact .walk-table .tokens { grid-area: 2 / 7; }
 .walk.compact .walk-table tr.wait-first > *, .walk.compact .walk-table tr.queue-head > * { border-top: 0; }
 .walk.compact .walk-table tr.wait-first, .walk.compact .walk-table tr.queue-head { border-top: 1px solid var(--line); }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
@@ -303,6 +325,8 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 .track .b.roomb { background: var(--room); }
 .track .b.waitb { background: transparent; border: 2px dashed var(--ink-3); }
 .walk.has-cap .track .b.waitb { border-right: 0; border-radius: 3px 0 0 3px; }
+.track .b.over-cap { border-radius: 3px 0 0 3px; box-shadow: inset -3px 0 0 var(--cap); }
+.walk-sum.over-cap { color: var(--cap); font-weight: 600; }
 .track:hover .b { filter: brightness(1.12); }
 .walk-axis { font-size: 0.75rem; color: var(--ink-2); margin-top: 4px; }
 .walk-axis .ticks { position: relative; height: 16px; }
@@ -320,13 +344,14 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   .walk { gap: 10px; }
 }
 @media (max-width: 560px) {
-  .why { padding-left: 28px; }
   .answer .big { font-size: 2.2rem; }
 }
-#mark[hidden], #marklabel[hidden], .cap-value[hidden], .bar-wrap[hidden], .scale[hidden], .bar > div[hidden] { display: none; }
+.brace[hidden], .cap-value[hidden], .bar-wrap[hidden], .scale[hidden], .bar > div[hidden] { display: none; }
 .reserved-amount { color: var(--ink-2); }
 .room-value { margin-left: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .pressure-reason { color: var(--ink-2); overflow-wrap: anywhere; }
+.walk-key { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 24px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); color: var(--ink-2); font-size: 0.85rem; }
+.walk-key .key { display: inline-flex; align-items: center; gap: 6px; cursor: help; }
 .leftover-row { display: grid; grid-template-columns: minmax(0, 1fr) max-content max-content; gap: 4px 16px; padding: 5px 0; }
 .leftover-row .age { white-space: nowrap; }
 .leftover-row .detail { color: var(--ink-2); overflow-wrap: anywhere; }
@@ -338,10 +363,11 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 .report-key span::before { content: ""; display: inline-block; width: 14px; height: 3px; background: var(--series); margin-right: 5px; vertical-align: middle; }
 .report-table { overflow-x: auto; }
 .report-table th, .report-table td { padding: 5px 12px 5px 0; vertical-align: top; }
-.report-top-row { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.report-top-row { margin: 0; padding: 10px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .report-top-row:last-child { border-bottom: 0; }
-.report-top-row p { margin: 3px 0; }
-.report-top-row .action { color: var(--ink-2); }
+.report-top-row .action { display: block; margin-top: 3px; color: var(--ink-2); }
+#history-details { margin-top: 12px; }
+#history-details > summary { cursor: pointer; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -349,6 +375,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   <p class="error" id="mac-idle-alert" role="status" hidden></p>
   <h1 class="page-title">Builds</h1>
   <div class="queue-error" id="queue-error" role="status"></div>
+  <div class="paused-badge" id="paused" role="status" hidden><span class="pb"></span>Paused · press space to resume</div>
   <div class="status"><span class="dot" id="dot"></span><span id="status">Reading…</span><a class="pill" id="pill" href="#swap" data-tip="pill"><span class="pd"></span><span id="pill-t">pressure –</span></a></div>
 
   <section class="card targets" id="targets" aria-label="Target availability" hidden></section>
@@ -356,73 +383,88 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   <section class="card">
     <div class="answer">
       <div class="big num" data-tip="room"><span id="room">–</span> <small id="room-unit"></small></div>
-      <div class="sub" id="answer" data-tip="room">Next step room</div>
+      <div class="sub" id="answer" data-tip="room">Free for the next step</div>
       <span class="cap-value" id="cap-value" data-tip="cap"></span>
       <div class="room-why" id="room-why" hidden></div>
       <div class="last-reading" id="last-reading" hidden></div>
     </div>
 
     <p class="ram-disagree" id="ram-disagree" hidden>RAM readings do not agree: the named parts exceed the total.</p>
+    <p class="ram-missing" id="ram-missing" hidden></p>
     <div class="bar-wrap" id="barwrap" role="img" aria-label="Build memory bar">
-      <span class="mark-label num" id="marklabel" data-tip="cap">cap</span>
+      <div class="brace l1" id="b-builds" data-tip="g-builds"><span class="brace-label"><span class="bn">builds </span><b id="bv-builds"></b></span></div>
+      <div class="brace l1 free" id="b-free" data-tip="g-free"><span class="brace-label"><span class="bn">free RAM </span><b id="bv-free"></b></span></div>
+      <div class="brace l1" id="b-else" data-tip="g-else"><span class="brace-label"><span class="bn">everything else </span><b id="bv-else"></b></span></div>
+      <div class="brace l2 reserved" id="b-reserved" data-tip="reserved"><span class="brace-label"><span class="bn">build reserved </span><b id="bv-reserved"></b></span></div>
+      <div class="brace l2 free" id="b-room" data-tip="room"><span class="brace-label"><span class="bn">free </span><b id="bv-room"></b></span></div>
+      <div class="brace l2" id="b-system" data-tip="system"><span class="brace-label"><span class="bn">system reserved </span><b id="bv-system"></b></span></div>
       <div class="bar">
+        <div class="seg-tools" id="s-tools" data-tip="tools"><span class="lbl" id="l-tools"></span></div>
         <div class="seg-used" id="s-queued" data-tip="queued"><span class="lbl" id="l-queued"></span></div>
         <div class="seg-ci" id="s-ci" data-tip="ci"><span class="lbl" id="l-ci"></span></div>
         <div class="hatch" id="s-reserved" data-tip="reserved"><span class="lbl" id="l-reserved"></span></div>
         <div class="seg-room" id="s-room" data-tip="room"><span class="lbl" id="l-room"></span></div>
-        <div class="seg-over" id="s-over" data-tip="shortfall"><span class="lbl" id="l-over"></span></div>
-        <div class="seg-tools" id="s-tools" data-tip="tools"><span class="lbl" id="l-tools"></span></div>
         <div class="seg-floor" id="s-safety" data-tip="safety"><span class="lbl" id="l-safety"></span></div>
-        <div class="seg-desktop" id="s-desktop" data-tip="desktop"><span class="lbl" id="l-desktop"></span></div>
         <div class="hatch-swap" id="s-swap" data-tip="swap"><span class="lbl" id="l-swap"></span></div>
+        <div class="seg-desktop" id="s-desktop" data-tip="desktop"><span class="lbl" id="l-desktop"></span></div>
         <div class="seg-agents" id="s-agents" data-tip="agents"><span class="lbl" id="l-agents"></span></div>
         <div class="seg-programs" id="s-programs" data-tip="programs"><span class="lbl" id="l-programs"></span></div>
         <div class="seg-kernel" id="s-kernel" data-tip="kernel"><span class="lbl" id="l-kernel"></span></div>
         <div class="seg-cache" id="s-cache" data-tip="cache"><span class="lbl" id="l-cache"></span></div>
         <div class="seg-unattributed" id="s-unattributed" data-tip="unattributed"><span class="lbl" id="l-unattributed"></span></div>
       </div>
-      <div class="mark" id="mark" data-tip="cap"></div>
+      <div class="brace cap" id="b-cap" data-tip="cap"><span class="brace-label"><span class="bn">queue cap </span><b id="bv-cap"></b></span></div>
     </div>
     <div class="scale num" id="scale"><div class="ticks" id="ticks-top" data-tip="budget"></div></div>
 
-    <details class="legend-box" open>
+    <details class="legend-box">
       <summary><span class="chev">▶</span><span class="name">Legend</span></summary>
     <div class="legend">
+     <div class="legend-col">
+     <div class="legend-group">
+      <div class="group-head" data-tip="g-builds"><span class="name">Builds</span><span class="v num" id="v-g-builds">–</span></div>
+      <div class="row" data-tip="tools"><span class="sw tools"></span><span class="name">Build tools</span><span class="v num" id="v-tools">–</span></div>
       <div class="row" data-tip="queued"><span class="sw used"></span><span class="name">Queued builds</span><span class="v num" id="v-queued">–</span></div>
       <div class="row" data-tip="ci"><span class="sw ci"></span><span class="name">hana CI</span><span class="v num" id="v-ci">–</span></div>
-      <div class="row" data-tip="reserved"><span class="sw res"></span><span class="name">Reserved RAM</span><span class="v num" id="v-reserved">–</span></div>
-      <div class="row" data-tip="room"><span class="sw room"></span><span class="name">Next step room</span><span class="v num" id="v-room">–</span></div>
-      <div class="row" data-tip="tools"><span class="sw tools"></span><span class="name">Build tools</span><span class="v num" id="v-tools">–</span></div>
-      <div class="row" data-tip="safety"><span class="sw floor"></span><span class="name">Safety</span><span class="v num" id="v-safety">–</span></div>
+     </div>
+     <div class="legend-group cap-group">
+      <div class="group-head" data-tip="cap"><span class="name">Queue cap: what builds may use</span></div>
+      <div class="row" data-tip="g-builds"><span></span><span class="name">Builds</span><span class="v num" id="v-cap-builds">–</span></div>
+      <div class="row" data-tip="reserved"><span class="sw res"></span><span class="name">Build reserved</span><span class="v num" id="v-cap-reserved">–</span></div>
+      <div class="row" data-tip="room"><span class="sw room"></span><span class="name">Free</span><span class="v num" id="v-cap-room">–</span></div>
+      <div class="row total" data-tip="cap"><span class="sw cap"></span><span class="name">Queue cap</span><span class="v num" id="v-cap">–</span></div>
+     </div>
+     </div>
+     <div class="legend-group">
+      <div class="group-head" data-tip="g-free"><span class="name">Free RAM</span><span class="v num" id="v-g-free">–</span></div>
+      <div class="row" data-tip="reserved"><span class="sw res"></span><span class="name">Build reserved</span><span class="v num" id="v-reserved">–</span><span class="note" id="reserved-note">Running builds grow into it.</span></div>
+      <div class="row" data-tip="room"><span class="sw room"></span><span class="name">Free</span><span class="v num" id="v-room">–</span><span class="note">The next step can start here.</span></div>
+      <div class="row" data-tip="system"><span></span><span class="name">System reserved</span><span class="v num" id="v-system">–</span></div>
+      <div class="row in" data-tip="safety"><span class="sw floor"></span><span class="name">Safety net</span><span class="v num" id="v-safety">–</span><span class="note" id="safety-note">A fixed setting.</span></div>
+      <div class="row in" data-tip="swap"><span class="sw swap"></span><span class="name">Swap coming back</span><span class="v num" id="v-swap">–</span><span class="note" id="swap-note">RAM held for swap that comes back.</span></div>
+      <div class="row" data-tip="shortfall"><span class="sw free"></span><span class="name">Shortfall</span><span class="v num" id="v-shortfall">–</span><span class="note">Reserves that free RAM does not cover.</span></div>
+     </div>
+     <div class="legend-group">
+      <div class="group-head" data-tip="g-else"><span class="name">Everything else</span><span class="v num" id="v-g-else">–</span></div>
       <div class="row" data-tip="desktop"><span class="sw desktop"></span><span class="name">Desktop</span><span class="v num" id="v-desktop">–</span></div>
-      <div class="row" data-tip="swap"><span class="sw swap"></span><span class="name">RAM for swap</span><span class="v num" id="v-swap">–</span></div>
       <div class="row" data-tip="agents"><span class="sw agents"></span><span class="name">Agents</span><span class="v num" id="v-agents">–</span></div>
       <div class="row" data-tip="programs"><span class="sw programs"></span><span class="name">Other programs</span><span class="v num" id="v-programs">–</span></div>
-      <div class="row" data-tip="kernel"><span class="sw kernel"></span><span class="name">Kernel, measured</span><span class="v num" id="v-kernel">–</span></div>
+      <div class="row" data-tip="kernel"><span class="sw kernel"></span><span class="name">Kernel</span><span class="v num" id="v-kernel">–</span><span class="note" id="kernel-note" hidden></span></div>
       <div class="row" data-tip="cache"><span class="sw cache"></span><span class="name">File and kernel cache</span><span class="v num" id="v-cache">–</span></div>
       <div class="row" data-tip="unattributed"><span class="sw unattributed"></span><span class="name">Not attributed</span><span class="v num" id="v-unattributed">–</span></div>
-      <div class="row" data-tip="cap"><span class="sw cap"></span><span class="name">Queue cap</span><span class="v num" id="v-cap">–</span></div>
-      <div class="row" data-tip="shortfall"><span class="sw free"></span><span class="name">Shortfall</span><span class="v num" id="v-shortfall">–</span></div>
-      <div class="row" data-tip="waiting"><span class="sw waiting"></span><span class="name">Waiting step, memory it needs</span></div>
-      <div class="row" data-tip="progress"><span class="name">Progress: </span><span class="sw progress building"></span><span>building, </span><span class="sw progress testing"></span><span>testing</span></div>
+     </div>
     </div>
-      <details class="room-explainer">
-        <summary><span class="chev">▶</span><span class="name">How the room is worked out</span></summary>
-        <div class="why">
-          <p class="num">Room = max(0, available − safety target − swap target − reservation target)</p>
-          <p class="num" id="room-equation"></p>
-          <p>A step starts when the memory it needs fits in this room and memory pressure is none.</p>
-          <p>Displayed amounts are rounded.</p>
-          <p id="ram-missing" hidden></p>
-        </div>
-      </details>
     </details>
   </section>
 
   <section class="card">
-    <div class="walk-head"><span class="section-head" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span></div>
+    <div class="walk-head"><span class="section-head" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span><div class="walk-tokens num" data-tip="tokens"><span>Tokens</span><dl id="walk-tokens"></dl></div></div>
     <div class="walk" id="walk"></div>
     <p class="pressure-reason" id="cap-reason"></p>
+    <div class="walk-key">
+      <span class="key" data-tip="waiting"><span class="sw waiting"></span>Waiting step, memory it needs</span>
+      <span class="key" data-tip="progress">Progress: <span class="sw progress building"></span>building, <span class="sw progress testing"></span>testing</span>
+    </div>
   </section>
 
   <section class="card" id="leftovers" hidden>
@@ -443,123 +485,212 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
     <div class="swaprows" id="swaprows"></div>
   </section>
   <section class="card" id="report-charts">
-    <div class="section-head">Build history charts</div>
+    <div class="section-head">Build history</div>
+    <div id="report-top">
+      <h3>Top 3 costs</h3>
+      <p class="report-window" id="cost-window"></p>
+      <div id="top-costs">Reading…</div>
+      <p class="report-window">Hours are summed over steps that run at the same time, so a day can pass 24 h.</p>
+    </div>
     <p class="report-window" id="history-window"></p>
     <div id="history-charts">Reading…</div>
-  </section>
-  <section class="card" id="report-top">
-    <div class="section-head">Top 3 costs</div>
-    <p class="report-window" id="cost-window"></p>
-    <div id="top-costs">Reading…</div>
   </section>
 </main>
 <div id="tip" role="tooltip"></div>
 <script>
 let latest = null;
+function field(label, value, kind = 'field', group = false) {
+  return {kind, label, value: String(value ?? ''), group};
+}
+function groupRows(rows) {
+  return rows.filter(row => row.value !== '').map((row, index) => ({...row, group: index === 0}));
+}
+// Each reading owns one set of shown leaf values and totals.
+const shownReadings = new WeakMap();
+function shownReading(data) {
+  if (shownReadings.has(data)) return shownReadings.get(data);
+  const rounded = new Map();
+  const leaf = bytes => {
+    if (!recorded(bytes)) return bytes;
+    if (!rounded.has(bytes)) rounded.set(bytes, Math.sign(bytes) * Math.round(Math.abs(bytes) / GIB * 10) * GIB / 10);
+    return rounded.get(bytes);
+  };
+  const sum = values => values.every(recorded) ? values.reduce((total, value) => total + value, 0)
+    : values.find(value => !recorded(value));
+  const source = data.ram;
+  const totals = new Set(['build_tools_bytes','other_programs_bytes','kernel_bytes','unattributed_bytes',
+    'available_bytes','total_bytes','cap_bytes','shortfall_bytes','safety_target_bytes','swap_target_bytes','build_target_bytes']);
+  const ram = Object.fromEntries(Object.entries(source).map(([key, value]) =>
+    [key, key.endsWith('_bytes') && !totals.has(key) ? leaf(value) : value]));
+  ram.programs = (source.programs || []).map(program => ({...program, bytes:leaf(program.bytes)}));
+  ram.build_tools_bytes = recorded(source.build_tools_bytes)
+    ? sum([ram.rust_analyzer_bytes,ram.sccache_bytes,ram.other_build_tools_bytes]) : source.build_tools_bytes;
+  ram.other_programs_bytes = recorded(source.other_programs_bytes)
+    ? sum([...ram.programs.map(program => program.bytes),ram.smaller_programs_bytes]) : source.other_programs_bytes;
+  ram.kernel_bytes = recorded(source.kernel_bytes)
+    ? sum([ram.compressed_swap_bytes,ram.kernel_structures_bytes,ram.kernel_counters_bytes]) : source.kernel_bytes;
+  ram.unnamed_bytes = leaf(source.unattributed_bytes - source.kernel_no_counter_bytes);
+  ram.unattributed_bytes = recorded(source.unattributed_bytes)
+    ? sum([ram.kernel_no_counter_bytes,ram.unnamed_bytes]) : source.unattributed_bytes;
+  for (const key of ['safety','swap','build'])
+    ram[key+'_target_bytes'] = sum([ram[key+'_covered_bytes'],ram[key+'_missing_bytes']]);
+  ram.shortfall_bytes = sum([ram.safety_missing_bytes,ram.swap_missing_bytes,ram.build_missing_bytes]);
+  ram.available_bytes = recorded(source.available_bytes)
+    ? sum([ram.build_covered_bytes,ram.room_bytes,ram.safety_covered_bytes,ram.swap_covered_bytes]) : source.available_bytes;
+  const builds = sum([ram.build_tools_bytes,ram.queued_builds_bytes,ram.ci_bytes]);
+  ram.cap_bytes = sum([builds,ram.build_covered_bytes,ram.room_bytes]);
+  ram.total_bytes = recorded(source.total_bytes)
+    ? sum([builds,ram.available_bytes,legendBytes(ram,'else')]) : source.total_bytes;
+  const rowMemory = row => {
+    const parts = row.parts?.map(part => ({...part,gib:leaf(part.gib*GIB)/GIB}));
+    const used = parts ? sum(parts.map(part => part.gib*GIB))/GIB
+      : recorded(row.used) ? leaf(row.used*GIB)/GIB : row.used;
+    const reserved = recorded(row.reserved) ? leaf(row.reserved*GIB)/GIB : 0;
+    return {...row,used,reserved,counted:used+reserved,...(parts ? {parts} : {})};
+  };
+  const shown = {...data,ram,cap:hasCap(data) ? ram.cap_bytes/GIB : data.cap,
+    total:ram.total_bytes/GIB,taken:sum([builds,ram.build_covered_bytes])/GIB,
+    walk:(data.walk || []).map(rowMemory),waiters:(data.waiters || []).map(row => ({...row,
+      need:leaf(row.need*GIB)/GIB,...(recorded(row.free) ? {free:leaf(row.free*GIB)/GIB} : {}),
+      ...(row.head_room ? {head_room:{...row.head_room,rows:row.head_room.rows?.map(term =>
+        ({...term,gib:leaf(term.gib*GIB)/GIB}))}} : {})}))};
+  shownReadings.set(data,shown);
+  shownReadings.set(shown,shown);
+  return shown;
+}
+function memoryRows(parts) {
+  return parts.map(([label, bytes]) => field(label, ramAmount(bytes)));
+}
+function queueCapMemory(d) {
+  return {builds:legendBytes(d.ram,'builds'),reserved:d.ram.build_covered_bytes,free:d.ram.room_bytes};
+}
+function reserveTargetRows(covered, target) {
+  return target > covered ? [field('Target', ramAmount(target))] : [];
+}
+function legendTip(name, bytes, caption, parts = []) {
+  const title = field(name, ramAmount(bytes), 'title');
+  return recorded(bytes) ? [title,field('',caption,'caption'),...groupRows(parts)] : [title];
+}
 const TIPS = {
-  queued: (d) => [`Queued builds · ${ramAmount(d.ram.queued_builds_bytes)}`,
-    "RAM that builds in the queue use now.\nThe queue cap counts it."],
-  ci: (d) => [`hana CI · ${ramAmount(d.ram.ci_bytes)}`,
-    "RAM used by hana CI programs.\nThe queue cap counts it.\nFile cache and kernel memory appear separately."],
-  tools: (d) => [`Build tools · ${ramAmount(d.ram.build_tools_bytes)}`, lines(
-    "RAM that build tools and builds outside the queue use now.\nThe queue cap does not count it.",
-    amountLines([["rust-analyzer", d.ram.rust_analyzer_bytes], ["sccache", d.ram.sccache_bytes],
-      ["Other build tools", d.ram.other_build_tools_bytes]]) || "No build tool RAM is recorded.")],
-  reserved: (d) => [`Reserved RAM · ${ramAmount(d.ram.build_covered_bytes)}`, lines(
-    "RAM the queue holds for running builds until they reach their expected peak.",
-    `Reservation target: ${ramAmount(d.ram.build_target_bytes)}.`,
-    optional(d.ram.build_missing_bytes, `Missing RAM: ${ramAmount(d.ram.build_missing_bytes)}.`))],
-  room: (d) => [`Next step room · ${ramAmount(d.ram.room_bytes)}`, lines(
-    "RAM that the next waiting step can start in.", `Available RAM: ${ramAmount(d.ram.available_bytes)}.`, `− Safety target: ${ramAmount(d.ram.safety_target_bytes)}.`,
-    optional(d.ram.swap_target_bytes, `− Swap reserve target: ${ramAmount(d.ram.swap_target_bytes)}.`),
-    optional(d.ram.build_target_bytes, `− Build reservation target: ${ramAmount(d.ram.build_target_bytes)}.`))],
-  safety: (d) => [`Safety · ${ramAmount(d.ram.safety_covered_bytes)}`, lines(
-    "RAM the queue always leaves free, so the machine does not run out of memory.",
-    `Target: ${ramAmount(d.ram.safety_target_bytes)}.`)],
-  desktop: (d) => measuredTip("Desktop", d.ram.desktop_bytes, lines(
-    "RAM that the desktop session uses, so the mouse and keyboard stay responsive.",
-    optional(d.ram.desktop_protection_bytes, `The system never takes back the first ${ramAmount(d.ram.desktop_protection_bytes)}.`))),
-  swap: (d) => [`RAM for swap · ${ramAmount(d.ram.swap_covered_bytes)}`, lines(
-    "RAM the queue leaves free for memory in swap, mostly agents' memory.",
-    "That memory can come back into RAM at any time.", `Target: ${ramAmount(d.ram.swap_target_bytes)}.`,
-    optional(d.ram.swap_missing_bytes, `Missing RAM: ${ramAmount(d.ram.swap_missing_bytes)}.`))],
-  agents: (d) => measuredTip("Agents", d.ram.agents_bytes,
-    "RAM used by agent sessions and their tools.\nFile cache and kernel memory appear separately."),
-  programs: (d) => [`Other programs · ${ramAmount(d.ram.other_programs_bytes)}`, lines(
-    "RAM that programs other than builds, agents and the desktop use.",
-    ...d.ram.programs.map(program => `${program.name}: ${ramAmount(program.bytes)}`),
-    d.ram.smaller_program_count ? `and ${d.ram.smaller_program_count} smaller programs: ${ramAmount(d.ram.smaller_programs_bytes)}` : "")],
-  kernel: (d) => measuredTip("Kernel, measured", d.ram.kernel_bytes, lines("RAM that the kernel uses for itself.", amountLines([
-    ["Compressed swap (zram)", d.ram.compressed_swap_bytes], ["Slab, stacks and page tables", d.ram.kernel_structures_bytes],
-    ["Other kernel counters", d.ram.kernel_counters_bytes]]),
-    "Reclaimable kernel cache appears in the cache block.")),
-  cache: (d) => measuredTip("File and kernel cache", d.ram.cache_bytes,
-    "Estimated cache outside available RAM.\nIncludes file cache and reclaimable kernel cache.\nPrograms can close while their file cache remains."),
-  unattributed: (d) => [`Not attributed · ${ramAmount(d.ram.unattributed_bytes)}`, d.ram.kernel_no_counter_bytes > 0
-    ? lines("RAM that the readings do not explain.",
-      `Kernel memory with no counter, such as driver memory: ${ramAmount(d.ram.kernel_no_counter_bytes)}.`,
-      optional(d.ram.unattributed_bytes - d.ram.kernel_no_counter_bytes,
-        `Memory with no program name: ${ramAmount(d.ram.unattributed_bytes - d.ram.kernel_no_counter_bytes)}.`))
-    : "RAM that the readings do not explain.\nNo program name is available for this amount."],
-  cap: (d) => !hasCap(d) ? ["Queue cap · unavailable", d.cap_text] : [`Queue cap · ${f1(d.cap)} GiB`, lines(
-    "Limit for queued builds and hana CI.", `Queued use counted: ${ramAmount(d.ram.queued_builds_bytes)}.`,
-    optional(d.ram.ci_bytes, `CI use counted: ${ramAmount(d.ram.ci_bytes)}.`),
-    "Queued builds, hana CI, reserved RAM and the next step room add to the cap.")],
-  shortfall: (d) => [`Shortfall · ${ramAmount(d.ram.shortfall_bytes)}`, lines(
-    optional(d.ram.safety_missing_bytes, `Safety reserve missing: ${ramAmount(d.ram.safety_missing_bytes)}.`),
-    optional(d.ram.swap_missing_bytes, `Swap reserve missing: ${ramAmount(d.ram.swap_missing_bytes)}.`),
-    optional(d.ram.build_missing_bytes, `Build reservation missing: ${ramAmount(d.ram.build_missing_bytes)}.`),
-    optional(overCap(d), `Queued and CI use above the cap: ${ramAmount(overCap(d))}.`))],
-  budget: (d) => [`RAM budget · ${ramAmount(d.ram.total_bytes)}`,
-    "Blocks divide this machine's usable RAM.\nAvailable RAM includes cache Linux expects to reclaim.\nReservations use available RAM."],
-  waiting: () => ["Waiting step", "The dashed bar shows the memory the step needs.\nIt ends at the queue cap."],
-  progress: () => ["Build progress", "The line shows completed work.\nThe legend gives the building and testing colors."],
+  'g-builds': d => legendTip('Builds', queueCapMemory(d).builds, 'RAM that builds use now', memoryRows([
+    ['Build tools', d.ram.build_tools_bytes], ['+ Queued builds', d.ram.queued_builds_bytes], ['+ hana CI', d.ram.ci_bytes]])),
+  tools: d => legendTip('Build tools', d.ram.build_tools_bytes, 'RAM that build tools use now', memoryRows([
+    ['rust-analyzer', d.ram.rust_analyzer_bytes], ['+ sccache', d.ram.sccache_bytes], ['+ Other build tools', d.ram.other_build_tools_bytes]])),
+  queued: d => legendTip('Queued builds', d.ram.queued_builds_bytes, 'RAM of builds the queue started'),
+  ci: d => legendTip('hana CI', d.ram.ci_bytes, 'RAM of hana CI programs'),
+  'g-free': d => legendTip('Free RAM', d.ram.available_bytes, 'RAM that no program holds', memoryRows([
+    ['Build reserved', queueCapMemory(d).reserved], ['+ Free', queueCapMemory(d).free],
+    ['+ System reserved', d.ram.safety_covered_bytes + d.ram.swap_covered_bytes]])),
+  reserved: d => legendTip('Build reserved', queueCapMemory(d).reserved, 'Held for running builds to grow into', [
+    ...reserveTargetRows(d.ram.build_covered_bytes, d.ram.build_target_bytes),
+    ...(d.ram.build_missing_bytes > 0 ? [field('Not covered', ramAmount(d.ram.build_missing_bytes))] : [])]),
+  room: d => legendTip('Free', queueCapMemory(d).free, 'Where the next step can start', [
+    field('Queue cap', hasCap(d) ? ramAmount(d.cap * GIB) : 'unavailable'),
+    field('− Builds', ramAmount(queueCapMemory(d).builds)), field('− Build reserved', ramAmount(queueCapMemory(d).reserved))]),
+  system: d => legendTip('System reserved', d.ram.safety_covered_bytes + d.ram.swap_covered_bytes,
+    'RAM kept outside the queue cap', memoryRows([
+      ['Safety net', d.ram.safety_covered_bytes], ['+ Swap coming back', d.ram.swap_covered_bytes]])),
+  safety: d => legendTip('Safety net', d.ram.safety_covered_bytes, 'RAM the queue always leaves free', [
+    ...reserveTargetRows(d.ram.safety_covered_bytes, d.ram.safety_target_bytes),
+    ...(d.ram.safety_missing_bytes > 0 ? [field('Not covered', ramAmount(d.ram.safety_missing_bytes))] : [])]),
+  swap: d => legendTip('Swap coming back', d.ram.swap_covered_bytes, 'RAM held for swap that comes back', [
+    ...(recorded(d.swap?.reserve_share_percent) ? [field('Share held',`${d.swap.reserve_share_percent}%`)] : []),
+    ...reserveTargetRows(d.ram.swap_covered_bytes, d.ram.swap_target_bytes),
+    ...(d.ram.swap_missing_bytes > 0 ? [field('Not covered', ramAmount(d.ram.swap_missing_bytes))] : [])]),
+  shortfall: d => legendTip('Shortfall', d.ram.shortfall_bytes, 'Reserves that free RAM does not cover', memoryRows([
+    ['Uncovered safety', d.ram.safety_missing_bytes], ['+ Uncovered swap', d.ram.swap_missing_bytes],
+    ['+ Uncovered reserve', d.ram.build_missing_bytes]].filter(([, bytes]) => bytes > 0)
+      .map(([label, bytes], index) => [index ? label : label.replace(/^\+ /, ''), bytes]))),
+  'g-else': d => legendTip('Everything else', legendBytes(d.ram, 'else'), 'RAM used outside builds', memoryRows([
+    ['Desktop', d.ram.desktop_bytes], ['+ Agents', d.ram.agents_bytes], ['+ Other programs', d.ram.other_programs_bytes],
+    ['+ Kernel', d.ram.kernel_bytes], ['+ File and kernel cache', d.ram.cache_bytes], ['+ Not attributed', d.ram.unattributed_bytes]])),
+  desktop: d => legendTip('Desktop', d.ram.desktop_bytes, 'RAM of the desktop session',
+    memoryRows([['Protected', d.ram.desktop_protection_bytes]])),
+  agents: d => legendTip('Agents', d.ram.agents_bytes, 'RAM of agent sessions and their tools'),
+  programs: d => legendTip('Other programs', d.ram.other_programs_bytes, 'RAM of all other programs', memoryRows([
+    ...d.ram.programs.map(program => [program.name, program.bytes]),
+    ...(d.ram.smaller_program_count ? [[`${d.ram.smaller_program_count} smaller programs`, d.ram.smaller_programs_bytes]] : [])])),
+  kernel: d => legendTip('Kernel', d.ram.kernel_bytes, 'RAM the kernel uses for itself', memoryRows([
+    ['Compressed swap (zram)', d.ram.compressed_swap_bytes], ['+ Slab, stacks, page tables', d.ram.kernel_structures_bytes],
+    ['+ Other kernel counters', d.ram.kernel_counters_bytes]])),
+  cache: d => legendTip('File and kernel cache', d.ram.cache_bytes, 'Estimated cache outside free RAM'),
+  unattributed: d => legendTip('Not attributed', d.ram.unattributed_bytes, 'RAM that the readings do not explain', memoryRows([
+    ['Kernel, no counter', d.ram.kernel_no_counter_bytes], ['+ No program name', d.ram.unnamed_bytes]])),
+  cap: d => legendTip('Queue cap', hasCap(d) ? d.cap * GIB : null, 'What builds may use', memoryRows([
+    ['Builds', queueCapMemory(d).builds], ['+ Build reserved', queueCapMemory(d).reserved], ['+ Free', queueCapMemory(d).free]])),
+  budget: d => legendTip('RAM', d.ram.total_bytes, 'Memory across this machine', memoryRows([
+    ['Builds', queueCapMemory(d).builds], ['+ Free RAM', d.ram.available_bytes], ['+ Everything else', legendBytes(d.ram, 'else')]])),
+  waiting: () => [field('Waiting step', '', 'title'), field('Dashed outline', 'memory needed'), field('End', 'queue cap')],
+  progress: () => [field('Build progress', '', 'title'), field('Blue', 'building'), field('Pink', 'testing')],
+  walkhead: () => [field('Running, in start order', '', 'title'), field('Blue', 'in use now'), field('Hatching', 'reserved'),
+    field('Dashed outline', 'waiting step'), field('Red line', 'queue cap')],
+  walksum: d => legendTip('Taken', hasCap(d) ? claimedGib(d) * GIB : null, 'Memory used or held by builds', [
+    ...memoryRows([['Builds', queueCapMemory(d).builds],
+      [overCapBytes(d) > 0 ? '+ Build reserved (full)' : '+ Build reserved',
+        queueCapMemory(d).reserved + overCapBytes(d)]]),
+    ...(overCapBytes(d) > 0 ? memoryRows([['Queue cap', d.cap * GIB], ['Over cap', overCapBytes(d)]]) : [])]),
+  tokens: d => {
+    const known = d.tokens?.kind === 'TokenPool';
+    const reason = known ? d.token_counts : d.tokens?.reason || 'no token pool reading';
+    return [field('Tokens', '', 'title'), ...groupRows(tokenPoolRows(d.tokens)),
+      ...(known ? [field('Job capacity', 'one extra job per token'),
+        field('Shared by', 'natedev cargo and nextest'), field('CI pool', 'separate'),
+        field('Pause below free RAM', ramAmount(d.tokens.memory_floor_bytes)),
+        field('Pool', d.tokens.paused ? 'paused' : 'active'),
+        field('Per-build counts', d.token_counts ? 'unavailable' : 'known')] : []),
+      ...becauseRows((reason || '').replace(/\.$/, ''))];
+  },
+  ticks: d => [field('Scale', ramAmount(d.total * GIB), 'title'), field('', 'One scale for both charts', 'caption'),
+    field('Start', '0.0 GiB'), field('Red line', hasCap(d) ? 'queue cap' : 'unavailable')],
+  swaphead: () => [field('Swap and pressure', '', 'title'), field('Swap', 'memory on disk'), field('Stall', 'waiting for memory')],
+  pill: d => [field('Memory pressure', ({ok:'none',warn:'near a limit',hold:'queue holds',neutral:'unavailable'})[level(d)], 'title')],
+  'g-some': d => pressureTip('Some tasks stall', d.psi.some, d.limits.some, 'Memory waits of at least one task'),
+  'g-full': d => pressureTip('All tasks stall', d.psi.full, d.limits.full, 'Memory waits of all active tasks'),
+  'g-swap': d => legendTip('Swap used', d.swap.used_bytes, 'Memory held on disk', memoryRows([['Capacity', d.swap.capacity_bytes]])),
 };
+function pressureTip(name, value, limit, caption) {
+  return !recorded(value) ? [field(name, 'unavailable', 'title')] : [field(name, formatPercent(value), 'title'),
+    field('', caption, 'caption'), ...groupRows([field('Average over', '10 s'), field('Queue holds above', formatPercent(limit))])];
+}
 const GIB = 1024 ** 3;
 const RAM_BLOCKS = [
-  ["queued", "Queued builds", r => r.queued_builds_bytes], ["ci", "hana CI", r => r.ci_bytes],
-  ["reserved", "Reserved RAM", r => r.build_covered_bytes], ["room", "Next step room", r => r.room_bytes],
-  ["tools", "Build tools", r => r.build_tools_bytes],
-  ["safety", "Safety", r => r.safety_covered_bytes], ["desktop", "Desktop", r => r.desktop_bytes],
-  ["swap", "RAM for swap", r => r.swap_covered_bytes],
-  ["agents", "Agents", r => r.agents_bytes], ["programs", "Other programs", r => r.other_programs_bytes],
-  ["kernel", "Kernel, measured", r => r.kernel_bytes], ["cache", "File and kernel cache", r => r.cache_bytes],
-  ["unattributed", "Not attributed", r => r.unattributed_bytes],
+  ["tools", "Build tools", r => r.build_tools_bytes, "builds"], ["queued", "Queued builds", r => r.queued_builds_bytes, "builds"],
+  ["ci", "hana CI", r => r.ci_bytes, "builds"],
+  ["reserved", "Build reserved", r => r.build_covered_bytes, "free"], ["room", "Free", r => r.room_bytes, "free"],
+  ["safety", "Safety net", r => r.safety_covered_bytes, "free"], ["swap", "Swap coming back", r => r.swap_covered_bytes, "free"],
+  ["desktop", "Desktop", r => r.desktop_bytes, "else"], ["agents", "Agents", r => r.agents_bytes, "else"],
+  ["programs", "Other programs", r => r.other_programs_bytes, "else"], ["kernel", "Kernel", r => r.kernel_bytes, "else"],
+  ["cache", "File and kernel cache", r => r.cache_bytes, "else"], ["unattributed", "Not attributed", r => r.unattributed_bytes, "else"],
 ];
-// Queued and CI use above the cap. The cap is below that use only when available RAM
-// does not cover the safety and swap reserves.
-function overCap(d) {
-  return hasCap(d) ? Math.max(0, Math.round(d.ram.queued_builds_bytes + d.ram.ci_bytes - d.cap * GIB)) : 0;
+// Bar widths exclude unavailable readings and negative values.
+function shownBytes(bytes) { return recorded(bytes) ? Math.max(0, bytes) : 0; }
+function groupBytes(r, group) {
+  return RAM_BLOCKS.filter(block => block[3] === group).reduce((sum, block) => sum + shownBytes(block[2](r)), 0);
 }
-// The bar widths of the cap terms: queued builds and CI stop at the cap, and the use above it has its own block.
-// CI sits right of queued builds, so the use above the cap comes off CI first.
-function capTermWidths(d) {
-  const over = overCap(d);
-  const ci = Math.max(0, d.ram.ci_bytes);
-  return {queued: Math.max(0, d.ram.queued_builds_bytes - Math.max(0, over - ci)), ci: ci - Math.min(ci, over), over};
+function legendBytes(r, group) {
+  return RAM_BLOCKS.filter(block => block[3] === group).reduce((sum, block) => {
+    const bytes = block[2](r);
+    return sum + (recorded(bytes) ? bytes : 0);
+  }, 0);
 }
-function lines(...items) { return items.filter(Boolean).join("\n"); }
-function optional(bytes, text) { return recorded(bytes) && bytes > 0 ? text : ""; }
+function tokenPoolRows(pool) {
+  return pool?.kind === 'TokenPool' ? [field('Total', pool.total), field('Available', pool.free)]
+    : [field('Status', 'unavailable')];
+}
 function ramAmount(bytes) {
   if (!recorded(bytes)) return "unavailable";
-  return bytes > 0 && bytes < 0.05 * GIB ? "<0.1 GiB" : `${f1(bytes / GIB)} GiB`;
-}
-function amountLines(parts) {
-  return lines(...parts.map(([name, bytes]) => optional(bytes, `${name}: ${ramAmount(bytes)}.`)));
-}
-function measuredTip(name, bytes, body) {
-  return recorded(bytes) ? [`${name} · ${ramAmount(bytes)}`, body]
-    : [`${name} · unavailable`, "The latest reading is unavailable.\nThis amount is unknown."];
+  return `${Object.is(bytes,-0) ? "-0.0" : f1(bytes / GIB)} GiB`;
 }
 function statusLine(d) {
   const status = d.memory_status, room = ramAmount(d.ram.room_bytes);
   return ({
     unavailable: "Memory reading unavailable; build capacity is unknown.",
-    gpu_slot: "A GPU test waits: another GPU test holds the GPU test slot.",
-    pressure: `Memory pressure prevents a new start; room is ${room}.`,
-    shortfall: `No room: reserves exceed available RAM by ${ramAmount(d.ram.shortfall_bytes)}.`,
-    no_room: "No room: safety, swap reserves, and build reservations use available RAM.",
-    one_running_memory_wait: `One build runs; another needs ${ramAmount(status.next_need_bytes)}, but room is ${ramAmount(status.check_room_bytes)}.`,
+    gpu_slot: "A GPU test waits: another GPU test holds the GPU test slot." + (status.next_need_bytes > status.check_room_bytes
+      ? ` It also needs ${ramAmount(status.next_need_bytes)}, and free is ${ramAmount(status.check_room_bytes)}.` : ""),
+    pressure: `Memory pressure prevents a new start; free is ${room}.`,
+    shortfall: `Nothing is free: reserves exceed free RAM by ${ramAmount(d.ram.shortfall_bytes)}.`,
+    no_room: "Nothing is free: the safety net, swap coming back and build reserved use all free RAM.",
+    one_running_memory_wait: `One build runs; another needs ${ramAmount(status.next_need_bytes)}, but free is ${ramAmount(status.check_room_bytes)}.`,
   })[status.code] || "";
 }
 function swapAmount(bytes) {
@@ -567,41 +698,32 @@ function swapAmount(bytes) {
   if (amount >= 1024 ** 3) return `${f1(bytes / 1024 ** 3)} GiB`;
   if (amount >= 1024 ** 2) return `${f1(bytes / 1024 ** 2)} MiB`;
   if (amount >= 1024) return `${f1(bytes / 1024)} KiB`;
-  return `${bytes} B`;
+  return `${f1(bytes)} B`;
 }
 function signedSwap(bytes) { return `${bytes < 0 ? "−" : "+"}${swapAmount(Math.abs(bytes))}`; }
-const SWAP_CATEGORY_TEXT = {
-  agents: "Swap charged to agent sessions and their tools.", desktop: "Swap charged to the desktop groups.",
-  system: "Swap charged to system services.", ci: "Swap charged to hana CI.",
-};
 function swapTip(row) {
-  const title = `${row.name} · ${swapAmount(row.bytes)}`;
-  if (row.kind === "total") return [`All swap used · ${swapAmount(row.bytes)}`,
-    "Swap space used across this machine.\nIncludes builds, CI, agents, and other programs.\nSome pages can also have RAM copies."];
-  if (row.kind === "difference") return [`Reading difference · ${signedSwap(row.bytes)}`,
-    "Group readings exceed the host total.\nThis is an accounting difference, not negative swap."];
-  if (row.kind === "unattributed") return [title, "Swap without a matching group reading."];
-  if (row.kind === "ungrouped") return [title, "Swap charged to groups without a program name."];
-  if (row.kind === "smaller") return [title, `Combined swap of ${row.members.length} named groups.\nThe expanded list shows each group.`];
-  if (row.category) return [title, SWAP_CATEGORY_TEXT[row.category]];
-  const owner = row.owner_count === 1 ? identityFields(row).map(([name, value]) => `${sentence(name)}: ${value}`) : [];
-  return [title, lines("Swap charged to this program or build.", ...owner)];
+  const captions = {total:'Swap across this machine', difference:'Group readings above the host total',
+    unattributed:'Swap without a matching group', ungrouped:'Swap without a program name', smaller:'Swap of the smaller named groups'};
+  return [field(row.name, row.kind === 'difference' ? signedSwap(row.bytes) : swapAmount(row.bytes), 'title'),
+    field('', captions[row.kind] || 'Swap charged to this program', 'caption'),
+    ...(row.owner_count === 1 ? groupRows(ownerFields(row)) : [])];
 }
 // The fraction of all RAM at the queue cap: both charts draw their cap line here.
-// The Running chart bars use the cap terms (queued use, CI use counted, covered reservations, room), which add to the cap.
+// Build tools, queued builds, CI, reserved memory and free memory add to the queue cap.
 function capEnd(d) {
   const total = recorded(d.ram.total_bytes) && d.ram.total_bytes > 0 ? d.ram.total_bytes : 1;
   return hasCap(d) ? d.cap * GIB / total : 0;
 }
 function poolTip(pool, d) {
-  if (pool === "builds_ci") return [`Builds and CI · ${swapAmount(d.swap.builds_ci_bytes)}`,
-    "Swap used by builds, build tools, and CI.\nThe queue excludes this from its swap reserve target."];
-  return [`Outside builds and CI · ${swapAmount(d.swap.outside_bytes)}`, lines("Swap used outside the builds and CI groups.",
-    `Queue reserve share: ${d.swap.reserve_share_percent}%.`, `RAM reserve target: ${ramAmount(d.ram.swap_target_bytes)}.`)];
+  return pool === 'builds_ci' ? [field('Builds and CI', swapAmount(d.swap.builds_ci_bytes), 'title'),
+    field('', 'Swap outside the reserve target', 'caption')] : [field('Outside builds and CI', swapAmount(d.swap.outside_bytes), 'title'),
+    ...groupRows([field('Reserve share', formatPercent(d.swap.reserve_share_percent)),
+      field('Swap coming back', ramAmount(d.ram.swap_covered_bytes)),
+      ...reserveTargetRows(d.ram.swap_covered_bytes, d.ram.swap_target_bytes)])];
 }
 const pctOf = (v, t) => t > 0 ? v / t * 100 : 0;
 function formatPercent(value, complete = true) {
-  const tenths = Math.floor(value * 10);
+  const tenths = Math.round(value * 10);
   return `${((complete ? tenths : Math.min(tenths, 999)) / 10).toFixed(1)}%`;
 }
 function level(d) {
@@ -610,42 +732,15 @@ function level(d) {
   const L = d.limits;
   return (d.psi.some >= L.some * 0.6 || d.psi.full >= L.full * 0.6) ? "warn" : "ok";
 }
-Object.assign(TIPS, {
-  pill: (d) => [`Memory pressure · ${({ ok: "none", warn: "near a limit", hold: "queue holds", neutral: "stall not recorded" })[level(d)]}`, `Pressure means the system waits for memory. Above a limit, the queue starts no new step. Click to see swap and the pressure checks.`],
-  walksum: (d) => [!hasCap(d) ? `Taken · ${f1(d.taken)} GiB · cap unavailable` : `Taken · ${f1(d.taken)} of ${f1(d.cap)} GiB`, d.cap_text],
-  walkhead: () => ["Running, in start order", "Blue shows memory a queued step uses now. Hatching shows reserved. The CI row shows its use and reserved inside the cap. Dashed outlines stop at the cap and show waiting steps. Numbers below bars show use and reserved."],
-  ticks: (d) => ["Scale in GiB", `One scale for both charts: 0 to ${f1(d.total)} GiB, all of the RAM. ${!hasCap(d) ? "The queue cap is unavailable." : "The red line is the queue cap."}`],
-  swaphead: () => ["Swap and memory pressure", "Swap is disk space the system uses when RAM is short. Swap itself is not a problem. Stalls are the problem: they show the system waits for memory."],
-  "g-some": (d) => [`Some tasks stall · ${(!recorded(d.psi.some) ? "not recorded" : formatPercent(d.psi.some))}`, lines(
-    "Memory waits affecting at least one task.", "The reading uses a ten-second average.", `The queue holds above ${formatPercent(d.limits.some)}.`)],
-  "g-full": (d) => [`All tasks stall · ${(!recorded(d.psi.full) ? "not recorded" : formatPercent(d.psi.full))}`, lines(
-    "Memory waits affecting all active tasks.", "The reading uses a ten-second average.", `The queue holds above ${formatPercent(d.limits.full)}.`)],
-  "g-swap": (d) => [`Swap used · ${ramAmount(d.swap.used_bytes)}`, lines(
-    `Swap capacity: ${ramAmount(d.swap.capacity_bytes)}.`, "Swap use alone does not hold the queue.")],
-});
+
 function macRow(row) {
   return row.kind === "mac-build" || row.kind === "mac-unavailable";
 }
 function ciRow(row) { return row.ci || !!row.ci_label; }
 const STEP_TABLE_HEADERS = {target: "Target", duration: "Dur", waiting: "Waiting"};
-const RUN_FROM = {showrunner: "this run is from the showrunner", director: "this run is from the unit director"};
 function ownerText(text) {
-  const shown = publicText(text || "");
-  return /not recorded/.test(shown) ? "" : shown;
-}
-function identityFields(row) {
-  if (ciRow(row)) return [["CI", row.ci_label || row.name]];
-  const showrunner = ["showrunner", ownerText(row.showrunner)];
-  const unit = ownerText(row.unit);
-  const fields = row.runner === "showrunner" ? [showrunner, ["unit", RUN_FROM.showrunner]]
-    : row.runner === "unit director" ? [showrunner, ["unit", unit], ["worker", RUN_FROM.director]]
-    : row.runner === "worker" ? [showrunner, ["unit", unit || RUN_FROM.showrunner], ["worker", ownerText(row.worker)]]
-    : [showrunner, ["unit", unit]];
-  return fields.filter(([, value]) => value);
-}
-function identityHtml(row) {
-  const fields = identityFields(row);
-  return fields.length ? `<dl class="identity">` + fields.map(([name, value]) => `<dt>${esc(name)}</dt><dd class="colon" aria-hidden="true">:</dd><dd>${esc(value)}</dd>`).join("") + `</dl>` : "";
+  const shown = publicText(text || '');
+  return /not recorded/.test(shown) || shown === '—' ? '' : shown;
 }
 function stageText(row) {
   if (macRow(row)) return ["MacTesting", "MacTestingCounter"].includes(row.stage?.kind) ? "testing" : row.stage?.kind === "MacBuilding" ? "building" : "—";
@@ -659,27 +754,131 @@ function doneText(row) {
     : progress.total > 0 && recorded(progress.done) ? 100 * progress.done / progress.total : null;
   return recorded(percent) ? formatPercent(percent, progress.done === progress.total) : "—";
 }
-function macTipFields(row, data) {
-  const fields = [[STEP_TABLE_HEADERS.target, "mac"],
-    ["Started", row.started_at ? `${ago(row.started_at, data.read_at)} ago` : "unavailable"],
-    ["Used", recorded(row.used) ? `${f1(row.used)} GiB` : "unavailable"],
-    ["Reading age", row.read_at ? `${ago(row.read_at, data.read_at)} old` : "unavailable"]];
-  if (row.progress?.kind === "RowProgress") fields.push(["Progress",
-    `${row.progress.done} of ${row.progress.total} ${row.progress.unit} · ${formatPercent(row.progress.percent, row.progress.done === row.progress.total)}`]);
-  return fields;
+function ownerFields(row) {
+  const fields = [field('Showrunner', ownerText(row.showrunner))];
+  if (row.runner === 'worker') fields.push(field('Worker', ownerText(row.worker)));
+  return fields.filter(row => row.value);
+}
+function rowTitle(row) {
+  if (ciRow(row)) return row.ci_label || `hana CI · ${row.detail || row.name}`;
+  const unit = ownerText(row.unit);
+  const name = publicText(row.name || '');
+  return unit && !name.startsWith(unit+' ') && !name.startsWith(unit+' · ') ? `${unit} · ${name}`
+    : unit && name.startsWith(unit+' ') ? `${unit} · ${name.slice(unit.length+1)}` : name;
+}
+function becauseRows(reason) {
+  if (!reason) return [];
+  return reason.length <= 30 ? [field('Because', reason)] : [field('Because', ''), field('', reason, 'long')];
+}
+function routeFields(row) {
+  return [field('Runs on', row.kind === 'cloud' ? 'AWS' : row.runs_on || ''),
+    ...(row.runs_on === 'natedev or Mac' ? [] : becauseRows(row.because || ''))];
+}
+function progressRows(row) {
+  const progress = row.progress;
+  if (!progress || progress.kind !== 'RowProgress') return [];
+  return groupRows([field(sentence(progress.phase), `${progress.done} of ${progress.total} ${progress.unit}`),
+    field('Done', formatPercent(progress.percent ?? 100 * progress.done / progress.total, progress.done === progress.total)),
+    ...(progress.unit === 'modules' ? [field('Order', 'slowest first')] : [])]);
+}
+function stepTooltip(key, data) {
+  const row = stepRow(key, data);
+  if (!row) return [];
+  const waiting = key.startsWith('wait:');
+  const duration = tipDuration(key, row, data);
+  const state = waiting ? 'waiting' : row.between_steps ? 'between steps' : 'running';
+  if (row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used)))
+    return [field(rowTitle(row), 'unavailable', 'title')];
+  const rows = [field(rowTitle(row), [state, duration].filter(Boolean).join(' '), 'title')];
+  if (row.group) return [field(row.name, ramAmount(row.used * GIB), 'title'), field('Started by', 'not the queue'),
+    ...groupRows(memoryRows((row.parts || []).map(part => [[part.who, recorded(part.pid) ? part.pid : '',
+      part.started_at > 0 ? ago(part.started_at, data.read_at) : ''].filter(Boolean).join(' · '), part.gib * GIB])))];
+  rows.push(...ownerFields(row));
+  if (row.priority_entries?.length) rows.push(field('Priority', row.priority_entries.map(entry => entry.unit).join(', ')));
+  if (waiting) {
+    if (row.place) rows.push(field('Place in line', row.place));
+    rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' :
+      row.kind === 'repository-slot' ? 'build slot' : row.why || 'its turn'), ...routeFields(row));
+    if (!['cloud', 'repository-slot'].includes(row.kind)) {
+      if (row.head_room?.unavailable) return [field(rowTitle(row), 'unavailable', 'title')];
+      let free = row.free ?? queueCapMemory(data).free / GIB;
+      if (row.head_room?.rows?.length) {
+        const terms = row.head_room.rows, result = terms.at(-1);
+        const cap = queueCapMemory(data);
+        const earlier = terms.slice(3, -1).map(term => ({label:term.label, tenths:Math.round(term.gib * 10)}));
+        free = Math.max(0, Math.round(cap.free / GIB * 10) - earlier.reduce((sum, term) => sum + term.tenths, 0)) / 10;
+        rows.push(...groupRows([field('Queue cap', ramAmount(data.cap * GIB)),
+          field('− Builds', ramAmount(cap.builds)), field('− Build reserved', ramAmount(cap.reserved)),
+          ...earlier.map(term => field(term.label, `${(term.tenths / 10).toFixed(1)} GiB`)),
+          field(result.label, `${free.toFixed(1)} GiB`, 'sum')]));
+      }
+      const freeTenths = Math.round(free * 10);
+      const needTenths = Math.round(row.need * 10);
+      const need = [field('Needs', `${(needTenths / 10).toFixed(1)} GiB`)];
+      if (!row.head_room?.rows?.length) {
+        // Free matches the page's Free row. The step's own room differs when the head and held slots
+        // get memory first, or when an earlier step gives back memory it held.
+        const pageTenths = Math.max(0, Math.round(queueCapMemory(data).free / GIB * 10));
+        need.push(field('Free', `${(pageTenths / 10).toFixed(1)} GiB`));
+        if (pageTenths > freeTenths) need.push(field('− Kept for other steps', `${((pageTenths - freeTenths) / 10).toFixed(1)} GiB`));
+        if (freeTenths > pageTenths) need.push(field('+ Given back by other steps', `${((freeTenths - pageTenths) / 10).toFixed(1)} GiB`));
+      }
+      if (needTenths > freeTenths) need.push(field('Short by', `${((needTenths - freeTenths) / 10).toFixed(1)} GiB`));
+      rows.push(...groupRows(need));
+    }
+  } else {
+    const machine = macRow(row) ? 'Mac' : row.kind === 'cloud' ? 'AWS' : row.machine || 'natedev';
+    rows.push(field('Runs on', machine));
+    if (row.kind === 'cloud') {
+      if (row.activity) rows.push(field('Status', row.activity));
+      if (row.failed_modules) rows.push(field('Failed modules', row.failed_modules));
+    } else if (macRow(row)) {
+      rows.push(...groupRows([field('Uses', ramAmount(row.used * GIB)),
+        ...(row.read_at ? [field('Reading age', ago(row.read_at, data.read_at))] : []), field('In queue cap', 'no')]));
+    } else {
+      if (!row.queued && !row.ci) rows.push(field('Started by', 'not the queue'));
+      const counted = (row.used + row.reserved) * GIB;
+      const memory = (row.queued || row.ci) && row.reserved > 0
+        ? [...memoryRows([['Uses', row.used * GIB], ['+ Build reserved', row.reserved * GIB]]),
+          field('= In queue cap', ramAmount(counted), 'sum')]
+        : recorded(row.used) ? [field('Uses', ramAmount(row.used * GIB))] : [];
+      rows.push(...groupRows(memory));
+    }
+    rows.push(...progressRows(row));
+  }
+  return rows.filter(row => row.kind === 'title' || row.kind === 'long' || row.value || row.label === 'Because');
 }
 function stepRow(key, data) {
-  const [kind, index] = key.split(":");
-  return kind === "row" ? data.walk[+index] : kind === "wait" ? data.waiters[+index] : null;
+  const [kind, index] = key.split(':');
+  return kind === 'row' ? data.walk[+index] : kind === 'wait' ? data.waiters[+index] : null;
+}
+function tipDuration(key, row, data) {
+  const since = key.startsWith('wait:') ? row.since : row.started_at;
+  return recorded(since) ? ago(since, data.read_at) : '';
+}
+function tooltipRows(key, data) {
+  data = shownReading(data);
+  const [kind, index] = key.split(':');
+  if (kind === 'row' || kind === 'wait') return stepTooltip(key, data);
+  if (kind === 'swap' && index !== undefined) return swapTip(data.swap_by[+index]);
+  if (kind === 'swap-pool') return poolTip(index, data);
+  const rows = TIPS[key](data);
+  if (key === 'walkhead' && data.unmatched_priority_entries?.length)
+    rows.push(field('Priority', data.unmatched_priority_entries.map(entry => entry.unit).join(', ')));
+  return rows;
 }
 function tooltipHtml(key, data) {
-  const [head, body] = tipText(key, data);
-  const row = stepRow(key, data);
-  if (!row) return `<b>${esc(head)}</b>${esc(body)}`;
-  if (!macRow(row)) return `<b>${esc(head)}</b>${identityHtml(row)}${esc(body)}`;
-  return `<b>${esc(head)}</b>${identityHtml(row)}<dl class="mac-tip-fields">` +
-    macTipFields(row, data).map(([name, value]) => `<dt>${esc(name)}</dt><dd>${esc(value)}</dd>`).join("") +
-    `</dl><span class="mac-note">Mac memory does not count against natedev.</span>`;
+  return '<dl class="tip">'+tooltipRows(key, data).map(row => {
+    const classes=[row.kind === 'field' ? '' : row.kind, row.group ? 'group' : ''].filter(Boolean).join(' ');
+    const attr=classes ? ` class="${classes}"` : '';
+    return ['caption','long'].includes(row.kind) ? `<dd${attr}>${esc(row.value)}</dd>`
+      : `<dt${attr}>${esc(row.label)}</dt><dd${attr}>${esc(row.value)}</dd>`;
+  }).join('')+'</dl>';
+}
+function tipText(key, data) {
+  const rows=tooltipRows(key,data);
+  return [rows.length ? `${rows[0].label}  ${rows[0].value}`.trimEnd() : '',
+    rows.slice(1).map(row => row.label ? `${row.label}  ${row.value}`.trimEnd() : row.value).join('\n')];
 }
 function sentence(text) { return text ? text[0].toUpperCase() + text.slice(1) : ""; }
 function targetOwner(row) {
@@ -701,6 +900,10 @@ function renderTargets(rows) {
 }
 function recorded(value) { return typeof value === "number"; }
 function hasCap(d) { return recorded(d.cap); }
+// Build reserves that do not fit under the queue cap; the cap holds only the covered part.
+function overCapBytes(d) { return hasCap(d) && recorded(d.ram.build_missing_bytes) ? Math.max(0, d.ram.build_missing_bytes) : 0; }
+// Taken includes the full build reserve, including the uncovered part.
+function claimedGib(d) { return d.taken + overCapBytes(d) / GIB; }
 function useValue(row) { return recorded(row.used) ? row.used : 0; }
 function visibleDetail(row) {
   if (row.ci) {
@@ -738,71 +941,19 @@ function cloudStatus(row, tip) {
   return `<div class="row-memory cloud-status" data-tip="${tip}"><div class="track" data-tip="${tip}"></div><div class="amounts">${esc(row.status)}` +
     (row.stale ? `${row.status ? " · " : ""}<span class="cap">no update for ${esc(row.late_age)}</span>` : "") + `</div></div>`;
 }
-function progressTip(row) {
-  const progress = row.progress;
-  if (!progress || progress.kind !== "RowProgress") return "";
-  const counter = `${progress.phase} · ${progress.done} of ${progress.total} ${progress.unit} · ${formatPercent(progress.percent, progress.done === progress.total)} done`;
-  return `\n${counter}` + (progress.unit === "modules" ? "\nModules start slowest first, so this reads low early." : "");
-}
-function rawTipText(key, d) {
-  const [kind, i] = key.split(":");
-  if (kind === "swap" && i !== undefined) {
-    const r = d.swap_by[+i];
-    return r ? swapTip(r) : ["", ""];
-  }
-  if (kind === "swap-pool") return poolTip(i, d);
-  if (kind === "row") {
-    const r = d.walk[+i];
-    if (!r) return ["", ""];
-    if (macRow(r)) return [`${r.name} · ${recorded(r.used) ? f1(r.used) + " GiB" : "unavailable"}`,
-      macTipFields(r, d).map(([name, value]) => `${name.padEnd(11)} ${value}`).join("\n") + "\nMac memory does not count against natedev."];
-    if (r.kind === "cloud") return [r.name, `${r.status ? r.status + ". " : ""}Target: ${r.machine}. No local memory reservation.${progressTip(r)}`];
-    if (r.ci) return [`${r.name} · ${r.detail}`, [r.unit, r.keep_text].filter(Boolean).join("\n") + progressTip(r)];
-    const when = r.started_at ? `Started ${ago(r.started_at, d.read_at)} ago. ` : "";
-    const res = !recorded(r.used) ? `Run use unavailable: ${r.used.reason}. Reserved ${f1(r.reserved)} GiB.` : r.reserved > 0 ? `It uses ${f1(r.used)} GiB. It reserves ${f1(r.reserved)} GiB. The queue counts ${f1(r.counted)} GiB.` : `It uses ${f1(r.used)} GiB. It reserves no memory.`;
-    const src = r.queued ? "The queue holds this memory for the run." : "Host free memory already accounts for this use.";
-    if (r.group) {
-      const parts = (r.parts || []).map((p) => `${p.who}${typeof p.pid === "number" ? ` · pid ${p.pid}` : ""} · ${p.age || ""} · ${f1(p.gib)} GiB`).join(", ");
-      const how = r.group === "Codex servers" ? "Codex servers hold this memory outside the build queue." : "Worker background runs hold this memory outside the build queue.";
-      return [`${r.name} · ${f1(r.used)} GiB`, `${how} ${r.detail ? r.detail + ". " : ""}By run: ${parts}.`];
-    }
-    const detail = !r.queued || r.between_steps ? visibleDetail(r) : "";
-    return [`${r.name}${detail ? " · " + detail : ""}`, `${when}${!recorded(r.used) ? res + " " : ""}${r.keep_text ? sentence(r.keep_text) + "." : res} ${src}${progressTip(r)}`];
-  }
-  if (kind === "wait") {
-    const w = d.waiters[+i];
-    if (!w) return ["", ""];
-    if (w.kind === "cloud") return [`Waits · ${w.name}`, `${w.reason}. No local memory reservation.`];
-    const need = w.head_text?.startsWith("Head: need ") ? "" : `Needs ${f1(w.need)} GiB. `;
-    return [`Waits · ${w.name}`, `${need}Waiting for ${ago(w.since, d.read_at)}. Reason: ${w.reason}.`];
-  }
-  return TIPS[key](d);
-}
 function memoryText(text) {
-  return text.replace(/kept aside|keep-asides?/gi, "reserved")
-    .replace(/([0-9]+(?:\.[0-9]+)?) MiB/g, (_, amount) => `${f1(Number(amount) / 1024)} GiB`)
+  return text.replace(/([0-9]+(?:\.[0-9]+)?) MiB/g, (_, amount) => `${f1(Number(amount) / 1024)} GiB`)
     .replace(/([0-9]+(?:\.[0-9]+)?) GiB/g, (_, amount) => `${f1(Number(amount))} GiB`);
 }
-function tipText(key, d) {
-  const text = rawTipText(key, d);
-  if (!text[0] && !text[1]) return text;
-  if (/^swap(-pool)?:/.test(key)) return text;
-  const row = stepRow(key, d);
-  const notes = row ? [row.head_text, row.priority_text, row.mac_text] : key === "walksum" && !d.waiters.length ? [d.head_text] : [];
-  if (key === "walkhead") notes.push(d.unmatched_priority_text);
-  text[1] = [text[1], ...notes].filter(Boolean).join("\n");
-  return text.map(memoryText);
-}
-function roomEquation(r) {
-  const terms = [r.available_bytes, r.safety_target_bytes, r.swap_target_bytes, r.build_target_bytes].map(bytes => f1(bytes / GIB));
-  return `= max(0, ${terms.join(" − ")}) = ${ramAmount(r.room_bytes)}`;
+function reserveDescription(description, needed, covered) {
+  return description + (needed > covered ? ` Needs ${ramAmount(needed)}; free RAM covers ${ramAmount(covered)}.` : "");
 }
 function ago(then, now) {
   const m = Math.max(0, Math.round((now - then) / 60));
   if (m < 1) return "<1 min";
   if (m < 60) return `${m} min`;
   const h = Math.floor(m / 60);
-  return h < 48 ? `${h} h ${m % 60} min` : `${Math.floor(h / 24)} days`;
+  return h < 24 ? `${h} h ${m % 60} min` : `${Math.floor(h / 24)} d ${h % 24} h`;
 }
 const tip = document.getElementById("tip");
 let tipKey = null;
@@ -860,8 +1011,8 @@ function render(d) {
   $("mac-idle-alert").textContent = d.mac_idle_alert;
   $("mac-idle-alert").hidden = !d.mac_idle_alert;
   renderTargets(d.targets || []);
+  const shown = shownReading(d), amounts = shown.ram;
   const r = d.ram;
-  $("room-equation").textContent = roomEquation(r);
   $("ram-missing").textContent = r.missing.length ? `Missing readings: ${r.missing.join("; ")}.` : "";
   $("ram-missing").hidden = !r.missing.length;
   document.body.classList.remove("queue-unavailable");
@@ -870,36 +1021,59 @@ function render(d) {
   $("barwrap").hidden = !total;
   $("scale").hidden = !total;
   const parts = [];
-  const widths = capTermWidths(d);
-  if (total) setSeg("s-over", widths.over, total);
-  $("s-over").hidden = widths.over === 0;
-  $("l-over").textContent = f1(widths.over / GIB);
   for (const [key, name, amount] of RAM_BLOCKS) {
     const bytes = amount(r);
-    const shown = key in widths ? widths[key] : recorded(bytes) ? Math.max(0, bytes) : 0;
+    const shown = shownBytes(bytes);
     if (total) setSeg(`s-${key}`, shown, total);
     $(`s-${key}`).hidden = shown === 0;
-    $(`l-${key}`).textContent = f1(shown / GIB);
-    $(`v-${key}`).textContent = ramAmount(bytes);
-    parts.push(`${name} ${ramAmount(bytes)}`);
+    const amountBytes = amount(amounts);
+    $(`l-${key}`).textContent = f1(shownBytes(amountBytes) / GIB);
+    $(`v-${key}`).textContent = ramAmount(amountBytes);
+    parts.push(`${name} ${ramAmount(amountBytes)}`);
   }
-  $("barwrap").setAttribute("aria-label", `RAM ${ramAmount(r.total_bytes)}: ${parts.join(", ")}`);
-  $("v-cap").textContent = !hasCap(d) ? "unavailable" : `${f1(d.cap)} GiB`;
-  $("v-shortfall").textContent = ramAmount(r.shortfall_bytes);
-  $("cap-value").textContent = !hasCap(d) ? "Queue cap unavailable" : `Queue cap ${f1(d.cap)} GiB`;
-  $("mark").hidden = !hasCap(d);
-  $("marklabel").hidden = !hasCap(d);
-  $("marklabel").textContent = hasCap(d) ? `cap ${f1(d.cap)}` : "";
+  $("barwrap").setAttribute("aria-label", `RAM ${ramAmount(amounts.total_bytes)}: ${parts.join(", ")}`);
+  const builds = groupBytes(r, "builds"), system = r.safety_covered_bytes + r.swap_covered_bytes;
+  const capMemory = queueCapMemory(shown);
+  for (const [id, bytes] of [["g-builds", capMemory.builds], ["g-free", amounts.available_bytes], ["g-else", legendBytes(amounts, "else")],
+    ["reserved", capMemory.reserved], ["room", capMemory.free],
+    ["system", amounts.safety_covered_bytes + amounts.swap_covered_bytes], ["cap-builds", capMemory.builds], ["cap-reserved", capMemory.reserved], ["cap-room", capMemory.free]]) {
+    $(`v-${id}`).textContent = ramAmount(bytes);
+  }
+  $("v-cap").textContent = !hasCap(d) ? "unavailable" : `${f1(shown.cap)} GiB`;
+  $("v-shortfall").textContent = ramAmount(amounts.shortfall_bytes);
+  $("v-shortfall").closest(".row").hidden = !(r.shortfall_bytes > 0);
+  for (const [key, description] of [["build", "Running builds grow into it."],
+    ["safety", "A fixed setting."], ["swap", "RAM held for swap that comes back."]]) {
+    $(key === "build" ? "reserved-note" : `${key}-note`).textContent =
+      reserveDescription(description, amounts[`${key}_target_bytes`], amounts[`${key}_covered_bytes`]);
+  }
+  const compressed = recorded(r.compressed_swap_bytes) && r.compressed_swap_bytes > 0;
+  $("kernel-note").textContent = compressed ? `Of which compressed swap: ${ramAmount(amounts.compressed_swap_bytes)}.` : "";
+  $("kernel-note").hidden = !compressed;
+  $("cap-value").textContent = !hasCap(d) ? "Queue cap unavailable" : `Queue cap ${f1(shown.cap)} GiB`;
+  const freeShown = groupBytes(r, "free");
+  const capBytes = hasCap(d) ? d.cap * GIB : 0;
+  for (const [id, from, size] of [["builds", 0, builds], ["free", builds, freeShown], ["else", builds + freeShown, groupBytes(r, "else")],
+    ["reserved", builds, r.build_covered_bytes], ["room", builds + r.build_covered_bytes, r.room_bytes],
+    ["system", builds + r.build_covered_bytes + r.room_bytes, system], ["cap", 0, capBytes]]) {
+    const brace = $(`b-${id}`);
+    brace.hidden = !total || size <= 0;
+    brace.style.left = `${pctOf(from, total)}%`;
+    brace.style.width = `${pctOf(size, total)}%`;
+    const amount = ({builds:capMemory.builds,free:amounts.available_bytes,else:legendBytes(amounts,"else"),
+      reserved:capMemory.reserved,room:capMemory.free,system:amounts.safety_covered_bytes+amounts.swap_covered_bytes,cap:shown.cap*GIB})[id];
+    $(`bv-${id}`).textContent = f1(amount / GIB);
+  }
 
-  const [roomValue, roomUnit] = ramAmount(r.room_bytes).split(" ");
+  const [roomValue, roomUnit] = ramAmount(capMemory.free).split(" ");
   $("room").textContent = roomValue;
   $("room-unit").textContent = roomUnit || "";
-  const why = d.read_error ? "" : statusLine(d);
+  const why = d.read_error ? "" : statusLine(shown);
   $("room-why").textContent = why;
   $("room-why").hidden = !why;
   $("last-reading").textContent = d.read_error ? `Last reading: ${new Date(d.read_at * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})}` : "";
   $("last-reading").hidden = !d.read_error;
-  $("swap-reserve").textContent = `RAM for swap: ${ramAmount(r.swap_covered_bytes)}`;
+  $("swap-reserve").textContent = `Swap coming back: ${ramAmount(amounts.swap_covered_bytes)}`;
   $("cap-reason").textContent = hasCap(d) ? "" : d.cap_text;
   latest = d;
   setTimeout(fitLabels, 650);
@@ -908,7 +1082,6 @@ function render(d) {
   renderWalk(d);
   renderSwap(d);
   renderLeftovers(d);
-  renderReport(d.report);
 }
 
 const swapView = new Map();
@@ -976,6 +1149,12 @@ function reportCost(value, unit = "h/day") {
     ? `${known} known; ${(value.unknown || 0).toFixed(2)} ${unit} unknown; upper bound ${((value.value || 0) + (value.unknown || 0)).toFixed(2)} ${unit}`
     : known;
 }
+// The lowest and highest day of a top cost, or its window value when no day is measured.
+function costRange(row) {
+  if (!row.range.length) return reportCost(row.recent);
+  const [low, high] = row.range.map(hours => hours.toFixed(hours >= 10 ? 0 : 1));
+  return `${low === high ? low : `${low}–${high}`} h/day`;
+}
 function sumReportCosts(points) {
   const values = points.filter(point => point.state !== "no data yet");
   if (!values.length) return {state: "no data yet"};
@@ -1004,18 +1183,28 @@ function reportPlot(title, buckets, series, unit) {
     return `<path d="${path}" fill="none" stroke="${color}" stroke-width="2"/>${dots}`;
   }).join("");
   const labels = buckets.map((bucket, index) => `<text x="${x(index)}" y="202" text-anchor="middle">${esc(bucket.label)}</text>`).join("");
-  const table = `<details><summary>Table view: ${esc(title)}</summary><div class="report-table"><table><thead><tr><th>Local day</th>${series.map(line => `<th>${esc(line.label)} (${esc(unit)})</th>`).join("")}</tr></thead><tbody>` + buckets.map((bucket, index) => `<tr><th>${esc(bucket.label)}${bucket.thin ? " · thin" : ""}</th>${series.map(line => `<td>${esc(reportCost(line.values[index], unit))}</td>`).join("")}</tr>`).join("") + `</tbody></table></div></details>`;
+  const table = `<details class="table-view"><summary>Table view: ${esc(title)}</summary><div class="report-table"><table><thead><tr><th>Local day</th>${series.map(line => `<th>${esc(line.label)} (${esc(unit)})</th>`).join("")}</tr></thead><tbody>` + buckets.map((bucket, index) => `<tr><th>${esc(bucket.label)}${bucket.thin ? " · thin" : ""}</th>${series.map(line => `<td>${esc(reportCost(line.values[index], unit))}</td>`).join("")}</tr>`).join("") + `</tbody></table></div></details>`;
   return `<h3>${esc(title)}</h3><svg class="report-chart" viewBox="0 0 900 220" role="img" aria-label="${esc(title)}"><line class="grid" x1="48" x2="848" y1="180" y2="180"/><line class="grid" x1="48" x2="848" y1="30" y2="30"/><text x="4" y="184">0</text><text x="4" y="34">${maximum.toFixed(1)}</text><text x="48" y="16">${esc(unit)}</text>${lines}${labels}${!points.length ? '<text x="450" y="100" text-anchor="middle">No measured data</text>' : ""}</svg>` +
     `<div class="report-key">${series.map((line, slot) => `<span style="--series:${colors[slot % colors.length]}">${esc(line.label)}</span>`).join("")}</div>${table}`;
 }
-const reportView = {machine: "", cause: "", unit: "daily", tables: new Set()};
+function phaseTimeHtml(buckets, phases) {
+  const title = "Hana phase time, without waits for the user or the showrunner";
+  if (buckets.some(bucket => bucket.phase.state === "measured")) return reportPlot(title, buckets, phases, "h/phase");
+  const line = buckets.some(bucket => bucket.phase.unrecorded > 0)
+    ? "Shown from the first phase that ends with a wait record. Earlier phases have no wait record."
+    : buckets.some(bucket => bucket.phase.finished > 0) ? "Hana phases ended in this range, but none has a valid start time."
+    : "No Hana phase ended in this range.";
+  return `<h3>${esc(title)}</h3><p class="report-window">${esc(line)}</p>`;
+}
+const reportView = {machine: "", cause: "", unit: "daily", details: false, tables: new Set()};
 let reportStamp = "";
 function captureReportView() {
   if (!$("history-machine")) return;
   reportView.machine = $("history-machine").value;
   reportView.cause = $("history-cause").value;
   reportView.unit = $("history-unit").value;
-  const tables = [...document.querySelectorAll("#history-plots details")];
+  reportView.details = $("history-details").open;
+  const tables = [...document.querySelectorAll("#history-charts details.table-view")];
   if (tables.length) reportView.tables = new Set(tables.filter(table => table.open).map(table => table.querySelector("summary").textContent));
 }
 function reportDate(value, zone) {
@@ -1036,10 +1225,12 @@ function renderReport(report) {
   }
   const data = report.charts;
   $("history-window").textContent = `${reportDate(data.start, report.zone)} – ${reportDate(data.end, report.zone)} · ${report.zone}`;
-  $("cost-window").textContent = `${reportDate(report.start, report.zone)} – ${reportDate(report.end, report.zone)} · ${report.zone} · ${report.recent_days} days · hours per day`;
+  const days = Math.round((data.end - data.start) / 86400000);
+  $("cost-window").textContent = `Last ${report.recent_days} days: ${reportDate(report.start, report.zone)} – ${reportDate(report.end, report.zone)} · ${report.zone}`;
   $("top-costs").innerHTML = report.top.length ? report.top.map(row =>
-    `<div class="report-top-row"><strong>${esc(row.machine)} · ${esc(row.cause)}</strong><p>${esc(reportCost(row.recent))}${row.window.state === "matches recent" ? "" : ` · Window: ${esc(reportCost(row.window))}`}</p><p class="action">${esc(row.action)} · ${esc(row.owner)}</p></div>`).join("") : "No data yet for this window.";
-  $("history-charts").innerHTML = `<div class="report-key"><label>Machine <select id="history-machine"><option value="">All machines</option>${data.machines.map(machine => `<option>${esc(machine)}</option>`).join("")}</select></label><label>Cause <select id="history-cause">${data.causes.map(cause => `<option>${esc(cause)}</option>`).join("")}</select></label><label>Cost unit <select id="history-unit"><option value="daily">h/day</option><option value="perPhase">h/finished phase</option></select></label></div><div id="history-plots"></div><p class="report-window">Costs can overlap. Dashed ranges show unknown costs. Tables name unavailable values.</p><div id="history-moments"></div>`;
+    `<p class="report-top-row"><strong>${esc(row.cause)} on ${esc(row.machine)}: ${esc(costRange(row))}.</strong>${row.window.state === "matches recent" ? "" : ` ${days}-day mean: ${esc(reportCost(row.window))}.`}${row.share ? ` ${esc(row.share)}` : ""}<span class="action">${esc(row.action)}</span></p>`).join("") : "No data yet for this window.";
+  $("history-charts").innerHTML = `<div id="history-phase"></div><details id="history-details"><summary>Details: costs by cause and by machine</summary><div class="report-key"><label>Machine <select id="history-machine"><option value="">All machines</option>${data.machines.map(machine => `<option>${esc(machine)}</option>`).join("")}</select></label><label>Cause <select id="history-cause">${data.causes.map(cause => `<option>${esc(cause)}</option>`).join("")}</select></label><label>Cost unit <select id="history-unit"><option value="daily">h/day</option><option value="perPhase">h/finished phase</option></select></label></div><div id="history-plots"></div><p class="report-window">Costs can overlap. Dashed ranges show unknown costs. Tables name unavailable values.</p></details><div id="history-moments"></div>`;
+  $("history-details").open = reportView.details;
   if (data.machines.includes(reportView.machine)) $("history-machine").value = reportView.machine;
   if (data.causes.includes(reportView.cause)) $("history-cause").value = reportView.cause;
   $("history-unit").value = reportView.unit;
@@ -1048,16 +1239,17 @@ function renderReport(report) {
     const machine = $("history-machine").value, cause = $("history-cause").value;
     const unit = $("history-unit").value;
     const unitText = unit === "daily" ? "h/day" : "h/finished phase";
-    const phases = ["median", "p90"].map(key => ({label: key, values: data.buckets.map(bucket =>
+    const phases = [["median", "half of phases take up to"], ["p90", "most phases take up to"]].map(([key, label]) => ({label, values: data.buckets.map(bucket =>
       bucket.phase.state === "measured" ? {state: "measured", value: bucket.phase[key] / 3600}
         : {state: "unavailable", reason: bucket.phase.reason})}));
     const causes = data.causes.map(label => ({label, values: data.buckets.map(bucket =>
       sumReportCosts(bucket.rows.filter(row => row.cause === label && (!machine || row.machine === machine)).map(row => row[unit])))}));
     const machines = data.machines.map(label => ({label, values: data.buckets.map(bucket =>
       sumReportCosts(bucket.rows.filter(row => row.machine === label && row.cause === cause).map(row => row[unit])))}));
-    $("history-plots").innerHTML = reportPlot("Hana phase time", data.buckets, phases, "h/phase") +
-      reportPlot("Costs by cause", data.buckets, causes, unitText) + reportPlot("Costs by machine", data.buckets, machines, unitText);
-    for (const table of document.querySelectorAll("#history-plots details")) {
+    $("history-phase").innerHTML = phaseTimeHtml(data.buckets, phases);
+    $("history-plots").innerHTML = reportPlot("Costs by cause", data.buckets, causes, unitText) +
+      reportPlot("Costs by machine", data.buckets, machines, unitText);
+    for (const table of document.querySelectorAll("#history-charts details.table-view")) {
       table.open = reportView.tables.has(table.querySelector("summary").textContent);
     }
   };
@@ -1098,26 +1290,37 @@ function renderWalk(d) {
   const scale = d.total;
   const pct = (v) => `${v / scale * 100}%`;
   const tableRows = [];
-  const columns = (place, duration) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
-    `<th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>`;
-  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—") => {
+  const columns = (place, duration, running = false) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
+    `<th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
+    (running ? '<th scope="col" class="slot">Slot</th><th scope="col" class="tokens">Tokens</th>' : "");
+  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—", slot = "—", tokens = "—") => {
     tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
       `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${esc(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
-      `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || (className.startsWith("wait") ? "" : "—"))}</td><td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td></tr>`);
+      (Array.isArray(machine)
+        // A waiting step lists the machines that can take it, each in its machine color.
+        ? `<td class="machine" data-machine="${esc(machine.join(" or "))}"><span class="wait-target">${machine.map(target => `<span class="machine" data-machine="${esc(target)}">${esc(target)}</span>`).join(" or ") || "—"}</span></td>`
+        : `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || "—")}</td>`) + `<td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td>` +
+      (className.startsWith("wait") ? "" : `<td class="slot">${Number.isInteger(slot) && slot > 0 ? slot : "—"}</td>` +
+        `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) + '</tr>');
   };
   const running = d.walk.map((row, index) => ({row, index}));
   const ordered = [...running.filter(({row}) => row.kind === "cloud" || macRow(row) || row.queued && !row.ci), ...running.filter(({row}) => row.ci && row.admitted)];
-  const rows = ordered.map(({row: r, index: i}) => {
+  const rows = [];
+  if (d.ram.build_tools_bytes > 0) {
+    cells("", "Build tools", "", "", null, "", null, "tools", "tools");
+    rows.push(`<div class="wrow tools" data-tip="tools">${rowLabel("Build tools")}` + rowMemory("tools") + `</div>`);
+  }
+  rows.push(...ordered.map(({row: r, index: i}) => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
     cells(stageText(r),
-      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${i}`, "", doneText(r));
+      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${i}`, "", doneText(r), r.slot, r.tokens);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${i}" data-run="${i}">${rowLabel(r.name, rowOwner(r))}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${i}`) : rowMemory(`row:${i}`)) + `</div>`;
-  });
+  }));
   // The table row only holds the place of the chart room row beside it; its value shows in the chart.
-  const columnClasses = ["place", "done", "step", "duration", "unit", "pid", "machine", "vcpus"];
+  const columnClasses = ["place", "done", "step", "duration", "unit", "pid", "machine", "vcpus", "slot", "tokens"];
   tableRows.push(`<tr class="room" data-tip="room">${columnClasses.map(column => `<td class="${column}"></td>`).join("")}</tr>`);
-  rows.push(`<div class="wrow room">${rowLabel("Next step room")}` + rowMemory("room") + `</div>`);
+  rows.push(`<div class="wrow room">${rowLabel("Free")}` + rowMemory("room") + `</div>`);
   if (d.waiters.length) {
     const units = d.queued_priority_units || [];
     const title = !units.length ? "Queued, in order of submission"
@@ -1129,7 +1332,7 @@ function renderWalk(d) {
   let localPosition = 0;
   d.waiters.forEach((w, i) => {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
-    cells(place, w.name, ago(w.since, d.read_at), ciRow(w) ? rowUnit(w) : w.detail, w.pid, w.machine || "", null, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
+    cells(place, w.name, ago(w.since, d.read_at), ciRow(w) ? rowUnit(w) : w.detail, w.pid, w.machine ? [w.machine] : w.targets || [], null, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
     rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${i}">${rowLabel(w.name, rowOwner(w, true))}` +
       (w.kind === "cloud" ? cloudStatus(w, `wait:${i}`) : rowMemory(`wait:${i}`)) +
       `</div>`);
@@ -1139,7 +1342,7 @@ function renderWalk(d) {
   $("walk").innerHTML = `<div class="walk-chart"><div class="walk-chart-head"><span class="report-window">Used · reserved</span></div>${rows.join("")}` +
     `<div class="walk-axis num"><span></span><div class="ticks" id="ticks" data-tip="ticks"></div></div></div>` +
     `<div class="walk-table"><table aria-label="Running and waiting steps"><thead><tr>` +
-    `${columns("Stage", STEP_TABLE_HEADERS.duration)}</tr></thead><tbody>${tableRows.join("")}</tbody></table></div>`;
+    `${columns("Stage", STEP_TABLE_HEADERS.duration, true)}</tr></thead><tbody>${tableRows.join("")}</tbody></table></div>`;
   const step = 6;
   const ticks = [];
   for (let v = 0; v <= scale; v += step) ticks.push(`<span style="left:${pct(v)}">${v}</span>`);
@@ -1149,7 +1352,11 @@ function renderWalk(d) {
   $("ticks").style.width = `${axisEnd / scale * 100}%`;
   $("ticks").innerHTML = lowerTicks.join("");
   $("ticks-top").innerHTML = ticks.join("");
-  $("walk-sum").textContent = !hasCap(d) ? `${f1(d.taken)} GiB taken · cap unavailable` : `${f1(d.taken)} of ${f1(d.cap)} GiB taken`;
+  const shown = shownReading(d), overCap = overCapBytes(shown);
+  $("walk-sum").textContent = !hasCap(d) ? `${f1(shown.taken)} GiB taken · cap unavailable`
+    : `${f1(claimedGib(shown))} of ${f1(shown.cap)} GiB taken${overCap > 0 ? ` · ${ramAmount(overCap)} over cap` : ""}`;
+  $("walk-sum").classList.toggle("over-cap", overCap > 0);
+  $("walk-tokens").innerHTML = tokenPoolRows(d.tokens).map(row => `<dt>${esc(row.label)}</dt><dd>${esc(row.value)}</dd>`).join('');
   fitLabels();
 }
 
@@ -1171,6 +1378,12 @@ function fitAxisLabels() {
       if (!label.hidden) kept.push(rect);
     }
   }
+}
+
+// The canvas font of an element. Its "font" shorthand reads empty when a longhand, such as tabular numbers, has no shorthand form.
+function canvasFont(element) {
+  const style = getComputedStyle(element);
+  return `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
 }
 
 const MIN_TRACK_WIDTH = 160;
@@ -1198,33 +1411,40 @@ function fitWalkDetails() {
   root.classList.add("layout-measuring");
   const context = document.createElement("canvas").getContext("2d");
   function measureColumn(name) {
-    const widths = [...table.querySelectorAll(`.${name}`)].map(cell => {
-      const style = getComputedStyle(cell);
-      context.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
-      return context.measureText(cell.textContent).width + parseFloat(style.paddingRight);
+    // Waiting targets wrap inside the column and do not size it.
+    const widths = [...table.querySelectorAll(name === "machine" ? "tr:not(.wait) > .machine" : `.${name}`)].map(cell => {
+      context.font = canvasFont(cell);
+      return context.measureText(cell.textContent).width + parseFloat(getComputedStyle(cell).paddingRight);
     });
     if (name === "duration") {
-      const style = getComputedStyle(table.querySelector("th.duration"));
-      context.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
-      widths.push(context.measureText(STEP_TABLE_HEADERS.waiting).width + parseFloat(style.paddingRight));
+      const header = table.querySelector("th.duration");
+      context.font = canvasFont(header);
+      widths.push(context.measureText(STEP_TABLE_HEADERS.waiting).width + parseFloat(getComputedStyle(header).paddingRight));
     }
     root.style.setProperty(`--${name}`, `${Math.ceil(Math.max(...widths))}px`);
   }
   measureColumn("duration");
   measureColumn("machine");
-  context.font = getComputedStyle(walk.querySelector(".amounts")).font;
+  context.font = canvasFont(walk.querySelector(".amounts"));
   const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci || row.kind === "mac-build"))
     .map(row => [useValue(row), row.reserved].filter(value => value > 0));
-  amountGroups.push([latest.room], ...latest.waiters.filter(row => row.kind !== "cloud").map(row => [row.need]));
+  amountGroups.push([latest.room], [latest.ram.build_tools_bytes / GIB], ...latest.waiters.filter(row => row.kind !== "cloud").map(row => [row.need]));
   const amountWidth = Math.max(...amountGroups.map(values => values.reduce((sum, value) =>
     sum + context.measureText(memoryAmount(value)).width, 0) + LABEL_GAP * Math.max(0, values.length - 1)));
-  const minimumTrackWidth = Math.max(MIN_TRACK_WIDTH, (amountWidth + LABEL_GAP + 1) / (capFraction || 1));
+  // A cloud status shows before the cap on one or two lines, so it never wraps one letter to a line.
+  const statusWidth = Math.max(0, ...[...walk.querySelectorAll(".cloud-status .amounts")].map(status => {
+    context.font = canvasFont(status);
+    const words = status.textContent.trim().split(/\s+/);
+    return Math.min(...words.map((_, index) => Math.max(context.measureText(words.slice(0, index).join(" ")).width,
+      context.measureText(words.slice(index).join(" ")).width)));
+  }));
+  const minimumTrackWidth = Math.max(MIN_TRACK_WIDTH, (Math.max(amountWidth + LABEL_GAP, statusWidth) + 1) / (capFraction || 1));
   const labels = [...walk.querySelectorAll(".row-label .name, .row-label .owner")];
   const roomHeading = walk.querySelector(".wrow.room .row-heading");
-  context.font = getComputedStyle(roomHeading).font;
-  const roomWidth = context.measureText(`Next step room ${memoryAmount(latest.room)}`).width + 8;
+  context.font = canvasFont(roomHeading);
+  const roomWidth = context.measureText(`Free ${memoryAmount(latest.room)}`).width + 8;
   const textWidth = Math.ceil(Math.max(roomWidth, ...labels.map(label => {
-    context.font = getComputedStyle(label).font;
+    context.font = canvasFont(label);
     return context.measureText(label.textContent).width;
   }))) + 1;
   const rem = parseFloat(getComputedStyle(root).fontSize);
@@ -1275,6 +1495,7 @@ function fitWalkDetails() {
 }
 
 function placeMemoryBars(d) {
+  const shown = shownReading(d);
   const track = $("walk").querySelector(".track");
   if (!track) return;
   const range = track.getBoundingClientRect();
@@ -1282,8 +1503,9 @@ function placeMemoryBars(d) {
   const progressEnd = !hasCap(d) ? 0 : Math.max(0, Math.floor(document.querySelector(".walk-bud").getBoundingClientRect().left) - range.left);
   const r = d.ram;
   const unit = width / (recorded(r.total_bytes) && r.total_bytes > 0 ? r.total_bytes / GIB : d.total);
-  const used = r.queued_builds_bytes / GIB * unit;
-  const ciWidth = r.ci_bytes / GIB * unit;
+  const tools = r.build_tools_bytes / GIB * unit;
+  const used = tools + r.queued_builds_bytes / GIB * unit;
+  const ciWidth = shownBytes(r.ci_bytes) / GIB * unit;
   const reserved = r.build_covered_bytes / GIB * unit;
   const room = r.room_bytes / GIB * unit;
   const reserveAt = used + ciWidth;
@@ -1291,36 +1513,47 @@ function placeMemoryBars(d) {
   const end = roomAt + room;
   const box = (left, size, className, tip = "") => size > 0
     ? `<div class="b ${className}" ${tip ? `data-tip="${tip}"` : ""} style="left:${left}px;width:${size}px"></div>` : "";
+  // A local bar stops at the cap line; a bar that the cap cuts shows a cap-colored end.
+  const chartEdge = !hasCap(d) ? width : progressEnd;
+  const capBox = (left, size, className) => {
+    const drawn = Math.min(size, chartEdge - left);
+    return box(left, drawn, drawn < size ? `${className} over-cap` : className);
+  };
   function placeAmounts(row, amounts) {
     const container = row.querySelector(".amounts");
     container.innerHTML = amounts.map(amount => `<span class="bar-amount ${amount.kind}" data-start="${amount.left}" style="left:${amount.left}px">${esc(amount.text || memoryAmount(amount.value))}</span>`).join("");
     const limit = !hasCap(d) ? width : Math.max(0, progressEnd - LABEL_GAP);
     placeBarLabels(container, limit);
   }
-  let usedAt = 0, reservedAt = reserveAt;
+  let usedAt = tools, reservedAt = reserveAt;
+  const toolsRow = document.querySelector(".wrow.tools");
+  if (toolsRow) {
+    toolsRow.querySelector(".track").innerHTML = capBox(0, tools, "seg-tools");
+    placeAmounts(toolsRow, [{kind: "used-amount", left: 0, value: shown.ram.build_tools_bytes / GIB}]);
+  }
   const reserveScale = r.build_target_bytes > 0 ? reserved / (r.build_target_bytes / GIB) : 0;
   for (const row of document.querySelectorAll(".wrow[data-run]")) {
-    const index = Number(row.dataset.run), run = d.walk[index];
+    const index = Number(row.dataset.run), run = d.walk[index], amount = shown.walk[index];
     let bars = "";
     const amounts = [];
     if (macRow(run)) {
       if (run.kind === "mac-build" && recorded(run.used)) {
         const useWidth = Math.min(row.querySelector(".track").clientWidth, run.used * unit);
         bars = box(0, useWidth, "seg-remote");
-        amounts.push({kind: "used-amount", left: 0, value: run.used});
+        amounts.push({kind: "used-amount", left: 0, value: amount.used});
       }
     } else if (run.kind === "cloud" && recorded(run.used)) {
       bars = box(0, Math.min(row.querySelector(".track").clientWidth, run.used * unit), "seg-remote");
     } else if (run.ci) {
-      bars = box(used, ciWidth, "seg-ci");
-      if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: used, value: run.used});
+      bars = capBox(used, ciWidth, "seg-ci");
+      if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: used, value: amount.used});
     } else if (run.kind !== "cloud") {
       const useWidth = Math.max(0, useValue(run) * unit);
       const reserveWidth = Math.max(0, Math.min(run.reserved * reserveScale, roomAt - reservedAt));
       const drawnUse = useWidth > 0 ? Math.max(3, useWidth) : 0;
-      bars = box(usedAt, drawnUse, "seg-used") + box(reservedAt, reserveWidth, "hatch");
-      if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: usedAt, value: run.used});
-      if (run.reserved > 0) amounts.push({kind: "reserved-amount", left: reservedAt, value: run.reserved});
+      bars = capBox(usedAt, drawnUse, "seg-used") + capBox(reservedAt, reserveWidth, "hatch");
+      if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: usedAt, value: amount.used});
+      if (run.reserved > 0) amounts.push({kind: "reserved-amount", left: reservedAt, value: amount.reserved});
       usedAt += useWidth;
       reservedAt += reserveWidth;
     }
@@ -1340,20 +1573,22 @@ function placeMemoryBars(d) {
   }
   const roomTrack = document.querySelector(".wrow.room .track");
   if (roomTrack) {
-    roomTrack.innerHTML = box(roomAt, room, "roomb");
+    roomTrack.innerHTML = capBox(roomAt, room, "roomb");
     roomTrack.closest(".wrow").querySelector(".room-value")?.remove();
     roomTrack.closest(".wrow").querySelector(".row-heading").insertAdjacentHTML("beforeend",
-      `<span class="room-value">${memoryAmount(d.room)}</span>`);
+      `<span class="room-value">${memoryAmount(shown.ram.room_bytes / GIB)}</span>`);
     roomTrack.closest(".wrow").querySelector(".amounts").replaceChildren();
   }
   for (const row of document.querySelectorAll(".wrow.wait")) {
     const waiter = d.waiters[Number(row.dataset.tip.split(":")[1])];
     if (waiter.kind === "cloud") continue;
-    const waitWidth = Math.min(end, waiter.need * unit);
-    const waitAt = !hasCap(d) ? roomAt : end - waitWidth;
+    // A wait bar stops at the room end or the cap line, whichever is first.
+    const waitEnd = !hasCap(d) ? end : Math.min(end, chartEdge);
+    const waitWidth = Math.min(waitEnd, waiter.need * unit);
+    const waitAt = !hasCap(d) ? roomAt : waitEnd - waitWidth;
     const drawnWidth = !hasCap(d) ? Math.max(0, Math.min(waitWidth, end - waitAt)) : waitWidth;
     row.querySelector(".track").innerHTML = box(waitAt, drawnWidth, "waitb");
-    placeAmounts(row, drawnWidth > 0 ? [{kind: "need-amount", left: waitAt, value: waiter.need}] : []);
+    placeAmounts(row, drawnWidth > 0 ? [{kind: "need-amount", left: waitAt, value: shown.waiters[Number(row.dataset.tip.split(":")[1])].need}] : []);
   }
   const roomRow = roomTrack.closest(".wrow");
   const placeDivider = (row, top) => row.style.setProperty("--divider-top", `${top - row.getBoundingClientRect().top}px`);
@@ -1363,7 +1598,7 @@ function placeMemoryBars(d) {
     const context = document.createElement("canvas").getContext("2d");
     const inkBottom = Math.max(...previousAmounts.map(label => {
       const style = getComputedStyle(label);
-      context.font = style.font;
+      context.font = canvasFont(label);
       const metrics = context.measureText(label.textContent);
       const leading = (parseFloat(style.lineHeight) - metrics.fontBoundingBoxAscent - metrics.fontBoundingBoxDescent) / 2;
       return label.getBoundingClientRect().top + leading + metrics.fontBoundingBoxAscent + metrics.actualBoundingBoxDescent;
@@ -1417,9 +1652,14 @@ function fitLabels() {
   if (latest) placeMemoryBars(latest);
   cutCapLine();
   fitAxisLabels();
-  const at = latest ? $("barwrap").getBoundingClientRect().width * capEnd(latest) : 0;
-  $("mark").style.left = `${at}px`;
-  $("marklabel").style.left = `${at}px`;
+  // A narrow bracket shows two lines when no bracket is under it, then the amount alone, then nothing.
+  for (const label of document.querySelectorAll("#barwrap .brace-label")) {
+    const brace = label.parentElement, tooWide = () => label.offsetWidth + 8 > brace.clientWidth;
+    label.classList.remove("hide", "stack", "bare");
+    if (tooWide() && ["b-builds", "b-else"].includes(brace.id)) label.classList.add("stack");
+    if (tooWide()) label.classList.add("bare");
+    label.classList.toggle("hide", tooWide());
+  }
   for (const [k] of RAM_BLOCKS) {
     const seg = $(`s-${k}`), lbl = $(`l-${k}`);
     lbl.classList.remove("tight");
@@ -1437,7 +1677,7 @@ let lastRead = 0;
 let readingFailure = "";
 function showStatus(text, stale) {
   $("status").textContent = text;
-  $("dot").classList.toggle("stale", stale);
+  $("dot").classList.toggle("stale", stale || paused);
   $("status").closest(".status").classList.toggle("is-stale", stale);
 }
 
@@ -1449,6 +1689,7 @@ function updateReadingStatus(readAt) {
   const staleText = readingFailure
     ? `${readingFailure} Showing the reading from ${time}, ${Math.round(age)} s old.`
     : `Last reading ${time}, ${Math.round(age)} s old. The feed has stopped.`;
+  if (paused) { showStatus(`Paused · read at ${time}`, false); return; }
   showStatus(age > STALE ? staleText : `Live · read at ${time}`, age > STALE);
   if (age > STALE) {
     $("pill").className = "pill neutral as-of";
@@ -1467,27 +1708,62 @@ function recordReadFailure(message) {
 }
 
 const consoleHidden = () => window.frameElement?.hidden === true;
+// The user, 11-16: space pauses every update so tooltips can be read on a still page; space again resumes.
+let paused = false;
+function setPaused(on) {
+  paused = on;
+  $("paused").hidden = !on;
+  if (on) updateReadingStatus(lastRead);
+  else { tick(); reloadWhenPageChanges(); }
+}
+addEventListener("keydown", event => {
+  if (event.code !== "Space" || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
+  // Space keeps its own job on a control: it presses a button and opens the legend.
+  if (event.target.closest?.("input, textarea, select, button, summary, [contenteditable]")) return;
+  event.preventDefault();
+  setPaused(!paused);
+});
 
 async function tick() {
-  if (consoleHidden()) return;
+  if (consoleHidden() || paused) return;
   try {
     const r = await fetch(`memory.json?t=${Date.now()}`, { cache: "no-store" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
-    if (d.ok && !d.error) { render(d); lastRead = d.read_at; readingFailure = d.read_error ? "The queue did not answer." : ""; }
+    // A reading that arrives after a pause waits; the next tick after resume shows it.
+    if (paused) return;
+    if (d.ok && !d.error) {
+      render(d); lastRead = d.read_at; readingFailure = d.read_error ? "The queue did not answer." : "";
+      if (d.report_version !== reportVersion) await loadReport(d.report_version);
+    }
     else { recordReadFailure("The queue did not answer."); return; }
   } catch (e) {
+    if (paused) return;
     recordReadFailure(`Cannot load the reading: ${e.message}.`);
     return;
   }
   updateReadingStatus(lastRead);
 }
+// The charts are large, so the page reads report.json only when memory.json names a new version.
+let reportVersion = null;
+async function loadReport(version) {
+  try {
+    const r = await fetch(`report.json?v=${encodeURIComponent(version)}`, { cache: "no-store" });
+    if (!r.ok) return;
+    const report = await r.json();
+    // A paused page keeps its charts; the first reading after resume loads this version again.
+    if (paused) return;
+    renderReport(report);
+    reportVersion = version;
+  } catch (e) { /* The next reading tries again. */ }
+}
 let pageStamp = null;
 async function reloadWhenPageChanges() {
-  if (consoleHidden()) return;
+  if (consoleHidden() || paused) return;
   try {
     const r = await fetch(location.pathname, { method: "HEAD", cache: "no-store" });
     const stamp = r.headers.get("Last-Modified");
+    if (paused) return;
     if (pageStamp && stamp && stamp !== pageStamp) location.reload();
     pageStamp = stamp || pageStamp;
   } catch (e) { /* The reading status already reports a lost server. */ }
@@ -1501,6 +1777,7 @@ addEventListener("message", event => {
     tick();
     reloadWhenPageChanges();
   }
+  if (event.source === parent && event.origin === location.origin && event.data === "console-space") setPaused(!paused);
 });
 </script>
 </body>

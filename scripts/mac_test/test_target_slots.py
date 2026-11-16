@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -119,9 +120,12 @@ class RepositorySlotTests(unittest.TestCase):
             + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n"
         )
+        private = copies_environment(self.root)
+        _ = shutil.copy2(Path(private["CONF_DIR"]) / "build_folders.conf", self.root / "build_folders.conf")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
-            **copies_environment(self.root),
+            **private,
+            "CONF_DIR": str(self.root),
             "HOME": str(self.root), "BUILD_TARGETS_CONFIG": str(registry),
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),

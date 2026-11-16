@@ -9,6 +9,7 @@ from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_queue import admission_records
 
 from scripts.agents import remote
+from scripts.copies.copies_test_support import copies_environment
 
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
@@ -20,7 +21,6 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import time
 from typing import ClassVar, ParamSpec, TypedDict, cast, override
 import unittest
@@ -317,10 +317,14 @@ class MergeGateFixture(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        directory = tempfile.TemporaryDirectory(dir=build_folders.tmpfs_temporary_parent(), prefix="merge-gate-test-")
-        cls.addClassCleanup(directory.cleanup)
-        cls.fixture_root = Path(directory.name) / "case"
-        cls.fixture_snapshot = Path(directory.name) / "snapshot"
+        # A leased folder: a run that ends by a signal leaves it free, and the next allocation removes it.
+        parent = merge_gate.gate_test_parent(build_folders.tmpfs_temporary_parent())
+        parent.mkdir(mode=0o700, exist_ok=True)
+        build_folders.sweep_temporary_build_folders(parent, wait=False)
+        directory = cls.enterClassContext(build_folders.temporary_build_folder(
+            build_folders.UniqueBuildFolder("merge-gate-test-", build_folders.ExplicitBuildParent(parent))))
+        cls.fixture_root = directory / "case"
+        cls.fixture_snapshot = directory / "snapshot"
         cls.fixture_snapshot.mkdir()
         cls.fixture_seeds = {}
 
@@ -421,7 +425,8 @@ class MergeGateFixture(unittest.TestCase):
         home = self.root / "home"
         git_config = write_fixture_git_config(root.parent)
         self.environment = {
-            **os.environ, **interpreter_cache_environment(root / "cache"), "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
+            **os.environ, **copies_environment(root, repository="origin"), **interpreter_cache_environment(root / "cache"),
+            "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
             "CODEX_HOME": str(home / "codex"), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": str(git_config),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
@@ -445,7 +450,8 @@ class MergeGateFixture(unittest.TestCase):
         self.environment["MERGE_GATE_TEST_PYTHONPATH"] = self.environment.get("PYTHONPATH", "")
         readings = root / "memory"
         readings.mkdir(exist_ok=True)
-        self.environment.update(fake_memory_readings(readings))
+        self.environment.update({key: value for key, value in fake_memory_readings(readings).items()
+                                 if key != "CONF_DIR"})
         self.environment.update({
             "BUILDLOG_DIR": str(root / "buildlog"),
             "BUILDLOG_JOBSERVER_FIFO": str(root / "jobserver"),

@@ -90,9 +90,15 @@ The retained remote helpers remain unreachable from these three commands.
 
 `clear` stops existing queued gates and running builds outside the hold's allow rules.
 `drain` keeps existing runs that work until they finish; a run that only waits waits for the release.
-Both accept `--keep PID`, `--release-eta HH:MM`, and `--zone IANA`.
+Both accept `--keep PID` and require `--release-eta HH:MM --zone IANA`.
+The dated form `YYYY-MM-DDTHH:MM` permits a later date in that zone.
+The release time must be in the future.
 Both keep the target held until explicit release.
 A holder file uses its holder's fixed staff ID.
+Its `release_eta` stores the release instant; old `"unknown"` values remain readable.
+At that instant, status shows `release overdue since HH:MM <zone>`.
+The enforcer sends the holder one overdue message and keeps the hold in force.
+The holder releases the hold or repeats clear or drain with a later ETA.
 `HolderIdentity.name` supplies the current display name.
 An explicit holder outside staff keeps its given key.
 Without `--holder`, the caller's native session must resolve to a staff member.
@@ -138,10 +144,11 @@ See [build-memory-admission.md](build-memory-admission.md) for the keep list, en
 The target table supplies each remote target's platform.
 
 1. Run tree-writing steps on natedev under every flag.
-2. Run `build` and `final` on natedev unless a flag pins them.
-3. Run other steps on the first eligible target in configured order.
+2. Run `final` on natedev unless a flag pins it.
+3. Run unpinned `build` steps on the first eligible target in configured order.
+4. Run other movable steps in the same order.
 
-`test`, `check`, `doc`, `example`, and lint judgments use this order from their first step.
+`build`, `test`, `check`, `doc`, `example`, and lint judgments use this order from their first step.
 The default order is Mac, then natedev.
 `--target <name>` pins movable steps to one target and waits for it.
 `--mac "<reason>"` pins movable steps to the Mac.
@@ -177,7 +184,7 @@ It saves no pass because a saved pass describes this machine.
 - The hold and routing messages repeat only when their text or decline reason changes. `verify.sh: running on natedev` marks local execution.
 - After routing, every command checks the hold before taking the cargo token. A test gives this wait the same Mac retry hook, so a hold that starts just after routing still permits a Mac run. Per step, `scripts/lint/invoke.sh` checks it again after memory admission. A new hold returns the memory reservation, waits, then repeats memory admission. Mac runs answer to Mac claims, not natedev holds.
 - `verify.sh` and `invoke.sh` create a missing, nonempty `$TMPDIR` before they make temp files. The lint CLI sources `invoke.sh` before it runs a command, so it uses the same setup.
-- `buildlog-sample.timer` checks once per minute on natedev. The queue pane, `/build:page`, and `/build:status` show the saved Mac idle alert. Three minutes without a natedev build or test on the Mac gives `MAC IDLE` when eligible steps wait. A block and an idle claim count as idle. A parked app does not count as build or test work. A future reach backoff shows `MAC UNREACHABLE`. Unreadable or stale state shows `MAC IDLE WATCH`.
+- `buildlog-sample.timer` checks once per minute on natedev. `/build:page` and `/build:status` show the saved Mac idle alert. Three minutes without a natedev build or test on the Mac gives `MAC IDLE` when eligible steps wait. A block and an idle claim count as idle. A parked app does not count as build or test work. A future reach backoff shows `MAC UNREACHABLE`. Unreadable or stale state shows `MAC IDLE WATCH`.
 - Every pass atomically saves `~/.local/state/mac-idle/alert.json`. The views read that file and shared timing config without subprocesses or locks. At the default three minutes the watch sends one message to the builds showrunner, resolved by `scripts/production/showrunners.py address builds`; at the default ten minutes it sends one phone push per outage. Blocks use an emergency push cleared by `/build:mac unblock` or the saved outage ending; idle claims and free Macs ask for a decision. The idle interval and its send keys reset after an active job. No waiting steps means no idle line or push.
 - Repairs still run only when no block or live claim exists. Buildlog schema 21 includes `mac_idle`, one row per cause per call; `message_showrunner` names its message action and failed sends stay pending without more rows. State lives under `~/.local/state/mac-idle/`. See the idle Mac watch in [mac-test-offload.md](mac-test-offload.md).
 - Exports for the build log: `BUILDLOG_TARGET` is `mac` from the start of a Mac attempt and for a call that ends there, empty after a decline or a lost run, `natedev` once tests start locally (a Mac pass confirmed on natedev is `natedev` with `BUILDLOG_MAC=passed`). `BUILDLOG_HOLD_WAIT_S` sums every wait a hold caused: routing sleeps, each declined Mac retry's seconds, and `wait-local`'s; memory waits are not counted. `BUILDLOG_MAC_HOLDER` carries a `busy` decline's `holder=` value and is passed on the `record.py call` line, never exported.
@@ -239,7 +246,7 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
 | `/build:hold` | `build_hold.py` | Clear, drain, or release natedev; check quiet and show holds. Use `/build:mac block` for the Mac. |
 | `/build:mac` | `mac_test.py` | Block, unblock, settle and show the Mac; audit which packages belong on it; claim it for a job of one's own (released after 15 idle minutes). |
 | `/build:status` | `build_targets.py status [--probe]` | Each target's state, read only, with the holder's showrunner and unit when its session is known. |
-| `/build:queue bump <selector>`, `clear`, `admit-head <why>` | `build_queue.py` | Changes unit priority or permits the head to exceed the budget when free memory permits. Use `/build:page` for the queue view. The unit-board pane retains its `--json` view and selected cards. Plain view requests exit 3 and name `/build:page`. |
+| `/build:bump <selector>`, `/build:bump clear [unit]` | `build_queue.py` | Changes unit priority. A bare command prints usage and the Builds page link. Use `/build:page` for the queue view. |
 | `/build:page` | `memory_feed.py link` | Prints the shared build page link. Use the `buildlog` CLI for detailed records. |
 | `/build:mac_report` | `buildlog mac-report` | How often tests finish on the Mac when it is usable. |
 
@@ -456,7 +463,7 @@ the log does not record that connection. Journal retention also limits the evide
 
 - A remote pass or failure ends its step. CI checks platform differences.
 - The routing rule permits remote read-only steps. Tree-writing steps always remain on natedev.
-- Unpinned `build` and `final` remain on natedev. A target flag can pin their movable steps elsewhere.
+- Unpinned `build` can run on any eligible target. The configured order selects the target. Unpinned `final` remains on natedev.
 - natedev's own limits are unchanged: the memory gate, the cargo token, build-folder turns.
 - A job never runs on a held target and never falls back to one. When every eligible target is held or full it waits and says what it is waiting on.
 - Code that picks a target counts `StateUnreadable` and `Held(end=AwaitingBlockRemoval)` as not free, and every reader of `TargetState` handles all five cases.

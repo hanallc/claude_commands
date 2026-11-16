@@ -67,7 +67,7 @@ from typing import Literal, Protocol, TextIO, cast
 from scripts.lib import process_group
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
-from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, waiting_rows
+from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import read_step_names
 from scripts.production import affected_modules, change_review, land_runs  # noqa: E402
@@ -539,7 +539,7 @@ def command(arguments: Sequence[str], repo: Path) -> subprocess.CompletedProcess
             process = cleanup.enter_context(subprocess.Popen(
                 arguments, cwd=repo, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, errors="replace", start_new_session=True))
+                text=True, errors="replace", start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get()))
             recovery = ACTIVE_GATE_RECOVERY.get()
             if isinstance(recovery, GateRecovery):
                 recovery.add_group(process.pid)
@@ -903,10 +903,10 @@ def private_gate_recovery(repo: Path, parent: Path) -> Generator[GateRecovery]:
 
 
 @contextmanager
-def gate_temporary(recovery: GateRecovery, request: build_folders.UniqueBuildFolder) -> Generator[Path]:
+def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator[Path]:
     with ExitStack() as cleanup:
         with cancellation.defer_cleanup_signals():
-            folder = cleanup.enter_context(build_folders.temporary_build_folder(request))
+            folder = cleanup.enter_context(build_folders.tool_folder(tool, parent))
             recovery.folders.append(str(folder))
             recovery.save()
         try:
@@ -1093,7 +1093,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
             process = subprocess.Popen([str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *argv],
                                        cwd=repo, env={**environment, "MERGE_GATE_PARENT_PID": str(os.getpid())},
                                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, text=True,
-                                       start_new_session=True)
+                                       start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get())
             recovery = ACTIVE_GATE_RECOVERY.get()
             if isinstance(recovery, GateRecovery):
                 recovery.add_group(process.pid)
@@ -1127,6 +1127,7 @@ raise SystemExit(99)
             "STAFF_FILE": str(root / "staff.json"),
             "HERDR_PANE_RECORD_DIR": str(root / "herdr-panes"),
             "BUILDLOG_DIR": str(buildlog),
+            session_folder.ROOT_ENV: str(root / "session"),
             "TEST_TIMES_OUT": str(root / "test-times.json"),
             "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(root / "live-memory-reads.jsonl"),
             "PATH": str(tools) + os.pathsep + environment.get("PATH", os.defpath)}
@@ -1402,6 +1403,14 @@ def module_runner(repo: Path) -> Path:
     return runner
 
 
+def gate_test_parent(tmpfs: Path) -> Path:
+    """The tmpfs parent that holds only the leased folders of merge gate test classes.
+
+    tmpfs (/dev/shm) is shared with other programs, so the sweep runs only on this parent.
+    """
+    return tmpfs / "merge-gate-tests"
+
+
 def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
@@ -1440,6 +1449,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     tmpfs = build_folders.tmpfs_temporary_parent()
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused(f"the test runner requires writable tmpfs at {tmpfs}")
+    # Remove the free test folders that a run ended by a signal left; a held folder costs one lock try.
+    build_folders.sweep_temporary_build_folders(gate_test_parent(tmpfs), wait=False)
     hold = BuildHoldWait() if shared else None
     if hold is not None:
         hold.wait_until_free()
@@ -1547,8 +1558,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             raise
 
     with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
-          gate_temporary(recovery, build_folders.UniqueBuildFolder(
-              build_folders.FOLDER_PREFIXES[mode.value], build_folders.ExplicitBuildParent(tmpfs))) as temporary,
+          gate_temporary(recovery, mode.value, tmpfs) as temporary,
           ExitStack() as module_folders,
           (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
           (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
@@ -1706,8 +1716,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     suite, path = request.suite, request.path
                     folder_cleanup = ExitStack()
                     _ = module_folders.callback(folder_cleanup.close)
-                    root = folder_cleanup.enter_context(build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-                        build_folders.FOLDER_PREFIXES["suite-module"].format(owner=f"{suite}-{path.stem}"), build_folders.ExplicitBuildParent(temporary))))
+                    root = folder_cleanup.enter_context(build_folders.tool_folder(f"{suite}-{path.stem}", temporary))
                     log = root / "output.log"
                     job_environment = ({**environment, "TMPDIR": str(root)} if request.kind is GateJobKind.TYPE_CHECK
                                        else test_module_environment(root, environment))
@@ -2717,6 +2726,41 @@ def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
         return 1
 
 
+def _sweep_nightly_slots() -> None:
+    """Sweep both slot pools without changing the nightly result."""
+    for machine in ("natedev", "Mac"):
+        try:
+            if machine == "natedev":
+                from scripts.lib import build_slots
+
+                build_slots.sweep_slots()
+            else:
+                settings = conf.read_or_repository("build_folders")
+                if not any(value for key, value in settings.values().items()
+                           if key == "roots.slots" or key.startswith("roots.slots.")):
+                    continue
+                scripts = Path(__file__).resolve().parents[1]
+                _ = subprocess.run([sys.executable, str(scripts / "lib/nix_env.py"), "exec",
+                                    sys.executable, str(scripts / "mac_test/mac_queue_run.py"),
+                                    "--kind", "run", "--what", "Sweep Mac build slots", "--package", "claude",
+                                    "--", "/bin/zsh", "-c",
+                                    '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/build_slots.py" sweep'],
+                                   check=True, capture_output=True, text=True)
+        except (Exception, KeyboardInterrupt) as error:
+            detail = f"Nightly slot sweep on {machine} failed: " + " ".join(str(error).splitlines())
+            if isinstance(error, subprocess.CalledProcessError):
+                detail += " " + " ".join(cast(str, error.stderr or error.stdout or "").splitlines())
+            print(detail, flush=True)
+            try:
+                from scripts.message import send_budget, session_send
+
+                _ = subprocess.run(session_send.send_argv("--to", "builds", "--from", "nightly", "--text", detail),
+                                   check=True, capture_output=True, text=True, timeout=send_budget.seconds())
+            except (Exception, KeyboardInterrupt) as notice_error:
+                print(f"Nightly slot sweep on {machine}: notice failed: "
+                      + " ".join(str(notice_error).splitlines()), flush=True)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] in {"nightly-assigned", "nightly-check"}:
@@ -2772,7 +2816,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkout = Path(args.main_repo if args.promote_only else args.repo).expanduser().resolve()
         with scratch.copy_lock(checkout):
             if args.nightly:
-                return nightly(args)
+                try:
+                    return nightly(args)
+                finally:
+                    _sweep_nightly_slots()
             if args.promote_only:
                 promote(args)
                 production, review_list = change_review_list(args)

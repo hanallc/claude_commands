@@ -117,6 +117,8 @@ WAIT_KINDS = (
 )
 
 HOLDER_WAIT_KINDS = ("WaitingForQuotaRefusal", "WaitingForMemoryOrSlot", "ReadyWithoutCapacity")
+# A phase does no work while it waits on the user or a supplier, so active phase time leaves these waits out.
+PAUSE_WAIT_KINDS = ("WaitingForUser", "WaitingForSupplier")
 
 
 class AgentIdentity(TypedDict):
@@ -491,13 +493,6 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
     write_text_atomic(
         _state_path(session_dir), json.dumps(stored, indent=2, sort_keys=True) + "\n",
     )
-
-
-SESSION_ROOTS = tuple(
-    Path(root)
-    for root in (os.environ.get("PROGRESS_SESSION_ROOTS") or "/tmp/claude/unit:/tmp/claude/delegate").split(":")
-    if root
-)
 
 
 def move_run(_history_file: Path, _old: Path, _new: Path, _new_branch: str) -> list[Path]:
@@ -6139,10 +6134,13 @@ def _supplier_fields(supplier: NamedSupplier | NoNamedSupplier) -> dict[str, obj
 
 
 def _turn_supplier(state: dict[str, object], reason: str) -> NamedSupplier | NoNamedSupplier:
-    if "waiting on the showrunner" in reason.lower():
-        return _showrunner_supplier(state)
+    """The supplier a blocked turn names, else the run's showrunner, which relays pauses and their end."""
     match = re.search(r"blocked: waiting on ((?:claude-|codex-|worker:|session:|codex:|uds:)[^\s,;]+)", reason, re.IGNORECASE)
-    return NamedSupplier(match[1]) if match else NoNamedSupplier("wait names no supplier address")
+    if match:
+        return NamedSupplier(match[1])
+    if re.search(r"\bpeer\b", reason, re.IGNORECASE):
+        return NoNamedSupplier("wait names no supplier address")
+    return _showrunner_supplier(state)
 
 
 def _supplier_address(identity: str, *, resolver: session_staff.RowResolver | None = None) -> NamedSupplier | NoNamedSupplier:
@@ -6368,11 +6366,8 @@ def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) 
     line = reason.lower()
     if line.startswith(("decision:", "gate:")):
         kind = "WaitingForUser"
-    elif line.startswith("blocked: waiting on ") and (
-        line.startswith("blocked: waiting on the showrunner")
-        or re.search(r"\bpeer\b", line) is not None
-        or re.match(r"blocked: waiting on (?:claude-|codex-|worker:|session:|codex:|uds:)", line) is not None
-    ):
+    elif line.startswith("blocked: waiting on ") or (line.startswith("blocked:") and re.search(r"\bpause[ds]?\b", line)):
+        # A block names its supplier or a pause; any other block is the director's own work and wakes it.
         kind = "WaitingForSupplier"
     else:
         return False
@@ -6380,6 +6375,9 @@ def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) 
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = _read_state(session_dir)
         supplier = _turn_supplier(state, reason) if kind == "WaitingForSupplier" else _showrunner_supplier(state)
+        if kind == "WaitingForSupplier" and isinstance(supplier, NoNamedSupplier) and re.search(r"\bpeer\b", line) is None:
+            # A block that names no supplier, in a run with no showrunner, waits on the user.
+            kind = "WaitingForUser"
         supplier_fields = _supplier_fields(supplier)
         marker_path = session_dir / "turn_wait.json"
         try:
@@ -6714,6 +6712,37 @@ def _close_interrupted_workers(passes: InterruptedWorkerPasses) -> None:
         print(f"anomaly: finish-phase: worker {identity}: pane retained: {' '.join(reason.splitlines())}", file=sys.stderr)
 
 
+def _paused_seconds(waits: Iterable[dict[str, object]], instance_id: str,
+                    started_at: float, finished_at: float, now: float) -> float:
+    """The time inside the phase that its user and supplier waits cover, counted once where they overlap.
+
+    An unclosed wait ends when it was marked unclosed; a wait still open ends now.
+    """
+    spans: list[tuple[float, float]] = []
+    for wait in waits:
+        if wait.get("phase_instance_id") != instance_id or wait.get("wait_kind") not in PAUSE_WAIT_KINDS:
+            continue
+        match wait.get("event_type"):
+            case "wait_started":
+                end = now
+            case "wait_finished":
+                end = _number((_object_dict(wait.get("wait_end")) or {}).get("epoch"), _number(wait.get("timestamp_epoch"), now))
+            case "wait_unclosed":
+                end = _number(wait.get("timestamp_epoch"), now)
+            case _:
+                continue
+        begin = max(started_at, _number(wait.get("wait_started_epoch"), end))
+        end = min(finished_at, end)
+        if end > begin:
+            spans.append((begin, end))
+    total, reached = 0.0, started_at
+    for begin, end in sorted(spans):
+        if end > reached:
+            total += end - max(begin, reached)
+            reached = end
+    return total
+
+
 def _finish_phase(args: argparse.Namespace) -> InterruptedWorkerPasses:
     # The run lock is already held. External starts use this same history lock,
     # through the cleanup scan and publication of phase_finished.
@@ -6754,12 +6783,15 @@ def _finish_phase_with_wait_lock(args: argparse.Namespace) -> InterruptedWorkerP
             + f"({_iso_time(started_at)})"
         )
     instance_id = _string(phase.get("instance_id"))
-    for wait in _waits_by_id(_run_events(state)).values():
+    run_waits = list(_waits_by_id(_run_events(state)).values())
+    external_waits = [wait for wait in _waits_by_id(_external_wait_events()).values()
+                      if wait.get("run_id") == state.get("run_id")]
+    paused = _paused_seconds(itertools.chain(run_waits, external_waits), instance_id, started_at, finished_at, now)
+    for wait in run_waits:
         if wait.get("phase_instance_id") == instance_id and wait.get("event_type") == "wait_started":
             _end_wait(state, wait, now, unclosed=True)
-    for wait in _waits_by_id(_external_wait_events()).values():
-        if (wait.get("run_id") == state.get("run_id") and wait.get("phase_instance_id") == instance_id
-                and wait.get("event_type") == "wait_started"):
+    for wait in external_waits:
+        if wait.get("phase_instance_id") == instance_id and wait.get("event_type") == "wait_started":
             _end_wait({"history_file": str(_external_wait_file())}, wait, now, unclosed=True)
     # Every window this phase left open, one per team member: the launchers that
     # would have closed them are gone. A pass from before passes carried their
@@ -6780,6 +6812,7 @@ def _finish_phase_with_wait_lock(args: argparse.Namespace) -> InterruptedWorkerP
     event["contract_revision"] = _contract_revision()
     event["status"] = status
     event["phase_elapsed_seconds"] = max(0, int(finished_at - started_at))
+    event["phase_active_seconds"] = max(0, int(finished_at - started_at - paused))
     if finished_at != now:
         event["recorded_at"] = _iso_time(now)
         event["backfilled"] = True
@@ -6802,6 +6835,40 @@ def _finish_phase_with_wait_lock(args: argparse.Namespace) -> InterruptedWorkerP
             _ = phase_reservation.clear(phase_dir)
     _refresh_phase_table(session_dir)
     return InterruptedWorkerPasses(tuple(dict.fromkeys(interrupted)))
+
+
+def _drop_phase(args: argparse.Namespace) -> InterruptedWorkerPasses:
+    """Close an open phase and record why its attempt leaves the board."""
+    reason = _arg_string(args, "reason").strip()
+    if not reason:
+        raise SystemExit("Cannot drop a phase: --reason is empty")
+    session_dir = _session_dir(args)
+    state = _read_state(session_dir)
+    phase_id = _arg_string(args, "phase_id")
+    passes = InterruptedWorkerPasses()
+    if _open_phase_named(state, phase_id) is not None:
+        passes = _finish_phase(argparse.Namespace(session_dir=str(session_dir), phase_id=phase_id, status="stopped"))
+        args.interrupted_worker_passes = passes
+        state = _read_state(session_dir)
+    events = _run_events(state)
+    finished = next((event for event in reversed(events)
+                     if event.get("event_type") == "phase_finished" and event.get("phase_id") == phase_id), None)
+    if finished is None:
+        raise SystemExit(f"Cannot drop Phase {phase_id}: no open or finished instance")
+    if finished.get("status") == "completed":
+        raise SystemExit(f"Cannot drop Phase {phase_id}: the newest instance completed")
+    instance = _string(finished.get("phase_instance_id"))
+    previous = next((event for event in reversed(events)
+                     if event.get("event_type") == "phase_dropped" and event.get("phase_instance_id") == instance), None)
+    if previous is not None and previous.get("reason") == reason:
+        return passes
+    phase = {"id": phase_id, "instance_id": instance, "title": finished.get("phase_title", ""),
+             "started_at": finished.get("phase_started_at", 0)}
+    event = _event(state, "phase_dropped", plan_history.now_epoch(), phase_record=phase)
+    event["reason"] = reason
+    _append_event(state, event)
+    _refresh_phase_table(session_dir)
+    return passes
 
 
 def _clear_run_pointer(session_dir: Path, *, record: staff.StaffSnapshot) -> None:
@@ -7263,6 +7330,12 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = finish_phase.add_argument("--finished-at", default="")
     finish_phase.set_defaults(handler=_finish_phase)
 
+    drop_phase = subparsers.add_parser("drop-phase")
+    _ = drop_phase.add_argument("--session-dir", required=True)
+    _ = drop_phase.add_argument("--phase-id", required=True)
+    _ = drop_phase.add_argument("--reason", required=True)
+    drop_phase.set_defaults(handler=_drop_phase)
+
     finish_run = subparsers.add_parser("finish-run")
     _ = finish_run.add_argument("--session-dir", required=True)
     _ = finish_run.add_argument(
@@ -7303,14 +7376,18 @@ def main() -> None:
         return
     session_dir = Path(session_text).expanduser().resolve()
     session_dir.mkdir(parents=True, exist_ok=True)
-    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            result = handler(args)
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-    if isinstance(result, InterruptedWorkerPasses):
-        _close_interrupted_workers(result)
+    result: object = None
+    try:
+        with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                result = handler(args)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    finally:
+        passes: object = getattr(args, "interrupted_worker_passes", result)
+        if isinstance(passes, InterruptedWorkerPasses):
+            _close_interrupted_workers(passes)
 
 
 if __name__ == "__main__":

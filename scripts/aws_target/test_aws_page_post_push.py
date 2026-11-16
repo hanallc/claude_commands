@@ -1,4 +1,4 @@
-"""The post-push hook publishes the AWS prices page after a main push that changes its code."""
+"""The post-push hook publishes the AWS page after a main push that changes its code."""
 from __future__ import annotations
 
 import os

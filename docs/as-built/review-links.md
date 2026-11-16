@@ -94,12 +94,12 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for AWS prices, Builds, Changes, Images and Questions, in alphabetical order.
+The left navigation has icons and labels for Accounts, AWS, Builds, Changes, Disks, Images, Investigations and Questions, in alphabetical order.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`. The content column is centered in the frame, 32px below its top edge, with at least 32px at each side.
 The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
-AWS prices, Builds, Changes, Images, Questions and Rebuilds put the title in the same place.
+AWS, Builds, Changes, Images, Investigations, Questions and Rebuilds put the title in the same place.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
@@ -160,8 +160,8 @@ The server must not send `X-Frame-Options: DENY` or `frame-ancestors 'none'` for
 `change_page.questions_url` returns the same page with `?type=questions`.
 The Builds entry calls `memory_feed.page_url`.
 That function returns the configured Builds page URL without publishing a reading.
-The AWS prices entry calls `aws_page.page_url`.
-That function returns the AWS prices page URL without publishing the page.
+The AWS entry calls `aws_page.page_url`.
+That function returns the AWS page URL without publishing the page.
 
 The bottom-left rebuild link shows only while the Rebuilds page names a machine.
 `rebuilds.url` in `config/console.conf` names its URL function, `change_page.rebuilds_url`.
@@ -182,6 +182,7 @@ The function takes a `console.NewsRequest` and returns the keys of the items tha
 Changes uses `change_browser.waiting_changes`.
 Questions uses `change_browser.waiting_questions`.
 Images uses `images.waiting_images` for registered images without `feedback_at`.
+Investigations uses `investigations_page.waiting_investigations` for answer-ready records, with the owner, id and answered time in each key.
 The Images page and its items function share the same waiting-record filter.
 Temporary change images stay outside the Images page and its new mark.
 A page without an items function, or an unavailable page, never shows the icon.
@@ -278,10 +279,18 @@ It deletes change images only when no To review row names them and their age exc
 The setting starts at 14 days and is read at each sweep.
 
 Questions read the canonical records through `update_registration.question_records_for_document`.
-A question belongs to the showrunner whose record owns it.
+A question belongs to the showrunner or producer whose fixed staff id owns it.
+A producer's question appears in its current staff name's filter with the same answer form.
+Producer questions use `<SHOWRUNNER_STATE_DIR>/<producer staff id>/questions` without a production document.
 A question without a staff owner appears under **Owner unavailable**.
 The reader also scans question folders under the showrunner state root when their owners leave staff.
-Owned cards show the title before the filed text, choices, and **Asked by <session>**.
+Cards show the title before the filed text and choices.
+Under the buttons, aligned footer lines show `source:`, `date:` and `time:`, in the same form as Changes.
+The source uses the asker's current staff name.
+For a unit, the source is `<parent showrunner name> · <unit name>`.
+The footer reads `since`, which the question record always keeps in the user zone.
+It shows the date as YYYY-MM-DD and the time as HH:MM.
+Cards in **Owner unavailable** show the footer without an answer form.
 They have no separate Question label.
 A question filed with parts (`ask --ask`) shows each part as its own section:
 - the one-line ask in bold, when it differs from the title in more than case and a final `?` or `.`;
@@ -326,6 +335,7 @@ It has no Ask showrunner to check or Ask a question controls.
 The typed `AnswerRelay` gives the same recipient decision as the CLI relay line.
 A unit relay receives the answer directly.
 A transferred unit's showrunner receives the answer with the unit's name.
+A producer receives its answer directly through its current session from the staff record at each send attempt.
 An answer without a relay goes to the question's showrunner.
 Each message starts with `From the user (via the review page): ` and names the question.
 
@@ -373,6 +383,32 @@ It then shows the last render time and the median of at most 10 successful rende
 The browser computes the data age from the render finish time and clamps negative ages to zero.
 The browser measures the first wait from request start to response end in its navigation entry.
 For a refresh, it measures the wait around `fetch` and the response body read.
+
+### Investigations page
+
+`/console/investigations.html` reads every owner's investigation folder, including owners without a current staff row.
+The console places Investigations between Images and Questions with the Lucide `search` icon.
+Each card shows its title, question, answer when present, and the source, date and time as aligned footer lines.
+The source uses the current staff name, or the fixed staff id when the staff row is absent.
+A unit source shows its parent showrunner name and unit name.
+The date and time show the filed time in the user's zone.
+Question and answer text use the Questions page's paragraph and list helper.
+
+The Owner menu lists All and the owners with records, in name order.
+The Show menu lists Not read, Answer ready, Waiting, Read and All.
+Not read is the default.
+The address retains both filters.
+Ready answers appear first, newest answer first.
+Waiting questions follow, oldest filed first.
+Read answers appear last, newest read first.
+
+Only answer-ready cards show Mark read.
+The signed form posts to the server, which calls `investigation.mark_read`.
+A successful save removes the card from the Not read view without a document reload.
+A failed save retains the card and displays the error.
+The page uses `page_frame.createPageRefresh` and `page_refresh_seconds`, with the same visibility rules as Questions.
+Refresh retains the filters and scroll position, skips active saves, and refuses older responses after a newer response or save.
+New ready answers mark the navigation entry as new until the user visits the page.
 
 ### Images page
 
@@ -567,6 +603,11 @@ An unrouted row retains verdict controls when its list's staff showrunner has an
 In that case, its owner remains unrouted and receives no message.
 
 `change_review.list_ready`, which `merge_checkpoint` and `merge_gate` call, stores each checkpoint unit's Producer id.
+A row covers a text-matched change when its merge contains that checkpoint or its merge is unknown.
+An edited row covers a change from the same merge only when its Producer matches the checkpoint unit's fixed staff id.
+Within each producer, pair ready changes first, in commit order.
+Pair held changes next only when all uncovered held changes for that producer wait on one step.
+An empty Producer cell or an unknown checkpoint producer permits only text matching.
 `merge_gate` reads the staff record before the merge.
 `merge_checkpoint` reads the staff record before the push.
 An unreadable staff record stops either run before anything is pushed.
