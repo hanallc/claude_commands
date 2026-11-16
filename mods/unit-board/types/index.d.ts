@@ -1,6 +1,6 @@
 export type AccountsPaneState<Status> =
   | { kind: 'loading' }
-  | { kind: 'accounts'; data: Status; zone: string; now: number }
+  | { kind: 'accounts'; data: Status }
   | { kind: 'failed'; reason: string };
 
 /** Missing keys are closed panes. Timers belong to the module, never persisted. */

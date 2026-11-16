@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_DIR"' EXIT
-mkdir -p "$TEST_DIR/scripts" "$TEST_DIR/bin"
+mkdir -p "$TEST_DIR/scripts" "$TEST_DIR/bin" "$TEST_DIR/lib"
 
 # Exercise the real push path with disposable hooks and command stubs.
 cp "$SCRIPT_DIR/validate_and_push.sh" "$SCRIPT_DIR/push_direct.sh" "$TEST_DIR/scripts/"
@@ -17,10 +17,36 @@ cat > "$TEST_DIR/scripts/choose_push_path.sh" <<'STUB'
 set -euo pipefail
 printf '%s\n' '{"push_path":"direct"}'
 STUB
-cat > "$TEST_DIR/scripts/post_push_hook.sh" <<'STUB'
+cat > "$TEST_DIR/lib/py" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
-exit "${HOOK_EXIT_STATUS:-0}"
+exec bash "$@"
+STUB
+chmod +x "$TEST_DIR/lib/py"
+cat > "$TEST_DIR/lib/main_push_lock.py" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+shift 3
+exec "$@"
+STUB
+cat > "$TEST_DIR/lib/land_main.py" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+branch=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --branch) branch="$2"; shift 2 ;;
+    --checkout|--commit) shift 2 ;;
+    *) exit 64 ;;
+  esac
+done
+git push origin "HEAD:refs/heads/$branch"
+if [ "${HOOK_EXIT_STATUS:-0}" -ne 0 ]; then
+  echo "HookFailed: exit $HOOK_EXIT_STATUS"
+  echo "Rerun: land_main.py --branch $branch" >&2
+else
+  echo HookAbsent
+fi
 STUB
 
 cat > "$TEST_DIR/bin/git" <<'STUB'
@@ -31,6 +57,7 @@ printf '\n' >> "$GIT_CALLS"
 case "$1 $2" in
   'push origin') ;;
   'branch --show-current') printf '%s\n' 'ci-test-branch' ;;
+  'symbolic-ref --quiet') printf '%s\n' 'origin/ci-test-branch' ;;
   'rev-parse HEAD') printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ;;
   *) printf 'unexpected git call: %s\n' "$*" >&2; exit 1 ;;
 esac
@@ -141,6 +168,12 @@ both_older_runs_cancelled() {
     [[ "$(grep -c '^cancelled run ' "$TEST_DIR/stdout" || true)" == 2 ]]
 }
 
+hook_failure_keeps_cancellation() {
+  both_older_runs_cancelled &&
+    grep -Fq "HookFailed: exit $HOOK_EXIT_STATUS" "$TEST_DIR/stdout" &&
+    grep -Fq 'Rerun: land_main.py' "$TEST_DIR/stderr"
+}
+
 live_queries_are_exact() {
   local workflow_query queued_query running_query
   workflow_query="$(query_line run list --branch ci-test-branch --commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
@@ -214,12 +247,12 @@ fi
 unset GH_FAIL_QUERY
 
 export HOOK_EXIT_STATUS=7
-if run_case 'target branch hook failure still cancels and retains status' 7 --to ci-test-branch --cancel-prior; then
-  check_case 'target branch hook failure still cancels and retains status' both_older_runs_cancelled
+if run_case 'target branch hook failure reports and still cancels' 0 --to ci-test-branch --cancel-prior; then
+  check_case 'target branch hook failure reports and still cancels' hook_failure_keeps_cancellation
 fi
 export HOOK_EXIT_STATUS=9
-if run_case 'current branch hook failure still cancels and retains status' 9 --cancel-prior; then
-  check_case 'current branch hook failure still cancels and retains status' both_older_runs_cancelled
+if run_case 'current branch hook failure reports and still cancels' 0 --cancel-prior; then
+  check_case 'current branch hook failure reports and still cancels' hook_failure_keeps_cancellation
 fi
 unset HOOK_EXIT_STATUS
 

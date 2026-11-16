@@ -230,7 +230,7 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
                   + f'data-pending="{str(change.waiting).lower()}"')
     if isinstance(page, UnavailableProduction):
         content = f'''<h1>{html.escape(row.get('Change', ''))}</h1>
-<h2>Proof</h2>{change_page.check_html(row.get(change_review.CHECK, ''))}
+<h2>Proof</h2>{change_page.review_html(row.get(change_review.CHECK, ''))}
 {anomaly}{change_page.question_html(change.question)}<p>{html.escape(page.reason)}</p>
 {change_page.change_details(row, shown)}'''
     else:
@@ -240,7 +240,7 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
         saved = f'<p>{html.escape(text)}</p>' if text else ""
         content = f'''<h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
-{change_page.check_html(row.get(change_review.CHECK, ''))}
+{change_page.review_html(row.get(change_review.CHECK, ''))}
 {anomaly}{change_page.question_html(change.question)}{saved}<p role="status" data-save-state></p>{form}
 {change_page.change_details(row, shown)}'''
     return f'<section {attributes}>' + change_page.change_content(row, content) + '</section>'

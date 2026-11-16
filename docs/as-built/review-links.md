@@ -333,6 +333,22 @@ Recovery clears an intent for an open question.
 For a closed question without `saved: true`, recovery clears the intent and prints `answer save state unknown; not sent`.
 Answers to questions and changes both post to `changes.html`.
 
+### Accounts page
+
+`/console/accounts.html` shows the accounts board that `/showrunner:accounts` shows.
+The console lists it as **Accounts**, with the Lucide `users` icon.
+The server renders it for each request in a child process (`accounts_page.py`).
+The child keeps the status read's stderr capture away from the server's request log.
+`accounts_page_seconds` in `config/review_links.conf` limits each render.
+A failed or late render gives 503 with **The Accounts page is not available.**
+
+- The table comes from `accounts.status_board()`: the board columns, rows, total row and tones.
+- The upcoming moves and the problems follow the table.
+- The page reads the stored usage only, as `accounts.py status --stored` does.
+
+The page reads its color tokens and base type from `console_theme.py`, and its main column and title from `page_frame.STYLE`.
+It refreshes when the console shows it again and when the tab becomes visible.
+
 ### Images page
 
 `/console/images.html` shows registered images with their instructions, oldest first.
@@ -1021,9 +1037,12 @@ Reduced motion disables fades and uses instant scrolling.
 
 Question items and change rows show a Lucide copy button inside the top right of each code block.
 Both Changes views recognize fenced code blocks and lines that contain only one backtick span.
-This applies to the How to check cell and the Proof cell.
+This applies to How to check, Proof, Question, Feedback, and Answer.
 The shared renderer emits each code block with its button.
-Plain proof text keeps its `<pre>` block without a copy button.
+Plain text uses `<p>` blocks without a box or a copy button.
+The paragraph style preserves line breaks, including a two-line check without code.
+The renderer removes blank lines at each text part's edges.
+Code blocks and paragraphs use the same 16px margin.
 Inline code keeps its current style.
 The button copies the code text without the button or its label.
 The button shows a check and the label “Copied” for two seconds after success.

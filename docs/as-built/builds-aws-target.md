@@ -677,7 +677,9 @@ The user renamed it from AWS prices to AWS on 2026-11-15, because it holds spend
 The published file stays `aws_prices.html`, so older links still open it.
 A Spend card at the top shows today, yesterday and the month to date, with the month forecast below them.
 `spend.read_spend` and `spend.month_spend` give these numbers; `/aws_spend` reads the same functions, so both show the same values.
-The day is the UTC day. The hourly AWS snapshot job publishes the page again, so the spend is current to the last hour.
+The day is the UTC day. The hourly buildlog run publishes the page, so the spend is current to the last hour.
+After each push to main, `.claude/config/post_push.sh` publishes it again
+when the push changes the page code and the pushing checkout is at the pushed commit, as the promotion step's ~/.claude is.
 The Prices and Quotas sections follow the Spend card.
 The user asked for these page changes on 2026-11-14 through builds:
 1. A switch above the two price cards shows `Spot price` or `Cost per gate`; the user asked for it on 2026-11-15 through builds.
@@ -690,10 +692,11 @@ The user asked for these page changes on 2026-11-14 through builds:
    A white box marks the lowest and the highest cell of each type column, in both themes; the user asked for it on 2026-11-15 through builds.
    The box is 1 px white inside a 1 px dark edge, which keeps it visible on the light page. Equal cells all have the box.
    A column with only two values has no box, because the colors already show which is which.
-   The cheapest cell of each table is bold on a gold background (`--cheapest`), with dark text.
-   The most expensive cell of each table is bold on a black background (`--dearest`) with white text and a 2 px white outline.
+   The cheapest cell of each table is bold on a gold background (`--cheapest`), with dark text and a 2 px white outline (`--mark-edge`).
+   The most expensive cell of each table is bold on a black background (`--dearest`) with white text and the same white outline.
    Both are the same in both themes, and they replace the scale color and the box of that cell.
    The user asked for them on 2026-11-15 through builds, because bold alone did not make the cheapest cell stand out.
+   The user asked for the white outline on the gold cell too, so both table marks match.
    A legend line above the cards explains the colors.
    A legend line under each price card that has a mark names the box, the gold cell and the black cell.
    Builds removed the vCPU group mark on 2026-11-15.

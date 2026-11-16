@@ -30,6 +30,19 @@ An unavailable lens keeps the worker with a plain `review` label.
 The roster reads no current role from the agents log.
 The [worker design](long-lived-workers.md#staff-membership-and-dispatch) defines stored run fields.
 
+Unit run events also record waits on named work.
+`progress_history.py start-wait --target WORK --by WHO --reason CONDITION --kind KIND` writes `wait_started` and prints the wait ID.
+`--target` requires `--by` and `--reason`.
+The event adds `wait_scope: unit`, `target_work`, `wait_by`, and `wait_attribution: {state: UnitTarget}`.
+It keeps the existing reason, kind, owner, start time, and wait ID fields.
+It has no phase or pass attribution and needs no current phase.
+`finish-wait --wait-id ID` writes the usual `wait_finished` event.
+Starting the target phase writes `wait_finished` for each open unit wait on that target.
+`phase_waits.unit_waits` also closes waits on `wait_unclosed`, target phase start, and run finish.
+It returns open waits in start order; the newest wait on a target replaces its earlier reason.
+`phase_waits.phase_waits` excludes unit waits.
+The Units board reads these reasons from the run events it already reads.
+
 | Source | Where | Gives |
 |---|---|---|
 | Showrunner registrations | notifier timers under `~/.local/state/notifier/showrunner-*` (`NOTIFIER_STATE_DIR`), via `showrunners.registered_showrunners()` | Owner staff id; staff supplies the current session, name, and document; native records supply the socket |

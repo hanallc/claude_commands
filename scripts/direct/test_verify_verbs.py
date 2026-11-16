@@ -35,7 +35,7 @@ class VerifyVerbTests(VerifyLintCacheFixture):
         ])
         self.assertEqual([line.split()[0] for line in flags.splitlines()], [
             "--test", "--name", "--check", "--saved", "--tree",
-            "--filter", "--run-ignored", "--features", "--no-cache",
+            "--filter", "--run-ignored", "--features", "--no-cache", "--attached",
             "--target", "--mac", "--local", "--session-dir",
         ])
 

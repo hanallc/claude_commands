@@ -96,7 +96,7 @@ class VerifyLintBerthCopyTests(support.VerifyLintScopeFixture):
                 for line in calls.read_text(encoding="utf-8").splitlines()] if calls.exists() else []
 
     def assert_copy_gone(self) -> None:
-        self.assertEqual(sorted(path.name for path in (self.root / "target").iterdir()
+        self.assertEqual(sorted(path.name for path in (self.root / "target/package").iterdir()
                                 if path.name.startswith(("verify-lint-copy", ".verify-lint-copy"))), [])
 
     def test_held_fix_reaches_the_worktree_through_the_copy(self) -> None:
@@ -109,7 +109,7 @@ class VerifyLintBerthCopyTests(support.VerifyLintScopeFixture):
         for call in calls:
             self.assertEqual(call["target"], str(self.root / "target"))
             manifest = cast(list[str], call["args"])[-1]
-            self.assertEqual(manifest, str(self.root / "target/verify-lint-copy/tree/Cargo.toml"))
+            self.assertEqual(manifest, str(self.root / "target/package/verify-lint-copy/tree/Cargo.toml"))
         self.assert_copy_gone()
 
     def test_foreign_fix_is_reported_and_not_written(self) -> None:
