@@ -27,7 +27,7 @@ import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
-from scripts.aws_target import admin_secrets, cloud_gate, gate_box, gate_trial as trial, ledger
+from scripts.aws_target import admin_secrets, aws_trial as trial, cloud_gate, gate_box, ledger
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.aws_target.aws_target import AwsCli
 from scripts.production import merge_gate
@@ -706,13 +706,13 @@ os.execv({git!r}, [{git!r}, *arguments])
         script = '''import ctypes, json, os, signal, sys
 from pathlib import Path
 from unittest import mock
-from scripts.aws_target import gate_trial
+from scripts.aws_target import aws_trial
 from scripts.lib.process_group import send_process_group
 assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
 repo, base, changed, state, settings, pids = sys.argv[1:]
-with (mock.patch.object(gate_trial, 'account_settings_path', return_value=Path(settings)),
-      mock.patch.object(gate_trial, 'paired_service', side_effect=AssertionError('unexpected service'))):
-    status = gate_trial.paired_main(['--repo', repo, '--base', base, '--changed', changed,
+with (mock.patch.object(aws_trial, 'account_settings_path', return_value=Path(settings)),
+      mock.patch.object(aws_trial, 'paired_service', side_effect=AssertionError('unexpected service'))):
+    status = aws_trial.paired_main(['--repo', repo, '--base', base, '--changed', changed,
                                    '--modules', 'fixture/test_sample.py'], Path(state))
 assert status == 1
 processes = json.loads(Path(pids).read_text())
@@ -912,9 +912,9 @@ pathlib.Path({str(box)!r}, 'uploaded-' + sys.argv[-1]).write_bytes(sys.stdin.buf
         for number in (signal.SIGINT,):
             script = '''import signal, sys
 from unittest import mock
-from scripts.aws_target import gate_trial
-with mock.patch.object(gate_trial.subprocess, 'call', side_effect=lambda command: signal.raise_signal(int(sys.argv[1]))), mock.patch.object(gate_trial.subprocess, 'run') as stop:
-    assert gate_trial.paired_service(['fixture'], 'fixture-unit') == 1
+from scripts.aws_target import aws_trial
+with mock.patch.object(aws_trial.subprocess, 'call', side_effect=lambda command: signal.raise_signal(int(sys.argv[1]))), mock.patch.object(aws_trial.subprocess, 'run') as stop:
+    assert aws_trial.paired_service(['fixture'], 'fixture-unit') == 1
     stop.assert_called_once_with(['systemctl', '--user', 'stop', 'fixture-unit'], check=False)
 '''
             reply = subprocess.run([sys.executable, '-c', script, str(number)], capture_output=True, text=True,

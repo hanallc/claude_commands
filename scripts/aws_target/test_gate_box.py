@@ -16,8 +16,8 @@ from typing import Self, cast, override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import gate_box, gate_trial, ledger
-from scripts.aws_target import test_gate_trial as trial_tests
+from scripts.aws_target import aws_trial, gate_box, ledger
+from scripts.aws_target import test_aws_trial as trial_tests
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import merge_gate as gate
 from scripts.test_times import gate_record
@@ -65,10 +65,10 @@ class GateBoxTests(unittest.TestCase):
                 source = source.replace("(root / 'boot.log').open('a')",
                     f"(FailedStageWrite() if name == {name!r} else (root / 'boot.log').open('a'))")
                 _ = path.write_text(source)
-                _ = gate_trial.checked_git(fixture.repo, 'add', '.')
-                _ = gate_trial.checked_git(fixture.repo, 'commit', '-qm', 'Fail the candidate stage writer')
-                fixture.changed = gate_trial.checked_git(fixture.repo, 'rev-parse', 'HEAD')
-                _ = gate_trial.checked_git(fixture.repo, 'push', str(fixture.origin), 'HEAD:refs/heads/stage')
+                _ = aws_trial.checked_git(fixture.repo, 'add', '.')
+                _ = aws_trial.checked_git(fixture.repo, 'commit', '-qm', 'Fail the candidate stage writer')
+                fixture.changed = aws_trial.checked_git(fixture.repo, 'rev-parse', 'HEAD')
+                _ = aws_trial.checked_git(fixture.repo, 'push', str(fixture.origin), 'HEAD:refs/heads/stage')
                 reply, traces = fixture.guest()
                 self.assertIn(' stage=' + name + '\n', (fixture.root / 'box/failed-stage-write').read_text())
                 self.assertEqual(len(traces), 8)
@@ -87,7 +87,7 @@ class GateBoxTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {'CONF_DIR': str(root)})))
 
     def test_trial_and_route_share_one_guest(self) -> None:
-        self.assertIs(gate_trial.GUEST, gate_box.GUEST)
+        self.assertIs(aws_trial.GUEST, gate_box.GUEST)
         _ = compile(gate_box.GUEST, '<gate guest>', 'exec')
         self.assertNotIn('basedpyright', gate_box.GUEST)
         self.assertNotIn('merge_gate', gate_box.GUEST)
