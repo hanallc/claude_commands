@@ -21,7 +21,7 @@ from unittest import mock
 
 from scripts.production import change_review
 from scripts.production import footer_counts
-from scripts.production import next_item
+from scripts.production import next_item, investigation
 from scripts.production.production_doc import Production
 from scripts.production import proposals_folder
 from scripts.production import showrunners
@@ -45,6 +45,7 @@ ITEM = re.compile(r"\b(\w+)-item\b")
 LEDGER = """\
 - 2026-10-05 rust/nateroids: Build CI tests without debug info [gain/week: 2.5 h red CI] — deferred
 - 2026-10-12 rust/hana: Run the GPU tests 8 at a time [gain/week: 38 min waiting] — proposed
+- 2026-10-13 rust/hana: Keep the smaller check [gain/week: 12 min waiting] — proposed
 """
 
 
@@ -92,6 +93,7 @@ class NextItemTests(unittest.TestCase):
                                                Entry("C2", "C2 Later change", Urgency(urgency.LATER), since=at(2))]),
             "proposal": Queue("proposal-demo", [Entry("P1", "P1 A proposal", since=at(3), value=(9.0,))]),
             "efficiency": Queue("efficiency", []),
+            "investigation": Queue("investigation", []),
             "question": Queue("question-demo", [Entry("Q1", "demo: Which port?", Urgency(urgency.BLOCKS), since=at(4)),
                                                 Entry("Q2", "demo: Newest question", since=at(5))]),
         }
@@ -201,11 +203,11 @@ class NextItemTests(unittest.TestCase):
         assert owner is not None
         _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
         _ = doc.write_text(f"# Demo\n\n## Production Context\n\n- **Efficiency ledger:** {self.root / 'ledger.md'}\n")
-        line = LEDGER.splitlines()[0]
+        line = LEDGER.splitlines()[1]
         self.assertEqual(run("show", "--kind", "efficiency", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name), (0, f"efficiency\n{line}\n", ""))
         self.assertEqual(run("move-to-end", "--kind", "efficiency", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name)[0], 0)
         self.assertEqual(run("show", "--kind", "efficiency", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name)[1],
-                         f"efficiency\n{LEDGER.splitlines()[1]}\n")
+                         f"efficiency\n{LEDGER.splitlines()[2]}\n")
         # A production whose doc names no Efficiency ledger has no efficiency items.
         bare = doc.with_name("bare-production.md")
         _ = fixture_member("showrunner", name="bare", doc=staff.LiveDoc(remote.local_machine(), bare))
@@ -254,6 +256,9 @@ class NextItemTests(unittest.TestCase):
             if existing is not None:
                 _ = staff.move(existing.id, staff.ReportsTo(parent) if parent is not None else staff.StaffRoot())
             owner = fixture_member("showrunner", name=name, parent=parent, doc=staff.LiveDoc(remote.local_machine(), doc))
+            with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}):
+                item = investigation.file(owner.id, f"{name}-item", "Find the cause.")
+                _ = investigation.answer(owner.id, item.id, "The cause is known.")
             _ = (outstanding / f"{owner.id}.json").write_text(
                 f'[{{"since": "2026-10-06T09:00", "text": "{name}-item"}}]')
             timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{name}"
@@ -291,7 +296,7 @@ class NextItemTests(unittest.TestCase):
                 mock.patch.object(showrunner_tree, "descendants_of", descendants_of), \
                 mock.patch.object(showrunners, "timer_docs", return_value=docs), \
                 mock.patch.object(change_review, "production_list", the_list), \
-                mock.patch.object(next_item, "read_production", production), \
+                mock.patch("scripts.production.production_doc.read_production", production), \
                 mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}):
             for kind in next_item.KINDS:
                 # Each showrunner shows its own production: never the one above, and not the ones below.

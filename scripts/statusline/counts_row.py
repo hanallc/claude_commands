@@ -23,13 +23,13 @@ except FileNotFoundError:
 import os
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
 from scripts.hooks import showrunner_footer  # noqa: E402
-from scripts.production import investigation, staff
+from scripts.production import staff
+from scripts.review_links import review_items
 from scripts.production.update_registration import QuestionStaff
 from scripts.lib.user_zone import user_zone
 
@@ -56,16 +56,9 @@ def retry_due(sources: list[Path]) -> str:
 
 def question_counts(owner: staff.StaffRow, zone: ZoneInfo, identities: QuestionStaff, sources: list[Path] | None,
                     source: str = "") -> tuple[int, str]:
-    """Count due questions and retain the next deferred deadline."""
-    from scripts.production.update_registration import DeferredUntil, OutstandingReminder, due, outstanding_file, read_open_items
-
-    items = read_open_items(outstanding_file(owner.id, identities=identities), identities=identities, sources=sources)
-    if source:
-        items[:] = [item for item in items if not isinstance(item, OutstandingReminder) and item.asked_by == source]
-    now = datetime.now(zone).replace(tzinfo=None)
-    afters = [item.timing.at for item in items if isinstance(item.timing, DeferredUntil) and item.timing.at > now]
-    return len(due(items, now)), "" if not afters else str(int(min(afters).replace(tzinfo=zone).timestamp()))
-
+    """Read question counts through the shared review reader."""
+    from scripts.review_links import review_items
+    return review_items.question_counts(owner, zone, identities, sources, source)
 
 def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None = None,
         source: str = "", require_complete: bool = False) -> tuple[str, str]:
@@ -77,7 +70,7 @@ def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None
     if member is not None and member.kind == "producer":
         identities = identities if identities is not None else QuestionStaff.for_record(record)
         questions, deadline = question_counts(member, user_zone(), identities, sources)
-        count = len(investigation.records(member.id, sources=sources))
+        count = review_items.ready_investigations(member.id, sources=sources)
         return footer_counts.counts_line(footer_counts.FooterCounts(questions=questions, investigations=count)) or "", deadline
     doc = showrunner_footer.production_doc(instance)
     if doc is not None:
@@ -88,7 +81,7 @@ def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None
             if member is None or member.kind != "showrunner":
                 return "", ""
             source = member.id
-        count = len(investigation.records(staff.StaffId(source), sources=sources))
+        count = review_items.ready_investigations(staff.StaffId(source), sources=sources)
         return footer_counts.counts_line(footer_counts.FooterCounts(investigations=count)) or "", ""
     from scripts.production.update_registration import RegistrationFailure
     if identities is None:
@@ -156,7 +149,7 @@ def write_unit(identity: str) -> Path:
             if unit is None:
                 raise ValueError(f"{identity}: no staff row")
             from scripts.production import footer_counts
-            count = len(investigation.records(unit.id, sources=sources))
+            count = review_items.ready_investigations(unit.id, sources=sources)
             line, due = footer_counts.counts_line(footer_counts.FooterCounts(investigations=count)) or "", ""
         else:
             instance = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier") / f"showrunner-{owner.id}"

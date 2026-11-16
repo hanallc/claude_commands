@@ -42,7 +42,7 @@ from typing import TypeVar, cast
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.lib import scratch, unit_runs  # noqa: E402
 from scripts.direct.progress_history import load_events  # noqa: E402
-from scripts.lib import urgency  # noqa: E402
+from scripts.lib import urgency, file_lock  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 from scripts.production import issues  # noqa: E402
@@ -1642,6 +1642,8 @@ def _verdict_write(
             reviewed_rows = list[str](("\n" + BODY[BODY.index(REVIEWED):]).splitlines(keepends=True))
             _insert(lines, len(lines), reviewed_rows)
         _add_column(path, lines, REVIEWED, "Merged")
+        if cells.get("Review log"):
+            _add_column(path, lines, REVIEWED, "Review log")
         if member is not None:
             _add_column(path, lines, REVIEWED, PRODUCTION)
         if PRODUCER in cells:
@@ -1725,6 +1727,30 @@ def _review_snapshots(paths: Iterable[Path], *, sources: list[Path] | None = Non
     return snapshots
 
 
+def record_review_log(path: Path, row: str, words: str, production: Path, who: str = "nate") -> None:
+    """Keep the user's Review action in the authoritative table row."""
+    from scripts.review_links import review_events
+    now = datetime.now().astimezone()
+    def write(lines: list[str]) -> None:
+        for section in (SECTION, REVIEWED):
+            if not any(line.strip() == section for line in lines):
+                continue
+            columns, first, end = _table(path, lines, section)
+            index = next((index for index in range(first, end) if lines[index].startswith(f"| {row} |")), None)
+            if index is None:
+                continue
+            _add_column(path, lines, section, "Review log")
+            columns, first, end = _table(path, lines, section)
+            index = next(index for index in range(first, end) if lines[index].startswith(f"| {row} |"))
+            cells = dict(zip(columns, _cells(lines[index])))
+            events = review_events.decode(_plain(cells.get("Review log", "")))
+            event = review_events.ReviewLog(now, who, words)
+            cells["Review log"] = _cell(review_events.encode(review_events.append(events, event)))
+            lines[index] = _row(path, columns, cells)+"\n"
+            return
+    _edit(path, production, now.date(), write, lambda _: f"review {row}")
+
+
 def set_row_kind(path: Path, row: str, kind: str, production: Path) -> str:
     """Classify by whether the change alters something the user runs or sees."""
     if kind not in REVIEW_KINDS:
@@ -1775,6 +1801,19 @@ def save_verdict(path: Path, row: str, verdict: str, production: Path) -> Verdic
     local_row = _row_id("row", row.rpartition("/")[2])
     shown = row_display_id(path, local_row)
     warnings: list[str] = []
+    root = change_routing.review_root()
+    delivery = change_routing.delivery_path(root, path, local_row)
+    slots = change_routing.delivery_slots(delivery)
+    empty_row: dict[str, str] = {}
+    pending_row = next((item for item in pending(path) if item["#"] == local_row), empty_row)
+    if slots.validation_requested and not lands(verdict) and pending_row.get("Review log"):
+        with file_lock.exclusive(root / ".review-link-delivery.lock"):
+            fields = cast(dict[str, object], json.loads(delivery.read_text()))
+            record_review_log(path, local_row, "Check found a problem: "+verdict, production,
+                              unit_lookup.doc_owner(production, staff.snapshot()).name)
+            _ = fields.pop("validation", None)
+            write_text_atomic(delivery, json.dumps(fields)+"\n")
+        return VerdictSaved([f"{shown}: the check found a problem; returned to For you"])
     result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append)
     return _verdict_output(path, local_row, shown, verdict, result, warnings)
 

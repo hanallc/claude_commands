@@ -35,7 +35,7 @@ STARTED_NS = time.time_ns()
 from scripts.disks import disks_page, sessions, slots
 from scripts.lib import conf
 from scripts.production import change_routing, change_review
-from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, image_store, images, investigations_page, list_page
+from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, image_store, images, investigations_page, list_page, review_page
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
@@ -279,12 +279,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 return None
             self.html_response(200, content)
             return None
-        if route.path == investigations_page.PAGE_PATH:
+        if route.path in (investigations_page.PAGE_PATH, "/console/questions.html", "/console/changes.html"):
+            self.redirect(review_page.legacy_url(route.path, route.query))
+            return None
+        if route.path == review_page.PAGE_PATH:
             try:
-                content = investigations_page.render(root)
+                content = review_page.render(root)
             except (OSError, ValueError) as error:
-                print(f"review-links investigations: {error}", file=sys.stderr)
-                self.html_response(503, change_page.document("<p>The Investigations page is not available.</p>"))
+                print(f"review-links review: {error}", file=sys.stderr)
+                self.html_response(503, change_page.document("<p>The Review page is not available.</p>"))
                 return None
             self.html_response(200, content)
             return None
@@ -451,6 +454,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).query or self.headers.get_content_type() != "application/x-www-form-urlencoded":
             self.html_response(400, change_page.document("<p>Use the answer form on the review page.</p>"))
             return
+        if urlsplit(self.path).path == review_page.PAGE_PATH:
+            self.review_post()
+            return
         if urlsplit(self.path).path == images.PAGE_PATH:
             self.image_post()
             return
@@ -591,6 +597,23 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 change_page.deliver(delivery, server.delivery_status)
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
+
+    def review_post(self) -> None:
+        """Save the review answer before its shared message delivery."""
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            body = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode("utf-8")
+            delivery, answer = review_page.submit(server.root, body, server.delivery_status)
+        except ValueError as error:
+            self.browser_failure(400, str(error), error)
+            return
+        except (OSError, RuntimeError, change_page.Refusal) as error:
+            self.browser_failure(503, "The answer could not be saved.", error)
+            return
+        try:
+            self.json_response(200, {"answer": answer})
+        finally:
+            change_page.deliver(delivery, server.delivery_status)
 
     def list_post(self) -> None:
         """Save List feedback before the shared sender starts."""

@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import cast
 
 from scripts.production import record_store, staff
+from scripts.review_links import review_events
+from scripts.review_links.review_events import ReviewLog
 from scripts.production.record_store import state_root as state_root
 
 ANSWER_SECTION = record_store.section("Answer")
@@ -41,6 +43,7 @@ class Investigation:
     read: str
     question: str
     answer: str
+    log: tuple[ReviewLog, ...] = ()
 
 
 def _store(owner: staff.StaffId) -> record_store.NumberedRecords:
@@ -65,7 +68,7 @@ def load(owner: staff.StaffId, identity: str, *, sources: list[Path] | None = No
         question, answer = record_store.split_section(body, int(fields["question_length"]), "Answer")
         item = Investigation(fields["id"], staff.StaffId(fields["owner"]), fields["title"],
                              InvestigationState(fields["state"]), fields["filed"], fields["answered"],
-                             fields["read"], question, answer)
+                             fields["read"], question, answer, review_events.decode(fields.get("review_log", "")))
         if not item.title.strip() or item.title.splitlines() != [item.title]:
             raise ValueError("title must have one line")
         for name, value, required in (
@@ -93,7 +96,7 @@ def records(owner: staff.StaffId, *, include_read: bool = False,
 def _save(item: Investigation) -> None:
     fields = {"id": item.id, "owner": item.owner, "title": item.title, "state": item.state,
               "filed": item.filed, "answered": item.answered, "read": item.read,
-              "question_length": str(len(item.question))}
+              "question_length": str(len(item.question)), "review_log": review_events.encode(item.log)}
     _store(item.owner).write(item.id, fields, f"{item.question}{ANSWER_SECTION}{item.answer}")
 
 
@@ -125,7 +128,8 @@ def answer(owner: staff.StaffId, identity: str, text: str) -> Investigation:
             return item
         if item.state != InvestigationState.OPEN:
             raise InvestigationError(f"{identity}: cannot answer an investigation in state {item.state}")
-        item = replace(item, state=InvestigationState.ANSWER_READY, answered=_now(), answer=text)
+        item = replace(item, state=InvestigationState.ANSWER_READY, answered=_now(), answer=text,
+                       log=(*item.log, ReviewLog(datetime.now(timezone.utc), str(owner), "Answer: "+text)))
         _save(item)
         return item
 
@@ -139,7 +143,8 @@ def mark_read(owner: staff.StaffId, identity: str) -> Investigation:
             return item
         if item.state != InvestigationState.ANSWER_READY:
             raise InvestigationError(f"{identity}: cannot read an investigation in state {item.state}")
-        item = replace(item, state=InvestigationState.READ, read=_now())
+        item = replace(item, state=InvestigationState.READ, read=_now(),
+                       log=(*item.log, ReviewLog(datetime.now(timezone.utc), "nate", "Marked read")))
         _save(item)
         return item
 

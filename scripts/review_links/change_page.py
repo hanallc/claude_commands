@@ -843,7 +843,8 @@ def closeout_before_save(page: ReviewPage, doc: Path, row_id: str, verdict: str,
 
 
 def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
-           prepared: change_review.ChangeQueue | next_item.ReadChangeLists = next_item.READ_CHANGE_LISTS) -> MessageDelivery | NoMessageDelivery:
+           prepared: change_review.ChangeQueue | next_item.ReadChangeLists = next_item.READ_CHANGE_LISTS,
+           feedback_closes: bool = False) -> MessageDelivery | NoMessageDelivery:
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) != {"row", "token", "outcome", "feedback"} or any(len(values) != 1 for values in fields.values()):
         raise AnswerRefused("expected only row, token, outcome and feedback")
@@ -871,7 +872,9 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         raise AnswerRefused("the production document is not available")
     message_page = replace(page, production=assignment.production)
     recipients = owner.showrunner_recipients
-    request_feedback = outcome == "feedback" and not change_review.lands(one_line)
+    request_feedback = outcome == "feedback" and not feedback_closes and not change_review.lands(one_line)
+    if outcome == "feedback" and feedback_closes:
+        verdict = "feedback: " + one_line
     if (outcome == "question" or request_feedback) and isinstance(owner, change_routing.UnroutedChange):
         raise AnswerRefused("this row has no showrunner to answer a question")
     if outcome == "question" or request_feedback:

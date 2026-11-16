@@ -474,7 +474,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(self.outstanding().read_bytes(), original)
         self.migrate()
         rows = self.question_rows()
-        self.assertEqual(rows, [{**legacy, "asked_by": self.asker_id}])
+        self.assertEqual(rows, [{**legacy, "asked_by": self.asker_id, "review_id": "Q1"}])
         remaining: object = cast(object, json.loads(self.outstanding().read_text())) if self.outstanding().exists() else []
         self.assertEqual(remaining, [])
         before = self.store_snapshot()

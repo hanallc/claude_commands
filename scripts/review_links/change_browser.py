@@ -586,7 +586,7 @@ section+section{border:0;margin:0;padding:0}
 </style>"""
 
 
-def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
+def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus, *, feedback_closes: bool = False) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) != {"row", "token", "outcome", "feedback"} or any(len(value) != 1 for value in fields.values()):
         raise change_page.AnswerRefused("use the answer form on this page")
@@ -629,7 +629,7 @@ def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus
         raise change_page.AnswerRefused("the production document is not available")
     fields["row"] = [found.row["#"]]
     rewritten = urlencode({key: values[0] for key, values in fields.items()})
-    delivery = change_page.submit(found.page, rewritten, status, prepared=prepared.queues[found.tab])
+    delivery = change_page.submit(found.page, rewritten, status, prepared=prepared.queues[found.tab], feedback_closes=feedback_closes)
     answer = ""
     if fields["outcome"] not in (["validate"], ["question"]):
         answer = next(row.get("Verdict", "") for row in change_review.review_rows(found.page.review_list)

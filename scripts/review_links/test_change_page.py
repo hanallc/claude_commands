@@ -594,13 +594,14 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.command(change_page, change_page.main, []).stdout, result.stdout)
         console = self.request(url.path, {})
         self.assertEqual(console.status, 200)
-        self.assertIn('data-url="/console/changes.html" data-title="Changes"', console.body)
+        self.assertIn('data-url="/console/review.html" data-title="Review"', console.body)
         self.assertIn('data-url="/console/rebuilds.html" data-title="Rebuilds needed"', console.body)
         manifest = self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST
         token = manifest.read_bytes()
         self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
-        changes = self.request("/console/changes.html", {})
-        self.assertEqual(changes.status, 200)
+        redirect = self.http_request("/console/changes.html", {})
+        self.assertEqual((redirect.status, redirect.location), (303, "/console/review.html#type=change"))
+        changes = self.legacy_browser_reply("/console/changes.html")
         self.assertIn("if(parent!==window) parent.postMessage('console-place',location.origin);", changes.body)
         self.assertIn("const hidden=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;", changes.body)
         self.assertIn("event.data==='console-shown')", changes.body)
@@ -1063,7 +1064,7 @@ class ChangePageTests(unittest.TestCase):
         _ = config.write_text(config.read_text().replace("unrouted_alert_retry_seconds=60", ""))
         path = change_page.page_url()
         with redirect_stderr(StringIO()) as errors:
-            reply = self.request(path, {})
+            reply = self.legacy_browser_reply(path)
         forms = BrowserForms()
         forms.feed(reply.body)
         self.assertEqual(reply.status, 200)
@@ -1342,7 +1343,7 @@ class ChangePageTests(unittest.TestCase):
         for state in ("pending", "failed"):
             with self.subTest(state=state):
                 _ = status.path(self.page, "C1").write_text(json.dumps({"verdict": {"attempt": "old", "state": state}}))
-                self.assert_no_delivery_controls(self.request(path, {}).body)
+                self.assert_no_delivery_controls(self.legacy_browser_reply(path).body)
                 content = self.request(self.page_path, {}).body
                 self.assertIn("Saved: works", content)
                 self.assert_no_delivery_controls(content)
@@ -1388,7 +1389,7 @@ class ChangePageTests(unittest.TestCase):
     def request(self, path: str, fields: dict[str, str]) -> Reply:
         self.delivery_done.clear()
         reply = self.http_request(path, fields)
-        if reply.status == 303 and fields.get("outcome") != "next":
+        if fields and reply.status == 303 and fields.get("outcome") != "next":
             self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS), "message delivery did not finish")
         return reply
 
@@ -1577,13 +1578,21 @@ class ChangePageTests(unittest.TestCase):
                 thread.join(TEST_HANG_GUARD_SECS)
         self.assertEqual(results, [[]])
 
+    def legacy_browser_reply(self, path: str) -> Reply:
+        """Render retained forms from a page that was open before the migration."""
+        if not path.startswith("/console/"):
+            return self.request(path, {})
+        browser = change_browser.page_at(self.root, path)
+        body = change_browser.render(browser, change_page.DeliveryStatus(self.root)).decode()
+        return Reply(200, body, "")
+
     def browser(self, kind: change_page.ReviewKind = "changes") -> tuple[str, BrowserForms, str]:
         path = change_page.page_url()
-        reply = self.request(path + ("?type=questions" if kind == "questions" else ""), {})
-        self.assertEqual(reply.status, 200)
+        browser = change_browser.page_at(self.root, path + ("?type=questions" if kind == "questions" else ""))
+        body = change_browser.render(browser, change_page.DeliveryStatus(self.root)).decode()
         forms = BrowserForms()
-        forms.feed(reply.body)
-        return path, forms, reply.body
+        forms.feed(body)
+        return path, forms, body
 
     def browser_fields(self, forms: BrowserForms, key: str, outcome: str = "works", feedback: str = "") -> dict[str, str]:
         return forms.rows[key] | {"row": key, "outcome": outcome, "feedback": feedback}
@@ -1669,7 +1678,7 @@ class ChangePageTests(unittest.TestCase):
         other = self.file_other_change()
         path = change_page.page_url()
         with patch.object(change_review, "read", wraps=change_review.read) as reads:
-            reply = self.request(path, {})
+            reply = self.legacy_browser_reply(path)
         self.assertEqual(reply.status, 200)
         for review_list in (self.review_list, other):
             self.assertEqual(sum(call.args == (review_list,) for call in reads.call_args_list), 1)
@@ -1708,7 +1717,7 @@ class ChangePageTests(unittest.TestCase):
                     self.assertNotIn(removed, body)
         with self.subTest(kind="unknown"):
             for query in ("?type=rebuilds", "?type=changes&type=questions"):
-                self.assertEqual(self.request(path + query, {}).status, 503)
+                self.assertEqual(self.request(path + query, {}).status, 303)
 
         rebuilds = path.rsplit("/", 1)[0] + "/" + change_page.REBUILDS_NAME
         with self.subTest(rebuilds="missing folder"):
@@ -1944,7 +1953,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("Check this yourself", self.messages[0][2])
         self.assertEqual(len(change_review.pending(self.review_list)), 3)
         refreshed = BrowserForms()
-        refreshed.feed(self.request(path, {}).body)
+        refreshed.feed(self.legacy_browser_reply(path).body)
         self.assertEqual(list(refreshed.rows), ["page-owner/C2", "page-owner/C3", "page-owner/C1"])
 
     def test_a_renamed_unit_gets_its_current_staff_session(self) -> None:
@@ -2000,7 +2009,7 @@ class ChangePageTests(unittest.TestCase):
                 self.assertEqual(list(pending.counts.items()), [("page-owner", 3), ("alpha", 0), ("demo", 0)])
                 status.record(change_page.MessageDelivery(page, "C1", (), "", attempt))
                 forms = BrowserForms()
-                forms.feed(self.request(path, {}).body)
+                forms.feed(self.legacy_browser_reply(path).body)
                 self.assertEqual(list(forms.counts.items()), [("page-owner", 3), ("alpha", 0), ("demo", 0)])
                 prepared = change_browser.prepare(change_browser.page_at(self.root, path), change_page.DeliveryStatus(self.root))
                 self.assertEqual(list(prepared.queues), ["page-owner", "alpha", "demo"])
@@ -2229,7 +2238,7 @@ class ChangePageTests(unittest.TestCase):
                 self.assertEqual(json.loads(reply.body), {"answer": "works"})
                 self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
                 self.assertFalse(self.delivery_done.is_set())
-                pending = self.request(path, {}).body
+                pending = self.legacy_browser_reply(path).body
                 refreshed = BrowserForms()
                 refreshed.feed(pending)
                 self.assertNotIn("page-owner/C1", refreshed.rows)
@@ -2240,7 +2249,7 @@ class ChangePageTests(unittest.TestCase):
                 release.set()
                 if entered.is_set():
                     self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
-        landed = self.request(path, {}).body
+        landed = self.legacy_browser_reply(path).body
         self.assert_no_delivery_controls(landed)
 
     def test_a_failed_browser_save_returns_plain_words_and_accepts_the_same_typed_answer_again(self) -> None:
@@ -2303,7 +2312,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("Saved: not works: Please fix", content)
         self.assert_no_delivery_controls(content)
         refreshed = BrowserForms()
-        refreshed.feed(self.request(path, {}).body)
+        refreshed.feed(self.legacy_browser_reply(path).body)
         self.assertEqual(refreshed.counts["page-owner"], 2)
         self.assert_record_cleared()
 
@@ -2360,7 +2369,7 @@ class ChangePageTests(unittest.TestCase):
         path, forms, body = self.browser()
         self.assertEqual(forms.orders["page-owner"], ["page-owner/C3", "page-owner/C2", "page-owner/C1"])
         before = set(self.root.iterdir())
-        self.assertEqual(self.request(path, {}).status, 200)
+        self.assertEqual(self.legacy_browser_reply(path).status, 200)
         self.assertEqual(set(self.root.iterdir()), before)
         self.assertIn('data-next hidden>Skip for now', body)
 
@@ -2494,7 +2503,7 @@ class ChangePageTests(unittest.TestCase):
                 prepared = change_browser.prepare(change_browser.page_at(self.root, path), status)
                 self.assertNotIn("page-owner/C1", [item.key for item in prepared.changes if item.waiting])
                 self.assertNotIn("C1", [entry.key for entry in prepared.queues["page-owner"].entries])
-                content = self.request(path, {}).body
+                content = self.legacy_browser_reply(path).body
                 refreshed = BrowserForms()
                 refreshed.feed(content)
                 self.assertEqual(refreshed.counts["page-owner"], 2)
@@ -2510,7 +2519,7 @@ class ChangePageTests(unittest.TestCase):
             self.assertEqual(self.http_request(path, self.browser_fields(
                 forms, "page-owner/C1", "validate", "Keep <these> words")).status, 200)
             self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
-        content = self.request(path, {}).body
+        content = self.legacy_browser_reply(path).body
         refreshed = BrowserForms()
         refreshed.feed(content)
         self.assertEqual(refreshed.counts["page-owner"], 2)
@@ -2527,7 +2536,7 @@ class ChangePageTests(unittest.TestCase):
             reply = self.http_request(path, self.browser_fields(forms, "page-owner/C1", "validate", "Keep this answer"))
         self.assertEqual(reply.status, 503)
         refreshed = BrowserForms()
-        refreshed.feed(self.request(path, {}).body)
+        refreshed.feed(self.legacy_browser_reply(path).body)
         self.assertEqual(refreshed.counts["page-owner"], 3)
         self.assertTrue(refreshed.pending["page-owner/C1"])
 
@@ -2555,7 +2564,7 @@ class ChangePageTests(unittest.TestCase):
             self.assertIn(line, self.messages[0][2])
         self.assertNotIn("Question id:", self.messages[0][2])
         self.assertNotIn("validate this", self.messages[0][2])
-        content = self.request(path, {}).body
+        content = self.legacy_browser_reply(path).body
         refreshed = BrowserForms()
         refreshed.feed(content)
         self.assertEqual(refreshed.counts["page-owner"], 2)
@@ -2572,7 +2581,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(len(self.messages), 1)
         note = self.answer_question("The <proof> now has three steps.", question_id=feedback.question_id)
         self.assertEqual(note.returncode, 0, note.stderr)
-        content = self.request(path, {}).body
+        content = self.legacy_browser_reply(path).body
         refreshed = BrowserForms()
         refreshed.feed(content)
         self.assertEqual(refreshed.counts["page-owner"], 3)
@@ -2627,7 +2636,7 @@ class ChangePageTests(unittest.TestCase):
         prepared = change_browser.prepare(browser, change_page.DeliveryStatus(self.root))
         self.assertIn("page-owner/C1", [item.key for item in prepared.changes if item.waiting])
         self.assertIn("C1", [entry.key for entry in prepared.queues["page-owner"].entries])
-        content = self.request(path, {}).body
+        content = self.legacy_browser_reply(path).body
         refreshed = BrowserForms()
         refreshed.feed(content)
         self.assertEqual(refreshed.counts["page-owner"], 3)
@@ -2793,7 +2802,7 @@ class ChangePageTests(unittest.TestCase):
                     assert isinstance(slots.question, change_page.OpenQuestion)
                     self.assertEqual(slots.question.text, normalized)
                     self.assertIn('<p> First &lt;line&gt; \n\n Second &amp; line\nThird</p>',
-                                  self.http_request(path, {}).body)
+                                  self.legacy_browser_reply(path).body)
                 saved = self.review_list.read_bytes()
                 delivery = record.read_bytes() if record.exists() else b""
                 messages = list(self.messages)
@@ -2865,7 +2874,7 @@ class ChangePageTests(unittest.TestCase):
             self.assertEqual(self.http_request(path, self.browser_fields(
                 forms, "page-owner/C1", "question", "Which <groups>?")).status, 200)
             self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
-        content = self.request(path, {}).body
+        content = self.legacy_browser_reply(path).body
         refreshed = BrowserForms()
         refreshed.feed(content)
         self.assertEqual(refreshed.counts["page-owner"], 2)
@@ -2903,7 +2912,7 @@ class ChangePageTests(unittest.TestCase):
             reply = self.http_request(path, self.browser_fields(forms, "page-owner/C1", "question", "Which groups?"))
         self.assertEqual(reply.status, 503)
         refreshed = BrowserForms()
-        refreshed.feed(self.request(path, {}).body)
+        refreshed.feed(self.legacy_browser_reply(path).body)
         self.assertEqual(refreshed.counts["page-owner"], 3)
         self.assertTrue(refreshed.pending["page-owner/C1"])
         self.assertEqual(self.messages, [])
@@ -2970,7 +2979,7 @@ class ChangePageTests(unittest.TestCase):
         prepared = change_browser.prepare(change_browser.page_at(self.root, path), change_page.DeliveryStatus(self.root))
         self.assertNotIn("page-owner/C1", [item.key for item in prepared.changes if item.waiting])
         self.assertNotIn("C1", [entry.key for entry in prepared.queues["page-owner"].entries])
-        content = self.request(path, {}).body
+        content = self.legacy_browser_reply(path).body
         refreshed = BrowserForms()
         refreshed.feed(content)
         self.assertEqual(refreshed.counts["page-owner"], 2)
@@ -3497,7 +3506,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(set(urgency.ended(queue.name)), {"demo/C1"})
         self.assertNotIn("demo/C1", [entry.key for entry in urgency.queue_order(queue.entries, queue.name)])
         self.assertEqual([recipient for recipient, _, _ in self.messages], ["demo"])
-        self.assertNotIn("changes left", self.request(path, {}).body)
+        self.assertNotIn("changes left", self.legacy_browser_reply(path).body)
 
     def test_paths_commands_extra_fields_and_forged_page_tokens_are_refused(self) -> None:
         before = self.review_list.read_bytes()
@@ -3537,7 +3546,7 @@ class ChangePageTests(unittest.TestCase):
                 saved = next(item for item in change_review.review_rows(self.review_list) if item["#"] == row)
                 self.assertEqual(saved["Verdict"], verdict)
                 self.assertIn("Saved: " + verdict.replace("<", "&lt;").replace(">", "&gt;"),
-                              self.request(path, {}).body)
+                              self.legacy_browser_reply(path).body)
 
     def test_not_works_with_words_preserves_them_and_returns_to_the_unit(self) -> None:
         words = "I still see the internal ids"
@@ -3584,7 +3593,7 @@ class ChangePageTests(unittest.TestCase):
                                       ["--production", "page-owner", "--list", str(self.review_list), *rows])
                 self.assertEqual((result.returncode, result.stderr), (0, ""))
                 path = urlsplit(result.stdout.strip()).path
-                reply = self.request(path, {})
+                reply = self.legacy_browser_reply(path)
                 self.assertEqual(reply.status, 200)
                 for row in ("C1", "C2", "C3"):
                     self.assertEqual(f'<section id="{row}" data-change-card>' in reply.body, row in rows)
@@ -3728,7 +3737,7 @@ class ChangePageTests(unittest.TestCase):
         self.feature_command("propose", "--review", "C1", *self.note_arguments("hana", "Numbered moves"))
         self.assertEqual(self.request(path, dict(self.answer(), token=page.token)).status, 303)
         self.assertEqual(self.proposal("C1")["status"], "landed")
-        self.assertIn("Saved: works", self.request(path, {}).body)
+        self.assertIn("Saved: works", self.legacy_browser_reply(path).body)
 
     def test_a_producer_id_routes_feedback_to_its_unit(self) -> None:
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Direct checkpoint", "Run", "Proof")],
@@ -3958,7 +3967,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
         other_path = urlsplit(change_page.publish(self.production, self.review_list, ["C1"])).path
         for path in (self.page_path, other_path):
-            body = self.request(path, {}).body
+            body = self.legacy_browser_reply(path).body
             self.assertIn("Saved: works", body)
             self.assert_no_delivery_controls(body)
             self.assertNotIn("private failure", body)
@@ -4236,7 +4245,7 @@ class ChangePageTests(unittest.TestCase):
         path = urlsplit(reply.location).path
         self.assertNotEqual(path, self.page_path)
         self.assertEqual(change_page.page_at(self.root, path).rows, ("C3",))
-        self.assertIn("Internal comments clarified", self.request(path, {}).body)
+        self.assertIn("Internal comments clarified", self.legacy_browser_reply(path).body)
         self.assertEqual([row["#"] for row in change_review.pending(self.review_list)], ["C2", "C3"])
 
     def test_an_empty_queue_shows_zero_without_a_next_control(self) -> None:
@@ -4244,7 +4253,7 @@ class ChangePageTests(unittest.TestCase):
         page = change_page.page_at(self.root, path)
         for row in page.rows:
             self.assertEqual(self.request(path, dict(self.answer(row), token=page.token)).status, 303)
-        body = self.request(path, {}).body
+        body = self.legacy_browser_reply(path).body
         self.assertIn("No changes to review.", body)
         self.assertNotIn('value="next"', body)
         self.assertEqual(self.request(path, {"outcome": "next", "token": page.token}).status, 400)

@@ -214,7 +214,7 @@ class FooterCountsTests(unittest.TestCase):
         doc = self.doc(f"- **Change review:** `{listing}`", f"- **Proposals:** {folder}",
                        f"- **Improvement queue:** {ledger}", f"- **Efficiency ledger:** `{efficiency}`")
         self.assertEqual(footer_counts.read_counts(doc, questions=1),
-                         FooterCounts(changes=2, proposals=2, questions=1, efficiency=2))
+                         FooterCounts(changes=2, proposals=2, questions=1, efficiency=1))
 
     def test_a_source_counts_only_its_waiting_items_and_omits_unrouted_rows(self) -> None:
         own = unit_membership("production", "own").id
@@ -244,9 +244,9 @@ class FooterCountsTests(unittest.TestCase):
         doc = self.doc(f"- **Change review:** {listing}", f"- **Proposals:** {folder}",
                        f"- **Improvement queue:** {backlog}", f"- **Efficiency ledger:** {ledger}")
         for extra, full_efficiency, own_efficiency in (
-                ("", 4, 2),
-                (f"- 2026-11-12 config: T [by: {own}] — deferred; related item — done\n", 5, 3),
-                (f"- 2026-11-12 config: T [by: {own}]  — proposed\n", 5, 3)):
+                ("", 3, 1),
+                (f"- 2026-11-12 config: T [by: {own}] — deferred; related item — done\n", 3, 1),
+                (f"- 2026-11-12 config: T [by: {own}]  — proposed\n", 4, 2)):
             _ = ledger.write_text(efficiency_lines + extra)
             for source, expected in (
                     ("", FooterCounts(changes=4, proposals=4, efficiency=full_efficiency, unrouted=1)),
@@ -307,11 +307,11 @@ class FooterCountsTests(unittest.TestCase):
             for title in titles:
                 self.assertIn(f"{title}\n{ledger}", [entry.item for entry in queue.entries])
 
-    def test_efficiency_counts_only_dated_proposed_and_deferred_first_statuses(self) -> None:
+    def test_efficiency_counts_only_dated_proposed_first_statuses(self) -> None:
         ledger = self.root / "efficiency.md"
         _ = ledger.write_text(EFFICIENCY_LEDGER, encoding="utf-8")
         doc = self.doc(f"- **Efficiency ledger:** {ledger}")
-        self.assertEqual(footer_counts.efficiency(doc), 2)
+        self.assertEqual(footer_counts.efficiency(doc), 1)
 
     def test_efficiency_without_a_readable_ledger_counts_nothing(self) -> None:
         for field in ("", f"- **Efficiency ledger:** {self.root / 'absent.md'}",

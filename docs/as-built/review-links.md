@@ -94,7 +94,7 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for Accounts, AWS, Builds, Changes, Disks, Images, Investigations, List and Questions, in alphabetical order.
+The left navigation has icons and labels for Accounts, AWS, Builds, Disks, Images, List and Review, in alphabetical order.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`. The content column is centered in the frame, 32px below its top edge, with at least 32px at each side.
 Each navigation page places `page_frame.title()` directly above its content.
@@ -122,16 +122,16 @@ Reduced motion stops the loader icon.
 `page_frame.createPageRefresh` owns the refresh timers, visibility handling, failures and status drawing.
 Each loader checks the request identity before it changes content.
 An older response cannot replace a newer response.
-Accounts, Changes, Investigations, List and Questions read their rendered page at `page_refresh_seconds` intervals.
+Accounts, List and Review read their rendered page at `page_refresh_seconds` intervals.
 Builds reads `memory.json` at its feed interval.
 Disks reads `disks.json` at `page.poll_seconds` intervals and requests a new measure when needed.
 AWS reads its published page when shown; its hourly publisher sets the data time and render time.
 Images reads its rendered page when shown.
-The Changes and Questions pages show Paused while text or an active save holds a replacement.
+Review retains typed text across refresh and holds replacement during an active save.
 
 The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
-AWS, Builds, Changes, Images, Investigations, List, Questions and Rebuilds put the title in the same place.
+AWS, Builds, Images, List, Review and Rebuilds put the title in the same place.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
@@ -162,7 +162,7 @@ A page that changes its place with `history.replaceState` posts `console-place` 
 
 A page in a hidden frame can pause its refresh: `window.frameElement?.hidden === true` while the frame is hidden.
 When the console shows a frame that was open before, it posts `console-shown` to that frame, and the page can load an update at once.
-The Changes page follows both rules.
+The Review page follows both rules.
 The shared refresh component stops data requests in hidden frames and hidden browser tabs.
 
 Older links forward to the fixed address with a 303 and keep their query.
@@ -211,10 +211,8 @@ When no machine needs a rebuild, the link hides, and an open Rebuilds page shows
 A navigation entry shows the Lucide `sparkle` icon when its page holds an item added after the user last opened that page.
 An optional `page.<id>.items` key names the page's items function, in the form `python:<module>:<function>`.
 The function takes a `console.NewsRequest` and returns the keys of the items that wait on the page.
-Changes uses `change_browser.waiting_changes`.
-Questions uses `change_browser.waiting_questions`.
+Review uses `review_page.waiting_items` for For you records.
 Images uses `images.waiting_images` for registered images without `feedback_at`.
-Investigations uses `investigations_page.waiting_investigations` for answer-ready records, with the owner, id and answered time in each key.
 The Images page and its items function share the same waiting-record filter.
 Temporary change images stay outside the Images page and its new mark.
 A page without an items function, or an unavailable page, never shows the icon.
@@ -239,151 +237,48 @@ They are `list-checks`, `message-circle-question`, `hammer`, `cloud`, `image`, `
 That folder includes the version, source, and ISC license.
 The console inlines the icons and makes no CDN, font, script, or stylesheet request.
 
-### Questions and Changes
+### Review page
 
-`changes.html` shows one kind of item: Changes by default, Questions with `?type=questions`.
-Any other `type` value gets a 503 page.
-The page has no tab bar and no combined total.
-The heading and document title follow the kind: **Changes to review** or **Questions to answer**.
-The page updates itself through its existing GET URL without a full reload.
-The one exception is a server update that changes the page script.
-The content carries `data-script`, a hash of the script from `change_page.script_version()`.
-When an update brings a different hash, the page loads again, because the old script cannot bind the new rows.
-`page_refresh_seconds` sets the interval from 5 to 300 seconds; it starts at 15.
-The page loads updates only while its browser tab is visible.
-It loads an update at once when the tab becomes visible again.
-Updates retain the selected showrunner, waiting card, open Details sections, and scroll position.
-If the card no longer waits, the page selects the next waiting item in the same filter.
-Typed text or an active save holds replacement; the page keeps only the newest loaded update.
-The page applies that update when all unsaved fields are empty or the save ends.
-A successful save requests a fresh update so an older response cannot restore the saved item.
-Updates preserve a retained field's focus and cursor.
-A failed load changes nothing; the next interval tries again.
-Button borders use light and dark colors with at least 3:1 contrast against the button fill and page background.
-The page shows one card at a time.
-The compact **Showrunner:** menu starts with **All (n)** and then lists each showrunner with its waiting count.
-All is the default and lists each root showrunner's queue in turn.
-The menu keeps the existing showrunner order.
-The menu stays on one line at phone and desktop widths.
-The URL fragment records the showrunner and card.
-All with no card keeps the URL without a fragment.
-Skip for now skips a card without saving an answer.
-The control hides when no other item waits in the selected filter.
-An empty page shows **No questions to answer.** or **No changes to review.**
+`/console/review.html` replaces the Changes, Questions and Investigations navigation pages.
+The old addresses redirect to Review with the corresponding type filter.
+Selected-row snapshots retain their signed legacy forms.
 
-Each change can hold one image id in its optional `Image` cell.
-`change_review.py add --image <png>` registers the file and fills that cell.
-`change_review.py edit --row <id> --image <png>` attaches or replaces an image without changing the other cells.
-It adds the `Image` column when needed and deletes the old image after writing the row.
-`change_review.py image --image <png>` registers a screenshot for a checkpoint line.
-`image --output <text file>` renders dark terminal output with headless Chrome in a temporary browser profile.
-It measures the wrapped text height before capture and uses that height for the image.
-The image height has a 160-pixel minimum because Chrome clips shorter screenshots.
-The image height has a 4096-pixel limit.
-The action prints the id for a final ` | image <id>` field, after optional ` | after <step>`.
-The parser accepts twelve lowercase hexadecimal characters.
-The commit hook requires an image on each visible Change-Review line through `change_review.problem`.
-Merge checks require the image for commits dated at or after 2026-11-16 00:00 EST, using the Git committer time (`%ct`).
-Malformed lines remain invalid at every date.
-Merged history remains readable without an image.
-`list-ready` and `live` leave the cell empty and print one line when the image is missing.
+`review_items.py` reads the existing question, change, investigation, proposal and efficiency stores.
+It projects each record into one `ReviewItem`; it stores no second record.
+Each item has an ID, type, owner, source unit, title, state, times, log and permitted actions.
+The states are **For you**, **Waiting** and **Done**.
+A future time hides an item without changing its state.
+The count readers and `/next` use this shared reader.
+Only For you items count in the status line.
+An open investigation and a deferred efficiency item do not count.
+Questions receive a stable owner-local `Q<n>` ID in their existing registration record.
 
-Both review pages use `change_page.change_content` and `CHANGE_IMAGE_STYLE` for the thumbnail.
-The thumbnail occupies 280px beside the 680px text column in a main area of at most 1056px.
-It has a 420px height limit and crops from the top left.
-A plain click opens the shared image zoom over the page.
-Escape or a click on the zoom closes it and returns focus to the image link.
-Shift, Ctrl, Meta and Alt clicks retain the browser's link action.
-Middle clicks and the right-click menu retain the browser's link action.
-Below 1000px, it moves under the text.
-A row without an image retains its text width and position.
+This phase shows Questions, Changes and Investigations.
+The table columns are Id, Type, Owner, Item, State and Age.
+One row can open its card in place.
+`record_table.py` supplies the table styles, filters, sorting and open-row controls for Review and The List.
+Each row becomes a card at phone width.
+Type chips and the Owner menu show counts.
+Show offers Open, For you, Waiting, Done and All.
+Open puts For you records before Waiting records.
+The text filter matches the ID and title.
+The address retains the filters, sort and open item.
+The default order uses the existing urgency levels and age.
+Questions use a violet circle-help icon; Changes use a blue diff icon; Investigations use a teal microscope icon.
 
-`image_store.register_file` shares draft creation, image suffix checks, and atomic publication between the two image stores.
-It stores a single image or a before and after pair with one record.
-`image_store.read_record` checks the optional `before` and `feedback_at` fields.
-Change images live in `change-images/<id>/`, separate from the Images page's `images/` store.
-`| image <id>` accepts an id from either store.
-`change_review._row_image` copies an Images page file into the change store and puts the new id in the row.
-It copies the after image for a pair. The source stays in the Images page store until its owner deletes it.
-`change_review.record_verdict` clears the cell and deletes its image for landing and return verdicts.
-The snapshot sweep skips both image stores during normal snapshot deletion.
-It deletes change images only when no To review row names them and their age exceeds `change_image_unclaimed_days`.
-The setting starts at 14 days and is read at each sweep.
-
-Questions read the canonical records through `update_registration.question_records_for_document`.
-A question belongs to the showrunner or producer whose fixed staff id owns it.
-A producer's question appears in its current staff name's filter with the same answer form.
-Producer questions use `<SHOWRUNNER_STATE_DIR>/<producer staff id>/questions` without a production document.
-A question without a staff owner appears under **Owner unavailable**.
-The reader also scans question folders under the showrunner state root when their owners leave staff.
-Cards show the title before the filed text and choices.
-Under the buttons, aligned footer lines show `source:`, `date:` and `time:`, in the same form as Changes.
-The source uses the asker's current staff name.
-For a unit, the source is `<parent showrunner name> · <unit name>`.
-The footer reads `since`, which the question record always keeps in the user zone.
-It shows the date as YYYY-MM-DD and the time as HH:MM.
-Cards in **Owner unavailable** show the footer without an answer form.
-They have no separate Question label.
-A question filed with parts (`ask --ask`) shows each part as its own section:
-- the one-line ask in bold, when it differs from the title in more than case and a final `?` or `.`;
-- **Context**;
-- **Items** as a numbered list, with each line of an item on its own line;
-- **Recommended**;
-- **Choices** as a list of radio items above the answer box. A choice fills the box; the user can edit the text or write their own.
-A question stored as one text, from before the parts form, shows in sections too:
-
-1. It uses `reviewed` when that field exists. Otherwise, it uses `question`.
-2. The title uses the first reviewed line when that line contains `?`. Otherwise, it uses that line's first sentence. For raw text, the title uses the first sentence that ends with `?`.
-3. For reviewed text, the body starts with the rest of the first line and excludes the title. Context paragraphs remain separate, and `- ` lines form a list.
-4. A raw question stored on one line shows each context sentence as a separate paragraph.
-5. **Items** holds runs marked `1)` `2)`, `1.` `2.`, `(1)` `(2)` or `(a)` `(b)`, in order.
-6. **Choices** uses numbered choices or labeled choices after `Choices:` as radio items.
-7. Reviewed text can end with two or more labeled choice paragraphs. These paragraphs use the same radio items.
-8. Choices without clear labels or numbers remain separate text items. The page does not invent answer values.
-9. **Recommended** uses explicit `Recommended:` text. A reviewed choice keeps its `(recommended)` mark without a second section.
-
-In all question text, each `http` or `https` address is a link that opens in the same tab (`target="_top"`), outside the console frame.
-A right click can open it in a new tab.
-In all question text, a span in backticks shows as code, and an address in a code span is not a link.
-An item that is only one backtick span, such as a command, shows as a code block.
-A fenced block or a backtick-only line after an item ending with `:` stays inside that item.
-The code block gets no separate number in either the parts form or the one-text form.
-Numbers inside code do not affect the item numbers.
-The form of a new question is in `~/.claude/docs/question_template.md`.
-The answer box has the label **Your answer** and this help line: `A choice fills this. Edit it or write your own. Nothing sends until you press Answer.`
-Three buttons share one row below the box: **Answer**, **Followup** and **Skip**.
-Answer and Followup stay disabled until the box holds text.
-- **Answer** records the answer and sends it to the asker.
-- **Followup** sends the text to the asker as a question about the question.
-  The question leaves the page, the counts and `/next` until the asker replies.
-  The message gives the asker the `update_registration.py reply` command.
-- **Skip** saves no answer. It moves the question to the end of the list that the page and `/next` use, and tells the asker that it stays open.
-A question card shows each earlier follow-up and its reply as **Follow-up** and **Reply** sections.
-A question card has no Skip for now control.
-An **Owner unavailable** card shows the question and `No showrunner owns this question.`
-It has no answer form, and the server refuses an answer.
-It has no Ask showrunner to check or Ask a question controls.
-`update_registration.answer` records the answer for its owning production.
-The typed `AnswerRelay` gives the same recipient decision as the CLI relay line.
-A unit relay receives the answer directly.
-A transferred unit's showrunner receives the answer with the unit's name.
-A producer receives its answer directly through its current session from the staff record at each send attempt.
-An answer without a relay goes to the question's showrunner.
-Each message starts with `From the user (via the review page): ` and names the question.
-
-A saved answer opens the next waiting question and shows **Answer saved.** above the card.
-A follow-up shows **Follow-up sent.**, and a skip shows **Skipped.**
-A failed save retains the typed answer and shows **Not saved: <reason>**.
-An answer to a question already answered elsewhere fails without sending another message.
-Question answers use the existing delivery budget, pause, claims, startup recovery, and failure alert.
-Private delivery records retain the answer text, message, source record, owning document, and fixed recipient ids for recovery.
-The first delivery record stores `saved: false` before the answer saves.
-The second delivery record stores `saved: true` after the answer saves.
-A save error clears that attempt's delivery intent and releases its claim.
-Recovery sends only answers with `saved: true` whose canonical question record is closed.
-Recovery clears an intent for an open question.
-For a closed question without `saved: true`, recovery clears the intent and prints `answer save state unknown; not sent`.
-Answers to questions and changes both post to `changes.html`.
+Questions offer Answer.
+Changes offer Works, Does not work, Ask showrunner to check, Ask a question and Send feedback.
+Investigations with an answer offer Mark read.
+The shared sender handles Question and Change delivery, retries, alerts and recovery.
+Send feedback closes a change.
+Ask showrunner to check transfers the next action to the showrunner.
+A successful check closes the item; only a problem returns it to For you.
+After a save, the row shows its result and leaves the view.
+The page does not open another card automatically.
+The shared status component refreshes the page every `page_refresh_seconds`, initially 15 seconds.
+Refresh retains the open row, scroll position and typed text.
+The Review navigation entry marks new For you items.
+Cross-type feedback, questions, Later, and owner reply commands belong to the next phase.
 
 ### Accounts page
 
@@ -408,7 +303,7 @@ A cached Accounts response carries its render failure to the status line.
 The page reads its color tokens and base type from `console_theme.py`, and its main column and title from `page_frame.STYLE`.
 It refreshes every 15 seconds through `page_refresh_seconds` while the page is visible.
 It also refreshes when the console shows it again and when the tab becomes visible.
-Changes, Images and Accounts use the same refresh helper in `page_frame.py`.
+Review, Images and Accounts use the same refresh helper in `page_frame.py`.
 Images has no interval timer.
 
 The shared status line shows the last server render time.
@@ -470,58 +365,6 @@ The counts strip uses the status line readers for questions, changes, and rebuil
 Each count links to its existing page.
 The strip omits proposals and efficiencies because they have no console page.
 Closed items show no check text in the page or CLI.
-
-### Investigations page
-
-`/console/investigations.html` reads every owner's investigation folder, including owners without a current staff row.
-The console places Investigations between Images and Questions with the Lucide `search` icon.
-Each card shows its title, question, answer when present, and the source, date and time as aligned footer lines.
-The source uses the current staff name, or the fixed staff id when the staff row is absent.
-A unit source shows its parent showrunner name and unit name.
-The date and time show the filed time in the user's zone.
-Question and answer text use the Questions page's paragraph and list helper.
-
-The Owner menu lists All and the owners with records, in name order.
-The Show menu lists Not read, Answer ready, Waiting, Read and All.
-Not read is the default.
-The address retains both filters.
-Ready answers appear first, newest answer first.
-Waiting questions follow, oldest filed first.
-Read answers appear last, newest read first.
-
-Only answer-ready cards show Mark read.
-The signed form posts to the server, which calls `investigation.mark_read`.
-A successful save removes the card from the Not read view without a document reload.
-A failed save retains the card and displays the error.
-The page uses `page_frame.createPageRefresh` and `page_refresh_seconds`, with the same visibility rules as Questions.
-Refresh retains the filters and scroll position, skips active saves, and refuses older responses after a newer response or save.
-New ready answers mark the navigation entry as new until the user visits the page.
-
-### Investigations page
-
-`/console/investigations.html` reads every owner's investigation folder, including owners without a current staff row.
-The console places Investigations between Images and Questions with the Lucide `search` icon.
-Each card shows its title, question, answer when present, and the source, date and time as aligned footer lines.
-The source uses the current staff name, or the fixed staff id when the staff row is absent.
-A unit source shows its parent showrunner name and unit name.
-The date and time show the filed time in the user's zone.
-Question and answer text use the Questions page's paragraph and list helper.
-
-The Owner menu lists All and the owners with records, in name order.
-The Show menu lists Not read, Answer ready, Waiting, Read and All.
-Not read is the default.
-The address retains both filters.
-Ready answers appear first, newest answer first.
-Waiting questions follow, oldest filed first.
-Read answers appear last, newest read first.
-
-Only answer-ready cards show Mark read.
-The signed form posts to the server, which calls `investigation.mark_read`.
-A successful save removes the card from the Not read view without a document reload.
-A failed save retains the card and displays the error.
-The page uses `page_frame.createPageRefresh` and `page_refresh_seconds`, with the same visibility rules as Questions.
-Refresh retains the filters and scroll position, skips active saves, and refuses older responses after a newer response or save.
-New ready answers mark the navigation entry as new until the user visits the page.
 
 ### Images page
 
@@ -740,40 +583,9 @@ The `unrouted` count covers all page lists across independent production roots.
 The page and status line use the same waiting rule.
 Saved verdicts, validation requests, and open questions leave the waiting count and Skip for now order as soon as they save.
 The page, footer, and `/next` use this rule regardless of delivery results.
-Empty lists and showrunners retain their zero-count menu options.
-Menu options with waiting changes precede empty options in alphabetical order.
-The selected type tab joins the content panel.
-Its keyboard focus outline stays inside the tab edges.
-Builds rows can remain in the natedev list while the builds filter shows them.
-
-Each showrunner view uses `next_item.change_queue` and `urgency.queue_order`, as `/next change` does without `--all-below`.
-The page shares its list reads and staff routing with `change_review.change_queue`.
-All lists each root's `/next change --all-below` order in turn through `urgency.queue_order`.
-It keeps each root queue's pin, moved rows, and dependencies.
-The page reads `changes_first_root` from `config/review_links.conf` at each render.
-The named root goes first, and other roots follow by name.
-The default is `natedev`.
-A name outside the live roots leaves the root order unchanged.
-Rows outside these queues go last.
-The server supplies each view's order for the first card, waiting list, and Skip for now.
-The browser uses these orders without sorting rows.
+Review shows one row per record and keeps one card open.
+The type, owner and state controls select the visible rows.
 Queue keys and prerequisites retain their list-based IDs.
-The `change` line and `/next` show the responsible showrunner's ID, such as `sdlc/C1514`.
-The shared staff resolver supplies the prefix used by the showrunner filter.
-Rows without a staff producer use the list's showrunner through the same resolver.
-`verdict` and `answer-question` print the same responsible-showrunner ID.
-Row commands and selected-row links accept that ID and the existing list-based ID.
-An ambiguous displayed ID requires an explicit `--list <path>`.
-Skip for now selects the next prepared row in the browser without a server request.
-The URL fragment stores the showrunner and row key.
-A reload restores that place when the row waits, awaits validation, or has an open question.
-An answered row stays absent from the browser list during delivery and after a reload.
-An empty showrunner filter shows **No changes for this showrunner.** or **No questions for this showrunner.** and hides Skip for now.
-The showrunner filter supplies the count; the card has no separate remaining count.
-Works and Does not work open the next waiting change at once, before the server answers.
-Other answers open the next waiting change in the same filter after a successful save.
-Skip for now skips a change without saving an answer.
-The page keeps the current row if the user selects Skip for now or another tab during the save.
 
 The record's `Kind` column remains the only source for the kind.
 Set it with `change_review.py set-kind --production <showrunner name> --row C27 --kind 'See in action'`.
@@ -783,25 +595,11 @@ Both kinds appear.
 An older row without Kind shows no kind line.
 The page shows every row with its recorded kind.
 
-The short URL ends in `/changes.html`.
-The page retains the plain, narrow layout and fits a phone.
-Each card starts with its title, then How to check or Proof.
-The title uses 20px text; section labels use 17px text.
-Aligned detail lines follow the buttons and are always shown: `change`, `date`, `time`, `commit`, and `kind`.
-A line is left out when its value is unknown.
-`time` is the time of day that the row was added, in the user's zone; older rows have no time.
-How to check and Proof show text lines in preformatted blocks.
-Consecutive lines that start with `- ` form a bulleted list.
-Consecutive lines that start with a number, a dot, and a space form a numbered list.
-Text without list lines stays in one block with all whitespace unchanged.
-In text with list lines, blank lines separate blocks and leading spaces are dropped.
-The list file stores cell line breaks as `<br>` and reads them as line breaks.
-A typed `<br>` takes one more backslash in storage and reads back unchanged.
-Every line separator that Python's `splitlines` recognizes is a line break.
-Each row stays on one table line.
-Works, Does not work, Ask showrunner to check, Ask a question, Send feedback, and Skip for now share one wrapping row in that order.
-A desktop width shows two button rows; a 390px phone shows three.
-The **Comment, question or feedback** field is a textarea with `feedback_rows` rows.
+The Review address is `/console/review.html`.
+Each Change card shows its check text and recorded proof.
+Only fenced code gets a box and a copy control.
+Other text keeps its line breaks in plain paragraphs.
+The **Your words** box accepts line breaks for every outcome.
 The setting starts at 5.
 The box accepts line breaks for every outcome.
 The server converts CRLF, CR, and Unicode line separators to newline characters.
@@ -809,14 +607,14 @@ The verdict cell joins stripped, nonblank lines with one space.
 The message and a question keep the normalized line breaks.
 Works with text saves `works: <text>`.
 Does not work with text saves `not works: <text>`.
-Send feedback asks the showrunner to act before the change returns to the user.
+Send feedback sends the words and closes the change.
 Each verdict saves the text from **Comment, question or feedback** as its comment.
 The existing `change_review.lands` function decides whether the verdict lands or returns the row.
 
 **Ask showrunner to check** sends the showrunner the row ID and **the user asks you to validate this**.
 The message includes any feedback from the form.
 This answer writes no verdict and runs no feature-log command.
-The current page advances when the request saves.
+The row leaves the view when the request saves.
 The review list retains the row until the showrunner saves a verdict.
 A direct link shows **The showrunner will validate this** without answer buttons.
 The delivery record preserves this state across page loads and server restarts.
@@ -831,7 +629,7 @@ It saves no verdict and runs no feature-log command.
 The server stores the question before it sends one message to the row's showrunner.
 The message names the row, list, production, change, and question.
 It includes a separate `Question id: <id>` line.
-The page advances after the save.
+The saved row leaves the view without opening another card.
 An open question survives page loads and server restarts.
 A failed HTTP save keeps the row waiting with its typed question and answer form.
 A direct link shows the open question without verdict buttons.
@@ -841,35 +639,21 @@ The command refuses a row without an open question.
 The command refuses an old or unknown question ID.
 The same ID and answer text change nothing and exit 0 on a rerun.
 The same ID with different answer text is refused.
-The row returns to its showrunner's count and Skip for now order after the answer saves.
+The row returns to For you after the answer saves.
 The page shows the question and answer below the change, with the usual answer buttons.
 Question and Answer show text lines in paragraphs and use the same list forms as How to check.
 The answer keeps its internal line breaks and strips only whitespace at its two ends.
 All text is escaped, including text in list items.
 The user can ask another question or save a verdict.
 
-Send feedback asks the showrunner to act on the text.
-Feedback uses the existing question delivery record with `kind: feedback`.
-The message contains `the user sends feedback to act on`, `Feedback id: <id>`, and `Feedback: <text>`.
-Open feedback removes the row from every waiting count and navigation order.
-A direct link shows **The showrunner will act on this** without answer buttons.
-The showrunner uses `change_page.py answer-question` with the feedback id to record its action.
-The page shows **Showrunner: <note>** and returns the row to the waiting count.
-A saved verdict closes the row as before.
-Feedback text that starts with `works` or `fine` saves a verdict under the existing rules.
-Feedback uses the existing delivery attempts, retry budget, and startup recovery.
-Owner unavailable changes retain their verdict controls and hide every showrunner action, including Send feedback.
-
+Send feedback sends the words through the existing sender and closes the change.
+Legacy forms from pages already open retain their prior feedback delivery record.
+Those forms store `kind: feedback` and accept `change_page.py answer-question` replies.
 
 Each answer uses a background `fetch` POST.
-The row shows **Saving** during a save.
-After Works or Does not work, the next card shows **Saving review.** until the save ends, then **Review saved.**
-An automatic move after another answer shows **Answer saved.**, **Follow-up sent.**, **Skipped.** or **Review saved.** above the next card.
-A failed Works or Does not work save puts the row back in the list with its typed text and answer form.
-The notice then shows **Not saved: <row>. <reason> It is back in the list.** and an **Open it** button that shows the row.
-Skip for now stays available during a save.
-A failed save retains the feedback and selected outcome on that row.
-A failed save keeps the row in that count and does not change the current row.
+The row shows **Saving…** during the save and **Saved: <result>** after success.
+The row then leaves the view without opening another card.
+A failed save keeps the row and typed text and shows **Not saved: <reason>**.
 
 The fixed `console/` folder holds the all-list browser's private `.review-link-browser.json` and no HTML file.
 The first `change_page.page_url` call creates the folder and the manifest with a hard link, so two first requests keep one secret.
@@ -1019,7 +803,7 @@ Older selected-row forms retain their styled failure page and typed answer.
 A fallback form needs only the page manifest and notice when row or queue reads fail.
 An unknown page, invalid content type, or refused bind shows one short sentence in the same style.
 
-The browser uses its prepared queue for Skip for now and stores no second queue on the server.
+Legacy browser forms use their prepared queue for Skip for now and store no second queue on the server.
 Ask showrunner to check calls the existing queue writer before the response.
 One stable lock in `urgency.py` protects pin, selection, and move operations across all queues.
 Each operation opens the lock separately and retains atomic file replacement.
@@ -1211,7 +995,7 @@ The alert guard uses only the configured folder.
 The page, the footer and `/next` use these same folder readers.
 
 
-Changes, Questions, and Images share one motion helper.
+Legacy Changes and Questions forms and the Images page share one motion helper.
 A different Changes or Questions card fades out for 180ms, then fades in for 270ms with a 4px upward move.
 A new switch completes the active switch first.
 The first load and an update that keeps the same card do not fade.

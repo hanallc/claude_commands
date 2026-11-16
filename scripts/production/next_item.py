@@ -40,12 +40,11 @@ from typing import NamedTuple, TypeVar, cast
 
 from scripts.production import change_review
 from scripts.production import proposals_folder
-from scripts.production import proposals_table
 from scripts.production.footer_counts import efficiency_ledger
 from scripts.production.store_owner import document_id
 from scripts.production import staff
-from scripts.production.production_doc import Refusal, read_production
-from scripts.production.update_registration import QuestionStaff, ProducerQuestions, RegistrationFailure, open_lists, question_queue
+from scripts.production.production_doc import Refusal
+from scripts.production.update_registration import RegistrationFailure
 
 from scripts.lib import urgency  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -57,7 +56,8 @@ PROPOSAL = "proposal"
 EFFICIENCY = "efficiency"
 QUESTION = "question"
 # The order a tie across lists keeps.
-KINDS = (CHANGE, PROPOSAL, EFFICIENCY, QUESTION)
+INVESTIGATION = "investigation"
+KINDS = (CHANGE, PROPOSAL, EFFICIENCY, QUESTION, INVESTIGATION)
 Item = TypeVar("Item")
 
 
@@ -113,24 +113,13 @@ def efficiency_queue(doc: Path, below: bool = False) -> Queue:
 def read_queue(kind: str, production: Path | None, below: bool = False, *,
                record: staff.StaffSnapshot | None = None) -> Queue:
     """The waiting items of one list."""
+    from scripts.review_links import review_items
     try:
-        match kind:
-            case "change":
-                return change_queue(_doc(production), below)
-            case "proposal":
-                doc = _doc(production)
-                waiting, _ = proposals_table.waiting_entries(doc, below)
-                return Queue(urgency.scope_queue(proposals_table.queue(doc, record=record), below), _as_text(waiting, proposals_table.proposal_text))
-            case "question":
-                identities = QuestionStaff.read() if record is None else QuestionStaff.for_record(record)
-                caller = identities.record.by_current_session(staff.caller_identity()) if production is None else None
-                owner = (caller if caller is not None and caller.kind == "producer"
-                         else identities.owner(_doc(production)))
-                found = ProducerQuestions(owner) if owner.kind == "producer" else read_production(owner)
-                due = open_lists(found, below, identities=identities).due
-                return Queue(question_queue(found, below), _as_text(due, lambda entry: entry.item.line()))
-            case _:
-                return efficiency_queue(_doc(production), below)
+        record = staff.snapshot() if record is None else record
+        caller = record.by_current_session(staff.caller_identity()) if kind == QUESTION and production is None else None
+        scope = caller if caller is not None and caller.kind == "producer" else _doc(production)
+        name, entries = review_items.next_queue(kind, scope, below, record)
+        return Queue(name, entries)
     except (change_review.ChangeReviewError, RegistrationFailure, Refusal, OSError, ValueError) as error:
         raise NextError(f"{kind}: {error}") from None
 

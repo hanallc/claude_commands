@@ -45,7 +45,7 @@ class PageStatusTests(unittest.TestCase):
     def test_only_the_configured_status_pages_have_age_limits(self) -> None:
         limits = {key for key in conf.read_or_repository("console").values() if key.startswith("status.") and key.endswith(".age_limit_seconds")}
         self.assertEqual(limits, {f"status.{page}.age_limit_seconds" for page in (
-            "accounts", "aws", "builds", "changes", "disks", "images", "investigations", "list", "questions")})
+            "accounts", "aws", "builds", "changes", "disks", "images", "investigations", "list", "questions", "review")})
 
     def test_invalid_initial_facts_report_failed_without_an_unhandled_rejection(self) -> None:
         markup = page_frame.title("AWS", "aws")
@@ -207,7 +207,7 @@ function response(status=200){
  const doc=new DOMParser().parseFromString(mode==='cached' ? failedPage : original,'text/html');
  const facts=doc.querySelector('[data-page-status]');
  facts.dataset.readAt=wall/1000;facts.dataset.renderSeconds=.42;
- const root=doc.querySelector('[data-accounts],[data-review-content],[data-images],[data-investigations],[data-list]');
+ const root=doc.querySelector('[data-accounts],[data-review-content],[data-images],[data-investigations],[data-list],[data-review]');
  if(root) root.dataset.loaded='true';
  const aws=doc.querySelector('#aws-prices-data');
  if(aws) aws.textContent=JSON.stringify({...JSON.parse(aws.textContent),read_at:wall/1000,render_seconds:.42});
@@ -258,7 +258,7 @@ window.fetch=async(url,options={})=>{
   shown();await flush();
   check(reads>0 && state()==='Live','the real loader completes a good read');
   check(part('render').textContent==='render 0.42 s','the real loader supplies render time');
-  const root=document.querySelector('[data-accounts],[data-review-content],[data-images],[data-investigations],[data-list]');
+  const root=document.querySelector('[data-accounts],[data-review-content],[data-images],[data-investigations],[data-list],[data-review]');
   if(root) check(root.dataset.loaded==='true','the real loader replaces page content');
   if(expectedPeriod) check(!!requestTimer(),'the real request period runs');
   else check([...intervals.values()].every(timer=>timer.ms===1000),'the zero-period page has only its age timer');

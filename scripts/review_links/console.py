@@ -78,6 +78,8 @@ def read_pages() -> tuple[ConsolePage, ...]:
                                if re.fullmatch(r"page\.[a-z][a-z0-9_-]*\.(label|icon|title|url|items)", key))
     pages: list[ConsolePage] = []
     for identity in identities:
+        if "review" in identities and identity in ("changes", "questions", "investigations"):
+            continue
         prefix = f"page.{identity}."
         label, icon, title, reference, items = (values.get(prefix + key, "") for key in ("label", "icon", "title", "url", "items"))
         if not label or not title or icon not in ICON_NAMES:
@@ -406,6 +408,12 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     } catch (_) {}
   }
   function select(identity, navigate = false) {
+    if (['changes','questions','investigations'].includes(identity) && entries.some(entry=>entry.dataset.page==='review')) {
+      const kind={changes:'change',questions:'question',investigations:'investigation'}[identity];
+      const url=new URL(location.href);
+      url.searchParams.set('at.review','/console/review.html#'+new URLSearchParams({type:kind}));
+      history.replaceState(null,'',url);identity='review';
+    }
     const selected = pages.find(entry => entry.dataset.page === identity) || entries[0];
     if (!selected) return;
     pages.forEach(entry => {

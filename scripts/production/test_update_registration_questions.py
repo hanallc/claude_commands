@@ -295,7 +295,7 @@ class RegistrationTests(RegistrationFixture):
         records = list(folder.glob("question-*.md"))
         self.assertEqual(len(records), 1)
         self.assertEqual(json.loads(legacy.read_text()), [reminder])
-        self.assertEqual(next(row for row in self.open_rows() if "question" in row), question)
+        self.assertEqual(next(row for row in self.open_rows() if "question" in row), question | {"review_id": "Q1"})
         self.assertEqual(list((self.root / "issues").iterdir()), [])
         paths = [legacy, *records]
         before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}

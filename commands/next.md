@@ -1,6 +1,6 @@
 ---
 description: Review one pending item with the user.
-argument-hint: "[change | proposal | efficiency | question] [oldest | newest] [all-below] | <change ID>"
+argument-hint: "[change | proposal | efficiency | question | investigation] [oldest | newest] [all-below] | <change ID>"
 ---
 
 # Next
@@ -8,11 +8,11 @@ argument-hint: "[change | proposal | efficiency | question] [oldest | newest] [a
 **Usage:** `/next` · `/next <kind>` · `/next [<kind>] oldest` · `/next [<kind>] newest` ·
 `/next [<kind>] [oldest|newest] all-below` · `/next to the end` · `/next <change ID>`
 
-Kinds: `change`, `proposal`, `efficiency`, `question`. The words "next", "next change", "next
+Kinds: `change`, `proposal`, `efficiency`, `question`, `investigation`. The words "next", "next change", "next
 proposal", "next efficiency proposal", "next question", "next oldest" and "next newest" mean this
 command too.
 
-- No kind: the most urgent item of all four kinds.
+- No kind: the most urgent item of all five kinds.
 - A kind: the most urgent item of that kind.
 - `oldest` or `newest`, alone or with a kind: the oldest or newest item instead (user,
   2026-10-22).
@@ -39,7 +39,7 @@ showrunner session, or pass the showrunner name.
 
 ## Order
 
-One order for all four kinds, from `~/.claude/scripts/lib/urgency.py`:
+One order for all five kinds, from `~/.claude/scripts/lib/urgency.py`:
 
 1. What the user called important, the newest mark first.
 2. What blocks work.
@@ -148,12 +148,12 @@ approved change; commit and push only when the user says so.
 ## question
 
 In a producer session, `/next question` reads that producer's own question folder without a production document.
-The Questions page sends an answer to the producer's current session.
+The Review page sends an answer to the producer's current session.
 For a chat answer, run `update_registration.py answer --production <producer name> --item "<its text>"`.
 Use its relay line to send the answer to the producer.
 
 The current open question. A question with a follow-up that waits for the asker's reply is not shown.
-A question skipped on the Questions page comes after the other questions. Mark: `update_registration.py mark-important
+Mark: `update_registration.py mark-important
 --production <showrunner name> --item "<its text>"`. Ask it in full: what is asked,
 why, and the answer choices. Act on the user's answer as `/showrunner:produce` →
 Throughout says, and remove the item through its Open-questions list.
@@ -170,3 +170,9 @@ prints whom the answer goes to:
   showrunner, beginning `From the user (via <your name>): `, naming the unit
   and the item. That showrunner relays it to its unit.
 - `relay: none`: act on the answer here.
+
+## investigation
+
+`/next investigation` reads answer-ready records through `review_items.py`.
+Show the question and answer, then record the user's read result with `investigation.py read --owner <owner> --id <id>`.
+Open investigations wait for the owner and do not appear in `/next`.

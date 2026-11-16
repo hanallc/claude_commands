@@ -31,7 +31,7 @@ from uuid import uuid4
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
 from scripts.production import change_review, investigation, staff, the_list
-from scripts.review_links import accounts_page, change_browser, change_page, console, investigations_page, list_page, serve
+from scripts.review_links import accounts_page, change_browser, change_page, console, investigations_page, list_page, review_page, serve
 from scripts.lib import atomic_file, conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -127,7 +127,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertIn("frame-src 'self'", headers["content-security-policy"])
         self.assertNotEqual(headers.get("x-frame-options"), "DENY")
         self.assertIn(b"<h1>Hana console</h1>", body)
-        self.assertIn(b'data-url="/console/changes.html" data-title="Changes"', body)
+        self.assertIn(b'data-url="/console/review.html" data-title="Review"', body)
         self.assertIn(b'href="?page=rebuilds" data-page="rebuilds"\ndata-url="/console/rebuilds.html"', body)
         self.assertTrue((self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST).is_file())
         for path in ("/console", "/console?page=questions"):
@@ -169,15 +169,15 @@ class ReviewLinksServerTests(unittest.TestCase):
             "STAFF_FILE": str(self.root.parent / "staff.json")})))
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
         _ = self.enterContext(patch.object(change_browser, "waiting_changes", return_value=frozenset({"a/C1"})))
-        questions = self.enterContext(patch.object(change_browser, "waiting_questions", return_value=frozenset({"q1"})))
-        self.assertEqual(self.post("/console/news", "open=changes"), (200, b'{"new": []}'))
+        questions = self.enterContext(patch.object(review_page, "waiting_items", return_value=frozenset({"q1"})))
+        self.assertEqual(self.post("/console/news", "open=images"), (200, b'{"new": []}'))
         questions.return_value = frozenset({"q1", "q2"})
-        self.assertEqual(self.post("/console/news", "open=changes"), (200, b'{"new": ["questions"]}'))
-        self.assertEqual(self.post("/console/news", "open=questions"), (200, b'{"new": []}'))
+        self.assertEqual(self.post("/console/news", "open=images"), (200, b'{"new": ["review"]}'))
+        self.assertEqual(self.post("/console/news", "open=review"), (200, b'{"new": []}'))
         # The Rebuilds page names no open page; the marks still follow new items.
         questions.return_value = frozenset({"q1", "q2", "q3"})
-        self.assertEqual(self.post("/console/news", "open="), (200, b'{"new": ["questions"]}'))
-        for body in ("open=nowhere", "", "open=changes&open=questions"):
+        self.assertEqual(self.post("/console/news", "open="), (200, b'{"new": ["review"]}'))
+        for body in ("open=nowhere", "", "open=images&open=review"):
             with self.subTest(body=body):
                 self.assertEqual(self.post("/console/news", body)[0], 400)
         self.assertEqual(self.request("/console/" + console.SEEN_NAME).status, 404)
@@ -189,7 +189,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         item = investigation.file(owner, "Find the cause", "Why?")
         fields = {"owner": owner, "id": item.id,
                   "token": investigations_page.request_token(self.root, owner, item.id)}
-        self.assertEqual(self.request(investigations_page.PAGE_PATH).status, 200)
+        self.assertEqual(self.request(investigations_page.PAGE_PATH).status, 303)
         self.assertEqual(self.post(investigations_page.PAGE_PATH, urlencode(fields))[0], 400)
         _ = investigation.answer(owner, item.id, "Found it.")
         for body in (urlencode({**fields, "token": "bad"}), urlencode(fields) + '&owner=other'):
