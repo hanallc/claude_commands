@@ -981,24 +981,43 @@ def _module_renames(repo: Path, path: str, before: str, old: tuple[style_footpri
     The scan reads the file's `plain_words`, and a raw site keeps its `r#`, so `mod r#lock;` takes
     `mod r#mutation_lock;`. In comments, each `crate` path to a renamed module is renamed.
     """
+    plain = plain_words(old)
+
+    def scans() -> Generator[RenamedModuleScan | NoRenamedText]:
+        for moved in moves:
+            root = crate_root(repo, moved.old)
+            if isinstance(root, NoCrateRoot):
+                yield NoRenamedText()
+                return
+            module = style_footprint.crate_module(moved.old, root)
+            if isinstance(module, style_footprint.OutsideCrate):
+                yield NoRenamedText()
+                return
+            yield RenamedModuleScan(path, plain, style_footprint.crate_module(path, root), module[:-1], moved.old,
+                                    moved.new, crate_library(repo, root))
+
+    return module_renames_from_scans(path, before, old, scans())
+
+
+def module_renames_from_scans(path: str, before: str, old: tuple[style_footprint.TokenSpan, ...],
+                              scans: Iterable[RenamedModuleScan | NoRenamedText]) -> _ModuleRenames | NoRenamedText | UncertainModulePath:
+    """Apply the scans to the code and comments of the file at path."""
     words, plain = tuple(span.token.value for span in old), plain_words(old)
     renamed = list(words)
-    scans: list[RenamedModuleScan] = []
-    for moved in moves:
-        root = crate_root(repo, moved.old)
-        if isinstance(root, NoCrateRoot):
-            return NoRenamedText()
-        module = style_footprint.crate_module(moved.old, root)
-        if isinstance(module, style_footprint.OutsideCrate):
-            return NoRenamedText()
-        scans.append(RenamedModuleScan(path, plain, style_footprint.crate_module(path, root), module[:-1], moved.old,
-                                       moved.new, crate_library(repo, root)))
-        sites = scans[-1].renames()
+    applied: list[RenamedModuleScan] = []
+    for scan in scans:
+        if isinstance(scan, NoRenamedText):
+            return scan
+        if scan.path != path:
+            raise ValueError("the module scan belongs to a different file")
+        sites = scan.renames()
         if isinstance(sites, UncertainModulePath):
             return sites
         for index, word in sites.items():
             renamed[index] = words[index].removesuffix(plain[index]) + word
-    comments = style_footprint.comment_gaps(before, old, lambda line: renamed_comment(line, tuple(scans)))
+        applied.append(scan)
+    comment_scans = tuple(applied)
+    comments = style_footprint.comment_gaps(before, old, lambda line: renamed_comment(line, comment_scans))
     module_sites = tuple(renamed) != words or comments != style_footprint.comment_gaps(before, old, lambda line: line)
     return _ModuleRenames(words, tuple(renamed), comments, module_sites)
 
