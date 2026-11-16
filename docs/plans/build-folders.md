@@ -56,9 +56,17 @@ This plan has nine phases and an estimate of **64 worker hours**.
    Pass the descriptor to the working process and its children.
    A held lock proves ownership; metadata only supplies attribution.
 4. Serialize acquisition, rescue, source reset, target removal, and folder deletion under that lock.
+   Python callers pass the held lease descriptor to build and test children.
+   Slot recovery removes a stale index lock under the lease.
+   Slot acquisition replaces target symlinks with directories inside the slot.
+   Explicit Cargo output settings remain unchanged.
+   Nested slots replace only defaults inherited from an enclosing slot.
    Preserve commits, refs, staged changes, unstaged changes, untracked source, ignored source, conflicts, and nested repository work.
    Publish the rescue objects under a unique `refs/rescue/<name>` in the source repository.
    Verify the rescue before deletion; retain the folder when rescue fails.
+   Workspace removal exports clean local branches, tags, and every stash reflog entry before it deletes private Git metadata.
+   When no local source remains, export the rescue into a sibling bare repository named `<workspace-root>-rescues.git`.
+   Incomplete slot recovery retains repositories with a different object store.
    Generated Cargo target data does not need a source snapshot.
    An ignore rule alone does not identify generated data.
 5. Use one pool for each machine and repository name (the user, 2026-11-15).
@@ -100,7 +108,8 @@ The user approved the slot values on 2026-11-12 (relayed by builds). On 2026-11-
 
 The values live in `config/build_folders.conf` as `slots.<machine>.<repository>.count` and `slots.<machine>.<repository>.max_bytes`.
 They change only through /tune and apply at the next slot take, with no deploy.
-`roots.slots.<machine>` keeps a suitable existing root. Existing `roots.*`, `names.*`, `patterns.*` and `prefixes.*` settings stay.
+`roots.slots.<machine>` keeps a suitable existing root. Existing `names.*` and `patterns.*` settings stay.
+The cutover on Thu 11-19 deletes `copies.root`, `roots.scratch*`, `roots.copies*` and the `prefixes.*` keys. The delete of `copies.root` needs a separate go from the user.
 Missing required capacity values stop admission with a named config error.
 Tests use explicit private values under the same schema; they do not set production limits.
 The private-config helper supplies test roots and values, not another allocation API or fixture registry.
@@ -325,8 +334,11 @@ Devtools owns production gate adapters.
 4. Pass the lease descriptor into local and remote working processes.
 5. Route destructive cache operations through rescue under the lease lock.
 6. Migrate adjacent gate fixtures through the maker and private config.
-7. Make `copies.standing()`, `copies.workspace()` and the gate pool take slots inside `copies.py`. Its callers, including style sync and the toolchain trial, stop writing under `~/worktrees/gates` with no caller change.
-8. Point the read-only `copies.gates_root()` users (`rust_release.py` disk check, `lint/sweep.py` floor roots) at the slot root. Delete the `copies.root` key.
+7. Make `copies.standing()` and the gate pool take slots inside `copies.py`. Its callers, including style sync and the toolchain trial, stop writing under `~/worktrees/gates` with no caller change.
+   `copies.workspace()` does not take a slot: it is a named, editable checkout on a branch, and a slot reset would destroy its edits. It becomes an editable maker folder under `roots.workspace`.
+   `copies.clone()` keeps its return-a-path API, so it cannot hold a slot lease. It becomes a maker folder outside `~/worktrees/gates`; its callers move to slots in Phase 5 (builds agreed 2026-11-15).
+   A full pool waits in the build queue for at most `slots.wait_seconds`, and the run shows in the Queued table.
+8. Point the read-only `copies.gates_root()` users (`rust_release.py` disk check, `lint/sweep.py` floor roots) at the slot root. Delete the `copies.root` key only after the user's separate go.
 9. Add a test that no test writes under the live slot or gate roots.
 
 Resources deletes `~/worktrees/gates` on cutover day, after Phase 4 is on main. It deletes each gate folder only when its lock has no holder.

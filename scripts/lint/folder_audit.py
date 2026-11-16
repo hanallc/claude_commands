@@ -194,7 +194,8 @@ def expected_rust_names(path: Path = RUST_ROOTS_FILE) -> frozenset[str] | None:
 
 def kept_in_temp(entry: Path, verify_name: re.Pattern[str]) -> bool:
     name = entry.name
-    if name in KEPT_NAMES or name.startswith(KEPT_PREFIXES) or TEMPFILE_NAME.fullmatch(name):
+    managed_names = {copy_record.root().name, copy_record.copies_root().name}
+    if name in KEPT_NAMES or name in managed_names or name.startswith(KEPT_PREFIXES) or TEMPFILE_NAME.fullmatch(name):
         return True
     return tmp_sweep.holds_no_file(str(entry)) or verify_name.fullmatch(name) is not None
 

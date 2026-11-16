@@ -200,16 +200,21 @@ def _snapshot(work_tree: Path, checkout: git_files.Checkout, head: str, generate
 
 
 def _local_ref_tips(work_tree: Path) -> dict[str, str]:
-    names = _oid(work_tree, "for-each-ref", "--format=%(refname)", "refs/heads/", "refs/tags/").splitlines()
-    if not names:
+    names = _oid(work_tree, "for-each-ref", "--format=%(refname)",
+                 "refs/heads/", "refs/tags/", "refs/stash").splitlines()
+    revisions = {name: name for name in names}
+    if "refs/stash" in revisions:
+        stashes = _oid(work_tree, "reflog", "show", "--format=%H", "refs/stash").splitlines()
+        revisions.update({f"refs/stash@{{{index}}}": commit for index, commit in enumerate(stashes)})
+    if not revisions:
         return {}
     peeled = _git(work_tree, "cat-file", "--batch-check=%(objectname) %(objecttype)",
-                  data="".join(f"{name}^{{commit}}\n" for name in names).encode()).stdout.decode().splitlines()
+                  data="".join(f"{revision}^{{commit}}\n" for revision in revisions.values()).encode()).stdout.decode().splitlines()
     refs: dict[str, str] = {}
-    for name, entry in zip(names, peeled, strict=True):
+    for name, entry in zip(revisions, peeled, strict=True):
         commit, kind = entry.split()
         if kind != "commit":
-            raise RescueError(("git", "cat-file", name + "^{commit}"), "nested ref does not name a commit")
+            raise RescueError(("git", "cat-file", name + "^{commit}"), "local ref does not name a commit")
         refs[name] = commit
     return refs
 
@@ -236,7 +241,8 @@ def _build_rescue(work_tree: Path, name: str, checkout: git_files.Checkout, excl
         return _RescueCommit(_commit(work_tree, tree, parents, f"Rescue {name}"), tree)
 
 
-def rescue(work_tree: Path, name: str, *, generated: Sequence[Path] = ()) -> RescueResult:
+def rescue(work_tree: Path, name: str, *, generated: Sequence[Path] = (),
+           retain_local_refs: bool = False) -> RescueResult:
     """Retain work in the common object store without changing the checkout or its index."""
     work_tree = work_tree.absolute()
     command = ["git", "-C", str(work_tree), "rescue"]
@@ -252,12 +258,13 @@ def rescue(work_tree: Path, name: str, *, generated: Sequence[Path] = ()) -> Res
                         for path in (*_OPERATION_HEAD_FILES, "sequencer/todo", "rebase-merge", "rebase-apply"))
         flagged = any(entry[:1].islower() or entry[:1] == b"S"
                       for entry in _git(work_tree, "ls-files", "-v", "-z").stdout.split(b"\0") if entry)
-        if (not _status_has_source(work_tree, status, excluded) and not unheld and not operation and not nested_paths
+        refs = _local_ref_tips(work_tree) if retain_local_refs else {}
+        if (not refs and not _status_has_source(work_tree, status, excluded) and not unheld and not operation and not nested_paths
                 and not flagged):
             return NothingToSave()
         base = f"refs/rescue/{name}"
         _ = _git(work_tree, "check-ref-format", base)
-        saved = _build_rescue(work_tree, name, checkout, excluded, nested_paths)
+        saved = _build_rescue(work_tree, name, checkout, excluded, nested_paths, tuple(refs.values()))
         suffix = 1
         while True:
             ref = base if suffix == 1 else f"{base}-{suffix}"

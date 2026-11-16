@@ -154,7 +154,7 @@ class GitRunner:
             return self._objects[key]
         literal_paths = {**(os.environ if environment is None else environment), "GIT_LITERAL_PATHSPECS": "1"}
         result = subprocess.run(["git", "-C", str(repo), *arguments], env=literal_paths,
-                                input=input, capture_output=True, check=False)
+                                input=input, capture_output=True, check=False, pass_fds=copies.COMMAND_LOCKS.get())
         # A ref write cannot change an object addressed by its full hash.
         # Do not cache failed reads. A later fetch can supply the object.
         if cacheable and result.returncode == 0:
@@ -427,7 +427,7 @@ def check_command(command: list[str], repo: Path, environment: dict[str, str], d
         raise Refused("over the fast-track time limit; use the normal path")
     with tempfile.TemporaryFile() as output:
         process = subprocess.Popen(command, cwd=repo, env=environment, stdout=output,
-                                   stderr=subprocess.STDOUT, start_new_session=True)
+                                   stderr=subprocess.STDOUT, start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get())
         try:
             _ = process.wait(timeout=remaining)
         except subprocess.TimeoutExpired as error:

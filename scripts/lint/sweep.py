@@ -188,7 +188,7 @@ from scripts.message import send_budget, send_result, session_send
 from scripts.message.session_send import session_send_argv
 from scripts.lib import file_lock
 from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS
-from scripts.lib import conf
+from scripts.lib import build_folders, conf
 from scripts.lib.cargo_target_config import (
     cargo_build_folder,
     cargo_folder_settings,
@@ -1244,9 +1244,37 @@ class TargetUse:
 
 @dataclass(frozen=True)
 class LockHeld:
-    """A cargo lock a build holds in a target."""
+    """A held lock that protects build output."""
 
     lock: str
+
+
+@dataclass(frozen=True)
+class SlotBuildOutput:
+    """Build output that shares a repository slot's maker lease."""
+
+    checkout: Path
+
+    @property
+    def lock(self) -> str:
+        return str(self.checkout.with_name(self.checkout.name + ".lock"))
+
+
+def output_slot_leases(path: str) -> tuple[SlotBuildOutput, ...]:
+    """Locate slot leases for direct output and recorded external output."""
+    settings = conf.read_or_repository("build_folders")
+    values = settings.values()
+    machine = store.host_name()
+    slot_value = values.get(f"roots.slots.{machine}", values.get("roots.slots", ""))
+    if not slot_value:
+        return ()
+    slots = Path(os.path.expandvars(slot_value)).expanduser().resolve()
+    cargo = Path(os.path.expandvars(settings.text("roots.slot_cargo"))).expanduser().resolve()
+    resolved = Path(path).resolve()
+    sources = (resolved, *(mapping.workspace_root.resolve() for mapping in OUTPUT_ROOTS.get().mappings_for(resolved)))
+    checkouts = {slots / source.relative_to(root).parts[0] for source in sources for root in (slots, cargo)
+                 if source != root and source.is_relative_to(root)}
+    return tuple(SlotBuildOutput(checkout) for checkout in sorted(checkouts))
 
 
 @dataclass(frozen=True)
@@ -2808,6 +2836,13 @@ def shrink_floor(
             lock = scratch.judgment_lock if dry_run else scratch.removal_lock
             blocked_pair = False
             for paired in paired_roots:
+                for slot in output_slot_leases(paired):
+                    if not guards.enter_context(build_folders.collector_lease(slot.checkout, wait=False)):
+                        busy[paired] = LockHeld(slot.lock)
+                        blocked_pair = True
+                        break
+                if blocked_pair:
+                    break
                 if not guards.enter_context(lock(Path(paired))):
                     busy[paired] = LockHeld(os.path.join(paired, ".claude-busy"))
                     blocked_pair = True
@@ -4473,6 +4508,14 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         tree_depth = lint_settings.whole("sweep_max_tree_depth")
         no_evidence = {item.path for item in OUTPUT_ROOTS.get().no_recorded_evidence}
         for root in targets:
+            held_slots = [slot for slot in output_slot_leases(root)
+                          if build_folders.build_folder_state(slot.checkout) == "held"]
+            if held_slots:
+                busy[root] = LockHeld(held_slots[0].lock)
+                held_targets.add(root)
+                _ = known_trees.setdefault(root, [])
+                print(f"lint sweep: busy slot lease; {root} left alone")
+                continue
             with scratch.judgment_lock(Path(root)) as idle_copy:
                 if root in no_evidence and not idle_copy:
                     held_targets.add(root)

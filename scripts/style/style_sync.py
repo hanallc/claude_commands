@@ -369,8 +369,7 @@ def verify_lint(directory: Path) -> tuple[int, str]:
         verifier_command(directory, os.getpid()), cwd=directory / "checkout", env={**os.environ, "UNIT_DETACHED_RUN": "1",
             "CARGO_BUILD_BUILD_DIR": str((directory / "checkout/target").resolve() / "intermediates")},
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        start_new_session=True, preexec_fn=unblock_held_signals,
-    ) as child:
+        start_new_session=True, preexec_fn=unblock_held_signals, pass_fds=copies.COMMAND_LOCKS.get()) as child:
         try:
             with signal_mask(signal.SIG_UNBLOCK):
                 output, _ = child.communicate()
@@ -480,8 +479,7 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
             saved = subprocess.run(
                 [str(PYTHON), str(Path(scratch.__file__)), "cargo-save", str(snapshot)],
                 env={**os.environ, "CARGO_BUILD_BUILD_DIR": str(intermediates)},
-                capture_output=True, text=True, check=False,
-            )
+                capture_output=True, text=True, check=False, pass_fds=copies.COMMAND_LOCKS.get())
             if saved.returncode:
                 raise Refusal(saved.stderr.strip() or "cannot save Cargo output roots")
             returncode, output = verify_lint(directory)

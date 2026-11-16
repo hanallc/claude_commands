@@ -13,14 +13,18 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 from typing import cast, override
 import unittest
 from unittest import mock
 
 from scripts.lib import build_folders, build_slots, git_rescue
+from scripts.build_queue import admission_protocol as wire, slot_wait
+from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.lib.build_slots_test_support import UseDefaultMaximum, private_slot_config
 from scripts.lib.descendants import adopt_descendants
 from scripts.lib.git_test_support import commit_repository
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -58,7 +62,7 @@ class BuildSlotsTests(unittest.TestCase):
 
     def take(self, commit: str = "HEAD") -> AbstractContextManager[build_slots.Slot]:
         return build_slots.take_slot(self.source, commit, showrunner="builds", unit="queue",
-                                     work="proof", purpose="test")
+                                     work="proof", purpose="test", wait_policy=build_slots.SlotWaitPolicy.REFUSE)
 
     def lease(self, path: Path) -> dict[str, object]:
         return cast(dict[str, object], json.loads(path.with_name(path.name + ".lease.json").read_text()))
@@ -176,10 +180,16 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
                                         cwd=checkout, env={**os.environ, "PYTHONPATH": str(checkout)},
                                         capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
+                if stage == "checkout":
+                    _ = (path / "recovery.txt").write_text("work before recovery\n")
                 with self.take() as recovered:
                     self.assertEqual(recovered.path, path)
                     self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
                     self.assertEqual((path / "change.txt").read_text(), "first commit\n")
+                    if stage == "checkout":
+                        refs = self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/rescue/").splitlines()
+                        self.assertEqual(len(refs), 1)
+                        self.assertEqual(self.git(self.source, "show", refs[0] + ":recovery.txt"), "work before recovery")
                 _ = self.git(self.source, "worktree", "remove", str(path))
                 path.with_name(path.name + ".lease.json").unlink()
 
@@ -192,6 +202,44 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
                                        work="proof", purpose="test") as slot:
                 self.assertEqual(slot.repository, self.source.name)
                 self.assertEqual(slot.path, self.slot_root / f"{self.source.name}-slot1")
+
+    def test_incomplete_slot_keeps_its_private_git_repository(self) -> None:
+        path = self.slot_root / "widget-slot1"
+        path.mkdir(parents=True)
+        _ = self.git(path, "init", "-q", "-b", "saved")
+        _ = (path / "local.txt").write_text("local commit\n")
+        tip = commit_repository(path, "private commit")
+        _ = (path / "edit.txt").write_text("unfinished edit\n")
+        with self.assertRaisesRegex(ValueError, "different Git repository; retained"):
+            with self.take():
+                self.fail("an incomplete private repository became a slot")
+        self.assertEqual(self.git(path, "rev-parse", "HEAD"), tip)
+        self.assertEqual((path / "edit.txt").read_text(), "unfinished edit\n")
+
+    def test_reuse_removes_a_stale_index_lock_and_an_external_target_link(self) -> None:
+        outside = self.root / "external-target"
+        outside.mkdir()
+        _ = (outside / "keep").write_text("external output\n")
+        for damage in ("index-lock", "target-link", "both"):
+            with self.subTest(damage=damage):
+                with self.take() as slot:
+                    path = slot.path
+                if damage in ("index-lock", "both"):
+                    directory = Path(self.git(path, "rev-parse", "--absolute-git-dir"))
+                    _ = (directory / "index.lock").write_text("interrupted Git write\n")
+                if damage in ("target-link", "both"):
+                    target = path / "target"
+                    if target.exists():
+                        shutil.rmtree(target)
+                    target.symlink_to(outside, target_is_directory=True)
+                with self.take() as reused:
+                    self.assertEqual(reused.path, path)
+                    self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
+                    self.assertFalse((path / "target").is_symlink())
+                    self.assertEqual((outside / "keep").read_text(), "external output\n")
+                    _ = (path / "target").mkdir(exist_ok=True)
+                    _ = (path / "target" / "new").write_text("slot output\n")
+                    self.assertFalse((outside / "new").exists())
 
     def test_reset_rescues_edits_and_retains_unchanged_files_target_and_cargo(self) -> None:
         with self.take() as first:
@@ -221,8 +269,21 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
         self.assertEqual(self.git(self.source, "show", refs[0] + ":change.txt"), "slot work")
         self.assertEqual(self.git(self.source, "show", refs[0] + ":untracked.txt"), "untracked source")
 
+    def test_build_output_keeps_new_and_reused_slots_clean_without_a_tracked_ignore_file(self) -> None:
+        (self.source / ".gitignore").unlink()
+        self.base = commit_repository(self.source, "no tracked ignore file")
+        for use in ("new", "reused"):
+            with self.subTest(use=use), self.take() as slot:
+                target = slot.path / "target"
+                target.mkdir(exist_ok=True)
+                _ = (target / "build-output").write_text("compiled output\n")
+                self.assertEqual(self.git(slot.path, "status", "--porcelain"), "")
+        (self.source / "target").mkdir()
+        _ = (self.source / "target/build-output").write_text("source build output\n")
+        self.assertEqual(self.git(self.source, "status", "--porcelain"), "?? target/")
+
     def test_rescue_failure_preserves_source_and_cargo_and_frees_the_lock(self) -> None:
-        for action in ("reset", "sweep"):
+        for action in ("reset", "recovery", "sweep"):
             with self.subTest(action=action):
                 with self.take() as slot:
                     path, cargo = slot.path, slot.cargo_dir
@@ -230,10 +291,14 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
                     cargo.mkdir(parents=True, exist_ok=True)
                     _ = (cargo / "keep").write_text("cached output\n")
                 self.age_lease(path)
+                if action == "recovery":
+                    lease = self.lease(path)
+                    lease["ready"] = False
+                    _ = path.with_name(path.name + ".lease.json").write_text(json.dumps(lease))
                 output = io.StringIO()
                 error = git_rescue.RescueError(("git", "update-ref"), "fixture write failure")
                 with mock.patch.object(git_rescue, "rescue", side_effect=error):
-                    if action == "reset":
+                    if action != "sweep":
                         with self.assertRaises(git_rescue.RescueError):
                             with self.take():
                                 self.fail("reset continued after a failed rescue")
@@ -246,6 +311,33 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
                 self.assertEqual((cargo / "keep").read_text(), "cached output\n")
                 self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
                 self.assertEqual(build_folders.build_folder_state(path), "free")
+
+    def test_a_damaged_index_and_source_edits_restore_from_the_rescue_before_reset(self) -> None:
+        for number, damaged in enumerate((b"damaged index\x00\xff", b"DIRC\x00\x00\x00\xff")):
+            with self.subTest(index=damaged):
+                before = set(self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/rescue/").splitlines())
+                with self.take() as slot:
+                    index = Path(self.git(slot.path, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+                    _ = (slot.path / "change.txt").write_text("source edit before reset\n")
+                    _ = (slot.path / "untracked.txt").write_text("untracked source\n")
+                    target = slot.path / "target"
+                    target.mkdir(exist_ok=True)
+                    _ = (target / "keep").write_text("cached build output\n")
+                    _ = index.write_bytes(damaged)
+                with self.take() as recovered:
+                    self.assertEqual(self.git(recovered.path, "status", "--porcelain"), "")
+                    self.assertEqual((recovered.path / "change.txt").read_text(), "first commit\n")
+                    self.assertEqual((recovered.path / "target/keep").read_text(), "cached build output\n")
+                after = set(self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/rescue/").splitlines())
+                self.assertEqual(len(after - before), 1)
+                saved, = after - before
+                restored = self.root / f"restored-{number}"
+                _ = self.git(self.source, "worktree", "add", "--detach", str(restored), saved)
+                self.assertEqual((restored / "change.txt").read_text(), "source edit before reset\n")
+                self.assertEqual((restored / "untracked.txt").read_text(), "untracked source\n")
+                backups = tuple(restored.glob(".rescue-index-*"))
+                self.assertEqual(len(backups), 1)
+                self.assertEqual(backups[0].read_bytes(), damaged)
 
     def test_a_different_common_git_folder_is_refused_without_changing_the_slot(self) -> None:
         with self.take() as first:
@@ -315,8 +407,6 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
         self.assertTrue(any(self.git(self.source, "show", ref + ":change.txt") == "old slot work" for ref in refs))
 
     def test_sweep_deletes_oversized_cargo_once_and_keeps_the_source(self) -> None:
-        _ = write_config_fixture(self.settings,
-                                 f"# whole: 1..\nslots.{self.machine}.widget.max_bytes=64\n")
         with self.take() as slot:
             path, cargo = slot.path, slot.cargo_dir
             cargo.mkdir(parents=True, exist_ok=True)
@@ -325,6 +415,8 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
             self.assertEqual(reused.path, path)
             self.assertEqual((cargo / "cache").stat().st_size, 256)
         source_stat = (path / "same.txt").stat()
+        _ = write_config_fixture(self.settings,
+                                 f"# whole: 1..\nslots.{self.machine}.widget.max_bytes=64\n")
         result = self.command("sweep")
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -338,6 +430,31 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
             build_slots.sweep_slots()
         self.assertEqual(repeated.getvalue(), "")
         self.assertTrue(path.is_dir())
+
+    def test_take_deletes_oversized_output_after_rescue_and_retains_source_times(self) -> None:
+        with self.take() as slot:
+            path, cargo = slot.path, slot.cargo_dir
+            (path / "target").mkdir()
+            _ = (path / "target/final").write_bytes(b"x" * 256)
+            _ = (cargo / "intermediate").write_bytes(b"y" * 256)
+            _ = (path / "change.txt").write_text("save this source\n")
+            source_stat = (path / "same.txt").stat()
+        _ = write_config_fixture(self.settings,
+                                 f"# whole: 1..\nslots.{self.machine}.widget.max_bytes=64\n")
+        output = io.StringIO()
+        with redirect_stdout(output), self.take() as reused:
+            self.assertEqual(reused.path, path)
+            self.assertFalse((path / "target/final").exists())
+            self.assertFalse((cargo / "intermediate").exists())
+            self.assertTrue(cargo.is_dir())
+            current = (path / "same.txt").stat()
+            self.assertEqual((current.st_ino, current.st_mtime_ns), (source_stat.st_ino, source_stat.st_mtime_ns))
+            self.assertEqual((path / "change.txt").read_text(), "first commit\n")
+        refs = self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/rescue/").splitlines()
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(self.git(self.source, "show", refs[0] + ":change.txt"), "save this source")
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertIn("widget-slot1", output.getvalue())
 
     def test_sweep_finishes_an_interrupted_delete_from_its_lease(self) -> None:
         with self.take() as slot:
@@ -386,14 +503,36 @@ sys.exit(7)
         _ = write_config_fixture(self.settings,
                                  f"slots.{self.machine}.widget.max=1\n")
         marker = self.root / "child-started"
-        with self.take():
-            result = self.command(*self.run_arguments(), sys.executable, "-c",
-                                  "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(marker))
+        original = dict(os.environ)
+        with AdmissionFixture() as fixture:
+            fixture.clock.epoch = time.time()
+
+            def expire_after_wait(reply: wire.Reply) -> wire.Reply:
+                if isinstance(reply, wire.RepositorySlotWaiting):
+                    fixture.clock.advance(60)
+                return reply
+
+            with mock.patch.dict(os.environ, {**original, "ADMISSION_SOCKET": str(fixture.socket_path)}), \
+                    mock.patch.object(fixture.server, "reply_filter", side_effect=expire_after_wait), fixture.serving():
+                with self.take():
+                    result = self.command(*self.run_arguments(), sys.executable, "-c",
+                                          "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(marker))
 
         self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
-        self.assertEqual(len((result.stdout + result.stderr).splitlines()), 1)
+        self.assertEqual(len((result.stdout + result.stderr).splitlines()), 2)
         self.assertIn("widget", result.stdout + result.stderr)
         self.assertFalse(marker.exists())
+
+    def test_mac_capacity_wait_expires_without_an_admission_service(self) -> None:
+        _ = write_config_fixture(self.settings,
+            f"slots.{self.machine}.widget.max=1\n# range: 5e-324..\nslots.wait_seconds=0.01\n")
+        with self.take() as held, mock.patch.object(sys, "platform", "darwin"), redirect_stderr(io.StringIO()):
+            with self.assertRaises(slot_wait.SlotWaitExpired):
+                with build_slots.take_slot(self.source, self.base, showrunner="builds", unit="queue",
+                                           work="proof", purpose="test"):
+                    self.fail("the held Mac slot was granted")
+            self.assertEqual(build_folders.build_folder_state(held.path), "held")
+        self.assertEqual(build_folders.build_folder_state(held.path), "free")
 
     @unittest.skipUnless(sys.platform == "linux", "descendant adoption requires Linux")
     def test_run_stops_a_detached_descendant_before_it_releases_the_slot(self) -> None:
@@ -464,7 +603,7 @@ print(json.dumps({'descendant': child.pid, 'group': os.getpgrp(), 'held': held})
         with self.assertRaises(ProcessLookupError):
             os.kill(int(report["descendant"]), 0)
         with self.assertRaises(ProcessLookupError):
-            os.killpg(int(report["group"]), 0)
+            send_process_group(int(report["group"]), 0)
         with self.take() as reused:
             self.assertEqual(reused.path, self.slot_root / "widget-slot1")
 

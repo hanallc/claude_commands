@@ -35,7 +35,7 @@ from scripts.copies.remote_test_support import local_remote_transport
 from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.herdr.herdr import HerdrPlace
 from scripts.herdr.test_worker_panes import PaneWorld
-from scripts.lib import process_group, process_start, atomic_file, conf, unit_runs
+from scripts.lib import build_folders, process_group, process_start, atomic_file, conf, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.conf import UseConfiguredValue
@@ -428,18 +428,22 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         _ = write_config_fixture(self.root / "scratch.conf")
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             cache = (tree / "target").resolve().parent
-        with copies.standing("other-unit", self.checkout, copies.CommittedSource("HEAD")) as other:
-            other_cache = (other / "target").resolve().parent
+            with copies.standing("other-unit", self.checkout, copies.CommittedSource("HEAD")) as other:
+                other_cache = (other / "target").resolve().parent
+            self.assertNotEqual(tree, other)
         with copies.workspace(
             str(self.unit_staff_id), self.checkout, "HEAD", name="worker", branch="worker", task="gate:retire-worker",
         ) as workspace:
             pass
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertFalse(tree.exists())
+        self.assertTrue(tree.exists())
+        self.assertEqual(build_folders.build_folder_state(tree), "free")
         self.assertFalse(workspace.exists())
-        self.assertFalse(other.exists())
-        self.assertFalse(cache.exists())
+        self.assertTrue(other.exists())
+        self.assertEqual(build_folders.build_folder_state(other), "free")
+        self.assertTrue(cache.exists())
+        self.assertEqual(build_folders.build_folder_state(cache), "free")
         self.assertTrue(other_cache.is_dir())
 
     def test_retire_keeps_a_same_named_units_copy_in_another_production(self) -> None:
@@ -449,16 +453,20 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         other = fixture_member("unit", name="alpha", parent=parent.id)
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as mine:
             mine_cache = (mine / "target").resolve().parent
-        with copies.standing(str(other.id), self.checkout, copies.CommittedSource("HEAD")) as theirs:
-            their_cache = (theirs / "target").resolve().parent
-            their_commit = git(theirs, "rev-parse", "HEAD")
+            with copies.standing(str(other.id), self.checkout, copies.CommittedSource("HEAD")) as theirs:
+                their_cache = (theirs / "target").resolve().parent
+                their_commit = git(theirs, "rev-parse", "HEAD")
+            self.assertNotEqual(mine, theirs)
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertFalse(mine.exists())
-        self.assertFalse(theirs.exists())
-        self.assertFalse(mine_cache.exists())
+        self.assertTrue(mine.exists())
+        self.assertEqual(build_folders.build_folder_state(mine), "free")
+        self.assertTrue(theirs.exists())
+        self.assertEqual(build_folders.build_folder_state(theirs), "free")
+        self.assertTrue(mine_cache.exists())
+        self.assertEqual(build_folders.build_folder_state(mine_cache), "free")
         self.assertTrue(their_cache.is_dir())
-        self.assertEqual(copies.read_record(their_cache).commit, their_commit)
+        self.assertEqual(git(their_cache, "rev-parse", "HEAD"), their_commit)
         self.assertEqual(their_commit, git(self.checkout, "rev-parse", "HEAD"))
 
     def test_retire_without_a_build_cache_has_no_standing_tree_to_remove(self) -> None:
@@ -469,19 +477,21 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         _ = git(self.checkout, "merge", "-q", "--no-ff", "-m", "Merge manifest removal", "alpha-branch")
         with copies.standing(str(self.unit_staff_id), self.worktree, copies.CommittedSource("HEAD")) as tree:
             self.assertTrue(tree.is_relative_to(Path(tempfile.gettempdir())))
-            self.assertEqual(copies.owned_trees(str(self.unit_staff_id)).standing, ())
+            self.assertEqual(build_folders.build_folder_state(tree), "held")
             self.assertEqual(git(tree, "rev-parse", "HEAD"), git(self.worktree, "rev-parse", "HEAD"))
-        self.assertFalse(tree.exists())
+        self.assertTrue(tree.exists())
+        self.assertEqual(build_folders.build_folder_state(tree), "free")
         code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertFalse(self.worktree.exists())
-        self.assertEqual(copies.owned_trees(str(self.unit_staff_id)).standing, ())
+        self.assertEqual(build_folders.build_folder_state(tree), "free")
 
     def test_retire_keeps_a_busy_tree_and_still_retires_the_unit(self) -> None:
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
-            self.assertIn("busy", output)
+            self.assertNotIn("busy", output)
+            self.assertEqual(build_folders.build_folder_state(tree), "held")
             self.assertTrue(tree.exists())
         self.assertFalse(self.worktree.exists())
 
@@ -489,11 +499,13 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
-            self.assertIn("busy", output)
+            self.assertNotIn("busy", output)
+            self.assertEqual(build_folders.build_folder_state(tree), "held")
         code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertIn("unchanged", output)
-        self.assertFalse(tree.exists())
+        self.assertTrue(tree.exists())
+        self.assertEqual(build_folders.build_folder_state(tree), "free")
 
 
     def test_one_retirement_shares_settings_through_validation_and_cleanup(self) -> None:
@@ -647,7 +659,9 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.restore_repository()
         _ = self.limits()
         atomic_file.write_text_atomic(self.root / "shutdown.conf", (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
-        self.enterContext(mock.patch.dict(os.environ, copies_environment(self.root)))
+        environment = copies_environment(self.root)
+        _ = shutil.copy2(Path(environment["CONF_DIR"]) / "build_folders.conf", self.root / "build_folders.conf")
+        self.enterContext(mock.patch.dict(os.environ, environment))
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
         write_machine_config(self.root)
         runs = self.root / "runs"
@@ -1313,7 +1327,8 @@ class RetireUnitTests(ShutdownRepositoryFixture):
             self.assertTrue(checkout.exists())
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertFalse(checkout.exists())
+        self.assertTrue(checkout.exists())
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
 
     def test_retirement_removes_only_its_remote_mirrors(self) -> None:
         mine = copies.RemoteMirror(str(self.unit_staff_id), copies.SelectedRepository("hana"), "mac", "mirror/alpha", "alpha-session")
