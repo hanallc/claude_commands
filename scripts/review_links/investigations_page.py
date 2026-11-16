@@ -56,15 +56,6 @@ def owner_name(members: staff.StaffSnapshot, owner: staff.StaffId) -> str:
     return member.name if member is not None else str(owner)
 
 
-def source_name(members: staff.StaffSnapshot, owner: staff.StaffId) -> str:
-    """Include the parent showrunner in a unit's source line."""
-    member = members.by_id(owner)
-    if member is None:
-        return str(owner)
-    parent = members.parent_of(member) if member.kind == "unit" else None
-    return f"{parent.name} · {member.name}" if parent is not None else member.name
-
-
 def request_token(root: Path, owner: str, identity: str) -> str:
     token = change_browser.browser_manifest(change_page.console_folder(root))[0]
     return hmac.new(token.encode(), f"investigation:{owner}:{identity}".encode(), hashlib.sha256).hexdigest()
@@ -72,7 +63,7 @@ def request_token(root: Path, owner: str, identity: str) -> str:
 
 def card(item: investigation.Investigation, root: Path, members: staff.StaffSnapshot) -> str:
     filed = datetime.fromisoformat(item.filed).astimezone(user_zone())
-    name = source_name(members, item.owner)
+    name = change_page.source_name(members, item.owner)
     details = (("source", name), ("date", filed.strftime("%Y-%m-%d")), ("time", filed.strftime("%H:%M")))
     content = (f'<article data-owner="{html.escape(item.owner, quote=True)}" data-state="{item.state}" '
                + f'data-key="{html.escape(f"{item.owner}/{item.id}", quote=True)}">'
