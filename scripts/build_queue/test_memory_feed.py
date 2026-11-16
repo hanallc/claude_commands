@@ -44,6 +44,8 @@ from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture, write_config_fixture
 
 REQUEST_TOKEN_DUMP = memory_feed.request_token_dump
+STEVIE_OUTPUT = memory_feed.stevie_output
+STEVIE = Path("/fixture/bin/stevie")
 
 
 class FeedStopped(Exception):
@@ -126,17 +128,27 @@ class MemoryFeedTests(unittest.TestCase):
 
     def test_the_token_pool_names_its_memory_pause(self) -> None:
         gib = admission_records.GIB
-        pool = memory_feed.token_pool(13 * gib)
+        pool = memory_feed.token_pool(13 * gib, STEVIE)
         self.assertEqual(pool, {"kind": "TokenPool", "total": 31, "free": 4, "memory_floor_bytes": 12 * gib, "paused": False})
         self.assertEqual(memory_feed.token_wait_stage(pool), "waiting for jobserver tokens")
-        paused = memory_feed.token_pool(11 * gib)
+        paused = memory_feed.token_pool(11 * gib, STEVIE)
         self.assertEqual(memory_feed.token_wait_stage(paused), "waiting for jobserver tokens (memory under 12 GiB)")
         for output, error in (("12288\n4\n", None), ("12288\nfour\n31\n", None), ("", ValueError("stevie exited 1: no device"))):
             with self.subTest(output=output, error=error), mock.patch.object(memory_feed, "stevie_output",
                     side_effect=error, return_value=output):
-                unavailable = memory_feed.token_pool(11 * gib)
+                unavailable = memory_feed.token_pool(11 * gib, STEVIE)
                 self.assertEqual(unavailable["kind"], "TokenPoolUnavailable")
                 self.assertEqual(memory_feed.token_wait_stage(unavailable), "waiting for jobserver tokens")
+
+    def test_stevie_runs_from_the_configured_path_without_a_search(self) -> None:
+        program = self.root / "programs" / "stevie"
+        program.parent.mkdir()
+        _ = program.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+        program.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(self.root / "empty")}):
+            self.assertEqual(STEVIE_OUTPUT(program).split(), ["-a", "-t", "-j"])
+            with self.assertRaisesRegex(ValueError, "stevie did not answer"):
+                _ = STEVIE_OUTPUT(self.root / "missing" / "stevie")
 
     def test_the_newest_steve_dump_gives_the_tokens_of_each_process(self) -> None:
         journal = textwrap.dedent("""\
@@ -780,7 +792,8 @@ process.stdout.write(JSON.stringify({
         with mock.patch.object(conf, "read", wraps=conf.read) as read:
             configuration = memory_feed.read_configuration()
         self.assertIn(mock.call("memory_feed"), read.call_args_list)
-        self.assertEqual(configuration, memory_feed.FeedConfiguration(self.output, 0.125, 7, 6, 300, configuration.colors, 6, 10))
+        self.assertEqual(configuration, memory_feed.FeedConfiguration(self.output, 0.125, 7, 6, 300, configuration.colors, 6, 10,
+                                                                   Path("/run/current-system/sw/bin/stevie")))
 
     def test_configuration_expands_the_output_folder(self) -> None:
         original = self.configuration.read_text()
