@@ -550,6 +550,16 @@ else
     PY="$VERIFY_START_DIR/../lib/py"
 fi
 
+# Send <signal> to child <pid>, then collect the child.
+# A trapped signal that arrives while Bash collects a child can lose that exit
+# status. The job table then shows the child as running, and wait never returns.
+# A child that Bash has not collected stays as a zombie, and kill still finds it.
+# So a failed kill means the child is gone, and no wait follows.
+collect_child() {
+    kill -s "$2" "$1" 2>/dev/null || return 0
+    wait "$1" 2>/dev/null || true
+}
+
 # One parent-owned helper serves command substitutions and cleanup traps.
 verify_helper() {
     if [[ "${1:-}" == --start ]]; then
@@ -1962,10 +1972,7 @@ after_tree_change() {
 
 stop_tree_watch() {
     if [[ -n "$TREE_WATCH_PID" ]]; then
-        # A group signal can reap the watcher before this cleanup starts.
-        if kill "$TREE_WATCH_PID" 2>/dev/null; then
-            wait "$TREE_WATCH_PID" 2>/dev/null || true
-        fi
+        collect_child "$TREE_WATCH_PID" TERM
         TREE_WATCH_PID=""
     fi
 }
@@ -1987,8 +1994,7 @@ cancel_tree_run() {
     stop_tree_watch
     if [[ -n "$runner_pid" ]]; then
         # offload.py's TERM handler stops the remote run and releases its claim.
-        kill -TERM "$runner_pid" 2>/dev/null || true
-        wait "$runner_pid" 2>/dev/null || true
+        collect_child "$runner_pid" TERM
         MAC_RUNNER_PID=""
     fi
     # Board release also stops a step's separately owned process group.
@@ -2184,8 +2190,7 @@ forward_mac_runner_signal() {
     TREE_WATCH_DIR=""
     trap - INT TERM HUP
     if [[ -n "$runner_pid" ]]; then
-        kill -s "$signal_name" "$runner_pid" 2>/dev/null || true
-        wait "$runner_pid" 2>/dev/null || true
+        collect_child "$runner_pid" "$signal_name"
     fi
     if [[ -n "$MAC_RESULT_FILE" ]]; then
         if [[ -d "$MAC_RESULT_FILE" ]]; then
@@ -2991,8 +2996,7 @@ stop_copy_watch() {
     local line copy_s="" copy_count="" natedev_s=""
     COPY_WORD="" COPY_MAC="" COPY_REASON="" COPY_SECONDS="" COPY_RUNNER_STATUS="" COPY_STOPPED=""
     [[ -n "$COPY_WATCH_PID" ]] || return 0
-    kill -TERM "$COPY_WATCH_PID" 2>/dev/null || true
-    wait "$COPY_WATCH_PID" 2>/dev/null || true
+    collect_child "$COPY_WATCH_PID" TERM
     COPY_WATCH_PID=""
     if [[ -f "$COPY_WATCH_DIR/result" ]]; then
         while IFS= read -r line; do
@@ -3253,8 +3257,7 @@ hold_interrupted() {
         # A background Bash sleep inherits ignored INT. End that waiter with
         # TERM for every caller signal; keep the caller's status in the record.
         if [[ "$MAC_ONLY" == 1 ]]; then signal_name=TERM; fi
-        kill -s "$signal_name" "$HOLD_WAITER_PID" 2>/dev/null || true
-        wait "$HOLD_WAITER_PID" 2>/dev/null || true
+        collect_child "$HOLD_WAITER_PID" "$signal_name"
     fi
     interrupt_hold_wait
     note_event interrupted "$SECONDS" 0 "" 0 "$code"
@@ -3328,8 +3331,7 @@ token_wait_interrupted() {
     local signal_name=$1
     trap - INT TERM HUP
     if [[ -n "$TOKEN_WAITER_PID" ]]; then
-        kill "$TOKEN_WAITER_PID" 2>/dev/null || true
-        wait "$TOKEN_WAITER_PID" 2>/dev/null || true
+        collect_child "$TOKEN_WAITER_PID" TERM
     fi
     bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null 2>&1 || true
     [[ -z "$TOKEN_WAIT_ENTRY" ]] || rm -f "$TOKEN_WAIT_ENTRY"
@@ -3707,8 +3709,7 @@ start_token_renewer() {
                 renew_sleep_pid=$!
             fi
             if [[ -n "$renew_sleep_pid" ]]; then
-                kill "$renew_sleep_pid" 2>/dev/null || true
-                wait "$renew_sleep_pid" 2>/dev/null || true
+                collect_child "$renew_sleep_pid" TERM
             fi
             exit 0
         ' INT TERM HUP
@@ -3728,8 +3729,7 @@ start_token_renewer() {
 
 stop_token_renewer() {
     [[ -n "${TOKEN_RENEWER_PID:-}" ]] || return 0
-    kill "$TOKEN_RENEWER_PID" 2>/dev/null || true
-    wait "$TOKEN_RENEWER_PID" 2>/dev/null || true
+    collect_child "$TOKEN_RENEWER_PID" TERM
     TOKEN_RENEWER_PID=""
 }
 
