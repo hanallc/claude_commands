@@ -26,7 +26,6 @@ import unittest.mock
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.production.cli_fixture import ImmutableGitSeed
-from scripts.buildlog.store import host_name
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lint import tmp_sweep, folder_audit, sweep
 from scripts.lib import build_folders, cargo_output, conf, copy_record, scratch, session_folder
@@ -287,8 +286,7 @@ class FolderAuditTests(unittest.TestCase):
                 self.assertTrue(checkout.exists())
                 self.assertTrue((checkout / "target").is_dir())
                 self.assertEqual(build_folders.build_folder_state(checkout), "free")
-                self.assertEqual(stderr.getvalue(),
-                    f"slots: origin on {host_name()} has no maximum of its own; it uses 2. Set slots.{host_name()}.origin.max with /tune.\n")
+                self.assertEqual(stderr.getvalue(), "")
 
     def test_shared_symlink_output_survives_a_different_cargo_target_setting(self) -> None:
         checkout, cache = self.cargo_checkout()

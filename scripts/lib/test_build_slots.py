@@ -109,19 +109,24 @@ class BuildSlotsTests(unittest.TestCase):
         with self.take() as lowest:
             self.assertEqual(lowest.number, 1)
 
-    def test_missing_repository_limit_uses_the_default_and_prints_the_tune_key(self) -> None:
-        _ = private_slot_config(self.root, repository="widget", maximum=UseDefaultMaximum())
-        output = io.StringIO()
-        with redirect_stdout(output), self.take() as held:
-            self.assertEqual(held.number, 1)
-        expected = (f"slots: widget on {self.machine} has no maximum of its own; it uses 1. "
-                    f"Set slots.{self.machine}.widget.max with /tune.")
-        self.assertEqual(output.getvalue().splitlines(), [expected])
-        with redirect_stdout(io.StringIO()), self.take():
-            with self.assertRaises(build_slots.SlotsFull) as raised:
-                with self.take():
-                    self.fail("the default maximum did not limit the pool")
-        self.assertEqual(raised.exception.maximum, 1)
+    def test_repository_limit_uses_own_or_default_maximum_without_output(self) -> None:
+        for maximum in (1, UseDefaultMaximum()):
+            with self.subTest(maximum=maximum):
+                _ = private_slot_config(self.root, repository="widget", maximum=maximum)
+                output = io.StringIO()
+                errors = io.StringIO()
+                with redirect_stdout(output), redirect_stderr(errors):
+                    with build_slots.take_slot(self.source, self.base, showrunner="builds", unit="queue",
+                                               work="proof", purpose="test",
+                                               report=lambda line: print(line, file=sys.stderr)) as held:
+                        self.assertEqual(held.number, 1)
+                    with self.take():
+                        with self.assertRaises(build_slots.SlotsFull) as raised:
+                            with self.take():
+                                self.fail("the maximum did not limit the pool")
+                    self.assertEqual(raised.exception.maximum, 1)
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(errors.getvalue(), "")
 
     def test_missing_slot_root_stops_allocation_and_sweep_until_private_settings_return(self) -> None:
         before = self.git(self.source, "worktree", "list", "--porcelain")
