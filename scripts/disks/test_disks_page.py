@@ -111,7 +111,7 @@ class DisksPageTests(unittest.TestCase):
         report = {"root": "/build/slot", "groups": [
             {"repository": "hana", "maximum": 8, "slots": [
                 {"name": "hana-slot1", "number": 1, "size": 70 * GIB, "last_used": now, "deleted_tonight": False,
-                 "used_by": {"purpose": "fps", "unit": "report", "showrunner": "builds"}},
+                 "used_by": {"name": "report integrate", "showrunner": "builds"}},
                 {"name": "hana-slot2", "number": 2, "size": 0, "last_used": now - 9 * 86400, "used_by": None,
                  "deleted_tonight": True}]},
             {"repository": "<b>", "maximum": None, "slots": [
@@ -124,13 +124,13 @@ class DisksPageTests(unittest.TestCase):
         # The card starts with one band per repository; an open band lists its slots.
         self.assertEqual(cells([])[1], ["hana|2 of 8 slots · 70 GiB", "&lt;b&gt;|1 slot · —"])
         html, shown = cells(["hana", "<b>"])
-        self.assertEqual(shown, ["hana|2 of 8 slots · 70 GiB", "hana-slot1|70 GiB|now|fps|report (builds)",
+        self.assertEqual(shown, ["hana|2 of 8 slots · 70 GiB", "hana-slot1|70 GiB|now|report integrate|builds",
                                  "hana-slot2|&lt; 256 MiB|9 days ago|deleted tonight", "&lt;b&gt;|1 slot · —",
                                  "x-slot1|—|—|—"])
         self.assertEqual(re.findall(r'aria-expanded="(\w+)" data-group="([^"]*)"', cells(["hana"])[0]),
                          [("true", "hana"), ("false", "&lt;b&gt;")])
         self.assertEqual(re.findall(r'<div class="narrow">(.*?)</div>', html), [
-            '<span class="tag run">fps</span><span class="dim">report (builds)</span>', '<span class="tag go">deleted tonight</span>'])
+            '<span class="tag run">report integrate</span><span class="dim">builds</span>', '<span class="tag go">deleted tonight</span>'])
         empty = cast(str, self.run_page(f"slotsHtml({json.dumps({'root': '/s', 'groups': []})}, {KEEP}, {now}, new Set())"))
         self.assertIn("No slots yet.", empty)
 

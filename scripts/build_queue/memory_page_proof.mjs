@@ -2359,8 +2359,25 @@ try {
           comparisons.push({swapShare:version,rows});
         }
 
+        // A gate job's tooltip says what the job does and what it changes, below its title (#109).
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
         await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1100,deviceScaleFactor:1,mobile:false});
+        const gateReading=structuredClone(base);
+        const gateIndex=gateReading.walk.findIndex(row=>row.queued);
+        assert.ok(gateIndex>=0,'The base reading has no queued run.');
+        const gateAbout='Merges the handler checkpoint into the sdlc branch, tests every module, then pushes sdlc.';
+        Object.assign(gateReading.walk[gateIndex],{name:'natemerge integrate',unit:'natemerge',about:gateAbout,changes:'branch sdlc',
+          started_at:gateReading.read_at-600});
+        await show(gateReading);
+        await evaluate(`showTip(proofTip('row', ${gateIndex}),700,420)`);
+        const gateTip=await evaluate("[...document.querySelectorAll('#tip dt, #tip dd')].map(cell=>cell.textContent)");
+        assert.ok(gateTip[0].startsWith('natemerge · integrate'),'The gate tooltip title: '+gateTip[0]);
+        assert.ok(gateTip.includes(gateAbout),'The gate tooltip omits its description.');
+        assert.equal(gateTip[gateTip.indexOf('Changes')+1],'branch sdlc');
+        const gateFit=await evaluate(`[...document.querySelectorAll('#tip dt, #tip dd')].every(cell=>cell.scrollWidth<=cell.clientWidth)
+          && document.querySelector('#tip .tip').scrollWidth<=document.querySelector('#tip .tip').clientWidth`);
+        assert.ok(gateFit,'The gate tooltip clips its text.');
+        await capture('gate-tooltip-dark-desktop','#tip');
         await show(base);
         await evaluate('hideTip()');
         const endClip=await evaluate(`(() => {

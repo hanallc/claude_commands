@@ -38,7 +38,7 @@ from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, 
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import atomic_file, conf, test_hang_guard
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
-from scripts.lib.build_steps import read_step_names
+from scripts.lib.build_steps import OTHER_COMMAND, StepJob, command_job, read_step_names
 from scripts.message import unit_labels
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture, write_config_fixture
@@ -583,6 +583,63 @@ process.stdout.write(JSON.stringify({
             self.assertEqual(row.get("showrunner"), "solo")
             self.assertEqual(row["unit"], "—")
             self.assertTrue(row["name"].startswith("fixture-project "))
+
+    def test_gate_rows_name_the_job_from_the_command_arguments(self) -> None:
+        gate_command = ["python3", "/repo/scripts/production/merge_gate.py", "--merge-branch", "sdlc"]
+        cases = (
+            (["--unit", "handler", "--checkpoint", "abc"], StepJob("integrate", unit="handler", branch="sdlc")),
+            (["--tests-only", "--full"], StepJob("test-all", branch="")),
+            (["--tests-only", "--module", "a", "--module=b"], StepJob("test-modules", modules=2)),
+            (["--tests-only"], StepJob("test-all")),
+            (["--nightly"], StepJob("test-nightly", branch="sdlc")),
+        )
+        names = read_step_names()
+        with tempfile.TemporaryDirectory() as folder:
+            proc = Path(folder)
+            for pid, (arguments, expected) in enumerate(cases, start=10):
+                with self.subTest(arguments=arguments):
+                    (proc / str(pid)).mkdir()
+                    command = gate_command[:2] + arguments + (gate_command[2:] if expected.branch else [])
+                    _ = (proc / str(pid) / "cmdline").write_bytes(b"\0".join(part.encode() for part in command) + b"\0")
+                    job = memory_feed.step_job("merge-gate", pid, proc)
+                    self.assertEqual(job, expected)
+                    notes = memory_feed.job_notes(job, "report", names)
+                    self.assertTrue(notes.get("about"))
+                    self.assertEqual(notes.get("changes"), "branch sdlc" if expected.step == "integrate" else "no branch")
+            self.assertIsInstance(memory_feed.step_job("nextest", 10, proc), memory_feed.NotGateStep)
+            self.assertIsInstance(memory_feed.step_job("merge-gate", 99, proc), memory_feed.CommandUnreadable)
+        for command, named in (
+            (["python3", "-X", "dev", "/repo/scripts/production/targeted_test.py"], StepJob("test-affected")),
+            (["py", "targeted_test.py", "--full"], StepJob("test-all")),
+            (["python3", "targeted_test.py", "--module", "a"], StepJob("test-modules", modules=1)),
+            (["python3", "-m", "scripts.production.merge_gate", "--tests-only"], StepJob("test-all")),
+            (["verify.sh", "--session-dir", "/session", "lint"], StepJob("lint")),
+            (["bash", "verify.sh", "test", "hana"], StepJob("test")),
+            (["python3", "-c", "pass", "merge_gate.py"], OTHER_COMMAND),
+            (["python3", "-cpass", "merge_gate.py"], OTHER_COMMAND),
+            (["python3", "-Bc", "pass", "merge_gate.py"], OTHER_COMMAND),
+            (["python3", "-", "merge_gate.py"], OTHER_COMMAND),
+            (["bash", "-c", "true", "verify.sh"], OTHER_COMMAND),
+            (["python3", "-Xdev", "-mscripts.production.merge_gate", "--nightly"], StepJob("test-nightly")),
+            (["python3", "-u", "-W", "ignore", "merge_gate.py", "--tests-only", "--full"], StepJob("test-all")),
+            (["python3", "tool.py", "merge_gate.py"], OTHER_COMMAND),
+            (["cargo", "build"], OTHER_COMMAND),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(command_job(command), named)
+        about = names.about(StepJob("integrate", unit="handler", branch="sdlc"), "report")
+        self.assertIn("handler", about)
+        self.assertEqual(names.about(StepJob("test-all"), "—"), "")
+        reading = reservation_reading()
+        integrate = StepJob("integrate", unit="handler", branch="sdlc")
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(memory_feed, "step_job", return_value=integrate)):
+            page = memory_feed.reading()
+        running, = [row for row in page["walk"] if row.get("queued")]
+        for row in (running, *page["waiters"]):
+            self.assertEqual(row.get("changes"), "branch sdlc")
+            self.assertIn("handler", row.get("about", ""))
+            self.assertIn("integrate", row["name"])
 
 
     def test_local_test_counters_reach_the_page_through_admission(self) -> None:

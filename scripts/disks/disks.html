@@ -296,9 +296,9 @@ function slotsHtml(report, keepBytes, now, opened) {
   const lastUsed = row => row.used_by ? "now" : row.last_used == null ? "—" : age(Math.max(0, now - row.last_used));
   const usedBy = row => {
     if (row.used_by) {
-      const who = row.used_by.showrunner ? `${row.used_by.unit} (${row.used_by.showrunner})` : row.used_by.unit;
-      return (row.used_by.purpose ? `<span class="tag run">${esc(row.used_by.purpose)}</span>` : "")
-        + `<span class="dim">${esc(who)}</span>`;
+      // The work as the Builds page names it, such as "report integrate", then its showrunner.
+      return (row.used_by.name ? `<span class="tag run">${esc(row.used_by.name)}</span>` : "")
+        + (row.used_by.showrunner ? `<span class="dim">${esc(row.used_by.showrunner)}</span>` : "");
     }
     return row.deleted_tonight ? '<span class="tag go">deleted tonight</span>' : "";
   };

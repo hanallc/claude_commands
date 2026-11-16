@@ -1932,7 +1932,7 @@ As built:
 - Slider: a drag works in Chrome and Firefox, on the page alone and inside the console frame. The user's failure did not show on natedev. These changes guard it: the label is a `div`, so a press on the text does not move the thumb; the ends and the value have fixed widths, so the track does not change size during a drag; the value is written only when it changes.
 - Tests: `test_disks_page` checks that only top folders are filtered and that Other opens, and that open rows stay across a reload until their folder or repository is gone, with rows for a joined name, a folder named `|other` and a drive inside a drive with no tree. Both fail on the old page.
 
-#### gatenames — gate steps get readable names and a description (#108, #109, #97) · status: next
+#### gatenames — gate steps get readable names and a description (#108, #109, #97) · status: done
 
 The user approved mockup version 2 at 13:58 EST on 2026-11-16 (`~/rust/hanadocs/morty/gate-tooltip-mockup-v2.png`). Use "integrate" for "land" and "test nightly" for "nightly". Promote gets no step.
 
@@ -1941,7 +1941,7 @@ The user approved mockup version 2 at 13:58 EST on 2026-11-16 (`~/rust/hanadocs/
 | integrate | Merges the `<unit>` checkpoint into the `<showrunner>` branch, tests every module, then pushes `<showrunner>`. | branch `<showrunner>` | `merge_gate.py --checkpoint` |
 | test all | Tests every module of `<unit>`. | no branch | `merge_gate.py --tests-only --full` |
 | test modules | Tests `<N>` named modules of `<unit>`. | no branch | `merge_gate.py --tests-only --module X` |
-| test affected | Tests the `<N>` modules that the `<unit>` change affects. | no branch | `targeted_test.py` |
+| test affected | Tests the modules that the `<unit>` change affects. | no branch | `targeted_test.py` |
 | test nightly | Tests the `<showrunner>` branch each night and records a red result with its owner. | no branch | `merge_gate.py --nightly` |
 
 1. The row name is "`<unit>` `<step>`". The tooltip title is "`<unit>` · `<step>`".
@@ -1951,6 +1951,17 @@ The user approved mockup version 2 at 13:58 EST on 2026-11-16 (`~/rust/hanadocs/
 5. A `--promote` run shows integrate only.
 6. Disks "Used by" (#97) uses the same name source: "`<unit>` `<step>`", for example "handler integrate".
 7. From the user (via builds), on the Slots pane: "how could the cargo-liner slots both be showing the same merge?" Cause: `copies.py` `standing()` writes `work='gate'` and `purpose='gate · <base commit subject>'` for every slot take, so a `verify.sh test` or `lint` run shows as a gate of main's last merge. Fix at the source: the lease names the real work (the unit and the step, such as test or lint) from the same name source. Never "gate" for a run that is not a gate, and never the base commit subject.
+
+As built:
+
+- `build_steps.command_job` finds the script after a python or shell interpreter, then reads its arguments. `merge_gate.py` gives integrate, test all, test modules, test nightly or promote; `--tests-only` tests every module. `targeted_test.py` gives test affected, test all with `--full` or test modules with `--module`. `verify.sh [--session-dir <dir>] <step>` gives that step. `--promote` gives integrate. Any other command is `OtherCommand`.
+- `config/build_steps.conf` holds the step names, the `[about]` sentences and the `[changes]` text. `StepNames.about` and `StepNames.changes` fill them. An unknown unit gives no sentence.
+- The feed reads `/proc/<pid>/cmdline` for a merge-gate or targeted-test row (`memory_feed.step_job`). The result is a job or a named state: not a gate step, pid not recorded, command unreadable, or another command. The row name and the tooltip title use the job step; the row carries `about` and `changes`. The queue is unchanged.
+- The tooltip shows the description as a caption under the title, then a Changes row, then the rows it showed before.
+- Slot lease: `copies.standing` takes a `step` key. It writes `work=<step>` and `purpose=<shown step name>`. `copies.run` passes the job of its command, else the program name. Every other caller names its work: `merge_gate.py --nightly` test-nightly, `bump_gate.py` integrate, `fast_track.py` promote and fast-track, `ci_points` ci, `waiting.scratch_test` test, `rust_release` toolchain-trial, the style checks style, lint or test, and `copies.py hold` hold. Only test fixtures use the default step run. `gate_purpose` and the base commit subject are gone.
+- Disks Used by: `slots.slot_use` names the staff id from the staff record and builds "`<unit>` `<step>`" with the same owner template as the Builds page, then shows the showrunner.
+- Director calls: the names use the unit that runs the job ("natemerge integrate"), as the mockup shows. "test affected" has no module count; the Testing row shows it. An unknown command uses its program name as the step.
+- Tests: `test_memory_feed` (each gate command gives its job, description and changes; the feed puts them on running and waiting rows), `test_memory_hover` (the caption and Changes rows follow the title), `test_copies` (the lease names the step), `test_slots` and `test_disks_page` (Used by). `memory_page_proof.mjs` checks the gate tooltip and saves `gate-tooltip-dark-desktop.png`.
 
 ### Tokens — The Builds page shows the jobserver tokens · status: done
 

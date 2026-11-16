@@ -11,13 +11,32 @@ from scripts.buildlog.store import host_name
 from scripts.disks import measure
 from scripts.disks.measure import DisksData
 from scripts.lib import build_folders, build_slots, conf
+from scripts.lib.build_steps import StepNames, read_step_names
+from scripts.message.unit_labels import OwnerRole
 
 State = Callable[[Path], Literal["held", "free"]]
+# The shown name of a lease owner: a staff id or a role name.
+OwnerNames = Callable[[str], str]
+
+
+def staff_names() -> OwnerNames:
+    """Name each staff id from this machine's staff record; keep any other owner text."""
+    from scripts.production import staff
+
+    try:
+        rows = staff.local_snapshot()
+    except staff.StaffUnreadable:
+        return lambda owner: owner
+
+    def name(owner: str) -> str:
+        row = rows.by_id(staff.StaffId(owner))
+        return row.name if row is not None else owner
+    return name
 
 
 class SlotUse(TypedDict):
-    purpose: str
-    unit: str
+    # "<unit> <step>", named as the Builds page names a step.
+    name: str
     showrunner: str
 
 
@@ -57,28 +76,38 @@ def last_use(record: Mapping[str, object]) -> datetime | None:
         return None
 
 
+def slot_use(record: Mapping[str, object], steps: StepNames, owners: OwnerNames) -> SlotUse:
+    """Name the work in a lease from its owner and its step key, as the Builds page does."""
+    text = {key: value for key in ("work", "purpose", "unit", "showrunner") if isinstance(value := record.get(key), str)}
+    unit = owners(text.get("unit", ""))
+    step = text.get("work", "")
+    current = " ".join(part for part in (unit, text.get("purpose", "")) if part)
+    name = steps.for_owner(step, unit, OwnerRole.UNIT, current_name=current) if step else current
+    return {"name": name, "showrunner": text.get("showrunner", "")}
+
+
 def slot_row(path: Path, number: int, cargo_root: Path, settings: conf.ConfigRead, data: DisksData | None, now: float,
-             state: State) -> SlotRow:
+             state: State, steps: StepNames, owners: OwnerNames) -> SlotRow:
     record = lease_record(path)
     held = state(path) == "held"
     used = last_use(record)
     sizes = [measure.tree_size(data, path), measure.tree_size(data, cargo_root / path.name)]
     known = [size for size in sizes if size is not None]
-    text = {key: value for key in ("purpose", "unit", "showrunner") if isinstance(value := record.get(key), str)}
     return {"name": path.name, "number": number, "size": sum(known) if known else None,
             "last_used": now if held else used.timestamp() if used else None,
-            "used_by": {"purpose": text.get("purpose", ""), "unit": text.get("unit", ""),
-                        "showrunner": text.get("showrunner", "")} if held else None,
+            "used_by": slot_use(record, steps, owners) if held else None,
             "deleted_tonight": (not held and used is not None
                                 and build_slots.unused(used, settings, datetime.fromtimestamp(now, timezone.utc)))}
 
 
 def read_slots(root: Path, cargo_root: Path, settings: conf.ConfigRead, machine: str, data: DisksData | None,
-               now: float, state: State = build_folders.build_folder_state) -> SlotReport:
+               now: float, state: State = build_folders.build_folder_state, owners: OwnerNames | None = None) -> SlotReport:
     """Each slot under root, grouped by repository, as the nightly sweep finds them."""
     groups: dict[str, list[SlotRow]] = {}
+    steps = read_step_names()
+    names = owners if owners is not None else staff_names()
     for path, repository, number in build_slots.slot_paths(root) if root.is_dir() else []:
-        groups.setdefault(repository, []).append(slot_row(path, number, cargo_root, settings, data, now, state))
+        groups.setdefault(repository, []).append(slot_row(path, number, cargo_root, settings, data, now, state, steps, names))
 
     def maximum(repository: str) -> int | None:
         try:

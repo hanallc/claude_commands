@@ -120,7 +120,7 @@ __PAGE_FRAME_STYLE__
 .tip dt { text-align: left; white-space: nowrap; }
 .tip dd { margin: 0; padding-left: 24px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .tip .title { font-weight: 700; padding-bottom: 4px; }
-.tip .caption { grid-column: 1 / -1; margin-top: -4px; padding: 0 0 4px; text-align: left; opacity: 0.7; }
+.tip .caption { grid-column: 1 / -1; margin-top: -4px; padding: 0 0 4px; text-align: left; white-space: normal; opacity: 0.7; }
 .tip .group { margin-top: 6px; padding-top: 6px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); }
 .tip .sum { font-weight: 700; }
 .tip .long { grid-column: 1 / -1; padding-left: 0; text-align: left; white-space: normal; opacity: 0.7; }
@@ -779,6 +779,8 @@ function stepTooltip(key, data) {
   if (row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used)))
     return [field(rowTitle(row), 'unavailable', 'title')];
   const rows = [field(rowTitle(row), [state, duration].filter(Boolean).join(' '), 'title')];
+  // A gate job says what it does and what it changes (#109).
+  if (row.about) rows.push(field('', row.about, 'caption'), field('Changes', row.changes));
   if (row.group) return [field(row.name, ramAmount(row.used * GIB), 'title'), field('Started by', 'not the queue'),
     ...groupRows(memoryRows((row.parts || []).map(part => [[part.who, recorded(part.pid) ? part.pid : '',
       part.started_at > 0 ? ago(part.started_at, data.read_at) : ''].filter(Boolean).join(' · '), part.gib * GIB])))];

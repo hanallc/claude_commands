@@ -466,7 +466,7 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
     sweep_stale_lint_dirs()
     # Signals stay held outside the work, so the dir never exists without its record and its cleanup path.
     with (stop_signals_raise(),
-          copies.standing(gate_owner(repo), checkout, copies.CommittedSource(tip)) as snapshot,
+          copies.standing(gate_owner(repo), checkout, copies.CommittedSource(tip), step="lint") as snapshot,
           signal_mask(signal.SIG_BLOCK),
           build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
               lint_prefix(), build_folders.ExplicitBuildParent(lint_temp_parent()))) as directory):

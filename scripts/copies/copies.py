@@ -18,7 +18,7 @@ import hashlib
 import shlex
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import re
 import shutil
 import stat
@@ -40,6 +40,7 @@ from scripts.lib.copy_record import (
 )
 from scripts.buildlog.store import host_name
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
+from scripts.lib.build_steps import StepJob, command_job, read_step_names
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
 from scripts.message import process_table, sessions
@@ -992,19 +993,13 @@ def _slot_preparation() -> Generator[None]:
         raise CopyError(str(error)) from error
 
 
-def gate_purpose(subject: str) -> str:
-    """Name the gated work from its commit subject."""
-    phase = re.fullmatch(r"[^()\s]+\(([^()]+)\): phase ([0-9]+) — (.+)", subject)
-    if phase is not None:
-        slug, number, title = phase.groups()
-        return f"gate · {slug} phase {number} · {title}"
-    return f"gate · {subject}" if subject else "gate"
-
-
 @contextmanager
 def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
-             merge: MergePolicy = NO_MERGE) -> Generator[Path]:
-    """Hold one repository slot through preparation and the caller's use."""
+             merge: MergePolicy = NO_MERGE, step: str = "run") -> Generator[Path]:
+    """Hold one repository slot through preparation and the caller's use.
+
+    step is the build_steps key of the work, such as integrate or lint; the lease shows its configured name.
+    """
     from scripts.lib import build_slots
     from scripts.production import staff
 
@@ -1020,11 +1015,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
         canonical = slot_source(source)
         if main_checkout(source) != canonical:
             _ = git(canonical, "fetch", "-q", "--", str(source), base)
-    try:
-        subject = git(canonical, "log", "-1", "--format=%s", base).decode(errors="replace").strip()
-        purpose = gate_purpose(subject)
-    except (CopyError, OSError):
-        purpose = "gate"
+    purpose = read_step_names().shown(step)
     unit = owner
     showrunner = owner_name(copy_owner(owner))
     try:
@@ -1039,7 +1030,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
     with ExitStack() as held_slot:
         with _slot_preparation():
             slot = held_slot.enter_context(build_slots.take_slot(canonical, base, showrunner=showrunner, unit=unit,
-                work="gate", purpose=purpose, report=lambda line: print(line, file=sys.stderr)))
+                work=step, purpose=purpose, report=lambda line: print(line, file=sys.stderr)))
         tree = slot.path
         descriptor = build_folders.build_folder_lock_fd(tree)
         token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), descriptor))
@@ -1985,7 +1976,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "hold":
             source = Path(args.repo or "").expanduser().resolve()
             staged = StagedSource(staged_tree(source))
-            with standing(source_owner(source), source, staged) as checkout:
+            with standing(source_owner(source), source, staged, step="hold") as checkout:
                 print(staged.tree)
                 print(checkout, flush=True)
                 _ = sys.stdin.read()
@@ -2011,7 +2002,9 @@ def main(argv: list[str] | None = None) -> int:
             policy: SourcePolicy = (WorktreeSource(args.commit, args.apply_uncommitted) if args.apply_uncommitted else
                                     CommittedSource(args.commit))
             merge: MergePolicy = MergeRevision(args.merge) if args.merge else NoMerge()
-            with standing(caller_owner(), args.repo or "", policy, merge=merge) as tree:
+            job = command_job(command)
+            with standing(caller_owner(), args.repo or "", policy, merge=merge,
+                          step=job.step if isinstance(job, StepJob) else PurePath(command[0]).name) as tree:
                 result = subprocess.run([part.replace("{tree}", str(tree)) for part in command],
                                         cwd=tree, pass_fds=COMMAND_LOCKS.get())
                 command_exit = result.returncode if result.returncode >= 0 else 128 - result.returncode

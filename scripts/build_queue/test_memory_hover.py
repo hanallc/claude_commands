@@ -261,6 +261,22 @@ class MemoryHoverTests(unittest.TestCase):
                     self.assertNotIn("Unit", [pair[0] for pair in fields])
                     self.assertNotIn("not recorded", html)
 
+    def test_a_gate_hover_says_what_the_job_does_and_changes_below_its_title(self) -> None:
+        about = "Merges the handler checkpoint into the sdlc branch, tests every module, then pushes sdlc."
+        row = {"name": "natemerge integrate", "queued": True, "used": 1, "reserved": 0, "counted": 1,
+               "showrunner": "builds", "unit": "natemerge", "runner": "unit director",
+               "about": about, "changes": "branch sdlc"}
+        data = {"read_at": 200, "walk": [row], "waiters": [{**row, "need": 2, "since": 100, "why": "its turn"}]}
+        for key in ("row:fixture-run-0", "wait:fixture-wait-0"):
+            with self.subTest(key=key):
+                html = cast(str, self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True))
+                grid = ElementTree.fromstring(html)
+                cells = [(cell.text or "", cell.get("class") or "") for cell in grid]
+                self.assertTrue(cells[0][0].startswith("natemerge · integrate"))
+                self.assertIn((about, "caption"), cells[2:4])
+                fields = [(cell.text, grid[index+1].text) for index, cell in enumerate(grid) if cell.tag == "dt"]
+                self.assertEqual(fields[1:3], [("Changes", "branch sdlc"), ("Showrunner", "builds")])
+
     def test_a_ci_hover_keeps_its_ci_line(self) -> None:
         data = {"read_at": 200, "walk": [{"name": "hana CI", "ci": True, "ci_label": "hana CI · runner-1",
                 "detail": "busy", "unit": "", "keep_text": "", "runner": "unknown"}]}

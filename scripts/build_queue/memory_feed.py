@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, assert_never
 
@@ -48,7 +48,7 @@ from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
 from scripts.build_queue.queue_lines import age, plain, step_text
 from scripts.build_queue.queue_view import reason_phrase
-from scripts.lib.build_steps import StepNames, read_step_names
+from scripts.lib.build_steps import OtherCommand, StepJob, StepNames, command_job, read_step_names
 from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeProcesses
 from scripts.build_queue import admission_records, target_availability
 from scripts.build_targets import target_config
@@ -343,6 +343,9 @@ class HeadRoom(TypedDict):
 
 class RowQueueNotes(TypedDict):
     key: NotRequired[str]
+    # A gate job's description sentence and what it changes (build_steps about. and changes.).
+    about: NotRequired[str]
+    changes: NotRequired[str]
     # True on the step the queue admits next; only that step shows its room.
     first_in_line: NotRequired[bool]
     head_room: NotRequired[HeadRoom]
@@ -516,6 +519,50 @@ class RunRow(RowQueueNotes):
     ci_cgroup: NotRequired[str]
     need: NotRequired[float]
     need_part: NotRequired[bool]
+
+
+# Queue steps whose job shows only in the command's arguments.
+GATE_STEPS = frozenset({"merge-gate", "targeted-test"})
+
+
+@dataclass(frozen=True)
+class NotGateStep:
+    """The step is not a merge gate or a targeted test, so its name already says its job."""
+
+
+@dataclass(frozen=True)
+class CommandUnreadable:
+    """The process ended or hid its command line before the feed read it."""
+    error: str
+
+
+StepJobReading = StepJob | NotGateStep | admission_records.PidNotRecorded | CommandUnreadable | OtherCommand
+
+
+def step_job(step: str, pid: int | admission_records.PidNotRecorded, proc: Path = PROC) -> StepJobReading:
+    """The job of a natedev merge gate or targeted test, read from its process arguments."""
+    if step not in GATE_STEPS:
+        return NotGateStep()
+    if not isinstance(pid, int):
+        return pid
+    try:
+        arguments = (proc / str(pid) / "cmdline").read_bytes().split(b"\0")
+    except OSError as error:
+        return CommandUnreadable(str(error))
+    return command_job([part.decode(errors="replace") for part in arguments if part])
+
+
+def job_step(job: StepJobReading, step: str) -> str:
+    """The step key a row shows: the job when the command named one, else the queue's step."""
+    return job.step if isinstance(job, StepJob) else step
+
+
+def job_notes(job: StepJobReading, unit: str, names: StepNames) -> RowQueueNotes:
+    """The description and changes rows of a gate job; empty for any other step."""
+    if not isinstance(job, StepJob):
+        return {}
+    about = names.about(job, unit)
+    return {"about": about, "changes": names.changes(job)} if about else {}
 
 
 def step_key(row: RunRow | WaitRow | MacBuildRow | MacReadingUnavailableRow | CloudWorkRow) -> str:
@@ -1911,8 +1958,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         identity = feed_step_labels(metadata, labels, ci_runners) if metadata is not None else unit_labels.UnitLabels("")
         unit = identity.unit
         ci_label = metadata.session_name if metadata is not None and metadata.unit in ci_runners else ""
-        name = names.for_owner(step.step, unit if unit != "—" else "", identity.role,
-            ci=bool(ci_label), current_name=step_text(step, names, labels=labels)) if step is not None else identity.session or hold.memory.owner
+        job: StepJobReading = step_job(step.step, step.pid) if step is not None and not ci_label else NotGateStep()
+        shown = replace(step, step=job_step(job, step.step)) if step is not None else step
+        name = names.for_owner(shown.step, unit if unit != "—" else "", identity.role,
+            ci=bool(ci_label), current_name=step_text(shown, names, labels=labels)) if shown is not None else identity.session or hold.memory.owner
         detail = unit if step is not None else SWAP_NAMES["between"]
         use = gib(hold.memory.use.bytes) if isinstance(hold.memory.use, admission_records.AnonymousRunUse) else hold.memory.use
         run = hold.memory.run
@@ -1929,7 +1978,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "queued": True, "keep_text": "", "group": "", "ci": False, "parts": [],
                      "need": gib(hold.memory.need), "need_part": need_in_next_part(steps_by_owner.get(hold.memory.owner, ())),
                      **(target_notes(step.route, routes, step.step, step.folder, step.package)
-                        if step is not None and not ci_label else NO_TARGET_NOTES)})
+                        if step is not None and not ci_label else NO_TARGET_NOTES),
+                     **job_notes(job, unit, names)})
     groups: dict[str, list[RunRow]] = {}
     remote_groups: set[str] = set()
     for entry in explanation.running:
@@ -2028,8 +2078,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         if isinstance(waiter.reason, admission_records.BehindHead):
             reason += ": the first step in line gets memory first"
         ci_label = waiter.session_name if waiter.unit in ci_runners else ""
-        waiters.append({"name": names.for_owner(waiter.step, identity.unit if identity.unit != "—" else "", identity.role,
-                            ci=bool(ci_label), current_name=step_text(waiter, names, labels=labels)),
+        job = NotGateStep() if ci_label else step_job(waiter.step, waiter.pid)
+        shown_waiter = replace(waiter, step=job_step(job, waiter.step))
+        waiters.append({"name": names.for_owner(shown_waiter.step, identity.unit if identity.unit != "—" else "", identity.role,
+                            ci=bool(ci_label), current_name=step_text(shown_waiter, names, labels=labels)),
                         **page_owner_labels(identity, ci_label=ci_label),
                         "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": "" if ci_label else identity.unit,
                         "need": gib(need), "since": waiter.since,
@@ -2039,7 +2091,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                                 gib(waiter.reason.free) if isinstance(waiter.reason, admission_records.NeedsMemory) else gib(ram["room_bytes"]),
                         "why": wait_why(waiter.reason),
                         **(NO_TARGET_NOTES if ci_label else target_notes(
-                            waiter.route, routes, waiter.step, waiter.folder, waiter.package))})
+                            waiter.route, routes, waiter.step, waiter.folder, waiter.package)),
+                        **job_notes(job, identity.unit, names)})
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
     if mac_status:
