@@ -111,6 +111,7 @@ class MeasureTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 1, f"{KEEP * 2}\t{argv[-1]}\n", "du: cannot read 'x'")
 
         self.assertEqual(measure.measure(settings(folder, str(folder)), runner, no_floors), 0)
+        self.assertGreater(self.data(folder)["render_seconds"], 0)
         drive = self.data(folder)["drives"][0]
         self.assertEqual(drive.get("floor"), 300 * GIB)
         self.assertGreater(drive.get("total", 0), 0)

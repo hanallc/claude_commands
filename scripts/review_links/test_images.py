@@ -18,6 +18,7 @@ from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode
 
+from scripts.review_links.test_page_frame import assert_status_states
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member
@@ -212,7 +213,7 @@ class ImagesTests(ImagesFixture):
         self.assertEqual(source.count(page_frame.ZOOM_SCRIPT), 1)
         self.assertEqual(source.count(page_frame.MOTION_SCRIPT), 1)
         self.assertEqual(source.count(page_frame.REFRESH_SCRIPT), 1)
-        self.assertIn("createPageRefresh(refresh);", source)
+        self.assertIn("createPageRefresh(refresh,()=>0);", source)
         self.assertIn("prefers-reduced-motion: reduce", source)
         self.assertLess(source.index(older["id"]), source.index(newer["id"]))
         self.assertIn('<nav data-image-groups aria-label="Image groups"></nav>', source)
@@ -231,6 +232,16 @@ class ImagesTests(ImagesFixture):
         self.assertIn("home.insertBefore(card, next?.parentNode === home ? next : null);", source)
         self.assertIn("status.textContent = 'Not sent: ' + error.message;", source)
         self.assertIn("new FormData(form, event.submitter)", source)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_page_status_uses_the_real_images_loader(self) -> None:
+        older = self.register("Older shot")
+        _ = self.register("Newer shot")
+        older_folder = self.root / image_store.IMAGES_FOLDER / older["id"]
+        older["registered_at"] = (datetime.now(UTC) - timedelta(days=9)).isoformat(timespec="seconds")
+        image_store.write_record(older_folder, older)
+        source = images.render(self.root).decode()
+        assert_status_states(self, source, 0)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_updates_keep_zoom_and_feedback_working_after_an_older_script_reloads(self) -> None:
