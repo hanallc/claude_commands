@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
 from scripts.build_queue.queue_lines import age
 from scripts.build_queue.scope_activity import NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
@@ -51,31 +51,6 @@ def room_text(room: admission_records.MemoryRoom | admission_records.ReadingUnav
     if room.shortfall:
         text += f"; shortfall {gib(room.shortfall)}"
     return text
-
-
-@dataclass(frozen=True)
-class RoomTerms:
-    """The terms of the first waiting step's room, in the order of the page's room equation."""
-    available: int
-    safety: int
-    swapped: int
-    reserved: int
-    ahead: int
-
-
-def room_terms(check: admission_records.RoomCheck, room: admission_records.MemoryRoom) -> RoomTerms:
-    """Split the room check into free memory less each reserved amount."""
-    reserved = room.kept
-    ahead = room.available - room.safety - reserved - room.agent_swap_demand - check.room
-    return RoomTerms(room.available, room.safety, room.agent_swap_demand, reserved, max(0, ahead))
-
-
-def head_room_values(check: admission_records.RoomCheck, room: admission_records.MemoryRoom) -> tuple[tuple[str, int], ...]:
-    """Use the legend names for the amounts in the room check."""
-    split = room_terms(check, room)
-    values = (("Free RAM", split.available), ("Safety net", split.safety),
-              ("Swap coming back", split.swapped), ("Build reserved", split.reserved))
-    return values + ((("Held for earlier steps", split.ahead),) if split.ahead else ())
 
 
 def keep_aside_text(run: admission_records.RunKeepAside) -> str:
