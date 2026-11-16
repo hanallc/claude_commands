@@ -490,6 +490,47 @@ The [launch receipt contract](build-followups-fn-length-hook.md#production-launc
 
 - `produce.md` names each subcommand in `<LoadProduction/>`, `<OpenMergeBranch/>`, `<PromoteMain/>` and `<Wrap/>` and keeps the close-out approvals, the live smoke verdict and the CI, smoke and mirror text.
 
+### Investigations: `investigation.py`
+
+An investigation records an answer that the user wants a session to find.
+The command resolves the caller's staff row from its current session.
+A caller without a staff row receives one refusal line.
+Units, showrunners, producers, and workers can own records.
+
+Records use `<SHOWRUNNER_STATE_DIR>/<owner staff id>/investigations/I<n>.md`.
+The default root is `~/.local/state/showrunner`.
+Each owner has its own number sequence.
+A file lock protects number selection and state changes.
+Number selection uses existing record filenames, including invalid records, so filing preserves their contents.
+Atomic replacement keeps each record complete.
+
+Frontmatter stores the id, fixed owner id, title, state, and filed, answered, and read times.
+The body contains the question and an `## Answer` section.
+A question length field preserves text that contains an Answer heading.
+The states are `open`, `answer ready`, and `read`, in that order.
+An exact repeat of an answer-ready or read operation changes nothing.
+Other state changes receive one refusal line.
+
+1. File an investigation with `investigation.py file --title "<one line>" --question "<full question>"`.
+2. Save its answer with `investigation.py answer --id I<n> --text "<answer>"`.
+3. Mark its answer read with `investigation.py read --id I<n>`.
+4. List waiting investigations with `investigation.py list`.
+5. Include read investigations with `investigation.py list --all`.
+
+Answer and read commands accept `--owner <staff id>` to select another owner's record.
+`records`, `load`, and `mark_read` provide the same store operations for console callers.
+`records` skips invalid records, reports each path and cause on stderr, and watches those paths for cache refresh.
+Invalid UTF-8 receives the same refusal as invalid record fields.
+
+The status line counts open and answer-ready investigations immediately after questions.
+A unit or producer counts only its own investigations.
+A showrunner counts its own investigations and its units' investigations through the existing production unit scope.
+A showrunner without a production document counts its own investigations and watches its investigation folder.
+Child showrunners retain their own counts.
+Read investigations do not count.
+The count cache watches each folder and record that it reads.
+A missing folder uses its nearest existing parent until the folder appears.
+
 ### Updates, time, log and questions: `update_registration.py`
 
 - `time <ISO or HH:MM>` prints `time: ok — HH:MM <zone>` in the user's zone, never UTC.
