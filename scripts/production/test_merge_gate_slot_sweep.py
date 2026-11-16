@@ -7,6 +7,7 @@ import io
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -19,7 +20,7 @@ from scripts.production.gate_modules import GateRefused
 
 class NightlySlotSweepTests(unittest.TestCase):
     def test_local_sweep_failure_reports_once_and_keeps_the_nightly_result(self) -> None:
-        for status in (0, 1):
+        for status in (0, 1, 75):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
                 config = private_slot_config(Path(temporary), repository="fixture")
                 events: list[str] = []
@@ -31,9 +32,11 @@ class NightlySlotSweepTests(unittest.TestCase):
 
                 def run(argv: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
                     self.assertTrue(options["check"])
-                    if argv[1].endswith("mac_queue_run.py"):
+                    if argv[1].endswith("nix_env.py"):
+                        self.assertEqual(list(argv[2:4]), ["exec", sys.executable])
+                        self.assertTrue(argv[4].endswith("mac_queue_run.py"))
                         events.append("Mac")
-                        self.assertEqual(list(argv[2:10]),
+                        self.assertEqual(list(argv[5:13]),
                                          ["--kind", "run", "--what", "Sweep Mac build slots", "--package", "claude", "--", "/bin/zsh"])
                     else:
                         self.assertTrue(argv[1].endswith("send.py"))
@@ -54,14 +57,16 @@ class NightlySlotSweepTests(unittest.TestCase):
                 self.assertEqual(output.getvalue().strip(), notices[0])
 
     def test_mac_sweep_failure_reports_once_and_keeps_the_nightly_result(self) -> None:
-        for status in (0, 1):
+        for status in (0, 1, 75):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
                 config = private_slot_config(Path(temporary), repository="fixture")
                 notices: list[str] = []
 
                 def run(argv: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
                     self.assertTrue(options["check"])
-                    if argv[1].endswith("mac_queue_run.py"):
+                    if argv[1].endswith("nix_env.py"):
+                        self.assertEqual(list(argv[2:4]), ["exec", sys.executable])
+                        self.assertTrue(argv[4].endswith("mac_queue_run.py"))
                         raise subprocess.CalledProcessError(3, argv, stderr="Mac is unreachable\n")
                     self.assertTrue(argv[1].endswith("send.py"))
                     notices.append(argv[-1])

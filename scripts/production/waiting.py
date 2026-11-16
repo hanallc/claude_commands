@@ -274,7 +274,7 @@ def scratch_test(production: Production, name: str, tests: str, state_dir: Path)
             try:
                 with log.open("w", encoding="utf-8") as output:
                     test = subprocess.run(["sh", "-c", tests], cwd=worktree, stdout=output,
-                                          stderr=subprocess.STDOUT, text=True, check=False)
+                                          stderr=subprocess.STDOUT, text=True, check=False, pass_fds=copies.COMMAND_LOCKS.get())
                 tail = tail_lines(log, 4) or f"exit {test.returncode}"
                 state: ScratchGreen | ScratchRed | ScratchConflict = (
                     ScratchGreen(log) if test.returncode == 0 else ScratchRed(tail, log))

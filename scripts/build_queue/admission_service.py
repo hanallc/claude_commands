@@ -137,10 +137,16 @@ class Readings(Protocol):
 
 
 class SystemReadings:
+    def __init__(self) -> None:
+        self.swap_in: gate.SwapInHistory = gate.SwapInHistory()
+
     def host(self) -> records.HostMemory | records.ReadingUnavailable:
         try:
-            return gate.read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
-        except (OSError, ValueError) as error:
+            host = gate.read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
+            window = conf.read("build_admission").whole("agent_swap_window_seconds")
+            returning = self.swap_in.read(Path(os.environ.get("BUILDLOG_VMSTAT", "/proc/vmstat")), time.monotonic(), window)
+            return replace(host, swap_in_window_bytes=returning) if isinstance(returning, int) else returning
+        except (OSError, ValueError, conf.Unusable) as error:
             return records.ReadingUnavailable(str(error) or "memory reading unavailable")
 
     def pressure(self, host: records.HostMemory, policy: records.AdmissionPolicy) -> records.Pressure:

@@ -427,26 +427,69 @@ class MemoryRoomRulesTests(unittest.TestCase):
 
     def test_swap_outside_the_build_and_ci_slices_is_demand(self) -> None:
         policy = admission_policy_fixture()
-        for case, swap_used, build_and_ci, share, demand in (
-            ("agents swapped", 15, 0, 100, 15),
-            ("build and CI swap excluded", 15, 4, 100, 11),
-            ("only build and CI swapped", 4, 4, 100, 0),
-            ("share 0", 15, 0, 0, 0),
-            ("share 50", 15, 0, 50, 7.5),
-            ("swapped past the cap", 30, 0, 100, 30),
+        for case, swap_used, build_and_ci, returned, share, demand in (
+            ("agents idle in swap", 15, 0, 0, 100, 0),
+            ("build and CI swap excluded", 15, 4, 15, 100, 11),
+            ("only build and CI swapped", 4, 4, 4, 100, 0),
+            ("share 0", 15, 0, 4, 0, 0),
+            ("share 50", 15, 0, 4, 50, 2),
+            ("swapped past the cap", 30, 0, 30, 100, 30),
+            ("burst below swapped total", 15, 0, 2, 100, 2),
+            ("burst exceeds current swap", 2, 0, 15, 100, 2),
         ):
             with self.subTest(case=case):
                 host = admission_records.HostMemory(20 * GIB, 64 * GIB, 32 * GIB, int((32 - swap_used) * GIB),
-                                                    build_and_ci_swap=build_and_ci * GIB)
+                                                    build_and_ci_swap=build_and_ci * GIB,
+                                                    swap_in_window_bytes=returned * GIB)
                 reading = gate.memory_room(host, [], replace(policy, agent_swap_share_percent=share))
                 assert isinstance(reading, admission_records.MemoryRoom)
                 self.assertEqual(reading.agent_swap_demand, int(demand * GIB))
                 self.assertEqual(reading.signed_room, 17 * GIB - int(demand * GIB))
-                # The swapped demand is outside the cap, so the cap is the most builds can get.
+                # The measured return reserve reduces the cap.
                 cap = reading.cap
                 assert isinstance(cap, int)
                 self.assertEqual(cap, max(0, 17 * GIB - int(demand * GIB)))
                 self.assertEqual(reading.room, max(0, cap - reading.cap_use - reading.kept))
+                self.assertLessEqual(cap, max(0, host.available - policy.safety_bytes))
+
+    def test_swap_in_window_sums_samples_and_expires_the_burst(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "vmstat"
+            history = gate.SwapInHistory()
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            for now, pages, demand_pages in (
+                (0, 100, 0), (1, 100, 0), (2, 110, 10), (3, 115, 15),
+                (600, 115, 15), (602, 115, 5), (603, 115, 0),
+                (604, 3, 0), (605, 5, 2), (604, 5, 0),
+            ):
+                with self.subTest(now=now, pages=pages):
+                    _ = path.write_text(f"pswpin {pages}\npswpout 900\n")
+                    self.assertEqual(history.read(path, now, 600), demand_pages * page_size)
+
+    def test_swap_in_window_is_independent_of_the_sample_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "vmstat"
+            for interval in (1, 5, 10):
+                with self.subTest(interval=interval):
+                    history = gate.SwapInHistory()
+                    amount: int | admission_records.ReadingUnavailable = 0
+                    for now in range(0, 101, interval):
+                        _ = path.write_text(f"pswpin {1000 + now * 2}\n")
+                        amount = history.read(path, now, 600)
+                    self.assertEqual(amount, 200 * int(os.sysconf("SC_PAGE_SIZE")))
+
+    def test_missing_or_invalid_swap_in_never_becomes_zero_demand(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "vmstat"
+            history = gate.SwapInHistory()
+            for content in (None, "pswpout 100\n", "pswpin -1\n", "pswpin invalid\n", "pswpin 1\npswpin 2\n"):
+                with self.subTest(content=content):
+                    if content is not None:
+                        _ = path.write_text(content)
+                    reading = history.read(path, 100, 600)
+                    self.assertIsInstance(reading, admission_records.ReadingUnavailable)
+                    assert isinstance(reading, admission_records.ReadingUnavailable)
+                    self.assertIn(str(path), reading.reason)
 
     def test_unavailable_slice_swap_cannot_publish_room(self) -> None:
         missing = admission_records.ReadingUnavailable("builds.slice: memory.swap.current is missing")
@@ -461,7 +504,7 @@ class MemoryRoomRulesTests(unittest.TestCase):
         waiter: admission_records.Waiter = {"pid": 200, "start_time": "200", "need": 8 * GIB, "since": NOW_EPOCH}
         for case, running, reservations, state in (
             ("no build runs", (), (), "admit"),
-            ("one build runs", (run,), (fixture_reservation(100, 2 * GIB),), "hold"),
+            ("one build runs", (run,), (fixture_reservation(100, 2 * GIB),), "admit"),
         ):
             with self.subTest(case=case):
                 inputs = admission_records.QueueInputs([(Path("200.waiting"), waiter)], running, reservations, host,
@@ -5129,8 +5172,8 @@ class ShellTests(unittest.TestCase):
     def test_wait_prints_a_line_only_when_the_reason_or_the_place_changes(self) -> None:
         peak = admission_records.ExpectedPeak(8 * GIB, "fallback", 0)
         snapshot = admission_records.AdmissionWaitSnapshot(queue_decision(0, 60 * GIB, peak.bytes, [], policy=admission_policy_fixture()), peak, (), 0, "repo", "nextest",
-            admission_policy_fixture(), ())
-        reply = wire.Wait(admission_records.NeedsMemory(), 1, "", "", snapshot)
+            admission_policy_fixture(), (), head_reason=admission_records.NeedsMemory())
+        reply = wire.Wait(admission_records.NeedsMemory(), 3, "", "", snapshot)
         with patch.object(client, "CLOCK", self.admission.clock), contextlib.redirect_stderr(io.StringIO()) as output:
             notice = client.WaitOutput()
             notice(reply)

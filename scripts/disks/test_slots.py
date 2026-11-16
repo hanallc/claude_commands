@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -11,6 +12,7 @@ from unittest import mock
 from scripts.disks import measure, slots
 from scripts.disks.measure import DisksData, Folder
 from scripts.lib import build_slots, conf
+from scripts.lib.build_slots_test_support import private_slot_config
 
 GIB = 1 << 30
 DAY = 86400
@@ -70,6 +72,32 @@ class ReadSlotsTests(unittest.TestCase):
         self.assertEqual((second["size"], second["used_by"], second["deleted_tonight"]), (40 * GIB, None, True))
         self.assertEqual((tenth["size"], tenth["last_used"], tenth["deleted_tonight"]), (0, NOW - 2 * DAY, False))
         self.assertFalse(report["groups"][1]["slots"][0]["deleted_tonight"])
+
+    def test_slot_report_reads_the_common_or_machine_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            configuration = private_slot_config(root, repository="widget")
+            common = root / "default-slots"
+            for pool, number in ((common, 1), (configuration.slots, 2)):
+                (pool / f"widget-slot{number}").mkdir(parents=True)
+            original = configuration.settings.read_text()
+            cases = (("common", common, 1), ("machine", configuration.slots, 2))
+            with mock.patch.dict(os.environ, configuration.environment), \
+                    mock.patch.object(measure, "read_data", return_value=DATA):
+                for name, pool, number in cases:
+                    with self.subTest(root=name):
+                        lines = original.splitlines()
+                        if name == "common":
+                            lines = [line for line in lines
+                                     if not line.startswith(f"roots.slots.{configuration.machine}=")]
+                        _ = configuration.settings.write_text("\n".join(lines) + "\n")
+                        report = slots.slot_report(NOW)
+                        self.assertIsNotNone(report)
+                        assert report is not None
+                        self.assertEqual(report["root"], str(pool))
+                        self.assertEqual([(group["repository"], group["maximum"],
+                                           [row["name"] for row in group["slots"]]) for group in report["groups"]],
+                                         [("widget", 2, [f"widget-slot{number}"])])
 
     def test_no_slot_root_in_the_config_gives_no_report(self) -> None:
         class Settings:

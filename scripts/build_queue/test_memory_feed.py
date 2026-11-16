@@ -1260,14 +1260,21 @@ process.stdout.write(JSON.stringify({
         for number in range(3):
             _ = self.cgroup(f"owner-{number}.slice", admission_records.GIB // 2)
         gib = admission_records.GIB
-        host = admission_records.HostMemory(30 * gib, 60 * gib, 4 * gib, gib, build_and_ci_swap=0)
-        with mock.patch.object(admission_client, "view", return_value=captured_reading(host=host)):
-            page = memory_feed.reading(replace(memory_feed.read_configuration(), swap_rows=1))
-        self.assertEqual((page["swap"]["used_bytes"], page["swap"]["capacity_bytes"]), (3 * gib, 4 * gib))
-        self.assertEqual((page["swap"]["builds_ci_bytes"], page["swap"]["outside_bytes"]), (0, 3 * gib))
-        self.assertEqual([row["kind"] for row in page["swap_by"]], ["owner", "smaller", "unattributed", "total"])
-        self.assertEqual(sum(row["bytes"] for row in page["swap_by"][:-1]), 3 * admission_records.GIB)
-        self.assertEqual(page["swap_by"][1]["bytes"], admission_records.GIB)
+        for returned in (0, gib):
+            with self.subTest(returned=returned):
+                host = admission_records.HostMemory(30 * gib, 60 * gib, 4 * gib, gib, build_and_ci_swap=0,
+                                                    swap_in_window_bytes=returned)
+                reading = captured_reading(host=host)
+                with (mock.patch.object(admission_client, "view", return_value=reading),
+                      mock.patch.object(gate.SwapInHistory, "read", side_effect=AssertionError("the feed must use the service reading"))):
+                    page = memory_feed.reading(replace(memory_feed.read_configuration(), swap_rows=1))
+                self.assertEqual((page["swap"]["used_bytes"], page["swap"]["capacity_bytes"]), (3 * gib, 4 * gib))
+                self.assertEqual((page["swap"]["builds_ci_bytes"], page["swap"]["outside_bytes"]), (0, 3 * gib))
+                self.assertEqual([row["kind"] for row in page["swap_by"]], ["owner", "smaller", "unattributed", "total"])
+                self.assertEqual(sum(row["bytes"] for row in page["swap_by"][:-1]), 3 * admission_records.GIB)
+                self.assertEqual(page["swap_by"][1]["bytes"], admission_records.GIB)
+                self.assertEqual(page["ram"]["swap_target_bytes"], returned)
+                self.assertEqual(page["ram"]["swap_covered_bytes"], returned)
 
     def test_between_steps_holds_name_their_distinct_owners(self) -> None:
         reading = captured_reading()
@@ -1679,6 +1686,24 @@ process.stdout.write(JSON.stringify({
                                  shown["rows"][-1]["gib"])
                 self.assertEqual(shown["rows"][2]["gib"], memory_feed.gib(blocks["build_covered_bytes"]))
                 self.assertNotIn("note", shown)
+        swap_short = replace(room, available=4 * gib, agent_swap_demand=6 * gib, signed_room=-11 * gib)
+        check = admission_records.RoomCheck(16 * gib, -11 * gib, False, basis=admission_records.DoesNotFit())
+        swap_ram = memory_feed.ram_blocks(swap_short, tools, 100.0, 1)
+        self.assertEqual(swap_ram["swap_covered_bytes"], gib)
+        self.assertEqual(swap_ram["swap_target_bytes"], 6 * gib)
+        shown = memory_feed.head_room(check, swap_short, swap_ram)
+        self.assertEqual([(row["label"], row["gib"]) for row in shown["rows"]],
+                         [("Queue cap", 6.0), ("− Builds", 6.0), ("− Build reserved", 0.0), ("= Free", 0.0)])
+        self.assertNotIn("note", shown)
+        no_swap = replace(room, agent_swap_demand=0, cap=27 * gib, signed_room=17 * gib)
+        check = admission_records.RoomCheck(16 * gib, 17 * gib, False, basis=admission_records.DoesNotFit())
+        no_swap_ram = memory_feed.ram_blocks(no_swap, tools, 100.0, 1)
+        self.assertEqual(no_swap_ram["swap_target_bytes"], 0)
+        self.assertEqual(no_swap_ram["swap_covered_bytes"], 0)
+        shown = memory_feed.head_room(check, no_swap, no_swap_ram)
+        self.assertEqual([(row["label"], row["gib"]) for row in shown["rows"]],
+                         [("Queue cap", 31.0), ("− Builds", 6.0), ("− Build reserved", 8.0), ("= Free", 17.0)])
+        self.assertNotIn("note", shown)
         run = admission_records.RunMemory("organon", gib, admission_records.RunUseUnavailable("no cgroup"))
         unavailable = memory_feed.head_room(check, replace(room, cap=admission_records.CapUnavailable((run,))), ram)
         self.assertEqual((unavailable["unavailable"], unavailable["rows"]),
@@ -2423,7 +2448,8 @@ def write_browser_fixture(folder: Path) -> None:
         for name, available, swapped in (("head_memory", 8, 0), ("head_shortfall", 2, 0), ("head_swap_shortfall", 4, 6)):
             held = gate.queue_read_from(replace(inputs, pressure=admission_records.NoPressureHold(),
                 host=admission_records.HostMemory(available * admission_records.GIB, 60 * admission_records.GIB,
-                    8 * admission_records.GIB, (8 - swapped) * admission_records.GIB)),
+                    8 * admission_records.GIB, (8 - swapped) * admission_records.GIB,
+                    swap_in_window_bytes=swapped * admission_records.GIB)),
                 admission_policy_fixture())
             held = with_wait_reason(held, admission_records.NeedsMemory())
             held = replace(held, view=replace(held.view,

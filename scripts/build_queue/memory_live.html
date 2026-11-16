@@ -436,7 +436,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
       <div class="row" data-tip="room"><span class="sw room"></span><span class="name">Free</span><span class="v num" id="v-room">–</span><span class="note">The next step can start here.</span></div>
       <div class="row" data-tip="system"><span></span><span class="name">System reserved</span><span class="v num" id="v-system">–</span></div>
       <div class="row in" data-tip="safety"><span class="sw floor"></span><span class="name">Safety net</span><span class="v num" id="v-safety">–</span><span class="note" id="safety-note">A fixed setting.</span></div>
-      <div class="row in" data-tip="swap"><span class="sw swap"></span><span class="name">Swap coming back</span><span class="v num" id="v-swap">–</span><span class="note" id="swap-note">Empty now; held for swapped memory.</span></div>
+      <div class="row in" data-tip="swap"><span class="sw swap"></span><span class="name">Swap coming back</span><span class="v num" id="v-swap">–</span><span class="note" id="swap-note">RAM held for swap that comes back.</span></div>
       <div class="row" data-tip="shortfall"><span class="sw free"></span><span class="name">Shortfall</span><span class="v num" id="v-shortfall">–</span><span class="note">Reserves that free RAM does not cover.</span></div>
      </div>
      <div class="legend-group">
@@ -598,7 +598,7 @@ const TIPS = {
   safety: d => legendTip('Safety net', d.ram.safety_covered_bytes, 'RAM the queue always leaves free', [
     ...reserveTargetRows(d.ram.safety_covered_bytes, d.ram.safety_target_bytes),
     ...(d.ram.safety_missing_bytes > 0 ? [field('Not covered', ramAmount(d.ram.safety_missing_bytes))] : [])]),
-  swap: d => legendTip('Swap coming back', d.ram.swap_covered_bytes, 'Held for memory that is in swap now', [
+  swap: d => legendTip('Swap coming back', d.ram.swap_covered_bytes, 'RAM held for swap that comes back', [
     ...(recorded(d.swap?.reserve_share_percent) ? [field('Share held',`${d.swap.reserve_share_percent}%`)] : []),
     ...reserveTargetRows(d.ram.swap_covered_bytes, d.ram.swap_target_bytes),
     ...(d.ram.swap_missing_bytes > 0 ? [field('Not covered', ramAmount(d.ram.swap_missing_bytes))] : [])]),
@@ -1038,7 +1038,7 @@ function render(d) {
   $("v-shortfall").textContent = ramAmount(amounts.shortfall_bytes);
   $("v-shortfall").closest(".row").hidden = !(r.shortfall_bytes > 0);
   for (const [key, description] of [["build", "Running builds grow into it."],
-    ["safety", "A fixed setting."], ["swap", "Empty now; held for swapped memory."]]) {
+    ["safety", "A fixed setting."], ["swap", "RAM held for swap that comes back."]]) {
     $(key === "build" ? "reserved-note" : `${key}-note`).textContent =
       reserveDescription(description, amounts[`${key}_target_bytes`], amounts[`${key}_covered_bytes`]);
   }

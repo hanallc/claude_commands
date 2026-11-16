@@ -6,6 +6,7 @@ from pathlib import Path
 import unittest
 
 from scripts.direct.verify_doc_test_support import CARGO_STUB, VerifyDocFixture
+from scripts.lib import build_folders
 
 
 class VerifyDocCheckoutTests(VerifyDocFixture):
@@ -31,8 +32,9 @@ class VerifyDocCheckoutTests(VerifyDocFixture):
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         initial = self.cargo_calls()[0]
         checkout = Path(initial["cwd"])
-        self.assertTrue(checkout.is_relative_to(self.root / "tmp"))
-        self.assertFalse(checkout.exists())
+        self.assertTrue(checkout.is_relative_to(self.root / "slots"))
+        self.assertTrue(checkout.exists())
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
         self.assertEqual(initial["target"], str(self.root / "target"))
         del self.environment["TEST_DOC_STAMP"]
         self.environment["TEST_DOC_DELETED"] = "absent"
@@ -43,8 +45,9 @@ class VerifyDocCheckoutTests(VerifyDocFixture):
         second = self.verify()
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         current = self.cargo_calls()[1]
-        self.assertNotEqual(current["cwd"], initial["cwd"])
-        self.assertFalse(Path(current["cwd"]).exists())
+        self.assertEqual(current["cwd"], initial["cwd"])
+        self.assertTrue(Path(current["cwd"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(current["cwd"])), "free")
         self.assertEqual(current["target"], initial["target"])
         self.assertEqual(times.read_text().splitlines(), [str(stamp), str(stamp)])
         self.assertEqual(current["sources"]["alpha/src/lib.rs"], "pub fn next_tree() {}\n")
@@ -58,11 +61,12 @@ class VerifyDocCheckoutTests(VerifyDocFixture):
         first, second = self.cargo_calls()
         self.assertEqual(first["target"], str(self.root / "target"))
         self.assertEqual(second["target"], first["target"])
-        self.assertNotEqual(second["cwd"], first["cwd"])
-        self.assertFalse(any(Path(call["cwd"]).exists() for call in (first, second)))
-        records = list((self.root / "home/worktrees/gates").glob("*/*/.gate.json"))
+        self.assertEqual(second["cwd"], first["cwd"])
+        self.assertTrue(all(Path(call["cwd"]).exists() for call in (first, second)))
+        self.assertEqual({build_folders.build_folder_state(Path(call["cwd"])) for call in (first, second)}, {"free"})
+        records = list((self.root / "slots").glob("*-slot*.lease.json"))
         self.assertEqual(len(records), 1)
-        self.assertTrue((records[0].parent / "target").is_dir())
+        self.assertTrue((Path(first["cwd"]) / "target").is_dir())
 
 
 if __name__ == "__main__":

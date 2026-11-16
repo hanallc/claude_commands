@@ -1125,7 +1125,7 @@ try {
             }
             await show(base);
             const reserveNotes=await evaluate(`['reserved-note','safety-note','swap-note'].map(id=>document.getElementById(id).textContent)`);
-            assert.deepEqual(reserveNotes,['Running builds grow into it.','A fixed setting.','Empty now; held for swapped memory.']);
+            assert.deepEqual(reserveNotes,['Running builds grow into it.','A fixed setting.','RAM held for swap that comes back.']);
             for (const name of ['old_cap','missing_cap','missing_use']) {
               await show(readings[name]);
               const state=await evaluate(`({rows:document.querySelectorAll('.wrow[data-run]').length,
@@ -1653,7 +1653,7 @@ try {
             {label:'= free',gib:7.1},{label:'needs',gib:16.3}],note};
           const room={unavailable:'',
             rows:[{label:'Queue cap',gib:17.1},{label:'− Builds',gib:1.5},{label:'− Build reserved',gib:8.5},
-            {label:'= Free for builds',gib:7.1}],note:'Build reserved is memory that running builds used at their next points in earlier runs.'};
+            {label:'= Free for builds',gib:7.1}]};
           const behind={...owner,name:'trunk nextest',unit:'trunk',detail:'trunk',pid:4243,need:2.0,
             reason:'behind #1: the first step in line gets memory first',runs_on:'natedev or Mac'};
           const head={...owner,place:1,why:'only 7.1 GiB is free for builds. It starts when 16.3 GiB is free.'};
@@ -1925,7 +1925,7 @@ try {
                   {label:'− Build reserved',gib:1.04},{label:'= Free',gib:1.04}]}},
                   {name:'slot',kind:'repository-slot',need:0,runs_on:'natedev'}]};
               window.renderReading(fractional);
-              return {...Object.fromEntries(['g-builds','cap','room','swap-pool:outside','walkhead','row:0','wait:0','wait:1']
+              return {...Object.fromEntries(['g-builds','cap','room','swap','swap-pool:outside','walkhead','row:0','wait:0','wait:1']
                 .map(key=>[key,tooltipRows(key,fractional)])),
                 legend:Object.fromEntries(['builds','reserved','room'].map(key=>[key,document.querySelector('#v-cap-'+key).textContent]))};
             })()`);
@@ -1943,6 +1943,7 @@ try {
             for(const [label,capLabel] of [['Queue cap','Queue cap'],['− Builds','Builds'],
               ['− Build reserved','+ Build reserved'],['= Free','+ Free']]) assert.equal(wait[label],cap[capLabel]);
             for(const key of ['cap','room','wait:0']) assert.ok(!review[key].some(row=>/Safety net|Swap coming back/.test(row.label)));
+            assert.equal(review.swap.find(row=>row.kind==='caption').value,'RAM held for swap that comes back');
             const swap=amounts(review['swap-pool:outside']);
             assert.equal(swap['Swap coming back'],'1.0 GiB');
             assert.equal(swap.Target,'2.0 GiB');
