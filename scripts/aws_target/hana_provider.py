@@ -28,6 +28,7 @@ PROVIDER_OPERATIONS = {
     'modify-instance-attribute': 'ec2:ModifyInstanceAttribute',
     'start-instances': 'ec2:StartInstances',
     'stop-instances': 'ec2:StopInstances',
+    # Control messages and digest source bundles use these scoped operations.
     'put-object': 's3:PutObject',
     'get-object': 's3:GetObject',
 }

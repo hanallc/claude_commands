@@ -15,6 +15,8 @@ from unittest.mock import patch
 from scripts.direct import simplify_daily
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.git_test_support import commit_repository
+from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib import build_folders
 from scripts.lib.checkout_test_support import copy_runtime
 from scripts.lib.nix_env_test_support import NixFixture, ROOT
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -92,9 +94,10 @@ class DailySimplifyTests(NixFixture):
         registry = write_registry(self.root / "models.conf", base_text=(ROOT / "config/models.conf").read_text())
         self.env.update({"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
                          "CODEX_CATALOG_SYNC_STATE_FILE": str(registry)})
+        self.env.update(private_slot_config(self.root, repository="origin").environment)
         settings = Path(self.env["CONF_DIR"])
+        _ = shutil.copytree(ROOT / "config/review", settings / "review", dirs_exist_ok=True)
         _ = write_config_fixture(settings / "direct.conf", "SIMPLIFY_LENS=on\nSIMPLIFY_FIRST_RUN_BEFORE=2026-11-05T22:50:00-05:00\n")
-        _ = write_config_fixture(settings / "build_folders.conf", f"roots.copies={self.root / 'copies'}\n")
         startup = self.root / "startup"
         startup.mkdir()
         _ = (startup / "sitecustomize.py").write_text('''import datetime, os, sys
@@ -124,7 +127,15 @@ if sys.argv[0].endswith(("assign.py", "simplify_daily.py")):
         self.script(self.bin / "claude", '''import json, os, subprocess, sys, uuid
 from pathlib import Path
 session = sys.argv[sys.argv.index("--session-id") + 1] if "--session-id" in sys.argv else str(uuid.uuid4())
+lock = os.stat(os.getcwd() + ".lock")
+inherited_lease = False
+for descriptor in range(3, 256):
+    try:
+        inherited_lease = inherited_lease or os.path.samestat(lock, os.fstat(descriptor))
+    except OSError:
+        pass
 record = {"argv": sys.argv[1:], "prompt": sys.stdin.read(), "cwd": os.getcwd(),
+          "inherited_lease": inherited_lease,
           "config_dir": os.environ.get("CLAUDE_CONFIG_DIR"), "session_id": session,
           "head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
           "branch": subprocess.check_output(["git", "branch", "--show-current"], text=True).strip(),
@@ -216,6 +227,11 @@ raise SystemExit(1 if failed else 0)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.artifacts() / "diff").read_text().strip(), self.git("diff", self.first, self.tip))
         self.assertEqual(self.reviews()[0]["head"], self.tip)
+        review = self.reviews()[0]
+        slot = Path(cast(str, review["cwd"]))
+        self.assertTrue(slot.is_relative_to(self.root / "slots"))
+        self.assertTrue(review["inherited_lease"])
+        self.assertEqual(build_folders.build_folder_state(slot), "free")
         self.assertEqual(self.git("rev-parse", "HEAD"), local_tip)
         self.assertEqual(self.refs()["refs/simplify/last"], self.tip)
 
@@ -278,7 +294,7 @@ raise SystemExit(1 if failed else 0)
         self.assertEqual((call["head"], call["branch"], call["content"]), (self.tip, "", "origin tip\n"))
         clone = Path(cast(str, call["cwd"]))
         self.assertNotEqual(clone, self.work)
-        self.assertFalse(clone.exists(), "The launcher must remove only its own clone")
+        self.assertEqual(build_folders.build_folder_state(clone), "free", "The launcher must release its slot")
         self.assertEqual((self.work / "payload.txt").read_text(), "uncommitted unit work\n")
         rows = [cast(dict[str, object], json.loads(line)) for line in
                 (Path(self.env["USAGE_STATE_DIR"]) / "agents.jsonl").read_text().splitlines()]
