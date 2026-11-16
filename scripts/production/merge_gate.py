@@ -67,7 +67,7 @@ from typing import Literal, Protocol, TextIO, cast
 from scripts.lib import process_group
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
-from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, waiting_rows
+from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import read_step_names
 from scripts.production import affected_modules, change_review, land_runs  # noqa: E402
@@ -903,10 +903,10 @@ def private_gate_recovery(repo: Path, parent: Path) -> Generator[GateRecovery]:
 
 
 @contextmanager
-def gate_temporary(recovery: GateRecovery, request: build_folders.UniqueBuildFolder) -> Generator[Path]:
+def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator[Path]:
     with ExitStack() as cleanup:
         with cancellation.defer_cleanup_signals():
-            folder = cleanup.enter_context(build_folders.temporary_build_folder(request))
+            folder = cleanup.enter_context(build_folders.tool_folder(tool, parent))
             recovery.folders.append(str(folder))
             recovery.save()
         try:
@@ -1127,6 +1127,7 @@ raise SystemExit(99)
             "STAFF_FILE": str(root / "staff.json"),
             "HERDR_PANE_RECORD_DIR": str(root / "herdr-panes"),
             "BUILDLOG_DIR": str(buildlog),
+            session_folder.ROOT_ENV: str(root / "session"),
             "TEST_TIMES_OUT": str(root / "test-times.json"),
             "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(root / "live-memory-reads.jsonl"),
             "PATH": str(tools) + os.pathsep + environment.get("PATH", os.defpath)}
@@ -1547,8 +1548,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             raise
 
     with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
-          gate_temporary(recovery, build_folders.UniqueBuildFolder(
-              build_folders.FOLDER_PREFIXES[mode.value], build_folders.ExplicitBuildParent(tmpfs))) as temporary,
+          gate_temporary(recovery, mode.value, tmpfs) as temporary,
           ExitStack() as module_folders,
           (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
           (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
@@ -1706,8 +1706,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     suite, path = request.suite, request.path
                     folder_cleanup = ExitStack()
                     _ = module_folders.callback(folder_cleanup.close)
-                    root = folder_cleanup.enter_context(build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-                        build_folders.FOLDER_PREFIXES["suite-module"].format(owner=f"{suite}-{path.stem}"), build_folders.ExplicitBuildParent(temporary))))
+                    root = folder_cleanup.enter_context(build_folders.tool_folder(f"{suite}-{path.stem}", temporary))
                     log = root / "output.log"
                     job_environment = ({**environment, "TMPDIR": str(root)} if request.kind is GateJobKind.TYPE_CHECK
                                        else test_module_environment(root, environment))
