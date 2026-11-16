@@ -11,6 +11,10 @@ pub(crate) const RUST_SUFFIX: &[u8] = b".rs";
 /// The line end that Python reads as one boundary, though both characters are boundaries.
 pub(crate) const CARRIAGE_RETURN_LINE_FEED: [char; 2] = ['\r', '\n'];
 
+// module queries
+/// The output fact name of each module site query.
+pub(crate) const MODULE_SITES_FACT: &str = "module_sites";
+
 // python token reader
 /// The Python `PUNCTUATION` alternatives of two characters, in pattern order.
 pub(crate) const PUNCTUATION_PAIRS: [[char; 2]; 9] = [
