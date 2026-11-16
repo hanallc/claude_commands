@@ -159,6 +159,12 @@ class TheListTests(unittest.TestCase):
         self.assertIn("check overdue", output)
         self.assertIn("●", output)
         self.assertIn("—", output)
+        for check in (START - timedelta(minutes=1), START + timedelta(hours=1), the_list.CheckCondition("The review ends")):
+            closed = self.add("Closed check", changes={"next_check": check})
+            _ = the_list.close(MORTY.id, closed.id, "The user removed it", source="nate")
+            row = next(line for line in self.command("list", "--all")[1].splitlines()
+                       if line.startswith(f"| {closed.number} |"))
+            self.assertEqual(row.split("|")[4].strip(), "Closed")
 
     def test_item_links_keep_conditions_and_refuse_cycles(self) -> None:
         first, second, third = self.add("First"), self.add("Second"), self.add("Third")

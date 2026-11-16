@@ -94,7 +94,7 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for Accounts, AWS, Builds, Changes, Disks, Images, Investigations and Questions, in alphabetical order.
+The left navigation has icons and labels for Accounts, AWS, Builds, Changes, Disks, Images, Investigations, List and Questions, in alphabetical order.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`. The content column is centered in the frame, 32px below its top edge, with at least 32px at each side.
 Each navigation page places `page_frame.title()` directly above its content.
@@ -122,7 +122,7 @@ Reduced motion stops the loader icon.
 `page_frame.createPageRefresh` owns the refresh timers, visibility handling, failures and status drawing.
 Each loader checks the request identity before it changes content.
 An older response cannot replace a newer response.
-Accounts, Changes, Investigations and Questions read their rendered page at `page_refresh_seconds` intervals.
+Accounts, Changes, Investigations, List and Questions read their rendered page at `page_refresh_seconds` intervals.
 Builds reads `memory.json` at its feed interval.
 Disks reads `disks.json` at `page.poll_seconds` intervals and requests a new measure when needed.
 AWS reads its published page when shown; its hourly publisher sets the data time and render time.
@@ -131,7 +131,7 @@ The Changes and Questions pages show Paused while text or an active save holds a
 
 The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
-AWS, Builds, Changes, Images, Investigations, Questions and Rebuilds put the title in the same place.
+AWS, Builds, Changes, Images, Investigations, List, Questions and Rebuilds put the title in the same place.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
@@ -413,6 +413,36 @@ Images has no interval timer.
 
 The shared status line shows the last server render time.
 The render value's hover text shows the median of at most 10 successful renders.
+
+### The List page
+
+`/console/list.html` reads the producer's numbered List records on each request.
+The navigation label is List, and the page title is The List.
+The page uses the shared status line in `page_frame.py`.
+The columns are #, Owner, Item, State, Next step, ETA, and Update.
+The default order uses `the_list.order`, which the CLI also uses.
+User decisions come first, then unread updates, then the earliest next check.
+A column button sorts its values; a second click reverses that order.
+
+The Owner menu includes record owners without a current staff row.
+The Show menu contains Open, Needs me, Unread, Done, Parked, Closed, and All.
+Open excludes Done, Closed, and items with a future parking time.
+The search field matches an item number or title.
+The address retains the owner, view, search, column, and direction.
+
+A row opens to show its latest status, completion condition, evidence, item links, and log.
+The log shows its newest entry first.
+The page has no feedback forms in this phase.
+An unread update shows a dot and marks the navigation entry as new.
+The navigation key includes the record ID and update time.
+The page uses `page_refresh_seconds` and the shared refresh helper.
+A refresh retains the search text, selection, focus, scroll position, open rows, and filters.
+An older response cannot replace a newer response.
+Phone layouts show each row as a card.
+The counts strip uses the status line readers for questions, changes, and rebuilds.
+Each count links to its existing page.
+The strip omits proposals and efficiencies because they have no console page.
+Closed items show no check text in the page or CLI.
 
 ### Investigations page
 
