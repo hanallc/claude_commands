@@ -653,12 +653,13 @@ def decode_run(value: object) -> GateRun:
                              number(row, 'peak_mib'), restart, wall_clock=wall_clock)
 
     row = mapping(value)
+    # A newer box leaves out the executions list when it equals the jobs list.
     for key in ('tests_reused', 'selection_certified'):
         if type(row[key]) is not bool:
             raise ValueError(f'{key}: expected a boolean')
     return GateRun(tuple(job(item) for item in rows(row, 'jobs')), number(row, 'seconds'),
                    number(row, 'peak_memory_mib'), row['tests_reused'] is True,
-                   row['selection_certified'] is True, tuple(job(item) for item in rows(row, 'executions')),
+                   row['selection_certified'] is True, tuple(job(item) for item in rows(row, 'executions' if 'executions' in row else 'jobs')),
                    str(row.get('time_limit_report', '')))
 
 
