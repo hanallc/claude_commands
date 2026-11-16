@@ -11,12 +11,13 @@ Tree-writing steps remain local.
 Unpinned build and final steps retain their local rules.
 A pinned final keeps its clean-tree check and saves no local pass.
 A remote build prints its target and binary path.
+`linux_only.<repo>` keeps tests, builds, examples and finals off the Mac.
+`check`, `lint` and `doc` steps ignore it for every selection: default, `--mac`, `--target mac` and a pinned Mac.
+These steps only compile, and only the Mac compiles macOS code, such as the macOS files of `hana_video`.
+`eligibility.COMPILE_ONLY_STEP_KINDS` and `eligibility.linux_only_applies` hold this rule.
 A step with a named package checks only that package against `linux_only.<repo>`.
-`linux_only` keeps a package's own steps off the Mac; a package that depends on one still runs there.
+A package that depends on a `linux_only` package still runs on the Mac.
 A step with no package refuses Mac offload when any workspace member is `linux_only`.
-`lint` and `doc` steps cover the whole workspace for every package, so they always use the workspace check.
-`eligibility.step_package` holds this rule.
-Without it, a `lint hana_diegetic --check` on the Mac judged the macOS code of `hana_video`, which CI never judges.
 
 `fixed_placement_constraints` retains every configured candidate that a fixed rule permits.
 Disk, busy, spending, reachability, and hold results remain refreshed evidence.
@@ -33,7 +34,9 @@ An idle alert marker does not control admission.
 Blocks, live repository claims, and retry delays still apply.
 Tree repair steps remain local.
 
-Lint during a hold keeps local `cargo fmt` and `taplo fmt`. It then runs `mend-check` (`mend --fail-on-warn`) and clippy judgment (`--workspace --all-targets --all-features -- -D warnings`) on the Mac. A lint can use this sequence when its first `mend --fix` waits for memory and a Mac becomes free. A clean judgment ends the call without local repairs. A Mac finding from this memory transition returns the lint to the natedev queue for `mend --fix`. A busy Mac or a `linux_only.<repo>` exclusion keeps the lint on natedev. Writing steps always run on natedev. Their leave hooks remain disabled while the commands run. Local formatting uses the protected `local_noncompiling` record state, including when a hold starts during formatting. The mirror never writes changes back. A finding must be fixed locally; a Linux-only lint error can appear later at the merge gate. A local step stopped for a new hold is routed again after the stop, rather than counted as a completed failure.
+Lint during a hold keeps local `cargo fmt` and `taplo fmt`. It then runs `mend-check` (`mend --fail-on-warn`) and clippy judgment (`--workspace --all-targets --all-features -- -D warnings`) on the Mac. A lint can use this sequence when its first `mend --fix` waits for memory and a Mac becomes free. A clean judgment ends the call without local repairs. A busy Mac keeps the lint on natedev. Local formatting uses the protected `local_noncompiling` record state, including when a hold starts during formatting.
+
+A `mend-check` finding starts the Mac fix pass in the same Mac run. The `mend-fix` verb runs `mend --fix --fail-on-warn` on the Mac copy. clippy then judges the fixed copy with `--all-targets --all-features`. On a pass, `return_fix` lists the mirror files that differ from the worktree in content, under the run's claim. It skips the mirror mark, `/.git`, `/target` and git-ignored paths. It writes the changed files and removes the deleted files only when the worktree tree key still equals the sent key. The return is all or nothing, with a roll-forward record in the worktree git folder (`mac-fix.json`, held under `mac-fix.lock`). `fix_return.py` writes each fixed file to a temporary sibling under a `staging` record. It then writes a `commit` record that lists the renames and removals, and fsyncs it. It runs the renames and removals and then deletes the record. At its start, `verify.sh` finishes a left record before any step reads the tree. A `staging` record is rolled back, so the tree is unchanged. A `commit` record is rolled forward. So a stop or SIGKILL at any point leaves the old tree or the fixed tree after the next run. natedev then runs `cargo fmt` and records the verdict key on the fixed tree. The result file adds `fix=applied|none|refused|failed|not_run`. A failed fix pass, a refused or failed return, or any decline other than busy or blocked returns the lint to the natedev queue for `mend --fix`, as before. Other writing steps always run on natedev, and their leave hooks remain disabled while the commands run. A Linux-only lint error can appear later at the merge gate. A local step stopped for a new hold is routed again after the stop, rather than counted as a completed failure.
 
 ## How it works
 
@@ -263,7 +266,7 @@ The runner command has this form:
 
 ```sh
 offload.py run --repo-root DIR [--package PKG] \
-  [--verb nextest|check|clippy|mend-check|doc|build] --call-id ID \
+  [--verb nextest|check|clippy|mend-check|mend-fix|doc|build] --call-id ID \
   [--settings FILE] [--last-decline busy|blocked] [--filter-run] \
   [--result FILE] -- <verb arguments>
 ```

@@ -1627,6 +1627,61 @@ class RebuildRowTests(unittest.TestCase):
             rebuild_row.write(config, run)
             self.assertEqual(cache.read_text(encoding="utf-8").splitlines()[0], "")
 
+    def test_changes_list_commits_after_each_switch_with_the_session_that_wrote_them(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            config, cache, projects = root / "statusline.conf", root / "cache", root / ".claude" / "projects"
+            (projects / "-etc-nixos").mkdir(parents=True)
+            _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
+                                  + "rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=120\n"
+                                  + f"rebuild.eval_retry_seconds=600\nrebuild.cache={cache}\n"
+                                  + "rebuild.generations=~/.local/state/rebuild/generations.log\n", encoding="utf-8")
+            switched = {"natedev": "a" * 40, "mac": "b" * 40}
+            # The running natedev system is the earlier switch, so a later switch to another system is not the base.
+            logs = {"natedev": f"/nix/store/x\nt switch system-1-link {'a' * 40}-dirty /nix/store/x\n"
+                               + f"t switch system-2-link {'c' * 40} /nix/store/y",
+                    "mac": f"/nix/store/m\nt switch system-9-link {'b' * 40} /nix/store/m"}
+            commands: list[list[str]] = []
+            mac_reachable = True
+
+            def run(command: list[str], *, timeout: int = 30) -> str:
+                commands.append(command)
+                if command[0] == "sh":
+                    self.assertEqual(command[2], "realpath /run/current-system && tail -n 200 "
+                                     + "~/.local/state/rebuild/generations.log")
+                    return logs["natedev"]
+                if command[0] == "ssh":
+                    return logs["mac"] if mac_reachable else ""
+                if command[0] == "rg":
+                    self.assertEqual(timeout, 120)
+                    self.assertIn('"type":"remote_session_change","url":"https://claude.ai/code/session_01Abc"', command)
+                    return (f"{projects}/-etc-nixos/96b016bf.jsonl\n"
+                            + f"{projects}/-etc-nixos/96b016bf/subagents/agent-1.jsonl")
+                self.assertEqual(command[:4], ["git", "-C", "/test/nixos", "log"])
+                base = command[-1].split("..")[0]
+                self.assertIn(base, switched.values())
+                return (f"{'d' * 40}\x1f2026-11-15T08:45:08-05:00\x1fmemory: THP defrag defer\x1f"
+                        + "https://claude.ai/code/session_01Abc\n"
+                        + f"{'e' * 40}\x1f2026-11-15T01:09:21-05:00\x1fby hand\x1f")
+
+            with patch("scripts.message.session_records.config_dirs", return_value=[root / ".claude"]):
+                rebuild_row.write_changes(config, run)
+                wrote = [rebuild_row.Change("d" * 40, "2026-11-15T08:45:08-05:00", "memory: THP defrag defer", "96b016bf"),
+                         rebuild_row.Change("e" * 40, "2026-11-15T01:09:21-05:00", "by hand", "")]
+                self.assertEqual(rebuild_row.read_changes(config), {"natedev": tuple(wrote), "mac": tuple(wrote)})
+                self.assertEqual([command[-1] for command in commands if command[0] == "git"],
+                                 [f"{'a' * 40}..main", f"{'b' * 40}..main"])
+                self.assertEqual(sum(command[0] == "rg" for command in commands), 1)
+                commands.clear()
+                mac_reachable = False
+                switched["natedev"] = "c" * 40
+                logs["natedev"] = f"/nix/store/y\nt switch system-2-link {'c' * 40} /nix/store/y"
+                rebuild_row.write_changes(config, run)
+                # The session map is kept, and a Mac that does not answer keeps its last list.
+                self.assertFalse(any(command[0] == "rg" for command in commands))
+                self.assertEqual(rebuild_row.read_changes(config)["mac"], tuple(wrote))
+                self.assertEqual(rebuild_row.switched_commit("", "/nix/store/x"), "")
+
     def test_read_command_prints_both_one_or_no_machines(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "statusline.conf"

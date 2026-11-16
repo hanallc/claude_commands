@@ -1,4 +1,7 @@
-"""The color tokens and base type of the console pages: the Accounts, AWS prices and Builds pages."""
+"""The color tokens and base type of the console pages: the Accounts, AWS prices and Builds pages.
+
+page_frame owns the main column and the page title; this module holds no main or h1 rule.
+"""
 from __future__ import annotations
 
 # A page takes the tokens alone, or the tokens and the base rules.
@@ -16,8 +19,7 @@ TOKENS = (f":root{{color-scheme:light;{_LIGHT}}}\n"
 CSS = TOKENS + (
        "*{box-sizing:border-box}\n"
        'body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}\n'
-       "main{max-width:1120px;margin:0 auto;padding:24px 16px 48px}\n"
-       "h1{font-size:1.4rem;margin:0;letter-spacing:-0.01em}h2{font-size:1.05rem;margin:0 0 4px}\n"
+       "h2{font-size:1.05rem;margin:0 0 4px}\n"
        ".card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 18px 14px;margin:0 0 16px}\n"
        ".note{color:var(--ink-2);font-size:0.86rem;margin:6px 0 0;max-width:78ch}\n"
        # A wide table scrolls inside its card, and a shadow marks more columns at the right edge.

@@ -62,12 +62,10 @@ class HanaSetupTests(CostFixture):
         self.assertFalse(settings.enabled)
 
     def base_settings(self) -> DeploymentSettings:
-        return DeploymentSettings('us-east-2', 'fixture-admin', 'fixture-gates', 'fixture-type', 'fixture-image',
-            '000000000000', 'fixture-release', 'us-east-2b', 'fixture-vpc', 'fixture-subnet', '', '/dev/xvda',
-            1, 1, 1, 1, hana_spend.read_settings(conf.read(self.workload)).spot_max_usd_per_hour,
+        return DeploymentSettings('us-east-2', 'fixture-admin', 'fixture-gates', 'fixture-image',
+            '000000000000', 'fixture-release', 'us-east-2b', 'fixture-vpc', 'fixture-subnet', '/dev/xvda',
             1, 2, 3, conf.read(self.workload).whole('aws_timeout_s'),
-            conf.read(self.settings).whole('preflight_max_age_s'), 'fixture-scaler',
-            'https://example.invalid/scripts', 'fixture-commit', 'fixture-hash', self.root / 'bootstrap')
+            conf.read(self.settings).whole('preflight_max_age_s'), 'fixture-scaler')
 
     def test_setup_requires_current_preparation_before_any_aws_call(self) -> None:
         fake = FakeAws(self.clock)
@@ -88,12 +86,16 @@ class HanaSetupTests(CostFixture):
         calls: list[str] = []
         def api_call(operation: str, *arguments: str, service: str = 'ec2', timeout_s: float | None = None) -> dict[str, object]:
             calls.append(operation)
-            if operation == 'deploy':
+            if operation == 'execute-change-set':
                 evidence = ledger.CostLedger(self.state).read_snapshot()
                 self.assertTrue(any(isinstance(row.state, ledger.HanaExposureOpen) for row in evidence.hana_compute))
                 self.assertTrue(evidence.hana_storage)
                 self.assertEqual(service, 'cloudformation')
                 self.assertIn('hana-build', arguments)
+                return {}
+            if operation == 'describe-change-set':
+                return {'Status': 'CREATE_COMPLETE', 'Changes': []}
+            if operation in ('create-change-set', 'wait') and service == 'cloudformation':
                 return {}
             if operation == 'describe-stacks':
                 outputs = {'Instance': IDENTITY.instance, 'ControlBucket': 'fixture-bucket', 'DataVolume': 'fixture-volume'}
@@ -123,6 +125,8 @@ class HanaSetupTests(CostFixture):
         self.assertEqual(record['state'], hana_box.Lifecycle.IDLE_STOPPED)
         self.assertEqual(ledger.mapping(record['identity'])['spot_request'], IDENTITY.spot_request)
         self.assertIn('stop-instances', calls)
+        self.assertLess(calls.index('create-change-set'), calls.index('execute-change-set'))
+        self.assertNotIn('deploy', calls)
         self.assertNotIn('start-instances', calls)
         self.assertFalse((self.state / 'gate-deployment.json').exists())
         self.assertEqual(conf.read(self.workload).text('enabled'), 'off')

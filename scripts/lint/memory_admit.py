@@ -602,6 +602,7 @@ class UsableAdmissionConfiguration:
     cloud_gate_stale_pushes: int
     progress_profile_rank: int
     peak_history_share_percent: int
+    progress_profile_sweep_seconds: float
 
 
 @dataclass(frozen=True)
@@ -618,10 +619,12 @@ def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdm
             cloud_gate_stale_pushes = settings.whole("cloud_gate_stale_pushes")
             progress_profile_rank = settings.whole("progress_profile_rank")
             peak_history_share_percent = settings.whole("peak_history_share_percent")
+            progress_profile_sweep_seconds = settings.number("progress_profile_sweep_seconds")
         config = records.read_memory_config(report=False)
         return UsableAdmissionConfiguration(replace(config,
             diagnostics=(*config.diagnostics, *records.configuration_diagnostics(messages))),
-            cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank, peak_history_share_percent)
+            cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank, peak_history_share_percent,
+            progress_profile_sweep_seconds)
     except conf.Unusable as error:
         return UnusableAdmissionConfiguration(str(error))
 
@@ -998,6 +1001,17 @@ def sum_swap_backed_use(readings: Iterable[AnonymousRunUse | RunUseUnavailable])
             return use
         total += use.bytes
     return AnonymousRunUse(total)
+
+
+def swap_backed_use_less(use: AnonymousRunUse | RunUseUnavailable,
+                         charged: Iterable[AnonymousRunUse | RunUseUnavailable]) -> AnonymousRunUse | RunUseUnavailable:
+    """Remove the swap-backed use that other readings already charge from one group's use."""
+    taken = sum_swap_backed_use(charged)
+    if isinstance(use, RunUseUnavailable):
+        return use
+    if isinstance(taken, RunUseUnavailable):
+        return taken
+    return AnonymousRunUse(max(0, use.bytes - taken.bytes))
 
 
 def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
@@ -1881,12 +1895,25 @@ def progress_text(reading: StepMemory) -> str:
     return f"{phase}; need {reading.remaining_need / GIB:.1f} GiB; {reason}"
 
 
+def ci_readings(readings: Iterable[StepMemory]) -> tuple[UnownedSliceMemory, ...]:
+    """Select the CI service readings that the queue cap counts."""
+    return tuple(reading for reading in readings
+                 if isinstance(reading, UnownedSliceMemory) and not isinstance(reading.job_state, NotServiceSlice))
+
+
+def ci_cap_use(readings: Iterable[StepMemory]) -> int:
+    """Return the CI use that the queue cap counts: swap-backed use, as for queued builds.
+
+    The CI file cache is in available RAM already, so the cap does not count it twice.
+    A reading without its swap-backed use counts its working set.
+    """
+    return sum(reading.anonymous.bytes if isinstance(reading.anonymous, AnonymousRunUse) else reading.bytes
+               for reading in ci_readings(readings))
+
+
 def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | ReadingUnavailable:
     """Calculate room from the captured run and CI readings."""
-    readings = tuple(step.measured for step in inputs.running)
-    ci_use = sum(reading.bytes for reading in readings
-                 if isinstance(reading, UnownedSliceMemory)
-                 and not isinstance(reading.job_state, NotServiceSlice))
+    ci_use = ci_cap_use(step.measured for step in inputs.running)
     return memory_room(inputs.host, run_memories(inputs), policy, ci_use=ci_use)
 
 
@@ -2751,6 +2778,8 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
             duplicate_use += sum(memory.anonymous.bytes for memory in scoped
                                  if isinstance(memory.anonymous, AnonymousRunUse))
             amount = max(0, amount - duplicate_use)
+            anonymous = swap_backed_use_less(working_set.anonymous,
+                                             (duplicate.anonymous, *(memory.anonymous for memory in scoped)))
             swapped = max(0, swapped - duplicate.swap_bytes - sum(memory.swap_bytes for memory in scoped))
             promise: MemoryPromise = NoPromise()
             activity = activity_reader.scope(members, child.name)
@@ -2777,7 +2806,7 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
                         job_state = RunningServiceJob(activity_reader.started_at(first))
             if required or amount or members:
                 result.append(UnownedSliceMemory(amount, promise=promise,
-                                                 swap_bytes=swapped,
+                                                 swap_bytes=swapped, anonymous=anonymous,
                                                  cgroup=str(child), owner=child.name,
                                                  activity=activity, pid=row_pid,
                                                  job_state=job_state, service_job_state=current_state))

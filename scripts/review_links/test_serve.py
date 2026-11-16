@@ -27,7 +27,8 @@ from typing import cast, override
 
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
-from scripts.review_links import accounts_page, change_page, serve
+from scripts.production import change_review
+from scripts.review_links import accounts_page, change_browser, change_page, console, serve
 from scripts.lib import atomic_file, conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -122,7 +123,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertNotEqual(headers.get("x-frame-options"), "DENY")
         self.assertIn(b"<h1>Hana console</h1>", body)
         self.assertIn(b'data-url="/console/changes.html" data-title="Changes"', body)
-        self.assertIn(b'data-rebuilds="/console/rebuilds.html"', body)
+        self.assertIn(b'href="?page=rebuilds" data-page="rebuilds"\ndata-url="/console/rebuilds.html"', body)
         self.assertTrue((self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST).is_file())
         for path in ("/console", "/console?page=questions"):
             with self.subTest(path=path):
@@ -131,6 +132,34 @@ class ReviewLinksServerTests(unittest.TestCase):
         for path in ("/../console/", "/%2e%2e/console/", "/.review-link-console.html"):
             with self.subTest(path=path):
                 self.assertEqual(self.request(path).status, 404)
+
+    def post(self, path: str, body: str) -> tuple[int, bytes]:
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
+        try:
+            connection.request("POST", path, body, {"Content-Type": "application/x-www-form-urlencoded"})
+            response = connection.getresponse()
+            return response.status, response.read()
+        finally:
+            connection.close()
+
+    def test_console_news_records_the_open_page_and_names_pages_with_new_items(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "REVIEW_LINKS_ROOT": str(self.root), "REVIEW_LINKS_HOST": "127.0.0.1",
+            "STAFF_FILE": str(self.root.parent / "staff.json")})))
+        _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
+        _ = self.enterContext(patch.object(change_browser, "waiting_changes", return_value=frozenset({"a/C1"})))
+        questions = self.enterContext(patch.object(change_browser, "waiting_questions", return_value=frozenset({"q1"})))
+        self.assertEqual(self.post("/console/news", "open=changes"), (200, b'{"new": []}'))
+        questions.return_value = frozenset({"q1", "q2"})
+        self.assertEqual(self.post("/console/news", "open=changes"), (200, b'{"new": ["questions"]}'))
+        self.assertEqual(self.post("/console/news", "open=questions"), (200, b'{"new": []}'))
+        # The Rebuilds page names no open page; the marks still follow new items.
+        questions.return_value = frozenset({"q1", "q2", "q3"})
+        self.assertEqual(self.post("/console/news", "open="), (200, b'{"new": ["questions"]}'))
+        for body in ("open=nowhere", "", "open=changes&open=questions"):
+            with self.subTest(body=body):
+                self.assertEqual(self.post("/console/news", body)[0], 400)
+        self.assertEqual(self.request("/console/" + console.SEEN_NAME).status, 404)
 
     def test_older_console_browser_and_rebuild_links_forward_to_the_fixed_address(self) -> None:
         for path, location in (
@@ -349,6 +378,24 @@ class SnapshotSweepTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-sweep-test-")))
+
+    def test_change_image_sweep_keeps_named_and_recent_images(self) -> None:
+        now = 1_800_000_000.0
+        listing = self.root / "lists"
+        listing.mkdir()
+        _ = (listing / (change_review.PREFIX + "test.md")).write_text(
+            f"## To review\n\n| # | {change_review.IMAGE} |\n| --- | --- |\n| C1 | 111111111111 |\n")
+        for identity, age in (("000000000000", 20), ("111111111111", 20), ("222222222222", 2)):
+            folder = self.root / "change-images" / identity
+            folder.mkdir(parents=True)
+            _ = (folder / "image.png").write_bytes(b"fixture image")
+            modified = now - age * 86400
+            os.utime(folder, (modified, modified))
+        with patch("scripts.production.change_review.lists_directory", return_value=listing):
+            self.assertEqual(serve.sweep_snapshots(self.root, now), 1)
+        self.assertFalse((self.root / "change-images" / "000000000000").exists())
+        self.assertTrue((self.root / "change-images" / "111111111111").is_dir())
+        self.assertTrue((self.root / "change-images" / "222222222222").is_dir())
 
     def snapshot(self, session: str, name: str, modified: float) -> Path:
         directory = self.root / session / name
@@ -664,7 +711,7 @@ class ServerCodeHealthTests(unittest.TestCase):
 
 
 class ServerCodeRestartTests(unittest.TestCase):
-    def test_a_changed_module_restarts_the_same_process_and_keeps_serving_http(self) -> None:
+    def test_a_changed_module_restarts_the_same_process_and_answers_a_request_sent_during_the_restart(self) -> None:
         checkout = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-restart-test-")))
         server_file = checkout / "scripts/review_links/serve.py"
         server_file.parent.mkdir(parents=True)
@@ -680,11 +727,16 @@ class ServerCodeRestartTests(unittest.TestCase):
         _ = driver.write_text(python_tool_source('''import importlib.util
 import os
 import sys
+import time
 from contextlib import redirect_stdout
 from pathlib import Path
 from scripts.review_links import serve
 
 checkout = Path(__file__).parent
+if serve.LISTEN_FD in os.environ:
+    # Hold the restart open, so the test sends a request before the new server starts.
+    print(f"restarting {os.getpid()}", file=sys.__stdout__, flush=True)
+    time.sleep(0.5)
 serve.__file__ = str(checkout / "scripts/review_links/serve.py")
 serve.tailscale_ip = lambda: "127.0.0.1"
 spec = importlib.util.spec_from_file_location("review_restart_fixture", checkout / "review_restart_fixture.py")
@@ -737,6 +789,18 @@ with redirect_stdout(sys.stderr):
         self.assertEqual(first[0], child.pid)
         self.assertEqual(first[1], "before")
         _ = module_file.write_text("VALUE = 'after_code_change'\n")
+        assert child.stdout is not None
+        ready, _, _ = select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)
+        self.assertEqual(ready, [child.stdout], errors_path.read_text())
+        self.assertEqual(cast(str, child.stdout.readline()).split(), ["restarting", str(first[0])])
+        during = HTTPConnection("127.0.0.1", first[2], timeout=TEST_HANG_GUARD_SECS)
+        try:
+            during.request("GET", "/answer.txt")
+            response = during.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read().decode(), (root / "answer.txt").read_text())
+        finally:
+            during.close()
         second = read_start()
         self.assertEqual(second, (first[0], "after_code_change", first[2]))
         self.assertEqual((checkout / "starts.txt").read_text().splitlines(),
@@ -816,8 +880,6 @@ class ReviewLinksConfigTests(unittest.TestCase):
                 self.assertFalse(snapshot.exists())
 
     def test_config_keeps_the_existing_values(self) -> None:
-        from scripts.lib import conf
-
         settings = conf.read(Path(__file__).resolve().parents[2] / "config/review_links.conf")
         for key, expected in {'unrouted_alert_recipient': 'natedev'}.items():
             with self.subTest(key=key):

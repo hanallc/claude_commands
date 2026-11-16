@@ -353,6 +353,30 @@ class ClientTests(unittest.TestCase):
             self.assertGreater(len(transport.requests), 1)
             self.assertEqual(transport.requests, [request] * len(transport.requests))
 
+    def test_a_ci_step_waits_through_a_natedev_hold_and_starts_after_the_release(self) -> None:
+        # CI run 43737288332 refused four steps 60 s into the fps hold on 2026-11-15.
+        held = wait_reply(records.NatedevHeld("fps", "Phase 3 timing"), 3, "",
+                          "natedev is held by fps for Phase 3 timing; waiting for release")
+        for reason, granted in ((held.reason, True), (records.ReadingUnavailable("natedev hold state is unreadable"), False)):
+            with self.subTest(reason=type(reason).__name__), AdmissionFixture() as fixture:
+                request = fixture.service_request()
+                reply = replace(held, reason=reason)
+                transport = self.use_transport(fixture, Exchange(reply_bytes(reply),
+                    *(TimedChunk(5, reply_bytes(reply)) for _ in range(24)), reply_bytes(GRANTED)))
+                waits: list[wire.Wait] = []
+                with redirect_stderr(io.StringIO()) as output:
+                    result = client.service_admit(request, waits.append, wire.AcquisitionTiming(10, 10, 5))
+                if granted:
+                    self.assertEqual(result, GRANTED)
+                    self.assertEqual(fixture.clock.monotonic(), 120)
+                    self.assertEqual(len(waits), 25)
+                    self.assertEqual(transport.requests, [request])
+                    self.assertNotIn("memory admission check failed", output.getvalue())
+                else:
+                    self.assertEqual(result, wire.Refused("natedev hold state is unreadable"))
+                    self.assertIn("natedev hold state is unreadable); step refused", output.getvalue())
+                self.doCleanups()
+
     def test_runner_wait_recovers_and_cleanup_uses_its_own_timing_without_home_reads(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.service_request()

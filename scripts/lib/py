@@ -8,7 +8,7 @@ shim="${BASH_SOURCE[0]}"
 # Normalize parent segments without a process or a directory change.
 IFS=/ read -r -a shim_parts <<< "$shim"
 shim=""
-for part in "${shim_parts[@]}"; do
+for part in ${shim_parts[@]+"${shim_parts[@]}"}; do
     case "$part" in
         ''|.) ;;
         ..) shim="${shim%/*}" ;;
@@ -92,7 +92,7 @@ launch()
 '
 startup="$root/scripts/lib/python_startup"
 native=1
-for option in "${python_options[@]}"; do
+for option in ${python_options[@]+"${python_options[@]}"}; do
     case "$option" in
         --*|-W*|-X*) ;;
         -*I*|-*E*|-*S*) native=0 ;;
@@ -101,17 +101,17 @@ done
 if [[ "$native" == 1 ]]; then
     export PYTHONPATH="$startup${PYTHONPATH+:$PYTHONPATH}"
     case "$mode" in
-        c|m) set -- "${python_options[@]}" -P "-$mode" "$target" "$@" ;;
-        file) set -- "${python_options[@]}" "${file_separator[@]}" "$target" "$@" ;;
+        c|m) set -- ${python_options[@]+"${python_options[@]}"} -P "-$mode" "$target" "$@" ;;
+        file) set -- ${python_options[@]+"${python_options[@]}"} ${file_separator[@]+"${file_separator[@]}"} "$target" "$@" ;;
         *)
             if [[ "$target" == - ]]; then
-                set -- "${python_options[@]}" -P - "$@"
+                set -- ${python_options[@]+"${python_options[@]}"} -P - "$@"
             else
-                set -- "${python_options[@]}" -P "$@"
+                set -- ${python_options[@]+"${python_options[@]}"} -P "$@"
             fi ;;
     esac
 else
-    set -- "${python_options[@]}" -P -c "$bootstrap" "$root" "$mode" "$target" "$@"
+    set -- ${python_options[@]+"${python_options[@]}"} -P -c "$bootstrap" "$root" "$mode" "$target" "$@"
 fi
 
 if [[ -n "${XDG_CACHE_HOME:-}" ]]; then

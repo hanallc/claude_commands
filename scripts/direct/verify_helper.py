@@ -18,10 +18,12 @@ import sys
 import tempfile
 import traceback
 from types import ModuleType
-from typing import BinaryIO, Callable, cast
+from typing import Callable, cast
 
 
 PARENT_CHECK_INTERVAL_SECONDS = 1
+# One request carries the caller's whole environment, so a large read takes it in a few calls.
+READ_SIZE = 65536
 PR_SET_PDEATHSIG = 1
 # A top-level main marks a program that the helper runs inside the helper process.
 TOP_LEVEL_MAIN = re.compile(rb"^def main\(", re.MULTILINE)
@@ -47,30 +49,45 @@ class SeparateProcess:
     """The path needs its original interpreter process."""
 
 
-def read_field(source: BinaryIO) -> str:
-    value = bytearray()
-    while byte := source.read(1):
-        if byte == b"\0":
-            return os.fsdecode(bytes(value))
-        value.extend(byte)
-    raise EOFError
+class FieldReader:
+    """Read NUL-terminated fields from a descriptor in large reads."""
+
+    def __init__(self, descriptor: int) -> None:
+        self.descriptor: int = descriptor
+        self.pending: bytearray = bytearray()
+        self.start: int = 0
+
+    @property
+    def buffered(self) -> bool:
+        return self.start < len(self.pending)
+
+    def field(self) -> str:
+        while (end := self.pending.find(b"\0", self.start)) < 0:
+            chunk = os.read(self.descriptor, READ_SIZE)
+            if not chunk:
+                raise EOFError
+            del self.pending[:self.start]
+            self.start = 0
+            self.pending += chunk
+        value = os.fsdecode(bytes(self.pending[self.start:end]))
+        self.start = end + 1
+        return value
+
+    def fields(self) -> list[str]:
+        values: list[str] = []
+        while value := self.field():
+            values.append(value)
+        return values
 
 
-def read_fields(source: BinaryIO) -> list[str]:
-    values: list[str] = []
-    while value := read_field(source):
-        values.append(value)
-    return values
-
-
-def read_call(source: BinaryIO) -> HelperCall:
-    program, directory = read_field(source), read_field(source)
-    count = int(read_field(source))
+def read_call(source: FieldReader) -> HelperCall:
+    program, directory = source.field(), source.field()
+    count = int(source.field())
     arguments: list[str] = []
     while len(arguments) < count:
-        arguments.append(read_field(source))
-    environment = dict(value.split("=", 1) for value in read_fields(source))
-    return HelperCall(program, directory, arguments, environment, read_field(source), read_fields(source))
+        arguments.append(source.field())
+    environment = dict(value.split("=", 1) for value in source.fields())
+    return HelperCall(program, directory, arguments, environment, source.field(), source.fields())
 
 
 def load_program(path: str) -> LoadedProgram | SeparateProcess:
@@ -194,13 +211,15 @@ def main() -> int:
     stop_when_parent_exits(parent)
     programs: dict[str, LoadedProgram | SeparateProcess] = {}
     with os.fdopen(os.dup(0), "rb", buffering=0) as source, os.fdopen(os.dup(1), "wb") as reply:
+        reader = FieldReader(source.fileno())
         while True:
-            if not select.select([source], [], [], PARENT_CHECK_INTERVAL_SECONDS)[0]:
+            # Bytes already read belong to the next request, so select would wait for nothing.
+            if not reader.buffered and not select.select([source], [], [], PARENT_CHECK_INTERVAL_SECONDS)[0]:
                 if os.getppid() != parent:
                     break
                 continue
             try:
-                call = read_call(source)
+                call = read_call(reader)
             except EOFError:
                 break
             result = run_call(call, programs)

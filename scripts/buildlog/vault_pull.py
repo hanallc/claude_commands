@@ -7,6 +7,7 @@ import math
 import re
 import shlex
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -16,7 +17,7 @@ from typing import Literal, cast, get_args
 from scripts.buildlog import ci
 from scripts.buildlog.health import Machine
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import file_lock
+from scripts.lib import file_lock, land_main
 from scripts.lib.process_failure import failure_detail
 from scripts.buildlog import store
 from scripts.buildlog import sync
@@ -200,7 +201,15 @@ def mac_git(*args: str) -> subprocess.CompletedProcess[str] | VaultCommandFailed
         "no route to host", "network is unreachable", "connection closed", "permission denied (publickey",
     )):
         return MacUnreachable()
-    return command_failure(result, Machine.MAC)
+    return command_failure(result, failing_machine())
+
+
+def failing_machine() -> Machine:
+    """A transfer with the Mac also fails on a damaged natedev object, so check natedev first."""
+    check = git("fsck", "--connectivity-only", "--no-dangling")
+    if isinstance(check, VaultCommandFailed) or check.returncode != 0:
+        return Machine.NATEDEV
+    return Machine.MAC
 
 
 def marked(stdout: str, prefix: str) -> tuple[str, ...]:
@@ -260,13 +269,15 @@ def publish_mac(merged: MacMerged) -> PullOutcome:
         target = commit.stdout.strip()
     elif forward.returncode != 0:
         return command_failure(forward)
-    pushed = git("push", "--porcelain", "origin", f"{target}:refs/heads/main")
-    if isinstance(pushed, VaultCommandFailed):
-        return pushed
-    if pushed.returncode != 0:
-        if any(line.startswith("!") and "[rejected]" in line for line in pushed.stdout.splitlines()):
-            return DeferredSync("GitHub main changed; the next hour retries")
-        return command_failure(pushed)
+    try:
+        landed = land_main.land(LOCAL_VAULT, target, "main",
+                                time_limit=land_main.CommandTimeLimit(COMMAND_TIMEOUT_S))
+    except land_main.NotFastForward:
+        return DeferredSync("GitHub main changed; the next hour retries")
+    except land_main.LandError as error:
+        return VaultCommandFailed(str(error))
+    if isinstance(landed.hook, land_main.HookFailed):
+        print(land_main.hook_report(landed.hook), file=sys.stderr)
     return Pulled(merged.commits)
 
 
@@ -330,35 +341,50 @@ def write_state(state: VaultState) -> None:
     write_text_atomic(path, json.dumps(data) + "\n")
 
 
-def stop_details(outcome: PullStop) -> tuple[StopCause, str, str]:
+@dataclass(frozen=True)
+class StopQuestion:
+    """The parts of the question that asks the user to repair a stopped sync."""
+
+    ask: str
+    context: str
+    choices: tuple[str, str]
+    recommend: str
+
+
+def stop_details(outcome: PullStop) -> tuple[StopCause, str, StopQuestion]:
     match outcome:
         case VaultConflict(files):
-            return ("conflict", f"The hanadocs merge has a conflict on Mac. Files: {', '.join(files)}.",
-                    "In a terminal on the Mac, resolve the conflicting edits in ~/rust/hanadocs. "
-                    + "Both copies changed the same content. The commits remain available. "
-                    + "1. Combine the edits and commit the result. This keeps the wanted content from both copies. "
-                    + "2. Choose one copy for each file and commit the result. This replaces the other copy's content. "
-                    + "I recommend choice 1. The next hourly sync retries the merge.")
+            return ("conflict", f"The hanadocs merge has a conflict on Mac. Files: {', '.join(files)}.", StopQuestion(
+                "In a terminal on the Mac, resolve the conflicting edits in ~/rust/hanadocs.",
+                "Both copies changed the same content. The commits remain available.",
+                ("Combine the edits and commit the result. This keeps the wanted content from both copies.",
+                 "Choose one copy for each file and commit the result. This replaces the other copy's content."),
+                "Combine the edits: the next hourly sync retries the merge."))
         case NotOnMain():
-            return ("not_on_main", "The hanadocs vault on the Mac is not on main.",
-                    "In a terminal on the Mac, select a branch for ~/rust/hanadocs. "
-                    + "1. Switch to main. The next hourly sync merges the vault. "
-                    + "2. Keep the current branch. The hourly sync remains stopped. I recommend choice 1.")
+            return ("not_on_main", "The hanadocs vault on the Mac is not on main.", StopQuestion(
+                "In a terminal on the Mac, select a branch for ~/rust/hanadocs.", "",
+                ("Switch to main. The next hourly sync merges the vault.",
+                 "Keep the current branch. The hourly sync remains stopped."),
+                "Switch to main: the sync starts again."))
         case MacUnreachable():
             return ("mac_unreachable", "natedev cannot reach the Mac for the hanadocs sync for at least 24 hours.",
-                    "In a terminal on the Mac, restore its network connection. "
-                    + "1. Wake the Mac and connect it to the network. The next hourly sync retries. "
-                    + "2. Keep the Mac offline. The Mac vault remains unchanged. I recommend choice 1.")
+                    StopQuestion("In a terminal on the Mac, restore its network connection.", "",
+                                 ("Wake the Mac and connect it to the network. The next hourly sync retries.",
+                                  "Keep the Mac offline. The Mac vault remains unchanged."),
+                                 "Wake the Mac: the sync starts again."))
         case VaultLocked(detail):
-            return ("vault_locked", f"A Git index lock stops the hanadocs sync on the Mac. Detail: {detail}",
-                    "In a terminal on the Mac, examine ~/rust/hanadocs/.git/index.lock. "
-                    + "1. Let an active Git process finish. Remove the lock if no Git process uses it. The next hourly sync retries. "
-                    + "2. Keep the lock. The sync retries each hour. I recommend choice 1.")
+            return ("vault_locked", f"A Git index lock stops the hanadocs sync on the Mac. Detail: {detail}", StopQuestion(
+                "In a terminal on the Mac, examine ~/rust/hanadocs/.git/index.lock.", "",
+                ("Let an active Git process finish. Remove the lock if no Git process uses it. The next hourly sync retries.",
+                 "Keep the lock. The sync retries each hour."),
+                "Remove an unused lock: the sync starts again."))
         case VaultCommandFailed(detail, machine):
             return ("command_failed", f"The hanadocs sync has an unknown command error on {machine}. Detail: {detail}",
-                    "In the natedev session on natedev, examine the buildlog.service log for the failing command and machine. "
-                    + "1. Repair the command error. The next hourly sync retries. "
-                    + "2. Leave the error unresolved. The vault sync remains stopped. I recommend choice 1.")
+                    StopQuestion("In the natedev session on natedev, examine the buildlog.service log for the failing command and machine.",
+                                 "",
+                                 ("Repair the command error. The next hourly sync retries.",
+                                  "Leave the error unresolved. The vault sync remains stopped."),
+                                 "Repair the error: the sync starts again."))
 
 
 def question_text(since: float) -> str:
@@ -374,12 +400,14 @@ def registration(command: str, *args: str) -> bool:
     return result is not None and result.returncode == 0
 
 
-def ask_question(reason: str, choices: str, since: float) -> bool:
+def ask_question(reason: str, question: StopQuestion, since: float) -> bool:
     opened = datetime.fromtimestamp(since, UTC)
+    context = f"{reason} {question.context}".strip()
+    choices = [part for choice in question.choices for part in ("--choice", choice)]
     return registration(
         "ask",
-        "--text", question_text(since),
-        "--question", reason + " " + choices, "--urgency", "soon",
+        "--text", question_text(since), "--ask", question.ask, "--context", context, *choices,
+        "--recommend", question.recommend, "--urgency", "soon",
         "--due", (opened + timedelta(days=1)).date().isoformat(),
     )
 
@@ -415,7 +443,7 @@ def _vault_locked() -> int:
                 description += "; the question was not withdrawn"
             print(description)
             return 0
-        cause, reason, choices = stop_details(outcome)
+        cause, reason, question = stop_details(outcome)
         previous = state.outage
         outage = replace(previous, cause=cause, detail=reason) if isinstance(previous, OpenOutage) else OpenOutage(cause, now, False, reason)
         last_good = state.last_good.at if isinstance(state.last_good, LastGoodPull) else outage.since
@@ -423,7 +451,7 @@ def _vault_locked() -> int:
         if isinstance(previous, OpenOutage) and not outage.asked and not sleeping:
             outage = replace(outage, asked=True)
             write_state(replace(state, outage=outage))
-            if not ask_question(reason, choices, outage.since):
+            if not ask_question(reason, question, outage.since):
                 outage = replace(outage, asked=False)
                 write_state(replace(state, outage=outage))
         else:

@@ -298,11 +298,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         listing = live_units.units_in("alpha", observed)
         rendered = unit_phases.table(listing, {}, snapshot=record, census_read=census.Census((), (), ()))
         self.assertEqual(rendered.splitlines(), [
-            "| Unit | Status | Progress | Phase | ETA Next | Workers |",
-            "| --- | --- | --- | --- | --- | --- |",
-            "",
-            "| Unit | Notes | Non-Phase Work | Queued |",
-            "| --- | --- | --- | --- |",
+            "working 0 · waiting to merge 0 · waiting on other work 0 · idle 0 · 0 units",
         ])
 
 

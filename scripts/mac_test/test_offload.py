@@ -1206,18 +1206,19 @@ class OffloadCommandTests(OffloadCommandFixture):
                         result = self.command(verb=verb, copy=option == "copy", filter_run=option == "filter")
                         self.assertEqual(result.returncode, 2, result.stdout)
 
-    def test_linux_only_workspace_member_declines_every_non_test_verb_before_claim(self) -> None:
+    def test_linux_only_workspace_member_declines_a_workspace_build_before_claim(self) -> None:
         self.write_portable_workspace()
         self.config["linux_only.hana"] = "portable"
         self.sync_config()
-        for verb in ("check", "clippy", "mend-check", "doc", "build"):
+        for verb in ("build",):
             with self.subTest(verb=verb):
                 self.assert_declined(self.command("--workspace", verb=verb, package=""), "linux_only")
         self.assertEqual(self.events_for("ssh"), [])
         self.assertEqual(self.events_for("rsync"), [])
 
-    def test_named_package_is_checked_alone_for_package_verbs(self) -> None:
-        # linux_only keeps the named package's own steps off the Mac; a package that depends on it still builds.
+    def test_named_package_is_checked_alone_and_compile_verbs_ignore_linux_only(self) -> None:
+        # linux_only keeps the named package's tests and builds off the Mac; a package that depends on it still builds.
+        # check, lint and doc only compile, and only the Mac compiles macOS code, so linux_only never applies to them.
         self.write_portable_workspace()
         _ = (self.repository / "Cargo.toml").write_text('[workspace]\nmembers=["portable", "linux-part"]\n')
         member = self.repository / "linux-part"
@@ -1228,37 +1229,32 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.config["linux_only.hana"] = "linux-part"
         self.sync_config()
         config = eligibility.read_config(self.config_path)
-        verbs: tuple[eligibility.MacVerb, ...] = ("nextest", "check", "clippy", "mend-check", "doc", "build")
-        workspace_verbs = ("clippy", "mend-check", "doc")
-        for verb in verbs:
+        compile_verbs: tuple[eligibility.MacVerb, ...] = ("check", "clippy", "mend-check", "doc")
+        for verb in (*compile_verbs, "nextest", "build"):
             with self.subTest(verb=verb):
-                policy = eligibility.mac_step_eligibility(config, self.repository, "portable", verb)
-                if verb in workspace_verbs:
-                    self.assertEqual(policy, eligibility.IneligibleMacStep("linux_only"))
-                else:
-                    self.assertIsInstance(policy, eligibility.KnownRepository)
-                self.assert_declined(self.command(verb=verb, package="linux-part"), "linux_only")
-                self.assert_declined(self.command("--workspace", verb=verb, package=""), "linux_only")
+                self.assertIsInstance(eligibility.mac_step_eligibility(config, self.repository, "portable", verb),
+                                      eligibility.KnownRepository)
+                for package in ("linux-part", ""):
+                    policy = eligibility.mac_step_eligibility(config, self.repository, package, verb)
+                    if verb in compile_verbs:
+                        self.assertIsInstance(policy, eligibility.KnownRepository)
+                    else:
+                        self.assertEqual(policy, eligibility.IneligibleMacStep("linux_only"))
+                if verb not in compile_verbs:
+                    self.assert_declined(self.command(verb=verb, package="linux-part"), "linux_only")
+                    self.assert_declined(self.command("--workspace", verb=verb, package=""), "linux_only")
         self.assertEqual(self.events_for("ssh"), [])
         self.assertEqual(self.events_for("rsync"), [])
-
-    def test_lint_and_doc_of_a_named_package_check_the_whole_workspace(self) -> None:
-        # verify.sh lints and documents the whole workspace for one package, so a linux_only member declines it.
-        self.write_portable_workspace()
-        _ = (self.repository / "Cargo.toml").write_text('[workspace]\nmembers=["portable", "linux-part"]\n')
-        member = self.repository / "linux-part"
-        member.mkdir(exist_ok=True)
-        _ = (member / "Cargo.toml").write_text('[package]\nname="linux-part"\nversion="0.1.0"\n')
-        self.config["linux_only.hana"] = "linux-part"
+        self.assertEqual(eligibility.mac_step_eligibility(config, self.repository, "linux-part", "clippy", kind="example"),
+                         eligibility.IneligibleMacStep("linux_only"))
+        result = self.command(verb="clippy", package="linux-part")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(len(self.events_for("rsync")), 1)
+        _ = self.config.pop("linux_only.hana")
         self.sync_config()
-        config = eligibility.read_config(self.config_path)
-        steps: tuple[tuple[eligibility.MacVerb, str], ...] = (("clippy", "lint"), ("mend-check", "lint"), ("doc", "doc"))
-        for verb, kind in steps:
-            with self.subTest(verb=verb):
-                self.assertEqual(eligibility.mac_step_eligibility(config, self.repository, "portable", verb, kind=kind),
-                                 eligibility.IneligibleMacStep("linux_only"))
-        self.assertIsInstance(eligibility.mac_step_eligibility(config, self.repository, "portable", "clippy", kind="example"),
-                              eligibility.KnownRepository)
+        self.assertEqual(eligibility.mac_step_eligibility(eligibility.read_config(self.config_path), self.repository,
+                                                          "linux-part", "clippy"),
+                         eligibility.IneligibleMacStep("repo"))
 
     def test_workspace_test_with_a_linux_only_member_declines_before_claim(self) -> None:
         self.write_portable_workspace()
@@ -1281,7 +1277,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                     _ = output.write(f'[{section}]\nimplicit={{workspace=true}}\n')
                 self.config["linux_only.hana"] = "linux-part"
                 self.sync_config()
-                for verb in ("check", "clippy", "mend-check", "doc"):
+                for verb in ("nextest", "build"):
                     self.assert_declined(self.command("--workspace", verb=verb, package=""), "linux_only")
         self.assertEqual(self.events_for("ssh"), [])
         self.assertEqual(self.events_for("rsync"), [])
@@ -1290,7 +1286,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.write_portable_workspace()
         with (self.repository / "portable/Cargo.toml").open("a") as output:
             _ = output.write('[dependencies]\nmissing={path="../missing"}\n')
-        for verb in ("check", "clippy", "mend-check", "doc"):
+        for verb in ("nextest", "build"):
             self.assert_declined(self.command("--workspace", verb=verb, package=""), "repo")
         self.assertEqual(self.events_for("ssh"), [])
         self.assertEqual(self.events_for("rsync"), [])
@@ -1311,8 +1307,9 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.config["linux_only.hana"] = "staged"
         self.sync_config()
         snapshot_source = offload.StagedDocSnapshot(snapshot)
-        self.assert_declined(self.command("--workspace", verb="doc", package="", source=snapshot_source), "linux_only")
-        self.assertEqual(len(self.events_for("rsync")), 1)
+        result = self.command("--workspace", verb="doc", package="", source=snapshot_source)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(len(self.events_for("rsync")), 2)
 
     def test_remote_test_command_sets_development_deployment_target_before_nextest(self) -> None:
         words = ("--no-fail-fast", "unit_case")

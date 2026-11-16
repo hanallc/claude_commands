@@ -10,7 +10,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.accounts import accounts
-from scripts.review_links import accounts_page, console_theme
+from scripts.review_links import accounts_page, console_theme, page_frame
 from scripts.whoami import agent_accounts
 
 AT = datetime(2026, 11, 15, 15, tzinfo=timezone.utc)
@@ -52,6 +52,8 @@ class AccountsPageTests(unittest.TestCase):
         self.assertIsInstance(source, accounts.StoredUsageOnly)
         self.assertIn("<div data-accounts>", page)
         self.assertIn(console_theme.CSS, page)
+        self.assertIn(page_frame.STYLE, page)
+        self.assertIn('<h1 class="page-title">Accounts</h1>', page)
         self.assertIn("'console-shown'", page)
 
     def test_render_runs_the_page_in_a_child_and_names_its_failure(self) -> None:
@@ -73,6 +75,8 @@ class ConsoleThemeTests(unittest.TestCase):
         self.assertEqual(console_theme.with_theme(f"<style>{console_theme.TOKENS_PLACEHOLDER}p{{}}</style>"),
                          f"<style>{console_theme.TOKENS}p{{}}</style>")
         self.assertTrue(console_theme.CSS.startswith(console_theme.TOKENS))
+        # page_frame owns the main column and the page title.
+        self.assertNotRegex(console_theme.CSS, r"(^|[}\n])(main|h1)\{")
         for source in ("<style></style>", console_theme.PLACEHOLDER + console_theme.TOKENS_PLACEHOLDER):
             with self.subTest(source=source), self.assertRaisesRegex(ValueError, "needs one"):
                 _ = console_theme.with_theme(source)

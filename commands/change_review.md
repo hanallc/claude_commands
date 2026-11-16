@@ -4,6 +4,8 @@ description: Add a change for the user to check to the top-level showrunner's ch
 
 # Change review
 
+Each action refuses an option it does not read.
+
 ## Bare command
 
 For `/change_review` with no action:
@@ -55,8 +57,8 @@ first row, with its frontmatter.
 Every write sets the list's `date_modified` and adds the production's doc to
 its `productions`, so the list's frontmatter names every production it holds.
 
-Every write commits the list itself when it sits in a git repository, so never
-commit it by hand. A `written but not committed` warning needs nothing: the
+Every write commits the list through Git plumbing without an index refresh.
+Do not commit the list by hand. A `written but not committed` warning needs nothing: the
 write stands and the next write commits it. The vault's Templater must exclude
 the change-review folder, since its creation trigger rewrites a new list within
 half a second and can drop a row; the vault owner sets Excluded folders →
@@ -73,7 +75,7 @@ carries: a showrunner's own change, a fix outside a run, or a change nobody
 sees in the app, such as a table's columns or a status line.
 
 ```sh
-… add [--production <name>] --change "<what changed for you>" --check "<how to try it: where and what to type>" --see "<what you see>" [--merged <hash>] [--urgency <level>] [--due <ISO>] [--after C<n>]
+… add [--production <name>] --change "<what changed for you>" --check "<how to try it: where and what to type>" --see "<what you see>" [--merged <hash>] [--urgency <level>] [--due <ISO>] [--after C<n>] [--image <png> | --output <text file>]
 ```
 
 `--urgency` is `blocks` (work stops until the user checks it), `soon` (with
@@ -90,6 +92,38 @@ shows each unit's phase" --check "In a showrunner session on natedev, type
 check cell is `<how to try it> You see: <what you see>`. Pass `--merged` when a
 commit holds the change. The Merged cell holds the date and time of the add, in the
 user's zone, then the commit: `2026-11-13 16:20 · 31770c75`. It prints the new row's id, such as `C12`.
+
+## Change images
+
+Every change review carries one image: a dark mode shot at desktop width, or `image --output <text file>` for terminal output.
+The parser still accepts a line without an image.
+Use `add --image <png>` to attach an existing screenshot to a manual row.
+Use `edit --row <id> --image <png>` to attach or replace an image on an existing row.
+Use `add --output <text file>` or `edit --row <id> --output <text file>` to attach rendered text.
+Pass one of `--image` and `--output`. Other actions refuse these options except `image`.
+An image replacement deletes the old image after the row is written.
+For a checkpoint, register the image first:
+
+```sh
+… image --image <png>
+… image --output <text file>
+```
+
+Use one option. `--output` renders the text as a dark terminal screenshot with headless Chrome.
+The action prints an image id and a hint.
+Add ` | image <id>` as the last Change-Review field, after ` | after <step>` when present.
+The id contains twelve lowercase hexadecimal characters.
+`list-ready` and `live` copy it into the row's `Image` cell.
+A missing image prints one line and leaves the cell empty.
+
+The console card and the one-row page show a 280px thumbnail beside the change text.
+The thumbnail moves below the text on narrow screens.
+Click the thumbnail to zoom over the page.
+Press Escape or click the zoom to return.
+Shift-click or use the right-click menu to open the full image in a new tab.
+A landing or return verdict deletes the image and clears its cell.
+Change images use `change-images/` and never appear on the Images page.
+The server deletes unclaimed images after `change_image_unclaimed_days`, which starts at 14 days.
 
 ## list-ready and live
 
@@ -127,6 +161,8 @@ what the person sees:
 
 ```sh
 … edit [--production <name>] --row <id> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
+… edit [--production <name>] --row <id> --image <png>
+… edit [--production <name>] --row <id> --output <text file>
 ```
 
 Pass the displayed ID, such as `sdlc/C9`.
@@ -134,6 +170,39 @@ The prefix names the responsible showrunner, even when another showrunner's list
 Commands also accept the list-based ID and a bare row number with the selected list.
 Pass `--list <path>` when the displayed ID matches several lists.
 The row keeps its id, its Merged cell and its place. It prints the new row.
+Add `--image <png>` or `--output <text file>` to a text edit to attach or replace the image.
+With only an image option, the row keeps all other cells.
+With any text option, pass all three text options.
+
+## batch
+
+Apply several edits and verdicts with one folder lock and one commit:
+
+```sh
+… batch --file <json>
+```
+
+The file contains an array of items:
+
+```json
+[
+  {"op": "edit", "production": "hana", "row": "hana/C1", "change": "New text", "check": "Open the page", "see": "The result"},
+  {"op": "edit", "production": "hana", "row": "hana/C2", "image": "/path/shot.png"},
+  {"op": "verdict", "production": "hana", "row": "hana/C3", "verdict": "works"}
+]
+```
+
+Each item can set `list` to the path accepted by `--list`.
+All lists must be in one folder.
+Each row can appear only once per list in a batch.
+A repeated row reports `batch item <j>: row <id> is already item <i>` before any list write.
+After a partial write, repeat the batch to finish the remaining writes and commit all target lists.
+An edit with only `image` or `output` keeps the row text.
+Use `output` for a rendered text file. Do not combine it with `image`.
+An edit with text needs `change`, `check`, and `see`.
+An invalid item reports its zero-based index and leaves all lists unchanged.
+The command applies items in array order and prints each single command's output.
+Image removal and verdict scratch removal follow the writes, outside the lock.
 
 ## show
 
@@ -155,18 +224,20 @@ Typed text or an active save holds replacement; only the newest loaded update wa
 Replacement continues when all unsaved fields are empty or the save ends.
 After a successful save, the page requests a fresh update to exclude older responses.
 A failed load changes nothing; the next interval tries again.
-The heading follows the type: Questions to answer, Changes to review, or Rebuilds needed.
+The heading follows the type: Questions to answer or Changes to review.
 An empty showrunner filter shows `No questions for this showrunner.` or `No changes for this showrunner.`
 An empty type shows `No questions to answer.` or `No changes to review.`
 The selected showrunner filter supplies the count; the card has no separate remaining count.
 A question stays with the showrunner whose question list holds it.
 An unknown question owner appears under **Owner unavailable**.
 Owned question cards show the title before the filed text, choices, and `Asked by <session>`.
-They omit the separate Question label and keep `Answer` and `Save answer`.
+They omit the separate Question label.
+Choices show as radio items; a choice fills the **Your answer** box.
 An **Owner unavailable** card shows `No showrunner owns this question.` without an answer form; the server refuses an answer.
-Save answer records the answer and opens the next waiting question.
-Skip for now skips a question without saving.
-It hides when no other item waits in the selected showrunner filter.
+Answer records the answer and opens the next waiting question.
+Followup sends the text to the asker; the question returns with the reply after the asker runs `update_registration.py reply`.
+Skip moves the question to the end of the list without an answer.
+Answer and Followup need text in the box.
 Questions have no Ask showrunner to check or Ask a question controls.
 A stale question refuses an answer if another session already answered it.
 Saved question answers use the same delivery attempts, startup recovery, and failure alert as changes.
@@ -176,13 +247,9 @@ Recovery sends only `saved: true` answers for closed questions.
 Recovery clears other intents; a closed question without save confirmation prints `answer save state unknown; not sent`.
 The relay follows the asker's current staff route; an answer without a relay goes to the question's showrunner.
 
-Rebuilds counts machines with open needs and shows natedev before the Mac.
-Each block tells the user where to run `rebuild`.
-Multiple needs share one rebuild; their unchanged reasons appear under `After the rebuild`, newest first.
-A closed Details disclosure shows full commits, affected staff names and kinds, and different requesters.
+Rebuilds shows natedev before the Mac.
+Each block has the machine title, then one entry per change with Who, When and Reason, newest first.
 Unknown staff IDs appear as `Unknown session: <id>`.
-The Mac block states that updates can take five minutes while the Mac is reachable.
-The last line tells the user that requests clear automatically and asks them to refresh after the rebuild.
 An empty view shows `No rebuilds needed.`
 Rebuilds has no showrunner menu, card navigation, Skip for now, or answer form.
 The status line also shows open needs as `rebuild natedev` or `rebuild mac`, even before system evaluation completes.
@@ -208,11 +275,15 @@ Its count covers all page lists, including independent production roots.
 Menu options with waiting changes precede empty options in alphabetical order.
 Keyboard focus keeps its visible outline.
 Answers save in the background.
-Each successful save opens the next waiting change in the same filter.
+Works and Does not work open the next waiting change at once, before the server answers.
+The next card shows **Saving review.** until the save ends, then **Review saved.**
+Other answers open the next waiting change in the same filter after a successful save.
 Navigation during a save prevents this automatic change.
 Skip for now skips a change without saving an answer.
 A failed HTTP save keeps the typed text, answer form, and waiting count, and shows `Not saved: <reason>`.
-An automatic move after a change save shows **Review saved.** above the next card.
+A failed Works or Does not work save puts the row back in the list.
+Its notice shows `Not saved: <row>. <reason> It is back in the list.` and an **Open it** button.
+An automatic move after another change save shows **Review saved.** above the next card.
 An automatic move after a question save shows **Answer saved.** above the next card.
 Manual navigation clears this notice.
 A direct link to a saved verdict shows **Saved: <answer>**.
@@ -250,7 +321,9 @@ A nonblocking lock prevents two renders from sending one alert at once.
 The router records acceptance only after the sender accepts or queues the alert.
 Do not ask for a batch size or take page answers in chat.
 
-The diagnostic command `show [--production <name>]` still prints the current row and count.
+The diagnostic command `show [--production <name>]` prints the current row and count.
+Use `show --row <id>` to print a selected row, with the same ID rules as `edit --row`.
+A row absent from the list gives an error.
 
 The list keeps the order of `/next` (`commands/next.md`): the row `show`
 printed stays first until its verdict. When the user calls a row important,

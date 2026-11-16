@@ -3009,6 +3009,57 @@ with patch.object(fcntl, "flock", admission):
                                    "epoch": 1025 + index * 10})
             self.assertEqual(wait["wait_started_epoch"], 1020 + index * 10)
 
+        for active_phase, finish in ((False, "finish-wait"), (True, "start-phase")):
+            with self.subTest(active_phase=active_phase, finish=finish):
+                name = "unit-wait-active" if active_phase else "unit-wait-no-phase"
+                target_session = self.start_run(name, 1000)
+                if active_phase:
+                    self.start_phase_and_pass(target_session, 1005)
+                before = self.read_events(name)
+                for flags, missing in (
+                        (("--reason", "the user approves the release"), "--by"),
+                        (("--by", "the user"), "--reason")):
+                    refused = self.run_failing_command("start-wait", "--session-dir", str(target_session),
+                        "--kind", "WaitingForUser", "--target", "30", *flags, at=1015)
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertEqual(len(refused.stderr.strip().splitlines()), 1)
+                    self.assertIn(missing, refused.stderr)
+                    self.assertEqual(self.read_events(name), before)
+                wait_id = self.run_command("start-wait", "--session-dir", str(target_session),
+                    "--kind", "WaitingForUser", "--target", "30", "--by", "the user",
+                    "--reason", "the user approves the release", "--owner-session", "director", at=1020)
+                started = self.read_events(name)[-1]
+                self.assertEqual((started["event_type"], started["wait_id"], started["wait_scope"],
+                                  started["target_work"], started["wait_by"], started["wait_reason"]),
+                                 ("wait_started", wait_id, "unit", "30", "the user", "the user approves the release"))
+                self.assertEqual(started["wait_attribution"], {"state": "UnitTarget"})
+                self.assertEqual((started["wait_kind"], started["wait_started_epoch"], started["owner_session"]),
+                                 ("WaitingForUser", 1020, "director"))
+                for field in ("phase_id", "phase_instance_id", "pass_instance_id"):
+                    self.assertFalse(started.get(field), field)
+                self.assertFalse(any(event["event_type"] == "wait_not_recorded" for event in self.read_events(name)))
+                wait_ids = [wait_id]
+                if finish == "start-phase":
+                    wait_ids.append(self.run_command("start-wait", "--session-dir", str(target_session),
+                        "--kind", "WaitingForUser", "--target", "30", "--by", "sdlc",
+                        "--reason", "the user approves board-reasons", at=1025))
+                    _ = self.run_command("start-phase", "--session-dir", str(target_session),
+                        "--phase-id", "31", "--phase-title", "Other work", at=1030)
+                    self.assertFalse(any(event["event_type"] == "wait_finished" and event.get("wait_id") == wait_id
+                                         for event in self.read_events(name)))
+                    _ = self.run_command("start-phase", "--session-dir", str(target_session),
+                        "--phase-id", "30", "--phase-title", "Target work", at=1040)
+                else:
+                    _ = self.run_command("finish-wait", "--session-dir", str(target_session), "--wait-id", wait_id, at=1040)
+                ended = [event for event in self.read_events(name) if event["event_type"] == "wait_finished"]
+                self.assertCountEqual([event["wait_id"] for event in ended], wait_ids)
+                for event in ended:
+                    self.assertEqual(event["wait_end"],
+                        {"state": "Finished", "at": "1970-01-01T00:17:20.000+00:00", "epoch": 1040})
+                report = cast(dict[str, object], json.loads(self.run_command(
+                    "waits", "--session-dir", str(target_session), at=1050)))
+                self.assertEqual(report["missing_n"], 0)
+
     def test_explicit_and_account_probe_sessions_write_no_wait(self) -> None:
         session = self.covered_wait_phase("wait-probes")
         before = self.read_events("wait-probes")
@@ -4134,6 +4185,26 @@ with patch.object(fcntl, "flock", admission):
             assert current is not None
             self.assertEqual(current.to_json().get("role"), role)
             self.finish_slot_pass(session, "TEST-worker", "completed", 41_030 + index * 20)
+
+    def test_dispatch_records_the_called_worker_model(self) -> None:
+        session = self.start_run("called-model", 41_000)
+        self.start_phase(session, 41_010)
+        parent = fixture_member("showrunner", name="called-parent")
+        prompt = self.root / "called-prompt.txt"
+        atomic_file.write_text_atomic(prompt, "Read the requested files.\n")
+        cases = (("impl", progress_history.CalledAgent("codex", "gpt-called", "high"),
+                  {"family": "codex", "model": "gpt-called", "effort": "high"}),
+                 ("test", progress_history.CALLED_AGENT_NOT_RECORDED,
+                  {"family": "unknown", "model": "unknown", "effort": "unset"}))
+        for index, (slot, called, expected) in enumerate(cases):
+            member = fixture_worker(slot, parent.id, runtime_id=fixture_runtime_id(f"called-{slot}"))
+            with self.subTest(slot=slot), patch.dict(os.environ, {"UNIT_NOW_EPOCH": str(41_020 + index * 20)}):
+                _ = progress_history.begin_dispatch(session, slot=slot, phase="3", role=cast(staff.WorkerRole, slot),
+                    worker_name=member.name, worker_id=member.id, launcher_command=["assign.sh"],
+                    prompt=prompt, kind="broad", lens="contract", called=called)
+                started = self.pass_events("called-model", "pass_started")[-1]
+                agent = cast(dict[str, object], started["called_agent"])
+                self.assertEqual({key: agent[key] for key in expected}, expected)
 
     def test_dispatch_api_reuses_active_and_completed_passes_after_launcher_loss(self) -> None:
         session = self.start_run("dispatch-api", 41_000)

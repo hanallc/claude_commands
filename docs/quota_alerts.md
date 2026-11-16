@@ -31,7 +31,16 @@ Zero, credits forecasts, Codex-to-Codex moves and unknown-account refusals write
 
 The Codex `5-hour limit:` notice from `five_hour.py` writes one log line per low spell, with its back-above line also logged. The Claude five-hour notice is unchanged: tell the user in one line and change nothing else. Escalation goes to the phone unless the user types in a terminal within 15 minutes.
 
-A Codex notice gives the reported credits and limit-reset count. Without an account move entry, low quota above zero switches nothing. At weekly zero, credits on moves workers to included Codex usage before paid credits. With credits off, workers may also move to another account using its own credits. A provider refusal still requests a move. The launcher reports the serving account, refusal time and known window through `agent_notes.py blocked --window weekly|five_hour|unknown --refused-at <aware ISO time>`. A later reading identifies the window only when exactly one window is at zero. Recorded refusal overrides positive saved percentages.
+A Codex notice gives the reported credits and limit-reset count.
+Without an account move entry, low quota above zero switches nothing.
+At weekly zero, credits on moves workers to included Codex usage before paid credits.
+With credits off, workers may also move to another account using its own credits.
+A quota refusal requests a move only when the workers account cannot use its allowance or permitted credits.
+Login faults and refusals from other homes never route workers to Claude or start no-worker mode.
+Their existing notices stay unchanged.
+The launcher reports the serving account, refusal time and known window through `agent_notes.py blocked --window weekly|five_hour|unknown --refused-at <aware ISO time>`.
+A later reading identifies the window only when exactly one window is at zero.
+The refusal record stays saved when the current allowance or permitted credits keep workers running.
 
 A known 5-hour refusal waits when its reset is in the future and less than 20 minutes away.
 One log line says `workers wait for <label>'s 5-hour reset at <time>`.
@@ -96,12 +105,26 @@ Without room, or after a failed move, that pass routes Codex assignments to Clau
 Assignment changes are live in the same pass, even while a landing holds main. Main gets them at the next notes pass that finds main free.
 The notice names the earliest refill and any failure.
 The fallback remains until that refill or the selected account recovers.
-Turning credits on does not end it early.
+Turning credits on permits recovery when the selected account can work.
 An account with credits off cannot buy room from its credit balance.
 
 While credits are on, an hourly forecast is logged; only the first hourly forecast also goes to the phone, with phone-only retries on failure. It uses decreases in numeric balances from `agent-notes/readings.jsonl`, skips purchases and divides usage by the observed interval. Less than 30 minutes of observation or a newest reading older than 10 minutes makes usage unknown. Whole-credit rounding may report zero use; a missing observation never means zero use. Unlimited and unknown balances are stated explicitly.
 
-The paid-credits opening notice uses `quota.paid_credits`. While a workers move is queued, every send and retry uses `quota.paid_credits_queued`: workers spend credits until the move runs, or wait if credits run out or are turned off. The saved notice keeps the ordinary values. If the queue empties before a retry, that retry uses `quota.paid_credits` again. Old saved notices are rebuilt from the current account reading. Both notices give the action to remove the account from `codex_credit_accounts`. An episode rereads this setting on every pass. The first on-to-off change requests the credits-off move once, stops forecasts and repeats no opening alert. When the workers stay on the account, that change also turns on no-worker mode and stops the Codex workers. An off-to-on change is recorded in the episode, so a later on-to-off change acts again.
+The paid-credits opening notice uses `quota.paid_credits`.
+While a workers move is queued, every send and retry uses `quota.paid_credits_queued`.
+Workers spend credits until the move runs, or wait if credits run out or are turned off.
+The saved notice keeps the ordinary values.
+If the queue empties before a retry, that retry uses `quota.paid_credits` again.
+Old saved notices are rebuilt from the current account reading.
+Both notices give the action to remove the account from `codex_credit_accounts`.
+An episode rereads this setting on every pass.
+The first on-to-off change requests the credits-off move once, stops forecasts and repeats no opening alert.
+No-worker mode starts only when the workers account is exhausted and `accounts.pick` finds no other account with allowance or permitted credits.
+Unknown capacity cannot confirm exhaustion.
+A failed move alone does not start the mode.
+Starting the mode sends the no-capacity notice and stops the Codex workers once.
+Capacity recovery ends the mode without a timer or delay.
+An off-to-on change is recorded in the episode, so a later on-to-off change acts again.
 
 
 Replay checks defer entries when their journal cannot be read or decoded. An undecodable final line with no trailing newline is skipped with a log naming the file; an undecodable middle line still blocks. Rows are appended as complete encoded lines. See `docs/accounts.md` for the engine guards and install order.

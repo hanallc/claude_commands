@@ -7,6 +7,7 @@ except FileNotFoundError:
     pass
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -35,7 +36,7 @@ from scripts.production.delivery_state import (
 from scripts.lib import atomic_file, conf, file_lock, urgency
 from scripts.production.production_doc import Refusal as Refusal, production_field
 from scripts.feature_log import feature_log
-from scripts.review_links import review_link
+from scripts.review_links import page_frame, review_link
 
 MANIFEST = ".review-link-changes.json"
 PAGE_NAME = "changes.html"
@@ -136,6 +137,9 @@ class SentCloseoutAlerts(TypedDict):
     messages: list[str]
 
 
+QuestionOutcome = Literal["answer", "followup", "skip"]
+
+
 class StoredUserAnswer(TypedDict):
     saved: bool
     source: str
@@ -144,6 +148,8 @@ class StoredUserAnswer(TypedDict):
     question: str
     answer: str
     message: str
+    # A record saved before follow-ups and skips has no kind; it is an answer.
+    kind: NotRequired[QuestionOutcome]
 
 
 @dataclass(frozen=True)
@@ -402,13 +408,38 @@ class DeliveryReadView:
         return self.status.slots(page, row)
 
 
+def script_version(script: str) -> str:
+    """Name a page script by its content; an open page reloads, not updates, when the server's script differs."""
+    return hashlib.sha256(script.encode()).hexdigest()[:12]
+
+
+CHANGE_IMAGE_STYLE = """main:has(.change-image){max-width:1056px}
+:is(section[data-type="changes"],section[data-change-card]){max-width:680px}:is(section[data-type="changes"],section[data-change-card]):has(>.change-image){max-width:992px;display:grid;grid-template-columns:minmax(0,680px) 280px;gap:32px;align-items:start}
+.change-text{min-width:0}.change-image{display:block;width:280px;max-width:100%}
+.change-image img{display:block;box-sizing:border-box;width:280px;max-width:100%;max-height:420px;object-fit:cover;object-position:top left;border:1px solid #8886;border-radius:6px}
+[data-showrunner-filter]{max-width:680px}
+@media(max-width:999px){:is(section[data-type="changes"],section[data-change-card]):has(>.change-image){display:block;max-width:680px}.change-image{margin-top:24px}}
+"""
+
+
+def change_content(row: dict[str, str], content: str) -> str:
+    """Place the change text beside its thumbnail when its image exists."""
+    path = change_review.image_path(row.get(change_review.IMAGE, ""))
+    if not path:
+        return content
+    alt = html.escape("Screenshot: " + row.get("Change", "Change preview"), quote=True)
+    thumbnail = (f'<a data-image-zoom class="change-image" href="{path}" target="_blank" rel="noopener">'
+                 + f'<img src="{path}" alt="{alt}"></a>')
+    return '<div class="change-text">' + content + '</div>' + thumbnail
+
+
 def document(content: str, title: str = TITLES["changes"]) -> bytes:
     return ('''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>''' + html.escape(title) + '''</title><style>
 :root{color-scheme:light dark;font:17px/1.55 system-ui,sans-serif}
-body{margin:0}main{max-width:680px;margin:auto;padding:40px 16px 64px}
-h1{font-size:26px;line-height:1.25;margin:0 0 16px}section h1,h2{font-size:20px;line-height:1.3}
+body{margin:0}''' + page_frame.STYLE + page_frame.ZOOM_STYLE + '''main{max-width:744px}
+''' + CHANGE_IMAGE_STYLE + '''h1{font-size:26px;line-height:1.25;margin:0 0 16px}section h1,h2{font-size:20px;line-height:1.3}
 h2{margin:16px 0}p{white-space:pre-wrap;margin:16px 0}main{overflow-wrap:anywhere}
 section h2{font-size:17px}section details{margin:16px 0}
 .answer-actions{display:flex;flex-wrap:wrap;gap:8px}.answer-actions button{margin:0}
@@ -421,7 +452,7 @@ section+section{border-top:1px solid #8886;margin-top:36px;padding-top:28px}
 form{margin-top:16px}label,textarea{display:block}textarea{box-sizing:border-box;width:100%;font:inherit;margin:8px 0 16px;resize:vertical}
 button{font:inherit;min-height:44px;max-width:100%;margin:0 8px 8px 0;padding:6px 12px;background:light-dark(#f2f2f2,#303030);color:CanvasText;border:1px solid light-dark(#707070,#a0a0a0)}button[aria-pressed=true]{outline:2px solid currentColor}
 summary{min-height:44px;align-content:center;cursor:pointer}button:focus-visible,summary:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid currentColor;outline-offset:2px}
-</style></head><body><main>''' + content + "</main></body></html>").encode("utf-8")
+</style><style>''' + page_frame.COPY_STYLE + '''</style></head><body><main>''' + content + "</main><script>" + page_frame.ZOOM_SCRIPT + page_frame.COPY_SCRIPT + "</script></body></html>").encode("utf-8")
 
 
 def answer_notice(page: ReviewPage, body: str, reason: str) -> AnswerNotice:
@@ -493,17 +524,35 @@ def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
     return document(f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>' + answer_form(page, notice, feedback_rows))
 
 
-def review_text_html(text: str, block: Literal["p", "pre"] = "p") -> str:
-    """Render review text as escaped text blocks and consecutive list runs."""
+LINK = re.compile(r"(https?://[^\s<>\"']*[^\s<>\"'.,;:!?)\]])")
+CODE_SPAN = re.compile(r"`([^`\n]+)`")
+
+
+def linked(text: str) -> str:
+    """Escape text and make each http or https address a link that opens in the same tab, outside the console frame."""
+    pieces = LINK.split(text)
+    return "".join(f'<a href="{html.escape(piece, quote=True)}" target="_top">{html.escape(piece)}</a>'
+                   if index % 2 else html.escape(piece) for index, piece in enumerate(pieces))
+
+
+def inline_html(text: str) -> str:
+    """Escape text, show each backtick span as code, and make each address outside a code span a link."""
+    pieces = CODE_SPAN.split(text)
+    return "".join(f"<code>{html.escape(piece)}</code>" if index % 2 else linked(piece) for index, piece in enumerate(pieces))
+
+
+def review_text_html(text: str, *, inline: bool = False) -> str:
+    """Render review text as escaped text blocks and consecutive list runs; `inline` adds links and code spans."""
+    escape = inline_html if inline else html.escape
     lines = text.splitlines()
     if not any(re.match(r"\s*(?:- |[0-9]+\. )", line) for line in lines):
-        return f"<{block}>{html.escape(text)}</{block}>"
+        return f"<p>{escape(text)}</p>"
     content: list[str] = []
     current = ""
     for line in lines:
         line = line.lstrip()
         numbered = re.match(r"([0-9]+)\. (.*)", line)
-        tag = "ul" if line.startswith("- ") else "ol" if numbered else block if line else ""
+        tag = "ul" if line.startswith("- ") else "ol" if numbered else "p" if line else ""
         if tag != current:
             if current:
                 content.append(f"</{current}>")
@@ -511,16 +560,37 @@ def review_text_html(text: str, block: Literal["p", "pre"] = "p") -> str:
                 start = (numbered[1].lstrip("0") or "0") if numbered else "1"
                 attribute = f' start="{start}"' if tag == "ol" and start != "1" else ""
                 content.append(f"<{tag}{attribute}>")
-        elif tag == block:
+        elif tag == "p":
             content.append("\n")
         if tag in ("ul", "ol"):
             item = numbered[2] if numbered else line[2:]
-            content.append(f"<li>{html.escape(item)}</li>")
+            content.append(f"<li>{escape(item)}</li>")
         elif tag:
-            content.append(html.escape(line))
+            content.append(escape(line))
         current = tag
     if current:
         content.append(f"</{current}>")
+    return "".join(content)
+
+
+BLANK_EDGES = re.compile(r"\A(?:[ \t]*\r?\n)+|(?:\r?\n[ \t]*)+\Z")
+
+
+def review_html(text: str) -> str:
+    """Render review text as paragraphs, lists, and code blocks with copy controls."""
+    content: list[str] = []
+    start = 0
+    for block in page_frame.CODE_BLOCK.finditer(text):
+        before = BLANK_EDGES.sub("", text[start:block.start()])
+        if before.strip():
+            content.append(review_text_html(before))
+        content.append(page_frame.code_block_html(block))
+        start = block.end()
+    if not content:
+        return review_text_html(BLANK_EDGES.sub("", text))
+    after = BLANK_EDGES.sub("", text[start:])
+    if after.strip():
+        content.append(review_text_html(after))
     return "".join(content)
 
 
@@ -528,9 +598,9 @@ def question_html(question: NoQuestion | OpenQuestion | AnsweredQuestion) -> str
     if isinstance(question, NoQuestion):
         return ""
     feedback = isinstance(question, (OpenFeedback, CompletedFeedback))
-    content = ('<h2>Feedback</h2>' if feedback else '<h2>Question</h2>') + review_text_html(question.text)
+    content = ('<h2>Feedback</h2>' if feedback else '<h2>Question</h2>') + review_html(question.text)
     if isinstance(question, AnsweredQuestion):
-        content += review_text_html('Showrunner: ' + question.answer) if feedback else '<h2>Answer</h2>' + review_text_html(question.answer)
+        content += review_html('Showrunner: ' + question.answer) if feedback else '<h2>Answer</h2>' + review_html(question.answer)
     else:
         content += '<p>The showrunner will act on this</p>' if feedback else '<p>The showrunner will answer this</p>'
     return content
@@ -614,12 +684,12 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         answer = (f'<p role="status">{html.escape(status_text)}</p>' if status_text and (verdict or not warning) else
                   "" if isinstance(question, OpenQuestion) else answer_form(page, form_notice, feedback_rows))
         proof_title = "Try it · What you should see" if row[change_review.KIND] == "See in action" else "Proof"
-        sections.append(f'''<section id="{row_id}">
-{alert}
+        content = f'''{alert}
 <h1>{html.escape(row["Change"])}</h1>
-<h2>{proof_title}</h2>{review_text_html(row[change_review.CHECK], "pre")}
+<h2>{proof_title}</h2>{review_html(row[change_review.CHECK])}
 {question_html(question)}{answer}
-{change_details(row, change_review.display_id(row, route_owner(page, row).tab))}</section>''')
+{change_details(row, change_review.display_id(row, route_owner(page, row).tab))}'''
+        sections.append(f'<section id="{row_id}" data-change-card>' + change_content(row, content) + '</section>')
     if notice.reason and not notice.row:
         sections.insert(0, f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>')
     queue = next_item.change_queue(page.production)
@@ -1014,7 +1084,8 @@ def recover_question_answers(status: DeliveryStatus) -> None:
                 identities = update_registration.QuestionStaff.read()
                 question = next((item for item in update_registration.question_records_for_document(page.production, identities)
                                  if item.path == page.review_list), None)
-                if question is None or question.status != "closed":
+                # An answer closes its question; a follow-up or a skip leaves it open.
+                if question is None or question.status != ("closed" if saved.get("kind", "answer") == "answer" else "open"):
                     status.clear_locked(page, page.rows[0], slots, "verdict")
                     continue
                 if not saved.get("saved", False):
