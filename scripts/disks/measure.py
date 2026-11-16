@@ -8,15 +8,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import subprocess
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
-from typing import NotRequired, TypedDict
+from pathlib import Path, PurePath
+from typing import NotRequired, TypedDict, cast
 
 from scripts.buildlog import disk, filesystem
+from scripts.disks import disks_page
 from scripts.disks.disks_page import DATA_FILE, LOCK_FILE
 from scripts.lib import conf, file_lock
 from scripts.lib.atomic_file import write_text_atomic
@@ -24,6 +26,9 @@ from scripts.lib.atomic_file import write_text_atomic
 # du exits 1 when it cannot read some folders; the folders it read are still valid.
 DU_PARTIAL_EXIT = 1
 LOCK_BUSY_EXIT = 3
+MOUNT_TABLE = Path("/proc/self/mountinfo")
+# The mount table writes a space, a tab, a newline and a backslash in a path as an octal escape.
+MOUNT_ESCAPE = re.compile(r"\\([0-7]{3})")
 
 
 class Folder(TypedDict):
@@ -47,6 +52,71 @@ class DisksData(TypedDict):
     measured_at: float
     keep_bytes: int
     drives: list[Drive]
+
+
+@dataclass(frozen=True)
+class Mount:
+    """One line of the mount table: the file system, its folder that the mount shows, and where it shows."""
+
+    device: str
+    root: PurePath
+    point: PurePath
+
+
+def read_mounts(table: Path = MOUNT_TABLE) -> tuple[Mount, ...]:
+    """This machine's mounts in mount order, or none where the system has no mount table, as on the Mac."""
+    try:
+        lines = table.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ()
+
+    def path(text: str) -> PurePath:
+        return PurePath(MOUNT_ESCAPE.sub(lambda match: chr(int(match[1], 8)), text))
+
+    return tuple(Mount(fields[2], path(fields[3]), path(fields[4])) for fields in map(str.split, lines) if len(fields) > 4)
+
+
+def drive_path(path: PurePath, mounts: Sequence[Mount]) -> PurePath:
+    """Where the measure finds a path. A path under a mount of a subfolder, such as /session on natedev,
+    is measured under the mount of its whole file system, such as /build/session."""
+    # The last mount at a point covers the earlier ones.
+    holding = max(((len(mount.point.parts), index, mount) for index, mount in enumerate(mounts)
+                   if mount.point == path or mount.point in path.parents), default=None)
+    if holding is None or holding[2].root == PurePath("/"):
+        return path
+    mount = holding[2]
+    whole = next((other for other in mounts if other.device == mount.device and other.root == PurePath("/")), None)
+    return whole.point / mount.root.relative_to("/") / path.relative_to(mount.point) if whole else path
+
+
+def tree_size(data: DisksData | None, path: PurePath) -> int | None:
+    """A path's measured size: 0 when its drive lists no such folder, None when no measured drive holds it."""
+    drives = sorted(data["drives"] if data else [], key=lambda drive: len(drive["mount"]), reverse=True)
+    for drive in drives:
+        mount = PurePath(drive["mount"])
+        if path != mount and mount not in path.parents:
+            continue
+        node: Folder | None = drive.get("tree")
+        if node is None:
+            return None
+        parts = path.relative_to(mount).parts
+        while parts:
+            # A chain of single children is one node, such as "home/natepiano".
+            match = next((child for child in node["children"]
+                          if PurePath(child["name"]).parts[:len(parts)] == parts[:len(PurePath(child["name"]).parts)]), None)
+            if match is None:
+                return 0
+            node, parts = match, parts[len(PurePath(match["name"]).parts):]
+        return node["size"]
+    return None
+
+
+def read_data() -> DisksData | None:
+    """The last measure, or None before the first measure."""
+    try:
+        return cast(DisksData, json.loads((disks_page.output_folder() / DATA_FILE).read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return None
 
 
 @dataclass(frozen=True)

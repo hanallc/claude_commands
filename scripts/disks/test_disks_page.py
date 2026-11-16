@@ -19,7 +19,7 @@ from scripts.review_links import page_frame
 GIB = 1 << 30
 KEEP = 256 << 20
 SETTINGS: disks_page.PageSettings = {"slider_min_gib": 1, "slider_default_gib": 10, "cache_seconds": 600, "poll_seconds": 5,
-                                     "wait_seconds": 3600,
+                                     "wait_seconds": 3600, "sessions_shown": 3,
                                      "names": {"/build": "Build </script> drive"}}
 
 
@@ -119,6 +119,25 @@ class DisksPageTests(unittest.TestCase):
             '<span class="tag run">fps</span><span class="dim">report (builds)</span>', '<span class="tag go">deleted tonight</span>'])
         empty = cast(str, self.run_page(f"slotsHtml({json.dumps({'root': '/s', 'groups': []})}, {KEEP}, {now})"))
         self.assertIn("No slots yet.", empty)
+
+    def test_the_sessions_card_names_the_largest_sessions_then_adds_up_the_rest(self) -> None:
+        def row(name: str, size: int | None, state: str, held: list[dict[str, object]] | None = None) -> dict[str, object]:
+            return {"name": name, "size": size, "state": state, "held": held or []}
+
+        report = {"root": "/session", "sessions": [
+            row("fps", 28 * GIB, "running", [{"name": "run", "task": "phase:fps/3", "ended": False},
+                                             {"name": "center-shot", "task": "phase:fps/3", "ended": True}]),
+            row("lfo", 7 * GIB, "ended"), row("<b>", 0, "unknown"), row("demo", GIB, "running"), row("sdlc", None, "running")]}
+        html = cast(str, self.run_page(f"sessionsHtml({json.dumps(report)}, {KEEP}, 3)"))
+        rows = cast(list[str], re.findall(r"<tr[^>]*>(.*?)</tr>", html))
+        cells = ["|".join(part for part in re.split(r"<[^>]+>", row) if part.strip()) for row in rows[1:]]
+        self.assertEqual(cells, ["fps|28 GiB|run|, |center-shot|(unsaved work)|running", "lfo|7.0 GiB|—|ended",
+                                 "&lt;b&gt;|&lt; 256 MiB|—|—", "2 more|1.0 GiB"])
+        self.assertEqual(re.findall(r'<i style="width:([0-9.]+)%">', html), ["100.0", "25.0"])
+        self.assertIn('<span title="phase:fps/3">run</span>', html)
+        self.assertIn('<span class="tag go">ended</span>', html)
+        empty = cast(str, self.run_page(f"sessionsHtml({json.dumps({'root': '/s', 'sessions': []})}, {KEEP}, 3)"))
+        self.assertIn("No session folders yet.", empty)
 
     def test_a_measure_starts_only_when_the_sizes_are_old_and_no_measure_runs(self) -> None:
         launches: list[str] = []

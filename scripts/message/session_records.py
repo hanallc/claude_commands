@@ -289,8 +289,7 @@ class SessionProcesses:
     pids: tuple[int, ...]
 
 
-def _session_observations(session_id: str) -> Iterator[LiveSessionProcess | SessionLivenessUnknown]:
-    registry = read_registry()
+def _session_observations(session_id: str, registry: RegistryRead) -> Iterator[LiveSessionProcess | SessionLivenessUnknown]:
     if sessions_dir() in registry.unreadable:
         yield SessionLivenessUnknown("session registry unreadable: " + str(sessions_dir()))
         return
@@ -306,15 +305,17 @@ def _session_observations(session_id: str) -> Iterator[LiveSessionProcess | Sess
                 yield observed
 
 
-def session_liveness(session_id: str) -> LiveSessionProcess | SessionNotLive | SessionLivenessUnknown:
-    """Find a running session and its pid, preserving unknown registry or process identity."""
-    return next(_session_observations(session_id), SessionNotLive())
+def session_liveness(session_id: str, registry: RegistryRead | None = None,
+                     ) -> LiveSessionProcess | SessionNotLive | SessionLivenessUnknown:
+    """Find a running session and its pid, preserving unknown registry or process identity.
+    A caller that checks many sessions reads the registry once and passes it."""
+    return next(_session_observations(session_id, read_registry() if registry is None else registry), SessionNotLive())
 
 
 def session_processes(session_id: str) -> SessionProcesses | SessionLivenessUnknown:
     """Count all registered processes; incomplete evidence cannot prove a unique process."""
     pids: list[int] = []
-    for observed in _session_observations(session_id):
+    for observed in _session_observations(session_id, read_registry()):
         if isinstance(observed, SessionLivenessUnknown):
             return observed
         pids.append(observed.pid)

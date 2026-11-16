@@ -65,6 +65,9 @@ tbody tr:hover td { background: var(--hover); }
 .slots tr.group th { padding-top: 14px; color: var(--ink); white-space: normal; }
 .slots tr.group th span { color: var(--ink-3); font-weight: 400; margin-left: 8px; }
 .slots tr.group:hover th { background: none; }
+.sessions col.size { width: 80px; } .sessions col.share { width: 18%; } .sessions col.state { width: 96px; }
+.sessions td.held { white-space: normal; overflow-wrap: anywhere; }
+.share i { display: block; height: 8px; min-width: 2px; border-radius: 3px; background: var(--accent); opacity: 0.7; }
 .tag { display: inline-block; padding: 0 7px; border-radius: 9px; font-size: 0.76rem; line-height: 18px; border: 1px solid var(--line); color: var(--ink-2); margin-right: 6px; }
 .tag.run { border-color: transparent; background: color-mix(in srgb, var(--room) 22%, transparent); color: var(--ink); }
 .tag.go { border-color: color-mix(in srgb, var(--floor) 60%, transparent); color: var(--floor); }
@@ -88,6 +91,9 @@ tbody tr:hover td { background: var(--hover); }
   .slots td:nth-child(3) { white-space: normal; }
   .slots .wide { display: none; }
   .slots .narrow { display: block; }
+  .sessions col.size { width: 64px; } .sessions col.share { width: 0; } .sessions col.state { width: 72px; }
+  .sessions .share { display: none; }
+  .sessions th { white-space: normal; }
 }
 </style>
 </head>
@@ -239,12 +245,36 @@ function slotsHtml(report, keepBytes, now) {
   return `<h2>Slots<span class="path">${esc(report.root)}</span></h2>${body}`;
 }
 
+// The Sessions card: each session folder, largest first, with its held folders and whether its session runs.
+// The largest folders show by name; one row adds up the rest.
+function sessionsHtml(report, keepBytes, shown) {
+  const folderSize = bytes => bytes == null ? "—" : keepBytes && bytes < keepBytes ? `&lt; ${size(keepBytes)}` : size(bytes);
+  const largest = Math.max(0, ...report.sessions.map(row => row.size || 0));
+  const held = row => row.held.length ? row.held.map(folder => `<span title="${esc(folder.task)}">${esc(folder.name)}</span>`
+    + (folder.ended ? ' <span class="dim">(unsaved work)</span>' : "")).join(", ") : '<span class="dim">—</span>';
+  const state = row => row.state === "ended" ? '<span class="tag go">ended</span>'
+    : `<span class="dim">${row.state === "running" ? "running" : "—"}</span>`;
+  const sessionRow = row => `<tr><td class="path">${esc(row.name)}</td><td class="n">${folderSize(row.size)}</td>`
+    + `<td class="share">${row.size && largest ? `<i style="width:${(100 * row.size / largest).toFixed(1)}%"></i>` : ""}</td>`
+    + `<td class="held">${held(row)}</td><td>${state(row)}</td></tr>`;
+  const named = report.sessions.slice(0, shown), rest = report.sessions.slice(shown);
+  const restSize = rest.some(row => row.size != null) ? rest.reduce((sum, row) => sum + (row.size || 0), 0) : null;
+  const more = rest.length ? `<tr><td class="dim">${rest.length} more</td><td class="n dim">${folderSize(restSize)}</td>`
+    + "<td class=\"share\"></td><td></td><td></td></tr>" : "";
+  const body = named.length ? `<table class="sessions"><colgroup><col><col class="size"><col class="share"><col><col class="state"></colgroup>`
+    + `<thead><tr><th>Session</th><th class="n">Size</th><th class="share" aria-label="Share of the largest session"></th>`
+    + `<th>Held folders</th><th>State</th></tr></thead><tbody>${named.map(sessionRow).join("")}${more}</tbody></table>`
+    : '<p class="problem">No session folders yet.</p>';
+  return `<h2>Sessions<span class="path">${esc(report.root)}</span></h2>${body}`;
+}
+
 const settings = JSON.parse(document.getElementById("disks-settings").textContent);
 const DATA_FILE = "disks.json";
 const MEASURE = "measure";
 const states = new Map();
 let data = null;
 let slotReport = null;
+let sessionReport = null;
 let measuring = null;
 let problem = "";
 
@@ -330,13 +360,16 @@ function renderStatus() {
 }
 
 function renderCards() {
-  const cards = document.getElementById("cards");
+  const cards = document.getElementById("cards"), keepBytes = data ? data.keep_bytes : 0;
   cards.replaceChildren();
-  if (!slotReport) return;
-  const card = document.createElement("section");
-  card.className = "card";
-  card.innerHTML = slotsHtml(slotReport, data ? data.keep_bytes : 0, Date.now() / 1000);
-  cards.append(card);
+  const add = html => {
+    const card = document.createElement("section");
+    card.className = "card";
+    card.innerHTML = html;
+    cards.append(card);
+  };
+  if (slotReport) add(slotsHtml(slotReport, keepBytes, Date.now() / 1000));
+  if (sessionReport) add(sessionsHtml(sessionReport, keepBytes, settings.sessions_shown));
 }
 
 function render() {
@@ -364,7 +397,7 @@ function show(next) {
   if (data) render(); else { renderCards(); renderStatus(); }
 }
 
-// Ask the server for a measure and the slots' current use. The server starts a measure only when the sizes
+// Ask the server for a measure and the slots and sessions in use now. The server starts a measure only when the sizes
 // are old. The page keeps the old sizes and reads the data file again until it changes.
 async function askMeasure() {
   try {
@@ -373,6 +406,7 @@ async function askMeasure() {
     const answer = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(answer.reason || `the server answered ${response.status}`);
     slotReport = answer.slots || null;
+    sessionReport = answer.sessions || null;
     if (answer.state === "current") {
       // The page's sizes are old only when another measure finished since the page read them.
       show(!data || Date.now() / 1000 - data.measured_at >= settings.cache_seconds ? await readData() : data);
@@ -391,7 +425,7 @@ async function poll() {
   try {
     const next = await readData();
     if (next && next.measured_at !== measuring.before) {
-      // A new measure gives new slot sizes, so the page asks once more; the server answers "current".
+      // A new measure gives new slot and session sizes, so the page asks once more; the server answers "current".
       measuring = null;
       show(next);
       await askMeasure();
