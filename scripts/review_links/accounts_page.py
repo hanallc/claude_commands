@@ -26,10 +26,10 @@ class AccountsRender:
     finished_at: float
 
     def with_recent_times(self, times: tuple[float, ...]) -> bytes:
-        facts = (f'data-load-time data-render-seconds="{self.seconds:.6f}" '
-                 + f'data-render-finished="{self.finished_at:.6f}" '
+        facts = (f'data-page-facts data-render-seconds="{self.seconds:.6f}" '
+                 + f'data-read-at="{self.finished_at:.6f}" '
                  + f'data-render-median="{median(times):.6f}" data-render-count="{len(times)}"')
-        return self.content.replace(b'data-load-time', facts.encode(), 1)
+        return self.content.replace(b'data-page-facts', facts.encode(), 1)
 
 
 def page_url() -> str:
@@ -65,8 +65,8 @@ def page() -> bytes:
     refresh_seconds = conf.read("review_links").number("page_refresh_seconds")
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             + '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Accounts</title>'
-            + f'{STYLE}</head><body><main data-refresh-seconds="{refresh_seconds}"><h1 class="page-title">Accounts</h1>'
-            + f'<p class="load-time" data-load-time></p><div data-accounts>{body}</div></main>'
+            + f'{STYLE}</head><body><main data-refresh-seconds="{refresh_seconds}">' + page_frame.title("Accounts", "accounts")
+            + f'<div data-accounts>{body}</div></main>'
             + f"<script>{SCRIPT}</script></body></html>").encode()
 
 
@@ -98,7 +98,6 @@ def main() -> int:
 
 STYLE = "<style>\n" + console_theme.CSS + page_frame.STYLE + """
 h2{margin:16px 0 4px}
-.load-time{color:var(--ink-2);font-size:.86rem;margin:0 0 16px}
 table{border-collapse:collapse;font-size:.86rem;font-variant-numeric:tabular-nums}
 .card{width:fit-content;max-width:100%}
 th,td{padding:5px 0 5px 18px;white-space:nowrap}th:first-child,td:first-child{padding-left:0}
@@ -116,37 +115,20 @@ tbody tr:hover td{background:var(--hover)}
 
 SCRIPT = page_frame.REFRESH_SCRIPT + r"""(() => {
 let view = document.querySelector('[data-accounts]');
-let timing = document.querySelector('[data-load-time]');
 let newestRequest = 0;
-function showTime(waited) {
-  const age = Math.max(0, Math.floor(Date.now()/1000 - Number(timing.dataset.renderFinished)));
-  timing.textContent = `Data from ${age} s ago. Loaded in ${waited.toFixed(2)} s. ` +
-    `The last render took ${Number(timing.dataset.renderSeconds).toFixed(2)} s ` +
-    `(median ${Number(timing.dataset.renderMedian).toFixed(2)} s of the last ${timing.dataset.renderCount}).`;
-}
-async function refresh() {
+async function refresh(supersede=false,current=()=>true) {
   const request = ++newestRequest;
-  try {
-    const started = performance.now();
-    const response = await fetch(location.pathname, {cache: 'no-store'});
-    if (!response.ok) return;
-    const source = await response.text(), waited = (performance.now() - started)/1000;
-    const page = new DOMParser().parseFromString(source, 'text/html');
-    const fresh = page.querySelector('[data-accounts]'), freshTiming = page.querySelector('[data-load-time]');
-    if (request !== newestRequest || !fresh || !freshTiming) return;
-    const top = scrollY;
-    view.replaceWith(fresh);
-    view = fresh;
-    timing.replaceWith(freshTiming);timing = freshTiming;showTime(waited);
-    scrollTo({top, behavior: 'instant'});
-  } catch (_) {}
+  const response = await fetch(location.pathname, {cache: 'no-store'});
+  if (!response.ok) throw new Error('HTTP ' + response.status);
+  const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+  const fresh = page.querySelector('[data-accounts]');
+  if (request !== newestRequest || !current()) return;
+  if (!fresh) throw new Error('The page has no accounts.');
+  const top = scrollY;
+  view.replaceWith(fresh);view = fresh;
+  scrollTo({top, behavior: 'instant'});
+  return pageRefreshFacts(page);
 }
-function showInitialTime() {
-  const navigation = performance.getEntriesByType('navigation')[0];
-  showTime(navigation ? (navigation.responseEnd-navigation.requestStart)/1000 : 0);
-}
-if (document.readyState === 'complete') showInitialTime();
-else addEventListener('load', showInitialTime, {once: true});
 createPageRefresh(refresh, () => document.querySelector('main').dataset.refreshSeconds);
 })();"""
 

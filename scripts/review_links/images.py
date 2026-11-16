@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import html
 import secrets
+import time
 import shutil
 import sys
 from datetime import UTC, datetime
@@ -156,18 +157,19 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
 
 
 def render(root: Path) -> bytes:
+    started, read_at = time.perf_counter(), time.time()
     token = console_token(root)
     members = staff.snapshot()
     rows = conf.read("review_links").whole("feedback_rows")
     cards = "".join(card(record, token, members, rows) for record in waiting_records(root))
-    content = (STYLE + '<h1 class="page-title">Images</h1><div data-image-filter><label for="image-window">Show:</label>'
+    content = (STYLE + page_frame.title("Images", "images") + '<div data-image-filter><label for="image-window">Show:</label>'
                + '<select id="image-window"><option value="day">Last day</option>'
                + '<option value="week" selected>Last 7 days</option><option value="all">All</option></select></div>'
                + '<div data-image-layout><nav data-image-groups aria-label="Image groups"></nav>'
                + f'<div><div data-images data-script="{SCRIPT_VERSION}">{cards}</div><p hidden data-empty></p></div></div>'
                + '<noscript>Enable JavaScript to filter images or answer on an image.</noscript>'
                + f'<script>{SCRIPT}</script>')
-    return change_page.document(content, "Images")
+    return page_frame.rendered(change_page.document(content, "Images"), started, read_at)
 
 
 def submit(root: Path, body: str) -> None:
@@ -348,13 +350,15 @@ function bind(root) {
     }
   }));
 }
-async function refresh() {
+async function refresh(supersede=false,current=()=>true) {
   if (sending) return;
-  try {
+  {
     const response = await fetch(location.pathname, {cache: 'no-store'});
-    if (!response.ok) return;
-    const fresh = new DOMParser().parseFromString(await response.text(), 'text/html').querySelector('[data-images]');
-    if (!fresh || sending) return;
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+    const fresh = page.querySelector('[data-images]');
+    if (sending || !current()) return;
+    if (!fresh) throw new Error('The page has no image list.');
     // A page from an older server script cannot bind the new cards, so it loads again.
     if (fresh.dataset.script !== list.dataset.script) {
       location.reload();
@@ -367,7 +371,8 @@ async function refresh() {
     bind(list);
     apply();
     scrollTo({top, behavior: 'instant'});
-  } catch (_) {}
+    return pageRefreshFacts(page);
+  }
 }
 function selectImage(target) {
   if (target.hidden) {
@@ -385,7 +390,7 @@ const start = new URLSearchParams(location.hash.slice(1));
 if (start.get('show') in spans) menu.value = start.get('show');
 menu.addEventListener('change', () => { motion.finish(); apply(); });
 addEventListener('hashchange', openImageLink);
-createPageRefresh(refresh);
+createPageRefresh(refresh,()=>0);
 bind(list);
 // An image link opens its image with a longer period when the image is older.
 const linkedImage = start.get('image');

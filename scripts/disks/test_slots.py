@@ -24,7 +24,7 @@ def folder(name: str, size: int, children: list[Folder] | None = None) -> Folder
     return {"name": name, "size": size, "other": size - sum(child["size"] for child in listed), "children": listed}
 
 
-DATA: DisksData = {"measured_at": NOW, "keep_bytes": GIB // 4, "drives": [
+DATA: DisksData = {"render_seconds": 0.01, "measured_at": NOW, "keep_bytes": GIB // 4, "drives": [
     {"mount": "/", "tree": folder("/", 900 * GIB, [folder("home/natepiano", 800 * GIB, [folder("slot", 3 * GIB)])])},
     {"mount": "/build", "tree": folder("/build", 500 * GIB, [
         folder("cargo", 200 * GIB, [folder("hana-slot1", 70 * GIB), folder("hana-slot2/debug", 40 * GIB)]),

@@ -8,6 +8,7 @@ import json
 import re
 import secrets
 import shlex
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -535,6 +536,7 @@ def render_rebuilds() -> bytes:
 
 
 def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
+    started, read_at = time.perf_counter(), time.time()
     settings = conf.read("review_links")
     feedback_rows = settings.whole("feedback_rows")
     refresh_seconds = settings.number("page_refresh_seconds")
@@ -550,8 +552,7 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
                      + f'data-count="{count}" value="{html.escape(name)}">{html.escape(label)} ({count})</option>')
     cards = (''.join(section(item, feedback_rows) for item in prepared.changes) if kind == "changes"
              else ''.join(question_section(item, browser, feedback_rows) for item in prepared.questions))
-    content = (PAGE_STYLE + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}" data-script="{SCRIPT_VERSION}">'
-               + f'<h1 class="page-title">{change_page.TITLES[kind]}</h1>'
+    content = (PAGE_STYLE + page_frame.title(change_page.TITLES[kind], kind) + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}" data-script="{SCRIPT_VERSION}">'
                + '<div data-showrunner-filter><label for="review-showrunner">Showrunner:</label>'
                + '<select id="review-showrunner" aria-label="Showrunner"><option value="">All</option></select></div>'
                + '<template data-runner-options>' + ''.join(menus) + '</template>'
@@ -561,7 +562,7 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
                + '<p hidden data-empty></p><div class="navigation"><button type="button" data-next hidden>Skip for now</button></div>'
                + '<noscript>Enable JavaScript to review items and use Skip for now.</noscript></div>'
                + '<script>const initial=' + json.dumps(browser.initial).replace('<', '\\u003c') + ';' + SCRIPT + '</script>')
-    return change_page.document(content, change_page.TITLES[kind])
+    return page_frame.rendered(change_page.document(content, change_page.TITLES[kind]), started, read_at)
 
 
 PAGE_STYLE = """<style>[hidden]{display:none!important}
@@ -711,7 +712,7 @@ SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + r'''
 const motion=createCardMotion();
 let content=document.querySelector('[data-review-content]');
 let rows,viewOrders,runnerOptions,showrunners,runnerMenu,next,empty,saveNotice;
-let shownPage=content.outerHTML, heldPage=null, newestRequest=0, activeLoads=0, activeSaves=0;
+let shownPage=content.outerHTML, heldPage=null, newestRequest=0, activeLoads=false, activeSaves=0;
 const remembered=new Map(), kind=content.dataset.kind; let current=null, tab='', navigation=0, shownHash='';
 function ordersFor(page,cards){
  const byKey=new Map(cards.map(row=>[row.dataset.key,row]));
@@ -857,21 +858,24 @@ function applyHeldPage(){
  if(field && !field.closest('section').hidden){field.focus({preventScroll:true});field.setSelectionRange(...selection);}
  window.scrollTo({left,top,behavior:'instant'});pageRefresh.restart();
 }
-async function refreshPage(supersede=false){
+async function refreshPage(supersede=false,current=()=>true){
  if(activeLoads && !supersede) return;
  const request=++newestRequest;
- activeLoads++;
+ activeLoads=true;
  try{
   const response=await fetch(location.href,{cache:'no-store'});
-  if(!response.ok) return;
-  const fresh=new DOMParser().parseFromString(await response.text(),'text/html').querySelector('[data-review-content]');
-  if(request!==newestRequest || !fresh) return;
-  heldPage=fresh;applyHeldPage();
- }catch(error){}
- finally{activeLoads--;}
+  if(!response.ok) throw new Error('HTTP '+response.status);
+  const page=new DOMParser().parseFromString(await response.text(),'text/html');
+  const fresh=page.querySelector('[data-review-content]');
+  if(request!==newestRequest || !current()) return;
+  if(!fresh) throw new Error('The page has no review list.');
+  heldPage=fresh;applyHeldPage();return pageRefreshFacts(page);
+ }finally{if(request===newestRequest) activeLoads=false;}
 }
-const pageRefresh=createPageRefresh(refreshPage,()=>content.dataset.refreshSeconds);
-document.addEventListener('input',()=>applyHeldPage());
+const pageRefresh=createPageRefresh(refreshPage,()=>content.dataset.refreshSeconds,()=>
+ activeSaves ? 'An answer is saving.' : [...content.querySelectorAll('textarea,input[type=text]')]
+  .some(field=>field.value!=='' && !field.closest('form')?.hidden) ? 'You have text in a field.' : '');
+document.addEventListener('input',()=>{applyHeldPage();pageRefresh.changed();});
 window.addEventListener('hashchange',()=>{if(location.hash!==shownHash){navigation++;clearNotice();}show();});
 bindPage();show();
 '''

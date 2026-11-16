@@ -48,6 +48,7 @@ class AccountsPageCache:
     """Keep the last good page and allow one render at a time."""
 
     page: bytes = b""
+    render_failed: bool = False
     recent_times: deque[float] = field(default_factory=lambda: deque(maxlen=10))
     rendering: bool = False
     first_render: Future[bytes] = field(default_factory=Future[bytes])
@@ -64,7 +65,7 @@ class AccountsPageCache:
                     except RuntimeError:
                         self.rendering = False
                         raise
-                return self.page
+                return self._response()
             if not self.rendering:
                 self.first_render = Future[bytes]()
                 self.rendering = True
@@ -80,10 +81,17 @@ class AccountsPageCache:
             return page
         return attempt.result()
 
+    def _response(self) -> bytes:
+        if self.render_failed:
+            return self.page.replace(b'data-page-facts',
+                                     b'data-page-facts data-read-error="The Accounts render failed."', 1)
+        return self.page
+
     def replace(self) -> bytes:
         try:
             rendered = accounts_page.render_with_facts()
             with self.condition:
+                self.render_failed = False
                 self.recent_times.append(rendered.seconds)
                 self.page = rendered.with_recent_times(tuple(self.recent_times))
                 return self.page
@@ -91,8 +99,9 @@ class AccountsPageCache:
             with self.condition:
                 if not self.page:
                     raise
+                self.render_failed = True
                 print(f"review-links accounts: {error}", file=sys.stderr)
-                return self.page
+                return self._response()
         finally:
             with self.condition:
                 self.rendering = False
