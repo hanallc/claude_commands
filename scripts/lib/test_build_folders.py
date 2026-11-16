@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 import os
 import fcntl
 import json
@@ -783,6 +783,75 @@ print('shared')
                 child.kill()
             _ = child.communicate(timeout=10)
 
+    def test_failed_clone_keeps_the_stage_while_a_child_holds_its_descriptor(self) -> None:
+        children: list[subprocess.Popen[str]] = []
+        stages: list[Path] = []
+
+        def failed_clone(command: Sequence[str], **options: object) -> Never:
+            self.assertIn("clone", command)
+            stage = Path(command[-1])
+            stages.append(stage)
+            _ = (stage / "partial").write_text("unfinished clone")
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+                pass_fds=cast(tuple[int, ...], options["pass_fds"]),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            )
+            children.append(child)
+            assert child.stdout is not None
+            self.assertTrue(select.select([child.stdout], [], [], 3)[0])
+            self.assertEqual(child.stdout.readline(), "ready\n")
+            raise subprocess.CalledProcessError(1, command, stderr=b"clone failed")
+
+        try:
+            request = folders.GitCloneStage(self.root, self.root, "clone-", "--shared")
+            with mock.patch.object(subprocess, "run", side_effect=failed_clone):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    _ = folders.create_build_folder(request)
+            stage, = stages
+            child, = children
+            self.assertEqual((stage / "partial").read_text(), "unfinished clone")
+            self.assertEqual(folders.build_folder_state(stage), "held")
+            folders.sweep_temporary_build_folders(self.root, wait=False, prefix="clone-")
+            self.assertTrue(stage.is_dir())
+            _ = child.communicate(input="end", timeout=3)
+            self.assertEqual(child.returncode, 0)
+            folders.sweep_temporary_build_folders(self.root, wait=False, prefix="clone-")
+            self.assertFalse(stage.exists())
+            self.assertFalse(stage.with_name(stage.name + ".lock").exists())
+            self.assertFalse(stage.with_name(stage.name + ".lease.json").exists())
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                _ = child.communicate(timeout=3)
+
+    def test_memory_proof_fixture_writer_inherits_the_folder_descriptor(self) -> None:
+        writer = self.root / "fixture-writer"
+        marker = self.root / "writer-descriptor"
+        _ = writer.write_text(f"#!{sys.executable}\n" + """import os
+from pathlib import Path
+descriptor = int(os.environ['BUILD_FOLDER_LOCK_FD'])
+folder = Path(os.environ['BUILD_FOLDER'])
+assert os.path.samestat(os.fstat(descriptor), folder.with_name(folder.name + '.lock').stat())
+Path(os.environ['WRITER_MARKER']).write_text('inherited')
+raise SystemExit(77)
+""")
+        writer.chmod(0o755)
+        proof = Path(__file__).resolve().parents[1] / "build_queue/memory_page_proof.mjs"
+        executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
+        with folders.temporary_build_folder(folders.UniqueBuildFolder("proof-writer-")) as folder:
+            descriptor = folders.build_folder_lock_fd(folder)
+            environment = {**os.environ, "PYTHON": str(writer), "WRITER_MARKER": str(marker),
+                           "BUILD_FOLDER": str(folder), "BUILD_FOLDER_LOCK_FD": str(descriptor)}
+            result = subprocess.run([executable, str(proof), str(folder)], env=environment,
+                                    pass_fds=(descriptor,), capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(marker.read_text(), "inherited")
+            self.assertIn("status: 77", result.stderr)
+            self.assertEqual(folders.build_folder_state(folder), "held")
+        self.assertFalse(folder.exists())
+
     def test_process_death_frees_the_lock_without_reading_the_lease(self) -> None:
         probe = """import signal
 from scripts.lib import build_folders as f
@@ -1383,6 +1452,37 @@ sys.exit(int(sys.argv[1]))
                 record = cast(dict[str, str], json.loads(result.stdout))
                 self.assertEqual(record["owner"], "unit")
                 self.assertFalse(Path(record["path"]).exists())
+
+    def test_prefixed_run_uses_its_private_parent_and_removes_all_records(self) -> None:
+        parent = self.root / "proof"
+        parent.mkdir()
+        probe = """import json, os
+from pathlib import Path
+folder = Path(os.environ['BUILD_FOLDER'])
+lease = json.loads(folder.with_name(folder.name + '.lease.json').read_text())
+assert lease['unit'] == 'queue'
+os.fstat(int(os.environ['BUILD_FOLDER_LOCK_FD']))
+print(folder)
+"""
+        result = self.command("run", "--owner", "queue", "--name", "proof", "--prefix", "memory-proof-",
+                              "--parent", str(parent), "--", sys.executable, "-c", probe)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        folder = Path(result.stdout.strip())
+        self.assertEqual(folder.parent, parent)
+        self.assertTrue(folder.name.startswith("memory-proof-"))
+        self.assertEqual(list(parent.iterdir()), [])
+
+    def test_collector_prefix_keeps_other_temporary_folders(self) -> None:
+        paths: list[Path] = []
+        for prefix in ("ci-", "other-"):
+            spec = folders.BuildFolderSpec(kind="legacy-unique", parent=self.root, purpose=prefix, suffix_length=8)
+            with folders.leased_build_folder(spec) as folder:
+                paths.append(folder)
+        folders.sweep_temporary_build_folders(self.root, wait=False, prefix="ci-")
+        self.assertFalse(paths[0].exists())
+        self.assertTrue(paths[1].exists())
+        folders.sweep_temporary_build_folders(self.root, wait=False)
+        self.assertFalse(paths[1].exists())
 
     def test_run_stops_and_reaps_an_escaped_descendant(self) -> None:
         probe = """import os, pathlib, subprocess, sys

@@ -13,11 +13,9 @@ from dataclasses import dataclass
 from functools import partial
 import os
 from pathlib import Path
-import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 
 
@@ -28,7 +26,7 @@ from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_place
 from scripts.build_queue import step_estimator
 from scripts.buildlog import parse
-from scripts.lib import cancellation
+from scripts.lib import build_folders, cancellation
 from scripts.lib.descendants import adopt_descendants
 
 
@@ -103,10 +101,10 @@ def end_with_front(front_pid: int) -> None:
         os._exit(1)
 
 
-def remove_abandoned_folders(shared_folder: Path) -> None:
-    """Remove this user's shared admission folders when their owners are not live."""
+def _abandoned_legacy_folder_names(shared_folder: Path, prefix: str) -> tuple[str, ...]:
+    """Select old CI folders whose process identity no longer matches."""
+    names: list[str] = []
     uid = os.getuid()
-    prefix = f"build-admission-ci-{uid}-"
     with os.scandir(shared_folder) as entries:
         for entry in entries:
             if not entry.name.startswith(prefix):
@@ -118,9 +116,10 @@ def remove_abandoned_folders(shared_folder: Path) -> None:
                 if (len(owner) == 3 and owner[0].isdecimal() and owner[1].isdecimal()
                         and records.process_start_time(int(owner[0])) == owner[1]):
                     continue
-                shutil.rmtree(entry.path)
+                names.append(entry.name)
             except FileNotFoundError:
                 pass
+    return tuple(names)
 
 
 def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_folder: Path | JobTemporaryFolder) -> int:
@@ -133,12 +132,11 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
     width = records.test_threads(argv)
     test_width: records.TestWidth = records.RequestedTestWidth(width) if width else records.UnspecifiedTestWidth()
     prefix = f"build-admission-ci-{os.getuid()}-"
-    if isinstance(shared_folder, Path):
-        remove_abandoned_folders(shared_folder)
-        prefix += f"{pid}-{start}-"
-    with tempfile.TemporaryDirectory(prefix=prefix,
-                                     dir=shared_folder if isinstance(shared_folder, Path) else None) as folder:
-        directory = Path(folder)
+    parent = shared_folder if isinstance(shared_folder, Path) else build_folders.inherited_temporary_parent()
+    legacy_names = _abandoned_legacy_folder_names(parent, prefix) if isinstance(shared_folder, Path) else ()
+    build_folders.sweep_temporary_build_folders(parent, wait=False, prefix=prefix, legacy_names=legacy_names)
+    request_folder = build_folders.UniqueBuildFolder(prefix, build_folders.ExplicitBuildParent(parent))
+    with build_folders.temporary_build_folder(request_folder) as directory:
         directory.chmod(0o755)
         sidecar = directory / "cargo.cgroup"
         _ = sidecar.write_text("")
@@ -166,7 +164,8 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
                 _ = adopt_descendants()
                 # The main thread forks because the death signal follows the thread that forks.
                 process = place.popen(argv, env=environment, stderr=subprocess.PIPE,
-                                      preexec_fn=partial(end_with_front, pid))
+                                      preexec_fn=partial(end_with_front, pid),
+                                      pass_fds=(build_folders.build_folder_lock_fd(directory),))
                 stream = process.stderr
                 if stream is None:
                     raise RuntimeError("cargo progress pipe is unavailable")

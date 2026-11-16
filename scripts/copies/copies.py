@@ -24,9 +24,8 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import time
-from typing import TYPE_CHECKING, NoReturn, TextIO, cast, override
+from typing import TYPE_CHECKING, Literal, NoReturn, TextIO, cast, override
 from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
@@ -590,13 +589,14 @@ def initialize_git(tree: Path, source: Path) -> None:
         # clone needs an empty destination; the tree already holds scratch's busy mark.
         # Stage only Git metadata, so first creation never has an unlocked checkout.
         clone_source = source
-        clone_mode = "--shared"
+        clone_mode: Literal["--shared", "--no-local"] = "--shared"
         if any(active.tree == source for active in ACTIVE_GATES.get()):
             clone_mode = "--no-local"
-        with tempfile.TemporaryDirectory(dir=tree, prefix=CLONE_STAGE + "-") as directory:
-            stage = Path(directory)
-            _ = git(source, "clone", clone_mode, "--no-checkout", "--quiet", "--", str(clone_source), str(stage))
-            _ = (stage / ".git").rename(tree / ".git")
+        build_folders.sweep_temporary_build_folders(tree, wait=False, prefix=CLONE_STAGE + "-")
+        request = build_folders.GitCloneStage(clone_source, tree, CLONE_STAGE + "-", clone_mode, COMMAND_LOCKS.get())
+        with _slot_preparation():
+            with build_folders.temporary_build_folder(request) as stage:
+                _ = (stage / ".git").rename(tree / ".git")
     if (tree / ".git").is_symlink() or not (tree / ".git").is_dir():
         raise CopyError(f"{tree}: standing checkout must own its .git directory")
     actual = git(tree, "rev-parse", "--absolute-git-dir").decode().strip()
