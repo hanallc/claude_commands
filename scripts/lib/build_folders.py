@@ -586,8 +586,11 @@ def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
                     except FileNotFoundError:
                         return True
                     with ExitStack() as children:
-                        # A held lease below a free folder keeps the folder.
-                        if not _hold_child_leases(path, children, wait=wait):
+                        # A held lease below a free folder, or an unreadable folder below it, keeps the folder.
+                        try:
+                            if not _hold_child_leases(path, children, wait=wait):
+                                return False
+                        except OSError:
                             return False
                         _remove_folder(path, directory, allocated)
                     return True

@@ -1447,11 +1447,18 @@ os._exit(0)
             "sweep-inner-", folders.ExplicitBuildParent(outer)))
         self.addCleanup(_release_folder, inner)
         _release_folder(outer)
+        # A free folder with an unreadable folder below it is kept, and the sweep goes on to the next folder.
+        unreadable = folders.create_build_folder(folders.UniqueBuildFolder("sweep-a-unreadable-"))
+        _release_folder(unreadable)
+        closed = unreadable / "closed"
+        closed.mkdir(mode=0)
+        self.addCleanup(closed.chmod, 0o700)
         with mock.patch("time.sleep", side_effect=AssertionError("waited on a held lock")):
             folders.sweep_temporary_build_folders(self.root, wait=False)
         self.assertTrue(held.is_dir())
         self.assertFalse(free.exists())
         self.assertTrue(inner.is_dir())
+        self.assertTrue(closed.is_dir())
 
     def test_a_lock_removed_after_its_open_is_not_current(self) -> None:
         real_open = os.open
