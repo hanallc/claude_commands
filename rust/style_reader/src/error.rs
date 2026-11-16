@@ -46,6 +46,8 @@ pub(crate) enum ReaderError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("cannot serialize the tree inventory")]
+    TreeSerialize(#[source] serde_json::Error),
     #[error("cannot write the facts to stdout")]
     Write(#[source] std::io::Error),
 }
