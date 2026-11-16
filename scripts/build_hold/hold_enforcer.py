@@ -475,63 +475,6 @@ def stop_queued_runs(
         print(f"{label}: pid {identity.pid}", flush=True)
 
 
-def drain(
-    holder: build_hold.Holder, proc_root: Path = build_hold.PROC_ROOT, *,
-    sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
-) -> int:
-    """Stop waiting gates and wait for working gates while the hold stays active."""
-    attempted: set[build_hold.ProcessIdentity] = set()
-    signalled: set[build_hold.ProcessIdentity] = set()
-    heartbeat = clock()
-    claims_unreadable = False
-    try:
-        while True:
-            processes = build_hold.read_audit_processes(proc_root)
-            claims = claimed_processes(proc_root)
-            runs = classify_drain_runs(processes, admitted_processes(), claims)
-            if isinstance(runs, build_hold.ClaimsUnreadable):
-                if not claims_unreadable:
-                    print(f"claims unreadable: {runs.reason}", file=sys.stderr)
-                claims_unreadable = True
-                sleep(1)
-                continue
-            claims_unreadable = False
-            if not runs:
-                print("drained", flush=True)
-                return 0
-            report = clock() >= heartbeat
-            for run in runs:
-                owner = run.owner.session_id if isinstance(run.owner, OwningSession) else "no session"
-                if isinstance(run, WaitingRun) and run.process.identity not in attempted:
-                    outcome = stop_waiting_run(run, holder, processes, proc_root)
-                    label = "stopped" if isinstance(outcome, StoppedRun) else "skipped: identity changed"
-                    print(f"{label}: {owner}, pid {run.process.identity.pid}", flush=True)
-                    attempted.add(run.process.identity)
-                    if isinstance(outcome, StoppedRun):
-                        signalled.add(run.process.identity)
-                if report:
-                    try:
-                        uptime = float((proc_root / "uptime").read_text().split()[0])
-                    except (OSError, ValueError, IndexError):
-                        uptime = clock()
-                    age = max(0, uptime - int(run.process.identity.start_time) / os.sysconf("SC_CLK_TCK"))
-                    if isinstance(run, WorkingRun):
-                        state = "working"
-                    elif run.process.identity in signalled:
-                        state = "TERM sent; still alive"
-                    else:
-                        state = "skipped: identity changed"
-                    detail = f": {run.reason}" if isinstance(run, WorkingRun) else ""
-                    print(f"{state}: {owner}, pid {run.process.identity.pid}, age {age:.0f}s{detail}", flush=True)
-            if report:
-                print(f"draining: {len(runs)} runs remain", flush=True)
-                heartbeat = clock() + 60
-            sleep(1)
-    except KeyboardInterrupt:
-        print("drain interrupted; the hold remains active", flush=True)
-        return 130
-
-
 @dataclass(frozen=True)
 class AllowedBuild:
     process: build_hold.AuditProcess
