@@ -227,8 +227,9 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertNotIn("Detached run live-0", text)
         self.assertIn("Detached run live-1", text)
 
-    def start(self, command: list[str], to: str = WORKER) -> tuple[MagicMock, str]:
-        """Start command for seat `to`; the Popen mock and what start printed."""
+    @contextlib.contextmanager
+    def supervisor_spawns(self) -> Generator[MagicMock]:
+        """Fake supervisor starts and keep other subprocess calls real."""
         popen = MagicMock(return_value=SimpleNamespace(pid=4321))
         real_popen = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
 
@@ -237,7 +238,12 @@ class DetachedRunsTests(unittest.TestCase):
                 return cast(subprocess.Popen[bytes], popen(arguments, **options))
             return real_popen(arguments, **options)
 
-        with patch.object(subprocess, "Popen", side_effect=spawn), contextlib.redirect_stdout(io.StringIO()) as output:
+        with patch.object(subprocess, "Popen", side_effect=spawn):
+            yield popen
+
+    def start(self, command: list[str], to: str = WORKER) -> tuple[MagicMock, str]:
+        """Start the command for the seat and return its supervisor calls and output."""
+        with self.supervisor_spawns() as popen, contextlib.redirect_stdout(io.StringIO()) as output:
             code = detached_runs.main(["start", "--session-dir", str(self.session), "--to", to, "--", *command])
         self.assertEqual(code, 0)
         return popen, output.getvalue()
@@ -360,6 +366,119 @@ class DetachedRunsTests(unittest.TestCase):
     def run_files(self, run_id: str) -> list[str]:
         folder = self.session / detached_runs.DETACHED_RUNS_DIR
         return sorted(path.name for path in folder.iterdir() if path.name.lstrip(".").startswith(run_id + "."))
+
+    @contextlib.contextmanager
+    def completion_that_prunes(self, path: Path) -> Generator[list[str]]:
+        completed: list[str] = []
+
+        def complete(record: detached_runs.RunRecord) -> None:
+            with (path.parent / ".start.lock").open("a") as admission:
+                fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            saved = cast(dict[str, object], json.loads(path.read_text()))
+            self.assertTrue(saved["completion_pending"])
+            _ = detached_runs.prune_finished(path.parent)
+            completed.append(record["run_id"])
+
+        with patch.object(detached_runs, "_complete_worker_dispatch", side_effect=complete):
+            yield completed
+
+    def test_reap_completes_cancelled_run_after_releasing_start_lock(self) -> None:
+        self.set_pass("active", 0)
+        for status in ("finished", "running"):
+            with self.subTest(status=status):
+                path = self.finished_run(f"cancelled-{status}", pid=DEAD_PID, exit_code=143,
+                                         status=status, completion_pending=status == "finished")
+                expected = [] if status == "finished" else [f"cancelled-{status}"]
+                with self.completion_that_prunes(path) as completed:
+                    self.assertEqual(detached_runs.reap_orphans(str(self.session)), expected)
+                    self.assertEqual(completed, [f"cancelled-{status}"])
+                    saved = cast(dict[str, object], json.loads(path.read_text()))
+                    self.assertEqual((saved["status"], saved["exit_code"], saved["completion_pending"]),
+                                     ("finished", 143, False))
+                    self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+                    self.assertEqual(completed, [f"cancelled-{status}"])
+
+    def test_start_completes_cancelled_run_after_releasing_start_lock(self) -> None:
+        self.set_pass("active", 0)
+        settings = self.root / "config/detached_runs.conf"
+        original = settings.read_text()
+        for outcome, expected in (("start", 0), ("twin", 0), ("limit", 4), ("unusable config", 2)):
+            with self.subTest(outcome=outcome):
+                path = self.finished_run("cancelled", pid=DEAD_PID, exit_code=143, completion_pending=True)
+                if outcome in ("twin", "limit"):
+                    _ = self.seat_runs(3)
+                if outcome == "unusable config":
+                    _ = settings.write_text("# whole: 1..\nLIVE_RUN_LIMIT=invalid\n")
+                command = ["fixture", "1"] if outcome == "twin" else ["new-check"]
+                with (self.completion_that_prunes(path) as completed,
+                      self.supervisor_spawns() as spawn,
+                      contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO())):
+                    try:
+                        code = detached_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER,
+                                                   "--", *command])
+                        self.assertEqual(code, expected)
+                        self.assertEqual(completed, ["cancelled"])
+                        saved = cast(dict[str, object], json.loads(path.read_text()))
+                        self.assertFalse(saved["completion_pending"])
+                        self.assertEqual(saved["exit_code"], 143)
+                        self.assertEqual(spawn.call_count, int(outcome == "start"))
+                    finally:
+                        _ = settings.write_text(original)
+                        for entry in path.parent.iterdir():
+                            entry.unlink()
+
+    def collect_completions(self, count: int) -> list[detached_runs.OrphanReapResult]:
+        """Defer completion events through the public reap path."""
+        collected: list[detached_runs.OrphanReapResult] = []
+        with patch.object(detached_runs.OrphanReapResult, "complete", autospec=True, side_effect=collected.append):
+            for _ in range(count):
+                self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+        self.assertEqual(len(collected), count)
+        return collected
+
+    def test_collected_completions_skip_settled_and_pruned_records(self) -> None:
+        for pruned in (True, False):
+            with self.subTest(pruned=pruned):
+                self.set_pass("active", 0)
+                path = self.finished_run("cancelled", pid=DEAD_PID, exit_code=143, completion_pending=True)
+                first, second = self.collect_completions(2)
+                self.update_record(path, label="fresh record")
+                with patch.object(detached_runs, "_complete_worker_dispatch") as complete:
+                    second.complete()
+                    if pruned:
+                        self.set_pass("completed", 0)
+                        self.assertEqual(detached_runs.prune_finished(path.parent), ["cancelled"])
+                    first.complete()
+                    complete.assert_called_once()
+                    self.assertEqual(complete.call_args.args[0]["label"], "fresh record")
+                if pruned:
+                    self.assertFalse(path.exists())
+                    self.assertEqual(self.run_files("cancelled"), [])
+
+    def test_collected_completions_do_not_recreate_a_missing_record(self) -> None:
+        path = self.finished_run("cancelled", pid=DEAD_PID, exit_code=143, completion_pending=True)
+        collected, = self.collect_completions(1)
+        path.unlink()
+        with patch.object(detached_runs, "_complete_worker_dispatch") as complete:
+            collected.complete()
+            complete.assert_not_called()
+        self.assertFalse(path.exists())
+
+    def test_reap_skips_a_completion_claim_that_another_holder_has(self) -> None:
+        self.set_pass("active", 0)
+        path = self.finished_run("cancelled", pid=DEAD_PID, exit_code=143, completion_pending=True)
+        with path.with_suffix(".completion.lock").open("a") as claim:
+            fcntl.flock(claim, fcntl.LOCK_EX)
+            with patch.object(detached_runs, "_complete_worker_dispatch") as complete:
+                self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+                complete.assert_not_called()
+            saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+            self.assertTrue(saved.get("completion_pending"))
+        with patch.object(detached_runs, "_complete_worker_dispatch") as complete:
+            self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+            complete.assert_called_once()
+        saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        self.assertFalse(saved.get("completion_pending"))
 
     def test_prune_keeps_only_the_finished_runs_that_a_reader_needs(self) -> None:
         runs = self.session / detached_runs.DETACHED_RUNS_DIR
@@ -807,6 +926,12 @@ with patch.object(subprocess.Popen, 'wait', checked_wait):
                             before = len(self.sent)
                             self.assertEqual(detached_runs.live_runs(path.parent, WORKER), [])
                             wait_for_notice_exit(saved.get("command_pid", 0))
+                            members = subprocess.check_output(["ps", "-A", "-o", "pid=", "-o", "pgid="],
+                                                              text=True, timeout=guard.remaining())
+                            for line in members.splitlines():
+                                member, group = (int(field) for field in line.split())
+                                if group == supervisor.pid:
+                                    wait_for_notice_exit(member)
                             self.assertEqual(detached_runs.reap_orphans(str(self.session)), ["r1"])
                             record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
                             self.assertEqual((record["status"], record.get("ended")), ("finished", "supervisor gone"))
@@ -1587,6 +1712,9 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
         def fail_once(thread: str) -> None:
             calls.append(thread)
+            runs = self.run_dir / detached_runs.DETACHED_RUNS_DIR
+            with (runs / ".start.lock").open("a") as admission:
+                fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if len(calls) == 1:
                 raise ValueError("director unavailable")
             complete(thread)
@@ -1596,6 +1724,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
             self.assertEqual(errors.getvalue().count("anomaly:"), 1)
             self.assertIn("director unavailable", errors.getvalue())
+            pending = cast(dict[str, object], json.loads(Path(records[0]["log"]).with_suffix(".json").read_text()))
+            self.assertTrue(pending["completion_pending"])
             with patch.object(detached_run_process, "supervises", return_value=True) as supervises:
                 self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
                 self.assertEqual(len(calls), 2)
