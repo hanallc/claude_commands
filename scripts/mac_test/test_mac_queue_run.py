@@ -116,8 +116,8 @@ class QueueRunTests(unittest.TestCase):
                                  + shlex.join([sys.executable, str(queue)]) + "\n")
         return environment
 
-    def command(self, root: Path) -> list[str]:
-        return [sys.executable, "-m", "scripts.mac_test.mac_queue_run", "--what", "camera shot", "--kind", "shot",
+    def command(self, root: Path, kind: str = "shot") -> list[str]:
+        return [sys.executable, "-m", "scripts.mac_test.mac_queue_run", "--what", "camera shot", "--kind", kind,
                 "--package", "hana", "--worktree", str(root), "--cwd", "/Mac scratch/checkout", "--",
                 "/bin/zsh", "-c", "cargo build -p hana; printf '%s' 'quoted value'"]
 
@@ -125,43 +125,45 @@ class QueueRunTests(unittest.TestCase):
         return [cast(list[str], json.loads(line)) for line in (root / "events").read_text().splitlines()]
 
     def test_every_run_returns_the_placement_and_keeps_the_mac_status(self) -> None:
-        for status, queue_refuses, return_fails in ((0, False, False), (23, False, False), (125, False, False), (2, True, False), (0, False, True), (2, True, True)):
-            with self.subTest(status=status, queue_refuses=queue_refuses, return_fails=return_fails), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                environment = {**self.fixture(root), "FAKE_MAC_STATUS": str(status),
-                               "FAKE_QUEUE_REFUSE": "1" if queue_refuses else "0", "FAKE_RETURN_FAIL": "1" if return_fails else "0"}
-                result = subprocess.run(self.command(root), capture_output=True, text=True, env=environment,
-                                        timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(result.returncode, status or (1 if return_fails else 0), result.stdout + result.stderr)
-                events = self.events(root)
-                self.assertEqual([event[0] for event in events], ["place-step", "cancel-placement" if queue_refuses else "finish-step"])
-                placed, released = events
-                self.assertIn("--once", placed)
-                self.assertIn("--wait-events", placed)
-                self.assertEqual(placed[placed.index("--target") + 1], "mac")
-                assignment = Path(placed[placed.index("--assignment-file") + 1])
-                self.assertEqual(assignment.exists(), return_fails)
-                if return_fails:
-                    self.assertTrue(assignment.is_relative_to(root / ".local/state"))
-                    self.assertIn(str(assignment), result.stderr)
-                    retry = result.stderr.split("return with: ", 1)[1].strip()
-                    retried = subprocess.run(retry, shell=True, env={**environment, "FAKE_RETURN_FAIL": "0"},
-                                             capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-                    self.assertEqual(retried.returncode, 0, retried.stderr)
-                    self.assertFalse(assignment.exists())
-                if queue_refuses:
-                    self.assertEqual(released[released.index("--episode") + 1], placed[placed.index("--episode") + 1])
-                    self.assertFalse((root / "remote").exists())
-                else:
-                    self.assertEqual(released[released.index("--assignment-file") + 1], str(assignment))
-                    self.assertEqual(released[released.index("--status") + 1], str(status))
-                    remote = cast(list[str], json.loads((root / "remote").read_text()))
-                    wrapper = shlex.split(remote[2])
-                    work = shlex.split(wrapper[0].removeprefix("work="))
-                    self.assertEqual(work[:3], ["cd", "/Mac scratch/checkout", "&&"])
-                    self.assertEqual(work[3], "MAC_PLACEMENT=" + placed[placed.index("--episode") + 1] + "/attempt")
-                    self.assertEqual(work[4:], self.command(root)[-3:])
-                    self.assertEqual(result.stdout.splitlines()[-1], f"mac_exit={status}")
+        cases = ((0, False, False), (23, False, False), (125, False, False), (2, True, False), (0, False, True), (2, True, True))
+        for kind in ("shot", "install", "probe", "run"):
+            for status, queue_refuses, return_fails in cases:
+                with (self.subTest(kind=kind, status=status, queue_refuses=queue_refuses, return_fails=return_fails),
+                      tempfile.TemporaryDirectory() as temporary):
+                    self.check_returned_placement(Path(temporary), kind, status, queue_refuses, return_fails)
+
+    def check_returned_placement(self, root: Path, kind: str, status: int, queue_refuses: bool, return_fails: bool) -> None:
+        environment = {**self.fixture(root), "FAKE_MAC_STATUS": str(status),
+                       "FAKE_QUEUE_REFUSE": "1" if queue_refuses else "0", "FAKE_RETURN_FAIL": "1" if return_fails else "0"}
+        result = subprocess.run(self.command(root, kind), capture_output=True, text=True, env=environment,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, status or (1 if return_fails else 0), result.stdout + result.stderr)
+        events = self.events(root)
+        # A Mac placement has no local grant, so each run returns it with a cancel.
+        self.assertEqual([event[0] for event in events], ["place-step", "cancel-placement"])
+        placed, released = events
+        self.assertIn("--once", placed)
+        self.assertIn("--wait-events", placed)
+        self.assertEqual(placed[placed.index("--target") + 1], "mac")
+        self.assertEqual(placed[placed.index("--kind") + 1], kind)
+        self.assertEqual(released[released.index("--episode") + 1], placed[placed.index("--episode") + 1])
+        self.assertEqual(released[released.index("--pid") + 1], placed[placed.index("--pid") + 1])
+        # No receipt outlives its run, a refused return included.
+        self.assertEqual(list((root / mac_queue_run.RECEIPTS).iterdir()), [])
+        if return_fails:
+            self.assertIn("the placement was not returned", result.stderr)
+        if queue_refuses:
+            self.assertEqual(released[released.index("--reason") + 1], "the Mac run did not start")
+            self.assertFalse((root / "remote").exists())
+        else:
+            self.assertEqual(released[released.index("--reason") + 1], f"the Mac run ended with status {status}")
+            remote = cast(list[str], json.loads((root / "remote").read_text()))
+            wrapper = shlex.split(remote[2])
+            work = shlex.split(wrapper[0].removeprefix("work="))
+            self.assertEqual(work[:3], ["cd", "/Mac scratch/checkout", "&&"])
+            self.assertEqual(work[3], "MAC_PLACEMENT=" + placed[placed.index("--episode") + 1] + "/attempt")
+            self.assertEqual(work[4:], self.command(root)[-3:])
+            self.assertEqual(result.stdout.splitlines()[-1], f"mac_exit={status}")
 
     def test_a_signal_ends_the_run_with_its_default_action(self) -> None:
         for waiting, signum in ((False, signal.SIGTERM), (False, signal.SIGHUP), (True, signal.SIGTERM),
@@ -187,8 +189,8 @@ class QueueRunTests(unittest.TestCase):
                 events = [event[0] for event in self.events(root)]
                 if signum == signal.SIGINT:
                     # Python's own KeyboardInterrupt runs the finally path, which returns the placement.
-                    self.assertEqual(events, ["place-step", "finish-step"])
-                    self.assertEqual(self.events(root)[-1][-1], "1")
+                    self.assertEqual(events, ["place-step", "cancel-placement"])
+                    self.assertEqual(self.events(root)[-1][-1], "the Mac run ended with status 1")
                     self.assertIn("signal_group TERM", (root / "stop").read_text())
                 else:
                     # The queue ends the placement when this process ends.

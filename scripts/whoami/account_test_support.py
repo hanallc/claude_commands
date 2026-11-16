@@ -1,9 +1,15 @@
 """Synthetic sign-in files for account and launcher tests."""
 
+from __future__ import annotations
+
 from datetime import datetime, timezone
 import base64
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from scripts.whoami.usage_store import StoredUsage
 
 
 def write_codex_auth(home: Path, login: str) -> None:
@@ -14,15 +20,22 @@ def write_codex_auth(home: Path, login: str) -> None:
     )
 
 
-def stored_room(login: str, left: float, resets: datetime) -> None:
-    """Store a fresh weekly reading for a Claude fixture account."""
+def store_usage(tool: str, login: str, usage: StoredUsage) -> None:
+    """Store one login's readings under the store lock."""
     from scripts.whoami import usage_store
 
     with usage_store.read_lock():
         saved = usage_store.load()
-        saved[usage_store.key("Claude", login)] = usage_store.StoredUsage(weekly=usage_store.StoredWindow(
-            left=left, at=datetime.now(timezone.utc).isoformat(), resets=resets.isoformat()))
+        saved[usage_store.key(tool, login)] = usage
         usage_store.write(saved)
+
+
+def stored_room(login: str, left: float, resets: datetime) -> None:
+    """Store a fresh weekly reading for a Claude fixture account."""
+    from scripts.whoami import usage_store
+
+    store_usage("Claude", login, usage_store.StoredUsage(weekly=usage_store.StoredWindow(
+        left=left, at=datetime.now(timezone.utc).isoformat(), resets=resets.isoformat())))
 
 
 def create_claude_account(label: str, login: str) -> None:

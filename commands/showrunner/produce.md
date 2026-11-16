@@ -86,6 +86,10 @@ State:
 
 @~/.claude/docs/decision_criteria.md
 
+The question form for every question to the user is defined by this import:
+
+@~/.claude/docs/question_template.md
+
 ---
 
 <Throughout>
@@ -266,7 +270,7 @@ State:
     their priorities, what they intend, and their taste where the guide is
     silent, <DesignAuthority/>). Never bring them a choice you can settle.
 - **Open questions.** Ask the user each question once, in full, in the reply
-  where it first comes up: what is asked, why, and the answer choices. Set it
+  where it first comes up, in the question form imported above <Throughout/>. Set it
   in `open_for_user` in that turn (**Open-questions list** below). After that turn no reply
   restates the question or its choices. The user sees only their count n, where n counts every `OUTSTANDING` item now due: everything that
   waits on the user, a step only they can run included. n counts this
@@ -818,9 +822,11 @@ Promote the exact sha pushed by <CIPoint/> after these checks:
    --smoke-passed <sha>`. The command checks that main is not dirty, pushes
    and promotes the doc's **Promote:** destinations. A held main is a topic in
    the next status report. The push is never forced. It starts one more CI run on
-   the same sha and leaves the public bevy_hana mirror alone: the mirror
-   updates only when main lands through validate_and_push, whose post-push
-   hook publishes it (user, 2026-10-03).
+   the same sha. Each main push goes through `scripts/lib/land_main.py`, which
+   then runs the repository's `.claude/config/post_push.sh`. So hana's public
+   bevy_hana mirror syncs on each promotion (user, 2026-11-15: "yes every
+   promotion to main may sync to the public mirror"). A failed hook does not
+   stop the promotion; its rerun command goes in the log line.
 5. Only when the doc declares no **Promote:** destination, find the worktree
    on `main` with `git -C CHECKOUT worktree list`. Fast-forward it with
    `git -C <it> merge --ff-only <sha>` only when its tree is clean and

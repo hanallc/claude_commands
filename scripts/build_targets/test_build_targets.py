@@ -30,6 +30,7 @@ from scripts.build_hold import build_hold
 from scripts.build_hold import owning_session as session_owner
 from scripts.mac_test import eligibility, claim_state, mac_test, offload
 from scripts.build_queue import placement
+from scripts.direct.step_selection import Pinned, ROUTED, TargetSelection
 from scripts.build_targets import targets, target_config
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
 from scripts.message import roster
@@ -813,17 +814,43 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         self.assertEqual(self.kind_answer("test", "portable"), "any_target\n")
         self.assertEqual(self.kind_answer("test", "linux-part"), "any_target\n")
 
-    def test_lint_and_doc_of_a_named_package_exclude_the_mac_for_a_linux_only_member(self) -> None:
-        # verify.sh lints and documents the whole workspace for one package.
+    def test_compile_steps_of_a_linux_only_package_reach_the_mac_and_tests_do_not(self) -> None:
+        # Only the Mac compiles macOS code, so check, lint and doc ignore linux_only for every selection.
         _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers=["crates/*"]\n')
-        for kind in ("lint", "doc"):
-            with self.subTest(kind=kind):
-                self.assertIn("mac\texcluded\tlinux_only", self.kind_output(kind, "portable"))
-                constraints = build_targets.fixed_placement_constraints(self.root, "portable", kind, ("cargo", kind),
-                                                                        NoOwningSession(), "fixed-source")
+        cases: tuple[tuple[build_targets.StepKind, bool], ...] = (
+            ("check", True), ("lint", True), ("doc", True), ("test", False))
+        selections: tuple[TargetSelection, ...] = (ROUTED, Pinned("mac"))
+        for kind, compiles in cases:
+            for package in ("linux-part", "portable", ""):
+                with self.subTest(kind=kind, package=package):
+                    allowed = compiles or package == "portable"
+                    self.assertIn("mac\teligible" if allowed else "mac\texcluded\tlinux_only",
+                                  self.kind_output(kind, package))
+                    for selection in selections:
+                        constraints = build_targets.fixed_placement_constraints(
+                            self.root, package, kind, ("cargo", kind), NoOwningSession(), "fixed-source",
+                            selection=selection)
+                        mac, = (candidate for candidate in constraints.candidates
+                                if candidate.destination.target == "mac")
+                        self.assertEqual(mac.eligibility,
+                                         placement.AllowedHost() if allowed else placement.FixedExclusion("linux_only"))
+
+    def test_a_repository_without_cargo_reaches_the_mac_only_through_its_linux_only_key(self) -> None:
+        (self.root / "Cargo.toml").unlink(missing_ok=True)
+        claude = eligibility.KnownRepository(".claude")
+        for settings, expected in (("linux_only..claude=\n", placement.AllowedHost()),
+                                   ("", placement.FixedExclusion("repo"))):
+            with self.subTest(settings=settings), mock.patch.object(eligibility, "repository_identity",
+                                                                    return_value=claude):
+                _ = write_config_fixture(self.settings, settings, template="mac_test")
+                if not settings:
+                    _ = self.settings.write_text("\n".join(line for line in self.settings.read_text().splitlines()
+                        if not line.startswith("linux_only..claude=")) + "\n")
+                constraints = build_targets.fixed_placement_constraints(
+                    self.root, "claude", "run", ("python3", "-m", "unittest"), NoOwningSession(), "fixed-source",
+                    selection=Pinned("mac"))
                 mac, = (candidate for candidate in constraints.candidates if candidate.destination.target == "mac")
-                self.assertEqual(mac.eligibility, placement.FixedExclusion("linux_only"))
-        self.assertIn("mac\teligible", self.kind_output("check", "portable"))
+                self.assertEqual(mac.eligibility, expected)
 
     def test_temporary_refusals_keep_mac_retries_and_off_refuses_mac_steps(self) -> None:
         self.assertEqual(self.kind_answer("check", free_gib=59), "any_target\n")

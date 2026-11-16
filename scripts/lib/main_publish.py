@@ -12,7 +12,8 @@ import subprocess
 import sys
 from typing import cast
 
-from scripts.lib import main_push_lock, waiting_rows
+from scripts.lib import land_main, main_push_lock, waiting_rows
+from scripts.lib.land_main import CommandTimeLimit as CommandTimeLimit, NoTimeLimit as NoTimeLimit, UNLIMITED_GIT
 from scripts.lib.atomic_file import write_text_atomic
 
 
@@ -74,17 +75,6 @@ class MacPullFailed:
     reason: str
 
 
-@dataclass(frozen=True)
-class CommandTimeLimit:
-    seconds: float
-
-
-@dataclass(frozen=True)
-class NoTimeLimit:
-    """The caller retains the existing unlimited Git operation."""
-
-
-UNLIMITED_GIT = NoTimeLimit()
 ZONE_SSH_LIMIT = CommandTimeLimit(120)
 PUBLICATION_PREFIXES = ("tune(", "zone(", "user zone: ")
 REGISTRY_SUBJECT = "config(models): "
@@ -202,15 +192,17 @@ def push(checkout: Path, *, time_limit: CommandTimeLimit | NoTimeLimit = UNLIMIT
         if listed.returncode:
             return False, f"not pushed: {first_line(listed)}"
         unpushed = listed.stdout.splitlines()
-        if not unpushed:
-            return True, "origin has it"
         others = [subject for subject in unpushed if not subject.startswith(PUBLICATION_PREFIXES)]
         if others:
             return False, f"not pushed: main holds {len(others)} other commit(s) origin does not have"
-        pushed = git(checkout, "push", "-q", "origin", "main", time_limit=time_limit)
-        if pushed.returncode:
-            return False, f"not pushed: {first_line(pushed)}"
-        return True, "pushed"
+        try:
+            landed = land_main.land(checkout, "main", time_limit=time_limit)
+        except (land_main.LandError, OSError) as error:
+            return False, f"not pushed: {error}"
+        detail = "pushed" if isinstance(landed.push, land_main.Pushed) else "origin has it"
+        if isinstance(landed.hook, (land_main.HookDone, land_main.HookFailed)):
+            detail += "; " + land_main.hook_report(landed.hook)
+        return True, detail
 
 
 def ssh(remote: str, *, ssh_program: str, host: str = "mac",

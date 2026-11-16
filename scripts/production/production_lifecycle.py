@@ -20,7 +20,7 @@ from typing import NamedTuple, cast
 
 from scripts.production import session_staff, staff, unit_config
 from scripts.agents import stop_resume
-from scripts.lib import main_publish, main_push_lock
+from scripts.lib import land_main, main_publish, main_push_lock
 from scripts.herdr import worker_panes
 from scripts.agents.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
@@ -349,12 +349,15 @@ def promote_main(production: Production, lines: list[str], no_ci: bool,
         report("main", "ok", f"origin/main is behind {tip}")
         promotion = production_doc.promotion_from_doc(lines)
         if isinstance(promotion, production_doc.NoPromotion) or not promotion.checkouts:
-            remote = checked(production.checkout, "promote", "rev-parse", "origin/main")
-            if remote != tip:
-                _ = checked(production.checkout, "push", "push", "origin", f"{tip}:refs/heads/main")
+            try:
+                landed = land_main.land(production.checkout, tip)
+            except land_main.LandError as error:
+                raise LifecycleStop("push", "failed", str(error)) from error
+            if isinstance(landed.push, land_main.Pushed):
                 report("promote", "ok", f"main pushed to {tip}")
             else:
                 report("promote", "ok", f"already at {tip}")
+            report("post-push", "ok", land_main.hook_report(landed.hook))
         else:
             for destination in promotion.checkouts:
                 result = promote_local_checkout(destination, production.merge_branch, tip)

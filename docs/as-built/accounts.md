@@ -288,13 +288,20 @@ An incomplete final journal row is distinct from corruption between complete row
 Queue edits and execution share locks on natedev.
 The Mac forwards edits instead of maintaining a second queue.
 
-Without a queued workers move, provider refusal or unavailable included usage can select another Codex account.
+Without a queued workers move, a quota refusal can select another Codex account when the workers account cannot work.
 Credit policy determines whether an exhausted account can continue.
 Worker assignment fallback to Claude remains separate from the selected Codex account.
 Routing returns only when the selected Codex account can work and its refusal has resolved.
-An owned workers refusal with no account capacity enables `no_worker_mode` on the workers-role host, `role_map.ROLE_MAP_HOST`.
+An owned workers refusal checks `codex_can_work` before it selects another account or routes work to Claude.
+Remaining allowance or a positive balance with credits on keeps the current account working.
+Login faults and refusals from other homes never route workers to Claude or start no-worker mode.
+The existing login fault notice stays unchanged.
+No-worker mode requires exhaustion on the workers account and no alternate account from `accounts.pick`.
+Unknown capacity cannot confirm exhaustion.
+The flag starts only on the workers-role host, `role_map.ROLE_MAP_HOST`.
 The refusal handler sets this flag independently of the first `NoRoomMove` entry and the Claude assignment switch.
-A zero account with credits off enables the same flag when its workers stay on it: no other account has room, or the workers move failed.
+The credits-off path uses the same capacity rule.
+A failed move does not start no-worker mode while another account has allowance or permitted credits.
 The saved flag triggers one broadcast to showrunners and unit directors on both machines.
 `config/accounts.conf` supplies `no_worker_mode_on` and `no_worker_mode_off`; `quota-alert` identifies the sender.
 Each producer that `no_worker_mode_fyi` names (`morty dwight`) gets one copy of each notice through `send.py`.
@@ -408,7 +415,9 @@ A second schedule caller prints `already claimed by <id>` and exits with code 0.
 ## Status, counts, and notes
 
 `StatusReading` separates stored facts from their display.
-`StatusDocument` carries account rows, problems, and session input paths.
+`StatusDocument` carries account rows, the board, problems, and session input paths.
+The `board` is `accounts.status_board()`: the table the unit-board plugin and the console Accounts page draw.
+Its `stale_at` is the next local midnight, when its reset text changes.
 The text table appends `Login ends` in the user's zone, with the same date format as `Weekly resets`.
 Each JSON account exports `login_ends_at` as an ISO 8601 UTC string, or null for an unknown date or Codex.
 `Report` distinguishes `LoginEndKnown` from `LoginEndUnknown`.

@@ -30,10 +30,11 @@ from scripts.build_queue import admission_client, admission_protocol as wire, cl
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.admission_test_support import AdmissionFixture, NOW as ADMISSION_NOW, only_admitted
 from scripts.build_queue.queue_fixture import write_process, write_scope
-from scripts.build_queue.scope_activity import RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, ScopeProcess, ScopeProcesses
+from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
+                                                ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import conf, test_hang_guard
-from scripts.review_links import review_link, test_serve
+from scripts.review_links import console_theme, page_frame, review_link, test_serve
 from scripts.lib.build_steps import read_step_names
 from scripts.message import unit_labels
 from scripts.lint import memory_admit as gate
@@ -168,7 +169,11 @@ class MemoryFeedTests(unittest.TestCase):
                     memory_feed.notify_unplaced_mac_runs(reading, notified)
                     self.assertEqual(send.call_count, 1 if label == "unplaced" else 0)
                     row = next(row for row in page["walk"] if row["pid"] == build.pid)
-                    self.assertIn(label, row["name"])
+                    if label.startswith("placement "):
+                        self.assertNotIn("placement", row["name"])
+                        self.assertEqual(row["gate_label"], label)
+                    else:
+                        self.assertIn(label, row["name"])
                     if label == "unplaced":
                         self.assertIn("pid 710001", str(send.call_args))
                         self.assertIn("Mac unplaced run: pid 710001", page["mac_idle_alert"])
@@ -193,8 +198,10 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.configuration.write_text(text)
 
     def expected_page(self, seconds: float = 0.125) -> str:
-        return Path(memory_feed.__file__).with_name("memory_live.html").read_text().replace(
-            "__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
+        page = console_theme.with_theme(Path(memory_feed.__file__).with_name("memory_live.html").read_text())
+        self.assertIn(console_theme.TOKENS, page)
+        return (page.replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
+                .replace("__PAGE_FRAME_STYLE__", page_frame.STYLE))
 
     def test_converted_rows_show_their_hosts_without_charging_remote_memory_locally(self) -> None:
         baseline = reservation_reading()
@@ -1591,7 +1598,7 @@ process.stdout.write(JSON.stringify({
                                   blocks["build_missing_bytes"]), missing)
                 self.assertEqual((blocks["room_bytes"], blocks["shortfall_bytes"]), (room, shortfall))
                 self.assertEqual(sum(missing), shortfall)
-                self.assertEqual(blocks["builds_bytes"], gib + 5 * gib)
+                self.assertEqual(blocks["build_tools_bytes"], 5 * gib)
                 self.assertEqual(blocks["queued_builds_bytes"], gib)
                 self.assertEqual(blocks["ci_bytes"], 2 * gib)
                 self.assertEqual((blocks["agents_bytes"], blocks["desktop_bytes"]), (5 * gib, gib * 3 // 2))
@@ -1603,7 +1610,8 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual((blocks["compressed_swap_bytes"], blocks["kernel_structures_bytes"],
                                   blocks["kernel_counters_bytes"], blocks["kernel_no_counter_bytes"]),
                                  (3 * gib, 2 * gib, gib, gib))
-                shown = (blocks["builds_bytes"] + blocks["ci_bytes"] + blocks["build_covered_bytes"] + blocks["room_bytes"]
+                shown = (blocks["queued_builds_bytes"] + blocks["build_tools_bytes"] + blocks["ci_bytes"]
+                         + blocks["build_covered_bytes"] + blocks["room_bytes"]
                          + blocks["safety_covered_bytes"] + gib * 3 // 2 + blocks["swap_covered_bytes"] + 5 * gib
                          + blocks["other_programs_bytes"] + 6 * gib + 4 * gib + blocks["unattributed_bytes"])
                 self.assertEqual(shown, 64 * gib)
@@ -1636,6 +1644,23 @@ process.stdout.write(JSON.stringify({
         small = replace(self.fixture_room(20 * gib), total=30 * gib)
         self.ram_fixture()
         self.assertEqual(memory_feed.ram_blocks(small, memory_feed.BuildToolRam(0, 0, 0), 100.0, 6)["agreement"], "disagree")
+
+    def test_the_cap_and_ci_block_count_ci_swap_backed_use_and_leave_the_file_cache_to_the_cache_block(self) -> None:
+        gib = admission_records.GIB
+
+        def unowned(working_set: int, anonymous: admission_records.AnonymousRunUse | admission_records.RunUseUnavailable,
+                    job_state: IdleService | NotServiceSlice, diagnostic: str = "") -> admission_records.UnownedSliceMemory:
+            return admission_records.UnownedSliceMemory(working_set, anonymous=anonymous, owner="hana-ci.slice",
+                                                        job_state=job_state, diagnostic=diagnostic,
+                                                        pid=admission_records.PidNotRecorded())
+
+        ci = unowned(3 * gib, admission_records.AnonymousRunUse(gib // 4), IdleService())
+        build_scope = unowned(2 * gib, admission_records.AnonymousRunUse(gib), NotServiceSlice())
+        absent = unowned(0, admission_records.RunUseUnavailable("not read"), IdleService(), diagnostic="CI slice absent")
+        self.assertEqual(gate.ci_cap_use((ci, build_scope, absent)), gib // 4)
+        # A reading without its swap-backed use counts its working set.
+        unread = unowned(3 * gib, admission_records.RunUseUnavailable("stat unreadable"), IdleService())
+        self.assertEqual(gate.ci_cap_use((ci, unread)), gib // 4 + 3 * gib)
 
     def test_the_memory_status_names_the_one_reason_a_start_waits(self) -> None:
         gib = admission_records.GIB

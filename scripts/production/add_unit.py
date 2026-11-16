@@ -1071,9 +1071,7 @@ def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_di
                                     or conversation.account != target):
                 raise Refusal("--source-fallback must name the pane launch's source account")
             if isinstance(conversation, unit_move.UnitConversation) and (not target or target == conversation.account):
-                prepared = accounts.prepared_account(conversation.account, resume=True)
-                if isinstance(prepared, accounts.AccountRefused):
-                    raise Refusal(prepared.reason)
+                _ = accounts.prepare_claude_launch(conversation.account, resume=True)
                 return accounts.NamedAccount(conversation.account, accounts.claude_account_dir(conversation.account))
         elif source_fallback:
             raise Refusal("--source-fallback requires a resumed session and its pane launch account")

@@ -31,7 +31,7 @@ from scripts.herdr import herdr_types
 from scripts.lib import conf, models_registry, nix_env, unit_runs
 from scripts.whoami import quota_state
 from scripts.production import staff, worker_admission
-from scripts.agents import detached_run_process, worker_lifecycle
+from scripts.agents import detached_run_process, shutdown_record, worker_lifecycle
 from scripts.direct import recorder_state
 
 if TYPE_CHECKING:
@@ -279,22 +279,25 @@ class WorkerLockHold:
 @contextmanager
 def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False,
                 deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> Generator[WorkerLockHold | Kept]:
-    """Serialize creation, then hold the published worker's fixed-id lock.
+    """Hold the name lock and the fixed-id lock through startup and dispatch.
 
-    A deadline waits for a published worker's lock until that monotonic time.
+    A deadline limits the wait for both locks.
     """
     with ExitStack() as operations:
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
-        if row is None:
-            path = _worker_lock_path(f"{parent}-{name.value}")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            creation = operations.enter_context(path.open("a"))
-            try:
+        path = _worker_lock_path(f"{parent}-{name.value}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        creation = operations.enter_context(path.open("a"))
+        try:
+            if deadline == worker_lifecycle.NO_LOCK_DEADLINE:
                 fcntl.flock(creation, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
-            except BlockingIOError:
-                yield Kept("worker creation lock is held")
-                return
+            else:
+                worker_lifecycle.acquire_flock(creation, deadline=deadline)
+        except (BlockingIOError, worker_lifecycle.OperationDeadlineExpired):
+            yield Kept("worker creation lock is held" if row is None else "dispatch lock is held")
+            return
+        if row is None:
             row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
         hold = WorkerLockHold(parent, name, operations, blocking=blocking)
         try:
@@ -326,6 +329,7 @@ class PaneEvidence:
     scan: herdr.RowPaneScan
     states: list[WorkerPane]
     layout_terminals: frozenset[str]
+    parent_tabs: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -444,7 +448,8 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
                 or isinstance(selection, SelectedWorkers) and row.name in selection.names
                 or isinstance(selection, SelectedWorkerRows) and row.id in selection.ids]
     if isinstance(read, PaneReadUnavailable):
-        return PaneEvidence([], herdr.RowPaneScan({}, []), [_uncertain(row, read.reason) for row in selected], frozenset())
+        return PaneEvidence([], herdr.RowPaneScan({}, []), [_uncertain(row, read.reason) for row in selected],
+                            frozenset(), frozenset())
     panes, scan, statuses, launch_owners = read.panes, read.scan, read.statuses, read.launch_owners
     parent_panes = scan.found.get(parent, []) + [pane for pane in panes
         if launch_owners.get(_text(pane, "pane_id")) == parent
@@ -507,7 +512,7 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
             if (launch_owners.get(_text(pane, "pane_id")) in worker_ids
                 or any(pane in scan.found.get(row.id, []) for row in workers))
             and _text(pane, "tab_id") in parent_tabs)
-    return PaneEvidence(panes, scan, states, terminals)
+    return PaneEvidence(panes, scan, states, terminals, frozenset(parent_tabs))
 
 
 def _evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr.Herdr, *,
@@ -1157,7 +1162,7 @@ def first_turn_session(client: herdr.Herdr, pane: str, terminal: str) -> str:
             session = client.native_session(pane, "codex", herdr.PROGRAM_TIMEOUT_SECONDS)
         except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
             failure = str(error)
-            _ = Event().wait(max(0, min(0.1, deadline - time.monotonic())))
+            _ = Event().wait(max(0, min(herdr.PANE_POLL_SECONDS, deadline - time.monotonic())))
             continue
         remaining_ms = int(max(0, deadline - time.monotonic()) * 1000)
         if isinstance(client.wait_turn_end(pane, remaining_ms), herdr.WaitTimedOut):
@@ -1471,7 +1476,14 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     _layout(owner.id, fresh)
     if isinstance(result, (OpenWorker, ProcessUnknownWorker)):
         return replace(result, created_pane=created_pane())
-    return result if isinstance(result, UncertainWorker) else _uncertain(row, "agent launch is incomplete")
+    if isinstance(result, UncertainWorker):
+        return result
+    state_kind = type(result).__name__ if result is not None else "missing"
+    scan_reason = next((item.reason for item in fresh.scan.unknown if item.pane == launched.pane), "none")
+    tab = next((_text(pane, "tab_id") for pane in fresh.panes if _text(pane, "pane_id") == launched.pane), "")
+    parent_tab = "yes" if tab and tab in fresh.parent_tabs else "no"
+    return _uncertain(row,
+        f"agent launch is incomplete; state={state_kind}; scan={scan_reason}; parent_tab={parent_tab}")
 
 
 def _retire_launch(row: staff.StaffRow, client: herdr.Herdr, record: staff.StaffSnapshot) -> None:
@@ -1514,7 +1526,16 @@ def close(parent: StaffId, name: WorkerName, *,
                     return _uncertain(row, "pane close is incomplete")
             _retire_launch(row, client, record)
             _layout(parent, evidence)
+            forget_restart(row)
             return Closed()
+
+
+def forget_restart(row: staff.StaffRow) -> None:
+    """Remove a suspended worker from the restart record: a restart never starts it."""
+    try:
+        shutdown_record.forget([str(row.id)])
+    except (OSError, ValueError) as error:
+        print(f"{row.name}: restart record anomaly: {' '.join(str(error).split())}", file=sys.stderr)
 
 
 def _layout(parent: StaffId, evidence: PaneEvidence) -> None:

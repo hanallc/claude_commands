@@ -5,6 +5,7 @@ from __future__ import annotations
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_provider_evidence
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.mac_test import claim_state, eligibility
+from scripts.lib.berth_test_support import write_unconfigured_berth
 from scripts.lib.checkout_test_support import copy_runtime, python_tool_source, write_python_tool
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
@@ -704,10 +705,17 @@ if os.environ.get("TEST_RUNNER_HOLD") == "1":
 mode = os.environ.get("TEST_RUNNER_MAC", "declined")
 reason = os.environ.get("TEST_RUNNER_REASON", "")
 runner_status = int(os.environ.get("TEST_RUNNER_STATUS", "75"))
+fix = ""
 answer = root / "runner-answer"
 if answer.exists():
     mode, reason, status_text = answer.read_text().splitlines()
     runner_status = int(status_text)
+# runner-answer-<verb> answers one verb: mode, reason, status, then an optional fix= word.
+verb_answer = root / ("runner-answer-" + (arguments[arguments.index("--verb") + 1] if "--verb" in arguments else ""))
+if verb_answer.exists():
+    mode, reason, status_text, *fix_words = verb_answer.read_text().splitlines()
+    runner_status = int(status_text)
+    fix = fix_words[0] if fix_words else ""
 if "--assignment-file" in arguments:
     if (mode == "passed" and runner_status == 0) or (mode == "failed" and runner_status not in (0, 75)):
         fixture_outcome = placement.AttemptCompleted(runner_status)
@@ -729,7 +737,8 @@ else:
         "mac=" + mode + "\n"
         + "reason=" + reason + "\n"
         + "seconds=" + os.environ.get("TEST_RUNNER_SECONDS", "3.25") + "\n"
-        + ("fetch=" + os.environ["TEST_RUNNER_FETCH"] + "\n" if "TEST_RUNNER_FETCH" in os.environ else ""),
+        + ("fetch=" + os.environ["TEST_RUNNER_FETCH"] + "\n" if "TEST_RUNNER_FETCH" in os.environ else "")
+        + ("fix=" + fix + "\n" if fix else ""),
         encoding="utf-8",
     )
 if mode == "declined":
@@ -1116,6 +1125,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         blocker = "#!/bin/sh\nexit 99\n"
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_executable(self.bin_directory / name, blocker)
+        write_unconfigured_berth(self.bin_directory)
         self.write_executable(self.bin_directory / "ssh", '#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n')
         reader = self.root / "lint-config.sh"
         _ = reader.write_text(
@@ -1293,10 +1303,10 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         if not library.is_symlink():
             library.symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
         functions = shell_functions(VERIFY,
-            "verify_helper",
+            "collect_child", "verify_helper",
             "try_mac_test", "find_mac_runner_pid", "forward_mac_runner_signal", "target_for_settings", "target_platform",
             "release_token", "stop_token_renewer",
-            "step_state", "publish_step_state", "tree_key", "set_verdict_keys", "after_tree_change",
+            "step_state", "publish_step_state", "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change",
             "start_tree_watch", "finish_tree_watch", "stop_tree_watch", "cancel_tree_run",
             "record_mac_pass", "cache_record", "user_clock", "finish_mac_pass", "note_event",
             "collect_hold_wait", "collect_routing_wait", "phase_wait_start", "phase_wait_holder_flags", "phase_wait_finish", "phase_wait_finish_all",
@@ -1660,6 +1670,10 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         temporary = answer.with_suffix(".new")
         _ = temporary.write_text(f"{mode}\n{reason}\n{status}\n")
         _ = temporary.replace(answer)
+
+    def set_verb_answer(self, verb: str, mode: str, status: int, fix: str = "") -> None:
+        """Answer one Mac verb; fix is the fix= word of a mend-fix result."""
+        _ = (self.runner_state / f"runner-answer-{verb}").write_text(f"{mode}\n\n{status}\n{fix}\n")
 
     def runner_episode(self) -> str:
         """Read the episode from the actual runner assignment."""

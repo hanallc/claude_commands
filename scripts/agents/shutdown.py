@@ -762,6 +762,8 @@ def main(argv: list[str] | None = None) -> int:
                     restart.prune_live_rows(reading)
                 else:
                     for row in rows:
+                        if restart.leaves_record(row, record) is not None:
+                            continue
                         try:
                             with staff.row_operation(str(row.id)):
                                 shutdown_record.update(started=[], pending=[str(row.id)])
@@ -1140,6 +1142,10 @@ def retirement_run_processes(owner: staff.StaffRow, inside: list[int], *, record
             if (run_record.get("status") == "running" and isinstance(pid, int) and not isinstance(pid, bool)
                     and pid > 0 and str(path) in retirement_command_line(pid, settings=settings)):
                 leaders[pid] = f"run supervisor {pid} of {run_record.get('label', path.stem)} in run {folder.name}"
+                # The command leads its own session; a live session ID is never reused, so its members are this run's.
+                group = run_record.get("command_group")
+                if isinstance(group, int) and not isinstance(group, bool) and group > 0:
+                    leaders[group] = leaders[pid]
     return {pid: f"process {pid} ({retirement_command_name(pid)}) of the {leaders[leader]}"
             for pid in inside if (leader := retirement_session_of(pid)) in leaders}
 

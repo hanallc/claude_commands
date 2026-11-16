@@ -559,6 +559,10 @@ Missing argv does not remove a compile count. A saved shape does not prove compi
 The join combines repeated attempts. Any positive count keeps the call in compile history.
 An unknown count or a missing join keeps the peak usable until the index supplies a known count.
 The peak's completion time controls its history window, including failed-build floors.
+The estimate reader decodes only rows that can be in the window (`HistoryWindow` in `step_estimator.py`).
+Rows append when steps end, so a binary search finds the first row that ended one day before the window.
+The day covers rows that came late; on 2026-11-15 the latest came 19 minutes late. A damaged row stops the search there.
+A row whose bytes do not hold the host and a requested step is not decoded.
 Merge-gate peaks keep their separate class and remain in the anonymous history.
 The gate uses its own cap, so Cargo estimates do not use those peaks.
 
@@ -889,6 +893,10 @@ The main loop clears the outage claim once after `silence_seconds` of continuous
 It uses the last usable configuration and retries a failed clear on a later loop.
 A shorter service start preserves the claim.
 Source changes stop the service after the settle interval. A missing source also counts as a change.
+Under systemd, the service then runs the new code in the same process with `execv`, and keeps the inherited socket.
+It sends `RELOADING=1` before `execv` and `READY=1` when the new listener is ready, so the systemd restart delay does not apply.
+A failed start of the new code exits, and `Restart=always` starts the service again.
+A service started without `LISTEN_FDS` stops on a source change and does not run `execv`.
 A restored head override receives reconnect grace only after the listener is ready.
 `down-alert` waits `silence_seconds` and claims `build-admission`.
 It sends the outage message to the `builds` session first.
@@ -1109,6 +1117,11 @@ Only removal ends the holder's hold.
 **Drain.** `build_hold.py drain --for '<why>'` keeps the natedev runs that work until they finish.
 It captures outermost gates that work, CI `Runner.Worker` processes, and builds that the enforcer could stop.
 A gate works when it has a cargo child, an admission reservation, or a Mac or AWS claim.
+A live step record also counts as a claim when the call cannot run on natedev, or waits for or runs on the Mac or AWS.
+`remote_step_callers` names these gates in `LiveClaims.routed`, and clear and the enforcer never stop them.
+A drain does not keep a routed gate, so a later natedev step of that call waits for the release.
+An unreadable step record of a live writer makes the claims unreadable.
+On 2026-11-15 a natedev hold stopped two gates whose builds waited for or ran on the Mac.
 A gate that only waits is not kept. It waits for the release like new work, and the drain does not wait for it.
 Unreadable claims or admission state keep every outermost gate.
 It publishes the hold with the first keep list and records a boot-relative start-tick bound immediately before publication.
@@ -1130,6 +1143,11 @@ A reused PID does not count when its start time differs.
 Status names each queued or running local CI placement and its state start time from existing admission records.
 Legacy CI cargo requests use the same hold and lineage check before memory admission.
 CI requests outside the keep list remain queued until release.
+A held CI request gets a `NatedevHeld` wait and waits through the hold; the release admits it.
+Only an unreadable hold state gives `ReadingUnavailable`, which the client refuses after its retry time.
+The CI client that nixos pins (bbc8803f4) does not know `NatedevHeld`.
+`snapshot_codec` writes it as `BehindHead` with a `_natedev_hold` field, and current readers restore it.
+GPU slot waits use the same shape with a `_gpu_slot` field.
 An existing CI reservation continues when the enforcer cannot stop its account.
 No process permission changes support these checks.
 **Clear.** `build_hold.py clear --for '<why>'` stops existing queued gates and running work outside the hold's allow rules.
@@ -1159,7 +1177,11 @@ The cleanup removes the JSON record, the state file, and this call’s `.step-<c
 The `state` and `remove` Python CLI verbs no longer exist.
 
 `step_record.read` opens the state file before it reads the JSON record.
-It keeps that file open through the join, then closes it on every path before process validation.
+It checks the writer process before it decodes the record, and keeps the state file open until it returns.
+The writer is the record's `pid` and `proc_start`.
+When the JSON is damaged, the writer is the pid in the call id (`v<UTC stamp>-<pid>-<random>`).
+An ended writer, or a pid with another start time, returns `StaleRecord`, even when the record is damaged.
+So a damaged record of a killed gate does not make the hold claims unreadable for good.
 Without a state file, the reader keeps the original row.
 The open state file supplies the UTC update time from its modification time.
 An unknown state word returns `UnreadableRecord` through the existing validation path.
@@ -1860,6 +1882,11 @@ The view shows zero room during a shortfall and records that shortfall in the ca
 The queue view and cards show captured process ids as `pid N` for each process row.
 The memory page shows `Stage`, `Duration`, `Unit`, `Pid`, `Machine`, and `vCPU` for running rows.
 The first column shows `building` or `testing` from the recorded progress counter.
+A natedev row shows `waiting for jobserver tokens` while its nextest step waits for test tokens; its `Done` cell shows `—`.
+`progress_profile.token_wait_line` prints the wait line in `nextest_tokens.py`, and `CounterParser` reads it from the step log as `NoCounter.token_wait`.
+The wait ends at the next line, which reports the tokens taken.
+`NoCounter.token_wait` is an optional field, so the counter wire union does not change for pinned clients.
+`build_queue.py --json` shows it in the running step's `measured.counter`.
 A row without a counter shows `—`.
 Local builds, merge gates, and cloud rows use their recorded counters.
 hana CI currently has no admission counter.
@@ -1868,7 +1895,15 @@ Idle or unreadable runners have no separate Running row.
 Their memory remains in the taken total, the cap, and the summary tooltip.
 Waiting rows use `#` in the first column for their queue place.
 Both sections use the same column widths.
-The narrow layout adds the `Step` column.
+The narrow layout adds the `Step` column and shows each cell in full.
+When that table is wider than the card, each step uses two lines: Step, Stage and Done, then Dur, Unit, Pid, Target and vCPU.
+Text wraps only when it does not fit. The chart row names also wrap in the narrow layout.
+`memory_page_proof.mjs` fails when a narrow table cell or chart name is cut, and uses two lines only at 390 px.
+The narrow table leaves out the room row, because the chart above it shows the next step room.
+Beside the chart, the table room row is empty and only keeps the rows aligned.
+The red cap line in the Running chart stops at each line of chart text that it would cross, so no text shows on it.
+`cutCapLine` draws the line as parts after the bar labels are placed; text clipped by an ellipsis does not count.
+`memory_page_proof.mjs` fails when chart text shows on the cap line or the table room row shows text.
 The Mac reader reads process data and cargo tile registrations in one SSH call per refresh.
 It uses cargo tile's `/tmp/cargo-tile/<uid>/state/pids` records and their named log files.
 A v3 registration must match the current boot, process start time, uid, PID, and generation.
@@ -1880,6 +1915,8 @@ The step name uses the command's package, then the repository when the command h
 A step name never contains an unknown-value dash.
 The reader also reads the repository URL from the workspace manifest when the Git origin is absent.
 The Mac row shows the repository on its second label line.
+A placed Mac row shows only its step name; the placement id stays in the row's `gate_label`.
+A `user`, `hana-ci` or `unplaced` run adds that label to its name.
 The stage uses a test counter or a running test binary as evidence for `testing`.
 The reader resolves the target folder from Cargo arguments, the process environment, and Cargo configuration.
 It embeds the shared Cargo folder reader in the same Mac reading.
@@ -1950,6 +1987,10 @@ Scope evidence includes all recorded scope members, including helpers outside th
 The service reads process commands and `RssAnon` only for a new highest run value.
 Lower samples, equal samples, and lower bin peaks retain the previous process evidence.
 Active records retain this evidence across service restarts and completion.
+The history merge reads only each record's profile and time; it does not keep the process evidence in memory.
+Each pass reads stale histories for at most `progress_profile_sweep_seconds` (initially 0.05), and always reads at least one key.
+After a restart, the service reads the history of each running step's key at once, and the other keys over the next passes.
+The sweep also deletes expired records, so an expired record can stay on disk until the sweep reaches its key.
 Old records remain readable with `ReadingSourceNotRecorded` and `PeakProcessesNotRecorded`.
 Unavailable process commands and anonymous readings have named states with their read errors.
 The nextest test phase keeps its frozen baseline and margin as the fallback. Its live test peak remains a floor.

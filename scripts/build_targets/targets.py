@@ -177,7 +177,7 @@ def mac_policy_eligibility(
             results.append(ExcludedTarget(target, "repo"))
         else:
             config = eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config()
-            policy = eligibility.linux_only_policy(config, repository, repo_root, package)
+            policy = eligibility.linux_only_policy(config, repository, repo_root, package, kind="")
             results.append(ExcludedTarget(target, policy.reason) if isinstance(policy, eligibility.IneligibleMacStep)
                            else EligibleTarget(target))
     return tuple(results)

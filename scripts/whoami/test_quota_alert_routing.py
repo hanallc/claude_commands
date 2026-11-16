@@ -15,6 +15,8 @@ from unittest import mock
 from scripts.whoami import quota_alert_test_support as support
 from scripts.whoami import quota_alert
 from scripts.whoami import agent_accounts
+from scripts.whoami.credit_accounts_test_support import set_credits
+from scripts.accounts import accounts, refusals
 from scripts.whoami.quota_alert_test_support import Notes, REGISTRY as REGISTRY
 
 setUpModule = support.setUpModule
@@ -95,14 +97,36 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertTrue(any("No delegated work needed to move" in line for line in log))
         self.assertEqual(self.pushed, [])
 
-    def test_a_refusal_above_weekly_threshold_still_uses_fallback_when_no_codex_has_room(self) -> None:
-        log = self.block([self.note("codex1.md", "active", "24")], self.now)
-        self.assertTrue(any("switched to claude" in line for line in log), log)
-        self.assertEqual(self.assignments()["direct"], "claude")
-        self.assertEqual(self.sent, [])
-        self.assertEqual(len(self.pushed), 0)
-        with quota_alert.state_file() as state:
-            self.assertEqual(state["episodes"], {})
+    def test_workers_refusals_keep_codex_when_current_allowance_or_credits_can_pay(self) -> None:
+        for left, balance, setting in (("96", "2544", "on"), ("0", "2544", "on"), ("96", "0", "off")):
+            with self.subTest(left=left, balance=balance, setting=setting):
+                set_credits(self.credits, "codex1", setting)
+                notes = [self.note("codex1.md", "active", left, credit_balance=balance)]
+                before = self.assignments()
+                self.pushed.clear()
+                self.assertIsInstance(accounts.pick("codex", self.now, exclude=frozenset({"codex1"})),
+                                      accounts.NoAccountWithRoom)
+                log: list[str] = []
+                with mock.patch.object(quota_alert, "switch_to_claude") as switch:
+                    for seconds in (0, 8):
+                        checked = self.now + timedelta(seconds=seconds)
+                        readings = self.alert_readings(notes, checked)
+                        identity = readings.selected_account
+                        assert isinstance(identity, agent_accounts.KnownCodexAccount)
+                        log = quota_alert.blocked(notes, identity, checked, codex_readings=readings,
+                                                  window=refusals.KnownWindow("weekly"))
+                        self.assertEqual(self.pushed, [])
+                        _ = self.alert(notes, self.now + timedelta(seconds=seconds + 1))
+                        self.pushed.clear()
+                switch.assert_not_called()
+                self.assertTrue(any("can still serve workers" in line for line in log), log)
+                self.assertEqual(self.assignments(), before)
+                self.assertEqual((self.broadcasts, self.broadcasts.stops, self.broadcasts.fyi), ([], [], []))
+                self.assertEqual(self.sent, [])
+                self.assertEqual(self.routing_entries(), [])
+                with quota_alert.state_file() as state:
+                    self.assertFalse(state.get("no_worker_mode", False))
+                    self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
 
 
 if __name__ == "__main__":

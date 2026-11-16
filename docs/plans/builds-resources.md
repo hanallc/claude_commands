@@ -2447,7 +2447,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - A call with none of `CLAUDECODE`, `CODEX_HOME`, `SSH_CONNECTION` and `SSH_CLIENT` is the user's terminal and passes with no check. Any other call needs `MAC_PLACEMENT=<episode>/<attempt>`; the gate runs `placement_check_command` from `config/mac_gate.conf` (queue `placement-status`: 0 current, 1 closed or unknown, 2 unreachable) inside `placement_check_timeout_seconds`, and fails closed. Refusal: `mac cargo gate refused: <reason>; run it through mac_queue_run.py`, exit `refusal_exit_code` (125).
 - State is under `~/.local/state/mac-gate` on the Mac: `checks/<placement>.live` keeps a live answer for `placement_recheck_seconds`; `records/<pid>` holds pid, start time and label for each root pass. A child under a recorded ancestor with the same start time writes no record. A call that writes a record removes expired checks and records of dead processes.
 - `queue_view.mac_build_script` reads the records with the process table. `MacBuild` carries `gate_label` and `gate_placement`; each cargo, rustc or cargo-nextest run is `user`, `placement <e>/<a>`, `hana-ci` or `unplaced`. `memory_feed` shows unplaced runs and sends builds one message for each.
-- `scripts/mac_test/mac_queue_run.py` takes a Mac placement (`place-step --once --wait-events --target mac`), runs the command over ssh with `MAC_PLACEMENT`, exits with the `mac_exit=` status, and gives the placement back (`finish-step` or `cancel-placement`) on every exit and signal.
+- `scripts/mac_test/mac_queue_run.py` takes a Mac placement (`place-step --once --wait-events --target mac`), runs the command over ssh with `MAC_PLACEMENT`, exits with the `mac_exit=` status, and gives the placement back with `cancel-placement`, whose reason names the run's result. It removes its receipt on every exit. A signal ends it with no handler, and the queue ends the placement when the process ends.
 - `mac_run.sh` runs the hana build and the `open -a Terminal` launch under one `mac_queue_run.py` placement. `offload.remote_test_command` sets `MAC_PLACEMENT` from the assignment and puts the gate folder before `$HOME/.cargo/bin`.
 - `commands/build/mac.md` names `mac_queue_run.py` for every Mac build, test, install or run, with a shot build, an install and a probe example.
 - Phase B (not in this repo): the Mac nixos PATH change in `modules/darwin/shell.nix` (`lib.mkAfter` gate folder line) and the tailnet path from the Mac to natedev ssh for the placement check. Both wait for the user's go; the gate does nothing on the Mac until then.
@@ -2621,3 +2621,19 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 **Files:** `config/build_admission.conf`, `scripts/lint/fixtures/build_admission.conf`, `scripts/build_queue/admission_records.py`, `scripts/lint/memory_admit.py`, `scripts/build_queue/memory_feed.py`, `scripts/build_queue/memory_live.html`, `scripts/build_queue/queue_view.py`, and their tests.
 
 **Gotchas:** a hana test run by plain cargo (not nextest) gets the step name from the caller; queue names the step from the cargo subcommand after #93 reaches main. The lint fixture config lists hana, so `admission_policy_fixture()` has the slot on.
+
+### Phase 129 — A hold stop ends the command group and the supervisor delivers the stopped result  · status: done
+
+#### As-built
+
+- Cause: a hold sent TERM to the detached supervisor's process group. The supervisor uses the default TERM disposition, so it died with the command. Its record stayed running, and no result reached the worker until a reap.
+- `detached_runs._run` starts the command with `start_new_session=True`. The record saves `command_group` beside `command_pid` and `command_started`.
+- `detached_runs.command_group(path)` reads the group of a running record. `stop_command(path, reason)` saves the stop reason and sends TERM to that group while the supervisor and the command leader are current. The `stop --reason <text> <record>` verb calls it.
+- `hold_enforcer.stop_waiting_run` also checks the command leader start and sends TERM to the recorded command group. A record with no group yet is a changed identity, and nothing is signalled.
+- The supervisor stays alive, records 128+n and delivers the result. A non-zero result with a stop reason reads `STOPPED (exit <n>)` with a `Stop reason:` line.
+- The orphan reaper waits while the recorded command group has live members.
+- No signal handler, mask or disposition is added.
+
+**Files:** `scripts/agents/detached_runs.py`, `scripts/build_hold/hold_enforcer.py`, their tests, `scripts/direct/test_verify_tree_cancel_lint.py`, `commands/unit/direct.md`, `docs/direct/write_prompt_contract.md` and three as-built docs.
+
+**Gotchas:** `kill -TERM -- -<supervisor pid>` now ends only the supervisor; use the `stop` verb. A `timeout` child that leaves the command group needs its own group stop.
