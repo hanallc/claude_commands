@@ -31,6 +31,9 @@ from typing import BinaryIO, TypedDict, cast
 
 UNKNOWN_IDENTITY = "unknown"
 CI_DIR = "ci"
+# Every AWS gate box records into one place, so the history counts AWS as one machine.
+CLOUD_GATE_PLACE = "aws"
+CLOUD_GATE_SOURCE = "cloud-gate"
 LOGS_DIR = "logs"
 RESULTS_DIR = "results"
 ERRORS_NAME = "errors.log"
