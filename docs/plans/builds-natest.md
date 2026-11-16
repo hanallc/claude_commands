@@ -4437,32 +4437,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** Phase 311
 **Owner:** natest (builds assigned it on 11-15 at 23:47 EST; a small fix, off the critical path).
 
-#### Work Order
+#### As-built
 
-**Goal:** `verify.sh lint` fails when any tracked TOML file that CI's `taplo fmt --check` checks is not formatted, in every lint path. A file outside the crates, such as `.claude/config/release.toml`, is included.
-
-**Report:** hana CI run 43798293618 failed its Taplo Check on commit 52970227f0. The step is `taplo fmt --check` at the hana repository top level. `.claude/config/release.toml` has an unsorted `reorder_arrays` array (hana `taplo.toml` sets `reorder_arrays = true`). `verify.sh final` on natedev and `verify.sh lint hana --mac` both passed the same hash.
-
-**Known facts (director probe):**
-- In a copy of the hana tree at 52970227f0, `taplo fmt --check` fails on `release.toml`, with no paths and with explicit paths. Taplo itself sees the file.
-- `workspace_taplo` lists `git ls-files -z -- '*.toml'` in `$WORKSPACE_ROOT`. In hana that is the repository top level, so its list includes the file.
-- `run_lint_held_sequence` (the held, Mac-judged path) and `HOLD_LINT=1` in `run_lint_sequence` run `workspace_taplo` with no `--check`. That is a format pass, not a judgment. In a berth repository the pass writes a lint copy, and `fix_return.py return-copy` can withhold a path that another reservation holds without a failure.
-- `workspace_taplo` runs at `$WORKSPACE_ROOT`, the Cargo workspace root. When that root is not the repository top level, files outside it are not listed. CI runs at the top level.
-
-**Spec:**
-1. Reproduce first. Make a scratch copy of the hana tree at 52970227f0 (`git archive`; keep output under `/tmp/claude/scratch/`). Use the stub tools of `verify_lint_scope_test_support.py` for cargo, mend and clippy, and the real `taplo`. Run each lint path: `lint <pkg>`, `lint <pkg> --check`, the held path, and the berth copy path. Name each path that passes with the misformatted file, and the cause, in the report.
-2. Fix every path that passes. The lint verdict must come from `taplo fmt --check` over the same files that CI's step checks: tracked TOML files of the whole repository, selected by the top-level Taplo config. A format pass can still run first. After it, a file that stays misformatted in the worktree (not written, or withheld by the copy return) fails lint and names the file.
-3. Run the check from the repository top level, with its `taplo.toml`, as CI does. Keep the explicit literal-path list, so untracked files stay out and Taplo's include and exclude rules still apply.
-4. Fix the cause in `verify.sh` (or the helper that owns it). Add no new lint path and no new option.
-5. Keep the existing `test_verify_lint_taplo.py` behavior checks.
-
-**Test:** add a test in `scripts/direct/test_verify_lint_taplo.py`. A tracked, misformatted TOML file outside the crates, in a dot folder (for example `.claude/config/release.toml`), fails lint on each path that step 1 found passing. The failure names the file. Use the module's existing fixture; start no new real `verify.sh` chain where a function-level call proves the fact.
-
-**Files:** `scripts/direct/verify.sh`, `scripts/direct/test_verify_lint_taplo.py`. Touch `scripts/direct/verify_lint_scope_test_support.py` or `scripts/mac_test/fix_return.py` only when the fix needs it, and say why.
-
-**Workers:** 1 writer; the fix and its test share one fixture, no split.
-- impl: all files above.
-
-**Constraints from prior phases:** Phase 308 and 309 own the held lint clippy exits; keep them. No signal handlers, masks or dispositions, tests included; do not change any trap. Save run output under a few GB; delete it after each read.
-
-**Acceptance gate:** the step 1 reproduction fails lint after the fix on every path, with the file named; the `scripts/direct/test_verify_lint*` modules pass on natedev; shellcheck adds no finding on `verify.sh`; basedpyright adds no finding on touched Python files; trial merges with origin/main and the open unit branches are clean.
+- `workspace_taplo` runs from the repository top level, as CI's `taplo fmt --check` does. It lists tracked TOML files, so a file in a dot folder outside the crates is checked.
+- The held lint path formats TOML into the copy, returns the copy, then runs `workspace_taplo --check` on the worktree. A withheld or still-misformatted file fails lint and is named.
+- The ordinary lint path checks only, as before.
+- `test_verify_lint_taplo` checks each lint path with a misformatted `.claude/config/release.toml`.
+- Commit 27e978424.
