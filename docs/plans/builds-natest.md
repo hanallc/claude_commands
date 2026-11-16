@@ -4548,40 +4548,11 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** Phase 320
 **Owner:** natest writes; sdlc owns (gate rename plan chunk 4 item 3). Builds ships 320 and 321 as one item and takes the user's go for the service stops (11-16 ~17:30).
 
-#### Work Order
+#### As-built
 
-**Goal:** one program outside the repository rewrites every stored `merge-gate` step value to `gate` and every `targeted-test` value to `test-affected`, once, at deploy; builds gets exact deploy steps with measured times.
-
-**Source:** queue inventory `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/steprename/inventory_for_natest.md`; phase 320 list `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/320/implementation/stored-records.md`; memory rule "migrate once at deploy".
-
-**Spec:**
-1. Write `/tmp/claude/scratch/natest-probe/p89/rename_step_names.py`. It is not committed. It takes the buildlog folder, the AWS state folder and the review page folder as arguments, with the live paths as defaults.
-2. Refusals, before any write:
-   1. No natedev drain hold in force (use `build_hold` as `move_gate_state.py` does).
-   2. `build-admission.service`, `build-admission.socket` or `build-memory-feed.service` is active, or `buildlog.service` is running.
-   3. A process of the user other than itself holds a file under the buildlog `admission/` folder open (reuse the `/proc` scan of `move_gate_state.py`).
-3. Convert each record of the phase 320 list. Match structured fields exactly; never replace text inside other strings. Write each file to a temporary file in the same folder, then `os.replace`. A rerun converts what is left and changes nothing when no old value remains.
-3a. Also convert these cloud attempt records (contract review of phase 320, F002): `<git-path cloud-gates>/current.json` retry `mode`; `<git-path cloud-gates>/<attempt>/request.json` `mode`; AWS `paired-trials/<trial>/<attempt>/request.json` `mode`; `remote-result.json` and legacy inline outcome results, nested `record.step`; `B/<host>/results/<YYYY-MM>/*.json.gz`, nested `record.step` (rewrite the gzip in place by temp file). Find each git-path folder for the live checkouts the gate uses. For uploaded cloud request and result objects, name their expiry or retention and whether any reader loads an old one; convert only when a reader does.
-4. Progress profiles: rename each `merge-gate` profile folder to the hash of the same key with `gate` (`memory_admit.py` key at about line 1946). Use the phase 320 hash function, not a copy. `targeted-test` keys cannot be listed: leave those folders, and report whether an existing cleanup removes unread folders. A rerun skips a folder already renamed.
-5. Index: after the jsonl rewrite, update `gate_runs.step` and `steps.step` in the index sqlite in one transaction, or rebuild it with the existing index command; name the choice and why.
-6. `queue.json`, `memory.json` and `report.json`: convert, or delete them when the started services write them again; name the choice.
-7. `.wait` files next to assignment files: find where they live; convert those found, and name the folders searched.
-8. Print each step with its time and the count of values changed per file. Exit 2 on a refusal, 0 on success.
-9. Prove it on a copy of the live records under `/tmp/claude/scratch/`: run it with the paths as arguments, then run it again (no change). Then show with the phase 320 code: the gate duration history (`gate_record.py`), the peak estimate for `gate` and `test-affected`, and the AWS run cost groups read the converted copy with the same counts as the old names had. Time the run on the copy. Make no change to live records.
-10. Write the deploy steps for builds in the reply: each stop (`build-admission.socket`, `build-admission.service`, `build-memory-feed.service`, the `buildlog` timer), the drain hold, the program, each start, the release, and the measured minutes builds stop. A system service stop needs sudo: name each command exactly.
-11. Do not edit `/etc/nixos`. No signal handlers, masks or dispositions.
-
-**Files:**
-- `scripts/lint/memory_admit.py`
-
-**Workers:** 1 writer. One program outside the repository; the listed file is read only, for the hash function.
-- impl: the program, the copy proof and the deploy steps.
-- test: opens as impl.
-
-**Constraints from prior phases:** Phase 320: code and config write and read only `gate` and `test-affected`; `gate.py --affected`; no dual read. Phase 318: `move_gate_state.py` holds the hold check and `/proc` scan to reuse. Phase 319: the gate state readers refuse while only `~/.local/state/merge-gate` exists.
-
-**Acceptance gate:**
-1. The copy proof of Spec item 9 passes and its output is in the reply, with the second run changing nothing.
-2. Each refusal of Spec item 2 is shown on the copy.
-3. The deploy steps of Spec item 10 are in the reply with measured times.
-4. basedpyright reports no finding on the program.
+- One program outside the repository, `/tmp/claude/scratch/natest-probe/p89/rename_step_names.py`, converts the stored step names once at deploy. It is deleted after the deploy.
+- It changes exact structured fields only: admission records, buildlog month records, pending steps, assignment wait files, AWS ledgers, cloud attempt `request.json`, `current.json`, `remote-result.json` and outcome records, and compressed results. Each file is rewritten through a temporary file and `os.replace`. It renames `merge-gate` progress profile folders to the `gate` key hash and updates the index rows in one transaction. It converts `queue.json` and deletes `memory.json` and `report.json`, which the feed writes again. Affected-test profile folders stay; the profile sweep removes them.
+- It refuses before any write without a natedev drain hold, with an admission or feed service or the buildlog service running, with a process holding an admission file, with a live hold or queue caller (review F001), or with an unfinished old AWS attempt.
+- A copy of the live records converted with 15,237 changes in 169 seconds; a second run changed nothing. The readers kept the same counts under the new names.
+- An old unit worktree can write an old name until it merges main. A later run under the same conditions converts it.
+- Checkpoint 419ef8cad.
