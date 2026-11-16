@@ -32,6 +32,19 @@ class WaitsOnTests(unittest.TestCase):
     def git(self, *args: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True, text=True).stdout.strip()
 
+    def test_bulk_phase_merges_keep_the_newest_commit_time_with_one_read(self) -> None:
+        output = ("a" * 40 + "\0" + "200\0Merge builds phase 5 (1234567) into sdlc\n"
+                  + "b" * 40 + "\0" + "100\0Merge builds phase 5 (7654321) into sdlc\n"
+                  + "c" * 40 + "\0" + "300\0Revert Merge builds phase 6 (1234567) into sdlc\n"
+                  + "d" * 40 + "\0" + "400\0Merge other phase 5 (1234567) into sdlc\n"
+                  + "e" * 40 + "\0" + "500\0Merge upper phase 5 (ABCDEF1) into sdlc\n")
+        with patch.object(waits_on, "git", return_value=subprocess.CompletedProcess([], 0, output, "")) as read:
+            self.assertEqual(waits_on.landed_phases(self.repo), {
+                ("builds", "5"): waits_on.PhaseMerge("a" * 40, 200, "1234567"),
+                ("other", "5"): waits_on.PhaseMerge("d" * 40, 400, "1234567"),
+                ("upper", "5"): waits_on.PhaseMerge("e" * 40, 500, "abcdef1")})
+        read.assert_called_once_with(self.repo, "log", "origin/main", "--merges", "--format=%H%x00%ct%x00%s")
+
     def test_each_kind_of_work_has_a_state(self) -> None:
         base = commit_repository(self.repo, "base", allow_empty=True)
         _ = self.git("switch", "-q", "-c", "builds-589")
@@ -147,7 +160,21 @@ class WaitsOnTests(unittest.TestCase):
                 item = unit_queue.QueuedItem("Read delivery", reference)
                 self.assertEqual(unit_phases.queued_text(item, found, view, now=0, zone=ZoneInfo("UTC"),
                     unit="handler", phase_ids=phase_ids).state_text,
-                    f"After {label}; {unit_phases.wait_text(found, view, now=0, zone=ZoneInfo('UTC'))}")
+                    f"After {label}; " + ("not on main yet" if isinstance(found, waits_on.NotFound)
+                        and label.startswith("commit ") else unit_phases.wait_text(found, view, now=0, zone=ZoneInfo('UTC'))))
+
+    def test_missing_commits_wait_for_main_without_a_missing_dependency_claim(self) -> None:
+        view = land_queue.LandView({}, {}, {}, frozenset(), {})
+        for reference, phase_ids, expected in (
+                ("e75b8ec06", (), "After commit e75b8ec06; not on main yet"),
+                ("E75B8EC06" + "A" * 31, (), "After commit E75B8EC06; not on main yet"),
+                ("e75b8ec06", ("e75b8ec06",), "After e75b8ec06; dependency not found locally"),
+                ("other/23", (), "After other phase 23; dependency not found locally"),
+                ("missing-ref", (), "After missing-ref; dependency not found locally")):
+            with self.subTest(reference=reference, phase_ids=phase_ids):
+                entry = unit_phases.queued_text(unit_queue.QueuedItem("Read delivery", reference), waits_on.NotFound(),
+                    view, now=0, zone=ZoneInfo("UTC"), unit="handler", phase_ids=phase_ids)
+                self.assertEqual(entry.state_text, expected)
 
     def test_the_queued_cell_names_the_wait_and_its_state(self) -> None:
         now, utc = 1_794_750_000.0, ZoneInfo("UTC")
