@@ -4544,7 +4544,7 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - An AWS launch reads the tested commit's `SuiteMode` values with `git show` and `ast`, without running its code. A commit that lacks the requested mode gets a local fallback before launch (review F001).
 - Checkpoint cf4ac06c4.
 
-### Phase 321 — the stored step names move to gate and test-affected once, at deploy  · status: todo
+### Phase 321 — the stored step names move to gate and test-affected once, at deploy  · status: done
 **Depends on:** Phase 320
 **Owner:** natest writes; sdlc owns (gate rename plan chunk 4 item 3). Builds ships 320 and 321 as one item and takes the user's go for the service stops (11-16 ~17:30).
 
