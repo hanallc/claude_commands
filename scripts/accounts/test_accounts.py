@@ -1316,6 +1316,8 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual(session_counts_cache().read_text(), reply)
             self.assertEqual(machine_role_counts((row,), now)[1], ())
             self.assertTrue(cast(str, json.loads(failed.read_text())["reason"]).startswith(type(failure).__name__))
+        with patch.object(accounts, "_start_session_counts_fetch", return_value=False):
+            self.assertEqual(machine_role_counts((row,), now)[1], ())
         late = now + timedelta(seconds=601)
         self.assertEqual(machine_role_counts((row,), late)[1], (f"{peer} unavailable: counts are {local} only",))
 

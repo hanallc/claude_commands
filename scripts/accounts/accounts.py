@@ -5738,10 +5738,7 @@ def _machine_role_counts(
     except (OSError, ValueError):
         peer_accounts = {}
         available = False
-    started = _start_session_counts_fetch()
-    available = available and started
-    if not available:
-        peer_accounts = {}
+    _ = _start_session_counts_fetch()
     counted: list[StatusRow] = []
     for row in rows:
         local_counts = {role: RoleSessionCountsDocument(busy=count.busy,
