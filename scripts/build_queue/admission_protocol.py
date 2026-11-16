@@ -49,6 +49,10 @@ from scripts.build_queue.admission_wire import (
     CallerCode as CallerCode,
     AdmitRequest as AdmitRequest,
     ServiceEstimateRequest as ServiceEstimateRequest,
+    RepositorySlotRequest as RepositorySlotRequest,
+    RepositorySlotWaiting as RepositorySlotWaiting,
+    RepositorySlotReady as RepositorySlotReady,
+    RepositorySlotExpired as RepositorySlotExpired,
     LaunchRequest as LaunchRequest,
     ReleaseRequest as ReleaseRequest,
     WidthRequest as WidthRequest,
@@ -56,7 +60,6 @@ from scripts.build_queue.admission_wire import (
     ViewRequest as ViewRequest,
     ExplainRequest as ExplainRequest,
     MineRequest as MineRequest,
-    AdmitHeadRequest as AdmitHeadRequest,
     PrioritySetRequest as PrioritySetRequest,
     PriorityClearRequest as PriorityClearRequest,
     TokenWaitRequest as TokenWaitRequest,
@@ -123,19 +126,27 @@ class CloudRow:
     wait: CloudSlotWait | records.ReadyForAdmission
 
 
+@dataclass(frozen=True)
+class RepositorySlotRow:
+    """A transient repository slot wait appears beside queued memory waits."""
+    owner: Owner
+    identity: Identity
+    since: float
+    machine: str
+    wait: RepositorySlotWaiting
+
 
 @dataclass(frozen=True)
 class CloudQueueRead(records.QueueRead):
     cloud: tuple[CloudRow, ...] = ()
     cloud_slots: int = 0
     cloud_gate_stale_pushes: int = field(kw_only=True)
-
+    repository_slots: tuple[RepositorySlotRow, ...] = ()
 
 
 @dataclass(frozen=True)
 class ViewReply:
     reading: records.QueueRead | CloudQueueRead
-
 
 
 @dataclass(frozen=True)
@@ -144,11 +155,9 @@ class ExplainReply:
     diagnostics: tuple[records.ConfigurationDiagnostic, ...] = ()
 
 
-
 @dataclass(frozen=True)
 class MineReply:
     reading: records.QueueRead | CloudQueueRead
-
 
 
 Reply = WireReply | ViewReply | ExplainReply | MineReply
@@ -162,7 +171,6 @@ def encode_reply(reply: Reply, *, version: int = VERSION) -> str:
         local = records.QueueRead(reading.view, reading.explanation, reading.ordered, reading.diagnostics)
         reply = type(reply)(local)
     return encode_envelope(reply, _REPLIES, version)
-
 
 
 def parse_reply(line: str | bytes, request: Request | None = None) -> Reply:

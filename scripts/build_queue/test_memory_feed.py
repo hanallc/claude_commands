@@ -25,6 +25,7 @@ from typing import Literal, cast, override
 from unittest import mock
 
 from scripts.buildlog import charts, costs, moments
+from scripts.direct import step_record
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view, target_availability
 from scripts.build_queue.test_queue_view import cloud_reading
@@ -50,7 +51,7 @@ def captured_reading(*, running: tuple[admission_records.RunningStep, ...] = (),
                      host: admission_records.HostMemory | None = None) -> admission_records.QueueRead:
     host = host or admission_records.HostMemory(30 * admission_records.GIB, 60 * admission_records.GIB)
     inputs = admission_records.QueueInputs([], running, (), host,
-        admission_records.NO_PRESSURE_HOLD, admission_records.ReadyToStart(), admission_records.NoHeadAdmissionOverride(), 200_000)
+        admission_records.NO_PRESSURE_HOLD, admission_records.ReadyToStart(), 200_000)
     return gate.queue_read_from(inputs, admission_policy_fixture())
 
 
@@ -210,6 +211,8 @@ class MemoryFeedTests(unittest.TestCase):
         _ = (self.root / "buildlog.conf").write_text("# whole: 1..\nTOP_COST_RECENT_DAYS=3\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(self.root),
+            "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
+            "VERIFY_PROC_ROOT": str(self.root / "proc"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "STAFF_FILE": str(self.root / "staff.json"),
@@ -1277,6 +1280,27 @@ process.stdout.write(JSON.stringify({
                 page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
                 self.assertEqual(page["decoder_revision"], "after")
 
+    def test_repository_slot_wait_reaches_the_queued_table_without_memory_charge(self) -> None:
+        base = captured_reading()
+        slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
+            wire.Identity("slot-session", "slot-showrunner", "gate", "proof", "slot-unit"),
+            base.explanation.now - 60, "natedev",
+            wire.RepositorySlotWaiting("widget", (1, 2), 2, "slots.natedev.widget.max"))
+        reading = wire.CloudQueueRead(base.view, base.explanation, base.ordered, base.diagnostics,
+            cloud_gate_stale_pushes=3, repository_slots=(slot,))
+        with mock.patch.object(admission_client, "view", return_value=base):
+            before = memory_feed.reading()
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            after = memory_feed.reading()
+        row, = after["waiters"]
+        self.assertEqual(row["reason"], "waits for a free widget slot (2 of 2 in use)")
+        self.assertEqual(row["pid"], slot.owner.pid)
+        self.assertEqual(row["since"], slot.since)
+        self.assertEqual(cast(memory_feed.WaitRow, row)["need"], 0)
+        self.assertEqual(after["reserved"], before["reserved"])
+        self.assertEqual(after["used"], before["used"])
+        self.assertEqual(after["waiting"], 1)
+
     def test_queue_priority_reaches_the_feed_and_clears_when_removed(self) -> None:
         base = captured_reading()
         first = with_queue_priority(base)
@@ -1331,11 +1355,47 @@ process.stdout.write(JSON.stringify({
 
     def test_can_run_on_names_the_mac_only_when_its_routes_allow_the_step(self) -> None:
         for fit, expected in ((target_availability.Allowed("busy with nextest hana"), "natedev or Mac"),
-                              (target_availability.NotAllowed("makes natedev artifacts"), "natedev only"),
+                              (target_availability.NotAllowed("creates a Linux install"), "natedev only"),
                               (target_availability.FitUnreadable("Mac state unreadable"), "natedev only (Mac state unknown)"),
                               (target_availability.NoMacTarget(), "natedev only")):
             with self.subTest(fit=fit):
                 self.assertEqual(memory_feed.local_runs_on(fit), expected)
+
+    def macroute_page(self) -> memory_feed.MemoryPage:
+        """Build three route rows from private verify records."""
+        from scripts.build_targets import targets
+        from scripts.build_targets.target_config import SshTarget
+        from scripts.mac_test import eligibility
+
+        reading = queued_reading(captured_reading(), ("build", "mend", "direct"))
+        rows = tuple(replace(row, pid=8100 + index, step=step)
+                     for index, (row, step) in enumerate(zip(reading.view.waiting[:3], ("build", "mend", "build"), strict=True)))
+        reading = replace(reading, view=replace(reading.view, waiting=rows))
+        for row in rows[:2]:
+            process = self.root / "proc" / str(row.pid)
+            process.mkdir(exist_ok=True)
+            _ = (process / "stat").write_text(f"{row.pid} (verify) S " + "0 " * 18 + "123 0\n")
+            record = step_record.StepRecord(str(row.pid), row.pid, "123", Path(row.folder), "build",
+                step_record.NamedPackage("handler"), step_record.AnyTarget(("natedev", "mac"), ("mac",)),
+                step_record.StepState.ON_NATEDEV, "now")
+            step_record.write(record)
+            _ = step_record.state_path(record.call_id).write_text(
+                "writes_tree local_noncompiling\n" if row.step == "mend" else "on_natedev\n")
+        job = targets.RunningJob("nextest hana_catalyst", datetime.now(UTC), targets.NotSeenIdle())
+        snapshots = (targets.TargetSnapshot(SshTarget("mac", "macos", self.root / "mac.conf"),
+                     (targets.Running((job,)),), (), eligibility.NO_BACKOFF),)
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(target_availability, "read_snapshots", return_value=snapshots)):
+            return memory_feed.reading()
+
+    def test_queued_tooltips_use_the_verify_route_or_the_direct_command_reason(self) -> None:
+        page = self.macroute_page()
+        self.assertEqual([row.get("mac_text") for row in page["waiters"]], [
+            "Mac: busy with nextest hana_catalyst",
+            "Mac: no, mend edits this checkout on natedev",
+            "Mac: no, a direct cargo command runs where it starts"])
+        self.assertEqual([row.get("runs_on") for row in page["waiters"]],
+                         ["natedev or Mac", "natedev only", "natedev only"])
 
     def test_swapped_memory_of_other_programs_shows_as_free_ram_when_it_comes_back(self) -> None:
         gib = admission_records.GIB
@@ -1406,6 +1466,13 @@ process.stdout.write(JSON.stringify({
 
         _ = write_idle_config(self.root)
         reading = queued_reading(captured_reading(), ())
+        for row in reading.view.waiting:
+            process = self.root / "proc" / str(row.pid)
+            process.mkdir(exist_ok=True)
+            _ = (process / "stat").write_text(f"{row.pid} (verify) S " + "0 " * 18 + "123 0\n")
+            step_record.write(step_record.StepRecord(str(row.pid), row.pid, "123", Path(row.folder), "test",
+                step_record.NamedPackage("hana"), step_record.AnyTarget(("natedev", "mac"), ("mac",)),
+                step_record.StepState.ON_NATEDEV, "now"))
         now = reading.explanation.now
         since = datetime.fromtimestamp(now - 600, UTC)
         block = targets.Held("research", "P15 F11 L0 run", since, targets.UntilReleased(), targets.HolderSession("mac-owner"))
@@ -2109,6 +2176,7 @@ def write_browser_fixture(folder: Path) -> None:
         pages["step_ci"] = json.loads(memory_feed.page_json(ci_page))
         pages["step_unknown"] = json.loads(memory_feed.page_json(fixture.owner_machine_page(
             unit_labels.UnitLabels("unknown", "—", "owner not recorded"))))
+        pages["macroute"] = json.loads(memory_feed.page_json(fixture.macroute_page()))
         for name, reading in readings.items():
             with mock.patch.object(admission_client, "view", return_value=reading):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
@@ -2158,6 +2226,14 @@ def write_browser_fixture(folder: Path) -> None:
               mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(
                   base.explanation.now - 540, mac_builds, "awk: private raw error"))):
             pages["mac_failed"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
+        placed = queue_view.MacBuild(710001, "/Mac/fps", base.explanation.now - 600,
+            "cargo nextest run -p fps", "hana", queue_view.MacTesting(710002),
+            int(2.1 * admission_records.GIB), gate_label=queue_view.MacGateLabel.PLACEMENT,
+            gate_placement="v20261115T234230-2719419-21122-step-1/24e0cf9c4113402abff80a3dfa0edcdb2")
+        with (mock.patch.object(admission_client, "view", return_value=base),
+              mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(
+                  base.explanation.now, (placed,)))):
+            pages["macroute_running"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         _ = (folder / "fixtures.json").write_text(json.dumps(pages))
     finally:
         _ = fixture.doCleanups()

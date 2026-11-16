@@ -78,7 +78,6 @@ from scripts.build_queue.admission_records import (
     GpuSlotFree,
     GpuSlotWait,
     GpuTestSlots,
-    HeadAdmissionOverride,
     HeadAdmissionStatus,
     HeadCause,
     HeadExplanation,
@@ -102,7 +101,6 @@ from scripts.build_queue.admission_records import (
     NeedsMemory,
     NextStartAt,
     NoFloor,
-    NoHeadAdmissionOverride,
     NoHeadroom,
     NoOrderHold,
     NoPeakRecorded,
@@ -112,7 +110,6 @@ from scripts.build_queue.admission_records import (
     NoTestWidth,
     NoWaiter,
     NormalOrder,
-    OverrideRoom,
     PackageNotRecorded,
     PeakDecayed,
     PeakFileUnreadable,
@@ -438,37 +435,15 @@ def apply_queue_priority(rows: Iterable[tuple[Path, Waiter]], context: QueueOrde
     return sorted(ranked, key=lambda item: waiter_order(item[1])), context.priority
 
 
-NO_HEAD_ADMISSION_OVERRIDE = NoHeadAdmissionOverride()
 
 
-def head_override_path(directory: Path) -> Path:
-    return directory / "admit-head.json"
 
 
-def head_override_matches(override: HeadAdmissionOverride, path: Path, waiter: Waiter) -> bool:
-    return (path.name == override["waiter"] and waiter["pid"] == override["pid"]
-            and waiter["start_time"] == override["start_time"])
 
 
-def read_head_override(directory: Path) -> HeadAdmissionOverride | NoHeadAdmissionOverride:
-    try:
-        value = cast(object, json.loads(head_override_path(directory).read_text()))
-    except FileNotFoundError:
-        return NoHeadAdmissionOverride()
-    if not isinstance(value, dict):
-        raise ValueError("invalid admit-head record")
-    row = cast(dict[str, object], value)
-    if (any(not isinstance(row.get(key), str) for key in ("waiter", "start_time", "unit", "step", "why", "set_by"))
-            or any(not isinstance(row.get(key), int) or isinstance(row.get(key), bool)
-                   for key in ("pid", "need", "free", "reserve"))):
-        raise ValueError("invalid admit-head record")
-    return cast(HeadAdmissionOverride, cast(object, row))
 
 
-def head_override_event(action: Literal["set", "admitted", "lapsed"], override: HeadAdmissionOverride,
-                        need: int, free: int, reserve: int, at: float) -> None:
-    record.head_admission(action, override["unit"], override["step"], need, free,
-                          reserve, override["why"], override["set_by"], at)
+
 
 
 def estimate_expired(waiter: Waiter, now: float, policy: AdmissionPolicy) -> bool:
@@ -484,15 +459,8 @@ def ranked_queue_waiters(inputs: QueueInputs) -> list[tuple[Path, RankedWaiter]]
                   key=lambda item: (records.waiter_owner(item[1]) not in claims, waiter_order(item[1])))
 
 
-@dataclass(frozen=True)
-class OverrideKept:
-    record: HeadAdmissionOverride | NoHeadAdmissionOverride = NoHeadAdmissionOverride()
 
 
-@dataclass(frozen=True)
-class OverrideEnded:
-    record: HeadAdmissionOverride
-    action: Literal["admitted", "lapsed"]
 
 
 @dataclass(frozen=True)
@@ -509,7 +477,6 @@ class BlockerNotRequested:
 class ProposedAdmission:
     rank: int
     spacing: StartSpacing
-    override: OverrideKept | OverrideEnded
 
 
 @dataclass(frozen=True)
@@ -1347,13 +1314,6 @@ class WaiterAdmission:
     state: QueuedWaiter | TokenWaitingWaiter
 
 
-def snapshot_head_override(override: HeadAdmissionOverride | NoHeadAdmissionOverride,
-                           ordered: list[tuple[Path, RankedWaiter]]) -> HeadAdmissionOverride | NoHeadAdmissionOverride:
-    candidate = first_queued_waiter(row for _, row in ordered)
-    if isinstance(override, NoHeadAdmissionOverride) or isinstance(candidate, NoWaiter):
-        return NoHeadAdmissionOverride()
-    path = next(path for path, row in ordered if records.waiter_owner(row) == records.waiter_owner(candidate.waiter))
-    return override if head_override_matches(override, path, candidate.waiter) else NoHeadAdmissionOverride()
 
 
 def queue_life_identity(row: Waiter) -> QueueLifeIdentity:
@@ -1695,7 +1655,6 @@ class HeadPolicy:
     walk: tuple[WaiterAdmission, ...]
     queued_head: QueuedHead | NoQueuedHead
     totals: AdmissionDecision
-    override: OverrideKept | OverrideEnded
     room: MemoryRoom | ReadingUnavailable
 
 
@@ -1929,12 +1888,8 @@ def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_s
     safety = policy.safety_bytes
     totals = AdmissionDecision("admit" if isinstance(room, MemoryRoom) and isinstance(inputs.pressure, NoPressureHold) else "hold",
         kept + safety, kept, safety, used, inputs.pressure, used + kept)
-    override = snapshot_head_override(inputs.override, ordered)
-    outcome: OverrideKept | OverrideEnded = OverrideKept(override)
-    if not isinstance(inputs.override, NoHeadAdmissionOverride) and isinstance(override, NoHeadAdmissionOverride):
-        outcome = OverrideEnded(inputs.override, "lapsed")
     admissions = admission_walk(inputs, ordered, queued_head, room, now, policy, kept, used, safety, next_start)
-    return HeadPolicy(tuple(admissions), queued_head, totals, outcome, room)
+    return HeadPolicy(tuple(admissions), queued_head, totals, room)
 
 
 def start_spacing_after(now: float, policy: AdmissionPolicy) -> NextStartAt:
@@ -1957,7 +1912,6 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         remaining, readable = room.signed_room, True
     else:
         remaining, readable = 0, False
-    available = inputs.host.available if isinstance(inputs.host, HostMemory) else 0
     claims = {slot.owner: slot for slot in inputs.slots if isinstance(slot, ContinuationSlot)}
     ordinary_head = first_queued_waiter(row for _, row in ordered if records.waiter_owner(row) not in claims)
     decisions: list[WaiterAdmission] = []
@@ -1967,7 +1921,6 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     ordinary_row = records.stored_waiter(ordinary_head.waiter) if isinstance(ordinary_head, QueuedWaiter) else NoWaiter()
     ordinary_owner = records.waiter_owner(ordinary_row) if not isinstance(ordinary_row, NoWaiter) else ""
     ordinary_need = ordinary_row["need"] if not isinstance(ordinary_row, NoWaiter) else 0
-    has_override = not isinstance(inputs.override, NoHeadAdmissionOverride)
     no_runs = not inputs.reservations and not inputs.slots
     new_started = False
     gpu = policy.gpu_tests
@@ -1990,12 +1943,9 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         protected_need = ordinary_need if ordinary_owner != owner and not reused else 0
         protected_need += protected_extra
         checked_room = remaining - protected_need
-        override = first and has_override
-        if override:
-            checked_room = available - safety - (room.agent_swap_demand if isinstance(room, MemoryRoom) else 0)
         fits = extra <= checked_room
-        basis: StartBasis = (WithinSlot() if within else OverrideRoom() if override and fits else
-                             Fits() if fits else StartsAlone() if alone else DoesNotFit())
+        basis: StartBasis = (WithinSlot() if within else Fits() if fits else
+                             StartsAlone() if alone else DoesNotFit())
         room_passes = not isinstance(basis, DoesNotFit)
         spacing = (inputs.spacing.at if isinstance(inputs.spacing, NextStartAt) and not due else
                    next_start.at if new_started else 0.0)
@@ -2091,10 +2041,8 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
         proposal: ProposedAdmission | NotAdmitted = NotAdmitted()
         if decision.state == "admit":
             spacing = inputs.spacing if decision.reused_slot else next_start
-            outcome = (OverrideEnded(inputs.override, "admitted") if first
-                       and not isinstance(inputs.override, NoHeadAdmissionOverride) else resolved.override)
             rank += 1
-            proposal = ProposedAdmission(rank, spacing, outcome)
+            proposal = ProposedAdmission(rank, spacing)
         blocker: BlockingIndex | NoSingleBlocker | BlockerNotRequested = BlockerNotRequested()
         if owner in inputs.blockers_for and decision.state == "hold" and isinstance(entry.state, QueuedWaiter):
             if not endings:
@@ -2261,7 +2209,6 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
                     min((item.waiter.need for item in line), default=0), max((item.waiter.need for item in line), default=0),
                     min((item.waiter.since for item in line), default=inputs.now)),
         inputs, tuple(row for _, row in ordered), inputs.reservations,
-        result.policy.override.record if isinstance(result.policy.override, OverrideKept) else NoHeadAdmissionOverride(),
         inputs.spacing, inputs.priority, room=result.policy.room, policy=policy)
     return QueueRead(view, explanation, ordered)
 
@@ -2540,7 +2487,7 @@ def reservation_identity(row: Reservation) -> WaiterIdentity:
 
 def build_queue_inputs(ordered: list[tuple[Path, RankedWaiter]],
                        reservations: list[tuple[Reservation, StepMemory]],
-                       readings: QueueSnapshotReadings, override: HeadAdmissionOverride | NoHeadAdmissionOverride,
+                       readings: QueueSnapshotReadings,
                        now: float, priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY,
                        unowned: tuple[UnownedSliceMemory, ...] = ()) -> QueueInputs:
     """Build queue evidence from supplied readings without external reads."""
@@ -2581,7 +2528,7 @@ def build_queue_inputs(ordered: list[tuple[Path, RankedWaiter]],
             run=activity.run if isinstance(activity, ScopeProcesses) else NoLiveBuildRun(),
             started_at=activity.started_at if isinstance(activity, ScopeProcesses) else 0.0))
     return QueueInputs(sorted(ordered, key=lambda item: waiter_order(item[1])), tuple(running), tuple(rows),
-                       readings.host, readings.pressure, readings.spacing, override, now, priority)
+                       readings.host, readings.pressure, readings.spacing, now, priority)
 
 
 def inputs_after_reservations_end(inputs: QueueInputs, live_reservations: set[str]) -> QueueInputs:

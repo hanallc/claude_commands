@@ -1159,25 +1159,6 @@ describe('accounts pane', () => {
     expect(fake.processes).toEqual([]);
   });
 
-  for (const close of ['showrunner:accounts', 'build:queue']) {
-    test(`closing ${close} preserves the accounts lifecycle`, async ($, on) => {
-      const fake = accountsHost(on);
-      await $.session.start(start);
-      await $.command.run(command());
-      await $.command.run(command(close, 'close'));
-      fake.clear();
-      fake.change(USAGE);
-      await fake.clock.advance(10_000);
-      expect(fake.accountRuns().length).toBe(close === 'showrunner:accounts' ? 0 : 1);
-      expect(fake.fs.includes(USAGE)).toBe(close !== 'showrunner:accounts');
-      await $.command.run(command(close === 'showrunner:accounts' ? 'build:queue' : 'showrunner:accounts', 'close'));
-      fake.clear();
-      await fake.clock.advance(60_000);
-      expect(fake.fs).toEqual([]);
-      expect(fake.processes).toEqual([]);
-    });
-  }
-
   for (const initial of [true, false]) {
     test(`${initial ? 'initial load' : 'refresh'} failure shows its reason and recovers on a watched change`, async ($, on) => {
       const fake = accountsHost(on);

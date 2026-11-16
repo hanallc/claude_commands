@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict
-from zoneinfo import ZoneInfo
 
 
 class CodeRootArguments(argparse.Namespace):
@@ -341,6 +340,7 @@ class RowQueueNotes(TypedDict):
     priority_text: NotRequired[str]
     ci_label: NotRequired[str]
     runs_on: NotRequired[str]
+    mac_text: NotRequired[str]
     runner: NotRequired[unit_labels.Runner]
     worker: NotRequired[str]
 
@@ -378,7 +378,6 @@ def head_room(check: admission_records.RoomCheck,
             if isinstance(room, admission_records.MemoryRoom) and room.agent_swap_demand else "")
     basis = ("It can start alone, because no build runs." if isinstance(check.basis, admission_records.StartsAlone) else
             "It fits in the memory it already holds." if isinstance(check.basis, admission_records.WithinSlot) else
-            "The user's admit does not count reserved memory." if isinstance(check.basis, admission_records.OverrideRoom) else
             "Free memory reading unavailable: " + room.reason if isinstance(room, admission_records.ReadingUnavailable) else "")
     return {"rows": rows, "note": " ".join(filter(None, (swap, basis)))}
 
@@ -1594,8 +1593,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "started_at": metadata.started_at if metadata is not None else 0,
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ())),
                      "queued": True, "keep_text": run_keep_text(hold, steps_by_owner.get(hold.memory.owner, ())), "group": "", "ci": False, "parts": [],
-                     "runs_on": local_runs_on(routes.fit(step.step, step.folder, step.package))
-                        if step is not None and not ci_label else ""})
+                     "runs_on": local_runs_on(routes.route(step))
+                        if step is not None and not ci_label else "",
+                     "mac_text": routes.line(step) if step is not None and not ci_label else ""})
     groups: dict[str, list[RunRow]] = {}
     remote_groups: set[str] = set()
     for entry in explanation.running:
@@ -1692,7 +1692,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         "reason": reason,
                         "fits": need <= captured.signed_room,
                         "runs_on": "" if ci_label else local_runs_on(
-                            routes.fit(waiter.step, waiter.folder, waiter.package))})
+                            routes.route(waiter)),
+                        "mac_text": "" if ci_label else routes.line(waiter)})
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
     if mac_status:
@@ -1707,9 +1708,15 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                          for build in mac_reading.builds)
     work_rows.sort(key=lambda row: row["started_at"])
     waiting_rows: list[WaitRow | CloudWaitRow] = list(waiters)
-    model = queue_view.QueueModel(
-        parsed, labels, admission_records.NoWaiter(), head_facts.PaceUnavailable(), ZoneInfo("UTC"),
-        queue_view.HostLoadUnavailable(), admission_records.NoWaiter(), names=names)
+    model = queue_view.QueueModel(parsed, labels, names=names)
+    slot_waiters: dict[wire.Owner, WaitRow] = {}
+    if isinstance(parsed, wire.CloudQueueRead):
+        for slot in parsed.repository_slots:
+            slot_row: WaitRow = {"name": slot.identity.step, "showrunner": slot.identity.name, "unit": slot.identity.unit,
+                "pid": slot.owner.pid, "detail": slot.wait.repository, "need": 0.0, "since": slot.since,
+                "reason": slot.wait.text, "fits": False, "runs_on": slot.machine}
+            slot_waiters[slot.owner] = slot_row
+        waiting_rows.extend(slot_waiters.values())
     cloud_slots_used = 0
     cloud_slots = 0
     if isinstance(parsed, wire.CloudQueueRead):
@@ -1738,7 +1745,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             else:
                 work_rows.append({**values, "started_at": cloud.started_at or cloud.since})
         work_rows.sort(key=lambda row: row["started_at"])
-        waiting_rows = [cloud_waiters[entry.owner] if isinstance(entry, wire.CloudRow) else waiters[entry.position - 1]
+        waiting_rows = [cloud_waiters[entry.owner] if isinstance(entry, wire.CloudRow)
+                        else slot_waiters[entry.owner] if isinstance(entry, wire.RepositorySlotRow) else waiters[entry.position - 1]
                         for entry in queue_view.waiting_builds(model)]
     unmatched_priority_text = ""
     queued_priority_units: list[str] = []

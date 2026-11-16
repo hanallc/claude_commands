@@ -629,24 +629,6 @@ class NoQueuePriority:
 NO_QUEUE_PRIORITY = NoQueuePriority()
 
 
-class HeadAdmissionOverride(TypedDict):
-    waiter: str
-    pid: int
-    start_time: str
-    unit: str
-    step: str
-    need: int
-    free: int
-    reserve: int
-    why: str
-    set_by: str
-
-
-@dataclass(frozen=True)
-class NoHeadAdmissionOverride:
-    pass
-
-
 def queue_command_actor() -> str:
     """Identify the user command without a session-role check."""
     return os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or "user"
@@ -742,15 +724,10 @@ class WithinSlot:
 
 
 @dataclass(frozen=True)
-class OverrideRoom:
-    pass
-
-
-@dataclass(frozen=True)
 class DoesNotFit:
     pass
 
-StartBasis = Fits | StartsAlone | WithinSlot | OverrideRoom | DoesNotFit
+StartBasis = Fits | StartsAlone | WithinSlot | DoesNotFit
 
 
 @dataclass(frozen=True)
@@ -1080,7 +1057,6 @@ class QueueExplanation:
     policy: AdmissionPolicy = field(kw_only=True)
     ordered: tuple[RankedWaiter, ...] = ()
     reservations: tuple[Reservation, ...] = ()
-    override: HeadAdmissionOverride | NoHeadAdmissionOverride = NoHeadAdmissionOverride()
     spacing: StartSpacing = ReadyToStart()
     priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY
     room: MemoryRoom | ReadingUnavailable = ReadingUnavailable()
@@ -1095,7 +1071,6 @@ class QueueInputs:
     host: HostMemory | ReadingUnavailable
     pressure: Pressure
     spacing: StartSpacing
-    override: HeadAdmissionOverride | NoHeadAdmissionOverride
     now: float
     priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY
     blockers_for: frozenset[str] = frozenset()
@@ -1234,7 +1209,6 @@ class MemoryConfig:
     unreachable_limit_seconds: float
     source_check_seconds: float
     source_settle_seconds: float
-    override_reconnect_seconds: float
     request_max_bytes: int
     program_first_peaks: Mapping[str, int]
     program_sample_seconds: float
@@ -1336,7 +1310,7 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 reading_alert_seconds=number("reading_alert_seconds"),
                 unreachable_limit_seconds=number("unreachable_limit_seconds"),
                 source_check_seconds=number("source_check_seconds"),
-                source_settle_seconds=number("source_settle_seconds"), override_reconnect_seconds=number("override_reconnect_seconds"),
+                source_settle_seconds=number("source_settle_seconds"),
                 request_max_bytes=whole("request_max_bytes"), program_first_peaks=first_peaks,
                 program_sample_seconds=number("program_sample_seconds"), program_stop_seconds=number("program_stop_seconds"),
                 peak_wave_seconds=number("peak_wave_seconds"))

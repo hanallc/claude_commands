@@ -1246,15 +1246,6 @@ def hold_event(args: list[str]) -> None:
     store.append_line(store.host_file(host, instant.timestamp()), record)
 
 
-def head_admission(action: Literal["set", "admitted", "lapsed"], unit: str, step: str,
-                   need: int, free: int, reserve: int, why: str, set_by: str, at: float) -> None:
-    host = store.host_name()
-    store.append_line(store.host_file(host, at), {
-        "kind": "head_admission", "v": RECORD_VERSION,
-        "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
-        "action": action, "unit": unit, "step": step, "need": need, "free": free,
-        "reserve": reserve, "why": why, "set_by": set_by,
-    })
 
 
 def queue_priority(action: Literal["set", "clear"], unit: str,

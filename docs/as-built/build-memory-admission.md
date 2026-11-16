@@ -87,23 +87,20 @@ The next check handles an unusable cloud setting like other unusable settings.
 The API supplies `progress_profile.publish_counter` for the route to write module counts.
 The service removes the progress files when the reservation ends.
 
-The queue pane and the build page show each cloud gate in the main table.
+The Builds page shows each cloud gate in the main table.
 A running row shows machine `aws` and its vCPU count.
-The queue pane's last column shows the state, module count, and failed modules.
 On the build page, a cloud row with a module counter draws the local rows' progress line.
 Small text under the line shows the module count and failed modules.
 The page omits the state `running` and shows any other state first.
 A waiting row shows `cloud` in the # column and its slot wait text.
 Its machine and vCPU cells stay blank.
-The queue pane's Head line shows `cloud N of M slots`.
 When no step waits, the build page's queue summary hover shows `AWS: N of M slots in use`.
-The selected cloud step card keeps its `Cloud` lines.
 Missing progress and module counts have explicit display states.
 `cloud_gate_stale_pushes=3` sets the update age threshold in `config/build_admission.conf`.
 The queue reading carries the checked threshold to the display.
 The display reads the push interval from `conf.read("cloud_gate").number("log_push_s")`.
 An older update shows `no update for <age>` in red.
-The display uses one age formatter for the table, the card, and the feed.
+The Builds page uses one age formatter for its rows.
 `CloudPushIntervalUnavailable` names an unavailable push interval.
 The display omits the stale age when the push interval is unavailable.
 
@@ -300,14 +297,13 @@ After a restart, the service restores live run places and removes ended run plac
 `admission_protocol.py` defines every request and reply. `admission_client.py` handles connections, retries, wait output, and bounded queries.
 `step_estimator.py` owns the estimates. `admission_records.py` owns the shared records, configuration, and wait phrases.
 
-The queue Step column and cards show the project before the step, such as `nateroids nextest`.
+The Builds page shows the owner unit with the step name, such as `nateroids nextest`.
 A step without a project name shows only the step.
 An absolute repository path does not supply a project name.
 Matching and history retain the original step name.
 The queue omits a live unowned scope when its run has no reservation and keeps no memory.
 A run with a memory hold shows through that hold.
 The services block and the block for processes from ended builds remain visible.
-The card selector still finds an unowned run by its owner.
 The memory page keeps this memory in Other.
 `memory_admit.py` owns the readers, pure admission rules, projection, and finalizer.
 
@@ -353,7 +349,7 @@ Queries project the stored `PassResult` through `queue_read_from_pass`. A releas
 `queue_read()` supplies one `QueueRead` for the complete queue page.
 A failed query raises `AdmissionUnavailable` within the query bound. Commands print `build queue: admission service unavailable: <reason>` and exit 2.
 `/build:page` shows the running and waiting steps, memory use, wait reasons, priority, and cloud slot counts.
-The page and the queue pane show the same saved Mac idle alert first, in red.
+The Builds page shows the saved Mac idle alert first, in red.
 The feed reads it through `mac_idle_alert.alert_line()` and sends its text in `mac_idle_alert`.
 An empty value hides the alert on the page.
 The feed uses `head_facts.priority_text()` for the page's `priority_text` line.
@@ -365,7 +361,7 @@ AWS runs only the ~/.claude test gate. A cloud gate shows `AWS (natedev only whe
 When memory holds the first step in line, its hover adds a `First in line` table.
 The table starts at free RAM and subtracts each term that is not zero: the safety net, swap coming back, build reserved, and RAM held for other waiting steps.
 It ends with free and the need.
-`queue_evidence.room_terms()` gives the terms to the table and to the queue pane's Head line.
+`queue_evidence.room_terms()` gives the memory amounts to the Builds page.
 The memory bar divides the machine's RAM into three groups, in this order:
 1. Builds: build tools, queued builds, and hana CI.
 2. Free RAM: build reserved, free, and system reserved. System reserved is the safety net and swap coming back.
@@ -381,22 +377,13 @@ The status line under the free amount names one cause, in this order:
 3. Nothing free: a shortfall, or reserves that use all free RAM.
 4. The GPU test slot. When free does not cover the step's need, the line also names the need and free.
 5. One running build that leaves too little free.
-The unit-board queue pane keeps `build_queue.py --json` and its selected cards.
-A position, session, folder, or `mine` selects cards in the pane.
-The pane resolves labels once and reads optional history once through `head_facts.read_head_facts()`.
-A view request without `--json` exits 3 with `build queue: the queue view is on the build page; run /build:page`.
-The controls `bump`, `clear`, and `admit-head` remain available.
-`queue_evidence.py` formats the recorded need, run keep-aside, room calculation, head cause, and release advice.
-The card uses the reply's policy and limits. It reads no current admission configuration to reinterpret the reply.
-The evidence includes host RAM, optional load, run needs, swap-backed use, held slots, keep-asides, room, and start spacing.
-It also includes estimate history, shape tiers, failed-peak floors, factors, recorded limits, package, filters, width, and completed CPU-token waits.
-A missing optional record remains unknown. Queue arrival and time waiting use `joined_at`. Start spacing has its own deadline.
-Admission and release calculations remain in `memory_admit.py`. An expired estimate requires a client refresh through the service.
-The pane prints priority and unowned memory once in the queue view.
-It prints shared evidence once below the selected cards.
-`build_why.py` and its command are removed. There is no alias.
-The pane keeps the last successful page after a failed refresh.
-A failed first query shows `Build queue could not be read.`
+Use `/build:page` for the queue view and admission evidence.
+Use `/build:bump <position|session|folder>` to set a waiting unit's priority.
+Use `/build:bump clear [unit]` to remove priority.
+`queue_evidence.py` formats the recorded memory amounts for the Builds page and memory reports.
+Admission and release calculations remain in `memory_admit.py`.
+The codec supplies an inactive legacy `QueueInputs.override` field for pinned clients.
+An expired estimate requires a client refresh through the service.
 
 | Request | Result |
 | --- | --- |
@@ -406,15 +393,13 @@ A failed first query shows `Build queue could not be read.`
 | `width` | Record the requested test width |
 | `token_wait` | Finalize a reservation and preserve its queue place |
 | `priority_set`, `priority_clear` | Change the one unit priority |
-| `admit_head` | Waive existing keep-asides for the head when free memory permits |
 | `view`, `explain`, `mine` | Read the stored pass |
 
-`/build:queue bump <position|session|folder>` uses the card's selector resolver to select a waiting step.
+`/build:bump <position|session|folder>` selects a waiting step by position, session, or folder.
 It sets priority for that step's unit. An unmatched selector exits 3 without a priority change.
 The service refuses `priority_set` when no waiting step or current reservation belongs to the unit.
-The queue commands `bump`, `clear`, and `admit-head` work from any session or a plain shell.
+`/build:bump` works from any session or a plain shell.
 `queue_command_actor()` selects `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`, then `"user"`.
-The pane passes its session id to mutating commands. Read-only commands keep their existing environment.
 
 Mutation requests have replay ids. The service persists each terminal reply before delivery.
 A replay returns the same reply. Live grants remain in the ledger until their reservation ends.
@@ -427,7 +412,7 @@ Unavailable settings produce refusals rather than replacement policy values.
 
 ### Durable state and lifetime
 
-`admission/state.json` holds reservations, waiter places, episodes, queue priority, head override, start spacing, and the replay ledger.
+`admission/state.json` holds reservations, waiter places, episodes, queue priority, start spacing, and the replay ledger.
 It also holds placement requests, assignments and current attempt keys.
 `SavedPlacementAssignment` retains assignment state, launch permission, exact provider reference, consumed holder identity, and retry decision.
 It also retains a terminal report intent until fresh provider evidence permits settlement.
@@ -463,7 +448,7 @@ The finalizer matches `reservation_id` to prevent a duplicate history row after 
 The finalizer records completed measurements for history. Release creates the run slot without changing the accepted need.
 
 At the first start without `state.json`, the service imports the old admission files through their existing readers.
-It imports live reservations, saved intents, waiter places, token handoffs, priority, head override, and start spacing.
+It imports live reservations, saved intents, waiter places, token handoffs, priority, and start spacing.
 It writes state before it deletes imported files. Later starts import nothing.
 The old `.waiting`, `.reservation`, `.token-wait`, and `queue_priority.json` forms have no live writer.
 There is no admission lock.
@@ -566,7 +551,7 @@ The gate reports its first need as a fallback and explains any matching anonymou
 The queue model reads the step names once from `config/build_steps.conf`.
 Renderers use its `StepNames` value without file reads.
 Other sentences read the step names when they need the text.
-Queue tables and cards use the prose name, including `targeted test` for `targeted-test`.
+The Builds page uses the configured step name, including `targeted test` for `targeted-test`.
 `step_promise` gives every admitted step a `LifetimePromise` until it ends.
 The run calculation uses the accepted need before tests start.
 For nextest, an observed test phase can select the frozen test-phase need instead.
@@ -839,7 +824,7 @@ Without a stored need or observed test window, need remains the full step estima
 The existing keep-aside formula remains `max(0, need − swap-backed use)`.
 For a 12 GiB step, 3 GiB test use, and 3 GiB history need, margin 1.2 gives 3.6 GiB need.
 That run keeps 0.6 GiB aside instead of 9 GiB.
-The queue view, card, build-why, and memory page use the keep-aside captured by the last pass.
+The Builds page uses the keep-aside from the last admission pass.
 Build-why explains the selection: `tests started: need X (test peak Y, history N x 1.2)`.
 No test-phase estimate worker remains.
 
@@ -918,7 +903,6 @@ Under systemd, the service then runs the new code in the same process with `exec
 It sends `RELOADING=1` before `execv` and `READY=1` when the new listener is ready, so the systemd restart delay does not apply.
 A failed start of the new code exits, and `Restart=always` starts the service again.
 A service started without `LISTEN_FDS` stops on a source change and does not run `execv`.
-A restored head override receives reconnect grace only after the listener is ready.
 `down-alert` waits `silence_seconds` and claims `build-admission`.
 It sends the outage message to the `builds` session first.
 The message names the journal command and the restart command.
@@ -988,7 +972,10 @@ Install on natedev from the repo root with `scripts/build_hold/install_cargo_wra
 
 `verify.sh` also times the `cargo` board-token acquisition and passes it as `BUILDLOG_TOKEN_WAIT_S`. The clock is Bash's `$SECONDS`, or the integer in `UNIT_TOKEN_CLOCK_FILE` when set, so a test advances a file instead of sleeping. A wait that times out exits 1 before any call is recorded, so its time is in no row.
 
-Queue-priority commands accept only unit labels in the local roster. Only sessions with a real unit supply membership; the no-unit display placeholder supplies none. Unknown units, including that placeholder, leave the old priority unchanged and return `build queue: unknown unit <unit>; the queue priority did not change` on stdout with exit 3. The pane shows this through its existing refusal protocol. Callers pass a unit as `--unit=<unit>`, including names that start with `-`. The pane passes its own session id to the command. Each card shows the stored priority reason once and counts priority steps as `N of <unit> (queue priority)`; old per-step bump records are not card reasons. Clearing an unreadable priority file removes it and names the removed file.
+`/build:bump` resolves the waiting step's recorded unit before it checks roster labels.
+The no-unit display placeholder supplies no unit.
+Unknown units keep the saved priority and return exit 3 with a refusal on stdout.
+The Builds page shows the saved priority order and reasons.
 
 Durable `Waiter` rows keep their join and token clocks. `RankedWaiter.order` holds `PriorityUnit` or `NormalOrder` only in the resolved queue. Priority transitions decode to `SettledPriority` or `PendingPriorityTransition`; a pending transition keeps its id and saved month-log offset through retries. One cleanup guard isolates both a failed token-wait intent and failed dead-owner reservation finalization. Each failure logs its record path and keeps the record for the next poll; other cleanup and admission continue.
 
@@ -1773,15 +1760,11 @@ A durable waiter has no `priority_rank` or resolved `order` field.
 The order is priority, the step's original order time, then pid.
 Token waiters keep their clocks and places but cannot protect room as the head.
 `TokenWaitersOnly` distinguishes a token-only queue from an empty queue.
-The renderers use the eligible head's position and token history.
 
 Priority accepts real roster units, including units without a waiting step.
 The no-unit display placeholder is not a unit.
 Unassigned sessions retain `NormalOrder`, including with an old placeholder priority record.
-The pane passes its session id explicitly.
 Unknown units return exit 3 with a stdout line starting `build queue: `.
-Cards show `N of <unit> (queue priority)` once and use the saved reason.
-Legacy move rows do not replace that reason.
 
 `SettledPriority` and `PendingPriorityTransition` name the priority publication states.
 A pending transition saves its log offset before the service publishes state.
@@ -1871,7 +1854,7 @@ The first eligible run follows queue priority, first run arrival, and PID.
 A younger run starts only if its need fits room minus the first run's need.
 Pressure or unreadable pressure holds new starts and extra memory only while it lasts.
 An unreadable pressure file shows `pressure unreadable: <path>` with a short error or `incomplete` when available.
-The client, card, and queue explanation retain that reason. The queue marker says `pressure unreadable`.
+The client and the queue explanation retain the pressure failure reason.
 An unreadable host memory reading retains its recorded reason too.
 If an unreadable reading holds queued starts for `reading_alert_seconds`, currently 300 seconds, the service sends one message to `natedev`.
 The message names the path and the hold time. `natedev` owns machine recovery and any later phone alert.
@@ -1892,16 +1875,15 @@ A closed connection frees its claim. An idle slot expires or ends with its verif
 Repeated release cannot recreate a slot. A standalone request has no reusable slot.
 Slots are not saved. Restart keeps active reservations and run order, but drops handoffs and waiting extras.
 
-`queue_evidence.room_text` supplies the captured cap calculation to the view, card, and memory report.
-The view shows zero room during a shortfall and records that shortfall in the cap explanation.
-The queue view and cards show captured process ids as `pid N` for each process row.
+`queue_evidence.room_text` supplies the saved cap calculation to the Builds page and the memory report.
+The Builds page shows zero room during a shortfall and records the shortfall in the cap explanation.
 The memory page shows `Stage`, `Duration`, `Unit`, `Pid`, `Machine`, and `vCPU` for running rows.
 The first column shows `building` or `testing` from the recorded progress counter.
 A natedev row shows `waiting for jobserver tokens` while its nextest step waits for test tokens; its `Done` cell shows `—`.
 `progress_profile.token_wait_line` prints the wait line in `nextest_tokens.py`, and `CounterParser` reads it from the step log as `NoCounter.token_wait`.
 The wait ends at the next line, which reports the tokens taken.
 `NoCounter.token_wait` is an optional field, so the counter wire union does not change for pinned clients.
-`build_queue.py --json` shows it in the running step's `measured.counter`.
+The admission reading stores it in the running step's `measured.counter`.
 A row without a counter shows `—`.
 Local builds, merge gates, and cloud rows use their recorded counters.
 hana CI currently has no admission counter.
@@ -1967,7 +1949,7 @@ A narrow view omits the machine column before it reduces name space.
 Waiting rows have no machine value. Services lines do not change.
 The admission service admits each running step on its own machine. No per-row protocol field is added.
 `keep_aside_text` explains each admitted run's need, swap-backed use, slot bytes, and kept bytes.
-`RoomCheck.basis` records `Fits`, `StartsAlone`, `WithinSlot`, `OverrideRoom`, or `DoesNotFit` in the admission walk.
+`RoomCheck.basis` records `Fits`, `StartsAlone`, `WithinSlot`, or `DoesNotFit` in the admission walk.
 `admission_pass` records one `HeadCause` on `HeadAdmissionStatus`.
 `HeadExplanation` retains that cause for the view and release advice.
 The formatters read the captured cause and room without a second room calculation.

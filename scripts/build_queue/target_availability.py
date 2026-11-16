@@ -12,9 +12,11 @@ from datetime import tzinfo
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, final
 
-from scripts.build_queue.admission_records import PackageNotRecorded
+from scripts.build_queue.admission_records import PackageNotRecorded, PidNotRecorded, RunningStep, WaitingStep
 from scripts.build_targets import build_targets, targets
 from scripts.build_targets.target_config import ConfigError, ExcludedTarget, SshTarget
+from scripts.direct import step_record
+from scripts.direct.step_selection import Pinned
 from scripts.message import unit_labels
 
 if TYPE_CHECKING:
@@ -90,8 +92,7 @@ def unavailable_row(target: str, reason: str) -> TargetRow:
 
 DYNAMIC_REASONS = frozenset({"backoff", "state"})
 # Plain words for the static Mac exclusions; other reasons show as recorded.
-EXCLUSION_TEXT = {"off": "Mac offload is off", "repo": "this repository does not run on the Mac",
-                  "linux_only": "this package runs only on Linux"}
+EXCLUSION_TEXT = {"off": "Mac offload is off", "repo": "this repository does not run on the Mac"}
 
 
 @dataclass(frozen=True)
@@ -129,6 +130,38 @@ class MacRoutes:
         self.labels: Mapping[str, unit_labels.UnitLabels] = labels
         self.zone: tzinfo = zone
         self.policies: dict[tuple[str, str | PackageNotRecorded, str], TargetFit | None] = {}
+        self.records: dict[int, step_record.StepRecord] = {record.pid: record for record in step_record.live_records()}
+
+    def route(self, step: WaitingStep | RunningStep) -> TargetFit | NoMacTarget:
+        """Read the recorded route before the live Mac state."""
+        record = self.records.get(step.pid) if not isinstance(step.pid, PidNotRecorded) else None
+        if record is None:
+            return NotAllowed("a direct cargo command runs where it starts")
+        if isinstance(record.runs_on, step_record.NatedevOnly):
+            reason = record.runs_on.reason
+            if reason == "step writes the tree":
+                reason = f"{step.step} edits this checkout on natedev"
+            elif reason == "linux_only":
+                reason = f"{step_record.package_name(record.package) or 'this workspace'} is Linux only"
+            return NotAllowed(reason)
+        if isinstance(record.selection, Pinned) and not record.runs_on.mac_targets:
+            return NotAllowed(f"this step is pinned to {record.selection.target}")
+        if record.runs_on.mac_targets:
+            mac = self.mac
+            fit = (self.state_fit(mac.states[0]) if isinstance(mac, targets.TargetSnapshot)
+                   else FitUnreadable(mac.reason) if isinstance(mac, SnapshotsUnreadable) else mac)
+        else:
+            fit = self.fit(record.kind, str(record.repo), step_record.package_name(record.package))
+        return fit
+
+    def line(self, step: WaitingStep | RunningStep) -> str:
+        """Format the route reason for every page reader."""
+        fit = self.route(step)
+        if isinstance(fit, Allowed):
+            return "Mac: " + fit.note
+        if isinstance(fit, (NotAllowed, FitUnreadable)):
+            return "Mac: no, " + fit.reason
+        return "Mac: no, no Mac target is configured"
 
     def fit(self, step: str, folder: str, package: str | PackageNotRecorded) -> TargetFit | NoMacTarget:
         mac = self.mac
@@ -136,7 +169,8 @@ class MacRoutes:
             return FitUnreadable("Mac state unreadable, " + mac.reason)
         if isinstance(mac, NoMacTarget):
             return mac
-        kind = build_targets.recorded_step_kind(step)
+        kind = (step if step in step_record.KINDS
+                else build_targets.recorded_step_kind(step))
         if isinstance(kind, build_targets.KindNotOffloaded):
             return NotAllowed("this step kind does not run on the Mac")
         rule = build_targets.step_routing_rule(kind)
@@ -158,7 +192,8 @@ class MacRoutes:
                 result = build_targets.step_policy(mac.target, Path(folder), name, kind, backoff=mac.backoff)
                 fit: TargetFit | None = None
                 if isinstance(result, ExcludedTarget) and result.reason not in DYNAMIC_REASONS:
-                    reason = EXCLUSION_TEXT.get(result.reason, result.reason)
+                    reason = (f"{name or 'this workspace'} is Linux only" if result.reason == "linux_only"
+                              else EXCLUSION_TEXT.get(result.reason, result.reason))
                     if isinstance(package, PackageNotRecorded) and result.reason == "linux_only":
                         reason += "; package not recorded"
                     fit = NotAllowed(reason)

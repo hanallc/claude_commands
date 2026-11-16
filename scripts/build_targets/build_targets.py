@@ -335,8 +335,6 @@ def step_routing_rule(kind: CommandKind, routing: Routing = ANY_ELIGIBLE_TARGET,
         return NatedevOnly(routing.reason)
     if isinstance(selection, Pinned):
         return AnyTarget()
-    if kind == "build":
-        return NatedevOnly("makes natedev artifacts")
     if kind == "final":
         return NatedevOnly("full gate runs on natedev")
     return AnyTarget()

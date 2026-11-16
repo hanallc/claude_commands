@@ -120,7 +120,7 @@ Codex rows:
 
 - `UnitLabels` shows the parent showrunner row's `name` and the unit row's `name`.
   A stopped showrunner keeps its staff name. `—` marks a missing part.
-- `unit_labels(entries) -> dict[str, UnitLabels]` keys a full roster's entries by Claude session id and Codex thread id. `/build:queue` uses it (`docs/as-built/build-memory-admission.md`, "Queue API").
+- `unit_labels(entries) -> dict[str, UnitLabels]` keys a full roster's entries by Claude session id and Codex thread id. The Builds page uses it (`docs/as-built/build-memory-admission.md`, "Queue API").
 - `unit_labels_for(session_ids, environment) -> dict[str, UnitLabels]` resolves Claude session ids and Codex thread ids.
   It reads session records, the showrunner registry, staff membership, and backend evidence.
   Staff parent rows select each worker's director and showrunner.

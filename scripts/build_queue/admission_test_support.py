@@ -859,7 +859,7 @@ def queue_decision(available: int, total: int | records.UnknownHostTotal, need: 
     slots = () if reservations else (blocking_slot(NOW),)
     row: records.Waiter = {"pid": 1000, "start_time": "1000", "need": need, "since": NOW}
     inputs = records.QueueInputs([(Path("1000.waiting"), row)], tuple(steps), tuple(reservations),
-        records.HostMemory(available, total), pressure, records.ReadyToStart(), records.NoHeadAdmissionOverride(), NOW, slots=slots)
+        records.HostMemory(available, total), pressure, records.ReadyToStart(), NOW, slots=slots)
     return gate.admission_pass(inputs, NOW, policy).rows[0].decision
 
 
