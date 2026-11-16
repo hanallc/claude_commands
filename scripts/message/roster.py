@@ -393,7 +393,7 @@ def shown_name(entry: RosterEntry) -> ShownName:
     address = _address(entry) or _session_address(entry)
     return ShownName(ProductionPart(production) if production else NoProduction(),
                      UnitPart(unit) if unit else NoUnit(), job, address or entry.name,
-                     entry.registry_name if entry.kind == "claude" and entry.role == "freestanding" and not entry.name
+                     entry.registry_name if entry.kind == "claude" and entry.role == "freestanding"
                      else NoRegistryName())
 
 
