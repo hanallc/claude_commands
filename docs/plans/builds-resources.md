@@ -2639,42 +2639,26 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 **Gotchas:** `kill -TERM -- -<supervisor pid>` now ends only the supervisor; use the `stop` verb. A `timeout` child that leaves the command group needs its own group stop.
 
 ### Phase 130 — The cutover deletes each free legacy gate folder after a Git rescue  · status: done
-**Source:** builds showrunner 2026-11-15, from the build-folders schedule (queue, `6a828e30c`): "a one-time run on natedev that deletes each ~/worktrees/gates folder whose lock has no holder (309 GiB on the system drive) … make it rescue Git work first, the same as the slot cleanup."
-**Depends on:** build-folders Phase 4 on main (batch656, `e75b8ec06`; it brings `scripts/lib/git_rescue.py`, and no writer uses `~/worktrees/gates` after it). The run is on Thu 11-19, cutover day.
 
-#### Work Order
+#### As-built
 
-**Goal:** one command deletes each free legacy gate folder under a given root after it rescues Git work, and `--dry-run` prints each decision with no change.
+- `scripts/lint/gate_folders_delete.py --root <path> [--dry-run]` is a one-time cutover command. It reads no config key.
+- For each `<root>/<repository>/<gate>` it holds `scratch.removal_lock(gate)`, or `scratch.judgment_lock(gate)` with `--dry-run` (it creates no file). A held lock keeps the gate as busy.
+- Under the lock it keeps a gate that holds its own repository (a `.git` folder), or a linked worktree whose common Git directory lies inside the gate. Otherwise it rescues each linked worktree with `git_rescue.rescue(worktree, f"{name}-{stamp}", generated=[worktree / "target"])`. A `RescueError` keeps the gate.
+- It then deletes the gate and runs `git worktree prune --expire now` once in each source repository. It deletes empty repository folders. Dot-entries, files and symlinks at the root are kept.
+- Each decision prints one line: `deleted|would delete <path>: <n> GiB[; prune failed <source>: <error>]` or `kept <path>: <reason>`. Sizes use `sweep.gib`.
+- A filesystem error keeps that folder, and the run continues. The exit status is 1 when a gate is kept for a rescue failure or a filesystem error, or a prune fails; busy, repository and root-entry keeps give 0.
+- No signal handler, mask or disposition.
 
-**Measured (2026-11-15 22:40 EST):** `~/worktrees/gates` holds 46 gate folders in 12 repository folders; `checkout` and `reload` are empty. Each gate folder holds only `.claude-busy`, `.gate.json` and `target`. No `.git` is in the top 6 levels. The root also holds `.remote-mirrors` (copies' remote mirror records) and an empty `.claude`.
+**Files:** `scripts/lint/gate_folders_delete.py`, `scripts/lint/test_gate_folders_delete.py` (real Git fixtures under a temporary root).
 
-**Spec:**
-1. Add one script, `scripts/lint/gate_folders_delete.py`. It takes `--root <path>` (required) and `--dry-run`. It reads no config key: `copies.root` goes at the same cutover.
-2. For each `<root>/<repository>/<gate>` folder, hold `scratch.removal_lock(folder)`, or `scratch.judgment_lock(folder)` with `--dry-run`, as `folder_audit.py` does. A held lock keeps the folder and prints `kept <path>: busy`. (Resources 11-16: `removal_lock` holds the lease, the busy marks and the leases below the folder through the removal; `judgment_lock` creates no file, which a dry run needs.)
-3. Under the lock, find each Git checkout in the folder:
-   - A linked worktree: `git_rescue.rescue(path, name, generated=[path / "target"])`, as `build_slots._rescue` does. A `RescueError` keeps the folder and prints the error.
-   - A repository with its own `.git` folder: keep the folder. A ref inside a deleted repository saves nothing.
-4. Delete the free folder while the lock is held. Then delete an empty repository folder. Print each deleted path and its size.
-5. Keep `.remote-mirrors`, every other dot-folder and every file at the root. Print them as kept.
-6. `--dry-run` prints each decision and deletes nothing.
-7. Add no signal handler, mask or disposition. The cutover removal commit deletes the script after the run.
-
-**Files:**
-- `scripts/lint/gate_folders_delete.py` — new: the one-time delete command.
-- `scripts/lint/test_gate_folders_delete.py` — new: fixture tests for the acceptance gate.
-
-**Workers:** `1 writer + 1 tester`
-- `impl` — `scripts/lint/gate_folders_delete.py`.
-- `test` — `scripts/lint/test_gate_folders_delete.py`, from the Spec alone. Fixtures live under a temporary root; no test reaches `~/worktrees/gates`.
-
-**State:** deletes gate folders and empty repository folders under `--root`; writes `refs/rescue/` refs in each linked worktree's source repository.
-
-**Exact command (natedev, Thu 11-19):**
+**Binds later work:** the cutover run on natedev, Thu 11-19, after build-folders Phase 4 is on main:
 1. `~/.claude/scripts/lib/py ~/.claude/scripts/lint/gate_folders_delete.py --root ~/worktrees/gates --dry-run`. Read each line.
-2. `~/.claude/scripts/lib/py ~/.claude/scripts/lint/gate_folders_delete.py --root ~/worktrees/gates`.
-3. Run step 2 again after each busy folder's task ends.
+2. The same command without `--dry-run`.
+3. Run step 2 again after each busy gate's task ends.
+The cutover removal commit deletes the script after the run.
 
-**Acceptance gate:** fixture tests: a free folder goes; a held `.claude-busy` keeps its folder; a linked worktree with edits gets a `refs/rescue/` ref in its source before deletion; a rescue failure keeps the folder; a folder with its own repository stays; `--dry-run` deletes nothing; `.remote-mirrors` stays. Run `scripts.lint.test_gate_folders_delete`; basedpyright 0/0 on both files.
+**Gotchas:** a `.git` file does not prove that the Git store is outside the gate (`git init --separate-git-dir`); resolve the common directory first. Rescue refs stay in each source under `refs/rescue/`.
 
 ### Phase 131 — The disk-floor sweep measures and alarms; it deletes nothing  · status: todo
 **Source:** build-folders Phase 8 (stall watch and alarm-only sweep), the resources part. builds showrunner 2026-11-15. Devtools owns the stall watch and `folder_audit.py`.
