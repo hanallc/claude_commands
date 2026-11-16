@@ -134,8 +134,11 @@ The server deletes unclaimed images after `change_image_unclaimed_days`, which s
 All merge callers use `list_ready` after the final promotion step succeeds, including the Mac pull.
 It fetches `origin main` and scans merge commits from 2026-11-06.
 It adds each uncovered checkpoint line, including after an interrupted call.
-A row covers the same change when its merge contains that checkpoint.
-A row without a known merge also covers that change.
+A row covers a text-matched change when its merge contains that checkpoint or its merge is unknown.
+An edited row covers a change from the same merge only when its Producer matches the checkpoint unit's fixed staff id.
+Within each producer, pair ready changes first, in commit order.
+Pair held changes next only when all uncovered held changes for that producer wait on one step.
+An empty Producer cell or an unknown checkpoint producer permits only text matching.
 A later fix can add a new row with the same words.
 A failed fetch prints one error line and adds nothing.
 The `append` and `drift` actions are removed.
