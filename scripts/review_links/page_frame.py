@@ -5,6 +5,25 @@ from __future__ import annotations
 import html
 import re
 
+REFRESH_SCRIPT = r'''function createPageRefresh(load,seconds=()=>0){
+ const paused=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;
+ let timer;
+ function refresh(supersede=false){if(!paused()) return load(supersede);}
+ function restart(){
+  clearInterval(timer);
+  if(!paused() && Number(seconds())>0) timer=setInterval(()=>refresh(),Number(seconds())*1000);
+ }
+ document.addEventListener('visibilitychange',()=>{restart();refresh(true);});
+ window.addEventListener('message',event=>{
+  if(event.source===parent && event.origin===location.origin && event.data==='console-shown'){
+   restart();refresh(true);
+  }
+ });
+ restart();
+ return {restart,refresh};
+}
+'''
+
 CODE_BLOCK = re.compile(r"(?m)^[ \t]*```[^`\n]*\n([\s\S]*?)\n[ \t]*```[ \t]*(?=\n|$)"
                         + r"|^[ \t]*`([^`\n]+)`[ \t]*(?=\n|$)")
 

@@ -477,6 +477,15 @@ class LocalCopyTests(unittest.TestCase):
         self.assertEqual(made, fix_return.InPlace())
         self.assertFalse(self.target.exists())
 
+    def test_repository_with_no_berth_ledger_fixes_in_place(self) -> None:
+        missing = berth_board.BoardUnavailable("the cargo-berth ledger is not initialized", ledger_missing=True)
+        with (patch("scripts.mac_test.fix_return.shutil.which", return_value="/bin/cargo-berth"),
+              patch.object(berth_board, "read_board", return_value=missing)):
+            self.assertEqual(fix_return.read_board(self.worktree), UNCONFIGURED)
+            made = fix_return.make_copy(self.worktree, self.metadata, os.getpid())
+        self.assertEqual(made, fix_return.InPlace())
+        self.assertFalse(self.target.exists())
+
     def test_unavailable_board_fails(self) -> None:
         self.board = berth_board.BoardUnavailable("ledger unreadable")
         made = fix_return.make_copy(self.worktree, self.metadata, os.getpid(), self.read)

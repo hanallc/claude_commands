@@ -17,7 +17,7 @@ use crate::unicode_tables::WORD;
 /// The Python token kinds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum TokenKind {
+pub(crate) enum TokenKind {
     Identifier,
     Literal,
     Punctuation,
@@ -27,13 +27,14 @@ enum TokenKind {
 /// One code token, with the line and the code-point offset where it starts.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct Token {
-    value: String,
-    kind:  TokenKind,
-    line:  usize,
-    start: usize,
+    pub(crate) value: String,
+    pub(crate) kind:  TokenKind,
+    pub(crate) line:  usize,
+    pub(crate) start: usize,
 }
 
 /// What the reader does at the cursor.
+#[derive(Clone, Copy)]
 enum Step {
     /// Move the cursor to end with no token: space or a comment.
     Skip { end: usize },
@@ -43,9 +44,16 @@ enum Step {
     UnterminatedComment,
 }
 
+/// A lexical step that normalization does not change.
+struct UnchangedStep {
+    start: usize,
+    step:  Step,
+}
+
 /// Reads the tokens of one source text and records the line and start of each.
 struct Tokenizer<'a> {
     text:    &'a [char],
+    reused:  &'a [UnchangedStep],
     cursor:  usize,
     // The offset where `line` was last brought up to date.
     counted: usize,
@@ -57,6 +65,7 @@ impl<'a> Tokenizer<'a> {
     const fn new(text: &'a [char]) -> Self {
         Self {
             text,
+            reused: &[],
             cursor: 0,
             counted: 0,
             line: 1,
@@ -85,6 +94,14 @@ impl<'a> Tokenizer<'a> {
     /// The Python reader tries each pattern in this order; a character no pattern reads is an
     /// unknown token.
     fn next_step(&self) -> Step {
+        let index = self
+            .reused
+            .partition_point(|reading| reading.start < self.cursor);
+        if let Some(reading) = self.reused.get(index)
+            && reading.start == self.cursor
+        {
+            return reading.step;
+        }
         self.space()
             .or_else(|| self.line_comment())
             .or_else(|| self.block_comment())
@@ -357,6 +374,80 @@ impl<'a> Tokenizer<'a> {
 
 /// Python `tokenized_text`: the code tokens of text.
 pub(crate) fn tokenize(text: &[char]) -> Vec<Token> { Tokenizer::new(text).run() }
+
+/// Reuse unchanged tokens and gaps; read changed regions until their token boundaries align.
+pub(crate) fn normalized_tokens(
+    text: &[char],
+    normalized: &[char],
+    tokens: &[Token],
+) -> Vec<Token> {
+    let mut position = 0;
+    let mut changed = Vec::new();
+    let offsets: Vec<_> = text
+        .iter()
+        .enumerate()
+        .map(|(index, &character)| {
+            let offset = position.min(normalized.len());
+            if normalized.get(offset) != Some(&character) {
+                changed.push(index);
+            }
+            if character != '\r' || text.get(index + 1) != Some(&'\n') {
+                position += 1;
+            }
+            offset
+        })
+        .chain(std::iter::once(normalized.len()))
+        .collect();
+    let unchanged = |start: usize, end: usize| {
+        changed
+            .get(changed.partition_point(|&index| index < start))
+            .is_none_or(|&index| index >= end)
+    };
+    let mut reused = Vec::new();
+    let mut previous_end = 0;
+    for token in tokens {
+        if token.kind == TokenKind::Unknown && token.value == UNTERMINATED_COMMENT {
+            if unchanged(previous_end, text.len()) {
+                reused.push(UnchangedStep {
+                    start: offsets[previous_end],
+                    step:  Step::UnterminatedComment,
+                });
+            }
+            previous_end = text.len();
+            break;
+        }
+        if offsets[previous_end] < offsets[token.start] && unchanged(previous_end, token.start) {
+            reused.push(UnchangedStep {
+                start: offsets[previous_end],
+                step:  Step::Skip {
+                    end: offsets[token.start],
+                },
+            });
+        }
+        let end = (token.start + token.value.chars().count()).min(text.len());
+        if unchanged(token.start, end) {
+            reused.push(UnchangedStep {
+                start: offsets[token.start],
+                step:  Step::Token {
+                    end:  offsets[end],
+                    kind: token.kind,
+                },
+            });
+        }
+        previous_end = end;
+    }
+    if offsets[previous_end] < normalized.len() && unchanged(previous_end, text.len()) {
+        reused.push(UnchangedStep {
+            start: offsets[previous_end],
+            step:  Step::Skip {
+                end: normalized.len(),
+            },
+        });
+    }
+    let mut reader = Tokenizer::new(normalized);
+    reader.reused = &reused;
+    reader.run()
+}
 
 /// Whether character falls in one of the sorted inclusive ranges of table.
 pub(crate) fn in_table(table: &[(u32, u32)], character: char) -> bool {
