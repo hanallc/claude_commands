@@ -77,9 +77,11 @@ is made writable and deleted, and a project folder left empty goes. With
 neither /proc nor lsof nothing goes.
 
 Each run appends one JSON line to LOG_NAME in the lint-sweep state folder: the
-entries deleted, the GiB freed, the count kept for each reason, and the paths
-kept for each reason except UNLISTED_REASONS, which hold most entries. Lines older than LOG_KEEP_SECONDS
-drop off. This replaced the 24-hour session scratch step (2026-10-21), whose
+entries deleted, the GiB freed, the count kept for each reason, and a sample of
+the paths kept for each reason except UNLISTED_REASONS, which hold most entries.
+lint.conf `tmp_sweep_log_sample` sets the sample size. Lines older than
+LOG_KEEP_SECONDS drop off, and the oldest lines also drop off while the log is
+larger than lint.conf `tmp_sweep_log_max_mib`. This replaced the 24-hour session scratch step (2026-10-21), whose
 folders it also covers.
 """
 
@@ -1476,7 +1478,8 @@ def apply_cleanup_plan(plan: Path, roots: Roots, now: float, proc: str, *,
             print(f"tmp sweep: deleted {path} ({removed['gib']:.1f} GiB), last changed {removed['last_change']}")
     for failure in result.failed:
         print(f"tmp sweep: could not delete {failure['path']}: {failure['error']}", file=sys.stderr)
-    append_log(state_dir() / LOG_NAME, record(result, False, now), now)
+    append_log(state_dir() / LOG_NAME, record(result, False, now, lint_settings=lint_settings), now,
+               lint_settings=lint_settings)
     return 1 if result.failed else 0
 
 
@@ -1491,7 +1494,12 @@ def state_dir() -> Path:
     return Path(os.path.expanduser(os.environ.get(STATE_ENV) or DEFAULT_STATE_DIR))
 
 
-def record(result: Sweep, dry_run: bool, now: float) -> RunRecord:
+def record(result: Sweep, dry_run: bool, now: float, *,
+           lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> RunRecord:
+    """The run's log line: every count, and the first lint.conf tmp_sweep_log_sample paths of each listed reason."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    sample = lint_settings.whole("tmp_sweep_log_sample")
     return RunRecord(
         at=datetime.fromtimestamp(now, user_zone()).isoformat(timespec="seconds"),
         dry_run=dry_run,
@@ -1499,27 +1507,41 @@ def record(result: Sweep, dry_run: bool, now: float) -> RunRecord:
         deleted=result.deleted,
         failed=result.failed,
         kept={reason: len(paths) for reason, paths in sorted(result.kept.items())},
-        kept_paths={reason: sorted(paths) for reason, paths in sorted(result.kept.items()) if reason not in UNLISTED_REASONS},
+        kept_paths={reason: sorted(paths)[:sample] for reason, paths in sorted(result.kept.items())
+                    if reason not in UNLISTED_REASONS},
     )
 
 
-def append_log(path: Path, entry: RunRecord, now: float) -> None:
-    """Add entry to the log and drop each line older than LOG_KEEP_SECONDS."""
+def append_log(path: Path, entry: RunRecord, now: float, *,
+               lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
+    """Add entry to the log. Drop each line older than LOG_KEEP_SECONDS, then the oldest lines
+    while the log is larger than lint.conf tmp_sweep_log_max_mib."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    limit = lint_settings.whole("tmp_sweep_log_max_mib") << 20
+    added = (json.dumps(entry, sort_keys=True) + "\n").encode()
     path.parent.mkdir(parents=True, exist_ok=True)
+    # The first pass measures the lines that stay by age; the second writes the newest that fit.
+    sizes: list[int] = []
+    try:
+        with path.open("rb") as source:
+            sizes = [len(line.rstrip(b"\n")) + 1 if logged_at(line.decode(errors="replace")) >= now - LOG_KEEP_SECONDS else 0
+                     for line in source]
+    except FileNotFoundError:
+        pass
+    total, first = len(added), len(sizes)
+    while first > 0 and total + sizes[first - 1] <= limit:
+        first -= 1
+        total += sizes[first]
     staged = path.with_name(f".{path.name}.{os.getpid()}")
     try:
-        with staged.open("w", encoding="utf-8") as output:
-            try:
-                with path.open(encoding="utf-8") as source:
-                    for line in source:
-                        if logged_at(line) >= now - LOG_KEEP_SECONDS:
-                            _ = output.write(line.rstrip("\n") + "\n")
-            except FileNotFoundError:
-                pass
-            # iterencode avoids a second full copy of a large run record.
-            for chunk in json.JSONEncoder(sort_keys=True).iterencode(entry):
-                _ = output.write(chunk)
-            _ = output.write("\n")
+        with staged.open("wb") as output:
+            if first < len(sizes):
+                with path.open("rb") as source:
+                    for number, line in enumerate(source):
+                        if number >= first and sizes[number]:
+                            _ = output.write(line.rstrip(b"\n") + b"\n")
+            _ = output.write(added)
         _ = staged.replace(path)
     finally:
         staged.unlink(missing_ok=True)
@@ -1552,6 +1574,8 @@ def run(dry_run: bool, now: float | None = None, roots: Roots | None = None, pro
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> int:
     """Sweep once, print each deletion and a summary, and log the run unless it is a dry run."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     moment = time.time() if now is None else now
     result = sweep(dry_run, roots or default_roots(), moment, proc, lint_settings=lint_settings, scratch_settings=scratch_settings)
     verb = "would delete" if dry_run else "deleted"
@@ -1563,7 +1587,8 @@ def run(dry_run: bool, now: float | None = None, roots: Roots | None = None, pro
         print(f"tmp sweep: removed {result.dataclass_code_removed} dataclass code entries")
     print(summary(result, dry_run))
     if not dry_run:
-        append_log(state_dir() / LOG_NAME, record(result, dry_run, moment), moment)
+        append_log(state_dir() / LOG_NAME, record(result, dry_run, moment, lint_settings=lint_settings), moment,
+                   lint_settings=lint_settings)
     return 1 if result.failed else 0
 
 

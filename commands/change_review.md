@@ -123,6 +123,9 @@ Press Escape or click the zoom to return.
 Shift-click or use the right-click menu to open the full image in a new tab.
 A landing or return verdict deletes the image and clears its cell.
 Change images use `change-images/` and never appear on the Images page.
+`| image <id>` accepts a change image id or an Images page id.
+An Images page id copies its file into `change-images/` and uses the new id in the row.
+For a pair, it copies the after image. The source stays on the Images page.
 The server deletes unclaimed images after `change_image_unclaimed_days`, which starts at 14 days.
 
 ## list-ready and live
@@ -273,6 +276,14 @@ These rows hide all showrunner actions, including Send feedback.
 The server refuses question and feedback requests without saving.
 Its count covers all page lists, including independent production roots.
 Menu options with waiting changes precede empty options in alphabetical order.
+Each showrunner view follows `/next change` for that production, with its pin and moved rows.
+All lists each root's `/next change --all-below` order in turn, with each root's pin and moved rows.
+The page reads `changes_first_root` from `config/review_links.conf` at each render.
+The named root goes first, and other roots follow by name.
+The default is `natedev`.
+A name outside the live roots leaves the root order unchanged.
+Rows outside these queues go last.
+The first card and Skip for now follow the selected view's order.
 Keyboard focus keeps its visible outline.
 Answers save in the background.
 Works and Does not work open the next waiting change at once, before the server answers.

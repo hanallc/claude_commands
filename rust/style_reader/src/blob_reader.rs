@@ -1,5 +1,6 @@
 //! Finds the Rust blobs of commits and reads their facts on every CPU.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::Path;
@@ -14,6 +15,7 @@ use crate::constants::BLOB_BATCH_SIZE;
 use crate::constants::RUST_SUFFIX;
 use crate::error::ReaderError;
 use crate::facts;
+use crate::module_sites::ModuleSitesQuery;
 use crate::request::FactKind;
 
 /// One repository, shared by the reader threads.
@@ -73,45 +75,61 @@ impl BlobReader {
         Ok(blobs.into_iter().collect())
     }
 
-    /// Write the JSON lines of the facts of each blob to output, in the order of blobs. Each batch
-    /// of blobs is read in parallel, and each thread reads with its own handle.
-    pub(crate) fn write_facts(
+    /// Write all facts and queries in bounded batches, including queried blobs outside the commits.
+    pub(crate) fn write_request(
         &self,
         blobs: &[ObjectId],
         kinds: &[FactKind],
+        queries: &[ModuleSitesQuery],
         output: &mut impl Write,
     ) -> Result<(), ReaderError> {
-        blobs.chunks(BLOB_BATCH_SIZE).try_for_each(|batch| {
-            self.read_facts(batch, kinds)?.iter().try_for_each(|line| {
+        let mut grouped: BTreeMap<ObjectId, Vec<&ModuleSitesQuery>> = BTreeMap::new();
+        for query in queries {
+            let id = ObjectId::from_hex(query.blob.as_bytes()).map_err(|source| {
+                ReaderError::QueryBlobId {
+                    blob: query.blob.clone(),
+                    source,
+                }
+            })?;
+            grouped.entry(id).or_default().push(query);
+        }
+        let all: Vec<_> = blobs
+            .iter()
+            .copied()
+            .chain(grouped.keys().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let requested: BTreeSet<_> = blobs.iter().copied().collect();
+        all.chunks(BLOB_BATCH_SIZE).try_for_each(|batch| {
+            let lines: Result<Vec<_>, _> = batch
+                .par_iter()
+                .map_init(
+                    || self.repository.to_thread_local(),
+                    |repository, &blob| {
+                        let object =
+                            repository
+                                .find_blob(blob)
+                                .map_err(|source| ReaderError::Blob {
+                                    blob,
+                                    source: Box::new(source),
+                                })?;
+                        let blob_kinds = if requested.contains(&blob) {
+                            kinds
+                        } else {
+                            &[]
+                        };
+                        let blob_queries = grouped.get(&blob).map_or(&[][..], Vec::as_slice);
+                        facts::blob_readings(blob, &object.data, blob_kinds, blob_queries)
+                            .map_err(|source| ReaderError::Serialize { blob, source })
+                    },
+                )
+                .collect();
+            lines?.iter().try_for_each(|line| {
                 output
                     .write_all(line.as_bytes())
                     .map_err(ReaderError::Write)
             })
         })
-    }
-
-    /// The JSON lines of the facts of each blob, in the order of blobs.
-    fn read_facts(
-        &self,
-        blobs: &[ObjectId],
-        kinds: &[FactKind],
-    ) -> Result<Vec<String>, ReaderError> {
-        blobs
-            .par_iter()
-            .map_init(
-                || self.repository.to_thread_local(),
-                |repository, &blob| {
-                    let object =
-                        repository
-                            .find_blob(blob)
-                            .map_err(|source| ReaderError::Blob {
-                                blob,
-                                source: Box::new(source),
-                            })?;
-                    facts::blob_facts(blob, &object.data, kinds)
-                        .map_err(|source| ReaderError::Serialize { blob, source })
-                },
-            )
-            .collect()
     }
 }
