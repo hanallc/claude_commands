@@ -579,12 +579,18 @@ class ClientTests(unittest.TestCase):
                                         connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
                                     if isinstance(request, wire.PrerequisiteReport):
                                         fixture.free(60 * GIB)
-                                    replies = previous(request, connection)
-                                    if isinstance(request, wire.PlacementRequest):
-                                        observed.extend(replies)
-                                    return replies
+                                    return previous(request, connection)
 
-                                with mock.patch.object(fixture.server, "handle_request", side_effect=free_after_first_reply):
+                                send = cast(Callable[[service.Connection, wire.Reply], None],
+                                    getattr(fixture.server, "_send"))
+
+                                def observe_sent_reply(connection: service.Connection, reply: wire.Reply) -> None:
+                                    if isinstance(connection.request, wire.PlacementRequest):
+                                        observed.append(reply)
+                                    send(connection, reply)
+
+                                with mock.patch.object(fixture.server, "handle_request", side_effect=free_after_first_reply), \
+                                        mock.patch.object(fixture.server, "_send", side_effect=observe_sent_reply):
                                     self.assertEqual(client.main(arguments), 0, errors.getvalue())
                                 self.assertEqual(len(observed), 2, observed)
                                 self.assertIsInstance(observed[0], wire.PlacementWait)

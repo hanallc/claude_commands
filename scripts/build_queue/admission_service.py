@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
 import os
 from pathlib import Path
+from queue import SimpleQueue
 import select
 import shlex
 import socket
@@ -935,6 +936,134 @@ class Connection:
     finished: bool = False
     version: int = 1
 
+    def request_buffer_ready(self, limit: int) -> bool:
+        """Handle a complete request or refuse a buffer that exceeds the limit."""
+        return b"\n" in self.received or len(self.received) > limit
+
+
+class PassStatusWork:
+    """Own idle sockets and a status view for one admission pass."""
+
+    def __init__(self, listener: socket.socket, connections: list[Connection],
+                 view: Mapping[str, status_wire.KnownPlacementStatus], limit: int) -> None:
+        self.listener: socket.socket = listener
+        self.connections: dict[int, Connection] = {item.socket.fileno():
+            Connection(item.socket, received=item.received) for item in connections}
+        self.view: Mapping[str, status_wire.KnownPlacementStatus] = view
+        self.limit: int = limit
+        self.events: select.epoll = select.epoll()
+        self.stop_event: int = os.eventfd(0, os.EFD_CLOEXEC | os.EFD_NONBLOCK)
+        self.events.register(self.stop_event, select.EPOLLIN)
+        self.events.register(listener.fileno(), select.EPOLLIN)
+        for descriptor in self.connections:
+            self.events.register(descriptor, select.EPOLLIN)
+        self.completed: Future[list[Connection]] = Future()
+
+    def finish(self) -> list[Connection]:
+        os.eventfd_write(self.stop_event, 1)
+        try:
+            return self.completed.result()
+        finally:
+            self.events.close()
+            os.close(self.stop_event)
+
+    def serve(self) -> list[Connection]:
+        while True:
+            ready = self.events.poll()
+            if any(descriptor == self.stop_event for descriptor, _events in ready):
+                return list(self.connections.values())
+            for descriptor, events in ready:
+                if descriptor == self.listener.fileno():
+                    while True:
+                        try:
+                            client = self.listener.accept()[0]
+                        except BlockingIOError:
+                            break
+                        client.setblocking(False)
+                        self.connections[client.fileno()] = Connection(client)
+                        self.events.register(client.fileno(), select.EPOLLIN)
+                else:
+                    self._connection_event(self.connections[descriptor], events)
+
+    def _connection_event(self, connection: Connection, events: int) -> None:
+        descriptor = connection.socket.fileno()
+        try:
+            if events & select.EPOLLIN and not connection.finished:
+                chunk = connection.socket.recv(min(65536, self.limit + 1 - len(connection.received)))
+                if not chunk:
+                    self.events.unregister(descriptor)
+                    connection.finished = True
+                    return
+                connection.received += chunk
+                if connection.request_buffer_ready(self.limit):
+                    if len(connection.received) > self.limit:
+                        self.events.unregister(descriptor)
+                        return
+                    line, _separator, tail = connection.received.partition(b"\n")
+                    version, request = wire.parse_request_envelope(line)
+                    if not tail and isinstance(request, status_wire.PlacementStatusRequest):
+                        status = self.view.get(placement.attempt_key(request.episode, request.attempt),
+                            status_wire.UnknownPlacementStatus(request.episode, request.attempt))
+                        connection.version = version
+                        connection.request = request
+                        connection.received = b""
+                        connection.sending = wire.encode_reply(status_wire.PlacementStatusReply(status), version=version).encode()
+                        connection.finished = True
+                        self.events.modify(descriptor, select.EPOLLOUT)
+                    else:
+                        self.events.unregister(descriptor)
+                        return
+            if connection.sending:
+                sent = connection.socket.send(connection.sending)
+                connection.sending = connection.sending[sent:]
+                if not connection.sending:
+                    self.events.unregister(descriptor)
+        except BlockingIOError:
+            pass
+        except (ValueError, TypeError):
+            # The admission loop applies its existing refusal rules after the pass.
+            self.events.unregister(descriptor)
+        except (BrokenPipeError, ConnectionResetError):
+            self.events.unregister(descriptor)
+            connection.finished = True
+            connection.sending = b""
+
+
+@dataclass(frozen=True)
+class StopStatusReader:
+    """End the status reader after its current pass."""
+
+
+@dataclass(frozen=True)
+class StatusReaderNotStarted:
+    """The admission socket has no status reader yet."""
+
+
+class PassStatusReader:
+    """Use one thread for status reads during admission passes."""
+
+    def __init__(self) -> None:
+        self.work: SimpleQueue[PassStatusWork | StopStatusReader] = SimpleQueue()
+        self.thread: threading.Thread = threading.Thread(target=self._serve, name="admission-pass-status", daemon=True)
+        self.thread.start()
+
+    def start_pass(self, work: PassStatusWork) -> None:
+        self.work.put(work)
+
+    def _serve(self) -> None:
+        while True:
+            work = self.work.get()
+            if isinstance(work, StopStatusReader):
+                return
+            try:
+                work.completed.set_result(work.serve())
+            except BaseException as error:
+                work.completed.set_exception(error)
+
+    def close(self) -> None:
+        self.work.put(StopStatusReader())
+        self.thread.join()
+
 
 @dataclass(frozen=True)
 class PendingCoordinatorEvidence:
@@ -1164,6 +1293,7 @@ class AdmissionServer:
         self.host_observations: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
         self.host_requests: dict[placement.HostEvidenceKey, wire.PlacementRequest] = {}
         self.placement_host_keys: dict[tuple[str, placement.PlacementDestination], placement.HostEvidenceKey] = {}
+        self.pass_host_keys: dict[tuple[str, placement.PlacementDestination], placement.HostEvidenceKey] | NoPass = NoPass()
         # Start time of each hold that keeps a remote destination for an older waiting request.
         self.placement_holds: dict[tuple[str, placement.PlacementDestination], float] = {}
         # The reading that answered each ended hold. That reading never starts another hold.
@@ -1213,6 +1343,7 @@ class AdmissionServer:
         self.reading_events: int = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
         self.epoll.register(self.reading_events, select.EPOLLIN)
         self.listener: socket.socket | NoConnection = NoConnection()
+        self.status_reader: PassStatusReader | StatusReaderNotStarted = StatusReaderNotStarted()
         self.inherited_listener: bool = False
         # A source change under systemd runs the new code in this process and keeps the socket.
         self.replace_in_place: bool = False
@@ -1914,10 +2045,52 @@ class AdmissionServer:
         from scripts.build_targets import target_config
 
         # One pass reads the target list once; each placement check in the pass uses that read.
-        with target_config.command_configuration():
-            result = self._pass(configuration)
+        self.pass_host_keys = {}
+        try:
+            with self._status_during_pass(), target_config.command_configuration():
+                result = self._pass(configuration)
+        finally:
+            self.pass_host_keys = NoPass()
         self._answer_parked_placements()
         return result
+
+    def _placement_status_view(self) -> Mapping[str, status_wire.KnownPlacementStatus]:
+        return MappingProxyType({key: status_wire.KnownPlacementStatus(
+            saved.assignment, self._assignment_state(saved), saved.provider)
+            for key, saved in self.assignments.items()})
+
+    @contextmanager
+    def _status_during_pass(self) -> Generator[None]:
+        if isinstance(self.listener, NoConnection):
+            yield
+            return
+        idle = [connection for connection in self.connections.values()
+                if isinstance(connection.request, NoRequest) and not connection.finished]
+        config = self.last_usable_configuration
+        request_limit = config.request_max_bytes if isinstance(config, records.MemoryConfig) else wire.CLEANUP_REQUEST_MAX_BYTES
+        limit = max(request_limit, wire.CLEANUP_REQUEST_MAX_BYTES)
+        assert isinstance(self.status_reader, PassStatusReader)
+        reader = PassStatusWork(self.listener, idle, self._placement_status_view(), limit)
+        self.status_reader.start_pass(reader)
+        try:
+            yield
+        finally:
+            # Publish the completed pass before the reader relinquishes the sockets.
+            try:
+                reader.view = self._placement_status_view()
+            finally:
+                deferred = reader.finish()
+            for connection in deferred:
+                descriptor = connection.socket.fileno()
+                if descriptor not in self.connections:
+                    self.epoll.register(descriptor, select.EPOLLIN)
+                self.connections[descriptor] = connection
+                if connection.finished and not connection.sending:
+                    self._disconnect(connection)
+                elif connection.sending:
+                    self.epoll.modify(descriptor, select.EPOLLIN | select.EPOLLOUT)
+                elif connection.request_buffer_ready(limit):
+                    os.eventfd_write(self.priority_events, 1)
 
     def _answer_parked_placements(self) -> None:
         parked, self.parked_placements = self.parked_placements, []
@@ -2444,8 +2617,14 @@ class AdmissionServer:
 
     def _request_host_evidence(self, request: wire.PlacementRequest,
                                destination: placement.PlacementDestination) -> placement.HostEvidence:
-        key = self.host_evidence_key(request, destination)
-        self.placement_host_keys[(request.episode, destination)] = key
+        identity = (request.episode, destination)
+        keys = self.pass_host_keys
+        key = keys.get(identity) if isinstance(keys, dict) else None
+        if key is None:
+            key = self.host_evidence_key(request, destination)
+            if isinstance(keys, dict):
+                keys[identity] = key
+        self.placement_host_keys[identity] = key
         if destination.provider == "local" and not self.background_local_evidence:
             try:
                 return self.host_probe(key)
@@ -2864,12 +3043,15 @@ done
     def _prepare_placements(self) -> None:
         # Keep the current holder label without retaining local process evidence.
         self.local_hold_holders.clear()
+        requested: set[tuple[str, placement.PlacementDestination]] = set()
         for saved in self.assignments.values():
-            if saved.assignment.destination.provider == "local":
+            identity = (saved.assignment.episode, saved.assignment.destination)
+            if saved.assignment.destination.provider == "local" or identity in requested:
                 continue
             submitted = self.placement_requests.get(saved.assignment.episode)
             if submitted is not None and (submitted.episode in self.current_assignments
                     or self._placement_waiting(submitted)):
+                requested.add(identity)
                 _ = self._request_host_evidence(submitted, saved.assignment.destination)
         for request in self.placement_requests.values():
             saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
@@ -3325,9 +3507,11 @@ done
             self.placement_requests[request.episode] = request
             if previous is None:
                 self.prerequisites[request.episode] = request.prerequisite
-            self._watch_owner(request.owner)
-            self.persist()
-            if isinstance(connection, Connection) and not self._pass_gap_open():
+            if previous != request:
+                self._watch_owner(request.owner)
+                self.persist()
+            if isinstance(connection, Connection):
+                # Drain socket requests before the loop runs the shared placement pass.
                 self.parked_placements.append(ParkedPlacement(request, connection))
                 self.next_pass = min(self.next_pass, self.clock.monotonic())
                 return []
@@ -3747,6 +3931,7 @@ done
             listener.listen()
         listener.setblocking(False)
         self.listener = listener
+        self.status_reader = PassStatusReader()
         self.epoll.register(listener.fileno(), select.EPOLLIN)
         self.listener_started_at = self.clock.monotonic()
         _notify("READY=1")
@@ -3805,9 +3990,11 @@ done
             process = self.system_reader.latest.processes.get(pid)
             identity = LiveOwnerIdentity(process.start) if process is not None else OwnerProcessGone()
         if isinstance(identity, LiveOwnerIdentity):
-            self.caller_versions[records.run_owner(pid, identity.start_time)] = request.code_version
-            if persist_change:
-                self.persist()
+            key = records.run_owner(pid, identity.start_time)
+            if self.caller_versions.get(key) != request.code_version:
+                self.caller_versions[key] = request.code_version
+                if persist_change:
+                    self.persist()
 
     def _read_request(self, connection: Connection) -> None:
         config = (self.configuration if isinstance(self.pending_configuration, NoPass)
@@ -3820,11 +4007,12 @@ done
         if len(connection.received) > limit:
             raise ValueError(reason)
         while not connection.finished:
-            chunk = connection.socket.recv(min(65536, limit + 1 - len(connection.received)))
-            if not chunk:
-                self._disconnect(connection)
-                return
-            connection.received += chunk
+            if b"\n" not in connection.received:
+                chunk = connection.socket.recv(min(65536, limit + 1 - len(connection.received)))
+                if not chunk:
+                    self._disconnect(connection)
+                    return
+                connection.received += chunk
             if len(connection.received) > limit:
                 raise ValueError(reason)
             if b"\n" in connection.received:
@@ -4051,6 +4239,9 @@ done
         _notify("WATCHDOG=1")
 
     def _receive_requests(self, ready: list[tuple[int, int]]) -> None:
+        config = self.last_usable_configuration
+        request_limit = config.request_max_bytes if isinstance(config, records.MemoryConfig) else wire.CLEANUP_REQUEST_MAX_BYTES
+        limit = max(request_limit, wire.CLEANUP_REQUEST_MAX_BYTES)
         readable = {descriptor for descriptor, events in ready if events & select.EPOLLIN}
         for descriptor, _events in ready:
             if not isinstance(self.listener, NoConnection) and descriptor == self.listener.fileno():
@@ -4064,7 +4255,7 @@ done
                     self.epoll.register(client.fileno(), select.EPOLLIN)
                     readable.add(client.fileno())
         for connection in list(self.connections.values()):
-            if connection.socket.fileno() in readable and not connection.finished:
+            if (connection.socket.fileno() in readable or connection.request_buffer_ready(limit)) and not connection.finished:
                 self._connection_event(connection, select.EPOLLIN)
 
     def start_reader(self) -> None:
@@ -4092,6 +4283,8 @@ done
             return
         self.closed = True
         self.stopped = True
+        if isinstance(self.status_reader, PassStatusReader):
+            self.status_reader.close()
         for worker in self.host_targets.values():
             worker.close()
         if not isinstance(self.system_reader, NoSystemReader):
