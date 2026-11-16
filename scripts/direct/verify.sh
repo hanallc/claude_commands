@@ -2737,6 +2737,7 @@ PLACEMENT_COMMAND=()
 PLACEMENT_ASSIGNMENT_FILE=""
 PLACEMENT_GRANT_FILE=""
 PLACEMENT_PROVIDER=""
+MAC_BACKOFF_PROBED=0
 
 placement_once() {
     local token=none reply line route="" status=0 monitor=0
@@ -2795,6 +2796,17 @@ placement_once() {
                     pinned_target_refuse "${line#*$'\t'}"
                 fi
                 BUILDLOG_MAC=declined BUILDLOG_MAC_REASON=${line#*$'\t'} BUILDLOG_MAC_S=0
+                # The backoff can outlast a short outage, so one fresh probe decides a Mac-only
+                # step. After it, the step waits while the service still reports the cleared backoff.
+                if [[ "$BUILDLOG_MAC_REASON" == backoff && "$MAC_ONLY" == 1 ]]; then
+                    local probe_args=(probe-backoff --target mac)
+                    [[ "$MAC_BACKOFF_PROBED" == 0 ]] || probe_args+=(--no-probe)
+                    if verify_helper "$BUILD_TARGETS_SCRIPT" "${probe_args[@]}"; then
+                        MAC_BACKOFF_PROBED=1
+                        return 78
+                    fi
+                    [[ "$MAC_BACKOFF_PROBED" == 1 ]] || BUILDLOG_MAC_REASON=unreachable
+                fi
                 mac_only_refuse "$BUILDLOG_MAC_REASON" ;;
             *) route=$line ;;
         esac
