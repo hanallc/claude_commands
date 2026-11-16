@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from difflib import get_close_matches
 from enum import StrEnum
+import fcntl
 from functools import cache
 import http.client
 import json
@@ -2215,44 +2216,45 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
                     owner = row.name
         except staff.StaffUnreadable:
             pass
+    state_path = launch_state_path(port)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "darwin":
+        print("hana_shot: macOS ignores XDG_CONFIG_HOME; this Hana reads your real config", file=sys.stderr)
     with ExitStack() as cleanup:
-        # The app reads this folder after launch returns, so it must outlive this process.
-        # shutdown removes it; the deadline bounds a forgotten app.
-        launch_folder = scratch.new(word=f"hana-shot-{port}")
-        _ = cleanup.callback(shutil.rmtree, launch_folder, ignore_errors=True)
-        config = launch_folder / "config"
-        config.mkdir()
-        log = launch_folder / "hana.log"
-        command = [
-            "env", f"XDG_CONFIG_HOME={config}", f"BRP_EXTRAS_PORT={port}",
-            f"HANA_TEST_PURPOSE={purpose.strip()}", f"HANA_TEST_OWNER={owner}",
-            f"BEVY_ASSET_ROOT={root / 'crates' / 'hana'}", str(executable),
-        ]
-        direnv = shutil.which("direnv")
-        if direnv is not None and (root / ".envrc").exists():
-            command = [direnv, "exec", str(root), *command]
-        if sys.platform == "darwin":
-            print("hana_shot: macOS ignores XDG_CONFIG_HOME; this Hana reads your real config", file=sys.stderr)
         process: subprocess.Popen[bytes] | None = None
         try:
-            with log.open("wb") as handle:
-                process = subprocess.Popen(
-                    command, cwd=root, stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-            state: LaunchState = {
-                "pid": process.pid,
-                "port": port,
-                "scratch": str(launch_folder),
-                "log": str(log),
-                "binary": str(executable),
-                "started": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            }
-            if uncommitted_paths:
-                state["uncommitted_paths"] = uncommitted_paths
-            state_path = launch_state_path(port)
-            state_path.parent.mkdir(parents=True, exist_ok=True)
-            _write_launch_state(state_path, state)
+            with launch_slot(state_path.parent, hana_shot_settings=hana_shot_settings):
+                # The app reads this folder after launch returns, so it must outlive this process.
+                # shutdown removes it; the deadline bounds a forgotten app.
+                launch_folder = scratch.new(word=f"hana-shot-{port}")
+                _ = cleanup.callback(shutil.rmtree, launch_folder, ignore_errors=True)
+                config = launch_folder / "config"
+                config.mkdir()
+                log = launch_folder / "hana.log"
+                command = [
+                    "env", f"XDG_CONFIG_HOME={config}", f"BRP_EXTRAS_PORT={port}",
+                    f"HANA_TEST_PURPOSE={purpose.strip()}", f"HANA_TEST_OWNER={owner}",
+                    f"BEVY_ASSET_ROOT={root / 'crates' / 'hana'}", str(executable),
+                ]
+                direnv = shutil.which("direnv")
+                if direnv is not None and (root / ".envrc").exists():
+                    command = [direnv, "exec", str(root), *command]
+                with log.open("wb") as handle:
+                    process = subprocess.Popen(
+                        command, cwd=root, stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                state: LaunchState = {
+                    "pid": process.pid,
+                    "port": port,
+                    "scratch": str(launch_folder),
+                    "log": str(log),
+                    "binary": str(executable),
+                    "started": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                }
+                if uncommitted_paths:
+                    state["uncommitted_paths"] = uncommitted_paths
+                _write_launch_state(state_path, state)
             start = time.monotonic()
             from scripts.buildlog import record
             _ = record.launch(state_path, root)
@@ -2264,6 +2266,44 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
             if process is not None:
                 shutdown(port, process, hana_shot_settings=hana_shot_settings)
             raise
+
+
+def live_launch_count(directory: Path) -> int:
+    """Count the launch records in directory whose app still runs; a dead or unreadable record does not count."""
+    count = 0
+    for path in directory.glob("*.json"):
+        if not path.stem.isdigit():
+            continue
+        record = _read_launch_state(path)
+        if not isinstance(record, WholeLaunchRecord):
+            continue
+        pid = record.state["pid"]
+        if process_alive(pid) and same_binary(pid, record.state["binary"]):
+            count += 1
+    return count
+
+
+@contextmanager
+def launch_slot(directory: Path, *, hana_shot_settings: conf.ConfigRead) -> Generator[None]:
+    """Refuse a launch at the local app cap; hold the lock until the new launch record exists.
+
+    The lock is a flock on the records folder itself, so parallel launches count each other's
+    records and no lock file is left. A dead app does not count.
+    queue's memory gate for app launches replaces this cap.
+    """
+    cap = hana_shot_settings.whole("local_app_cap")
+    lock = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        live = live_launch_count(directory)
+        if live >= cap:
+            raise Refused(
+                f"{live} test Hana apps from hana_shot launch still run on this machine and the cap is {cap}; "
+                + "shut one down (hana_shot.py shutdown --port <port>) or raise local_app_cap in config/hana_shot.conf"
+            )
+        yield
+    finally:
+        os.close(lock)
 
 
 def wait_ready(brp: Brp, process: subprocess.Popen[bytes], log: Path) -> None:

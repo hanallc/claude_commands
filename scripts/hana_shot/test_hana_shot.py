@@ -1035,6 +1035,52 @@ class LaunchRecordRecoveryTests(HanaShotTest):
             state, _ = hana_shot.launch(self.port, str(self.root), str(self.executable), purpose=LAUNCH_RECORDING_PURPOSE, owner=owner)
         return state
 
+    def app_record(self, port: int, *, live: bool) -> None:
+        """Save a launch record for another port; a live record names a running process."""
+        process = subprocess.Popen(["sleep", "300"], stdin=subprocess.DEVNULL)
+        if live:
+            self.addCleanup(process.wait, timeout=TEST_HANG_GUARD_SECS)
+            self.addCleanup(process.kill)
+        else:
+            process.kill()
+            _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+        _ = (self.state_path.parent / f"{port}.json").write_text(json.dumps({
+            "pid": process.pid, "port": port, "binary": "sleep",
+            "log": str(self.scratch / f"{port}.log"), "scratch": str(self.scratch / f"{port}-scratch"),
+        }))
+
+    def test_launch_at_the_local_app_cap_is_refused_before_a_start(self) -> None:
+        self.stop_fake_listener()
+        self.app_record(self.port + 1, live=True)
+        self.app_record(self.port + 2, live=True)
+        with (
+            mock.patch.object(hana_shot, "uncommitted_build_paths", return_value=[]),
+            mock.patch.object(subprocess, "Popen") as start,
+            self.assertRaises(hana_shot.Refused) as refused,
+        ):
+            _ = hana_shot.launch(self.port, str(self.root), str(self.executable), purpose=LAUNCH_RECORDING_PURPOSE, owner="cap-test")
+        self.assertEqual(str(refused.exception).splitlines(), [
+            "2 test Hana apps from hana_shot launch still run on this machine and the cap is 2; "
+            + "shut one down (hana_shot.py shutdown --port <port>) or raise local_app_cap in config/hana_shot.conf",
+        ])
+        start.assert_not_called()
+        self.assertFalse(self.state_path.exists())
+
+    def test_launch_under_the_local_app_cap_starts(self) -> None:
+        self.stop_fake_listener()
+        self.app_record(self.port + 1, live=True)
+        state = self.launch_without_starting_hana(owner="cap-test")
+        self.assertEqual(state["pid"], 424242)
+        self.assertTrue(self.state_path.is_file())
+
+    def test_dead_app_record_does_not_count_toward_the_local_app_cap(self) -> None:
+        self.stop_fake_listener()
+        self.app_record(self.port + 1, live=True)
+        self.app_record(self.port + 2, live=False)
+        state = self.launch_without_starting_hana(owner="cap-test")
+        self.assertEqual(state["pid"], 424242)
+        self.assertEqual(hana_shot.live_launch_count(self.state_path.parent), 1)
+
     def test_explicit_launch_owner_takes_precedence_over_the_callers_unit(self) -> None:
         self.stop_fake_listener()
         self.enterContext(isolated_staff_file(self.scratch / "staff.json", {}))
