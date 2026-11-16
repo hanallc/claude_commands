@@ -19,6 +19,8 @@ from uuid import uuid4
 
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lib import build_folders
+from scripts.lint.memory_test_support import config_environment
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
@@ -95,6 +97,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
                               + "# range: 0.001..\nREMOTE_SECONDS=5\n")
         staff_file = self.root / "staff.json"
         self.environment = {
+            **config_environment(self.root / "settings"),
             "HOME": str(self.home), "PATH": os.environ.get("PATH", os.defpath),
             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
             "WORKTREES_STATE_DIR": str(self.state),
@@ -233,6 +236,9 @@ class WorktreeLifecycleTests(unittest.TestCase):
                     self.assertLessEqual(made_at, after)
                     self.assertEqual((tree / "code.txt").read_text(), "base\n")
                     self.assertEqual(self.git(tree, "branch", "--show-current"), branch)
+                    self.assertEqual(build_folders.build_folder_state(tree), "free")
+                    lease = cast(dict[str, object], json.loads(tree.with_name(tree.name + ".lease.json").read_text()))
+                    self.assertEqual(lease["purpose"], tree.name)
 
     def test_merged_checkpoint_and_plan_shrink_end_all_recorded_items(self) -> None:
         for branch in ("checkpoint", "ancestor-with-earlier-target-date", "without-branch-config"):

@@ -211,6 +211,7 @@ class CoverageOverlapTests(unittest.TestCase):
                 (TOOL.parents[1] / "lib" / "code_kind.py", library / "code_kind.py"),
                 *((TOOL.parents[1] / relative, root / "scripts" / relative) for relative in (
                     "lib/py", "lib/python_startup/sitecustomize.py", "lib/conf.py", "lib/conf_reads.py", "lib/terminal_cells.py", "buildlog/treekey.py",
+                    "lib/build_folders.py", "lib/boot_identity.py",
                     "production/gate_modules.py", "test_times/module_run.py",
                 )),
             ):
@@ -220,6 +221,7 @@ class CoverageOverlapTests(unittest.TestCase):
             sources = {
                 "scripts/fixture/product.py": PRODUCT,
                 "config/test_times.conf": "COVERAGE_LEAF_PROGRAMS=git\n",
+                "config/build_folders.conf": (TOOL.parents[2] / "config/build_folders.conf").read_text(),
                 **sources,
             }
             for relative, source in sources.items():
