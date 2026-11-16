@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from scripts.lib import build_folders
 from scripts.lib.test_models_registry import write_registry
 
 import json
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -301,10 +303,11 @@ class AddStyleTests(unittest.TestCase):
     def interrupted_bootstrap_publish(self, path: Path) -> None:
         real_replace = os.replace
 
-        def interrupted_replace(source: str | Path, destination: str | Path) -> None:
+        def interrupted_replace(source: str | Path, destination: str | Path, *,
+                                src_dir_fd: int | None = None, dst_dir_fd: int | None = None) -> None:
             if Path(destination) == path:
                 raise OSError("stopped before publish")
-            real_replace(source, destination)
+            real_replace(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
         with mock.patch.object(os, "replace", interrupted_replace):
             stopped = self.run_bootstrap(success=False)
@@ -478,9 +481,12 @@ class AddStyleTests(unittest.TestCase):
                           (self.repo / ".git/info/exclude").read_bytes()), before)
 
     def test_bootstrap_creates_excluded_production_plans_and_pins_style_branch(self) -> None:
+        self.checkout.mkdir()
+        self.checkout.chmod(0o700)
         self.assertFalse(any(row.name == "sample-style" for row in staff.snapshot().find(kind="showrunner")))
         _ = self.run_bootstrap_process()
 
+        self.assertEqual(stat.S_IMODE(self.checkout.stat().st_mode), 0o700)
         self.assertEqual(self.git("rev-parse", "style/main"), self.initial_tip)
         self.assertIn(str(self.checkout), self.git("worktree", "list", "--porcelain"))
         production = read_production("sample-style")
@@ -523,7 +529,14 @@ class AddStyleTests(unittest.TestCase):
         }, {"command": "showrunners.py", "arguments": ["attach", "sample-style", "parent"]}])
 
     def test_launch_with_an_existing_staff_row_uses_its_doc_without_a_doc_argument(self) -> None:
-        _ = self.run_bootstrap()
+        _ = self.git("branch", "style/main", self.initial_tip)
+        _ = self.git("commit", "--allow-empty", "-qm", "Advance the parent branch")
+        with mock.patch.object(build_folders, "create_build_folder", wraps=build_folders.create_build_folder) as create:
+            _ = self.run_bootstrap()
+        create.assert_called_once_with(build_folders.LinkedEditableRepository(
+            self.checkout, self.repo, build_folders.ExistingWorktreeBranch("style/main")))
+        self.assertEqual(self.git("rev-parse", "style/main"), self.initial_tip)
+        self.assertNotEqual(self.git("rev-parse", "main"), self.initial_tip)
         self._timer_conf().unlink()
         _ = self.run_bootstrap()
 
