@@ -377,6 +377,107 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 
 **Ruled out:** a class-wide platform pin in `setUp` (most `NativePaneSessionTests` tests do not fake `/proc`).
 
+### Phase 40 — Every main push lands through one function, and the post-push hook runs after each one  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** every push of a repository's default branch goes through `scripts/lib/land_main.py`, which pushes under the main push lock and then runs the repository's `.claude/config/post_push.sh`, so hana's public mirror syncs on every promotion (P783, user-approved 2026-11-15).
+
+**Spec:**
+- `scripts/lib/land_main.py` holds one function, `land(checkout, commit, branch) -> Landed`, and a CLI (`--checkout`, `--commit`, `--branch`, default `main`). It does these steps:
+  1. Take `main_push_lock.main_push_lock(checkout)`; a hold this process already has, or one passed by `MAIN_PUSH_LOCK_HELD`, is used as is.
+  2. Fetch the branch from origin. When origin is at `commit`, push nothing (`AlreadyLanded`). When origin is an ancestor of `commit`, run `git push origin <commit>:refs/heads/<branch>` (no `+`, no `--force`) (`Pushed`). Otherwise refuse (`NotFastForward`) and run no hook.
+  3. When `branch` is the default branch (`git symbolic-ref refs/remotes/origin/HEAD`, else `main`; no `gh` call) and `<checkout root>/.claude/config/post_push.sh` exists, run it with bash from the checkout root, with `LANDED_SHA` (full 40-character commit) and `LANDED_BRANCH` exported. Skip the hook when the completion record in the git common dir (`post-push-completed`) already names `commit`; write the record after exit 0 only.
+  4. A failed hook does not fail the landing. `Landed` carries the push outcome and a hook outcome (`HookAbsent`, `HookDone`, `HookSkipped`, `HookFailed(exit, rerun command)`). The CLI prints one line for each and exits 0 on a landed push with a failed hook; it prints the rerun command to stderr.
+- Every default-branch push calls it:
+  1. `scripts/validate_and_push/push_direct.sh`: the main path calls the CLI in place of its `git push` and `post_push_hook.sh`. The `CI_VALIDATED_BASE` checks stay under the same lock hold.
+  2. `scripts/validate_and_push/push_pr_branch_and_merge.sh`: after `gh pr merge` and `git pull --ff-only`, call the CLI with the merged commit (origin already has it, so only the hook runs).
+  3. `scripts/production/production_lifecycle.py` `promote_main` (both the direct push and each promotion checkout).
+  4. `scripts/production/merge_checkpoint.py` `promote_local_checkout` (both pushes).
+  5. `scripts/production/merge_gate.py` promotion push, `scripts/production/fast_track.py` (`HEAD:main`), and `scripts/lib/main_publish.py` `push`.
+  6. `scripts/release/restore_unreleased.sh` when its base branch is the default branch.
+- `scripts/lib/main_push_lock.py` CLI passes `held_environment(checkout)` to its child, so a nested `land_main.py` reuses the hold and does not deadlock.
+- `scripts/validate_and_push/post_push_hook.sh` goes; its doc text moves to the `land_main.py` docstring. Each caller's report names the hook outcome; a `HookFailed` is one report line with the rerun command, never a stop.
+- `commands/showrunner/produce.md` step 4 of promotion (about line 825): remove "leaves the public bevy_hana mirror alone … (user, 2026-10-03)". State that promotion runs the repository's post-push hook through `land_main`, so hana's mirror syncs on each promotion (user, 2026-11-15: "yes every promotion to main may sync to the public mirror").
+- Hook interface (agreed with hana-merges, 2026-11-15): cwd is the landing checkout's root, which can be a worktree on the merge branch; env `LANDED_SHA`, `LANDED_BRANCH`; exit 0 means the sync is done; the hook can run under the main push lock and must not push the default branch; it must be safe to run again for one `LANDED_SHA`.
+
+**Files:**
+- `scripts/lib/land_main.py`, `scripts/lib/test_land_main.py` — new
+- `scripts/lib/main_push_lock.py`, `scripts/lib/main_publish.py`
+- `scripts/production/production_lifecycle.py`, `scripts/production/merge_checkpoint.py`, `scripts/production/merge_gate.py`, `scripts/production/fast_track.py`
+- `scripts/validate_and_push/push_direct.sh`, `scripts/validate_and_push/push_pr_branch_and_merge.sh`, `scripts/validate_and_push/post_push_hook.sh` — shell callers; the hook runner goes
+- `scripts/release/restore_unreleased.sh`
+- `commands/showrunner/produce.md` — the director edits it
+- `scripts/validate_and_push/test_rerun.py`, `scripts/release/test_release.py`, `scripts/lib/test_main_publish.py`, `scripts/lib/test_main_push_lock.py`, `scripts/production/test_production_lifecycle.py`, `scripts/production/test_merge_checkpoint.py`, `scripts/production/test_merge_gate.py`, `scripts/production/test_fast_track.py` — tests that fake these pushes
+
+**Workers:** 1 writer + 1 tester.
+- `impl` — `land_main.py`, `main_push_lock.py`, and the five Python callers
+- `test` — `test_land_main.py`, the three shell callers and `post_push_hook.sh`, and the caller test updates
+
+**State:** the `post-push-completed` record in the git common dir (already written by `push_pr_branch_and_merge.sh`); now one writer, `land_main.py`.
+
+**Constraints from prior phases:** run tests under `systemd-run --user --scope -q -p MemoryMax=2G -E TMPDIR=/tmp`. No test pushes to a real remote; tests use a local bare origin.
+
+**Acceptance gate:** `test_land_main` covers: push and hook; unchanged tip with a done record (no hook); unchanged tip after a failed hook (hook runs); not fast-forward (refused, no hook); feature branch (no hook); absent hook; nested lock hold through the CLI. `scripts.lib`, `scripts.production`, `scripts.validate_and_push` and `scripts.release` suites pass on natedev; basedpyright prints `0 errors, 0 warnings` on each changed Python file; `rg 'push origin (main|"main"|HEAD:main)|"push", "origin", "main"'` finds no default-branch push outside `land_main.py`.
+
+### Phase 41 — Each release step skips work that is done, and the GitHub release goes to the configured repository  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a rerun of `/release` after a partial failure finishes the release, and the GitHub release goes to `github_release_repo` from `.claude/config/release.toml`, never to a private origin (user, 2026-11-15: "the release has to go to the public natepiano/bevy_Hana").
+
+**Spec:**
+- `scripts/release/create_release_branch.sh`: an existing release branch at `HEAD` is checked out and reused; one at another commit is refused with both commits named.
+- `scripts/release/publish_crate.sh`: a version already on crates.io (`verify_published.sh`'s read) prints `already published` and skips both dry-run and publish.
+- `scripts/release/create_github_release.sh`: a release that exists for the tag on the target repository (`gh release view <tag> --repo <repo>`) prints `already released` and exits 0.
+- The GitHub repository: `commands/release.md` STEP 1 reads `github_release_repo` (`owner/name`) from `release.toml`. With no key, origin's repository is used only when `gh repo view --json isPrivate` says it is public; a private origin with no key stops STEP 1 with the key to add. STEP 8 passes that repository to `create_github_release.sh`. When it is not origin, STEP 8 needs the tag on that repository first (Phase 42's `post_publish` hook makes it for hana); without it, STEP 8 stops and names the missing tag.
+- `commands/release.md` Configuration section documents `github_release_repo`.
+
+**Files:**
+- `scripts/release/create_release_branch.sh`, `scripts/release/publish_crate.sh`, `scripts/release/create_github_release.sh`
+- `scripts/release/test_release.py`
+- `commands/release.md` — the director edits it
+
+**Workers:** 1 writer + 1 tester.
+- `impl` — the three scripts
+- `test` — `test_release.py` cases with stub `gh` and `cargo` on `PATH`
+
+**State:** none
+
+**Constraints from prior phases:** no test publishes or makes a release; stubs only.
+
+**Acceptance gate:** `scripts.release.test_release` covers each skip and each refusal; `bash -n` on each script; the suite passes on natedev.
+
+### Phase 42 — One `/release` run releases a list of crates and runs the post-publish hook for each  · status: todo
+**Depends on:** Phase 40, Phase 41
+
+#### Work Order
+
+**Goal:** `/release hana_clerestory hana_kana hana_lagrange …` releases each named crate in `publish_order` order in one run, with one user yes, and runs hana's `post_publish.sh` after each publish, so mirror tags and GitHub releases need no hand step.
+
+**Spec:**
+- STEP 0 accepts several package tokens. Each token is `<crate>` (takes the run's `patch` or version) or `<crate>@<version>`. One package keeps today's single-package mode exactly.
+- STEP 1 orders the crates by `publish_order` from `release.toml` (an array of crate names); a named crate absent from it stops the run. Without the key, the order is the order given.
+- Before the first public push, the run lists every crate, its version and each public push (crates.io publish, the `post_publish` hook, the GitHub release on its repository). One user yes covers that list; anything outside it needs a new yes. Dry-run lists and asks nothing.
+- The run does the single-package pipeline once for each crate, in order. After STEP 6 publishes a crate and before STEP 8, it runs `scripts/release/post_publish_hook.sh` (new): when `<repo root>/.claude/config/post_publish.sh` exists, it runs it with bash from the repo root with `CRATE`, `VERSION` (no `v`) and `SHA` (the full base-branch commit the release branch was cut from) exported. A nonzero exit stops the run before that crate's GitHub release and names the rerun command.
+- A rerun of the same command skips each crate whose steps are done (Phase 41) and runs the hook again; the hook is safe to rerun (hana-merges' side).
+- A final report lists each crate with its version, tag and release URL.
+
+**Files:**
+- `commands/release.md` — the director edits it
+- `scripts/release/post_publish_hook.sh` — new
+- `scripts/release/test_release.py`
+
+**Workers:** 1 writer — `impl` writes `post_publish_hook.sh` and its tests; the director writes `release.md`.
+
+**State:** none
+
+**Constraints from prior phases:** the hana half (`mirror.py`, `post_push.sh`, `post_publish.sh`, `release.toml` keys) belongs to hana-merges; this phase reads only the agreed keys and env names.
+
+**Acceptance gate:** `scripts.release.test_release` covers the hook runner (absent hook, env names, nonzero exit); a `/release … dry-run` with two hana crates in the hana checkout lists both crates in `publish_order` order with their pushes and changes nothing.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
