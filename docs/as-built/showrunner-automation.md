@@ -767,14 +767,16 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Rows follow this order: Now, Also, Next, Later, Stopped, Done.
     Now names the current task and its recorded worker, director action, resource wait, or merge state.
     The open phase takes priority over merge tasks for Now.
-    Each current task has one row, with separate State lines for its actors and no equal states.
+    Each current task has one row with no equal states; `state_sentence` joins its actors' states with semicolons.
+    No row has an empty Work cell.
     A busy session does not prove that the director works on a phase.
     An unexplained task names the missing step and the latest matching finished step with its time, when recorded.
     Also names each additional current task.
     The first queue entry supplies Next; otherwise, the first unfinished plan phase supplies Next.
     Every remaining queue entry and plan phase has its own Later row and dependency state.
     Queue text uses the description after its first colon as the title and the prefix as the ID.
-    The title starts with a capital.
+    `queue_title` drops notes in parentheses and each clause after the first semicolon.
+    `capitalized` gives a capital only to a plain lowercase first word; file names and IDs stay as written.
     A matching finished activity produces a queue conflict instead of an unstarted claim.
     Missing next work uses `Not recorded` and `The director has not chosen the next task`.
     Only a readable plan with every phase done permits `Nothing queued; the plan is complete`.
