@@ -41,7 +41,7 @@ from scripts.build_queue import placement
 from scripts.build_queue import step_estimator
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import cloud_progress
-from scripts.build_queue import queue_snapshot
+from scripts.build_queue import queue_snapshot, slot_wait
 from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
 from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
@@ -137,10 +137,16 @@ class Readings(Protocol):
 
 
 class SystemReadings:
+    def __init__(self) -> None:
+        self.swap_in: gate.SwapInHistory = gate.SwapInHistory()
+
     def host(self) -> records.HostMemory | records.ReadingUnavailable:
         try:
-            return gate.read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
-        except (OSError, ValueError) as error:
+            host = gate.read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
+            window = conf.read("build_admission").whole("agent_swap_window_seconds")
+            returning = self.swap_in.read(Path(os.environ.get("BUILDLOG_VMSTAT", "/proc/vmstat")), time.monotonic(), window)
+            return replace(host, swap_in_window_bytes=returning) if isinstance(returning, int) else returning
+        except (OSError, ValueError, conf.Unusable) as error:
             return records.ReadingUnavailable(str(error) or "memory reading unavailable")
 
     def pressure(self, host: records.HostMemory, policy: records.AdmissionPolicy) -> records.Pressure:
@@ -390,7 +396,6 @@ class ServiceState:
     places: dict[str, WaiterPlace]
     ledger: dict[str, ReplayEntry]
     spacing: records.StartSpacing
-    override: records.HeadAdmissionOverride | records.NoHeadAdmissionOverride
     priority: records.QueuePriority | records.NoQueuePriority = records.NO_QUEUE_PRIORITY
     build_history_generation: int = 0
 
@@ -921,21 +926,6 @@ class ScopeWatch:
     episode: str
 
 
-@dataclass(frozen=True)
-class NoReconnectGrace:
-    pass
-
-
-@dataclass(frozen=True)
-class ReconnectAwaitingListener:
-    """A restored override has not yet had any opportunity to reconnect."""
-
-
-@dataclass(frozen=True)
-class ReconnectDeadline:
-    at: float
-
-
 @dataclass
 class Connection:
     socket: socket.socket
@@ -953,7 +943,7 @@ class PendingCoordinatorEvidence:
 
 @dataclass(frozen=True)
 class DeferredOwnerRequest:
-    request: wire.AdmitRequest | wire.LaunchRequest | wire.ServiceEstimateRequest
+    request: wire.AdmitRequest | wire.LaunchRequest | wire.ServiceEstimateRequest | wire.RepositorySlotRequest
     connection: Connection
     arrived_monotonic: float
 
@@ -965,7 +955,7 @@ class ParkedPlacement:
     connection: Connection
 
 
-QueueChange = wire.PrioritySetRequest | wire.PriorityClearRequest | wire.AdmitHeadRequest
+QueueChange = wire.PrioritySetRequest | wire.PriorityClearRequest
 
 
 @dataclass
@@ -1003,6 +993,15 @@ class WaitingAdmission:
     row: records.Waiter
     connection: Connection | NoConnection
     last_reply: wire.Wait | NoWaitReply = NoWaitReply()
+    last_sent: float = float("-inf")
+
+
+@dataclass
+class WaitingRepositorySlot:
+    """The loop owns this connection until capacity or the deadline ends its wait."""
+    request: wire.RepositorySlotRequest
+    connection: Connection | NoConnection
+    reply: wire.RepositorySlotWaiting | wire.RepositorySlotReady | wire.RepositorySlotExpired | NoWaitReply = NoWaitReply()
     last_sent: float = float("-inf")
 
 
@@ -1119,7 +1118,6 @@ def process_uid(pid: int, proc: Path) -> int | OwnerProcessGone:
     return OwnerProcessGone()
 
 
-
 def episode_constraints(first: placement.PlacementConstraints,
                         later: placement.PlacementConstraints) -> placement.PlacementConstraints:
     """Keep the constraints of an episode's first request, so a later land or a busy target cannot change them.
@@ -1143,6 +1141,7 @@ class AdmissionServer:
         self.fault: Callable[[str], None] = fault
         self.socket_path: Path = socket_path if socket_path is not None else wire.admission_socket_path()
         self.waiters: dict[str, WaitingAdmission] = {}
+        self.repository_slot_waiters: dict[str, WaitingRepositorySlot] = {}
         self.reservations: dict[str, ReservationRecord] = {}
         self.lifecycle_outbox: tuple[PendingAdmission | PendingLeft, ...] = ()
         self.places: dict[str, WaiterPlace] = {}
@@ -1170,7 +1169,6 @@ class AdmissionServer:
         # The reading that answered each ended hold. That reading never starts another hold.
         self.placement_hold_answers: dict[tuple[str, placement.PlacementDestination], float] = {}
         self.spacing: records.StartSpacing = records.ReadyToStart()
-        self.override: records.HeadAdmissionOverride | records.NoHeadAdmissionOverride = records.NoHeadAdmissionOverride()
         self.last_inputs: records.QueueInputs | NoPass = NoPass()
         self.last_result: gate.PassResult | NoPass = NoPass()
         self.last_policy: records.AdmissionPolicy | NoPass = NoPass()
@@ -1206,7 +1204,6 @@ class AdmissionServer:
         self.deferred_requests: list[DeferredOwnerRequest] = []
         self.parked_placements: list[ParkedPlacement] = []
         self.last_pass_started: float = float("-inf")
-        self.override_reconnect_until: ReconnectDeadline | ReconnectAwaitingListener | NoReconnectGrace = NoReconnectGrace()
         self.receiving_requests: bool = False
         self.connections: dict[int, Connection] = {}
         self.watchers: dict[int, OwnerWatch | ScopeWatch] = {}
@@ -1263,7 +1260,7 @@ class AdmissionServer:
             state = read_state(self.state_dir)
             self.reservations, self.places = state.reservations, state.places
             self.ledger = ReplayLedger(state.ledger)
-            self.spacing, self.override, self.priority = state.spacing, state.override, state.priority
+            self.spacing, self.priority = state.spacing, state.priority
             self.build_history_generation = state.build_history_generation
             self.run_places = state.run_places
             self.lifecycle_outbox = state.lifecycle_outbox
@@ -1272,8 +1269,6 @@ class AdmissionServer:
             self.assignments = state.assignments
             self.current_assignments = state.current_assignments
             self._persisted = wire.encode_record(state)
-            if not isinstance(self.override, records.NoHeadAdmissionOverride):
-                self.override_reconnect_until = ReconnectAwaitingListener()
         self.persist()
         for episode, record in list(self.reservations.items()):
             if not self._end_if_finished(episode, record):
@@ -1329,7 +1324,7 @@ class AdmissionServer:
             self.ledger.expire(now - self.last_usable_configuration.replay_retention_seconds,
                                protected_keys, live_reservations)
             self._prune_ended_placements(now - self.last_usable_configuration.ended_placement_seconds)
-        state = ServiceState(self.reservations, self.places, self.ledger, self.spacing, self.override, self.priority,
+        state = ServiceState(self.reservations, self.places, self.ledger, self.spacing, self.priority,
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
             self.placement_requests, self.assignments, self.current_assignments)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
@@ -1483,20 +1478,6 @@ class AdmissionServer:
             if sessions and not isinstance(self.priority, records.NoQueuePriority) else {})
         return gate.apply_queue_priority(rows, gate.QueueOrderContext(self.priority, labels))
 
-    def _override_pending_reconnect(self) -> bool:
-        if isinstance(self.override_reconnect_until, NoReconnectGrace):
-            return False
-        if (isinstance(self.override, records.NoHeadAdmissionOverride)
-                or any(gate.head_override_matches(self.override, path, row)
-                       for path, row in self._ordered_waiters())):
-            self.override_reconnect_until = NoReconnectGrace()
-            return False
-        if (isinstance(self.override_reconnect_until, ReconnectDeadline)
-                and not self.receiving_requests
-                and self.clock.monotonic() >= self.override_reconnect_until.at):
-            self.override_reconnect_until = NoReconnectGrace()
-            return False
-        return True
 
     def _prune_runs(self) -> None:
         now = self.clock.now()
@@ -1704,7 +1685,7 @@ class AdmissionServer:
                         if waiting.request.episode not in self.placement_requests
                         or self._local_placement_ready(self.placement_requests[waiting.request.episode])}
         inputs = gate.build_queue_inputs([(path, row) for path, row in ordered
-            if records.waiter_owner(row) in local_owners], memories, readings, self.override, now, priority, unowned)
+            if records.waiter_owner(row) in local_owners], memories, readings, now, priority, unowned)
         represented = {(step.run.pid, step.run.start_time) for step in inputs.running
                        if isinstance(step.run, LiveBuildRun)}
         between = tuple(step for step in evidence.between
@@ -1861,11 +1842,6 @@ class AdmissionServer:
         self.pending_configuration = NoPass()
         return self._read_configuration() if isinstance(configuration, NoPass) else configuration
 
-    def _arm_override_reconnect(self, config: records.MemoryConfig) -> None:
-        if isinstance(self.override_reconnect_until, ReconnectAwaitingListener) and not isinstance(self.listener, NoConnection):
-            self.override_reconnect_until = ReconnectDeadline(self.clock.monotonic() + max(
-                config.override_reconnect_seconds, config.reconnect_seconds))
-            self.next_pass = min(self.next_pass, self.override_reconnect_until.at)
 
     def _check_reading_alert(self, inputs: records.QueueInputs, result: gate.PassResult, config: records.MemoryConfig) -> None:
         """Measure unreadable holds with the service clock and start at most one sender."""
@@ -1952,6 +1928,7 @@ class AdmissionServer:
     def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
               ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
         self.last_pass_started = self.clock.monotonic()
+        self._advance_repository_slots()
         self._prune_runs()
         self.configuration = configuration
         self.pass_stale = False
@@ -1977,7 +1954,6 @@ class AdmissionServer:
             return self.configuration
         config = self.configuration.config
         self.last_usable_configuration = config
-        self._arm_override_reconnect(config)
         self.next_source_check = min(self.next_source_check,
                                      self.clock.monotonic() + config.source_check_seconds)
         policy = config.policy
@@ -1991,9 +1967,6 @@ class AdmissionServer:
             held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
             inputs = replace(inputs, ordered=[(path, row) for path, row in inputs.ordered
                                              if records.waiter_owner(row) not in held_owners])
-        preserve_override = self._override_pending_reconnect()
-        if preserve_override:
-            inputs = replace(inputs, override=records.NoHeadAdmissionOverride())
         inputs = self._placement_pass(inputs, policy)
         result = gate.admission_pass(inputs, inputs.now, policy)
         self._check_reading_alert(inputs, result, config)
@@ -2006,8 +1979,6 @@ class AdmissionServer:
         head_need = head.waiter["need"] if isinstance(head, gate.QueuedHead) else 0
         starts = sorted((row for row in result.rows if isinstance(row.admission, gate.ProposedAdmission)),
                         key=lambda row: cast(gate.ProposedAdmission, row.admission).rank)
-        if not starts:
-            self._effects(inputs.spacing, result.policy.override, result.policy.totals, preserve_override)
         for decision in starts:
             episode = by_owner[decision.owner]
             waiting = self.waiters[episode]
@@ -2019,7 +1990,7 @@ class AdmissionServer:
                 key = placement.attempt_key(episode, assignment.attempt)
                 self.assignments[key] = replace(self.assignments[key], permission=placement.PermissionConsumed(inputs.now))
             proposed = cast(gate.ProposedAdmission, decision.admission)
-            self._effects(proposed.spacing, proposed.override, decision.decision, preserve_override)
+            self.spacing = proposed.spacing
             self._admit(waiting, config, self.configuration.peak_history_share_percent)
         self.persist()
         waiting_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
@@ -2044,17 +2015,15 @@ class AdmissionServer:
             if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                 self._deliver(waiting, reply)
                 waiting.last_reply, waiting.last_sent = reply, inputs.now
-        interval = (config.waiting_pass_seconds if self.waiters or any(self._placement_waiting(request)
+        interval = (config.waiting_pass_seconds if self.waiters or self.repository_slot_waiters or any(self._placement_waiting(request)
                     for request in self.placement_requests.values()) else config.running_pass_seconds)
         self.next_pass = self.clock.monotonic() + interval
-        if isinstance(self.override_reconnect_until, ReconnectDeadline):
-            self.next_pass = min(self.next_pass, self.override_reconnect_until.at)
         if starts or cloud_started:
             self.next_pass = self.clock.monotonic()
         try:
             ordered, priority = self._queue_order()
             queue_snapshot.write_queue_snapshot(self.state_dir,
-                replace(inputs, ordered=ordered, spacing=self.spacing, override=self.override, priority=priority), policy)
+                replace(inputs, ordered=ordered, spacing=self.spacing, priority=priority), policy)
         except OSError:
             # An old snapshot expires without changing the admission result.
             pass
@@ -2111,7 +2080,11 @@ class AdmissionServer:
                 progress.read_counter(sidecar) if record.sidecar else progress.NoCounter(), records.ReadyForAdmission()))
         used = len(rows)
         waiting_cloud = self._cloud_waiters()
-        if not rows and not waiting_cloud:
+        slot_rows = tuple(wire.RepositorySlotRow(waiting.request.owner, waiting.request.identity,
+            waiting.request.since, waiting.request.machine, waiting.reply)
+            for waiting in sorted(self.repository_slot_waiters.values(), key=lambda item: (item.request.since, item.request.owner.pid))
+            if isinstance(waiting.reply, wire.RepositorySlotWaiting))
+        if not rows and not waiting_cloud and not slot_rows:
             return reading
         slots = configuration.cloud_gate_slots
         for waiting in waiting_cloud:
@@ -2122,7 +2095,58 @@ class AdmissionServer:
                 cloud_progress.read(sidecar) if request.sidecar else cloud_progress.NoCloudProgress(),
                 progress.read_counter(sidecar) if request.sidecar else progress.NoCounter(), wire.CloudSlotWait(used, slots)))
         return wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered, reading.diagnostics,
-            tuple(rows), slots, cloud_gate_stale_pushes=configuration.cloud_gate_stale_pushes)
+            tuple(rows), slots, cloud_gate_stale_pushes=configuration.cloud_gate_stale_pushes, repository_slots=slot_rows)
+
+    def _advance_repository_slots(self) -> None:
+        if not self.repository_slot_waiters:
+            return
+        pools: dict[tuple[str, str, str], list[WaitingRepositorySlot]] = {}
+        for episode, waiting in list(self.repository_slot_waiters.items()):
+            request = waiting.request
+            if not self._live(request.owner):
+                del self.repository_slot_waiters[episode]
+                continue
+            pools.setdefault((request.repository, request.machine, request.root), []).append(waiting)
+        if not pools:
+            return
+        locks = Path("/proc/locks").read_text()
+        now = self.clock.now()
+        for (repository, machine, root), waiting_pool in pools.items():
+            pool = slot_wait.read_pool(repository, machine, Path(root), locks)
+            available = len(pool.held) < pool.maximum
+            for waiting in sorted(waiting_pool, key=lambda item: (item.request.since, item.request.owner.pid)):
+                request = waiting.request
+                reply: wire.RepositorySlotWaiting | wire.RepositorySlotReady | wire.RepositorySlotExpired
+                if now >= request.deadline:
+                    reply = wire.RepositorySlotExpired(pool.expired_text)
+                elif available:
+                    reply = wire.RepositorySlotReady()
+                    available = False
+                else:
+                    reply = wire.RepositorySlotWaiting(repository, pool.held, pool.maximum, pool.maximum_key)
+                previous = waiting.reply
+                waiting.reply = reply
+                if not isinstance(reply, wire.RepositorySlotWaiting):
+                    del self.repository_slot_waiters[request.episode]
+                repeat_due = (isinstance(self.last_usable_configuration, records.MemoryConfig)
+                              and now - waiting.last_sent >= self.last_usable_configuration.wait_reply_seconds)
+                if isinstance(waiting.connection, Connection) and (previous != reply or repeat_due):
+                    self._send(waiting.connection, reply)
+                    waiting.last_sent = now
+
+    def _repository_slot(self, request: wire.RepositorySlotRequest,
+                         connection: Connection | NoConnection) -> list[wire.Reply]:
+        waiting = self.repository_slot_waiters.get(request.episode)
+        if waiting is None:
+            waiting = WaitingRepositorySlot(request, connection)
+            self.repository_slot_waiters[request.episode] = waiting
+        else:
+            waiting.connection = connection
+        self._advance_repository_slots()
+        self._publish_replies()
+        if isinstance(waiting.reply, NoWaitReply):
+            return [wire.Refused("slot waiter owner no longer exists")]
+        return [waiting.reply]
 
     def _placement_reading(self, reading: records.QueueRead) -> records.QueueRead:
         remote: list[records.RunningStep] = []
@@ -2205,19 +2229,6 @@ class AdmissionServer:
                 return published.mine_bytes
         return wire.encode_reply(reply).encode()
 
-    def _effects(self, spacing: records.StartSpacing, override: gate.OverrideKept | gate.OverrideEnded,
-                 decision: records.AdmissionDecision, preserve_override: bool) -> None:
-        self.spacing = spacing
-        if preserve_override:
-            return
-        if isinstance(override, gate.OverrideEnded):
-            available = (self.last_inputs.host.available if isinstance(self.last_inputs, records.QueueInputs)
-                         and isinstance(self.last_inputs.host, records.HostMemory) else 0)
-            gate.head_override_event(override.action, override.record, override.record["need"],
-                available, decision.reserve, self.clock.now())
-            self.override = records.NoHeadAdmissionOverride()
-        else:
-            self.override = override.record
 
     def _save_place(self, waiting: WaitingAdmission) -> None:
         row, request = waiting.row, waiting.request
@@ -3377,15 +3388,15 @@ done
             return ""
         if uid == os.getuid():
             return ""
-        if isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest, wire.AdmitHeadRequest)):
+        if isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest)):
             return "queue priority and head admission require the service account"
         if isinstance(request, (wire.BuildHistoryRequest, wire.ViewRequest, wire.ExplainRequest, wire.MineRequest)):
             return ""
-        key = (request.episode if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest))
+        key = (request.episode if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.RepositorySlotRequest))
                else request.request_id)
         if not key.startswith(f"uid:{uid}:"):
             return "request belongs to another account"
-        if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest)):
+        if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.RepositorySlotRequest)):
             if self._account(request.owner.pid) != uid or not self._live(request.owner):
                 return "owner belongs to another account or no longer exists"
             if isinstance(request, wire.AdmitRequest) and isinstance(request.run, wire.RunIdentity):
@@ -3455,6 +3466,8 @@ done
             status = (saved if isinstance(saved, status_wire.UnknownPlacementStatus) else
                 status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider))
             return [status_wire.PlacementStatusReply(status)]
+        if isinstance(request, wire.RepositorySlotRequest):
+            return self._repository_slot(request, connection)
         if isinstance(connection, Connection):
             self._record_caller_version(request, connection, persist_change=not isinstance(request, wire.ConsumePermission))
         if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ClaimFailure, wire.ExecutionReport,
@@ -3504,7 +3517,7 @@ done
         replay = self.ledger.get(key)
         if replay is not None:
             return [replay.reply]
-        if isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest, wire.AdmitHeadRequest)):
+        if isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest)):
             return self._submit_queue_change(request, connection)
         configuration = (self.configuration if isinstance(request, (wire.ReleaseRequest, wire.TokenWaitRequest))
                          else self._take_configuration())
@@ -3630,66 +3643,46 @@ done
                             labels: Mapping[str, gate.UnitMembership]) -> list[wire.Reply]:
         key = request.request_id
         configuration = self._take_configuration()
-        if isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest)):
-            if isinstance(request, wire.PrioritySetRequest):
-                if not request.unit.strip():
-                    return self._mutation_reply(key, wire.Refused("unit is required"))
-                entries = self.priority.entries if isinstance(self.priority, records.QueuePriority) else ()
-                if any(entry["unit"] == request.unit for entry in entries):
-                    return self._mutation_reply(key, wire.Ok())
-                rows = [waiting.row for waiting in self.waiters.values()]
-                rows.extend(record.queue_waiter for record in self.reservations.values())
-                recorded_sessions = {row.get("session_id", "") for row in rows if row.get("unit", "")}
-                units = {label.unit for session, label in labels.items() if session not in recorded_sessions}
-                units.update(row.get("unit", "") for row in rows if row.get("unit", ""))
-                if request.unit == "—" or request.unit not in units:
-                    return self._mutation_reply(key, wire.Refused(
-                        f"unknown unit {request.unit}; the queue priority did not change"))
-                changed = True
-                entry: records.PriorityEntry = {"unit": request.unit, "why": request.why,
-                    "set_at": self.clock.now(), "set_by": request.actor}
-                entries = (*entries, entry)
-                unit, why, actor = request.unit, request.why, request.actor
-            else:
-                entries = self.priority.entries if isinstance(self.priority, records.QueuePriority) else ()
-                if request.unit and not any(entry["unit"] == request.unit for entry in entries):
-                    return self._mutation_reply(key, wire.Refused(
-                        f"unknown unit {request.unit}; the queue priority did not change"))
-                removed = tuple(entry for entry in entries if not request.unit or entry["unit"] == request.unit)
-                changed = bool(removed)
-                entries = tuple(entry for entry in entries if request.unit and entry["unit"] != request.unit)
-                unit = request.unit or ", ".join(entry["unit"] for entry in removed)
-                why, actor = ", ".join(entry["why"] for entry in removed), request.actor
-            at = self.clock.now()
-            month_row_end = store.read_last_whole_row_end(store.host_file(self.host, at))
-            if not changed:
+        if isinstance(request, wire.PrioritySetRequest):
+            if not request.unit.strip():
+                return self._mutation_reply(key, wire.Refused("unit is required"))
+            entries = self.priority.entries if isinstance(self.priority, records.QueuePriority) else ()
+            if any(entry["unit"] == request.unit for entry in entries):
                 return self._mutation_reply(key, wire.Ok())
-            transition = records.PendingPriorityTransition(key,
-                "set" if isinstance(request, wire.PrioritySetRequest) else "clear", at,
-                month_row_end, unit, why, actor)
-            self.priority = records.QueuePriority(entries, transition)
-            self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
-            self.persist()
-            self._finish_priority()
+            rows = [waiting.row for waiting in self.waiters.values()]
+            rows.extend(record.queue_waiter for record in self.reservations.values())
+            recorded_sessions = {row.get("session_id", "") for row in rows if row.get("unit", "")}
+            units = {label.unit for session, label in labels.items() if session not in recorded_sessions}
+            units.update(row.get("unit", "") for row in rows if row.get("unit", ""))
+            if request.unit == "—" or request.unit not in units:
+                return self._mutation_reply(key, wire.Refused(
+                    f"unknown unit {request.unit}; the queue priority did not change"))
+            changed = True
+            entry: records.PriorityEntry = {"unit": request.unit, "why": request.why,
+                "set_at": self.clock.now(), "set_by": request.actor}
+            entries = (*entries, entry)
+            unit, why, actor = request.unit, request.why, request.actor
         else:
-            ordered = self.last_inputs.ordered if isinstance(self.last_inputs, records.QueueInputs) else ()
-            if not ordered:
-                return self._mutation_reply(key, wire.Refused("nothing waits; no head to admit"))
-            if not isinstance(self.last_inputs, records.QueueInputs) or not isinstance(self.last_inputs.host, records.HostMemory):
-                return self._mutation_reply(key, wire.Refused("memory reading unavailable"))
-            candidate = gate.first_queued_waiter(row for _, row in ordered)
-            if isinstance(candidate, records.NoWaiter):
-                return self._mutation_reply(key, wire.Refused("all waiting steps are waiting for the cargo token"))
-            row = candidate.waiter
-            host = self.last_inputs.host
-            reserve = cast(records.AdmissionPolicy, self.last_policy).safety_bytes
-            self.override = {"waiter": records.waiter_owner(row), "pid": row["pid"], "start_time": row["start_time"],
-                "unit": gate.waiter_unit_name(gate.RecordedQueueIdentities().identity(row["pid"],
-                    cast(dict[str, object], cast(object, row))), row["pid"]),
-                "step": row.get("step", ""), "need": row["need"], "free": host.available, "reserve": reserve,
-                "why": request.why, "set_by": request.actor}
-            gate.head_override_event("set", self.override, row["need"], host.available, reserve, self.clock.now())
-            self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
+            entries = self.priority.entries if isinstance(self.priority, records.QueuePriority) else ()
+            if request.unit and not any(entry["unit"] == request.unit for entry in entries):
+                return self._mutation_reply(key, wire.Refused(
+                    f"unknown unit {request.unit}; the queue priority did not change"))
+            removed = tuple(entry for entry in entries if not request.unit or entry["unit"] == request.unit)
+            changed = bool(removed)
+            entries = tuple(entry for entry in entries if request.unit and entry["unit"] != request.unit)
+            unit = request.unit or ", ".join(entry["unit"] for entry in removed)
+            why, actor = ", ".join(entry["why"] for entry in removed), request.actor
+        at = self.clock.now()
+        month_row_end = store.read_last_whole_row_end(store.host_file(self.host, at))
+        if not changed:
+            return self._mutation_reply(key, wire.Ok())
+        transition = records.PendingPriorityTransition(key,
+            "set" if isinstance(request, wire.PrioritySetRequest) else "clear", at,
+            month_row_end, unit, why, actor)
+        self.priority = records.QueuePriority(entries, transition)
+        self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
+        self.persist()
+        self._finish_priority()
         _ = self._run_pass(configuration)
         return [self.ledger[key].reply]
 
@@ -3712,7 +3705,7 @@ done
         if connection.finished:
             return
         connection.sending += self.reply_bytes(reply, version=connection.version)
-        connection.finished = not isinstance(reply, (wire.Wait, wire.BuildHistoryReply))
+        connection.finished = not isinstance(reply, (wire.Wait, wire.BuildHistoryReply, wire.RepositorySlotWaiting))
         if connection.finished:
             self._drop_deferred_requests(connection)
         self.epoll.modify(connection.socket.fileno(), select.EPOLLOUT if connection.finished
@@ -3753,8 +3746,6 @@ done
         listener.setblocking(False)
         self.listener = listener
         self.epoll.register(listener.fileno(), select.EPOLLIN)
-        if isinstance(self.last_usable_configuration, records.MemoryConfig):
-            self._arm_override_reconnect(self.last_usable_configuration)
         self.listener_started_at = self.clock.monotonic()
         _notify("READY=1")
 
@@ -3765,6 +3756,11 @@ done
 
     def _disconnect(self, connection: Connection) -> None:
         self._drop_deferred_requests(connection)
+        removed = [episode for episode, waiting in self.repository_slot_waiters.items() if waiting.connection is connection]
+        for episode in removed:
+            del self.repository_slot_waiters[episode]
+        if removed:
+            self._publish_replies()
         descriptor = connection.socket.fileno()
         if descriptor < 0:
             return
@@ -3843,7 +3839,7 @@ done
                     connection.request = request
                 connection.received = b""
                 if (not isinstance(self.system_reader, NoSystemReader)
-                        and isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest))
+                        and isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.RepositorySlotRequest))
                         and ((process := self.system_reader.latest.processes.get(request.owner.pid)) is None
                              or process.start != request.owner.start_time)):
                     self.deferred_requests.append(DeferredOwnerRequest(request, connection, self.clock.monotonic()))
@@ -4200,7 +4196,7 @@ def drain_check(directory: Path, *, service: bool, include_gate_callers: bool, p
         try:
             state = read_state(directory)
         except FileNotFoundError:
-            state = ServiceState({}, {}, {}, records.ReadyToStart(), records.NoHeadAdmissionOverride())
+            state = ServiceState({}, {}, {}, records.ReadyToStart())
         versions = state.caller_versions
         rows = [(record.reservation_id, reservation_row(record)) for record in state.reservations.values()]
         owners = [place.owner for place in state.places.values()

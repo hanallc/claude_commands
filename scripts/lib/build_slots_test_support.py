@@ -33,17 +33,25 @@ def private_slot_config(root: Path, *, repository: str, maximum: int | UseDefaul
     cargo = root / "cargo"
     machine = host_name()
     lines = [line for line in settings.read_text().splitlines()
-             if not line.startswith(("roots.slots", "roots.slot_cargo", "slots.", "patterns.slot="))]
+             if not line.startswith(("roots.slots", "roots.slot_cargo", "roots.workspace", "slots.", "patterns.slot="))]
     lines.extend((f"roots.slots={root / 'default-slots'}", f"roots.slots.{machine}={slots}",
                   f"roots.slot_cargo={root / 'default-cargo'}", f"roots.slot_cargo.{machine}={cargo}",
+                  f"roots.workspace={root / 'workspaces'}",
                   "patterns.slot={repository}-slot{slot}", "# whole: 1..",
                   f"slots.{machine}.default_max={default_maximum}", "# whole: 1..",
-                  f"slots.unused_days={unused_days}"))
+                  f"slots.unused_days={unused_days}", "# range: 5e-324..", "slots.wait_seconds=30"))
     if isinstance(maximum, int):
         lines.extend(("# whole: 1..", f"slots.{machine}.{repository}.max={maximum}"))
     _ = settings.write_text("\n".join(lines) + "\n")
+    copies = settings.with_name("copies.conf")
+    copy_lines = [line for line in copies.read_text().splitlines()
+                  if not line.startswith("remote_registry=")]
+    copy_lines.append(f"remote_registry={root / 'remote-mirrors'}")
+    _ = copies.write_text("\n".join(copy_lines) + "\n")
     git_config = write_fixture_git_config(root)
     environment.update({
+        "COPIES_CONFIG": str(copies), "SCRATCH_ROOT": str(root / "scratch"),
+        "SCRATCH_COPIES_ROOT": str(root / "workspaces"), "SCRATCH_HOLDS": str(root / "holds.json"),
         "GIT_CONFIG_GLOBAL": str(git_config), "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
         "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid",

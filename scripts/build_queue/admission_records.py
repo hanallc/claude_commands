@@ -20,13 +20,14 @@ from scripts.build_queue import placement
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
-from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, StepRoute
+from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
 from scripts.lib import conf
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
                                    TestPhaseChargeUse as TestPhaseChargeUse)
 
 GIB = 1 << 30
+DIRECT_CARGO = LocalRequired("a direct cargo command runs where it starts")
 
 
 @dataclass(frozen=True)
@@ -549,6 +550,7 @@ class HostMemory:
     swap_total: int = 0
     swap_free: int = 0
     build_and_ci_swap: int | ReadingUnavailable = field(default=0, kw_only=True)
+    swap_in_window_bytes: int = field(default=0, kw_only=True)
 
 Pressure = NoPressureHold | MemoryPressure | PressureUnavailable
 
@@ -584,7 +586,7 @@ class Waiter(TypedDict):
     need_runs: NotRequired[int]
     need_basis: NotRequired[dict[str, object]]
     test_threads: NotRequired[int | None]
-    # Where the caller lets the step run; absent means any eligible target.
+    # The placement request records the route. A direct command has no route.
     route: NotRequired[StepRoute]
 
 
@@ -666,24 +668,6 @@ class NoQueuePriority:
     """The queue has no unit priority."""
 
 NO_QUEUE_PRIORITY = NoQueuePriority()
-
-
-class HeadAdmissionOverride(TypedDict):
-    waiter: str
-    pid: int
-    start_time: str
-    unit: str
-    step: str
-    need: int
-    free: int
-    reserve: int
-    why: str
-    set_by: str
-
-
-@dataclass(frozen=True)
-class NoHeadAdmissionOverride:
-    """The queue head has no admission override."""
 
 
 def queue_command_actor() -> str:
@@ -788,15 +772,10 @@ class WithinSlot:
 
 
 @dataclass(frozen=True)
-class OverrideRoom:
-    """An explicit override permits the step despite the memory room check."""
-
-
-@dataclass(frozen=True)
 class DoesNotFit:
     """The memory need exceeds the available room."""
 
-StartBasis = Fits | StartsAlone | WithinSlot | OverrideRoom | DoesNotFit
+StartBasis = Fits | StartsAlone | WithinSlot | DoesNotFit
 
 
 @dataclass(frozen=True)
@@ -960,7 +939,7 @@ class WaitingStep:
     project: str = ""
     run: LiveBuildRun | NoLiveBuildRun = field(default=NoLiveBuildRun(), kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
-    route: StepRoute = field(default=ANY_ELIGIBLE_TARGET, kw_only=True)
+    route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -980,7 +959,7 @@ class RunningStep:
     execution: placement.ExecutionEvidence = placement.ExecutionNotStarted()
     assignment_host: str = ""
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
-    route: StepRoute = field(default=ANY_ELIGIBLE_TARGET, kw_only=True)
+    route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
 
 
 def execution_host(step: RunningStep, local_host: str) -> str:
@@ -1150,7 +1129,6 @@ class QueueExplanation:
     policy: AdmissionPolicy = field(kw_only=True)
     ordered: tuple[RankedWaiter, ...] = ()
     reservations: tuple[Reservation, ...] = ()
-    override: HeadAdmissionOverride | NoHeadAdmissionOverride = NoHeadAdmissionOverride()
     spacing: StartSpacing = ReadyToStart()
     priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY
     room: MemoryRoom | ReadingUnavailable = ReadingUnavailable()
@@ -1165,7 +1143,6 @@ class QueueInputs:
     host: HostMemory | ReadingUnavailable
     pressure: Pressure
     spacing: StartSpacing
-    override: HeadAdmissionOverride | NoHeadAdmissionOverride
     now: float
     priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY
     blockers_for: frozenset[str] = frozenset()
@@ -1313,7 +1290,6 @@ class MemoryConfig:
     unreachable_limit_seconds: float
     source_check_seconds: float
     source_settle_seconds: float
-    override_reconnect_seconds: float
     request_max_bytes: int
     program_first_peaks: Mapping[str, int]
     program_sample_seconds: float
@@ -1415,7 +1391,7 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 reading_alert_seconds=number("reading_alert_seconds"),
                 unreachable_limit_seconds=number("unreachable_limit_seconds"),
                 source_check_seconds=number("source_check_seconds"),
-                source_settle_seconds=number("source_settle_seconds"), override_reconnect_seconds=number("override_reconnect_seconds"),
+                source_settle_seconds=number("source_settle_seconds"),
                 request_max_bytes=whole("request_max_bytes"), program_first_peaks=first_peaks,
                 program_sample_seconds=number("program_sample_seconds"), program_stop_seconds=number("program_stop_seconds"),
                 peak_wave_seconds=number("peak_wave_seconds"))
@@ -1454,8 +1430,8 @@ def pressure_text(pressure: MemoryPressure) -> str:
 
 
 def waiter_route(row: Waiter) -> StepRoute:
-    """The route the placement request carried, or any eligible target for a row without one."""
-    return row.get("route", ANY_ELIGIBLE_TARGET)
+    """Return the placement route, or keep a direct command where it starts."""
+    return row.get("route", DIRECT_CARGO)
 
 
 def stored_waiter(row: Waiter) -> Waiter:

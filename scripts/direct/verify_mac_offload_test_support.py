@@ -1258,7 +1258,11 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
         }
 
-        self.environment["COPIES_CONFIG"] = copies_environment(self.root)["COPIES_CONFIG"]
+        private = copies_environment(self.root)
+        configuration = Path(self.environment["CONF_DIR"])
+        if configuration != Path(private["CONF_DIR"]):
+            _ = shutil.copy2(Path(private["CONF_DIR"]) / "build_folders.conf", configuration / "build_folders.conf")
+        self.environment.update({key: value for key, value in private.items() if key not in ("HOME", "CONF_DIR")})
         seed_interpreter_cache(self.root / "cache")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
 

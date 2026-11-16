@@ -2124,6 +2124,31 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertEqual(self.read_events(name), before)
         self.assertEqual((session / "turn_wait.json").read_bytes(), marker)
 
+    def test_a_pause_without_a_supplier_waits_and_leaves_active_phase_time(self) -> None:
+        name = "pause-turn-wait"
+        session = self.covered_wait_phase(name)
+        self.enterContext(patch.dict(os.environ, {"UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0", "UNIT_SYNC_WRITES": "0"}))
+        pause = "blocked: your pause of all hana work; the showrunner sends the resume word"
+        self.assertTrue(progress_history.record_turn_wait(session, "director", pause))
+        _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=1100)
+        events = self.read_events(name)
+        wait = next(event for event in events if event.get("event_type") == "wait_started")
+        # This run has no showrunner, so the pause waits on the user.
+        self.assertEqual(wait["wait_kind"], "WaitingForUser")
+        finished = next(event for event in events if event.get("event_type") == "phase_finished")
+        self.assertEqual((finished["phase_elapsed_seconds"], finished["phase_active_seconds"]), (90, 10))
+
+    def test_paused_seconds_count_overlapping_user_and_supplier_waits_once(self) -> None:
+        def wait(kind: str, begin: float, end: float, instance: str = "phase") -> dict[str, object]:
+            return {"event_type": "wait_finished", "wait_kind": kind, "phase_instance_id": instance,
+                    "wait_started_epoch": begin, "wait_end": {"epoch": end}}
+        waits: list[dict[str, object]] = [wait("WaitingForUser", 90, 130), wait("WaitingForSupplier", 120, 150),
+                 {"event_type": "wait_started", "wait_kind": "WaitingForSupplier", "phase_instance_id": "phase",
+                  "wait_started_epoch": 190},
+                 wait("WaitingForMemoryOrSlot", 160, 180), wait("WaitingForUser", 100, 200, "other")]
+        # Spans 100-150 and 190-200 lie in the phase; the memory wait and the other phase do not count.
+        self.assertEqual(progress_history._paused_seconds(waits, "phase", 100, 200, 400), 60)  # pyright: ignore[reportPrivateUsage]
+
     def test_pending_forward_preserves_body_whitespace_and_ignores_the_record_counter(self) -> None:
         name = "pending-exact-body"
         session, _, prompt = self.forwarded_supplier_wait(name, "\nThe checkpoint is merged.\n\n")

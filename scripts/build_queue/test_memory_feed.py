@@ -29,19 +29,21 @@ from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view, target_availability
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
-from scripts.build_targets import target_config, targets
+from scripts.build_targets import build_targets, target_config, targets
 from scripts.build_queue.queue_view import refresh_mac_builds
 from scripts.build_queue.admission_test_support import AdmissionFixture, NOW as ADMISSION_NOW, only_admitted
 from scripts.build_queue.queue_fixture import write_process, write_scope
 from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
-from scripts.lib import conf, test_hang_guard
+from scripts.lib import atomic_file, conf, test_hang_guard
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
 from scripts.lib.build_steps import read_step_names
 from scripts.message import unit_labels
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture, write_config_fixture
+
+REQUEST_TOKEN_DUMP = memory_feed.request_token_dump
 
 
 class FeedStopped(Exception):
@@ -52,7 +54,7 @@ def captured_reading(*, running: tuple[admission_records.RunningStep, ...] = (),
                      host: admission_records.HostMemory | None = None) -> admission_records.QueueRead:
     host = host or admission_records.HostMemory(30 * admission_records.GIB, 60 * admission_records.GIB)
     inputs = admission_records.QueueInputs([], running, (), host,
-        admission_records.NO_PRESSURE_HOLD, admission_records.ReadyToStart(), admission_records.NoHeadAdmissionOverride(), 200_000)
+        admission_records.NO_PRESSURE_HOLD, admission_records.ReadyToStart(), 200_000)
     return gate.queue_read_from(inputs, admission_policy_fixture())
 
 
@@ -73,12 +75,14 @@ def queued_reading(reading: admission_records.QueueRead, units: tuple[str, ...])
     return with_queue_priority(current, units) if units else current
 
 
-def report_fixture(*, empty: bool = False) -> charts.PageData:
+def report_fixture(*, empty: bool = False, unrecorded: bool = False, startless: bool = False) -> charts.PageData:
     end = datetime(2026, 11, 8, tzinfo=UTC)
     start = end - timedelta(days=7)
     ranked = () if empty else (costs.RankedCost("fixture", "Memory wait", 120),)
-    phases = () if empty else (moments.ProgressFinish(end.timestamp() - 1, "fixture-phase",
-        "/fixture/hana", "natedev", 600.0),)
+    # Two phase times keep the median and the p90 points apart, so the page proof reads one point alone.
+    phases = () if empty else tuple(moments.ProgressFinish(end.timestamp() - 1, f"fixture-phase-{seconds}",
+        "/fixture/hana", "natedev", moments.WaitsNotRecorded() if unrecorded else moments.PhaseStartUnavailable() if startless
+        else seconds) for seconds in (600.0, 6000.0))
     build_costs = costs.BuildCosts(start, end, phases, ranked, costs.MacIdleEstimate(0, 0, 0, 0, 0))
     bucket = charts.DailyBucket(start, end, False, build_costs, frozenset({"fixture"}),
         {} if empty else {"fixture": start.timestamp()})
@@ -119,6 +123,104 @@ class MemoryFeedTests(unittest.TestCase):
     root: Path = Path()
     output: Path = Path()
     configuration: Path = Path()
+
+    def test_the_token_pool_names_its_memory_pause(self) -> None:
+        gib = admission_records.GIB
+        pool = memory_feed.token_pool(13 * gib)
+        self.assertEqual(pool, {"kind": "TokenPool", "total": 31, "free": 4, "memory_floor_bytes": 12 * gib, "paused": False})
+        self.assertEqual(memory_feed.token_wait_stage(pool), "waiting for jobserver tokens")
+        paused = memory_feed.token_pool(11 * gib)
+        self.assertEqual(memory_feed.token_wait_stage(paused), "waiting for jobserver tokens (memory under 12 GiB)")
+        for output, error in (("12288\n4\n", None), ("12288\nfour\n31\n", None), ("", ValueError("stevie exited 1: no device"))):
+            with self.subTest(output=output, error=error), mock.patch.object(memory_feed, "stevie_output",
+                    side_effect=error, return_value=output):
+                unavailable = memory_feed.token_pool(11 * gib)
+                self.assertEqual(unavailable["kind"], "TokenPoolUnavailable")
+                self.assertEqual(memory_feed.token_wait_stage(unavailable), "waiting for jobserver tokens")
+
+    def test_the_newest_steve_dump_gives_the_tokens_of_each_process(self) -> None:
+        journal = textwrap.dedent("""\
+            1763270000.000000 natedev steve[1304]: steve: currently 20 tokens available out of 31
+            1763270000.000001 natedev steve[1304]:   PID 50 (cargo build) holds 9 tokens:
+            1763270010.000000 natedev steve[1304]: steve: currently 26 tokens available out of 31
+            1763270010.000001 natedev steve[1304]:   PID 60 (cargo nextest run (x)) holds 3 tokens:
+            1763270010.000002 natedev steve[1304]:     job 0x2b running for 1.5s
+            1763270010.000003 natedev steve[1304]:   PID 61 holds 2 tokens:
+            1763270010.000004 natedev steve[1304]:   1 processes waiting for a job token (in order):
+            1763270010.000005 natedev steve[1304]:     PID 62 is performing a blocking read
+            1763270011.000000 natedev steve[1304]: Warning: PID 63 (build-script-main) returned incorrect token value 0x2b
+            1763270011.000001 natedev steve[1304]:   PID 64 holds 7 tokens:
+            """)
+        self.assertEqual(memory_feed.token_holders(journal), memory_feed.TokenHolders({60: 3, 61: 2}))
+        self.assertIsInstance(memory_feed.token_holders("1763270011.0 natedev steve[1304]: Device closed by PID 5\n"),
+                              memory_feed.TokenHoldersUnknown)
+
+    def test_an_incomplete_steve_dump_gives_way_to_the_complete_one_before_it(self) -> None:
+        complete = textwrap.dedent("""\
+            1763270000.000000 natedev steve[1304]: steve: currently 25 tokens available out of 31
+            1763270000.000001 natedev steve[1304]:   PID 50 (cargo build) holds 6 tokens:
+            """)
+        cut = "1763270010.000000 natedev steve[1304]: steve: currently 26 tokens available out of 31\n"
+        self.assertEqual(memory_feed.token_holders(complete + cut), memory_feed.TokenHolders({50: 6}))
+        self.assertEqual(memory_feed.token_holders(cut + "1763270010.000001 natedev steve[1304]:   PID 60 holds 3 tokens:\n"),
+                         memory_feed.TokenHoldersUnknown("Each steve token dump in the journal window was incomplete."))
+        self.assertEqual(memory_feed.token_holders("1763270000.0 natedev steve[1304]: steve: currently 31 tokens available out of 31\n"),
+                         memory_feed.TokenHolders({}))
+
+    def test_tokens_go_to_the_nearest_running_step_above_each_holder(self) -> None:
+        proc = self.root / "proc"
+        for pid, parent in ((300, 200), (200, 100), (100, 1), (400, 1)):
+            (proc / str(pid)).mkdir()
+            _ = (proc / str(pid) / "stat").write_text(f"{pid} (rustc (x) y) S {parent} 0 0\n")
+        holders = memory_feed.TokenHolders({300: 2, 200: 1, 400: 5, 999: 4})
+        self.assertEqual(memory_feed.tokens_by_run(holders, {100, 200}), {200: 3})
+
+    def test_local_running_rows_carry_their_tokens_only_when_counts_are_known(self) -> None:
+        reading = reservation_reading()
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            unknown = memory_feed.reading()
+
+        def rows(page: memory_feed.MemoryPage) -> list[dict[str, object]]:
+            return [cast(dict[str, object], cast(object, row)) for row in page["walk"]]
+
+        def local(row: dict[str, object]) -> bool:
+            return row.get("machine") == "fixture" and not row.get("ci") and isinstance(row.get("pid"), int)
+
+        pids = [row["pid"] for row in rows(unknown) if local(row)]
+        self.assertTrue(pids)
+        self.assertTrue(all("tokens" not in row for row in rows(unknown)))
+        self.assertEqual(unknown["token_counts"], memory_feed.NO_TOKEN_DUMP_YET.reason)
+        self.assertEqual(unknown["tokens"], {"kind": "TokenPool", "total": 31, "free": 4,
+                                             "memory_floor_bytes": 12 * admission_records.GIB,
+                                             "paused": unknown["available"] < 12})
+        pid = pids[0]
+        assert isinstance(pid, int)
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            known = memory_feed.reading(holders=memory_feed.TokenHolders({pid: 6}))
+        self.assertEqual(known["token_counts"], "")
+        self.assertEqual({row["pid"]: row["tokens"] for row in rows(known) if local(row) and "tokens" in row}, {pid: 6})
+        self.assertTrue(all("tokens" not in row for row in rows(known) if local(row) and row["pid"] != pid))
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            idle = memory_feed.reading(holders=memory_feed.TokenHolders({pid: 0}))
+        self.assertEqual({row["pid"]: row["tokens"] for row in rows(idle) if "tokens" in row}, {pid: 0})
+        self.assertTrue(all("tokens" not in row for row in rows(known) if not local(row)))
+
+    def test_the_feed_shows_why_token_counts_are_unknown_when_steve_refuses_a_dump(self) -> None:
+        reading = reservation_reading()
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            self.assertEqual(memory_feed.main(["--once"]), 0)
+        page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
+        self.assertEqual(page["token_counts"], "Job type reload is not applicable for unit steve.service.")
+
+    def test_a_denied_token_dump_gives_a_plain_reason(self) -> None:
+        denied = subprocess.CompletedProcess(memory_feed.STEVE_DUMP_COMMAND, 1, "",
+                                             "Failed to reload steve.service: Access denied.\nSee system logs for details.")
+        failed = subprocess.CompletedProcess(memory_feed.STEVE_DUMP_COMMAND, 1, "", "Unit steve.service not loaded.\nMore text.")
+        for result, expected in ((denied, memory_feed.STEVE_DUMP_DENIED_REASON),
+                                 (failed, "systemctl reload steve exited 1: Unit steve.service not loaded."),
+                                 (subprocess.CompletedProcess(memory_feed.STEVE_DUMP_COMMAND, 0, "", ""), "")):
+            with self.subTest(expected=expected), mock.patch.object(subprocess, "run", return_value=result):
+                self.assertEqual(REQUEST_TOKEN_DUMP(), expected)
 
     def test_run_slot_numbers_use_the_run_machine_root(self) -> None:
         mac_machine = "private-mac-host"
@@ -228,6 +330,11 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(memory_feed, "PROC", self.root / "proc"))
         _ = self.enterContext(mock.patch.object(memory_feed, "SYS_BLOCK", self.root / "sys" / "block"))
         _ = self.enterContext(mock.patch.object(memory_feed, "CI_CGROUP", self.root / "ci"))
+        # The live jobserver and its journal stay out of the tests: 12 GiB floor, 4 free of 31 tokens.
+        _ = self.enterContext(mock.patch.object(memory_feed, "stevie_output", return_value="12288\n4\n31\n"))
+        _ = self.enterContext(mock.patch.object(memory_feed, "request_token_dump",
+            return_value="Job type reload is not applicable for unit steve.service."))
+        _ = self.enterContext(mock.patch.object(memory_feed, "steve_journal", return_value=""))
         _ = self.enterContext(mock.patch.object(memory_feed, "CGROUP", self.root / "cgroup"))
         _ = self.enterContext(mock.patch.object(charts, "page_data", return_value=report_fixture()))
         _ = self.enterContext(mock.patch.object(queue_view, "mac_reading_path", return_value=self.root / "mac-builds.json"))
@@ -673,7 +780,7 @@ process.stdout.write(JSON.stringify({
         with mock.patch.object(conf, "read", wraps=conf.read) as read:
             configuration = memory_feed.read_configuration()
         self.assertIn(mock.call("memory_feed"), read.call_args_list)
-        self.assertEqual(configuration, memory_feed.FeedConfiguration(self.output, 0.125, 7, 6, 300, configuration.colors, 6))
+        self.assertEqual(configuration, memory_feed.FeedConfiguration(self.output, 0.125, 7, 6, 300, configuration.colors, 6, 10))
 
     def test_configuration_expands_the_output_folder(self) -> None:
         original = self.configuration.read_text()
@@ -780,8 +887,8 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(page["available"], 30)
         self.assertEqual(page["walk"], [])
         self.assertEqual(page["limits"], {"some": 25, "full": 5})
-        self.assertEqual(set(path.name for path in self.output.iterdir()), {"memory_live.html", "memory.json"})
-        for name in ("memory_live.html", "memory.json"):
+        self.assertEqual(set(path.name for path in self.output.iterdir()), {"memory_live.html", "memory.json", memory_feed.REPORT_NAME})
+        for name in ("memory_live.html", "memory.json", memory_feed.REPORT_NAME):
             with self.subTest(name=name):
                 self.assertEqual((self.output / name).stat().st_mode & 0o777, 0o644)
 
@@ -926,8 +1033,10 @@ process.stdout.write(JSON.stringify({
         report_calls_per_cycle: list[int] = []
         with (mock.patch.object(admission_client, "view", return_value=captured_reading()) as queue,
               mock.patch.object(charts, "page_data", return_value=report_fixture()) as provider,
-              mock.patch.object(time, "monotonic", side_effect=[0.0, 100.0, 301.0]),
-              mock.patch.object(time, "sleep", side_effect=[None, None, FeedStopped])):
+              # Each cycle reads the clock once, then once more after its token dump request.
+              mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 100.0, 100.0, 301.0, 301.0]),
+              mock.patch.object(time, "sleep", side_effect=[None, None, FeedStopped]),
+              mock.patch.object(memory_feed, "write_text_atomic", wraps=atomic_file.write_text_atomic) as write):
             def view() -> admission_records.QueueRead:
                 report_calls_per_cycle.append(provider.call_count)
                 return captured_reading()
@@ -938,6 +1047,15 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(queue.call_count, 3)
         self.assertEqual(report_calls_per_cycle, [1, 1, 2])
         self.assertEqual(provider.call_args_list, [mock.call(7, n=3), mock.call(7, n=3)])
+        # The second report read has the same text, so only the first one writes report.json.
+        written = [cast(Path, call.args[0]).name for call in write.call_args_list]
+        self.assertEqual(written.count(memory_feed.REPORT_NAME), 1)
+        self.assertLess(written.index(memory_feed.REPORT_NAME), written.index("memory.json"))
+        report_text = (self.output / memory_feed.REPORT_NAME).read_text()
+        page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
+        self.assertNotIn("report", page)
+        self.assertEqual(page["report_version"], memory_feed.report_file(memory_feed.report_reading(7)).version)
+        self.assertEqual(report_text, memory_feed.report_file(memory_feed.report_reading(7)).text)
 
     def test_mac_readings_follow_the_configured_refresh_window(self) -> None:
         for interval, expected in ((30, [710001, 710001, 710002]), (60, [710001, 710001, 710001])):
@@ -964,11 +1082,40 @@ process.stdout.write(JSON.stringify({
 
                 with (mock.patch.object(admission_client, "view", return_value=captured_reading()),
                       mock.patch.object(queue_view, "refresh_mac_builds", side_effect=refresh),
-                      mock.patch.object(time, "monotonic", side_effect=[0.0, 29.0, 30.0]),
+                      mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 29.0, 29.0, 30.0]),
                       mock.patch.object(time, "sleep", side_effect=after_cycle)):
                     with self.assertRaises(FeedStopped):
                         _ = memory_feed.main([])
                 self.assertEqual(published, expected)
+
+    def test_token_dump_requests_keep_the_interval_after_slow_reads(self) -> None:
+        clock = [0.0]
+        requests: list[float] = []
+
+        def slow_journal(dump_seconds: int) -> memory_feed.TokenHoldersUnknown:
+            del dump_seconds
+            clock[0] += 4
+            return memory_feed.NO_TOKEN_DUMP_YET
+
+        def request() -> str:
+            requests.append(clock[0])
+            return ""
+
+        def sleep(seconds: float) -> None:
+            del seconds
+            clock[0] += 9
+            if clock[0] > 30:
+                raise FeedStopped
+
+        with (mock.patch.object(admission_client, "view", return_value=captured_reading()),
+              mock.patch.object(memory_feed, "newest_token_holders", side_effect=slow_journal),
+              mock.patch.object(memory_feed, "request_token_dump", side_effect=request),
+              mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+              mock.patch.object(time, "sleep", side_effect=sleep)):
+            with self.assertRaises(FeedStopped):
+                _ = memory_feed.main([])
+        # Each journal read takes 4 s and each cycle sleeps 9 s; requests stay at least 10 s apart.
+        self.assertEqual(requests, [4.0, 26.0])
 
     def test_report_dates_use_the_configured_user_zone(self) -> None:
         with mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
@@ -1113,14 +1260,21 @@ process.stdout.write(JSON.stringify({
         for number in range(3):
             _ = self.cgroup(f"owner-{number}.slice", admission_records.GIB // 2)
         gib = admission_records.GIB
-        host = admission_records.HostMemory(30 * gib, 60 * gib, 4 * gib, gib, build_and_ci_swap=0)
-        with mock.patch.object(admission_client, "view", return_value=captured_reading(host=host)):
-            page = memory_feed.reading(replace(memory_feed.read_configuration(), swap_rows=1))
-        self.assertEqual((page["swap"]["used_bytes"], page["swap"]["capacity_bytes"]), (3 * gib, 4 * gib))
-        self.assertEqual((page["swap"]["builds_ci_bytes"], page["swap"]["outside_bytes"]), (0, 3 * gib))
-        self.assertEqual([row["kind"] for row in page["swap_by"]], ["owner", "smaller", "unattributed", "total"])
-        self.assertEqual(sum(row["bytes"] for row in page["swap_by"][:-1]), 3 * admission_records.GIB)
-        self.assertEqual(page["swap_by"][1]["bytes"], admission_records.GIB)
+        for returned in (0, gib):
+            with self.subTest(returned=returned):
+                host = admission_records.HostMemory(30 * gib, 60 * gib, 4 * gib, gib, build_and_ci_swap=0,
+                                                    swap_in_window_bytes=returned)
+                reading = captured_reading(host=host)
+                with (mock.patch.object(admission_client, "view", return_value=reading),
+                      mock.patch.object(gate.SwapInHistory, "read", side_effect=AssertionError("the feed must use the service reading"))):
+                    page = memory_feed.reading(replace(memory_feed.read_configuration(), swap_rows=1))
+                self.assertEqual((page["swap"]["used_bytes"], page["swap"]["capacity_bytes"]), (3 * gib, 4 * gib))
+                self.assertEqual((page["swap"]["builds_ci_bytes"], page["swap"]["outside_bytes"]), (0, 3 * gib))
+                self.assertEqual([row["kind"] for row in page["swap_by"]], ["owner", "smaller", "unattributed", "total"])
+                self.assertEqual(sum(row["bytes"] for row in page["swap_by"][:-1]), 3 * admission_records.GIB)
+                self.assertEqual(page["swap_by"][1]["bytes"], admission_records.GIB)
+                self.assertEqual(page["ram"]["swap_target_bytes"], returned)
+                self.assertEqual(page["ram"]["swap_covered_bytes"], returned)
 
     def test_between_steps_holds_name_their_distinct_owners(self) -> None:
         reading = captured_reading()
@@ -1146,8 +1300,8 @@ process.stdout.write(JSON.stringify({
         with (mock.patch.object(charts, "page_data") as provider,
               mock.patch.object(admission_client, "view", return_value=reservation_reading())):
             page = memory_feed.reading()
+            text = memory_feed.report_file(memory_feed.report_reading(memory_feed.read_configuration().history_days)).text
         provider.assert_not_called()
-        text = memory_feed.page_json(page)
         self.assertIn("history_days", text)
         self.assertIn("TOP_COST_RECENT_DAYS", text)
         self.assertTrue(page["walk"])
@@ -1289,6 +1443,27 @@ process.stdout.write(JSON.stringify({
                 page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
                 self.assertEqual(page["decoder_revision"], "after")
 
+    def test_repository_slot_wait_reaches_the_queued_table_without_memory_charge(self) -> None:
+        base = captured_reading()
+        slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
+            wire.Identity("slot-session", "slot-showrunner", "gate", "proof", "slot-unit"),
+            base.explanation.now - 60, "natedev",
+            wire.RepositorySlotWaiting("widget", (1, 2), 2, "slots.natedev.widget.max"))
+        reading = wire.CloudQueueRead(base.view, base.explanation, base.ordered, base.diagnostics,
+            cloud_gate_stale_pushes=3, repository_slots=(slot,))
+        with mock.patch.object(admission_client, "view", return_value=base):
+            before = memory_feed.reading()
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            after = memory_feed.reading()
+        row, = after["waiters"]
+        self.assertEqual(row["reason"], "waits for a free widget slot (2 of 2 in use)")
+        self.assertEqual(row["pid"], slot.owner.pid)
+        self.assertEqual(row["since"], slot.since)
+        self.assertEqual(cast(memory_feed.WaitRow, row)["need"], 0)
+        self.assertEqual(after["reserved"], before["reserved"])
+        self.assertEqual(after["used"], before["used"])
+        self.assertEqual(after["waiting"], 1)
+
     def test_queue_priority_reaches_the_feed_and_clears_when_removed(self) -> None:
         base = captured_reading()
         first = with_queue_priority(base)
@@ -1343,7 +1518,7 @@ process.stdout.write(JSON.stringify({
 
     def test_can_run_on_names_the_mac_only_when_its_routes_allow_the_step(self) -> None:
         for fit, expected in ((target_availability.Allowed("busy with nextest hana"), "natedev or Mac"),
-                              (target_availability.NotAllowed("makes natedev artifacts"), "natedev only"),
+                              (target_availability.NotAllowed("creates a Linux install"), "natedev only"),
                               (target_availability.FitUnreadable("Mac state unreadable"), "natedev only (Mac state unknown)"),
                               (target_availability.NoMacTarget(), "natedev only")):
             with self.subTest(fit=fit):
@@ -1384,30 +1559,93 @@ process.stdout.write(JSON.stringify({
         routes = target_availability.MacRoutes((snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free())), {}, UTC)
         with mock.patch.object(routes, "holds", return_value="busy with check cargo-handler"):
             self.assertEqual(memory_feed.target_notes(target_config.PinnedTarget("mac"), routes, "nextest", "/r", "p"),
-                             {"runs_on": "Mac only", "targets": ["mac"], "mac_state": "busy with check cargo-handler"})
+                             {"runs_on": "Mac only", "targets": ["mac"], "mac_state": "busy with check cargo-handler",
+                              "mac_text": "Mac: no block or claim recorded"})
             self.assertEqual(memory_feed.target_notes(target_config.LOCAL_CALLER, routes, "nextest", "/r", "p"),
-                             {"runs_on": "natedev only (the run asks for it)", "targets": ["natedev"]})
+                             {"runs_on": "natedev only (the run asks for it)", "targets": ["natedev"],
+                              "mac_text": "Mac: no, local caller"})
         with mock.patch.object(routes, "holds", return_value=""):
             self.assertEqual(memory_feed.target_notes(target_config.MAC_ONLY, routes, "nextest", "/r", "p"),
-                             {"runs_on": "Mac only", "targets": ["mac"]})
+                             {"runs_on": "Mac only", "targets": ["mac"], "mac_text": "Mac: no block or claim recorded"})
 
-    def test_swapped_memory_of_other_programs_shows_as_free_ram_when_it_comes_back(self) -> None:
+    def macroute_page(self) -> memory_feed.MemoryPage:
+        """Build three rows from their recorded placement routes."""
+        from scripts.build_targets import targets
+        from scripts.build_targets.target_config import SshTarget
+        from scripts.mac_test import eligibility
+
+        reading = queued_reading(captured_reading(), ("build", "mend", "direct"))
+        routes = (target_config.ANY_ELIGIBLE_TARGET, target_config.WRITES_TREE, admission_records.DIRECT_CARGO)
+        rows = tuple(replace(row, pid=8100 + index, step=step, route=route)
+                     for index, (row, step, route) in enumerate(zip(
+                         reading.view.waiting[:3], ("build", "mend", "build"), routes, strict=True)))
+        reading = replace(reading, view=replace(reading.view, waiting=rows))
+        job = targets.RunningJob("nextest hana_catalyst", datetime.now(UTC), targets.NotSeenIdle())
+        snapshots = (targets.TargetSnapshot(SshTarget("mac", "macos", self.root / "mac.conf"),
+                     (targets.Running((job,)),), (), eligibility.NO_BACKOFF),)
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(target_availability, "read_snapshots", return_value=snapshots),
+              mock.patch.object(build_targets, "step_policy", return_value=eligibility.KnownRepository("handler", "/r"))):
+            return memory_feed.reading()
+
+    def test_queued_tooltips_use_the_verify_route_or_the_direct_command_reason(self) -> None:
+        page = self.macroute_page()
+        self.assertEqual([row.get("mac_text") for row in page["waiters"]], [
+            "Mac: busy with nextest hana_catalyst",
+            "Mac: no, mend edits this checkout on natedev",
+            "Mac: no, a direct cargo command runs where it starts"])
+        self.assertEqual([row.get("runs_on") for row in page["waiters"]],
+                         ["natedev or Mac", "natedev only (step writes the tree)",
+                          "natedev only (a direct cargo command runs where it starts)"])
+
+    def test_head_room_rows_are_inside_the_queue_cap_and_add_up(self) -> None:
         gib = admission_records.GIB
-        room = admission_records.MemoryRoom(28 * gib, 3 * gib, 0, 8 * gib, 7 * gib, 64 * gib, (), agent_swap_demand=10 * gib)
-        check = admission_records.RoomCheck(16 * gib, 7 * gib, False, basis=admission_records.DoesNotFit())
-        shown = memory_feed.head_room(check, room)
-        self.assertEqual([(row["label"], row["gib"]) for row in shown["rows"]], [
-            ("Free RAM", 28.0), ("− Safety net", 3.0), ("− Swap coming back", 10.0), ("− Build reserved", 8.0),
-            ("= Free", 7.0), ("need", 16.0)])
-        self.assertEqual(shown["note"], f"Other programs have 10.0 GiB of memory in swap. {memory_feed.SWAP_RETURN_NOTE}")
+        self.ram_fixture()
+        tools = memory_feed.BuildToolRam(rust_analyzer=gib, sccache=0, other=0)
+        room = admission_records.MemoryRoom(28 * gib, 3 * gib, 2 * gib, 8 * gib, 7 * gib, 17 * gib, (), agent_swap_demand=10 * gib)
+        ram = memory_feed.ram_blocks(room, tools, 100.0, 1)
+        for ahead in (0, 2):
+            with self.subTest(ahead=ahead):
+                check = admission_records.RoomCheck(16 * gib, (7 - ahead) * gib, False, basis=admission_records.DoesNotFit())
+                shown = memory_feed.head_room(check, room, ram)
+                rows = [(row["label"], row["gib"]) for row in shown["rows"]]
+                self.assertEqual(rows, [("Queue cap", 18.0), ("− Builds", 3.0), ("− Build reserved", 8.0),
+                                        *([("− Held for builds ahead in line", 2.0)] if ahead else []),
+                                        ("= Free for builds", 7.0 - ahead)])
+                self.assertEqual(rows[0][1] - sum(amount for _, amount in rows[1:-1]), rows[-1][1])
+                self.assertEqual(rows[0][1], memory_feed.gib(ram["cap_bytes"]))
+                self.assertEqual(shown["unavailable"], "")
+                self.assertEqual(shown["note"], f"{memory_feed.BUILD_RESERVED_NOTE} "
+                                 + f"Swap coming back needs 10.0 GiB. {memory_feed.SWAP_RETURN_NOTE}")
+        short = replace(room, available=16 * gib, signed_room=-5 * gib)
+        check = admission_records.RoomCheck(16 * gib, -5 * gib, False, basis=admission_records.DoesNotFit())
+        shown = memory_feed.head_room(check, short, memory_feed.ram_blocks(short, tools, 100.0, 1))
+        self.assertEqual([(row["label"], row["gib"]) for row in shown["rows"]],
+                         [("Queue cap", 6.0), ("− Builds", 3.0), ("− Build reserved", 3.0), ("= Free for builds", 0.0)])
+        self.assertIn("Running builds need 8.0 GiB reserved. Free RAM covers 3.0 GiB of it.", shown["note"])
+        swap_short = replace(room, available=4 * gib, agent_swap_demand=6 * gib, signed_room=-11 * gib)
+        check = admission_records.RoomCheck(16 * gib, -11 * gib, False, basis=admission_records.DoesNotFit())
+        swap_ram = memory_feed.ram_blocks(swap_short, tools, 100.0, 1)
+        self.assertEqual(swap_ram["swap_covered_bytes"], gib)
+        self.assertIn("Swap coming back needs 6.0 GiB. Free RAM covers 1.0 GiB of it.",
+                      memory_feed.head_room(check, swap_short, swap_ram)["note"])
+        no_swap = replace(room, agent_swap_demand=0, cap=27 * gib, signed_room=17 * gib)
+        check = admission_records.RoomCheck(16 * gib, 17 * gib, False, basis=admission_records.DoesNotFit())
+        no_swap_ram = memory_feed.ram_blocks(no_swap, tools, 100.0, 1)
+        self.assertEqual(memory_feed.head_room(check, no_swap, no_swap_ram)["note"], memory_feed.BUILD_RESERVED_NOTE)
+        run = admission_records.RunMemory("organon", gib, admission_records.RunUseUnavailable("no cgroup"))
+        unavailable = memory_feed.head_room(check, replace(room, cap=admission_records.CapUnavailable((run,))), ram)
+        self.assertEqual((unavailable["unavailable"], unavailable["rows"]),
+                         ("Queue cap unavailable: memory use is unavailable for organon: no cgroup", []))
+        unread = memory_feed.head_room(check, admission_records.ReadingUnavailable("meminfo is missing"), ram)
+        self.assertEqual((unread["unavailable"], unread["rows"]), ("Queue cap unavailable: meminfo is missing", []))
 
     def test_only_a_head_that_memory_holds_shows_its_room_rows(self) -> None:
         gib = admission_records.GIB
         reading = with_wait_reason(reservation_reading(), admission_records.NeedsMemory())
         room = admission_records.RoomCheck(20 * gib, 15 * gib, False, basis=admission_records.DoesNotFit())
-        expected_rows = [[("Free RAM", 30.0), ("− Safety net", 3.0), ("− Swap coming back", 0.0),
-                          ("− Build reserved", 9.0), ("− Held for earlier steps", 3.0),
-                          ("= Free", 15.0), ("need", 20.0)]]
+        expected_rows = [[("Queue cap", 28.0), ("− Builds", 1.0), ("− Build reserved", 9.0),
+                          ("− Held for builds ahead in line", 3.0), ("= Free for builds", 15.0)]]
         states: tuple[tuple[Literal["admit", "hold"], admission_records.HeadCause], ...] = (
             ("admit", admission_records.NeedsMemory()), ("hold", admission_records.NeedsMemory()),
             ("hold", admission_records.StartSpacingWait(110)), ("hold", admission_records.GpuSlotWait(1, 1)))
@@ -1424,6 +1662,39 @@ process.stdout.write(JSON.stringify({
                          for waiter in page["waiters"] if "head_room" in waiter]
                 self.assertEqual(shown, expected_rows if state == "hold" else [])
                 self.assertNotIn("admission_check", page)
+                first = page["waiters"][0]
+                self.assertEqual((first.get("place"), first.get("why")),
+                                 (1, "only 15.0 GiB is free for builds. It starts when 20.0 GiB is free."))
+
+    def test_each_wait_reason_says_why_in_the_same_form(self) -> None:
+        gib = admission_records.GIB
+        waiting = with_wait_reason(reservation_reading(), admission_records.NeedsMemory()).view.waiting
+        decision = admission_records.AdmissionDecision("hold", 0, 0, 0, 0)
+        cases: tuple[tuple[admission_records.WaitReason, str], ...] = (
+            (admission_records.NeedsMemory(need=4 * gib, free=gib),
+             "only 1.0 GiB is free for builds. It starts when 4.0 GiB is free."),
+            (admission_records.BehindHead("first", 0, "fixture"), "it is behind the first build in line, which gets memory first."),
+            (admission_records.TokenWaitingWaiter(0), "another build runs in the same work folder. One build at a time can use a folder."),
+            (admission_records.StartSpacingWait(0), "the queue waits a short time between two starts. It starts after that time."),
+            (admission_records.MemoryPressure(1.0), "memory pressure is high. It starts when the pressure goes down."),
+            (admission_records.GpuSlotWait(1, 1), "1 of 1 GPU test slots are in use. It starts when a GPU test ends."),
+            (admission_records.EstimateExpired(0), "its memory estimate expired. The queue reads a new estimate before it starts."),
+            (admission_records.NatedevHeld("research", "a disk walk"), "natedev is held by research for a disk walk. It starts when the hold ends."),
+            (admission_records.ReadingUnavailable("meminfo is missing"),
+             "a memory reading is unavailable: meminfo is missing. It starts when the reading comes back."),
+            (admission_records.PressureUnavailable("PSI is missing"),
+             "a memory reading is unavailable: PSI is missing. It starts when the reading comes back."),
+            (admission_records.ReadyForAdmission(), "nothing. It starts at the next check."),
+            (admission_records.HeadAdmissionStatus(decision, 0, 0, cause=admission_records.ReadyForAdmission()),
+             "the build at number 1 in line starts first."),
+            (admission_records.HeadAdmissionStatus(decision, 0, 0, cause=admission_records.MemoryPressure(1.0)),
+             "memory pressure is high. It starts when the pressure goes down."))
+        for reason, expected in cases:
+            with self.subTest(reason=type(reason).__name__):
+                self.assertEqual(memory_feed.wait_why(reason, waiting, None), expected)
+        check = admission_records.RoomCheck(6 * gib, -2 * gib, False, basis=admission_records.DoesNotFit())
+        self.assertEqual(memory_feed.wait_why(admission_records.NeedsMemory(), waiting, check),
+                         "only 0.0 GiB is free for builds. It starts when 6.0 GiB is free.")
 
     def test_mac_idle_alert_reaches_the_feed_and_clears_with_the_watch_state(self) -> None:
         _ = write_idle_config(self.root)
@@ -1460,6 +1731,8 @@ process.stdout.write(JSON.stringify({
 
         _ = write_idle_config(self.root)
         reading = queued_reading(captured_reading(), ())
+        reading = replace(reading, view=replace(reading.view, waiting=tuple(
+            replace(row, route=target_config.ANY_ELIGIBLE_TARGET) for row in reading.view.waiting)))
         now = reading.explanation.now
         since = datetime.fromtimestamp(now - 600, UTC)
         block = targets.Held("research", "P15 F11 L0 run", since, targets.UntilReleased(), targets.HolderSession("mac-owner"))
@@ -2008,15 +2281,24 @@ process.stdout.write(JSON.stringify({
     def test_one_report_call_supplies_both_sections(self) -> None:
         with (mock.patch.object(charts, "page_data", return_value=report_fixture()) as provider,
               mock.patch.object(admission_client, "view", return_value=captured_reading())):
-            page = memory_feed.reading()
+            report = memory_feed.report_reading(7)
         provider.assert_called_once_with(7, n=3)
-        report = page["report"]
         assert isinstance(report, memory_feed.ReportSections)
         row = report.top[0]
         self.assertEqual((row["machine"], row["cause"], row["range"]), ("fixture", "Memory wait", [30 / 3600, 60 / 3600]))
         self.assertEqual(row["share"], "fixture nextest paid 75% of it.")
         self.assertEqual(row["action"], "Action: lower the memory peak of fixture nextest. It holds the most build memory: "
-                                        + "12 GiB·h/day, peak p90 3.0 GiB.")
+                                        + "12 GiB·h/day. Most runs peak at 3.0 GiB or less.")
+
+    def test_an_unmeasured_day_sends_no_range_and_no_share(self) -> None:
+        report = report_fixture()
+        assert not isinstance(report.top.rows, charts.NoDataYet)
+        row = replace(report.top.rows[0], share=cost_actions.NoShare.VALUE,
+                      days=(charts.MeasuredCost(30), charts.CostUnavailable("1 applicable waits missing")))
+        with mock.patch.object(charts, "page_data", return_value=replace(report, top=replace(report.top, rows=(row,)))):
+            sections = memory_feed.report_reading(7)
+        assert isinstance(sections, memory_feed.ReportSections)
+        self.assertEqual((sections.top[0]["range"], sections.top[0]["share"]), ([], ""))
 
     def test_report_failures_keep_the_queue_reading(self) -> None:
         for failure in (charts.IndexUnavailable("private index is missing"),
@@ -2028,15 +2310,13 @@ process.stdout.write(JSON.stringify({
                 with (provider,
                       mock.patch.object(admission_client, "view", return_value=reservation_reading())):
                     page = memory_feed.reading()
-                text = memory_feed.page_json(page)
+                    text = memory_feed.report_file(memory_feed.report_reading(7)).text
                 self.assertTrue(page["walk"])
                 self.assertIn(failure.reason if isinstance(failure, charts.IndexUnavailable) else str(failure), text)
 
     def test_an_empty_report_keeps_its_recent_window(self) -> None:
-        with (mock.patch.object(charts, "page_data", return_value=report_fixture(empty=True)),
-              mock.patch.object(admission_client, "view", return_value=captured_reading())):
-            page = memory_feed.reading()
-        text = memory_feed.page_json(page)
+        with mock.patch.object(charts, "page_data", return_value=report_fixture(empty=True)):
+            text = memory_feed.report_file(memory_feed.report_reading(7)).text
         self.assertIn("2026-11-05", text)
         self.assertIn("2026-11-08", text)
 
@@ -2095,7 +2375,8 @@ def write_browser_fixture(folder: Path) -> None:
         for name, available, swapped in (("head_memory", 8, 0), ("head_shortfall", 2, 0), ("head_swap_shortfall", 4, 6)):
             held = gate.queue_read_from(replace(inputs, pressure=admission_records.NoPressureHold(),
                 host=admission_records.HostMemory(available * admission_records.GIB, 60 * admission_records.GIB,
-                    8 * admission_records.GIB, (8 - swapped) * admission_records.GIB)),
+                    8 * admission_records.GIB, (8 - swapped) * admission_records.GIB,
+                    swap_in_window_bytes=swapped * admission_records.GIB)),
                 admission_policy_fixture())
             held = with_wait_reason(held, admission_records.NeedsMemory())
             held = replace(held, view=replace(held.view,
@@ -2141,6 +2422,7 @@ def write_browser_fixture(folder: Path) -> None:
             runs=(replace(room.runs[0], memory=missing),))
         readings["missing_use"] = replace(base, explanation=replace(base.explanation, room=missing_room))
         pages: dict[str, object] = {}
+        reports: dict[str, memory_feed.ReportFile] = {}
         director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
                                           unit_labels.DirectsUnit("panes"))
         runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
@@ -2169,6 +2451,7 @@ def write_browser_fixture(folder: Path) -> None:
         pages["step_ci"] = json.loads(memory_feed.page_json(ci_page))
         pages["step_unknown"] = json.loads(memory_feed.page_json(fixture.owner_machine_page(
             unit_labels.UnitLabels("unknown", "—", "owner not recorded"))))
+        pages["macroute"] = json.loads(memory_feed.page_json(fixture.macroute_page()))
         for name, reading in readings.items():
             with mock.patch.object(admission_client, "view", return_value=reading):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
@@ -2190,10 +2473,13 @@ def write_browser_fixture(folder: Path) -> None:
             pages["mac_idle"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         (fixture.root / "mac-idle" / "alert.json").unlink()
         for name, report in (("empty_report", report_fixture(empty=True)),
+                             ("unrecorded_report", report_fixture(unrecorded=True)),
+                             ("startless_report", report_fixture(startless=True)),
                              ("missing_report", charts.IndexUnavailable("private index is missing"))):
             with (mock.patch.object(charts, "page_data", return_value=report),
                   mock.patch.object(admission_client, "view", return_value=base)):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
+                reports[name] = memory_feed.report_file(memory_feed.report_reading(configuration.history_days))
         mac_builds = tuple(queue_view.MacBuild(pid, path, base.explanation.now - 120 + index,
             command, repository, queue_view.MacBuilding(), int(used * admission_records.GIB),
             queue_view.mac_command_jobs(command), progress_profile.ProgressCounter("build:1", done, 1000), unit)
@@ -2218,6 +2504,19 @@ def write_browser_fixture(folder: Path) -> None:
               mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(
                   base.explanation.now - 540, mac_builds, "awk: private raw error"))):
             pages["mac_failed"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
+        placed = queue_view.MacBuild(710001, "/Mac/fps", base.explanation.now - 600,
+            "cargo nextest run -p fps", "hana", queue_view.MacTesting(710002),
+            int(2.1 * admission_records.GIB), gate_label=queue_view.MacGateLabel.PLACEMENT,
+            gate_placement="v20261115T234230-2719419-21122-step-1/24e0cf9c4113402abff80a3dfa0edcdb2")
+        with (mock.patch.object(admission_client, "view", return_value=base),
+              mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(
+                  base.explanation.now, (placed,)))):
+            pages["macroute_running"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
+        # The proof serves each reading's report as report.json and shows it with its reading.
+        default_report = memory_feed.report_file(memory_feed.report_reading(configuration.history_days))
+        for name, page in pages.items():
+            report = reports.get(name, default_report)
+            cast(dict[str, object], page).update(report_version=report.version, report=cast(object, json.loads(report.text)))
         _ = (folder / "fixtures.json").write_text(json.dumps(pages))
     finally:
         _ = fixture.doCleanups()

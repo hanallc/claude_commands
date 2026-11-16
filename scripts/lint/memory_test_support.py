@@ -176,6 +176,8 @@ def fake_memory_readings(root: Path, *, available_kib: int = 67108864,
                          swap_total_kib: int = 0, swap_free_kib: int = 0, some_avg10: float = 0.0) -> dict[str, str]:
     meminfo = root / "meminfo"
     pressure = root / "pressure"
+    vmstat = root / "vmstat"
+    _ = vmstat.write_text("pswpin 0\n")
     _ = meminfo.write_text(f"MemTotal: {total_kib} kB\nMemAvailable: {available_kib} kB\n"
                           + f"SwapTotal: {swap_total_kib} kB\nSwapFree: {swap_free_kib} kB\n")
     write_pressure_reading(pressure, full_avg10=full_avg10, some_avg10=some_avg10)
@@ -183,6 +185,7 @@ def fake_memory_readings(root: Path, *, available_kib: int = 67108864,
         **config_environment(root),
         **private_ci_environment(root),
         "BUILDLOG_MEMINFO": str(meminfo),
+        "BUILDLOG_VMSTAT": str(vmstat),
         "BUILDLOG_BUILDS_CGROUP": str(root / "builds.slice"),
         "BUILDLOG_MEMORY_PRESSURE": str(pressure),
         "BUILDLOG_LIVE_MEMORY_TRIPWIRE": os.environ.get("BUILDLOG_LIVE_MEMORY_TRIPWIRE",

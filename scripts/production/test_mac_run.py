@@ -739,7 +739,10 @@ class MacRunTests(unittest.TestCase):
         remote.mkdir()
         local_environment = copies_environment(local)
         remote_environment = copies_environment(remote)
-        self.environment.update({key: value for key, value in local_environment.items() if key != "HOME"})
+        _ = shutil.copy2(Path(local_environment["CONF_DIR"]) / "build_folders.conf",
+                         Path(self.environment["CONF_DIR"]) / "build_folders.conf")
+        self.environment.update({key: value for key, value in local_environment.items()
+                                 if key not in ("HOME", "CONF_DIR")})
         self.environment.update({
             "MAC_RUN_SHA": head, "MAC_RUN_REAL_COPIES": "1", "MAC_RUN_REAL_PATH": os.environ["PATH"],
             "MAC_RUN_REMOTE_COPIES_CONFIG": remote_environment["COPIES_CONFIG"],

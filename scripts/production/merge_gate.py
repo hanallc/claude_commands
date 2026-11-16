@@ -539,7 +539,7 @@ def command(arguments: Sequence[str], repo: Path) -> subprocess.CompletedProcess
             process = cleanup.enter_context(subprocess.Popen(
                 arguments, cwd=repo, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, errors="replace", start_new_session=True))
+                text=True, errors="replace", start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get()))
             recovery = ACTIVE_GATE_RECOVERY.get()
             if isinstance(recovery, GateRecovery):
                 recovery.add_group(process.pid)
@@ -1093,7 +1093,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
             process = subprocess.Popen([str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *argv],
                                        cwd=repo, env={**environment, "MERGE_GATE_PARENT_PID": str(os.getpid())},
                                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, text=True,
-                                       start_new_session=True)
+                                       start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get())
             recovery = ACTIVE_GATE_RECOVERY.get()
             if isinstance(recovery, GateRecovery):
                 recovery.add_group(process.pid)
@@ -2730,8 +2730,9 @@ def _sweep_nightly_slots() -> None:
                            if key == "roots.slots" or key.startswith("roots.slots.")):
                     continue
                 scripts = Path(__file__).resolve().parents[1]
-                _ = subprocess.run([sys.executable, str(scripts / "mac_test/mac_queue_run.py"),
-                                    "--kind", "run", "--what", "Sweep Mac build slots", "--package=claude",
+                _ = subprocess.run([sys.executable, str(scripts / "lib/nix_env.py"), "exec",
+                                    sys.executable, str(scripts / "mac_test/mac_queue_run.py"),
+                                    "--kind", "run", "--what", "Sweep Mac build slots", "--package", "claude",
                                     "--", "/bin/zsh", "-c",
                                     '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/build_slots.py" sweep'],
                                    check=True, capture_output=True, text=True)

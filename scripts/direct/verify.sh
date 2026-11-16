@@ -10,7 +10,7 @@
 #   lint [<package>]       repair and format code; check TOML and run Clippy
 #   doc [<package>]        document the staged workspace; deny warnings
 #   example [<package>]    run Clippy on examples on an eligible target
-#   build [<package>]      build binaries on natedev and print their paths
+#   build [<package>]      build binaries on an eligible target; print paths
 #   final [<package>]      check workspace targets; run tests on natedev
 #   help <command>       show details for one command
 #
@@ -139,7 +139,7 @@
 # Usage: verify build [<package>] [--bin <name> | --example <name>]
 #                     [--release] [--features <list>] [--attached]
 #
-# Build binaries on natedev unless --target or --mac pins the step.
+# Build binaries on an eligible target. --target or --mac pins the step.
 # --local pins the step to natedev.
 # --bin selects one binary. --example selects one example.
 # Enable the example's required features when building an example.
