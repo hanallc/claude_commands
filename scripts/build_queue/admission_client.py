@@ -1199,7 +1199,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
         # A Mac-only step is pinned to the Mac, so the routing rule lets a build leave natedev.
         selection = (step_selection.Pinned(args.target) if args.target else
                      step_selection.Pinned("mac") if args.mac_only else step_selection.ROUTED)
-        routing = target_config.LocalRequired("local caller") if args.local_only else target_config.ANY_ELIGIBLE_TARGET
+        routing = target_config.LOCAL_CALLER if args.local_only else target_config.ANY_ELIGIBLE_TARGET
         kind = args.kind or local.profile.step
         if kind == "nextest":
             kind = "test"
@@ -1223,7 +1223,9 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             local=wire.LocalAdmissionContext(local.argv, local.cwd, local.sidecar, local.call,
                 local.test_width, local.fresh_test, local.token_back_at), prerequisite=prerequisite,
             purpose=placement.SpeculativeCopy(args.parent_episode, args.call_started)
-                if args.parent_episode else placement.NormalStep())
+                if args.parent_episode else placement.NormalStep(),
+            route=target_config.step_route(local=args.local_only, mac_only=args.mac_only, target=args.target,
+                                           writes_tree=args.writes_tree))
         if already_queued:
             _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex, episode, owner, prerequisite))
         while True:

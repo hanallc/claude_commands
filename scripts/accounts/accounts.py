@@ -4332,7 +4332,7 @@ BoardTone = Literal["default", "success", "error", "warning", "inactive"]
 
 
 class BoardSpan(TypedDict):
-    """One styled piece of a board cell; the console Accounts page and the unit-board plugin draw it as it is."""
+    """One styled piece of a board cell; the console Accounts page draws it as it is."""
     text: str
     tone: BoardTone
     kind: Literal["fact", "bold"]
@@ -4345,9 +4345,8 @@ class BoardColumn(TypedDict):
 
 
 class BoardRow(TypedDict):
-    """The cells of one table line, and the same facts for a pane too narrow for the table."""
+    """The cells of one table line."""
     cells: dict[str, list[BoardSpan]]
-    facts: list[list[BoardSpan]]
 
 
 class Board(TypedDict):
@@ -4508,10 +4507,6 @@ def _count_cells(count: RoleSessionCounts | NoRoleCount | None) -> dict[str, str
             "exited": str(count.exited), "total": str(count.total)}
 
 
-def _count_facts(counts: dict[str, str]) -> list[list[BoardSpan]]:
-    return [[_span(key, "inactive"), _span(f" {counts[key]}")] for key in COUNT_COLUMNS if counts[key]]
-
-
 def _account_board_rows(row: StatusRow, reading: StatusReading, *, account_config: conf.ConfigRead) -> list[BoardRow]:
     weekly = row.weekly_left_percent
     known = not isinstance(weekly, (StatusUnavailable, WeeklyNotReadSince))
@@ -4526,22 +4521,12 @@ def _account_board_rows(row: StatusRow, reading: StatusReading, *, account_confi
     for index, role in enumerate(roles):
         first = index == 0
         counts = _count_cells(row.role_counts[index] if index < len(row.role_counts) else None)
-        facts = [[_span(f"{left} left", tone)]] if first else []
-        if role:
-            facts.append([_span("role", "inactive"), _span(f" {role}")])
-        facts.extend(_count_facts(counts))
-        if first and reset:
-            facts.append([_span("resets", "inactive"), _span(f" {reset}")])
-        if first and balance:
-            facts.append([_span("credits", "inactive"), _span(" "), _span(balance)])
-        if first and row.use_credits:
-            facts.append([_span("enabled")])
         cells = {"dot": [_span("●", dot)] if first else [], "label": [_span(row.label, kind="bold")] if first else [],
                  "left": [_span(left, tone)] if first else [], "roles": [_span(role)],
                  **{key: [_span(value)] for key, value in counts.items()},
                  "resets": [_span(reset)] if first else [], "credits": [_span(balance)] if first else [],
                  "enabled": [_span("yes" if row.use_credits else "")] if first else []}
-        lines.append(BoardRow(cells=cells, facts=facts))
+        lines.append(BoardRow(cells=cells))
     return lines
 
 
@@ -4562,8 +4547,7 @@ def status_board(reading: StatusReading, *, account_config: conf.ConfigRead | Re
     empty: list[BoardSpan] = []
     lines.append(BoardRow(cells={"dot": empty, "label": [_span("total", kind="bold")], "left": empty, "roles": empty,
                                  **{key: [_span(value)] for key, value in total.items()},
-                                 "resets": empty, "credits": empty, "enabled": empty},
-                          facts=_count_facts(total)))
+                                 "resets": empty, "credits": empty, "enabled": empty}))
     return Board(columns=list(BOARD_COLUMNS), rows=lines, stale_at=stale_at)
 
 
@@ -5686,15 +5670,20 @@ def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
     return MachineSessionCounts(machine=machine, at=stamp, accounts=checked)
 
 
+def _session_counts_failure() -> Path:
+    return _session_counts_cache().with_name("peer_session_counts_failed.json")
+
+
 def _fetch_session_counts() -> int:
-    """Fetch only the other machine's local counts through the shared transport."""
+    """Fetch the other machine's counts; a failed read keeps the last good copy for its age limit."""
     try:
         machine = remote.other_machine()
         text = role_map.ssh_role_map(("session-counts-read",), machine=machine)
         _ = _decode_session_counts(text, machine)
         atomic_file.write_text_atomic(_session_counts_cache(), text)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        atomic_file.write_text_atomic(_session_counts_cache(), json.dumps({"unavailable": True}))
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        atomic_file.write_text_atomic(_session_counts_failure(), json.dumps({
+            "at": datetime.now(timezone.utc).isoformat(), "reason": f"{type(error).__name__}: {error}"}))
         return 1
     return 0
 
@@ -5733,10 +5722,7 @@ def _machine_role_counts(
     except (OSError, ValueError):
         peer_accounts = {}
         available = False
-    started = _start_session_counts_fetch()
-    available = available and started
-    if not available:
-        peer_accounts = {}
+    _ = _start_session_counts_fetch()
     counted: list[StatusRow] = []
     for row in rows:
         local_counts = {role: RoleSessionCountsDocument(busy=count.busy,

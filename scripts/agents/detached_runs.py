@@ -30,7 +30,7 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
@@ -61,8 +61,6 @@ SUPERSEDED_VERDICT = ("SUPERSEDED (exit 76): a newer call of the same verb repla
 # The verdict of a run whose supervisor is gone: it reported no exit status.
 ORPHAN_VERDICT = ("FAIL (no exit status): the run's supervisor process is gone, so the command was killed or "
                   + "crashed before it reported. Start the run again if you still need its result.")
-# Where run folders and their active markers live; tests point this at a temporary folder.
-RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
 from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR as DETACHED_RUNS_DIR, DETACHED_RUN_START_GRACE_SECS
 # On natedev the command runs in builds-detached.slice, a child of builds.slice.
 # The parent slice's memory limit and CPU weight also apply to the detached command.
@@ -338,6 +336,35 @@ def _orphaned(path: Path, raw: dict[str, object], now: float) -> bool:
     return now - started >= DETACHED_RUN_START_GRACE_SECS
 
 
+@dataclass
+class OrphanReapResult:
+    """Keep reaped run IDs and the completion events that must follow the admission lock."""
+
+    run_ids: list[str] = field(default_factory=list)
+    pending_completions: list[tuple[Path, RunRecord]] = field(default_factory=list)
+
+    def queue_completion(self, path: Path, record: RunRecord) -> None:
+        """Create the claim file while the caller holds the admission lock."""
+        path.with_suffix(".completion.lock").touch(exist_ok=True)
+        self.pending_completions.append((path, record))
+
+    def complete(self) -> None:
+        for path, _ in self.pending_completions:
+            # Pruning can remove the claim file after collection. Do not create it here.
+            try:
+                claim = path.with_suffix(".completion.lock").open("r")
+            except FileNotFoundError:
+                continue
+            with claim:
+                try:
+                    fcntl.flock(claim, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                current = worker_lifecycle.read_json_object(path)
+                if current.get("completion_pending") is True:
+                    _finish_record(path, cast(RunRecord, cast(object, current)))
+
+
 def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
     """Recover results after the command and owned group processes end.
 
@@ -349,21 +376,23 @@ def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
         return []
     with (runs / ".start.lock").open("a") as admission:
         fcntl.flock(admission, fcntl.LOCK_EX)
-        return _reap_orphans_locked(runs, worker)
+        result = _reap_orphans_locked(runs, worker)
+    result.complete()
+    return result.run_ids
 
 
-def _reap_orphans_locked(runs: Path, worker: str = "") -> list[str]:
+def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
     """Reap orphan records while the caller holds the runs-folder admission lock."""
     now = time.time()
     records = [(path, raw) for path in sorted(runs.glob("*.json"))
                if (raw := worker_lifecycle.read_json_object(path)).get("run_id")]
-    reaped: list[str] = []
+    result = OrphanReapResult()
     for path, raw in records:
         if worker and raw.get("worker") != worker:
             continue
         if raw.get("status") == "finished" and raw.get("completion_pending"):
             if not detached_run_process.supervises(_integer(raw.get("pid")), path):
-                _finish_record(path, _read_record(path))
+                result.queue_completion(path, _read_record(path))
             continue
         if not _orphaned(path, raw, now):
             continue
@@ -389,13 +418,15 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> list[str]:
             record = _read_record(path)
             record.update({
                 "status": "finished", "ended": "supervisor gone", "delivery": delivery,
+                "completion_pending": True,
                 "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             })
-            _finish_record(path, record)
-            reaped.append(record["run_id"])
+            record = _write_record(path, record)
+            result.queue_completion(path, record)
+            result.run_ids.append(record["run_id"])
         finally:
             claim.unlink(missing_ok=True)
-    return reaped
+    return result
 
 
 def _finish_record(path: Path, record: RunRecord) -> None:
@@ -420,7 +451,7 @@ def _complete_worker_dispatch(record: RunRecord) -> None:
 
 
 # The files each run keeps beside its record; the record goes last.
-_RUN_FILES = ("{}.log", "{}.scope", "{}.reap", "{}.record.lock", ".{}.delivery.lock", "{}.json")
+_RUN_FILES = ("{}.log", "{}.scope", "{}.reap", "{}.record.lock", "{}.completion.lock", ".{}.delivery.lock", "{}.json")
 
 
 def prune_finished(runs: Path) -> list[str]:
@@ -594,46 +625,50 @@ def command_start(args: argparse.Namespace) -> int:
     runs.mkdir(parents=True, exist_ok=True)
     cwd = os.getcwd()
     tree_key = treekey.tree_key(cwd) or ""
-    with (runs / ".start.lock").open("a") as admission:
-        fcntl.flock(admission, fcntl.LOCK_EX)
-        _ = _reap_orphans_locked(runs)
-        if twin := live_twin(runs, name, command, tree_key):
-            started = time.strftime("%H:%M:%S", time.localtime(twin["started_at"]))
-            print(f"run {twin['run_id']} is already running for {name} on these files (started {started}, "
-                  + f"log {twin['log']}); started nothing; its result arrives as your next message")
-            return 0
-        try:
-            limit = conf.read("detached_runs").whole("LIVE_RUN_LIMIT")
-        except conf.Unusable as error:
-            print(f"detached_runs: {error}", file=sys.stderr)
-            return 2
-        active = live_runs(runs, name)
-        if len(active) >= limit:
-            details = "\n".join(f"  {run['run_id']}: {run['label']}" for run in active)
-            print(f"detached_runs: live-run limit {limit} reached for {name}; started nothing.\n"
-                  + f"Live runs:\n{details}\n"
-                  + "Wait for a run's result; it arrives as your next message. "
-                  + "Or put more files in one run.", file=sys.stderr)
-            return LIVE_RUN_LIMIT_REACHED
-        run_id = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{secrets.token_hex(2)}"
-        record_path = runs / f"{run_id}.json"
-        log_path = runs / f"{run_id}.log"
-        record: RunRecord = {
-            "run_id": run_id, "status": "running", "session_dir": session_dir, "worker": name,
-            "staff_id": reference or _worker_reference(session_dir, name), "label": label, "command": command,
-            "log": str(log_path), "started_at": time.time(), "pid": 0,
-            "director_dir": director_dir, "done_message_file": done_file, "tree_key": tree_key,
-        }
-        _ = _write_record(record_path, record)
-        with log_path.open("ab") as log:
-            supervisor = subprocess.Popen(
-                [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "supervise", str(record_path)],
-                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                start_new_session=True, cwd=cwd,
-            )
-        record["pid"] = supervisor.pid
-        _ = _write_record(record_path, record)
-        _ = _prune_finished_locked(runs)
+    reaped = OrphanReapResult()
+    try:
+        with (runs / ".start.lock").open("a") as admission:
+            fcntl.flock(admission, fcntl.LOCK_EX)
+            reaped = _reap_orphans_locked(runs)
+            if twin := live_twin(runs, name, command, tree_key):
+                started = time.strftime("%H:%M:%S", time.localtime(twin["started_at"]))
+                print(f"run {twin['run_id']} is already running for {name} on these files (started {started}, "
+                      + f"log {twin['log']}); started nothing; its result arrives as your next message")
+                return 0
+            try:
+                limit = conf.read("detached_runs").whole("LIVE_RUN_LIMIT")
+            except conf.Unusable as error:
+                print(f"detached_runs: {error}", file=sys.stderr)
+                return 2
+            active = live_runs(runs, name)
+            if len(active) >= limit:
+                details = "\n".join(f"  {run['run_id']}: {run['label']}" for run in active)
+                print(f"detached_runs: live-run limit {limit} reached for {name}; started nothing.\n"
+                      + f"Live runs:\n{details}\n"
+                      + "Wait for a run's result; it arrives as your next message. "
+                      + "Or put more files in one run.", file=sys.stderr)
+                return LIVE_RUN_LIMIT_REACHED
+            run_id = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{secrets.token_hex(2)}"
+            record_path = runs / f"{run_id}.json"
+            log_path = runs / f"{run_id}.log"
+            record: RunRecord = {
+                "run_id": run_id, "status": "running", "session_dir": session_dir, "worker": name,
+                "staff_id": reference or _worker_reference(session_dir, name), "label": label, "command": command,
+                "log": str(log_path), "started_at": time.time(), "pid": 0,
+                "director_dir": director_dir, "done_message_file": done_file, "tree_key": tree_key,
+            }
+            _ = _write_record(record_path, record)
+            with log_path.open("ab") as log:
+                supervisor = subprocess.Popen(
+                    [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "supervise", str(record_path)],
+                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    start_new_session=True, cwd=cwd,
+                )
+            record["pid"] = supervisor.pid
+            _ = _write_record(record_path, record)
+    finally:
+        reaped.complete()
+    _ = prune_finished(runs)
     print(f"run {run_id} started detached for {name} (pid {supervisor.pid}, log {log_path}); "
           + "its result arrives as your next message")
     return 0

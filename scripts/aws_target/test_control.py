@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -23,6 +23,14 @@ from scripts.aws_target.ledger_test_support import CostFixture, text_setting
 from scripts.lib import atomic_file, conf
 from scripts.notify import push_texts
 from scripts.review_links import console_theme, review_link
+
+
+def table_texts(tables: spot_table.SpotTables) -> tuple[str, ...]:
+    """Every snapshot line, then every title, header and cell of the tables, for text checks."""
+    every = (*tables.prices, *tables.quotas, *(table for costs in tables.runs
+             for table in (*costs.tables, *costs.prices, costs.refused, costs.launched)), tables.hours)
+    return (*(text for _region, text in tables.snapshot_rows),
+            *(text for table in every for text in (table.title, *table.headers, *(cell for row in table.rows for cell in row))))
 
 
 class ControlTests(CostFixture):
@@ -304,19 +312,13 @@ class ControlTests(CostFixture):
         before = {path: path.read_bytes() for path in self.state.iterdir()}
         with (mock.patch.object(subprocess, 'run', side_effect=AssertionError('No external command')),
               mock.patch.object(admin_secrets.AdminSecretSession, 'get', side_effect=AssertionError('No administrator key'))):
-            table = spot_table.render(self.state, int(self.clock.now), width=50)
-            argv = ['deploy.py', 'spot-table', '--settings', str(self.settings), '--directory', str(self.state)]
-            with mock.patch.object(sys, 'argv', argv), redirect_stdout(StringIO()) as output:
-                self.assertEqual(deploy.main(), 0)
-        self.assertIn('Spot prices (USD/h; lowest zone)', output.getvalue())
-        # The price table splits its region columns to fit; the cost per run tables below it do not split.
-        self.assertTrue(all(len(line) <= 50 for line in table.split('\nUSD per merge gate', 1)[0].splitlines()))
-        self.assertIn('0.2500', table)
-        self.assertNotIn('0.3000', table)
-        self.assertIn(f'Snapshot read {int(self.clock.now - old) // 60} min ago (stale)', table)
-        for region in self.regions:
-            self.assertIn(region, table)
-        standard, gpu = spot_table.spot_tables(self.state, int(self.clock.now)).quotas
+            tables = spot_table.spot_tables(self.state, int(self.clock.now))
+        cells = {cell for table in tables.prices for row in table.rows for cell in row[1:]}
+        self.assertTrue(any(cell.startswith('0.2500 [old ') for cell in cells))
+        self.assertFalse(any('0.3000' in cell for cell in cells))
+        self.assertEqual(tables.snapshot_rows, (('', f'Snapshot read {int(self.clock.now - old) // 60} min ago (stale)'),))
+        self.assertEqual([row[0] for row in tables.prices[0].rows], list(self.regions))
+        standard, gpu = tables.quotas
         self.assertEqual((standard.headers[1], gpu.headers[1]), ('Standard quota', 'G and VT quota'))
         for size in self.sizes:
             vcpus = deploy.largest_gate_vcpus((size,))
@@ -327,11 +329,10 @@ class ControlTests(CostFixture):
             for row in quotas.rows:
                 self.assertEqual(row[column], f'{quota // vcpus} boxes')
         # A stale region names its note in an empty cell, not the sign of a type it does not sell.
-        prices = spot_table.spot_tables(self.state, int(self.clock.now)).prices[1]
+        prices = tables.prices[1]
         column = prices.headers.index(self.omitted)
         self.assertTrue(all('old' in row[column] for row in prices.rows))
         self.assertEqual(prices.not_sold, frozenset())
-        self.assertNotIn(spot_table.NOT_SOLD_LEGEND, table)
         self.assertEqual(before, {path: path.read_bytes() for path in self.state.iterdir()})
 
     def test_table_ranks_cost_per_run_with_region_times_and_marks_other_region_times(self) -> None:
@@ -346,36 +347,29 @@ class ControlTests(CostFixture):
         events.append({'attempt': 'fast', 'instance_type': fast, 'mode': 'merge-gate', 'region': home, 'result': 'refused',
                        'time': self.clock.now - 3600 - 400, 'error_code': 'InsufficientInstanceCapacity'})
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
-        table = spot_table.render(self.state, int(self.clock.now), width=200, settings_path=self.settings)
-        lines = table.splitlines()
-
-        def block(size: str) -> list[list[str]]:
-            # One block per type: the type, a header line, then one line per region.
-            first = lines.index(size) + 2
-            return [line.split() for line in lines[first:first + len(self.regions)]]
+        merge_gates = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings).runs[0]
+        tables = {table.title: table for table in merge_gates.tables}
 
         # The fixture lowest zone price is 0.25 USD/h, so 6 minutes cost 0.0250 and 12 minutes 0.0500.
         # One refused request came before one launch of the fast type at home; the other region has no requests.
         # No bill covers the runs yet; the other region has no runs of its own.
-        self.assertEqual(block(fast), [
-            [home, '0.2500', '6.0', '1', '0.0250', 'bill', 'due', '1', 'bill', 'due', '0'],
-            [other, '0.2500', '6.0', '1', 'elsewhere', '0.0250', 'no', 'runs', 'no', 'runs', '0']])
-        self.assertEqual([cells[:5] for cells in block(slow)], [[home, '0.2500', '12.0', '1', '0.0500'],
-                                                               [other, '0.2500', '12.0', '1', 'elsewhere']])
+        self.assertEqual(tables[fast].rows, (
+            (home, '0.2500', '6.0', '1', '0.0250', 'bill due', '1 bill due', '0'),
+            (other, '0.2500', '6.0', '1 elsewhere', '0.0250', 'no runs', 'no runs', '0')))
+        self.assertEqual([row[:5] for row in tables[slow].rows], [(home, '0.2500', '12.0', '1', '0.0500'),
+                                                                 (other, '0.2500', '12.0', '1 elsewhere', '0.0500')])
         for size in self.compare:
-            self.assertEqual([cells[2:] for cells in block(size)], [['—', '0', '—', 'no', 'runs', 'no', 'runs', '0']]
+            self.assertEqual([row[2:] for row in tables[size].rows], [('—', '0', '—', 'no runs', 'no runs', '0')]
                              * len(self.regions))
-        # Every number column is right-aligned: each line ends where the header ends.
-        header = lines[lines.index(fast) + 1]
-        self.assertEqual(header.split('  ')[-1], 'paid runs')
-        self.assertIn('merge gate (minutes)', header)
-        self.assertEqual(len(lines[lines.index(fast) + 2]), len(header))
-        self.assertIn(f'Cheapest merge gate: {fast} in {home}, 0.0250 USD (estimate)', lines)
+        # Every column after the region holds a number.
+        self.assertEqual(tables[fast].headers[-1], 'paid runs')
+        self.assertIn('merge gate (minutes)', tables[fast].headers)
+        self.assertEqual(tables[fast].right, frozenset(range(1, len(tables[fast].headers))))
+        self.assertEqual(merge_gates.summary_of(merge_gates.cheapest),
+                         f'Cheapest merge gate: {fast} in {home}, 0.0250 USD (estimate)')
         # Refused requests and launched boxes have their own tables: one row per type, one column per region.
-        refused = lines.index('Refused merge gate requests (capacity and quota)')
-        launched = lines.index('Launched merge gate boxes')
-        self.assertEqual(lines[refused + 2].split(), [fast, '1', '0'])
-        self.assertEqual(lines[launched + 2].split(), [fast, '1', '0'])
+        self.assertEqual(merge_gates.refused.rows[0], (fast, '1', '0'))
+        self.assertEqual(merge_gates.launched.rows[0], (fast, '1', '0'))
 
     def test_paid_run_cell_counts_the_runs_whose_bill_is_still_due(self) -> None:
         self.assertEqual(self.snapshot(), 0)
@@ -430,18 +424,14 @@ class ControlTests(CostFixture):
                 table = next(table for table in costs.tables if table.title == size)
                 self.assertEqual(table.headers[2:4], (f'{costs.scope.noun} (minutes)', 'runs'))
                 self.assertEqual(table.rows[0][2:5], (*run_time, usd))
-                self.assertEqual(f'{evidence.expected_usd(Decimal("0.25"), size, home, costs.scope.modes, Decimal(0), Decimal(0)):.4f}', usd)
-                self.assertEqual(costs.summary, f'Cheapest {costs.scope.noun}: {size} in {home}, {usd} USD (estimate)')
+                self.assertEqual(f'{evidence.expected_usd(Decimal("0.25"), size, home, costs.scope.modes, Decimal(0), Decimal(0), unmeasured_extra_s=Decimal(0)):.4f}', usd)
+                self.assertEqual(costs.summary_of(costs.cheapest), f'Cheapest {costs.scope.noun}: {size} in {home}, {usd} USD (estimate)')
                 # The Cost per gate view shows the same estimate; a GPU type without runs has none.
                 standard, gpu = costs.prices
                 self.assertEqual((standard.title, standard.headers[1]), (f'Standard cost per {costs.scope.noun} (USD; estimate)', size))
                 self.assertEqual((standard.rows[0][1], f'{standard.values[0][1]:.4f}'), (usd, usd))
                 self.assertEqual({cell for row in gpu.rows for cell in row[1:]}, {spot_table.NOT_SOLD})
                 self.assertEqual({value for row in gpu.values for value in row}, {None})
-        # The terminal table shows the merge gate scope only.
-        table = spot_table.render(self.state, int(self.clock.now), settings_path=self.settings)
-        self.assertIn('merge gate (minutes)', table)
-        self.assertNotIn('targeted test (minutes)', table)
 
     def test_page_holds_the_tables_as_data_and_its_link_needs_the_page(self) -> None:
         self.assertEqual(self.snapshot(), 0)
@@ -480,9 +470,9 @@ class ControlTests(CostFixture):
         self.assertEqual([table['not_sold'] for table in data['prices']], [[], []])
         self.assertEqual([table['region_axis'] for table in (*data['prices'], *data['quotas'])], ['rows'] * 4)
         self.assertEqual(data['regions'], sorted(self.regions, key=aws_page.region_filter_key))
-        self.assertEqual([line['text'] for line in data['snapshot']], list(tables.snapshot_lines))
+        self.assertEqual([line['text'] for line in data['snapshot']], [text for _region, text in tables.snapshot_rows])
         summaries = [entry['estimates'][0]['summary'] if entry['estimates'] else entry['no_estimate'] for entry in data['runs']]
-        self.assertEqual(summaries, [costs.summary for costs in tables.runs])
+        self.assertEqual(summaries, [costs.summary_of(costs.cheapest) for costs in tables.runs])
 
     def test_region_filter_sorts_each_group_alphabetically_in_the_group_order(self) -> None:
         regions = ('us-west-2', 'sa-east-1', 'me-south-1', 'ap-south-1', 'eu-west-1', 'ca-central-1',
@@ -538,17 +528,17 @@ class ControlTests(CostFixture):
     def test_snapshot_line_is_one_line_only_when_every_region_agrees(self) -> None:
         reads = tuple(spot_table.RegionRead(region, 3364, False, None, 0) for region in ('a', 'b'))
         tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
-        self.assertEqual(replace(tables, regions=reads).snapshot_lines, ('Snapshot read 56 min ago',))
+        self.assertEqual(replace(tables, regions=reads).snapshot_rows, (('', 'Snapshot read 56 min ago'),))
         differ = (reads[0], spot_table.RegionRead('b', 7200, True, None, 0))
-        self.assertEqual(replace(tables, regions=differ).snapshot_lines,
-                         ('a: read 56 min ago', 'b: read 120 min ago (stale)'))
+        self.assertEqual(replace(tables, regions=differ).snapshot_rows,
+                         (('a', 'a: read 56 min ago'), ('b', 'b: read 120 min ago (stale)')))
 
     def test_absent_snapshot_prints_unknown_values_without_creating_files(self) -> None:
-        table = spot_table.render(self.state, int(self.clock.now))
-        self.assertIn('no snapshot was ever taken', table)
-        self.assertIn('no snapshot', table)
-        self.assertNotIn(' -', table)
-        self.assertNotIn('0.0000', table)
+        texts = table_texts(spot_table.spot_tables(self.state, int(self.clock.now)))
+        self.assertIn('Snapshot no snapshot was ever taken', texts)
+        self.assertIn('no snapshot', texts)
+        self.assertNotIn('-', texts)
+        self.assertFalse(any('0.0000' in text for text in texts))
         self.assertEqual(list(self.state.iterdir()), [])
 
     def test_tick_reads_only_account_charges(self) -> None:
@@ -587,11 +577,11 @@ class ControlTests(CostFixture):
         self.assertEqual((failure.region, failure.at, failure.read, failure.reason),
                          (self.regions[0], int(self.clock.now), 'price', self.failure_reason))
         before = {path: path.read_bytes() for path in self.state.iterdir()}
-        table = spot_table.render(self.state, int(self.clock.now), settings_path=self.settings)
-        self.assertIn('read failed', table)
-        self.assertIn(datetime.fromtimestamp(self.clock.now, UTC).isoformat(), table)
-        self.assertIn(self.failure_reason, table)
-        self.assertNotIn(' -', table)
+        texts = table_texts(spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings))
+        self.assertIn('read failed', texts)
+        self.assertIn(datetime.fromtimestamp(self.clock.now, UTC).isoformat(), '\n'.join(texts))
+        self.assertIn(self.failure_reason, '\n'.join(texts))
+        self.assertNotIn('-', texts)
         self.assertEqual(before, {path: path.read_bytes() for path in self.state.iterdir()})
 
     def test_every_failed_region_has_a_record_but_the_streak_sends_one_notice(self) -> None:
@@ -602,11 +592,11 @@ class ControlTests(CostFixture):
         failures = aws_target.snapshot_failures(aws_target.read_snapshot(self.state))
         self.assertEqual(tuple(row.region for row in failures), self.regions)
         self.assertEqual(len(self.notices), 1)
-        table = spot_table.render(self.state, int(self.clock.now), settings_path=self.settings)
+        texts = table_texts(spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings))
         for region in self.regions:
-            self.assertIn(region + ': last read failed at', table)
+            self.assertIn('\n' + region + ': last read failed at', '\n' + '\n'.join(texts))
             self.assertIn(region, self.notices[0][1].body)
-        self.assertNotIn(' -', table)
+        self.assertNotIn('-', texts)
 
     def test_failure_with_cached_prices_shows_the_error_and_the_last_good_age(self) -> None:
         self.assertEqual(self.snapshot(), 0)
@@ -615,10 +605,10 @@ class ControlTests(CostFixture):
         self.failure = 'get-service-quota'
         with redirect_stderr(StringIO()):
             self.assertEqual(self.snapshot(), 1)
-        table = spot_table.render(self.state, int(self.clock.now), settings_path=self.settings)
-        self.assertIn('0.2500 [read failed]', table)
-        self.assertIn(f'last good read {interval // 60} min ago', table)
-        self.assertIn('Standard quota: AwsUnavailable:', table)
+        texts = table_texts(spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings))
+        self.assertIn('0.2500 [read failed]', texts)
+        self.assertIn(f'last good read {interval // 60} min ago', '\n'.join(texts))
+        self.assertIn('Standard quota: AwsUnavailable:', '\n'.join(texts))
 
     def test_failure_notice_sends_once_per_streak_and_success_resets_it(self) -> None:
         self.failure = 'describe-spot-price-history'
@@ -712,7 +702,8 @@ class ControlTests(CostFixture):
                 self.assertEqual(saved['failure_streak'], {'since': since, 'notice_claimed': False})
                 self.assertTrue(aws_target.snapshot_failures(saved))
                 self.assertEqual(self.notices, [])
-                self.assertIn('read failed', spot_table.render(self.state, int(self.clock.now), settings_path=self.settings))
+                self.assertIn('read failed', table_texts(spot_table.spot_tables(self.state, int(self.clock.now),
+                                                                               settings_path=self.settings)))
                 self.clock.advance(interval)
         self.failure_reason = 'AccessDenied: fixture read denied'
         with redirect_stderr(StringIO()):
@@ -802,8 +793,6 @@ class ControlTests(CostFixture):
         column = gpu.headers.index(self.omitted)
         self.assertEqual({row[column] for row in gpu.rows}, {spot_table.NOT_SOLD})
         self.assertEqual(gpu.not_sold, frozenset((row, column) for row in range(len(gpu.rows))))
-        lines = spot_table.render(self.state, int(self.clock.now), settings_path=self.settings).splitlines()
-        self.assertEqual(lines.count(spot_table.NOT_SOLD_LEGEND), 1)
 
 
 
@@ -976,7 +965,7 @@ class HoursCheckTests(CostFixture):
         self.assertEqual(cells[self.size][self.other], '0.0/0.5 (100%) over')
         self.assertEqual(cells[gpu][self.home], 'not billed')
         self.assertIn(f'above {self.limit:.0%}', tables.hours_note)
-        self.assertIn('Billed hours / box hours', spot_table.render(self.state, int(self.clock.now), settings_path=self.settings))
+        self.assertEqual(tables.hours.title, 'Billed hours / box hours')
 
     def test_failed_notice_stays_pending_and_old_days_leave_the_claims(self) -> None:
         one = self.day(1)

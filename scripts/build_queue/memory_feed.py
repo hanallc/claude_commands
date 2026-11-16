@@ -40,7 +40,7 @@ from scripts.build_queue import admission_code
 # Preserve the schema check across the imports below.
 ADMISSION_VERSION_AT_IMPORT = admission_code.admission_code_version(installed.code_root / "scripts")
 
-from scripts.buildlog import charts, mac_idle_alert, parse
+from scripts.buildlog import charts, cost_actions, mac_idle_alert, parse
 from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
@@ -52,6 +52,7 @@ from scripts.build_queue.queue_view import reason_phrase
 from scripts.lib.build_steps import StepNames, read_step_names
 from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeProcesses
 from scripts.build_queue import admission_records, target_availability
+from scripts.build_targets import target_config
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
 from scripts.lib import build_slots, conf
@@ -341,6 +342,8 @@ class RowQueueNotes(TypedDict):
     priority_text: NotRequired[str]
     ci_label: NotRequired[str]
     runs_on: NotRequired[str]
+    targets: NotRequired[list[str]]
+    mac_state: NotRequired[str]
     runner: NotRequired[unit_labels.Runner]
     worker: NotRequired[str]
 
@@ -353,13 +356,74 @@ class PageOwnerLabels(TypedDict):
     worker: str
 
 
-def local_runs_on(mac: target_availability.TargetFit | target_availability.NoMacTarget) -> str:
-    """Name the targets that can take a natedev queue step now: natedev, and the Mac when its routes allow it."""
+# The machine names that rows show in the Target column, and the words for them in "can run on" text.
+LOCAL_TARGET = "natedev"
+MAC_TARGET = "mac"
+TARGET_WORDS = {MAC_TARGET: "Mac"}
+
+
+@dataclass(frozen=True)
+class RunsOn:
+    """The machines that can take a natedev queue step, and why it is limited to them."""
+
+    targets: tuple[str, ...]
+    reason: str = ""
+
+    def text(self) -> str:
+        """The "can run on" words, such as "natedev or Mac" or "natedev only (the run asks for it)"."""
+        words = " or ".join(TARGET_WORDS.get(target, target) for target in self.targets)
+        words += " only" if len(self.targets) == 1 else ""
+        return f"{words} ({self.reason})" if self.reason else words
+
+
+def local_runs_on(mac: target_availability.TargetFit | target_availability.NoMacTarget) -> RunsOn:
+    """The targets that can take a natedev queue step now: natedev, and the Mac when its routes allow it."""
     if isinstance(mac, target_availability.Allowed):
-        return "natedev or Mac"
+        return RunsOn((LOCAL_TARGET, MAC_TARGET))
     if isinstance(mac, target_availability.FitUnreadable):
-        return "natedev only (Mac state unknown)"
-    return "natedev only"
+        return RunsOn((LOCAL_TARGET,), "Mac state unknown")
+    return RunsOn((LOCAL_TARGET,))
+
+
+# A run that asks for natedev: the plain words of the local caller route.
+RUN_ASKS_TEXT = "the run asks for it"
+
+
+def step_runs_on(route: target_config.StepRoute, routes: target_availability.MacRoutes, step: str, folder: str,
+                 package: str | admission_records.PackageNotRecorded) -> RunsOn:
+    """The targets that can take a natedev queue step: a route that limits the step first, else the Mac routes."""
+    if isinstance(route, target_config.LocalRequired):
+        return RunsOn((LOCAL_TARGET,), RUN_ASKS_TEXT if route == target_config.LOCAL_CALLER else route.reason)
+    if mac_only_route(route, routes):
+        return RunsOn((MAC_TARGET,))
+    if isinstance(route, target_config.PinnedTarget):
+        return RunsOn((route.target,))
+    return local_runs_on(routes.fit(step, folder, package))
+
+
+class TargetNotes(TypedDict):
+    runs_on: str
+    targets: list[str]
+    mac_state: NotRequired[str]
+
+
+def target_notes(route: target_config.StepRoute, routes: target_availability.MacRoutes, step: str, folder: str,
+                 package: str | admission_records.PackageNotRecorded) -> TargetNotes:
+    """The step's "can run on" text and targets, and for a Mac-only step what holds the Mac, for every row that shows them."""
+    runs_on = step_runs_on(route, routes, step, folder, package)
+    notes: TargetNotes = {"runs_on": runs_on.text(), "targets": list(runs_on.targets)}
+    if mac_only_route(route, routes) and (holds := routes.holds(folder)):
+        notes["mac_state"] = holds
+    return notes
+
+
+NO_TARGET_NOTES: TargetNotes = {"runs_on": "", "targets": []}
+
+
+def mac_only_route(route: target_config.StepRoute, routes: target_availability.MacRoutes) -> bool:
+    """A Mac-only step, or a step pinned to the Mac target."""
+    return isinstance(route, target_config.MacOnly) or (isinstance(route, target_config.PinnedTarget)
+                                                        and routes.is_mac(route.target))
 
 
 CLOUD_RUNS_ON = "AWS (natedev only when AWS cannot start the gate)"
@@ -553,8 +617,10 @@ class ReportCost(TypedDict):
     cause: str
     recent: dict[str, object]
     window: dict[str, object]
+    # The lowest and highest measured day in hours; empty when no day is measured.
+    range: list[float]
+    share: str
     action: str
-    owner: str
 
 
 @dataclass(frozen=True)
@@ -938,9 +1004,12 @@ def report_reading(days: int) -> ReportSections | charts.IndexUnavailable:
             for row in top.rows:
                 window: dict[str, object] = ({"state": "matches recent"} if isinstance(row.window, charts.WindowMatchesRecent)
                           else charts.cost_json(row.window.value, 3600))
+                measured = [seconds for seconds in map(charts.known_seconds, row.days) if seconds is not None]
                 rows.append({"machine": row.machine, "cause": row.cause,
                              "recent": charts.cost_json(row.recent, 3600 * top.recent_days),
-                             "window": window, "action": row.action.text, "owner": row.action.owner})
+                             "window": window, "range": list(cost_actions.daily_range(measured) or ()),
+                             "share": cost_actions.share_text(row.share),
+                             "action": cost_actions.action_text(row.action)})
         zone = user_zone()
         return ReportSections(charts.chart_data(report.charts), tuple(rows), top.start.astimezone(zone).isoformat(),
                               top.end.astimezone(zone).isoformat(), top.recent_days, str(zone))
@@ -1594,8 +1663,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "started_at": metadata.started_at if metadata is not None else 0,
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ())),
                      "queued": True, "keep_text": run_keep_text(hold, steps_by_owner.get(hold.memory.owner, ())), "group": "", "ci": False, "parts": [],
-                     "runs_on": local_runs_on(routes.fit(step.step, step.folder, step.package))
-                        if step is not None and not ci_label else ""})
+                     **(target_notes(step.route, routes, step.step, step.folder, step.package)
+                        if step is not None and not ci_label else NO_TARGET_NOTES)})
     groups: dict[str, list[RunRow]] = {}
     remote_groups: set[str] = set()
     for entry in explanation.running:
@@ -1691,8 +1760,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         "need": gib(waiter.need), "since": waiter.since,
                         "reason": reason,
                         "fits": need <= captured.signed_room,
-                        "runs_on": "" if ci_label else local_runs_on(
-                            routes.fit(waiter.step, waiter.folder, waiter.package))})
+                        **(NO_TARGET_NOTES if ci_label else target_notes(
+                            waiter.route, routes, waiter.step, waiter.folder, waiter.package))})
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
     if mac_status:
@@ -1734,7 +1803,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                     and not isinstance(cloud.wait, wire.CloudSlotWait) else ""}
             if isinstance(cloud.wait, wire.CloudSlotWait):
                 cloud_waiters[cloud.owner] = {**values, "since": cloud.since, "reason": cloud.wait.text,
-                    "runs_on": CLOUD_RUNS_ON}
+                    "runs_on": CLOUD_RUNS_ON, "targets": ["aws"]}
             else:
                 work_rows.append({**values, "started_at": cloud.started_at or cloud.since})
         work_rows.sort(key=lambda row: row["started_at"])

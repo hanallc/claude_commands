@@ -32,6 +32,43 @@ class WaitsOnTests(unittest.TestCase):
     def git(self, *args: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True, text=True).stdout.strip()
 
+    def test_bulk_phase_merges_keep_the_newest_commit_time_with_one_read(self) -> None:
+        output = ("a" * 40 + "\0" + "200\0Merge builds phase 5 (1234567) into sdlc\n"
+                  + "b" * 40 + "\0" + "100\0Merge builds phase 5 (7654321) into sdlc\n"
+                  + "c" * 40 + "\0" + "300\0Revert Merge builds phase 6 (1234567) into sdlc\n"
+                  + "d" * 40 + "\0" + "400\0Merge other phase 5 (1234567) into sdlc\n"
+                  + "e" * 40 + "\0" + "500\0Merge upper phase 5 (ABCDEF1) into sdlc\n")
+        with patch.object(waits_on, "git", return_value=subprocess.CompletedProcess([], 0, output, "")) as read:
+            self.assertEqual(waits_on.landed_phases(self.repo), {
+                ("builds", "5"): waits_on.PhaseMerge("a" * 40, 200, "1234567"),
+                ("other", "5"): waits_on.PhaseMerge("d" * 40, 400, "1234567"),
+                ("upper", "5"): waits_on.PhaseMerge("e" * 40, 500, "abcdef1")})
+        read.assert_called_once_with(self.repo, "log", "origin/main", "--merges", "--format=%H%x00%ct%x00%s")
+
+    def test_main_commit_identities_use_one_read_and_ignore_bad_records(self) -> None:
+        output = "100\0Checkpoint delivery\n101\0Checkpoint delivery\n100\0Other delivery\nbad\0Invalid time\nmissing separator\n"
+        with patch.object(waits_on, "git", return_value=subprocess.CompletedProcess([], 0, output, "")) as read:
+            self.assertEqual(waits_on.main_commit_identities(self.repo), frozenset({
+                waits_on.CommitIdentity(100, "Checkpoint delivery"), waits_on.CommitIdentity(101, "Checkpoint delivery"),
+                waits_on.CommitIdentity(100, "Other delivery")}))
+        read.assert_called_once_with(self.repo, "log", "origin/main", "--no-merges", "--format=%at%x00%s")
+        with patch.object(waits_on, "git", return_value=subprocess.CompletedProcess([], 128, output, "unreadable")):
+            self.assertEqual(waits_on.main_commit_identities(self.repo), frozenset())
+
+    def test_copied_commit_requires_both_identity_fields_and_a_readable_commit(self) -> None:
+        identities = frozenset({waits_on.CommitIdentity(100, "Checkpoint delivery")})
+        for output, status, expected in (("100\0Checkpoint delivery\n", 0, True),
+                                         ("101\0Checkpoint delivery\n", 0, False),
+                                         ("100\0Other delivery\n", 0, False),
+                                         ("100\0Checkpoint delivery\n", 128, False), ("", 128, False)):
+            with self.subTest(output=output, status=status):
+                with patch.object(waits_on, "git", return_value=subprocess.CompletedProcess([], status, output, "")) as read:
+                    self.assertEqual(waits_on.copied_on_main(self.repo, "a" * 40, identities), expected)
+                read.assert_called_once_with(self.repo, "show", "-s", "--format=%at%x00%s", "a" * 40)
+        with patch.object(waits_on, "git") as read:
+            self.assertFalse(waits_on.copied_on_main(self.repo, "a" * 40, frozenset()))
+        read.assert_not_called()
+
     def test_each_kind_of_work_has_a_state(self) -> None:
         base = commit_repository(self.repo, "base", allow_empty=True)
         _ = self.git("switch", "-q", "-c", "builds-589")
@@ -100,6 +137,69 @@ class WaitsOnTests(unittest.TestCase):
         runs[path].append({"event_type": "wait_finished", "wait_id": "hold"})
         self.assertEqual(state("handler/22"), waits_on.PhaseSent(sent))
 
+    def test_work_after_a_checkpoint_reopens_only_an_unfinished_phase(self) -> None:
+        base = commit_repository(self.repo, "base", allow_empty=True)
+        _ = self.git("update-ref", "refs/remotes/origin/main", base)
+        sent = commit_repository(self.repo, "sent", allow_empty=True)
+        member = staff.StaffRow(staff.StaffId("handler"), "unit", "handler", staff.StaffRoot(),
+                                current_session=staff.StaffId("handler-session"), run=staff.OpenRun(self.root / "run"))
+        for commit in (base, sent):
+            for start in ("pass_started", "activity_started"):
+                for finished in (False, True):
+                    with self.subTest(commit=commit, start=start, finished=finished):
+                        events: list[dict[str, object]] = [
+                            {"event_type": "phase_started", "phase_id": "23", "phase_instance_id": "current"},
+                            {"event_type": "checkpoint", "phase_instance_id": "current", "checkpoint_commit": commit}]
+                        if finished:
+                            events.append({"event_type": "phase_finished", "phase_instance_id": "current"})
+                        events.extend([
+                            {"event_type": start, "phase_instance_id": "current"},
+                            {"event_type": "eta_stated", "eta_phase_id": "23", "eta_at": 1_794_760_000}])
+                        found = waits_on.phase_state(self.repo, member, "23", lambda _: events)
+                        expected = (waits_on.OnMain(base) if commit == base else waits_on.PhaseSent(sent))
+                        self.assertEqual(found, expected if finished else waits_on.PhaseOpen(1_794_760_000.0))
+                        if not finished:
+                            with patch.object(waits_on, "landed_phase", return_value=base):
+                                self.assertEqual(waits_on.phase_state(self.repo, member, "23", lambda _: events),
+                                                 waits_on.PhaseOpen(1_794_760_000.0))
+                            events.append({"event_type": "checkpoint", "phase_instance_id": "current",
+                                           "checkpoint_commit": sent})
+                            self.assertEqual(waits_on.phase_state(self.repo, member, "23", lambda _: events),
+                                             waits_on.PhaseSent(sent))
+
+    def test_bare_commit_dependencies_have_a_commit_label(self) -> None:
+        view = land_queue.LandView({}, {}, {}, frozenset(), {})
+        cases: tuple[tuple[str, waits_on.WaitState, tuple[str, ...], str], ...] = (
+            ("e75b8ec06", waits_on.NotOnMain("e75b8ec06" + "a" * 31), (), "commit e75b8ec06"),
+            ("e75b8ec", waits_on.NotFound(), (), "commit e75b8ec"),
+            ("E75B8EC06" + "A" * 31, waits_on.NotFound(), (), "commit E75B8EC06"),
+            ("release", waits_on.NotOnMain("b" * 40), (), "branch release"),
+            ("feature/report", waits_on.NotOnMain("b" * 40), (), "branch feature/report"),
+            ("e75b8ec06", waits_on.PhaseOpen(None), ("e75b8ec06",), "e75b8ec06"),
+            ("1234567", waits_on.PhaseNotStarted(), ("1234567",), "phase 1234567"),
+            ("handler/e75b8ec06", waits_on.PhaseOpen(None), (), "e75b8ec06"),
+            ("other/e75b8ec06", waits_on.PhaseOpen(None), (), "other phase e75b8ec06"))
+        for reference, found, phase_ids, label in cases:
+            with self.subTest(reference=reference, found=found):
+                item = unit_queue.QueuedItem("Read delivery", reference)
+                self.assertEqual(unit_phases.queued_text(item, found, view, now=0, zone=ZoneInfo("UTC"),
+                    unit="handler", phase_ids=phase_ids).state_text,
+                    f"After {label}; " + ("not on main yet" if isinstance(found, waits_on.NotFound)
+                        and label.startswith("commit ") else unit_phases.wait_text(found, view, now=0, zone=ZoneInfo('UTC'))))
+
+    def test_missing_commits_wait_for_main_without_a_missing_dependency_claim(self) -> None:
+        view = land_queue.LandView({}, {}, {}, frozenset(), {})
+        for reference, phase_ids, expected in (
+                ("e75b8ec06", (), "After commit e75b8ec06; not on main yet"),
+                ("E75B8EC06" + "A" * 31, (), "After commit E75B8EC06; not on main yet"),
+                ("e75b8ec06", ("e75b8ec06",), "After e75b8ec06; dependency not found locally"),
+                ("other/23", (), "After other phase 23; dependency not found locally"),
+                ("missing-ref", (), "After missing-ref; dependency not found locally")):
+            with self.subTest(reference=reference, phase_ids=phase_ids):
+                entry = unit_phases.queued_text(unit_queue.QueuedItem("Read delivery", reference), waits_on.NotFound(),
+                    view, now=0, zone=ZoneInfo("UTC"), unit="handler", phase_ids=phase_ids)
+                self.assertEqual(entry.state_text, expected)
+
     def test_the_queued_cell_names_the_wait_and_its_state(self) -> None:
         now, utc = 1_794_750_000.0, ZoneInfo("UTC")
         failed: land_runs.LandResult = {"commit": "c" * 40, "production": "builds", "unit": "report", "phase": "89",
@@ -118,23 +218,25 @@ class WaitsOnTests(unittest.TestCase):
         landed: land_runs.LandResult = {**failed, "commit": "d" * 40, "landed": True}
         held = waits_on.PhaseSent("d" * 40, phase_waits.UnitWait(
             "589", "sdlc", "the user approves board-reasons", "WaitingForUser", now - 600, "hold"))
-        waiting = "Waits for builds phase 589 to merge"
         approval = "Sdlc keeps it waiting until the user approves board-reasons; since 13:30"
         cases: tuple[tuple[waits_on.WaitState, frozenset[str], dict[str, land_runs.LandResult], str], ...] = (
-            (waits_on.PhaseSent("c" * 40), frozenset(), {}, waiting),
-            (waits_on.NotOnMain("c" * 40), frozenset(), {"c" * 40: failed}, waiting),
-            (waits_on.PhaseSent("c" * 40), frozenset({"c" * 9}), {}, waiting),
-            (waits_on.NotOnMain("d" * 40), frozenset(), {}, waiting),
-            (waits_on.PhaseOpen(now + 3600), frozenset(), {}, waiting),
-            (waits_on.PhaseOpen(None), frozenset(), {}, waiting),
-            (waits_on.PhaseNotStarted(), frozenset(), {}, waiting),
-            (waits_on.NotFound(), frozenset(), {}, waiting),
-            (waits_on.PhaseSent("d" * 40), frozenset(), {"d" * 40: landed}, waiting),
+            (waits_on.PhaseSent("c" * 40), frozenset(), {}, "After builds phase 589; 10th in the merge line"),
+            (waits_on.PhaseSent("e" * 40), frozenset(), {}, "After builds phase 589; not in the merge line"),
+            (waits_on.NotOnMain("c" * 40), frozenset(), {"c" * 40: failed},
+             "After branch builds/589; 10th in the merge line; last attempt failed at red: test_x red; 13:30"),
+            (waits_on.PhaseSent("c" * 40), frozenset({"c" * 9}), {}, "After builds phase 589; merging now"),
+            (waits_on.NotOnMain("d" * 40), frozenset(), {}, "After branch builds/589; not on main yet"),
+            (waits_on.PhaseOpen(now + 3600), frozenset(), {}, "After builds phase 589; started"),
+            (waits_on.PhaseOpen(None), frozenset(), {}, "After builds phase 589; started"),
+            (waits_on.PhaseNotStarted(), frozenset(), {}, "After builds phase 589; not started"),
+            (waits_on.NotFound(), frozenset(), {}, "After builds phase 589; dependency not found locally"),
+            (waits_on.PhaseSent("d" * 40), frozenset(), {"d" * 40: landed}, "After builds phase 589; merged 13:30"),
             (held, frozenset(), {}, approval),
-            (held, frozenset({"d" * 40}), {}, waiting),
-            (held, frozenset(), {"d" * 40: landed}, waiting),
-            (held, frozenset(), {"d" * 40: {**failed, "commit": "d" * 40}}, waiting),
-            (waits_on.PhaseSent("c" * 40, held.wait), frozenset(), {}, waiting),
+            (held, frozenset({"d" * 40}), {}, "After builds phase 589; merging now"),
+            (held, frozenset(), {"d" * 40: landed}, "After builds phase 589; merged 13:30"),
+            (held, frozenset(), {"d" * 40: {**failed, "commit": "d" * 40}},
+             "After builds phase 589; did not merge: failed at red: test_x red; 13:30"),
+            (waits_on.PhaseSent("c" * 40, held.wait), frozenset(), {}, "After builds phase 589; 10th in the merge line"),
         )
         for found, running, results, expected in cases:
             with self.subTest(state=found, running=running, results=results):
@@ -149,9 +251,9 @@ class WaitsOnTests(unittest.TestCase):
                 self.assertEqual(unit_phases.queued_text(unit_queue.QueuedItem(queued), None,
                                                          view, now=now, zone=utc),
                                  unit_phases.WorkItem(expected, "Ready"))
-        for reference, expected in (("handler/41", "Waits for phase 41 to merge"),
-                                    ("handler/acctcolor", "Waits for acctcolor to merge"),
-                                    ("other/23", "Waits for other phase 23 to merge")):
+        for reference, expected in (("handler/41", "After phase 41; not started"),
+                                    ("handler/acctcolor", "After acctcolor; not started"),
+                                    ("other/23", "After other phase 23; not started")):
             with self.subTest(reference=reference):
                 self.assertEqual(unit_phases.queued_text(unit_queue.QueuedItem("Read delivery", reference),
                     waits_on.PhaseNotStarted(), view, now=now, zone=utc, unit="handler"),
@@ -211,11 +313,11 @@ class WaitsOnTests(unittest.TestCase):
                 "7" * 40: land_queue.Place(4, "builds batch", "builder carrier")}),
              {"carried": unit_phases.SentCommit("7" * 40)}, False,
              (running, first, *paired, unit_phases.WorkItem("Carried", "4th in sdlc's merge line"), *failures), frozenset()),
-            ("submitted work has no line", view,
+            ("checkpoint has no line", view,
              {"absent": unit_phases.SentCommit("6" * 40), "no-hash": unit_phases.SentCommitUnrecorded(),
               "not-sent": unit_phases.NoSentWork()}, False,
              (running, first, *paired,
-              unit_phases.WorkItem("Absent", "Merge submission not in the merge line; reason not recorded"),
+              unit_phases.WorkItem("Absent", "Checkpoint 666666666 at time not recorded; not in sdlc's merge line"),
               unit_phases.WorkItem("no-hash", "Merge position not recorded"), *failures), frozenset()),
         ]
         for name, found, open_sent, on_main, expected, grouped in cases:

@@ -415,6 +415,35 @@ class CloudGateTests(CostFixture):
         numeric_settings(self.root / 'cloud_gate.conf', {'gate_wait_usd_per_minute': '0'})
         self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0].region, 'eu-south-2')
 
+    def test_a_far_region_pays_its_own_transfer(self) -> None:
+        worker, variants = self.steering_fixture()
+        self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.48'})
+        text_setting(self.root / 'cloud_gate.conf', 'region_transfer_usd', '{}')
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
+        # The 0.02 USD/h saving over the 20 minute lifetime is 0.0067 USD, below the 0.01 USD transfer.
+        text_setting(self.root / 'cloud_gate.conf', 'region_transfer_usd', '{"us-west-2": 0.01}')
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0].region, 'us-east-2')
+
+    def test_a_region_without_runs_adds_its_unmeasured_seconds(self) -> None:
+        worker, variants = self.steering_fixture()
+        self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.48'})
+        self.gate_history([('m7a.8xlarge', 'us-east-2', 300)])
+        text_setting(self.root / 'cloud_gate.conf', 'unmeasured_region_extra_seconds', '{}')
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
+        # us-west-2 borrows the 300 s run: 0.48 USD/h for 360 s costs more than 0.5 USD/h for 300 s.
+        text_setting(self.root / 'cloud_gate.conf', 'unmeasured_region_extra_seconds', '{"us-west-2": 60, "us-east-2": 600}')
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0].region, 'us-east-2')
+
+    def test_region_maps_refuse_a_negative_number(self) -> None:
+        worker, variants = self.steering_fixture()
+        self.variant_prices(variants, {})
+        for key in ('region_transfer_usd', 'unmeasured_region_extra_seconds', 'region_extra_gate_seconds'):
+            with self.subTest(key=key):
+                text_setting(self.root / 'cloud_gate.conf', key, '{"us-west-2": -1}')
+                with self.assertRaisesRegex(ValueError, key):
+                    _ = worker.rank_variants(variants, 'merge-gate')
+                text_setting(self.root / 'cloud_gate.conf', key, '{}')
+
     def test_live_price_reads_run_concurrently(self) -> None:
         worker, variants = self.live_price_fixture()
         path = self.root / 'cloud_gate.conf'
@@ -807,6 +836,85 @@ class CloudGateTests(CostFixture):
         self.assertIn('artifacts/attempt/result.json', reads)
         self.assertEqual(len(self.fake.launches), 1)
         self.assertTrue(self.fake.terminated)
+
+    def outage_worker(self, outage: Callable[[list[str]], bool]) -> cloud_gate.GateWorker:
+        """A worker whose AWS calls fail with a connect error while outage(arguments) is true."""
+        def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if outage(list(arguments)):
+                self.fake.commands.append(list(arguments))
+                region = arguments[arguments.index('--region') + 1]
+                return subprocess.CompletedProcess(list(arguments), 255, '',
+                    f'Could not connect to the endpoint URL: "https://ec2.{region}.amazonaws.com/"')
+            return self.fake(arguments, **options)
+        return cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=transport),
+            self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=self.advance)
+
+    def test_short_poll_outage_keeps_the_box_and_completes(self) -> None:
+        self.fake.has_result = False
+        failed = 0
+        def outage(arguments: list[str]) -> bool:
+            nonlocal failed
+            if 'describe-instances' not in arguments or failed == 3:
+                return False
+            failed += 1
+            self.fake.has_result = failed == 3
+            return True
+        with redirect_stdout(StringIO()) as output:
+            outcome = self.outage_worker(outage).execute(self.folder, self.request, self.deployment)
+        self.assertEqual(outcome['status'], 'complete')
+        self.assertEqual(output.getvalue().count('Cloud gate poll skipped:'), 3)
+        self.assertEqual(len(self.fake.launches), 1)
+        self.assertTrue(self.fake.terminated)
+
+    def test_long_poll_outage_ends_the_cloud_try_after_observe_outage_s(self) -> None:
+        self.fake.has_result = False
+        started = self.now
+        def outage(arguments: list[str]) -> bool:
+            return 'describe-instances' in arguments and not self.fake.terminated
+        with redirect_stdout(StringIO()):
+            outcome = self.outage_worker(outage).execute(self.folder, self.request, self.deployment)
+        self.assertEqual(outcome['status'], 'fallback')
+        self.assertIn('Could not connect to the endpoint', str(outcome['reason']))
+        self.assertGreaterEqual(self.now - started, cloud_gate.settings().number('observe_outage_s'))
+        self.assertTrue(self.fake.terminated)
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateTerminated)
+
+    def test_termination_repeats_through_an_outage(self) -> None:
+        failed = False
+        def outage(arguments: list[str]) -> bool:
+            nonlocal failed
+            if 'terminate-instances' in arguments and not failed:
+                failed = True
+                return True
+            return False
+        with redirect_stdout(StringIO()) as output:
+            outcome = self.outage_worker(outage).execute(self.folder, self.request, self.deployment)
+        self.assertEqual(outcome['status'], 'complete')
+        self.assertIn('Cloud gate termination waits on fixture-region:', output.getvalue())
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateTerminated)
+
+    def test_unreachable_region_moves_the_launch_to_the_next_region(self) -> None:
+        self.deployment['regions'] = [{**ledger.rows(self.deployment, 'regions')[0], 'region': region}
+                                      for region in ('us-east-2', 'us-west-2')]
+        def outage(arguments: list[str]) -> bool:
+            return 'run-instances' in arguments and arguments[arguments.index('--region') + 1] == 'us-east-2'
+        with redirect_stdout(StringIO()) as output:
+            outcome = self.outage_worker(outage).execute(self.folder, self.request, self.deployment)
+        self.assertEqual(outcome['status'], 'complete')
+        launches = [command[command.index('--region') + 1] for command in self.fake.commands if 'run-instances' in command]
+        self.assertEqual(launches, ['us-east-2', 'us-east-2', 'us-west-2'])
+        self.assertIn('Cloud gate skips us-east-2:', output.getvalue())
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].region, 'us-west-2')
+
+    def test_unreachable_last_region_still_falls_back(self) -> None:
+        def outage(arguments: list[str]) -> bool:
+            return 'run-instances' in arguments
+        with redirect_stdout(StringIO()):
+            outcome = self.outage_worker(outage).execute(self.folder, self.request, self.deployment)
+        self.assertEqual(outcome['status'], 'fallback')
+        self.assertFalse(self.fake.terminated)
+        self.assertEqual(sum('run-instances' in command for command in self.fake.commands),
+                         cloud_gate.settings().whole('launch_reply_tries'))
 
     def test_worker_kills_recover_through_cleanup_or_the_next_start(self) -> None:
         _ = self.book.reserve_gate(self.settings, ledger.GateReservation(
@@ -1485,7 +1593,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         decision = self.book.guard(self.settings, 'admission', int(self.now) + 60, notify=lambda _event: True)
         self.assertIsInstance(decision, ledger.SpendingRefused)
 
-    def test_import_uses_real_remote_host_and_appends_once(self) -> None:
+    def test_import_files_under_aws_keeps_remote_host_and_appends_once(self) -> None:
         buildlog = self.root / 'buildlog'
         destination = buildlog / 'fixture-guest.jsonl'
         destination.parent.mkdir()
@@ -1505,11 +1613,11 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                       mock.patch.object(store, 'host_file', return_value=destination) as host_file):
                     cloud_gate.import_record(self.folder, result)
                     cloud_gate.import_record(self.folder, result)
-                self.assertEqual(host_file.call_args.args[0], 'fixture-guest')
+                self.assertEqual(host_file.call_args.args[0], 'aws')
                 # The result leaves the gate copy for the store, beside the gate run record.
                 self.assertFalse((self.folder / cloud_gate.RESULT_FILE).exists())
                 kept_result = ledger.text(cloud_gate.read(self.folder / 'imported.json'), 'result')
-                self.assertTrue(kept_result.startswith('fixture-guest/results/'))
+                self.assertTrue(kept_result.startswith('aws/results/'))
                 if not retried:
                     # The store keeps the first result of a record id, as it keeps the first record.
                     self.assertEqual(json.loads(gzip.decompress((buildlog / kept_result).read_bytes())), result)

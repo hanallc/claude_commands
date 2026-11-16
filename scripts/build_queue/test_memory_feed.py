@@ -24,10 +24,12 @@ import unittest
 from typing import Literal, cast, override
 from unittest import mock
 
-from scripts.buildlog import charts, costs, moments
+from scripts.buildlog import charts, cost_actions, costs, moments
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view, target_availability
 from scripts.build_queue.test_queue_view import cloud_reading
+from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
+from scripts.build_targets import target_config, targets
 from scripts.build_queue.queue_view import refresh_mac_builds
 from scripts.build_queue.admission_test_support import AdmissionFixture, NOW as ADMISSION_NOW, only_admitted
 from scripts.build_queue.queue_fixture import write_process, write_scope
@@ -82,7 +84,9 @@ def report_fixture(*, empty: bool = False) -> charts.PageData:
         {} if empty else {"fixture": start.timestamp()})
     rows = charts.NoDataYet.VALUE if empty else (charts.TopCost("fixture", "Memory wait",
         charts.MeasuredCost(120), charts.WindowDiffers(charts.MeasuredCost(240)),
-        charts.CostAction("Reduce the memory wait.", "fixture-owner")),)
+        (charts.MeasuredCost(30), charts.MeasuredCost(60), charts.MeasuredCost(30)),
+        cost_actions.LargestShare(costs.StepKind("fixture", "nextest"), 0.75),
+        cost_actions.LowerMemoryPeak(costs.StepKind("fixture", "nextest"), 12.4, 3 << 30)),)
     return charts.PageData(charts.ChartSet(start, end, "UTC", (bucket,), ("fixture",), ()),
         charts.TopCosts(end - timedelta(days=3), end, 3, rows))
 
@@ -353,11 +357,18 @@ process.stdout.write(JSON.stringify({
                     self.assertIn(f'<td class="place">{place}</td>', cell)
                     self.assertIn(f'<td class="pid">{row["pid"]}</td>', cell)
                     machine = str(row.get("machine") or "")
-                    self.assertIn(f'<td class="machine" data-machine="{machine}">{machine}</td>', cell)
                     if kind == "wait":
+                        # A queued row names the machines that can take it, in a span that wraps in the column.
                         self.assertEqual(machine, "")
+                        targets = " or ".join(cast(list[str], row["targets"]))
+                        self.assertTrue(targets)
+                        shown = " or ".join(f'<span class="machine" data-machine="{target}">{target}</span>'
+                                            for target in cast(list[str], row["targets"]))
+                        self.assertIn(f'<td class="machine" data-machine="{targets}"><span class="wait-target">{shown}</span></td>',
+                                      cell)
                     else:
                         self.assertTrue(machine)
+                        self.assertIn(f'<td class="machine" data-machine="{machine}">{machine}</td>', cell)
                     cpus = row.get("vcpus")
                     shown_cpus = str(cpus) if kind == "row" and isinstance(cpus, int) else "—" if kind == "row" else ""
                     self.assertIn(f'<td class="vcpus">{shown_cpus}</td>', cell)
@@ -1336,7 +1347,49 @@ process.stdout.write(JSON.stringify({
                               (target_availability.FitUnreadable("Mac state unreadable"), "natedev only (Mac state unknown)"),
                               (target_availability.NoMacTarget(), "natedev only")):
             with self.subTest(fit=fit):
-                self.assertEqual(memory_feed.local_runs_on(fit), expected)
+                self.assertEqual(memory_feed.local_runs_on(fit).text(), expected)
+
+    def test_can_run_on_names_a_route_that_limits_the_step_before_the_mac_routes(self) -> None:
+        routes = target_availability.MacRoutes((snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free())), {}, UTC)
+        for route, expected in ((target_config.LOCAL_CALLER, "natedev only (the run asks for it)"),
+                                (target_config.WRITES_TREE, "natedev only (step writes the tree)"),
+                                (target_config.MAC_ONLY, "Mac only"),
+                                (target_config.PinnedTarget("mac"), "Mac only"),
+                                (target_config.PinnedTarget("natedev"), "natedev only")):
+            with self.subTest(route=route), mock.patch.object(routes, "fit") as fit:
+                self.assertEqual(memory_feed.step_runs_on(route, routes, "nextest", "/fixture/hana", "hana").text(), expected)
+                self.assertEqual(memory_feed.mac_only_route(route, routes), expected == "Mac only")
+                fit.assert_not_called()
+        with mock.patch.object(routes, "fit", return_value=target_availability.Allowed("no block or claim recorded")):
+            self.assertEqual(memory_feed.step_runs_on(target_config.ANY_ELIGIBLE_TARGET, routes, "nextest",
+                                                      "/fixture/hana", "hana"), memory_feed.RunsOn(("natedev", "mac")))
+
+    def test_a_mac_only_step_names_what_holds_the_mac_on_its_queued_run_and_waiting_rows(self) -> None:
+        reading = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
+        view, explanation = reading.view, reading.explanation
+        reading = replace(reading, view=replace(view,
+            running=tuple(replace(step, route=target_config.MAC_ONLY) for step in view.running),
+            waiting=tuple(replace(step, route=target_config.MAC_ONLY) for step in view.waiting)),
+            explanation=replace(explanation, running=tuple(replace(entry, step=replace(entry.step, route=target_config.MAC_ONLY))
+                                                           for entry in explanation.running)))
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(target_availability.MacRoutes, "holds", return_value="build hold by research (hana) until released")):
+            page = memory_feed.reading()
+        running, = [row for row in page["walk"] if row.get("queued")]
+        waiting, = page["waiters"]
+        for row in (running, waiting):
+            self.assertEqual((row.get("runs_on"), row.get("mac_state")), ("Mac only", "build hold by research (hana) until released"))
+
+    def test_target_notes_name_what_holds_the_mac_only_for_a_mac_only_step_while_something_holds_it(self) -> None:
+        routes = target_availability.MacRoutes((snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free())), {}, UTC)
+        with mock.patch.object(routes, "holds", return_value="busy with check cargo-handler"):
+            self.assertEqual(memory_feed.target_notes(target_config.PinnedTarget("mac"), routes, "nextest", "/r", "p"),
+                             {"runs_on": "Mac only", "targets": ["mac"], "mac_state": "busy with check cargo-handler"})
+            self.assertEqual(memory_feed.target_notes(target_config.LOCAL_CALLER, routes, "nextest", "/r", "p"),
+                             {"runs_on": "natedev only (the run asks for it)", "targets": ["natedev"]})
+        with mock.patch.object(routes, "holds", return_value=""):
+            self.assertEqual(memory_feed.target_notes(target_config.MAC_ONLY, routes, "nextest", "/r", "p"),
+                             {"runs_on": "Mac only", "targets": ["mac"]})
 
     def test_swapped_memory_of_other_programs_shows_as_free_ram_when_it_comes_back(self) -> None:
         gib = admission_records.GIB
@@ -1430,6 +1483,7 @@ process.stdout.write(JSON.stringify({
                     "holder": "research", "unit": "research", "showrunner": "hana", "since": "since " + since.strftime("%H:%M UTC"),
                     "until": "until released"}])
                 self.assertEqual({waiter.get("runs_on") for waiter in page["waiters"]}, {"natedev or Mac"})
+                self.assertEqual({tuple(waiter.get("targets", ())) for waiter in page["waiters"]}, {("natedev", "mac")})
 
     def test_cloud_rows_show_stage_and_location(self) -> None:
         reading = cloud_reading(reservation_reading())
@@ -1598,6 +1652,7 @@ process.stdout.write(JSON.stringify({
                 local, = [row for row in runs if row.get("kind") != "cloud"]
                 waiter, = [row for row in waits if row.get("kind") == "cloud"]
                 self.assertEqual(waiter["runs_on"], memory_feed.CLOUD_RUNS_ON)
+                self.assertEqual(waiter.get("targets"), ["aws"])
                 self.assertNotIn("AWS", "".join(str(row.get("runs_on", "")) for row in waits if row.get("kind") != "cloud"))
                 self.assertEqual(remote["machine"], "aws")
                 self.assertEqual(remote["vcpus"], 32 if isinstance(cloud.progress, cloud_progress.CloudProgress)
@@ -1955,9 +2010,13 @@ process.stdout.write(JSON.stringify({
               mock.patch.object(admission_client, "view", return_value=captured_reading())):
             page = memory_feed.reading()
         provider.assert_called_once_with(7, n=3)
-        text = memory_feed.page_json(page)
-        for expected in ("Memory wait", "fixture-owner", "Reduce the memory wait."):
-            self.assertIn(expected, text)
+        report = page["report"]
+        assert isinstance(report, memory_feed.ReportSections)
+        row = report.top[0]
+        self.assertEqual((row["machine"], row["cause"], row["range"]), ("fixture", "Memory wait", [30 / 3600, 60 / 3600]))
+        self.assertEqual(row["share"], "fixture nextest paid 75% of it.")
+        self.assertEqual(row["action"], "Action: lower the memory peak of fixture nextest. It holds the most build memory: "
+                                        + "12 GiB·h/day, peak p90 3.0 GiB.")
 
     def test_report_failures_keep_the_queue_reading(self) -> None:
         for failure in (charts.IndexUnavailable("private index is missing"),

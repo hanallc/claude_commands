@@ -55,9 +55,8 @@ Clone removal deletes the complete project entry for its exact recorded folder k
 
 ## Every account in one table
 
-`/showrunner:accounts` opens the accounts board.
-`/showrunner:accounts close` closes it.
-The board refreshes stored readings every ten seconds.
+Open Hana console, Accounts to see the accounts board.
+The page refreshes every 15 seconds.
 The board and terminal table show upcoming moves under the table and before the problems.
 Both use the exact group text from `accounts.py next list`.
 An empty queue shows `Upcoming moves: none`.
@@ -176,7 +175,8 @@ One file lock prevents concurrent fetches.
 The board read never waits for the fetch.
 `status --stored` reads the saved peer counts with the same ten-minute age limit.
 The board uses `peer_session_counts.json` only within the existing ten-minute age limit.
-A failed fetch replaces that copy with an unavailable marker.
+A failed fetch keeps the last good copy, so one slow read on a busy machine does not hide the peer counts.
+It writes the time and reason of the last failure to `peer_session_counts_failed.json`; each failure replaces that file.
 A missing, damaged, or old copy also makes the peer unavailable.
 Problems then contains one line: `<machine> unavailable: counts are <this machine> only`.
 The count columns then show local counts only.
@@ -393,7 +393,8 @@ claude3
 /login
 ```
 
-Never `/logout` in a unit director's session: every unit on that account stops working. After any login, run `/showrunner:accounts`; every directory must match its label.
+A logout in a unit director's session stops every unit on that account.
+After login, use Hana console, Accounts to check that every directory matches its label.
 
 Historical `default`, `~/.claude` or `~/.codex` records resolve from their own login or a dated cutover entry in `config/accounts.json`, covering only records before that cutover and matching the tool. Without evidence they stay unresolved; today's login never names a past record. A resolved resume uses the numbered account's folder.
 
@@ -469,7 +470,13 @@ For claude3, run in a terminal:
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup claude3
 ```
 
-Then start `claude3` in a terminal, run `/login` as claude3, and check `/showrunner:accounts`. Setup links shared content to `~/.claude`; it reports existing real files or directories rather than replacing them. Login stays separate for each directory.
+1. Start `claude3` in a terminal.
+2. Run `/login` as claude3.
+3. Check Hana console, Accounts.
+
+Setup links shared content to `~/.claude`.
+It reports existing real files or directories and keeps them.
+Login stays separate for each directory.
 
 ## Setting up a Codex home
 
@@ -493,7 +500,7 @@ env CODEX_HOME="$HOME/.codex1" codex login
 
 Keep `env CODEX_HOME` on that command so it runs the binary directly and the login stays in the numbered home; workers always use their mapped account. Do not sign in to the shared `~/.codex` home.
 
-Open `/showrunner:accounts` to see the new home's row.
+Open Hana console, Accounts to see the new home's row.
 It shows `spare` until selected for workers.
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py check codex1` to check the home directly.
 Problems name missing or broken shared links, the wrong login, or a login held by another home.

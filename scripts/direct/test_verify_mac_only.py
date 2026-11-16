@@ -8,6 +8,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
 from typing import cast, final, override
@@ -19,6 +20,7 @@ from scripts.direct.verify_mac_offload_test_support import (
 )
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.build_folders_test_support import tool_folders
 
 
 @final
@@ -205,7 +207,8 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         def busy_wait_delivered() -> bool:
             if not busy_published:
                 return False
-            for path in (self.root / "tmp").glob(f"verify-hold.{process.pid}.*/placement-*.json.queued"):
+            for path in (queued for hold in tool_folders(self.root / "tmp", "verify", pid=process.pid)
+                         for queued in hold.glob("placement-*.json.queued")):
                 try:
                     queued = wire.parse_record(path.read_text(), admission_client.QueuedPlacementEpisode)
                 except (OSError, ValueError):
@@ -378,6 +381,37 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.assertEqual(self.last_call()["mac_reason"], "unreachable")
         self.assertEqual(self.last_call()["mac_s"], 0)
         self.assertEqual(self.routing_record()["target"], "")
+
+    def write_backoff(self) -> Path:
+        """Mark the Mac as unreachable a short time ago, as a failed probe does."""
+        state = Path(self.environment["MAC_TEST_STATE_DIR"])
+        state.mkdir(parents=True, exist_ok=True)
+        _ = (state / "failed_probe").write_text("failed\n")
+        backoff = state / "unreachable_until"
+        _ = backoff.write_text(f"{time.time() + 300:.6f}\n")
+        return backoff
+
+    def test_backoff_takes_one_fresh_probe_and_a_reached_mac_runs_the_step(self) -> None:
+        backoff = self.write_backoff()
+        result = self.verify("test", "sample", "--mac", "needs macOS", extra={
+            "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("mac_test: the Mac is reachable again", result.stderr)
+        self.assertFalse(backoff.exists())
+        self.assertEqual(len(self.runner_events()), 1)
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(self.routing_record()["target"], "mac")
+
+    def test_backoff_with_a_failed_fresh_probe_refuses_as_unreachable(self) -> None:
+        backoff = self.write_backoff()
+        self.write_executable(self.bin_directory / "ssh", '#!/bin/sh\nexit 255\n')
+        result = self.routing_result()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("the Mac cannot be reached (/build:status --probe)", result.stderr)
+        self.assertTrue(backoff.exists())
+        self.assertEqual(self.runner_events(), [])
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(self.last_call()["mac_reason"], "unreachable")
 
     def test_mac_failure_keeps_runner_status(self) -> None:
         result = self.mac_result(extra={

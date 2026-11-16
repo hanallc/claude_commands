@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 gix        = { workspace = true, features = ["max-performance-safe", "sha1"] }
+libc       = { workspace = true }
 rayon      = { workspace = true }
 serde      = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

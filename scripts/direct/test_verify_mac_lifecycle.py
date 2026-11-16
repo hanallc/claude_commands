@@ -11,6 +11,7 @@ from scripts.build_queue import admission_client, admission_protocol as wire, pl
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.build_folders_test_support import tool_folders
 
 
 @final
@@ -116,7 +117,8 @@ class VerifyMacLifecycleTests(VerifyMacOffloadFixture):
         self.release_memory(meminfo)
         self.wait_until(waiting_on_the_hold, "the hold wait", (process,))
         def delivered_hold_wait() -> bool:
-            for path in (self.root / "tmp").glob(f"verify-hold.{process.pid}.*/placement-*.json.wait"):
+            for path in (wait for hold in tool_folders(self.root / "tmp", "verify", pid=process.pid)
+                         for wait in hold.glob("placement-*.json.wait")):
                 try:
                     notice = wire.parse_record(path.read_text(), admission_client.PlacementWaitNotice)
                 except (OSError, ValueError):

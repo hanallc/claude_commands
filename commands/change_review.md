@@ -96,7 +96,8 @@ user's zone, then the commit: `2026-11-13 16:20 · 31770c75`. It prints the new 
 ## Change images
 
 Every change review carries one image: a dark mode shot at desktop width, or `image --output <text file>` for terminal output.
-The parser still accepts a line without an image.
+The commit hook requires a final ` | image <id>` field on each visible Change-Review line.
+Merge checks require that field for commits dated at or after 2026-11-16 00:00 EST, using the Git committer time.
 Use `add --image <png>` to attach an existing screenshot to a manual row.
 Use `edit --row <id> --image <png>` to attach or replace an image on an existing row.
 Use `add --output <text file>` or `edit --row <id> --output <text file>` to attach rendered text.
@@ -276,6 +277,14 @@ These rows hide all showrunner actions, including Send feedback.
 The server refuses question and feedback requests without saving.
 Its count covers all page lists, including independent production roots.
 Menu options with waiting changes precede empty options in alphabetical order.
+Each showrunner view follows `/next change` for that production, with its pin and moved rows.
+All lists each root's `/next change --all-below` order in turn, with each root's pin and moved rows.
+The page reads `changes_first_root` from `config/review_links.conf` at each render.
+The named root goes first, and other roots follow by name.
+The default is `natedev`.
+A name outside the live roots leaves the root order unchanged.
+Rows outside these queues go last.
+The first card and Skip for now follow the selected view's order.
 Keyboard focus keeps its visible outline.
 Answers save in the background.
 Works and Does not work open the next waiting change at once, before the server answers.

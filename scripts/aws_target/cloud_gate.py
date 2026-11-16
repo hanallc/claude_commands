@@ -112,6 +112,11 @@ def aws_down(reason: str) -> bool:
                                            'InternalFailure', 'ServerInternal', '(Unavailable)'))
 
 
+def not_sent(reason: str) -> bool:
+    """A connect failure means AWS never received the request."""
+    return any(code in reason for code in ('Could not connect to the endpoint', 'EndpointConnectionError'))
+
+
 def definite_refusal(reason: str) -> bool:
     return 'An error occurred (' in reason and not aws_down(reason)
 
@@ -361,13 +366,22 @@ class GateWorker:
     def terminate(self, attempt: str, instance: str, *,
                   result_seen_at: int | _ResultNotReceived = _RESULT_NOT_RECEIVED) -> None:
         api = self.regional_api(self.box_region)
-        _ = api.call('terminate-instances', '--instance-ids', instance)
         deadline = self.clock() + settings().number('termination_timeout_s')
+        requested = False
         while self.clock() < deadline:
-            if api.observe(instance, int(self.clock())).state == 'terminated':
-                ended_at = int(self.clock()) if isinstance(result_seen_at, _ResultNotReceived) else result_seen_at
-                self.book.resolve_gate(attempt, ledger.GateTerminated(ended_at, instance))
-                return
+            try:
+                if not requested:
+                    _ = api.call('terminate-instances', '--instance-ids', instance)
+                    requested = True
+                if api.observe(instance, int(self.clock())).state == 'terminated':
+                    ended_at = int(self.clock()) if isinstance(result_seen_at, _ResultNotReceived) else result_seen_at
+                    self.book.resolve_gate(attempt, ledger.GateTerminated(ended_at, instance))
+                    return
+            except AwsUnavailable as error:
+                # A regional outage repeats the call until the deadline; any other error ends the try.
+                if not aws_down(str(error)):
+                    raise
+                print(f'Cloud gate termination waits on {self.box_region}: {error}', flush=True)
             self.pause(settings().number('result_poll_s'))
         raise AwsUnavailable('Termination is unconfirmed; the expiry function still owns cleanup')
 
@@ -561,18 +575,17 @@ class GateWorker:
             return sorted(variants, key=cooled)
         default_seconds = Decimal(values.whole('lifetime_minutes') * 60)
         transfer = conf.decimal(values.text('remote_region_transfer_usd'))
+        transfers = run_cost.region_numbers(values, 'region_transfer_usd')
         wait_cost = conf.decimal(values.text('gate_wait_usd_per_minute'))
-        extra_seconds = {region: conf.decimal(str(seconds)) for region, seconds in
-                         ledger.mapping(cast(object, json.loads(values.text('region_extra_gate_seconds')))).items()}
-        if any(not region or seconds < 0 for region, seconds in extra_seconds.items()):
-            raise ValueError('The regional gate delay must be nonnegative')
+        extra_seconds = run_cost.region_numbers(values, 'region_extra_gate_seconds')
+        unmeasured = run_cost.region_numbers(values, 'unmeasured_region_extra_seconds')
         def order(item: tuple[int, GateLaunchVariant]) -> tuple[bool, bool, Decimal, int, int]:
             position, variant = item
             key = (variant.region, variant.instance_type, variant.zone)
             # The expected USD of one run: box time by type and region, plus the wait for expected refusals.
             cost = (evidence.expected_usd(prices[key], variant.instance_type, variant.region, (mode,), wait_cost,
-                                         default_seconds)
-                    + (transfer if variant.region != self.api.region else Decimal(0))
+                                         default_seconds, unmeasured_extra_s=unmeasured.get(variant.region, Decimal(0)))
+                    + (transfers.get(variant.region, transfer) if variant.region != self.api.region else Decimal(0))
                     + extra_seconds.get(variant.region, Decimal(0)) * wait_cost / 60
                     if key in prices else Decimal(0))
             return cooled(variant), key not in prices, cost, type_rank(variant), position
@@ -620,6 +633,7 @@ class GateWorker:
         regional_rows = {ledger.text(row, 'region'): row for row in ledger.rows(deployment, 'regions')}
         index = ledger.instant(launch, 'variant') if launch else 0
         stop = max(index + 1, len(variants)) if launch.get('arguments') else len(variants)
+        unreachable: set[str] = set()
         for offset in range(index, stop):
             if launch.get('arguments') and offset == index:
                 arguments = ledger.mapping(launch['arguments'])
@@ -628,7 +642,7 @@ class GateWorker:
                 zone = str(launch.get('zone', ''))
             else:
                 variant = variants[offset]
-                if variant.instance_type in unauthorized:
+                if variant.instance_type in unauthorized or variant.region in unreachable:
                     continue
                 regional = regional_rows[variant.region]
                 size = variant.instance_type
@@ -717,6 +731,13 @@ class GateWorker:
                     launch = {**saved_order, 'variant': offset + 1}
                     save(path, launch)
                     continue
+                if not_sent(str(error)) and any(row.region != self.box_region for row in variants[offset + 1:]):
+                    # No box exists, so the next region can launch; this region's other variants would fail the same way.
+                    print(f'Cloud gate skips {self.box_region}: {launch_error_code(str(error)) or str(error)}', flush=True)
+                    unreachable.add(self.box_region)
+                    launch = {**saved_order, 'variant': offset + 1}
+                    save(path, launch)
+                    continue
                 if launch_error_code(str(error)) == 'UnauthorizedOperation' and any(
                         row.instance_type not in (size, *unauthorized) for row in variants[offset + 1:]):
                     # The stack policy names its types, so another type can still launch.
@@ -792,6 +813,7 @@ class GateWorker:
                     print(f'Gate time limit disabled: no passing history for {self.size_vcpus} vCPUs', flush=True)
                 began = 0.0
                 deadline = float('inf')
+                outage_since: float | None = None
                 while self.clock() < ledger.instant(request, 'expires'):
                     try:
                         bucket = ledger.text(deployment, 'bucket')
@@ -830,8 +852,17 @@ class GateWorker:
                                 interruption_code = code
                             detail = ': '.join(ledger.text(reason, key) for key in ('Code', 'Message') if reason.get(key))
                             raise ValueError('The instance stopped without a final result' + (f' ({detail})' if detail else ''))
+                        outage_since = None
                     except subprocess.TimeoutExpired:
                         pass
+                    except AwsUnavailable as error:
+                        # The box keeps running through a short AWS outage; a long one ends the cloud try.
+                        if not aws_down(str(error)):
+                            raise
+                        outage_since = self.clock() if outage_since is None else outage_since
+                        if self.clock() - outage_since >= settings().number('observe_outage_s'):
+                            raise
+                        print(f'Cloud gate poll skipped: {error}', flush=True)
                     if time.monotonic() >= deadline:
                         text = (folder / 'gate.log').read_text() if (folder / 'gate.log').exists() else ''
                         row = time_limit_result(request, text, time.monotonic() - began, limit, self.size_vcpus)
@@ -927,21 +958,22 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
     if not host or Path(host).name != host or host in ('.', '..'):
         raise ValueError('Invalid remote host')
     at = datetime.fromisoformat(ledger.text(record, 'started_at')).timestamp()
-    destination = store.host_file(host, at)
+    # The record keeps the box host; the file is the one AWS place.
+    destination = store.host_file(store.CLOUD_GATE_PLACE, at)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with store.locked_append(destination) as handle:
         _ = handle.seek(0)
         records = [ledger.mapping(cast(object, json.loads(line))) for line in handle if line.endswith(b'\n')]
         if not any(previous.get('id') == record['id'] for previous in records):
             run = gate_box.decode_run(row['gate'])
-            gate_record.keep_failure_logs(ledger.text(record, 'id'), host, at,
+            gate_record.keep_failure_logs(ledger.text(record, 'id'), store.CLOUD_GATE_PLACE, at,
                 cast(list[gate_record.ModuleRun], record['modules']), gate_box.execution_records(run))
             store.append_locked(handle, record)
     from scripts.buildlog.record import keep_result
     imported: dict[str, object] = {'id': record['id']}
     try:
         # The result leaves the checkout: a gate copy is a reused slot.
-        imported['result'] = keep_result(json.dumps(row).encode(), host, at, ledger.text(record, 'id'))
+        imported['result'] = keep_result(json.dumps(row).encode(), store.CLOUD_GATE_PLACE, at, ledger.text(record, 'id'))
         (folder / RESULT_FILE).unlink(missing_ok=True)
     except OSError as error:
         gate_record.report_not_written(error)

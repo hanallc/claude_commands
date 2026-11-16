@@ -3306,6 +3306,48 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                     pending.unlink()
                     self.paths.run.unlink()
 
+    def test_release_survives_a_watcher_pass_during_the_fence_settle(self) -> None:
+        from scripts.buildlog import sync as buildlog_sync
+        from scripts.mac_test import offload, claim_state
+
+        # A watcher pass that lands during the settle adds bookkeeping; a new owner still refuses.
+        transfer: buildlog_sync.TransferBytes = {"operation": "ssh_activity", "sent_bytes": 1992,
+                                                 "received_bytes": 21, "complete": True}
+        for new_owner in (False, True):
+            with self.subTest(new_owner=new_owner):
+                record = self.write_claim()
+                identity = claim_state.ClaimIdentity(cast(str, record["claim_id"]), cast(str, record["episode"]),
+                                                     cast(str, record["attempt"]))
+                prepared = self.run_private_shell(offload.prepare_start_fence_command(identity, "mac"), self.root)
+                self.assertEqual(prepared.returncode, 0, prepared.stderr)
+                pending = offload.pending_start_path(self.paths.target, identity)
+                pending.parent.mkdir(parents=True, exist_ok=True)
+                _ = pending.write_text("pending")
+                rewritten: dict[str, object] = {**record, "transfers": [transfer],
+                                                "idle_since": "2026-10-13T12:01:00+00:00",
+                                                "work_idle_since": "2026-10-13T12:01:00+00:00"}
+                if new_owner:
+                    rewritten["pid"] = cast(int, record["pid"]) + 1
+
+                def remote(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    del options
+                    _ = self.paths.run.write_text(json.dumps(rewritten))
+                    return self.run_private_shell(arguments[-1], self.root)
+
+                with mock.patch.object(subprocess, "run", side_effect=remote), \
+                     mock.patch.object(mac_test, "start_watcher"):
+                    answer = mac_test.release_exact_claims(self.paths, cast(int, record["pid"]), identity, "")
+                if new_owner:
+                    self.assertEqual(answer, mac_test.ClaimReleaseRefused("the exact claim changed during cleanup"))
+                    self.assertEqual(self.read_claim(), rewritten)
+                    self.assertTrue(pending.exists())
+                    pending.unlink()
+                    self.paths.run.unlink()
+                else:
+                    self.assertEqual(answer, mac_test.ClaimsReleased(1, (transfer,)))
+                    self.assertFalse(self.paths.run.exists())
+                    self.assertFalse(pending.exists())
+
     def test_process_claim_release_message_keeps_process_bound_claim_command(self) -> None:
         record = self.write_claim(idle_since=mac_test.timestamp(self.now - timedelta(minutes=15)))
         _ = record.pop("remote_host")

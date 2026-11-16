@@ -2768,6 +2768,7 @@ done
             if run_place is not None:
                 row["order_since"] = min(run_place.since, row.get("order_since", row["since"]))
             row["build_run"] = _live_run(request.run)
+        row["route"] = request.route
         prerequisite = self.prerequisites.get(request.episode, placement.TokenRequired())
         if isinstance(prerequisite, placement.TokenRequired):
             row["token_left_at"] = row.get("token_left_at", request.since)

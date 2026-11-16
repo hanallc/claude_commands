@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 
 from scripts.lib import conf
-from scripts.buildlog import charts, costs, index, moments, record
+from scripts.buildlog import charts, cost_actions, costs, index, moments, record
 from scripts.buildlog import test_moments as fixtures
 from scripts.buildlog.test_holds import hold_event
 from scripts.buildlog.test_index import Record, call, ci_job, ci_run
@@ -131,32 +131,40 @@ class PageDataTests(ChartFixture):
         self.assertEqual((result.start.tzinfo, result.end.tzinfo), (self.ZONE, self.ZONE))
         self.assertEqual(result.recent_days, 2)
 
-    def test_actions_and_owners_read_the_fixture_config_at_use(self) -> None:
-        self.configure("COST_ACTION_MEMORY_WAIT", "Reduce the fixture memory wait.")
-        self.configure("COST_OWNER_MEMORY_WAIT", "fixture-owner")
-        with closing(self.fixture.connection(fixtures.build("wait", 10, mem_wait_s=3600))):
-            first = self.rows(1)[0]
-            self.configure("COST_ACTION_MEMORY_WAIT", "Reduce the new fixture memory wait.")
-            self.configure("COST_OWNER_MEMORY_WAIT", "new-fixture-owner")
-            second = self.rows(1)[0]
-        self.assertEqual(first.action, charts.CostAction("Reduce the fixture memory wait.", "fixture-owner"))
-        self.assertEqual(second.action, charts.CostAction("Reduce the new fixture memory wait.", "new-fixture-owner"))
+    def test_memory_wait_names_the_largest_memory_holder_and_each_day(self) -> None:
+        gib = 1 << 30
+        with closing(self.fixture.connection(
+            fixtures.build("hana-1", 10, repo="hana", mem_wait_s=5400, peak_mem_bytes=8 * gib, duration_s=3600),
+            # A verify gate copy has its own folder name and the origin of the repository it copies.
+            fixtures.build("hana-2", 90000, repo="checkout", repo_identity="https://github.com/natepiano/hana",
+                           mem_wait_s=1800, peak_mem_bytes=10 * gib, duration_s=3600),
+            fixtures.build("port", 20, repo="port", step="clippy", mem_wait_s=1800, peak_mem_bytes=30 * gib, duration_s=600),
+        )):
+            row = self.rows(1)[0]
+        self.assertEqual((row.machine, row.cause, row.recent), ("natedev", "Memory wait", charts.MeasuredCost(9000)))
+        self.assertEqual(row.days, (charts.MeasuredCost(7200), charts.MeasuredCost(1800)))
+        self.assertEqual(row.share, cost_actions.LargestShare(costs.StepKind("hana", "nextest"), 0.8))
+        self.assertEqual(row.action, cost_actions.LowerMemoryPeak(costs.StepKind("hana", "nextest"), 9.0, 10 * gib))
 
-    def test_missing_or_empty_action_keys_name_the_config_error(self) -> None:
-        source = self.config_file.read_text()
-        with closing(self.fixture.connection(fixtures.build("wait", 10, mem_wait_s=3600))):
-            for key in ("COST_ACTION_MEMORY_WAIT", "COST_OWNER_MEMORY_WAIT"):
-                for missing in (True, False):
-                    with self.subTest(key=key, missing=missing):
-                        _ = self.config_file.write_text(source)
-                        if missing:
-                            _ = self.config_file.write_text("\n".join(
-                                line for line in source.splitlines() if not line.startswith(key + "=")
-                            ) + "\n")
-                        else:
-                            self.configure(key, "")
-                        with self.assertRaisesRegex(conf.Unusable, key):
-                            _ = charts.page_data(7)
+    def test_failed_runs_name_the_test_that_failed_most_else_the_step(self) -> None:
+        failed = {"status": "failed", "duration_s": 1.0, "attempts": 1}
+        with closing(self.fixture.connection(
+            fixtures.build("one", 10, target="cloud", repo="hana", status=100, duration_s=3600,
+                           tests=[{"binary": "hana", "test": "tests::flaky", **failed},
+                                  {"binary": "hana", "test": "tests::other", **failed}]),
+            fixtures.build("two", 20, target="cloud", repo="hana", status=100, duration_s=3600,
+                           tests=[{"binary": "hana", "test": "tests::flaky", **failed}]),
+            fixtures.build("lint", 30, target="mac", repo="port", step="clippy", status=1, duration_s=1800),
+        )):
+            values = {(row.machine, row.cause): row.action for row in self.rows(10)}
+        self.assertEqual(values["cloud", "Failed runs"], cost_actions.FixTest("hana", "tests::flaky", 2))
+        self.assertEqual(values["mac", "Failed runs"], cost_actions.FixStep(costs.StepKind("port", "clippy"), 1))
+
+    def test_a_cost_without_a_named_action_says_so(self) -> None:
+        with closing(self.fixture.connection(fixtures.build("cold", 30, target="mac", crates_compiled=50, duration_s=1800))):
+            row = self.rows(1)[0]
+        self.assertEqual((row.cause, row.action), ("Cold rebuilds", cost_actions.NoActionKnown.VALUE))
+        self.assertEqual(cost_actions.action_text(row.action), "No action known.")
 
     def test_page_data_reads_the_index_once_for_charts_and_costs(self) -> None:
         with closing(self.fixture.connection(fixtures.build("wait", 10, mem_wait_s=3600))), \
