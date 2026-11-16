@@ -373,6 +373,10 @@ Phase 142 is complete at `a266766ad`. Its aws pairs measured wait holder at 62.6
   - Completion condition: measure each candidate on its callers before a phase; a shared base keeps equality, hash, repr, `is_dataclass` and frozen behavior.
   - Revealed by: phase 307 design probe (fix 1 of the verify flow cost plan).
 
+- [ ] **copies.py reads each source fact once per operation.** Owner: natest (measure); the unit whose open branch changes `copies.py` (change). Later candidate (builds, 2026-11-15): declined while queue's build-folders phase 4 rewrites `copies.py`.
+  - Why needed: git probe `p312` at `4f1692a05`: a git read whose exact argv repeats on the same repository with no write between is 2,995 of 19,987 git starts in `style/test_crate_run.py` (15%) and 265 of 6,226 in `production/test_fast_track.py` (4%). Sources: `refresh_remotes` reads `origin_url` and source refs again, `commit_at` repeats, and `workspace()` refreshes at entry and exit. About 1 ms per git start; about 2-3 aws s on crate_run.
+  - Completion condition: after queue phase 4 merges, check the new `copies.py` for repeat reads; pass each value down in one operation, never a process-level cache.
+
 ## Floors
 
 Each floor row states its measurement conditions: revision, filesystem roots and bytecode cache (showrunner, 2026-11-09). Compare a gate reading with a floor only under the same conditions. The older rows are wall floors from before 2026-11-06, not CPU floors. A wall floor does not hold a module back when its CPU rank calls it and direct calls were not tried. The `direct/test_verify*` rows go to the batches.

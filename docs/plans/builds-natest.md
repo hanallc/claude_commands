@@ -4426,26 +4426,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** Phase 310
 **Owner:** natest (builds gave a go on 11-15 at 19:00 EST; base a4db0246f; no open unit branch touches the phase file).
 
-#### Work Order
+#### As-built
 
-**Goal:** the five most costly tests in `mac_test/test_offload.py` start fewer real claim chains. Each test keeps one full `self.command` run. The other cases check the same facts through the offload functions that make them, in the test process.
-
-**Measure:** `module_cost.py --tests 20 --commands 12` at a4db0246f's base: `mac_test/test_offload.py` uses 25.9 CPU s on natedev. Its 102 `mac_test.py` starts (claim and release around each run) use 16.4 s. These five tests use 11.1 s: `test_each_mac_verb_keeps_arguments_and_names_its_claim` 2.47, `test_exit_four_is_no_tests_only_for_nextest` 2.23, `test_probe_copy_and_run_arguments_preserve_nextest_words` 2.22, `test_non_test_verbs_never_apply_nextest_skip_words_or_start_a_copy` 2.16, `test_run_settings_selects_alternate_host_and_budget_over_environment_default` 2.06. Target: about 7 CPU s less on the module.
-
-**Spec:**
-1. `self.command` already runs `offload.main` in the test process. The cost is the real `mac_test.py` claim and release processes and the fake ssh and rsync chain of each run. A loop over verbs or settings repeats that chain for each case.
-2. In each of the five tests, keep one full `self.command` run: the first case of its loop. Keep every assertion of that case as it is, the claim held during rsync included.
-3. For each other case, check the same fact with a direct call of the offload or eligibility function that makes it. Examples: `offload.remote_test_command` for the remote lint words; `offload.claim_arguments` for the claim's `what` text; the function near `offload.py:1195-1204` for the exit-4 message and wire reason; the settings function that the run calls for the selected host and budget. Every assertion stays; only its source changes from a run to the direct call.
-4. A case whose fact only a full run can show keeps its run. Name each such case and the reason in the report.
-5. `test_probe_copy_and_run_arguments_preserve_nextest_words` has one run. Find its cost in the profile (`module_cost.py --tests`) and cut it only when an assertion can move to a direct call without loss. Otherwise leave it and say so.
-6. Add no production change. If a needed function is missing or private, report it; do not edit `offload.py`.
-7. Add no new test method and remove no assertion. The other tests in the module stay as they are.
-
-**Files:** `scripts/mac_test/test_offload.py` only. `offload_test_support.py` has 57 users; do not change it.
-
-**Workers:** 1 writer; one test file, no split.
-- impl: `scripts/mac_test/test_offload.py`.
-
-**Constraints from prior phases:** Phase 306 moved verify.sh runner-result checks into the test process with one end-to-end run kept; follow that shape. No signal handlers, masks or dispositions, tests included; do not change any trap.
-
-**Acceptance gate:** `mac_test/test_offload` passes on natedev 3 times in a row; basedpyright adds no finding on `scripts/mac_test/test_offload.py`; `module_cost.py --tree <worktree> --tests 10 mac_test/test_offload.py` before and after shows the CPU cut; trial merges with origin/main and the open unit branches are clean.
+- Five tests in `mac_test/test_offload.py` keep one full `self.command` run each. Their other cases call `remote_test_command`, `claim_arguments`, `claimed_run` with `write_result`, `ssh_prefix`, `request_mirror` and `remote_rsync` directly.
+- The settings test keeps real settings parsing and placement; only `run_offload` is replaced. The byte-count cases keep the real `capture_copy` parsing and `persist_attempt`, with mocked child processes.
+- Paired module_cost in one copy, 3 rounds after a warm-up (natedev, loaded): 31.4 / 40.2 / 34.9 CPU s before, 21.0 / 19.3 / 18.8 after; about 300 fewer processes per run.
+- Commit abc3df056.
