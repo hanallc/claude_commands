@@ -22,6 +22,7 @@ from scripts.lib.process_start import Started, Unreadable, process_start
 
 # The results file keeps only this many newest rows.
 KEPT_RESULTS = 300
+DEFAULT_STATE_DIR = "~/.local/state/gate"
 
 
 class LandRecord(TypedDict):
@@ -47,7 +48,7 @@ class LandResult(TypedDict):
 
 def state_dir() -> Path:
     """The merge gate state folder; `gate.gate_state_dir` returns this one."""
-    return Path(os.environ.get("GATE_STATE_DIR", "~/.local/state/merge-gate")).expanduser()
+    return Path(os.environ.get("GATE_STATE_DIR", DEFAULT_STATE_DIR)).expanduser()
 
 
 def lands_dir() -> Path:
