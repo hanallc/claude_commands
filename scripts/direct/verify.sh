@@ -1114,7 +1114,7 @@ require_taplo() {
 
 workspace_taplo() (
     # Explicit paths retain Taplo's include/exclude rules and omit untracked files.
-    cd "$WORKSPACE_ROOT" || return
+    cd "$(git rev-parse --show-toplevel)" || return
     local listing file pattern character index
     local -a files=()
     listing="$(mktemp)" || return
@@ -1137,11 +1137,9 @@ workspace_taplo() (
     rm -f "$listing"
     # No paths means a repository scan to Taplo, so skip the empty set.
     (( ${#files[@]} )) || return 0
-    # During a copy pass Taplo writes the copy; the same relative paths name its files.
-    if [[ -n "${LINT_COPY_TREE:-}" ]]; then
-        local prefix
-        prefix="$(git rev-parse --show-prefix)" || return
-        cd "$LINT_COPY_TREE/$prefix" || return
+    # Format the copy, but judge the worktree that CI will receive.
+    if [[ -n "${LINT_COPY_TREE:-}" && "${1:-}" != --check ]]; then
+        cd "$LINT_COPY_TREE" || return
     fi
     local status=0
     run taplo fmt "$@" -- "${files[@]}" || status=$?
@@ -2616,6 +2614,7 @@ PLACEMENT_COMMAND=()
 PLACEMENT_ASSIGNMENT_FILE=""
 PLACEMENT_GRANT_FILE=""
 PLACEMENT_PROVIDER=""
+MAC_BACKOFF_PROBED=0
 
 placement_once() {
     local token=none reply line route="" status=0 monitor=0
@@ -2674,6 +2673,17 @@ placement_once() {
                     pinned_target_refuse "${line#*$'\t'}"
                 fi
                 BUILDLOG_MAC=declined BUILDLOG_MAC_REASON=${line#*$'\t'} BUILDLOG_MAC_S=0
+                # The backoff can outlast a short outage, so one fresh probe decides a Mac-only
+                # step. After it, the step waits while the service still reports the cleared backoff.
+                if [[ "$BUILDLOG_MAC_REASON" == backoff && "$MAC_ONLY" == 1 ]]; then
+                    local probe_args=(probe-backoff --target mac)
+                    [[ "$MAC_BACKOFF_PROBED" == 0 ]] || probe_args+=(--no-probe)
+                    if verify_helper "$BUILD_TARGETS_SCRIPT" "${probe_args[@]}"; then
+                        MAC_BACKOFF_PROBED=1
+                        return 78
+                    fi
+                    [[ "$MAC_BACKOFF_PROBED" == 1 ]] || BUILDLOG_MAC_REASON=unreachable
+                fi
                 mac_only_refuse "$BUILDLOG_MAC_REASON" ;;
             *) route=$line ;;
         esac
@@ -4093,6 +4103,7 @@ run_lint_held_sequence() {
     lint_rewrite fmt_cargo --all
     workspace_taplo
     lint_copy_return || exit 1
+    workspace_taplo --check || exit "$?"
     lint_status=0
     if lint_config_enabled mend; then
         local mend_status=0
@@ -4259,12 +4270,9 @@ run_lint_sequence() {
     if [[ -n "${RUN_LOG}" ]]; then
         set_verdict_keys
     fi
-    # Cargo's workspace root can differ from the caller's directory.
-    # Run there so Taplo uses the same config and scope as the push gate.
+    # Taplo checks the repository with its top-level config, as CI does.
     load_metadata
-    TAPLO_ARGS=(--check)
-    if [[ "$HOLD_LINT" == 1 ]]; then TAPLO_ARGS=(); fi
-    if workspace_taplo ${TAPLO_ARGS[@]+"${TAPLO_ARGS[@]}"}; then
+    if workspace_taplo --check; then
         :
     else
         taplo_status=$?
