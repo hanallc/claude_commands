@@ -514,7 +514,7 @@ class ControlTests(CostFixture):
         self.assertEqual(data['tiles'][0]['note'], 'UTC 2026-01-15, estimate of the $35.00 daily limit. 5 gate runs.')
         self.assertEqual(data['tiles'][1]['note'], 'UTC 2026-01-14, provisional bill of the $35.00 daily limit. 7 gate runs.')
         self.assertEqual(data['tiles'][2]['note'], 'UTC 2026-01, of the $400.00 monthly limit.')
-        # The page and /aws_spend share one month calculation.
+        # The page and the buildlog report share one month calculation.
         self.assertEqual(data['forecast'], 'Month forecast: $57.00 at $3.00 a day, the average of the last 2 billed days. '
                          + '32-CPU gate compute is 67% of the spend on those days.')
         no_bill = aws_page.spend_data(spend.Spend(read.days[:1], Decimal(35), Decimal(400)), now, 2)
