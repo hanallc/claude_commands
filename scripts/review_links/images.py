@@ -137,7 +137,7 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
     caption = record["caption"]
     added = datetime.fromisoformat(record["registered_at"])
     owner, name = owner_names(members, record["owner"])
-    return (f'<article id="image-{record["id"]}"{' class="pair"' if pair else ''} data-image="{record["id"]}" data-registered="{int(added.timestamp())}" '
+    return (f'<article id="image-{record["id"]}"{' class="pair"' if pair else ''} data-image="{record["id"]}" '
             + f'data-owner="{html.escape(record["owner"], quote=True)}" data-owner-name="{html.escape(name, quote=True)}">'
             + f'<h2 class="caption">{html.escape(caption)}</h2><dl class="image-details">'
             + f'<dt>Owner:</dt><dd>{html.escape(owner)}</dd>'
@@ -162,12 +162,10 @@ def render(root: Path) -> bytes:
     members = staff.snapshot()
     rows = conf.read("review_links").whole("feedback_rows")
     cards = "".join(card(record, token, members, rows) for record in waiting_records(root))
-    content = (STYLE + page_frame.title("Images", "images") + '<div data-image-filter><label for="image-window">Show:</label>'
-               + '<select id="image-window"><option value="day">Last day</option>'
-               + '<option value="week" selected>Last 7 days</option><option value="all">All</option></select></div>'
+    content = (STYLE + page_frame.title("Images", "images")
                + '<div data-image-layout><nav data-image-groups aria-label="Image groups"></nav>'
                + f'<div><div data-images data-script="{SCRIPT_VERSION}">{cards}</div><p hidden data-empty></p></div></div>'
-               + '<noscript>Enable JavaScript to filter images or answer on an image.</noscript>'
+               + '<noscript>Enable JavaScript to answer on an image.</noscript>'
                + f'<script>{SCRIPT}</script>')
     return page_frame.rendered(change_page.document(content, "Images"), started, read_at)
 
@@ -240,8 +238,6 @@ def send_answer(root: Path, identity: str, answer: str, feedback: str) -> None:
 # There a single card keeps 680px, and a pair card takes up to two of them: 1376 = 680 + 16 + 680.
 # A pair stacks, before on top, when its card is narrower than 600px.
 STYLE = """<style>[hidden]{display:none!important}
-[data-image-filter]{display:flex;align-items:center;gap:8px;margin-bottom:16px}
-[data-image-filter] select{font:inherit;min-height:44px;color:CanvasText;background:Canvas}
 [data-images] article{padding:24px 0;border-top:1px solid #8886}[data-images] article:first-child{border-top:0;padding-top:8px}
 [data-images] img{display:block;max-width:100%;height:auto;border:1px solid #8886;border-radius:6px}
 [data-images] article{container-type:inline-size}
@@ -275,25 +271,14 @@ color:inherit;text-decoration:none;overflow-wrap:anywhere}
 
 SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + r"""(() => {
 const motion = createCardMotion();
-const menu = document.getElementById('image-window');
 const empty = document.querySelector('[data-empty]');
-const spans = {day: 86400, week: 604800, all: Infinity};
 const groups = document.querySelector('[data-image-groups]');
 let list = document.querySelector('[data-images]');
 let sending = 0;
 function apply() {
-  const now = Date.now() / 1000, span = spans[menu.value];
-  let shown = 0;
-  list.querySelectorAll('article').forEach(card => {
-    card.hidden = now - Number(card.dataset.registered) > span;
-    if (!card.hidden) shown++;
-  });
-  empty.hidden = shown > 0;
+  empty.hidden = list.children.length > 0;
   showGroups();
-  empty.textContent = list.children.length ? 'No images in this period. Choose a longer period.' : 'No images registered.';
-  // The default period keeps a plain URL; the console records any other period.
-  history.replaceState(null, '', menu.value === 'week' ? location.pathname : '#' + new URLSearchParams({show: menu.value}));
-  if (parent !== window) parent.postMessage('console-place', location.origin);
+  empty.textContent = 'No images registered.';
 }
 // One row for each run of shown images from the same owner; the row opens the first image of the run.
 function showGroups() {
@@ -375,10 +360,6 @@ async function refresh(supersede=false,current=()=>true) {
   }
 }
 function selectImage(target) {
-  if (target.hidden) {
-    menu.value = 'all';
-    apply();
-  }
   void motion.scrollCard(target);
 }
 function openImageLink() {
@@ -387,18 +368,15 @@ function openImageLink() {
   if (target) selectImage(target);
 }
 const start = new URLSearchParams(location.hash.slice(1));
-if (start.get('show') in spans) menu.value = start.get('show');
-menu.addEventListener('change', () => { motion.finish(); apply(); });
 addEventListener('hashchange', openImageLink);
 createPageRefresh(refresh,()=>0);
 bind(list);
-// An image link opens its image with a longer period when the image is older.
+// An image link opens its image at once.
 const linkedImage = start.get('image');
 apply();
 if (linkedImage) {
   const target = document.getElementById('image-' + linkedImage);
   if (target) {
-    if (target.hidden) { menu.value = 'all'; apply(); }
     motion.scroll(target, true);
   }
 }
