@@ -176,7 +176,8 @@ One file lock prevents concurrent fetches.
 The board read never waits for the fetch.
 `status --stored` reads the saved peer counts with the same ten-minute age limit.
 The board uses `peer_session_counts.json` only within the existing ten-minute age limit.
-A failed fetch replaces that copy with an unavailable marker.
+A failed fetch keeps the last good copy, so one slow read on a busy machine does not hide the peer counts.
+It writes the time and reason of the last failure to `peer_session_counts_failed.json`; each failure replaces that file.
 A missing, damaged, or old copy also makes the peer unavailable.
 Problems then contains one line: `<machine> unavailable: counts are <this machine> only`.
 The count columns then show local counts only.
