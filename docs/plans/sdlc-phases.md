@@ -380,46 +380,35 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 ### Phase 40 — Every main push lands through one function, and the post-push hook runs after each one  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** every push of a repository's default branch goes through `scripts/lib/land_main.py`, which pushes under the main push lock and then runs the repository's `.claude/config/post_push.sh`, so hana's public mirror syncs on every promotion (P783, user-approved 2026-11-15).
-
-**Spec:**
-- `scripts/lib/land_main.py` holds one function, `land(checkout, commit, branch) -> Landed`, and a CLI (`--checkout`, `--commit`, `--branch`, default `main`). It does these steps:
-  1. Take `main_push_lock.main_push_lock(checkout)`; a hold this process already has, or one passed by `MAIN_PUSH_LOCK_HELD`, is used as is.
-  2. Fetch the branch from origin. When origin is at `commit`, push nothing (`AlreadyLanded`). When origin is an ancestor of `commit`, run `git push origin <commit>:refs/heads/<branch>` (no `+`, no `--force`) (`Pushed`). Otherwise refuse (`NotFastForward`) and run no hook.
-  3. When `branch` is the default branch (`git symbolic-ref refs/remotes/origin/HEAD`, else `main`; no `gh` call) and `<checkout root>/.claude/config/post_push.sh` exists, run it with bash from the checkout root, with `LANDED_SHA` (full 40-character commit) and `LANDED_BRANCH` exported. Skip the hook when the completion record in the git common dir (`post-push-completed`) already names `commit`; write the record after exit 0 only.
-  4. A failed hook does not fail the landing. `Landed` carries the push outcome and a hook outcome (`HookAbsent`, `HookDone`, `HookSkipped`, `HookFailed(exit, rerun command)`). The CLI prints one line for each and exits 0 on a landed push with a failed hook; it prints the rerun command to stderr.
-- Every default-branch push calls it:
-  1. `scripts/validate_and_push/push_direct.sh`: the main path calls the CLI in place of its `git push` and `post_push_hook.sh`. The `CI_VALIDATED_BASE` checks stay under the same lock hold.
-  2. `scripts/validate_and_push/push_pr_branch_and_merge.sh`: after `gh pr merge` and `git pull --ff-only`, call the CLI with the merged commit (origin already has it, so only the hook runs).
-  3. `scripts/production/production_lifecycle.py` `promote_main` (both the direct push and each promotion checkout).
-  4. `scripts/production/merge_checkpoint.py` `promote_local_checkout` (both pushes).
-  5. `scripts/production/merge_gate.py` promotion push, `scripts/production/fast_track.py` (`HEAD:main`), and `scripts/lib/main_publish.py` `push`.
-  6. `scripts/release/restore_unreleased.sh` when its base branch is the default branch.
-- `scripts/lib/main_push_lock.py` CLI passes `held_environment(checkout)` to its child, so a nested `land_main.py` reuses the hold and does not deadlock.
-- `scripts/validate_and_push/post_push_hook.sh` goes; its doc text moves to the `land_main.py` docstring. Each caller's report names the hook outcome; a `HookFailed` is one report line with the rerun command, never a stop.
-- `commands/showrunner/produce.md` step 4 of promotion (about line 825): remove "leaves the public bevy_hana mirror alone … (user, 2026-10-03)". State that promotion runs the repository's post-push hook through `land_main`, so hana's mirror syncs on each promotion (user, 2026-11-15: "yes every promotion to main may sync to the public mirror").
-- Hook interface (agreed with hana-merges, 2026-11-15): cwd is the landing checkout's root, which can be a worktree on the merge branch; env `LANDED_SHA`, `LANDED_BRANCH`; exit 0 means the sync is done; the hook can run under the main push lock and must not push the default branch; it must be safe to run again for one `LANDED_SHA`.
+- `scripts/lib/land_main.py` holds `land(checkout, commit, branch="main", *, time_limit=UNLIMITED_GIT) -> Landed(commit, branch, push, hook)` and a CLI (`--checkout`, `--commit`, `--branch`). Under `main_push_lock.main_push_lock(checkout)` it fetches the branch, then:
+  1. Origin at the commit: `AlreadyLanded`; the hook runs unless the record names the commit.
+  2. The commit is a strict ancestor of origin: `AlreadyLanded` with `HookSkipped`. The newer landing owns the hook.
+  3. Origin is an ancestor of the commit: a plain fast-forward push (`Pushed`).
+  4. Otherwise: `NotFastForward(LandError)`, and no hook runs.
+- On the default branch (`refs/remotes/origin/HEAD`, else `main`), it runs `<checkout root>/.claude/config/post_push.sh` with bash, with `LANDED_SHA` and `LANDED_BRANCH`, inside the lock. After exit 0 it writes the commit to `post-push-completed` in the git common dir. An unreadable record counts as no record.
+- Hook outcomes are `HookAbsent`, `HookDone`, `HookSkipped` and `HookFailed(exit_code, rerun_command)`; `hook_report(hook)` gives one line. A failed hook never fails the landing: the CLI prints the rerun command and exits 0. It exits 1 on `LandError`.
+- Every default-branch push calls it: `push_direct.sh`, `push_pr_branch_and_merge.sh`, `restore_unreleased.sh`, `main_publish.push`, `fast_track`, `merge_checkpoint.promote_local_checkout`, `merge_gate.promote`, `production_lifecycle.promote_main`, `models_registry._publish` and `vault_pull.publish_mac` (120 s time limit). `post_push_hook.sh` no longer exists.
+- `main_push_lock.py`'s CLI passes `held_environment(checkout)` to its child, so a nested `land_main.py` reuses the hold.
+- Callers report the hook: `main_publish` only when it ran or failed; `merge_checkpoint` as a `post-push` line, `warning` on failure. `commands/showrunner/produce.md` states that each promotion syncs hana's mirror through the hook.
+- Hook interface (agreed with hana-merges): cwd is the landing checkout root, which can be a merge-branch worktree; exit 0 means the sync is done; the hook can run under the main push lock, must not push the default branch, and must be safe to rerun for one `LANDED_SHA`.
 
 **Files:**
-- `scripts/lib/land_main.py`, `scripts/lib/test_land_main.py` — new
-- `scripts/lib/main_push_lock.py`, `scripts/lib/main_publish.py`
-- `scripts/production/production_lifecycle.py`, `scripts/production/merge_checkpoint.py`, `scripts/production/merge_gate.py`, `scripts/production/fast_track.py`
-- `scripts/validate_and_push/push_direct.sh`, `scripts/validate_and_push/push_pr_branch_and_merge.sh`, `scripts/validate_and_push/post_push_hook.sh` — shell callers; the hook runner goes
-- `scripts/release/restore_unreleased.sh`
-- `commands/showrunner/produce.md` — the director edits it
-- `scripts/validate_and_push/test_rerun.py`, `scripts/release/test_release.py`, `scripts/lib/test_main_publish.py`, `scripts/lib/test_main_push_lock.py`, `scripts/production/test_production_lifecycle.py`, `scripts/production/test_merge_checkpoint.py`, `scripts/production/test_merge_gate.py`, `scripts/production/test_fast_track.py` — tests that fake these pushes
+- `scripts/lib/land_main.py`, `scripts/lib/test_land_main.py` — the landing path and its tests
+- `scripts/lib/main_push_lock.py`, `scripts/lib/main_publish.py`, `scripts/lib/models_registry.py`, `scripts/buildlog/vault_pull.py` — callers
+- `scripts/production/production_lifecycle.py`, `scripts/production/merge_checkpoint.py`, `scripts/production/merge_gate.py`, `scripts/production/fast_track.py` — promotion callers
+- `scripts/validate_and_push/push_direct.sh`, `scripts/validate_and_push/push_pr_branch_and_merge.sh`, `scripts/release/restore_unreleased.sh` — shell callers of the CLI
+- `docs/as-built/validate-and-push-cancel-prior.md`, `commands/showrunner/produce.md` — docs
 
-**Workers:** 1 writer + 1 tester.
-- `impl` — `land_main.py`, `main_push_lock.py`, and the five Python callers
-- `test` — `test_land_main.py`, the three shell callers and `post_push_hook.sh`, and the caller test updates
+**Binds later work:** the release's main push (`restore_unreleased.sh`) runs `post_push.sh`; `test_release.py` installs a hook file and checks `post-push hook: done`.
 
-**State:** the `post-push-completed` record in the git common dir (already written by `push_pr_branch_and_merge.sh`); now one writer, `land_main.py`.
+**Gotchas:**
+- `land` fetches inside the lock even when the caller fetched before; tests that count fetches see two.
+- A test that injects a push failure patches `land_main.land` where the caller looks it up, not `git push`.
+- `systemd-run` expands `${...}` in its arguments; run a gate loop from a script file.
 
-**Constraints from prior phases:** run tests under `systemd-run --user --scope -q -p MemoryMax=2G -E TMPDIR=/tmp`. No test pushes to a real remote; tests use a local bare origin.
-
-**Acceptance gate:** `test_land_main` covers: push and hook; unchanged tip with a done record (no hook); unchanged tip after a failed hook (hook runs); not fast-forward (refused, no hook); feature branch (no hook); absent hook; nested lock hold through the CLI. `scripts.lib`, `scripts.production`, `scripts.validate_and_push` and `scripts.release` suites pass on natedev; basedpyright prints `0 errors, 0 warnings` on each changed Python file; `rg 'push origin (main|"main"|HEAD:main)|"push", "origin", "main"'` finds no default-branch push outside `land_main.py`.
+**Ruled out:** a nonzero exit on a hook failure (the landing is done; the rerun line is the remedy).
 
 ### Phase 41 — Each release step skips work that is done, and the GitHub release goes to the configured repository  · status: todo
 **Depends on:** none
@@ -440,14 +429,11 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 - `scripts/release/test_release.py`
 - `commands/release.md` — the director edits it
 
-**Workers:** 1 writer + 1 tester.
-- `impl` — the three scripts
-- `test` — `test_release.py` cases with stub `gh` and `cargo` on `PATH`
+**Workers:** 1 writer — `impl` writes the three scripts and the `test_release.py` cases with stub `gh` and `cargo` on `PATH`.
 
 **State:** none
 
-**Constraints from prior phases:** no test publishes or makes a release; stubs only.
-
+**Constraints from prior phases:** no test publishes or makes a release; stubs only. Phase 40: `restore_unreleased.sh` lands the release's main push through `scripts/lib/land_main.py`, so the repository's `post_push.sh` runs there too; `test_release.py` installs a hook file and checks `post-push hook: done`. Run tests under `systemd-run --user --scope -q -p MemoryMax=2G -E TMPDIR=/tmp`.
 **Acceptance gate:** `scripts.release.test_release` covers each skip and each refusal; `bash -n` on each script; the suite passes on natedev.
 
 ### Phase 42 — One `/release` run releases a list of crates and runs the post-publish hook for each  · status: todo
