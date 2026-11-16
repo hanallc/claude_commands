@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import select
@@ -250,26 +251,30 @@ class BoardReclaimTests(unittest.TestCase):
     def test_release_waits_for_guard_before_removing_lock(self) -> None:
         self.assert_acquired(self.board("acquire", "holder", "cargo"), "acquired cargo")
         guard_holder = self.guard_process()
-        # Observe the retry after a real failed lock attempt, then hold that
-        # retry until the parent has checked the lock and released the guard.
+        # Block the retry until the parent checks the lock and releases the guard.
         retry_read, retry_write = os.pipe()
         continue_read, continue_write = os.pipe()
         for descriptor in (retry_read, retry_write, continue_read, continue_write):
             self.addCleanup(os.close, descriptor)
+        # Board uses descriptor 9 for its guard. Keep child pipes above shell descriptors.
+        child_retry_write = fcntl.fcntl(retry_write, fcntl.F_DUPFD_CLOEXEC, 10)
+        self.addCleanup(os.close, child_retry_write)
+        child_continue_read = fcntl.fcntl(continue_read, fcntl.F_DUPFD_CLOEXEC, 10)
+        self.addCleanup(os.close, child_continue_read)
         tools = self.root / "bin"
         tools.mkdir()
         sleeper = tools / "sleep"
         _ = sleeper.write_text(
             f"#!{sys.executable}\nimport os\n"
-            + f"os.write({retry_write}, b'R')\n"
-            + f"os.read({continue_read}, 1)\n"
+            + f"os.write({child_retry_write}, b'R')\n"
+            + f"os.read({child_continue_read}, 1)\n"
         )
         sleeper.chmod(0o755)
         release = subprocess.Popen(
             ["bash", str(BOARD), "release", str(self.root), "holder", "cargo"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"]},
-            pass_fds=(retry_write, continue_read),
+            pass_fds=(child_retry_write, child_continue_read),
         )
         self.addCleanup(self.stop_guard, release)
         ready, _, _ = select.select([retry_read], [], [], TEST_HANG_GUARD_SECS)
