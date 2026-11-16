@@ -5,6 +5,9 @@ from scripts.build_queue.admission_test_support import caller_admission, caller_
 from scripts.build_queue import placement
 from scripts.lib.berth_test_support import write_unconfigured_berth
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.copies import copies
+from scripts.lib.build_slots_test_support import private_slot_config
+from unittest import mock
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
@@ -194,7 +197,13 @@ class VerifyDocFixture(unittest.TestCase):
             "LINT_CONFIG_FILE": str(self.config), **config_environment(self.root),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })
-        # These are doc-policy tests, not interpreter-discovery tests. Exercise
+        private = private_slot_config(self.root, repository=self.repo.name)
+        configuration = Path(self.environment["CONF_DIR"])
+        _ = shutil.copy2(private.settings, configuration / "build_folders.conf")
+        self.environment.update({key: value for key, value in private.environment.items() if key != "CONF_DIR"})
+        with mock.patch.dict(os.environ, self.environment):
+            self.assertTrue(copies.gates_root().is_relative_to(self.root))
+        # These tests use the interpreter cache. Exercise
         # the real shim's cache hit instead of revalidating Python every call.
         seed_interpreter_cache(self.root / "cache")
         _ = self.environment.pop("CLAUDE_PYTHON", None)

@@ -65,6 +65,7 @@ class Unusable(ValueError):
 
 @dataclass(frozen=True)
 class Setting:
+    """The setting holds its stored value, limit, and source line."""
     value: str
     limit: str
     line: int
@@ -75,17 +76,20 @@ Result = TypeVar("Result")
 
 @dataclass(frozen=True)
 class UsableLiveValue[Value]:
+    """The live configuration supplies this usable value."""
     value: Value
 
 
 @dataclass(frozen=True)
 class RecoveredValue[Value]:
+    """The recovered configuration value includes the reason for recovery."""
     value: Value
     reason: str
 
 
 @dataclass(frozen=True)
 class UnavailableValue:
+    """The reason explains why no usable configuration value is available."""
     reason: str
 
 
@@ -95,6 +99,7 @@ class _MissingKey(ValueError):
 
 @dataclass(frozen=True)
 class _UnreadableFile:
+    """The file read failure holds its reason and whether the file is missing."""
     reason: str
     missing: bool
 

@@ -44,11 +44,11 @@ def main() -> object:
         output.write(json.dumps({"command": command, "args": sys.argv[2:], "call_id": os.environ.get("BUILDLOG_CALL_ID", "")}) + "\n")
     if command in ("constraints", "submitting-session", "source-key", "assigned-info", "reserve", "release-wait"):
         if command == "constraints" and os.environ.get("TEST_MAC_ALLOWED", "1") != "1":
-            sys.argv.extend(("--local", "makes natedev artifacts"))
+            sys.argv.extend(("--local", "creates a Linux install"))
         return real_main()
     if command == "eligible":
         allowed = os.environ.get("TEST_MAC_ALLOWED", "1") == "1"
-        print("any_target" if allowed else "natedev_only makes natedev artifacts")
+        print("any_target" if allowed else "natedev_only creates a Linux install")
         print("natedev\teligible\t-\t-\t-")
         if allowed:
             print("mac\teligible\t-\t" + os.environ["MAC_TEST_CONFIG"] + "\tmacos")

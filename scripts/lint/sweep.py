@@ -188,7 +188,7 @@ from scripts.message import send_budget, send_result, session_send
 from scripts.message.session_send import session_send_argv
 from scripts.lib import file_lock
 from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS
-from scripts.lib import conf
+from scripts.lib import build_folders, conf
 from scripts.lib.cargo_target_config import (
     cargo_build_folder,
     cargo_folder_settings,
@@ -1005,6 +1005,13 @@ class FloorAlertChannels(Enum):
     NATEDEV_AND_PHONE = "natedev_and_phone"
 
 
+class TrimRecovery(Enum):
+    """Which saved trim intents a sweep finishes before it scans."""
+
+    EVERY_SAVED_TRIM = "every saved trim"
+    INSIDE_SWEPT_ROOTS = "only trims whose output is inside the swept roots"
+
+
 class FloorMachine(Enum):
     """The machine whose disk crossed the alert line."""
 
@@ -1244,9 +1251,37 @@ class TargetUse:
 
 @dataclass(frozen=True)
 class LockHeld:
-    """A cargo lock a build holds in a target."""
+    """A held lock that protects build output."""
 
     lock: str
+
+
+@dataclass(frozen=True)
+class SlotBuildOutput:
+    """Build output that shares a repository slot's maker lease."""
+
+    checkout: Path
+
+    @property
+    def lock(self) -> str:
+        return str(self.checkout.with_name(self.checkout.name + ".lock"))
+
+
+def output_slot_leases(path: str) -> tuple[SlotBuildOutput, ...]:
+    """Locate slot leases for direct output and recorded external output."""
+    settings = conf.read_or_repository("build_folders")
+    values = settings.values()
+    machine = store.host_name()
+    slot_value = values.get(f"roots.slots.{machine}", values.get("roots.slots", ""))
+    if not slot_value:
+        return ()
+    slots = Path(os.path.expandvars(slot_value)).expanduser().resolve()
+    cargo = Path(os.path.expandvars(settings.text("roots.slot_cargo"))).expanduser().resolve()
+    resolved = Path(path).resolve()
+    sources = (resolved, *(mapping.workspace_root.resolve() for mapping in OUTPUT_ROOTS.get().mappings_for(resolved)))
+    checkouts = {slots / source.relative_to(root).parts[0] for source in sources for root in (slots, cargo)
+                 if source != root and source.is_relative_to(root)}
+    return tuple(SlotBuildOutput(checkout) for checkout in sorted(checkouts))
 
 
 @dataclass(frozen=True)
@@ -2177,10 +2212,33 @@ def stamp_newer(root: str, moment: float) -> bool:
         return False
 
 
+def trim_inside(take: TrimTake, roots: Sequence[str]) -> bool:
+    """Whether every output root of take is inside one of roots."""
+    return all(any(Path(output).is_relative_to(root) for root in roots)
+               for output in take.output_roots or (take.target,))
+
+
+def saved_trim_outside(roots: Sequence[str]) -> str | None:
+    """The first root whose own saved trim has output outside roots; recoverable_trim would finish it."""
+    for root in roots:
+        try:
+            take = read_trim_intent(trim_intent_path(os.path.abspath(root)))
+        except (OSError, ValueError, KeyError):
+            # No intent; or a damaged one, which recoverable_trim sets aside without a removal.
+            continue
+        if not trim_inside(take, roots):
+            return root
+    return None
+
+
 def recover_pending_trims(locked_targets: Sequence[str] = (), *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    scope: TrimRecovery = TrimRecovery.EVERY_SAVED_TRIM,
 ) -> None:
-    """Publish unfinished takes even when the rerun has no output or shortfall left."""
+    """Publish unfinished takes even when the rerun has no output or shortfall left.
+
+    With INSIDE_SWEPT_ROOTS, a take with output outside locked_targets stays saved.
+    """
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     directory = floor_record_path().parent / "trims"
@@ -2197,6 +2255,8 @@ def recover_pending_trims(locked_targets: Sequence[str] = (), *,
                     continue
                 with ExitStack() as guards:
                     roots = take.output_roots or (take.target,)
+                    if scope is TrimRecovery.INSIDE_SWEPT_ROOTS and not trim_inside(take, locked_targets):
+                        continue
                     if len(roots) > 1:
                         owners = TargetOwnerIndex(roots)
                         if build_hold_targets(roots, {}, lint_settings=lint_settings) or process_uses(owners):
@@ -2547,11 +2607,18 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]], *,
 
 
 def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run: bool,
-          recent_minutes: float, *, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> int:
+          recent_minutes: float, *, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+          trim_recovery: TrimRecovery = TrimRecovery.EVERY_SAVED_TRIM) -> int:
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
+    if trim_recovery is TrimRecovery.INSIDE_SWEPT_ROOTS:
+        outside = saved_trim_outside(roots)
+        if outside is not None:
+            # The workspace sweep that saved it finishes it.
+            print(f"lint sweep: {outside} has a saved trim with output outside it; skipped")
+            return 0
     if not dry_run:
-        recover_pending_trims(roots, lint_settings=lint_settings)
+        recover_pending_trims(roots, lint_settings=lint_settings, scope=trim_recovery)
     scan = scan_roots(roots, trees, lint_settings=lint_settings)
     total = sum(scan.blocks.values())
     label = ", ".join(roots)
@@ -2808,6 +2875,13 @@ def shrink_floor(
             lock = scratch.judgment_lock if dry_run else scratch.removal_lock
             blocked_pair = False
             for paired in paired_roots:
+                for slot in output_slot_leases(paired):
+                    if not guards.enter_context(build_folders.collector_lease(slot.checkout, wait=False)):
+                        busy[paired] = LockHeld(slot.lock)
+                        blocked_pair = True
+                        break
+                if blocked_pair:
+                    break
                 if not guards.enter_context(lock(Path(paired))):
                     busy[paired] = LockHeld(os.path.join(paired, ".claude-busy"))
                     blocked_pair = True
@@ -4473,6 +4547,14 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         tree_depth = lint_settings.whole("sweep_max_tree_depth")
         no_evidence = {item.path for item in OUTPUT_ROOTS.get().no_recorded_evidence}
         for root in targets:
+            held_slots = [slot for slot in output_slot_leases(root)
+                          if build_folders.build_folder_state(slot.checkout) == "held"]
+            if held_slots:
+                busy[root] = LockHeld(held_slots[0].lock)
+                held_targets.add(root)
+                _ = known_trees.setdefault(root, [])
+                print(f"lint sweep: busy slot lease; {root} left alone")
+                continue
             with scratch.judgment_lock(Path(root)) as idle_copy:
                 if root in no_evidence and not idle_copy:
                     held_targets.add(root)
@@ -5093,6 +5175,12 @@ def main(argv: list[str]) -> int:
         print(f"lint sweep: {error}", file=sys.stderr)
         return 2
     recent_minutes = recent_seconds / 60
+    if target_dir is not None:
+        if floor_only:
+            print(f"lint sweep: {TARGET_DIR_FLAG} does not go with {FLOOR_ONLY_FLAG}", file=sys.stderr)
+            return 2
+        # A CI runner hook sweeps its own target folder as the runner account. natedev's timer holds the floor.
+        return sweep_workspace(target_dir, settings_read, dry_run, recent_minutes, lint_settings=settings_read)
     if floor is None and floor_key is not None:
         print(f"lint sweep: {floor_key} in {config} must be a non-negative number of GiB", file=sys.stderr)
         return 2
@@ -5109,18 +5197,22 @@ def main(argv: list[str]) -> int:
 def report_assessment(run: Callable[[], tmp_sweep.SweepAssessment], scope: SweepFailureScope,
                       dry_run: bool, lint_settings: conf.ConfigRead) -> int:
     """Assess one scope and report its failure episode."""
-    from scripts.lint import tmp_sweep
-
-    detail = ""
-    try:
-        assessment = run()
-    except (conf.Unusable, OSError) as error:
-        detail = str(error)
-        print(f"lint sweep: {scope.label}: {error}", file=sys.stderr)
-        assessment = tmp_sweep.CompletedSweepAssessment(1)
+    assessment, detail = assess_scope(run, scope)
     if not dry_run:
         notify_floor_problem(assessment, lint_settings=lint_settings, detail=detail, scope=scope)
     return assessment.status
+
+
+def assess_scope(run: Callable[[], tmp_sweep.SweepAssessment],
+                 scope: SweepFailureScope) -> tuple[tmp_sweep.SweepAssessment, str]:
+    """Assess one scope; a failure prints and gives status 1 with its detail."""
+    from scripts.lint import tmp_sweep
+
+    try:
+        return run(), ""
+    except (conf.Unusable, OSError) as error:
+        print(f"lint sweep: {scope.label}: {error}", file=sys.stderr)
+        return tmp_sweep.CompletedSweepAssessment(1), str(error)
 
 
 def sweep_workspace(target_dir: str | None, budget_config: conf.ConfigRead, dry_run: bool,
@@ -5148,15 +5240,22 @@ def sweep_workspace(target_dir: str | None, budget_config: conf.ConfigRead, dry_
                         Path(root, USE_STAMP).touch()
                     except OSError:
                         pass
-            return _sweep_workspace(roots, budget_config, dry_run, recent_minutes, repo, lint_settings=lint_settings)
-        return report_assessment(assess, WorkspaceFailureScope(tuple(sorted(roots))), dry_run, lint_settings)
+            # A named target folder finishes only its own saved trims.
+            recovery = TrimRecovery.EVERY_SAVED_TRIM if target_dir is None else TrimRecovery.INSIDE_SWEPT_ROOTS
+            return _sweep_workspace(roots, budget_config, dry_run, recent_minutes, repo, lint_settings=lint_settings,
+                                    trim_recovery=recovery)
+        scope = WorkspaceFailureScope(tuple(sorted(roots)))
+        if target_dir is not None:
+            # A named target folder belongs to a CI runner: a failure prints to its job log, with no notice.
+            return assess_scope(assess, scope)[0].status
+        return report_assessment(assess, scope, dry_run, lint_settings)
     finally:
         OUTPUT_ROOTS.reset(token)
 
 
 def _sweep_workspace(roots: list[str], budget_config: conf.ConfigRead, dry_run: bool,
                     recent_minutes: float, repo: str | None, *,
-                    lint_settings: conf.ConfigRead) -> tmp_sweep.SweepAssessment:
+                    lint_settings: conf.ConfigRead, trim_recovery: TrimRecovery) -> tmp_sweep.SweepAssessment:
     """Sweep the resolved output roots to their budget."""
     from scripts.lint import tmp_sweep
 
@@ -5185,7 +5284,8 @@ def _sweep_workspace(roots: list[str], budget_config: conf.ConfigRead, dry_run: 
     try:
         doc_status = prune_doc_index(roots, doc_budget, dry_run, lint_settings=lint_settings)
         return tmp_sweep.CompletedSweepAssessment(
-            sweep(roots, trees, budget, source, dry_run, recent_minutes, lint_settings=lint_settings) or doc_status)
+            sweep(roots, trees, budget, source, dry_run, recent_minutes, lint_settings=lint_settings,
+                  trim_recovery=trim_recovery) or doc_status)
     finally:
         release(locks.held)
 

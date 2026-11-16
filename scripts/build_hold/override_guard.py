@@ -31,11 +31,12 @@ def user_home() -> Path:
 
 @dataclass(frozen=True)
 class OverridesAllowed:
-    pass
+    """The caller can use configuration overrides."""
 
 
 @dataclass(frozen=True)
 class OverridesRefused:
+    """The refusal line explains why the caller cannot use configuration overrides."""
     line: str
 
 

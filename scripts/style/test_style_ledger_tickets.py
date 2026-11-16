@@ -22,6 +22,7 @@ from typing import cast, final
 from unittest import mock
 from scripts.style import rules
 from scripts.style import style_ledger
+from scripts.style import style_reader
 from scripts.style import style_plan
 from scripts.style import mechanical_classes
 from scripts.lib import berth_board
@@ -884,6 +885,33 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.assertNotIn("fatal:", str(refused.exception))
         self.assertIsInstance(refused.exception.__cause__, style_ledger.GitReadFailed)
         self.assertEqual(self.ledger_contents(ledger), before, "failed proof must roll back all rows and reservations")
+
+    def test_reader_failures_use_the_prerequisite_refusal_without_ledger_writes(self) -> None:
+        settings = self.root / "style_reader.conf"
+        executable = self.root / "failed-reader"
+        read_tip = cast(Callable[[Path, str], style_ledger.RepositoryTip], vars(style_ledger)["_tip"])
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}):
+            _ = settings.write_text("reader=python\n")
+            cache = style_ledger.GitReadCache(self.repo)
+            _ = cache.tip(self.initial_tip)
+            _ = settings.write_text("reader=rust\n")
+            for failure, command in (("exit", "exit 7"), ("reply", "printf 'invalid JSON\\n'")):
+                _ = executable.write_text(f"#!/bin/sh\n{command}\n")
+                executable.chmod(0o700)
+                with style_reader.use_client(style_reader.ReaderClient(executable)), style_ledger.Ledger(
+                        self.repo, self.root / "reader-failure.sqlite", git_cache=cache) as ledger:
+                    before = self.ledger_contents(ledger)
+                    operations: tuple[tuple[str, Callable[[], object]], ...] = (
+                        ("tip", lambda: read_tip(self.repo, self.initial_tip)),
+                        ("entries", lambda: style_ledger.tree_entries(self.repo, "HEAD")),
+                        ("names", lambda: ledger.files_naming(self.initial_tip, "fn")),
+                    )
+                    for operation, read in operations:
+                        with self.subTest(failure=failure, operation=operation):
+                            with self.assertRaisesRegex(style_ledger.CheckCouldNotRun, "style reader:") as refused:
+                                _ = read()
+                            self.assertIsInstance(refused.exception.__cause__, style_reader.ReaderError)
+                            self.assertEqual(self.ledger_contents(ledger), before)
 
     def test_git_boundary_checkpoint_restamp_failure_is_contextual_and_atomic(self) -> None:
         ledger = self.checkpointed_read_transition()

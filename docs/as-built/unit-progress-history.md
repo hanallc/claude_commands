@@ -28,7 +28,7 @@ per-run JSONL files under:
 ```
 
 The live session cache remains in
-`/tmp/claude/unit/<run-id>/progress_history_state.json` (under `/tmp/claude/delegate/` for a run started before the folder rename). Deleting `/tmp`
+`<run root>/<run-id>/progress_history_state.json`. The run root is `/session/<name>/run` for a run made in a session folder, else `/tmp/claude/unit` (`/tmp/claude/delegate` for a run started before the folder rename). Deleting `/tmp`
 does not remove the durable event stream.
 
 ## Configuration digest

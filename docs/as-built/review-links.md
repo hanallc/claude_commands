@@ -94,12 +94,12 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for AWS prices, Builds, Changes, Images and Questions, in alphabetical order.
+The left navigation has icons and labels for AWS, Builds, Changes, Images and Questions, in alphabetical order.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`. The content column is centered in the frame, 32px below its top edge, with at least 32px at each side.
 The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
-AWS prices, Builds, Changes, Images, Questions and Rebuilds put the title in the same place.
+AWS, Builds, Changes, Images, Questions and Rebuilds put the title in the same place.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
@@ -160,8 +160,8 @@ The server must not send `X-Frame-Options: DENY` or `frame-ancestors 'none'` for
 `change_page.questions_url` returns the same page with `?type=questions`.
 The Builds entry calls `memory_feed.page_url`.
 That function returns the configured Builds page URL without publishing a reading.
-The AWS prices entry calls `aws_page.page_url`.
-That function returns the AWS prices page URL without publishing the page.
+The AWS entry calls `aws_page.page_url`.
+That function returns the AWS page URL without publishing the page.
 
 The bottom-left rebuild link shows only while the Rebuilds page names a machine.
 `rebuilds.url` in `config/console.conf` names its URL function, `change_page.rebuilds_url`.
@@ -244,8 +244,15 @@ Each change can hold one image id in its optional `Image` cell.
 It adds the `Image` column when needed and deletes the old image after writing the row.
 `change_review.py image --image <png>` registers a screenshot for a checkpoint line.
 `image --output <text file>` renders dark terminal output with headless Chrome in a temporary browser profile.
+It measures the wrapped text height before capture and uses that height for the image.
+The image height has a 160-pixel minimum because Chrome clips shorter screenshots.
+The image height has a 4096-pixel limit.
 The action prints the id for a final ` | image <id>` field, after optional ` | after <step>`.
 The parser accepts twelve lowercase hexadecimal characters.
+The commit hook requires an image on each visible Change-Review line through `change_review.problem`.
+Merge checks require the image for commits dated at or after 2026-11-16 00:00 EST, using the Git committer time (`%ct`).
+Malformed lines remain invalid at every date.
+Merged history remains readable without an image.
 `list-ready` and `live` leave the cell empty and print one line when the image is missing.
 
 Both review pages use `change_page.change_content` and `CHANGE_IMAGE_STYLE` for the thumbnail.

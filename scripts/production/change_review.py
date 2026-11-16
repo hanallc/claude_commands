@@ -1,7 +1,7 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Read unit commit trailers and write change review rows.
 
-A visible trailer has three fields, optional after <step>, and optional last image <id>.
+A visible trailer requires three fields and a final image <id>, with optional after <step> before the image.
 An invisible change uses Change-Review: none — <reason>.
 Every supplied review line must parse, whatever the commit subject.
 Only checkpoints that change more than Markdown require a review line.
@@ -69,11 +69,13 @@ IMAGE = "Image"
 KIND = "Kind"
 REVIEW_KINDS = ("See in action", "Read only")
 NOT_YET = "not yet"
-FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see> [| after <step>] [| image <id>]"
+FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see> [| after <step>] | image <id>"
 SEPARATOR = " | "
 SHORT = 8
 # Commits made before the rule landed carry no line and are not read: 2026-10-15 00:00 EDT.
 CHECKED_FROM = 1792036800
+# Commits made before the image rule landed need no image: 2026-11-16 00:00 EST.
+IMAGES_CHECKED_FROM = 1794805200
 LANDED = "2026-10-15"
 # Scan only merges made after the readiness rule starts.
 READY_FROM = "2026-11-06"
@@ -158,6 +160,7 @@ class Commit:
     subject: str
     message: str
     files: tuple[str, ...]
+    timestamp: int
     ancestry: Mapping[str, tuple[str, ...]] = field(default_factory=dict[str, tuple[str, ...]], repr=False, compare=False)
 
 
@@ -201,15 +204,19 @@ def needs_trailer(subject: str, files: tuple[str, ...]) -> bool:
     return subject.startswith("checkpoint(") and not (files and all(name.endswith(".md") for name in files))
 
 
-def problem(subject: str, message: str, files: tuple[str, ...]) -> str:
+def problem(subject: str, message: str, files: tuple[str, ...], *, timestamp: int = IMAGES_CHECKED_FROM) -> str:
     """Why a commit's message fails the rule, or the empty string."""
     found = entries(message)
     if not found and needs_trailer(subject, files):
         return f"no {TRAILER} line: add `{TRAILER}: {FORM}` or `{TRAILER}: none — <why nothing visible changes>`"
     bad = [item.text for item in found if isinstance(item, Malformed)]
     if bad:
-        return (f"{TRAILER} line {bad[0]!r} needs three parts split by {SEPARATOR.strip()!r}, optionally followed by ` | after <step>` and then ` | image <12-hex id>`: "
+        return (f"{TRAILER} line {bad[0]!r} needs three parts split by {SEPARATOR.strip()!r}, optional ` | after <step>`, and required ` | image <12-hex id>`: "
                 + f"`{TRAILER}: {FORM}`, or `{TRAILER}: none — <why nothing visible changes>`")
+    for line, item in zip(_LINE.finditer(message), found):
+        if timestamp >= IMAGES_CHECKED_FROM and isinstance(item, Visible) and not item.image:
+            return (f"{TRAILER} line {line.group(0)!r} has no image: register one with change_review.py image --image <png> "
+                    + "(or --output <text file> for terminal output), then end the line with | image <id>")
     return ""
 
 
@@ -297,7 +304,7 @@ def unit_commits(repo: Path, checkpoint: str, previous: str, merge_branch: str,
         if int(stamp) < checked_from:
             continue
         if len(parents) < 2:
-            commits.append(Commit(sha, message.partition("\n")[0], message, _files(repo, sha), ancestry))
+            commits.append(Commit(sha, message.partition("\n")[0], message, _files(repo, sha), int(stamp), ancestry))
         elif reason := merge_review_problem(message, is_merge=True):
             raise ChangeReviewError(f"{sha[:SHORT]}: {reason}. Make the merge again without the lines")
     return commits
@@ -309,9 +316,10 @@ def missing(commits: list[Commit]) -> list[str]:
     A pushed commit cannot be amended, so a later checkpoint carries the lines for one that missed them.
     """
     covered = [found.group("sha") for commit in commits if entries(commit.message)
-               and not problem(commit.subject, commit.message, commit.files) for found in _COVERS.finditer(commit.message)]
+               and not problem(commit.subject, commit.message, commit.files, timestamp=commit.timestamp)
+               for found in _COVERS.finditer(commit.message)]
     return [f"{commit.sha[:SHORT]} {commit.subject}: {reason}" for commit in commits
-            if (reason := problem(commit.subject, commit.message, commit.files))
+            if (reason := problem(commit.subject, commit.message, commit.files, timestamp=commit.timestamp))
             and not any(commit.sha.startswith(sha) for sha in covered)]
 
 
@@ -1296,16 +1304,16 @@ def merge_commits(repo: Path, merge: str, *, excluded_refs: Sequence[str] = ()) 
     parents = _git(repo, "rev-list", "--parents", "-n", "1", merge, "--").split()[1:]
     if len(parents) < 2:
         return []
-    records = _git(repo, "log", "--topo-order", "--format=%x1e%H %P%x1f%B", parents[1], f"^{parents[0]}",
+    records = _git(repo, "log", "--topo-order", "--format=%x1e%H %ct %P%x1f%B", parents[1], f"^{parents[0]}",
                    *(f"^{ref}" for ref in excluded_refs), "--")
     commits: list[Commit] = []
     ancestry: dict[str, tuple[str, ...]] = {}
     for record in records.split("\x1e")[1:]:
         header, message = record.split("\x1f", 1)
-        sha, *parents = header.split()
+        sha, stamp, *parents = header.split()
         ancestry[sha] = tuple(parents)
         if len(parents) < 2:
-            commits.append(Commit(sha, message.split("\n", 1)[0], message, (), ancestry))
+            commits.append(Commit(sha, message.split("\n", 1)[0], message, (), int(stamp), ancestry))
     return commits
 
 

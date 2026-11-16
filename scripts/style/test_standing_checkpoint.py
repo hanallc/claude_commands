@@ -20,6 +20,8 @@ from unittest import mock
 from typing import ClassVar, cast, final, override
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.copies import copies
+from scripts.copies.copies_test_support import copies_environment
 from scripts.direct import phase_reservation
 from scripts.style import fake_fmt
 from scripts.style.style_child_test_support import style_cli_command, unqueued_style_children
@@ -96,14 +98,17 @@ class StandingCheckpointTests(unittest.TestCase):
         self.unit = self.root / "sample-style-names"
         self.catalog = self.root / "nate_style/rust"
         self.bin = self.root / "bin"
+        private = copies_environment(self.root)
         self.env = {
-            **os.environ, **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.root / "home"),
+            **os.environ, **private, **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.root / "home"),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(self.catalog.parent),
             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
             fake_fmt.STATE: str(self.root / "fmt"),
         }
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env)))
+        self.assertTrue(copies.gates_root().is_relative_to(self.root))
         self.doc = self.style / "docs/sample-style-production.md"
         self.plan = self.unit / "docs/style-production/units/names-unit.md"
         self.template = self.style / "docs/style-production/units/names-unit.md"

@@ -57,7 +57,7 @@ class Runner(Protocol):
 
 def run_command(repo: Path, arguments: Sequence[str]) -> CommandResult:
     result = (bulk.cargo_output(repo, arguments) if arguments and Path(arguments[0]).name == "cargo"
-              else subprocess.run(arguments, cwd=repo, capture_output=True, text=True, check=False))
+              else subprocess.run(arguments, cwd=repo, capture_output=True, text=True, check=False, pass_fds=copies.COMMAND_LOCKS.get()))
     return CommandResult(result.returncode, result.stdout, result.stderr)
 
 
@@ -794,7 +794,7 @@ def plan_constants(repo: Path, ledger: ledger_api.Ledger, base: str, selected: S
             findings.append(current)
     # Target discovery shares the frozen manifest/path reader with source ownership.
     # No export is needed; snapshots never consult untracked files or write sources.
-    blobs = {path: entry.object for path, entry in ledger_api.tree_entries(repo, base).items()
+    blobs = {path: entry.object for path, entry in ledger_api.tree_entries(repo, base, reader_source=ledger.reader_source).items()
              if entry.kind == "blob" and entry.mode in ledger_api.REGULAR_FILE_MODES}
     contents = {path: data for path, data in ledger_api.blob_contents(repo, blobs)}
     members = rules.workspace_members({path: data.decode() for path, data in contents.items()

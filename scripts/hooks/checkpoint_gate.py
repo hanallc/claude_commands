@@ -36,8 +36,7 @@ def commit_tree(directory: Path, every: bool) -> str:
     """Write a tree using a private index; -a adds only tracked working changes."""
     from scripts.lib import build_folders
 
-    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-            build_folders.FOLDER_PREFIXES["checkpoint-doc"], build_folders.SystemTemporaryParent())) as temporary:
+    with build_folders.tool_folder("checkpoint-doc") as temporary:
         index = Path(git(directory, "rev-parse", "--git-path", "index"))
         if not index.is_absolute():
             index = directory / index
@@ -54,8 +53,7 @@ def path_commit_tree(directory: Path, paths: tuple[str, ...], include_staged: bo
     """Select working paths over HEAD (--only) or over the index (--include)."""
     from scripts.lib import build_folders
 
-    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-            build_folders.FOLDER_PREFIXES["checkpoint-paths"], build_folders.SystemTemporaryParent())) as temporary:
+    with build_folders.tool_folder("checkpoint-paths") as temporary:
         private_index = temporary / "index"
         environment = {**os.environ, "GIT_INDEX_FILE": str(private_index)}
         if include_staged:

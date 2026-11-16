@@ -7,7 +7,6 @@ from pathlib import Path
 import shlex
 from typing import cast, override
 
-from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.verify_mac_offload_test_support import (
     CARGO_STUB, RUNNER_STUB, VERIFY, VerifyMacOffloadFixture,
 )
@@ -24,8 +23,6 @@ class VerifyResultEnvironmentTests(VerifyMacOffloadFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.environment.update({name: value for name, value in copies_environment(self.root).items()
-                                 if name != "HOME"})
         for name in ("NO_COLOR", "CLICOLOR"):
             _ = self.environment.pop(name, None)
         cargo = CARGO_STUB.replace(

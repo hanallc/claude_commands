@@ -14,7 +14,7 @@ from contextlib import redirect_stdout
 from unittest import mock
 from zoneinfo import ZoneInfo
 from scripts.production import merge_gate
-from scripts.copies import copies as copy_api
+from scripts.lib import build_folders
 from scripts.production.affected_modules import CertifiedBase, FullSuite
 from scripts.buildlog.store import host_name
 from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, gate_suites
@@ -246,7 +246,8 @@ class MergeGateLedgerTests(MergeGateFixture):
         type_call, = [call for call in self.calls() if call["tool"] == "basedpyright"]
         checkout = Path(type_call["cwd"])
         self.assertNotEqual(checkout, self.checkout)
-        self.assertFalse(checkout.exists())
+        self.assertTrue(checkout.exists())
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
         marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
         record = cast(dict[str, object], json.loads(marker.read_text()))
         tree = self.git(self.checkout, "rev-parse", f"{tip}^{{tree}}")
@@ -272,7 +273,7 @@ class MergeGateLedgerTests(MergeGateFixture):
                 def suite_run(repo: Path, type_dirs: list[str], *, module_time_limit_s: float,
                               full: bool) -> merge_gate.GateRun:
                     self.assertNotEqual(repo, self.checkout)
-                    self.assertTrue((repo / ".git/objects/info/alternates").is_file())
+                    self.assertTrue((repo / ".git").is_file())
                     self.assertEqual(merge_gate.checked_git(repo, "rev-parse", "HEAD"), self.checkpoint)
                     self.assertEqual(merge_gate.checked_git(repo, "status", "--porcelain"), "")
                     self.assertTrue(full)
@@ -294,8 +295,9 @@ class MergeGateLedgerTests(MergeGateFixture):
                 self.assertEqual(self.git(self.checkout, "status", "--porcelain"), before_status)
                 self.assertEqual(self.git(self.checkout, "show-ref", "--heads"), before_branches)
                 self.assertEqual((self.checkout / "subject.txt").read_text(), "base\n")
-                self.assertFalse(any(path.exists() for path in copies))
-                self.assertEqual(len(set(copies)), len(copies))
+                self.assertTrue(all(path.exists() for path in copies))
+                self.assertEqual({build_folders.build_folder_state(path) for path in copies}, {"free"})
+                self.assertEqual(len(set(copies)), 1)
                 self.assertEqual(len(set(caches)), 1)
                 self.assertTrue(caches[0].is_dir())
                 if red:
@@ -318,8 +320,9 @@ class MergeGateLedgerTests(MergeGateFixture):
         def suite_run(repo: Path, *_args: object, **_kwargs: object) -> merge_gate.GateRun:
             observed.append(repo)
             retained.append((repo / "target").resolve().parent)
-            self.assertEqual(copy_api.read_record(repo).owner, "configured-nightly")
-            self.assertTrue((repo / ".git").is_dir())
+            lease = cast(dict[str, object], json.loads(repo.with_name(repo.name + ".lease.json").read_text()))
+            self.assertEqual(lease["unit"], "configured-nightly")
+            self.assertTrue((repo / ".git").is_file())
             return merge_gate.GateRun((merge_gate.GateJobResult("hooks", "test_first.py", 0, 0, "fixture"),), 0, 0)
 
         with (mock.patch.dict(os.environ, self.environment),
@@ -331,9 +334,10 @@ class MergeGateLedgerTests(MergeGateFixture):
             code = merge_gate.main(["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration"])
         self.assertEqual(code, 0)
         checkout, = observed
-        self.assertEqual(checkout.name, "checkout")
-        self.assertFalse(checkout.exists())
-        self.assertEqual(retained[0].name, "configured-nightly-gate")
+        self.assertEqual(checkout.name, "origin-slot1")
+        self.assertTrue(checkout.exists())
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
+        self.assertEqual(retained[0], checkout)
         self.assertTrue((retained[0] / "target").is_dir())
 
     def test_nightly_notice_resolves_the_production_from_its_branch_without_a_calling_session(self) -> None:
