@@ -541,18 +541,18 @@ def inline_html(text: str) -> str:
     return "".join(f"<code>{html.escape(piece)}</code>" if index % 2 else linked(piece) for index, piece in enumerate(pieces))
 
 
-def review_text_html(text: str, block: Literal["p", "pre"] = "p", *, inline: bool = False) -> str:
+def review_text_html(text: str, *, inline: bool = False) -> str:
     """Render review text as escaped text blocks and consecutive list runs; `inline` adds links and code spans."""
     escape = inline_html if inline else html.escape
     lines = text.splitlines()
     if not any(re.match(r"\s*(?:- |[0-9]+\. )", line) for line in lines):
-        return f"<{block}>{escape(text)}</{block}>"
+        return f"<p>{escape(text)}</p>"
     content: list[str] = []
     current = ""
     for line in lines:
         line = line.lstrip()
         numbered = re.match(r"([0-9]+)\. (.*)", line)
-        tag = "ul" if line.startswith("- ") else "ol" if numbered else block if line else ""
+        tag = "ul" if line.startswith("- ") else "ol" if numbered else "p" if line else ""
         if tag != current:
             if current:
                 content.append(f"</{current}>")
@@ -560,7 +560,7 @@ def review_text_html(text: str, block: Literal["p", "pre"] = "p", *, inline: boo
                 start = (numbered[1].lstrip("0") or "0") if numbered else "1"
                 attribute = f' start="{start}"' if tag == "ol" and start != "1" else ""
                 content.append(f"<{tag}{attribute}>")
-        elif tag == block:
+        elif tag == "p":
             content.append("\n")
         if tag in ("ul", "ol"):
             item = numbered[2] if numbered else line[2:]
@@ -573,21 +573,24 @@ def review_text_html(text: str, block: Literal["p", "pre"] = "p", *, inline: boo
     return "".join(content)
 
 
-def check_html(text: str) -> str:
-    """Render check text with copy controls for code blocks."""
+BLANK_EDGES = re.compile(r"\A(?:[ \t]*\r?\n)+|(?:\r?\n[ \t]*)+\Z")
+
+
+def review_html(text: str) -> str:
+    """Render review text as paragraphs, lists, and code blocks with copy controls."""
     content: list[str] = []
     start = 0
     for block in page_frame.CODE_BLOCK.finditer(text):
-        before = text[start:block.start()]
+        before = BLANK_EDGES.sub("", text[start:block.start()])
         if before.strip():
-            content.append(review_text_html(before, "pre"))
+            content.append(review_text_html(before))
         content.append(page_frame.code_block_html(block))
         start = block.end()
     if not content:
-        return review_text_html(text, "pre")
-    after = text[start:]
+        return review_text_html(BLANK_EDGES.sub("", text))
+    after = BLANK_EDGES.sub("", text[start:])
     if after.strip():
-        content.append(review_text_html(after, "pre"))
+        content.append(review_text_html(after))
     return "".join(content)
 
 
@@ -595,9 +598,9 @@ def question_html(question: NoQuestion | OpenQuestion | AnsweredQuestion) -> str
     if isinstance(question, NoQuestion):
         return ""
     feedback = isinstance(question, (OpenFeedback, CompletedFeedback))
-    content = ('<h2>Feedback</h2>' if feedback else '<h2>Question</h2>') + review_text_html(question.text)
+    content = ('<h2>Feedback</h2>' if feedback else '<h2>Question</h2>') + review_html(question.text)
     if isinstance(question, AnsweredQuestion):
-        content += review_text_html('Showrunner: ' + question.answer) if feedback else '<h2>Answer</h2>' + review_text_html(question.answer)
+        content += review_html('Showrunner: ' + question.answer) if feedback else '<h2>Answer</h2>' + review_html(question.answer)
     else:
         content += '<p>The showrunner will act on this</p>' if feedback else '<p>The showrunner will answer this</p>'
     return content
@@ -683,7 +686,7 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         proof_title = "Try it · What you should see" if row[change_review.KIND] == "See in action" else "Proof"
         content = f'''{alert}
 <h1>{html.escape(row["Change"])}</h1>
-<h2>{proof_title}</h2>{check_html(row[change_review.CHECK])}
+<h2>{proof_title}</h2>{review_html(row[change_review.CHECK])}
 {question_html(question)}{answer}
 {change_details(row, change_review.display_id(row, route_owner(page, row).tab))}'''
         sections.append(f'<section id="{row_id}" data-change-card>' + change_content(row, content) + '</section>')

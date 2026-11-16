@@ -1021,9 +1021,12 @@ Reduced motion disables fades and uses instant scrolling.
 
 Question items and change rows show a Lucide copy button inside the top right of each code block.
 Both Changes views recognize fenced code blocks and lines that contain only one backtick span.
-This applies to the How to check cell and the Proof cell.
+This applies to How to check, Proof, Question, Feedback, and Answer.
 The shared renderer emits each code block with its button.
-Plain proof text keeps its `<pre>` block without a copy button.
+Plain text uses `<p>` blocks without a box or a copy button.
+The paragraph style preserves line breaks, including a two-line check without code.
+The renderer removes blank lines at each text part's edges.
+Code blocks and paragraphs use the same 16px margin.
 Inline code keeps its current style.
 The button copies the code text without the button or its label.
 The button shows a check and the label “Copied” for two seconds after success.
