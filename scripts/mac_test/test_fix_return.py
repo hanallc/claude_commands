@@ -368,8 +368,18 @@ class HoldFilterTests(unittest.TestCase):
             ("src/held.rs", "src/free.rs", "src/clear.rs"), ("src/gone.rs",)))
         self.assertEqual(withheld, (fix_return.Withheld("src/foreign.rs", "other-2 (theirs)"),))
 
+    def test_own_file_scope_keeps_a_path_another_worktree_also_holds(self) -> None:
+        # hana: the startup reservation and the caller's own reservation both name the file.
+        kept, withheld = self.hold(
+            reservation("own-1", self.ROOT, "mine", "src/foreign.rs", "file:src/gone.rs"),
+            reservation("other-2", Path("/fixture/other"), "theirs", "src/foreign.rs", "src/gone.rs"),
+        )
+        self.assertEqual(kept, fix_return.MirrorChanges(("src/foreign.rs",), ("src/gone.rs",)))
+        self.assertEqual(withheld, (fix_return.Withheld("src/held.rs", ""), fix_return.Withheld("src/free.rs", ""),
+                                    fix_return.Withheld("src/clear.rs", "")))
+
     def test_outstanding_reservation_whose_tip_is_in_head_history_does_not_withhold(self) -> None:
-        # A later phase branch holds hook.rs; an earlier phase's outstanding reservation also lists it.
+        # A later phase branch holds hook.rs by its tree; an earlier phase's outstanding reservation lists it.
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         git(root, "init", "-q")
         _ = (root / "hook.rs").write_text("earlier phase\n")
@@ -383,7 +393,7 @@ class HoldFilterTests(unittest.TestCase):
         _ = (root / "hook.rs").write_text("later phase\n")
         commit_all(root)
         changes = fix_return.MirrorChanges(("hook.rs",), ())
-        own = reservation("own-66", root, "tile-phase-66", "file:hook.rs")
+        own = reservation("own-66", root, "tile-phase-66", "tree:.")
 
         def hold(tip: str, lifecycle: str = "outstanding") -> tuple[fix_return.MirrorChanges, tuple[fix_return.Withheld, ...]]:
             earlier = reservation("other-43j", Path("/fixture/other"), "tile-phase-43j", "file:hook.rs",

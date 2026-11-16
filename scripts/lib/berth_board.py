@@ -48,6 +48,14 @@ class Reservation:
                 return True
         return False
 
+    def names_file(self, path: str | Path) -> bool:
+        """Whether a blocking file scope names this exact path; a tree scope does not."""
+        if self.edit_blocking_status != "blocking":
+            return False
+        candidate = PurePosixPath(path).as_posix()
+        return any(not scope.startswith("tree:") and candidate == scope.removeprefix("file:")
+                   for scope in self.scopes)
+
 
 @dataclass(frozen=True)
 class Board:

@@ -337,7 +337,9 @@ def hold_filter(repo_root: Path, changes: MirrorChanges,
     """Keep the paths that this worktree holds; withhold every other path.
 
     A path that another worktree's blocking reservation holds is withheld with
-    that reservation. An outstanding reservation whose protected tip is in this
+    that reservation, unless this worktree's own reservation names the same
+    file: berth then lets both hold it. A tree scope of this worktree does not
+    win over another worktree's hold. An outstanding reservation whose protected tip is in this
     worktree's HEAD history holds nothing here: its work is already in this
     branch. A path that no blocking reservation holds is withheld with no
     holder. An unconfigured board keeps every path.
@@ -356,7 +358,9 @@ def hold_filter(repo_root: Path, changes: MirrorChanges,
         for path in paths:
             holders = [(reservation, own) for reservation, own in reservations if reservation.blocks(path)]
             foreign = [reservation for reservation, own in holders if not own]
-            if foreign:
+            if any(own and reservation.names_file(path) for reservation, own in holders):
+                result.append(path)
+            elif foreign:
                 withheld.append(Withheld(path, f"{foreign[0].reservation_id} ({foreign[0].holder_branch})"))
             elif holders:
                 result.append(path)
