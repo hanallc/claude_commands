@@ -21,7 +21,7 @@ import textwrap
 import tempfile
 import time
 import unittest
-from typing import cast, override
+from typing import Literal, cast, override
 from unittest import mock
 
 from scripts.buildlog import charts, costs, moments
@@ -171,7 +171,7 @@ class MemoryFeedTests(unittest.TestCase):
                     row = next(row for row in page["walk"] if row["pid"] == build.pid)
                     if label.startswith("placement "):
                         self.assertNotIn("placement", row["name"])
-                        self.assertEqual(row["gate_label"], label)
+                        self.assertEqual(cast(memory_feed.MacBuildRow, row)["gate_label"], label)
                     else:
                         self.assertIn(label, row["name"])
                     if label == "unplaced":
@@ -298,6 +298,7 @@ process.stdout.write(JSON.stringify({
                           "started_at": 199_000, "job": "tests"}
                 step = admission_records.RunningStep("", "hana-ci.slice", "service", str(cgroup), 0,
                     admission_records.UnownedSliceMemory(admission_records.GIB // 8,
+                        anonymous=admission_records.AnonymousRunUse(admission_records.GIB // 8),
                         cgroup=str(cgroup), owner="hana-ci.slice", pid=701,
                         job_state=RunningServiceJob(199_000) if busy else IdleService()), pid=701)
                 reading = captured_reading(running=(step,))
@@ -309,6 +310,7 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(page["ci_ram"], 0.125)
                 self.assertEqual(page["taken"], page["used"] + page["ci_ram"] + page["reserved"])
                 self.assertEqual(page["taken"], 0.125)
+                self.assertEqual(page["taken"], cast(float, page["cap"]) - page["room"])
                 self.assertEqual(row.get("admitted"), busy)
 
     def test_the_feed_publishes_configured_colors_for_both_themes(self) -> None:
@@ -335,6 +337,7 @@ process.stdout.write(JSON.stringify({
             with self.subTest(state=state):
                 step = admission_records.RunningStep("", "hana-ci.slice", "service", "/ci", 0,
                     admission_records.UnownedSliceMemory(admission_records.GIB // 8, owner="hana-ci.slice",
+                        anonymous=admission_records.AnonymousRunUse(admission_records.GIB // 8),
                         job_state=RunningServiceJob(199_000), service_job_state=state, pid=701), pid=701)
                 reading = with_wait_reason(captured_reading(running=(step,)), admission_records.StartSpacingWait(110))
                 with mock.patch.object(admission_client, "view", return_value=reading):
@@ -347,7 +350,7 @@ process.stdout.write(JSON.stringify({
 
     def test_page_heading_shows_next_step_room_without_a_waiting_count(self) -> None:
         page = self.expected_page()
-        self.assertIn('id="answer" data-tip="room">Next step room</div>', page)
+        self.assertIn('id="answer" data-tip="room">Free for the next step</div>', page)
         self.assertNotIn("steps wait", page)
         self.assertNotIn("step waits", page)
 
@@ -1242,9 +1245,46 @@ process.stdout.write(JSON.stringify({
                     self.assertEqual(row.get("priority_text", ""), expected)
                 self.assertEqual(page["unmatched_priority_text"],
                     "queue priority: research (the user's bump)" if priority and unit == "other" else "")
-                notes = [row["head_text"] for row in page["waiters"] if "head_text" in row]
-                self.assertEqual(notes, [page["head_text"]])
-                self.assertIn("cloud 1 of 1 slots", notes[0])
+                self.assertEqual([row for row in page["waiters"] if "head_room" in row], [])
+                self.assertNotIn("head_text", page)
+
+    def test_can_run_on_names_the_mac_only_when_its_routes_allow_the_step(self) -> None:
+        for fit, expected in ((target_availability.Allowed("busy with nextest hana"), "natedev or Mac"),
+                              (target_availability.NotAllowed("makes natedev artifacts"), "natedev only"),
+                              (target_availability.FitUnreadable("Mac state unreadable"), "natedev only (Mac state unknown)"),
+                              (target_availability.NoMacTarget(), "natedev only")):
+            with self.subTest(fit=fit):
+                self.assertEqual(memory_feed.local_runs_on(fit), expected)
+
+    def test_swapped_memory_of_other_programs_shows_as_free_ram_when_it_comes_back(self) -> None:
+        gib = admission_records.GIB
+        room = admission_records.MemoryRoom(28 * gib, 3 * gib, 0, 8 * gib, 7 * gib, 64 * gib, (), agent_swap_demand=10 * gib)
+        check = admission_records.RoomCheck(16 * gib, 7 * gib, False, basis=admission_records.DoesNotFit())
+        shown = memory_feed.head_room(check, room)
+        self.assertEqual([(row["label"], row["gib"]) for row in shown["rows"]], [
+            ("free RAM", 28.0), ("− safety net", 3.0), ("− swap coming back", 10.0), ("− build reserved", 8.0),
+            ("= free", 7.0), ("needs", 16.0)])
+        self.assertEqual(shown["note"], f"Other programs have 10.0 GiB of memory in swap. {memory_feed.SWAP_RETURN_NOTE}")
+
+    def test_only_a_head_that_memory_holds_shows_its_room_rows(self) -> None:
+        gib = admission_records.GIB
+        reading = with_wait_reason(reservation_reading(), admission_records.NeedsMemory())
+        room = admission_records.RoomCheck(20 * gib, 15 * gib, False, basis=admission_records.DoesNotFit())
+        states: tuple[tuple[Literal["admit", "hold"], list[list[tuple[str, float]]]], ...] = (("admit", []), ("hold", [[
+                ("free RAM", 30.0), ("− safety net", 3.0), ("− build reserved", 9.0),
+                ("− held for other waiting steps", 3.0), ("= free", 15.0), ("needs", 20.0)]]))
+        for state, expected in states:
+            with self.subTest(state=state):
+                head = admission_records.HeadExplanation(reading.view.waiting[0], admission_records.NeedSourceNotRecorded(),
+                    admission_records.AdmissionDecision(state, 0, 0, 0, 0), room,
+                    admission_records.FreeCheck(30 * gib, 20 * gib, 0, 0, 0, True), False,
+                    cause=admission_records.NeedsMemory())
+                current = replace(reading, explanation=replace(reading.explanation, head=head))
+                with mock.patch.object(admission_client, "view", return_value=current):
+                    page = memory_feed.reading()
+                shown = [[(row["label"], row["gib"]) for row in waiter["head_room"]["rows"]]
+                         for waiter in page["waiters"] if "head_room" in waiter]
+                self.assertEqual(shown, expected)
 
     def test_mac_idle_alert_reaches_the_feed_and_clears_with_the_watch_state(self) -> None:
         _ = write_idle_config(self.root)
@@ -1303,8 +1343,7 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(page["targets"], [{"target": "mac", "state": "Blocked", "reason": "P15 F11 L0 run",
                     "holder": "research", "unit": "research", "showrunner": "hana", "since": "since " + since.strftime("%H:%M UTC"),
                     "until": "until released"}])
-                self.assertEqual({waiter.get("mac_text") for waiter in page["waiters"]},
-                                 {"Mac: blocked by research (hana) until released"})
+                self.assertEqual({waiter.get("runs_on") for waiter in page["waiters"]}, {"natedev or Mac"})
 
     def test_cloud_rows_show_stage_and_location(self) -> None:
         reading = cloud_reading(reservation_reading())
@@ -1466,12 +1505,13 @@ process.stdout.write(JSON.stringify({
                 self.assertNotIn("cloud_heading", payload)
                 self.assertEqual(page["cloud_slots_used"], 1)
                 self.assertEqual(page["cloud_slots"], 1)
-                self.assertIn("cloud 1 of 1 slots", page["head_text"])
                 runs = cast(list[dict[str, object]], payload["walk"])
                 waits = cast(list[dict[str, object]], payload["waiters"])
                 remote, = [row for row in runs if row.get("kind") == "cloud"]
                 local, = [row for row in runs if row.get("kind") != "cloud"]
                 waiter, = [row for row in waits if row.get("kind") == "cloud"]
+                self.assertEqual(waiter["runs_on"], memory_feed.CLOUD_RUNS_ON)
+                self.assertNotIn("AWS", "".join(str(row.get("runs_on", "")) for row in waits if row.get("kind") != "cloud"))
                 self.assertEqual(remote["machine"], "aws")
                 self.assertEqual(remote["vcpus"], 32 if isinstance(cloud.progress, cloud_progress.CloudProgress)
                                  else {"kind": "UnknownCpuCount"})
@@ -1601,6 +1641,7 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(blocks["build_tools_bytes"], 5 * gib)
                 self.assertEqual(blocks["queued_builds_bytes"], gib)
                 self.assertEqual(blocks["ci_bytes"], 2 * gib)
+                self.assertEqual(blocks["cap_bytes"], gib + 5 * gib + 2 * gib + covered[2] + room)
                 self.assertEqual((blocks["agents_bytes"], blocks["desktop_bytes"]), (5 * gib, gib * 3 // 2))
                 self.assertEqual(blocks["desktop_protection_bytes"], 2 * gib)
                 self.assertEqual(blocks["programs"], [{"id": "chrome", "name": "Chrome", "bytes": 3 * gib}])
@@ -1686,6 +1727,10 @@ process.stdout.write(JSON.stringify({
         assert isinstance(head, admission_records.HeadExplanation)
         gpu_wait = replace(waiting, head=replace(head, cause=admission_records.GpuSlotWait(1, 1)))
         self.assertEqual(memory_feed.memory_status(gpu_wait, room, 0)["code"], "gpu_slot")
+        # Memory outside the queue that leaves nothing free is the cause, not the GPU slot.
+        for code, available in (("shortfall", 5 * gib), ("no_room", 12 * gib)):
+            with self.subTest(gpu_slot=code):
+                self.assertEqual(memory_feed.memory_status(gpu_wait, self.fixture_room(available), 0)["code"], code)
 
     def test_detached_python_counts_in_other_and_reserved_cargo_counts_once(self) -> None:
         for cargo_use in (0, 2 * admission_records.GIB):
