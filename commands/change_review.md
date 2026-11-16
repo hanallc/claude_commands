@@ -123,6 +123,9 @@ Press Escape or click the zoom to return.
 Shift-click or use the right-click menu to open the full image in a new tab.
 A landing or return verdict deletes the image and clears its cell.
 Change images use `change-images/` and never appear on the Images page.
+`| image <id>` accepts a change image id or an Images page id.
+An Images page id copies its file into `change-images/` and uses the new id in the row.
+For a pair, it copies the after image. The source stays on the Images page.
 The server deletes unclaimed images after `change_image_unclaimed_days`, which starts at 14 days.
 
 ## list-ready and live
