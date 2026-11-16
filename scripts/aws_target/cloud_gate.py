@@ -110,6 +110,11 @@ def aws_down(reason: str) -> bool:
                                            'InternalFailure', 'ServerInternal', '(Unavailable)'))
 
 
+def not_sent(reason: str) -> bool:
+    """A connect failure means AWS never received the request."""
+    return any(code in reason for code in ('Could not connect to the endpoint', 'EndpointConnectionError'))
+
+
 def definite_refusal(reason: str) -> bool:
     return 'An error occurred (' in reason and not aws_down(reason)
 
@@ -359,13 +364,22 @@ class GateWorker:
     def terminate(self, attempt: str, instance: str, *,
                   result_seen_at: int | _ResultNotReceived = _RESULT_NOT_RECEIVED) -> None:
         api = self.regional_api(self.box_region)
-        _ = api.call('terminate-instances', '--instance-ids', instance)
         deadline = self.clock() + settings().number('termination_timeout_s')
+        requested = False
         while self.clock() < deadline:
-            if api.observe(instance, int(self.clock())).state == 'terminated':
-                ended_at = int(self.clock()) if isinstance(result_seen_at, _ResultNotReceived) else result_seen_at
-                self.book.resolve_gate(attempt, ledger.GateTerminated(ended_at, instance))
-                return
+            try:
+                if not requested:
+                    _ = api.call('terminate-instances', '--instance-ids', instance)
+                    requested = True
+                if api.observe(instance, int(self.clock())).state == 'terminated':
+                    ended_at = int(self.clock()) if isinstance(result_seen_at, _ResultNotReceived) else result_seen_at
+                    self.book.resolve_gate(attempt, ledger.GateTerminated(ended_at, instance))
+                    return
+            except AwsUnavailable as error:
+                # A regional outage repeats the call until the deadline; any other error ends the try.
+                if not aws_down(str(error)):
+                    raise
+                print(f'Cloud gate termination waits on {self.box_region}: {error}', flush=True)
             self.pause(settings().number('result_poll_s'))
         raise AwsUnavailable('Termination is unconfirmed; the expiry function still owns cleanup')
 
@@ -618,6 +632,7 @@ class GateWorker:
         regional_rows = {ledger.text(row, 'region'): row for row in ledger.rows(deployment, 'regions')}
         index = ledger.instant(launch, 'variant') if launch else 0
         stop = max(index + 1, len(variants)) if launch.get('arguments') else len(variants)
+        unreachable: set[str] = set()
         for offset in range(index, stop):
             if launch.get('arguments') and offset == index:
                 arguments = ledger.mapping(launch['arguments'])
@@ -626,7 +641,7 @@ class GateWorker:
                 zone = str(launch.get('zone', ''))
             else:
                 variant = variants[offset]
-                if variant.instance_type in unauthorized:
+                if variant.instance_type in unauthorized or variant.region in unreachable:
                     continue
                 regional = regional_rows[variant.region]
                 size = variant.instance_type
@@ -715,6 +730,13 @@ class GateWorker:
                     launch = {**saved_order, 'variant': offset + 1}
                     save(path, launch)
                     continue
+                if not_sent(str(error)) and any(row.region != self.box_region for row in variants[offset + 1:]):
+                    # No box exists, so the next region can launch; this region's other variants would fail the same way.
+                    print(f'Cloud gate skips {self.box_region}: {launch_error_code(str(error)) or str(error)}', flush=True)
+                    unreachable.add(self.box_region)
+                    launch = {**saved_order, 'variant': offset + 1}
+                    save(path, launch)
+                    continue
                 if launch_error_code(str(error)) == 'UnauthorizedOperation' and any(
                         row.instance_type not in (size, *unauthorized) for row in variants[offset + 1:]):
                     # The stack policy names its types, so another type can still launch.
@@ -790,6 +812,7 @@ class GateWorker:
                     print(f'Gate time limit disabled: no passing history for {self.size_vcpus} vCPUs', flush=True)
                 began = 0.0
                 deadline = float('inf')
+                outage_since: float | None = None
                 while self.clock() < ledger.instant(request, 'expires'):
                     try:
                         bucket = ledger.text(deployment, 'bucket')
@@ -825,8 +848,17 @@ class GateWorker:
                                 interruption_code = code
                             detail = ': '.join(ledger.text(reason, key) for key in ('Code', 'Message') if reason.get(key))
                             raise ValueError('The instance stopped without a final result' + (f' ({detail})' if detail else ''))
+                        outage_since = None
                     except subprocess.TimeoutExpired:
                         pass
+                    except AwsUnavailable as error:
+                        # The box keeps running through a short AWS outage; a long one ends the cloud try.
+                        if not aws_down(str(error)):
+                            raise
+                        outage_since = self.clock() if outage_since is None else outage_since
+                        if self.clock() - outage_since >= settings().number('observe_outage_s'):
+                            raise
+                        print(f'Cloud gate poll skipped: {error}', flush=True)
                     if time.monotonic() >= deadline:
                         text = (folder / 'gate.log').read_text() if (folder / 'gate.log').exists() else ''
                         row = time_limit_result(request, text, time.monotonic() - began, limit, self.size_vcpus)
