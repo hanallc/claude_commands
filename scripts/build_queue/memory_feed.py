@@ -19,7 +19,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, assert_never
-from zoneinfo import ZoneInfo
 
 
 class CodeRootArguments(argparse.Namespace):
@@ -143,6 +142,7 @@ SWAP_OWNER_SLICES: dict[str, SwapCategory] = {"app-agents.slice": "agents", "ses
                                               "system.slice": "system", "hana.slice": "ci", "hana-ci.slice": "ci"}
 SwapPool = Literal["outside", "builds_ci"]
 SWAP_POOLS: tuple[SwapPool, ...] = ("outside", "builds_ci")
+SWAP_RETURN_NOTE = "The reserve uses swap-in measured within the recent window."
 BUILD_RESERVED_NOTE = "Build reserved is memory that running builds used at their next points in earlier runs."
 BUILDS_CI_SLICES = frozenset({"builds.slice", "hana.slice", "hana-ci.slice"})
 SwapRowKind = Literal["owner", "ungrouped", "unattributed", "difference", "smaller", "total"]
@@ -346,6 +346,7 @@ class RowQueueNotes(TypedDict):
     priority_text: NotRequired[str]
     ci_label: NotRequired[str]
     runs_on: NotRequired[str]
+    mac_text: NotRequired[str]
     targets: NotRequired[list[str]]
     mac_state: NotRequired[str]
     runner: NotRequired[unit_labels.Runner]
@@ -402,10 +403,11 @@ def step_runs_on(route: target_config.StepRoute, routes: target_availability.Mac
         return RunsOn((MAC_TARGET,))
     if isinstance(route, target_config.PinnedTarget):
         return RunsOn((route.target,))
-    return local_runs_on(routes.fit(step, folder, package))
+    return local_runs_on(routes.route_fit(route, step, folder, package))
 
 
 class TargetNotes(TypedDict):
+    mac_text: str
     runs_on: str
     targets: list[str]
     mac_state: NotRequired[str]
@@ -415,13 +417,14 @@ def target_notes(route: target_config.StepRoute, routes: target_availability.Mac
                  package: str | admission_records.PackageNotRecorded) -> TargetNotes:
     """The step's "can run on" text and targets, and for a Mac-only step what holds the Mac, for every row that shows them."""
     runs_on = step_runs_on(route, routes, step, folder, package)
-    notes: TargetNotes = {"runs_on": runs_on.text(), "targets": list(runs_on.targets)}
+    notes: TargetNotes = {"runs_on": runs_on.text(), "targets": list(runs_on.targets),
+                          "mac_text": target_availability.mac_reason(routes.route_fit(route, step, folder, package))}
     if mac_only_route(route, routes) and (holds := routes.holds(folder)):
         notes["mac_state"] = holds
     return notes
 
 
-NO_TARGET_NOTES: TargetNotes = {"runs_on": "", "targets": []}
+NO_TARGET_NOTES: TargetNotes = {"runs_on": "", "targets": [], "mac_text": ""}
 
 
 def mac_only_route(route: target_config.StepRoute, routes: target_availability.MacRoutes) -> bool:
@@ -435,20 +438,21 @@ CLOUD_RUNS_ON = "AWS (natedev only when AWS cannot start the gate)"
 
 def head_room(check: admission_records.RoomCheck,
               room: admission_records.MemoryRoom | admission_records.ReadingUnavailable, ram: RamBlocks) -> HeadRoom:
-    """Show the first waiting step's room inside the queue cap, with the memory bar legend's amounts.
+    """Show the first waiting step's room with the cap legend amounts.
 
-    The rows add up: the cap less Builds, Build reserved and the memory held for builds ahead is free for builds."""
-    override = isinstance(check.basis, admission_records.OverrideRoom)
+    Subtract builds, reserved memory, and memory held for earlier builds from the cap.
+    The result is free memory for builds.
+    """
     basis = ("It can start alone, because no build runs." if isinstance(check.basis, admission_records.StartsAlone) else
             "It fits in the memory it already holds." if isinstance(check.basis, admission_records.WithinSlot) else
-            "The user's admit does not count memory held for running builds." if override else "")
+            "")
     if isinstance(room, admission_records.ReadingUnavailable):
         return {"unavailable": f"Queue cap unavailable: {room.reason}", "rows": [], "note": basis}
     if isinstance(room.cap, admission_records.CapUnavailable):
         return {"unavailable": f"Queue cap unavailable: {cap_unavailable_reason(room.cap)}", "rows": [], "note": basis}
     cap = ram["cap_bytes"]
     builds = ram["queued_builds_bytes"] + ram["build_tools_bytes"] + ram["ci_bytes"]
-    reserved = 0 if override else ram["build_covered_bytes"]
+    reserved = ram["build_covered_bytes"]
     free = max(0, check.room)
     ahead = cap - builds - reserved - free
     rows: list[RoomRow] = [{"label": "Queue cap", "gib": gib(cap)}, {"label": "− Builds", "gib": gib(builds)},
@@ -456,11 +460,20 @@ def head_room(check: admission_records.RoomCheck,
     if ahead > 0:
         rows.append({"label": "− Held for builds ahead in line", "gib": gib(ahead)})
     rows.append({"label": "= Free for builds", "gib": gib(free)})
-    return {"unavailable": "", "rows": rows, "note": " ".join(filter(None, (BUILD_RESERVED_NOTE, basis)))}
+    uncovered = (f"Running builds need {gib(ram['build_target_bytes']):.1f} GiB reserved. "
+                 + f"Free RAM covers {gib(ram['build_covered_bytes']):.1f} GiB of it."
+                 if ram["build_target_bytes"] > ram["build_covered_bytes"] else "")
+    swap = (" ".join(filter(None, (
+        f"Swap coming back needs {gib(ram['swap_target_bytes']):.1f} GiB.",
+        f"Free RAM covers {gib(ram['swap_covered_bytes']):.1f} GiB of it."
+        if ram["swap_target_bytes"] > ram["swap_covered_bytes"] else "", SWAP_RETURN_NOTE)))
+            if room.agent_swap_demand else "")
+    return {"unavailable": "", "rows": rows,
+            "note": " ".join(filter(None, (BUILD_RESERVED_NOTE, uncovered, swap, basis)))}
 
 
 def cap_unavailable_reason(cap: admission_records.CapUnavailable) -> str:
-    """Name the runs whose memory use is unknown, so the cap cannot be read."""
+    """Name the runs with unknown memory use when the cap is unavailable."""
     missing = "; ".join(f"{run.owner}: {run.use.reason}" for run in cap.runs
                         if isinstance(run.use, admission_records.RunUseUnavailable))
     return f"memory use is unavailable for {missing}" if missing else "memory use is unavailable for a running build"
@@ -560,6 +573,11 @@ class WaitRow(RowQueueNotes):
     since: float
     reason: str
     fits: bool
+
+
+class MemoryWaitRow(WaitRow):
+    """A step that holds a place in the memory queue."""
+
     place: int
     why: str
 
@@ -1982,7 +2000,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         # steve lists each connected process, holders of 0 included; a step with no line keeps the dash.
         for pid, held in counts.items():
             token_rows[pid]["tokens"] = held
-    waiters: list[WaitRow] = []
+    waiters: list[MemoryWaitRow] = []
     checks = {row.waiter.pid: row.room for row in explanation.line.steps}
     if isinstance(explanation.head, admission_records.HeadExplanation):
         checks[explanation.head.waiter.pid] = explanation.head.room
@@ -2018,9 +2036,15 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                          for build in mac_reading.builds)
     work_rows.sort(key=lambda row: row["started_at"])
     waiting_rows: list[WaitRow | CloudWaitRow] = list(waiters)
-    model = queue_view.QueueModel(
-        parsed, labels, admission_records.NoWaiter(), head_facts.PaceUnavailable(), ZoneInfo("UTC"),
-        queue_view.HostLoadUnavailable(), admission_records.NoWaiter(), names=names)
+    model = queue_view.QueueModel(parsed, labels, names=names)
+    slot_waiters: dict[wire.Owner, WaitRow] = {}
+    if isinstance(parsed, wire.CloudQueueRead):
+        for slot in parsed.repository_slots:
+            slot_row: WaitRow = {"name": slot.identity.step, "showrunner": slot.identity.name, "unit": slot.identity.unit,
+                "pid": slot.owner.pid, "detail": slot.wait.repository, "need": 0.0, "since": slot.since,
+                "reason": slot.wait.text, "fits": False, "runs_on": slot.machine}
+            slot_waiters[slot.owner] = slot_row
+        waiting_rows.extend(slot_waiters.values())
     cloud_slots_used = 0
     cloud_slots = 0
     if isinstance(parsed, wire.CloudQueueRead):
@@ -2049,7 +2073,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             else:
                 work_rows.append({**values, "started_at": cloud.started_at or cloud.since})
         work_rows.sort(key=lambda row: row["started_at"])
-        waiting_rows = [cloud_waiters[entry.owner] if isinstance(entry, wire.CloudRow) else waiters[entry.position - 1]
+        waiting_rows = [cloud_waiters[entry.owner] if isinstance(entry, wire.CloudRow)
+                        else slot_waiters[entry.owner] if isinstance(entry, wire.RepositorySlotRow) else waiters[entry.position - 1]
                         for entry in queue_view.waiting_builds(model)]
     unmatched_priority_text = ""
     queued_priority_units: list[str] = []

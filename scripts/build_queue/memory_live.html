@@ -107,7 +107,7 @@ __PAGE_FRAME_STYLE__
 .legend .row .name { font-weight: 600; }
 .legend .row .v { text-align: right; padding-left: 12px; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
 .legend .row[data-tip="room"] .name { white-space: nowrap; }
-#tip { white-space: pre-line; position: fixed; z-index: 10; max-width: 300px; padding: 8px 10px; border-radius: 8px; background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.4; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; box-shadow: 0 4px 14px rgb(0 0 0 / 0.2); }
+#tip { white-space: pre-line; position: fixed; z-index: 10; width: max-content; max-width: min(calc(100vw - 20px), 24rem); overflow-wrap: anywhere; padding: 8px 10px; border-radius: 8px; background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.4; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; box-shadow: 0 4px 14px rgb(0 0 0 / 0.2); }
 #tip.on { opacity: 1; }
 #tip .tip-fields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 16px; margin: 6px 0 0; white-space: normal; }
 #tip .tip-fields dt { text-align: left; }
@@ -116,11 +116,9 @@ __PAGE_FRAME_STYLE__
 #tip .tip-fields.numbers dd { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 #tip .tip-line { display: block; margin-top: 6px; }
 #tip .identity { display: grid; grid-template-columns: max-content max-content minmax(0, 1fr); gap: 2px 0; margin: 6px 0; white-space: normal; }
-#tip:has(.identity) { max-width: min(calc(100vw - 20px), 24rem); }
 #tip .identity dd { margin: 0; overflow-wrap: anywhere; }
 #tip .identity dd.colon { padding: 0 8px 0 2px; }
-#tip .mac-note { display: block; margin-top: 6px; white-space: nowrap; }
-#tip:has(.mac-note) { width: max-content; max-width: min(calc(100vw - 20px), 34rem); }
+#tip .mac-note { display: block; margin-top: 6px; }
 .seg-remote { background: var(--remote-memory); }
 .machine[data-machine="natedev"] { color: var(--machine-natedev); }
 .machine[data-machine="mac"] { color: var(--machine-mac); }
@@ -537,8 +535,8 @@ const TIPS = {
     "RAM that the desktop session uses, so the mouse and keyboard stay responsive.",
     optional(d.ram.desktop_protection_bytes, `The system never takes back the first ${ramAmount(d.ram.desktop_protection_bytes)}.`))),
   swap: (d) => [`Swap coming back · ${ramAmount(d.ram.swap_covered_bytes)}`, lines(
-    "Empty RAM the queue holds for memory in swap, mostly agents' memory.",
-    "That memory can come back into RAM at any time.",
+    "Empty RAM the queue holds for recent swap-in.",
+    "The reserve uses swap-in within the configured window, limited to swap outside builds and CI.",
     `Swap coming back: ${ramAmount(d.ram.swap_target_bytes)}.`,
     optional(d.ram.swap_missing_bytes, `Free RAM does not cover ${ramAmount(d.ram.swap_missing_bytes)} of it.`))],
   agents: (d) => measuredTip("Agents", d.ram.agents_bytes,
@@ -782,7 +780,7 @@ function waitLines(w) {
 }
 function roomFields(w) { return (w.head_room?.rows || []).map(row => [row.label, `${f1(row.gib)} GiB`]); }
 function waitNotes(w) {
-  return [w.head_room?.note, w.kind === "cloud" ? "No local memory reservation." : "", w.priority_text];
+  return [w.mac_text, w.head_room?.note, w.kind === "cloud" ? "No local memory reservation." : "", w.priority_text];
 }
 function waitTipHtml(w, d) {
   return identityHtml(w, waitFields(w)) + waitLines(w).map(lineHtml).join("") + lineHtml(w.head_room?.unavailable) +
@@ -912,7 +910,7 @@ function tipText(key, d) {
   if (/^swap(-pool)?:/.test(key)) return text;
   const row = stepRow(key, d);
   if (key.startsWith("wait:")) return text.map(memoryText);
-  const notes = row ? [...targetFields(row).map(([name, value]) => `${name}: ${value}`), row.priority_text]
+  const notes = row ? [...targetFields(row).map(([name, value]) => `${name}: ${value}`), row.mac_text, row.priority_text]
     : key === "walksum" && !d.waiters.length && d.cloud_slots ? [`AWS: ${d.cloud_slots_used} of ${d.cloud_slots} slots in use`] : [];
   if (key === "walkhead") notes.push(d.unmatched_priority_text);
   text[1] = [text[1], ...notes].filter(Boolean).join("\n");

@@ -561,18 +561,17 @@ class GateWorker:
             return sorted(variants, key=cooled)
         default_seconds = Decimal(values.whole('lifetime_minutes') * 60)
         transfer = conf.decimal(values.text('remote_region_transfer_usd'))
+        transfers = run_cost.region_numbers(values, 'region_transfer_usd')
         wait_cost = conf.decimal(values.text('gate_wait_usd_per_minute'))
-        extra_seconds = {region: conf.decimal(str(seconds)) for region, seconds in
-                         ledger.mapping(cast(object, json.loads(values.text('region_extra_gate_seconds')))).items()}
-        if any(not region or seconds < 0 for region, seconds in extra_seconds.items()):
-            raise ValueError('The regional gate delay must be nonnegative')
+        extra_seconds = run_cost.region_numbers(values, 'region_extra_gate_seconds')
+        unmeasured = run_cost.region_numbers(values, 'unmeasured_region_extra_seconds')
         def order(item: tuple[int, GateLaunchVariant]) -> tuple[bool, bool, Decimal, int, int]:
             position, variant = item
             key = (variant.region, variant.instance_type, variant.zone)
             # The expected USD of one run: box time by type and region, plus the wait for expected refusals.
             cost = (evidence.expected_usd(prices[key], variant.instance_type, variant.region, (mode,), wait_cost,
-                                         default_seconds)
-                    + (transfer if variant.region != self.api.region else Decimal(0))
+                                         default_seconds, unmeasured_extra_s=unmeasured.get(variant.region, Decimal(0)))
+                    + (transfers.get(variant.region, transfer) if variant.region != self.api.region else Decimal(0))
                     + extra_seconds.get(variant.region, Decimal(0)) * wait_cost / 60
                     if key in prices else Decimal(0))
             return cooled(variant), key not in prices, cost, type_rank(variant), position

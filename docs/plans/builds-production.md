@@ -34,7 +34,7 @@ Scope of each unit:
 - **resources-unit** — what a build may use and when it starts: memory admission, build holds, build targets and their slots, the cargo wrapper, and the sweeps that keep `/tmp` and the disk under their limits. Its `/etc/nixos` changes (steve slots, `builds.slice`, `modules/linux/disk-floor.nix`, the buildlog timers) go through the natedev session. Memory admission moves to queue-unit as resources' in-flight admission phases land.
 - **report-unit** — what the build log records and what its reports show: `/build:report`, `/build:mac_report` and the `/build:status` table. In `scripts/buildlog/`, verify-unit owns `port_lint.py`, `mac_idle.py` and their tests, and natedev's screenshot-unit owns the one `buildlog hourly` call site.
 - **verify-unit** — `verify.sh` and how fast it runs: the final pass, the verify cache, lint and test scope, the Mac test offload and the copy guard. It also touches `commands/showrunner/produce.md` (one clause in the Mac run rule), `commands/unit/direct.md` (the verify rows), `config/README.md` and `pyrightconfig.json` (one entry each).
-- **queue-unit** — the build queue: the `/build:queue` view and evidence cards, the queue service, the memory gate's wait loop, and gate copies (`copies.py`).
+- **queue-unit** — the build queue: the Builds page and `/build:bump`, the queue service, the memory gate's wait loop, and gate copies (`copies.py`).
 - **aws-unit** — the AWS build box: `deploy.py`, the box steps and their build log rows.
 - **natest-unit** — ~/.claude test speed: the test-time history tools, and test changes in shared test files by berth.
 

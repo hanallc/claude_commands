@@ -492,7 +492,8 @@ class MemoryHoverTests(unittest.TestCase):
 
     def test_queue_notes_appear_once_in_their_row_tooltips(self) -> None:
         priority = "queue priority: port (the user's bump)"
-        note = memory_feed.BUILD_RESERVED_NOTE
+        note = (f"{memory_feed.BUILD_RESERVED_NOTE} Swap coming back needs 2.0 GiB. "
+                + memory_feed.SWAP_RETURN_NOTE)
         room: memory_feed.HeadRoom = {"unavailable": "", "rows": [
             {"label": "Queue cap", "gib": 7.5}, {"label": "− Builds", "gib": 1.5},
             {"label": "− Build reserved", "gib": 6.0}, {"label": "= Free for builds", "gib": 0.0}], "note": note}
@@ -693,8 +694,8 @@ function fitLabels() {}
                        "RAM the queue never gives to builds.\nSafety net: 4.0 GiB.\nSwap coming back: 2.0 GiB."],
             "safety": ["Safety net · 4.0 GiB",
                        "RAM the queue always leaves free, so the machine does not run out of memory.\nSafety net: 4.0 GiB."],
-            "swap": ["Swap coming back · 2.0 GiB", "Empty RAM the queue holds for memory in swap, mostly agents' memory.\n" +
-                     "That memory can come back into RAM at any time.\nSwap coming back: 2.0 GiB."],
+            "swap": ["Swap coming back · 2.0 GiB", "Empty RAM the queue holds for recent swap-in.\n" +
+                     "The reserve uses swap-in within the configured window, limited to swap outside builds and CI.\nSwap coming back: 2.0 GiB."],
             "g-else": ["Everything else · 27.0 GiB",
                        "RAM that the desktop, agents, other programs, the kernel and the cache use."],
             "desktop": ["Desktop · 3.0 GiB",

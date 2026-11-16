@@ -96,7 +96,7 @@ def slot_report(now: float) -> SlotReport | None:
     settings = conf.read_or_repository("build_folders")
     machine = host_name()
     try:
-        root = build_slots.slot_folder_root(settings, machine)
+        root = build_slots.configured_slot_root()
     except build_slots.SlotsNotConfigured:
         return None
     return read_slots(root, build_slots.slot_cargo_root(settings), settings, machine, measure.read_data(), now)

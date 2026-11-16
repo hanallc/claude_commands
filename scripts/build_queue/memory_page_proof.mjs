@@ -8,6 +8,7 @@
 // Add --blocks as the fourth argument for the target block and hold images.
 // Add --identity as the fourth argument for the row hover identity block images.
 // Add --wait-tip as the fourth argument for the waiting step hover images.
+// Add --macroute as the fourth argument for the Mac route and width images.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
 import {createServer} from 'node:http';
@@ -37,6 +38,7 @@ try {
   const blocksComparison = process.argv[4] === '--blocks';
   const identityComparison = process.argv[4] === '--identity';
   const waitTipComparison = process.argv[4] === '--wait-tip';
+  const macrouteComparison = process.argv[4] === '--macroute';
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
@@ -1115,12 +1117,14 @@ try {
                   const row=document.querySelector('.walk-table tr[data-tip="wait:0"]').getBoundingClientRect();
                   const groups=[...document.querySelectorAll('.legend-group')].map(group=>group.getBoundingClientRect());
                   showTip('wait:0',card.right-140,row.top);
-                  placeTip(card.right-140,legend.bottom+22+document.querySelector('#tip').offsetHeight);
-                  const tip=document.querySelector('#tip').getBoundingClientRect();
-                  const covered=groups.find(group=>group.right>tip.left&&group.left<tip.right&&group.bottom>tip.top&&group.top<tip.bottom);
-                  if(covered) {
-                    throw new Error('The head tooltip covers a legend group: the group ends at '+covered.bottom+
-                      ', the tooltip starts at '+tip.top+'.');
+                  const popup=document.querySelector('#tip');
+                  const legendRight=Math.max(...groups.map(group=>group.right));
+                  const beside=card.right-legendRight>=popup.offsetWidth+24;
+                  const top=beside?legend.top+36:Math.max(...groups.map(group=>group.bottom))+18;
+                  placeTip(card.right-popup.offsetWidth/2-8,top+popup.offsetHeight+14);
+                  const tip=popup.getBoundingClientRect();
+                  if(groups.some(group=>group.left<tip.right&&group.right>tip.left&&group.top<tip.bottom&&group.bottom>tip.top)) {
+                    throw new Error('The head tooltip covers a legend group.');
                   }
                   return {x:card.left,y:card.top+scrollY,width:Math.max(card.right,tip.right+8)-card.left,
                     height:Math.max(row.bottom,tip.bottom)-card.top+8,scale:1};
@@ -1661,7 +1665,8 @@ try {
             {label:'= free',gib:7.1},{label:'needs',gib:16.3}],note};
           const room={unavailable:'',
             rows:[{label:'Queue cap',gib:17.1},{label:'− Builds',gib:1.5},{label:'− Build reserved',gib:8.5},
-            {label:'= Free for builds',gib:7.1}],note:'Build reserved is memory that running builds used at their next points in earlier runs.'};
+            {label:'= Free for builds',gib:7.1}],note:'Build reserved is memory that running builds used at their next points in earlier runs. '+
+            'The queue holds 9.8 GiB for swap coming back. The reserve uses swap-in measured within the recent window.'};
           const behind={...owner,name:'trunk nextest',unit:'trunk',detail:'trunk',pid:4243,need:2.0,
             reason:'behind #1: the first step in line gets memory first',runs_on:'natedev or Mac'};
           const head={...owner,place:1,why:'only 7.1 GiB is free for builds. It starts when 16.3 GiB is free.'};
@@ -1750,7 +1755,7 @@ try {
             [['showrunner','builds'],['unit','this run is from the showrunner']]);
           assert.equal(lefts(showrunnerState).length,1);
         }
-        if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison && !waitTipComparison) {
+        if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison && !waitTipComparison && !macrouteComparison) {
           const review = structuredClone(readings.spacing);
           review.priority_text = "queue priority: port (the user's bump)";
           review.head_text = 'Head: need 1.9 GiB > room 0.0 GiB (free 8.5 GiB − safety 3.0 GiB − 6.0 GiB swapped outside builds) · cloud 2 of 9 slots';
@@ -1854,6 +1859,65 @@ try {
             }
           }
         }
+
+        await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+        await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1100,deviceScaleFactor:1,mobile:false});
+        for(const version of beforePage ? ['before','after'] : ['after']) {
+          await navigate(version==='before' ? 'before.html' : 'memory_live.html');
+          const reading=structuredClone(readings.macroute_running);
+          const row=reading.walk.find(row=>row.kind==='mac-build');
+          if(version==='before') row.name += ' · '+row.gate_label;
+          await show(reading);
+          const index=reading.walk.findIndex(row=>row.kind==='mac-build');
+          await evaluate(`showTip('row:${index}',700,420)`);
+          const state=await evaluate(`(() => {
+            const tip=document.querySelector('#tip');
+            const head=tip.querySelector('b');
+            return {title:head.firstElementChild?.textContent||head.textContent,
+              duration:head.children[1]?.textContent,width:tip.getBoundingClientRect().width,
+              scroll:tip.scrollWidth,client:tip.clientWidth};
+          })()`);
+          if(version==='after') {
+            assert.equal(state.title,'fps nextest · 2.1 GiB');
+            assert.equal(state.duration,'10 min');
+            assert.ok(state.width<=24*16+22,JSON.stringify(state));
+            assert.ok(state.scroll<=state.client,JSON.stringify(state));
+          }
+          const desktop=await call('Page.captureScreenshot',{format:'png'});
+          await writeFile(join(folder,`macroute-${version}-running-desktop.png`),Buffer.from(desktop.data,'base64'));
+          await capture(`macroute-${version}-running-tip`,'#tip');
+          comparisons.push({version,...state});
+        }
+        await navigate('memory_live.html');
+        await show(readings.macroute);
+        const routeLines = [
+          'Mac: busy with nextest hana_catalyst',
+          'Mac: no, mend edits this checkout on natedev',
+          'Mac: no, a direct cargo command runs where it starts'];
+        const routeTips = [];
+        for (const [index,line] of routeLines.entries()) {
+          await evaluate(`showTip('wait:${index}',700,420)`);
+          const tip = await evaluate(`({text:document.querySelector('#tip').innerText,html:document.querySelector('#tip').innerHTML})`);
+          assert.ok(tip.text.includes(line),tip.text);
+          routeTips.push(tip.html);
+        }
+        await evaluate(`(() => {
+          document.querySelector('#tip').style.display='none';
+          const panel=document.createElement('div');
+          panel.style.cssText='position:fixed;left:24px;right:24px;top:250px;display:flex;align-items:flex-start;gap:18px;z-index:10000';
+          for(const html of ${JSON.stringify(routeTips)}) {
+            const tip=document.createElement('div');
+            tip.id='tip';
+            tip.className='on';
+            tip.style.cssText='position:relative;left:auto;top:auto;opacity:1;flex:0 1 auto;min-width:0';
+            tip.innerHTML=html;
+            panel.append(tip);
+          }
+          document.body.append(panel);
+        })()`);
+        const routeShot=await call('Page.captureScreenshot',{format:'png'});
+        await writeFile(join(folder,'macroute-dark-desktop.png'),Buffer.from(routeShot.data,'base64'));
+        comparisons.push({routeLines});
 
         await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,
           failures:failures.map(({cards,...state})=>state)},null,2)+'\n');

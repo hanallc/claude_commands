@@ -168,6 +168,14 @@ def _settings() -> ConfigRead:
     return conf.read_or_repository("build_folders")
 
 
+def repository_git_timeout() -> float:
+    """Keep the copies Git deadline when the maker creates a slot."""
+    from scripts.lib import conf
+
+    path = Path(os.environ.get("COPIES_CONFIG") or Path(__file__).resolve().parents[2] / "config/copies.conf")
+    return float(conf.read(path.expanduser()).values()["git_timeout_seconds"])
+
+
 def repository_key_for(name: str, identity: str) -> str:
     """Append the configured identity hash to a readable repository name."""
     from hashlib import sha256
@@ -445,11 +453,19 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                         except FileNotFoundError:
                             lease = {}
                         if existing is not None and lease.get("ready") is not True:
+                            if (path / ".git").exists():
+                                from scripts.lib import git_files, git_rescue
+
+                                checkout = git_files.at(path)
+                                if checkout.common_dir != git_files.at(spec.slot_checkout.source).common_dir:
+                                    raise ValueError(f"{path}: incomplete slot owns a different Git repository; retained")
+                                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                                _ = git_rescue.rescue(path, f"{path.name}-recovery-{stamp}", generated=[path / "target"])
                             _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "prune", "--expire", "now"],
-                                               check=True, capture_output=True, pass_fds=(descriptor,))
+                                               check=True, capture_output=True, pass_fds=(descriptor,), timeout=repository_git_timeout())
                             _remove_folder(path, directory, existing)
                             _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "prune", "--expire", "now"],
-                                               check=True, capture_output=True, pass_fds=(descriptor,))
+                                               check=True, capture_output=True, pass_fds=(descriptor,), timeout=repository_git_timeout())
                             existing = None
                     new_folder = existing is None
                     if isinstance(spec.slot_checkout, SlotCheckout):
@@ -472,7 +488,8 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
 
                         _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "add", "--detach",
                                             str(path), spec.slot_checkout.commit], check=True,
-                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(descriptor,))
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(descriptor,),
+                                           timeout=repository_git_timeout())
                         _write_lease(path, directory, allocation)
                     os.set_inheritable(descriptor, True)
                     _locks[descriptor] = path
@@ -596,6 +613,16 @@ def collector_lease(path: Path, *, children: bool = False, wait: bool = True) ->
         except (OSError, ValueError):
             free = False
         yield free
+
+
+@contextmanager
+def leased_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
+    """Hold the maker lease while a persistent folder is in use."""
+    path = create_build_folder(spec)
+    try:
+        yield path
+    finally:
+        _release_build_folder(path)
 
 
 @contextmanager
@@ -744,6 +771,7 @@ def run_build_command(command: Sequence[str], *, path: Path, environment: Mappin
     """Keep the caller until the command and its descendants stop."""
     import subprocess
     from scripts.lib.descendants import adopt_descendants
+    from scripts.lib.process_group import send_process_group
 
     if not command:
         raise ValueError("run needs a command after --")
@@ -766,12 +794,12 @@ def run_build_command(command: Sequence[str], *, path: Path, environment: Mappin
         if sys.platform == "darwin":
             # A descendant outside the group still holds the slot if it inherits the lock descriptor.
             try:
-                os.killpg(child.pid, signal.SIGKILL)
+                send_process_group(child.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             while True:
                 try:
-                    os.killpg(child.pid, 0)
+                    send_process_group(child.pid, 0)
                 except ProcessLookupError:
                     break
                 time.sleep(0.01)

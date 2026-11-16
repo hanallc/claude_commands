@@ -30,8 +30,9 @@ from scripts.style import fake_fmt
 from scripts.style.style_child_test_support import StyleQueueFake, install_refusal_tools, unqueued_style_children
 from scripts.build_queue import queue_place
 from scripts.style.style_plan_test_support import unit_staff_id
-from scripts.lib import berth_board
+from scripts.lib import berth_board, build_folders
 from scripts.copies import copies
+from scripts.copies.copies_test_support import copies_environment
 from scripts.style import rules
 from scripts.style.ledger_test_support import machine_rename_fixture, MACHINE_RENAME_AFTER, ticket_owner_id
 from scripts.style import style_ledger as ledger_api
@@ -101,6 +102,7 @@ class BulkRunFixture(CargoProjectTests):
         environment = os.environ.copy()
         try:
             CargoProjectTests.setUp(fixture)
+            fixture.enterContext(mock.patch.dict(os.environ, copies_environment(fixture.root)))
             cls.fixture_root = fixture.root
             cls.fixture_environment = {key: value for key, value in os.environ.items()
                                        if environment.get(key) != value}
@@ -409,6 +411,7 @@ class WorkspaceRunTests(BulkRunFixture):
     def setUp(self) -> None:
         super().setUp()
         self.enterContext(mock.patch.dict(os.environ, {
+            **copies_environment(self.root),
             "HOME": str(self.root / "gate-home"),
             "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
         }))
@@ -1641,7 +1644,8 @@ class WorkspaceRunTests(BulkRunFixture):
                                        ("bash", verify, "final", "--saved", "--tree", str(report["tested_tree"]))])
         self.assertTrue(all(folder == self.runner.test_checkout for folder, args in self.runner.calls if args[0] == "bash"))
         self.assertNotEqual(self.runner.test_checkout, self.repo)
-        self.assertFalse(self.runner.test_checkout.exists())
+        self.assertTrue(self.runner.test_checkout.exists())
+        self.assertEqual(build_folders.build_folder_state(self.runner.test_checkout), "free")
         self.assertEqual(self.runner.test_tree, report["tested_tree"])
         self.assertEqual(self.git("rev-list", "--count", f"{self.base}..HEAD"), "1")
         self.assertIn(f"Tested-Tree: {report['tested_tree']}", self.git("log", "-1", "--format=%B"))
@@ -2215,7 +2219,8 @@ class WorkspaceRunTests(BulkRunFixture):
                 self.runner.mutate_stage = stage
                 with self.assertRaisesRegex(bulk.BulkRenameError, "clean checkout"):
                     _ = run.test_tree(self.repo, self.base, self.tree, self.runner, {})
-                self.assertFalse(self.runner.test_checkout.exists())
+                self.assertTrue(self.runner.test_checkout.exists())
+                self.assertEqual(build_folders.build_folder_state(self.runner.test_checkout), "free")
                 self.assertEqual("final --saved" if self.runner.calls[-1][1][2:4] == ("final", "--saved") else self.runner.calls[-1][1][2], stage)
 
     def test_hidden_untracked_test_output_never_publishes_or_keeps_the_batch_commit(self) -> None:
@@ -2239,7 +2244,8 @@ class WorkspaceRunTests(BulkRunFixture):
         self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git("status", "--porcelain=v1", "--untracked-files=all"), "")
         self.assertEqual([("final --saved" if args[2:4] == ("final", "--saved") else args[2]) for _, args in self.runner.calls if args[0] == "bash"], ["final"])
-        self.assertFalse(self.runner.test_checkout.exists())
+        self.assertTrue(self.runner.test_checkout.exists())
+        self.assertEqual(build_folders.build_folder_state(self.runner.test_checkout), "free")
         self.assertFalse(tuple(ticket for ticket in ledger.proposal_tickets()
                                if ticket["state"] not in ledger_api.FINAL_TICKET_STATES))
         self.assertTrue(all(isinstance(f.build_ticket, ledger_api.NoBuildTicket)
