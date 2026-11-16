@@ -319,7 +319,7 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 - `PageData(charts: ChartSet, top: TopCosts)`. `TopCosts(start, end, recent_days, rows: tuple[TopCost, ...] | NoDataYet)`: `start` and `end` bound the recent window, in the user zone. `TopCost(machine, cause, recent: ChartCost, window: WindowValue, action: CostAction)`. `CostAction(action, owner)`.
 - `WindowValue = WindowMatchesRecent | WindowDiffers(value: ChartCost)`. An unknown recent value is a match. A known recent value with an unknown window value is `WindowDiffers(window)`. Otherwise per-day rates differ when the gap is above 0.5 of the recent rate. An upper bound keeps its unknown part per day.
 - Rows rank the six causes (`COST_KEYS`) by recent seconds and keep `CostUnavailable`, `NoDataYet` and `MacIdleUpperBound` as they are.
-- `config/buildlog.conf` holds `TOP_COST_RECENT_DAYS=2` and `COST_ACTION_*`/`COST_OWNER_*` for each cause, read at use. `TOP_COST_RECENT_DAYS` greater than `days` raises `conf.Unusable` that names the key and the days.
+- `config/buildlog.conf` holds `TOP_COST_RECENT_DAYS=7`, read at use. `TOP_COST_RECENT_DAYS` greater than `days` raises `conf.Unusable` that names the key and the days.
 - `collect_charts` and `page_data` share `read_snapshot` and `chart_series`.
 
 **Files:**
@@ -1671,7 +1671,7 @@ From the user (via builds), 2026-11-15: "this said that the mac was busy with a 
 - Tests: `test_memory_feed` (each route before the Mac routes, the Mac field on the waiting and queued run rows), `test_target_availability` (each Mac state, the repository filter, a whole-Mac claim), `test_memory_hover` (the Mac field below "can run on"), `test_targets` (the `step_route` order) and `test_placement` (local, pinned and routed steps keep their route in the waiting and running views).
 - Proof: `phases/94/proof2/` pairs `before-local`/`local` and `before-either`/`either-busy`. They show the tooltip before the merge.
 
-### Phases 95–99 — The Disks page · status: in progress (95 and 96 done)
+### Phases 95–99 — The Disks page · status: done
 
 From builds (item 11), 2026-11-15: build the Disks page from the approved mockup 2. Builds' conditions:
 1. Show real folders as they are, before and after the cutover. Read the slot and session roots from config. Hard-code no path and no threshold.
@@ -1743,6 +1743,24 @@ Files: a new `scripts/disks/` folder (report owns it) and `config/disks.conf`. T
 4. `serve.py` and `console.conf` are not report's files. The owner reviews the change, or makes it.
 5. Proof: one dark desktop shot of the live page.
 
+##### Phase 97 as-built
+
+- `scripts/disks/disks.html`:
+  - The page shows the old data at once. It posts to `measure` beside it when `disks.json` is missing or older than `cache_seconds`.
+  - The answer `current` reads the data again. Any other answer shows "Measuring…" and reads the data again every `page.poll_seconds` until `measured_at` changes.
+  - After the wait limit (`measure.timeout_seconds` for each drive), the line adds "The measure did not finish."
+  - With no data, the line reads "Measuring the drives. The first measure takes some minutes."
+  - With current data, the line adds "The page measures again when you open it and the sizes are more than N minutes old."
+- `scripts/disks/disks_page.py`:
+  - `start_measure` returns `current` when the data is newer than `cache_seconds`, and `running` when `disks.lock` is held.
+  - Otherwise it starts `measure.py` in its own session and returns `started`. A thread reaps the process. The server never waits.
+  - `page_url` publishes the page with the current config, then gives its link. `main` prints the link.
+  - `measure.py` no longer publishes the page.
+- `scripts/review_links/serve.py`: a POST to the `measure` path beside the page calls `start_measure` and answers `{"state": ...}` at once. A start failure answers 503.
+- `config/console.conf`: `page.disks.*` with label Disks, the `hard-drive` icon and `disks_page:page_url`. `console.py` adds `hard-drive` to `ICON_NAMES`; the Lucide icon is in `scripts/review_links/lucide`.
+- `config/disks.conf`: `page.poll_seconds=5`.
+- Tests: `start_measure` (missing, current, running, old), the status line, the serve route, the console page list. Chrome check: one POST on open, "Measuring…", then the new time after the data changes.
+
 #### Phase 98 — Slots card
 
 1. The card reads `roots.slots.<machine>` and `roots.slot_cargo.<machine>` from `build_folders.conf`. With no such key, the card does not show.
@@ -1751,8 +1769,149 @@ Files: a new `scripts/disks/` folder (report owns it) and `config/disks.conf`. T
 4. "deleted tonight" shows when the last use is older than the nightly delete's day count, read from config. With no such key, the tag does not show.
 5. The slot sizes come from the same measure as the drive cards.
 
+##### Phase 98 as-built
+
+- `scripts/disks/slots.py`:
+  - `slot_report` reads the slot root and the cargo root through `build_slots` (`slot_folder_root`, `slot_cargo_root`). With no slot root it returns nothing, and the page shows no card.
+  - `read_slots` finds the slots with `build_slots.slot_paths`, as the nightly sweep does. It groups the slots by repository, with the maximum from `build_slots.configured_maximum`.
+  - Size: the checkout plus `<slot_cargo>/<name>`, from the last measure's trees (`tree_size`). A folder that the measure does not list is below `measure.keep_bytes`. A path on no measured drive has no size.
+  - Used by: `build_folders.build_folder_state` gives held or free. A held slot shows the lease's purpose, unit and showrunner, and "now" as its last use.
+  - "deleted tonight": a free slot that `build_slots.unused` names, the same rule the sweep in the nightly merge gate uses.
+- `scripts/lib/build_slots.py` (queue's file, by builds' finding): the public readers `slot_folder_root`, `slot_cargo_root`, `lease_path`, `slot_paths`, `unused` and `configured_maximum`. The pool and the sweep use them.
+- `scripts/review_links/serve.py`: the measure answer adds `slots`, read at each POST, so the holders are current. `json_response` takes any JSON mapping.
+- `scripts/disks/disks.html`:
+  - The page now posts on each open; the server starts a measure only when the sizes are old.
+  - After a measure, the page posts once more for the new slot sizes.
+  - The Slots card follows mockup 2: a group row for each repository ("N of M slots · size"), then Slot, Size, Last used and Used by. On a phone, the holder goes under the slot name.
+- `disks_page.publish` writes the page only when its content changes (admin-console's note on phase 97).
+- Tests: `scripts/disks/test_slots.py` (sizes from the trees, groups, use, the nightly delete, no root), the card HTML, the publish, the serve answer. Chrome check with fixture slots: no cut text and no page wider than the window at 1400, 800, 390 and 360 px, light and dark.
+
 #### Phase 99 — Sessions card
 
 1. The card reads the session root from config when verify adds it. With no such key, the card does not show.
 2. Each session row shows its size, the held folders from verify's hold records, and its state.
 3. An ended session shows when its folder is deleted, from the same records.
+
+##### Phase 99 as-built
+
+Builds asked for verify's folder layout phase 4 (10c25b033) in this branch before it merges, so the card reads verify's own readers.
+
+- `scripts/disks/sessions.py`:
+  - `session_report` reads the root from `session_folder.session_root`. Until that folder exists, it returns nothing and the page shows no card.
+  - `read_sessions` lists each folder under the root, largest first. Dot folders, links and files are not sessions.
+  - Size: `measure.tree_size` of the folder at `measure.drive_path`. On natedev `/session` is a mount of `/build/session`, so the size comes from the build drive's tree.
+  - Held folders: each `scratch.holds()` path inside the folder, by its path in the folder. A hold that ended with unsaved work shows "(unsaved work)".
+  - State: `session_records.session_liveness` of the session id in `.session.json`: running, ended, or unknown ("—").
+  - No code deletes a session folder yet, so the card shows no delete time (condition 5). The held folders go when their task ends (`scratch.end`); the task name is the tooltip of each held folder.
+- `scripts/disks/measure.py`: `tree_size` moved here from `slots.py`, with `read_data`, `read_mounts` (`/proc/self/mountinfo`, none on the Mac) and `drive_path`.
+- `scripts/review_links/serve.py`: the measure answer adds `sessions`.
+- `scripts/disks/disks.html`: the Sessions card follows mockup 2: Session, Size, a bar on the largest session's scale, Held folders and State. `page.sessions_shown` in `disks.conf` (10) names the largest sessions; one row adds up the rest. On a phone the bar does not show.
+- Tests: `test_sessions` (sizes through the mount, held folders, states, no root), `test_measure` (the mount table and `drive_path`), `test_disks_page` (the card HTML), `test_serve` (the answer). Chrome check with fixture sessions: no cut text and no page wider than the window at 1400, 800, 390 and 360 px, light and dark.
+
+### Phases 100–101 — Build history names the cost and its action · status: in progress
+
+Builds' order (11-15): above the plots, show the top three costs as sentences with the number, the cause and the action that cuts it.
+Name each action only from the data the page has. Drop the h/day sum plots, or move them under Details. Fix the Hana phase p90 where the phase record stays open.
+
+#### Phase 100 — Top costs as sentences, sum plots under Details
+
+##### Phase 100 as-built
+
+- `scripts/buildlog/cost_actions.py` (new) names the action from the rows behind each cost:
+  - Memory wait: the step kind that holds the most build memory (peak times run time), with its peak p90.
+  - Failed runs: the test that failed most on the machine, else the step kind that failed most.
+  - Any other cause: "No action known."
+  - The step kind that paid the largest part of the cost ("hana nextest paid 34% of it").
+- `scripts/buildlog/costs.py`: each contribution carries its `StepKind` (repository and step).
+- `scripts/buildlog/charts.py`: `TopCost` carries each day of the window, the largest share and the action. The 12 `COST_ACTION_*`/`COST_OWNER_*` keys are deleted; the user approved it on 2026-11-15.
+- `scripts/build_queue/memory_feed.py`: each top cost sends its daily range, share and action text.
+- `scripts/build_queue/memory_live.html`: the Build history card starts with "Top 3 costs" for the last `TOP_COST_RECENT_DAYS` days. Then the Hana phase time plot. The cause and machine plots are under "Details: costs by cause and by machine".
+- Tests: `test_charts` (memory holder, failed test, failed step, no action), `test_memory_feed` (the sent text), `memory_page_proof.mjs` (the sentences and the Details state).
+
+#### Phase 101 — Hana phase time counts only active time
+
+As built:
+
+- Cause: `record_turn_wait` recorded no wait for a `blocked:` turn end that
+  named no supplier address. A pause relayed by the showrunner counted as
+  phase time. Hana phase 14 holds 180 h of such a pause.
+- Every `blocked:` turn end now opens a wait. The supplier is the named
+  address, else the run's showrunner. A run with no showrunner waits on the
+  user. A `peer` block with no address keeps `NoNamedSupplier`.
+- `finish-phase` writes `phase_active_seconds`: the phase time less the union
+  of its `WaitingForUser` and `WaitingForSupplier` waits. An open wait ends at
+  the finish. `phase_elapsed_seconds` is unchanged, so ETA bands do not change.
+- `moments.progress_events` reads `phase_active_seconds`. A record from before
+  this change is `WaitsNotRecorded`, because its wall time can hold waits.
+  A day with only such records reads `phases ended before waits were recorded`.
+- When no day in the range is measured, the card shows no plot and no table.
+  One line names why: "Shown from the first phase that ends with a wait
+  record. Earlier phases have no wait record.", "Hana phases ended in this
+  range, but none has a valid start time." or "No Hana phase ended in this
+  range."
+- The plot title is "Hana phase time, without waits for the user or the
+  showrunner". The legend says "half of phases take up to" and "most phases
+  take up to". The memory action says "Most runs peak at N GiB or less."
+
+#### Builds page hover wording (C1584, C1309, C1578, C1605)
+
+As built:
+
+- Every hover box shows the run or wait time in bold at the top right.
+- A queued running build says "Current memory: N GiB", "Historically uses N
+  GiB" (with "in the next part of the build" for a progress peak), the room
+  the queue holds for it, and its progress.
+- A waiting build says its place in line, "It needs N GiB to start." and
+  "Why it waits: …". `memory_feed.wait_why` writes one sentence for each
+  wait reason, in the same form.
+- The waiting build that gets memory next shows a table: "Queue cap",
+  "− Builds", "− Build reserved", "− Held for builds ahead in line" (only
+  above 0) and "= Free for builds". Each row is the memory bar legend's
+  amount, so the rows add up and the cap and Builds count the build tools.
+  One note follows: "Build reserved is memory that running builds used at
+  their next points in earlier runs."
+- The queue cap hover says the cap is RAM less the programs that run now,
+  the safety net and the swap coming back, and that those three are
+  outside the cap. The user set what is inside the cap and where it is
+  explained on 2026-11-15; queue gave the words.
+- An unavailable cap shows "Queue cap unavailable: <reason>" and no table.
+- "can run on" and "Mac" are fields in the running and the waiting boxes.
+
+#### Builds page weight (C1672)
+
+From builds, relaying the user on C1672: the memory and the queue should be always visible and fast.
+
+As built:
+
+- Cause: `charts.chart_series` made a chart machine of each buildlog source folder. Each cloud gate host has its own folder, so about 1475 hosts gave 6 causes × 8 days of empty rows: 19.8 MB of the 19.9 MB `memory.json`.
+- `charts.chart_series` now takes only configured targets and machines with a step in the window.
+- `memory_feed.main` writes `report.json` beside `memory.json`, only when the report text changes. It writes `report.json` first. `memory.json` carries `report_version`, a sha256 prefix of that text, in place of `report`.
+- `memory_live.html` reads `memory.json` each 3 s as before. It reads `report.json` only when `report_version` changes.
+- Tests: `test_charts` (a folder with no step is no machine), `test_memory_feed` (one `report.json` write for two equal reads, written before `memory.json`), `memory_page_proof.mjs` (serves `report.json`).
+
+### Tokens — The Builds page shows the jobserver tokens · status: done
+
+From builds, relaying the user: "sometime i see the build is waiting for a token - what token? if they are used - we should show them in a column next to slots on the running on the builds page". The build folders are already named slots, so the user approved the name "tokens" on 2026-11-16.
+
+As built:
+
+- `memory_feed.token_pool` reads `stevie -a -t -j` (floor MiB, free, total). The pool is paused while the admission's MemAvailable is under the floor.
+- The Running header shows "Tokens: N total, M free", or "Tokens: unavailable". Its hover says what a token is, that hana CI has its own pool, and the memory floor.
+- In the memory pause, a token wait stage reads "waiting for jobserver tokens (memory under 12 GiB)". A remote row keeps the plain stage.
+- The Running table has a Tokens column after Slot. Each `token_dump_seconds` (config, 10 s), the feed reads the newest steve dump from the journal, then runs `systemctl --no-ask-password reload steve` for the next one. Each holder pid counts for its nearest ancestor that is a local, non-CI run pid. A dump counts only when its holder lines add up to the taken tokens; an incomplete dump gives way to the one before it. The next request time starts after the request, so slow reads never shorten the interval.
+- steve lists each connected process, holders of 0 included. A local step shows the sum of its lines, 0 included. A step with no line in the dump shows "—". CI, Mac and AWS rows always show "—".
+- The polkit rule (nixos 2ed52e5) is live, so the reload works. When a reload is refused, the column shows "—" and the header hover gives the reason.
+- Tests: `test_memory_feed` (pool, pause text, dump parse, ancestor count, refused reason), `test_memory_hover` (column and header), `memory_page_proof.mjs` (column values, pool line, no overflow).
+
+### Cap bar — Running bars stop at the cap line · status: done
+
+From builds: the reserved bar ran past the chart into the Stage column. "The bar must stop at the chart edge and show the over-cap state inside the chart."
+
+As built:
+
+- `placeMemoryBars` draws each local bar (build tools, CI, used, reserved, Free) with `capBox`. It cuts the bar at the cap line. A cut bar gets the `over-cap` class: square right corners and a 3px cap-colored end. Mac and cloud rows keep their own scale.
+- With a cap, a wait bar ends at the room end or the cap line, whichever is first. A need larger than the cap stops at the cap line.
+- When build reserves do not fit under the cap (`build_missing_bytes` > 0), the Running header reads "X of Y GiB taken · Z GiB over cap" in the cap color. The feed's taken is cap minus free, so the page adds the uncovered reserve: X counts each full build reserve, so X − Y = Z. The user asked on 2026-11-16 how "28.0 of 28.0 GiB taken" could be 1 GiB over the cap; now it reads "29.0 of 28.0".
+- The header tooltip reads Builds + Build reserved (full) = Taken, then "That is Z GiB over the Y GiB queue cap, so nothing is free."
+- The Queue cap legend stays as it is: the feed defines the cap as Builds + covered Build reserved + Free, so its rows always add to the total. The Shortfall row already names the uncovered reserve.
+- Tests: `memory_page_proof.mjs` adds two readings. In the first, build tools grow past the cap and one wait needs cap + 10 GiB; the proof checks that no local bar ends past the cap line and the cut bar's cap-colored end. The legend sum check skips this reading, because live data cannot produce it. In the second, the running build reserves all of free plus 1 GiB; the proof checks the header text and color, that every number in the header and tooltip adds up within 0.1 GiB, and that the base reading names no over-cap amount.

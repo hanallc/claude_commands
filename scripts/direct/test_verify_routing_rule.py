@@ -69,7 +69,7 @@ printf '%s\n' "${ARGS[@]}"
                     routing = targets.LocalRequired("local files") if pin == "--local" else targets.ANY_ELIGIBLE_TARGET
                     selection = Pinned("mac" if pin == "--mac" else "linux") if pin in ("--mac", "--target") else ROUTED
                     answer = build_targets.step_routing_rule(command, routing, selection)
-                    local = pin == "--local" or command in ("build", "final") and not pin
+                    local = pin == "--local" or command == "final" and not pin
                     self.assertIsInstance(answer, build_targets.NatedevOnly if local else build_targets.AnyTarget)
                     writing = build_targets.step_routing_rule(command, routing, selection, writes_tree=True)
                     self.assertIsInstance(writing, build_targets.NatedevOnly)

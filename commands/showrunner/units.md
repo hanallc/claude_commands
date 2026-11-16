@@ -40,16 +40,6 @@ Its rows use the same cached plan and run records as the Progress bar.
 6. `Done` explains a stopped task that a later attempt finished while the bar still includes that attempt.
 
 A busy session does not prove a task.
-With readable sources and no current task, open phase, pending merge, hold, or next work, the unit is idle.
-The director's busy status does not change this result.
-Its only current row is `Now | Nothing to do | The plan is complete and the queue is empty` for a complete readable plan.
-Otherwise, its only current row is `Now | Nothing to do | No plan or queued work`.
-The block has no Next row.
-Only events from an open phase can supply a finished-step fallback.
-Unreadable sources never produce `Nothing to do`.
-A missing plan file in an existing local worktree is an absent plan.
-A missing plan file keeps its unavailable state when the worktree is missing or remote.
-Other plan read errors keep the plan unavailable.
 Each current task has one row.
 Several actors share its State cell, joined by semicolons; equal states appear once.
 No task row has an empty Work cell; a cell longer than the line limit continues on the next row.
@@ -150,7 +140,6 @@ A process without an identity reports an unreadable thread when its pane holds s
 One staff candidate retains its pane placement with unknown status.
 Morty produces no anomaly when its native ID is on the producer staff row named `morty`.
 The command sends one message with all anomaly lines to `UNIT_ANOMALIES_TO` in `config/production.conf` (`sdlc`).
-The same text to the same recipient sends once inside `units_anomaly_repeat_minutes`.
 A failed send adds one anomaly line. It changes neither the table nor the exit code.
 
 Use `agents` to pause, exit, or resume units:

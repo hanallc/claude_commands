@@ -2,20 +2,24 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import re
 import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from typing import cast
+from unittest import mock
 
 from scripts.disks import disks_page
-from scripts.lib import test_hang_guard
+from scripts.lib import file_lock, test_hang_guard
 from scripts.review_links import page_frame
 
 GIB = 1 << 30
 KEEP = 256 << 20
-SETTINGS: disks_page.PageSettings = {"slider_min_gib": 1, "slider_default_gib": 10, "cache_seconds": 600,
+SETTINGS: disks_page.PageSettings = {"slider_min_gib": 1, "slider_default_gib": 10, "cache_seconds": 600, "poll_seconds": 5,
+                                     "wait_seconds": 3600, "sessions_shown": 3,
                                      "names": {"/build": "Build </script> drive"}}
 
 
@@ -75,6 +79,79 @@ class DisksPageTests(unittest.TestCase):
         middle: float = result[4]
         self.assertAlmostEqual(middle, GIB * math.sqrt(60), delta=1)
         self.assertEqual(result[5], 10 * GIB)
+
+    def test_the_status_line_names_the_age_then_the_measure_then_a_problem(self) -> None:
+        recent = "statusText(Date.now() / 1000 - 120, Date.now() / 1000, {}).replace(/^Sizes from [^,]+, /, '')"
+        calls = ("statusText(null, 0, true, '', 600)", "statusText(null, 0, false, '', 600)",
+                 "statusText(null, 0, false, 'The measure did not finish.', 600)",
+                 recent.format("false, '', 600"), recent.format("true, 'The measure did not finish.', 600"))
+        self.assertEqual(self.run_page(f"[{', '.join(calls)}]"), [
+            "Measuring the drives. The first measure takes some minutes.", "No sizes yet.", "The measure did not finish.",
+            "2 minutes ago. The page measures again when you open it and the sizes are more than 10 minutes old.",
+            "2 minutes ago. Measuring… The measure did not finish."])
+
+    def test_publish_writes_the_page_only_when_its_content_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            page = disks_page.publish(Path(directory), SETTINGS)
+            os.utime(page, (0, 0))
+            _ = disks_page.publish(Path(directory), SETTINGS)
+            self.assertEqual(page.stat().st_mtime, 0)
+            _ = disks_page.publish(Path(directory), {**SETTINGS, "poll_seconds": 6})
+            self.assertNotEqual(page.stat().st_mtime, 0)
+
+    def test_the_slots_card_shows_each_group_and_each_slot_with_its_use(self) -> None:
+        now = 1000 * 86400
+        report = {"root": "/build/slot", "groups": [
+            {"repository": "hana", "maximum": 8, "slots": [
+                {"name": "hana-slot1", "number": 1, "size": 70 * GIB, "last_used": now, "deleted_tonight": False,
+                 "used_by": {"purpose": "fps", "unit": "report", "showrunner": "builds"}},
+                {"name": "hana-slot2", "number": 2, "size": 0, "last_used": now - 9 * 86400, "used_by": None,
+                 "deleted_tonight": True}]},
+            {"repository": "<b>", "maximum": None, "slots": [
+                {"name": "x-slot1", "number": 1, "size": None, "last_used": None, "used_by": None, "deleted_tonight": False}]}]}
+        html = cast(str, self.run_page(f"slotsHtml({json.dumps(report)}, {KEEP}, {now})"))
+        rows = cast(list[str], re.findall(r"<tr[^>]*>(.*?)</tr>", re.sub(r'<div class="narrow">.*?</div>', "", html)))
+        cells = ["|".join(part for part in re.split(r"<[^>]+>", row) if part) for row in rows[1:]]
+        self.assertEqual(cells, ["hana|2 of 8 slots · 70 GiB", "hana-slot1|70 GiB|now|fps|report (builds)",
+                                 "hana-slot2|&lt; 256 MiB|9 days ago|deleted tonight", "&lt;b&gt;|1 slot · —",
+                                 "x-slot1|—|—|—"])
+        self.assertEqual(re.findall(r'<div class="narrow">(.*?)</div>', html), [
+            '<span class="tag run">fps</span><span class="dim">report (builds)</span>', '<span class="tag go">deleted tonight</span>'])
+        empty = cast(str, self.run_page(f"slotsHtml({json.dumps({'root': '/s', 'groups': []})}, {KEEP}, {now})"))
+        self.assertIn("No slots yet.", empty)
+
+    def test_the_sessions_card_names_the_largest_sessions_then_adds_up_the_rest(self) -> None:
+        def row(name: str, size: int | None, state: str, held: list[dict[str, object]] | None = None) -> dict[str, object]:
+            return {"name": name, "size": size, "state": state, "held": held or []}
+
+        report = {"root": "/session", "sessions": [
+            row("fps", 28 * GIB, "running", [{"name": "run", "task": "phase:fps/3", "ended": False},
+                                             {"name": "center-shot", "task": "phase:fps/3", "ended": True}]),
+            row("lfo", 7 * GIB, "ended"), row("<b>", 0, "unknown"), row("demo", GIB, "running"), row("sdlc", None, "running")]}
+        html = cast(str, self.run_page(f"sessionsHtml({json.dumps(report)}, {KEEP}, 3)"))
+        rows = cast(list[str], re.findall(r"<tr[^>]*>(.*?)</tr>", html))
+        cells = ["|".join(part for part in re.split(r"<[^>]+>", row) if part.strip()) for row in rows[1:]]
+        self.assertEqual(cells, ["fps|28 GiB|run|, |center-shot|(unsaved work)|running", "lfo|7.0 GiB|—|ended",
+                                 "&lt;b&gt;|&lt; 256 MiB|—|—", "2 more|1.0 GiB"])
+        self.assertEqual(re.findall(r'<i style="width:([0-9.]+)%">', html), ["100.0", "25.0"])
+        self.assertIn('<span title="phase:fps/3">run</span>', html)
+        self.assertIn('<span class="tag go">ended</span>', html)
+        empty = cast(str, self.run_page(f"sessionsHtml({json.dumps({'root': '/s', 'sessions': []})}, {KEEP}, 3)"))
+        self.assertIn("No session folders yet.", empty)
+
+    def test_a_measure_starts_only_when_the_sizes_are_old_and_no_measure_runs(self) -> None:
+        launches: list[str] = []
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(disks_page, "output_folder", return_value=Path(directory)):
+            folder = Path(directory)
+            self.assertIs(disks_page.start_measure(1000, lambda: launches.append("missing")), disks_page.MeasureStart.STARTED)
+            _ = (folder / disks_page.DATA_FILE).write_text(json.dumps({"measured_at": 900}))
+            self.assertIs(disks_page.start_measure(1000, lambda: launches.append("current")), disks_page.MeasureStart.CURRENT)
+            with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False):
+                self.assertIs(disks_page.start_measure(5000, lambda: launches.append("running")), disks_page.MeasureStart.RUNNING)
+            self.assertIs(disks_page.start_measure(5000, lambda: launches.append("old")), disks_page.MeasureStart.STARTED)
+            _ = (folder / disks_page.DATA_FILE).write_text("[]")
+            self.assertIsNone(disks_page.measured_at(folder))
+        self.assertEqual(launches, ["missing", "old"])
 
     def rows(self, limit: int, opened: list[str]) -> list[dict[str, object]]:
         return cast(list[dict[str, object]], self.run_page(

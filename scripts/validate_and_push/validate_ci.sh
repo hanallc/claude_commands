@@ -36,6 +36,7 @@ LOCAL_CI_FILE="${REPO_ROOT}/.claude/config/local_ci.sh"
 # showrunner pushes each merge this way, after its own tests, and runs the full
 # validation every fifth merge. clippy, rustdoc, nextest and local CI are skipped.
 VALIDATE_QUICK="${VALIDATE_QUICK:-0}"
+MERGED_CHECKOUT_LOCAL_REASON="it edits the merged checkout on natedev with mend and fmt, and the push goes from there"
 
 # Canonical local CI mirror for Nate's Rust repos.
 # Variations:
@@ -231,6 +232,7 @@ EOF
 # analyzes.
 run_self_mend() {
   local mend_bin="${REPO_TARGET_DIR}/debug/cargo-mend"
+  local -x BUILD_QUEUE_LOCAL_REASON="$MERGED_CHECKOUT_LOCAL_REASON"
 
   echo "+ cargo build -p ${MEND_SELF_PACKAGE} --bin cargo-mend"
   cargo build -p "$MEND_SELF_PACKAGE" --bin cargo-mend
@@ -251,10 +253,10 @@ if ! lint_config_enabled mend; then
 elif [ -n "$MEND_SELF_PACKAGE" ]; then
   run_autofix_step "cargo-mend autofix (in-repo build)" run_self_mend --fix
 else
-  run_autofix_step "cargo-mend autofix" "$LINT_CMD" mend --workspace --fix
+  run_autofix_step "cargo-mend autofix" env BUILD_QUEUE_LOCAL_REASON="$MERGED_CHECKOUT_LOCAL_REASON" "$LINT_CMD" mend --workspace --fix
 fi
 
-run_autofix_step "rustfmt" env LINT_CONFIG_FORCE=1 "$LINT_CMD" fmt
+run_autofix_step "rustfmt" env BUILD_QUEUE_LOCAL_REASON="$MERGED_CHECKOUT_LOCAL_REASON" LINT_CONFIG_FORCE=1 "$LINT_CMD" fmt
 
 run_autofix_step "taplo" taplo fmt
 

@@ -996,7 +996,7 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - `refill_lock` covers only the board read, busy-files read, selection and ticket writes of one refill pass. It never covers the catalog read, the sync wait, a judge run or any work after `next_phase` returns.
 - `phase_text` takes only the ticket record, pinned texts and Delegation Context, so a rebuild is byte-identical. Pinned text comes from the ledger, never the live catalog.
 - A proposal ticket's Work Order gives a build Goal (`Apply the approved findings ...`, never `Judge`) and states its scope as plain fact, never as an override of a copied invariant.
-- A unit director builds each prompt only from its own Work Order, plan and conversation, never from another unit's prompt files under `/tmp/claude/unit/*` (`docs/delegate/compose_work_order.md` **Fallback**). A missing build fact goes to the showrunner.
+- A unit director builds each prompt only from its own Work Order, plan and conversation, never from another unit's prompt files in its run folder (`/session/<name>/run/*` or `/tmp/claude/unit/*`; `docs/delegate/compose_work_order.md` **Fallback**). A missing build fact goes to the showrunner.
 - Plan and pin writes use `atomic_write`.
 - The style showrunner's unit-checkpoint merge preserves the unit tip as an ancestor for its next fast-forward.
   Direct style units use the normal unit merge route.

@@ -82,7 +82,7 @@ A launch that needs a built binary — a smoke or shot helper's, or a launcher
 that takes a path — builds it with this one line, then starts the
 `binary: <path>` it prints:
 
-`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" build [<package>] [--bin <name> | --example <name>]`
+`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" build [<package>] [--bin <name> | --example <name>] --local "the smoke test launches this binary on natedev"`
 
 It waits for a build hold, takes the cargo token and memory admission, and
 records the build, and its allow rule needs no approval. You and every helper

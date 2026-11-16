@@ -128,6 +128,17 @@ class TestRunFolderTests(unittest.TestCase):
                     self.assertEqual(os.environ["BUILDLOG_DIR"], caller or str(path / "buildlog"))
                 self.assertEqual(os.environ.get("BUILDLOG_DIR"), caller or None)
 
+    def test_a_run_has_an_absent_session_root_and_restores_the_callers(self) -> None:
+        for caller in ("", str(self.root / "caller-session")):
+            with self.subTest(caller=caller), mock.patch.dict(os.environ, self.environment()):
+                _ = os.environ.pop("SESSION_TEMP_ROOT", None)
+                if caller:
+                    os.environ["SESSION_TEMP_ROOT"] = caller
+                with testing_folders.test_run_folder() as path:
+                    self.assertEqual(os.environ["SESSION_TEMP_ROOT"], str(path / "session"))
+                    self.assertFalse((path / "session").exists())
+                self.assertEqual(os.environ.get("SESSION_TEMP_ROOT"), caller or None)
+
     def test_the_context_resets_tempfile_and_restores_the_callers_environment(self) -> None:
         with mock.patch.dict(os.environ, self.environment()), mock.patch.object(tempfile, "tempdir", str(self.root)):
             with testing_folders.test_run_folder() as path:

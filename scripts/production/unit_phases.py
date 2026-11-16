@@ -12,7 +12,6 @@ try:
 except FileNotFoundError:
     pass
 
-import hashlib
 import json
 import sys
 import subprocess
@@ -786,14 +785,6 @@ def read_work_queue(staff_id: staff.StaffId) -> UnitWorkQueue | UnreadableWorkQu
         return UnreadableWorkQueue()
 
 
-def local_worktree_exists(tree: staff.PresentWorktree) -> bool:
-    """Confirm that the worktree folder exists on this machine."""
-    try:
-        return tree.machine == remote.local_machine() and tree.path.is_dir()
-    except OSError:
-        return False
-
-
 def fallback_plan(member: staff.StaffRow, run: NewestUnitRun, opened: OpenUnitRun | NoOpenUnitRun,
                   record: object, *, read_plan: Callable[[Path], list[plan_history.PlanPhase]]) -> BoardPlanRecord:
     """Read unfinished plan headings against the newest run's open phases."""
@@ -958,7 +949,6 @@ class NextWork(NamedTuple):
     first: ReadyNext | BlockedNext | NoNextWork | NextUnavailable
     wait_targets: frozenset[str]
     later: tuple[WorkItem, ...] = ()
-    plan_complete: bool = False
 
 
 class UnitBoardState(NamedTuple):
@@ -980,17 +970,13 @@ class UnitBoardState(NamedTuple):
     current_work: str = ""
 
     @property
-    def nothing_to_do(self) -> bool:
-        """Readable sources show no current task, merge, hold, or next work."""
-        return (self.readable and not self.has_open and not self.tasks and not self.merge.pending
-                and not self.held and isinstance(self.next_work.first, NoNextWork))
-
-    @property
     def bucket(self) -> str:
         if (any(task.kind in ("running", "own_wait") for task in self.tasks)
                 or self.busy and any(task.kind in ("unexplained", "result") for task in self.tasks)):
             return "working"
-        if self.held or self.nothing_to_do:
+        if self.held or (not self.busy and self.readable and not self.has_open and not self.merge.pending
+                         and not any(task.kind == "unit_wait" for task in self.tasks)
+                         and isinstance(self.next_work.first, NoNextWork)):
             return "idle"
         if any(task.kind == "waiting" for task in self.tasks):
             return "waiting on other work"
@@ -1284,7 +1270,7 @@ def next_work(queue: UnitWorkQueue | UnreadableWorkQueue, record: object, *, ope
     if isinstance(queue, UnreadableWorkQueue):
         empty = "Queue unavailable; next task not recorded"
     return NextWork(tuple(items), pending[0] if pending else NoPlanNext(), empty, first,
-                    frozenset(targets), tuple(pending[1:]), complete)
+                    frozenset(targets), tuple(pending[1:]))
 
 
 
@@ -1342,9 +1328,6 @@ def unit_block(state: UnitBoardState, *, columns: int | None) -> str:
     if (not current and not state.workers_unavailable and pending
             and isinstance(next_item.first, BlockedNext) and state.fallback == next_item.first.reason):
         current.append(pending.pop(0))
-    if state.nothing_to_do:
-        text = "The plan is complete and the queue is empty" if next_item.plan_complete else "No plan or queued work"
-        current = [WorkItem("Nothing to do", text)]
     if not current and not state.workers_unavailable:
         current.append(WorkItem("Not recorded", state.fallback))
     if state.workers_unavailable:
@@ -1356,7 +1339,7 @@ def unit_block(state: UnitBoardState, *, columns: int | None) -> str:
     if pending:
         rows.extend(item_rows("Next", pending[:1]))
         rows.extend(item_rows("Later", pending[1:]))
-    elif not state.nothing_to_do:
+    else:
         rows.extend(item_rows("Next", (WorkItem("Not recorded", next_item.empty),)))
     for label in ("Stopped", "Done"):
         rows.extend((label, entry.work, entry.state_text) for kind, entry in state.past if kind == label)
@@ -1396,7 +1379,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             merge_times[key] = max(merge_times.get(key, at), at)
     events: dict[Path, list[dict[str, object]]] = {}
     plans: dict[Path, list[plan_history.PlanPhase]] = {}
-    plan_failures: dict[Path, OSError | UnicodeError] = {}
+    plan_failures: dict[Path, str] = {}
     queues: dict[staff.StaffId, UnitWorkQueue | UnreadableWorkQueue] = {}
     wait_states: dict[str, waits_on.WaitState] = {}
     main_states: dict[str, bool] = {}
@@ -1413,7 +1396,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                 plans[path] = plan_history.plan_phases(path)
             except (OSError, UnicodeError) as error:
                 plans[path] = []
-                plan_failures[path] = error
+                plan_failures[path] = str(error)
         return plans[path]
 
     def read_queue(identity: staff.StaffId) -> UnitWorkQueue | UnreadableWorkQueue:
@@ -1467,12 +1450,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                     record = fallback_plan(member, run, opened, record, read_plan=read_plan)
                 plan_path = record_fields(record).get("plan", "")
                 if Path(plan_path) in plan_failures:
-                    error = plan_failures[Path(plan_path)]
-                    if (isinstance(error, FileNotFoundError) and isinstance(member.worktree, staff.PresentWorktree)
-                            and local_worktree_exists(member.worktree)):
-                        record = {"plan": plan_path}
-                    else:
-                        record = {**record_fields(record), "unavailable": str(error)}
+                    record = {**record_fields(record), "unavailable": plan_failures[Path(plan_path)]}
                 if isinstance(opened, OpenUnitRun):
                     plan_path = record_fields(record).get("plan", "")
                     built = phase_table.build_run(Path(plan_path), run_events)
@@ -1543,9 +1521,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                        and existing.state_text.startswith(task.state_text) for existing in tasks))
         tasks += tuple(TaskLine(wait.target, unit_wait_state(wait, now=now, zone=zone), "unit_wait")
                        for wait in waits if wait.target not in merge.wait_targets | next_item.wait_targets)
-        open_instances = {phase.instance_id for phase in phases}
-        open_events = [event for event in run_events if event.get("phase_instance_id") in open_instances]
-        fallback = hold or finished_step_text(open_events, now=now, zone=zone)
+        fallback = hold or finished_step_text(run_events, now=now, zone=zone)
         if not hold and isinstance(next_item.first, BlockedNext):
             fallback = next_item.first.reason
         readable = (not isinstance(queue, UnreadableWorkQueue) and "unavailable" not in record_fields(record)
@@ -1586,8 +1562,6 @@ def production_records(doc: Path) -> dict[str, object]:
                 if path not in plans:
                     try:
                         plans[path] = phase_table.build_plan(path, resolver=resolver)
-                    except phase_table.RemovedPlan as error:
-                        plans[path] = {"plan": str(path)} if local_worktree_exists(tree) else {"unavailable": str(error)}
                     except phase_table.NoPlan as error:
                         plans[path] = {"unavailable": str(error)}
                 records[member.name] = plans[path]
@@ -1630,13 +1604,8 @@ def send_anomalies(lines: tuple[str, ...]) -> None:
     if not lines:
         return
     try:
-        settings = conf.read("production")
-        target = settings.text("UNIT_ANOMALIES_TO")
-        repeat_minutes = settings.number("units_anomaly_repeat_minutes")
-        message = "\n".join(lines)
-        key = "unit-anomalies:" + hashlib.sha256(message.encode("utf-8")).hexdigest()[:12]
-        done = subprocess.run(session_send.send_argv("--to", target, "--from", "unit_phases.py", "--text", message,
-                               "--key", key, "--repeat-minutes", f"{repeat_minutes:g}",
+        target = conf.read("production").text("UNIT_ANOMALIES_TO")
+        done = subprocess.run(session_send.send_argv("--to", target, "--from", "unit_phases.py", "--text", "\n".join(lines),
                                send_script=showrunners.SEND),
                               capture_output=True, text=True, check=False)
         if done.returncode:

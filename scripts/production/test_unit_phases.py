@@ -26,12 +26,11 @@ from unittest.mock import Mock, patch
 
 from scripts.production import census, display_cells, land_queue, land_runs, live_units, unit_queue
 from scripts.accounts import session_state
-from scripts.lib import conf, unit_runs
+from scripts.lib import unit_runs
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
 from scripts.message import sessions
 from scripts.production import showrunners
 from scripts.production import unit_lookup
-from scripts.production import session_staff, unit_config
 from scripts.production import waits_on
 from scripts.herdr.herdr import HerdrPlace
 from scripts.production import unit_phases
@@ -275,48 +274,8 @@ class UnitPhasesTests(unittest.TestCase):
                     "| Unit | Director |", "| --- | --- |", f"| namecheck | {status} |", "",
                     "**namecheck** — idle", "",
                     "| Item | Work | State |", "| --- | --- | --- |",
-                    "| Now | Nothing to do | No plan or queued work |"])
-
-    def test_empty_units_are_idle_for_busy_and_idle_directors_without_a_next_row(self) -> None:
-        member = self.member("empty")
-        path = self.write_run(member, "empty", [])
-        cases: tuple[tuple[object, str], ...] = ((None, "No plan or queued work"),
-            ({"phases": []}, "No plan or queued work"),
-            (typed_record(self.root / "plan.md", "done"), "The plan is complete and the queue is empty"))
-        for status in ("busy", "idle"):
-            for record, expected in cases:
-                with self.subTest(status=status, record=record):
-                    with (patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads,
-                          patch.object(unit_queue, "read_items", wraps=unit_queue.read_items) as queues):
-                        rendered = self.blocks([member], {member.name: record}, statuses=[status])
-                    self.assertIn("**empty** — idle", rendered)
-                    self.assertEqual(detail_rows(rendered, member.name), [DetailRow("Now", "Nothing to do", expected)])
-                    self.assertEqual(rendered.splitlines()[0],
-                        "working 0 · waiting to merge 0 · waiting on other work 0 · idle 1 · 1 units")
-                    self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
-                    self.assertEqual(queues.call_count, 1)
-
-    def test_finished_steps_of_closed_phases_do_not_supply_now(self) -> None:
-        member = self.member("closed")
-        at = datetime(2026, 11, 15, 17, 57, tzinfo=UTC).timestamp()
-        for kind in ("pass", "activity"):
-            for queued in (False, True):
-                with self.subTest(kind=kind, queued=queued):
-                    _ = self.write_run(member, "closed", [("closed", "Closed delivery")], [
-                        self.phase_event(kind + "_started", "closed", pass_kind="impl", pass_instance_id="writer",
-                                         activity_instance_id="check", activity_text="Checks the closed delivery"),
-                        self.phase_event(kind + "_finished", "closed", pass_kind="impl", pass_instance_id="writer",
-                                         activity_instance_id="check", activity_text="Checks the closed delivery", timestamp_epoch=at),
-                        self.phase_event("phase_finished", "closed", status="completed")])
-                    _ = self.queue(member, *([unit_queue.QueuedItem("Next delivery")] if queued else []))
-                    rendered = self.blocks([member], {}, statuses=["busy"])
-                    rows = detail_rows(rendered, member.name)
-                    if queued:
-                        self.assertIn(("Now", "Not recorded", "Director's current step not recorded"), rows)
-                        self.assertIn(("Next", "Next delivery", "Ready"), rows)
-                    else:
-                        self.assertEqual(rows, [DetailRow("Now", "Nothing to do", "No plan or queued work")])
-                    self.assertNotIn("finished at", rendered)
+                    "| Now | Not recorded | Director's current step not recorded |",
+                    "| Next | Not recorded | The director has not chosen the next task |"])
 
     def test_top_table_names_the_director_and_keeps_its_status_values(self) -> None:
         member = self.member("director")
@@ -377,8 +336,7 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertEqual(rendered.count("\n\n"), 7)
         self.assertEqual(rendered.count("| Item | Work | State |"), 3)
         self.assertEqual(rendered.count("| Now |"), 3)
-        self.assertEqual(rendered.count("| Now | Nothing to do | No plan or queued work |"), 3)
-        self.assertNotIn("| Next |", rendered)
+        self.assertEqual(rendered.count("| Next |"), 3)
         for field in ("Also", "Wait", "Merge"):
             self.assertNotIn(f"| {field} |", rendered)
         self.assertEqual(unit_phases.table([], {}, census_read=LOCAL).strip(),
@@ -386,17 +344,18 @@ class UnitPhasesTests(unittest.TestCase):
 
     def test_phase_names_the_open_phase_or_where_the_plan_stands(self) -> None:
         member = self.member("plan")
-        cases: list[tuple[object, str, DetailRow, DetailRow | None, tuple[tuple[str, str], ...], unit_phases.PlanSource]] = [
+        cases: list[tuple[object, str, DetailRow, DetailRow, tuple[tuple[str, str], ...], unit_phases.PlanSource]] = [
             (typed_record(self.root / "plan.md", "done", "todo", "todo"), "unknown",
              DetailRow("Now", "Not recorded", "Director's current step not recorded"),
              DetailRow("Next", "Delivery 2 (2)", "Not started"), (), unit_phases.PlanSource.READABLE),
             (typed_record(self.root / "plan.md", "done"), "idle",
-             DetailRow("Now", "Nothing to do", "The plan is complete and the queue is empty"),
-             None, (), unit_phases.PlanSource.READABLE),
+             DetailRow("Now", "Not recorded", "Director's current step not recorded"),
+             DetailRow("Next", "Not recorded", "Nothing queued; the plan is complete"), (), unit_phases.PlanSource.READABLE),
             ({"current": None, "phases": []}, "idle",
-             DetailRow("Now", "Nothing to do", "No plan or queued work"), None, (), unit_phases.PlanSource.EMPTY),
-            (None, "idle", DetailRow("Now", "Nothing to do", "No plan or queued work"),
-             None, (), unit_phases.PlanSource.ABSENT),
+             DetailRow("Now", "Not recorded", "Director's current step not recorded"),
+             DetailRow("Next", "Not recorded", "The director has not chosen the next task"), (), unit_phases.PlanSource.EMPTY),
+            (None, "idle", DetailRow("Now", "Not recorded", "Director's current step not recorded"),
+             DetailRow("Next", "Not recorded", "The director has not chosen the next task"), (), unit_phases.PlanSource.ABSENT),
             ({"unavailable": "plan unreadable"}, "unknown",
              DetailRow("Now", "Not recorded", "Director's current step not recorded"),
              DetailRow("Next", "Not recorded", "The director has not chosen the next task"), (), unit_phases.PlanSource.UNAVAILABLE),
@@ -420,93 +379,13 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertIn(f"**plan** — {bucket}", rendered)
                 rows = detail_rows(rendered, "plan")
                 self.assertIn(now, rows)
-                if next_text is None:
-                    self.assertEqual(rows, [now])
-                else:
-                    self.assertIn(next_text, rows)
+                self.assertIn(next_text, rows)
                 self.assertEqual(len(seen), 1)
                 self.assertEqual(seen[0].plan_source, source)
                 if isinstance(record, phase_table.PhaseRecord) and len(record.phases) == 3:
                     self.assertIn(("Later", "Delivery 3 (3)", "Not started"), rows)
                 if source != unit_phases.PlanSource.READABLE:
                     self.assertNotIn("Nothing queued", rendered)
-
-    def test_configured_missing_plans_are_absent_only_in_existing_local_worktrees(self) -> None:
-        owner = fixture_member("showrunner", name="sdlc")
-        config = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plan.md")), unit_config.NoAppPort(), ())
-        cases: tuple[tuple[str, str, bool, OSError | UnicodeError], ...] = (
-            ("removed", "natedev", True, FileNotFoundError("plan removed")),
-            ("missing-tree", "natedev", False, FileNotFoundError("worktree missing")),
-            ("remote-tree", "mac", True, FileNotFoundError("remote plan unreadable here")),
-            ("permission", "natedev", True, PermissionError("plan denied")),
-            ("read-error", "natedev", True, OSError("plan read failed")),
-            ("encoding", "natedev", True, UnicodeError("plan encoding failed")),
-        )
-        for name, machine, exists, error in cases:
-            with self.subTest(name=name):
-                tree = self.root / name
-                if exists:
-                    tree.mkdir()
-                member = fixture_member("unit", name=name, parent=owner.id,
-                    worktree=staff.PresentWorktree(machine, tree))
-                with (patch.object(unit_lookup, "doc_units", return_value=[member]),
-                      patch.object(session_staff.RowResolver, "unit_config", return_value=config),
-                      patch.object(plan_history, "plan_phases", side_effect=error) as read):
-                    records = unit_phases.production_records(self.root / "production.md")
-                read.assert_called_once_with(tree / "docs/plan.md")
-                absent = name == "removed"
-                self.assertEqual(unit_phases.task_facts(records[name], ()).plan_source,
-                                 unit_phases.PlanSource.ABSENT if absent else unit_phases.PlanSource.UNAVAILABLE)
-                rendered = self.blocks([member], records, statuses=["busy"])
-                label = f" ({machine})" if machine != "natedev" else ""
-                self.assertIn(f"**{name}**{label} — {'idle' if absent else 'unknown'}", rendered)
-                if absent:
-                    self.assertEqual(detail_rows(rendered, name),
-                        [DetailRow("Now", "Nothing to do", "No plan or queued work")])
-                else:
-                    self.assertNotIn("Nothing to do", rendered)
-                    self.assertIn("unavailable", unit_phases.record_fields(records[name]))
-
-    def test_fallback_missing_plans_are_absent_only_in_existing_local_worktrees(self) -> None:
-        owner = fixture_member("showrunner", name="sdlc")
-        original_facts = unit_phases.task_facts
-        cases: tuple[tuple[str, str, bool, OSError | UnicodeError], ...] = (
-            ("removed", "natedev", True, FileNotFoundError("plan removed")),
-            ("missing-tree", "natedev", False, FileNotFoundError("worktree missing")),
-            ("remote-tree", "mac", True, FileNotFoundError("remote plan unreadable here")),
-            ("permission", "natedev", True, PermissionError("plan denied")),
-            ("read-error", "natedev", True, OSError("plan read failed")),
-            ("encoding", "natedev", True, UnicodeError("plan encoding failed")),
-        )
-        for name, machine, exists, error in cases:
-            with self.subTest(name=name):
-                tree = self.root / name
-                if exists:
-                    tree.mkdir()
-                member = fixture_member("unit", name=name, parent=owner.id,
-                    worktree=staff.PresentWorktree(machine, tree))
-                _ = self.write_run(member, name, (), plan="docs/plan.md")
-                sources: list[unit_phases.PlanSource] = []
-
-                def facts(record: object, events: Sequence[dict[str, object]]) -> unit_phases.UnitTaskFacts:
-                    found = original_facts(record, events)
-                    sources.append(found.plan_source)
-                    return found
-
-                with (patch.object(plan_history, "plan_phases", side_effect=error) as read,
-                      patch.object(unit_phases, "task_facts", side_effect=facts)):
-                    rendered = self.blocks([member], {name: {"unavailable": "configured plan unavailable"}},
-                                           statuses=["busy"])
-                read.assert_called_once_with(tree / "docs/plan.md")
-                absent = name == "removed"
-                self.assertEqual(sources, [unit_phases.PlanSource.ABSENT if absent else unit_phases.PlanSource.UNAVAILABLE])
-                label = f" ({machine})" if machine != "natedev" else ""
-                self.assertIn(f"**{name}**{label} — {'idle' if absent else 'unknown'}", rendered)
-                if absent:
-                    self.assertEqual(detail_rows(rendered, name),
-                        [DetailRow("Now", "Nothing to do", "No plan or queued work")])
-                else:
-                    self.assertNotIn("Nothing to do", rendered)
 
     def test_workers_join_the_open_pass_by_id_before_assignment(self) -> None:
         member = self.member("roles")
@@ -1806,7 +1685,7 @@ class UnitPhasesTests(unittest.TestCase):
                     self.assertIn("**holds** — idle", rendered)
                     self.assertIn(("Now", "Not recorded", expected), detail_rows(rendered, "holds"))
         rendered = self.blocks([member], {}, statuses=["busy"])
-        self.assertIn(("Now", "Nothing to do", "No plan or queued work"),
+        self.assertIn(("Now", "Not recorded", "Director's current step not recorded"),
                       detail_rows(rendered, "holds"))
         from scripts.whoami import quota_state
         with patch.object(quota_state, "no_worker_mode", return_value=True):
@@ -1822,7 +1701,6 @@ class UnitPhasesTests(unittest.TestCase):
             rendered = self.blocks([member, other], {})
         self.assertIn("**unreadable** — unknown", rendered)
         self.assertIn(("Next", "Not recorded", "Queue unavailable; next task not recorded"), detail_rows(rendered, "unreadable"))
-        self.assertNotIn("Nothing to do", [row.work for row in detail_rows(rendered, "unreadable")])
         self.assertIn("**other** — idle", rendered)
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertIn(str(path), errors.getvalue())
@@ -1850,7 +1728,7 @@ class UnitPhasesTests(unittest.TestCase):
 
         initial = render()
         self.assertIn("**first** — idle", initial)
-        self.assertIn(("Now", "Nothing to do", "No plan or queued work"), detail_rows(initial, "first"))
+        self.assertIn(("Now", "Not recorded", "Director's current step not recorded"), detail_rows(initial, "first"))
         _ = staff.pause(second.id, "review the change")
         paused = render()
         self.assertIn("**first** — idle", paused)
@@ -1924,43 +1802,7 @@ class UnitPhasesTests(unittest.TestCase):
     def test_failed_anomaly_send_keeps_the_table_and_exit_code_and_adds_one_line(self) -> None:
         self.assert_anomaly_delivery(send_code=1)
 
-    def test_skipped_anomaly_send_keeps_the_table_and_exit_code_without_an_extra_line(self) -> None:
-        self.assert_anomaly_delivery(send_code=0, send_output="SKIPPED: repeat window")
-
-    def test_anomaly_keys_follow_the_joined_text_and_use_the_configured_window(self) -> None:
-        config = self.root / "table-conf/production.conf"
-        _ = config.write_text(config.read_text().replace("units_anomaly_repeat_minutes=60",
-                                                       "units_anomaly_repeat_minutes=2.5"))
-        messages = (("anomaly: census took longer than 10 s", "anomaly: café unreadable"),
-                    ("anomaly: census took longer than 10 s", "anomaly: café unreadable"),
-                    ("anomaly: census took longer than 11 s", "anomaly: café unreadable"))
-        sender = Mock(return_value=subprocess.CompletedProcess(["send.py"], 0, "SKIPPED: repeat window", ""))
-        output = io.StringIO()
-        with (patch.object(unit_phases, "subprocess", SimpleNamespace(run=sender)), contextlib.redirect_stdout(output)):
-            for message in messages:
-                unit_phases.send_anomalies(message)
-        self.assertEqual(sender.call_count, 3)
-        keys: list[str] = []
-        for call, message in zip(sender.call_args_list, messages, strict=True):
-            command = cast(list[str], call.args[0])
-            keys.append(command[command.index("--key") + 1])
-            self.assertEqual(command[command.index("--text") + 1], "\n".join(message))
-            self.assertEqual(command[command.index("--repeat-minutes") + 1], "2.5")
-        self.assertEqual(keys, ["unit-anomalies:b488aba285f2", "unit-anomalies:b488aba285f2",
-                               "unit-anomalies:7d046a634ca9"])
-        self.assertEqual(output.getvalue(), "")
-
-    def test_unreadable_anomaly_repeat_key_reports_one_line_without_a_send(self) -> None:
-        sender = Mock()
-        output = io.StringIO()
-        with (patch.object(conf.ConfigRead, "number", side_effect=conf.Unusable("repeat setting unavailable")) as number,
-              patch.object(unit_phases, "subprocess", SimpleNamespace(run=sender)), contextlib.redirect_stdout(output)):
-            unit_phases.send_anomalies(("anomaly: census unavailable",))
-        number.assert_called_once_with("units_anomaly_repeat_minutes")
-        sender.assert_not_called()
-        self.assertEqual(output.getvalue(), "anomaly: could not send unit anomalies: repeat setting unavailable\n")
-
-    def assert_anomaly_delivery(self, *, send_code: int, send_output: str = "") -> None:
+    def assert_anomaly_delivery(self, *, send_code: int) -> None:
         from scripts.production import session_staff
 
         doc = self.root / "production.md"
@@ -1980,7 +1822,7 @@ class UnitPhasesTests(unittest.TestCase):
 
         output, errors = io.StringIO(), io.StringIO()
         sender = Mock(return_value=subprocess.CompletedProcess(
-            ["send.py"], send_code, "fixture delivery detail" if send_code else send_output,
+            ["send.py"], send_code, "fixture delivery detail" if send_code else "",
             "fixture send failed\nfixture failure detail" if send_code else ""))
         with (patch.dict(os.environ, {"CONF_DIR": str(config)}),
               patch.object(unit_lookup, "observed_session_labels", side_effect=observed),
@@ -1997,7 +1839,8 @@ class UnitPhasesTests(unittest.TestCase):
             "| Unit | Director |", "| --- | --- |", "| member | exited |", "",
             "**member** — idle", "",
             "| Item | Work | State |", "| --- | --- | --- |",
-            "| Now | Nothing to do | No plan or queued work |",
+            "| Now | Not recorded | Director's current step not recorded |",
+            "| Next | Not recorded | The director has not chosen the next task |",
         ])
         anomalies = [line for line in lines if line.startswith("anomaly:")
                      and ("unread-codex" in line or "unread-claude" in line)]
@@ -2012,8 +1855,6 @@ class UnitPhasesTests(unittest.TestCase):
         assert call is not None
         command = cast(list[str], call.args[0])
         self.assertEqual(command[command.index("--to") + 1], "fixture-director")
-        self.assertRegex(command[command.index("--key") + 1], r"^unit-anomalies:[0-9a-f]{12}$")
-        self.assertEqual(command[command.index("--repeat-minutes") + 1], "60")
         message = command[command.index("--text") + 1]
         for line in anomalies:
             self.assertIn(line, message)
@@ -2290,7 +2131,8 @@ class UnitPhasesTests(unittest.TestCase):
                     "working 0 · waiting to merge 0 · waiting on other work 0 · idle 1 · 1 units\n\n"
                     + "| Unit | Director |\n| --- | --- |\n| a | idle |\n\n"
                     + "**a** — idle\n\n| Item | Work | State |\n| --- | --- | --- |\n"
-                    + "| Now | Nothing to do | No plan or queued work |\n")
+                    + "| Now | Not recorded | Director's current step not recorded |\n"
+                    + "| Next | Not recorded | The director has not chosen the next task |\n")
 
                 unordered = [unit("zulu", live("zulu"))._replace(machine="natedev"),
                              unit("Beta", live("Beta"))._replace(machine="mac"),

@@ -19,6 +19,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -37,7 +38,6 @@ from scripts.mac_test import claim_state
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue.queue_fixture import blocking_slot, fixture_reservation, write_process, write_scope
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
-from scripts.lib import build_folders
 from scripts.lib.socket_test_support import short_socket_directory
 
 NOW = datetime(2026, 10, 31, 12, tzinfo=UTC).timestamp()
@@ -355,14 +355,12 @@ class AdmissionFixture(ExitStack):
             raise unittest.SkipTest("admission service needs Linux pidfd and cgroup v2")
         if configuration := os.environ.get("CONF_DIR"):
             _ = config_environment(Path(configuration))
-        self.root: Path = root if root is not None else self.enter_context(
-            build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-                prefix=build_folders.FOLDER_PREFIXES["admit-test"])))
+        self.root: Path = root if root is not None else Path(self.enter_context(tempfile.TemporaryDirectory()))
         self.temporary: Path = self.root / "tmp"
         self.temporary.mkdir(parents=True, exist_ok=True)
         # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
         self.socket_dir: Path = Path(self.enter_context(
-            short_socket_directory(build_folders.FOLDER_PREFIXES["admit-sock"])))
+            short_socket_directory()))
         self.state_dir: Path = (log_dir if log_dir is not None else self.root / "log") / "admission"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.socket_path: Path = self.socket_dir / "admission.sock"
@@ -859,7 +857,7 @@ def queue_decision(available: int, total: int | records.UnknownHostTotal, need: 
     slots = () if reservations else (blocking_slot(NOW),)
     row: records.Waiter = {"pid": 1000, "start_time": "1000", "need": need, "since": NOW}
     inputs = records.QueueInputs([(Path("1000.waiting"), row)], tuple(steps), tuple(reservations),
-        records.HostMemory(available, total), pressure, records.ReadyToStart(), records.NoHeadAdmissionOverride(), NOW, slots=slots)
+        records.HostMemory(available, total), pressure, records.ReadyToStart(), NOW, slots=slots)
     return gate.admission_pass(inputs, NOW, policy).rows[0].decision
 
 

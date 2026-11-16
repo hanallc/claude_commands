@@ -21,12 +21,14 @@ Platform = Literal["linux", "macos"]
 
 @dataclass(frozen=True)
 class LocalTarget:
+    """The local target holds its name and platform."""
     name: str
     platform: Platform
 
 
 @dataclass(frozen=True)
 class SshTarget:
+    """The SSH target holds its name, platform, and settings path."""
     name: str
     platform: Platform
     settings: Path
@@ -42,6 +44,7 @@ class AnyEligibleTarget:
 
 @dataclass(frozen=True)
 class LocalRequired:
+    """The reason requires local execution."""
     reason: str
 
 
@@ -70,8 +73,10 @@ StepRoute = AnyEligibleTarget | LocalRequired | MacOnly | PinnedTarget
 MAC_ONLY = MacOnly()
 
 
-def step_route(*, local: bool, mac_only: bool, target: str, writes_tree: bool) -> StepRoute:
+def step_route(*, local: bool, mac_only: bool, target: str, writes_tree: bool, local_reason: str = "") -> StepRoute:
     """Apply the placement client's order: tree writes and --local stay on natedev, then --mac-only, then a pin."""
+    if local_reason:
+        return LocalRequired(local_reason)
     if writes_tree:
         return WRITES_TREE
     if local:
@@ -85,11 +90,13 @@ def step_route(*, local: bool, mac_only: bool, target: str, writes_tree: bool) -
 
 @dataclass(frozen=True)
 class EligibleTarget:
+    """This target is eligible for execution."""
     target: Target
 
 
 @dataclass(frozen=True)
 class ExcludedTarget:
+    """The target is excluded for this reason."""
     target: Target
     reason: str
 
