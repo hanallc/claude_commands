@@ -493,13 +493,6 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
     )
 
 
-SESSION_ROOTS = tuple(
-    Path(root)
-    for root in (os.environ.get("PROGRESS_SESSION_ROOTS") or "/tmp/claude/unit:/tmp/claude/delegate").split(":")
-    if root
-)
-
-
 def move_run(_history_file: Path, _old: Path, _new: Path, _new_branch: str) -> list[Path]:
     """Staff supplies the current folder; historical records remain unchanged."""
     return []

@@ -1071,7 +1071,7 @@ assert not loaded, loaded
             former_run = self.root / f"delegate-{index}"
             with (mock.patch.dict(os.environ, {copy_record.ROOT_ENV: str(scratch_root),
                                                copy_record.COPIES_ENV: str(copies_root)}),
-                  mock.patch.object(unit_runs, "run_roots", return_value=(current_run, former_run))):
+                  mock.patch.object(unit_runs, "new_run_root", return_value=current_run)):
                 parents = (folders.ExplicitBuildParent(copy_record.root()),
                            folders.ExplicitBuildParent(copy_record.copies_root()), folders.UnitRunParent())
                 for parent, expected in zip(parents, (scratch_root, copies_root, current_run), strict=True):

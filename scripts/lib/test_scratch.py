@@ -23,7 +23,7 @@ from unittest import mock
 
 from scripts.copies import copies
 from scripts.production.cli_fixture import ImmutableGitSeed
-from scripts.lib import build_folders, cargo_output, copy_record, scratch
+from scripts.lib import build_folders, cargo_output, copy_record, scratch, session_folder
 from scripts.lint import sweep
 
 from scripts.lib import conf
@@ -56,7 +56,9 @@ class ScratchTests(unittest.TestCase):
             "HOME": str(self.base),
             copy_record.ROOT_ENV: str(self.base / "scratch"), scratch.VISIBLE_ROOT_ENV: str(self.base / "repro"),
             scratch.HOLDS_ENV: str(self.base / "holds.json"), copy_record.COPIES_ENV: str(self.base / "copies"),
-            "CODEX_THREAD_ID": MAKER_ID, "STAFF_FILE": str(self.base / "staff.json")}))
+            "CODEX_THREAD_ID": MAKER_ID, "STAFF_FILE": str(self.base / "staff.json"),
+            # An absent session root: a run without the test-run folder must not reach the live root.
+            session_folder.ROOT_ENV: str(self.base / "session")}))
         _ = staff.ensure("showrunner", name="maker", runtime_id=MAKER_ID)
         def registered_plan(unit: str) -> Path:
             return self.base / "registered-plans" / f"{unit}.md"
@@ -90,6 +92,35 @@ class ScratchTests(unittest.TestCase):
         scratch.register_copy(path, task=task, owner_unit="maker", source_path=str(path),
                               source_commit="a" * 40, copy_commit="b" * 40, target_mode="none",
                               seed_source="", borrows_from="", **details)
+
+    def test_a_callers_folder_goes_in_its_session_folder_and_its_task_ends_it(self) -> None:
+        sessions = self.base / "session"
+        sessions.mkdir()
+        self.enterContext(mock.patch.dict(os.environ, {session_folder.ROOT_ENV: str(sessions)}))
+        folder = sessions / "maker"
+        (folder / session_folder.RUN).mkdir(parents=True)
+        shot = scratch.new("gate:shot", "center-shot")
+        second = scratch.new("gate:shot", "center-shot")
+        unnamed = scratch.new("phase:maker/21")
+        taken = scratch.new("gate:shot", session_folder.RUN)
+        until = scratch.new(word="hana-shot-15751")
+        loose = self.base / "loose"
+        loose.mkdir()
+        adopted = scratch.adopt(loose, "gate:shot", "adopted")
+        self.assertEqual(session_folder.folder_for(sessions, MAKER_ID), folder)
+        self.assertEqual([shot, second, unnamed, taken, until, adopted],
+                         [folder / "center-shot", folder / "center-shot-2", folder / "phase-maker-21",
+                          folder / "run-2", folder / "hana-shot-15751", folder / "adopted"])
+        held = scratch.holds()
+        self.assertEqual({path: hold["task"] for path, hold in held.items()}, {
+            str(shot): "gate:shot", str(second): "gate:shot", str(unnamed): "phase:maker/21",
+            str(taken): "gate:shot", str(adopted): "gate:shot"})
+        self.assertEqual(sorted(scratch.end("gate:shot")), sorted([shot, second, taken, adopted]))
+        self.assertEqual(sorted(path.name for path in folder.iterdir()),
+                         [".session.json", "hana-shot-15751", "phase-maker-21", session_folder.RUN])
+        self.assertEqual(list(scratch.holds()), [str(unnamed)])
+        self.assertEqual(scratch.new("gate:other", visible=False).parent, folder)
+        self.assertFalse((self.base / "scratch").exists())
 
     def test_checkout_removal_saves_outputs_before_source_deletion_and_keeps_retry_evidence(self) -> None:
         checkout = self.base / "cargo-checkout"
