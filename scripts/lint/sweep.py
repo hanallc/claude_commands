@@ -5093,6 +5093,12 @@ def main(argv: list[str]) -> int:
         print(f"lint sweep: {error}", file=sys.stderr)
         return 2
     recent_minutes = recent_seconds / 60
+    if target_dir is not None:
+        if floor_only:
+            print(f"lint sweep: {TARGET_DIR_FLAG} does not go with {FLOOR_ONLY_FLAG}", file=sys.stderr)
+            return 2
+        # A CI runner hook sweeps its own target folder as the runner account. natedev's timer holds the floor.
+        return sweep_workspace(target_dir, settings_read, dry_run, recent_minutes, lint_settings=settings_read)
     if floor is None and floor_key is not None:
         print(f"lint sweep: {floor_key} in {config} must be a non-negative number of GiB", file=sys.stderr)
         return 2
@@ -5109,18 +5115,22 @@ def main(argv: list[str]) -> int:
 def report_assessment(run: Callable[[], tmp_sweep.SweepAssessment], scope: SweepFailureScope,
                       dry_run: bool, lint_settings: conf.ConfigRead) -> int:
     """Assess one scope and report its failure episode."""
-    from scripts.lint import tmp_sweep
-
-    detail = ""
-    try:
-        assessment = run()
-    except (conf.Unusable, OSError) as error:
-        detail = str(error)
-        print(f"lint sweep: {scope.label}: {error}", file=sys.stderr)
-        assessment = tmp_sweep.CompletedSweepAssessment(1)
+    assessment, detail = assess_scope(run, scope)
     if not dry_run:
         notify_floor_problem(assessment, lint_settings=lint_settings, detail=detail, scope=scope)
     return assessment.status
+
+
+def assess_scope(run: Callable[[], tmp_sweep.SweepAssessment],
+                 scope: SweepFailureScope) -> tuple[tmp_sweep.SweepAssessment, str]:
+    """Assess one scope; a failure prints and gives status 1 with its detail."""
+    from scripts.lint import tmp_sweep
+
+    try:
+        return run(), ""
+    except (conf.Unusable, OSError) as error:
+        print(f"lint sweep: {scope.label}: {error}", file=sys.stderr)
+        return tmp_sweep.CompletedSweepAssessment(1), str(error)
 
 
 def sweep_workspace(target_dir: str | None, budget_config: conf.ConfigRead, dry_run: bool,
@@ -5149,7 +5159,11 @@ def sweep_workspace(target_dir: str | None, budget_config: conf.ConfigRead, dry_
                     except OSError:
                         pass
             return _sweep_workspace(roots, budget_config, dry_run, recent_minutes, repo, lint_settings=lint_settings)
-        return report_assessment(assess, WorkspaceFailureScope(tuple(sorted(roots))), dry_run, lint_settings)
+        scope = WorkspaceFailureScope(tuple(sorted(roots)))
+        if target_dir is not None:
+            # A named target folder belongs to a CI runner: a failure prints to its job log, with no notice.
+            return assess_scope(assess, scope)[0].status
+        return report_assessment(assess, scope, dry_run, lint_settings)
     finally:
         OUTPUT_ROOTS.reset(token)
 
