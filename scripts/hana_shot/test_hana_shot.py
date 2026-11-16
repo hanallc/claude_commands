@@ -1035,7 +1035,7 @@ class LaunchRecordRecoveryTests(HanaShotTest):
             state, _ = hana_shot.launch(self.port, str(self.root), str(self.executable), purpose=LAUNCH_RECORDING_PURPOSE, owner=owner)
         return state
 
-    def app_record(self, port: int, *, live: bool) -> None:
+    def app_record(self, port: int, *, live: bool, binary: str = "sleep") -> None:
         """Save a launch record for another port; a live record names a running process."""
         process = subprocess.Popen(["sleep", "300"], stdin=subprocess.DEVNULL)
         if live:
@@ -1045,7 +1045,7 @@ class LaunchRecordRecoveryTests(HanaShotTest):
             process.kill()
             _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
         _ = (self.state_path.parent / f"{port}.json").write_text(json.dumps({
-            "pid": process.pid, "port": port, "binary": "sleep",
+            "pid": process.pid, "port": port, "binary": binary,
             "log": str(self.scratch / f"{port}.log"), "scratch": str(self.scratch / f"{port}-scratch"),
         }))
 
@@ -1080,6 +1080,13 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         state = self.launch_without_starting_hana(owner="cap-test")
         self.assertEqual(state["pid"], 424242)
         self.assertEqual(hana_shot.live_launch_count(self.state_path.parent), 1)
+
+    def test_record_whose_pid_runs_another_program_does_not_count_toward_the_local_app_cap(self) -> None:
+        self.app_record(self.port + 1, live=True)
+        self.app_record(self.port + 2, live=True, binary=str(self.scratch / "hana"))
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform), mock.patch.object(sys, "platform", platform):
+                self.assertEqual(hana_shot.live_launch_count(self.state_path.parent), 1)
 
     def test_explicit_launch_owner_takes_precedence_over_the_callers_unit(self) -> None:
         self.stop_fake_listener()

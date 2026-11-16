@@ -2344,10 +2344,16 @@ def process_alive(pid: int) -> bool:
 
 
 def same_binary(pid: int, binary: str) -> bool:
-    cmdline = Path(f"/proc/{pid}/cmdline")
-    if not cmdline.exists():
-        return sys.platform == "darwin"
-    return binary.encode() in cmdline.read_bytes()
+    """Whether pid still runs the recorded binary; a process that exits during the read does not."""
+    if sys.platform == "darwin":
+        listing = subprocess.run(
+            ["ps", "-ww", "-p", str(pid), "-o", "command="], capture_output=True, text=True, check=False,
+        )
+        return listing.returncode == 0 and binary in listing.stdout
+    try:
+        return binary.encode() in Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
 
 
 def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
