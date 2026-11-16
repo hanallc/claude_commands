@@ -4432,3 +4432,15 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The settings test keeps real settings parsing and placement; only `run_offload` is replaced. The byte-count cases keep the real `capture_copy` parsing and `persist_attempt`, with mocked child processes.
 - Paired module_cost in one copy, 3 rounds after a warm-up (natedev, loaded): 31.4 / 40.2 / 34.9 CPU s before, 21.0 / 19.3 / 18.8 after; about 300 fewer processes per run.
 - Commit abc3df056.
+
+### Phase 312 — verify.sh lint fails on every misformatted TOML file that CI's taplo step checks  · status: done
+**Depends on:** Phase 311
+**Owner:** natest (builds assigned it on 11-15 at 23:47 EST; a small fix, off the critical path).
+
+#### As-built
+
+- `workspace_taplo` runs from the repository top level, as CI's `taplo fmt --check` does. It lists tracked TOML files, so a file in a dot folder outside the crates is checked.
+- The held lint path formats TOML into the copy, returns the copy, then runs `workspace_taplo --check` on the worktree. A withheld or still-misformatted file fails lint and is named.
+- The ordinary lint path checks only, as before.
+- `test_verify_lint_taplo` checks each lint path with a misformatted `.claude/config/release.toml`.
+- Commit 27e978424.

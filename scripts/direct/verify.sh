@@ -1114,7 +1114,7 @@ require_taplo() {
 
 workspace_taplo() (
     # Explicit paths retain Taplo's include/exclude rules and omit untracked files.
-    cd "$WORKSPACE_ROOT" || return
+    cd "$(git rev-parse --show-toplevel)" || return
     local listing file pattern character index
     local -a files=()
     listing="$(mktemp)" || return
@@ -1137,11 +1137,9 @@ workspace_taplo() (
     rm -f "$listing"
     # No paths means a repository scan to Taplo, so skip the empty set.
     (( ${#files[@]} )) || return 0
-    # During a copy pass Taplo writes the copy; the same relative paths name its files.
-    if [[ -n "${LINT_COPY_TREE:-}" ]]; then
-        local prefix
-        prefix="$(git rev-parse --show-prefix)" || return
-        cd "$LINT_COPY_TREE/$prefix" || return
+    # Format the copy, but judge the worktree that CI will receive.
+    if [[ -n "${LINT_COPY_TREE:-}" && "${1:-}" != --check ]]; then
+        cd "$LINT_COPY_TREE" || return
     fi
     local status=0
     run taplo fmt "$@" -- "${files[@]}" || status=$?
@@ -4105,6 +4103,7 @@ run_lint_held_sequence() {
     lint_rewrite fmt_cargo --all
     workspace_taplo
     lint_copy_return || exit 1
+    workspace_taplo --check || exit "$?"
     lint_status=0
     if lint_config_enabled mend; then
         local mend_status=0
@@ -4271,12 +4270,9 @@ run_lint_sequence() {
     if [[ -n "${RUN_LOG}" ]]; then
         set_verdict_keys
     fi
-    # Cargo's workspace root can differ from the caller's directory.
-    # Run there so Taplo uses the same config and scope as the push gate.
+    # Taplo checks the repository with its top-level config, as CI does.
     load_metadata
-    TAPLO_ARGS=(--check)
-    if [[ "$HOLD_LINT" == 1 ]]; then TAPLO_ARGS=(); fi
-    if workspace_taplo ${TAPLO_ARGS[@]+"${TAPLO_ARGS[@]}"}; then
+    if workspace_taplo --check; then
         :
     else
         taplo_status=$?
