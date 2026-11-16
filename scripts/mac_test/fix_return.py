@@ -304,10 +304,18 @@ BoardReader = Callable[[Path], berth_board.Board | berth_board.BoardUnavailable]
 
 
 def read_board(repo_root: Path) -> berth_board.Board | berth_board.BoardUnavailable:
-    """Read the reservations. A host without cargo-berth has an unconfigured board."""
+    """Read the reservations. A host without cargo-berth has an unconfigured board.
+
+    A repository with no cargo-berth ledger, such as a copies.py clone, also has
+    an unconfigured board. No reservation can hold a path there, so the fix pass
+    writes the worktree in place.
+    """
     if shutil.which("cargo-berth") is None:
         return berth_board.Board((), configured=False)
-    return berth_board.read_board(repo_root)
+    board = berth_board.read_board(repo_root)
+    if isinstance(board, berth_board.BoardUnavailable) and board.ledger_missing:
+        return berth_board.Board((), configured=False)
+    return board
 
 
 def hold_filter(repo_root: Path, changes: MirrorChanges,
@@ -407,7 +415,7 @@ class CopyMade:
 
 @dataclass(frozen=True)
 class InPlace:
-    """cargo-berth does not configure the repository, so the fix pass writes the worktree."""
+    """cargo-berth does not configure the repository, or it has no ledger, so the fix pass writes the worktree."""
 
 
 def listed_files(repo_root: Path) -> list[str]:
