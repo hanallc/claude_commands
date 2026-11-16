@@ -8,6 +8,7 @@ libc       = "=0.2.191"
 rayon      = "=1.11.0"
 serde      = "=1.0.228"
 serde_json = "=1.0.149"
+sha2       = "=0.10.9"
 tempfile   = "=3.27.0"
 thiserror  = "=2.0.18"
 

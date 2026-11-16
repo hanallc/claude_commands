@@ -31,6 +31,7 @@ from typing import cast
 from scripts.lib import conf
 from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import queue_place as shell_place
+from scripts.build_targets import target_config
 from scripts.build_queue import admission_records as records, admission_service as service, step_estimator
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
 from scripts.build_queue.admission_test_support import (
@@ -116,19 +117,24 @@ class ClientTests(unittest.TestCase):
                 fixture.release(occupied)
 
     def test_wait_lines_name_the_head_and_identify_the_current_build(self) -> None:
-        for position, label, expected in (
-            (2, "hana CI · hana-linux-2 · test", "head hana CI · hana-linux-2 · test needs 12.3 GiB"),
-            (2, "compiler · check", "head compiler · check needs 12.3 GiB"),
-            (2, "hana · test", "head hana · test needs 12.3 GiB"),
-            (2, "42 · test", "head 42 · test needs 12.3 GiB"),
-            (1, "hana CI · hana-linux-2 · test", "this build is the queue head"),
+        for position, label, expected, reason in (
+            (2, "hana CI · hana-linux-2 · test", "head hana CI · hana-linux-2 · test needs 12.3 GiB", ""),
+            (2, "compiler · check", "head compiler · check needs 12.3 GiB", ""),
+            (2, "hana · test", "head hana · test needs 12.3 GiB", ""),
+            (2, "42 · test", "head 42 · test needs 12.3 GiB", ""),
+            (1, "hana CI · hana-linux-2 · test", "this build is the queue head", ""),
+            (1, "hana · test", "this build is the queue head", "it edits the merged checkout"),
         ):
             with self.subTest(position=position, label=label), AdmissionFixture() as fixture:
                 waiting = replace(WAIT, position=position, head=label,
                     snapshot=replace(WAIT.snapshot, head_need=int(12.3 * GIB), head_label=label))
                 with mock.patch.object(client, "CLOCK", fixture.clock), redirect_stderr(io.StringIO()) as output:
-                    client.WaitOutput()(waiting)
+                    client.WaitOutput(local_reason=reason)(waiting)
                 self.assertIn(expected, output.getvalue())
+                if reason:
+                    self.assertIn(f"runs on natedev: {reason}", output.getvalue())
+                else:
+                    self.assertNotIn("runs on natedev:", output.getvalue())
                 self.assertNotIn("head  needs", output.getvalue())
                 if position == 1:
                     self.assertNotIn(f"head {label} needs", output.getvalue())
@@ -728,11 +734,14 @@ class ClientTests(unittest.TestCase):
     def test_unit_override_uses_the_shared_request_identity(self) -> None:
         with AdmissionFixture() as fixture:
             original = fixture.request()
-            for unit in ("queue-unit", ""):
-                with self.subTest(unit=unit), mock.patch.dict(os.environ, {records.BUILDLOG_UNIT: unit}):
+            for unit, reason in (("queue-unit", ""), ("", ""),
+                                 ("queue-unit", "it edits the merged checkout")):
+                with self.subTest(unit=unit, reason=reason), mock.patch.dict(os.environ,
+                        {records.BUILDLOG_UNIT: unit, "BUILD_QUEUE_LOCAL_REASON": reason}):
                     request = client.step_request(list(original.argv), original.cwd, original.owner,
                         original.since, original.sidecar, original.episode, original.profile)
                     self.assertEqual(request.identity.unit, unit)
+                    self.assertEqual(request.route, target_config.LocalRequired(reason) if reason else records.DIRECT_CARGO)
                     launch = wire.LaunchRequest(request.episode, request.owner, request.since,
                                                 request.identity, request.profile)
                     self.assertEqual(launch.identity.unit, unit)
@@ -1697,6 +1706,39 @@ class ClientTests(unittest.TestCase):
                 with mock.patch.object(sys, "argv", argv), redirect_stderr(io.StringIO()) as output:
                     self.assertEqual(client.main(), 2)
                 self.assertIn("admission service unavailable: no socket", output.getvalue())
+                self.doCleanups()
+
+    def test_placement_status_waits_for_slow_answers_and_refuses_dead_services(self) -> None:
+        # The Mac gate reads this on each cargo call; a busy service must not refuse the step.
+        from scripts.build_queue import admission_wire as status_wire
+
+        unknown = status_wire.PlacementStatusReply(status_wire.UnknownPlacementStatus("episode-a", "attempt-a"))
+        cases: tuple[tuple[str, str], ...] = (
+            ("slow", ""), ("missing", "no socket"), ("refused", "connect refused"))
+        for service_state, reason in cases:
+            with self.subTest(service=service_state), AdmissionFixture() as fixture:
+                fixture.configure(silence_seconds=1)
+                response = (Exchange(TimeoutError(), reply_bytes(unknown)) if service_state == "slow" else
+                            Exchange(connect_error=FileNotFoundError()) if service_state == "missing" else
+                            Exchange(connect_error=ConnectionRefusedError()))
+                transport = self.use_transport(fixture, response)
+                with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                    result = client.main(["placement-status", "--episode", "episode-a", "--attempt", "attempt-a"])
+                if service_state == "slow":
+                    self.assertEqual(result, 1)
+                    self.assertEqual(output.getvalue(), "unknown\t-\t-\t-\t-\t-\n")
+                    self.assertIn("admission service not answering", errors.getvalue())
+                    self.assertGreater(fixture.clock.monotonic(), 0.5)
+                    self.assertEqual(transport.requests, [replace(status_wire.PlacementStatusRequest("episode-a", "attempt-a"),
+                        code_version=client.LOADED_ADMISSION_CODE_VERSION)])
+                else:
+                    self.assertEqual(result, 2)
+                    self.assertEqual(errors.getvalue(), f"admission service unavailable: {reason}\n")
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertEqual(fixture.clock.monotonic(), 0)
+                    self.assertFalse(transport.requests)
+                self.assertEqual(len(transport.attempts), 1)
+                self.assertFalse(fixture.clock.sleeps)
                 self.doCleanups()
 
     def test_lint_cancellation_waits_for_slow_answers_and_refuses_dead_services(self) -> None:

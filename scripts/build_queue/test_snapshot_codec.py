@@ -10,10 +10,11 @@ from typing import Literal, NotRequired, TypedDict, cast, get_args
 import unittest
 from unittest import mock
 
+from scripts.build_targets import target_config
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import admission_protocol as wire, placement
-from scripts.build_queue.admission_test_support import GIB, snapshot_with_head_cause, wait_reply
+from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, snapshot_with_head_cause, wait_reply
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.build_queue.scope_activity import NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
@@ -75,6 +76,31 @@ def pinned_snapshot_reader(revision: str = "7fdfd9a6a") -> Generator[tuple[Calla
 
 
 class SnapshotCodecTests(unittest.TestCase):
+    def test_older_services_read_direct_requests_with_a_local_reason(self) -> None:
+        reason = "it edits the merged checkout on natedev with mend and fmt, and the push goes from there"
+        for revision in (CI_CLIENT, "1be2f8932"):
+            with self.subTest(revision=revision), AdmissionFixture() as fixture, \
+                    pinned_snapshot_reader(revision) as (parse, schema, pinned):
+                parse_request = cast(Callable[[str], object], getattr(pinned, "parse_request"))
+                encode_request = cast(Callable[[object], str], getattr(pinned, "encode_request"))
+                for base in (fixture.request(), fixture.service_request()):
+                    with self.subTest(request=type(base).__name__):
+                        request = replace(base, route=target_config.LocalRequired(reason))
+                        encoded = wire.encode_request(request)
+                        self.assertEqual(wire.parse_request(encoded), request)
+                        decoded = parse_request(encoded)
+                        self.assertEqual(type(decoded).__name__, type(request).__name__)
+                        self.assertEqual(cast(str, getattr(decoded, "episode")), request.episode)
+                        restored = wire.parse_request(encode_request(decoded))
+                        assert isinstance(restored, (wire.AdmitRequest, wire.ServiceEstimateRequest))
+                        self.assertEqual(restored.route, records.DIRECT_CARGO)
+                running = records.RunningStep("session", "fixture", "build", "/fixture", 0,
+                    records.MeasuredMemory(1024), pid=42, route=target_config.LocalRequired(reason))
+                snapshot = replace(wait_reply(records.NeedsMemory()).snapshot, running=(running,))
+                parsed = parse(codec.snapshot_value(snapshot), schema)
+                rows = cast(tuple[object, ...], getattr(parsed, "running"))
+                self.assertEqual(cast(str, getattr(rows[0], "step")), "build")
+
     def test_pinned_client_reads_current_pressure_policy_and_some_pressure(self) -> None:
         with pinned_snapshot_reader() as (parse, schema, _pinned):
             for pressure in (records.NoPressureHold(), records.MemoryPressure(0, 91, 50, condition="some")):
