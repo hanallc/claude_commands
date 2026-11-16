@@ -217,6 +217,65 @@ try {
           })()`);
         };
         await navigate('memory_live.html');
+        // The user, 11-16: space pauses every update, a tooltip still opens, and space again resumes.
+        const pressSpace = async () => {
+          for (const type of ['keyDown','keyUp'])
+            await call('Input.dispatchKeyEvent',{type,code:'Space',key:' ',windowsVirtualKeyCode:32,nativeVirtualKeyCode:32});
+        };
+        // A reading that fails after the pause leaves the page as it was.
+        await evaluate(`(()=>{
+          window.proofRead=window.fetch;
+          window.fetch=()=>new Promise((_,reject)=>{window.proofFail=reject;});
+          window.proofPending=tick();
+          scrollTo(0,0);
+        })()`);
+        await pressSpace();
+        const lateFailure = await evaluate(`(async()=>{
+          window.proofFail(new Error('proof'));
+          await window.proofPending;
+          const read=window.proofRead;
+          window.proofFetches=0;
+          window.fetch=(...request)=>{window.proofFetches++;return read(...request);};
+          return readingFailure;
+        })()`);
+        assert.equal(lateFailure,'','A reading that fails after the pause changes the page.');
+        // A report that arrives after the pause leaves the charts as they were.
+        const lateReport = await evaluate(`(async()=>{
+          const draw=window.renderReport, version=reportVersion;
+          let drawn=0;
+          window.renderReport=()=>{drawn++;};
+          await loadReport('proof-late');
+          window.renderReport=draw;
+          window.proofFetches=0;
+          return {drawn,kept:reportVersion===version};
+        })()`);
+        assert.deepEqual(lateReport,{drawn:0,kept:true},'A report that arrives after the pause changes the charts.');
+        const pausedPage = await evaluate(`(async()=>{
+          const badge=document.querySelector('#paused');
+          const shown=!badge.hidden&&getComputedStyle(badge).display!=='none';
+          await tick();
+          await reloadWhenPageChanges();
+          const pill=document.querySelector('#pill').getBoundingClientRect();
+          return {shown,fetches:window.proofFetches,pill:{x:pill.left+pill.width/2,y:pill.top+pill.height/2}};
+        })()`);
+        assert.ok(pausedPage.shown,'Space does not show the paused badge.');
+        assert.equal(pausedPage.fetches,0,'A paused page still reads.');
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved',x:pausedPage.pill.x,y:pausedPage.pill.y});
+        const pausedTip = await evaluate(`(()=>{
+          const tip=document.querySelector('#tip');
+          const boxes=[tip,document.querySelector('#paused'),document.querySelector('.status')].map(item=>item.getBoundingClientRect());
+          const left=Math.min(...boxes.map(box=>box.left))-12, top=Math.min(...boxes.map(box=>box.top))-12;
+          const right=Math.max(...boxes.map(box=>box.right))+12, bottom=Math.max(...boxes.map(box=>box.bottom))+12;
+          return {on:tip.classList.contains('on'),clip:{x:Math.max(0,left),y:Math.max(0,top),width:right-Math.max(0,left),height:bottom-Math.max(0,top),scale:1}};
+        })()`);
+        assert.ok(pausedTip.on,'A paused page opens no tooltip.');
+        const pausedShot=await call('Page.captureScreenshot',{format:'png',clip:pausedTip.clip});
+        await writeFile(join(folder,'paused-tooltip-dark-desktop.png'),Buffer.from(pausedShot.data,'base64'));
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved',x:4,y:4});
+        await pressSpace();
+        const resumedPage = await evaluate(`({hidden:document.querySelector('#paused').hidden,fetches:window.proofFetches})`);
+        assert.ok(resumedPage.hidden,'Space does not clear the paused badge.');
+        assert.ok(resumedPage.fetches>0,'Space does not resume reading.');
 
         const comparisons = [];
         const proofs = [];
