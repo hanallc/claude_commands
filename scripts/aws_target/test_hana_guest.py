@@ -210,6 +210,13 @@ class HanaGuestTests(unittest.TestCase):
         for unit in (guard, files['hana-watchdog.service'].content, receiver):
             self.assertIn('Environment=PATH=' + guest.SYSTEM_BIN + '\n', unit)
 
+    def test_no_tool_setup_omits_only_the_tool_unit(self) -> None:
+        files = {file.path.name: file for file in guest.render_files(
+            self.settings, device=Path('/dev/disk/by-label/hana-data'))}
+        expected = self.files()
+        _ = expected.pop('hana-tools.service')
+        self.assertEqual(files, expected)
+
     def test_rendered_program_runs_without_repository_imports(self) -> None:
         control = self.root / 'control'
         control.mkdir()
