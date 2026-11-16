@@ -529,6 +529,20 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(tips[5][0]["value"], "9.0 GiB")
         self.assertEqual(tips[5][-1]["value"], "-1.0 GiB")
 
+    def test_taken_counts_the_full_reserve_above_the_cap(self) -> None:
+        ram = {**RAM_FIXTURE, "build_covered_bytes": 6 * GIB, "build_missing_bytes": GIB,
+               "build_target_bytes": 7 * GIB, "room_bytes": 0}
+        data = {"ram": ram, "cap": 13, "taken": 13}
+        rows = cast(list[dict[str, object]], self.page_expression("tooltipRows('walksum', data)", data))
+        self.assertEqual([(row["label"], row["value"]) for row in rows], [
+            ("Taken", "14.0 GiB"), ("", "Memory used or held by builds"),
+            ("Builds", "7.0 GiB"), ("+ Build reserved (full)", "7.0 GiB"),
+            ("Queue cap", "13.0 GiB"), ("Over cap", "1.0 GiB")])
+        fields = {str(row["label"]): float(str(row["value"]).split()[0])
+                  for row in rows if str(row["value"]).endswith(" GiB")}
+        self.assertEqual(fields["Taken"], fields["Builds"] + fields["+ Build reserved (full)"])
+        self.assertEqual(fields["Over cap"], fields["Taken"] - fields["Queue cap"])
+
     def test_swap_tooltip_uses_the_feed_share_before_the_target(self) -> None:
         for share in (20, 65, None):
             swap = {**SWAP_FIXTURE}

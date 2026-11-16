@@ -1998,8 +1998,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                   if row.get("machine") == machine and not row["ci"] and isinstance(row["pid"], int)}
     if isinstance(holders, TokenHolders):
         counts = tokens_by_run(holders, set(token_rows))
-        for pid, row in token_rows.items():
-            row["tokens"] = counts.get(pid, 0)
+        # steve lists each connected process, including holders of zero tokens.
+        # A step without a line keeps the dash.
+        for pid, held in counts.items():
+            token_rows[pid]["tokens"] = held
     waiters: list[MemoryWaitRow] = []
     checks = {row.waiter.pid: row.room for row in explanation.line.steps}
     if isinstance(explanation.head, admission_records.HeadExplanation):

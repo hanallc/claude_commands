@@ -216,7 +216,8 @@ try {
 
         const comparisons = [];
         const proofs = [];
-        const show = async (reading, clearTip=true) => {
+        // An over-cap reading takes more than the cap total, so its legend rows exceed that total.
+        const show = async (reading, clearTip=true, legendSums=true) => {
           const totals=await evaluate(`(async () => {
           ${clearTip ? "hideTip();" : ""}
           document.body.classList.remove('queue-unavailable');
@@ -235,7 +236,7 @@ try {
               .filter(row=>!row.hidden&&row.dataset.tip!=='shortfall')
               .map(row=>row.querySelector('.v').textContent)}));
           })()`);
-          for(const group of totals) {
+          for(const group of legendSums?totals:[]) {
             if(group.total==='unavailable') continue;
             const amount=text=>text==='unavailable'?0:Number.parseFloat(text.replace('<',''));
             const sum=group.rows.reduce((total,text)=>total+amount(text),0);
@@ -842,6 +843,69 @@ try {
               await writeFile(join(folder,'legend-totals-dark-desktop.png'),Buffer.from(legendShot.data,'base64'));
             }
             proof.capLine=capLine;
+            // Bars that add to more than the cap stop at the cap line; a cut bar ends in the cap color.
+            const overReading=structuredClone(base), over=overReading.room+1;
+            Object.assign(overReading.ram,{build_tools_bytes:overReading.ram.build_tools_bytes+over*gib,
+              available_bytes:overReading.ram.available_bytes-over*gib,room_bytes:0});
+            overReading.room=0;
+            overReading.taken=overReading.cap+1;
+            // A waiting step that needs more than the cap also stops at the cap line.
+            overReading.waiters.find(row=>row.kind!=='cloud').need=overReading.cap+10;
+            await show(overReading,true,false);
+            const overCap=await evaluate(`(() => {
+              const edge=document.querySelector('#walk .walk-bud').getBoundingClientRect().left+1;
+              const bars=[...document.querySelectorAll('#walk .wrow .track .b:not(.row-progress):not(.seg-remote)')]
+                .map(bar=>({cls:bar.className,right:bar.getBoundingClientRect().right}));
+              const cut=document.querySelector('#walk .track .b.over-cap');
+              return {edge,bars,cut:cut?getComputedStyle(cut).boxShadow:'',
+                cap:getComputedStyle(document.querySelector('#walk .walk-bud .cap-part')||document.querySelector('#walk .walk-bud')).borderLeftColor};
+            })()`);
+            assert.ok(overCap.bars.length>0,'The over-cap chart draws no bars.');
+            assert.ok(overCap.bars.some(bar=>bar.cls.includes('waitb')),'The over-cap chart draws no wait bar.');
+            for(const bar of overCap.bars) assert.ok(bar.right<=overCap.edge+0.5,'A bar runs past the cap line. '+JSON.stringify({bar,edge:overCap.edge}));
+            assert.ok(overCap.cut.includes(overCap.cap),'A bar cut at the cap has no cap-colored end. '+JSON.stringify(overCap));
+            proof.overCap=overCap;
+            // Build reserves that do not fit under the cap: the Running header names the amount over the cap.
+            const shortReading=structuredClone(base);
+            // The running build reserves all of free and 1 GiB more, so its reserve fills the cap.
+            const shortRun=shortReading.walk.find(row=>row.kind!=='cloud'&&!row.ci&&typeof row.reserved==='number');
+            shortRun.reserved+=shortReading.room+1;
+            if(typeof shortReading.reserved==='number') shortReading.reserved+=shortReading.room+1;
+            Object.assign(shortReading.ram,{build_covered_bytes:shortReading.ram.build_covered_bytes+shortReading.ram.room_bytes,room_bytes:0});
+            Object.assign(shortReading.ram,{build_target_bytes:shortReading.ram.build_covered_bytes+gib,build_missing_bytes:gib,shortfall_bytes:gib});
+            Object.assign(shortReading,{room:0,taken:shortReading.cap,shortfall:1});
+            await show(shortReading);
+            if(theme==='dark'&&width===1400) {
+              const shortClip=await evaluate(`(()=>{
+                const memory=document.querySelector('#barwrap').getBoundingClientRect();
+                const running=document.querySelector('#walk').closest('.card').getBoundingClientRect();
+                return {x:running.left,y:memory.top+scrollY,width:running.width,height:running.bottom-memory.top,scale:1};
+              })()`);
+              const shortShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:shortClip});
+              await writeFile(join(folder,'over-cap-dark-desktop.png'),Buffer.from(shortShot.data,'base64'));
+            }
+            const overHeader=await evaluate(`(() => ({sum:document.querySelector('#walk-sum').textContent,
+              sumColor:getComputedStyle(document.querySelector('#walk-sum')).color,hover:tipText('walksum',latest)[1],rows:tooltipRows('walksum',latest),
+              cap:getComputedStyle(document.querySelector('#walk .walk-bud .cap-part')||document.querySelector('#walk .walk-bud')).borderLeftColor}))()`);
+            // Taken counts the full reserve, so it reads 1 GiB more than the cap.
+            assert.equal(overHeader.sum,(shortReading.cap+1).toFixed(1)+' of '+shortReading.cap.toFixed(1)+' GiB taken · 1.0 GiB over cap');
+            assert.equal(overHeader.sumColor,overHeader.cap,'The over-cap total is not in the cap color.');
+            const fields=Object.fromEntries(overHeader.rows.map(row=>[row.label,row.value]));
+            assert.equal(fields.Taken,(shortReading.cap+1).toFixed(1)+' GiB');
+            assert.equal(fields['Queue cap'],shortReading.cap.toFixed(1)+' GiB');
+            assert.equal(fields['Over cap'],'1.0 GiB');
+            assert.ok('+ Build reserved (full)' in fields,overHeader.hover);
+            // Taken includes the full reserve. The difference from the cap is the uncovered reserve.
+            const number=(text,pattern)=>Number.parseFloat(text.match(pattern)[1]);
+            const header={taken:number(overHeader.sum,/^([0-9.]+) of/),cap:number(overHeader.sum,/of ([0-9.]+) GiB/),over:number(overHeader.sum,/· ([0-9.]+) GiB over cap/)};
+            const tip={builds:parseFloat(fields.Builds),reserved:parseFloat(fields['+ Build reserved (full)']),
+              taken:parseFloat(fields.Taken),over:parseFloat(fields['Over cap']),cap:parseFloat(fields['Queue cap'])};
+            assert.ok(Math.abs(tip.builds+tip.reserved-tip.taken)<=0.1+1e-9,'Builds + Build reserved is not Taken. '+JSON.stringify(tip));
+            assert.ok(Math.abs(tip.taken-tip.cap-tip.over)<=0.1+1e-9,'Taken - Queue cap is not the amount over the cap. '+JSON.stringify(tip));
+            assert.deepEqual([header.taken,header.cap,header.over],[tip.taken,tip.cap,tip.over],'The header and its tooltip differ.');
+            const plainHeader=await (async()=>{await show(base);return evaluate(`document.querySelector('#walk-sum').textContent`);})();
+            assert.ok(!plainHeader.includes('over cap'),'The header names an over-cap amount when nothing is over the cap.');
+            proof.overHeader=overHeader;
             // Cloud status text and bar labels are as wide as on the live page; none of it may show on the cap line.
             const cloudReading=structuredClone(base);
             cloudReading.walk.push({kind:'cloud',name:'cloud merge',showrunner:'fixture-owner',unit:'cloud',pid:31,detail:'cloud',
