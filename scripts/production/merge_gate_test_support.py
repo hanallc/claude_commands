@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
-from scripts.lib.checkout_test_support import copy_runtime
+from scripts.lib.checkout_test_support import copy_runtime, copy_test_runner
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_queue import admission_records
@@ -52,10 +51,7 @@ FIXTURE_FOLDERS = ("lib", "hooks", "message", "notify", "direct", "fixture_a", "
 
 def install_test_runner(checkout: Path) -> Path:
     """Install the runner, its bootstrap, and its descendant helper in the copy."""
-    for relative in (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py", "scripts/lib/conf_reads.py"):
-        destination = checkout / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        _ = shutil.copyfile(SCRIPT.parents[2] / relative, destination)
+    copy_test_runner(checkout)
     return checkout / "scripts/test_times/module_run.py"
 
 

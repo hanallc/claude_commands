@@ -18,10 +18,11 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 SHIM = Path(__file__).with_name("py")
-FIXTURE = """import json, os, pathlib, sys, tempfile, unittest
+FIXTURE = """import json, os, pathlib, sys, unittest, uuid
 class Fixture(unittest.TestCase):
     def test_folder(self):
-        path = pathlib.Path(tempfile.mkdtemp(prefix='leftover-'))
+        path = pathlib.Path(os.environ['TMPDIR']) / ('leftover-' + uuid.uuid4().hex)
+        path.mkdir()
         (path / 'output').write_text('test output')
         print(json.dumps([os.environ['TMPDIR'], str(path), os.getpid()]), flush=True)
         sys.stdin.read(1)

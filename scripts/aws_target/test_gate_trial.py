@@ -1,8 +1,7 @@
 """Measure trial lifecycles with a fake AWS command and clock."""
 from __future__ import annotations
 
-from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
-from scripts.lib.checkout_test_support import copy_startup
+from scripts.lib.checkout_test_support import copy_startup, copy_test_runner
 
 from collections.abc import Callable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
@@ -316,8 +315,8 @@ class PairedTrialTests(CostFixture):
         self.repo.mkdir()
         for args in (('init', '-q'), ('config', 'user.name', 'Fixture'), ('config', 'user.email', 'fixture@example.invalid')):
             _ = trial.checked_git(self.repo, *args)
-        for relative in (*STARTUP_FILES, 'scripts/test_times/module_run.py', 'scripts/lib/descendants.py',
-                         'scripts/lib/process_group.py', 'scripts/aws_target/gate_box.py',
+        copy_test_runner(self.repo)
+        for relative in ('scripts/lib/process_group.py', 'scripts/aws_target/gate_box.py',
                          'scripts/aws_target/__init__.py'):
             path = self.repo / relative
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -328,7 +327,7 @@ class PairedTrialTests(CostFixture):
             + "    return {**environment, 'TMPDIR': str(root), 'TEST_TIMES_OUT': str(root / 'test-times.json')}\n"
             + "def process_memory_mib(roots):\n"
             + "    return {pid: 0.0 for pid in roots}\n")
-        (self.repo / 'config').mkdir()
+        (self.repo / 'config').mkdir(exist_ok=True)
         (self.repo / 'scripts/fixture').mkdir()
         _ = (self.repo / 'scripts/fixture/test_sample.py').write_text('''import json, os, pathlib, unittest
 class Sample(unittest.TestCase):

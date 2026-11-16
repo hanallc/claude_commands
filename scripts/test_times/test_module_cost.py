@@ -1,7 +1,7 @@
 """Test process counts and module costs with private test modules."""
 from __future__ import annotations
 
-from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
+from scripts.lib.checkout_test_support import copy_test_runner
 
 from contextlib import ExitStack, redirect_stdout
 import io
@@ -19,14 +19,6 @@ from unittest import mock
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.test_times import module_cost, task_cpu
-
-
-def install_runner(tree: Path) -> None:
-    source = Path(module_cost.__file__).resolve().parents[2]
-    for relative in (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py"):
-        destination = tree / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        _ = shutil.copyfile(source / relative, destination)
 
 
 class ModuleCostTests(unittest.TestCase):
@@ -69,7 +61,7 @@ class ModuleCostTests(unittest.TestCase):
             self.enterContext(mock.patch.dict(os.environ, {
                 "PYTHONPATH": os.pathsep.join((str(tree / "scripts/lib/python_startup"), os.environ.get("PYTHONPATH", ""))),
             }))
-            install_runner(tree)
+            copy_test_runner(tree)
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
             _ = (folder / "test_stop.py").write_text(
@@ -173,7 +165,7 @@ class ModuleCostTests(unittest.TestCase):
             self.enterContext(mock.patch.dict(os.environ, {
                 "PYTHONPATH": os.pathsep.join((str(tree / "scripts/lib/python_startup"), os.environ.get("PYTHONPATH", ""))),
             }))
-            install_runner(tree)
+            copy_test_runner(tree)
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
             modules = ["test_first.py", "test_second.py"]
@@ -208,7 +200,7 @@ class ModuleCostTests(unittest.TestCase):
             self.enterContext(mock.patch.dict(os.environ, {
                 "PYTHONPATH": os.pathsep.join((str(tree / "scripts/lib/python_startup"), os.environ.get("PYTHONPATH", ""))),
             }))
-            install_runner(tree)
+            copy_test_runner(tree)
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
             _ = (folder / "test_cpu.py").write_text(
@@ -237,7 +229,7 @@ class ModuleCostTests(unittest.TestCase):
             self.enterContext(mock.patch.dict(os.environ, {
                 "PYTHONPATH": os.pathsep.join((str(tree / "scripts/lib/python_startup"), os.environ.get("PYTHONPATH", ""))),
             }))
-            install_runner(tree)
+            copy_test_runner(tree)
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
             pids = tree / "pids"
@@ -274,7 +266,7 @@ class ModuleCostTests(unittest.TestCase):
             self.enterContext(mock.patch.dict(os.environ, {
                 "PYTHONPATH": os.pathsep.join((str(tree / "scripts/lib/python_startup"), os.environ.get("PYTHONPATH", ""))),
             }))
-            install_runner(tree)
+            copy_test_runner(tree)
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
             heavy = tree / "heavy.py"
@@ -317,7 +309,7 @@ class ModuleCostTests(unittest.TestCase):
                 "PYTHONPATH": os.pathsep.join((str(tree / "scripts/lib/python_startup"), os.environ.get("PYTHONPATH", ""))),
                 "HERDR_BIN": "/host/herdr",
             }))
-            install_runner(tree)
+            copy_test_runner(tree)
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
             _ = (folder / "test_children.py").write_text(

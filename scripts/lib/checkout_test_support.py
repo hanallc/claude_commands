@@ -8,7 +8,7 @@ import shutil
 import shlex
 import sys
 
-from scripts.lib.python_startup.sitecustomize import STARTUP_FILES, inherited_paths
+from scripts.lib.python_startup.sitecustomize import STARTUP_FILES, TEST_RUNNER_FILES, inherited_paths
 
 
 SOURCE = Path(__file__).resolve().parents[2]
@@ -38,6 +38,16 @@ def copy_runtime(checkout: Path, *, configuration: bool = True) -> None:
 def copy_startup(checkout: Path) -> None:
     """Install the shared startup files in a temporary checkout."""
     for relative in STARTUP_FILES:
+        destination = checkout / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink():
+            destination.unlink()
+        _ = shutil.copy2(SOURCE / relative, destination)
+
+
+def copy_test_runner(checkout: Path) -> None:
+    """Install the test runner and its dependencies in a temporary checkout."""
+    for relative in TEST_RUNNER_FILES:
         destination = checkout / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.is_symlink():
