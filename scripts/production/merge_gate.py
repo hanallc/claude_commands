@@ -2731,7 +2731,7 @@ def _sweep_nightly_slots() -> None:
                     continue
                 scripts = Path(__file__).resolve().parents[1]
                 _ = subprocess.run([sys.executable, str(scripts / "mac_test/mac_queue_run.py"),
-                                    "--kind", "run", "--what", "Sweep Mac build slots", "--package", "claude",
+                                    "--kind", "run", "--what", "Sweep Mac build slots", "--package=claude",
                                     "--", "/bin/zsh", "-c",
                                     '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/build_slots.py" sweep'],
                                    check=True, capture_output=True, text=True)
