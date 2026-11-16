@@ -624,13 +624,14 @@ It normalizes that line's whitespace and redacts it again.
 A successful regional read removes previous prices for types or zones absent from the new reply.
 The snapshot does not change `controller.json`.
 
-`python3 scripts/aws_target/deploy.py spot-table` reads only the local snapshot, cost ledger and configuration.
-It prints two price tables: the standard types, then the GPU types.
+`spot_table.spot_tables` reads only the local snapshot, cost ledger and configuration.
+It is the one source of the AWS prices page; no terminal output remains.
+The user, 2026-11-15, removed the `/aws_prices` command and its `deploy.py spot-table` output because the page shows the prices.
+It gives two price tables: the standard types, then the GPU types.
 Each has candidate regions as rows and machine types as columns.
 The user asked for this layout on 2026-11-15 through builds, because the regions outnumber the types.
 Each cell shows the lowest zone price in USD/h.
 A type that a region does not sell shows `—` (`spot_table.NOT_SOLD`), in `Table.not_sold`.
-One line `— not sold here` under the price tables names it.
 Another empty cell says `no snapshot` or `read failed`.
 Cached prices and quotas remain visible after a read failure.
 Their price cells include `read failed`, and the regional detail gives the last good age.
@@ -638,17 +639,15 @@ Old prices include `old <minutes> min` in their cells.
 Each failed region shows the saved error time, age, failed read, error class, and AWS error line.
 Each region without evidence says `no snapshot was ever taken`.
 The table never uses a bare `-` for an unavailable value.
-It splits wide tables into groups of columns to fit the terminal.
 Each region shows its snapshot age and a stale mark after `price_max_age_seconds`, under the prices.
-The `/aws_prices` command runs `spot-table` and shows its lines unchanged.
 Below the prices, two quota tables show the Standard quota and the G and VT quota in vCPUs.
 Each also shows the number of boxes of its types that fit: standard types in the first, GPU types in the second.
 One region read writes the prices and both quotas together, so the quota cells show no age.
 The box counts divide the quota by the existing type-size vCPU calculation and round downward.
 An absent snapshot explains missing quotas and box counts without creating files.
 The standard rows are `instance_types`, then `price_compare_instance_types`; the GPU rows are `gpu_instance_types`.
-The hourly snapshot reads prices for all three lists, so `/aws_prices` can compare types the gates do not use yet.
-Below the quotas, `/aws_prices` shows one block for each standard type, with one line for each candidate region.
+The hourly snapshot reads prices for all three lists, so the page can compare types the gates do not use yet.
+Below the quotas, the page shows one run table for each standard type, with one line for each candidate region.
 The user asked for this layout on 2026-11-14 through builds. Each line shows:
 1. The lowest zone Spot price in USD/h.
 2. The median merge gate box time in minutes with one decimal, such as `7.5`, from launch to finish, boot included.
@@ -666,7 +665,6 @@ The bill names the region by its usage type prefix, such as `USE2-SpotUsage:c7a.
 `ledger.REGION_USAGE_PREFIXES` maps each prefix to a region.
 A launch row without a region ran in the home region, `region` in `aws_target.conf`.
 The next line names the cheapest merge gate by estimate.
-These blocks do not split for a narrow terminal.
 Below them, two tables show the refused requests and the launched boxes of each type and region.
 Refused requests are capacity and quota refusals.
 The last table shows billed hours / box hours for each type and region, from `run_cost.hours_checks`.
@@ -732,7 +730,7 @@ It compares the billed Spot hours with the recorded box hours for each type, reg
    Billed hours with no box hours are also over.
 `run_cost.day_hours_checks` gives one `HoursCheck` per type, region and day in the window.
 Days run from the window start day up to, but not including, the end day, like the bill split.
-`run_cost.hours_checks` sums the days with a bill read for each type and region, for the `/aws_prices` table.
+`run_cost.hours_checks` sums the days with a bill read for each type and region, for the billed hours table on the AWS prices page.
 `HoursCheck` holds `billed_hours`, `box_hours`, `hours_gap_ratio` and `hours_gap_over`.
 Without a bill read, `billed_hours` and `hours_gap_ratio` are `None`, and `box_hours` counts every day.
 `aws_target.hourly` checks the last `run_cost_days` days after its price read.
@@ -802,7 +800,7 @@ Refusals count the zone and quota codes below over the last `run_cost_days` days
 Expected box time is the median box time, launch to finish, for the type, region and mode over the last `run_cost_days` days.
 A region without its own runs uses the type's runs in all regions; a type without runs uses all runs of the mode.
 Without any runs, it uses `lifetime_minutes`.
-`/aws_prices` shows the same expected cost and refusals per launch, without the remote transfer and regional delay.
+The AWS prices page shows the same expected cost and refusals per launch, without the remote transfer and regional delay.
 Its expected cost includes the unmeasured seconds.
 `remote_region_transfer_usd=0.00015` applies when the region differs from the home region.
 Local measurements cover 692 gates with a source bundle, request, and result.

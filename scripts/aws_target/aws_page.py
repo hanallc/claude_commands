@@ -1,4 +1,4 @@
-"""Publish the AWS prices page: the /aws_prices tables as data for the admin console."""
+"""Publish the AWS prices page: the spot_table tables as data for the admin console."""
 from __future__ import annotations
 
 import argparse

@@ -1,4 +1,4 @@
-"""Read the local Spot snapshot and the run ledger into tables, and format them for a terminal."""
+"""Read the local Spot snapshot and the run ledger into tables for the AWS prices page."""
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
@@ -6,14 +6,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-import shutil
 from statistics import median
-import textwrap
 from typing import Literal
 
 from scripts.aws_target import ledger, run_cost
 from scripts.aws_target.aws_target import SnapshotFailure, gate_sizes, largest_gate_vcpus, read_snapshot, snapshot_failures
-from scripts.aws_target.terminal_table import aligned_table
 from scripts.lib import conf
 
 
@@ -39,7 +36,6 @@ class Table:
 
 
 NOT_SOLD = '—'
-NOT_SOLD_LEGEND = f'{NOT_SOLD} not sold here'
 
 
 def minutes_ago(seconds: int) -> str:
@@ -109,10 +105,6 @@ class RunCosts:
     def cheapest(self) -> Cheapest | None:
         return self.estimates[0] if self.estimates else None
 
-    @property
-    def summary(self) -> str:
-        return self.summary_of(self.cheapest)
-
     def summary_of(self, cheapest: Cheapest | None) -> str:
         if cheapest is None:
             return f'Cheapest {self.scope.noun}: no estimate; the snapshot has no price or the ledger has no runs'
@@ -138,10 +130,6 @@ class SpotTables:
         if len(details) == 1 and not any(read.failure for read in self.regions):
             return (('', f'Snapshot {details.pop()}'),)
         return tuple((read.region, f'{read.region}: {read.detail}') for read in self.regions)
-
-    @property
-    def snapshot_lines(self) -> tuple[str, ...]:
-        return tuple(line for _region, line in self.snapshot_rows)
 
 
 def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None) -> SpotTables:
@@ -347,42 +335,3 @@ def hours_cell(check: run_cost.HoursCheck | None) -> str:
     gap = f' ({check.hours_gap_ratio:.0%})' if check.hours_gap_ratio is not None else ''
     return f'{check.billed_hours:.1f}/{check.box_hours:.1f}{gap}' + (' over' if check.hours_gap_over else '')
 
-
-def split_table(table: Table, width: int) -> list[str]:
-    """Draw the first column and as many equal columns as fit the width, then the next columns below."""
-    columns = table.headers[1:]
-    label_width = max(len(table.headers[0]), *(len(row[0]) for row in table.rows))
-    column_width = max(8, *(len(header) for header in columns), *(len(cell) for row in table.rows for cell in row[1:]))
-    count = max(1, (width - label_width) // (column_width + 2))
-    lines = [table.title]
-    for start in range(0, len(columns), count):
-        indexes = range(1 + start, 1 + min(start + count, len(columns)))
-        lines.extend(aligned_table([table.headers[0], *(table.headers[index] for index in indexes)],
-                                   [[row[0], *(row[index] for index in indexes)] for row in table.rows],
-                                   right=frozenset(position for position, index in enumerate(indexes, 1) if index in table.right),
-                                   minimum_widths=[label_width, *(column_width for _ in indexes)]))
-        lines.append('')
-    return lines
-
-
-def render(directory: Path, now: int, *, width: int | None = None, settings_path: Path | None = None) -> str:
-    """Show prices, quotas, merge gate costs, billed hours, and the reason for each unavailable value."""
-    tables = spot_tables(directory, now, settings_path=settings_path)
-    terminal_width = width if width is not None else shutil.get_terminal_size().columns
-    lines = [line for table in tables.prices for line in split_table(table, terminal_width)]
-    if any(table.not_sold for table in tables.prices):
-        lines.extend((NOT_SOLD_LEGEND, ''))
-    lines.extend((*tables.snapshot_lines, ''))
-    lines.extend(line for table in tables.quotas for line in split_table(table, terminal_width))
-    merge_gates = tables.runs[0]
-    lines.extend(textwrap.wrap(merge_gates.explanation, terminal_width))
-    for table in merge_gates.tables:
-        lines.extend(('', table.title, *('  ' + line for line in aligned_table(table.headers, table.rows, right=table.right))))
-    lines.extend(('', merge_gates.summary, ''))
-    lines.extend((*split_table(merge_gates.refused, terminal_width), *split_table(merge_gates.launched, terminal_width)))
-    if tables.hours.rows:
-        lines.extend(split_table(tables.hours, terminal_width))
-    else:
-        lines.append(tables.hours.title)
-    lines.extend(textwrap.wrap(tables.hours_note, terminal_width))
-    return '\n'.join(lines)
