@@ -16,7 +16,6 @@ import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, assert_never
 from zoneinfo import ZoneInfo
@@ -654,8 +653,20 @@ class ReportSections:
     zone: str
 
 
-class ReportNotRead(Enum):
-    VALUE = "not read"
+# The page reads report.json only when this version in memory.json changes.
+REPORT_NAME = "report.json"
+REPORT_VERSION_LENGTH = 16
+
+
+@dataclass(frozen=True)
+class ReportFile:
+    text: str
+    version: str
+
+
+def report_file(report: ReportSections | charts.IndexUnavailable) -> ReportFile:
+    text = json.dumps(codec.snapshot_value(report))
+    return ReportFile(text, hashlib.sha256(text.encode()).hexdigest()[:REPORT_VERSION_LENGTH])
 
 
 class SwapTotals(TypedDict):
@@ -702,7 +713,7 @@ class MemoryPage(TypedDict):
     cloud_slots: int
     psi: PressureValues
     limits: PressureLimits
-    report: ReportSections | charts.IndexUnavailable
+    report_version: str
     swap_rows: int
     leftovers: list[LeftoverScope]
 
@@ -1638,7 +1649,7 @@ def memory_status(explanation: admission_records.QueueExplanation, room: admissi
 
 
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
-            report: ReportSections | charts.IndexUnavailable | ReportNotRead = ReportNotRead.VALUE) -> MemoryPage:
+            report_version: str = "") -> MemoryPage:
     if isinstance(configuration, conf.UseConfiguredValue):
         configuration = read_configuration()
     names = read_step_names()
@@ -1924,7 +1935,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "targets": target_availability.availability_rows(snapshots, labels, zone),
         "cloud_slots_used": cloud_slots_used, "cloud_slots": cloud_slots,
         "limits": {"some": policy.some_avg10_limit, "full": policy.full_avg10_limit},
-        "report": report_reading(configuration.history_days) if isinstance(report, ReportNotRead) else report,
+        "report_version": report_version,
         "swap_rows": configuration.swap_rows, "leftovers": leftovers,
     }
 
@@ -1960,7 +1971,7 @@ def main(argv: Sequence[str]) -> int:
     publish_page(configuration)
     target = configuration.output_folder / "memory.json"
     last_good: MemoryPage | NoGoodReading = NoGoodReading()
-    report: ReportSections | charts.IndexUnavailable | ReportNotRead = ReportNotRead.VALUE
+    report_version = ""
     next_report_at = 0.0
     next_mac_at = 0.0
     notified_mac_runs: set[tuple[int, float]] = set()
@@ -1969,8 +1980,12 @@ def main(argv: Sequence[str]) -> int:
             print("The installed feed code changed. Restart the feed.", file=sys.stderr)
             return 1
         now = time.monotonic()
-        if isinstance(report, ReportNotRead) or now >= next_report_at:
-            report = report_reading(configuration.history_days)
+        if now >= next_report_at:
+            report = report_file(report_reading(configuration.history_days))
+            if report.version != report_version:
+                # The report goes first, so memory.json never names a report that is not written.
+                write_text_atomic(configuration.output_folder / REPORT_NAME, report.text, new_file_mode=0o644)
+                report_version = report.version
             next_report_at = now + configuration.report_refresh_seconds
         try:
             if now >= next_mac_at:
@@ -1979,7 +1994,7 @@ def main(argv: Sequence[str]) -> int:
                     # A one-time proof run reads the Mac but sends no alert.
                     notify_unplaced_mac_runs(queue_view.read_mac_builds(), notified_mac_runs)
                 next_mac_at = now + queue_view.mac_activity_refresh_seconds()
-            payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report)
+            payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report_version)
             last_good = payload
         except (OSError, ValueError, KeyError, RuntimeError) as error:
             if isinstance(last_good, NoGoodReading):

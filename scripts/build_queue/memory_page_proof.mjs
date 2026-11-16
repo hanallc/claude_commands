@@ -109,9 +109,10 @@ try {
   }
 
   const server = createServer((req, res) => {
-    const isData = req.url.startsWith('/memory.json');
-    res.writeHead(200, {'Content-Type':isData ? 'application/json' : 'text/html; charset=utf-8'});
-    res.end(isData ? JSON.stringify({...base,read_at:Date.now()/1000}) : req.url === '/before.html' ? beforePage : page);
+    const isData = req.url.startsWith('/memory.json'), isReport = req.url.startsWith('/report.json');
+    res.writeHead(200, {'Content-Type':isData || isReport ? 'application/json' : 'text/html; charset=utf-8'});
+    res.end(isData ? JSON.stringify({...base,read_at:Date.now()/1000}) : isReport ? JSON.stringify(base.report)
+      : req.url === '/before.html' ? beforePage : page);
   });
   try {
     server.listen(0, '127.0.0.1');
@@ -216,6 +217,7 @@ try {
           data.read_at = Date.now()/1000;
           latest = data;
           window.renderReading(data);
+          renderReport(data.report);
           fitLabels();
           await document.fonts.ready;
           await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));

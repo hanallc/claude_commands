@@ -1041,7 +1041,6 @@ function render(d) {
   renderWalk(d);
   renderSwap(d);
   renderLeftovers(d);
-  renderReport(d.report);
 }
 
 const swapView = new Map();
@@ -1660,13 +1659,26 @@ async function tick() {
     const r = await fetch(`memory.json?t=${Date.now()}`, { cache: "no-store" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
-    if (d.ok && !d.error) { render(d); lastRead = d.read_at; readingFailure = d.read_error ? "The queue did not answer." : ""; }
+    if (d.ok && !d.error) {
+      render(d); lastRead = d.read_at; readingFailure = d.read_error ? "The queue did not answer." : "";
+      if (d.report_version !== reportVersion) await loadReport(d.report_version);
+    }
     else { recordReadFailure("The queue did not answer."); return; }
   } catch (e) {
     recordReadFailure(`Cannot load the reading: ${e.message}.`);
     return;
   }
   updateReadingStatus(lastRead);
+}
+// The charts are large, so the page reads report.json only when memory.json names a new version.
+let reportVersion = null;
+async function loadReport(version) {
+  try {
+    const r = await fetch(`report.json?v=${encodeURIComponent(version)}`, { cache: "no-store" });
+    if (!r.ok) return;
+    renderReport(await r.json());
+    reportVersion = version;
+  } catch (e) { /* The next reading tries again. */ }
 }
 let pageStamp = null;
 async function reloadWhenPageChanges() {

@@ -36,7 +36,7 @@ from scripts.build_queue.queue_fixture import write_process, write_scope
 from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
-from scripts.lib import conf, test_hang_guard
+from scripts.lib import atomic_file, conf, test_hang_guard
 from scripts.review_links import page_frame, review_link, test_serve
 from scripts.lib.build_steps import read_step_names
 from scripts.message import unit_labels
@@ -781,8 +781,8 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(page["available"], 30)
         self.assertEqual(page["walk"], [])
         self.assertEqual(page["limits"], {"some": 25, "full": 5})
-        self.assertEqual(set(path.name for path in self.output.iterdir()), {"memory_live.html", "memory.json"})
-        for name in ("memory_live.html", "memory.json"):
+        self.assertEqual(set(path.name for path in self.output.iterdir()), {"memory_live.html", "memory.json", memory_feed.REPORT_NAME})
+        for name in ("memory_live.html", "memory.json", memory_feed.REPORT_NAME):
             with self.subTest(name=name):
                 self.assertEqual((self.output / name).stat().st_mode & 0o777, 0o644)
 
@@ -928,7 +928,8 @@ process.stdout.write(JSON.stringify({
         with (mock.patch.object(admission_client, "view", return_value=captured_reading()) as queue,
               mock.patch.object(charts, "page_data", return_value=report_fixture()) as provider,
               mock.patch.object(time, "monotonic", side_effect=[0.0, 100.0, 301.0]),
-              mock.patch.object(time, "sleep", side_effect=[None, None, FeedStopped])):
+              mock.patch.object(time, "sleep", side_effect=[None, None, FeedStopped]),
+              mock.patch.object(memory_feed, "write_text_atomic", wraps=atomic_file.write_text_atomic) as write):
             def view() -> admission_records.QueueRead:
                 report_calls_per_cycle.append(provider.call_count)
                 return captured_reading()
@@ -939,6 +940,15 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(queue.call_count, 3)
         self.assertEqual(report_calls_per_cycle, [1, 1, 2])
         self.assertEqual(provider.call_args_list, [mock.call(7, n=3), mock.call(7, n=3)])
+        # The second report read has the same text, so only the first one writes report.json.
+        written = [cast(Path, call.args[0]).name for call in write.call_args_list]
+        self.assertEqual(written.count(memory_feed.REPORT_NAME), 1)
+        self.assertLess(written.index(memory_feed.REPORT_NAME), written.index("memory.json"))
+        report_text = (self.output / memory_feed.REPORT_NAME).read_text()
+        page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
+        self.assertNotIn("report", page)
+        self.assertEqual(page["report_version"], memory_feed.report_file(memory_feed.report_reading(7)).version)
+        self.assertEqual(report_text, memory_feed.report_file(memory_feed.report_reading(7)).text)
 
     def test_mac_readings_follow_the_configured_refresh_window(self) -> None:
         for interval, expected in ((30, [710001, 710001, 710002]), (60, [710001, 710001, 710001])):
@@ -1147,8 +1157,8 @@ process.stdout.write(JSON.stringify({
         with (mock.patch.object(charts, "page_data") as provider,
               mock.patch.object(admission_client, "view", return_value=reservation_reading())):
             page = memory_feed.reading()
+            text = memory_feed.report_file(memory_feed.report_reading(memory_feed.read_configuration().history_days)).text
         provider.assert_not_called()
-        text = memory_feed.page_json(page)
         self.assertIn("history_days", text)
         self.assertIn("TOP_COST_RECENT_DAYS", text)
         self.assertTrue(page["walk"])
@@ -2061,9 +2071,8 @@ process.stdout.write(JSON.stringify({
     def test_one_report_call_supplies_both_sections(self) -> None:
         with (mock.patch.object(charts, "page_data", return_value=report_fixture()) as provider,
               mock.patch.object(admission_client, "view", return_value=captured_reading())):
-            page = memory_feed.reading()
+            report = memory_feed.report_reading(7)
         provider.assert_called_once_with(7, n=3)
-        report = page["report"]
         assert isinstance(report, memory_feed.ReportSections)
         row = report.top[0]
         self.assertEqual((row["machine"], row["cause"], row["range"]), ("fixture", "Memory wait", [30 / 3600, 60 / 3600]))
@@ -2076,10 +2085,8 @@ process.stdout.write(JSON.stringify({
         assert not isinstance(report.top.rows, charts.NoDataYet)
         row = replace(report.top.rows[0], share=cost_actions.NoShare.VALUE,
                       days=(charts.MeasuredCost(30), charts.CostUnavailable("1 applicable waits missing")))
-        with (mock.patch.object(charts, "page_data", return_value=replace(report, top=replace(report.top, rows=(row,)))),
-              mock.patch.object(admission_client, "view", return_value=captured_reading())):
-            page = memory_feed.reading()
-        sections = page["report"]
+        with mock.patch.object(charts, "page_data", return_value=replace(report, top=replace(report.top, rows=(row,)))):
+            sections = memory_feed.report_reading(7)
         assert isinstance(sections, memory_feed.ReportSections)
         self.assertEqual((sections.top[0]["range"], sections.top[0]["share"]), ([], ""))
 
@@ -2093,15 +2100,13 @@ process.stdout.write(JSON.stringify({
                 with (provider,
                       mock.patch.object(admission_client, "view", return_value=reservation_reading())):
                     page = memory_feed.reading()
-                text = memory_feed.page_json(page)
+                    text = memory_feed.report_file(memory_feed.report_reading(7)).text
                 self.assertTrue(page["walk"])
                 self.assertIn(failure.reason if isinstance(failure, charts.IndexUnavailable) else str(failure), text)
 
     def test_an_empty_report_keeps_its_recent_window(self) -> None:
-        with (mock.patch.object(charts, "page_data", return_value=report_fixture(empty=True)),
-              mock.patch.object(admission_client, "view", return_value=captured_reading())):
-            page = memory_feed.reading()
-        text = memory_feed.page_json(page)
+        with mock.patch.object(charts, "page_data", return_value=report_fixture(empty=True)):
+            text = memory_feed.report_file(memory_feed.report_reading(7)).text
         self.assertIn("2026-11-05", text)
         self.assertIn("2026-11-08", text)
 
@@ -2206,6 +2211,7 @@ def write_browser_fixture(folder: Path) -> None:
             runs=(replace(room.runs[0], memory=missing),))
         readings["missing_use"] = replace(base, explanation=replace(base.explanation, room=missing_room))
         pages: dict[str, object] = {}
+        reports: dict[str, memory_feed.ReportFile] = {}
         director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
                                           unit_labels.DirectsUnit("panes"))
         runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
@@ -2261,6 +2267,7 @@ def write_browser_fixture(folder: Path) -> None:
             with (mock.patch.object(charts, "page_data", return_value=report),
                   mock.patch.object(admission_client, "view", return_value=base)):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
+                reports[name] = memory_feed.report_file(memory_feed.report_reading(configuration.history_days))
         mac_builds = tuple(queue_view.MacBuild(pid, path, base.explanation.now - 120 + index,
             command, repository, queue_view.MacBuilding(), int(used * admission_records.GIB),
             queue_view.mac_command_jobs(command), progress_profile.ProgressCounter("build:1", done, 1000), unit)
@@ -2285,6 +2292,11 @@ def write_browser_fixture(folder: Path) -> None:
               mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(
                   base.explanation.now - 540, mac_builds, "awk: private raw error"))):
             pages["mac_failed"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
+        # The proof serves each reading's report as report.json and shows it with its reading.
+        default_report = memory_feed.report_file(memory_feed.report_reading(configuration.history_days))
+        for name, page in pages.items():
+            report = reports.get(name, default_report)
+            cast(dict[str, object], page).update(report_version=report.version, report=cast(object, json.loads(report.text)))
         _ = (folder / "fixtures.json").write_text(json.dumps(pages))
     finally:
         _ = fixture.doCleanups()

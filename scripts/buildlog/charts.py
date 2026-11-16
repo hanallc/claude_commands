@@ -175,7 +175,9 @@ def chart_series(reading: costs.CostReading, start: datetime, end: datetime, zon
         daily = costs.CostReading(tuple(contributions[position]), tuple(observations[position]),
                                   tuple(spans[position]), tuple(phases[position]), reading.coverage, reading.first_sources)
         buckets.append(build_bucket(daily, low, high, thin=low != full_low or high != full_high))
-    machines = sorted(set(configured) | set(reading.first_sources))
+    # A source folder with no step in the window is no chart machine: each cloud gate host has its own folder.
+    machines = sorted(set(configured) | {item.machine for item in reading.observations}
+                      | {item.machine for item in reading.contributions})
     if reading.idle_spans and "mac" not in machines:
         machines.append("mac")
     return ChartSet(start, end, str(zone), tuple(buckets), tuple(sorted(machines)), moments.MOMENTS)

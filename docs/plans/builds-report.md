@@ -1876,3 +1876,15 @@ As built:
   explained on 2026-11-15; queue gave the words.
 - An unavailable cap shows "Queue cap unavailable: <reason>" and no table.
 - "can run on" and "Mac" are fields in the running and the waiting boxes.
+
+#### Builds page weight (C1672)
+
+From builds, relaying the user on C1672: the memory and the queue should be always visible and fast.
+
+As built:
+
+- Cause: `charts.chart_series` made a chart machine of each buildlog source folder. Each cloud gate host has its own folder, so about 1475 hosts gave 6 causes × 8 days of empty rows: 19.8 MB of the 19.9 MB `memory.json`.
+- `charts.chart_series` now takes only configured targets and machines with a step in the window.
+- `memory_feed.main` writes `report.json` beside `memory.json`, only when the report text changes. It writes `report.json` first. `memory.json` carries `report_version`, a sha256 prefix of that text, in place of `report`.
+- `memory_live.html` reads `memory.json` each 3 s as before. It reads `report.json` only when `report_version` changes.
+- Tests: `test_charts` (a folder with no step is no machine), `test_memory_feed` (one `report.json` write for two equal reads, written before `memory.json`), `memory_page_proof.mjs` (serves `report.json`).
