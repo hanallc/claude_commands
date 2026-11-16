@@ -4365,7 +4365,7 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 #### As-built
 
 - Gate copies become reused slots; the largest copy held 11.2 GB of gate results in 472 folders of .git/cloud-gates.
-- `record.keep_result` keeps a result gzipped at `<host>/results/<YYYY-MM>/<record id>.json.gz` in the buildlog store (`store.RESULTS_DIR`). `keep_log` and `keep_result` share `_keep_compressed`.
+- `record.keep_result` keeps a result gzipped at `<place>/results/<YYYY-MM>/<record id>.json.gz` in the buildlog store (`store.RESULTS_DIR`). A cloud gate result goes under `aws`, beside its gate run record. `keep_log` and `keep_result` share `_keep_compressed`.
 - `cloud_gate.import_record` keeps the imported row after the record append, deletes `remote-result.json` from the gate folder and names the stored file in imported.json `result`. A store write failure is reported with `report_not_written` and leaves the folder file.
 - Commit ce1875a45. Production change.
 

@@ -149,8 +149,13 @@ class IndexedMonthlySource:
 
 
 def indexed_monthly_sources(connection: sqlite3.Connection) -> tuple[IndexedMonthlySource, ...]:
-    """Keep nonempty indexed sources, including missing or incomplete files."""
+    """Keep nonempty indexed sources, including missing or incomplete files.
+
+    A file of cloud gate runs is the AWS place, also when an older import named it after its box.
+    """
     rows = cast(list[tuple[str, int]], connection.execute("SELECT path, offset FROM files").fetchall())
+    cloud_gate_files = {path for (path,) in cast(list[tuple[str]], connection.execute(
+        "SELECT DISTINCT src FROM gate_runs WHERE source = ?", (store.CLOUD_GATE_SOURCE,)).fetchall())}
     sources: list[IndexedMonthlySource] = []
     legacy_hosts: dict[str, str] = {}
     for name, offset in rows:
@@ -166,7 +171,8 @@ def indexed_monthly_sources(connection: sqlite3.Connection) -> tuple[IndexedMont
             complete = (store.root()/path).stat().st_size == offset
         except OSError:
             complete = False
-        machine = "CI" if path.parent.name == "ci" else machine_name(None, path.parent.name, legacy_hosts)
+        machine = ("CI" if path.parent.name == "ci" else store.CLOUD_GATE_PLACE if name in cloud_gate_files
+                   else machine_name(None, path.parent.name, legacy_hosts))
         sources.append(IndexedMonthlySource(machine, low.timestamp(), high.timestamp(), complete, name))
     return tuple(sources)
 
@@ -342,6 +348,16 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
         if conclusion in ("cancelled", "failure"):
             contributions.append(CostContribution(at, "CI", "Cancelled CI" if conclusion == "cancelled" else "Failed runs", max(0, seconds)))
     sources = indexed_monthly_sources(connection)
+    # A gate run is a recorded event of the place that holds its file; AWS records nothing else.
+    source_machines = {source.path: source.machine for source in sources}
+    gate_rows = cast(Sequence[tuple[str, int | None, float | None, float]], connection.execute(
+        "SELECT src, status, wall_s, unixepoch(started_at,'subsec') FROM gate_runs WHERE "
+        + moments.window_bounds("started_at"), parameters).fetchall())
+    for src, status, wall, at in gate_rows:
+        machine = source_machines.get(src) or machine_name(None, Path(src).parent.name, legacy_hosts)
+        observations.append(SourceObservation(at, machine))
+        if status:
+            contributions.append(CostContribution(at, machine, "Failed runs", max(0.0, wall or 0.0)))
     coverage = source_coverage(sources, observations)
     first_sources = first_source_times(connection, sources)
     return CostReading(tuple(contributions), tuple(observations), sweep_idle(timeline, coverage),

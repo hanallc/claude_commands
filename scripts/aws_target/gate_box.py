@@ -685,7 +685,7 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
     """Return an explicit buildlog record with the remote host identity."""
     from scripts.test_times import gate_record
     from datetime import UTC
-    from scripts.buildlog import record
+    from scripts.buildlog import record, store
     from scripts.production.merge_gate import GateRun
     import os
     if not isinstance(value, GateRun):
@@ -701,7 +701,7 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
             'reason': 'time limit' if value.time_limit_report else 'cloud gate',
             'vcpus': os.cpu_count() or 1, 'status': int(not value.passed), 'max_jobs': os.cpu_count() or 1,
             'peak_mib': value.peak_memory_mib, 'cap_mib': 0, 'checkout': '/var/lib/gate-trial/repo',
-            'branch': 'HEAD', 'sha': commit, 'tree': tree, 'source': 'cloud-gate', 'step': mode,
+            'branch': 'HEAD', 'sha': commit, 'tree': tree, 'source': store.CLOUD_GATE_SOURCE, 'step': mode,
             'aborted': False, 'dirty': False, 'dirty_paths': [], 'dirty_path_count': 0,
             'suites': suites, 'modules': modules, 'slow_test_s': gate_record.slow_test_s(),
             'tests_run': sum(module['tests_run'] for module in modules)}
