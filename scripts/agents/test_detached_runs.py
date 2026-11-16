@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.direct import pass_record as pass_recorder
+
 import contextlib
 import fcntl
 import io
@@ -1690,7 +1692,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     line = f"Read the unchanged prompt file {json.dumps(str(prompt))}. End your final reply with DONE {dispatch_id}."
                     reply = self.fixture.root / "finished-reply.txt"
                     progress_history.save_dispatch_delivery(self.run_dir, dispatch_id,
-                        progress_history.DispatchDelivery(line, dispatch_id, str(reply)))
+                        pass_recorder.DispatchDelivery(line, dispatch_id, str(reply)))
                     agent.append(pane, "user", line)
                     agent.append(pane, "assistant", "The command is complete.\nDONE " + dispatch_id)
                     self.fixture.world.locations[pane]["agent_status"] = "done"

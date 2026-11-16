@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from scripts.direct import pass_record as pass_recorder
+
 from scripts.agents import remote
 
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
@@ -195,14 +197,14 @@ class ProgressHistoryTests(unittest.TestCase):
         script.parent.mkdir(parents=True)
         _ = script.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(log)!r}).touch()\n")
         script.chmod(0o755)
-        digest = cast(Callable[[], str], vars(progress_history)["_config_digest"])
+        digest = cast(Callable[[], str], vars(pass_recorder)["config_digest"])
         clear = cast(Callable[[], None], getattr(digest, "cache_clear"))
         reads = self.root / "config-reads"
         original = self.models_config_file.read_text()
         configuration = models_registry.LaunchModelConfiguration(self.models_config_file, original, ())
         for inherited in (False, True):
             _ = reads.write_text("")
-            with self.subTest(inherited=inherited), patch.object(models_registry, "launch_configuration", wraps=models_registry.launch_configuration) as launches, patch.object(models_registry, "__file__", str(script.parent.parent / "lib/models_registry.py")), patch.dict(os.environ, {
+            with self.subTest(inherited=inherited), patch.object(pass_recorder, "inherited_registry_text", wraps=pass_recorder.inherited_registry_text) as launches, patch.object(models_registry, "__file__", str(script.parent.parent / "lib/models_registry.py")), patch.dict(os.environ, {
                 "HOME": str(self.root), "CONF_DIR": str(settings), "MODELS_CONFIG_FILE": str(self.models_config_file),
                 "MODELS_CONFIG_TIER_ONLY": "0", "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "missing-sync-state"),
                 "MODELS_LAUNCH_CONFIGURATION": configuration.environment({})["MODELS_LAUNCH_CONFIGURATION"] if inherited else "",
@@ -215,7 +217,7 @@ class ProgressHistoryTests(unittest.TestCase):
                         self.assertEqual(digest(), hashlib.sha256(text.encode() + b"fixture=1\n").hexdigest()[:12])
                     self.assertIn("direct", reads.read_text().splitlines())
                     self.assertFalse(log.exists(), "progress telemetry ran catalog synchronization")
-                    self.assertEqual(launches.call_count, int(inherited), "telemetry entered the fresh launch path")
+                    self.assertEqual(launches.call_count, int(inherited), "telemetry decoded unexpected inherited text")
                 finally:
                     clear()
 
@@ -311,7 +313,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before)
 
     def test_event_write_syncs_by_default_and_flushes_without_sync_for_disposable_state(self) -> None:
-        append = cast(Callable[[dict[str, object], dict[str, object]], None], vars(progress_history)["_append_event"])
+        append = cast(Callable[[dict[str, object], dict[str, object]], None], vars(pass_recorder)["append_event"])
         history = self.root / "sync-event.jsonl"
 
         def flushed(descriptor: int) -> None:
@@ -343,11 +345,12 @@ from pathlib import Path
 from unittest.mock import patch
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct import progress_history
+from scripts.direct import pass_record as pass_recorder
 from scripts.lib import user_zone
 
 root, working = map(Path, sys.argv[1:])
 caller = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
-          progress_history.DEFAULT_MODELS_CONFIG_PATH,
+          pass_recorder.DEFAULT_MODELS_CONFIG_PATH,
           user_zone.CONF, {sig: signal.getsignal(sig) for sig in
                           (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)})
 plan = working / 'cold-plan.md'
@@ -385,9 +388,9 @@ for number in (1, 2):
     events = [json.loads(line) for line in history.read_text().splitlines()]
     started, = [event for event in events if event['event_type'] == 'pass_started']
     assert started['config_digest'] == hashlib.sha256(registry.read_bytes() + settings.read_bytes()).hexdigest()[:12]
-    assert progress_history._config_digest.cache_info().currsize == 0
+    assert pass_recorder.config_digest.cache_info().currsize == 0
     restored = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
-                progress_history.DEFAULT_MODELS_CONFIG_PATH,
+                pass_recorder.DEFAULT_MODELS_CONFIG_PATH,
                 user_zone.CONF, {sig: signal.getsignal(sig) for sig in caller[-1]})
     assert restored == caller, (restored, caller)
 print('two homes isolated; recorder lock retained; caller restored')
@@ -2370,7 +2373,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         name = "stopped-phase-publication"
         session = self.start_run(name, 1000)
         arguments = ["start-phase", "--session-dir", str(session), "--phase-id", "13", "--phase-title", "Rerun"]
-        with stop_once(progress_history, "_append_event", when="before",
+        with stop_once(pass_recorder, "append_event", when="before",
                        argument=1, matches=lambda value: isinstance(value, dict)
                        and cast(dict[str, object], value).get("event_type") == "phase_started"):
             with self.assertRaises(InjectedStop):
@@ -2683,14 +2686,15 @@ print('two homes isolated; recorder lock retained; caller restored')
         finish_program = '''import sys
 from unittest.mock import patch
 from scripts.direct import progress_history as recorder
-append = recorder._append_event
+from scripts.direct import pass_record as pass_recorder
+append = pass_recorder.append_event
 def publication(state, event):
     if event.get("event_type") == "phase_finished":
         print("publishing", flush=True)
         sys.stdin.readline()
     append(state, event)
 sys.argv = ["progress_history.py", *sys.argv[1:]]
-with patch.object(recorder, "_append_event", publication):
+with patch.object(pass_recorder, "append_event", publication):
     recorder.main()
 '''
         start_program = '''import fcntl, sys
@@ -3362,7 +3366,7 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual((started["production"], started["unit"]),
                          ({"state": "Recorded", "value": "Other production"}, {"state": "Recorded", "value": "other"}))
         self.assertEqual(started["working_dir"], str(worktree))
-        current = plan_history.staff_directory(dict(started), staff.snapshot())
+        current = pass_recorder.staff_directory(dict(started), staff.snapshot())
         self.assertEqual(current["working_dir"], str(worktree))
         report = cast(dict[str, object], json.loads(self.run_command("waits", at=1040)))
         phase, = cast(list[dict[str, object]], report["phases"])
@@ -3657,7 +3661,7 @@ with patch.object(fcntl, "flock", admission):
                 if failure == "stale-pointer":
                     _ = staff.set_run(owner.id, staff.OpenRun(session_dir))
                 if failure == "state-write":
-                    with patch.object(progress_history, "_write_state", side_effect=OSError("state write failed")):
+                    with patch.object(pass_recorder, "write_state", side_effect=OSError("state write failed")):
                         with self.assertRaisesRegex(OSError, "state write failed"):
                             _ = self.run_command(
                                 "start-phase", "--session-dir", str(session_dir),
@@ -4125,7 +4129,7 @@ with patch.object(fcntl, "flock", admission):
                 self.assertEqual(self.pass_events(name, "pass_finished"), [])
                 if status == "error":
                     self.finish_slot_pass(session, "review", "error", 41_080)
-                    with patch.object(plan_history, "now_epoch", return_value=finished_at):
+                    with patch.object(pass_recorder, "now_epoch", return_value=finished_at):
                         progress_history.complete_dispatch(session, "review", str(active["instance_id"]))
                     failed, finished = self.pass_events(name, "pass_finished")
                     self.assertEqual(failed["status"], "error")
@@ -4301,8 +4305,8 @@ with patch.object(fcntl, "flock", admission):
             instances[slot] = progress_history.begin_dispatch(run, slot=slot, phase="3", role=cast(staff.WorkerRole, slot),
                 worker_name=slot, worker_id=staff.StaffId(fixture_runtime_id("hook-" + slot)),
                 launcher_command=["assign.sh", "--role", slot], prompt=prompt, kind=slot, lens="")
-        delivery = progress_history.DispatchDelivery("The exact prompt.", instances["impl"], str(self.root / "reply.txt"),
-            actions=progress_history.CompletionActions(summary_file=str(self.root / "summary.txt"), held_role="held-reviewer",
+        delivery = pass_recorder.DispatchDelivery("The exact prompt.", instances["impl"], str(self.root / "reply.txt"),
+            actions=pass_recorder.CompletionActions(summary_file=str(self.root / "summary.txt"), held_role="held-reviewer",
                 finish_phase="3", finish_run=True))
         progress_history.save_dispatch_delivery(run, instances["impl"], delivery)
         before = self.pass_slots(run)["test"]
@@ -4311,7 +4315,7 @@ with patch.object(fcntl, "flock", admission):
         slots = self.pass_slots(run)
         self.assertEqual(slots["impl"]["status"], "completed")
         self.assertEqual(slots["test"], before)
-        self.assertEqual(progress_history.dispatch_delivery(slots["impl"]), delivery)
+        self.assertEqual(pass_recorder.dispatch_delivery(slots["impl"]), delivery)
         self.assertEqual(slots["impl"]["launcher_command"], ["assign.sh", "--role", "impl"])
         self.assertEqual(len(self.pass_events("hook-completion", "pass_finished")), 1)
         self.assertEqual(self.pass_events("hook-completion", "pass_finished")[0].get("reply_file"), delivery.reply_file)
@@ -4343,16 +4347,16 @@ with patch.object(fcntl, "flock", admission):
                     result = progress_history.dispatch_worker(
                         session, slot="test", phase="3", role="review", prompt=prompt, launcher_command=command,
                     )
-                    self.assertEqual(result, progress_history.MatchedDispatch("impl2", instance))
+                    self.assertEqual(result, pass_recorder.MatchedDispatch("impl2", instance))
                     original_prompt = prompt.read_text()
                     with self.subTest(prompt="changed content"):
                         _ = prompt.write_text(original_prompt + "Read the changed work order.\n")
                         changed = progress_history.dispatch_worker(
                             session, slot="test", phase="3", role="review", prompt=prompt, launcher_command=command)
                         if status == "active":
-                            self.assertEqual(changed, progress_history.ActiveDispatchPromptConflict("impl2", instance))
+                            self.assertEqual(changed, pass_recorder.ActiveDispatchPromptConflict("impl2", instance))
                         else:
-                            self.assertIsInstance(changed, progress_history.NoMatchedDispatch)
+                            self.assertIsInstance(changed, pass_recorder.NoMatchedDispatch)
                         _ = prompt.write_text(original_prompt)
                     for changed_prompt, changed_command in (
                         (self.root / "different-prompt.txt", command),
@@ -4362,14 +4366,14 @@ with patch.object(fcntl, "flock", admission):
                             session, slot="test", phase="3", role="review",
                             prompt=changed_prompt, launcher_command=changed_command,
                         )
-                        self.assertIsInstance(result, progress_history.NoMatchedDispatch)
+                        self.assertIsInstance(result, pass_recorder.NoMatchedDispatch)
                     self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns)
                                       for path in session.rglob("*") if path.is_file()}, before)
             missing = self.root / "no-recorder-state"
             before_paths = set(self.root.rglob("*"))
             self.assertIsInstance(progress_history.dispatch_worker(
                 missing, slot="test", phase="3", role="review", prompt=prompt, launcher_command=command,
-            ), progress_history.NoMatchedDispatch)
+            ), pass_recorder.NoMatchedDispatch)
             self.assertEqual(set(self.root.rglob("*")), before_paths)
 
     def test_fix_dispatch_requires_and_records_the_launcher_repair_metadata(self) -> None:
@@ -6675,7 +6679,7 @@ with patch.object(fcntl, "flock", admission):
             claude_session=claude_session,
             codex_session=codex_session,
         )
-        read = cast(Callable[[Path], dict[str, object]], vars(progress_history)["_read_state"])
+        read = cast(Callable[[Path], dict[str, object]], vars(pass_recorder)["read_state"])
         after_pass = cast("dict[str, object]", read(session_dir)["main_agent"])
         _ = self.run_command(
             "start-activity",
@@ -8020,7 +8024,7 @@ with patch.object(fcntl, "flock", admission):
             self.assertFalse((directory / name).exists(), name)
         state = self.read_state(session_dir)
         self.assertNotIn("working_dir", state)
-        current = plan_history.staff_directory(state, staff.snapshot())
+        current = pass_recorder.staff_directory(state, staff.snapshot())
         self.assertEqual(current["working_dir"], str(self.working_dir))
         with redirect_stdout(io.StringIO()):
             self.assertEqual(phase_reservation.main([
@@ -8703,7 +8707,7 @@ CalibrationSamples = Callable[[list[dict[str, object]]], list[dict[str, object]]
 
 
 def private(name: str) -> object:
-    found = vars(progress_history).get(name)
+    found = vars(pass_recorder).get(name) if hasattr(pass_recorder, name) else vars(progress_history).get(name)
     if not callable(found):
         raise AssertionError(f"progress recorder function is unavailable: {name}")
     return found
@@ -8968,9 +8972,9 @@ class StaffProgressHistoryTests(StaffTestCase):
         _ = (runs / "a.jsonl").write_text(compact + "\n" + json.dumps(events[1]) + "\n")
         _ = (runs / "b.jsonl").write_text("\n".join(json.dumps(event) for event in events[2:]) +
                                             '\n{"event_type":"progress_reported",broken JSON}\n')
-        decode = cast(Callable[[str], dict[str, object] | None], getattr(progress_history, "_json_object"))
+        decode = cast(Callable[[str], dict[str, object] | None], getattr(pass_recorder, "json_object"))
         with patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(runs.parent)}), \
-             patch.object(progress_history, "_json_object", wraps=decode) as parsed:
+             patch.object(pass_recorder, "json_object", wraps=decode) as parsed:
             found = progress_history.events_for_worktrees((first, second), frozenset({"checkpoint", "phase_started"}))
         self.assertEqual([event["timestamp_epoch"] for event in found], [1, 3])
         self.assertEqual([event["working_dir"] for event in found], [str(second), str(first)])
@@ -8989,8 +8993,8 @@ class StaffProgressHistoryTests(StaffTestCase):
         state: dict[str, object] = {"owner_staff_id": row.id,
                                    "main_agent": {"session_id": row.current_session},
                                    "working_dir": str(first), "branch": "old-branch"}
-        write = cast(Callable[[Path, dict[str, object]], None], getattr(progress_history, "_write_state"))
-        read = cast(Callable[[Path], dict[str, object]], getattr(progress_history, "_read_state"))
+        write = cast(Callable[[Path, dict[str, object]], None], getattr(pass_recorder, "write_state"))
+        read = cast(Callable[[Path], dict[str, object]], getattr(pass_recorder, "read_state"))
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root))
         _ = staff.set_run(row.id, staff.OpenRun(run))
         write(run, state)
@@ -9013,7 +9017,7 @@ class StaffProgressHistoryTests(StaffTestCase):
                 current_member = staff.local_snapshot().by_id(member.id)
                 assert current_member is not None
                 fixture_session(current_member.current_session, backend)
-                resolved = plan_history.staff_directory({"owner_staff_id": member.id}, staff.snapshot())
+                resolved = pass_recorder.staff_directory({"owner_staff_id": member.id}, staff.snapshot())
                 agent = cast(dict[str, object], resolved["main_agent"])
                 self.assertEqual(agent["family"], backend.family)
                 evidence: dict[collect.Agent, tuple[Assignment, ...]] = {}
@@ -9042,7 +9046,7 @@ class StaffProgressHistoryTests(StaffTestCase):
                 self.assertFalse((transcript.parent.parent / "auth.json").exists())
                 self.assertNotIn(transcript.parent.parent, agent_accounts.codex_homes(default))
                 with patch.dict(os.environ, {"CODEX_HOME": ""}):
-                    resolved = plan_history.staff_directory({"owner_staff_id": numbered.id}, staff.snapshot())
+                    resolved = pass_recorder.staff_directory({"owner_staff_id": numbered.id}, staff.snapshot())
                 agent = cast(dict[str, object], resolved["main_agent"])
                 self.assertEqual(agent["family"], "codex")
                 evidence = {}
@@ -9136,10 +9140,10 @@ class StaffProgressHistoryTests(StaffTestCase):
             "pass": {"impl": {"worker_id": worker.id, "called_agent": {
                 "family": "codex", "session_id": worker.current_session, "model": "turn-model"}}},
         }
-        write = cast(Callable[[Path, dict[str, object]], None], getattr(progress_history, "_write_state"))
-        read = cast(Callable[[Path], dict[str, object]], getattr(progress_history, "_read_state"))
+        write = cast(Callable[[Path, dict[str, object]], None], getattr(pass_recorder, "write_state"))
+        read = cast(Callable[[Path], dict[str, object]], getattr(pass_recorder, "read_state"))
         append = cast(Callable[[dict[str, object], dict[str, object]], None],
-                      getattr(progress_history, "_append_event"))
+                      getattr(pass_recorder, "append_event"))
         write(run, state)
         append(state, {**state, "event_type": "run_started"})
         path = run / "progress_history_state.json"
@@ -9158,7 +9162,7 @@ class StaffProgressHistoryTests(StaffTestCase):
         loaded = read(run)
         self.assertEqual(loaded["working_dir"], str(destination))
         self.assertEqual(loaded["worktree"], destination.name)
-        event = plan_history.staff_directory(dict(recorded), staff.snapshot())
+        event = pass_recorder.staff_directory(dict(recorded), staff.snapshot())
         self.assertEqual(event["working_dir"], str(first))
         self.assertEqual([(item.read_bytes(), item.stat().st_mtime_ns) for item in (path, history)], before)
 

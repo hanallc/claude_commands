@@ -1,9 +1,12 @@
 """Start, observe, and close staff workers through proved native panes."""
 from __future__ import annotations
+
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
 except FileNotFoundError:
     pass
+
+from scripts.direct import pass_record as pass_recorder
 
 import argparse
 import errno
@@ -817,7 +820,7 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
             return ReleasedWorkerPass.ENDED
         return CompletedWorkerPass(dispatch if isinstance(dispatch, str) else "")
     if status == "active":
-        if progress_history.dispatch_delivery(passed).line:
+        if pass_recorder.dispatch_delivery(passed).line:
             if isinstance(_completed_turn(row, dispatch), CloseAllowed):
                 return CompletedWorkerPass(dispatch if isinstance(dispatch, str) else "")
             return DispatchHoldsWorker("submitted pass awaits completion")

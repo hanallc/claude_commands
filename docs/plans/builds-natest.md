@@ -4465,3 +4465,59 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `cleanup_program_starts` and the tests parse `program_start.ProgramStart`; `queue_place.py` keeps no alias. `queue_place.main` sends the two old actions to `program_start.main` for runs that loaded the old file before the merge.
 - The private scope wrapper child imports `program_start_test_support.py`, not the test module.
 - Paired natedev CPU (test_queue_place plus test_bulk_run): 44.6/43.4/40.7 to 37.1/33.0/29.2 s (median saving 10.5 s). Base: queue probebackoff 687230599. Commit 9c4b9fb93.
+
+### Phase 315 — The launcher's three recorder commands load only what they use  · status: done
+**Depends on:** Phase 314
+**Owner:** natest (builds go 11-16 12:4x EST: scripts/direct is natest's to change for this; no other unit owns it).
+
+#### Work Order
+
+**Goal:** `check-launch`, `start-pass` and `finish-pass` run from a small recorder module that loads only the code they use. A launcher recorder start costs about 65 ms less CPU, in tests and in production.
+
+**Base:** builds-natest 502b11246 (phase 314), with origin/main 3b25d9189 merged at the phase start (deff511fd). Merge origin/main again before the hash (sdlc-devtools-tests edits `progress_history.py` often).
+
+**Measure** (natedev, `module_cost.py --commands`, p89/rl_cost_all.txt): `direct/test_review_launcher.py` 26.6 CPU s, 52 recorder starts 10.0 s; `direct/test_review_launcher_style.py` 25.9 s, 38 starts 7.3 s. CPU stamps in one recorder start: Python start about 66 ms, recorder import about 115 ms, command work about 6 ms. A call trace of the three commands (p89/ph_funcs.txt) uses 47 `progress_history` functions, 6 `plan_history` functions (`staff_directory`, `_staff_paths`, `_director_family`, `_worktree_branch`, `_head_text`, `now_epoch`), `staff`, `atomic_file`, `models_registry`, `transcripts`, `unit_runs`, `recorder_state`, `conf_reads`, `registry_rows`, `session_records`. They load `session_staff` (about 35 ms) and `worker_lifecycle` (about 11 ms) and never call them.
+
+**Spec:**
+1. Make a new module `scripts/direct/pass_record.py`. Move into it, without change of behavior, the code that `check-launch`, `start-pass` and `finish-pass` run: their handlers, their argument parsers, and the shared state core they call (state path, read, write, event append, slot and pass records, launch check). Give it a `main()` for these three commands only. Keep each command's arguments, output, exit codes and refusal text.
+2. `pass_record.py` must not import `session_staff`, `worker_lifecycle`, `plan_history` or `progress_history`, directly or through its imports. Target: `pass_record` and its imports under 50 ms with `-X importtime`.
+3. Move the 6 `plan_history` functions that the path calls into `pass_record.py` or into one other light module that `pass_record.py` imports. `plan_history.py` imports them from their new home. Do not copy a function.
+4. `progress_history.py` imports the moved core from `pass_record.py` and drops its own copies. Every other recorder command keeps its behavior.
+5. No re-export layer (builds rule, 11-16). Point every caller of the three commands and of each moved name at the new home in this phase: `scripts/direct/review.sh`, `assign.py`, `assign_claude.py`, `recorder_fixture.py`, `assign_claude_test_support.py`, the tests, and the docs that name these three commands (`docs/as-built/unit-progress-history.md`, `docs/as-built/repair-rounds.md`, `docs/direct/dual_review.md`, `docs/direct/no_worker_mode.md`, `docs/direct/repair_rounds.md`; check `commands/` too). Other callers of a moved function (for example `findings.py`, `phase_table.py`, `unit_phases.py`, the conversation-pause hooks, the verify wait test support files) change only when they import a moved name.
+6. Deploy window: `progress_history.main` sends `check-launch`, `start-pass` and `finish-pass` to `pass_record.main`, for a launcher loaded before the merge. Mark it with one comment that names its removal date, 2026-11-23 (same rule as phase 314 F001; builds 11-16).
+7. No signal handlers, masks or dispositions. Do not change any trap.
+8. Add no test method. Remove no assertion. Every behavior check stays.
+
+**Files:**
+- `scripts/direct/pass_record.py`
+- `scripts/direct/progress_history.py`
+- `scripts/direct/plan_history.py`
+- `scripts/direct/review.sh`
+- `scripts/direct/assign.py`
+- `scripts/direct/assign_claude.py`
+- `scripts/direct/recorder_fixture.py`
+- `scripts/direct/assign_claude_test_support.py`
+- `scripts/direct/review_launcher_test_support.py`
+- `scripts/direct/demo_refusals.sh`
+- `scripts/direct/test_progress_history.py`
+- `scripts/direct/test_assign_launcher.py`
+- `scripts/direct/test_assign_claude_records.py`
+- `scripts/direct/test_review_launcher_records.py`
+- `scripts/direct/test_review_launcher_delivery.py`
+- `scripts/direct/test_review_launcher_trees.py`
+- `docs/as-built/unit-progress-history.md`
+- `docs/as-built/repair-rounds.md`
+- `docs/direct/dual_review.md`
+- `docs/direct/no_worker_mode.md`
+- `docs/direct/repair_rounds.md`
+
+**Workers:** 1 writer; the split is not useful (one module boundary, every caller follows it).
+
+**Constraints from prior phases:** Phase 314 shape: a light start module, callers repointed, one old-name delegation for the deploy window. No lazy imports (sdlc kept them out of the recorder). The fixture `configure_launcher_fixture` patches the recorder file text; it must patch the file that now runs these commands.
+
+**Acceptance gate:**
+1. `python3 -X importtime -c "import scripts.direct.pass_record"` shows the module and its imports under 50 ms; name the number. Name `progress_history` import before and after.
+2. These modules pass on natedev: every `direct/test_review_launcher*`, `direct/test_assign*`, `direct/test_progress_history*`, `direct/test_plan_history*`, `direct/test_verify_wait_holder`, and every module that imports a moved name or starts `progress_history.py` or `pass_record.py`.
+3. basedpyright adds no finding on each touched Python file.
+4. Paired `module_cost.py` in one copy (swap the changed files, warm-up round, 3 rounds) on `direct/test_review_launcher.py` and `direct/test_review_launcher_style.py`; report CPU and ms per recorder start, before and after.
+5. Trial merges with origin/main and the open unit branches are clean.

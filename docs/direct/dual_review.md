@@ -1,5 +1,7 @@
 # Dual review
 
+Launchers run `check-launch`, `start-pass`, and `finish-pass` through `scripts/direct/pass_record.py`.
+
 Read at the point of use from `/unit:direct`. Defines `<DualReview/>`,
 `<TeamReview/>`, `<ReviewPromptContract/>`, `<BroadReviewPrompt/>`, and
 `<ClosureReview/>` in full.

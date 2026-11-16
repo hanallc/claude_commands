@@ -164,7 +164,7 @@ class AssignClaudeLauncherWorkerTests(support.InProcessAssignClaudeLauncherFixtu
         session_dir, first = self.first_worker_launch()
         self.assertEqual(first.returncode, 0, first.stderr)
         name = self.recorded_worker(session_dir).name
-        recorder = self.root / "scripts/direct/progress_history.py"
+        recorder = self.root / "scripts/direct/pass_record.py"
         _ = recorder.write_text(recorder.read_text().replace(
             "from __future__ import annotations\n",
             "from __future__ import annotations\n"

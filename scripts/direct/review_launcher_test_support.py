@@ -322,8 +322,8 @@ class ReviewLauncherFixture(LauncherFixture):
                 (self.root / filename).read_text(encoding="utf-8").splitlines()]
 
     def trace_pass_recorder(self, environment: dict[str, str]) -> None:
-        recorder = self.review_script.parent / "progress_history.py"
-        _ = recorder.rename(recorder.with_name("progress_history_real.py"))
+        recorder = self.review_script.parent / "pass_record.py"
+        _ = recorder.rename(recorder.with_name("pass_record_real.py"))
         _ = recorder.write_text('''import json
 import os
 from pathlib import Path
@@ -332,7 +332,7 @@ import sys
 if sys.argv[1] in ("start-pass", "finish-pass"):
     with Path(os.environ["STUB_PASS_CALLS"]).open("a") as calls:
         calls.write(json.dumps({"verb": sys.argv[1], "argv": sys.argv[2:]}) + "\\n")
-os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress_history_real.py")), *sys.argv[1:]])
+os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("pass_record_real.py")), *sys.argv[1:]])
 ''', encoding="utf-8")
         calls = self.root / "pass-calls.jsonl"
         calls.touch()

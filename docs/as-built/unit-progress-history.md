@@ -56,7 +56,7 @@ Staffed run state stores no director session, director family, or dispatch parti
 Current reads resolve those facts through the fixed staff references.
 Native transcript evidence supplies the director family.
 Shared account-home discovery includes numbered Codex accounts when staff has no session home.
-Active readers obtain the current folder through `plan_history.staff_directory`.
+Active readers obtain the current folder through `pass_record.staff_directory`.
 They do not route through saved folder copies or an absolute plan path.
 `start-run` with a plan calls `unit_config.set_plan` on the unit's existing `.unit.toml`.
 `start-run` with a different plan on an existing run records that plan and its project clock.
@@ -322,8 +322,8 @@ findings.py status --session-dir <dir> [--phase <id>]
 ```text
 progress_history.py start-run --session-dir <dir> --working-dir <dir> [--plan-doc <path>]
 progress_history.py start-phase --session-dir <dir> --phase-id <id> --phase-title <title> [--work-order-file <path>] [--started-at <ISO with zone>]
-progress_history.py start-pass ...        # launcher only
-progress_history.py finish-pass ...       # launcher only, or --orphaned-launcher --status canceled
+pass_record.py start-pass ...        # launcher only
+pass_record.py finish-pass ...       # launcher only, or --orphaned-launcher --status canceled
 progress_history.py start-activity --session-dir <dir> --label <label> --activity <text>
 progress_history.py finish-activity --session-dir <dir> [--status completed|error|canceled|interrupted] [--result <outcome>]
 progress_history.py calibrate --session-dir <dir> --candidate-percent <N>

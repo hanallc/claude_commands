@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Save a worker turn and notify its director through one completion rule."""
 from __future__ import annotations
+
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
 except FileNotFoundError:
     pass
+
+from scripts.direct import pass_record as pass_recorder
 
 import hashlib
 import io
@@ -156,7 +159,7 @@ def _prepare_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed:
 def repeat_completion_notice(worker_name: str, parent: staff.StaffRow, run: Path,
                              passed: dict[str, object]) -> Callable[[], None]:
     """Prepare the saved notice for delivery after the caller releases its lock."""
-    delivery = progress_history.dispatch_delivery(passed)
+    delivery = pass_recorder.dispatch_delivery(passed)
     completion = progress_history.hook_completion(passed)
     outcome = TurnOutcome(completion.outcome) if isinstance(completion, progress_history.HookCompletion) else TurnOutcome.DONE
     path = Path(completion.reply_file if isinstance(completion, progress_history.HookCompletion) else delivery.reply_file)
@@ -171,7 +174,7 @@ def repeat_completion_notice(worker_name: str, parent: staff.StaffRow, run: Path
 
 def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_panes.WorkerPane,
                   client: herdr.Herdr, run: Path, passed: dict[str, object], instance: str,
-                  delivery: progress_history.DispatchDelivery) -> TurnOutcome | TurnDecision:
+                  delivery: pass_recorder.DispatchDelivery) -> TurnOutcome | TurnDecision:
     with redirect_stderr(io.StringIO()) as diagnostics:
         try:
             result = (worker.dispatch_turn(parent.id, state, client, delivery.line, delivery.completion_id, run=run)
@@ -190,7 +193,7 @@ def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_pan
 
 
 def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, passed: dict[str, object],
-                       instance: str, delivery: progress_history.DispatchDelivery,
+                       instance: str, delivery: pass_recorder.DispatchDelivery,
                        completion: progress_history.HookCompletion,
                        state: worker_panes.WorkerPane | worker_panes.WorkerNotObserved,
                        hold: worker_panes.WorkerLockHold) -> TurnDecision:
@@ -291,7 +294,7 @@ def finish_late_completion(row: staff.StaffRow, parent: staff.StaffRow, hold: wo
     completion = progress_history.hook_completion(passed)
     if not isinstance(completion, progress_history.HookCompletion) or completion.finished:
         return _no_notice
-    delivery = progress_history.dispatch_delivery(passed)
+    delivery = pass_recorder.dispatch_delivery(passed)
     same_hold = delivery.actions.held_role == new_held_role
     instance = str(passed.get("instance_id", ""))
     late = f"late result of pass {instance} in run {recorded.directory.name}"
@@ -370,7 +373,7 @@ def _handle_locked(event: WorkerEvent) -> TurnOutcome | TurnDecision:
                 passed.get("status") in ("completed", "error")):
             return ignore_turn("no active dispatch or recoverable completion exists")
         instance = active.instance_id if isinstance(active, progress_history.ActiveDispatch) else str(passed.get("instance_id", ""))
-        delivery = progress_history.dispatch_delivery(passed)
+        delivery = pass_recorder.dispatch_delivery(passed)
         if not delivery.line:
             return ignore_turn("the dispatch delivery line is empty")
         client = herdr.Herdr(herdr.shared_session())

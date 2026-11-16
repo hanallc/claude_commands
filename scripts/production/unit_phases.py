@@ -7,10 +7,13 @@ Without `--production`, the caller's staff row names the production.
 The phase and task come from the unit's run records.
 """
 from __future__ import annotations
+
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
 except FileNotFoundError:
     pass
+
+from scripts.direct import pass_record as pass_recorder
 
 import hashlib
 import json
@@ -1374,7 +1377,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
           columns: int | None = None) -> str:
     """Build each unit's state once for its status row, block and summary bucket."""
     snapshot = plan_history.staff_record() if snapshot is None else snapshot
-    now = plan_history.now_epoch() if now is None else now
+    now = pass_recorder.now_epoch() if now is None else now
     zone = user_zone() if zone is None else zone
     view = census_view(census_read)
     land = land_queue.land_view(REPOSITORY)

@@ -1,6 +1,8 @@
 """Worker operations preserve native identity and proved pane ownership."""
 from __future__ import annotations
 
+from scripts.direct import pass_record as pass_recorder
+
 import io
 import json
 import fcntl
@@ -2096,7 +2098,7 @@ class WorkerPaneTests(StaffTestCase):
         self.dispatch(opened.row, "impl")
         run = self.root / "run"
         progress_history.save_dispatch_delivery(run, "dispatch-" + opened.row.name,
-            progress_history.DispatchDelivery("saved prompt", "dispatch-" + opened.row.name, str(self.root / "reply"), "",
+            pass_recorder.DispatchDelivery("saved prompt", "dispatch-" + opened.row.name, str(self.root / "reply"), "",
                                               progress_history.NO_COMPLETION_ACTIONS))
         with patch("scripts.agents.detached_runs.live_runs", return_value=[]):
             self.assertIsInstance(worker_panes.can_close(opened), worker_panes.Kept)
@@ -2376,7 +2378,7 @@ class WorkerPaneTests(StaffTestCase):
                 if unfinished:
                     self.dispatch(row, "impl")
                     progress_history.save_dispatch_delivery(self.root / "run", "dispatch-" + row.name,
-                        progress_history.DispatchDelivery("saved prompt", "dispatch-" + row.name, str(self.root / "reply"), "",
+                        pass_recorder.DispatchDelivery("saved prompt", "dispatch-" + row.name, str(self.root / "reply"), "",
                                                           progress_history.NO_COMPLETION_ACTIONS))
                 else:
                     self.completed_dispatch(row, "impl")

@@ -114,7 +114,7 @@ Work moved to another phase is not saved work.
 
 ## Launch and review boundaries
 
-`progress_history.py check-launch` and `start-pass` check the named open phase and the prompt's first `Phase <id> — <title>` line.
+`pass_record.py check-launch` and `start-pass` check the named open phase and the prompt's first `Phase <id> — <title>` line.
 A recorded launch needs `--phase-id`.
 A fix needs a ledger batch in flight, a landed batch awaiting review, or an explicit `--fix-cause`.
 The launcher records `worker_id` for recovery.
