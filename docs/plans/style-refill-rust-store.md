@@ -1,6 +1,8 @@
-# Refill on a fast store: design brief
+# Style refill in Rust
 
-Status: design (style-unit). The brief is from 2026-11-14; the design below it is from 2026-11-15.
+Status: proposed design, 2026-11-16. Phases 1–5 are complete. Phases 6–12 are proposed.
+
+The showrunner selected Rust for selection. SQLite remains the ledger. The user controls the switch to Rust.
 
 ## The ask
 
@@ -13,280 +15,760 @@ Design a refill that is fast on a cold start and on a warm start. Evaluate the u
 instance and a Rust program that runs the refill. If SpacetimeDB is not the best fit, say why, and name the store
 that is. Compare on cold time, warm time, memory, and how simple the result is to build and debug.
 
-## Current numbers
+Later, the user: "a refill shouldn't even take minutes - you have the wrong design". The showrunner then set the direction: the selection moves to Rust.
 
-Measured on natedev under `systemd-run --user --scope -p MemoryMax=2G -p MemorySwapMax=0`, cargo-liner ledger:
+## Result
 
-| Run | Time | Peak memory |
+Move the complete selection calculation into the existing `style_reader` package.
+Keep Git facts inside Rust throughout selection.
+Read authoritative SQLite rows in batches, then calculate with indexed Rust values.
+Save compact selection partitions in a separate SQLite cache.
+Keep the Python command line and all authoritative writes.
+
+The acceptance targets are below 10 seconds cold and below 3 seconds warm on cargo-liner-style.
+The complete process tree must fit below 2 GiB.
+These targets are not measured results from a Rust selector.
+
+The current refill remains available throughout construction.
+The replacement keeps existing ticket and judgment formats.
+
+## Evidence and limits
+
+### Completed work
+
+The user requested a replacement that permits current work to continue on 2026-11-14.
+The user later rejected refill times measured in minutes.
+
+The earlier design predicted cold time below four minutes after phase 4.
+The measured result was 494 seconds, or 8:14.
+That prediction underestimated Python selection and the cost of transferring facts from Rust.
+
+| Completed phase | Result |
+| --- | --- |
+| 1 | `gix` reads, the Python token reader port, line facts, and name facts |
+| 2 | Module scans, module sites, declarations, name sites, and code identities |
+| 3 | Python client, tree inventories, and `reader=python\|rust` |
+| 4 | Rust blob facts remain in memory; the Rust path omits several saved blob kinds |
+| 5 | Module declarations use `module_scan` once per blob; crate-root checks share results |
+
+The switch in `config/style_reader.conf` defaults to Python.
+It selects a fact reader, not a complete selector.
+The previous phase 6, “shadow, switch, delete,” becomes phase 12 below.
+
+### Supplied measurements
+
+These runs used the same load and a 2 GiB limit on 2026-11-16.
+
+| Reader with Python selection | Cold | Warm | Result digest prefix |
+| --- | ---: | ---: | --- |
+| Python | 704 s | 165 s | `2de7c1bdf58dba21` |
+| Rust | 494 s | 132 s | `2de7c1bdf58dba21` |
+
+`scripts/style/refill_measure.py` backs up the ledger through a read-only SQLite connection.
+It clears derived tables and starts separate cold and warm processes.
+It compares selection, candidates, cells, and declaration proofs.
+Its `COUNT` operation does not test ticket publication or the complete `next-phase` command.
+
+“Cold” here means no saved derived results and a new process.
+It does not mean an empty operating-system page cache.
+Measure the first run after a host restart separately.
+Do not clear shared host caches for that measurement.
+
+An earlier Rust probe parsed 25 MB with `syn` in 0.22 seconds using eight threads.
+That result excludes selection, Git history, SQLite, and Python communication.
+It supports a small parsing budget, not a refill-time prediction.
+
+The supplied 529-second profile sampled stacks every 10 milliseconds.
+Its percentages are inclusive and overlap.
+Do not add them to predict a speed increase.
+
+| Work | Inclusive share | Design response |
+| --- | ---: | --- |
+| Coverage and candidate sites | About 35% | Bulk judgment indexes and native candidate enumeration |
+| Declaration groups and follow checks | About 34% | Shared declaration, name, and rename indexes |
+| Finding footprints | About 12% | Calculate from shared source indexes |
+| Candidate tickets | About 11% | One coverage result and ranking pass for all requested families |
+| Preparing Rust blob facts | About 9% | Keep facts in Rust; remove Python decoding and compression |
+| Git subprocesses | About 12% | In-process Git reads and shared revision comparisons |
+
+Saved-result publication also appears inside these paths.
+Changing the store alone cannot remove these calculations or their repeated traversal.
+
+### Measurements from this design round
+
+Two read-only probes ran on natedev under the required 2 GiB scope.
+They opened the live ledger with Python `sqlite3` URI `mode=ro` and `query_only=ON`.
+Each probe used one read transaction and a 32 MiB SQLite cache.
+Neither probe wrote the ledger or ran a refill.
+
+The design checkout is `6270817606ea0546417113e7e4450c4cfa0e3772`.
+The observed ledger schema is 46.
+Its synced commit is `5142c3ca45e58d90aa2ab65aee58e24e052efcbb`.
+The Git probe observed cargo-liner-style HEAD `6f2f75038ef5e6ce26ce75b23a6571113de31362`.
+
+| Observation | Result |
+| --- | ---: |
+| Ledger file size | 4,417,458,176 bytes |
+| Rows outside `refill_*`, `listed_rules`, and `listed_sites` | 142,497 |
+| Value bytes in those rows | 66,927,233 bytes |
+| Python scan and value-byte accounting for those rows | 0.565 s |
+| Judgment rows | 54,320 |
+| Held finding rows | 47,579 |
+| Rust paths at observed HEAD | 1,306 |
+| Rust source bytes at observed HEAD | 25,000,962 bytes |
+| First probe, including derived-kind counts and Git inventory | 2.99 s |
+| Second probe, including derived payload accounting | 5.90 s |
+| Maximum reported Python RSS in either probe | 306,620 KiB |
+
+The value-byte count measures UTF-8 strings, byte arrays, and eight bytes per number.
+The derived payload counts below use SQLite byte lengths after conversion to BLOB.
+Neither count includes indexes, page slack, or Rust allocation overhead.
+The first scan includes small control tables as well as selection inputs.
+These probes observed a later live ledger than the supplied refill benchmark.
+Host page-cache state was uncontrolled.
+
+| Existing derived data | Rows | Logical payload bytes |
+| --- | ---: | ---: |
+| `refill_cells` | 74,300 | 97,154,072 |
+| `refill_findings` | 21,826 | 362,808,884 |
+| `refill_inputs` | 34,913 | 199,467,431 |
+| `refill_dependencies` | 168,265 | 29,206,837 |
+| `listed_sites` | 462,180 | 108,789,668 |
+| `refill_candidates` | 0 | 0 |
+
+`refill_objects` also contains 1,179,579 `finding_word` rows and 1,262 `line_count` rows.
+The source-row scan makes a bulk read plausible within one second on this host.
+It does not prove the cost of Rust indexes, selection, or durable cache publication.
+
+## Store choice
+
+Keep SQLite as the authoritative ledger.
+The store choice is settled for this work.
+Do not introduce SpacetimeDB, another database engine, or a service process.
+
+Use `selection.sqlite` beside `ledger.sqlite` for disposable Rust results.
+This separates new cache writes from current ledger users.
+It permits cache deletion without removing judgments or findings.
+The Rust child opens the authoritative ledger read-only.
+Python retains all authoritative migrations and writes.
+
+Retain the current ledger journal mode.
+Do not include `VACUUM` or file shrinkage in a refill.
+The new selector can avoid old derived pages without shrinking the ledger.
+
+## Architecture
+
+### Calculation ownership
+
+Extend `rust/style_reader` with selection modules and a versioned selection request.
+Keep the current fact request compatible during overlap.
+Reuse its token semantics, Unicode tables, Git reader, and error conventions.
+Do not replace the token reader with `syn` during this port.
+
+| Rust stage | Existing Python behavior | Outputs |
 | --- | --- | --- |
-| Cold refill (no saved results) | 15:46 | 1.70 GB |
-| Warm refill (saved results) | 0:37 | 0.62 GB |
-| Cold refill before phase 5 of the refill plan | 19:18 | 1.73 GB |
+| Source observation | `refill_inputs`, `RepositoryTip`, rule and revision identities | Source views and source-row indexes |
+| Findings | `declarations`, `finding_sites`, declaration methods in `style_ledger` | Declaration outcomes, site evidence, built rename evidence |
+| Footprints | `style_footprint`, `approved_renames`, footprint methods in `style_plan` | Source paths, rename permission results, refusal reasons |
+| Candidates and coverage | `candidate_generators`, `refill_facts`, `refill_cells`, coverage methods | Listed sites, cells, verdicts, scope comparisons |
+| Selection | `ranked_work`, `candidate_tickets`, `_select_observed_phase`, batching methods | Ordered candidates, counts, waits, and proposed actions |
 
-The ledger is one SQLite file of about 3.7 GB (`~/.local/state/style/cargo-liner/ledger.sqlite`).
+Python keeps the command line, staff lookup, and existing document parsers.
+It supplies compact rule definitions and external document observations once per request.
+Rust determines eligibility and ranking from those values.
+Python keeps ticket allocation, assignment, decision-file writes, plan writes, and worker dispatch.
+It also keeps existing mutation locks and recovery behavior.
 
-After the row and tokenize cuts (branch `sdlc-style-cold-refill-rows`, 2026-11-14), on a copy of the live ledger:
+The port includes selection calculations invoked by reconciliation and publication guards.
+Leaving those calculations in Python would move the delay outside the benchmark.
+Python writers may request Rust validation through the same child.
+They must not repeat source scans or selection in Python.
 
-| Measure | Before | After |
+### Reads and indexes
+
+Read ledger source projections in one short SQLite read transaction.
+Read the source-version vector inside that transaction.
+Close the transaction before Git analysis and selection.
+Do not hold a reader lock during the complete calculation.
+For a changed partition, bulk-read its supporting source rows, including unchanged rows needed by its proof.
+Do not reconstruct a complete source-row mirror in the cache.
+
+Build these indexes once for the request:
+
+1. Index judgments by rule, path, generation, and judgment order.
+2. Index findings by identity, rule, path, proposal, ticket, and declared name.
+3. Index ticket relations and current states.
+4. Index declarations and names by blob, crate, and revision view.
+5. Index revision ancestry, removals, and changed paths.
+
+Preserve Python ordering at each output boundary.
+Share the cell population across families and candidate queries.
+Share declaration outcomes across selection and the follow step.
+Use indexes to select possible declaration matches before applying existing proof rules.
+Do not compare every finding with every declaration.
+
+Use `gix` for trees, blobs, revision resolution, ancestry, and comparisons where parity tests establish equivalence.
+Memoize distinct revision pairs for the request.
+Preserve merge-base, rename, pathspec, and missing-object behavior explicitly.
+Matching trees do not imply matching ancestry or removal history.
+
+A missing native Git operation may use a batched Git adapter during construction.
+Record its invocation count and elapsed time.
+Phase 11 must remove repeated per-cell and per-finding Git processes.
+A remaining bounded adapter must pass timing and differential tests.
+
+### Candidate semantics
+
+Port every generator reachable from the rule catalog, including manifest and workspace generators.
+Preserve `#uncovered` coverage, candidate text, line numbers, ordering, and ignore behavior.
+The source set includes manifests and other selected files, not only Rust blobs.
+
+Regex candidates currently use ripgrep plus Python exclusion patterns.
+Pre-filters use Python regular expressions.
+These are separate semantics and require separate differential fixtures.
+
+Phase 8 first retains ripgrep behavior in a Rust-owned batch adapter.
+Share one temporary source export per distinct selection domain within a refill.
+Reuse its path topology and selected contents across compatible rules.
+Do not create an export once per rule and file.
+The timing gate includes exports and subprocesses.
+
+Port compatible regex operations to native libraries only after proving their behavior.
+A bounded compatibility adapter may handle unsupported Python regex constructs during construction.
+Expose adapter use in diagnostics and timing results.
+Phase 11 requires native support for the pinned rule catalog or a measured adapter within budget.
+An unsupported rule must produce a prerequisite error or an explicitly selected Python run.
+It must never produce an empty candidate list as a substitute.
+
+### Process boundary and publication
+
+Start one Rust child for one refill command.
+Keep that child through mutation acknowledgements and multiple ticket selections within the command.
+Use bounded JSON messages for control values and selected outputs.
+Do not transfer tokens, complete source facts, or the full cell population in production requests.
+Use separate streamed diagnostic output for differential comparisons.
+
+The initial request identifies the repository, ledger, cache, implementation, unit, revisions, selection mode, and external inputs.
+The reply contains its observation identity and one selection result or publication step.
+No Rust reply directly changes authoritative state.
+
+`COUNT` and assignment differ today.
+`COUNT` projects followed findings without writing them.
+Assignment can drop a queued ticket, release its findings, and then select those findings.
+The protocol must preserve that sequence.
+
+Use this publication sequence:
+
+1. Acquire the existing refill lock in Python.
+2. Capture the board, external inputs, and resolved revision identities.
+3. Request selection from Rust.
+4. Validate the returned source versions under the Python writer transaction.
+5. Validate relevant external identities and existing ownership guards.
+6. Apply the next existing mutation group through Python writers.
+7. Send committed changes and refreshed observations to Rust.
+8. Continue selection from the resulting state.
+
+The writer rejects stale results before applying a mutation group.
+An external change requires a new observation before further actions.
+Permit at most two automatic retries, then return the existing waiting or prerequisite-failure result.
+Include retry time in the command timing.
+
+The refill lock does not exclude every judgment writer or external file editor.
+The source-version check and final approval check remain necessary.
+Retain current transaction boundaries and decision-file recovery order.
+Do not hold a SQLite write transaction across a decision command or Git operation.
+Request any additional Rust proof before acquiring the writer transaction.
+Inside that transaction, compare the proof's versions and apply the existing bounded writer checks.
+Do not ask the child to observe uncommitted Python writes through another connection.
+
+The follow step must still skip decisions with missing generated content or a missing Parent line.
+An approval change before publication must still prevent a rename from becoming built.
+Partial publication must resume through the existing recovery path.
+Never save an action sequence as permission to replay writes on a later refill.
+
+### Switch and binary identity
+
+Add `selection=python|rust` beside the existing `reader` setting.
+Its default remains `python` until the user authorizes the change.
+Rust selection owns its source reader internally.
+Python selection continues to honor `reader=python|rust`.
+
+Shadow comparison uses a separate command and private copies.
+It does not run the slow selector on every production refill.
+It does not write live tickets, plans, or proposals.
+
+Identify a build with its Rust sources, dependency lockfile, protocol version, and ported Python contract digest.
+Include relevant workspace settings in that identity.
+The current stamp covers only `HEAD:rust/style_reader`; that is insufficient for the expanded selector.
+Reject incompatible binaries before selection.
+
+Build and install the binary before enabling the selector.
+Do not compile synchronously inside a timed refill.
+The explicitly selected Python path remains usable without the new binary.
+A requested Rust run with no matching binary returns a prerequisite failure.
+Do not hide a slow Python fallback in a successful Rust timing result.
+
+## Warm reuse and change keys
+
+A warm refill compares a small manifest before loading source rows or scanning blobs.
+It reuses valid partitions and recalculates affected partitions.
+The final busy-file filter and publication checks always use current inputs.
+
+### Durable ledger changes
+
+Reuse `refill_tables` and `refill_rows` for source versions and changed-row keys.
+The existing `refill_changed_rows(source_table,version)` index supports incremental reads.
+Do not use `PRAGMA data_version` as a cursor across processes.
+The existing `selection_version()` value serves one connection, not a persistent cache.
+
+Audit every authoritative table read by selection and publication validation.
+Current version triggers cover 18 tables.
+They omit tables such as `handoffs`, `bulk_refusals`, and `sync_waits`.
+Add source-version triggers for every missing source before enabling warm reuse.
+Do not treat the current trigger list as a complete dependency list.
+
+Each insert, update, and deletion advances its table version in the same transaction.
+Keep old and new primary keys for key-changing updates.
+Keep deletion markers while retained cache cursors require them.
+Store a ledger revision epoch to distinguish resets, migrations, and restored state.
+An epoch change, version regression, or unavailable change history requires a full calculation.
+
+Change the benchmark's blanket `refill_*` deletion to an explicit derived-table list.
+Preserve source versions, deletion markers, and report rows such as `refill_results`.
+A reset of source tracking must advance the epoch.
+Test resets must follow the same rule.
+
+Current `Ledger` admission rejects a newer schema, including read-only admission.
+An additive migration alone therefore does not preserve compatibility with old executables.
+Deploy Python admission support for both schemas before migrating the shared ledger.
+That compatibility release must keep Python selection and must not apply the new migration during ordinary ledger opening.
+Apply the explicit migration only after all active callers use that release.
+Measure trigger overhead on current judgment and ticket writes.
+Prove Python behavior before and after migration on a private backup.
+Rollback selects Python within the compatible release; it does not restore a schema-46 executable.
+
+### Input identities
+
+| Change key | Contents | Affected calculation |
 | --- | --- | --- |
-| Dependency rows | 4,698,263 | 451,462 |
-| Ledger size | 4.39 GB | 2.00 GB |
-| Cold refill | 12:32 | 9:54 |
-| Bytes written, cold | 63.5 GB | 26.6 GB |
-| Warm refill | 0:34 | 0:29 |
-| Cold peak memory | 1.92 GB | 1.90 GB |
+| Implementation | Protocol, selector semantics, reader semantics, rule interpreter, dependencies | All partitions |
+| Ledger identity | Repository identity, database identity, schema, revision epoch | All partitions |
+| Ledger cursor | Version per source table; changed keys and deletion markers | Subscribers of old and new row membership |
+| Revision roles | Synced commit, unit tip, main tip, pushed tip, checkpoints, branch presence | Ancestry, removals, scope matches, and selection |
+| Source membership | Trees, paths, modes, blobs, submodules, manifests | Source scopes and membership queries |
+| Rule catalog | Rule identities, judged bodies, generations, reach, tier, family, generators | Rule partitions and ranking |
+| Decisions | Contents, presence, approval, status, Parent, generated-body fields | Related findings and decision selection |
+| Work assignment | Staff revision, production document, plan, family scopes, first files, ticket limits | Unit eligibility, ranking, batching |
+| Availability | Board, ownership, yields, checkpoints, pending sync, worktree observations | Final selection and publication |
+| Tool environment | Locale, ripgrep executable/configuration, external ignores, lint configuration | Search, generators, lint coverage |
+| Git availability | Required object identities and current availability | Every reused result requiring those objects |
 
-Cell rows (branch `sdlc-style-cell-columns`): dependency rows 451,143 -> 168,053 and ledger 1.99 -> 1.79 GB. Cold and
-warm time did not change (measured side by side under the same load: cold 19:07 -> 18:56, warm 0:58 -> 1:01).
+Hash relevant external file contents once per observation.
+Include additions, deletions, and directory membership in the manifest.
+Do not use only modification time and file size as durable identities.
+Two edits can preserve both values.
 
-Module renames once (branch `sdlc-style-module-renames-once`), side by side under the same load: `_module_renames`
-tokenize calls 4,426 -> 1,912 (205 M -> 59 M characters), cold 16:24 -> 13:14, bytes written 26.0 -> 5.3 GB, warm
-0:44 -> 0:42, cold peak 1.91 -> 1.92 GB. Both sides gave the same result.
+Resolve mutable Git refs once per observation and recheck relevant refs before publication.
+The worktree identity includes every file that current selection reads from the worktree.
+Do not replace those reads with HEAD contents.
 
-WAL journal mode gave no cut (cold 10:24, 27.9 GB written), so the ledger stays in rollback mode.
+### Recalculation boundaries
 
-## Current system
+Keep coverage partitions by rule and crate.
+Keep finding partitions by source view and search domain.
+Keep generator partitions by specification and its file, crate, or workspace domain.
+Retain canonical ordered rows inside each partition.
 
-- Code: `scripts/style/style_plan.py` (refill entry, selection), `scripts/style/style_ledger.py` (ledger, coverage,
-  yields), `scripts/style/refill_findings.py`, `refill_cells.py`, `refill_facts.py`, `refill_inputs.py`,
-  `style_footprint.py`, `declarations.py`, `finding_sites.py`, `approved_renames.py`.
-- As-built: `docs/as-built/style-showrunner.md`.
-- Earlier speed plan: `docs/plans/style-refill-in-seconds.md` (phases 1-5 landed; phase 6, refill groups and outputs,
-  is not started). Its target was a few seconds and less than 200 MB for an ordinary refill.
-- Inputs: Git objects of the target repository (cargo-liner), the ledger tables, rule files in
-  `~/rust/nate_style/rust/`, and the staff and plan files.
+Store subscriptions to semantic domains, including queries that found nothing.
+Examples include a rule/path judgment group, a proposal, a declaration name, and manifest membership.
+Do not store one dependency row per token, candidate site, or Git object.
 
-## Early profile of the cold path
+A changed row maps through both its previous cached membership and its current membership.
+This invalidates the old path when a finding moves.
+A deletion uses cached membership and its deletion marker.
+A missing membership map invalidates the complete affected stage.
 
-The first 534 one-second samples of the cold run:
+A changed tree produces added, removed, mode-changed, and content-changed paths.
+Use old and new declaration names to invalidate name-search domains.
+An added declaration must invalidate a previous “not found” result.
+An outside-rename search can cross crate boundaries.
+Its subscription must cover that complete search domain.
 
-| Work | Share | Cause |
+Built-rename membership, rule generations, removal barriers, and ancestry can affect many partitions.
+Recalculate the complete stage when a smaller affected set cannot be proved.
+Correctness takes priority over a small-change timing target.
+
+An unchanged warm refill reads its manifest and only compact outputs needed for the unit.
+It performs no tokenization, candidate enumeration, declaration proof, or coverage calculation.
+It still checks required Git objects in one deduplicated batch.
+A cache hit does not prove that an old object still exists.
+Unavailable objects invalidate dependent results and invoke the existing missing-object behavior.
+Preserve Python cases that skip unavailable judgment history instead of refusing the complete refill.
+Do not save missing-object failures as completed results.
+Object restoration must permit a subsequent successful calculation.
+
+An ordinary changed warm case changes at most ten files, one decision, or one hundred ledger rows.
+The below-three-second target applies when those changes affect a bounded set of partitions.
+A catalog replacement, history rewrite, or broad rename dependency can require a cold-sized calculation.
+Measure those cases separately and apply the cold target to them.
+
+## Saved results
+
+The cache stores completed selection partitions, not another copy of source history.
+Source rows remain authoritative only in `ledger.sqlite`.
+
+| Existing saved kind | Rust disposition | Reason |
 | --- | --- | --- |
-| Declaration reading (`_declaration_reading`, `_compute_declaration_groups`) | about 35% | Python tokenizer and parser per file |
-| Footprints (`finding_footprint`, `module_readings`, `_module_renames`) | about 45% | Python tokenizer per file, read again per finding |
-| Saved-result writes (`refill_facts.dependencies`, `input_fact`, `publication`) | about 20% | Point reads and writes on a 3.7 GB SQLite file under a 2 GB limit |
+| `tree`, `tree_entry`, `source_text`, `masked_source`, tokens, line counts | Request memory only | Read each required blob once; avoid source duplication |
+| `finding_word`, `finding_words` | Request search indexes only | More than one million rows represent a small source corpus |
+| `finding_declarations`, `finding_module_links`, `footprint_modules`, `rust_code` | Request facts only | Reuse the native reader and remove Python encoding |
+| `ancestor`, `scope_comparison` | Request maps only | Batch revision work; retain resulting coverage partitions |
+| Per-file `generator`, trait declarations, trait implementation counts | Request facts and indexes | Share scans and cross-file counts |
+| `refill_candidates`, `listed_rules`, `listed_sites` | Compact generator partitions | Preserve completed membership and candidate results |
+| `refill_cells` | Compact coverage partitions | Preserve judgment results without repeated identities and object lists |
+| `refill_findings` views `synced` and `built` | Compact finding partitions | Preserve follow proofs and built-rename results by domain |
+| `refill_findings` views `footprint:*` | No separate saved layer | Derive paths from shared indexes; include required paths in finding partitions |
+| `object_group` and repeated object lists | One required-object manifest per observation | Preserve availability checks without repeated arrays |
+| `refill_dependencies` | Coarse partition subscriptions | Preserve mutable and negative-query dependencies without per-result expansion |
+| `refill_tables`, `refill_rows` | Retain and complete source coverage | Detect authoritative changes across processes |
+| `refill_results` | Retain as report state | It records user-visible operation results |
 
-Full profile of the cold run with the row cut (one-second samples): `input_fact` about 15% (leaf),
-`run_git` about 14%, `token_spans` and `tokenized_text` about 18%.
+“Request only” is a design choice to test, not a measured native recomputation cost.
+Phase 6 measures saved bytes and repeated work by kind.
+Phases 7–10 compare native recomputation with compact cache reads.
+If recomputation exceeds its budget, retain the smallest shared immutable index with a measured benefit.
+Do not restore the old graph of individual saved facts by default.
 
-Tokenizer calls in one cold run, after the cuts:
+Use these cache tables:
 
-| Caller | Calls | Distinct texts | Characters |
-| --- | --: | --: | --: |
-| `_module_renames` (via `module_readings`) | 4,629 | 926 | 214 M |
-| `declarations.source_spans` | 4,625 | 3,141 | 121 M |
-| `module_declaration_text` | 1,712 | 1,712 | 38 M |
-| `_rust_code` | 1,094 | 1,094 | 28 M |
+| Table | Purpose |
+| --- | --- |
+| `selection_observations` | Completed manifest, source cursors, implementation identity, partition references |
+| `selection_partitions` | Versioned payloads for coverage, generators, and finding outcomes |
+| `selection_subscriptions` | Domains that invalidate partitions, including empty query results |
+| `selection_source_routes` | Previous row membership needed for changes and deletions |
+| `selection_required_objects` | Deduplicated requirements shared by completed observations |
 
-`_module_renames` reads each large file about 5 times, once for each moved file. A token cache for those files does
-not fit under the 2 GB limit. A reader keyed by blob id removes this repeat.
+Use compact typed payloads with explicit format versions.
+Intern repeated paths, rules, names, and candidate text within each payload.
+Represent source-backed text by blob and source position where exact reconstruction is possible.
+Retain literal candidate text when the generator transforms it.
+Do not serialize complete finding records inside every proof.
 
-The user, 2026-11-14: "wouldn't the other parts go faster if it was syn based - and running in parallel on multiple
-threads?" Evaluate a Rust reader that parses each blob once with `syn`, on many threads (for example `rayon`), keyed
-by Git blob id, so a blob is parsed once for all rules and findings.
+Publish changed partitions and their completed observation in one cache transaction.
+Do not mark a partial observation complete.
+After a crash, reuse the previous complete observation or calculate again.
+A damaged cache permits reconstruction; a damaged source ledger returns an error.
+Cache failure must not silently change an authoritative result.
 
-## Constraints
+Retain current observations for configured units and one previous observation for recovery.
+Prune unreferenced partitions after publication with a bounded deletion budget.
+Measure logical cache size and bytes written separately.
+The initial cold cache budget is 64 MiB.
+The ordinary changed-refill budget is 4 MiB written.
+These are engineering budgets, not measurements.
 
-1. The current Python refill keeps working, unchanged in behavior, until the replacement proves the same output and
-   is faster. Build the replacement beside it.
-2. The phases must be able to run in parallel with the current style work.
-3. Each phase proves its output against the current refill on the same inputs (a differential run).
-4. A heavy run on natedev runs only under `MemoryMax=2G`. Nothing runs on the Mac outside the build queue.
-5. The live ledger opens read-only. Probes use a copy.
+During overlap, leave Python derived tables and consumers intact.
+The Rust path neither populates nor depends on them.
+At phase 12, audit consumers before deleting any table or reader.
+Reports and remaining ledger methods must receive equivalent projections first.
 
-## What the design gives
+## Types and resource bounds
 
-1. The architecture: the store, the Rust program, and how they read Git and the ledger.
-2. The data model, and how a change in an input finds the results it changes.
-3. The cutover: shadow runs, the differential proof, and the switch.
-4. Phases that can run beside the current work, each with its proof and an estimate.
-5. Risks, and what to measure first to settle the store choice.
+Apply `~/.claude/docs/type_design.md` to every new type and protocol value.
+Names must describe a role, state, or guarantee.
+Preserve existing domain distinctions at the wire boundary.
 
-## Design
+| Type | Meaning |
+| --- | --- |
+| `ObservedSelectionInputs` | Inputs for one attempt; publication has not validated them |
+| `SelectionObservationId` | Identity of source versions, external inputs, and implementation |
+| `SelectionMode::Count` / `SelectionMode::Assign` | Project changes or request authoritative publication |
+| `UnitBranchState::Present` / `UnitBranchState::NotCreated` | Explicit branch availability |
+| `CacheValidity` | `Current`, `Absent`, `Invalidated`, `UnsupportedVersion`, or `Damaged` |
+| `SourceRowChange` | `Present` with a row identity, or `Deleted` with its previous identity |
+| `DeclarationOutcome` | Existing moved, unchanged, removed, uncertain, and approval-dependent outcomes |
+| `SelectionProgress` | `NeedsPublication`, `Complete`, `Waiting`, or `InputsChanged` |
+| `ValidatedPublication` | Python-side value valid only inside the writer's current validation scope |
+| `SelectionError` | Named `thiserror` variants for source, protocol, prerequisite, and resource failures |
 
-Status: design (style-unit, 2026-11-15). Written without a designer, under no-worker mode, at the showrunner's request.
+Convert library `Option` values and boundary booleans into explicit domain states.
+Do not use a missing value for both “not read” and “proved absent.”
+Keep limits and version constants in `constants.rs`.
+Use spelled-out names and no `#[allow]` attributes.
+Pin new workspace dependencies with `=`.
+Keep Rust unit tests in the file under test.
+Use tempdir repositories for integration and differential fixtures.
 
-### Result
+Start with eight parsing workers and a bounded queue.
+Share compact facts and release token buffers after their consumers finish.
+Do not retain source ASTs or all token vectors for every historical blob.
+Include indexes and pending serialization in the resource budget.
 
-Do not use SpacetimeDB. Keep SQLite as the ledger. Build a Rust reader beside the Python refill.
+| Resource | Initial budget |
+| --- | ---: |
+| Authoritative rows and selection indexes | 384 MiB |
+| Git objects, trees, compact facts, parsing workers | 512 MiB |
+| Partition payloads and output batches | 256 MiB |
+| Python, SQLite caches, protocol buffers | 256 MiB |
+| Remaining cgroup margin, including file-cache charges | 640 MiB |
 
-The reader reads Git objects in its own process. It reads each Rust blob once, on all CPUs, and returns the
-facts that the refill now gets from the Python tokenizer. A blob fact is keyed by the blob id and the reader
-version. It never goes stale, so it needs no dependency row and no saved result.
+These budgets total 2 GiB.
+They are allocation limits to verify, not observed Rust memory.
+Reduce workers and release request caches before exceeding the limits.
+Return a named resource error if the input still cannot fit.
+Never truncate findings or candidates to fit memory.
+Record the cgroup peak as well as simultaneous process RSS.
 
-The store is not the main cost. The cold refill spends its time in Python token reads, Git processes and
-saved-result reads and writes. A faster store changes only the last part. A Rust reader removes the first two
-parts, and with them most of the saved results.
+## Differential proof and overlap
 
-Expected times on cargo-liner, cold and warm, under the same load as the measure:
+Extend the differential pattern from phases 1–4 to each selection stage.
+Run both implementations against identical immutable input captures.
+Sequential reads of a changing live ledger do not prove equality.
 
-| Point | Cold | Warm |
-| --- | --: | --: |
-| Now (2026-11-14 measure) | 13:14 | 0:42 |
-| After phase 4 (reader and no saved blob facts) | below 4:00 | below 0:20 |
-| After phase 5 stages (selection ported where the profile names it) | below 0:10 | below 0:03 |
+Freeze these inputs in the parity harness:
 
-The phase 4 number is an estimate: the token reads, `run_git` and `input_fact` are about half of the cold
-profile, and the Python code that walks token tuples is a further part. Phase 4 measures it. Seconds, which the
-user asks for, need phase 5: the selection code is Python too.
+1. Capture a private SQLite backup and its source versions.
+2. Pin exact Git commits and required objects.
+3. Capture rule bytes and external configuration.
+4. Capture proposal files, plans, staff values, and board values.
+5. Record locale, tool identities, and selection mode.
 
-### Why the cold refill is slow
+The fixture harness creates temporary repositories and separate copies of mutable outputs.
+It runs current Python as the reference.
+It compares typed intermediate values before comparing the final digest.
+Canonicalize only explicitly unordered sets and nondeterministic test identifiers.
+Preserve candidate order, tie breaks, reasons, paths, lines, and refusal classes.
 
-The target repository is small. At `cargo-liner-style` `ff68c6bc4`, the tip has 1,318 Rust files with 25.0 MB of
-text. A cold refill reads about 3,141 distinct Rust texts across the commits that it compares.
+The current digest is necessary but insufficient for assignment.
+Test `COUNT`, assignment, queued-ticket reuse, and multiple tickets.
+Compare normalized action traces, authoritative rows, and document bytes.
+Inject faults between mutation groups.
+Verify that retries neither duplicate tickets nor omit decision recovery.
 
-The Python refill tokenizes about 250 M characters in one cold run: each byte about ten times.
+Every ported module belongs to a dependency manifest used by the parity gate.
+A Python change in that manifest requires stage parity on the same candidate revision.
+A behavior change requires its Rust change in the same integration change.
+Unrelated Python changes do not require a selector rebuild.
+An intentional behavior change first receives its own approved specification and fixture.
+Do not resolve a differential failure by weakening the comparison.
 
-| Caller | Calls | Distinct texts | Characters |
-| --- | --: | --: | --: |
-| `declarations.source_spans` | 4,625 | 3,141 | 121 M |
-| `_head_spans` (module renames) | 1,912 | 923 | 59 M |
-| `module_declaration_text` | 1,712 | 1,712 | 38 M |
-| `_rust_code` | 1,094 | 1,094 | 28 M |
+Current units may continue changing Python during construction.
+Integrate their changes at least once per implementation day.
+The integration owner handles parity failures and contract-digest changes.
+Do not leave that responsibility with an unowned future synchronization task.
 
-The cold profile after the row cuts: token reads about 18%, `run_git` about 14%, `input_fact` about 15%.
-Most other samples are Python code that reads the token tuples that these calls make.
-Saved results exist because the Python reads are slow; they write 5.3 GB in a cold run.
+Compare warm reuse with full reconstruction after each change sequence:
 
-A Rust probe (natedev, 2026-11-15, load 22) read the 1,306 Rust files of the `cargo-liner-style` work tree
-(25.0 MB) and lexed and parsed each one:
+1. Insert, update, and delete each source-row kind.
+2. Move a finding between paths, crates, proposals, and tickets.
+3. Add a declaration that changes an empty search result.
+4. Change a built rename or rule generation.
+5. Delete and restore a file or required Git object.
+6. Move a ref without changing its tree, or rewrite its ancestry.
+7. Change approval during selection or publication.
+8. Change a rule, ignore file, locale, lint configuration, or regex configuration.
+9. Change busy files, ticket capacity, family scope, or a checkpoint.
+10. Interrupt cache or authoritative publication between committed steps.
 
-| Threads | Read | Lex (`proc-macro2`) | Parse (`syn` 2, `full`) | Peak memory |
-| --: | --: | --: | --: | --: |
-| 1 | 0.014 s | 0.26 s | 1.26 s | 68 MB |
-| 8 | 0.009 s | 0.041 s | 0.22 s | 138 MB |
-| 32 | 0.007 s | 0.036 s | 0.17 s | 251 MB |
+Keep concurrency and stale-observation tests in the normal targeted suite.
+Use captured cargo-liner inputs for acceptance measurements, not as a live test dependency.
 
-`syn` parsed all 1,306 files. A cold refill reads about 2.4 times this text (3,141 distinct texts), so one read of
-each blob costs less than one second on 32 threads, and about 3 seconds on one thread. The Python refill spends
-minutes on the same reads.
+The planned overlap ends with phase 12.
+The estimates imply 66–110 active hours on the critical dependency path.
+They assume phases 7 and 8 run concurrently after phase 6.
+Build waiting, user decisions, and observation time are additional.
+Re-estimate after phase 6 and the first complete differential run.
 
-### Store choice
+## Expected times
 
-| Need | SpacetimeDB | SQLite (current) | Embedded key-value (redb) | No store for blob facts |
-| --- | --- | --- | --- | --- |
-| Python readers (refill, Units report, `rules.py`, tests) | No Python client; every reader changes | `sqlite3` in the standard library | Needs a Rust bridge | Not a reader |
-| Process count | A server that must run before each refill | None | None | None |
-| Memory | All tables in RAM; the ledger is 1.79 GB, near the 2 GB limit | Page cache only | Page cache only | None |
-| Where the parse runs | Outside it: reducers run WebAssembly with no file or Git access, under one write lock | Outside it | Outside it | In the reader |
-| Fit | Many live clients that subscribe to changes | One batch job, one machine | Fast immutable key reads | Facts cheaper to make than to read |
-| Cold and warm time | No cut: the parse and Git reads stay outside it; a network hop is added | As now | Faster key reads only | Cold and warm both lose the saved-result reads and writes |
-| License | Business Source License 1.1 | Public domain | MIT or Apache-2.0 | — |
+Every row after phase 5 is an estimate.
+The profile gives priorities, not independent subtractable time components.
+Intermediate ranges include temporary adapters and Python serialization.
+They do not authorize an intermediate default switch.
 
-SpacetimeDB is fast for its case: many clients that read and change shared state in memory. The refill is one
-batch job on one machine. Its cost is CPU work on Git blobs, which SpacetimeDB cannot run in a reducer. It would
-add a server, hold the full ledger in RAM, and need a new client in every Python reader.
+| Completed point | Cold | Warm | Basis |
+| --- | ---: | ---: | --- |
+| 5: current Rust reader | **494 s measured** | **132 s measured** | Supplied equal-load benchmark |
+| 6: contracts and measurement | 490–540 s | 130–145 s | No selection removal; instrumentation overhead |
+| 7 alone: findings and footprints | 300–430 s | 85–135 s | Removes much of two overlapping finding paths; Python coverage remains |
+| 8 alone: candidates and coverage | 320–450 s | 85–135 s | Removes much of coverage and enumeration; Python findings remain |
+| 7 and 8 integrated | 160–300 s | 45–100 s | Both large stages move; orchestration and transfer remain |
+| 9: complete native selection | 12–30 s | 6–15 s | Bulk reads and shared indexes replace repeated Python traversal |
+| 10: compact partitions and changes | 8–18 s | 1–4 s unchanged; 2–6 s ordinary changes | Warm runs skip proofs; cold still needs measured tuning |
+| 11: acceptance | 4–9 s | 0.6–2 s unchanged; 1–2.8 s ordinary changes | Engineering budgets below; actual gate results required |
+| 12: deployment | Same as phase 11 | Same as phase 11 | Deployment adds no selection work |
 
-Blob facts need no store if the reader makes them in less time than a store read takes. Phase 1 measures this.
-If a store is needed, use one SQLite table keyed by blob id, in a separate file next to the ledger. It needs no
-dependency rows, because a blob id names its content.
+The phase 9 improvement requires removal of repeated work, not just translation of loops.
+The phase 11 ranges have low confidence until a complete native selector exists.
+If a range fails, retain the old default and revise the affected phase.
+Do not label a result in minutes as completion of the seconds target.
 
-### Architecture
+| End-state stage | Cold budget | Ordinary warm budget | Evidence or assumption |
+| --- | ---: | ---: | --- |
+| Python entry and external capture | 0.5 s | 0.5 s | Unmeasured; phase 6 isolates it |
+| Ledger observation and cache reads | 1.0 s | 0.25 s | The source scan took 0.565 s; native reads remain unmeasured |
+| Git availability, trees, facts | 2.0 s | 0.35 s | Small corpus and prior parse probe; history checks need measurement |
+| Candidates, coverage, finding proofs | 3.0 s | 0.6 s | Unmeasured native indexes; no multiplicative scans |
+| Ranking and result encoding | 0.5 s | 0.2 s | Compact outputs and shared cells |
+| Cache publication and local writers | 1.0 s | 0.4 s | One cache transaction and bounded changes; unmeasured |
+| Remaining time margin | 1.0 s | 0.5 s | Allows variation within the targets |
+| Total | 9.0 s | 2.8 s | Budget, not prediction evidence |
 
-1. `style-reader` (name TBD): one Rust binary in a new folder `rust/style_reader/` of this repository.
-   - Git: `gix` reads trees and blobs in its process. No `git` subprocess for a tree list, a blob or a name search.
-   - Threads: `rayon` runs one blob on each task.
-   - Input: one request on stdin: the repository, the commits, and the fact kinds.
-   - Output: JSON lines on stdout, one line per blob and fact kind. Python reads them with `json`.
-   - Scope: every Rust blob at the requested commits. A full read costs less than a second, so the client does
-     not predict which blobs selection will ask for.
-2. `scripts/style/style_reader.py` (name TBD): the Python client. It starts the reader once for each refill
-   process and fills the refill's existing in-memory maps. Selection code does not change.
-3. A configuration key `[refill] reader = python | rust | shadow`. The default stays `python` until the cutover.
-   `shadow` runs both and writes each difference to the refill log.
+Measure both the selection benchmark and the complete command through durable local publication.
+Report build waiting and worker dispatch separately from refill work.
+Do not exclude proposal commands, reconciliation, cache writes, or retries from command timing.
+A command with many authoritative edits must report those edits and their cost separately.
+Acceptance fixtures include ordinary ticket assignment and declaration-follow publication.
 
-The reader ports the facts, not the tokens. Token tuples for 250 M characters cannot cross a pipe at a useful
-speed. Each fact kind is the output that a Python caller keeps today:
+## Phases
 
-| Fact kind | Python source | Used by |
+Estimates are active elapsed hours for one director and a shared pool of two Codex workers.
+The director owns integration and review.
+During concurrent phases 7 and 8, each phase receives one worker.
+The estimates exclude build waiting and user-response time.
+Each phase must finish its proof before dependent integration.
+
+| # | Status | Phase | Dependencies | Proof | Estimate |
+| --- | --- | --- | --- | --- | --- |
+| 1 | done | Git reader, tokens, lines, names | — | Existing blob differential suite | Complete |
+| 2 | done | Native fact ports | — | Existing per-kind differential suite | Complete |
+| 3 | done | Python client and reader switch | — | Equal refill results | Complete |
+| 4 | done | Remove Rust blob persistence | — | Equal result, row and time measurements | Complete |
+| 5 | done | Module-scan declarations and crate-root reuse | — | Stage differential proof | Complete |
+| 6 | todo | Observation contract, parity capture, source audit, stage measurements | **Depends on:** 5 | Frozen-input repeatability; complete source inventory; concurrent-write fixtures | 6–10 h |
+| 7 | todo | Declaration outcomes, site evidence, rename permission, footprints | **Depends on:** 6 | Ordered stage values and failures equal Python; bounded memory | 20–32 h |
+| 8 | todo | Candidate generators, judgment coverage, scope comparisons | **Depends on:** 6 | Listed sites, cells, verdicts, and ordering equal Python | 16–24 h |
+| 9 | todo | Complete selection and Python publication adapter | **Depends on:** 7, 8 | `COUNT` and assignment traces equal Python; fault and race tests pass | 16–24 h |
+| 10 | todo | Compact cache, source changes, partition invalidation | **Depends on:** 9 | Mutation sequences equal reconstruction; crash recovery passes | 12–20 h |
+| 11 | todo | Timing, memory, installation, Mac proof | **Depends on:** 10 | Cold/warm targets; complete command proof; platform parity | 8–16 h |
+| 12 | todo | Shadow comparison, authorized switch, removal | **Depends on:** 11 | No unresolved differences; rollback proof; consumer audit | 4–8 h work, plus proposed 2 days observation |
+
+### Phase 6 outputs
+
+Define the request schema, mutation boundaries, build identity, and source projection list.
+Measure startup, authoritative reads, external files, Git checks, and cache encoding separately.
+Count unique revision pairs, declaration searches, rule scans, and cross-process calls.
+Record candidate and finding counts beside timing results.
+Identify quadratic loops before translating them.
+
+Add capture and replay without changing default selection.
+Audit source triggers and benchmark reset behavior.
+Prove read consistency and stale-publication rejection on tempdir fixtures.
+Define the compatible schema admission release and its migration test.
+Revise estimates and budgets from those results.
+
+### Phases 7 and 8 boundaries
+
+Phase 7 owns finding and footprint modules.
+Phase 8 owns generator and coverage modules.
+Both use the phase 6 source contract.
+Changes to shared types require integration review.
+
+Use stage adapters for tests and explicit experimental runs.
+Do not insert a Rust request per finding or cell into normal refill.
+Retain complete stage results within the request where temporary Python adapters need them.
+
+Phase 7 covers outside renames, ambiguous declarations, moved sites, and approval-dependent results.
+Phase 8 covers active generators, partial coverage, lint coverage, removal history, and pending merges.
+The corpus must include malformed Rust, Unicode, invalid UTF-8, and path attributes.
+
+### Phase 9 outputs
+
+Move family ranking, queued-ticket handling, batching, sync waits, and checkpoint selection into Rust.
+Return actions and compact status values through the publication protocol.
+Port expensive preflight and writer-validation calculations reached by the complete command.
+Keep existing writer behavior and recovery order.
+
+Compare full refill outputs on captured cargo-liner inputs.
+Compare authoritative assignment behavior on tempdir repositories.
+Record residual Python time and every subprocess before phase 10.
+
+### Phase 10 outputs
+
+Implement the cache schema and invalidation rules above.
+Keep cache writes separate from authoritative publication.
+Add trigger coverage for every source in the audit.
+Deploy schema compatibility before the explicit tracking migration.
+Prove negative-search invalidation, deletion handling, epoch resets, and missing-object recovery.
+
+Verify unchanged warm runs perform zero candidate, coverage, and declaration calculations.
+Verify ordinary changes recalculate only affected domains.
+Measure broad invalidations separately.
+
+### Phase 11 acceptance
+
+Use release binaries built through the approved build system.
+Use the same pinned inputs and comparable host load for both implementations.
+Run at least three cold trials and twenty warm trials in fresh processes.
+Report every trial, the median, and the warm 95th percentile.
+Require every cold trial below 10 seconds and the warm 95th percentile below 3 seconds.
+Repeat this check for the complete ordinary refill command.
+
+Include unchanged, source-edit, ledger-edit, and decision-edit warm cases.
+Compare outputs with fresh reconstruction.
+Report the cgroup peak, bytes written, cache size, process count, and result digest.
+Reject results that depend on unbounded memory or hidden Python calculations.
+
+Use this scope for heavy natedev probes:
+
+```sh
+systemd-run --user --scope -q -p MemoryMax=2G -p MemorySwapMax=0 <probe-command>
+```
+
+Run Rust checks and tests through the required wrapper:
+
+```sh
+bash ~/.claude/scripts/direct/verify.sh check style_reader
+bash ~/.claude/scripts/direct/verify.sh test style_reader
+```
+
+Do not invoke Cargo directly.
+The Mac requires its own binary from the Mac build queue.
+Verify architecture, source identity, protocol identity, and differential results before enabling Rust there.
+The Python path remains available on the Mac until that proof exists.
+A natedev executable cannot serve as the Mac installation.
+
+### Phase 12 proposal
+
+Use one day of private shadow comparisons after phase 11.
+Include mutation sequences and ordinary production input captures.
+Present results and a concrete switch change for user approval.
+After approval, retain the Python switch for one further observation day.
+
+The showrunner must confirm this schedule.
+This design does not authorize the switch or choose the user's process.
+Keep the previous compatible release and configuration for rollback during observation.
+Test rollback after cache publication and a normal ticket assignment.
+Rollback must not reverse authoritative schema or ticket formats.
+
+After observation, remove obsolete Python selection and private derived-cache consumers.
+Retain writer helpers required by other commands.
+Audit each old table before removing its triggers or rows.
+Do not delete the reference implementation before acceptance completes.
+
+## Risks and first measurements
+
+| Risk | First measurement or proof | Response |
 | --- | --- | --- |
-| `declarations` | `declarations.read_declarations` | Declaration groups, name sites, moved-site lines |
-| `module_scan` | `DeclarationScan` (module declarations, scopes, `#[path]`, inline modules, item starts, plain words) | `declares_module`, `EditedFiles.declaring` |
-| `module_sites` | `_module_renames` sites for every `mod` name in the file | `module_site_readings`, `renamed_text` |
-| `name_sites` | `declarations.name_sites` | Approved renames, finding sites |
-| `lines` | Line count and line starts | `read_slices`, `fill_decision_batch` |
-| `names` | The set of identifiers in the blob | `files_naming` (replaces `git grep`) |
+| The port preserves repeated algorithms | Count searches, scans, pair comparisons, and result construction | Replace repeated traversal with shared indexes |
+| Source rows appear cheap only with cached pages | Repeat projected reads on a private capture; record host state | Report filesystem-cold results separately |
+| Git history dominates | Time unique ancestry/diff pairs and object checks | Share revision work and prove native semantics |
+| Regex exports or document commands exceed the budget | Measure operations outside the current `COUNT` benchmark | Remove repeated work without semantic changes |
+| A source lacks invalidation coverage | Mutate every audited source in fixtures | Refuse warm reuse until its proof passes |
+| New declarations evade positive dependencies | Add a previously absent matching declaration | Subscribe to search domains and empty results |
+| Warm reuse preserves unavailable evidence | Remove and restore an object between refills | Validate shared object requirements each observation |
+| Assignment diverges from `COUNT` | Compare action traces and fault recovery | Preserve mutation order and publication checks |
+| Cache payloads repeat source data | Measure bytes by partition and shared field | Intern values and remove redundant fields |
+| Concurrent changes prevent stable selection | Inject changes during reads and publication | Bound retries and return a waiting result |
+| Compilation enters the timed command | Test an absent or mismatched binary | Return a prerequisite failure; install before deployment |
+| Mac locale or Git behavior differs | Run the same corpus with the Mac-built binary | Keep Python until parity passes |
 
-#### syn or a port of the token reader
+## Questions for the showrunner
 
-Speed does not decide this: `syn` parses the full tip in 0.17 s on 32 threads. Equal output decides it.
+1. Confirm the owner of daily Python/Rust integration and parity failures.
+2. Confirm capacity for concurrent phases 7 and 8 after phase 6.
+3. Confirm the proposed shadow and rollback observation schedule for phase 12.
 
-The Python facts are defined on its own token stream: comments drop out, literals stay opaque, and an
-unterminated comment or an unknown character makes a file unreadable. `syn` builds a full syntax tree with its
-own rules. It rejects a file that is not valid Rust, for example an old commit in the middle of an edit, where
-the Python stream still reads the `mod` lines. It also reads some text in a different way, for example a raw
-string or a lifetime. A `syn` reader would change refill results at these edges, and each edge would need a
-decision.
-
-Port `tokenized_text` and each fact reader one to one, so the differential proof can require equal output on
-every blob. A lexer port costs about the same as the `proc-macro2` lex above. Use `syn` later for a new fact
-that needs full syntax, with its own differential case.
-
-Two port details need tests:
-
-1. Python's `str.isspace`, `\d` and `\w` use Unicode classes. Rust's `char::is_whitespace` does not match
-   `str.isspace` for U+001C to U+001F. Port the Python classes as tables.
-2. Python offsets count code points; Rust offsets count bytes. The reader returns code-point offsets.
-
-### Data model and change detection
-
-| Fact | Key | Lifetime | Dependency rows |
-| --- | --- | --- | --- |
-| Blob fact | Blob id, fact kind, reader version | Never stale | None |
-| Tree list | Commit id | Never stale | None |
-| Name search | Commit id, name | Never stale | None (the reader answers it from `names`) |
-| Footprint, declaration group, cell state | Current keys in the ledger | As now | Only ledger rows and the commit set |
-
-A change in a Rust file is a new blob id, so it finds no old fact. A change in a ledger row finds its results
-through the existing ledger dependency rows. The `git_object` source kind goes away from `refill_dependencies`,
-because a result no longer records each blob that it read: it records the commits, and each commit names its
-blobs.
-
-When blob facts are fast, a footprint is cheaper to make again than to load. Phase 4 measures each saved
-result kind against a new calculation and deletes the saved results that lose.
-
-### Cutover
-
-1. Each phase adds a differential test to the targeted suite. The test runs the Python reader and the Rust reader
-   on a fixture corpus and on every blob of a pinned `cargo-liner` commit, and requires equal output.
-   A Python change to a ported reader fails this test until the Rust reader changes too.
-2. Shadow: the cargo-liner units run `reader = shadow` for one day of refills. Each difference stops the cutover.
-3. Switch the default to `rust`. Keep the Python reader for one more day as the `python` value.
-4. Delete the Python fact readers, their saved-result kinds and the `shadow` value.
-
-The current refill keeps working at each step: the switch default is `python` until step 3.
-
-### Phases
-
-Each phase runs beside the current style work. It adds new files, and it changes refill code only behind the
-switch. Estimates are for one director with no workers.
-
-| # | Phase | Proof | Estimate |
-| --- | --- | --- | --- |
-| 1 | Reader start: `gix` blob reads, the token reader port, `lines` and `names`, on all CPUs | Equal tokens on every blob of the pinned commit; reader time and peak for all blobs of a cold refill | 4 h |
-| 2 | Fact ports: `module_scan`, `module_sites`, `declarations`, `name_sites` | Differential test per kind, fixtures and pinned commit | 6 h |
-| 3 | Refill client and switch; `files_naming` and tree lists from the reader | Cold and warm refill, both sides at the same load: same result | 4 h |
-| 4 | Remove saved blob facts and `git_object` dependency rows on the `rust` path; measure each saved result kind | Same result; cold, warm, peak, rows, bytes written | 3 h |
-| 5 | Profile again; port the next stage the profile names (likely footprints or declaration groups) | Its own differential test | 4 h for each stage |
-| 6 | Shadow, switch, delete | One day of shadow refills with no difference | 2 h of work, 2 days of time |
-
-### Risks
-
-1. Two readers exist until phase 6. Other units change the Python readers often (for example
-   `edits_module_owners` on 2026-11-14). The differential test makes each such change also change the Rust
-   reader. Keep the overlap short.
-2. The Mac. A style refill that runs on the Mac needs the reader binary there. The binary must come from the Mac
-   build queue, never from natedev. Until it does, the Mac keeps `reader = python`.
-3. The build. The reader is a compiled binary in a repository of scripts. On natedev a `cargo build` waits in
-   the build queue for memory (the probe waited 32 minutes). Recommendation: the land worker builds the reader
-   through the build queue when a land changes `rust/style_reader/`, and the client runs the binary from one
-   fixed path. This choice goes to the showrunner before phase 3.
-4. The rest of the refill stays Python. If phase 4 leaves the cold refill above one minute, the cost is in
-   selection code, and phase 5 ports it a stage at a time.
-
-### What to measure first
-
-1. The reader time and peak memory for all blobs of one cold refill, on 32 threads and on 1 thread.
-2. The time to read one blob fact from SQLite against the time to make it again. This settles whether blob
-   facts need a store.
-3. The cold refill time with the reader against the Python refill, both sides at the same load.
+The user still owns the default switch decision.
+Architecture and measurement work can proceed before those process choices are settled.
