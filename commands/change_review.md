@@ -96,7 +96,8 @@ user's zone, then the commit: `2026-11-13 16:20 · 31770c75`. It prints the new 
 ## Change images
 
 Every change review carries one image: a dark mode shot at desktop width, or `image --output <text file>` for terminal output.
-The parser still accepts a line without an image.
+The commit hook requires a final ` | image <id>` field on each visible Change-Review line.
+Merge checks require that field for commits dated at or after 2026-11-16 00:00 EST, using the Git committer time.
 Use `add --image <png>` to attach an existing screenshot to a manual row.
 Use `edit --row <id> --image <png>` to attach or replace an image on an existing row.
 Use `add --output <text file>` or `edit --row <id> --output <text file>` to attach rendered text.

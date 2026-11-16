@@ -21,6 +21,8 @@ RECORD = ".review-link-image.json"
 DRAFT_PREFIX = ".review-link-draft-"
 SUFFIXES = frozenset((".png", ".jpg", ".jpeg", ".gif", ".webp"))
 IDENTITY = re.compile(r"[0-9a-f]{12}")
+# Chrome clips a headless screenshot below about 150 pixels.
+MIN_OUTPUT_IMAGE_HEIGHT = 160
 
 
 class ImageRecord(TypedDict):
@@ -147,7 +149,6 @@ def register_output(output: Path) -> str:
     text = output.read_text(encoding="utf-8", errors="replace").expandtabs(4)
     lines = text.splitlines() or [""]
     width = min(1440, max(640, max(map(len, lines)) * 9 + 48))
-    height = min(4096, max(120, len(lines) * 22 + 48))
     with tempfile.TemporaryDirectory(prefix="change-output-") as temporary:
         folder = Path(temporary)
         page = folder / "output.html"
@@ -155,9 +156,19 @@ def register_output(output: Path) -> str:
         _ = page.write_text('<!doctype html><meta charset="utf-8"><style>'
             + 'body{margin:0;padding:24px;background:#161b22;color:#e6edf3;box-sizing:border-box}'
             + 'pre{margin:0;font:15px/22px ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere}'
-            + '</style><pre>' + html.escape(text) + '</pre>', encoding="utf-8")
-        _ = subprocess.run(["google-chrome", "--headless", "--no-sandbox", "--disable-gpu", "--hide-scrollbars",
+            + '</style><pre>' + html.escape(text) + '</pre><script>'
+            + 'document.title="output-size:"+Math.ceil(document.body.getBoundingClientRect().height)'
+            + '</script>', encoding="utf-8")
+        chrome = ["google-chrome", "--headless", "--no-sandbox", "--disable-gpu", "--hide-scrollbars",
+            "--force-device-scale-factor=1",
             "--no-default-browser-check", "--no-first-run", f"--user-data-dir={folder / 'profile'}",
-            f"--window-size={width},{height}", f"--screenshot={shot}", page.as_uri()],
+        ]
+        measured = subprocess.run([*chrome, f"--window-size={width},600", "--dump-dom", page.as_uri()],
+            capture_output=True, text=True, check=True, timeout=30)
+        size = re.search(r"<title>output-size:(\d+)</title>", measured.stdout)
+        if size is None:
+            raise ValueError("Chrome did not report the output page size")
+        window_height = min(4096, max(MIN_OUTPUT_IMAGE_HEIGHT, int(size[1])))
+        _ = subprocess.run([*chrome, f"--window-size={width},{window_height}", f"--screenshot={shot}", page.as_uri()],
             capture_output=True, text=True, check=True, timeout=30)
         return register_change(shot)

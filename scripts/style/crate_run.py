@@ -34,6 +34,7 @@ from scripts.style import style_ledger as ledger_api
 from scripts.style import style_proposals
 from scripts.style import style_footprint
 from scripts.style import style_sync
+from scripts.style.style_config import ReaderSource
 from scripts.copies import copies
 from scripts.style.style_ledger import _path_attributes  # pyright: ignore[reportPrivateUsage]
 
@@ -308,13 +309,14 @@ class SourceOwnership:
     unreadable loaders make ownership unproved, rather than guessing from a directory.
     """
 
-    def __init__(self, repo: Path, commit: str, members: tuple[rules.WorkspaceMember, ...]) -> None:
+    def __init__(self, repo: Path, commit: str, members: tuple[rules.WorkspaceMember, ...], *,
+                 reader_source: ReaderSource | ledger_api.ConfiguredReader = ledger_api.CONFIGURED_READER) -> None:
         self.directories: tuple[str, ...] = tuple(member.directory for member in members)
         self.owners: dict[str, set[str]] = {}
         self.sources: dict[str, bulk.BindingText] = {}
         self.uncertain: dict[str, list[str]] = defaultdict(list)
         self.inline_folders: dict[str, set[str]] = defaultdict(set)
-        inventory = ledger_api.tree_entries(repo, commit)
+        inventory = ledger_api.tree_entries(repo, commit, reader_source=reader_source)
         blobs = {path: entry.object for path, entry in inventory.items()
                  if (path.endswith(".rs") or Path(path).name == "Cargo.toml") and entry.kind == "blob"
                  and entry.mode in ledger_api.REGULAR_FILE_MODES}
@@ -699,7 +701,7 @@ def dry_run_crates(repo: Path, packages: Sequence[str], rule: str, base_tree: st
     selected = run.select(ledger, definition)
     directories = tuple(member.directory for member in members)
     spanning = cross_crate_proposals(selected, directories)
-    ownership = SourceOwnership(repo, base, members)
+    ownership = SourceOwnership(repo, base, members, reader_source=ledger.reader_source)
     reports: dict[str, list[dict[str, object]]] = {}
     for member in members:
         if member.package_name not in packages:
@@ -1193,7 +1195,7 @@ class CrateRun:
                 raise bulk.BulkRenameError("planning requires the exact frozen private base")
         unchanged_base()
         members = coverage_report.workspace(self.ledger, base)
-        ownership = SourceOwnership(checkout, base, members)
+        ownership = SourceOwnership(checkout, base, members, reader_source=self.ledger.reader_source)
         def boundary(_repo: Path, path: str) -> None:
             ownership.require(record["directory"], (path,))
             available(self.repo, path)
@@ -1282,7 +1284,7 @@ class CrateRun:
                 raise bulk.BulkRenameError("no surviving findings: " + "; ".join(sorted(set(refused.values()))))
             _ = run.git(checkout, "add", "--", *sorted(kept))
             tree = run.git(checkout, "write-tree")
-            final_ownership = SourceOwnership(checkout, tree, members)
+            final_ownership = SourceOwnership(checkout, tree, members, reader_source=self.ledger.reader_source)
             def final_boundary(_repo: Path, path: str) -> None:
                 ownership.require(record["directory"], (path,))
                 final_ownership.require(record["directory"], (path,))
@@ -1347,11 +1349,11 @@ class CrateRun:
             _ = record.pop("integration", None)
             self.save(manifest)
         if candidate is None:
-            previous = ledger_api.tree_entries(self.repo, expected)
+            previous = self.ledger.tree_entries(expected)
             base_entries = (previous if expected == manifest["base"] else
-                            ledger_api.tree_entries(self.repo, manifest["base"]))
+                            self.ledger.tree_entries(manifest["base"]))
             worker = result_evidence["commit"]
-            worker_entries = ledger_api.tree_entries(self.repo, worker)
+            worker_entries = self.ledger.tree_entries(worker)
             paths = changed(self.repo, manifest["base"], worker)
             overlap = any(previous.get(path) != base_entries.get(path) for path in paths)
             try:
@@ -1366,7 +1368,7 @@ class CrateRun:
                     union[path] = worker_entries[path]
                 else:
                     _ = union.pop(path, None)
-            if not overlap and ledger_api.tree_entries(self.repo, tree) != union:
+            if not overlap and self.ledger.tree_entries(tree) != union:
                 raise bulk.BulkRenameError("integration tree differs from the exact edit union")
             candidate = run.git(self.repo, "commit-tree", tree, "-p", expected, "-p", worker,
                                 "-m", f"style(crate-run): integrate {self.run_id}")
@@ -1396,7 +1398,7 @@ class CrateRun:
                 if run.git(checkout, "rev-parse", "HEAD") != source_commit:
                     raise bulk.BulkRenameError("integration checkout moved")
                 members = coverage_report.workspace(self.ledger, candidate)
-                ownership = SourceOwnership(checkout, source_commit, members)
+                ownership = SourceOwnership(checkout, source_commit, members, reader_source=self.ledger.reader_source)
                 for path in changed(self.repo, expected, candidate):
                     ownership.require(ownership.home(path), (path,))
                 workspace = run.WorkspaceEdits(checkout, source_commit, ())

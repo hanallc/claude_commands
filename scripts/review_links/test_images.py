@@ -119,15 +119,41 @@ class ChangeImageTests(ImagesFixture):
             self.assertIn("background:#161b22", page.read_text())
             profile = next(value.split("=", 1)[1] for value in arguments if value.startswith("--user-data-dir="))
             self.assertTrue(Path(profile).is_relative_to(page.parent))
+            if "--dump-dom" in arguments:
+                self.assertIn("Math.ceil(document.body.getBoundingClientRect().height)", page.read_text())
+                return subprocess.CompletedProcess(arguments, 0, "<title>output-size:92</title>", "")
+            self.assertIn("--window-size=640,160", arguments)
             shot = next(value.split("=", 1)[1] for value in arguments if value.startswith("--screenshot="))
             _ = Path(shot).write_bytes(PNG)
             return subprocess.CompletedProcess(arguments, 0, "", "")
 
         with patch("scripts.review_links.image_store.subprocess.run", side_effect=chrome) as run:
             identity = image_store.register_output(output)
+        self.assertEqual(run.call_count, 2)
         self.assertTrue(image_store.change_image(self.root, identity))
         arguments = cast(list[str], run.call_args.args[0])
         self.assertFalse(Path(arguments[-1].removeprefix("file://")).parent.exists())
+
+    def test_output_sizes_wrapped_lines_with_a_minimum_height_and_a_cap(self) -> None:
+        output = self.temporary / "wrapped.txt"
+        _ = output.write_text("x" * 300 + "\n" + "short\n" * 5)
+        for content, height in ((70, 160), (160, 160), (246, 246), (5000, 4096)):
+            with self.subTest(content=content):
+                def chrome(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+                    self.assertIn("--force-device-scale-factor=1", arguments)
+                    if "--dump-dom" in arguments:
+                        self.assertIn("--window-size=1440,600", arguments)
+                        return subprocess.CompletedProcess(arguments, 0,
+                            f"<title>output-size:{content}</title>", "")
+                    self.assertIn(f"--window-size=1440,{height}", arguments)
+                    shot = next(value.split("=", 1)[1] for value in arguments if value.startswith("--screenshot="))
+                    _ = Path(shot).write_bytes(PNG)
+                    return subprocess.CompletedProcess(arguments, 0, "", "")
+
+                with patch("scripts.review_links.image_store.subprocess.run", side_effect=chrome) as run:
+                    identity = image_store.register_output(output)
+                self.assertEqual(run.call_count, 2)
+                self.assertTrue(image_store.change_image(self.root, identity))
 
 
 class ImagesTests(ImagesFixture):
