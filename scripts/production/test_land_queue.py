@@ -20,7 +20,7 @@ class LandQueueTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(patch.dict(os.environ, {"MERGE_GATE_STATE_DIR": str(self.root)}))
+        self.enterContext(patch.dict(os.environ, {"GATE_STATE_DIR": str(self.root)}))
 
     def run_line(self, *argv: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()

@@ -185,13 +185,13 @@ from scripts.build_queue.step_estimator import (
     OutcomeNotRecorded,
 )
 
-MERGE_GATE_TESTS = "tests"
-MERGE_GATE_TYPES = "types"
+GATE_TESTS = "tests"
+GATE_TYPES = "types"
 
 
 def merge_gate_shape(argv: Sequence[str]) -> str:
     """Separate type-check profiles from test-only profiles."""
-    return MERGE_GATE_TYPES if "--type-dirs" in argv else MERGE_GATE_TESTS
+    return GATE_TYPES if "--type-dirs" in argv else GATE_TESTS
 
 
 PROC = Path("/proc")
@@ -1848,7 +1848,7 @@ PROGRESS_STEPS = ("build", "check", "clippy", "mend", "nextest", "test", "t", "m
 def reservation_profile_key(row: Reservation, host: str) -> str:
     """Use the history identity for each step rather than its run owner."""
     if row["step"] == "merge-gate":
-        return progress.profile_key((host, row["step"], row.get("shape", MERGE_GATE_TESTS)))
+        return progress.profile_key((host, row["step"], row.get("shape", GATE_TESTS)))
     width = row["test_threads"].threads if isinstance(row["test_threads"], RequestedTestWidth) else "unknown"
     return progress.profile_key((host, row.get("repo_identity", row["repo"]), row["step"],
         row.get("shape", ""), row.get("test_scope", "full"), row.get("package", ""),

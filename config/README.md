@@ -78,7 +78,9 @@ whose first 1M release changes, is a row here.
 `agents_slice` selects the systemd slice for agent panes and Codex app-server processes.
 Both callers read the value when they use it.
 
-## merge_gate.conf
+## gate.conf
+
+`merge_gate.conf` links to `gate.conf` for running gates; chunk 6 removes the link.
 
 `nightly_result_push=on` sends the nightly result or the reason that the checks did not run.
 `off` disables both pushes. The user can remove this push later.

@@ -73,7 +73,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
                           "--main-repo", str(self.gate.main), "--ssh", str(self.gate.bin / "ssh")]
         for mode in ([], ["--tests-only"], ["--promote-only"]):
             with self.subTest(mode=mode):
-                os.environ["MERGE_GATE_PASSED_DIR"] = str(self.gate.state / ("passes-" + "-".join(mode)))
+                os.environ["GATE_PASSED_DIR"] = str(self.gate.state / ("passes-" + "-".join(mode)))
                 (self.gate.state / "modules.jsonl").unlink(missing_ok=True)
                 (self.gate.state / "tools.jsonl").unlink(missing_ok=True)
                 self.hold()
@@ -193,13 +193,13 @@ class MergeGateHoldTests(TemporaryHoldTest):
     def test_signalled_module_and_types_jobs_resume_after_hold_release(self) -> None:
         for suite in ("hooks", "types"):
             with self.subTest(suite=suite):
-                os.environ["MERGE_GATE_PASSED_DIR"] = str(self.gate.state / ("passes-" + suite))
+                os.environ["GATE_PASSED_DIR"] = str(self.gate.state / ("passes-" + suite))
                 (self.gate.state / "modules.jsonl").unlink(missing_ok=True)
                 self.gate.write(self.gate.state / "signal-hooks", "once")
                 if suite == "types":
                     self.gate.write(self.gate.bin / "basedpyright", "#!" + sys.executable + "\n"
                                     + "import os, pathlib, signal\n"
-                                    + "marker = pathlib.Path(os.environ['MERGE_GATE_TEST_STATE']) / 'signal-types'\n"
+                                    + "marker = pathlib.Path(os.environ['GATE_TEST_STATE']) / 'signal-types'\n"
                                     + "if marker.exists():\n"
                                     + "    marker.unlink()\n"
                                     + "    os.kill(os.getpid(), signal.SIGTERM)\n"

@@ -289,8 +289,8 @@ def stop_after_start(*arguments, **options):
     job = start(*arguments, **options)
     if arguments[0] == "hooks":
         from scripts.direct.wait_for_test_state import wait_until
-        wait_until((Path(os.environ["MERGE_GATE_TEST_STATE"]) / "module-held").exists,
-                   Path(os.environ["MERGE_GATE_TEST_STATE"]), timeout={TEST_HANG_GUARD_SECS})
+        wait_until((Path(os.environ["GATE_TEST_STATE"]) / "module-held").exists,
+                   Path(os.environ["GATE_TEST_STATE"]), timeout={TEST_HANG_GUARD_SECS})
         Path({str(launched)!r}).write_text(str(job.process.pid))
         os.kill(os.getpid(), signal.SIGTERM)
     return job

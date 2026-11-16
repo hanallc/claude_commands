@@ -87,7 +87,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
             with self.subTest(reruns=reruns):
                 self.restore_fixture(("hooks",))
                 self.configure_gate("merge_gate_governor_gib=4")
-                _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf",
+                _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf",
                                          f"memory_stop_reruns={reruns}")
                 self.record_module_peaks({"hooks/test_first.py": 48.0})
                 output = io.StringIO()
@@ -219,7 +219,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
     def test_scope_skips_disabled_failed_probe_and_existing_builds_slice(self) -> None:
         for reason in ("disabled", "probe", "existing"):
             with self.subTest(reason=reason):
-                self.environment["MERGE_GATE_PASSED_DIR"] = str(self.state / ("passes-" + reason))
+                self.environment["GATE_PASSED_DIR"] = str(self.state / ("passes-" + reason))
                 self.environment["BUILDLOG_SCOPE"] = "0" if reason == "disabled" else "1"
                 self.write(self.state / "scope-fails", "fail")
                 (self.state / "tools.jsonl").unlink(missing_ok=True)

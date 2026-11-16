@@ -45,7 +45,7 @@ class MergeGateLedgerTests(MergeGateFixture):
     def test_dirty_and_failed_runs_do_not_record_a_pass(self) -> None:
         for state in ("tracked", "staged", "untracked", "failed"):
             with self.subTest(state=state):
-                self.environment["MERGE_GATE_PASSED_DIR"] = str(self.state / state)
+                self.environment["GATE_PASSED_DIR"] = str(self.state / state)
                 self.clear_gate_events()
                 if state == "tracked":
                     self.write(self.checkout / "subject.txt", "edited\n")
@@ -179,7 +179,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         first = self.run_gate("--tests-only")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         original = self.pass_records()[0]
-        path = Path(self.environment["MERGE_GATE_PASSED_DIR"]) / "passed-trees.jsonl"
+        path = Path(self.environment["GATE_PASSED_DIR"]) / "passed-trees.jsonl"
         for mismatch in ("host", "suites", "dirty"):
             with self.subTest(mismatch=mismatch):
                 record = dict(original)
@@ -248,7 +248,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         self.assertNotEqual(checkout, self.checkout)
         self.assertTrue(checkout.exists())
         self.assertEqual(build_folders.build_folder_state(checkout), "free")
-        marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
+        marker = Path(self.environment["GATE_STATE_DIR"]) / "full-required"
         record = cast(dict[str, object], json.loads(marker.read_text()))
         tree = self.git(self.checkout, "rev-parse", f"{tip}^{{tree}}")
         self.assertEqual(record["tree"], tree)
@@ -267,7 +267,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         before_branches = self.git(self.checkout, "show-ref", "--heads")
         copies: list[Path] = []
         caches: list[Path] = []
-        marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
+        marker = Path(self.environment["GATE_STATE_DIR"]) / "full-required"
         for red in (True, False):
             with self.subTest(red=red):
                 def suite_run(repo: Path, type_dirs: list[str], *, module_time_limit_s: float,
@@ -365,7 +365,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         self.assertIn("could not tell quiet: offline", output.getvalue())
 
     def test_unavailable_ledger_runs_all_modules_and_reports_once(self) -> None:
-        directory = Path(self.environment["MERGE_GATE_PASSED_DIR"])
+        directory = Path(self.environment["GATE_PASSED_DIR"])
         first = self.run_gate("--tests-only")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         path = directory / "passed-trees.jsonl"
@@ -387,7 +387,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         finish = gate.finish_gate_job
         for state in ("dirty-at-end", "dirty-at-start", "new-head", "append-fails"):
             with self.subTest(state=state):
-                self.environment["MERGE_GATE_PASSED_DIR"] = str(self.state / state)
+                self.environment["GATE_PASSED_DIR"] = str(self.state / state)
                 self.clear_gate_events()
                 if state == "dirty-at-start":
                     self.write(self.checkout / "subject.txt", "temporary edit\n")
@@ -402,7 +402,7 @@ class MergeGateLedgerTests(MergeGateFixture):
                         self.write(self.checkout / "subject.txt", "new commit during run\n")
                         _ = self.commit(self.checkout, "changed during tests")
                     else:
-                        path = Path(self.environment["MERGE_GATE_PASSED_DIR"]) / "passed-trees.jsonl"
+                        path = Path(self.environment["GATE_PASSED_DIR"]) / "passed-trees.jsonl"
                         path.unlink()
                         path.mkdir()
                     return result

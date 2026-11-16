@@ -6,7 +6,7 @@ The governor starts a job when its expected memory fits and a CPU slot is free.
 With no job running, the governor always starts one job.
 Memory samples update the queue reservation and the recorded peaks.
 A module above the governor's memory limit stops and runs again alone.
-merge_gate.conf sets the memory retry count. Each stop sends a message to sdlc.
+gate.conf sets the memory retry count. Each stop sends a message to sdlc.
 A job still running at the module time limit fails the gate (default 1800 s).
 After the parallel pass, up to eight failed test modules run once more, alone.
 Time-limited jobs and the type check do not run again. Each test module uses a
@@ -18,7 +18,7 @@ SharedMachine is the default. WholeMachine uses one job per CPU without shared a
 Merge and tests-only runs omit type checks unless --type-dirs names folders.
 The daily --nightly run checks all scripts, including hooks.
 A nightly type failure reports the checker output without requiring full test runs.
-A green nightly sends a result push unless merge_gate.conf disables it.
+A green nightly sends a result push unless gate.conf disables it.
 A red nightly records its result and notifies sdlc. Only its assignment sends the user push.
 A failure before the checks start sends the reason. Silence keeps the newest result.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
@@ -131,7 +131,7 @@ if sys.platform == "linux":
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
         raise OSError(ctypes.get_errno(), "cannot set the gate parent death signal")
-    if os.getppid() != int(os.environ["MERGE_GATE_PARENT_PID"]):
+    if os.getppid() != int(os.environ["GATE_PARENT_PID"]):
         os.kill(os.getpid(), signal.SIGKILL)
 for disposition in signal.valid_signals():
     if disposition not in (signal.SIGKILL, signal.SIGSTOP):
@@ -937,7 +937,7 @@ def typecheck_python() -> Path | str:
     python = venv / "bin" / "python"
     stamp = venv / "gate-requirements.txt"
     wanted = "\n".join(TYPECHECK_REQUIREMENTS) + "\n"
-    uv = os.environ.get("MERGE_GATE_UV", "uv")
+    uv = os.environ.get("GATE_UV", "uv")
     command = f"{uv} venv --clear {venv} && {uv} pip install --python {python} {' '.join(TYPECHECK_REQUIREMENTS)}"
     venv.parent.mkdir(parents=True, exist_ok=True)
     with (venv.parent / "typecheck-venv.lock").open("w") as lock:
@@ -1101,7 +1101,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     try:
         with cancellation.defer_cleanup_signals():
             process = subprocess.Popen([str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *argv],
-                                       cwd=repo, env={**environment, "MERGE_GATE_PARENT_PID": str(os.getpid())},
+                                       cwd=repo, env={**environment, "GATE_PARENT_PID": str(os.getpid())},
                                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, text=True,
                                        start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get())
             recovery = ACTIVE_GATE_RECOVERY.get()
@@ -1222,7 +1222,7 @@ class PassedTreeLedger:
 
     @property
     def path(self) -> Path:
-        directory = Path(os.environ.get("MERGE_GATE_PASSED_DIR", "~/.local/state/merge-gate")).expanduser()
+        directory = Path(os.environ.get("GATE_PASSED_DIR", "~/.local/state/merge-gate")).expanduser()
         return directory / "passed-trees.jsonl"
 
     def report_error(self, error: Exception) -> None:
@@ -1434,7 +1434,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         recover_gate_runs(repo)
     governor_gib = merge_gate_governor_gib() if shared else 0.0
     try:
-        memory_stop_reruns = conf.read("merge_gate").whole("memory_stop_reruns") if shared else 0
+        memory_stop_reruns = conf.read("gate").whole("memory_stop_reruns") if shared else 0
     except conf.Unusable as error:
         raise GateRefused(str(error)) from error
     if isinstance(machine, WholeMachine):
@@ -1539,7 +1539,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     largest_module = ""
     starting_load = one_minute_load()
     maximum_load = starting_load
-    python = os.environ.get("MERGE_GATE_PYTHON", str(python_shim(repo)))
+    python = os.environ.get("GATE_PYTHON", str(python_shim(repo)))
     reason = selection.reason if isinstance(selection, FullSuite) and not reused else ""
     elapsed = 0.0
     time_limit_report = ""
@@ -1732,7 +1732,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                                        else test_module_environment(root, environment))
                     if request.kind is GateJobKind.TYPE_CHECK:
                         _ = job_environment.pop("BUILDLOG_LIVE_MEMORY_TRIPWIRE", None)
-                    argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
+                    argv = ([os.environ.get("GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
                              *type_dirs]
                             if request.kind is GateJobKind.TYPE_CHECK else
                             [*scope_prefix, python, str(runner), str(path.parent), path.name])
@@ -1881,7 +1881,10 @@ def live_state_refusal(repo: Path, target: str) -> str:
                                stderr=subprocess.PIPE, check=True)
         except (OSError, subprocess.SubprocessError) as error:
             return f"promotion refused: live state check could not export {target}: {error}"
-        settings = tree / "config" / "merge_gate.conf"
+        settings = tree / "config" / "gate.conf"
+        # Chunk 6 removes the old config path.
+        if not settings.exists():
+            settings = tree / "config" / "merge_gate.conf"
         if not settings.exists():
             return ""
         # A target tree from before these checks names none.
@@ -1932,7 +1935,7 @@ class NoRecordedPush:
 
 
 def push_record_path(repo: Path, operation: str, source: str) -> Path:
-    directory = Path(os.environ.get("MERGE_GATE_PASSED_DIR", "~/.local/state/merge-gate")).expanduser()
+    directory = Path(os.environ.get("GATE_PASSED_DIR", "~/.local/state/merge-gate")).expanduser()
     identity = json.dumps([str(repo.resolve()), operation, source]).encode()
     return directory / "push-recovery" / (hashlib.sha256(identity).hexdigest() + ".json")
 
@@ -2067,7 +2070,7 @@ def rollback_merge(repo: Path, baseline: str) -> None:
 
 def notify_style(repo: Path, branch: str, tip: str) -> None:
     try:
-        script = (os.environ.get("MERGE_GATE_STYLE_SYNC") or shutil.which("style_sync.py")
+        script = (os.environ.get("GATE_STYLE_SYNC") or shutil.which("style_sync.py")
                   or str(Path(__file__).resolve().parents[1] / "style/style_sync.py"))
         python = str(Path(__file__).resolve().parents[1] / "lib/py")
         _ = sys.stdout.flush()
@@ -2276,7 +2279,7 @@ def nightly_check_values(result: GateRun) -> dict[str, str]:
     summaries = type_check_summaries("\n".join(job.output for job in failed_types))
     failed = [f"{job.suite}/{job.module}" for job in result.jobs
               if job.kind is GateJobKind.TEST_MODULE and job.returncode]
-    config = conf.read("merge_gate")
+    config = conf.read("gate")
     limit = config.whole("nightly_result_modules") if failed and config.text("nightly_result_push") != "off" else len(failed)
     unfinished = (any(job.kind is GateJobKind.RUNNER_FAILURE for job in result.jobs)
                   or not result.jobs and not result.passed)
@@ -2295,7 +2298,7 @@ def push_nightly_result(args: GateArguments, result: GateRun | Exception) -> Non
         from scripts.message import send_budget
         from scripts.notify import push_texts, review
         from scripts.notify.pushover import MESSAGE_MAX
-        config = conf.read("merge_gate")
+        config = conf.read("gate")
         if config.text("nightly_result_push") == "off":
             return
         values = {"branch": args.merge_branch, "time": datetime.now(user_zone()).strftime("%H:%M %Z")}
@@ -2436,7 +2439,7 @@ def send_nightly_red(directory: Path, result: NightlyRedResult, assignment: Nigh
     from scripts.notify import push_texts, review
     from scripts.production import staff
 
-    if isinstance(result.delivery, NightlyPushAccepted) or conf.read("merge_gate").text("nightly_result_push") == "off":
+    if isinstance(result.delivery, NightlyPushAccepted) or conf.read("gate").text("nightly_result_push") == "off":
         return False
     row = staff.snapshot().by_id(staff.StaffId(assignment.unit))
     rendered = push_texts.render("nightly.assigned", branch=result.branch, time=nightly_time(result.finished),
@@ -2491,7 +2494,7 @@ def alert_nightly_unassigned(directory: Path, result: NightlyRedResult) -> bool:
     """Tell the production owner once in each assignment window that a red result has no assigned fix."""
     from scripts.production import showrunners
 
-    window = timedelta(minutes=conf.read("merge_gate").whole("nightly_assign_minutes"))
+    window = timedelta(minutes=conf.read("gate").whole("nightly_assign_minutes"))
     now = datetime.now(UTC)
     since = datetime.fromisoformat(result.alerted.at if isinstance(result.alerted, NightlyAlertSent) else result.finished)
     if now - since < window:

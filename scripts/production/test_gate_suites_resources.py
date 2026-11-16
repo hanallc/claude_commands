@@ -617,7 +617,7 @@ class HeldModule(unittest.TestCase):
         pid = int(os.read(reader, 32))
         os.close(reader)
         os.waitpid(intermediate, 0)
-        state = Path(os.environ["MERGE_GATE_TEST_STATE"])
+        state = Path(os.environ["GATE_TEST_STATE"])
         temporary = state / "detached-pid.tmp"
         temporary.write_text(str(pid))
         temporary.replace(state / "detached-pid")

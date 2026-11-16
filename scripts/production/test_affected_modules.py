@@ -32,7 +32,7 @@ class AffectedModulesTests(unittest.TestCase):
         _ = self.git("config", "maintenance.auto", "false")
         _ = self.git("config", "user.name", "Selection Fixture")
         _ = self.git("config", "user.email", "fixture@example.invalid")
-        self.write(".git/test-config/merge_gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
+        self.write(".git/test-config/gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
                    + "# text:\nscan_roots=\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.repo / ".git/test-config")})))
         self.write(".git/test-config/buildlog.conf", (Path(__file__).resolve().parents[2] / "config/buildlog.conf").read_text())
@@ -226,7 +226,7 @@ class AffectedModulesTests(unittest.TestCase):
         self.write("commands/component/seed.txt", "fixture\n")
         for expression, changed, selected, declaration in cases:
             with self.subTest(scan=expression, changed=changed, declaration=declaration):
-                self.write(".git/test-config/merge_gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
+                self.write(".git/test-config/gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
                            + f"# text:\nscan_roots={declaration}\n")
                 self.write(changed, "# before\n")
                 self.write("scripts/component/audit.py", "import os\nfrom scripts.component import directory_walk\n"
@@ -277,7 +277,7 @@ class AffectedModulesTests(unittest.TestCase):
                             self.assertEqual(result.modules, (self.repo / "scripts/checks/test_audit.py",) if selected else ())
                 self.modules.remove(self.repo / "scripts/checks/test_audit.py")
 
-        words = conf.read(Path(__file__).resolve().parents[2] / "config/merge_gate.conf").text("scan_roots").split()
+        words = conf.read(Path(__file__).resolve().parents[2] / "config/gate.conf").text("scan_roots").split()
         data_inputs = (
             ("config/issue_score.conf", ("issue_score/test_experiment.py", "issue_score/test_score_issues.py")),
             ("config/agent_notes.toml", ("maintenance/test_vault_commit.py",)),
@@ -292,7 +292,7 @@ class AffectedModulesTests(unittest.TestCase):
                     path = self.repo / word.partition(":")[2]
                     if not path.exists():
                         path.mkdir(parents=True)
-                self.write(".git/test-config/merge_gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
+                self.write(".git/test-config/gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
                            + f"# text:\nscan_roots={declaration}\n")
                 for name in names:
                     self.add_test(name, "from pathlib import Path\n"
@@ -451,7 +451,7 @@ class AffectedModulesTests(unittest.TestCase):
         )
         for certificate, branches, expected_base, changed in cases:
             with self.subTest(branches=branches, certificate=certificate):
-                self.write(".git/test-config/merge_gate.conf", f"# text:\nlanding_branches={branches}\n"
+                self.write(".git/test-config/gate.conf", f"# text:\nlanding_branches={branches}\n"
                            + "# text:\nscan_roots=\n")
                 with mock.patch.object(affected, "git_output", wraps=affected.git_output) as git:
                     result = affected.select_affected(self.repo, certificate, self.modules, set())

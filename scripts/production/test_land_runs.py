@@ -23,7 +23,7 @@ class LandRunTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(patch.dict(os.environ, {"MERGE_GATE_STATE_DIR": str(self.root)}))
+        self.enterContext(patch.dict(os.environ, {"GATE_STATE_DIR": str(self.root)}))
 
     def test_a_land_is_running_only_while_its_process_holds_the_record(self) -> None:
         self.assertEqual(gate.gate_state_dir(), self.root)

@@ -255,7 +255,7 @@ class NightlyPushTests(unittest.TestCase):
         _ = shutil.copytree(Path(__file__).resolve().parents[2] / "config", config)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "CONF_DIR": str(config),
-            "MERGE_GATE_STATE_DIR": str(self.root / "state"), "USER_ZONE": "America/New_York"})))
+            "GATE_STATE_DIR": str(self.root / "state"), "USER_ZONE": "America/New_York"})))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         owner = fixture_member("showrunner", name="sdlc")
         _ = fixture_member("unit", name="fixes", parent=owner.id)
@@ -332,7 +332,7 @@ class NightlyPushTests(unittest.TestCase):
                 case_run = (gate.GateRun(tuple(gate.GateJobResult("production",
                             f"test_staff.py_{index}_" + "x" * 100, 1, 0, "FAIL: saved branch differs")
                             for index in range(8)), 0, 0) if route.startswith("long ") else run)
-                with (mock.patch.dict(os.environ, {"MERGE_GATE_STATE_DIR": str(state)}),
+                with (mock.patch.dict(os.environ, {"GATE_STATE_DIR": str(state)}),
                       self.execution(case_run) as sent, mock.patch.object(gate, "datetime", NightlyClock),
                       mock.patch.object(showrunners, "tell", return_value="told sdlc") as notice,
                       redirect_stdout(io.StringIO())):
@@ -503,7 +503,7 @@ class NightlyPushTests(unittest.TestCase):
         run = gate.GateRun((gate.GateJobResult("production", "test_staff.py", 1, 0, ""),), 0, 0)
         for reference in ("builds/queue", str(queue.id)):
             with (self.subTest(reference=reference), tempfile.TemporaryDirectory() as directory,
-                  mock.patch.dict(os.environ, {"MERGE_GATE_STATE_DIR": directory}),
+                  mock.patch.dict(os.environ, {"GATE_STATE_DIR": directory}),
                   self.execution(run) as sent, redirect_stdout(io.StringIO())):
                 self.assertEqual(self.nightly(), 1)
                 self.assertEqual(gate.main(["nightly-assigned", "--unit", reference]), 0)
@@ -519,7 +519,7 @@ class NightlyPushTests(unittest.TestCase):
         for run in (gate.GateRun((gate.GateJobResult("test", "ok", 0, 0, ""),), 0, 0),
                     GateRefused("runner failed")):
             with self.execution(run) as sent, mock.patch.object(push_texts, "render") as render:
-                _ = (self.root / "config/merge_gate.conf").write_text("nightly_result_push=off\n")
+                _ = (self.root / "config/gate.conf").write_text("nightly_result_push=off\n")
                 _ = self.nightly()
                 sent.assert_not_called()
                 render.assert_not_called()
@@ -532,7 +532,7 @@ class NightlyPushTests(unittest.TestCase):
     def test_failed_module_limit_is_read_again_for_each_run(self) -> None:
         jobs = tuple(gate.GateJobResult("test", f"test_{i}.py", 1, 0, "") for i in range(4))
         for limit in (1, 3):
-            _ = (self.root / "config/merge_gate.conf").write_text(
+            _ = (self.root / "config/gate.conf").write_text(
                 f"nightly_result_push=on\n# whole: 1..\nnightly_result_modules={limit}\n")
             with self.execution(gate.GateRun(jobs, 0, 0)) as sent, redirect_stdout(io.StringIO()):
                 self.assertEqual(self.nightly(), 1)

@@ -163,7 +163,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
     def test_targeted_selection_precedes_the_route_and_survives_fallback(self) -> None:
         from scripts.aws_target import cloud_gate
 
-        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf", "scan_roots=\n")
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf", "scan_roots=\n")
         subject, base = self.prepare_affected_subject()
         first = self.run_gate("--tests-only", type_dirs=())
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
@@ -195,7 +195,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
                 if red_types:
                     self.write(self.state / "types-red", "red")
                 if change == "fallback-full":
-                    (Path(self.environment["MERGE_GATE_PASSED_DIR"]) / "passed-trees.jsonl").unlink()
+                    (Path(self.environment["GATE_PASSED_DIR"]) / "passed-trees.jsonl").unlink()
                     for ref in self.git(self.checkout, "for-each-ref", "--format=%(refname)", "refs/remotes/origin").splitlines():
                         _ = self.git(self.checkout, "update-ref", "-d", ref)
                 expected_tree = cloud_gate.working_tree(self.checkout)[0]
@@ -480,8 +480,8 @@ class MergeGateSuitesTests(GateSuitesFixture):
     def test_modules_use_only_the_checked_tree_pythonpath(self) -> None:
         caller_path = self.root / "caller-pythonpath"
         caller_path.mkdir()
-        self.environment.update({"PYTHONPATH": str(caller_path), "MERGE_GATE_TEST_PYTHONPATH": str(caller_path),
-                                 "MERGE_GATE_TEST_ISOLATION": "1"})
+        self.environment.update({"PYTHONPATH": str(caller_path), "GATE_TEST_PYTHONPATH": str(caller_path),
+                                 "GATE_TEST_ISOLATION": "1"})
         result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -490,7 +490,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
         caller_path = self.root / "caller-pythonpath"
         self.write(caller_path / "caller_only.py", 'VALUE = "caller"\n')
         self.environment["PYTHONPATH"] = str(caller_path)
-        del self.environment["MERGE_GATE_PYTHON"]
+        del self.environment["GATE_PYTHON"]
         self.write(self.checkout / "scripts/hooks/test_first.py", "import caller_only\n")
         identity = self.checkout / "scripts/message/checkout_identity.py"
         self.write(identity, 'VALUE = "checked tree"\n')

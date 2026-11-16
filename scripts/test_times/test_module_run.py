@@ -735,36 +735,40 @@ class FixtureCPU(unittest.TestCase):
 @unittest.skipUnless(sys.platform == "linux", "Descendant adoption uses Linux prctl and pidfds")
 class ModuleProcessCleanupTests(unittest.TestCase):
     def test_gate_parent_death_keeps_the_sigkill_status_without_a_traceback(self) -> None:
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        processes = OwnedTestProcesses()
-        self.addCleanup(processes.finish)
-        environment = processes.environment({**os.environ, "HOME": str(root / "home"),
-            "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog"),
-            "PYTHONPATH": str(root)})
-        _ = environment.pop("TEST_TIMES_OUT", None)
-        _ = (root / "test_parent.py").write_text("""import signal, unittest
+        for parent_name in ("GATE_PARENT_PID", "MERGE_GATE_PARENT_PID"):
+            with self.subTest(parent_name=parent_name):
+                root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+                processes = OwnedTestProcesses()
+                self.addCleanup(processes.finish)
+                environment = processes.environment({**os.environ, "HOME": str(root / "home"),
+                    "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog"),
+                    "PYTHONPATH": str(root)})
+                _ = environment.pop("TEST_TIMES_OUT", None)
+                _ = (root / "test_parent.py").write_text("""import signal, unittest
 class ParentDeath(unittest.TestCase):
     def test_wait(self):
         print('ready', flush=True)
         signal.pause()
 """, encoding="utf-8")
-        parent = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
-            env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        processes.track(parent)
-        environment["MERGE_GATE_PARENT_PID"] = str(parent.pid)
-        runner = subprocess.Popen([sys.executable, str(RUNNER), str(root), "test_parent.py"],
-            env=environment, cwd=root, stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-        processes.track(runner)
-        output = runner.stdout
-        assert output is not None
-        self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0])
-        self.assertEqual(cast(str, output.readline()), "ready\n")
-        parent.send_signal(signal.SIGTERM)
-        self.assertEqual(parent.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGTERM)
-        stdout, stderr = runner.communicate(timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(runner.returncode, -signal.SIGKILL, stdout + stderr)
-        self.assertNotIn("Traceback", stderr)
+                parent = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
+                    env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                processes.track(parent)
+                _ = environment.pop("GATE_PARENT_PID", None)
+                _ = environment.pop("MERGE_GATE_PARENT_PID", None)
+                environment[parent_name] = str(parent.pid)
+                runner = subprocess.Popen([sys.executable, str(RUNNER), str(root), "test_parent.py"],
+                    env=environment, cwd=root, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+                processes.track(runner)
+                output = runner.stdout
+                assert output is not None
+                self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0])
+                self.assertEqual(cast(str, output.readline()), "ready\n")
+                parent.send_signal(signal.SIGTERM)
+                self.assertEqual(parent.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGTERM)
+                stdout, stderr = runner.communicate(timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(runner.returncode, -signal.SIGKILL, stdout + stderr)
+                self.assertNotIn("Traceback", stderr)
 
     def test_gate_parent_death_before_bootstrap_stops_the_module(self) -> None:
         from scripts.production import merge_gate
@@ -779,7 +783,7 @@ reader, writer = os.pipe()
 prefix = 'import os; os.write(' + str(writer) + ', b"R"); os.close(' + str(writer) + '); os.read(0, 1)\n'
 child = subprocess.Popen([sys.executable, '-c', prefix + {merge_gate.SUITE_BOOTSTRAP!r},
     sys.executable, '-c', 'import signal; signal.pause()'],
-    env={{**os.environ, 'MERGE_GATE_PARENT_PID': str(os.getpid())}},
+    env={{**os.environ, 'GATE_PARENT_PID': str(os.getpid())}},
     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     pass_fds=(writer,), start_new_session=True)
 os.close(writer)

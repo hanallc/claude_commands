@@ -213,9 +213,19 @@ def start_process(arguments: list[str]) -> str:
     return selected
 
 
+def gate_parent_pid(consume: bool = False) -> str:
+    """Read the gate parent and optionally clear both names before tests start."""
+    # Chunk 6 removes the old parent variable read.
+    parent = os.environ.get("GATE_PARENT_PID") or os.environ.get("MERGE_GATE_PARENT_PID", "")
+    if consume:
+        _ = os.environ.pop("GATE_PARENT_PID", None)
+        _ = os.environ.pop("MERGE_GATE_PARENT_PID", None)
+    return parent
+
+
 def _start_test_run(selected: str, arguments: list[str]) -> None:
-    # Decide before any import; module_run.py removes the gate variable later.
-    if os.environ.get("MERGE_GATE_PARENT_PID"):
+    # Decide before any import; module_run.py removes the gate variables later.
+    if gate_parent_pid():
         return
     original = sys.orig_argv
     unittest_module = ("-munittest" in original

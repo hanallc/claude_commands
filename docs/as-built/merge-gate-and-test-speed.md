@@ -350,7 +350,7 @@ An empty hold directory starts no subprocess.
 One line names the holder when a wait starts; another reports the wait when it ends.
 `Gate tests:` excludes hold wait; a separate line reports that wait when it exceeds zero.
 
-**Passed trees.** `${MERGE_GATE_PASSED_DIR:-~/.local/state/merge-gate}/passed-trees.jsonl` has one JSON line per passing run, with `kind: full` or `kind: affected` (a legacy record without `kind` is full). Fields are `tree` (`HEAD^{tree}`), `commit`, `at` (UTC), `host`, `checkout`, sorted `suites`, and `source` (`tests-only` or `checkpoint`). Full passes also record `reason`; older records without it remain valid. The checkout must have an empty `git status --porcelain`, including untracked files; ignored files do not count. It must still be clean with the same tree after the run. Failed runs and reused results add no record. Each append uses one write. A read or write error prints one reason and leaves the gate result unchanged; a ledger unavailable at lookup makes all modules run.
+**Passed trees.** `${GATE_PASSED_DIR:-~/.local/state/merge-gate}/passed-trees.jsonl` has one JSON line per passing run, with `kind: full` or `kind: affected` (a legacy record without `kind` is full). Fields are `tree` (`HEAD^{tree}`), `commit`, `at` (UTC), `host`, `checkout`, sorted `suites`, and `source` (`tests-only` or `checkpoint`). Full passes also record `reason`; older records without it remain valid. The checkout must have an empty `git status --porcelain`, including untracked files; ignored files do not count. It must still be clean with the same tree after the run. Failed runs and reused results add no record. Each append uses one write. A read or write error prints one reason and leaves the gate result unchanged; a ledger unavailable at lookup makes all modules run.
 
 Before modules start, a clean checkout can reuse the most recent full record for the same tree, host, and sorted suite names.
 Affected records certify neither reuse nor a selection base.
@@ -366,7 +366,7 @@ An added or removed test folder changes the ledger suite set and prevents reuse 
 
 **Affected modules for targeted tests** (`scripts/production/affected_modules.py`).
 The certified base is the newest full record on this host with the complete suite set and an ancestor of `HEAD`.
-Other candidates are the merge bases of `HEAD` and the origin refs in `landing_branches` in `config/merge_gate.conf`.
+Other candidates are the merge bases of `HEAD` and the origin refs in `landing_branches` in `config/gate.conf`.
 These branches hold commits that passed a merge gate, which runs all modules.
 The selector uses the candidate with the fewest changed paths to `HEAD`.
 A tie keeps the certified base first, then the branch order in the config.
@@ -425,7 +425,7 @@ Both pushes use need `note` and the key `nightly-result`.
 The result requires no action. The failure text includes an action.
 The gate says the next nightly run tries again. The cold credentials example directs the user to run `github-warmup`.
 Silence keeps only the newest push on that key and delivers it when silence ends.
-The gate reads `nightly_result_push` and `nightly_result_modules` from `config/merge_gate.conf` at use.
+The gate reads `nightly_result_push` and `nightly_result_modules` from `config/gate.conf` at use.
 `nightly_result_push=off` disables all nightly result pushes. The default is `on`.
 `nightly_result_modules=8` limits the failed test modules named before `and N more`.
 A push failure does not change the gate result, marker or showrunner notice.
@@ -435,7 +435,7 @@ The caller's local branches, HEAD and edits stay unchanged.
 Git disables terminal credential prompts and uses SSH batch mode.
 Promotion stays separate and runs no tests.
 A green nightly records a full pass.
-A failed test module or runner writes `${MERGE_GATE_STATE_DIR:-~/.local/state/merge-gate}/full-required` atomically.
+A failed test module or runner writes `${GATE_STATE_DIR:-~/.local/state/merge-gate}/full-required` atomically.
 The marker records the tree, UTC time and failed modules.
 While the marker exists, every merge gate runs all modules until a merge gate passes.
 An unreadable marker also requires all modules in a merge gate.
@@ -444,7 +444,7 @@ Every red nightly waits for the result lock before it saves its result.
 It then notifies the production owner through the existing messaging path.
 `nightly_owner` selects the owner for both the standing checkout and the notice.
 The gate sends no red result push.
-`${MERGE_GATE_STATE_DIR:-~/.local/state/merge-gate}/nightly-red/<id>.json` stores each red result.
+`${GATE_STATE_DIR:-~/.local/state/merge-gate}/nightly-red/<id>.json` stores each red result.
 The record holds the branch, tree, finish time, failure lines, receipt time, assignment, push acceptance, and last owner alert.
 The receipt time records successful delivery to the production owner.
 An unconfirmed notice keeps its receipt state empty.
@@ -461,7 +461,7 @@ Only `nightly-assigned` sends the user push, and the push names the assignee.
 An unassigned red result never sends a user push.
 `merge_gate.py nightly-check` alerts the production owner when an unassigned result reaches its deadline.
 The alert repeats once in each later deadline window until the fix is assigned.
-`nightly_assign_minutes=30` sets that window in `config/merge_gate.conf`.
+`nightly_assign_minutes=30` sets that window in `config/gate.conf`.
 The alert uses the key `merge-gate-nightly-unassigned:<id>` and names the `nightly-assigned` command.
 A failed alert stays due, and the next check sends it again.
 The existing `scripts/maintenance/herdr_upkeep.py` job runs this check every 120 seconds.
@@ -543,7 +543,7 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
 - Each job has its own `TMPDIR` under `/dev/shm/merge-gate-*` or `/dev/shm/targeted-test-*`.
   The runner reads the output and removes the temporary folder when the job ends.
   Outside gate jobs, the shared Python bootstrap gives direct unittest and timed runs a maker folder.
-  The bootstrap decides once, at interpreter startup, while `MERGE_GATE_PARENT_PID` marks a gate job.
+  The bootstrap decides once, at interpreter startup, while `GATE_PARENT_PID` marks a gate job.
   A later `package_root.py` run inside an import selects the checkout only and starts no folder.
   `targeted_test.py` uses the same test-folder context for its outer run.
   These folders use `<inherited TMPDIR>/test-runs/test-run-*`.
@@ -566,8 +566,8 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   Basedpyright then does not run.
   The job passes on exit 0 with the line `0 errors, 0 warnings, 0 notes`.
   The gate creates no `.venv` in the repository.
-- `MERGE_GATE_PYTHON` and `MERGE_GATE_BASEDPYRIGHT` override the interpreter and the type checker; tests use these.
-- **Ordering cache.** `${MERGE_GATE_STATE_DIR:-~/.local/state/merge-gate}/module_seconds.json` maps `suite/path/to/module.py` to the first pass's seconds. Nested paths also remain in retry and report identities, so same-named modules in one suite stay separate. Modules with no recorded time start first, then the rest longest first. The cache is rewritten atomically after every run, red ones included. `module_history.json` also records only the first pass; reruns do not change either file's module times.
+- `GATE_PYTHON` and `GATE_BASEDPYRIGHT` override the interpreter and the type checker; tests use these.
+- **Ordering cache.** `${GATE_STATE_DIR:-~/.local/state/merge-gate}/module_seconds.json` maps `suite/path/to/module.py` to the first pass's seconds. Nested paths also remain in retry and report identities, so same-named modules in one suite stay separate. Modules with no recorded time start first, then the rest longest first. The cache is rewritten atomically after every run, red ones included. `module_history.json` also records only the first pass; reruns do not change either file's module times.
 - **CPU records.** `module_cpu_seconds.json` maps each module path to the last completed attempt's CPU seconds.
   The type-check job uses the `types/basedpyright` key.
   The runner reads user and system CPU time with `os.wait4` when it reaps each leader.
@@ -603,7 +603,7 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   A test module above this limit stops, whether it runs alone or beside other jobs.
   The sample includes resident and swapped memory for the module and its descendants.
   The type-check job has no memory stop.
-  `memory_stop_reruns` in `config/merge_gate.conf` sets the reruns alone after a memory stop; the default is one.
+  `memory_stop_reruns` in `config/gate.conf` sets the reruns alone after a memory stop; the default is one.
   The gate reads this count at use. Memory stops do not count toward the eight ordinary failures that prevent reruns.
   Another memory stop after the last allowed rerun fails the gate and retains the reason.
   Each stop sends sdlc a peer message with the gate, module, peak, limit, and next action.
@@ -653,9 +653,9 @@ A private index exposes edits hidden by `assume-unchanged` or `skip-worktree`.
 The live index and edits stay unchanged; untracked files do not count.
 Local, Mac, and checkpoint promotion use this function.
 
-`live_state_refusal` exports the target tree and reads `live_state_checks` from its `config/merge_gate.conf`.
+`live_state_refusal` exports the target tree and reads `live_state_checks` from its `config/gate.conf`.
 It runs each listed module from that tree as `python3 -m <module> state-check`, within `live_state_check_seconds`.
-A listed module that the tree does not have refuses the promotion, so a rename or deletion cannot stop a check without notice. A tree without `config/merge_gate.conf` or without the `live_state_checks` key has no checks.
+A listed module that the tree does not have refuses the promotion, so a rename or deletion cannot stop a check without notice. A tree without `config/gate.conf` or without the `live_state_checks` key has no checks.
 A nonzero exit refuses the promotion before main moves, and names the module and its last error line.
 The checks only read live state. Local and checkpoint promotion run them; the Mac promotion does not.
 The first check is `scripts.build_queue.admission_service`, which reads admission `state.json` as `serve` does.
@@ -940,7 +940,7 @@ The command provides no import converter.
 The gate starts test modules through the checked tree's `scripts/lib/py`.
 It removes the caller's `PYTHONPATH` before the shim sets the checked tree's package root.
 The gate refuses a tree without that shim.
-`MERGE_GATE_PYTHON` selects the test interpreter.
+`GATE_PYTHON` selects the test interpreter.
 For script paths, the shim selects the script's checkout.
 For stdin, `-c`, and `-m`, it selects its own checkout and passes `-P` before other Python arguments.
 Outside the gate, it retains inherited Python paths after that root.
@@ -968,7 +968,7 @@ This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_g
 | `ADD_SHOWRUNNER_POLL_S` | `scripts/production/add_showrunner.py` (`POLL_S`, read at import) | `2.0` | `0.01`; default test imports with it unset |
 | `leftover_timeout_s` (`OffloadConfig`, settings file) | `scripts/mac_test/eligibility.py` | `10` s | small or large per case; invalid values fall back to 10 |
 | `UNIT_RUN_ROOT` | `end_session.sh` (passed to `unit_runs.py held --root`) | every run root: each `/session/<name>/run`, then `/tmp/claude/unit` and `/tmp/claude/delegate` | a temp dir |
-| `MERGE_GATE_STATE_DIR`, `MERGE_GATE_PYTHON`, `MERGE_GATE_BASEDPYRIGHT`, `MERGE_GATE_UV` | `merge_gate.py` | `~/.local/state/merge-gate`, `sys.executable`, `basedpyright`, `uv` | scratch dir and stubs |
+| `GATE_STATE_DIR`, `GATE_PYTHON`, `GATE_BASEDPYRIGHT`, `GATE_UV` | `merge_gate.py` | `~/.local/state/merge-gate`, `sys.executable`, `basedpyright`, `uv` | scratch dir and stubs |
 
 The build hold reader finds the run owner through `StaffRow.run`.
 Tests use a private `STAFF_FILE` and private run folders.

@@ -170,7 +170,7 @@ class CloudGateTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root / "buildlog")})))
-        _ = write_config_fixture(self.root / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
+        _ = write_config_fixture(self.root / "gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
         _ = write_config_fixture(self.root / "test_times.conf", "TOP_RUNS=3\nGATE_FAILURE_LOG_KIB=4")
         repository = Path(__file__).resolve().parents[2]
         # The fixture keeps two sizes, so the shipped type list can change without these cases.
@@ -2125,7 +2125,7 @@ class CloudRouteTests(CostFixture):
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
         _ = self.enterContext(mock.patch.object(cloud_gate, 'account_settings_path', side_effect=lambda: Path(os.environ.get('AWS_TARGET_CONFIG', str(self.settings)))))
         repository = Path(__file__).resolve().parents[2]
-        for name in ('merge_gate', 'cloud_gate'):
+        for name in ('gate', 'cloud_gate'):
             _ = (self.root / (name + '.conf')).write_bytes((repository / 'config' / (name + '.conf')).read_bytes())
         self.repo = self.root / 'repo'
         folder = self.repo / 'scripts/fixture'
@@ -2679,7 +2679,7 @@ class CloudRouteTests(CostFixture):
                 before = len(self.fallback_rows())
                 with (mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('The session must not call AWS')),
                       mock.patch.object(store, 'host_file', return_value=destination),
-                      mock.patch.dict(os.environ, {'MERGE_GATE_PASSED_DIR': str(self.root / 'passed')}),
+                      mock.patch.dict(os.environ, {'GATE_PASSED_DIR': str(self.root / 'passed')}),
                       redirect_stdout(StringIO()) as output):
                     outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
                                              module_time_limit_s=1800, service=service)

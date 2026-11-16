@@ -67,10 +67,10 @@ from pathlib import Path
 import sys
 
 TEST_HANG_GUARD_SECS = __TEST_HANG_GUARD_SECS__
-with open(Path(os.environ["MERGE_GATE_TEST_REPO"]) / "scripts/lib/package_root.py") as package_root:
+with open(Path(os.environ["GATE_TEST_REPO"]) / "scripts/lib/package_root.py") as package_root:
     exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.wait_for_test_state import wait_until
-state = Path(os.environ["MERGE_GATE_TEST_STATE"])
+state = Path(os.environ["GATE_TEST_STATE"])
 name = Path(sys.argv[0]).name
 with (state / "tools.jsonl").open("a") as output:
     output.write(json.dumps({"tool": name, "args": sys.argv[1:], "cwd": os.getcwd(), "pid": os.getpid()}) + "\\n")
@@ -134,7 +134,7 @@ import time
 import unittest
 
 TEST_HANG_GUARD_SECS = __TEST_HANG_GUARD_SECS__
-state = Path(os.environ["MERGE_GATE_TEST_STATE"])
+state = Path(os.environ["GATE_TEST_STATE"])
 module = Path(__file__)
 suite = module.relative_to(Path.cwd() / "scripts").parts[0]
 module_name = module.relative_to(Path.cwd() / "scripts" / suite).as_posix()
@@ -164,16 +164,16 @@ class FixtureTest(unittest.TestCase):
         self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
         self.assertEqual(signal.getsignal(signal.SIGHUP), signal.SIG_DFL)
         self.assertEqual(signal.getsignal(signal.SIGQUIT), signal.SIG_DFL)
-        if os.environ.get("MERGE_GATE_TEST_ISOLATION") == "1":
+        if os.environ.get("GATE_TEST_ISOLATION") == "1":
             self.assertNotIn(str(Path.cwd()), os.environ.get("PYTHONPATH", "").split(os.pathsep))
             self.assertIn(str(Path.cwd()), sys.path)
-            self.assertNotIn(os.environ["MERGE_GATE_TEST_PYTHONPATH"], sys.path)
-            self.assertNotIn(os.environ["MERGE_GATE_TEST_REPO"], sys.path)
+            self.assertNotIn(os.environ["GATE_TEST_PYTHONPATH"], sys.path)
+            self.assertNotIn(os.environ["GATE_TEST_REPO"], sys.path)
         record({"suite": suite, "module": module_name, "pid": os.getpid(),
                 "event": "start", "tmpdir": str(tmp)})
         if (state / "sample-module-memory").exists():
             import subprocess
-            checkout = Path(os.environ["MERGE_GATE_TEST_REPO"])
+            checkout = Path(os.environ["GATE_TEST_REPO"])
             (state / (str(os.getpgrp()) + ".memory-ready")).touch()
             subprocess.run([str(checkout / "scripts/lib/py"),
                             str(checkout / "scripts/direct/wait_for_test_state.py"),
@@ -339,7 +339,7 @@ class MergeGateFixture(unittest.TestCase):
         self.restore_fixture(suites_for_case(self))
         _ = self.enterContext(mock.patch.object(session_send, "SEND_SCRIPT", self.bin / "send.py"))
         self.admission = caller_admission(self, self.root, self.environment)
-        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
         self.admission_started = True
 
     def restore_fixture(self, folders: tuple[str, ...]) -> None:
@@ -365,7 +365,7 @@ class MergeGateFixture(unittest.TestCase):
         self.base, self.checkpoint = seed.base, seed.checkpoint
         if restart_admission:
             self.admission = caller_admission(self, self.root, self.environment)
-            _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
+            _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
 
     @property
     def module_count(self) -> int:
@@ -432,14 +432,14 @@ class MergeGateFixture(unittest.TestCase):
             "CODEX_HOME": str(home / "codex"), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": str(git_config),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
-            "MERGE_GATE_TEST_STATE": str(self.state),
-            "MERGE_GATE_TEST_REPO": str(SCRIPT.parents[2]),
-            "MERGE_GATE_PYTHON": str(self.bin / "suite-python"),
-            "MERGE_GATE_BASEDPYRIGHT": str(self.bin / "basedpyright"),
-            "MERGE_GATE_UV": str(self.bin / "uv"),
-            "MERGE_GATE_STATE_DIR": str(self.state / "runner"),
-            "MERGE_GATE_PASSED_DIR": str(self.state / "passes"),
-            "MERGE_GATE_STYLE_SYNC": str(self.bin / "style_sync.py"),
+            "GATE_TEST_STATE": str(self.state),
+            "GATE_TEST_REPO": str(SCRIPT.parents[2]),
+            "GATE_PYTHON": str(self.bin / "suite-python"),
+            "GATE_BASEDPYRIGHT": str(self.bin / "basedpyright"),
+            "GATE_UV": str(self.bin / "uv"),
+            "GATE_STATE_DIR": str(self.state / "runner"),
+            "GATE_PASSED_DIR": str(self.state / "passes"),
+            "GATE_STYLE_SYNC": str(self.bin / "style_sync.py"),
             "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
@@ -449,7 +449,7 @@ class MergeGateFixture(unittest.TestCase):
             # The calling showrunner is found from these update timers, never the live ones.
             "NOTIFIER_STATE_DIR": str(home / "notifier"), "CLAUDE_CODE_SESSION_ID": "fixture-showrunner",
         }
-        self.environment["MERGE_GATE_TEST_PYTHONPATH"] = self.environment.get("PYTHONPATH", "")
+        self.environment["GATE_TEST_PYTHONPATH"] = self.environment.get("PYTHONPATH", "")
         readings = root / "memory"
         readings.mkdir(exist_ok=True)
         self.environment.update({key: value for key, value in fake_memory_readings(readings).items()
@@ -551,7 +551,7 @@ class MergeGateFixture(unittest.TestCase):
         self.bin.mkdir()
         self.state.mkdir()
         _ = write_config_fixture(self.root / "config/buildlog.conf")
-        _ = write_config_fixture(self.root / "config/merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
+        _ = write_config_fixture(self.root / "config/gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
         # These tests prove gate behavior without a near deadline from their short jobs.
         history = Path(self.environment["BUILDLOG_DIR"])
         history.mkdir(parents=True, exist_ok=True)
@@ -687,7 +687,7 @@ class MergeGateFixture(unittest.TestCase):
                        "(signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)]; ")
         source += ("from scripts.production import gate; \n"
                    + "from pathlib import Path\nimport os\nfrom scripts.message import session_send\n"
-                   + "session_send.SEND_SCRIPT = Path(os.environ['MERGE_GATE_TEST_STATE']).parent / 'bin/send.py'\n"
+                   + "session_send.SEND_SCRIPT = Path(os.environ['GATE_TEST_STATE']).parent / 'bin/send.py'\n"
                    + "entry = gate\n"
                    + preamble + "\n"
                    + "raise SystemExit(entry.main(sys.argv[1:]))")
@@ -712,11 +712,11 @@ class MergeGateFixture(unittest.TestCase):
         return [cast(ModuleEvent, json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
 
     def pass_records(self) -> list[dict[str, object]]:
-        path = Path(self.environment["MERGE_GATE_PASSED_DIR"]) / "passed-trees.jsonl"
+        path = Path(self.environment["GATE_PASSED_DIR"]) / "passed-trees.jsonl"
         return [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
 
     def write_nightly_red_marker(self) -> tuple[Path, str]:
-        marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
+        marker = Path(self.environment["GATE_STATE_DIR"]) / "full-required"
         notice = json.dumps({"tree": "red-tree", "at": "2026-10-29T00:00:00+00:00"})
         self.write(marker, notice)
         return marker, notice

@@ -26,11 +26,13 @@ class Fixture(unittest.TestCase):
         print(json.dumps([os.environ['TMPDIR'], str(path), os.getpid()]), flush=True)
         sys.stdin.read(1)
 """
-GATE_FIXTURE = """import os, unittest
+GATE_FIXTURE = """import os, subprocess, tempfile, unittest
 from scripts.lib import build_folders
 class Fixture(unittest.TestCase):
     def test_folder(self):
         print('TMPDIR=' + os.environ['TMPDIR'], flush=True)
+        self.assertNotIn('GATE_PARENT_PID', os.environ)
+        self.assertNotIn('MERGE_GATE_PARENT_PID', os.environ)
 """
 MODULE_RUN = Path(__file__).resolve().parents[1] / "test_times/module_run.py"
 
@@ -45,6 +47,7 @@ class TestRunFolderTests(unittest.TestCase):
 
     def environment(self) -> dict[str, str]:
         result = {**os.environ, "TMPDIR": str(self.root)}
+        _ = result.pop("GATE_PARENT_PID", None)
         _ = result.pop("MERGE_GATE_PARENT_PID", None)
         _ = result.pop(testing_folders.RUN_FOLDER_ENV, None)
         return result
@@ -108,15 +111,33 @@ class TestRunFolderTests(unittest.TestCase):
         self.assertEqual(list(live_folder.parent.iterdir()), [])
 
     def test_a_gate_job_keeps_its_folder_when_a_test_imports_the_maker(self) -> None:
-        _ = (self.root / "test_gate_fixture.py").write_text(GATE_FIXTURE)
-        environment = {**self.environment(), "MERGE_GATE_PARENT_PID": str(os.getpid()), "PYTHONPATH": str(self.root)}
-        _ = environment.pop("TEST_TIMES_OUT", None)
-        result = subprocess.run([str(SHIM), str(MODULE_RUN), str(self.root), "test_gate_fixture.py"],
-                                cwd=self.root, env=environment, text=True, capture_output=True,
-                                timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(f"TMPDIR={self.root}\n", result.stdout + result.stderr)
-        self.assertFalse((self.root / "test-runs").exists())
+        child_source = """import os, pathlib, unittest
+class Child(unittest.TestCase):
+    def test_folder(self):
+        path = pathlib.Path(os.environ['TMPDIR'])
+        self.assertEqual(path.parent.name, 'test-runs')
+        self.assertTrue(path.is_dir())
+"""
+        _ = (self.root / "test_child.py").write_text(child_source)
+        source = GATE_FIXTURE + f"""        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as temporary:
+            child = subprocess.run(
+                [{str(SHIM)!r}, '-m', 'unittest', 'discover', '-s', {str(self.root)!r}, '-p', 'test_child.py'],
+                env={{**os.environ, 'TMPDIR': temporary}},
+                capture_output=True, text=True, timeout={TEST_HANG_GUARD_SECS!r})
+            self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
+"""
+        _ = (self.root / "test_gate_fixture.py").write_text(source)
+        for values in ({"GATE_PARENT_PID": str(os.getpid())},
+                       {"MERGE_GATE_PARENT_PID": str(os.getpid())}):
+            with self.subTest(values=values):
+                environment = {**self.environment(), **values, "PYTHONPATH": str(self.root)}
+                _ = environment.pop("TEST_TIMES_OUT", None)
+                result = subprocess.run([str(SHIM), str(MODULE_RUN), str(self.root), "test_gate_fixture.py"],
+                                        cwd=self.root, env=environment, text=True, capture_output=True,
+                                        timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"TMPDIR={self.root}\n", result.stdout + result.stderr)
+                self.assertFalse((self.root / "test-runs").exists())
 
     def test_a_run_without_a_build_log_keeps_its_log_in_the_run_folder(self) -> None:
         for caller in ("", str(self.root / "caller-buildlog")):

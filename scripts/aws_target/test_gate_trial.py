@@ -214,7 +214,7 @@ class GuestTests(unittest.TestCase):
                 run = original_run(repo, full=full, machine=machine, module_time_limit_s=module_time_limit_s)
                 _ = (root / 'stat').write_text('cpu 500 0 100 20000 5000 0 0 400 20000 20000\n')
                 return run
-            with (mock.patch.dict(os.environ, {'MERGE_GATE_BASEDPYRIGHT': str(types), 'MERGE_GATE_PYTHON': sys.executable,
+            with (mock.patch.dict(os.environ, {'GATE_BASEDPYRIGHT': str(types), 'GATE_PYTHON': sys.executable,
                                                  'GATE_BOX_DIR': str(root), 'box_dir': str(root)}),
                   mock.patch.object(sys, 'path', list(sys.path)),
                   mock.patch.object(gate_box, 'CANDIDATE_GUEST', candidate),

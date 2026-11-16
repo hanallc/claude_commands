@@ -188,7 +188,7 @@ class MemoryRecordTest(unittest.TestCase):
 import json
 import os
 from pathlib import Path
-state = Path(os.environ["MERGE_GATE_TEST_STATE"])
+state = Path(os.environ["GATE_TEST_STATE"])
 (state / "types-memory-environment.json").write_text(json.dumps({
     "tripwire_present": "BUILDLOG_LIVE_MEMORY_TRIPWIRE" in os.environ}))
 print("0 errors, 0 warnings, 0 notes")

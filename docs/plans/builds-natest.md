@@ -4493,3 +4493,79 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The five matchers know `gate.py` by its exact base name; `ADMISSION_CODE_PATHS` gained `production/gate.py`, so the admission code version changes at merge. `checkpoint_gate.runs_merge_gate` accepts both names.
 - `config/fast_track.conf` `refused_paths` lists `gate.py` beside `merge_gate.py` (/tune on main 935154e9c). The sensitive-path test requires the `refused path:` text (review F002).
 - Config keys, helper and test method names that hold `merge_gate` are chunk 3 work. Checkpoint 0e19e746f; main merged at 935154e9c.
+
+### Phase 317 — the gate's environment variables and config file take the gate name  · status: done
+**Depends on:** Phase 316
+**Owner:** natest writes; sdlc owns (gate rename plan chunk 3; user go via morty and builds 11-16 13:50 EST, including the config file rename).
+
+#### Work Order
+
+**Goal:** the gate's environment variables are `GATE_*` and its config file is `config/gate.conf`, in one commit; a gate started before the deploy still works.
+
+**Source:** gate rename plan at fd66bc22c, chunk 3, decisions 6 and 7.
+
+**Spec:**
+1. Rename each `MERGE_GATE_<NAME>` environment variable to `GATE_<NAME>` everywhere it is set or read, in one commit: the 16 names at the base. First check that no `GATE_<NAME>` already exists with another meaning (the AWS box uses `GATE_TEST_{BIN,BLOCK,HOST,ROOT}`, `GATE_BOX_DIR` and others). Stop and report a collision before you rename it.
+2. `scripts/lib/python_startup/sitecustomize.py` reads `GATE_PARENT_PID`, then `MERGE_GATE_PARENT_PID`, until chunk 6, because a gate started before the deploy still sets the old name for its children. Mark the old read with one comment that names chunk 6.
+3. `git mv config/merge_gate.conf config/gate.conf`. The keys and values do not change. Every `conf.read("merge_gate")`, `read_or_repository`, fixture write of `merge_gate.conf`, and doc that names the file uses `gate`.
+4. Deploy check: list each read of the gate config that a gate run makes after its own push to main. If any exists, a gate that loaded the old code before the deploy would read a missing `merge_gate.conf`. Then keep `config/merge_gate.conf` as a git symlink to `gate.conf` until chunk 6, with one line in `config/README.md` that says chunk 6 removes it. If none exists, add no symlink. Report the list either way.
+5. Check `config/live_settings.conf`, `scripts/lib/tune.py` and the config validators for the stem `merge_gate`; change each to `gate`.
+6. Update `config/README.md` and the as-built docs that name a renamed variable or the config file. Do not change the prose "merge gate" (chunk 5). Do not change the state folder or stored step names (chunk 4).
+7. Do not edit `/etc/nixos` or `config/cloud_gate.conf`.
+8. No signal handlers, masks or dispositions. Do not change any trap.
+9. Every behavior check stays. Remove no assertion. Change only the names above.
+
+**Files:**
+- `config/README.md`
+- `docs/as-built/merge-gate-and-test-speed.md`
+- `docs/as-built/message-clarity.md`
+- `scripts/aws_target/test_cloud_gate.py`
+- `scripts/aws_target/test_gate_box.py`
+- `scripts/aws_target/test_gate_trial.py`
+- `scripts/hooks/test_build_hold_guard.py`
+- `scripts/lib/python_startup/sitecustomize.py`
+- `scripts/lib/test_testing_folders.py`
+- `scripts/lint/memory_admit.py`
+- `scripts/maintenance/test_herdr_upkeep.py`
+- `scripts/production/affected_modules.py`
+- `scripts/production/fast_track.py`
+- `scripts/production/gate.py`
+- `scripts/production/gate_suites_test_support.py`
+- `scripts/production/gate_test_support.py`
+- `scripts/production/land_runs.py`
+- `scripts/production/test_affected_modules.py`
+- `scripts/production/test_gate_holds.py`
+- `scripts/production/test_gate_ledger.py`
+- `scripts/production/test_gate_promotion.py`
+- `scripts/production/test_gate_suites.py`
+- `scripts/production/test_gate_suites_reruns.py`
+- `scripts/production/test_gate_suites_resources.py`
+- `scripts/production/test_gate_suites_signals.py`
+- `scripts/production/test_gate_suites_tripwires.py`
+- `scripts/production/test_gate_suites_types.py`
+- `scripts/production/test_gate_targeted.py`
+- `scripts/production/test_gate_test_times.py`
+- `scripts/production/test_land_queue.py`
+- `scripts/production/test_land_runs.py`
+- `scripts/production/test_unit_phases.py`
+- `scripts/test_times/gate_record.py`
+- `scripts/test_times/module_run.py`
+- `scripts/test_times/test_gate_record.py`
+- `scripts/test_times/test_module_run.py`
+- `config/merge_gate.conf`
+- `config/gate.conf`
+- `config/live_settings.conf`
+- `scripts/lib/tune.py`
+
+**Workers:** 1 writer. The names change together in one commit, so nothing splits.
+- impl: every file above.
+- test: opens as impl.
+
+**Constraints from prior phases:** Phase 316: `gate.py` is the gate; `merge_gate.py` and `targeted_test.py` are entry points; `SuiteMode` aliases stay until chunk 6. Config keys that hold `merge_gate` (for example `merge_gate_governor_gib`) are keys, not the file stem; keep them.
+
+**Acceptance gate:**
+1. `git grep -E 'MERGE_GATE_'` shows only the `MERGE_GATE_PARENT_PID` fallback read in `sitecustomize.py` and old plan docs.
+2. `git grep -E "merge_gate\.conf|conf\.[a-z_]+\(['\"]merge_gate['\"]"` shows no reader; the symlink and its README line only if item 4 needs them.
+3. These modules pass on natedev, in batches of 4 under the hold rules: every module in Files, and every module that sets or reads a renamed variable.
+4. basedpyright adds no finding on each touched Python file.
+5. Trial merges with origin/main and the open unit branches are clean.

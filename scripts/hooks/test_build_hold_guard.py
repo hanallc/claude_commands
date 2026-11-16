@@ -22,7 +22,7 @@ HOOK = Path(__file__).with_name("pre-tool-use-build-hold-guard.py")
 FRONT = HOOK.with_suffix(".sh")
 CARGO_BUILDS = ("build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r",
                 "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "mend", "miri")
-MERGE_GATE_COMMANDS = (
+GATE_COMMANDS = (
     "python3 gate.py --tests-only",
     "python3.13 -u '/work tree/gate.py' --targeted",
     "scripts/lib/py scripts/production/gate.py --targeted",
@@ -37,7 +37,7 @@ MERGE_GATE_COMMANDS = (
     "bash -lc 'python3 merge_gate.py --tests-only'",
     "env CHECK=1 python3 -W ignore -X dev -- merge_gate.py --help",
 )
-MERGE_GATE_REFUSAL = REFUSAL + " This run waits for the hold to end. Run it after the release."
+GATE_REFUSAL = REFUSAL + " This run waits for the hold to end. Run it after the release."
 
 
 class BuildHoldGuardTest(TemporaryGuardTest):
@@ -79,7 +79,7 @@ class BuildHoldGuardTest(TemporaryGuardTest):
         # The marker must take priority even when the worker inherits the holder's id.
         self.codex_unit("another-director", "other")
         for command, reason in ((["cargo", "check"], REFUSAL),
-                                (["python3", "scripts/production/merge_gate.py", "--tests-only"], MERGE_GATE_REFUSAL)):
+                                (["python3", "scripts/production/merge_gate.py", "--tests-only"], GATE_REFUSAL)):
             with self.subTest(command=command):
                 response = cast(dict[str, dict[str, str]], json.loads(self.run_hook(command, session="codex-thread")))
                 self.assertEqual(response, {"hookSpecificOutput": {
@@ -89,18 +89,18 @@ class BuildHoldGuardTest(TemporaryGuardTest):
 
     def test_merge_gate_launch_forms_are_refused_during_another_hold(self) -> None:
         self.hold()
-        for command in MERGE_GATE_COMMANDS:
+        for command in GATE_COMMANDS:
             with self.subTest(command=command):
-                self.assert_denied(command, MERGE_GATE_REFUSAL)
+                self.assert_denied(command, GATE_REFUSAL)
 
     def test_merge_gate_launch_forms_are_allowed_without_a_hold(self) -> None:
-        for command in MERGE_GATE_COMMANDS:
+        for command in GATE_COMMANDS:
             with self.subTest(command=command):
                 self.assertEqual(self.run_hook(command), "", command)
 
     def test_merge_gate_launch_forms_are_allowed_for_the_sole_holder(self) -> None:
         self.hold("caller")
-        for command in MERGE_GATE_COMMANDS:
+        for command in GATE_COMMANDS:
             with self.subTest(command=command):
                 self.assertEqual(self.run_hook(command), "", command)
 

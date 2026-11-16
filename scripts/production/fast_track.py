@@ -474,7 +474,7 @@ def fast_check(runner: GitRunner, repo: Path, paths: list[str], config: FastTrac
                 raise Refused(f"not a Python package module: {path}")
             check_command([sys.executable, "-c", f"import {module}"], repo, environment, deadline)
         if python_files:
-            check_command([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"),
+            check_command([os.environ.get("GATE_BASEDPYRIGHT", "basedpyright"),
                            *map(str, python_files)], repo, environment, deadline, types=True)
 
 
