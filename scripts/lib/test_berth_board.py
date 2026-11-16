@@ -98,6 +98,17 @@ class BerthBoardTests(unittest.TestCase):
         self.assertIsInstance(result, BoardUnavailable)
         if isinstance(result, BoardUnavailable):
             self.assertIn("cannot read reservation journal", result.reason)
+            self.assertFalse(result.ledger_missing)
+
+    def test_ledger_that_was_never_initialized_is_marked_missing(self) -> None:
+        # cargo-berth board --json in a copies.py clone of hana, 2026-11-15.
+        message = ("The reservation ledger could not be read: the cargo-berth ledger is not initialized; "
+                   "run cargo-berth init and retry")
+        value = envelope(populated=False)
+        value.update(status="ledger_unreadable", exit_code=4, payload={"kind": "no_facts", "alerts": []},
+                     message=message)
+        result = self.read(value, exit_code=4)
+        self.assertEqual(result, BoardUnavailable(message, ledger_missing=True))
 
     def test_empty_malformed_and_non_envelope_output_are_unavailable(self) -> None:
         for stdout, code in (("", 0), ("", 2), ("", 4), ("not json", 1), ("{}", 0), ("[]", 0), ('{"reservations": []}', 0)):
