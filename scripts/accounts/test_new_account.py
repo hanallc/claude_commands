@@ -221,7 +221,7 @@ class NewAccountTests(unittest.TestCase):
         self.assertTrue(note.startswith('---\ndate_created: "[['))
         self.assertIn("done: ~/.claude4 is logged in", stdout)
         self.assertIn("done: claude4 alias: comes from the account note", stdout)
-        self.assertTrue(stdout.endswith("claude4 is ready; /showrunner:accounts shows its row.\n"))
+        self.assertTrue(stdout.endswith("claude4 is ready; Hana console, Accounts shows its row.\n"))
         self.assertIsInstance(accounts.account_directory_readiness("claude4"), accounts.AccountDirectoryReady)
 
     def test_new_claude_account_inserts_the_first_free_color_after_the_last_account_without_changing_other_bytes(self) -> None:

@@ -416,7 +416,7 @@ A second schedule caller prints `already claimed by <id>` and exits with code 0.
 
 `StatusReading` separates stored facts from their display.
 `StatusDocument` carries account rows, the board, problems, and session input paths.
-The `board` is `accounts.status_board()`: the table the unit-board plugin and the console Accounts page draw.
+The `board` is `accounts.status_board()`: the table the console Accounts page draws.
 Its `stale_at` is the next local midnight, when its reset text changes.
 The text table appends `Login ends` in the user's zone, with the same date format as `Weekly resets`.
 Each JSON account exports `login_ends_at` as an ISO 8601 UTC string, or null for an unknown date or Codex.
@@ -462,7 +462,7 @@ The board sums available machine counts and identifies an unavailable peer.
 `status --stored` reads saved usage, role maps, and peer counts.
 It does not wait for the detached counts fetch.
 Local session counts still use current local registry evidence.
-The [pane design](accounts-queue-panes.md) owns the display contract and refresh lifecycle.
+The [console Accounts page](review-links.md#accounts-page) defines the display and refresh behavior.
 
 Account notes use numbered filenames.
 Each note shows its roles and live session count.
