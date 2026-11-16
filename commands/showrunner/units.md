@@ -41,12 +41,14 @@ Its rows use the same cached plan and run records as the Progress bar.
 
 A busy session does not prove a task.
 Each current task has one row.
-Several actors use separate lines in its State cell; equal states appear once.
+Several actors share its State cell, joined by semicolons; equal states appear once.
+No row has an empty Work cell.
 The open phase supplies Now before any merge task.
 Without current activity, State names the missing step and the latest finished step with its recorded time.
 A queue entry uses `<title after the colon> (<id before the colon>)`.
 A queue entry without a colon keeps its full text.
-The first letter of a queue title is a capital.
+A queue title drops its notes in parentheses and each clause after its first semicolon.
+A title that starts with a plain lowercase word gets a capital; file names and IDs stay as written.
 A finished activity that matches the queue ID produces a conflict row; the board does not remove the entry.
 An unknown next task uses `Next | Not recorded | The director has not chosen the next task`.
 Only a readable plan with every phase done permits `Nothing queued; the plan is complete`.

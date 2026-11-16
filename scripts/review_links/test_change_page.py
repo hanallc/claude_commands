@@ -599,7 +599,9 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(changes.status, 200)
         self.assertIn("if(parent!==window) parent.postMessage('console-place',location.origin);", changes.body)
         self.assertIn("const paused=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;", changes.body)
-        self.assertIn("event.data==='console-shown') refreshPage(true);", changes.body)
+        self.assertIn("event.data==='console-shown')", changes.body)
+        self.assertIn("restart();refresh(true);", changes.body)
+        self.assertIn("createPageRefresh(refreshPage,()=>content.dataset.refreshSeconds)", changes.body)
         self.assertEqual(self.request("/console/rebuilds.html", {}).status, 200)
         self.assertEqual(change_page.page_url(), "/console/changes.html")
         self.assertEqual(manifest.read_bytes(), token)
@@ -3043,7 +3045,8 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("go(following?.dataset.key || '')", body)
         self.assertNotIn("rows.push(row)", body)
         with self.subTest(refresh="visibility, held content, and position"):
-            for rule in ("document.visibilityState!=='visible'", "setInterval(refreshPage,Number(content.dataset.refreshSeconds)*1000)",
+            for rule in ("document.visibilityState!=='visible'", "setInterval(()=>refresh(),Number(seconds())*1000)",
+                         "createPageRefresh(refreshPage,()=>content.dataset.refreshSeconds)", "pageRefresh.restart()",
                          "document.addEventListener('visibilitychange'", "fetch(location.href,{cache:'no-store'})",
                          "new DOMParser()", "content.replaceWith(fresh)", "fresh.outerHTML===shownPage",
                          "if(!heldPage || activeSaves", "field.value!==''", "document.addEventListener('input'",
@@ -3057,11 +3060,12 @@ class ChangePageTests(unittest.TestCase):
             self.assertIn("activeLoads && !supersede", body)
             self.assertIn("activeLoads++", body)
             self.assertIn("finally{activeLoads--;}", body)
-            self.assertIn("heldPage=null;newestRequest++;refreshPage(true)", body)
+            self.assertIn("heldPage=null;newestRequest++;pageRefresh.refresh(true)", body)
             self.assertIn("if(request!==newestRequest || !fresh) return", body)
         with self.subTest(refresh="a visible tab replaces an active load"):
             self.assertIn("async function refreshPage(supersede=false)", body)
-            self.assertIn("if(document.visibilityState==='visible') refreshPage(true)", body)
+            self.assertIn("document.addEventListener('visibilitychange',()=>{restart();refresh(true);})", body)
+            self.assertIn("if(!paused()) return load(supersede)", body)
         with self.subTest(navigation="one kind and a showrunner menu"):
             self.assertNotIn('role="tablist"', body)
             self.assertIn('data-kind="changes"', body)

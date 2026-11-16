@@ -172,12 +172,12 @@ class WaitsOnTests(unittest.TestCase):
                                    {"e" * 40: held, "f" * 40: later, "9" * 40: older}, frozenset(), {})
 
         failures = (
-            unit_phases.WorkItem("Center-column", "sdlc cannot merge it: merge conflict in docs/a.md, b.md"),
+            unit_phases.WorkItem("center-column", "sdlc cannot merge it: merge conflict in docs/a.md, b.md"),
             unit_phases.WorkItem("Images", "sdlc cannot merge it: merge conflict in docs/a.md, b.md"))
-        running = unit_phases.WorkItem("Images-card", "sdlc merges it now")
-        first = unit_phases.WorkItem("Shot-rule", "1st in sdlc's merge line")
-        paired = (unit_phases.WorkItem("Workers-why", "2nd in sdlc's merge line"),
-                  unit_phases.WorkItem("Land-line", "Merges with workers-why"))
+        running = unit_phases.WorkItem("images-card", "sdlc merges it now")
+        first = unit_phases.WorkItem("shot-rule", "1st in sdlc's merge line")
+        paired = (unit_phases.WorkItem("workers-why", "2nd in sdlc's merge line"),
+                  unit_phases.WorkItem("land-line", "Merges with workers-why"))
         carried_view = view._replace(carried_line={"7" * 40: line["c" * 40]})
         running_view = view._replace(running={"0" * 40: "shelled images-card", "8" * 40: "shelled live-owner"},
                                     carried_running=frozenset({"7" * 40}))
@@ -187,21 +187,21 @@ class WaitsOnTests(unittest.TestCase):
             ("open rows before other phases", view,
              {"images-card": unit_phases.SentCommit("0" * 40), "shot-rule": unit_phases.SentCommit("a" * 40),
               "land-line": unit_phases.SentCommit("c" * 40), "images": unit_phases.SentCommit("f" * 40)}, True,
-             (running, first, unit_phases.WorkItem("Land-line", "2nd in sdlc's merge line"),
-              unit_phases.WorkItem("Workers-why", "Merges with land-line"), failures[1]),
+             (running, first, unit_phases.WorkItem("land-line", "2nd in sdlc's merge line"),
+              unit_phases.WorkItem("workers-why", "Merges with land-line"), failures[1]),
              frozenset({"land-line"})),
             ("single open row", view, {"shot-rule": unit_phases.SentCommit("a" * 40)}, False,
              (running, first, *paired, *failures), frozenset()),
             ("carried commit joins its item", carried_view,
              {"workers-why": unit_phases.SentCommit("b" * 40), "checkpoint-wait": unit_phases.SentCommit("7" * 40),
               "land-line": unit_phases.SentCommit("c" * 40)}, False,
-             (running, first, paired[0], unit_phases.WorkItem("Checkpoint-wait", "Merges with workers-why"),
+             (running, first, paired[0], unit_phases.WorkItem("checkpoint-wait", "Merges with workers-why"),
               paired[1], *failures), frozenset({"workers-why", "checkpoint-wait", "land-line"})),
             ("running direct and carried commits", running_view,
              {"carried": unit_phases.SentCommit("7" * 40), "images-card": unit_phases.SentCommit("0" * 40)}, False,
              (unit_phases.WorkItem("Carried", "sdlc merges it now"),
-              unit_phases.WorkItem("Images-card", "Merges with carried"),
-              unit_phases.WorkItem("Live-owner", "Merges with carried"), first, *paired, *failures),
+              unit_phases.WorkItem("images-card", "Merges with carried"),
+              unit_phases.WorkItem("live-owner", "Merges with carried"), first, *paired, *failures),
              frozenset({"carried", "images-card"})),
             ("single running open row", view, {"images-card": unit_phases.SentCommit("0" * 40)}, False,
              (running, first, *paired, *failures), frozenset()),
@@ -216,7 +216,7 @@ class WaitsOnTests(unittest.TestCase):
               "not-sent": unit_phases.NoSentWork()}, False,
              (running, first, *paired,
               unit_phases.WorkItem("Absent", "Merge submission not in the merge line; reason not recorded"),
-              unit_phases.WorkItem("No-hash", "Merge position not recorded"), *failures), frozenset()),
+              unit_phases.WorkItem("no-hash", "Merge position not recorded"), *failures), frozenset()),
         ]
         for name, found, open_sent, on_main, expected, grouped in cases:
             with self.subTest(group=name):
