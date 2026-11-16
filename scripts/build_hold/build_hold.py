@@ -475,7 +475,7 @@ def read_audit_processes(
     for pid, process in processes.items():
         if (isinstance(selection, FullBuildAudit) or process.uid == selection.uid and
                 any(name in AUDIT_COMMANDS | {"pytest", "py.test", "sccache", "bash", "sh", "dash", "zsh",
-                                             "verify.sh", "merge_gate.py", "clippy-driver", "rust-analyzer",
+                                             "verify.sh", "merge_gate.py", "gate.py", "clippy-driver", "rust-analyzer",
                                              "basedpyright", "node", "nodejs"}
                     or name.startswith("python") for name in (process.command, process.executable))):
             details.add(pid)

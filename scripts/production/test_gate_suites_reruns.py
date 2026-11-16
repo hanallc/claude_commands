@@ -10,10 +10,10 @@ import subprocess
 from typing import final
 from contextlib import redirect_stdout
 from unittest import mock
-from scripts.production import merge_gate
+from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
-from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, gate_suites
-from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
+from scripts.production.gate_test_support import FIXTURE_FOLDERS, gate_suites
+from scripts.production.gate_suites_test_support import GateSuitesFixture
 from scripts.lint.memory_test_support import write_config_fixture
 from pathlib import Path
 
@@ -32,7 +32,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
         output = io.StringIO()
         with mock.patch.dict(os.environ, self.environment), \
                 self.sampling_module_memory({"hooks/test_first.py": (5120.0, 32.0)}), redirect_stdout(output):
-            run = merge_gate.run_suites(self.checkout)
+            run = gate.run_suites(self.checkout)
         self.assertFalse(run.passed, output.getvalue())
         result, = run.executions
         self.assertTrue(result.tripwire_tripped)
@@ -41,10 +41,10 @@ class MergeGateRerunsTests(GateSuitesFixture):
         starts = [event for event in self.module_events() if event["event"] == "start"]
         self.assertEqual(len(starts), 1)
         self.assertNotIn("Rerun alone:", output.getvalue())
-        self.assertEqual(merge_gate.read_measures(self.state / "runner/module_peak_mib.json"),
+        self.assertEqual(gate.read_measures(self.state / "runner/module_peak_mib.json"),
                          {"hooks/test_first.py": 48.0})
         message, = [call for call in self.calls() if call["tool"] == "send.py"]
-        self.assertEqual(message["args"][:4], ["--to", "sdlc", "--from", "merge_gate"])
+        self.assertEqual(message["args"][:4], ["--to", "sdlc", "--from", "gate"])
         text = message["args"][message["args"].index("--text") + 1]
         self.assertIn("the gate fails", text)
         self.assertNotIn("runs again alone", text)
@@ -54,14 +54,14 @@ class MergeGateRerunsTests(GateSuitesFixture):
 
     @gate_suites("lib", "hooks")
     def test_memory_stopped_module_passes_alone_and_messages_name_the_gate(self) -> None:
-        for mode in merge_gate.SuiteMode:
+        for mode in gate.SuiteMode:
             with self.subTest(mode=mode):
                 self.restore_fixture(("lib", "hooks"))
                 self.configure_gate("merge_gate_governor_gib=4")
                 output = io.StringIO()
                 with mock.patch.dict(os.environ, self.environment), \
                         self.sampling_module_memory({"hooks/test_first.py": (5120.0, 64.0)}), redirect_stdout(output):
-                    run = merge_gate.run_suites(self.checkout, mode=mode, full=True)
+                    run = gate.run_suites(self.checkout, mode=mode, full=True)
                 self.assertTrue(run.passed, output.getvalue())
                 attempts = [job for job in run.executions if job.suite == "hooks"]
                 self.assertEqual(len(attempts), 2)
@@ -75,7 +75,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
                 self.assertIn("passed on rerun alone; first run", output.getvalue())
                 messages = [call for call in self.calls() if call["tool"] == "send.py"]
                 self.assertEqual(len(messages), 1)
-                self.assertEqual(messages[0]["args"][:4], ["--to", "sdlc", "--from", "merge_gate"])
+                self.assertEqual(messages[0]["args"][:4], ["--to", "sdlc", "--from", "gate"])
                 text = messages[0]["args"][messages[0]["args"].index("--text") + 1]
                 for detail in (mode.value, "integration", self.base[:7], "hooks/test_first.py", "5.000 GiB",
                                "limit 4 GiB", "runs again alone"):
@@ -93,11 +93,11 @@ class MergeGateRerunsTests(GateSuitesFixture):
                 output = io.StringIO()
                 with mock.patch.dict(os.environ, self.environment), \
                         self.sampling_module_memory({"hooks/test_first.py": samples}) as started, redirect_stdout(output):
-                    run = merge_gate.run_suites(self.checkout)
+                    run = gate.run_suites(self.checkout)
                 self.assertEqual(run.passed, passed, output.getvalue())
                 self.assertEqual(len(started), len(samples))
                 self.assertEqual(len(run.executions), len(samples))
-                peaks = merge_gate.read_measures(self.state / "runner/module_peak_mib.json")
+                peaks = gate.read_measures(self.state / "runner/module_peak_mib.json")
                 self.assertEqual(peaks, {"hooks/test_first.py": 64.0 if passed else 48.0})
                 stops = [job for job in started if job.killed_for]
                 messages = [call for call in self.calls() if call["tool"] == "send.py"]
@@ -122,7 +122,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
         output = io.StringIO()
         with mock.patch.dict(os.environ, self.environment), \
                 self.sampling_module_memory({"hooks/test_first.py": (5120.0, 32.0)}), redirect_stdout(output):
-            run = merge_gate.run_suites(self.checkout)
+            run = gate.run_suites(self.checkout)
         self.assertFalse(run.passed, output.getvalue())
         starts = [event for event in self.module_events() if event["event"] == "start"]
         self.assertEqual(len(starts), self.module_count + 2)
@@ -139,7 +139,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
                 output = io.StringIO()
                 with mock.patch.dict(os.environ, self.environment), \
                         self.sampling_module_memory({"hooks/test_first.py": samples}), redirect_stdout(output):
-                    run = merge_gate.run_suites(self.checkout)
+                    run = gate.run_suites(self.checkout)
                 self.assertEqual(run.passed, passed, output.getvalue())
                 stops = [job for job in run.executions if job.killed_for]
                 messages = [call for call in self.calls() if call["tool"] == "send.py"]
@@ -171,18 +171,18 @@ class MergeGateRerunsTests(GateSuitesFixture):
         self.write(self.state / "fail-first-lib", "fail")
         self.environment["BUILDLOG_SCOPE"] = "1"
         output = io.StringIO()
-        first_results: list[merge_gate.GateJobResult] = []
-        finish = merge_gate.finish_gate_job
+        first_results: list[gate.GateJobResult] = []
+        finish = gate.finish_gate_job
 
-        def record_finish(job: merge_gate.RunningGateJob, status: int) -> merge_gate.GateJobResult:
+        def record_finish(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
             result = finish(job, status)
             first_results.append(result)
             return result
 
         with mock.patch.dict(os.environ, self.environment), \
                 mock.patch.object(queue_place, "in_builds_slice", return_value=False), \
-                mock.patch.object(merge_gate, "finish_gate_job", side_effect=record_finish), redirect_stdout(output):
-            run = merge_gate.run_suites(self.checkout, type_dirs=("scripts/production",))
+                mock.patch.object(gate, "finish_gate_job", side_effect=record_finish), redirect_stdout(output):
+            run = gate.run_suites(self.checkout, type_dirs=("scripts/production",))
         report = output.getvalue()
         self.assertTrue(run.passed, report)
         self.assertEqual(len(run.jobs), self.module_count + 1)
@@ -199,8 +199,8 @@ class MergeGateRerunsTests(GateSuitesFixture):
         self.assertEqual(sum(row["event"] == "finish" for row in events[:first_rerun]), self.module_count - 2)
         self.assertEqual([row["event"] for row in events[first_rerun:]], ["start", "finish", "start", "finish"])
         runner = self.state / "runner"
-        timings = merge_gate.read_measures(runner / "module_seconds.json")
-        history = merge_gate.read_history(runner / "module_history.json")
+        timings = gate.read_measures(runner / "module_seconds.json")
+        history = gate.read_history(runner / "module_history.json")
         for first in first_results[:self.module_count + 1]:
             if first.suite != "types":
                 key = f"{first.suite}/{first.module}"
@@ -227,7 +227,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
                 with mock.patch.dict(os.environ, self.environment), \
                         mock.patch.object(queue_place, "in_builds_slice", return_value=reason == "existing"), \
                         redirect_stdout(output):
-                    run = merge_gate.run_suites(self.checkout)
+                    run = gate.run_suites(self.checkout)
                 self.assertTrue(run.passed, output.getvalue())
                 scopes = [call for call in self.calls() if call["tool"] == "systemd-run"]
                 self.assertEqual([call["args"][-1] for call in scopes], ["true"] if reason == "probe" else [])
@@ -235,14 +235,14 @@ class MergeGateRerunsTests(GateSuitesFixture):
                            "existing": "gate already runs in builds.slice"}[reason]
                 self.assertIn("Module scope skipped: " + message, output.getvalue())
 
-    @gate_suites(*FIXTURE_FOLDERS[:merge_gate.RERUN_LIMIT])
+    @gate_suites(*FIXTURE_FOLDERS[:gate.RERUN_LIMIT])
     def test_more_than_the_rerun_limit_keeps_all_first_failures(self) -> None:
-        failed_suites = self.suites[:merge_gate.RERUN_LIMIT]
+        failed_suites = self.suites[:gate.RERUN_LIMIT]
         for suite in failed_suites:
             self.write(self.state / ("red-" + suite), "red")
         result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn(f"{merge_gate.RERUN_LIMIT + 1} modules failed; this is a real breakage, not load", result.stdout)
+        self.assertIn(f"{gate.RERUN_LIMIT + 1} modules failed; this is a real breakage, not load", result.stdout)
         self.assertNotIn("Rerun alone:", result.stdout)
         starts = [row for row in self.module_events() if row["event"] == "start"]
         self.assertEqual(len(starts), self.module_count)
@@ -257,10 +257,10 @@ class MergeGateRerunsTests(GateSuitesFixture):
         self.assert_not_pushed()
 
     def test_failed_rollback_names_merge_commit_and_blocking_files(self) -> None:
-        with mock.patch.object(merge_gate, "git", return_value=subprocess.CompletedProcess([], 1, " M unit.txt", "blocked")), mock.patch.object(
-                merge_gate, "checked_git", side_effect=["merge-commit", "unit.txt\0"]):
+        with mock.patch.object(gate, "git", return_value=subprocess.CompletedProcess([], 1, " M unit.txt", "blocked")), mock.patch.object(
+                gate, "checked_git", side_effect=["merge-commit", "unit.txt\0"]):
             with self.assertRaisesRegex(GateRefused, "merge NOT undone; merge commit merge-commit; blocking files: M unit.txt"):
-                merge_gate.rollback_merge(self.checkout, self.base)
+                gate.rollback_merge(self.checkout, self.base)
 
 
 if __name__ == "__main__":

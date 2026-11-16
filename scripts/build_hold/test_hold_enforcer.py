@@ -855,7 +855,7 @@ class HoldEnforcerTests(unittest.TestCase):
         (cargo / "cwd").symlink_to("/dev/shm/mac-idle-suite-123/tmp456")
         _ = self.process(30, "claude", start=100, session="claude-session")
         _ = self.process(31, "python3", parent=30, argv=("python3", "-m", "unittest", "scripts.agents.codex_test_support"))
-        _ = self.process(40, "python3", argv=("python3", "-m", "unittest", "scripts.production.test_merge_gate"),
+        _ = self.process(40, "python3", argv=("python3", "-m", "unittest", "scripts.production.test_gate"),
                          environment={"CLAUDE_CODE_SESSION_ID": "detached-session"})
         decisions = {item.process.identity.pid: item for item in self.decisions()}
         self.assertEqual(set(decisions), {20, 21, 31, 40})
@@ -885,8 +885,15 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertTrue(all(row["action"] == "stopped" for row in self.rows()))
 
     def test_merge_gate_entry_points_wait_but_mentions_do_not_protect_tests(self) -> None:
+        for name in ("cloud_gate.py", "gate_box.py"):
+            with self.subTest(name=name):
+                _ = self.process(30, "python3", argv=("python3", f"/tree/{name}"), session="other")
+                self.assertEqual(self.decisions(), ())
         for argv in (
             ("/tree/merge_gate.py", "--tests-only"),
+            ("/tree/gate.py", "--tests-only"),
+            ("python3", "-u", "/tree/gate.py", "--targeted"),
+            ("python3", "-m", "scripts.production.gate", "--tests-only"),
             ("python3", "-u", "/tree/merge_gate.py", "--promote-only"),
             ("python3", "-m", "scripts.production.merge_gate", "--tests-only"),
         ):
@@ -1069,6 +1076,14 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual(detailed, {(10, "cmdline"), (10, "environ"), (20, "cmdline"),
                                     (20, "environ"), (30, "environ")})
         self.assertEqual(table[30].environment, {})
+        for command, expected in (("gate.py", True), ("cloud_gate.py", False), ("gate_box.py", False)):
+            with self.subTest(command=command):
+                _ = self.process(40, command, argv=(command, "--tests-only"))
+                detailed.clear()
+                with mock.patch.object(Path, "read_bytes", read):
+                    _ = self.table()
+                self.assertEqual((40, "cmdline") in detailed, expected)
+
 
     def test_other_uid_and_enforcer_ancestors_are_never_stopped(self) -> None:
         _ = self.process(10, "python3", argv=("python3", "-m", "unittest"))

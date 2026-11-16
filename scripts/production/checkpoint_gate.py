@@ -138,7 +138,7 @@ GATE_GREEN_ALONE = re.compile(r"^--- (\S+) passed on rerun alone; first run exit
 
 
 def runs_merge_gate(command: Sequence[str]) -> bool:
-    return any(Path(word).name == "merge_gate.py" for word in command)
+    return any(Path(word).name in {"merge_gate.py", "gate.py"} for word in command)
 
 
 def red_names(command: Sequence[str], output: str) -> frozenset[str]:

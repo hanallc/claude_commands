@@ -9,7 +9,7 @@ from scripts.production import checkpoint_gate
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, configure_test_environment
 
 MERGE_TEST = "- **Merge tests:** `verify.sh test cargo-tile`"
-GATE = ["py", "/repo/scripts/production/merge_gate.py", "--checkout", ".", "--tests-only"]
+GATE = ["py", "/repo/scripts/production/gate.py", "--checkout", ".", "--tests-only"]
 
 
 def setUpModule() -> None:

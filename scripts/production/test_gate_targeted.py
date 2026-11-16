@@ -4,18 +4,21 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 from typing import ClassVar, override
 from unittest import mock
 
-from scripts.production import merge_gate, targeted_test
+from scripts.production import gate
 from scripts.lib import build_folders
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.affected_modules import NoCertifiedBase
-from scripts.production.merge_gate_test_support import MergeGateFixture, SUITE_MODULE, gate_suites
+from scripts.production.gate_test_support import MergeGateFixture, SUITE_MODULE, gate_suites
 from scripts.lint.memory_test_support import write_config_fixture
 
 
 class TargetedTestTests(MergeGateFixture):
-    suite_mode: ClassVar[merge_gate.SuiteMode] = merge_gate.SuiteMode.TARGETED_TEST
+    suite_mode: ClassVar[gate.SuiteMode] = gate.SuiteMode.TARGETED
 
     @override
     def setUp(self) -> None:
@@ -27,8 +30,8 @@ class TargetedTestTests(MergeGateFixture):
     def test_targeted_runner_holds_and_removes_its_test_folder(self) -> None:
         allocated: list[Path] = []
 
-        def run(_args: merge_gate.GateArguments, mode: merge_gate.SuiteMode) -> int:
-            self.assertIs(mode, merge_gate.SuiteMode.TARGETED_TEST)
+        def run(_args: gate.GateArguments, mode: gate.SuiteMode) -> int:
+            self.assertIs(mode, gate.SuiteMode.TARGETED)
             path = Path(os.environ["TMPDIR"])
             allocated.append(path)
             self.assertEqual(build_folders.build_folder_state(path), "held")
@@ -36,13 +39,35 @@ class TargetedTestTests(MergeGateFixture):
             return 7
 
         with mock.patch.dict(os.environ, {**self.environment, "TMPDIR": str(self.root)}):
-            with mock.patch.object(merge_gate, "run_tests_only", side_effect=run):
-                self.assertEqual(targeted_test.main(["--repo", str(self.checkout)]), 7)
+            with mock.patch.object(gate, "run_tests_only", side_effect=run):
+                self.assertEqual(gate.main(["--targeted", "--repo", str(self.checkout)]), 7)
             self.assertEqual(os.environ["TMPDIR"], str(self.root))
         path, = allocated
         self.assertFalse(path.exists())
         self.assertFalse(path.with_name(path.name + ".lease.json").exists())
         self.assertFalse(path.with_name(path.name + ".lock").exists())
+
+        with self.subTest(entry="script"):
+            startup = self.root / "startup"
+            self.write(startup / "sitecustomize.py", '''import argparse
+import sys
+
+original_exit = argparse.ArgumentParser.exit
+
+def checked_exit(parser, status=0, message=None):
+    from scripts.production import gate, merge_gate
+    print("gate module identity:", gate is merge_gate is sys.modules["__main__"])
+    original_exit(parser, status, message)
+
+argparse.ArgumentParser.exit = checked_exit
+''')
+            environment = {**self.environment, "PYTHONPATH": os.pathsep.join(
+                (str(startup), str(Path(__file__).resolve().parents[2])))}
+            result = subprocess.run([sys.executable, str(gate.__file__), "--help"],
+                                    cwd=self.checkout, env=environment, capture_output=True,
+                                    text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("gate module identity: True", result.stdout)
 
     def test_a_changed_suite_set_cannot_reuse_or_certify_an_old_full_pass(self) -> None:
         first = self.run_gate()
@@ -50,9 +75,9 @@ class TargetedTestTests(MergeGateFixture):
         original, = self.pass_records()
         self.write(self.checkout / "scripts" / "added_folder" / "test_added.py", SUITE_MODULE)
         _ = self.commit(self.checkout, "new test folder")
-        tree = merge_gate.clean_test_tree(self.checkout)
+        tree = gate.clean_test_tree(self.checkout)
         folders = sorted([*self.suites, "added_folder"])
-        ledger = merge_gate.PassedTreeLedger(self.checkout, "tests-only", tree, folders)
+        ledger = gate.PassedTreeLedger(self.checkout, "tests-only", tree, folders)
         with mock.patch.dict(os.environ, self.environment):
             # The old full pass cannot certify an ancestor after a folder is added.
             self.assertIsInstance(ledger.certified_base(), NoCertifiedBase)

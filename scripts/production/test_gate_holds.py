@@ -16,11 +16,11 @@ from types import SimpleNamespace
 from typing import final, override
 from contextlib import redirect_stdout
 from unittest import mock
-from scripts.production import merge_gate
+from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
 from scripts.direct.local_release_wait import IntervalReleasePolling
 from scripts.build_hold.test_hold_applies import TemporaryHoldTest
-from scripts.production.merge_gate_test_support import MergeGateFixture, gate_suites, suites_for_case, wait_for_file
+from scripts.production.gate_test_support import MergeGateFixture, gate_suites, suites_for_case, wait_for_file
 
 
 @final
@@ -90,10 +90,10 @@ class MergeGateHoldTests(TemporaryHoldTest):
 
                 events = IntervalReleasePolling()
                 output = io.StringIO()
-                with mock.patch.object(merge_gate, "local_release_waiter", return_value=events), \
+                with mock.patch.object(gate, "local_release_waiter", return_value=events), \
                         mock.patch.object(events, "wait", side_effect=release), \
                         redirect_stdout(output):
-                    code = merge_gate.main([*arguments, *mode])
+                    code = gate.main([*arguments, *mode])
                 self.assertEqual(code, 0, output.getvalue())
                 self.assertEqual(output.getvalue().count("natedev is held by builder; waiting"), 1)
                 self.assertEqual(output.getvalue().count("Gate hold: released after"), 1)
@@ -109,9 +109,9 @@ class MergeGateHoldTests(TemporaryHoldTest):
     def test_sole_holder_runs_all_modules_and_types_without_waiting(self) -> None:
         self.hold("caller", "builder")
         output = io.StringIO()
-        with mock.patch.object(merge_gate, "local_release_waiter",
+        with mock.patch.object(gate, "local_release_waiter",
                                side_effect=AssertionError("the sole holder must run")), redirect_stdout(output):
-            run = merge_gate.run_suites(self.gate.checkout, type_dirs=("scripts/production",))
+            run = gate.run_suites(self.gate.checkout, type_dirs=("scripts/production",))
         self.assertTrue(run.passed, output.getvalue())
         self.assertEqual(len(run.jobs), self.gate.module_count + 1)
         self.assertTrue((self.holders / "caller").exists())
@@ -122,14 +122,14 @@ class MergeGateHoldTests(TemporaryHoldTest):
     @gate_suites("lib", "hooks")
     def test_mid_gate_hold_stops_new_starts_and_excludes_wait_time(self) -> None:
         self.gate.write(self.gate.state / "concurrency-barrier", "held")
-        start = merge_gate.start_gate_job
-        finish = merge_gate.finish_gate_job
-        started: list[merge_gate.RunningGateJob] = []
+        start = gate.start_gate_job
+        finish = gate.finish_gate_job
+        started: list[gate.RunningGateJob] = []
         now = [0.0]
         clock = SimpleNamespace(monotonic=lambda: now[0], sleep=time.sleep, time=time.time)
 
         def start_module(suite: str, path: Path, argv: list[str], repo: Path,
-                         environment: dict[str, str], log: Path) -> merge_gate.RunningGateJob:
+                         environment: dict[str, str], log: Path) -> gate.RunningGateJob:
             self.assertFalse((self.holders / "other").exists(), self.gate.module_events())
             job = start(suite, path, argv, repo, environment, log)
             started.append(job)
@@ -140,7 +140,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
             (self.gate.state / f"{job.process.pid}.released").touch()
             return job
 
-        def finish_module(job: merge_gate.RunningGateJob, status: int) -> merge_gate.GateJobResult:
+        def finish_module(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
             result = finish(job, status)
             if job is started[0]:
                 recorded = self.gate.module_events()
@@ -151,10 +151,10 @@ class MergeGateHoldTests(TemporaryHoldTest):
             return result
 
         output = io.StringIO()
-        with mock.patch.object(merge_gate, "start_gate_job", side_effect=start_module), \
-                mock.patch.object(merge_gate, "finish_gate_job", side_effect=finish_module), \
-                mock.patch.object(merge_gate, "time", clock), redirect_stdout(output):
-            run = merge_gate.run_suites(self.gate.checkout, max_running_jobs=2)
+        with mock.patch.object(gate, "start_gate_job", side_effect=start_module), \
+                mock.patch.object(gate, "finish_gate_job", side_effect=finish_module), \
+                mock.patch.object(gate, "time", clock), redirect_stdout(output):
+            run = gate.run_suites(self.gate.checkout, max_running_jobs=2)
         self.assertTrue(run.passed, output.getvalue())
         self.assertEqual(len(run.jobs), self.gate.module_count)
         self.assertEqual(len([event for event in self.gate.module_events() if event["event"] == "finish"]), self.gate.module_count)
@@ -163,10 +163,10 @@ class MergeGateHoldTests(TemporaryHoldTest):
         self.assertIn("Gate tests: 0.00s;", output.getvalue())
 
     def test_final_hold_read_error_undoes_the_merge_without_pushing(self) -> None:
-        wait_until_free = merge_gate.BuildHoldWait.wait_until_free
+        wait_until_free = gate.BuildHoldWait.wait_until_free
         reads = 0
 
-        def fail_final_hold_read(hold: merge_gate.BuildHoldWait) -> None:
+        def fail_final_hold_read(hold: gate.BuildHoldWait) -> None:
             nonlocal reads
             reads += 1
             if reads == 3:
@@ -175,9 +175,9 @@ class MergeGateHoldTests(TemporaryHoldTest):
             wait_until_free(hold)
 
         output = io.StringIO()
-        with mock.patch.object(merge_gate.BuildHoldWait, "wait_until_free", fail_final_hold_read), \
+        with mock.patch.object(gate.BuildHoldWait, "wait_until_free", fail_final_hold_read), \
                 contextlib.redirect_stderr(output), redirect_stdout(output):
-            code = merge_gate.main([
+            code = gate.main([
                 "--repo", str(self.gate.checkout), "--merge-branch", "integration",
                 "--unit-branch", "unit-phase", "--checkpoint", self.gate.checkpoint,
                 "--previous-checkpoint", self.gate.base, "--unit", "fixture", "--phase", "hold",
@@ -206,12 +206,12 @@ class MergeGateHoldTests(TemporaryHoldTest):
                                     + "print('0 errors, 0 warnings, 0 notes')\n")
                     self.gate.write(self.gate.state / "signal-types", "once")
                     (self.gate.state / "signal-hooks").unlink()
-                start = merge_gate.start_gate_job
+                start = gate.start_gate_job
                 starts: list[str] = []
 
                 def start_job(name: str, path: Path, argv: list[str], repo: Path,
                               environment: dict[str, str], log: Path, *,
-                              kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE) -> merge_gate.RunningGateJob:
+                              kind: gate.GateJobKind = gate.GateJobKind.TEST_MODULE) -> gate.RunningGateJob:
                     self.assertFalse((self.holders / "other").exists())
                     if not starts:
                         self.hold()
@@ -226,11 +226,11 @@ class MergeGateHoldTests(TemporaryHoldTest):
 
                 events = IntervalReleasePolling()
                 output = io.StringIO()
-                with mock.patch.object(merge_gate, "RERUN_LIMIT", 0), \
-                        mock.patch.object(merge_gate, "start_gate_job", side_effect=start_job), \
-                        mock.patch.object(merge_gate, "local_release_waiter", return_value=events), \
+                with mock.patch.object(gate, "RERUN_LIMIT", 0), \
+                        mock.patch.object(gate, "start_gate_job", side_effect=start_job), \
+                        mock.patch.object(gate, "local_release_waiter", return_value=events), \
                         mock.patch.object(events, "wait", side_effect=release), redirect_stdout(output):
-                    run = merge_gate.run_suites(self.gate.checkout, max_running_jobs=1,
+                    run = gate.run_suites(self.gate.checkout, max_running_jobs=1,
                                                type_dirs=("scripts/production",) if suite == "types" else ())
                 self.assertTrue(run.passed, output.getvalue())
                 self.assertEqual(starts[:2], [suite, suite])
@@ -245,7 +245,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
         self.gate.write(self.gate.state / "signal-hooks", "always")
         output = io.StringIO()
         with redirect_stdout(output):
-            run = merge_gate.run_suites(self.gate.checkout)
+            run = gate.run_suites(self.gate.checkout)
         self.assertFalse(run.passed, output.getvalue())
         self.assertEqual(len(run.jobs), 1)
         self.assertEqual(run.jobs[0].returncode, -signal.SIGTERM)
@@ -255,7 +255,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
     def test_unreadable_hold_state_refuses_before_any_job(self) -> None:
         self.unreadable()
         with self.assertRaisesRegex(GateRefused, "natedev hold state cannot be read"):
-            _ = merge_gate.run_suites(self.gate.checkout, type_dirs=("scripts/production",))
+            _ = gate.run_suites(self.gate.checkout, type_dirs=("scripts/production",))
         self.assertEqual(self.gate.calls(), [])
         self.assertEqual(self.gate.module_events(), [])
 

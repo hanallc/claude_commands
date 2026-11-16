@@ -444,7 +444,7 @@ def check_command(command: list[str], repo: Path, environment: dict[str, str], d
 
 
 def fast_check(runner: GitRunner, repo: Path, paths: list[str], config: FastTrackLimits) -> None:
-    from scripts.production import merge_gate
+    from scripts.production import gate
 
     deadline = time.monotonic() + config.check_time_limit_seconds
     check_paths(runner, repo, paths, config)
@@ -462,7 +462,7 @@ def fast_check(runner: GitRunner, repo: Path, paths: list[str], config: FastTrac
         for number, module in enumerate(sorted(modules)):
             root = temporary / str(number)
             root.mkdir()
-            isolated = merge_gate.test_module_environment(root, environment)
+            isolated = gate.test_module_environment(root, environment)
             check_command([str(repo / "scripts/lib/py"), "-m", "unittest",
                            ".".join(module.with_suffix("").parts)], repo, isolated, deadline, empty_suite=True)
             for marker in (root / "build-tool-calls.jsonl", root / "live-memory-reads.jsonl"):

@@ -256,7 +256,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/fast_track.py` | read | copies.source_owner |
 | `scripts/production/waiting.py` | read | Production.owner.id |
 | `scripts/production/merge_gate.py` | read | snapshot, initial_snapshot, doc_owner |
-| `scripts/production/merge_gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
+| `scripts/production/gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/production/next_item.py` | read | snapshot |
 | `scripts/production/production_doc.py` | read | StaffRow, StaffSnapshot, LiveDoc, WrappedDoc |
 | `scripts/production/production_lifecycle.py` | write | defer_retire, operation, retire_pending, set_doc, set_worktree, snapshot |

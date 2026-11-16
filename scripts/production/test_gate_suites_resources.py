@@ -22,10 +22,10 @@ import threading
 from typing import final
 from contextlib import redirect_stdout
 from unittest import mock
-from scripts.production import merge_gate
+from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
-from scripts.production.merge_gate_test_support import SUITE_MODULE, gate_suites, wait_for_file
-from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
+from scripts.production.gate_test_support import SUITE_MODULE, gate_suites, wait_for_file
+from scripts.production.gate_suites_test_support import GateSuitesFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -72,7 +72,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
                 "lib/test_second.py": (2048.0,),
                 "hooks/test_first.py": (32.0,),
         }) as started, redirect_stdout(output):
-            run = merge_gate.run_suites(self.checkout, max_running_jobs=3)
+            run = gate.run_suites(self.checkout, max_running_jobs=3)
         self.assertTrue(run.passed, output.getvalue())
         stopped = [job for job in started if job.killed_for]
         self.assertEqual([(job.suite, job.module) for job in stopped], [("lib", "test_first.py")])
@@ -83,7 +83,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         self.assertEqual(len(initial), 3, events)
         self.assertEqual([event["event"] for event in events[-2:]], ["start", "finish"])
         self.assertEqual(events[-2]["module"], "test_first.py")
-        peaks = merge_gate.read_measures(self.state / "runner/module_peak_mib.json")
+        peaks = gate.read_measures(self.state / "runner/module_peak_mib.json")
         self.assertEqual(peaks, {"lib/test_first.py": 64.0, "lib/test_second.py": 2048.0, "hooks/test_first.py": 32.0})
         self.assertIn("peak memory 2.500 GiB exceeds the memory limit of 2 GiB", output.getvalue())
         messages = [call for call in self.calls() if call["tool"] == "send.py"]
@@ -111,7 +111,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
                 output = io.StringIO()
                 with mock.patch.dict(os.environ, self.environment), \
                         self.sampling_module_memory({"hooks/test_first.py": (5120.0,)}), redirect_stdout(output):
-                    run = merge_gate.run_suites(self.checkout)
+                    run = gate.run_suites(self.checkout)
                 self.assertFalse(run.passed, output.getvalue())
                 self.assertEqual(len(run.executions), 2)
                 for result in run.executions:
@@ -127,12 +127,12 @@ class MergeGateResourcesTests(GateSuitesFixture):
                 self.supply_jobserver(b"")
                 waiting = threading.Event()
                 select_ready = select.select
-                acquire = merge_gate.SharedCPUPool.acquire
+                acquire = gate.SharedCPUPool.acquire
                 blocking: list[bool] = []
                 held = False
                 hold_waits: list[bool] = []
 
-                def acquire_slot(pool: merge_gate.SharedCPUPool) -> merge_gate.SharedCPUSlot:
+                def acquire_slot(pool: gate.SharedCPUPool) -> gate.SharedCPUSlot:
                     def observe_wait(readers: list[int], writers: list[int], errors: list[int],
                                      timeout: float | None = None) -> tuple[list[int], list[int], list[int]]:
                         nonlocal held
@@ -161,9 +161,9 @@ class MergeGateResourcesTests(GateSuitesFixture):
                     self.supply_jobserver(b"Q")
 
                 with ThreadPoolExecutor(max_workers=1) as executor, \
-                        mock.patch.object(merge_gate.SharedCPUPool, "acquire", acquire_slot), \
-                        mock.patch.object(merge_gate.BuildHoldWait, "admits", side_effect=lambda: not held), \
-                        mock.patch.object(merge_gate.BuildHoldWait, "wait_until_free", side_effect=release_hold):
+                        mock.patch.object(gate.SharedCPUPool, "acquire", acquire_slot), \
+                        mock.patch.object(gate.BuildHoldWait, "admits", side_effect=lambda: not held), \
+                        mock.patch.object(gate.BuildHoldWait, "wait_until_free", side_effect=release_hold):
                     released = executor.submit(return_slot)
                     result = self.run_gate("--tests-only")
                     _ = released.result(timeout=TEST_HANG_GUARD_SECS)
@@ -193,9 +193,9 @@ class MergeGateResourcesTests(GateSuitesFixture):
                     stopped = executor.submit(stop)
                     with mock.patch.dict(os.environ, self.environment), \
                             self.assertRaises(KeyboardInterrupt):
-                        with merge_gate.shared_cpu_pool() as pool:
-                            assert isinstance(pool, merge_gate.SharedCPUPool)
-                            self.assertIsInstance(pool.try_acquire(), merge_gate.SharedCPUSlot)
+                        with gate.shared_cpu_pool() as pool:
+                            assert isinstance(pool, gate.SharedCPUPool)
+                            self.assertIsInstance(pool.try_acquire(), gate.SharedCPUSlot)
                             blocking_descriptor = pool.blocking
 
                             def observe_wait(readers: list[int], writers: list[int], errors: list[int],
@@ -218,9 +218,9 @@ class MergeGateResourcesTests(GateSuitesFixture):
                 read = os.read
                 with mock.patch.dict(os.environ, self.environment), \
                         self.assertRaises(KeyboardInterrupt):
-                    with merge_gate.shared_cpu_pool() as pool:
-                        assert isinstance(pool, merge_gate.SharedCPUPool)
-                        self.assertIsInstance(pool.try_acquire(), merge_gate.SharedCPUSlot)
+                    with gate.shared_cpu_pool() as pool:
+                        assert isinstance(pool, gate.SharedCPUPool)
+                        self.assertIsInstance(pool.try_acquire(), gate.SharedCPUSlot)
                         token_descriptor = pool.descriptor
 
                         def interrupt_read(descriptor: int, count: int) -> bytes:
@@ -235,14 +235,14 @@ class MergeGateResourcesTests(GateSuitesFixture):
                 self.assertEqual(self.jobserver_tokens(), b"A\0")
 
     def test_interrupt_after_reaping_preserves_status_and_cpu_and_allows_cleanup(self) -> None:
-        jobs: list[merge_gate.RunningGateJob] = []
+        jobs: list[gate.RunningGateJob] = []
         for name, source in (("finished", "raise SystemExit(7)"),
                              ("running", "import signal; signal.pause()")):
-            job = merge_gate.start_gate_job(
+            job = gate.start_gate_job(
                 "hooks", Path(f"test_{name}.py"), [sys.executable, "-c", source],
                 self.checkout, self.environment, self.state / f"{name}.log")
             self.addCleanup(job.output.close)
-            self.addCleanup(merge_gate.kill_job_group, job)
+            self.addCleanup(gate.kill_job_group, job)
             jobs.append(job)
         finished, running = jobs
         _ = os.waitid(os.P_PID, finished.process.pid, os.WEXITED | os.WNOWAIT)
@@ -259,14 +259,14 @@ class MergeGateResourcesTests(GateSuitesFixture):
         try:
             with mock.patch.object(os, "wait4", side_effect=interrupt_after_wait):
                 with self.assertRaises(KeyboardInterrupt):
-                    merge_gate.reap_gate_job(finished)
+                    gate.reap_gate_job(finished)
         finally:
             stopped.set()
             worker.join(TEST_HANG_GUARD_SECS)
         self.assertEqual(finished.process.returncode, 7)
         self.assertGreater(finished.cpu_seconds, 0.0)
         for job in jobs:
-            merge_gate.kill_job_group(job)
+            gate.kill_job_group(job)
         self.assertEqual(finished.process.returncode, 7)
         self.assertEqual(running.process.returncode, -signal.SIGKILL)
 
@@ -285,12 +285,12 @@ class MergeGateResourcesTests(GateSuitesFixture):
             path = self.checkout / "scripts" / key
             self.write(path, path.read_text() + CPU_WORKLOAD)
         cpu_path = self.state / "runner" / "module_cpu_seconds.json"
-        merge_gate.save_measures(cpu_path, {"lib/test_first.py": 99.0, "unselected/test_old.py": 7.0})
+        gate.save_measures(cpu_path, {"lib/test_first.py": 99.0, "unselected/test_old.py": 7.0})
         output = io.StringIO()
         with mock.patch.dict(os.environ, self.environment), redirect_stdout(output):
-            run = merge_gate.run_suites(self.checkout, type_dirs=("scripts",), full=True)
+            run = gate.run_suites(self.checkout, type_dirs=("scripts",), full=True)
         self.assertTrue(run.passed, output.getvalue())
-        records = merge_gate.read_measures(cpu_path)
+        records = gate.read_measures(cpu_path)
         results = {f"{job.suite}/{job.module}": job for job in run.jobs}
         self.assertEqual(set(results), {*workloads, "types/basedpyright"})
         self.assertEqual(records, {**{key: job.cpu_seconds for key, job in results.items()},
@@ -319,22 +319,22 @@ class MergeGateResourcesTests(GateSuitesFixture):
             "hooks/test_first.py": {"leader": 0.1, "child": 0.0, "sleep": 0.0},
         }))
         self.write(self.state / "fail-first-hooks", "fail")
-        attempts: list[merge_gate.GateJobResult] = []
-        finish = merge_gate.finish_gate_job
+        attempts: list[gate.GateJobResult] = []
+        finish = gate.finish_gate_job
 
-        def record_attempt(job: merge_gate.RunningGateJob, status: int) -> merge_gate.GateJobResult:
+        def record_attempt(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
             result = finish(job, status)
             attempts.append(result)
             return result
 
         output = io.StringIO()
         with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(merge_gate, "finish_gate_job", side_effect=record_attempt), redirect_stdout(output):
-            run = merge_gate.run_suites(self.checkout)
+                mock.patch.object(gate, "finish_gate_job", side_effect=record_attempt), redirect_stdout(output):
+            run = gate.run_suites(self.checkout)
         self.assertTrue(run.passed, output.getvalue())
         self.assertEqual([job.returncode for job in attempts], [1, 0])
         self.assertEqual(run.jobs, (attempts[-1],))
-        self.assertEqual(merge_gate.read_measures(self.state / "runner" / "module_cpu_seconds.json"),
+        self.assertEqual(gate.read_measures(self.state / "runner" / "module_cpu_seconds.json"),
                          {"hooks/test_first.py": attempts[-1].cpu_seconds})
         total = sum(job.cpu_seconds for job in attempts)
         self.assertGreater(total, attempts[-1].cpu_seconds)
@@ -345,12 +345,12 @@ class MergeGateResourcesTests(GateSuitesFixture):
         for kind in (stat.S_IFIFO, stat.S_IFCHR):
             mode = os.stat_result((kind | 0o600, *metadata[1:]))
             with self.subTest(kind=kind), mock.patch.dict(os.environ, self.environment), \
-                    mock.patch.object(os, "fstat", return_value=mode), merge_gate.shared_cpu_pool() as pool:
-                self.assertIsInstance(pool, merge_gate.SharedCPUPool)
-                if not isinstance(pool, merge_gate.SharedCPUPool):
+                    mock.patch.object(os, "fstat", return_value=mode), gate.shared_cpu_pool() as pool:
+                self.assertIsInstance(pool, gate.SharedCPUPool)
+                if not isinstance(pool, gate.SharedCPUPool):
                     self.fail("the private pool was not opened")
                 slot = pool.try_acquire()
-                self.assertIsInstance(slot, merge_gate.SharedCPUSlot)
+                self.assertIsInstance(slot, gate.SharedCPUSlot)
                 self.assertEqual(self.jobserver_tokens(), b"")
             self.assertEqual(self.jobserver_tokens(), b"Q")
 
@@ -359,7 +359,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         path.unlink()
         self.write(path, "Q")
         with mock.patch.dict(os.environ, self.environment), self.assertRaises(GateRefused):
-            with merge_gate.shared_cpu_pool():
+            with gate.shared_cpu_pool():
                 self.fail("a regular file must not provide CPU slots")
         self.assertEqual(path.read_text(), "Q")
 
@@ -368,8 +368,8 @@ class MergeGateResourcesTests(GateSuitesFixture):
         metadata = Path(self.environment["BUILDLOG_JOBSERVER_FIFO"]).stat()
         mode = os.stat_result((stat.S_IFCHR | 0o600, *metadata[1:]))
         with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(os, "fstat", return_value=mode), merge_gate.shared_cpu_pool() as pool:
-            if not isinstance(pool, merge_gate.SharedCPUPool):
+                mock.patch.object(os, "fstat", return_value=mode), gate.shared_cpu_pool() as pool:
+            if not isinstance(pool, gate.SharedCPUPool):
                 self.fail("the private pool was not opened")
             pool_descriptor = pool.descriptor
             read = os.read
@@ -379,21 +379,21 @@ class MergeGateResourcesTests(GateSuitesFixture):
                 return read(descriptor, count)
 
             with mock.patch.object(os, "read", side_effect=read_other_descriptor):
-                self.assertIsInstance(pool.try_acquire(), merge_gate.WaitingForCPU)
+                self.assertIsInstance(pool.try_acquire(), gate.WaitingForCPU)
 
     @gate_suites("lib")
     def test_one_shared_slot_serializes_modules_and_is_returned_after_each(self) -> None:
         self.supply_jobserver(b"Q")
-        start = merge_gate.start_gate_job
+        start = gate.start_gate_job
         available_at_start: list[bytes] = []
 
         def observed(suite: str, path: Path, argv: list[str], repo: Path,
                      environment: dict[str, str], log: Path, *,
-                kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE) -> merge_gate.RunningGateJob:
+                kind: gate.GateJobKind = gate.GateJobKind.TEST_MODULE) -> gate.RunningGateJob:
             available_at_start.append(self.jobserver_tokens())
             return start(suite, path, argv, repo, environment, log, kind=kind)
 
-        with mock.patch.object(merge_gate, "start_gate_job", side_effect=observed):
+        with mock.patch.object(gate, "start_gate_job", side_effect=observed):
             result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(available_at_start, [b""] * (self.module_count + 1))
@@ -431,9 +431,9 @@ class MergeGateResourcesTests(GateSuitesFixture):
                     replies = self.admission.server.handle_request(wire.ReleaseRequest("release-busy", busy.reservation, 0))
                 self.assertEqual(replies, [wire.Ok()])
 
-        acquire = merge_gate.SharedCPUPool.acquire
+        acquire = gate.SharedCPUPool.acquire
 
-        def free_slot(pool: merge_gate.SharedCPUPool) -> merge_gate.SharedCPUSlot:
+        def free_slot(pool: gate.SharedCPUPool) -> gate.SharedCPUSlot:
             if admitted and "slot" not in waited:
                 assert_busy()
                 self.assertEqual(self.module_events(), [])
@@ -442,7 +442,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
             return acquire(pool)
 
         with self.observing_admission(observed), \
-                mock.patch.object(merge_gate.SharedCPUPool, "acquire", free_slot), \
+                mock.patch.object(gate.SharedCPUPool, "acquire", free_slot), \
                 mock.patch.object(copy_record, "copy_folder", return_value=self.checkout):
             result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -477,13 +477,13 @@ class MergeGateResourcesTests(GateSuitesFixture):
     @gate_suites("lib", "hooks")
     def test_running_job_limit_bounds_overlap_without_dropping_modules(self) -> None:
         self.write(self.state / "concurrency-barrier", "held")
-        started: list[merge_gate.RunningGateJob] = []
-        start = merge_gate.start_gate_job
-        sample = merge_gate.process_memory_mib
+        started: list[gate.RunningGateJob] = []
+        start = gate.start_gate_job
+        sample = gate.process_memory_mib
 
         def start_blocked(suite: str, path: Path, argv: list[str], repo: Path,
                           environment: dict[str, str], log: Path, *,
-                kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE) -> merge_gate.RunningGateJob:
+                kind: gate.GateJobKind = gate.GateJobKind.TEST_MODULE) -> gate.RunningGateJob:
             job = start(suite, path, argv, repo, environment, log, kind=kind)
             started.append(job)
             wait_for_file(self.state / f"{job.process.pid}.started")
@@ -498,10 +498,10 @@ class MergeGateResourcesTests(GateSuitesFixture):
 
         output = io.StringIO()
         with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(merge_gate, "start_gate_job", side_effect=start_blocked), \
-                mock.patch.object(merge_gate, "process_memory_mib", side_effect=release_at_sample), \
+                mock.patch.object(gate, "start_gate_job", side_effect=start_blocked), \
+                mock.patch.object(gate, "process_memory_mib", side_effect=release_at_sample), \
                 redirect_stdout(output):
-            run = merge_gate.run_suites(self.checkout, max_running_jobs=2)
+            run = gate.run_suites(self.checkout, max_running_jobs=2)
         self.assertTrue(run.passed, output.getvalue())
         expected = {(suite, "test_first.py") for suite in self.suites}
         expected.add(("lib", "test_second.py"))
@@ -547,14 +547,14 @@ class MergeGateResourcesTests(GateSuitesFixture):
     def test_a_module_still_running_at_the_time_limit_is_killed_and_the_gate_is_red(self) -> None:
         self.write(self.state / "hold-module", "hold")
         cpu_path = self.state / "runner" / "module_cpu_seconds.json"
-        merge_gate.save_measures(cpu_path, {"hooks/test_first.py": 12.0})
+        gate.save_measures(cpu_path, {"hooks/test_first.py": 12.0})
         self.environment["BUILDLOG_SCOPE"] = "1"
         output = io.StringIO()
         monotonic = time.monotonic
         deadline = monotonic() + TEST_HANG_GUARD_SECS
         sampled: set[int] = set()
         killed: list[int] = []
-        kill = merge_gate.kill_job_group
+        kill = gate.kill_job_group
 
         def module_clock() -> float:
             if monotonic() >= deadline:
@@ -566,16 +566,16 @@ class MergeGateResourcesTests(GateSuitesFixture):
             sampled.update(roots)
             return dict.fromkeys(roots, 1.0)
 
-        def kill_module(job: merge_gate.RunningGateJob) -> None:
+        def kill_module(job: gate.RunningGateJob) -> None:
             killed.append(job.process.pid)
             kill(job)
 
         with mock.patch.dict(os.environ, self.environment), \
                 mock.patch.object(queue_place, "in_builds_slice", return_value=False), \
-                mock.patch("scripts.production.merge_gate.time.monotonic", side_effect=module_clock), \
-                mock.patch.object(merge_gate, "process_memory_mib", side_effect=sample), \
-                mock.patch.object(merge_gate, "kill_job_group", side_effect=kill_module), redirect_stdout(output):
-            result = merge_gate.run_suites(self.checkout)
+                mock.patch("scripts.production.gate.time.monotonic", side_effect=module_clock), \
+                mock.patch.object(gate, "process_memory_mib", side_effect=sample), \
+                mock.patch.object(gate, "kill_job_group", side_effect=kill_module), redirect_stdout(output):
+            result = gate.run_suites(self.checkout)
         self.assertFalse(result.passed, output.getvalue())
         self.assertIn("hooks/test_first.py killed: still running after 1800 s, the module time limit", output.getvalue())
         self.assertRegex(output.getvalue(), r"(?m)^hooks: RED ")
@@ -588,7 +588,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         starts = [row for row in self.module_events() if row["event"] == "start"]
         self.assertEqual(len(starts), 1)
         self.assertTrue(cpu_path.is_file())
-        self.assertEqual(merge_gate.read_measures(cpu_path), {"hooks/test_first.py": 12.0})
+        self.assertEqual(gate.read_measures(cpu_path), {"hooks/test_first.py": 12.0})
         self.assertGreater(result.jobs[0].cpu_seconds, 0.0)
 
     def test_module_time_limit_kills_and_reaps_a_detached_orphan(self) -> None:
@@ -643,7 +643,7 @@ class HeldModule(unittest.TestCase):
 
         with mock.patch.dict(os.environ, self.environment), \
                 mock.patch.object(time, "monotonic", side_effect=module_clock), redirect_stdout(output):
-            result = merge_gate.run_suites(self.checkout)
+            result = gate.run_suites(self.checkout)
         self.assertFalse(result.passed, output.getvalue())
         self.assertIn("hooks/test_first.py killed: still running after 1800 s, the module time limit", output.getvalue())
         observer = select.poll()
@@ -670,8 +670,8 @@ class HeldModule(unittest.TestCase):
             events = self.state / "modules.jsonl"
             return 20.0 if events.exists() and len(events.read_text().splitlines()) == 2 * self.module_count else 60.0
 
-        with mock.patch.dict(os.environ, self.environment), mock.patch.object(merge_gate, "one_minute_load", side_effect=measured_load), redirect_stdout(output):
-            result = merge_gate.run_suites(self.checkout)
+        with mock.patch.dict(os.environ, self.environment), mock.patch.object(gate, "one_minute_load", side_effect=measured_load), redirect_stdout(output):
+            result = gate.run_suites(self.checkout)
         self.assertTrue(result.passed, output.getvalue())
         self.assertIn("One-minute load: start=10.00 max=60.00 end=20.00", output.getvalue())
 

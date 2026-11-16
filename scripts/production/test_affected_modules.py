@@ -686,7 +686,7 @@ class AffectedModulesTests(unittest.TestCase):
 
     def test_unreferenced_inputs_select_only_tests_in_a_changed_python_folder(self) -> None:
         paths = ["scripts/lib/new.py", "scripts/other/conftest.py", "settings.json",
-                 "scripts/production/merge_gate.py", "scripts/production/affected_modules.py",
+                 "scripts/production/gate.py", "scripts/production/affected_modules.py",
                  "scripts/agents/models_config.sh"]
         for path in paths:
             with self.subTest(path=path):

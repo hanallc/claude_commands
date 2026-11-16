@@ -6935,7 +6935,10 @@ class AdmissionConfigurationTests(unittest.TestCase):
 
     def test_drain_ignores_current_socket_waiters_and_counts_older_caller_code(self) -> None:
         scripts = Path(__file__).resolve().parents[1]
-        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/merge_gate.py", "build_queue/admission_client.py",
+        for name, expected in (("gate.py", True), ("cloud_gate.py", False), ("gate_box.py", False)):
+            with self.subTest(name=name):
+                self.assertEqual(name in service.ADMISSION_CALLERS, expected)
+        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/merge_gate.py", "production/gate.py", "build_queue/admission_client.py",
                          "build_queue/queue_place.py", "mac_test/offload.py", "mac_test/copy_watch.py"):
             with self.subTest(script=relative), AdmissionFixture() as fixture:
                 caller = fixture.proc.spawn()

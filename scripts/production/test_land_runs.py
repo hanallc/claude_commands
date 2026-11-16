@@ -14,7 +14,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.lib.process_start import Started, process_start
-from scripts.production import checkpoint_gate, land_runs, merge_checkpoint, merge_gate
+from scripts.production import checkpoint_gate, land_runs, merge_checkpoint, gate
 
 
 class LandRunTests(unittest.TestCase):
@@ -26,7 +26,7 @@ class LandRunTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {"MERGE_GATE_STATE_DIR": str(self.root)}))
 
     def test_a_land_is_running_only_while_its_process_holds_the_record(self) -> None:
-        self.assertEqual(merge_gate.gate_state_dir(), self.root)
+        self.assertEqual(gate.gate_state_dir(), self.root)
         self.assertEqual(land_runs.running_lands(), {})
         with land_runs.landing(["a" * 40, "b" * 9], ["shelled images-card"]):
             self.assertEqual(land_runs.running_lands(), {"a" * 40: "shelled images-card", "b" * 9: ""})

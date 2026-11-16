@@ -388,6 +388,9 @@ class ProtocolTests(unittest.TestCase):
                     self.assertEqual(wire.parse_record(wire.encode_record(current), type(current)), current)
 
     def test_shell_and_protocol_share_a_version_that_includes_the_version_module(self) -> None:
+        for name, expected in (("gate.py", True), ("cloud_gate.py", False), ("gate_box.py", False)):
+            with self.subTest(name=name):
+                self.assertEqual(f"production/{name}" in admission_code.ADMISSION_CODE_PATHS, expected)
         with AdmissionFixture() as fixture:
             source = Path(__file__).resolve().parents[1]
             scripts = fixture.root / "scripts"

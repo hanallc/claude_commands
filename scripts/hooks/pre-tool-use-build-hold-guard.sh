@@ -4,7 +4,10 @@
 IFS= read -r -d '' hook_input || true
 case "$hook_input" in
     *cargo*|*merge_gate*|*targeted_test*) ;;
-    *) exit 0 ;;
+    *)
+        gate_path='(^|[^[:alnum:]_.-])gate\.py([^[:alnum:]_.-]|$)'
+        [[ "$hook_input" =~ $gate_path ]] || exit 0
+        ;;
 esac
 
 hold_dir="${BUILD_HOLD_DIR:-$HOME/.local/state/build-hold}"

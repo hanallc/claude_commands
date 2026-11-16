@@ -270,7 +270,7 @@ On failure, it undoes the merge and prints the failed suites' output.
 
 **Offload cleanup tests.** `test_offload_cleanup.py` keeps the real sh/zsh cleanup and selector protocols; the results, leftovers and takeover modules cover the command outcomes. `offload_cleanup_test_support.py` copies a private Git and tool seed at the original paths for each case and creates fresh FIFO descriptors. Ordinary calls reuse the existing in-process CLI helper; claim-owner exit, streaming and timeout cases retain real subprocesses and the two-second timeout assertion.
 
-**Merge gate suite tests.** `test_merge_gate_suites.py` covers discovery, isolation and reporting; the resources, tripwires, reruns, types, signals and admission modules keep each subject independently runnable. `merge_gate_suites_test_support.py` reuses the committed class seed and private copies, launches Python directly for real module jobs, and uses directory events and process descriptors for fixture barriers and cleanup. Admission arithmetic needs no Git fixture. Signal, process-group, memory-growth and timeout contracts retain real children; the controlled timeout clock and memory-growth pacing are unchanged.
+**Merge gate suite tests.** `test_gate_suites.py` covers discovery, isolation and reporting; the resources, tripwires, reruns, types, signals and admission modules keep each subject independently runnable. `gate_suites_test_support.py` reuses the committed class seed and private copies, launches Python directly for real module jobs, and uses directory events and process descriptors for fixture barriers and cleanup. Admission arithmetic needs no Git fixture. Signal, process-group, memory-growth and timeout contracts retain real children; the controlled timeout clock and memory-growth pacing are unchanged.
 
 `discover_test_modules` finds every `scripts/**/test_*.py` file outside `__pycache__`, in path order. The first folder under `scripts/` is its suite; a test file directly under `scripts/` is refused. `test_module_name` keeps the path within the suite in timing keys, results and log lines. Retries keep the original job path, so a nested failure reruns the same file. Job kind is independent of suite name: a test suite named `types` still runs unittests, and the type check has its own job kind. Discovery tests check real regression paths and nested retries.
 
@@ -686,13 +686,13 @@ A failed Mac advance names the published local commit and leaves retry to main s
 Tests use independent scratch repositories.
 The modules in `scripts/production/` cover these subjects:
 
-1. `test_merge_gate.py`: checkpoints and change review.
-2. `test_merge_gate_ledger.py`: certified passes.
-3. `test_targeted_test.py`: affected selection.
-4. `test_merge_gate_suites.py`: jobs, resources, reruns and types.
-5. `test_merge_gate_promotion.py`: local and Mac promotion.
-6. `test_merge_gate_holds.py`: holds and interruptions.
- `merge_gate_test_support.py` caches one repository seed per class and fixture folder set, then restores a private copy at its original path for each test. Cases declare the folders needed for their contract. The fixture writes test modules in those folders; it does not replace discovery or copy the checkout's suite names. CLI calls run in-process except where signals, child ownership or the executable entry point are under test. The gate discovers all parts through `test_*.py`; the affected-module graph follows their shared-helper imports.
+1. `test_gate.py`: checkpoints and change review.
+2. `test_gate_ledger.py`: certified passes.
+3. `test_gate_targeted.py`: affected selection.
+4. `test_gate_suites.py`: jobs, resources, reruns and types.
+5. `test_gate_promotion.py`: local and Mac promotion.
+6. `test_gate_holds.py`: holds and interruptions.
+ `gate_test_support.py` caches one repository seed per class and fixture folder set, then restores a private copy at its original path for each test. Cases declare the folders needed for their contract. The fixture writes test modules in those folders; it does not replace discovery or copy the checkout's suite names. CLI calls run in-process except where signals, child ownership or the executable entry point are under test. The gate discovers all parts through `test_*.py`; the affected-module graph follows their shared-helper imports.
 
 Checkpoint integration modules separate inputs, receipts, validation, promotion, history, child handoffs, and handoff ledger recovery.
 `merge_checkpoint_test_support.py` restores a private Git seed at the same paths for each case.

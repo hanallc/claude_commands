@@ -46,7 +46,7 @@ class LandResult(TypedDict):
 
 
 def state_dir() -> Path:
-    """The merge gate state folder; `merge_gate.gate_state_dir` returns this one."""
+    """The merge gate state folder; `gate.gate_state_dir` returns this one."""
     return Path(os.environ.get("MERGE_GATE_STATE_DIR", "~/.local/state/merge-gate")).expanduser()
 
 

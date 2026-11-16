@@ -1008,7 +1008,7 @@ class StaffTests(StaffCommandTestCase):
 
     def test_gate_module_writes_keep_the_inherited_staff_and_launch_folders_unchanged(self) -> None:
         from scripts.herdr import pane_launch
-        from scripts.production import merge_gate
+        from scripts.production import gate
 
         inherited_state = self.root / "inherited-state"
         inherited_staff = inherited_state / "staff"
@@ -1025,7 +1025,7 @@ class StaffTests(StaffCommandTestCase):
         before = folder_bytes(inherited_staff), folder_bytes(inherited_launches)
         module_root = self.root / "gate-module"
         module_root.mkdir()
-        environment = merge_gate.test_module_environment(module_root, {
+        environment = gate.test_module_environment(module_root, {
             **os.environ,
             "STAFF_FILE": str(inherited_staff / "staff.json"),
             "HERDR_PANE_RECORD_DIR": str(inherited_launches),

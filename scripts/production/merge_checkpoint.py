@@ -37,7 +37,7 @@ from scripts.production.showrunners import owner_for
 from scripts.production.production_doc import Production, ProductionDocument, Refusal, cell_value, production_field, read_production
 
 from scripts.direct import progress_history  # noqa: E402
-from scripts.production import merge_gate, production_doc, session_staff, staff, unit_config, unit_lookup, unit_names  # noqa: E402
+from scripts.production import gate, production_doc, session_staff, staff, unit_config, unit_lookup, unit_names  # noqa: E402
 from scripts.agents import remote  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.message import sessions  # noqa: E402
@@ -963,10 +963,10 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
             if unpushed:
                 return PromotionOriginPushed(tip)
             return PromotionAlreadyAtTip(tip)
-        if conflict := merge_gate.promotion_edit_conflict(checkout, tip, waiting_rows.WAITING_PATHS):
+        if conflict := gate.promotion_edit_conflict(checkout, tip, waiting_rows.WAITING_PATHS):
             raise checkpoint_gate.Stop("promote", "failed", conflict,
                        "clear the listed checkout paths and rerun this checkpoint")
-        if refusal := merge_gate.live_state_refusal(checkout, tip):
+        if refusal := gate.live_state_refusal(checkout, tip):
             raise checkpoint_gate.Stop("promote", "failed", refusal,
                        "run the conversion that the refusal names, then rerun this checkpoint")
         contained = not git(checkout, "merge-base", "--is-ancestor", tip, current).returncode

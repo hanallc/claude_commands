@@ -18,9 +18,9 @@ from unittest import mock
 from scripts.buildlog import store
 from scripts.build_hold import build_hold
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.production import merge_gate
+from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
-from scripts.production.merge_gate_test_support import MergeGateFixture, SUITE_MODULE, gate_suites
+from scripts.production.gate_test_support import MergeGateFixture, SUITE_MODULE, gate_suites
 from scripts.test_times import gate_record
 
 
@@ -81,28 +81,28 @@ class MergeGateTestTimesTests(MergeGateFixture):
         _ = self.commit(self.checkout, "fixed test durations")
         self.write(self.state / "fail-first-hooks", "fail")
         launches: list[tuple[list[str], Path, dict[str, str]]] = []
-        finished: list[merge_gate.GateJobResult] = []
-        start = merge_gate.start_gate_job
-        finish = merge_gate.finish_gate_job
+        finished: list[gate.GateJobResult] = []
+        start = gate.start_gate_job
+        finish = gate.finish_gate_job
 
         def observe_start(suite: str, path: Path, argv: list[str], repo: Path,
                           environment: dict[str, str], log: Path, *,
-                          kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE
-                          ) -> merge_gate.RunningGateJob:
+                          kind: gate.GateJobKind = gate.GateJobKind.TEST_MODULE
+                          ) -> gate.RunningGateJob:
             job = start(suite, path, argv, repo, environment, log, kind=kind)
             # Supply a measured peak to test its path into the record.
             job.peak_memory_mib = 12.5
-            if kind is merge_gate.GateJobKind.TEST_MODULE:
+            if kind is gate.GateJobKind.TEST_MODULE:
                 launches.append((argv, log.parent, environment))
             return job
 
-        def observe_finish(job: merge_gate.RunningGateJob, status: int) -> merge_gate.GateJobResult:
+        def observe_finish(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
             result = finish(job, status)
             finished.append(result)
             return result
 
-        with mock.patch.object(merge_gate, "start_gate_job", side_effect=observe_start), \
-                mock.patch.object(merge_gate, "finish_gate_job", side_effect=observe_finish):
+        with mock.patch.object(gate, "start_gate_job", side_effect=observe_start), \
+                mock.patch.object(gate, "finish_gate_job", side_effect=observe_finish):
             result = self.run_gate("--tests-only", "--full")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         record = self.only_record()
@@ -218,9 +218,9 @@ class MergeGateTestTimesTests(MergeGateFixture):
     def test_record_write_and_config_failures_keep_the_output_and_verdict(self) -> None:
         # Each compared run uses the same completed type environment.
         with mock.patch.dict(os.environ, self.environment), redirect_stdout(io.StringIO()):
-            _ = merge_gate.typecheck_python()
-        with mock.patch.object(merge_gate, "process_memory_mib", return_value={os.getpid(): 16.0}), \
-                mock.patch.object(merge_gate, "one_minute_load", return_value=0.0):
+            _ = gate.typecheck_python()
+        with mock.patch.object(gate, "process_memory_mib", return_value={os.getpid(): 16.0}), \
+                mock.patch.object(gate, "one_minute_load", return_value=0.0):
             # A first passing run gives each compared run the same time limit history.
             history = self.run_gate("--tests-only", "--full")
             self.assertEqual(history.returncode, 0, history.stdout + history.stderr)
@@ -256,14 +256,14 @@ class MergeGateTestTimesTests(MergeGateFixture):
     @gate_suites("hooks", "notify", "direct")
     def test_an_exception_keeps_completed_executions_and_leaves_with_the_same_exception(self) -> None:
         failure = RuntimeError("injected stop after a completed module")
-        start = merge_gate.start_gate_job
-        launched: list[merge_gate.RunningGateJob] = []
+        start = gate.start_gate_job
+        launched: list[gate.RunningGateJob] = []
         self.write(self.checkout / "subject.txt", "dirty test tree\n")
 
         def stop_second_start(suite: str, path: Path, argv: list[str], repo: Path,
                               environment: dict[str, str], log: Path, *,
-                              kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE
-                              ) -> merge_gate.RunningGateJob:
+                              kind: gate.GateJobKind = gate.GateJobKind.TEST_MODULE
+                              ) -> gate.RunningGateJob:
             if launched:
                 raise failure
             job = start(suite, path, argv, repo, environment, log, kind=kind)
@@ -271,10 +271,10 @@ class MergeGateTestTimesTests(MergeGateFixture):
             return job
 
         with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(merge_gate, "start_gate_job", side_effect=stop_second_start), \
+                mock.patch.object(gate, "start_gate_job", side_effect=stop_second_start), \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             with self.assertRaises(RuntimeError) as caught:
-                _ = merge_gate.run_suites(self.checkout, max_running_jobs=1, full=True)
+                _ = gate.run_suites(self.checkout, max_running_jobs=1, full=True)
         self.assertIs(caught.exception, failure)
         self.assertEqual(len(launched), 1)
         self.assertIsNotNone(launched[0].process.returncode)
@@ -287,21 +287,21 @@ class MergeGateTestTimesTests(MergeGateFixture):
 
     def test_a_hold_keeps_the_stopped_attempt_before_the_requeued_attempt(self) -> None:
         self.write(self.state / "signal-hooks", "once")
-        start = merge_gate.start_gate_job
+        start = gate.start_gate_job
         held = False
         starts = 0
         hold_waits: list[float] = []
 
         def hold_first_start(suite: str, path: Path, argv: list[str], repo: Path,
                              environment: dict[str, str], log: Path, *,
-                             kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE
-                             ) -> merge_gate.RunningGateJob:
+                             kind: gate.GateJobKind = gate.GateJobKind.TEST_MODULE
+                             ) -> gate.RunningGateJob:
             nonlocal held, starts
             starts += 1
             held = starts == 1
             return start(suite, path, argv, repo, environment, log, kind=kind)
 
-        def release_hold(hold: merge_gate.BuildHoldWait) -> None:
+        def release_hold(hold: gate.BuildHoldWait) -> None:
             nonlocal held
             if held:
                 began = time.monotonic()
@@ -310,11 +310,11 @@ class MergeGateTestTimesTests(MergeGateFixture):
                 hold_waits.append(hold.seconds)
 
         with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(merge_gate, "start_gate_job", side_effect=hold_first_start), \
-                mock.patch.object(merge_gate.BuildHoldWait, "admits", side_effect=lambda: not held), \
-                mock.patch.object(merge_gate.BuildHoldWait, "wait_until_free", autospec=True, side_effect=release_hold), \
+                mock.patch.object(gate, "start_gate_job", side_effect=hold_first_start), \
+                mock.patch.object(gate.BuildHoldWait, "admits", side_effect=lambda: not held), \
+                mock.patch.object(gate.BuildHoldWait, "wait_until_free", autospec=True, side_effect=release_hold), \
                 redirect_stdout(io.StringIO()) as output:
-            run = merge_gate.run_suites(self.checkout, full=True)
+            run = gate.run_suites(self.checkout, full=True)
         self.assertTrue(run.passed, output.getvalue())
         record = self.only_record()
         self.assertEqual((record["aborted"], record["status"]), (False, 0))
@@ -334,17 +334,17 @@ class MergeGateTestTimesTests(MergeGateFixture):
         marker.mkdir(parents=True)
         with mock.patch.dict(os.environ, self.environment), redirect_stdout(io.StringIO()):
             with self.assertRaises(IsADirectoryError):
-                _ = merge_gate.run_suites(self.checkout, full=True)
+                _ = gate.run_suites(self.checkout, full=True)
         record = self.only_record()
         self.assertEqual((record["aborted"], record["status"]), (False, 0))
         self.assertTrue(marker.is_dir())
 
     def test_a_hold_read_failure_keeps_the_finished_signal_attempt(self) -> None:
         self.write(self.state / "signal-hooks", "always")
-        finish = merge_gate.finish_gate_job
-        finished: list[merge_gate.GateJobResult] = []
+        finish = gate.finish_gate_job
+        finished: list[gate.GateJobResult] = []
 
-        def fail_hold_read_after_finish(job: merge_gate.RunningGateJob, status: int) -> merge_gate.GateJobResult:
+        def fail_hold_read_after_finish(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
             result = finish(job, status)
             finished.append(result)
             _ = self.enterContext(mock.patch.object(build_hold, "natedev_holds",
@@ -352,10 +352,10 @@ class MergeGateTestTimesTests(MergeGateFixture):
             return result
 
         with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(merge_gate, "finish_gate_job", side_effect=fail_hold_read_after_finish), \
+                mock.patch.object(gate, "finish_gate_job", side_effect=fail_hold_read_after_finish), \
                 redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(GateRefused, "hold state cannot be read"):
-                _ = merge_gate.run_suites(self.checkout, full=True)
+                _ = gate.run_suites(self.checkout, full=True)
         self.assertEqual(len(finished), 1)
         self.assertLess(finished[0].returncode, 0)
         record = self.only_record()
@@ -365,25 +365,25 @@ class MergeGateTestTimesTests(MergeGateFixture):
 
     def test_an_abort_during_a_hold_records_the_current_wait(self) -> None:
         self.write(self.state / "signal-hooks", "once")
-        finish = merge_gate.finish_gate_job
-        admits = merge_gate.BuildHoldWait.admits
+        finish = gate.finish_gate_job
+        admits = gate.BuildHoldWait.admits
         completed = False
         wait_started: list[float] = []
         failure = GateRefused("fixture interrupts the hold wait")
 
-        def finish_before_hold(job: merge_gate.RunningGateJob, status: int) -> merge_gate.GateJobResult:
+        def finish_before_hold(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
             nonlocal completed
             result = finish(job, status)
             completed = True
             return result
 
-        def admit_until_finished(hold: merge_gate.BuildHoldWait) -> bool:
+        def admit_until_finished(hold: gate.BuildHoldWait) -> bool:
             if completed:
                 hold.waiting = True
                 return False
             return admits(hold)
 
-        def stop_current_wait(hold: merge_gate.BuildHoldWait) -> None:
+        def stop_current_wait(hold: gate.BuildHoldWait) -> None:
             if not completed:
                 return
             hold.started = time.monotonic()
@@ -395,12 +395,12 @@ class MergeGateTestTimesTests(MergeGateFixture):
 
         before = time.monotonic()
         with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(merge_gate, "finish_gate_job", side_effect=finish_before_hold), \
-                mock.patch.object(merge_gate.BuildHoldWait, "admits", autospec=True, side_effect=admit_until_finished), \
-                mock.patch.object(merge_gate.BuildHoldWait, "wait_until_free", autospec=True, side_effect=stop_current_wait), \
+                mock.patch.object(gate, "finish_gate_job", side_effect=finish_before_hold), \
+                mock.patch.object(gate.BuildHoldWait, "admits", autospec=True, side_effect=admit_until_finished), \
+                mock.patch.object(gate.BuildHoldWait, "wait_until_free", autospec=True, side_effect=stop_current_wait), \
                 redirect_stdout(io.StringIO()):
             with self.assertRaises(GateRefused) as caught:
-                _ = merge_gate.run_suites(self.checkout, full=True)
+                _ = gate.run_suites(self.checkout, full=True)
         self.assertIs(caught.exception, failure)
         record = self.only_record()
         self.assertEqual((record["aborted"], record["status"], record["hold_wait_s"]), (True, 1, 3.0))
@@ -412,7 +412,7 @@ class MergeGateTestTimesTests(MergeGateFixture):
 
 class BuildHoldWaitTests(unittest.TestCase):
     def test_waited_seconds_include_only_an_active_wait(self) -> None:
-        hold = merge_gate.BuildHoldWait()
+        hold = gate.BuildHoldWait()
         hold.seconds = 4.0
         hold.started = 10.0
         hold.waiting = True

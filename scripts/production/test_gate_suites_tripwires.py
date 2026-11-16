@@ -13,9 +13,9 @@ import time
 from typing import cast, final
 from contextlib import redirect_stdout
 from unittest import mock
-from scripts.production import merge_gate
-from scripts.production.merge_gate_test_support import gate_suites
-from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
+from scripts.production import gate
+from scripts.production.gate_test_support import gate_suites
+from scripts.production.gate_suites_test_support import GateSuitesFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.test_times import gate_record
 
@@ -52,11 +52,11 @@ class MergeGateTripwiresTests(GateSuitesFixture):
         ]
         self.write(root / "live-memory-reads.jsonl", "".join(json.dumps(record) + "\n" for record in records))
         began = time.time()
-        job = merge_gate.start_gate_job(
+        job = gate.start_gate_job(
             "hooks", Path("test_memory_reader.py"), [sys.executable, "-c", "print('module passed')"],
             self.checkout, self.environment, root / "output.log")
         status = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
-        result = merge_gate.finish_gate_job(job, status)
+        result = gate.finish_gate_job(job, status)
         wall_clock = result.wall_clock
         if not isinstance(wall_clock, gate_record.WallClockSpan):
             self.fail("The executed job has no wall-clock span")
@@ -83,11 +83,11 @@ class MergeGateTripwiresTests(GateSuitesFixture):
                 root = self.root / f"unreadable-memory-job-{index}"
                 root.mkdir()
                 self.write(root / "live-memory-reads.jsonl", line)
-                job = merge_gate.start_gate_job(
+                job = gate.start_gate_job(
                     "hooks", Path("test_memory_reader.py"), [sys.executable, "-c", "print('module passed')"],
                     self.checkout, self.environment, root / "output.log")
                 status = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
-                result = merge_gate.finish_gate_job(job, status)
+                result = gate.finish_gate_job(job, status)
                 self.assertEqual(status, 0)
                 self.assertEqual(result.returncode, 1)
                 self.assertTrue(result.tripwire_tripped)
@@ -111,11 +111,11 @@ if not first_run.exists():
         held = False
         starts: list[str] = []
         statuses: list[int] = []
-        start = merge_gate.start_gate_job
-        finish = merge_gate.finish_gate_job
+        start = gate.start_gate_job
+        finish = gate.finish_gate_job
 
         def start_during_hold(suite: str, path: Path, argv: list[str], repo: Path,
-                              environment: dict[str, str], log: Path) -> merge_gate.RunningGateJob:
+                              environment: dict[str, str], log: Path) -> gate.RunningGateJob:
             nonlocal held
             held = True
             starts.append(path.name)
@@ -125,18 +125,18 @@ if not first_run.exists():
             nonlocal held
             held = False
 
-        def record_finish(job: merge_gate.RunningGateJob, status: int) -> merge_gate.GateJobResult:
+        def record_finish(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
             self.assertTrue(held)
             statuses.append(status)
             return finish(job, status)
 
         output = io.StringIO()
         with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(merge_gate.BuildHoldWait, "admits", side_effect=lambda: not held), \
-                mock.patch.object(merge_gate.BuildHoldWait, "wait_until_free", side_effect=release_hold), \
-                mock.patch.object(merge_gate, "start_gate_job", side_effect=start_during_hold), \
-                mock.patch.object(merge_gate, "finish_gate_job", side_effect=record_finish), redirect_stdout(output):
-            run = merge_gate.run_suites(self.checkout)
+                mock.patch.object(gate.BuildHoldWait, "admits", side_effect=lambda: not held), \
+                mock.patch.object(gate.BuildHoldWait, "wait_until_free", side_effect=release_hold), \
+                mock.patch.object(gate, "start_gate_job", side_effect=start_during_hold), \
+                mock.patch.object(gate, "finish_gate_job", side_effect=record_finish), redirect_stdout(output):
+            run = gate.run_suites(self.checkout)
         self.assertFalse(run.passed, output.getvalue())
         self.assertEqual(starts, ["test_first.py"])
         self.assertEqual(statuses, [-signal.SIGTERM])
@@ -156,12 +156,12 @@ if not first_run.exists():
                     root.mkdir()
                     if record_state == "empty":
                         self.write(root / "live-memory-reads.jsonl", "")
-                    job = merge_gate.start_gate_job(
+                    job = gate.start_gate_job(
                         "hooks", Path("test_memory_reader.py"),
                         [sys.executable, "-c", f"raise SystemExit({exit_status})"],
                         self.checkout, self.environment, root / "output.log")
                     status = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
-                    result = merge_gate.finish_gate_job(job, status)
+                    result = gate.finish_gate_job(job, status)
                     self.assertEqual(status, exit_status)
                     self.assertEqual(result.returncode, exit_status)
                     self.assertFalse(result.tripwire_tripped)
@@ -195,14 +195,14 @@ print("0 errors, 0 warnings, 0 notes")
 raise SystemExit(0)
 ''')
         module_statuses: list[tuple[str, int]] = []
-        finish = merge_gate.finish_gate_job
+        finish = gate.finish_gate_job
 
-        def record_finish(job: merge_gate.RunningGateJob, status: int) -> merge_gate.GateJobResult:
+        def record_finish(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
             if job.suite == "lib":
                 module_statuses.append((job.path.name, status))
             return finish(job, status)
 
-        with mock.patch.object(merge_gate, "finish_gate_job", side_effect=record_finish):
+        with mock.patch.object(gate, "finish_gate_job", side_effect=record_finish):
             result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn(

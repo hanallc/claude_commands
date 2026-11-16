@@ -23,6 +23,9 @@ FRONT = HOOK.with_suffix(".sh")
 CARGO_BUILDS = ("build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r",
                 "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "mend", "miri")
 MERGE_GATE_COMMANDS = (
+    "python3 gate.py --tests-only",
+    "python3.13 -u '/work tree/gate.py' --targeted",
+    "scripts/lib/py scripts/production/gate.py --targeted",
     "python3 merge_gate.py --tests-only",
     "/usr/bin/python3 scripts/production/merge_gate.py --promote-only",
     "python3.13 -u '/work tree/merge_gate.py' --repo /repo",
@@ -113,6 +116,11 @@ class BuildHoldGuardTest(TemporaryGuardTest):
             "python3 other.py merge_gate.py",
             "python3 -W merge_gate.py other.py",
             "python3 merge_gate.py.bak",
+            "python3 cloud_gate.py --tests-only",
+            "python3 gate_box.py --tests-only",
+            "python3 gate.py.bak",
+            "python3 -m scripts.production.cloud_gate",
+            "python3 -m scripts.production.gate_box",
         ):
             with self.subTest(command=command):
                 self.assertEqual(self.run_hook(command), "", command)
