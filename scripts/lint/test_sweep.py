@@ -7634,6 +7634,21 @@ class RunnerTargetDirTests(SweepCase):
             status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root)])
         self.assertEqual(status, 0)
 
+    def test_a_target_dir_run_finishes_only_its_own_saved_trims(self) -> None:
+        target = self.target()
+        other = self.target()
+        own = sweep.TrimTake(str(target.root), "budget take", 0, at=time.time() - DAY)
+        unrelated = sweep.TrimTake(str(other.root), "budget take", 0, at=time.time() - DAY)
+        for take in (own, unrelated):
+            sweep.trim_intent_path(take.target).parent.mkdir(parents=True, exist_ok=True)
+            take.save()
+        with (redirect_stdout(io.StringIO()),
+              mock.patch.object(sweep, "hold_floor", side_effect=AssertionError("held the floor"))):
+            status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root)])
+        self.assertEqual(status, 0)
+        self.assertFalse(sweep.trim_intent_path(own.target).exists())
+        self.assertTrue(sweep.trim_intent_path(unrelated.target).exists())
+
     def test_a_target_dir_failure_prints_to_the_job_log_and_sends_no_notice(self) -> None:
         target = self.target()
         errors = io.StringIO()
