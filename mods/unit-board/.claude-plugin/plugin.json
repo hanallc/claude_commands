@@ -1,7 +1,7 @@
 {
   "name": "unit-board",
   "version": "0.1.0",
-  "description": "Accounts and build queue panes.",
+  "description": "Build queue pane.",
   "author": {
     "name": "Nate"
   },

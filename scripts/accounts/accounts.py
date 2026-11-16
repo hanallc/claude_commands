@@ -4332,7 +4332,7 @@ BoardTone = Literal["default", "success", "error", "warning", "inactive"]
 
 
 class BoardSpan(TypedDict):
-    """One styled piece of a board cell; the console Accounts page and the unit-board plugin draw it as it is."""
+    """One styled piece of a board cell; the console Accounts page draws it as it is."""
     text: str
     tone: BoardTone
     kind: Literal["fact", "bold"]
@@ -4345,7 +4345,7 @@ class BoardColumn(TypedDict):
 
 
 class BoardRow(TypedDict):
-    """The cells of one table line, and the same facts for a pane too narrow for the table."""
+    """The cells of one table line, and the same facts as a list of short lines."""
     cells: dict[str, list[BoardSpan]]
     facts: list[list[BoardSpan]]
 

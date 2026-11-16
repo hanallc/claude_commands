@@ -338,7 +338,7 @@ Answers to questions and changes both post to `changes.html`.
 
 ### Accounts page
 
-`/console/accounts.html` shows the accounts board that `/showrunner:accounts` shows.
+Hana console, Accounts (`/console/accounts.html`) shows the accounts board.
 The console lists it as **Accounts**, with the Lucide `users` icon.
 The server keeps the last good page and its render times under one lock.
 The first request waits for a render in a child process (`accounts_page.py`).
