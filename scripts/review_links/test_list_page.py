@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.agents.remote import local_machine
 from scripts.lib import conf
 from scripts.production import change_review, change_routing, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
@@ -153,7 +154,7 @@ class ListPageTests(unittest.TestCase):
             _ = listing.write_text('## To review\n\n| # | Change | How to check | Producer |\n'
                 + '| --- | --- | --- | --- |\n'
                 + ''.join(f'| C{number} | Work | Read it | {owner.id} |\n' for number in range(1, count + 1)))
-            owners.append(replace(owner, doc=staff.LiveDoc("natedev", doc)))
+            owners.append(replace(owner, doc=staff.LiveDoc(local_machine(), doc)))
             listings.append(listing)
         members = staff.StaffSnapshot(tuple(owners))
         with listings[0].open('a') as output:
