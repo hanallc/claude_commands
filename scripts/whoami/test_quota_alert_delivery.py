@@ -128,6 +128,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_legacy_blocked_cli_finds_the_canonical_episode_and_saves_no_spaced_label(self) -> None:
         notes: Notes = [self.note("codex1.md", "active", "1")]
         _ = self.alert(notes, self.now)
+        notes = [self.note("codex1.md", "active", "0", credit_balance="0")]
         _ = self.block(notes, self.now)
         with quota_alert.state_file() as state:
             self.assertIsInstance(state["fallback"], quota_alert.AccountCodexQuotaFallback)

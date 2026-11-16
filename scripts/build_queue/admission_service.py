@@ -983,6 +983,10 @@ def _refreshes(first: wire.Request | NoRequest, request: wire.Request) -> bool:
             and (request.episode, request.owner, request.since) == (first.episode, first.owner, first.since))
 
 
+# systemd passes the first inherited socket at this descriptor.
+LISTEN_FD = 3
+
+
 def _notify(message: str) -> None:
     address = os.environ.get("NOTIFY_SOCKET", "")
     if address:
@@ -1117,6 +1121,8 @@ class AdmissionServer:
         self.placement_host_keys: dict[tuple[str, placement.PlacementDestination], placement.HostEvidenceKey] = {}
         # Start time of each hold that keeps a remote destination for an older waiting request.
         self.placement_holds: dict[tuple[str, placement.PlacementDestination], float] = {}
+        # The reading that answered each ended hold. That reading never starts another hold.
+        self.placement_hold_answers: dict[tuple[str, placement.PlacementDestination], float] = {}
         self.spacing: records.StartSpacing = records.ReadyToStart()
         self.override: records.HeadAdmissionOverride | records.NoHeadAdmissionOverride = records.NoHeadAdmissionOverride()
         self.last_inputs: records.QueueInputs | NoPass = NoPass()
@@ -1164,11 +1170,18 @@ class AdmissionServer:
         self.reading_events: int = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
         self.epoll.register(self.reading_events, select.EPOLLIN)
         self.listener: socket.socket | NoConnection = NoConnection()
+        self.inherited_listener: bool = False
+        # A source change under systemd runs the new code in this process and keeps the socket.
+        self.replace_in_place: bool = False
         self.stopped: bool = False
         self.closed: bool = False
         self.next_pass: float = float("inf")
         self.next_source_check: float = float("inf")
-        self.sources: dict[Path, tuple[int, int] | SourceMissing] = self._source_stamps()
+        # The service watches each loaded module under this folder and stops when one changes.
+        self.source_root: Path = Path(__file__).resolve().parents[1]
+        self.source_module_count: int = len(sys.modules)
+        self.sources: dict[Path, tuple[int, int] | SourceMissing] = {
+            path: self._stamp(path) for path in self._source_paths()}
         self.source_change_at: float | SourcesUnchanged = SourcesUnchanged()
         state_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1362,7 +1375,7 @@ class AdmissionServer:
                     or isinstance(watch, ScopeWatch) and watch.episode not in self.reservations):
                 self._unwatch(descriptor)
 
-    def _ci_hold_reasons(self) -> dict[str, str]:
+    def _ci_hold_reasons(self) -> dict[str, records.NatedevHeld | records.ReadingUnavailable]:
         """Apply the existing hold policy to legacy CI admission requests."""
         waiting = {episode: item for episode, item in self.waiters.items()
                    if isinstance(item.request, ServiceEstimatedAdmission)}
@@ -1375,14 +1388,14 @@ class AdmissionServer:
             directory = build_hold.holder_directory()
             holds = build_hold.natedev_holds(directory)
         except OSError as error:
-            return {episode: f"natedev hold state is unreadable: {error}" for episode in waiting}
-        reasons: dict[str, str] = {}
+            return {episode: records.ReadingUnavailable(f"natedev hold state is unreadable: {error}") for episode in waiting}
+        reasons: dict[str, records.NatedevHeld | records.ReadingUnavailable] = {}
         for episode, item in waiting.items():
             owner = item.request.owner
             lineage = build_targets.read_caller_lineage(self.proc.path, owner.pid, owner.start_time)
             blocking = build_targets.hold_waited_on(holds, NoOwningSession(), directory, lineage)
             if isinstance(blocking, build_hold.Holder):
-                reasons[episode] = f"natedev is held by {blocking.name} for {blocking.purpose}; waiting for release"
+                reasons[episode] = records.NatedevHeld(blocking.name, blocking.purpose)
         return reasons
 
     def _ordered_waiters(self) -> list[tuple[Path, records.RankedWaiter]]:
@@ -1568,7 +1581,8 @@ class AdmissionServer:
             return self.system_reader.latest.lifetimes.get(record.episode, gate.LiveOwnerProcess())
         return self.proc.lifetime(reservation_row(record), self._live(record.owner))
 
-    def _inputs(self, config: records.MemoryConfig, profile_rank: int, profile_share: int) -> records.QueueInputs:
+    def _inputs(self, config: records.MemoryConfig, profile_rank: int, profile_share: int,
+                sweep_seconds: float) -> records.QueueInputs:
         now = self.clock.now()
         plan = self._reading_plan(config)
         if isinstance(self.system_reader, NoSystemReader):
@@ -1640,7 +1654,7 @@ class AdmissionServer:
         if between:
             inputs = replace(inputs, running=(*inputs.running, *between))
         return self._progress_inputs(self._inputs_with_current_slots(inputs), dict(evidence.processes),
-                                     config.policy, profile_rank, profile_share)
+                                     config.policy, profile_rank, profile_share, sweep_seconds)
 
     def _unowned_memory(self, evidence: SystemEvidence, rows: list[records.Reservation]
                         ) -> tuple[records.UnownedSliceMemory, ...]:
@@ -1689,7 +1703,10 @@ class AdmissionServer:
             if workers and all(gate.process_tree({pid: evidence.processes[pid].start},
                                dict(evidence.processes)).intersection(tree_pids | scoped_pids) for pid in workers):
                 legacy_job = IdleService()
-            result.append(replace(memory, bytes=max(0, memory.bytes - use), job_state=legacy_job, service_job_state=job,
+            anonymous = gate.swap_backed_use_less(memory.anonymous,
+                                                  (item.anonymous for item in (*duplicate, *scoped)))
+            result.append(replace(memory, bytes=max(0, memory.bytes - use), anonymous=anonymous,
+                                  job_state=legacy_job, service_job_state=job,
                                   swap_bytes=max(0, memory.swap_bytes - sum(item.swap_bytes for item in (*duplicate, *scoped)))))
         return tuple(result)
 
@@ -1720,12 +1737,13 @@ class AdmissionServer:
                 pass
 
     def _progress_inputs(self, inputs: records.QueueInputs, processes: dict[int, gate.ProcessIdentity],
-                         policy: records.AdmissionPolicy, profile_rank: int, profile_share: int) -> records.QueueInputs:
+                         policy: records.AdmissionPolicy, profile_rank: int, profile_share: int,
+                         sweep_seconds: float) -> records.QueueInputs:
         """Capture counters and profile samples on the service loop thread."""
         attributed = iter(gate.attributed_step_uses(inputs))
         running: list[records.RunningStep] = []
         cutoff = inputs.now - step_estimator.HISTORY_DAYS * 86400
-        self.progress_history.prune(cutoff, rank=profile_rank, share_percent=profile_share)
+        self.progress_history.prune(cutoff, sweep_seconds, rank=profile_rank, share_percent=profile_share)
         for step in inputs.running:
             if not gate.running_has_reservation(step):
                 running.append(step)
@@ -1742,7 +1760,8 @@ class AdmissionServer:
             counter = progress.read_counter(sidecar) if row["sidecar"] else progress.NoCounter()
             if isinstance(counter, progress.NoCounter) and row["sidecar"] and row["step"] != "merge-gate":
                 counter = self.progress_captures.log_counter(progress.progress_path(sidecar, "log"))
-            if isinstance(counter, progress.NoCounter) and row["step"] != "merge-gate" and self.boot_id:
+            if (isinstance(counter, progress.NoCounter) and isinstance(counter.token_wait, progress.NoTokenWait)
+                    and row["step"] != "merge-gate" and self.boot_id):
                 pids = gate.process_tree({row["pid"]: row["start_time"]}, processes)
                 counter = self.progress_captures.counter({pid: processes[pid].start for pid in pids}, self.boot_id)
             key = gate.reservation_profile_key(row, self.host)
@@ -1905,7 +1924,8 @@ class AdmissionServer:
         self.last_diagnostics = config.diagnostics
         self._settle_attempt_reports()
         self._prepare_placements()
-        inputs = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent)
+        inputs = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent,
+                              self.configuration.progress_profile_sweep_seconds)
         ci_holds = self._ci_hold_reasons()
         if ci_holds:
             held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
@@ -1956,11 +1976,10 @@ class AdmissionServer:
                 if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                     self._deliver(waiting, reply)
                     waiting.last_reply, waiting.last_sent = reply, inputs.now
-        for position, (episode, text) in enumerate(ci_holds.items(), len(result.rows) + 1):
+        for position, (episode, reason) in enumerate(ci_holds.items(), len(result.rows) + 1):
             waiting = self.waiters[episode]
-            reason = records.ReadingUnavailable(text)
             decision = records.AdmissionDecision("hold", waiting.row["need"], 0, 0, 0, free_passes=False)
-            reply = wire.Wait(reason, position, "", text,
+            reply = wire.Wait(reason, position, "", reason_phrase(reason, ()),
                 self._wait_snapshot(waiting, decision, inputs, config, reason, records.NoHolder(), head_label, head_need))
             if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                 self._deliver(waiting, reply)
@@ -2094,8 +2113,8 @@ class AdmissionServer:
         ci_holds = self._ci_hold_reasons()
         if ci_holds:
             held_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
-                row.get("step", ""), row.get("folder", ""), row["since"], row["need"], records.ReadingUnavailable(text),
-                row.get("unit", "")) for episode, text in ci_holds.items() for row in (self.waiters[episode].row,))
+                row.get("step", ""), row.get("folder", ""), row["since"], row["need"], reason,
+                row.get("unit", "")) for episode, reason in ci_holds.items() for row in (self.waiters[episode].row,))
             reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, *held_steps)),
                 ordered=[*reading.ordered, *((self.state_dir / records.waiter_owner(self.waiters[episode].row),
                     gate.rank_waiter(self.waiters[episode].row, records.NormalOrder())) for episode in ci_holds)])
@@ -2601,7 +2620,7 @@ done
             return (isinstance(report.path, placement.DispatchPathSettled)
                 and isinstance(report.outcome, placement.AttemptDeclined)
                 and evidence.observed_at >= report.received_at)
-        return (self._ended_claim_holder(saved)
+        return ((self._ended_claim_holder(saved) or self._unconfirmed_holder_owner_ended(saved))
             and isinstance(saved.permission, placement.PermissionConsumed)
             and evidence.observed_at > saved.permission.consumed_at
             and not self._start_pending(saved))
@@ -2624,6 +2643,17 @@ done
                 and isinstance(saved.holder, placement.ClaimHolderIdentity)
                 and saved.holder.host == self.host
                 and not self._live(wire.Owner(saved.holder.pid, saved.holder.start_time)))
+
+    def _unconfirmed_holder_owner_ended(self, saved: records.SavedPlacementAssignment) -> bool:
+        """A claim with no confirmed holder frees its assignment after its submitting owner ends.
+
+        No holder process can be checked, so only fresh evidence without the claim releases it.
+        Without this rule, the assignment stays current with no process behind it.
+        """
+        return (saved.assignment.destination.provider != "local"
+                and isinstance(saved.provider, placement.ProviderClaimReference)
+                and isinstance(saved.holder, placement.ClaimHolderUnconfirmed)
+                and not self._placement_owner_live(saved.assignment.owner))
 
     def _start_pending(self, saved: records.SavedPlacementAssignment) -> bool:
         from scripts.mac_test import claim_state, offload
@@ -2825,8 +2855,15 @@ done
         saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
         if saved is not None:
             state = self._assignment_state(saved)
-            if isinstance(state, placement.ClosedAssignment):
+            if isinstance(state, placement.ClosedAssignment) and saved.assignment.destination.provider == "local":
                 return self._placement_status(saved.assignment, state.reason)
+            if isinstance(state, placement.ClosedAssignment):
+                # A released provider claim is final only after a pass settles the attempt and its retry.
+                self.next_pass = min(self.next_pass, self.clock.monotonic())
+                return wire.PlacementWait(request.episode, request.since, 1,
+                    self.placement_eligibility.get(request.episode, ()),
+                    provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
+                    retry_notices=retry_notices)
             if saved.assignment.destination.provider == "local":
                 replay = self.ledger[request.episode]
                 assert isinstance(replay.reply, wire.Admitted)
@@ -2901,6 +2938,7 @@ done
         """Remove remote selections before the local planner commits any effects."""
         if not any(self._placement_waiting(request) for request in self.placement_requests.values()):
             self.placement_holds = {}
+            self.placement_hold_answers = {}
             return inputs
         owners = {records.waiter_owner(self._placement_row(request)): request
                   for request in self.placement_requests.values() if self._placement_waiting(request)}
@@ -2931,6 +2969,7 @@ done
         held: list[PlacementHold] = []
         taken: list[placement.PlacementDestination] = []
         holds: dict[tuple[str, placement.PlacementDestination], float] = {}
+        answers: dict[tuple[str, placement.PlacementDestination], float] = {}
         for _, row in ordered:
             owner = records.waiter_owner(row)
             request = owners.get(owner)
@@ -2945,7 +2984,7 @@ done
                         and isinstance(candidate.eligibility, placement.EvidenceNeeded)):
                     break
                 if not isinstance(candidate.eligibility, placement.AllowedHost):
-                    hold = self._placement_hold(request, candidate)
+                    hold = self._placement_hold(request, candidate, answers)
                     if hold is not None:
                         waiting_for.append(hold)
                     continue
@@ -2990,12 +3029,17 @@ done
                     if start is not None and hold.observed_at < start:
                         holds[(hold.episode, hold.destination)] = start
         self.placement_holds = holds
+        self.placement_hold_answers = answers
         return replace(inputs, ordered=[(path, row) for path, row in inputs.ordered
             if records.waiter_owner(row) not in removed], slots=tuple(self.slots.values()))
 
-    def _placement_hold(self, request: wire.PlacementRequest,
-                        candidate: placement.CandidateEligibility) -> PlacementHold | None:
-        """Return the hold that keeps a remote destination for a waiting request whose evidence is not current."""
+    def _placement_hold(self, request: wire.PlacementRequest, candidate: placement.CandidateEligibility,
+                        answers: dict[tuple[str, placement.PlacementDestination], float]) -> PlacementHold | None:
+        """Return the hold that keeps a remote destination for a waiting request that can use it now.
+
+        The request can use it when its last reading allowed it or said busy, or when it has no reading.
+        A reading that answered an earlier hold starts no new hold: the request cannot use the destination now.
+        """
         destination = candidate.destination
         eligibility = candidate.eligibility
         key = self.placement_host_keys.get((request.episode, destination))
@@ -3004,7 +3048,20 @@ done
                 or not (isinstance(eligibility, placement.EvidenceNeeded)
                         or isinstance(eligibility, placement.TemporaryExclusion) and eligibility.reason == "busy")):
             return None
-        return PlacementHold(request.episode, destination, key, self.host_evidence(key).observed_at)
+        reader = self.host_readers.get(key)
+        latest = reader.latest if reader is not None else self.host_observations.get(key)
+        if (isinstance(latest, placement.FreshHostEvidence) and not isinstance(latest.eligibility, placement.AllowedHost)
+                and not (isinstance(latest.eligibility, placement.TemporaryExclusion) and latest.eligibility.reason == "busy")):
+            return None
+        pair = (request.episode, destination)
+        observed_at = self.host_evidence(key).observed_at
+        start = self.placement_holds.get(pair)
+        answer = observed_at if start is not None and observed_at >= start else self.placement_hold_answers.get(pair)
+        if answer is not None:
+            answers[pair] = answer
+        if answer == observed_at:
+            return None
+        return PlacementHold(request.episode, destination, key, observed_at)
 
     def _held_for_older(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
                         held: list[PlacementHold], holds: dict[tuple[str, placement.PlacementDestination], float]) -> bool:
@@ -3102,6 +3159,10 @@ done
                 self._close_for_report(saved, report)
                 continue
             if assignment.destination.provider == "local":
+                # A coordinator that ends before its execution report leaves the local assignment current.
+                state = self._assignment_state(saved)
+                if isinstance(state, placement.ClosedAssignment) and not self._placement_owner_live(assignment.owner):
+                    self._close_placement(saved, state.reason, placement.DoNotRetry("coordinator ended"))
                 continue
             submitted = self.placement_requests.get(assignment.episode)
             if submitted is None:
@@ -3591,7 +3652,8 @@ done
             return
         inherited = int(os.environ.get("LISTEN_FDS") or "0")
         if inherited and int(os.environ.get("LISTEN_PID", str(os.getpid()))) == os.getpid():
-            listener = socket.socket(fileno=3)
+            listener = socket.socket(fileno=LISTEN_FD)
+            self.inherited_listener = True
         else:
             self.socket_path.parent.mkdir(parents=True, exist_ok=True)
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -3749,16 +3811,15 @@ done
         except (BrokenPipeError, ConnectionResetError):
             self._disconnect(connection)
 
-    def _source_stamps(self) -> dict[Path, tuple[int, int] | SourceMissing]:
-        scripts = Path(__file__).resolve().parents[1]
+    def _source_paths(self) -> set[Path]:
         paths: set[Path] = set()
         for module in list(sys.modules.values()):
             filename = cast(object, getattr(module, "__file__", None))
             if isinstance(filename, str):
                 path = Path(filename).resolve()
-                if path.is_relative_to(scripts):
+                if path.is_relative_to(self.source_root):
                     paths.add(path)
-        return {path: self._stamp(path) for path in paths}
+        return paths
 
     @staticmethod
     def _stamp(path: Path) -> tuple[int, int] | SourceMissing:
@@ -3770,6 +3831,11 @@ done
 
     def _check_sources(self) -> None:
         configuration = self.last_usable_configuration
+        if len(sys.modules) != self.source_module_count:
+            # A function-level import loads its module after start. Watch it from the first check after it loads.
+            self.source_module_count = len(sys.modules)
+            for path in self._source_paths() - self.sources.keys():
+                self.sources[path] = self._stamp(path)
         current = {path: self._stamp(path) for path in self.sources}
         now = self.clock.monotonic()
         if current != self.sources:
@@ -3779,7 +3845,9 @@ done
               and not isinstance(self.source_change_at, SourcesUnchanged)
               and now - self.source_change_at >= configuration.source_settle_seconds):
             self.persist()
-            _notify("STOPPING=1")
+            self.replace_in_place = self.inherited_listener
+            _notify(f"RELOADING=1\nMONOTONIC_USEC={time.monotonic_ns() // 1000}" if self.replace_in_place
+                    else "STOPPING=1")
             self.stopped = True
         self.next_source_check = (now + configuration.source_check_seconds
                                   if isinstance(configuration, records.MemoryConfig) else float("inf"))
@@ -3971,9 +4039,13 @@ done
             os.close(descriptor)
         self.watchers.clear()
         if not isinstance(self.listener, NoConnection):
-            self.listener.close()
-            if not os.environ.get("LISTEN_FDS"):
-                self.socket_path.unlink(missing_ok=True)
+            if self.replace_in_place:
+                # The descriptor stays open for the replacement process.
+                _ = self.listener.detach()
+            else:
+                self.listener.close()
+                if not os.environ.get("LISTEN_FDS"):
+                    self.socket_path.unlink(missing_ok=True)
         self.epoll.close()
 
 
@@ -4163,6 +4235,10 @@ def main() -> int:
         server.serve_forever()
     finally:
         server.close()
+    if server.replace_in_place:
+        # The new code takes the same socket without the systemd restart delay; a failed start restarts as before.
+        os.set_inheritable(LISTEN_FD, True)
+        os.execv(sys.executable, sys.orig_argv)
     return 0
 
 

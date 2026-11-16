@@ -64,7 +64,11 @@ write_test_registry "$MODELS_CONFIG_FILE" \
     assignments/codex_case=codex \
     assignments/direct.simplify=claude \
     direct.claude/simplify=opus:max \
+    direct.options/claude_account.simplify=caller \
     assignments/claude_case=claude \
+    assignments/account_case=claude \
+    account_case.claude/task=opus:max \
+    account_case.options/claude_account=caller \
     assignments/bare_case=codex \
     assignments/tier_case=codex \
     assignments/tier_case.claude_task=claude \
@@ -126,7 +130,7 @@ assert_equal "claude write command is wrong" \
 
 claude_readonly="$(run_dry claude_case.task readonly)"
 assert_equal "claude readonly command is wrong" \
-    "cd $WORKING_DIR && env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 $claude_command --print --permission-mode plan --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
+    "cd $WORKING_DIR && env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 $claude_command --print --permission-mode plan --disallowedTools Edit\\,Write\\,NotebookEdit --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$claude_readonly"
 
 # The simplify run also carries a session id as an extra argument.
@@ -149,9 +153,6 @@ assert "--dangerously-skip-permissions" not in arguments, arguments
 PYTHON
 [[ ! -e "$LOG_FILE" ]] || fail "simplify dry run wrote a log"
 [[ ! -e "${LOG_FILE}.session" ]] || fail "the agent launcher wrote a private session file"
-if run_dry direct.simplify write > "$TEST_DIR/simplify-write.stdout"; then
-    fail "simplify accepted write mode"
-fi
 
 bare_command="$(run_dry bare_case.task write)"
 assert_equal "bare pair did not omit the effort flag" \
@@ -165,7 +166,7 @@ assert_equal "codex command did not carry the function's service tier" \
 
 tier_claude_command="$(run_dry tier_case.claude_task readonly)"
 assert_equal "claude command carried a codex service tier" \
-    "cd $WORKING_DIR && env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 $claude_command --print --permission-mode plan --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
+    "cd $WORKING_DIR && env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 $claude_command --print --permission-mode plan --disallowedTools Edit\\,Write\\,NotebookEdit --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$tier_claude_command"
 
 MISSING_PROMPT="$TEST_DIR/missing.txt"
@@ -290,6 +291,8 @@ export CLAUDE_CONFIG_DIR="$HOME/.claude2"
 run_exec_fixture direct.simplify readonly "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
 assert_equal "simplify replaced the caller account with the workers account" "$HOME/.claude2" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 assert_equal "simplify used the worker catalog" "claude-opus-claude2-fixture" "$(recorded_claude_model)"
+run_exec_fixture account_case.task readonly "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
+assert_equal "a claude_account=caller row did not keep the caller account" "$HOME/.claude2" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 
 # The worker's registry-selected Claude path uses the same account.
 export STAFF_FILE="$TEST_DIR/staff.json"

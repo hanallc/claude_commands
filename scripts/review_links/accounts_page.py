@@ -8,7 +8,7 @@ import sys
 
 from scripts.accounts import accounts
 from scripts.lib import conf
-from scripts.review_links import change_page, console_theme, review_link
+from scripts.review_links import change_page, console_theme, page_frame, review_link
 
 PAGE_NAME = "accounts.html"
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/{PAGE_NAME}"
@@ -48,7 +48,7 @@ def page() -> bytes:
     body = board(accounts.read_status(source=accounts.StoredUsageOnly()))
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             + '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Accounts</title>'
-            + f'{STYLE}</head><body><main><h1>Accounts</h1><div data-accounts>{body}</div></main>'
+            + f'{STYLE}</head><body><main><h1 class="page-title">Accounts</h1><div data-accounts>{body}</div></main>'
             + f"<script>{SCRIPT}</script></body></html>").encode()
 
 
@@ -70,7 +70,8 @@ def main() -> int:
     return 0
 
 
-STYLE = "<style>\n" + console_theme.CSS + """h1{margin:0 0 16px}h2{margin:16px 0 4px}
+STYLE = "<style>\n" + console_theme.CSS + page_frame.STYLE + """
+h2{margin:16px 0 4px}
 table{border-collapse:collapse;font-size:.86rem;font-variant-numeric:tabular-nums}
 .card{width:fit-content;max-width:100%}
 th,td{padding:5px 0 5px 18px;white-space:nowrap}th:first-child,td:first-child{padding-left:0}

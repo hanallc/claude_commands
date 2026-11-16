@@ -480,6 +480,30 @@ class PlacementTests(unittest.TestCase):
                 self.assertIsInstance(reply.permission, placement.PermissionConsumed)
                 self.assertEqual(len(fixture.server.assignments), 1)
 
+    def test_a_released_claim_waits_for_its_settlement_instead_of_a_final_status(self) -> None:
+        with PlacementFixture() as fixture:
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            claim = adopt_assignment(fixture, request, assignment)
+            authorized, = fixture.connect(consume_permission("consume-declined", assignment, claim)).replies()
+            self.assertIsInstance(authorized, wire.FirstAuthorization)
+            _ = fixture.connect(wire.ExecutionReport("declined", assignment, claim, placement.ExecutionNotStarted(),
+                placement.AttemptDeclined("no_tests"), placement.DispatchPathSettled())).replies()
+            key = placement.attempt_key(assignment.episode, assignment.attempt)
+            fixture.clock.advance(1)
+            # The release evidence arrives after the pass that settles reports.
+            with mock.patch.object(fixture.server, "_settle_attempt_reports"):
+                _ = publish_candidate(fixture, request)
+                waiting, = fixture.server.handle_request(request)
+            self.assertIsInstance(waiting, wire.PlacementWait)
+            self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
+            _ = fixture.run_pass()
+            settled = fixture.server.assignments[key]
+            self.assertEqual(settled.state, placement.ClosedAssignment("no_tests"))
+            self.assertNotEqual(settled.retry, placement.DoNotRetry("attempt is not settled"))
+            self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+
     def test_an_empty_scan_cannot_close_a_pending_dispatch_before_or_after_restart(self) -> None:
         cases: tuple[tuple[str, placement.AttemptOutcome], ...] = tuple(
             (pending, outcome) for pending in ("claim", "start", "cleanup")
@@ -1184,6 +1208,46 @@ class MacOrderTests(unittest.TestCase):
             _ = fixture.run_pass()
             self.assertEqual(self.assigned(fixture, order.older, order.younger), [order.younger.episode])
             self.assertEqual(fixture.server.placement_holds, {})
+
+    def test_older_requests_that_cannot_use_the_mac_never_keep_it_from_a_younger_one(self) -> None:
+        """11-15 10:44-11:04: two older cargo-liner steps waited on natedev memory and could not use the Mac.
+
+        The tile nextest read the cargo-liner scope free. Each new tile reading started new holds for the older
+        steps, and the tile reading expired before both older probes answered. The tile nextest never got the Mac.
+        """
+        for refusal in ("busy", "disk"):
+            with (self.subTest(refusal=refusal), PlacementFixture() as fixture,
+                  mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+                fixture.configure(waiting_pass_seconds=1)
+                _ = write_config_fixture(fixture.root / "mac_test.conf", "probe_timeout_s=5\n", template="mac_test")
+                fixture.free(0)
+                fixture.hold_starts()
+                _ = fixture.run_pass()
+                readings: dict[placement.HostEvidenceKey, placement.HostEligibility] = {}
+                older: list[wire.PlacementRequest] = []
+                for name, age in (("handler-mend", 1500), ("handler-clippy", 1400)):
+                    request = placement_request(fixture, session=OwningSession(name), since=fixture.clock.now() - age)
+                    request = replace(request, constraints=replace(request.constraints,
+                        candidates=(*request.constraints.candidates, local_candidate(fixture))))
+                    readings[self.provide(fixture, request, placement.TemporaryExclusion(refusal))] = (
+                        placement.TemporaryExclusion(refusal))
+                    self.assertIsInstance(fixture.connect(request).replies()[-1], wire.PlacementWait)
+                    older.append(request)
+                tile = placement_request(fixture, session=OwningSession("tile-nextest"),
+                                         since=fixture.clock.now() - 1300)
+                readings[self.provide(fixture, tile, ALLOWED_HOST)] = ALLOWED_HOST
+                self.assertIsInstance(fixture.connect(tile).replies()[-1], wire.PlacementWait)
+                worker = fixture.server.host_targets[("mac", "mac")]
+                assert isinstance(worker, ManualEvidenceWorker)
+                for _probe in range(15):
+                    # Each Mac probe takes four seconds, so three probes outlast one reading.
+                    fixture.clock.advance(4)
+                    for key, eligibility in readings.items():
+                        fixture.provider_evidence[key] = placement.FreshHostEvidence(
+                            key, fixture.clock.now(), "host-generation-a", eligibility)
+                    _ = worker.probe_next()
+                    _ = fixture.run_pass()
+                self.assertEqual(self.assigned(fixture, *older, tile), [tile.episode])
 
 
 class PassGapTests(unittest.TestCase):

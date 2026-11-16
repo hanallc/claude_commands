@@ -20,7 +20,7 @@ from scripts.production import change_review, change_routing, staff, update_regi
 from scripts.production.production_doc import Production, read_production
 from scripts.production.issues import frontmatter
 from scripts.production.change_routing import UnavailableProduction
-from scripts.review_links import change_page
+from scripts.review_links import change_page, console, page_frame
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
 from scripts.statusline import rebuild_row
 
@@ -90,6 +90,22 @@ def page_at(root: Path, path: str) -> ReviewBrowser:
             return ReviewBrowser(token, initial, "questions")
         case _:
             raise ValueError("type must be changes or questions")
+
+
+def waiting_changes(request: console.NewsRequest) -> frozenset[str]:
+    """Name the changes that wait for the user, for the console's new mark."""
+    return frozenset(item.key for item in request.shared(console_reviews).changes if item.waiting)
+
+
+def waiting_questions(request: console.NewsRequest) -> frozenset[str]:
+    """Name the questions that wait for the user, for the console's new mark."""
+    return frozenset(item.key for item in request.shared(console_reviews).questions)
+
+
+def console_reviews(root: Path) -> PreparedReviews:
+    """Read the change lists and questions once for the console's news request."""
+    token, initial = browser_manifest(change_page.console_folder(root))
+    return prepare(ReviewBrowser(token, initial), change_page.DeliveryStatus(root))
 
 
 def rebuilds_at(root: Path, path: str) -> None:
@@ -209,22 +225,25 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
     page, row = change.page, change.row
     shown = change_review.display_id(row, change.tab)
     anomaly = f"<p>{html.escape(change.anomaly)}</p>" if change.anomaly else ""
+    attributes = (f'hidden data-type="changes" data-key="{html.escape(change.key)}" '
+                  + f'data-shown="{html.escape(shown)}" data-tab="{html.escape(change.tab)}" '
+                  + f'data-pending="{str(change.waiting).lower()}"')
     if isinstance(page, UnavailableProduction):
-        return f'''<section hidden data-type="changes" data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
-<h1>{html.escape(row.get('Change', ''))}</h1>
-<h2>Proof</h2>{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
+        content = f'''<h1>{html.escape(row.get('Change', ''))}</h1>
+<h2>Proof</h2>{change_page.check_html(row.get(change_review.CHECK, ''))}
 {anomaly}{change_page.question_html(change.question)}<p>{html.escape(page.reason)}</p>
-{change_page.change_details(row, shown)}</section>'''
-    form = change_page.answer_form(page, change_page.AnswerNotice(row["#"]), feedback_rows).replace(
-        '<form method="post">', f'<form method="post" action="{change_page.PAGE_NAME}">') if change.waiting else ""
-    text = change_page.answer_status(row.get("Verdict", ""), change.slots)
-    saved = f'<p>{html.escape(text)}</p>' if text else ""
-    return f'''<section hidden data-type="changes" data-key="{html.escape(change.key)}" data-shown="{html.escape(shown)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
-<h1>{html.escape(row.get('Change', ''))}</h1>
+{change_page.change_details(row, shown)}'''
+    else:
+        form = change_page.answer_form(page, change_page.AnswerNotice(row["#"]), feedback_rows).replace(
+            '<form method="post">', f'<form method="post" action="{change_page.PAGE_NAME}">') if change.waiting else ""
+        text = change_page.answer_status(row.get("Verdict", ""), change.slots)
+        saved = f'<p>{html.escape(text)}</p>' if text else ""
+        content = f'''<h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
-{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
+{change_page.check_html(row.get(change_review.CHECK, ''))}
 {anomaly}{change_page.question_html(change.question)}{saved}<p role="status" data-save-state></p>{form}
-{change_page.change_details(row, shown)}</section>'''
+{change_page.change_details(row, shown)}'''
+    return f'<section {attributes}>' + change_page.change_content(row, content) + '</section>'
 
 
 # A question stored as one text marks its parts inline: numbered items, then "Choices:" and "Recommended:".
@@ -234,6 +253,9 @@ ITEM_MARKS = (re.compile(r"(?<![\w(])(\d+)\)\s"), re.compile(r"\((\d+)\)\s"), re
               re.compile(r"\(([a-z])\)\s"))
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
 BLANK_LINE = re.compile(r"\n\s*\n")
+CHOICE_LABEL_PATTERN = r'''(?:'[^'\n]+'|"[^"\n]+"|[^'"\n:.!?;]{1,60}?)(?:\s+\(recommended\))?:\s+'''
+CHOICE_LABEL = re.compile(CHOICE_LABEL_PATTERN, re.IGNORECASE)
+INLINE_CHOICE = re.compile(r"(?:^|(?<=[.!?;])\s+)" + CHOICE_LABEL_PATTERN, re.IGNORECASE)
 
 
 def split_at(text: str, mark: re.Pattern[str]) -> tuple[str, str]:
@@ -246,9 +268,12 @@ def numbered_run(text: str) -> tuple[str, list[str], str]:
 
     Return the text before the run, the items and the text after a blank line in the last item."""
     best: list[re.Match[str]] = []
+    code_blocks = list(page_frame.CODE_BLOCK.finditer(text))
     for style in ITEM_MARKS:
         run: list[re.Match[str]] = []
         for mark in style.finditer(text):
+            if any(block.start() <= mark.start() < block.end() for block in code_blocks):
+                continue
             value = mark[1]
             if not run and value in ("1", "a"):
                 run.append(mark)
@@ -260,21 +285,38 @@ def numbered_run(text: str) -> tuple[str, list[str], str]:
         return text, [], ""
     ends = [mark.start() for mark in best[1:]] + [len(text)]
     items = [text[mark.end():end].strip() for mark, end in zip(best, ends)]
-    last = BLANK_LINE.split(items[-1], maxsplit=1)
-    items[-1] = last[0]
-    return text[:best[0].start()].strip(), [item.rstrip(";,").strip() for item in items], last[1] if len(last) > 1 else ""
+    last = items[-1]
+    blocks = list(page_frame.CODE_BLOCK.finditer(last))
+    trailing = ""
+    for blank in BLANK_LINE.finditer(last):
+        if any(block.start() <= blank.start() < block.end()
+               or block.start() == blank.end() and last[:blank.start()].rstrip().endswith(":") for block in blocks):
+            continue
+        items[-1], trailing = last[:blank.start()], last[blank.end():]
+        break
+    return text[:best[0].start()].strip(), [item.rstrip(";,").strip() for item in items], trailing
 
 
 def item_html(entry: str) -> str:
-    """Show an item that is one backtick span, such as a command, as a code block."""
-    whole = change_page.CODE_SPAN.fullmatch(entry.strip())
+    """Show a code block alone or after an item's text that ends with a colon."""
+    whole = page_frame.CODE_BLOCK.fullmatch(entry.strip())
     if whole is not None:
-        return f"<pre><code>{html.escape(whole.group(1))}</code></pre>"
+        return page_frame.code_block_html(whole)
+    for block in page_frame.CODE_BLOCK.finditer(entry):
+        before, after = entry[:block.start()].rstrip(), entry[block.end():].strip()
+        if before.endswith(":"):
+            return item_html(before) + item_html(block[0]) + (item_html(after) if after else "")
     return "<br>".join(change_page.inline_html(line) for line in entry.splitlines())
 
 
 def item_list(items: list[str]) -> str:
-    return '<h2>Items</h2><ol class="question-items">' + "".join(f"<li>{item_html(entry)}</li>" for entry in items) + "</ol>"
+    entries: list[str] = []
+    for entry in items:
+        if entries and entries[-1].rstrip().endswith(":") and page_frame.CODE_BLOCK.fullmatch(entry.strip()) is not None:
+            entries[-1] += "\n" + entry
+        else:
+            entries.append(entry)
+    return '<h2>Items</h2><ol class="question-items">' + "".join(f"<li>{item_html(entry)}</li>" for entry in entries) + "</ol>"
 
 
 def choice_list(choices: list[str]) -> str:
@@ -291,42 +333,88 @@ def followup_sections(item: update_registration.OutstandingItem) -> str:
                    for each in item.get("followups", []))
 
 
-def text_sections(text: str) -> tuple[str, str]:
-    """Show a question stored as one text in sections: the text, its items, its choices and the recommendation."""
+def question_text(item: update_registration.OutstandingItem) -> tuple[str, str]:
+    """Separate the question sentence from its context without repeating the title."""
+    text = item.get("reviewed", item.get("question", item["text"])).strip()
+    if "reviewed" in item:
+        title, _, context = text.partition("\n")
+        if "?" in title:
+            return title.strip(), context.strip()
+        first = SENTENCE_END.split(title, maxsplit=1)
+        return first[0], "\n\n".join(part for part in (*first[1:], context.strip()) if part)
+    question = SENTENCE_END.split(text[:text.index("?") + 1])[-1] if "?" in text else ""
+    if question:
+        before, _, after = text.partition(question)
+        return question.strip(), (before.strip() + "\n\n" + after.strip()).strip()
+    title, _, context = text.partition("\n")
+    first = SENTENCE_END.split(title, maxsplit=1)
+    return first[0], "\n\n".join(part for part in (*first[1:], context.strip()) if part)
+
+
+def question_paragraphs(text: str) -> str:
+    """Keep paragraphs and list lines separate; split sentences in text stored on one line."""
+    paragraphs = BLANK_LINE.split(text.strip()) if "\n" in text else SENTENCE_END.split(text.strip())
+    return "".join(change_page.review_text_html(paragraph, inline=True) for paragraph in paragraphs if paragraph)
+
+
+def reviewed_choices(text: str) -> tuple[str, list[str]]:
+    """Recognize a final group of labeled choice paragraphs after the context."""
+    paragraphs = BLANK_LINE.split(text)
+    start = len(paragraphs)
+    while start and CHOICE_LABEL.match(paragraphs[start - 1]) is not None:
+        start -= 1
+    choices = paragraphs[start:]
+    if len(choices) < 2 or any("\n" in choice for choice in choices):
+        return text, []
+    return "\n\n".join(paragraphs[:start]), choices
+
+
+def text_sections(text: str, *, reviewed: bool = False) -> tuple[str, str]:
+    """Show context, items, choices and the recommendation as separate sections."""
     rest, recommend = split_at(text, RECOMMEND_MARK)
     lead, choice_text = split_at(rest, CHOICES_MARK)
+    paragraphs: list[str] = []
+    if reviewed and not choice_text:
+        lead, paragraphs = reviewed_choices(lead)
     lead, items, trailing = numbered_run(lead)
     if items and "\n" not in text:
         # In one paragraph, the text after the last item's first sentence is not part of that item.
         last = SENTENCE_END.split(items[-1], maxsplit=1)
         items[-1], trailing = last[0], last[1] if len(last) > 1 else ""
     choice_lead, choices, choice_trailing = numbered_run(choice_text)
-    if not items and not choice_text and not recommend:
-        return change_page.review_text_html(text, inline=True), ""
-    body = change_page.review_text_html(lead, inline=True) if lead else ""
-    body += (item_list(items) if items else "") + (change_page.review_text_html(trailing, inline=True) if trailing else "")
-    # Only numbered choices become buttons; other choice text shows as text.
+    choices = paragraphs or choices
     if choice_text and not choices:
-        body += '<h2>Choices</h2>' + change_page.review_text_html(choice_text, inline=True)
+        marks = list(INLINE_CHOICE.finditer(choice_text))
+        if len(marks) >= 2 and marks[0].start() == 0:
+            choices = [choice_text[mark.start():end].strip().rstrip(";")
+                       for mark, end in zip(marks, [mark.start() for mark in marks[1:]] + [len(choice_text)])]
+            choice_lead = ""
+    body = question_paragraphs(lead) if lead else ""
+    body += (item_list(items) if items else "") + (question_paragraphs(trailing) if trailing else "")
+    # Unmarked choices stay text because their boundaries do not identify safe answer values.
+    if choice_text and not choices:
+        lines = [part.strip() for part in re.split(r";\s+|\n+|(?<=[.!?])\s+", choice_text) if part.strip()]
+        body += '<h2>Choices</h2><ul>' + "".join(f'<li>{change_page.inline_html(line)}</li>' for line in lines) + '</ul>'
     elif choice_lead:
-        body += '<h2>Choices</h2>' + change_page.review_text_html(choice_lead, inline=True)
+        body += '<h2>Choices</h2>' + question_paragraphs(choice_lead)
     if choice_trailing:
-        body += change_page.review_text_html(choice_trailing, inline=True)
+        body += question_paragraphs(choice_trailing)
     if recommend:
-        body += '<h2>Recommended</h2>' + change_page.review_text_html(recommend, inline=True)
+        body += '<h2>Recommended</h2>' + question_paragraphs(recommend)
     return body, choice_list(choices)
 
 
 def question_parts(item: update_registration.OutstandingItem) -> tuple[str, str]:
     """Return the question body and its choice buttons; a question stored as one text shows in sections."""
     if "parts" not in item:
-        body, choices = text_sections(item.get("question", ""))
+        _, context = question_text(item)
+        body, choices = text_sections(context, reviewed="reviewed" in item)
         return body + followup_sections(item), choices
     parts = item["parts"]
     same = parts["ask"].strip().rstrip("?.").casefold() == item["text"].strip().rstrip("?.").casefold()
     body = "" if same else f'<p class="question-ask">{change_page.inline_html(parts["ask"])}</p>'
     if parts["context"].strip():
-        body += '<h2>Context</h2>' + change_page.review_text_html(parts["context"], inline=True)
+        body += '<h2>Context</h2>' + question_paragraphs(parts["context"])
     if parts["items"]:
         body += item_list(parts["items"])
     if parts["recommend"].strip():
@@ -340,6 +428,7 @@ ANSWER_HELP = "A choice fills this. Edit it or write your own. Nothing sends unt
 def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback_rows: int) -> str:
     key = html.escape(question.key)
     body, choices = question_parts(question.record.item)
+    title = question.record.item["text"] if "parts" in question.record.item else question_text(question.record.item)[0]
     owned = question.tab != "unrouted"
     # Without an owner there is no form, so the choices show as a list the user cannot pick.
     shown_choices = "" if owned else choices.replace('<input type="radio"', '<input type="radio" disabled')
@@ -353,24 +442,27 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
 <button name="outcome" value="followup" disabled data-needs-text>Followup</button>
 <button name="outcome" value="skip">Skip</button></div></form>'''
     return f'''<section hidden data-type="questions" data-key="{key}" data-tab="{html.escape(question.tab)}" data-pending="true">
-<h1>{html.escape(question.record.item["text"])}</h1>
+<h1>{html.escape(title)}</h1>
 {body}{shown_choices}
 <p>Asked by {html.escape(question.asker)}</p><p role="status" data-save-state></p>{form}</section>'''
 
 
+@dataclass(frozen=True)
+class Rebuild:
+    """One change that a machine's rebuild applies: its time, its owner and its reason."""
+
+    at: str
+    owner: str
+    reason: str
+
+
 def rebuild_list(answer: rebuild_row.RebuildAnswer, changes: dict[str, tuple[rebuild_row.Change, ...]],
                  record: staff.StaffSnapshot) -> str:
-    """Show each machine the status line names, then one entry per change: who made it, when and why."""
+    """Show each machine the status line names, then its changes under each owner and each shown time."""
     def who(session: str) -> str:
         member = record.by_member_reference(session) if session else None
         return (f"{member.name} ({member.kind})" if member is not None
                 else f"Unknown session: {session}" if session else "Unknown session")
-
-    def entry(session: str, at: str, reason: str) -> tuple[datetime, str]:
-        moment = datetime.fromisoformat(at)
-        return moment, (f'<li><dl><dt>Who</dt><dd>{html.escape(who(session))}</dd>'
-                        + f'<dt>When</dt><dd><time datetime="{html.escape(at, quote=True)}">{shown_time(moment)}</time></dd>'
-                        + f'<dt>Reason</dt><dd>{html.escape(reason)}</dd></dl></li>')
 
     names = ["the Mac" if machine == "mac" else machine for machine in answer.machines]
     blocks: list[str] = []
@@ -378,28 +470,45 @@ def rebuild_list(answer: rebuild_row.RebuildAnswer, changes: dict[str, tuple[reb
         records = next((machine.records for machine in answer.needs if machine.newest["machine"] == machine_name), ())
         filed = {item["nixos_commit"] for item in records}
         # A filed need and its commit are one change; the need gives the requester and the reason.
-        items = [entry(item["requested_by"] or item["concerns"], item["created_at"], item["reason"]) for item in records]
-        items += [entry(change.session, change.at, change.reason)
+        items = [Rebuild(item["created_at"], who(item["requested_by"] or item["concerns"]), item["reason"])
+                 for item in records]
+        items += [Rebuild(change.at, who(change.session), change.reason)
                   for change in changes.get(machine_name, ()) if change.commit not in filed]
-        listed = ('<ul>' + ''.join(shown for _, shown in sorted(items, key=lambda item: item[0], reverse=True)) + '</ul>'
-                  if items else '<p>The change list is not available yet.</p>')
+        listed = owner_groups(items) if items else '<p>The change list is not available yet.</p>'
         blocks.append(f'<article data-machine="{html.escape(machine_name)}"><h2>Rebuild {html.escape(name)}</h2>{listed}</article>')
     label = f"Rebuild {' and '.join(names)}" if names else ""
     return (f'<div data-rebuilds data-count="{len(names)}" data-label="{html.escape(label, quote=True)}">'
             + (''.join(blocks) if blocks else '<p>No rebuilds needed.</p>') + '</div>')
 
 
-REBUILD_STYLE = """<style>[data-rebuilds] article+article{border-top:1px solid GrayText;margin-top:32px;padding-top:16px}
-[data-rebuilds] h2{margin-top:0}[data-rebuilds] ul{list-style:none;padding:0}[data-rebuilds] li+li{margin-top:16px}
-[data-rebuilds] dl{display:grid;grid-template-columns:5em minmax(0,1fr);column-gap:12px;row-gap:4px;margin:0;font-size:15px}
-[data-rebuilds] dt{color:GrayText}[data-rebuilds] dd{margin:0;min-width:0;overflow-wrap:anywhere}</style>"""
+def owner_groups(items: list[Rebuild]) -> str:
+    """Name each owner once, newest change first; under an owner, changes at one shown time share that time."""
+    owners: dict[str, dict[str, list[Rebuild]]] = {}
+    for item in sorted(items, key=lambda item: datetime.fromisoformat(item.at), reverse=True):
+        owners.setdefault(item.owner, {}).setdefault(shown_time(datetime.fromisoformat(item.at)), []).append(item)
+    return ''.join(
+        f'<div data-owner><h3>{html.escape(owner)}</h3><dl>'
+        + ''.join(f'<dt><time datetime="{html.escape(group[0].at, quote=True)}">{html.escape(shown)}</time></dt>'
+                  + ''.join(f'<dd>{html.escape(item.reason)}</dd>' for item in group)
+                  for shown, group in times.items())
+        + '</dl></div>' for owner, times in owners.items())
+
+
+# Machines sit side by side when the frame is wide; under each owner, a time is a column beside its reasons.
+REBUILD_STYLE = """<style>main{max-width:1124px}
+[data-rebuilds]{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:32px 48px;align-items:start}
+[data-rebuilds] h2{margin:8px 0 0}[data-rebuilds] h3{font-size:17px;line-height:1.3;margin:24px 0 8px}
+[data-rebuilds] dl{display:grid;grid-template-columns:max-content minmax(0,1fr);column-gap:16px;row-gap:4px;margin:0;font-size:15px}
+[data-rebuilds] dt{grid-column:1;color:light-dark(#5f5f5f,#b0b0b0)}[data-rebuilds] dd{grid-column:2;margin:0;min-width:0;overflow-wrap:anywhere}
+[data-rebuilds] dd+dt,[data-rebuilds] dd+dt+dd{padding-top:8px}
+@media (max-width:480px){[data-rebuilds] dl{display:block}[data-rebuilds] dd+dt{padding-top:12px}[data-rebuilds] dd+dt+dd{padding-top:0}}</style>"""
 
 
 def render_rebuilds() -> bytes:
-    """Render the status line's rebuild answer for the console's rebuild link and overlay."""
+    """Render the status line's rebuild answer for the console's rebuild link and Rebuilds page."""
     config = conf.path("statusline")
     rebuilds = rebuild_list(rebuild_row.read(config), rebuild_row.read_changes(config), staff.snapshot())
-    return change_page.document(REBUILD_STYLE + '<h1>Rebuilds needed</h1>' + rebuilds, "Rebuilds needed")
+    return change_page.document(REBUILD_STYLE + '<h1 class="page-title">Rebuilds needed</h1>' + rebuilds, "Rebuilds needed")
 
 
 def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
@@ -418,8 +527,8 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
                      + f'data-count="{count}" value="{html.escape(name)}">{html.escape(label)} ({count})</option>')
     cards = (''.join(section(item, feedback_rows) for item in prepared.changes) if kind == "changes"
              else ''.join(question_section(item, browser, feedback_rows) for item in prepared.questions))
-    content = (PAGE_STYLE + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}">'
-               + f'<h1>{change_page.TITLES[kind]}</h1>'
+    content = (PAGE_STYLE + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}" data-script="{SCRIPT_VERSION}">'
+               + f'<h1 class="page-title">{change_page.TITLES[kind]}</h1>'
                + '<div data-showrunner-filter><label for="review-showrunner">Showrunner:</label>'
                + '<select id="review-showrunner" aria-label="Showrunner"><option value="">All</option></select></div>'
                + '<template data-runner-options>' + ''.join(menus) + '</template>'
@@ -572,7 +681,8 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
     return change_page.MessageDelivery(page, page.rows[0], (recipient,), message, attempt, (question.owner,)), answer
 
 
-SCRIPT = r'''
+SCRIPT = page_frame.MOTION_SCRIPT + r'''
+const motion=createCardMotion();
 let content=document.querySelector('[data-review-content]');
 let rows,runnerOptions,showrunners,runnerMenu,next,empty,saveNotice;
 let shownPage=content.outerHTML, heldPage=null, newestRequest=0, activeLoads=0, activeSaves=0, refreshTimer;
@@ -600,6 +710,7 @@ function bindPage(){
 }
 function waiting(){return rows.filter(r=>(tab==='' || r.dataset.tab===tab) && r.dataset.pending==='true');}
 function show(){
+ const previous=current;
  const place=new URLSearchParams(location.hash.slice(1));
  const requested=place.has('row') ? place.get('row') : initial;
  tab=place.get('showrunner') || '';
@@ -614,10 +725,15 @@ function show(){
  empty.hidden=current!==null;
  empty.textContent=kind==='questions' ? (pending.length ? 'No questions for this showrunner.' : 'No questions to answer.') :
   (pending.length ? 'No changes for this showrunner.' : 'No changes to review.');
- rows.forEach(r=>r.hidden=r!==current);
+ const target=current, cards=rows;
+ const navigationTarget=target?.querySelector('form:not([hidden]) .answer-actions') || content.querySelector('.navigation');
+ const reveal=()=>{cards.forEach(row=>row.hidden=row!==target);navigationTarget.append(next);};
+ if(previous && previous.dataset.key!==target?.dataset.key && previous.isConnected)
+  void motion.switchCard(previous,target,reveal);
+ else if(previous!==target){motion.finish();reveal();}
+ else if(!previous) reveal();
  // A question has its own Skip, which the server keeps.
  next.hidden=kind==='questions' || !waiting().some(r=>r!==current);
- (current?.querySelector('form:not([hidden]) .answer-actions') || content.querySelector('.navigation')).append(next);
  if(current) remembered.set(tab,current.dataset.key);
  // The default place, All with no card, keeps a plain URL.
  history.replaceState(null,'',tab || current ? '#'+new URLSearchParams({showrunner:tab,row:current?.dataset.key || ''}) : location.pathname+location.search);
@@ -639,9 +755,10 @@ async function save(row,form,outcome){
  form.querySelectorAll('button[name=outcome]').forEach(b=>b.setAttribute('aria-pressed',String(b.value===outcome)));
  state.textContent='Saving'; row.dataset.saveState='saving';
  const moveOn=notice=>{
-  row.dataset.pending='false';form.hidden=true;
+  row.dataset.pending='false';
   if(current===row && (tab==='' || tab===row.dataset.tab) && navigation===position){advance(row);saveNotice.textContent=notice;saveNotice.hidden=false;}
   else show();
+  motion.settled().then(()=>{if(row.dataset.pending==='false') form.hidden=true;});
  };
  // Works and Does not work show the next change at once; a failed save puts the change back.
  const early=kind!=='questions' && (outcome==='works' || outcome==='not works');
@@ -669,7 +786,7 @@ async function save(row,form,outcome){
  }finally{
   form.dataset.saving='false';activeSaves--;
   // Read after the save, so an older response cannot restore the saved item.
-  if(saved){heldPage=null;newestRequest++;refreshPage(true);}
+  if(saved){await motion.settled();heldPage=null;newestRequest++;refreshPage(true);}
   else applyHeldPage();
  }
 }
@@ -681,6 +798,8 @@ function applyHeldPage(){
  if(!heldPage || activeSaves || [...content.querySelectorAll('textarea,input[type=text]')].some(field=>field.value!=='' && !field.closest('form')?.hidden)) return;
  const fresh=heldPage;heldPage=null;
  if(fresh.outerHTML===shownPage) return;
+ // A page from an older server script cannot bind the new rows, so it loads again.
+ if(fresh.dataset.script!==content.dataset.script){location.reload();return;}
  const opened=new Set([...content.querySelectorAll('details[open]')].map(detailKey));
  const left=scrollX,top=scrollY,focused=document.activeElement;
  const controlId=focused===runnerMenu ? focused.id : '';
@@ -692,6 +811,7 @@ function applyHeldPage(){
  const keep=candidates.find(row=>row.dataset.key===current?.dataset.key);
  const chosen=keep || following.map(key=>candidates.find(row=>row.dataset.key===key)).find(Boolean) || candidates[0];
  const notice=saveNotice.hidden ? '' : saveNotice.textContent;
+ motion.finish();
  shownPage=fresh.outerHTML;content.replaceWith(fresh);content=fresh;bindPage();
  content.querySelectorAll('details').forEach(detail=>detail.open=opened.has(detailKey(detail)));
  history.replaceState(null,'','#'+new URLSearchParams({showrunner:tab,row:chosen?.dataset.key || ''}));
@@ -727,3 +847,5 @@ window.addEventListener('message',event=>{if(event.source===parent && event.orig
 window.addEventListener('hashchange',()=>{if(location.hash!==shownHash){navigation++;clearNotice();}show();});
 bindPage();show();scheduleRefresh();
 '''
+SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE
+                                          + page_frame.COPY_SCRIPT + page_frame.COPY_STYLE + page_frame.COPY_BUTTON)

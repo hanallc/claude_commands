@@ -21,6 +21,12 @@ class PhaseWait(NamedTuple):
     reason: str
     started: float
     holder: NamedWaitHolder | UnnamedWaitHolder
+    wait_kind: str
+    resource_kind: str
+    resource: str
+    pass_instance_id: str
+    owner_session: str
+    wait_attribution: Mapping[str, object]
 
 
 def _wait_holder(value: object) -> NamedWaitHolder | UnnamedWaitHolder:
@@ -51,11 +57,17 @@ def phase_waits(events: Sequence[Mapping[str, object]], instance_id: str) -> lis
             waits[wait_id] = {**waits[wait_id], "holder": event.get("holder")}
         elif kind == "pass_finished":
             waits = {key: wait for key, wait in waits.items()
-                     if wait.get("pass_instance_id") != event.get("pass_instance_id")}
+                     if not event.get("pass_instance_id") or wait.get("pass_instance_id") != event.get("pass_instance_id")}
     result: list[PhaseWait] = []
     for wait in waits.values():
         started = wait.get("wait_started_epoch", wait.get("timestamp_epoch"))
         if isinstance(started, int | float):
+            holder = wait.get("holder")
+            holder_fields = cast(dict[str, object], holder) if isinstance(holder, dict) else {}
+            attribution = wait.get("wait_attribution")
             result.append(PhaseWait(str(wait.get("wait_reason") or wait.get("wait_kind") or "wait"),
-                                    float(started), _wait_holder(wait.get("holder"))))
+                                    float(started), _wait_holder(holder_fields), str(wait.get("wait_kind", "")),
+                                    str(holder_fields.get("resource_kind", "")), str(holder_fields.get("resource", "")),
+                                    str(wait.get("pass_instance_id", "")), str(wait.get("owner_session", "")),
+                                    cast(dict[str, object], attribution) if isinstance(attribution, dict) else {}))
     return result

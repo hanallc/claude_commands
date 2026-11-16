@@ -433,7 +433,7 @@ Approved setup uses the existing encrypted admin session and progress display.
 It reserves compute and storage costs before requesting resources.
 Setup permission does not enable command permission.
 The separate stack creates the instance, retained data volume, launch template, security group, private control bucket, and scaler policy.
-The root disk retains its data after termination.
+The root disk keeps its data while the box is stopped. AWS deletes the root disk when the box is terminated.
 The Spot request is persistent and uses interruption behavior `stop`.
 Setup confirms the instance, request, and stopped state before registering the lifecycle controller.
 Repeat approved setup after a timeout to read the existing stack and confirm its stop.

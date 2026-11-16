@@ -358,7 +358,7 @@ class ControlTests(CostFixture):
         # One refused request came before one launch of the fast type at home; the other region has no requests.
         # No bill covers the runs yet; the other region has no runs of its own.
         self.assertEqual(block(fast), [
-            [home, '0.2500', '6.0', '1', '0.0250', 'bill', 'due', 'bill', 'due', '0'],
+            [home, '0.2500', '6.0', '1', '0.0250', 'bill', 'due', '1', 'bill', 'due', '0'],
             [other, '0.2500', '6.0', '1', 'elsewhere', '0.0250', 'no', 'runs', 'no', 'runs', '0']])
         self.assertEqual([cells[:5] for cells in block(slow)], [[home, '0.2500', '12.0', '1', '0.0500'],
                                                                [other, '0.2500', '12.0', '1', 'elsewhere']])
@@ -376,6 +376,31 @@ class ControlTests(CostFixture):
         launched = lines.index('Launched merge gate boxes')
         self.assertEqual(lines[refused + 2].split(), [fast, '1', '0'])
         self.assertEqual(lines[launched + 2].split(), [fast, '1', '0'])
+
+    def test_paid_run_cell_counts_the_runs_whose_bill_is_still_due(self) -> None:
+        self.assertEqual(self.snapshot(), 0)
+        billed_size, due_size = self.standard
+        home = self.regions[0]
+        today = datetime.fromtimestamp(self.clock.now, UTC).date()
+        midnight = int(datetime(today.year, today.month, today.day, tzinfo=UTC).timestamp())
+        events: list[dict[str, object]] = []
+        # The billed type runs yesterday and today; the other type runs only today. Only yesterday has a bill.
+        for attempt, size, finished in (('old', billed_size, midnight - 3600), ('new', billed_size, midnight + 60),
+                                        ('due', due_size, midnight + 60)):
+            row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': 'merge-gate', 'region': home}
+            events.extend(({**row, 'time': finished - 360, 'result': 'launched'},
+                           {**row, 'time': finished, 'result': 'finished', 'gate_s': 300}))
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
+        yesterday = midnight - 86400
+        bill = ledger.ChargeRead((today - timedelta(days=1)).isoformat(), midnight + 3600, yesterday, midnight,
+                                 Decimal(1), Decimal(0), Decimal(0), (ledger.UsageTypeCost(
+                                     ledger.REGION_USAGE_PREFIXES[home][-1] + '-SpotUsage:' + billed_size,
+                                     Decimal('0.05'), Decimal('0.1'), 'Hrs'),))
+        with mock.patch.object(ledger.CostLedger, 'read_bills', return_value=(bill,)):
+            tables = spot_table.spot_tables(self.state, max(int(self.clock.now), midnight + 120), settings_path=self.settings)
+        cells = {table.title: table.rows[0][6] for table in tables.runs[0].tables}
+        self.assertEqual(cells[billed_size], '0.0500 (1 bill due)')
+        self.assertEqual(cells[due_size], '1 bill due')
 
     def test_each_scope_counts_only_its_run_kinds(self) -> None:
         self.assertEqual(self.snapshot(), 0)
@@ -454,10 +479,17 @@ class ControlTests(CostFixture):
                          ['Standard cost per merge gate (USD; estimate)', 'GPU cost per merge gate (USD; estimate)'])
         self.assertEqual([table['not_sold'] for table in data['prices']], [[], []])
         self.assertEqual([table['region_axis'] for table in (*data['prices'], *data['quotas'])], ['rows'] * 4)
-        self.assertEqual(data['regions'], list(self.regions))
+        self.assertEqual(data['regions'], sorted(self.regions, key=aws_page.region_filter_key))
         self.assertEqual([line['text'] for line in data['snapshot']], list(tables.snapshot_lines))
         summaries = [entry['estimates'][0]['summary'] if entry['estimates'] else entry['no_estimate'] for entry in data['runs']]
         self.assertEqual(summaries, [costs.summary for costs in tables.runs])
+
+    def test_region_filter_sorts_each_group_alphabetically_in_the_group_order(self) -> None:
+        regions = ('us-west-2', 'sa-east-1', 'me-south-1', 'ap-south-1', 'eu-west-1', 'ca-central-1',
+                   'us-east-2', 'ap-northeast-1', 'eu-central-1', 'af-south-1')
+        self.assertEqual(sorted(regions, key=aws_page.region_filter_key),
+                         ['us-east-2', 'us-west-2', 'eu-central-1', 'eu-west-1', 'ap-northeast-1', 'ap-south-1',
+                          'ca-central-1', 'sa-east-1', 'af-south-1', 'me-south-1'])
 
     def test_page_data_cannot_end_its_script_element(self) -> None:
         folder = self.root / 'page'
@@ -483,8 +515,8 @@ class ControlTests(CostFixture):
         tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
         paid = {costs.scope.name: next(table for table in costs.tables if table.title == size).rows[0][5:] for costs in tables.runs}
         self.assertEqual(paid, {'merge-gate': ('bill due', 'no runs', '0'),
-                                'targeted-test': ('bill due', 'bill due', '0'),
-                                'both': ('bill due', 'bill due', '0')})
+                                'targeted-test': ('bill due', '1 bill due', '0'),
+                                'both': ('bill due', '1 bill due', '0')})
         self.assertEqual([(costs.cheapest.size if costs.cheapest else None) for costs in tables.runs],
                          [self.standard[0], None, self.standard[0]])
 

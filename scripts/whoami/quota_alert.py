@@ -740,8 +740,14 @@ def _fyi(producer: str, active: bool) -> Callable[[], list[str]]:
     return arguments
 
 
-def _start_no_worker_mode(state: State) -> bool:
-    """Enter the mode on the role map host only; workers run there."""
+def _start_no_worker_mode(state: State, readiness: agent_accounts.CodexWorkReadiness,
+                          destination: accounts.PickedAccount | accounts.NoAccountWithRoom) -> bool:
+    """Enter only when the workers account is exhausted and no other account can work."""
+    from scripts.accounts import accounts
+
+    if (not isinstance(readiness, agent_accounts.CodexWorkExhausted)
+            or not isinstance(destination, accounts.NoAccountWithRoom)):
+        return False
     if socket.gethostname().split(".", 1)[0] != role_map.ROLE_MAP_HOST:
         return False
     state["no_worker_mode"] = True
@@ -813,29 +819,16 @@ def state_file() -> Generator[State]:
 
 
 
-def ahead(resets: str | None, *, now: datetime) -> bool:
-    """Whether a note's reset is still to come."""
-    reset = reset_time(resets)
-    return isinstance(reset, note_file.KnownReset) and reset.value > now
-
-
-def remaining(note: AgentNote) -> float | None:
-    try:
-        return float(note.get("weekly_remaining_usage") or "")
-    except ValueError:
-        return None
-
-
 def percent(note: AgentNote) -> str:
-    value = remaining(note)
+    value = note_file.remaining(note)
     return "unknown" if value is None else f"{value:g}%"
 
 
 def low(notes: list[AgentNote], threshold: float, *, now: datetime) -> list[AgentNote]:
     """Notes in use at or under the threshold in a window that has not reset."""
     return [note for note in notes
-            if note_file.in_use(note) and ahead(note.get("resets"), now=now)
-            and (value := remaining(note)) is not None and value <= threshold]
+            if note_file.in_use(note) and note_file.ahead(note.get("resets"), now=now)
+            and (value := note_file.remaining(note)) is not None and value <= threshold]
 
 
 def recovered(name: str, notes: list[AgentNote], threshold: float,
@@ -879,14 +872,14 @@ def recovered(name: str, notes: list[AgentNote], threshold: float,
                 pass
         if note is None:
             return False
-        value = remaining(note)
+        value = note_file.remaining(note)
         if value is not None and math.isfinite(value) and value > threshold:
             return True
         reset = reset_time(note.get("resets"))
         return isinstance(reset, note_file.KnownReset) and reset.value <= now
     if note is None or not note_file.in_use(note):
         return True
-    value = remaining(note)
+    value = note_file.remaining(note)
     return value is not None and value > threshold
 
 
@@ -1263,7 +1256,7 @@ def codex_next_move_push(note: AgentNote, fallback: CodexQuotaFallback = NO_CODE
     from scripts.notify.push_texts import render
     from scripts.accounts import accounts
 
-    left = remaining(note)
+    left = note_file.remaining(note)
     if left is None or not 0 < left <= 2:
         return QuotaStatusNote(note.label, "no Codex account-move reminder outside 0–2% weekly usage left")
     at = now or datetime.now(timezone.utc)
@@ -1847,7 +1840,6 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
     if isinstance(credits, agent_accounts.CreditsOn) and isinstance(chosen, accounts.PickedAccount):
         chosen = _zero_destination(label, now, prefer_weekly_room=True, included_only=True)
     stamp = now.isoformat(timespec="seconds")
-    move_failed = False
     if (isinstance(chosen, accounts.PickedAccount) and not workers_queued
             and isinstance(state["fallback"], NoCodexQuotaFallback)):
         move_id = uuid.uuid4().hex
@@ -1868,7 +1860,6 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
                 moves.append_move(moves.FailedMove(kind="failed", at=stamp, tool="codex", subject="workers",
                     move_id=move_id, reason=str(error)))
             values["reason"] = f"Workers could not move to {chosen.label} because {_worker_move_failure_cause(str(error))}."
-            move_failed = True
             if isinstance(credits, agent_accounts.CreditsOn):
                 chosen = accounts.NoAccountWithRoom(accounts.NoResetKnown(), chosen.reasons)
         else:
@@ -1901,9 +1892,7 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
     values["until"] = reset_display(refusals.KnownReset(until))
     note = CodexQuotaAccountNote(note_file.note_path(label), {"weekly_remaining_usage": "0", "resets": reset.isoformat()}, label)
     switched = switch_to_claude(state, note, stamp, owner, hold=CreditsOffHold(until))
-    # The workers stay on an account that cannot pay. An account with room takes them in the restore pass.
-    if move_failed or isinstance(chosen, accounts.NoAccountWithRoom):
-        _ = _start_no_worker_mode(state)
+    _ = _start_no_worker_mode(state, codex_can_work(report, now, credits), chosen)
     if isinstance(switched, CodexWorkSwitchFailed):
         values["outcome"] = "work could not move"
         values["fallback"] = (f"The switch to Claude failed because {_work_routing_failure_cause(switched.cause)}. "
@@ -2125,7 +2114,7 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
                     if isinstance(reset, note_file.KnownReset):
                         episodes[name]["weekly_reset"] = reset.value.isoformat()
             episode = episodes[name]
-            if note.tool == "codex" and remaining(note) == 0:
+            if note.tool == "codex" and note_file.remaining(note) == 0:
                 episode["reached_zero"] = True
             if episode.get("push") == "due":
                 push = (claude_next_move_push(note, selection) if note.tool == "claude"
@@ -2333,6 +2322,8 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                      and not isinstance(readings.workers, NoWorkersHome)
                      and selected.home == readings.workers.home)
         if owns_role and not isinstance(readings.workers, NoWorkersHome):
+            readiness = codex_can_work(selected_codex_report(readings, now), now,
+                                       agent_accounts.codex_credits_setting(readings.workers.label))
             entries = moves.read_moves()
             if (isinstance(reset, refusals.KnownReset) and (pending_head
                     or isinstance(window, refusals.KnownWindow) and window.name == "five_hour"
@@ -2351,6 +2342,8 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
             elif pending_head:
                 return RoutedRefusal([f"workers next entry is pending; {name} refusal recorded without a fallback move"], outcome)
             else:
+                if isinstance(readiness, CodexWorkAvailable):
+                    return RoutedRefusal([f"{name} refused work; its allowance or paid credits can still serve workers. Nothing switched to Claude."], outcome)
                 chosen = accounts.pick("codex", now, exclude=frozenset({readings.workers.label}), keep=accounts.NoKeep())
                 if isinstance(chosen, accounts.PickedAccount):
                     move_id = uuid.uuid4().hex
@@ -2382,7 +2375,7 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                             move_id=uuid.uuid4().hex, earliest_reset=chosen.earliest_reset.at.isoformat()
                             if isinstance(chosen.earliest_reset, accounts.EarliestReset) else ""))
                     no_room = accounts.no_room_line("codex", chosen)
-                    if _start_no_worker_mode(state):
+                    if _start_no_worker_mode(state, readiness, chosen):
                         outcome = NO_WORKER_MODE_STARTED
         if pending_head and not transition_line:
             return RoutedRefusal([f"workers next entry is pending; {name} refusal recorded without a fallback move"], outcome)

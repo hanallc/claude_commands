@@ -312,6 +312,19 @@ class LedgerTestCase(unittest.TestCase):
         return [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_ledger.__file__)), *arguments[:prefix],
                 "--repo", str(self.repo), *arguments[prefix:]]
 
+    def forget_tips(self) -> None:
+        """Drop the process tip cache, as a new ledger process starts with none."""
+        read_tip = cast(Callable[[Path, str], style_ledger.RepositoryTip], vars(style_ledger)["_read_tip"])
+        cast(Callable[[], None], getattr(read_tip, "cache_clear"))()
+
+    @contextmanager
+    def tip_builds(self) -> Generator[mock.MagicMock]:
+        """Spy on each tip build. Drop the process tip cache first, so the spy sees each read."""
+        self.forget_tips()
+        builder = cast(Callable[[Path, str], style_ledger.RepositoryTip], vars(style_ledger)["_tip"])
+        with mock.patch.object(style_ledger, "_tip", wraps=builder) as builds:
+            yield builds
+
     def cli(self, *arguments: str, success: bool = True) -> subprocess.CompletedProcess[str]:
         # main owns and closes its ledger each call; only argparse's argv is process-global.
         # Rule paths are patched in setUp. The footprint caches contain immutable text only.

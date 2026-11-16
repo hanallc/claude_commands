@@ -78,6 +78,7 @@ class BerthBoardTests(unittest.TestCase):
                 self.assertIsInstance(result, Board)
                 if isinstance(result, Board):
                     self.assertEqual(result.reservations(), ())
+                    self.assertTrue(result.configured)
 
     def test_unconfigured_exit_four_is_an_available_empty_board(self) -> None:
         value = envelope(populated=False)
@@ -87,6 +88,7 @@ class BerthBoardTests(unittest.TestCase):
         self.assertIsInstance(result, Board)
         if isinstance(result, Board):
             self.assertEqual(result.reservations(), ())
+            self.assertFalse(result.configured)
 
     def test_unreadable_ledger_exit_four_is_unavailable_with_its_diagnostic(self) -> None:
         value = envelope(populated=False)

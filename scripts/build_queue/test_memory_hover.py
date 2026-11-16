@@ -24,7 +24,7 @@ RAM_FIXTURE: dict[str, object] = {
     "safety_target_bytes": 4 * GIB, "swap_target_bytes": 2 * GIB, "build_target_bytes": 6 * GIB,
     "room_bytes": 18 * GIB, "shortfall_bytes": 0, "safety_covered_bytes": 4 * GIB, "swap_covered_bytes": 2 * GIB,
     "build_covered_bytes": 6 * GIB, "safety_missing_bytes": 0, "swap_missing_bytes": 0, "build_missing_bytes": 0,
-    "builds_bytes": 5 * GIB, "queued_builds_bytes": 3 * GIB, "rust_analyzer_bytes": GIB, "sccache_bytes": 512 * MIB,
+    "queued_builds_bytes": 3 * GIB, "build_tools_bytes": 2 * GIB, "rust_analyzer_bytes": GIB, "sccache_bytes": 512 * MIB,
     "other_build_tools_bytes": 512 * MIB, "ci_bytes": 2 * GIB, "agents_bytes": 8 * GIB, "desktop_bytes": 3 * GIB,
     "desktop_protection_bytes": 2 * GIB, "other_programs_bytes": 4 * GIB, "smaller_programs_bytes": GIB,
     "smaller_program_count": 5,
@@ -45,7 +45,7 @@ class MemoryHoverTests(unittest.TestCase):
     def test_builds_page_has_no_navigation_or_framing_restriction(self) -> None:
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         self.assertIn("<title>Builds</title>", page)
-        self.assertIn("<h1>Builds</h1>", page)
+        self.assertIn('<h1 class="page-title">Builds</h1>', page)
         elements: list[tuple[str, dict[str, str]]] = []
 
         def collect(tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -133,6 +133,24 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(row[1].get("class"), "done")
                 self.assertEqual(row[1].text, expected)
                 self.assertEqual(root.findtext(".//tr[@data-tip='row:1']/td[@class='done']"), "—")
+
+    def test_a_token_wait_is_the_stage_of_its_running_row(self) -> None:
+        row = memory_tests.ProgressKeepAsideTests.reservation("nextest", need=4 * GIB)
+        memory = admission_records.MeasuredMemory(9 * GIB, anonymous=admission_records.AnonymousRunUse(GIB))
+        counter = progress.parse_progress("Finished `test` profile in 29s\n" + progress.token_wait_line(4) + "\n")
+        adjusted = gate.progress_memory(row, memory, gate.AttributedStepUse(memory.anonymous, True), counter,
+            progress.NoMatchingProfile("no profile"), admission_policy_fixture())
+        inputs = memory_tests.ProgressKeepAsideTests.inputs((row,), (adjusted,))
+        stage = memory_feed.row_progress(inputs.running)
+        self.assertEqual(stage, {"kind": "TokenWaitProgress", "stage": "waiting for jobserver tokens", "tokens": 4})
+        data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "waiters": [],
+                "walk": [{"name": "hana nextest", "queued": True, "progress": stage}]}
+        rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+        root = ElementTree.fromstring(f"<root>{rendered}</root>")
+        cells = root.find(".//tr[@data-tip='row:0']")
+        assert cells is not None
+        self.assertEqual(cells[0].text, "waiting for jobserver tokens")
+        self.assertEqual(cells[1].text, "—")
 
     def test_the_mac_memory_note_follows_all_tooltip_fields(self) -> None:
         data = {"read_at": 200, "walk": [{"kind": "mac-build", "machine": "mac", "name": "hana nextest",
@@ -544,28 +562,34 @@ function fitLabels() {}
         self.assertIn("1.0", str(result))
         self.assertIn("20.0 GiB", str(result))
 
-    def test_the_bar_and_legend_show_the_twelve_blocks_in_order(self) -> None:
+    def test_the_bar_and_legend_show_the_thirteen_blocks_in_order(self) -> None:
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
-        order = ["builds", "ci", "reserved", "room", "safety", "desktop", "swap", "agents", "programs", "kernel",
+        # The user, 11-15: the cap terms come first and end at the cap mark; build tools sit after it.
+        order = ["queued", "ci", "reserved", "room", "tools", "safety", "desktop", "swap", "agents", "programs", "kernel",
                  "cache", "unattributed"]
         bar = page[page.index('<div class="bar">'):page.index('<div class="scale')]
         legend = page[page.index('<div class="legend">'):page.index('<details class="room-explainer">')]
-        self.assertEqual([part.split('"')[0] for part in bar.split('id="s-')[1:]], order)
+        self.assertEqual([part.split('"')[0] for part in bar.split('id="s-')[1:]], [*order[:4], "over", *order[4:]])
         self.assertEqual([part.split('"')[0] for part in legend.split('data-tip="')[1:]],
                          [*order, "cap", "shortfall", "waiting", "progress"])
         self.assertIn('<details class="legend-box" open>', page)
-        for removed in ('id="mark"', 'id="marklabel"', "updateNativeOwnerTips", "pageOwnerTipFields", "nativeTipText"):
+        # The user, 11-15: the memory bar keeps its cap marker.
+        self.assertIn('<div class="mark" id="mark" data-tip="cap">', bar)
+        self.assertIn('id="marklabel" data-tip="cap"', page)
+        for removed in ("updateNativeOwnerTips", "pageOwnerTipFields", "nativeTipText"):
             self.assertNotIn(removed, page)
 
     def test_each_ram_block_tooltip_uses_the_design_text(self) -> None:
-        keys = ["builds", "ci", "reserved", "room", "safety", "desktop", "swap", "agents", "programs", "kernel",
+        keys = ["queued", "ci", "tools", "reserved", "room", "safety", "desktop", "swap", "agents", "programs", "kernel",
                 "cache", "unattributed", "cap", "budget"]
         tips = cast(list[list[str]], self.page_expression(
             "[" + ", ".join(f"tipText('{key}', data)" for key in keys) + "]", {"cap": 40, "cap_text": "fixture"}))
         self.assertEqual(dict(zip(keys, tips, strict=True)), {
-            "builds": ["Builds and tools · 5.0 GiB", "RAM that builds and build tools use now.\n" +
-                       "Queued builds: 3.0 GiB.\nrust-analyzer: 1.0 GiB.\nsccache: 0.5 GiB.\nOther build tools: 0.5 GiB."],
-            "ci": ["hana CI · 2.0 GiB", "RAM used by hana CI programs.\nFile cache and kernel memory appear separately."],
+            "queued": ["Queued builds · 3.0 GiB", "RAM that builds in the queue use now.\nThe queue cap counts it."],
+            "ci": ["hana CI · 2.0 GiB",
+                   "RAM used by hana CI programs.\nThe queue cap counts it.\nFile cache and kernel memory appear separately."],
+            "tools": ["Build tools · 2.0 GiB", "RAM that build tools and builds outside the queue use now.\n" +
+                      "The queue cap does not count it.\nrust-analyzer: 1.0 GiB.\nsccache: 0.5 GiB.\nOther build tools: 0.5 GiB."],
             "reserved": ["Reserved RAM · 6.0 GiB",
                          "RAM the queue holds for running builds until they reach their expected peak.\n" +
                          "Reservation target: 6.0 GiB."],
@@ -592,7 +616,7 @@ function fitLabels() {}
                              "Kernel memory with no counter, such as driver memory: 1.5 GiB.\n" +
                              "Memory with no program name: 0.5 GiB."],
             "cap": ["Queue cap · 40.0 GiB", "Limit for queued builds and hana CI.\nQueued use counted: 3.0 GiB.\n" +
-                    "CI use counted: 2.0 GiB.\nReservations count toward this limit."],
+                    "CI use counted: 2.0 GiB.\nQueued builds, hana CI, reserved RAM and the next step room add to the cap."],
             "budget": ["RAM budget · 64.0 GiB", "Blocks divide this machine's usable RAM.\n" +
                        "Available RAM includes cache Linux expects to reclaim.\nReservations use available RAM."],
         })
@@ -606,7 +630,7 @@ function fitLabels() {}
                "kernel_bytes": {"kind": "ReadingUnavailable", "reason": "meminfo is missing"},
                "kernel_no_counter_bytes": 0}
         tips = cast(list[list[str]], self.page_expression(
-            "[tipText('shortfall', data), tipText('reserved', data), tipText('kernel', data), tipText('builds', data)," +
+            "[tipText('shortfall', data), tipText('reserved', data), tipText('kernel', data), tipText('tools', data)," +
             " ramAmount(0), tipText('unattributed', data)]", {"ram": ram}))
         self.assertEqual(tips[0], ["Shortfall · 3.0 GiB",
                                    "Swap reserve missing: 1.0 GiB.\nBuild reservation missing: 6.0 GiB."])
@@ -615,15 +639,20 @@ function fitLabels() {}
                                    "Reservation target: 6.0 GiB.\nMissing RAM: 6.0 GiB."])
         self.assertEqual(tips[2], ["Kernel, measured · unavailable",
                                    "The latest reading is unavailable.\nThis amount is unknown."])
-        self.assertEqual(tips[3][1], "RAM that builds and build tools use now.\nQueued builds: 3.0 GiB.\nsccache: <0.1 GiB.\nOther build tools: 0.5 GiB.")
+        self.assertEqual(tips[3][1], "RAM that build tools and builds outside the queue use now.\n" +
+                         "The queue cap does not count it.\nsccache: <0.1 GiB.\nOther build tools: 0.5 GiB.")
         self.assertEqual(tips[5], ["Not attributed · 2.0 GiB",
                                    "RAM that the readings do not explain.\nNo program name is available for this amount."])
         self.assertEqual(tips[4], "0.0 GiB")
-        empty = {**RAM_FIXTURE, "builds_bytes": 0, "queued_builds_bytes": 0, "rust_analyzer_bytes": 0,
+        empty = {**RAM_FIXTURE, "build_tools_bytes": 0, "rust_analyzer_bytes": 0,
                  "sccache_bytes": 0, "other_build_tools_bytes": 0}
-        self.assertEqual(self.page_expression("tipText('builds', data)", {"ram": empty}),
-                         ["Builds and tools · 0.0 GiB",
-                          "RAM that builds and build tools use now.\nNo build program RAM is recorded."])
+        self.assertEqual(self.page_expression("tipText('tools', data)", {"ram": empty}),
+                         ["Build tools · 0.0 GiB", "RAM that build tools and builds outside the queue use now.\n" +
+                          "The queue cap does not count it.\nNo build tool RAM is recorded."])
+        # Queued use 3 GiB and CI use 2 GiB over a 4 GiB cap: 1 GiB is above the cap.
+        self.assertEqual(self.page_expression("[tipText('shortfall', data), capTermWidths(data)]", {"ram": ram, "cap": 4}),
+                         [["Shortfall · 3.0 GiB", "Swap reserve missing: 1.0 GiB.\nBuild reservation missing: 6.0 GiB.\n" +
+                           "Queued and CI use above the cap: 1.0 GiB."], {"queued": 3 * GIB, "ci": GIB, "over": GIB}])
 
     def test_the_status_line_names_the_one_reason_a_start_waits(self) -> None:
         for code, ram, expected in (

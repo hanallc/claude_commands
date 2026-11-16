@@ -19,6 +19,7 @@ Two policies in the cargo layer that every session's builds go through. First, e
 - `nextest_physical_cores [sysfs_root]` sets `LINT_PHYSICAL_CORES` once per shell. On Linux it counts distinct `physical_package_id:core_id` pairs under `${1:-/sys/devices/system/cpu}/cpu[0-9]*/topology/`; on darwin it reads `sysctl -n hw.physicalcpu`. A value that is not a positive integer leaves it empty.
 - `nextest_logical_cores` sets `LINT_LOGICAL_CORES` once from `getconf _NPROCESSORS_ONLN`, with the same rule.
 - `nextest_width_arm EPOCH` sets `LINT_TEST_WIDTH_ARM` to `physical` when `(EPOCH / 6000) % 2 == 0`, else `logical`. `trial` mode passes `${EPOCHSECONDS:-$(date +%s)}`.
+- `require_nextest` runs `cargo nextest --version`. On a failure it prints `cargo nextest is required`, then the first error line when there is one, such as a Mac cargo gate refusal. It exits 2.
 - `run_nextest` runs `require_nextest`, waits out any build hold (`build_hold_wait_local`), then picks the width and runs `cargo nextest run --test-threads <N> "$@"`. It adds no flag when `NEXTEST_TEST_THREADS` is set, when an argument before `--` is `--test-threads`, `--test-threads=*`, `--jobs`, `--jobs=*`, `-j` or `-j*`, or when the core count is unreadable. Arguments after `--` belong to the test binaries and never suppress the width. The exit status passes through unchanged.
 
 ### Jobserver tokens (`scripts/lint/nextest_tokens.py`)
@@ -28,7 +29,7 @@ On natedev, compiles and test threads share one jobserver pool, `/dev/steve`. Ea
 1. `run_nextest` calls `nextest_token_pool` in `physical` and `logical` mode. It sets `LINT_NEXTEST_POOL` to the path in `CARGO_MAKEFLAGS` `--jobserver-auth=fifo:PATH` when that path is a readable and writable character device or FIFO. Otherwise the pool is empty.
 2. After the memory gate admits the step, `run_step_attempt` runs `nextest_tokens.py --pool P --width-file F --reservation R -- cargo nextest run --test-threads W ...` inside the step's scope.
 3. The holder builds first with `--no-run` and the selection arguments before `--`. The compile takes tokens as cargo always does, and the step holds no test token while it compiles.
-4. It takes `test_token_floor` tokens (`config/build_admission.conf`, 4), and waits for them with `nextest: waiting for K more jobserver tokens`. Then it takes free tokens without a wait, up to W.
+4. It takes `test_token_floor` tokens (`config/build_admission.conf`, 4), and waits for them with `nextest: waiting for K more jobserver tokens`. `progress_profile.token_wait_line` defines that line; the Builds page shows the wait as the stage `waiting for jobserver tokens`. Then it takes free tokens without a wait, up to W.
 5. It writes the token count N to F. When N is not W, it sets the reservation's `test_threads` to N (`admission_client.width`).
 6. It prints `nextest: N of W test threads; load <one-minute load> on <cpu count> CPUs (<host>); one jobserver token for each thread`, then runs the tests with `--test-threads N`.
 7. Every token goes back when the tests end, on any exit or signal. TERM, INT and HUP go on to the child, and the holder exits 128 + the signal. steve also takes back the tokens of a process that dies.

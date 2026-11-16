@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, redirect_stderr
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar, cast, override
@@ -566,6 +567,27 @@ class CodexRerunFixture(CodexZeroEpisodeFixture):
         _ = self.enterContext(mock.patch.object(quota_alert, "edit_registry", side_effect=self.edit_assignments))
         _ = self.enterContext(mock.patch.object(accounts, "check_codex_target", return_value=
             accounts.SelectableCodexAccount(self.root / ".codex3", "account3@example.invalid", "codex3")))
+
+    @override
+    def note(self, number: int, setting: str = "off", *, left: int = 0) -> quota_alert.AgentNote:
+        """Keep credits off so zero allowance tests a real fallback and its recovery."""
+        return super().note(number, setting, left=left)
+
+    @override
+    def readings(self, now: datetime, *, selected: int = 1, left: int = 0,
+                 balance: str | None = "6370", spare_left: int = 0,
+                 spare_accounts: tuple[tuple[int, int, str], ...] = (),
+                 spare_five_hour: tuple[tuple[int, int], ...] = ()) -> quota_alert.CodexAlertPassReadings:
+        """Give recovery passes a current window after the original fixture window expires."""
+        readings = super().readings(now, selected=selected, left=left, balance=balance, spare_left=spare_left,
+                                    spare_accounts=spare_accounts, spare_five_hour=spare_five_hour)
+        checked_homes: list[quota_alert.CodexHomeReading] = []
+        for checked in readings.checked_homes:
+            quotas = [replace(window, resets_at=now + timedelta(days=2))
+                      if window.resets_at is not None and window.resets_at <= now else window
+                      for window in checked.report.quotas]
+            checked_homes.append(replace(checked, report=replace(checked.report, quotas=quotas)))
+        return replace(readings, checked_homes=tuple(checked_homes))
 
     def read_assignments(self) -> dict[str, str]:
         return cast(dict[str, str], json.loads((self.root / "rerun-assignments.json").read_text()))
