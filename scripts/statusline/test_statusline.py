@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 from scripts.accounts import new_account
 from scripts.hooks import showrunner_footer
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
-from scripts.production import session_labels, staff
+from scripts.production import footer_counts, investigation, session_labels, staff
 from scripts.rebuild import need
 from scripts.agents import remote
 from scripts.statusline import adhoc_items, assignment, counts_row, rebuild_row
@@ -983,6 +983,80 @@ class CountsRowTests(unittest.TestCase):
         _ = question.write_text(question.read_text().replace("status: open", "status: closed"))
         self.assertFalse(any(line.startswith("For you:") for line in self.lines(producer.current_session)))
 
+    def file_investigation(self, owner: staff.StaffRow, *, answered: bool = False,
+                           read: bool = False) -> investigation.Investigation:
+        """File a record in this test's private state folder."""
+        with patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.home / ".local/state/showrunner")}):
+            item = investigation.file(owner.id, "Find the cause", "What caused this?")
+            if answered or read:
+                item = investigation.answer(owner.id, item.id, "The cause is known.")
+            if read:
+                item = investigation.mark_read(owner.id, item.id)
+            return item
+
+    def test_investigations_count_the_showrunner_and_its_units_only(self) -> None:
+        doc = self.home / "docs/plans/show-production.md"
+        child = replace(OWNER, id=staff.StaffId("8895d721-c144-467b-a5c6-3de002566337"), name="child",
+                        parent=staff.ReportsTo(OWNER.id), current_session=staff.StaffId("8895d721-c144-467b-a5c6-3de002566337"))
+        child_unit = replace(UNIT, id=staff.StaffId("41ea8ccc-37c1-4bb2-9fde-cddaf15d8fb7"), name="child-unit",
+                             parent=staff.ReportsTo(child.id), current_session=staff.StaffId("41ea8ccc-37c1-4bb2-9fde-cddaf15d8fb7"))
+        _ = (self.home / ".local/state/staff/staff.json").write_text(staff_text(
+            replace(OWNER, doc=staff.LiveDoc(remote.local_machine(), doc)), UNIT, PRODUCER, child, child_unit, WORKER))
+        _ = self.file_investigation(OWNER, answered=True)
+        _ = self.file_investigation(UNIT)
+        _ = self.file_investigation(UNIT, read=True)
+        for excluded in (PRODUCER, child, child_unit, WORKER):
+            _ = self.file_investigation(excluded)
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                self.assertEqual(self.lines(shell=shell)[-1], "For you: 2 investigations")
+                self.assertEqual(self.lines(UNIT.current_session, shell=shell)[-1], "For you: 1 investigation")
+                self.assertEqual(self.lines(PRODUCER.current_session, shell=shell)[-1], "For you: 1 investigation")
+        sources = self.cache.read_text().splitlines()[2:]
+        state = self.home / ".local/state/showrunner"
+        self.assertIn(str(state / OWNER.id / "investigations"), sources)
+        self.assertIn(str(state / UNIT.id / "investigations"), sources)
+        self.assertNotIn(str(state / child.id / "investigations"), sources)
+
+    def test_investigation_cache_refreshes_for_new_records_and_read_answers(self) -> None:
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                self.assertFalse(any(line.startswith("For you:") for line in self.lines(shell=shell)))
+                item = self.file_investigation(OWNER)
+                self.assertEqual(self.lines(shell=shell)[-1], "For you: 1 investigation")
+                built = self.cache.stat().st_mtime_ns
+                self.assertEqual(self.lines(shell=shell)[-1], "For you: 1 investigation")
+                self.assertEqual(self.cache.stat().st_mtime_ns, built)
+                other = self.file_investigation(OWNER, answered=True)
+                self.assertEqual(self.lines(shell=shell)[-1], "For you: 2 investigations")
+                with patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.home / ".local/state/showrunner")}):
+                    _ = investigation.answer(OWNER.id, item.id, "The cause is known.")
+                    _ = investigation.mark_read(OWNER.id, item.id)
+                    self.assertEqual(self.lines(shell=shell)[-1], "For you: 1 investigation")
+                    _ = investigation.mark_read(OWNER.id, other.id)
+                self.assertFalse(any(line.startswith("For you:") for line in self.lines(shell=shell)))
+
+    def test_investigation_counts_follow_questions_in_the_line(self) -> None:
+        self.assertEqual(footer_counts.counts_line(footer_counts.FooterCounts(questions=1, investigations=2, changes=3)),
+                         "For you: 1 question, 2 investigations, 3 changes")
+        self.assertEqual(footer_counts.total([footer_counts.FooterCounts(investigations=1),
+                                             footer_counts.FooterCounts(investigations=2)]).investigations, 3)
+
+    def test_a_showrunner_without_a_document_counts_and_watches_its_investigations(self) -> None:
+        _ = (self.home / ".local/state/staff/staff.json").write_text(staff_text(OWNER, UNIT))
+        _ = self.file_investigation(UNIT)
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                self.assertFalse(any(line.startswith("For you:") for line in self.lines(shell=shell)))
+                item = self.file_investigation(OWNER)
+                self.assertEqual(self.lines(shell=shell)[-1], "For you: 1 investigation")
+                path = self.home / ".local/state/showrunner" / OWNER.id / "investigations"
+                sources = self.cache.read_text().splitlines()[2:]
+                self.assertIn(str(path), sources)
+                self.assertIn(str(path / f"{item.id}.md"), sources)
+                (path / f"{item.id}.md").unlink()
+
+
     def test_a_unit_session_shows_its_source_counts_and_refreshes_only_its_cache(self) -> None:
         unit = replace(UNIT, current_session=staff.StaffId("73073af3-56ea-48e9-8548-a39963c92e53"))
         other = replace(UNIT, id=staff.StaffId("c5214833-d70b-4058-983f-c851b92d0350"), name="other",
@@ -1522,7 +1596,7 @@ class CountsRowTests(unittest.TestCase):
                     cache = counts_row.write(instance)
                 line, due, *sources = cache.read_text(encoding="utf-8").splitlines()
                 self.assertEqual((line, due), ("", ""))
-                expected = {str(instance / "conf"), str(record)}
+                expected = {str(instance / "conf"), str(record), str(self.cache.parent.parent)}
                 if watched is not None:
                     expected.add(str(watched))
                 self.assertEqual(set(sources), expected)
