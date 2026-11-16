@@ -198,8 +198,11 @@ class MemoryFeedTests(unittest.TestCase):
         with mock.patch.object(admission_client, "view", return_value=reading):
             known = memory_feed.reading(holders=memory_feed.TokenHolders({pid: 6}))
         self.assertEqual(known["token_counts"], "")
-        self.assertEqual({row["pid"]: row["tokens"] for row in rows(known) if local(row)},
-                         {other: 6 if other == pid else 0 for other in pids})
+        self.assertEqual({row["pid"]: row["tokens"] for row in rows(known) if local(row) and "tokens" in row}, {pid: 6})
+        self.assertTrue(all("tokens" not in row for row in rows(known) if local(row) and row["pid"] != pid))
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            idle = memory_feed.reading(holders=memory_feed.TokenHolders({pid: 0}))
+        self.assertEqual({row["pid"]: row["tokens"] for row in rows(idle) if "tokens" in row}, {pid: 0})
         self.assertTrue(all("tokens" not in row for row in rows(known) if not local(row)))
 
     def test_the_feed_shows_why_token_counts_are_unknown_when_steve_refuses_a_dump(self) -> None:

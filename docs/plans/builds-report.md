@@ -1899,7 +1899,8 @@ As built:
 - The Running header shows "Tokens: N total, M free", or "Tokens: unavailable". Its hover says what a token is, that hana CI has its own pool, and the memory floor.
 - In the memory pause, a token wait stage reads "waiting for jobserver tokens (memory under 12 GiB)". A remote row keeps the plain stage.
 - The Running table has a Tokens column after Slot. Each `token_dump_seconds` (config, 10 s), the feed reads the newest steve dump from the journal, then runs `systemctl --no-ask-password reload steve` for the next one. Each holder pid counts for its nearest ancestor that is a local, non-CI run pid. A dump counts only when its holder lines add up to the taken tokens; an incomplete dump gives way to the one before it. The next request time starts after the request, so slow reads never shorten the interval.
-- Until natedev's polkit rule (nixos 2ed52e5) is live, the reload is refused. The column shows "—", and the header hover says "natedev does not yet let the feed ask steve which build holds each token." CI, Mac and AWS rows always show "—".
+- steve lists each connected process, holders of 0 included. A local step shows the sum of its lines, 0 included. A step with no line in the dump shows "—". CI, Mac and AWS rows always show "—".
+- The polkit rule (nixos 2ed52e5) is live, so the reload works. When a reload is refused, the column shows "—" and the header hover gives the reason.
 - Tests: `test_memory_feed` (pool, pause text, dump parse, ancestor count, refused reason), `test_memory_hover` (column and header), `memory_page_proof.mjs` (column values, pool line, no overflow).
 
 ### Cap bar — Running bars stop at the cap line · status: done
