@@ -75,6 +75,7 @@
 # UNIT_RUN_DIR, UNIT_SESSION_DIR or --session-dir enables saved results.
 # In that session, reuse a pass only when the tree and inputs still match.
 # Filtered runs have separate results. Failed tests always run again.
+# A run that a signal or a hold stop ends saves no pass.
 # Test keys include configured result variables and each --env value.
 # Tests use fixed terminal values from direct.conf on every target.
 # --no-cache ignores saved results. --target also ignores saved results.
@@ -101,6 +102,7 @@
 # In that session, reuse a pass or failure when the tree and inputs match.
 # A plain package lint result can answer another package in the workspace.
 # Do not save a result if edits change the tree after judgment.
+# Do not save a result from a run that a signal or a hold stop ends.
 # --no-cache ignores saved results.
 # End help.
 #
@@ -4043,8 +4045,27 @@ verify_cleanup() {
     [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
 }
 # EXIT alone would report success for a failed cargo run, so branch on the
-# status the trap receives; a lint failure record keeps it.
-trap 'EXIT_STATUS=$?; [[ ${EXIT_STATUS} -eq 0 ]] && verify_cleanup completed || verify_cleanup error; finish_verify_run "$EXIT_STATUS"; exit "${EXIT_STATUS}"' EXIT
+# status the trap receives; a lint failure record keeps it. $2 is the command
+# that ended the shell. An untrapped fatal signal, such as SIGPIPE after a
+# hold stop ends the run-log readers, runs this trap with the status of the
+# last command, often 0. Only an exit command completes a run, so any other
+# command records the run as interrupted (status 128: the signal is
+# unknown here) and writes no pass.
+verify_exit() {
+    EXIT_STATUS=$1
+    if (( EXIT_STATUS == 0 )) && [[ "$2" != exit && "$2" != "exit "* ]]; then
+        EXIT_STATUS=128
+        interrupt_hold_wait
+        verify_cleanup interrupted
+    elif (( EXIT_STATUS == 0 )); then
+        verify_cleanup completed
+    else
+        verify_cleanup error
+    fi
+    finish_verify_run "$EXIT_STATUS"
+    exit "$EXIT_STATUS"
+}
+trap 'verify_exit "$?" "$BASH_COMMAND"' EXIT
 verify_interrupted() {
     trap - EXIT
     # A process-group stop can deliver the same signal more than once.
@@ -4531,3 +4552,5 @@ clean_tree()
         exit 2
         ;;
 esac
+# The EXIT trap counts only an exit command as a finished run.
+exit
