@@ -673,7 +673,13 @@ A cell is `<billed>/<box> (<gap>)`, such as `9.2/8.8 (4%)`, with `over` when `ho
 A type and region without a bill read shows `not billed`. Only types with hours have a row.
 An unreadable cost ledger shows a note in place of the billed hours.
 
-The AWS prices page shows the same tables, published by `aws_page.publish`.
+The AWS page shows the same tables, published by `aws_page.publish`.
+The user renamed it from AWS prices to AWS on 2026-11-15, because it holds spend, prices and quotas.
+The published file stays `aws_prices.html`, so older links still open it.
+A Spend card at the top shows today, yesterday and the month to date, with the month forecast below them.
+`spend.read_spend` and `spend.month_spend` give these numbers; `/aws_spend` reads the same functions, so both show the same values.
+The day is the UTC day. The hourly AWS snapshot job publishes the page again, so the spend is current to the last hour.
+The Prices and Quotas sections follow the Spend card.
 The user asked for these page changes on 2026-11-14 through builds:
 1. A switch above the two price cards shows `Spot price` or `Cost per gate`; the user asked for it on 2026-11-15 through builds.
    `Cost per gate` shows a second switch, `Merge gates`, `Targeted runs` or `Both`, and it sets both cards.
