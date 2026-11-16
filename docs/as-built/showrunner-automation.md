@@ -762,11 +762,11 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `PlanSource` distinguishes absent, unavailable, readable empty, and readable populated plans.
     A failed fallback plan read retains its unavailable state.
     Without a fallback plan, the configured source remains unchanged.
-    `TaskAttempt` retains the phase ID, plan scope, title, instance, outcome, finish time, and recorded stop reason.
+    `TaskAttempt` retains the phase ID, plan scope, title, instance, outcome, and recorded stop reason.
     The reader does not convert a stopped attempt into an unstarted task.
   - **Unit rows:** Each title precedes a blank line and an `Item | Work | State` table.
     `display_cells.wrapped(..., keep=(0, 1, 2))` preserves each cell before `display_cells.escaped` escapes it.
-    Rows follow this order: Now, Also, Next, Later, Stopped, Done.
+    Rows follow this order: Now, Also, Next, Later, Stopped.
     Now names the current task and its recorded worker, director action, resource wait, or merge state.
     The open phase takes priority over merge tasks for Now.
     Each current task has one row with no equal states; `state_sentence` joins its actors' states with semicolons.
@@ -793,15 +793,15 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A matching finished activity produces a queue conflict instead of an unstarted claim.
     Missing next work uses `Not recorded` and `The director has not chosen the next task`.
     Only a readable plan with every phase done permits `Nothing queued; the plan is complete`.
-  - **Stopped history:** `past_tasks` retains one row per stopped task in the selected run.
-    A later completed attempt resolves only the same plan scope and phase ID.
-    Its Done row supplies the completion date in the production time zone.
-    An explicit title containing `the <unit> unit owns <id>` names the unit that finished the work.
-    Equal titles with different IDs do not prove a replacement.
+  - **Stopped history:** `past_tasks` retains one row per unresolved stopped task in the selected run.
+    A stopped attempt shows a Stopped row until a later completed attempt has the same plan scope and phase ID.
+    Then the board shows no row for that stopped attempt.
+    The board does not infer replacements from equal titles.
     A newer unfinished attempt remains current after an earlier completion.
     Unresolved attempts say `Stopped; reason not recorded` when the stop event supplies no reason.
   - **Merge and wait facts:** Each merge phase has its title in Work.
     State names the live merge rank, the production that merges it, or the short failure cause.
+    An open sent phase with a successful final merge state has no merge row and contributes no pending merge.
     `SentCommit` retains the checkpoint's `timestamp_epoch`, or `CheckpointTimeUnrecorded` when the event has no time.
     A checkpoint outside the line uses `Checkpoint <9 hash characters> at <time>; not in <production>'s merge line`.
     Without a production name, the text ends with `not in the merge line`.
@@ -830,6 +830,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Phase ETA text retains its first-task placement and the production time zone.
     Dependencies use local `origin/main` without a fetch.
     Queue and plan dependencies use `After <dep>; <short state>`.
+    Queued dependencies show their line position and carrier, when present, without text from earlier failed attempts.
     Queue and plan dependencies share `wait_state` and `dependency_state_text`, including main checks and recorded holds.
     Plan references to this unit lose their unit prefix before the completed-phase filter.
     A queue dependency on main uses `Ready`; a plan dependency on main has no wait.
