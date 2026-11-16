@@ -354,22 +354,35 @@ source() {
         self.memory_hook_observer = RELEASE_MEMORY_AT_WAIT
         previous = self.admission.server.handle_request
 
+        def record_event(request: wire.PlacementRequest | wire.ConsumePermission | wire.ExecutionReport | wire.ClaimFailure,
+                         replies: list[wire.Reply]) -> None:
+            targets = ({candidate.destination.target for candidate in request.constraints.candidates
+                        if candidate.destination.provider != "local"} if isinstance(request, wire.PlacementRequest)
+                       else {request.assignment.destination.target})
+            event = {"request": json.loads(wire.encode_request(request)),
+                     "replies": [json.loads(wire.encode_reply(reply)) for reply in replies],
+                     "claims": {target: [held.record for held in caller_provider_controls(self, self.admission).claims(target)]
+                                for target in targets}}
+            with (self.runner_state / "queue-events.jsonl").open("a") as output:
+                _ = output.write(json.dumps(event) + "\n")
+
         def observe(request: wire.Request,
                     connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
             replies = previous(request, connection)
-            if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ExecutionReport, wire.ClaimFailure)):
-                targets = ({candidate.destination.target for candidate in request.constraints.candidates
-                            if candidate.destination.provider != "local"} if isinstance(request, wire.PlacementRequest)
-                           else {request.assignment.destination.target})
-                event = {"request": json.loads(wire.encode_request(request)),
-                         "replies": [json.loads(wire.encode_reply(reply)) for reply in replies],
-                         "claims": {target: [held.record for held in caller_provider_controls(self, self.admission).claims(target)]
-                                    for target in targets}}
-                with (self.runner_state / "queue-events.jsonl").open("a") as output:
-                    _ = output.write(json.dumps(event) + "\n")
+            if isinstance(request, (wire.ConsumePermission, wire.ExecutionReport, wire.ClaimFailure)):
+                record_event(request, replies)
             return replies
 
         _ = self.enterContext(mock.patch.object(self.admission.server, "handle_request", side_effect=observe))
+        previous_reply = self.admission.server.reply_filter
+
+        def observe_reply(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, (wire.PlacementWait, wire.Assignment, wire.LocalPlacementGranted)):
+                episode = reply.episode if isinstance(reply, wire.PlacementWait) else reply.assignment.episode
+                record_event(self.admission.server.placement_requests[episode], [reply])
+            return previous_reply(reply)
+
+        _ = self.enterContext(mock.patch.object(self.admission.server, "reply_filter", side_effect=observe_reply))
 
     @contextmanager
     def spare_after_linux_refusal(self) -> Generator[None]:

@@ -38,7 +38,7 @@ from types import FrameType
 from typing import IO, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, override
 
 from scripts.lib import conf, process_group, scratch
-from scripts.build_queue import admission_records, app_gate
+from scripts.build_queue import admission_records
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -2483,6 +2483,8 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
             print("hana_shot: macOS ignores XDG_CONFIG_HOME; this Hana reads your real config", file=sys.stderr)
         app_pid = launch_folder / "app.pid"
         if sys.platform == "linux":
+            from scripts.build_queue import app_gate
+
             command = app_gate.command(executable, root, purpose.strip(), owner, app_pid, command)
         process: subprocess.Popen[bytes] | None = None
         try:
@@ -2637,6 +2639,8 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
         if recorded_scope.exists() or recorded_scope.with_suffix(".owner").exists():
             app_scope = recorded_scope
     if isinstance(app_scope, Path):
+        from scripts.build_queue import app_gate
+
         if shutdown_answered:
             deadline = time.monotonic() + shutdown_seconds
             while time.monotonic() < deadline:

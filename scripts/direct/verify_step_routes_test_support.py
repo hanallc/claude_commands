@@ -124,12 +124,15 @@ class VerifyStepRouteTools(VerifyMacOffloadFixture):
                     (placement.PrelaunchRefused, placement.AttemptDeclined)):
                 caller_provider_controls(self, admission).set_host(request.assignment.destination.target,
                     placement.TemporaryExclusion(request.outcome.reason))
-            replies = previous(request, connection)
-            if (isinstance(request, wire.PlacementRequest)
-                    and ("--fix" in request.constraints.command or self.environment.get("TEST_MAC_ALLOWED") == "0")):
-                for reply in replies:
-                    if not isinstance(reply, wire.PlacementWait):
-                        continue
+            return previous(request, connection)
+
+        _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=handle))
+        previous_reply = admission.server.reply_filter
+
+        def observe_reply(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.PlacementWait):
+                request = admission.server.placement_requests[reply.episode]
+                if "--fix" in request.constraints.command or self.environment.get("TEST_MAC_ALLOWED") == "0":
                     for candidate in reply.eligibility:
                         if (candidate.destination.provider == "local"
                                 and isinstance(candidate.eligibility, placement.TemporaryExclusion)
@@ -139,10 +142,10 @@ class VerifyStepRouteTools(VerifyMacOffloadFixture):
                                 self.assertEqual(self.local_runs(), [])
                             for holder in Path(self.environment["BUILD_HOLD_DIR"]).iterdir():
                                 holder.unlink()
-                            return replies
-            return replies
+                            break
+            return previous_reply(reply)
 
-        _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=handle))
+        _ = self.enterContext(mock.patch.object(admission.server, "reply_filter", side_effect=observe_reply))
 
     @override
     def build_fixture(self) -> None:

@@ -275,7 +275,7 @@ class LaunchRecordingTests(unittest.TestCase):
                 "import json, sys",
                 "before = list(sys.path)",
                 "import scripts.hana_shot.hana_shot",
-                "print(json.dumps({'before': before, 'after': sys.path, 'record': 'scripts.buildlog.record' in sys.modules}))",
+                "print(json.dumps({'before': before, 'after': sys.path, 'record': 'scripts.buildlog.record' in sys.modules, 'app_gate': 'scripts.build_queue.app_gate' in sys.modules}))",
             ))],
             cwd=Path(__file__).resolve().parents[2],
             env={name: value for name, value in os.environ.items() if name != "PYTHONPATH"},
@@ -284,7 +284,9 @@ class LaunchRecordingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         imports = cast(Record, json.loads(result.stdout))
         self.assertEqual(imports["after"], imports["before"])
-        self.assertIs(imports["record"], False)
+        for name in ("record", "app_gate"):
+            with self.subTest(module=name):
+                self.assertIs(imports[name], False)
 
     def test_signal_during_recording_shuts_down_the_fake_app_and_removes_launch_state(self) -> None:
         recorder_path = str(Path(record.__file__).resolve())
