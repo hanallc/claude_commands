@@ -937,9 +937,11 @@ class WaitOutput:
                        {"kind": "unit", "unit": holder.unit} if isinstance(holder, records.UnitHolder) else {"kind": "none"})
             self.on_event("holder " + json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
             self.last_holder = reply.snapshot.holder
-        if not first and reasons == self.last_reasons and reply.position == self.last_position:
+        if not first and reasons == self.last_reasons and reply.position >= self.last_position:
             return
-        self.last_reasons, self.last_position = reasons, reply.position
+        self.last_reasons = reasons
+        # Retain the lowest displayed place across reason changes in this wait.
+        self.last_position = reply.position if first else min(self.last_position, reply.position)
         snapshot = reply.snapshot
         prefix = ("waiting for memory since " + datetime.fromtimestamp(CLOCK.now(), user_zone()).strftime("%H:%M %Z")
                   if first else f"still waiting for memory ({int(CLOCK.monotonic() - self.started) // 60} min)")
