@@ -278,7 +278,9 @@ It deletes change images only when no To review row names them and their age exc
 The setting starts at 14 days and is read at each sweep.
 
 Questions read the canonical records through `update_registration.question_records_for_document`.
-A question belongs to the showrunner whose record owns it.
+A question belongs to the showrunner or producer whose fixed staff id owns it.
+A producer's question appears in its current staff name's filter with the same answer form.
+Producer questions use `<SHOWRUNNER_STATE_DIR>/<producer staff id>/questions` without a production document.
 A question without a staff owner appears under **Owner unavailable**.
 The reader also scans question folders under the showrunner state root when their owners leave staff.
 Owned cards show the title before the filed text, choices, and **Asked by <session>**.
@@ -326,6 +328,7 @@ It has no Ask showrunner to check or Ask a question controls.
 The typed `AnswerRelay` gives the same recipient decision as the CLI relay line.
 A unit relay receives the answer directly.
 A transferred unit's showrunner receives the answer with the unit's name.
+A producer receives its answer directly through its current session from the staff record at each send attempt.
 An answer without a relay goes to the question's showrunner.
 Each message starts with `From the user (via the review page): ` and names the question.
 
