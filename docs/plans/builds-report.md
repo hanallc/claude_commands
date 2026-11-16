@@ -1864,12 +1864,15 @@ As built:
 - A waiting build says its place in line, "It needs N GiB to start." and
   "Why it waits: …". `memory_feed.wait_why` writes one sentence for each
   wait reason, in the same form.
-- The waiting build that gets memory next shows the queue cap first. One
-  line says the cap is RAM less the programs that run now, the safety net
-  and the swap coming back. The table then goes "Queue cap", "− Builds",
-  "− Build reserved", "− Held for builds ahead in line" (only above 0) and
-  "= Free for builds". The rows add up. The cap and Builds count the build
-  tools, as the memory bar legend does. The user set what is inside the
-  cap on 2026-11-15; queue gave the words.
+- The waiting build that gets memory next shows a table: "Queue cap",
+  "− Builds", "− Build reserved", "− Held for builds ahead in line" (only
+  above 0) and "= Free for builds". Each row is the memory bar legend's
+  amount, so the rows add up and the cap and Builds count the build tools.
+  One note follows: "Build reserved is memory that running builds used at
+  their next points in earlier runs."
+- The queue cap hover says the cap is RAM less the programs that run now,
+  the safety net and the swap coming back, and that those three are
+  outside the cap. The user set what is inside the cap and where it is
+  explained on 2026-11-15; queue gave the words.
 - An unavailable cap shows "Queue cap unavailable: <reason>" and no table.
 - "can run on" and "Mac" are fields in the running and the waiting boxes.

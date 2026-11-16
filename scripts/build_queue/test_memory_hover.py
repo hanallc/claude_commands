@@ -470,11 +470,8 @@ class MemoryHoverTests(unittest.TestCase):
 
     def test_queue_notes_appear_once_in_their_row_tooltips(self) -> None:
         priority = "queue priority: port (the user's bump)"
-        cap_text = ("Queue cap: 7.5 GiB. It is RAM less the programs that run now, the 3.0 GiB safety net "
-                    + "and the 2.0 GiB of swap coming back. Those three are outside the cap.")
-        note = (f"{memory_feed.BUILD_RESERVED_NOTE} Other programs have 2.0 GiB in swap. "
-                + "It can come back into RAM when they run, so it is outside the cap.")
-        room: memory_feed.HeadRoom = {"cap_text": cap_text, "rows": [
+        note = memory_feed.BUILD_RESERVED_NOTE
+        room: memory_feed.HeadRoom = {"unavailable": "", "rows": [
             {"label": "Queue cap", "gib": 7.5}, {"label": "− Builds", "gib": 1.5},
             {"label": "− Build reserved", "gib": 6.0}, {"label": "= Free for builds", "gib": 0.0}], "note": note}
         data = {"read_at": 200, "waiters": [
@@ -491,7 +488,7 @@ class MemoryHoverTests(unittest.TestCase):
         expected = ("\n".join((
             "It is first in line.", "It needs 1.9 GiB to start.",
             "Why it waits: only 0.0 GiB is free for builds. It starts when 1.9 GiB is free.",
-            "can run on: natedev only", cap_text, "Queue cap: 7.5 GiB", "− Builds: 1.5 GiB",
+            "can run on: natedev only", "Queue cap: 7.5 GiB", "− Builds: 1.5 GiB",
             "− Build reserved: 6.0 GiB", "= Free for builds: 0.0 GiB", note, priority)),
             "It is number 2 in line.\nIt needs 2.0 GiB to start.\n"
             + "Why it waits: it is behind the first build in line, which gets memory first.\ncan run on: natedev or Mac",
@@ -504,7 +501,8 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertNotIn("Head", hover[1])
                 html = str(self.page_expression(f"tooltipHtml('wait:{index}', data)", data, walk=True))
                 self.assertEqual(html.count("= Free for builds"), int(index == 0))
-                self.assertEqual(html.count("Those three are outside the cap."), int(index == 0))
+                self.assertEqual(html.count(note), int(index == 0))
+                self.assertNotIn("outside the cap", html)
                 self.assertEqual(html.count(priority), int(index == 0))
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         for removed in ("priority-line", "head-line", "wait-reasons", "row-time", ".wait-reason"):
@@ -607,6 +605,15 @@ function fitLabels() {}
         self.assertIn("private memory.stat is missing", str(hover))
         self.assertNotIn("NaN", str(hover))
 
+    def test_the_queue_cap_tooltip_names_what_is_outside_the_cap(self) -> None:
+        # The user, 11-15: the queue cap explanation goes on the queue cap hover, not in the waiting build's box.
+        gib = 1024 ** 3
+        hover = cast(list[str], self.page_expression("tipText('cap', data)", {"cap": 15.0, "ram": {
+            "safety_target_bytes": 3 * gib, "swap_target_bytes": 11 * gib, "build_covered_bytes": 10 * gib,
+            "room_bytes": 0}}))
+        self.assertIn("It is RAM less the programs that run now, the 3.0 GiB safety net and the 11.0 GiB "
+                      + "of swap coming back. Those three are outside the cap.", hover[1])
+
     def test_missing_pressure_keeps_the_other_limit_readings(self) -> None:
         result = self.page_expression("[level(data), tipText('g-full', data), tipText('cap', data)]", {
             "psi":{"some":{"kind":"PressureNotRecorded", "reason":"private PSI is missing"}, "full":1},
@@ -684,7 +691,9 @@ function fitLabels() {}
             "unattributed": ["Not attributed · 2.0 GiB", "RAM that the readings do not explain.\n" +
                              "Kernel memory with no counter, such as driver memory: 1.5 GiB.\n" +
                              "Memory with no program name: 0.5 GiB."],
-            "cap": ["Queue cap · 31.0 GiB", "What builds may use.\nBuilds: 7.0 GiB.\n+ Build reserved: 6.0 GiB.\n" +
+            "cap": ["Queue cap · 31.0 GiB", "What builds may use.\nIt is RAM less the programs that run now, the 4.0 GiB "
+                    + "safety net and the 2.0 GiB of swap coming back. Those three are outside the cap.\n"
+                    + "Builds: 7.0 GiB.\n+ Build reserved: 6.0 GiB.\n" +
                     "+ Free: 18.0 GiB.\nA step starts when the memory it needs fits in free."],
             "budget": ["RAM · 64.0 GiB", "The bar divides this machine's RAM into builds, free RAM and everything else.\n" +
                        "Free RAM includes cache that Linux can take back."],

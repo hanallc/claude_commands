@@ -1408,26 +1408,19 @@ process.stdout.write(JSON.stringify({
                                         ("= Free for builds", 7.0 - ahead)])
                 self.assertEqual(rows[0][1] - sum(amount for _, amount in rows[1:-1]), rows[-1][1])
                 self.assertEqual(rows[0][1], memory_feed.gib(ram["cap_bytes"]))
-                self.assertEqual(shown["cap_text"], "Queue cap: 18.0 GiB. It is RAM less the programs that run now, "
-                                 + "the 3.0 GiB safety net and the 10.0 GiB of swap coming back. Those three are outside the cap.")
-                self.assertEqual(shown["note"], f"{memory_feed.BUILD_RESERVED_NOTE} "
-                                 + f"Other programs have 10.0 GiB in swap. {memory_feed.SWAP_RETURN_NOTE}")
+                self.assertEqual((shown["unavailable"], shown["note"]), ("", memory_feed.BUILD_RESERVED_NOTE))
         short = replace(room, available=16 * gib, signed_room=-5 * gib)
         check = admission_records.RoomCheck(16 * gib, -5 * gib, False, basis=admission_records.DoesNotFit())
         shown = memory_feed.head_room(check, short, memory_feed.ram_blocks(short, tools, 100.0, 1))
         self.assertEqual([(row["label"], row["gib"]) for row in shown["rows"]],
                          [("Queue cap", 6.0), ("− Builds", 3.0), ("− Build reserved", 3.0), ("= Free for builds", 0.0)])
-        self.assertIn("Running builds need 8.0 GiB reserved. Free RAM covers 3.0 GiB of it.", shown["note"])
-        no_swap = replace(room, agent_swap_demand=0, cap=27 * gib, signed_room=17 * gib)
-        check = admission_records.RoomCheck(16 * gib, 17 * gib, False, basis=admission_records.DoesNotFit())
-        no_swap_ram = memory_feed.ram_blocks(no_swap, tools, 100.0, 1)
-        self.assertEqual(memory_feed.head_room(check, no_swap, no_swap_ram)["note"], memory_feed.BUILD_RESERVED_NOTE)
+        self.assertEqual(shown["note"], memory_feed.BUILD_RESERVED_NOTE)
         run = admission_records.RunMemory("organon", gib, admission_records.RunUseUnavailable("no cgroup"))
         unavailable = memory_feed.head_room(check, replace(room, cap=admission_records.CapUnavailable((run,))), ram)
-        self.assertEqual((unavailable["cap_text"], unavailable["rows"]),
+        self.assertEqual((unavailable["unavailable"], unavailable["rows"]),
                          ("Queue cap unavailable: memory use is unavailable for organon: no cgroup", []))
         unread = memory_feed.head_room(check, admission_records.ReadingUnavailable("meminfo is missing"), ram)
-        self.assertEqual((unread["cap_text"], unread["rows"]), ("Queue cap unavailable: meminfo is missing", []))
+        self.assertEqual((unread["unavailable"], unread["rows"]), ("Queue cap unavailable: meminfo is missing", []))
 
     def test_only_a_head_that_memory_holds_shows_its_room_rows(self) -> None:
         gib = admission_records.GIB

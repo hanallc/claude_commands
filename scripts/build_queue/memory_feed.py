@@ -143,7 +143,6 @@ SWAP_OWNER_SLICES: dict[str, SwapCategory] = {"app-agents.slice": "agents", "ses
                                               "system.slice": "system", "hana.slice": "ci", "hana-ci.slice": "ci"}
 SwapPool = Literal["outside", "builds_ci"]
 SWAP_POOLS: tuple[SwapPool, ...] = ("outside", "builds_ci")
-SWAP_RETURN_NOTE = "It can come back into RAM when they run, so it is outside the cap."
 BUILD_RESERVED_NOTE = "Build reserved is memory that running builds used at their next points in earlier runs."
 BUILDS_CI_SLICES = frozenset({"builds.slice", "hana.slice", "hana-ci.slice"})
 SwapRowKind = Literal["owner", "ungrouped", "unattributed", "difference", "smaller", "total"]
@@ -334,7 +333,8 @@ class RoomRow(TypedDict):
 
 class HeadRoom(TypedDict):
     """The first waiting step's room inside the queue cap: the cap, less each term, then the memory free for builds."""
-    cap_text: str
+    # Why the queue cap is unavailable; empty when the rows show.
+    unavailable: str
     rows: list[RoomRow]
     note: str
 
@@ -441,29 +441,20 @@ def head_room(check: admission_records.RoomCheck,
             "It fits in the memory it already holds." if isinstance(check.basis, admission_records.WithinSlot) else
             "The user's admit does not count memory held for running builds." if override else "")
     if isinstance(room, admission_records.ReadingUnavailable):
-        return {"cap_text": f"Queue cap unavailable: {room.reason}", "rows": [], "note": basis}
+        return {"unavailable": f"Queue cap unavailable: {room.reason}", "rows": [], "note": basis}
     if isinstance(room.cap, admission_records.CapUnavailable):
-        return {"cap_text": f"Queue cap unavailable: {cap_unavailable_reason(room.cap)}", "rows": [], "note": basis}
+        return {"unavailable": f"Queue cap unavailable: {cap_unavailable_reason(room.cap)}", "rows": [], "note": basis}
     cap = ram["cap_bytes"]
     builds = ram["queued_builds_bytes"] + ram["build_tools_bytes"] + ram["ci_bytes"]
     reserved = 0 if override else ram["build_covered_bytes"]
     free = max(0, check.room)
     ahead = cap - builds - reserved - free
-    cap_text = (f"Queue cap: {gib(cap):.1f} GiB. It is RAM less the programs that run now, "
-                f"the {gib(room.safety):.1f} GiB safety net and the {gib(room.agent_swap_demand):.1f} GiB of swap coming back. "
-                "Those three are outside the cap.")
     rows: list[RoomRow] = [{"label": "Queue cap", "gib": gib(cap)}, {"label": "− Builds", "gib": gib(builds)},
                            {"label": "− Build reserved", "gib": gib(reserved)}]
     if ahead > 0:
         rows.append({"label": "− Held for builds ahead in line", "gib": gib(ahead)})
     rows.append({"label": "= Free for builds", "gib": gib(free)})
-    uncovered = (f"Running builds need {gib(ram['build_target_bytes']):.1f} GiB reserved. "
-                 + f"Free RAM covers {gib(ram['build_covered_bytes']):.1f} GiB of it."
-                 if not override and ram["build_target_bytes"] > ram["build_covered_bytes"] else "")
-    swap = (f"Other programs have {gib(room.agent_swap_demand):.1f} GiB in swap. {SWAP_RETURN_NOTE}"
-            if room.agent_swap_demand else "")
-    return {"cap_text": cap_text, "rows": rows,
-            "note": " ".join(filter(None, (BUILD_RESERVED_NOTE, uncovered, swap, basis)))}
+    return {"unavailable": "", "rows": rows, "note": " ".join(filter(None, (BUILD_RESERVED_NOTE, basis)))}
 
 
 def cap_unavailable_reason(cap: admission_records.CapUnavailable) -> str:

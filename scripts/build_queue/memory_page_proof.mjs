@@ -1015,7 +1015,7 @@ try {
                 return {removed:document.querySelector('#head-line,#admission-terms,#admission-check-rows')===null,
                   values:Object.fromEntries(rows.map(row=>[row.label.replace(/^[−=] /,''),f1(row.gib)+' GiB'])),
                   all:latest.waiters[0].head_room.rows.map(row=>row.gib),
-                  hover:tipText('wait:0',latest)[1],legend,reservedNote:document.querySelector('#reserved-note').textContent,
+                  hover:tipText('wait:0',latest)[1],capHover:tipText('cap',latest)[1],legend,reservedNote:document.querySelector('#reserved-note').textContent,
                   covered:document.querySelector('#v-reserved').textContent,
                   scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
               })()`);
@@ -1031,14 +1031,13 @@ try {
               const [cap,...terms]=headProof.all;
               assert.ok(Math.abs(cap-terms.slice(0,-1).reduce((a,b)=>a+b,0)-terms.at(-1))<0.3,
                 'The head rows do not add up: '+headProof.all.join(', '));
-              const safety=(readings[name].ram.safety_target_bytes/gib).toFixed(1), swap=(readings[name].ram.swap_target_bytes/gib).toFixed(1);
-              assert.ok(headProof.hover.includes(`the ${safety} GiB safety net and the ${swap} GiB of swap coming back`),
-                'The cap line omits the safety net or the swap: '+headProof.hover);
-              const ram=readings[name].ram, target=(ram.build_target_bytes/gib).toFixed(1), covered=(ram.build_covered_bytes/gib).toFixed(1);
+              const ram=readings[name].ram, covered=(ram.build_covered_bytes/gib).toFixed(1);
+              const safety=(ram.safety_target_bytes/gib).toFixed(1), swap=(ram.swap_target_bytes/gib).toFixed(1);
+              assert.ok(!headProof.hover.includes('outside the cap'),'The head tooltip explains the queue cap: '+headProof.hover);
+              assert.ok(headProof.capHover.includes(`the ${safety} GiB safety net and the ${swap} GiB of swap coming back`),
+                'The queue cap tooltip omits the safety net or the swap: '+headProof.capHover);
               assert.equal(headProof.values['Build reserved'],covered+' GiB');
               assert.ok(ram.build_target_bytes>ram.build_covered_bytes,'The fixture has no uncovered build reserve.');
-              assert.ok(headProof.hover.includes(`Running builds need ${target} GiB reserved. Free RAM covers ${covered} GiB of it.`),
-                'The head tooltip omits the uncovered build reserve: '+headProof.hover);
               if(name==='head_swap_shortfall') assert.ok(readings[name].ram.swap_target_bytes>readings[name].ram.swap_covered_bytes);
               assert.ok(headProof.scroll<=headProof.client,'The admission requirements overflow the page.');
               if(name==='head_memory'&&theme==='dark'&&width===1400) {
@@ -1592,11 +1591,9 @@ try {
           const oldRoom={rows:[{label:'free RAM',gib:28.4},{label:'− safety net',gib:3.0},
             {label:'− swap coming back',gib:9.8},{label:'− build reserved',gib:8.5},
             {label:'= free',gib:7.1},{label:'needs',gib:16.3}],note};
-          const room={cap_text:'Queue cap: 17.1 GiB. It is RAM less the programs that run now, the 3.0 GiB safety net '+
-            'and the 9.8 GiB of swap coming back. Those three are outside the cap.',
+          const room={unavailable:'',
             rows:[{label:'Queue cap',gib:17.1},{label:'− Builds',gib:1.5},{label:'− Build reserved',gib:8.5},
-            {label:'= Free for builds',gib:7.1}],note:'Build reserved is memory that running builds used at their next points in earlier runs. '+
-            'Other programs have 9.8 GiB in swap. It can come back into RAM when they run, so it is outside the cap.'};
+            {label:'= Free for builds',gib:7.1}],note:'Build reserved is memory that running builds used at their next points in earlier runs.'};
           const behind={...owner,name:'trunk nextest',unit:'trunk',detail:'trunk',pid:4243,need:2.0,
             reason:'behind #1: the first step in line gets memory first',runs_on:'natedev or Mac'};
           const head={...owner,place:1,why:'only 7.1 GiB is free for builds. It starts when 16.3 GiB is free.'};
@@ -1619,7 +1616,7 @@ try {
                   assert.ok(index<2 ? tooltip.includes('Why it waits: ') : /\nreason\s/.test(tooltip),tooltip);
                   assert.ok(tooltip.includes('can run on'),tooltip);
                   assert.equal(tooltip.includes('= Free for builds'),index===0,tooltip);
-                  assert.equal(tooltip.includes('Those three are outside the cap.'),index===0,tooltip);
+                  assert.ok(!tooltip.includes('outside the cap'),tooltip);
                   assert.ok(!/needs\s/.test(tooltip),tooltip);
                 }
                 await capture(`${version}-${theme}-wait-${index+1}`,'#tip');
@@ -1704,8 +1701,7 @@ try {
             ci_label:'hana CI · fixture-runner · doctests',detail:'',reason:'free memory',place:1,
             why:'only 0.0 GiB is free for builds. It starts when 1.9 GiB is free.',
             head_text:review.head_text,priority_text:review.priority_text,
-            head_room:{cap_text:'Queue cap: 0.0 GiB. It is RAM less the programs that run now, the 3.0 GiB safety net '+
-              'and the 6.0 GiB of swap coming back. Those three are outside the cap.',
+            head_room:{unavailable:'',
               rows:[{label:'Queue cap',gib:0.0},{label:'− Builds',gib:0.0},{label:'− Build reserved',gib:0.0},
               {label:'= Free for builds',gib:0.0}],note:''}}];
           review.ci_ram = 0.125;

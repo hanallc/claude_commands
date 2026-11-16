@@ -563,7 +563,9 @@ const TIPS = {
         `Memory with no program name: ${ramAmount(d.ram.unattributed_bytes - d.ram.kernel_no_counter_bytes)}.`))
     : "RAM that the readings do not explain.\nNo program name is available for this amount."],
   cap: (d) => !hasCap(d) ? ["Queue cap · unavailable", d.cap_text] : [`Queue cap · ${f1(d.cap)} GiB`, lines(
-    "What builds may use.", `Builds: ${ramAmount(legendBytes(d.ram, "builds"))}.`,
+    "What builds may use.",
+    `It is RAM less the programs that run now, the ${ramAmount(d.ram.safety_target_bytes)} safety net and the ` +
+    `${ramAmount(d.ram.swap_target_bytes)} of swap coming back. Those three are outside the cap.`, `Builds: ${ramAmount(legendBytes(d.ram, "builds"))}.`,
     `+ Build reserved: ${ramAmount(d.ram.build_covered_bytes)}.`, `+ Free: ${ramAmount(d.ram.room_bytes)}.`,
     "A step starts when the memory it needs fits in free.")],
   shortfall: (d) => [`Shortfall · ${ramAmount(d.ram.shortfall_bytes)}`, lines("Reserves that free RAM does not cover.",
@@ -773,7 +775,7 @@ function waitNotes(w) {
   return [w.head_room?.note, w.kind === "cloud" ? "No local memory reservation." : "", w.priority_text];
 }
 function waitTipHtml(w, d) {
-  return identityHtml(w, waitFields(w)) + waitLines(w).map(lineHtml).join("") + lineHtml(w.head_room?.cap_text) +
+  return identityHtml(w, waitFields(w)) + waitLines(w).map(lineHtml).join("") + lineHtml(w.head_room?.unavailable) +
     fieldsHtml(roomFields(w), "numbers") +
     waitNotes(w).map(lineHtml).join("");
 }
@@ -879,7 +881,7 @@ function rawTipText(key, d) {
   if (kind === "wait") {
     const w = d.waiters[+i];
     if (!w) return ["", ""];
-    const fields = [...waitFields(w).map(([name, value]) => `${name}: ${value}`), w.head_room?.cap_text,
+    const fields = [...waitFields(w).map(([name, value]) => `${name}: ${value}`), w.head_room?.unavailable,
       ...roomFields(w).map(([name, value]) => `${name}: ${value}`)];
     return [`Waits · ${w.name}`, [...waitLines(w), ...fields, ...waitNotes(w)]
       .filter(Boolean).join("\n")];
