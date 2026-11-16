@@ -434,30 +434,21 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 ### Phase 42 — One `/release` run releases a list of crates and runs the post-publish hook for each  · status: done
 **Depends on:** Phase 40, Phase 41
 
-#### Work Order
+#### As-built
 
-**Goal:** `/release patch hana_clerestory hana_kana hana_lagrange …` releases each named crate in `publish_order` order in one run, with one user yes, and runs hana's `post_publish.sh` after each publish, so mirror tags and GitHub releases need no hand step.
-
-**Spec:**
-- STEP 0 accepts several package tokens. Each token is `<crate>` (takes the run's `patch` or version) or `<crate>@<version>`. A bare `<crate>` still needs the run's version or `patch`, as today. One package keeps today's single-package mode exactly.
-- STEP 1 orders the crates by `publish_order` from `release.toml` (an array of crate names); a named crate absent from it stops the run. Without the key, the order is the order given.
-- Before the first public push, the run lists every crate, its version and each public push (crates.io publish, the `post_publish` hook, the GitHub release on its repository). One user yes covers that list, including each crate's next dev version. It replaces each crate's `publish` confirmation (STEP 6) and dev-version confirmation (STEP 11); anything outside the list needs a new yes. Dry-run lists and asks nothing.
-- The run does the single-package pipeline once for each crate, in order. After STEP 6 publishes a crate and before STEP 8, it runs `scripts/release/post_publish_hook.sh` (new): when `<repo root>/.claude/config/post_publish.sh` exists, it runs it with bash from the repo root with `CRATE`, `VERSION` (no `v`) and `SHA` (the full base-branch commit the release branch was cut from) exported. A nonzero exit stops the run before that crate's GitHub release and names the rerun command.
-- The run resolves each crate's version once, before the list. A failure names the rerun command with every crate as `<crate>@<version>`, so a rerun never resolves a new patch. On a rerun, a crate is done when its version is on crates.io (`verify_published.sh`) and its GitHub release exists (`gh release view <tag> --repo <repo>`). A done crate is reported and skipped before its pipeline, because its STEP 11 already restored the dev version. Every other crate resumes per Phase 41 and runs the hook again; the hook is safe to rerun (hana-merges' side).
-- A final report lists each crate with its version, tag and release URL.
+- `/release <bump|version> <crate>[@<version>] ...` with more than one package runs Multi-Package Mode in `commands/release.md`. One package keeps single-package mode. Multi-package mode runs only in normal and isolated mode, from `${BASE_BRANCH}`: on a `release-` branch STEP 1 stops, and hotfix mode stops.
+- STEP 1 orders the crates by `publish_order` (an array of crate names) in `.claude/config/release.toml`; a named crate absent from it stops the run. Without the key, the order is the order given. Each crate's version is resolved once.
+- After `git fetch origin ${BASE_BRANCH}`, each crate gets one state: `done` (on crates.io, GitHub release present, and neither `HEAD` nor `origin/${BASE_BRANCH}` holds the release version), `push` (the STEP 11 commit is local only), `resume` (Phase 41 rule) or `new`. A `done` crate is reported and skipped.
+- The plan block lists each crate, its state, version, next dev version and public pushes; one yes covers it and replaces the STEP 6 and STEP 11 confirmations. Dry-run lists and asks nothing. A nonzero patch part counts as a patch release for the next dev version; a resume reads the version from the parent of the version commit.
+- After the yes, a `push` crate runs `git push origin ${BASE_BRANCH}` (dry-run prints `[DRY-RUN] Would push ${BASE_BRANCH}`); other crates run the single-package pipeline. On a failure the run checks out `${BASE_BRANCH}` when the tree is clean and prints `rerun: /release <crate>@<version> ...` with every crate. The final report lists each crate's version, tag and release URL.
+- STEP 7 ends with `scripts/release/post_publish_hook.sh <crate> <version> <sha> [--dry-run]`; `<sha>` is `git merge-base ${BASE_BRANCH} HEAD` (the version commit in hotfix mode, `HEAD` in dry-run). It runs `<repo root>/.claude/config/post_publish.sh` with bash from the repo root, with `CRATE`, `VERSION` and `SHA` exported. It prints `post-publish hook: absent`, `done`, or `failed (exit N)` plus a `rerun:` line on stderr and exits 1; a failure stops before STEP 8. It refuses a version with a leading `v` and a SHA that is not a 40-hex commit.
 
 **Files:**
-- `commands/release.md` — the director edits it
-- `scripts/release/post_publish_hook.sh` — new
-- `scripts/release/test_release.py`
+- `commands/release.md` — Multi-Package Mode, `publish_order` in Configuration, the STEP 1 stop, the STEP 7 hook
+- `scripts/release/post_publish_hook.sh` — the hook runner
+- `scripts/release/test_release.py` — hook runner tests: absent hook, env names, nonzero exit, bad version, bad SHA
 
-**Workers:** 1 writer — `impl` writes `post_publish_hook.sh` and its tests; the director writes `release.md`.
-
-**State:** none
-
-**Constraints from prior phases:** the hana half (`mirror.py`, `post_push.sh`, `post_publish.sh`, `release.toml` keys) belongs to hana-merges; this phase reads only the agreed keys and env names. Phase 41: `commands/release.md` STEP 0 detects a resume when the released crate's `Cargo.toml` version at `HEAD` equals its release version; the resume runs `validate_version.sh <version> --resume <crates>` and skips STEPs 2–4. Do this check for each crate in the list. `create_github_release.sh <version> <repo> <project> <notes> [--package <crate>]` prints `already released` for an existing release; a new release needs its tag on `<repo>` first, so the `post_publish` hook must push the tag before STEP 8. A missing tag (HTTP 404) stops with `ERROR: tag <tag> is not on <repo>`. `publish_crate.sh` prints `already published`, and `create_release_branch.sh` reuses a branch at `HEAD`.
-
-**Acceptance gate:** `scripts.release.test_release` covers the hook runner (absent hook, env names, nonzero exit); a `/release … dry-run` with two hana crates in the hana checkout lists both crates in `publish_order` order with their versions, next dev versions and pushes, prints the `<crate>@<version>` rerun form, and changes nothing.
+**Gotchas:** hana main has no `publish_order` or `github_release_repo` yet; hana-merges owns those keys and `post_publish.sh`.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
