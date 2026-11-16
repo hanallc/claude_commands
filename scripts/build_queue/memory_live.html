@@ -733,7 +733,9 @@ function fieldsHtml(fields, kind = "") {
     fields.map(([name, value]) => `<dt>${esc(name)}</dt><dd>${esc(memoryText(value))}</dd>`).join("") + `</dl>` : "";
 }
 function lineHtml(text) { return text ? `<span class="tip-line">${esc(memoryText(text))}</span>` : ""; }
-function targetFields(row) { return row.runs_on ? [["can run on", row.runs_on]] : []; }
+function targetFields(row) {
+  return [["can run on", row.runs_on], ["Mac", row.mac_state]].filter(([, value]) => value);
+}
 function waitFields(w, d) {
   return [["waiting", ago(w.since, d.read_at)], ["reason", w.reason], ...targetFields(w)];
 }

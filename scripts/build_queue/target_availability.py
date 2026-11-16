@@ -19,6 +19,7 @@ from scripts.message import unit_labels
 
 if TYPE_CHECKING:
     from scripts.mac_test import mac_test
+    from scripts.mac_test.claim_state import ClaimScope
 
 
 class TargetRow(TypedDict):
@@ -129,6 +130,7 @@ class MacRoutes:
         self.labels: Mapping[str, unit_labels.UnitLabels] = labels
         self.zone: tzinfo = zone
         self.policies: dict[tuple[str, str | PackageNotRecorded, str], TargetFit | None] = {}
+        self.scopes: dict[str, ClaimScope] = {}
 
     def fit(self, step: str, folder: str, package: str | PackageNotRecorded) -> TargetFit | NoMacTarget:
         mac = self.mac
@@ -167,9 +169,44 @@ class MacRoutes:
             self.policies[key] = fit
         return self.policies[key]
 
+    def is_mac(self, target: str) -> bool:
+        """Say whether a pinned target name is the Mac target."""
+        return isinstance(self.mac, targets.TargetSnapshot) and self.mac.target.name == target
+
     def blocked(self) -> bool:
         """The Mac card shows the block, so the idle alert omits its copy."""
         return isinstance(self.mac, targets.TargetSnapshot) and isinstance(self.mac.states[0], targets.Held)
+
+    def holds(self, folder: str) -> str:
+        """Name only what keeps this folder's repository off the Mac: a block, the Mac state or its own claim.
+
+        A Mac free for this repository gives "".
+        """
+        mac = self.mac
+        if isinstance(mac, SnapshotsUnreadable):
+            return "state unreadable, " + mac.reason
+        if isinstance(mac, NoMacTarget):
+            return ""
+        state = mac.states[0]
+        if isinstance(state, targets.Running):
+            jobs = self.repository_jobs(mac, folder)
+            return "busy with " + "; ".join(job.what for job in jobs) if jobs else ""
+        if isinstance(state, targets.StateUnreadable):
+            return "state unreadable, " + state.reason
+        fit = self.state_fit(state)
+        return fit.note if isinstance(fit, Allowed) and not isinstance(state, targets.Free) else ""
+
+    def repository_jobs(self, mac: targets.TargetSnapshot, folder: str) -> tuple[targets.RunningJob, ...]:
+        """The live claims that keep this repository off the Mac: its own claim and any whole Mac claim."""
+        from scripts.mac_test import mac_test
+
+        # Cost: target_claim_scope runs git once for each Mac-only waiting folder in each page reading,
+        # and only while the Mac runs a claim. self.scopes keeps one result for each folder in the reading.
+        if folder not in self.scopes:
+            self.scopes[folder] = mac_test.target_claim_scope(mac_test.state_paths(mac.target.name), folder)
+        scope = self.scopes[folder]
+        return tuple(targets.running_job(claim) for claim in mac.claims
+                     if mac_test.run_is_live(claim.record) and same_repository(claim.scope, scope))
 
     def state_fit(self, state: targets.TargetState) -> TargetFit:
         if isinstance(state, targets.Held):
@@ -185,6 +222,17 @@ class MacRoutes:
         if isinstance(state, targets.StateUnreadable):
             return FitUnreadable("Mac state unreadable, " + state.reason)
         return Allowed("no block or claim recorded")
+
+
+def same_repository(claim: ClaimScope, step: ClaimScope) -> bool:
+    """A whole Mac scope matches every repository; a repository matches by key, else by name."""
+    from scripts.mac_test import mac_test
+
+    if not isinstance(claim, mac_test.RepositoryScope) or not isinstance(step, mac_test.RepositoryScope):
+        return True
+    if claim.key and step.key:
+        return claim.key == step.key
+    return claim.name == step.name
 
 
 def mac_claims(snapshots: Snapshots) -> Sequence[mac_test.HeldClaim]:

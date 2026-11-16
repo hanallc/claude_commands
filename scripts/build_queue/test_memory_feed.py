@@ -28,6 +28,8 @@ from scripts.buildlog import charts, costs, moments
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view, target_availability
 from scripts.build_queue.test_queue_view import cloud_reading
+from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
+from scripts.build_targets import target_config, targets
 from scripts.build_queue.queue_view import refresh_mac_builds
 from scripts.build_queue.admission_test_support import AdmissionFixture, NOW as ADMISSION_NOW, only_admitted
 from scripts.build_queue.queue_fixture import write_process, write_scope
@@ -1337,6 +1339,48 @@ process.stdout.write(JSON.stringify({
                               (target_availability.NoMacTarget(), "natedev only")):
             with self.subTest(fit=fit):
                 self.assertEqual(memory_feed.local_runs_on(fit), expected)
+
+    def test_can_run_on_names_a_route_that_limits_the_step_before_the_mac_routes(self) -> None:
+        routes = target_availability.MacRoutes((snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free())), {}, UTC)
+        for route, expected in ((target_config.LOCAL_CALLER, "natedev only (the run asks for it)"),
+                                (target_config.WRITES_TREE, "natedev only (step writes the tree)"),
+                                (target_config.MAC_ONLY, "Mac only"),
+                                (target_config.PinnedTarget("mac"), "Mac only"),
+                                (target_config.PinnedTarget("natedev"), "natedev only")):
+            with self.subTest(route=route), mock.patch.object(routes, "fit") as fit:
+                self.assertEqual(memory_feed.step_runs_on(route, routes, "nextest", "/fixture/hana", "hana"), expected)
+                self.assertEqual(memory_feed.mac_only_route(route, routes), expected == "Mac only")
+                fit.assert_not_called()
+        with mock.patch.object(routes, "fit", return_value=target_availability.Allowed("no block or claim recorded")):
+            self.assertEqual(memory_feed.step_runs_on(target_config.ANY_ELIGIBLE_TARGET, routes, "nextest",
+                                                      "/fixture/hana", "hana"), "natedev or Mac")
+
+    def test_a_mac_only_step_names_what_holds_the_mac_on_its_queued_run_and_waiting_rows(self) -> None:
+        reading = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
+        view, explanation = reading.view, reading.explanation
+        reading = replace(reading, view=replace(view,
+            running=tuple(replace(step, route=target_config.MAC_ONLY) for step in view.running),
+            waiting=tuple(replace(step, route=target_config.MAC_ONLY) for step in view.waiting)),
+            explanation=replace(explanation, running=tuple(replace(entry, step=replace(entry.step, route=target_config.MAC_ONLY))
+                                                           for entry in explanation.running)))
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(target_availability.MacRoutes, "holds", return_value="blocked by research until released")):
+            page = memory_feed.reading()
+        running, = [row for row in page["walk"] if row.get("queued")]
+        waiting, = page["waiters"]
+        for row in (running, waiting):
+            self.assertEqual((row.get("runs_on"), row.get("mac_state")), ("Mac only", "blocked by research until released"))
+
+    def test_target_notes_name_what_holds_the_mac_only_for_a_mac_only_step_while_something_holds_it(self) -> None:
+        routes = target_availability.MacRoutes((snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free())), {}, UTC)
+        with mock.patch.object(routes, "holds", return_value="busy with check cargo-handler"):
+            self.assertEqual(memory_feed.target_notes(target_config.PinnedTarget("mac"), routes, "nextest", "/r", "p"),
+                             {"runs_on": "Mac only", "mac_state": "busy with check cargo-handler"})
+            self.assertEqual(memory_feed.target_notes(target_config.LOCAL_CALLER, routes, "nextest", "/r", "p"),
+                             {"runs_on": "natedev only (the run asks for it)"})
+        with mock.patch.object(routes, "holds", return_value=""):
+            self.assertEqual(memory_feed.target_notes(target_config.MAC_ONLY, routes, "nextest", "/r", "p"),
+                             {"runs_on": "Mac only"})
 
     def test_swapped_memory_of_other_programs_shows_as_free_ram_when_it_comes_back(self) -> None:
         gib = admission_records.GIB
