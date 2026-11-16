@@ -25,6 +25,8 @@ PERMIT = Path('/run/hana-aws/work-permit.json')
 GENERATION = Path('/run/hana-aws/generation')
 BOOT_ID = Path('/proc/sys/kernel/random/boot_id')
 WORK_SLICE = 'hana-work.slice'
+# NixOS gives a raw unit no system PATH; the guest programs run systemctl and systemd-run from here.
+SYSTEM_BIN = '/run/current-system/sw/bin'
 
 
 @dataclass(frozen=True)
@@ -406,8 +408,7 @@ def render_files(settings: SafetySettings, *, device: Path, tool_setup: Path) ->
     for path in (device, tool_setup):
         if not re.fullmatch(r'/[A-Za-z0-9_./-]+', str(path)) or '..' in path.parts:
             raise ValueError('Expected an absolute device or setup path')
-    python = '/run/current-system/sw/bin/python3'
-    prefix = f'{python} {CONTROL}/safety.py'
+    prefix = f'{SYSTEM_BIN}/python3 {CONTROL}/safety.py'
     guard = f'''[Unit]
 Description=Hana boot permit guard
 DefaultDependencies=no
@@ -419,6 +420,7 @@ RemainAfterExit=yes
 RuntimeDirectory=hana-aws
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
+Environment=PATH={SYSTEM_BIN}
 ExecStart={prefix} guard
 TimeoutStartSec={settings.guard_grace_seconds + settings.watchdog_check_seconds}s
 
@@ -433,6 +435,7 @@ StartLimitAction=poweroff
 
 [Service]
 Type=simple
+Environment=PATH={SYSTEM_BIN}
 ExecStart={prefix} watchdog
 Restart=always
 RestartSec={settings.watchdog_check_seconds}s
