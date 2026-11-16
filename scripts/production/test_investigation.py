@@ -170,7 +170,9 @@ class InvestigationTests(unittest.TestCase):
     def test_invalid_records_keep_their_numbers_and_valid_records_still_count(self) -> None:
         item = investigation.file(OWNER.id, "Cause", "Why?")
         path = investigation.folder(OWNER.id) / "I2.md"
-        for text in (b"bad", b"\xff"):
+        bad_time = (path.parent / "I1.md").read_text().replace('id: "I1"', 'id: "I2"')
+        bad_time = bad_time.replace(f'filed: {json.dumps(item.filed)}', 'filed: "bad"')
+        for text in (b"bad", b"\xff", bad_time.encode()):
             with self.subTest(text=text):
                 _ = path.write_bytes(text)
                 errors = io.StringIO()
@@ -191,6 +193,28 @@ class InvestigationTests(unittest.TestCase):
                 self.assertEqual(next_item.id, "I3")
                 self.assertEqual(path.read_bytes(), text)
                 (path.parent / "I3.md").unlink()
+
+    def test_load_checks_required_times_and_empty_times_for_each_state(self) -> None:
+        item = investigation.file(OWNER.id, "Cause", "Why?")
+        path = investigation.folder(OWNER.id) / f"{item.id}.md"
+        for state in investigation.InvestigationState:
+            if state == investigation.InvestigationState.ANSWER_READY:
+                item = investigation.answer(OWNER.id, item.id, "Found it.")
+            elif state == investigation.InvestigationState.READ:
+                item = investigation.mark_read(OWNER.id, item.id)
+            before = path.read_text()
+            for field, value, required in (
+                    ("filed", item.filed, True),
+                    ("answered", item.answered, state != investigation.InvestigationState.OPEN),
+                    ("read", item.read, state == investigation.InvestigationState.READ)):
+                invalid = ("", "bad", "2026-11-16T13:00:00") if required else ("2026-11-16T13:00:00+00:00",)
+                for time in invalid:
+                    with self.subTest(state=state, field=field, time=time):
+                        _ = path.write_text(before.replace(f'{field}: {json.dumps(value)}',
+                                                           f'{field}: {json.dumps(time)}'))
+                        with self.assertRaises(investigation.InvestigationError):
+                            _ = investigation.load(OWNER.id, item.id)
+                _ = path.write_text(before)
 
 
 if __name__ == "__main__":

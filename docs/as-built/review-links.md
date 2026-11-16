@@ -94,12 +94,12 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for AWS, Builds, Changes, Images and Questions, in alphabetical order.
+The left navigation has icons and labels for Accounts, AWS, Builds, Changes, Disks, Images, Investigations and Questions, in alphabetical order.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`. The content column is centered in the frame, 32px below its top edge, with at least 32px at each side.
 The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
-AWS, Builds, Changes, Images, Questions and Rebuilds put the title in the same place.
+AWS, Builds, Changes, Images, Investigations, Questions and Rebuilds put the title in the same place.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
@@ -182,6 +182,7 @@ The function takes a `console.NewsRequest` and returns the keys of the items tha
 Changes uses `change_browser.waiting_changes`.
 Questions uses `change_browser.waiting_questions`.
 Images uses `images.waiting_images` for registered images without `feedback_at`.
+Investigations uses `investigations_page.waiting_investigations` for answer-ready records, with the owner, id and answered time in each key.
 The Images page and its items function share the same waiting-record filter.
 Temporary change images stay outside the Images page and its new mark.
 A page without an items function, or an unavailable page, never shows the icon.
@@ -376,6 +377,32 @@ It then shows the last render time and the median of at most 10 successful rende
 The browser computes the data age from the render finish time and clamps negative ages to zero.
 The browser measures the first wait from request start to response end in its navigation entry.
 For a refresh, it measures the wait around `fetch` and the response body read.
+
+### Investigations page
+
+`/console/investigations.html` reads every owner's investigation folder, including owners without a current staff row.
+The console places Investigations between Images and Questions with the Lucide `search` icon.
+Each card shows its title, question, answer when present, and the source, date and time as aligned footer lines.
+The source uses the current staff name, or the fixed staff id when the staff row is absent.
+A unit source shows its parent showrunner name and unit name.
+The date and time show the filed time in the user's zone.
+Question and answer text use the Questions page's paragraph and list helper.
+
+The Owner menu lists All and the owners with records, in name order.
+The Show menu lists Not read, Answer ready, Waiting, Read and All.
+Not read is the default.
+The address retains both filters.
+Ready answers appear first, newest answer first.
+Waiting questions follow, oldest filed first.
+Read answers appear last, newest read first.
+
+Only answer-ready cards show Mark read.
+The signed form posts to the server, which calls `investigation.mark_read`.
+A successful save removes the card from the Not read view without a document reload.
+A failed save retains the card and displays the error.
+The page uses `page_frame.createPageRefresh` and `page_refresh_seconds`, with the same visibility rules as Questions.
+Refresh retains the filters and scroll position, skips active saves, and refuses older responses after a newer response or save.
+New ready answers mark the navigation entry as new until the user visits the page.
 
 ### Images page
 

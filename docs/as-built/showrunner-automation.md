@@ -528,6 +528,9 @@ A showrunner counts its own investigations and its units' investigations through
 A showrunner without a production document counts its own investigations and watches its investigation folder.
 Child showrunners retain their own counts.
 Read investigations do not count.
+The console's Investigations page shows questions and answers with Owner and Show filters.
+The user selects Mark read on an answer-ready card to remove it from the default view and the status line count.
+New answers mark the navigation entry until the user visits the page.
 The count cache watches each folder and record that it reads.
 A missing folder uses its nearest existing parent until the folder appears.
 
