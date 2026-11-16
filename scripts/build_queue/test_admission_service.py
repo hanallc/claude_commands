@@ -4099,6 +4099,13 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(environment["USER_ZONE"], "UTC")
         self.assertEqual(environment["USER_ZONE"], os.environ["USER_ZONE"])
 
+    def test_caller_admission_serves_without_a_home_override(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        environment = {"BUILDLOG_DIR": str(root / "log")}
+        _ = caller_admission(self, root, environment)
+        self.assertIsInstance(client.build_history_generation(), records.BuildHistoryGeneration)
+        self.assertNotIn("HOME", environment)
+
     def test_fixture_uses_utc_and_restores_the_callers_zone(self) -> None:
         for zone in ("Pacific/Pago_Pago", ""):
             with self.subTest(zone=zone), mock.patch.dict(os.environ):
