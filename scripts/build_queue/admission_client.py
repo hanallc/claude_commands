@@ -838,6 +838,7 @@ class WaitOutput:
     last_provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
     announced_retries: set[str] = field(default_factory=set)
     status_open: bool = False
+    local_reason: str = field(default_factory=lambda: os.environ.get("BUILD_QUEUE_LOCAL_REASON", ""))
 
     def retry_notices(self, notices: tuple[placement.ProviderRetryNotice, ...], *, placement_events: bool) -> None:
         for retry in notices:
@@ -890,6 +891,8 @@ class WaitOutput:
                       if isinstance(reply.holder, placement.ResourceHolderUnit) else {"kind": "none"})
             self.on_event("resource " + json.dumps({"resource": reply.resource, "reason": reply.reason,
                 "holder": holder}, separators=(",", ":")))
+            if self.local_reason:
+                self.status(f"waiting for {reply.resource}: {reply.reason}; runs on natedev: {self.local_reason}")
         self.held = True
         self.last_resource = reply
 
@@ -954,6 +957,7 @@ class WaitOutput:
                 if snapshot.head_need and reply.position != 1 else "")
         parts = (place, f"{subject} needs {snapshot.peak.bytes / records.GIB:.1f} GiB",
                  f"{snapshot.available / records.GIB:.1f} GiB free", reason, head,
+                 f"runs on natedev: {self.local_reason}" if self.local_reason else "",
                  "/build:page shows the detail" if first else "")
         self.status(f"{prefix}: " + "; ".join(part for part in parts if part))
 
@@ -1041,7 +1045,8 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
     return wire.AdmitRequest(episode, owner, tuple(argv), cwd, since, sidecar,
         identity,
         records.CallRecord(call) if call else records.NoCallRecord(), width_value_typed, estimate.profile,
-        isinstance(estimate.cache, records.FreshTest), float(os.environ.get("BUILDLOG_MEM_TOKEN_BACK_AT", "0")), run)
+        isinstance(estimate.cache, records.FreshTest), float(os.environ.get("BUILDLOG_MEM_TOKEN_BACK_AT", "0")), run,
+        route=records.direct_cargo_route())
 
 
 def write_shell_grant(path: Path, grant: wire.Admitted | wire.LaunchAdmitted, elapsed: int) -> None:
@@ -1155,6 +1160,7 @@ class ClientArguments(argparse.Namespace):
     token: str = "none"
     writes_tree: bool = False
     local_only: bool = False
+    local_reason: str = ""
     mac_only: bool = False
     once: bool = False
     reason: str = ""
@@ -1162,6 +1168,7 @@ class ClientArguments(argparse.Namespace):
 
 
 def _place_step(args: ClientArguments, output: WaitOutput) -> int:
+    output.local_reason = args.local_reason or output.local_reason
     if args.command == "cancel-placement":
         from scripts.build_queue import placement, admission_records as records
         from scripts.buildlog import store
@@ -1226,7 +1233,8 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
         # A Mac-only step is pinned to the Mac, so the routing rule lets a build leave natedev.
         selection = (step_selection.Pinned(args.target) if args.target else
                      step_selection.Pinned("mac") if args.mac_only else step_selection.ROUTED)
-        routing = target_config.LOCAL_CALLER if args.local_only else target_config.ANY_ELIGIBLE_TARGET
+        routing = (target_config.LocalRequired(args.local_reason) if args.local_reason else
+                   target_config.LOCAL_CALLER if args.local_only else target_config.ANY_ELIGIBLE_TARGET)
         kind = args.kind or local.profile.step
         if kind == "nextest":
             kind = "test"
@@ -1252,7 +1260,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             purpose=placement.SpeculativeCopy(args.parent_episode, args.call_started)
                 if args.parent_episode else placement.NormalStep(),
             route=target_config.step_route(local=args.local_only, mac_only=args.mac_only, target=args.target,
-                                           writes_tree=args.writes_tree))
+                                           writes_tree=args.writes_tree, local_reason=args.local_reason))
         if already_queued:
             _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex, episode, owner, prerequisite))
         while True:
@@ -1340,6 +1348,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = placement_parser.add_argument("--token", choices=("required", "held", "none"), default="none")
     _ = placement_parser.add_argument("--writes-tree", action="store_true")
     _ = placement_parser.add_argument("--local-only", action="store_true")
+    _ = placement_parser.add_argument("--local-reason", default=os.environ.get("BUILD_QUEUE_LOCAL_REASON", ""))
     _ = placement_parser.add_argument("--mac-only", action="store_true")
     _ = placement_parser.add_argument("--once", action="store_true")
     _ = placement_parser.add_argument("--wait-events", action="store_true")

@@ -412,12 +412,16 @@ class TargetNotes(TypedDict):
 
 def target_notes(route: target_config.StepRoute, routes: target_availability.MacRoutes, step: str, folder: str,
                  package: str | admission_records.PackageNotRecorded) -> TargetNotes:
-    """The step's "can run on" text and targets, and for a Mac-only step what holds the Mac, for every row that shows them."""
+    """State the route reason once and name any Mac hold."""
     runs_on = step_runs_on(route, routes, step, folder, package)
+    route_excludes_mac = isinstance(route, target_config.LocalRequired) or (
+        isinstance(route, target_config.PinnedTarget) and not routes.is_mac(route.target))
     notes: TargetNotes = {"runs_on": runs_on.text(), "targets": list(runs_on.targets),
-                          "mac_text": target_availability.mac_reason(routes.route_fit(route, step, folder, package))}
+                          "mac_text": "" if route_excludes_mac else
+                          target_availability.mac_reason(routes.route_fit(route, step, folder, package))}
     if mac_only_route(route, routes) and (holds := routes.holds(folder)):
         notes["mac_state"] = holds
+        notes["mac_text"] = ""
     return notes
 
 

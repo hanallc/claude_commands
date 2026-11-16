@@ -109,11 +109,12 @@ __PAGE_FRAME_STYLE__
 .legend .row[data-tip="room"] .name { white-space: nowrap; }
 #tip { white-space: pre-line; position: fixed; z-index: 10; width: max-content; max-width: min(calc(100vw - 20px), 24rem); overflow-wrap: anywhere; padding: 8px 10px; border-radius: 8px; background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.4; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; box-shadow: 0 4px 14px rgb(0 0 0 / 0.2); }
 #tip.on { opacity: 1; }
-#tip .tip-fields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 16px; margin: 6px 0 0; white-space: normal; }
-#tip .tip-fields dt { text-align: left; }
+#tip dt { text-align: right; }
+#tip dd:not(.colon) { text-align: right; }
+#tip .tip-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 2px 16px; margin: 6px 0 0; white-space: normal; }
 #tip .tip-fields dd { margin: 0; overflow-wrap: anywhere; }
 #tip .tip-fields.numbers { grid-template-columns: minmax(0, 1fr) max-content; }
-#tip .tip-fields.numbers dd { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+#tip .tip-fields.numbers dd { font-variant-numeric: tabular-nums; white-space: nowrap; }
 #tip .tip-line { display: block; margin-top: 6px; }
 #tip .identity { display: grid; grid-template-columns: max-content max-content minmax(0, 1fr); gap: 2px 0; margin: 6px 0; white-space: normal; }
 #tip .identity dd { margin: 0; overflow-wrap: anywhere; }
@@ -733,19 +734,31 @@ function tipHead(head, duration) {
 function tooltipHtml(key, data) {
   const [head, body] = tipText(key, data);
   const row = stepRow(key, data);
-  if (!row) return `<b>${esc(head)}</b>${esc(body)}`;
+  if (!row) return `<b>${esc(head)}</b>${textTipHtml(body)}`;
   const top = tipHead(head, tipDuration(key, row, data));
   if (key.startsWith("wait:")) return top + waitTipHtml(row, data);
   if (!macRow(row)) {
     const lines = [rawTipText(key, data)[1], row.priority_text].filter(Boolean).join("\n");
-    return `${top}${identityHtml(row, targetFields(row))}${esc(memoryText(lines))}`;
+    return `${top}${identityHtml(row, targetFields(row))}${textTipHtml(memoryText(lines))}`;
   }
   return `${top}${identityHtml(row)}${fieldsHtml(macTipFields(row, data), "numbers")}` +
     `<span class="mac-note">Mac memory does not count against natedev.</span>`;
 }
 function fieldsHtml(fields, kind = "") {
   return fields.length ? `<dl class="tip-fields${kind ? " " + kind : ""}">` +
-    fields.map(([name, value]) => `<dt>${esc(name)}</dt><dd>${esc(memoryText(value))}</dd>`).join("") + `</dl>` : "";
+    fields.map(([name, value]) => `<dt>${esc(name)}</dt><dd>${esc(value)}</dd>`).join("") + `</dl>` : "";
+}
+function textTipHtml(body) {
+  const blocks = [];
+  let fields = [];
+  const flush = () => { if (fields.length) blocks.push(fieldsHtml(fields)); fields = []; };
+  for (const line of body.split("\n")) {
+    const field = line.match(/^([^:]+:\s+)(.+)$/);
+    if (field) fields.push([field[1], field[2]]);
+    else { flush(); blocks.push(esc(line)); }
+  }
+  flush();
+  return blocks.join("\n");
 }
 function lineHtml(text) { return text ? `<span class="tip-line">${esc(memoryText(text))}</span>` : ""; }
 function targetFields(row) {

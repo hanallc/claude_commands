@@ -25,7 +25,7 @@ const folder = callerFolder ? resolve(callerFolder) : await mkdtemp(join(tmpdir(
 try {
   await mkdir(folder, {recursive:true});
   const systemTemporaryRoot = execFileSync(process.env.PYTHON || 'python3', ['-c',
-    'from pathlib import Path; import sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())', folder],
+    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE)); from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())', folder],
     {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
   const page = await readFile(join(folder, 'memory_live.html'));
   const beforePage = process.argv[3] ? (await readFile(process.argv[3], 'utf8'))
@@ -1827,13 +1827,14 @@ try {
         await show(readings.macroute);
         const routeLines = [
           'Mac: busy with nextest hana_catalyst',
-          'Mac: no, mend edits this checkout on natedev',
-          'Mac: no, a direct cargo command runs where it starts'];
+          'natedev only (step writes the tree)',
+          'natedev only (a direct cargo command runs where it starts)'];
         const routeTips = [];
         for (const [index,line] of routeLines.entries()) {
           await evaluate(`showTip('wait:${index}',700,420)`);
           const tip = await evaluate(`({text:document.querySelector('#tip').innerText,html:document.querySelector('#tip').innerHTML})`);
           assert.ok(tip.text.includes(line),tip.text);
+          if(index>0) assert.ok(!tip.text.includes("Mac: no,"),tip.text);
           routeTips.push(tip.html);
         }
         await evaluate(`(() => {
@@ -1853,6 +1854,71 @@ try {
         const routeShot=await call('Page.captureScreenshot',{format:'png'});
         await writeFile(join(folder,'macroute-dark-desktop.png'),Buffer.from(routeShot.data,'base64'));
         comparisons.push({routeLines});
+
+        const localReason = 'it edits the merged checkout on natedev with mend and fmt, and the push goes from there';
+        const legendReading={...structuredClone(base),cap:31,
+          ram:JSON.parse(await readFile(join(folder,'legend_ram.json'),'utf8'))};
+        for (const theme of ['light','dark']) {
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
+          for (const width of [390,900,1400]) {
+            await call('Emulation.setDeviceMetricsOverride',{width,height:1100,deviceScaleFactor:1,mobile:false});
+            await navigate('memory_live.html');
+            for (const [kind,reading,key] of [
+              ['waiting table',readings.head_memory,'wait:0'],
+              ['waiting row',readings.macroute_reason,'wait:2'],
+              ['running row',readings.step_owners,'row:0'],
+              ['Mac row',readings.macroute_running,'row:'+readings.macroute_running.walk.findIndex(row=>row.kind==='mac-build')],
+              ...['g-builds','tools','reserved','room','system','safety','swap','programs','kernel','unattributed','cap','g-swap']
+                .map(key=>['legend',legendReading,key])]) {
+              await show(reading);
+              const alignment=await evaluate(`(() => {
+                showTip(${JSON.stringify(key)},${width/2},420);
+                const tip=document.querySelector('#tip'), rect=tip.getBoundingClientRect();
+                return {values:[...tip.querySelectorAll('dd:not(.colon)')].map(cell=>({
+                  text:cell.textContent,align:getComputedStyle(cell).textAlign,
+                  right:cell.getBoundingClientRect().right,group:cell.parentElement.className})),
+                  labels:[...tip.querySelectorAll('dt')].map(cell=>({text:cell.textContent,
+                    align:getComputedStyle(cell).textAlign})),
+                  colonGaps:[...tip.querySelectorAll('.identity dt')].map(cell=>{
+                    const label=document.createRange(),colon=document.createRange();
+                    label.selectNodeContents(cell);
+                    colon.selectNodeContents(cell.nextElementSibling);
+                    return colon.getBoundingClientRect().left-label.getBoundingClientRect().right;
+                  }),
+                  left:rect.left,right:rect.right,scroll:tip.scrollWidth,client:tip.clientWidth};
+              })()`);
+              assert.ok(alignment.values.length>0,`${kind} ${key} has no value cells.`);
+              for(const cell of alignment.values) assert.equal(cell.align,'right',`${kind} ${key}: ${cell.text}`);
+              for(const label of alignment.labels) assert.equal(label.align,'right',`${kind} ${key}: ${label.text}`);
+              for(const gap of alignment.colonGaps) assert.ok(gap>=0 && gap<=3,`${kind} ${key}: colon gap ${gap}`);
+              for(const group of new Set(alignment.values.map(cell=>cell.group))) {
+                const rights=alignment.values.filter(cell=>cell.group===group).map(cell=>cell.right);
+                assert.ok(Math.max(...rights)-Math.min(...rights)<=1,`${kind} ${key}: value edges differ.`);
+              }
+              assert.ok(alignment.left>=0 && alignment.right<=width && alignment.scroll<=alignment.client,
+                `${kind} ${key}: `+JSON.stringify(alignment));
+              comparisons.push({tooltipAlignment:true,kind,key,theme,width,...alignment});
+            }
+            await show(readings.macroute_reason);
+            await evaluate(`showTip('wait:2',${width/2},420)`);
+            const tip = await evaluate(`(() => {
+              const node=document.querySelector('#tip'), rect=node.getBoundingClientRect();
+              return {text:node.innerText,left:rect.left,right:rect.right,scroll:node.scrollWidth,client:node.clientWidth};
+            })()`);
+            assert.ok(tip.text.includes('natedev only ('+localReason+')'),tip.text);
+            assert.equal(tip.text.split(localReason).length-1,1,tip.text);
+            assert.ok(!tip.text.includes('Mac: no,'),tip.text);
+            const memory=tip.text.match(/It needs ([\d.]+) GiB to start\.\nWhy it waits: only ([\d.]+) GiB is free for builds\. It starts when ([\d.]+) GiB is free\./);
+            assert.ok(memory,tip.text);
+            const [need,free,start]=memory.slice(1).map(Number);
+            assert.ok(free<need && start>=need,`The waiting memory values contradict each other: ${tip.text}`);
+            assert.ok(tip.left>=0 && tip.right<=width && tip.scroll<=tip.client,JSON.stringify(tip));
+            comparisons.push({localReason:true,theme,width,...tip});
+          }
+        }
+        const reasonShot=await call('Page.captureScreenshot',{format:'png'});
+        await writeFile(join(folder,'direct-cargo-local-reason-dark-desktop.png'),Buffer.from(reasonShot.data,'base64'));
+        await capture('direct-cargo-local-reason-dark-tooltip','#tip');
 
         await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,
           failures:failures.map(({cards,...state})=>state)},null,2)+'\n');

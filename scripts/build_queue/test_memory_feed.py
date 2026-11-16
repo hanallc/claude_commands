@@ -26,7 +26,7 @@ from unittest import mock
 
 from scripts.buildlog import charts, cost_actions, costs, moments
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view, target_availability
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, target_availability
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
 from scripts.build_targets import build_targets, target_config, targets
@@ -568,6 +568,9 @@ process.stdout.write(JSON.stringify({
                 ci = next(row for row in page["walk"] if row.get("ci"))
                 self.assertEqual(ci["unit"], "")
                 self.assertTrue(ci.get("ci_label"))
+                for row in (run, page["waiters"][0], ci):
+                    self.assertFalse(row.get("mac_text"))
+                    self.assertFalse(row.get("runs_on"))
         impostor = replace(base.view.waiting[0], unit="other", session_name="hana-linux-1")
         self.assertNotEqual(memory_feed.feed_step_labels(impostor, {}, frozenset({"hana-linux-1"})).owner_text, "hana CI")
 
@@ -1388,43 +1391,65 @@ process.stdout.write(JSON.stringify({
                                                       "/fixture/hana", "hana"), memory_feed.RunsOn(("natedev", "mac")))
 
     def test_a_mac_only_step_names_what_holds_the_mac_on_its_queued_run_and_waiting_rows(self) -> None:
-        reading = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
-        view, explanation = reading.view, reading.explanation
-        reading = replace(reading, view=replace(view,
-            running=tuple(replace(step, route=target_config.MAC_ONLY) for step in view.running),
-            waiting=tuple(replace(step, route=target_config.MAC_ONLY) for step in view.waiting)),
-            explanation=replace(explanation, running=tuple(replace(entry, step=replace(entry.step, route=target_config.MAC_ONLY))
-                                                           for entry in explanation.running)))
-        with (mock.patch.object(admission_client, "view", return_value=reading),
-              mock.patch.object(target_availability.MacRoutes, "holds", return_value="build hold by research (hana) until released")):
-            page = memory_feed.reading()
-        running, = [row for row in page["walk"] if row.get("queued")]
-        waiting, = page["waiters"]
-        for row in (running, waiting):
-            self.assertEqual((row.get("runs_on"), row.get("mac_state")), ("Mac only", "build hold by research (hana) until released"))
+        base = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
+        reason = "it edits the merged checkout on natedev with mend and fmt, and the push goes from there"
+        cases = (
+            (target_config.MAC_ONLY, "Mac only", True),
+            (target_config.PinnedTarget("mac"), "Mac only", True),
+            (target_config.PinnedTarget("natedev"), "natedev only", False),
+            (target_config.LOCAL_CALLER, "natedev only (the run asks for it)", False),
+            (target_config.WRITES_TREE, "natedev only (step writes the tree)", False),
+            (target_config.LocalRequired(reason), f"natedev only ({reason})", False),
+        )
+        for route, runs_on, mac_only in cases:
+            with self.subTest(route=route):
+                view, explanation = base.view, base.explanation
+                reading = replace(base, view=replace(view,
+                    running=tuple(replace(step, route=route) for step in view.running),
+                    waiting=tuple(replace(step, route=route) for step in view.waiting)),
+                    explanation=replace(explanation, running=tuple(replace(entry, step=replace(entry.step, route=route))
+                                                                  for entry in explanation.running)))
+                with (mock.patch.object(admission_client, "view", return_value=reading),
+                      mock.patch.object(target_availability, "read_snapshots", return_value=(
+                          snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free()))),
+                      mock.patch.object(target_availability.MacRoutes, "holds", return_value="build hold by research (hana) until released")):
+                    page = memory_feed.reading()
+                running, = [row for row in page["walk"] if row.get("queued")]
+                waiting, = page["waiters"]
+                for row in (running, waiting):
+                    if mac_only:
+                        self.assertEqual((row.get("runs_on"), row.get("mac_state")),
+                                         ("Mac only", "build hold by research (hana) until released"))
+                    else:
+                        self.assertEqual(row.get("runs_on"), runs_on)
+                        self.assertNotIn("mac_state", row)
+                    self.assertEqual(row.get("mac_text"), "")
 
     def test_target_notes_name_what_holds_the_mac_only_for_a_mac_only_step_while_something_holds_it(self) -> None:
         routes = target_availability.MacRoutes((snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free())), {}, UTC)
         with mock.patch.object(routes, "holds", return_value="busy with check cargo-handler"):
             self.assertEqual(memory_feed.target_notes(target_config.PinnedTarget("mac"), routes, "nextest", "/r", "p"),
                              {"runs_on": "Mac only", "targets": ["mac"], "mac_state": "busy with check cargo-handler",
-                              "mac_text": "Mac: no block or claim recorded"})
+                              "mac_text": ""})
             self.assertEqual(memory_feed.target_notes(target_config.LOCAL_CALLER, routes, "nextest", "/r", "p"),
                              {"runs_on": "natedev only (the run asks for it)", "targets": ["natedev"],
-                              "mac_text": "Mac: no, local caller"})
+                              "mac_text": ""})
         with mock.patch.object(routes, "holds", return_value=""):
             self.assertEqual(memory_feed.target_notes(target_config.MAC_ONLY, routes, "nextest", "/r", "p"),
                              {"runs_on": "Mac only", "targets": ["mac"], "mac_text": "Mac: no block or claim recorded"})
 
-    def macroute_page(self) -> memory_feed.MemoryPage:
+    def macroute_page(self, *, local_reason: str = "") -> memory_feed.MemoryPage:
         """Build three rows from their recorded placement routes."""
         from scripts.build_targets import targets
         from scripts.build_targets.target_config import SshTarget
         from scripts.mac_test import eligibility
 
-        reading = queued_reading(captured_reading(), ("build", "mend", "direct"))
-        routes = (target_config.ANY_ELIGIBLE_TARGET, target_config.WRITES_TREE, admission_records.DIRECT_CARGO)
-        rows = tuple(replace(row, pid=8100 + index, step=step, route=route)
+        reading = queued_reading(captured_reading(host=admission_records.HostMemory(
+            0, 60 * admission_records.GIB)), ("build", "mend", "direct"))
+        routes = (target_config.ANY_ELIGIBLE_TARGET, target_config.WRITES_TREE,
+                  target_config.LocalRequired(local_reason) if local_reason else admission_records.DIRECT_CARGO)
+        rows = tuple(replace(row, pid=8100 + index, step=step, route=route,
+                             reason=admission_records.NeedsMemory(need=row.need, free=0))
                      for index, (row, step, route) in enumerate(zip(
                          reading.view.waiting[:3], ("build", "mend", "build"), routes, strict=True)))
         reading = replace(reading, view=replace(reading.view, waiting=rows))
@@ -1436,12 +1461,37 @@ process.stdout.write(JSON.stringify({
               mock.patch.object(build_targets, "step_policy", return_value=eligibility.KnownRepository("handler", "/r"))):
             return memory_feed.reading()
 
+    def test_direct_request_reason_reaches_the_waiter_page(self) -> None:
+        for reason in ("", "it edits the merged checkout on natedev with mend and fmt, and the push goes from there"):
+            with self.subTest(reason=reason), AdmissionFixture() as fixture:
+                _ = fixture.occupy_host()
+                original = fixture.request(step="check")
+                fixture.free(0)
+                with (mock.patch.dict(os.environ, {"BUILD_QUEUE_LOCAL_REASON": reason}),
+                      mock.patch.object(admission_client, "CLOCK", fixture.clock),
+                      mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
+                          original.profile, step_estimator.ReusableEstimate()))):
+                    request = admission_client.step_request(list(original.argv), original.cwd, original.owner,
+                        original.since, original.sidecar, original.episode)
+                with fixture.loop_turn():
+                    replies = fixture.server.handle_request(wire.parse_request(wire.encode_request(request)))
+                    self.assertTrue(any(isinstance(reply, wire.Wait) for reply in replies), repr(replies))
+                    reply, = fixture.server.handle_request(wire.ViewRequest())
+                    assert isinstance(reply, wire.ViewReply)
+                    reading = reply.reading
+                with mock.patch.object(admission_client, "view", return_value=reading):
+                    page = memory_feed.reading()
+                row, = page["waiters"]
+                expected = reason or admission_records.DIRECT_CARGO.reason
+                self.assertEqual(row.get("runs_on"), f"natedev only ({expected})")
+                self.assertEqual(row.get("mac_text"), "")
+
     def test_queued_tooltips_use_the_verify_route_or_the_direct_command_reason(self) -> None:
         page = self.macroute_page()
         self.assertEqual([row.get("mac_text") for row in page["waiters"]], [
             "Mac: busy with nextest hana_catalyst",
-            "Mac: no, mend edits this checkout on natedev",
-            "Mac: no, a direct cargo command runs where it starts"])
+            "",
+            ""])
         self.assertEqual([row.get("runs_on") for row in page["waiters"]],
                          ["natedev or Mac", "natedev only (step writes the tree)",
                           "natedev only (a direct cargo command runs where it starts)"])
@@ -2298,6 +2348,8 @@ def write_browser_fixture(folder: Path) -> None:
         pages["step_unknown"] = json.loads(memory_feed.page_json(fixture.owner_machine_page(
             unit_labels.UnitLabels("unknown", "—", "owner not recorded"))))
         pages["macroute"] = json.loads(memory_feed.page_json(fixture.macroute_page()))
+        pages["macroute_reason"] = json.loads(memory_feed.page_json(fixture.macroute_page(
+            local_reason="it edits the merged checkout on natedev with mend and fmt, and the push goes from there")))
         for name, reading in readings.items():
             with mock.patch.object(admission_client, "view", return_value=reading):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
