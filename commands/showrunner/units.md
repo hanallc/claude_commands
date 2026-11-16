@@ -58,6 +58,9 @@ Merge rows name each phase title and its live rank, active merge, or short failu
 A checkpoint outside the line uses `Checkpoint <9 hash characters> at <time>; not in <production>'s merge line`.
 Without a production name, the text ends with `not in the merge line`.
 A finished phase counts as merged when its checkpoint reaches main, its unit and phase have a successful result, or main records its merge.
+A finished phase also counts as merged when main has a non-merge commit with the same author time and subject as its checkpoint.
+The board reads main's non-merge commits once per render and caches each unresolved checkpoint's identity check.
+An unreadable checkpoint stays unmerged.
 A successful result for the exact checkpoint hash counts, with or without a valid result time.
 Other evidence needs a result time or merge commit time at or after the latest checkpoint time, when recorded.
 Without a checkpoint time, the merge subject must name a prefix of the checkpoint hash, in any letter case.
@@ -76,7 +79,7 @@ Dependencies outside the merge line say `not in the merge line`.
 A local dependency uses its ID, with `phase` before a numeric ID.
 An external dependency uses `<unit> phase <id>` without its title.
 A bare commit dependency uses `After commit <first 9 hash characters>; <short state>`.
-A missing commit uses `not on main yet`; other missing dependencies retain `dependency not found locally`.
+A missing commit, or a commit or branch not on main, uses `not on main yet`; other missing dependencies retain `dependency not found locally`.
 A branch dependency uses `After branch <name>; <short state>`.
 A recorded phase ID keeps its phase form, even when it contains only hexadecimal characters.
 Recorded unit waits and plan `waits_for` conditions retain their text.

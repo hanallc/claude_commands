@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import subprocess
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from pathlib import Path
 from typing import NamedTuple
 
@@ -94,6 +94,35 @@ class PhaseMerge(NamedTuple):
     commit: str
     timestamp_epoch: int
     checkpoint_commit: str
+
+
+class CommitIdentity(NamedTuple):
+    """The author time and subject that remain the same when Git copies a commit."""
+
+    author_epoch: int
+    subject: str
+
+
+def main_commit_identities(repo: Path) -> frozenset[CommitIdentity]:
+    """Read the identities of main's non-merge commits in one Git call."""
+    result = git(repo, "log", "origin/main", "--no-merges", "--format=%at%x00%s")
+    found: set[CommitIdentity] = set()
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            recorded, separator, subject = line.partition("\0")
+            if separator and recorded.isdecimal():
+                found.add(CommitIdentity(int(recorded), subject))
+    return frozenset(found)
+
+
+def copied_on_main(repo: Path, commit: str, identities: Collection[CommitIdentity]) -> bool:
+    """Check whether main contains a non-merge commit with this checkpoint's identity."""
+    if not identities:
+        return False
+    result = git(repo, "show", "-s", "--format=%at%x00%s", commit)
+    recorded, separator, subject = result.stdout.rstrip("\n").partition("\0")
+    return (result.returncode == 0 and bool(separator) and recorded.isdecimal()
+            and CommitIdentity(int(recorded), subject) in identities)
 
 
 def landed_phases(repo: Path) -> dict[tuple[str, str], PhaseMerge]:

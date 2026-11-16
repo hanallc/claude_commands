@@ -783,6 +783,63 @@ class UnitPhasesTests(unittest.TestCase):
                         self.assertNotIn("Completed delivery (delivery)", [row.work for row in rows])
                     self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
 
+    def test_finished_checkpoint_copies_share_main_and_checkpoint_reads(self) -> None:
+        member = self.member("copies")
+        other = self.member("shared")
+        base = self.repository()
+        _ = self.git("switch", "-q", "-c", "checkpoints")
+        subject = "checkpoint(delivery): show each page title"
+        with patch.dict(os.environ, {"GIT_AUTHOR_DATE": "2026-11-15T17:54:35+00:00"}):
+            _ = (self.root / "delivery.txt").write_text("delivery\n")
+            checkpoint = commit_repository(self.root, subject, "delivery.txt")
+        with patch.dict(os.environ, {"GIT_AUTHOR_DATE": "2026-11-15T17:54:36+00:00"}):
+            different_time = commit_repository(self.root, subject, allow_empty=True)
+        with patch.dict(os.environ, {"GIT_AUTHOR_DATE": "2026-11-15T17:54:35+00:00"}):
+            different_subject = commit_repository(self.root, "checkpoint(delivery): another title", allow_empty=True)
+        _ = self.git("switch", "-q", "main")
+        _ = (self.root / "main.txt").write_text("main progress\n")
+        _ = commit_repository(self.root, "Main progress", "main.txt")
+        with patch.dict(os.environ, {"GIT_COMMITTER_DATE": "2026-11-15T17:55:22+00:00"}):
+            _ = self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "cherry-pick", checkpoint)
+        copied = self.git("rev-parse", "HEAD")
+        _ = self.git("update-ref", "refs/remotes/origin/main", copied)
+        self.assertNotEqual(checkpoint, copied)
+        self.assertFalse(waits_on.on_main(self.root, checkpoint))
+        phases = [("copied", checkpoint), ("repeated", checkpoint), ("different-time", different_time),
+                  ("different-subject", different_subject), ("unreadable", "f" * 40),
+                  ("subject", "a" * 40), ("result", "b" * 40), ("ancestry", base)]
+        path = self.write_run(member, "copies", [(phase, phase.capitalize() + " delivery") for phase, _ in phases],
+            [event for phase, commit in phases for event in (
+                self.phase_event("checkpoint", phase, checkpoint_commit=commit, timestamp_epoch=100),
+                self.phase_event("phase_finished", phase, status="completed"))])
+        other_path = self.write_run(other, "shared-copy", [("copied", "Shared delivery")], [
+            self.phase_event("checkpoint", "copied", checkpoint_commit=checkpoint),
+            self.phase_event("phase_finished", "copied", status="completed")])
+        landed: land_runs.LandResult = {"commit": "b" * 40, "production": "sdlc", "unit": member.name,
+            "phase": "result", "landed": True, "step": "", "state": "", "detail": "", "time": "1970-01-01T00:03:20+00:00"}
+        view = land_queue.LandView({}, {}, {landed["commit"]: landed}, frozenset(), {})
+        with (patch.object(land_queue, "land_view", return_value=view),
+              patch.object(waits_on, "landed_phases", return_value={
+                  (member.name, "subject"): waits_on.PhaseMerge("c" * 40, 200, "a" * 9)}),
+              patch.object(waits_on, "main_commit_identities", wraps=waits_on.main_commit_identities) as main_reads,
+              patch.object(waits_on, "copied_on_main", wraps=waits_on.copied_on_main) as checks,
+              patch.object(waits_on, "git", wraps=waits_on.git) as git_reads,
+              patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as run_reads):
+            rendered = self.blocks([member, other], {})
+        work = [row.work for row in detail_rows(rendered, member.name)]
+        for phase in ("copied", "repeated", "subject", "result", "ancestry"):
+            self.assertNotIn(phase.capitalize() + f" delivery ({phase})", work)
+        for phase in ("different-time", "different-subject", "unreadable"):
+            self.assertIn(phase.capitalize() + f" delivery ({phase})", work)
+        self.assertNotIn("Shared delivery (copied)", [row.work for row in detail_rows(rendered, other.name)])
+        main_reads.assert_called_once_with(self.root)
+        expected = [checkpoint, different_time, different_subject, "f" * 40]
+        self.assertCountEqual([call.args[1] for call in checks.call_args_list], expected)
+        self.assertCountEqual([call.args[-1] for call in git_reads.call_args_list if call.args[1] == "show"], expected)
+        self.assertEqual(sum(call.args[1:] == ("log", "origin/main", "--no-merges", "--format=%at%x00%s")
+                             for call in git_reads.call_args_list), 1)
+        self.assertCountEqual([call.args[0] for call in run_reads.call_args_list], [path, other_path])
+
     def test_finished_phases_use_merge_subjects_and_results_with_other_hashes(self) -> None:
         member = self.member("finished")
         _ = self.repository()
@@ -1054,7 +1111,7 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertIn(("Later 3", "After submission", "After dependency phase sent; not in the merge line"), rows)
         self.assertIn(("Later 4", "After open work", "After dependency phase open; started"), rows)
         self.assertIn(("Later 5", "After unknown work", "After missing-ref; dependency not found locally"), rows)
-        self.assertIn(("Later 6", "After branch", "After branch pending-branch; absent from the local copy of main"), rows)
+        self.assertIn(("Later 6", "After branch", "After branch pending-branch; not on main yet"), rows)
         self.assertIn(("Later 7", "Later work (2)", "After phase 1; started"), rows)
         self.assertIn(("Later 8", "Last work (3)", "Waits for " + waiting.strip()), rows)
         self.assertNotIn("Then 3", rendered)
