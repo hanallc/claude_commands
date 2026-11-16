@@ -550,6 +550,7 @@ class HostMemory:
     swap_total: int = 0
     swap_free: int = 0
     build_and_ci_swap: int | ReadingUnavailable = field(default=0, kw_only=True)
+    swap_in_window_bytes: int = field(default=0, kw_only=True)
 
 Pressure = NoPressureHold | MemoryPressure | PressureUnavailable
 

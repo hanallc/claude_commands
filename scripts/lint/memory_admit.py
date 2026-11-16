@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import uuid
+from collections import deque
 from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -606,7 +607,8 @@ def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory]
     if isinstance(host.build_and_ci_swap, ReadingUnavailable):
         return host.build_and_ci_swap
     swapped_outside = max(0, host.swap_total - host.swap_free - host.build_and_ci_swap)
-    agent_swap_demand = (swapped_outside * policy.agent_swap_share_percent + 99) // 100
+    returning_swap = min(swapped_outside, host.swap_in_window_bytes)
+    agent_swap_demand = (returning_swap * policy.agent_swap_share_percent + 99) // 100
     safety = policy.safety_bytes
     holds = tuple(RunKeepAside(run,
                   max(0, run.need - run.use.bytes) + run.held
@@ -614,7 +616,7 @@ def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory]
     used = sum(run.use.bytes for run in runs if isinstance(run.use, AnonymousRunUse))
     kept = sum(run.bytes for run in holds)
     unavailable = tuple(run for run in runs if isinstance(run.use, RunUseUnavailable))
-    # Swapped agent memory can return to RAM at any time, so it is outside the cap and the room.
+    # Reserve RAM for the measured swap-in burst while MemAvailable tracks current use.
     cap: int | CapUnavailable = (CapUnavailable(unavailable) if unavailable
                                  else max(0, used + ci_use + host.available - safety - agent_swap_demand))
     return MemoryRoom(host.available, safety, used, kept,
@@ -1149,7 +1151,7 @@ def check_memory_reading(path: Path) -> None:
         return
     live_path = os.path.realpath(path)
     cgroup = Path(live_path).is_relative_to("/sys/fs/cgroup")
-    if live_path not in ("/proc/meminfo", "/proc/pressure/memory") and not cgroup:
+    if live_path not in ("/proc/meminfo", "/proc/pressure/memory", "/proc/vmstat") and not cgroup:
         return
     try:
         with Path(record_path).open("ab", buffering=0) as output:
@@ -1158,6 +1160,8 @@ def check_memory_reading(path: Path) -> None:
         pass  # The refusal below still stops the read; callers swallow OSError.
     if cgroup:
         raise LiveMemoryReading(f"live memory reading {live_path} in a test; fake BUILDLOG_BUILDS_CGROUP (scripts/lint/memory_test_support.py)")
+    if live_path == "/proc/vmstat":
+        raise LiveMemoryReading(f"live memory reading {live_path} in a test; fake BUILDLOG_VMSTAT (scripts/lint/memory_test_support.py)")
     raise LiveMemoryReading(
         f"live memory reading {live_path} in a test; fake BUILDLOG_MEMINFO and "
         + "BUILDLOG_MEMORY_PRESSURE (scripts/lint/memory_test_support.py)"
@@ -1169,6 +1173,42 @@ def kib_fields(parts: list[str]) -> dict[str, int]:
     if len(parts) == 3 and parts[2] == "kB" and parts[1].isdecimal():
         return {parts[0].removesuffix(":"): int(parts[1]) * 1024}
     return {}
+
+
+@dataclass(frozen=True)
+class SwapInSample:
+    """A sample holds the cumulative swapped-in page count and its monotonic time."""
+
+    at: float
+    pages: int
+
+
+class SwapInHistory:
+    """The service reader retains swap-in counters within one window."""
+
+    def __init__(self) -> None:
+        self.samples: deque[SwapInSample] = deque()
+
+    def read(self, path: Path, now: float, window_seconds: int) -> int | ReadingUnavailable:
+        """Return swap-in bytes between the newest and oldest samples inside the window."""
+        check_memory_reading(path)
+        try:
+            rows = [line.split() for line in path.read_text().splitlines()]
+            counters = [parts for parts in rows if parts and parts[0] == "pswpin"]
+            if len(counters) != 1 or len(counters[0]) != 2 or not counters[0][1].isdecimal():
+                raise ValueError("expected one nonnegative pswpin page count")
+            pages = int(counters[0][1])
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            if window_seconds < 1 or page_size < 1:
+                raise ValueError("the swap-in window and page size must be positive")
+        except (OSError, UnicodeError, ValueError) as error:
+            return ReadingUnavailable(f"{path}: swap-in reading unavailable: {error}")
+        if self.samples and (pages < self.samples[-1].pages or now < self.samples[-1].at):
+            self.samples.clear()
+        while self.samples and self.samples[0].at < now - window_seconds:
+            del self.samples[0]
+        self.samples.append(SwapInSample(now, pages))
+        return (pages - self.samples[0].pages) * page_size
 
 
 def read_meminfo(path: Path) -> HostMemory:
