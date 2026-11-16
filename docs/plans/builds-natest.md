@@ -4535,52 +4535,14 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** Phase 319
 **Owner:** natest writes; sdlc owns (gate rename plan chunk 4 item 3). The user chose the names 11-16 17:23 ("Name 1 D Name 2 gate-box"), relayed by morty and builds. The one-off rewrite of the stored records is the next phase.
 
-#### Work Order
+#### As-built
 
-**Goal:** the code and config write and read the step names `gate` (full run) and `test-affected` (affected-modules run), and `gate.py` takes `--affected`; no code or config writes `merge-gate` or `targeted-test` as a step name or mode.
-
-**Source:** user answer 11-16 17:23 via builds; queue inventory `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/steprename/inventory_for_natest.md`; report notes in `/tmp/claude/scratch/natest-probe/p89/phase319_notes.md`.
-
-**Spec:**
-1. Step names: every writer and reader of the step value `merge-gate` uses `gate`; of `targeted-test` uses `test-affected`. This covers the gate run record field, the admission and memory readers, the buildlog index query (`step = 'merge-gate'`), `memory_feed.py` `GATE_STEPS`, `memory_admit.py` progress-profile keys (about lines 1946 and 1948), and the AWS mode values that `cloud_gate.py` writes and `run_cost.py` groups.
-2. Mode flag: `gate.py --targeted` is `--affected`. Update every caller (`targeted_test.py` entry point, scripts, commands, docs). No alias for `--targeted`.
-3. Config keys, one key per name, no duplicates:
-   - `config/build_steps.conf`: `names.merge-gate` -> `names.gate`; `names.targeted-test` -> `names.test-affected` (value `test affected`; report's batch730 adds the same key under the gate jobs, so keep one line); `prose.merge-gate` -> `prose.gate`; `owned.merge-gate` -> `owned.gate`; `owned.targeted-test` -> `owned.test-affected`; `owned.showrunner-merge-gate` -> `owned.showrunner-gate`.
-   - `config/build_admission.conf`: `program_first_peak_gib.merge-gate` -> `.gate`; `program_first_peak_gib.targeted-test` -> `.test-affected`; `peak_hold_seconds.merge-gate` -> `.gate`; `peak_hold_seconds.targeted-test` -> `.test-affected`. Values stay. Update the comments near them and `scripts/lint/fixtures/build_admission.conf`.
-   - `config/README.md` where it names these keys.
-4. Do not change these (other work owns them): folder names and paths (`~/.local/state/merge-gate` in the phase 319 guard, `config/build_folders.conf` `prefixes.*`), `merge_gate_governor_gib`, the AWS box user and folder (`gate_box.py`, `deploy.py` box paths), script file names, prose "merge gate" outside the renamed keys (chunk 5), and the `merge_gate.py` / `targeted_test.py` entry points (chunk 6). Name each remaining `merge-gate` or `targeted-test` hit in `scripts/ config/ commands/` and why it stays.
-5. No dual read of the old names: stored records move once at deploy, in the next phase. List each stored record the old names reach, so the next phase covers it; compare with the queue inventory.
-6. Tests: update fixtures and expected values to the new names. Remove no assertion. Every behavior check stays.
-7. No signal handlers, masks or dispositions. No lazy imports.
-
-**Files:**
-- `scripts/production/gate.py`
-- `scripts/production/targeted_test.py`
-- `scripts/production/gate_test_support.py`
-- `scripts/buildlog/index.py`
-- `scripts/build_queue/admission_records.py`
-- `scripts/build_queue/admission_service.py`
-- `scripts/build_queue/memory_feed.py`
-- `scripts/lint/memory_admit.py`
-- `scripts/aws_target/cloud_gate.py`
-- `scripts/aws_target/run_cost.py`
-- `scripts/aws_target/gate_trial.py`
-- `scripts/lint/fixtures/build_admission.conf`
-- `config/build_steps.conf`
-- `config/build_admission.conf`
-- `config/README.md`
-
-**Workers:** 1 writer. The rename crosses every file at once; a split leaves a red tree.
-- impl: every file above and the test modules that hold the old names.
-- test: opens as impl.
-
-**Constraints from prior phases:** Phase 316: `gate.py` is the gate; `merge_gate.py` and `targeted_test.py` are entry points until chunk 6. Phase 317: variables are `GATE_*`; `config/gate.conf`. Phase 318: state folder `~/.local/state/gate`. Phase 319: the state readers refuse while only the old folder exists.
-
-**Acceptance gate:**
-1. `git grep -nE "merge-gate|targeted-test|--targeted" -- scripts config commands` finds only the hits Spec item 4 keeps, each named in the reply.
-2. Every test module that holds a renamed name passes on natedev, in batches of 4 under the hold rules.
-3. The reply lists the stored records of Spec item 5.
-4. basedpyright adds no finding on each touched Python file.
+- The stored step names are `gate` (full run) and `test-affected` (affected-modules run). Every writer and reader uses them: the gate run record, the admission and memory readers, the buildlog index query, `memory_feed.py` `GATE_STEPS`, the `memory_admit.py` progress-profile keys, and the AWS mode values that `cloud_gate.py` writes and `run_cost.py` groups.
+- `gate.py --affected` replaces `--targeted`, with no alias.
+- Ten config keys take the new names, one key per name: `names.*`, `prose.gate`, `owned.*` in `build_steps.conf`, and `program_first_peak_gib.*` and `peak_hold_seconds.*` in `build_admission.conf`. Values stay, except the shown name of an affected-modules run with no owner, which reads `test affected`.
+- No dual read of the old names. Phase 321's program converts the stored records once at deploy. The kept old-name hits (folder paths, the AWS box user, script file names, prose "merge gate") belong to other chunks of the rename plan.
+- An AWS launch reads the tested commit's `SuiteMode` values with `git show` and `ast`, without running its code. A commit that lacks the requested mode gets a local fallback before launch (review F001).
+- Checkpoint cf4ac06c4.
 
 ### Phase 321 — the stored step names move to gate and test-affected once, at deploy  · status: todo
 **Depends on:** Phase 320
