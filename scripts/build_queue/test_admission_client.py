@@ -133,6 +133,37 @@ class ClientTests(unittest.TestCase):
                 if position == 1:
                     self.assertNotIn(f"head {label} needs", output.getvalue())
 
+    def test_wait_lines_report_only_a_new_lowest_place_or_a_changed_reason(self) -> None:
+        memory_wait = replace(WAIT, snapshot=replace(WAIT.snapshot, head_reason=records.NeedsMemory()))
+        estimate_wait = replace(EXPIRED, snapshot=replace(EXPIRED.snapshot, head_reason=records.EstimateExpired(1)))
+        for resource_wait in (False, True):
+            for replies, shown in (
+                ((memory_wait, memory_wait, memory_wait, memory_wait, estimate_wait), (13, 12, 12)),
+                ((memory_wait, estimate_wait, estimate_wait, estimate_wait, estimate_wait), (13, 14, 12)),
+            ):
+                with self.subTest(resource_wait=resource_wait, shown=shown), AdmissionFixture() as fixture, \
+                        mock.patch.object(client, "CLOCK", fixture.clock), redirect_stderr(io.StringIO()) as output:
+                    events: list[str] = []
+                    printer = client.WaitOutput(on_event=events.append)
+                    if resource_wait:
+                        printer(replace(memory_wait, position=2))
+                        printer.resource_wait(wire.PlacementResourceWait("natedev", "blocked"))
+                        _ = output.seek(0)
+                        _ = output.truncate()
+                        events.clear()
+                    for position, waiting in zip((13, 14, 13, 12, 12), replies, strict=True):
+                        printer(replace(waiting, position=position))
+                    lines = output.getvalue().splitlines()
+                    self.assertEqual(len(lines), len(shown), lines)
+                    self.assertTrue(lines[0].startswith("waiting for memory since "), lines)
+                    for line, position in zip(lines, shown, strict=True):
+                        self.assertIn(f"place {position} in line", line)
+                    self.assertTrue(all(line.startswith("still waiting for memory") for line in lines[1:]), lines)
+                    self.assertEqual(events, (["done"] if resource_wait else [])
+                        + ["first", 'holder {"kind":"none"}'])
+                    printer.finished()
+                    self.assertTrue(output.getvalue().splitlines()[-1].endswith("starting"))
+
     def service_wait_record(self) -> tuple[dict[str, object], dict[str, object]]:
         raw = cast(dict[str, object], json.loads(wire.encode_reply(replace(WAIT, snapshot=service_snapshot()))))
         snapshot = cast(dict[str, object], cast(dict[str, object], raw["data"])["snapshot"])
