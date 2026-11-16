@@ -1018,7 +1018,7 @@ def need_in_next_part(steps: Sequence[admission_records.RunningStep]) -> bool:
                and isinstance(step.measured.window, progress.WindowPeak) for step in steps)
 
 
-WaitCause = Literal["memory", "its turn", "GPU slot", "build slot", "memory pressure", "AWS slot", "build hold", "Mac"]
+WaitCause = Literal["memory", "its turn", "a few seconds after another start", "GPU slot", "build slot", "memory pressure", "AWS slot", "build hold", "Mac"]
 
 
 def wait_why(reason: admission_records.WaitReason) -> WaitCause:
@@ -1031,7 +1031,7 @@ def wait_why(reason: admission_records.WaitReason) -> WaitCause:
         case admission_records.TokenWaitingWaiter():
             return "its turn"
         case admission_records.StartSpacingWait():
-            return "its turn"
+            return "a few seconds after another start"
         case admission_records.MemoryPressure():
             return "memory pressure"
         case admission_records.GpuSlotWait():

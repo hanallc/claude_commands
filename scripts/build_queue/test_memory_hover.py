@@ -700,12 +700,18 @@ function fitLabels() {}
 
     def test_each_wait_state_has_a_page_hover_reason(self) -> None:
         for reason, expected in ((admission_records.PressureUnavailable("cannot read PSI"), "memory"),
-                                  (admission_records.StartSpacingWait(110), "its turn"),
+                                  (admission_records.StartSpacingWait(110), "a few seconds after another start"),
                                   (admission_records.BehindHead("first", 1, "head-session"), "its turn")):
             with self.subTest(reason=reason):
                 hover = self.page_expression("tipText('wait:0', data)", {"read_at": 200_000, "waiters": [{
                     "name": "fixture", "need": 1, "since": 100, "why": memory_feed.wait_why(reason)}]})
                 self.assertIn("Waits for  "+expected, str(hover))
+                html = str(self.page_expression("tooltipHtml('wait:0', data)", {"read_at": 200_000, "waiters": [{
+                    "name": "fixture", "need": 1, "since": 100, "why": memory_feed.wait_why(reason)}]}, walk=True))
+                grid = ElementTree.fromstring(html)
+                fields = dict(zip((cell.text for cell in grid.findall("dt")),
+                                  (cell.text for cell in grid.findall("dd"))))
+                self.assertEqual(fields["Waits for"], expected)
 
     def test_a_mac_only_wait_hover_names_what_holds_the_mac_below_can_run_on(self) -> None:
         reason = "held by research for Mac CI restore"

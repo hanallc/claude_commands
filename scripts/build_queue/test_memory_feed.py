@@ -36,7 +36,7 @@ from scripts.build_queue.queue_fixture import write_process, write_scope
 from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
-from scripts.lib import atomic_file, conf, test_hang_guard
+from scripts.lib import atomic_file, build_folders, conf, test_hang_guard
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
 from scripts.lib.build_steps import read_step_names
 from scripts.message import unit_labels
@@ -1084,13 +1084,16 @@ process.stdout.write(JSON.stringify({
             sys.exit(1)
         """))
         chrome.chmod(0o755)
-        for ending in ('exit', 'kill', 'request'):
-            with self.subTest(ending=ending), tempfile.TemporaryDirectory(dir=self.root) as directory:
-                caller = Path(directory)
+        for ending, explicit_output in ((ending, explicit) for ending in ('exit', 'kill', 'request')
+                                        for explicit in (False, True)):
+            with self.subTest(ending=ending, explicit_output=explicit_output), \
+                 build_folders.tool_folder("page-proof-caller", parent=self.root) as caller:
                 environment = {**os.environ, "TMPDIR": str(caller), "CHROME": str(chrome),
                     "CHROME_REPORT": str(report), "CHROME_END": ending}
-                result = subprocess.run([executable, str(Path(memory_feed.__file__).with_name("memory_page_proof.mjs")),
-                    str(self.root / "proof")], env=environment, text=True, capture_output=True,
+                command = [executable, str(Path(memory_feed.__file__).with_name("memory_page_proof.mjs"))]
+                if explicit_output:
+                    command.append(str(self.root / "proof"))
+                result = subprocess.run(command, env=environment, text=True, capture_output=True,
                     timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
                 self.assertNotEqual(result.returncode, 0)
                 if ending == 'request':
@@ -1865,7 +1868,7 @@ process.stdout.write(JSON.stringify({
             (admission_records.NeedsMemory(need=4 * gib, free=gib), "memory"),
             (admission_records.BehindHead("first", 0, "fixture"), "its turn"),
             (admission_records.TokenWaitingWaiter(0), "its turn"),
-            (admission_records.StartSpacingWait(0), "its turn"),
+            (admission_records.StartSpacingWait(0), "a few seconds after another start"),
             (admission_records.MemoryPressure(1.0), "memory pressure"),
             (admission_records.GpuSlotWait(1, 1), "GPU slot"),
             (admission_records.EstimateExpired(0), "memory"),

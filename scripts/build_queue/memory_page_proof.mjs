@@ -19,7 +19,6 @@ import {spawn, execFileSync} from 'node:child_process';
 import {once} from 'node:events';
 import {inflateSync} from 'node:zlib';
 import {join, dirname, resolve} from 'node:path';
-import {tmpdir} from 'node:os';
 import {fileURLToPath} from 'node:url';
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -51,8 +50,15 @@ if (process.argv[2] === '--leased-chrome') {
 }
 const leasedOutput = process.argv[2] === '--leased-output';
 if (!process.argv[2]) {
-  const child = spawn(python, [maker, 'run', '--owner', 'queue', '--name', 'memory-page-proof',
-    '--prefix', 'memory-page-proof-', '--parent', tmpdir(), '--', process.execPath,
+  const outputFolder = `import os, sys
+from pathlib import Path
+from scripts.lib import build_folders
+with build_folders.tool_folder('memory-page-proof') as folder:
+    descriptor = build_folders.build_folder_lock_fd(folder)
+    environment = {**os.environ, 'BUILD_FOLDER': str(folder), 'BUILD_FOLDER_LOCK_FD': str(descriptor), 'TMPDIR': str(folder)}
+    sys.exit(build_folders.run_build_command(sys.argv[1:], path=Path.cwd(), environment=environment, pass_fds=(descriptor,)))
+`;
+  const child = spawn(python, ['-c', outputFolder, process.execPath,
     fileURLToPath(import.meta.url), '--leased-output'], {cwd:repo,stdio:leaseStdio(['inherit','inherit','inherit'])});
   const [status] = await once(child, 'exit');
   process.exit(status ?? 1);
@@ -1241,8 +1247,10 @@ const folder = callerFolder ? resolve(callerFolder) : process.env.BUILD_FOLDER;
               machine:document.querySelector('.walk-table td.machine').textContent})`);
             assert.equal(absentCells.unit,'');assert.equal(absentCells.owner,'');assert.equal(absentCells.machine,'—');
 
-            for (const [name, expected] of [['pressure','memory'],['spacing','its turn'],['head','its turn']]) {
-              await show(readings[name]);
+            for (const [name, expected] of [['pressure','memory'],['spacing','a few seconds after another start'],['head','its turn']]) {
+              const reading = structuredClone(readings[name]);
+              if (name === 'spacing') reading.waiters[0].name = 'hana nextest';
+              await show(reading);
               const state=await evaluate(`({list:document.querySelector('#priority-line,#head-line,#wait-reasons'),
                 hover:tipText('wait:0',latest)[1], rows:document.querySelectorAll('.wrow[data-run]').length})`);
               assert.equal(state.list,null,'The removed list remains.');
@@ -1262,6 +1270,7 @@ const folder = callerFolder ? resolve(callerFolder) : process.env.BUILD_FOLDER;
                     height:Math.max(box.bottom,tipBox.bottom)-top+4,scale:1}};
                 })()`);
                 assert.ok(clip.text.includes(expected),'The waiting tooltip omits the explanation.');
+                assert.ok(clip.text.includes('Waits for'),'The waiting tooltip omits the cause label.');
                 const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:clip.clip});
                 await writeFile(join(folder,'start-spacing-dark-desktop.png'),Buffer.from(shot.data,'base64'));
                 await evaluate("hideTip();window.scrollTo(0,0)");
