@@ -20,6 +20,10 @@ class PhaseWaitsTests(unittest.TestCase):
              "wait_reason": "build queue", "wait_started_epoch": 1_050,
              "holder": {"state": "NamedHolder", "resource_kind": "slot", "resource": "build",
                  "holder": {"state": "UnitHolder", "unit": "builder"}}},
+            {"event_type": "wait_started", "wait_scope": "unit", "target_work": "eight",
+             "wait_id": "unit", "wait_by": "the user", "wait_reason": "the user approves the release",
+             "wait_kind": "WaitingForUser", "wait_started_epoch": 1_060,
+             "wait_attribution": {"state": "UnitTarget"}},
         ]
         waits = phase_waits.phase_waits(events, "eight")
         self.assertEqual([(wait.reason, wait.started) for wait in waits],
@@ -51,6 +55,32 @@ class PhaseWaitsTests(unittest.TestCase):
                              ("phase_finished", {"phase_instance_id": "eight"}), ("run_finished", {})):
             with self.subTest(finish=kind):
                 self.assertEqual(phase_waits.phase_waits([events[0], {"event_type": kind, **fields}], "eight"), [])
+
+    def test_unit_waits_keep_the_newest_reason_in_start_order_and_close_at_the_target(self) -> None:
+        first: dict[str, object] = {"event_type": "wait_started", "wait_scope": "unit", "target_work": "30",
+            "wait_id": "old", "wait_by": "sdlc", "wait_reason": "the workers return",
+            "wait_kind": "WaitingForSupplier", "wait_started_epoch": 1_000,
+            "wait_attribution": {"state": "UnitTarget"}}
+        second = {**first, "target_work": "merge-once", "wait_id": "merge", "wait_started_epoch": 1_010}
+        newest = {**first, "wait_id": "new", "wait_by": "the user", "wait_reason": "the user approves the release",
+                  "wait_kind": "WaitingForUser", "wait_started_epoch": 1_020}
+        events = [first, second, newest,
+            {"event_type": "wait_finished", "wait_id": "old"},
+            {"event_type": "phase_started", "phase_id": "31"},
+            {"event_type": "phase_finished", "phase_id": "30"},
+            {"event_type": "wait_started", "phase_instance_id": "phase", "wait_id": "phase",
+             "wait_reason": "memory admission", "wait_started_epoch": 1_030}]
+        waits = phase_waits.unit_waits(events)
+        self.assertEqual([(wait.target, wait.by, wait.reason, wait.kind, wait.started, wait.wait_id) for wait in waits], [
+            ("merge-once", "sdlc", "the workers return", "WaitingForSupplier", 1_010, "merge"),
+            ("30", "the user", "the user approves the release", "WaitingForUser", 1_020, "new")])
+        for finish in (
+                {"event_type": "wait_finished", "wait_id": "new"},
+                {"event_type": "wait_unclosed", "wait_id": "new"},
+                {"event_type": "phase_started", "phase_id": "30"}):
+            with self.subTest(finish=finish):
+                self.assertEqual([wait.target for wait in phase_waits.unit_waits([*events, finish])], ["merge-once"])
+        self.assertEqual(phase_waits.unit_waits([*events, {"event_type": "run_finished"}]), [])
 
 
 if __name__ == "__main__":

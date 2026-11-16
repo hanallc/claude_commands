@@ -108,7 +108,7 @@ def shot(markdown: Path, columns: int, png: Path) -> None:
                                      "-e", claude, "--bare", "--resume", session], cwd=cwd, env=env)
             try:
                 time.sleep(settings.whole("reply_shot_render_seconds"))
-                _ = subprocess.run(["import", "-display", display, "-window", "root", "-trim", str(png)], check=True)
+                _ = subprocess.run(["import", "-display", display, "-window", "root", "-silent", "-trim", str(png)], check=True)
             finally:
                 term.terminate()
                 _ = term.wait(timeout=10)
