@@ -775,6 +775,9 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Readable empty records select `idle` when the director is not busy.
     An open task wait selects `waiting on other work` before unresolved sent work selects `waiting to merge`.
     The first next item's recorded dependency then selects `waiting on other work`.
+    A unit wait on done work selects `waiting to merge` at the merge rule.
+    A unit wait on the first next item, or an unmatched target, selects `waiting on other work` at the next-work rule.
+    An open unit wait prevents an otherwise empty unit from counting as idle.
     Other units select `unknown`.
     A later queue wait never adds another count.
   - **Current tasks:** The staff current run takes priority; otherwise, the newest owned run supplies open phases.
@@ -809,6 +812,25 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Empty records distinguish a complete plan from no plan or assigned work.
     Census failure says `Workers unavailable; who runs cannot be determined.`
     No-worker mode adds `Workers cannot start because no-worker mode is on.`
+  - **Unit waits and holds:** `start-wait --target WORK --by WHO --reason CONDITION --kind KIND` records one unit wait.
+    `--target` requires both `--by` and `--reason`.
+    The event has `wait_scope: unit`, `target_work`, `wait_by`, and `wait_attribution: {state: UnitTarget}`.
+    It has no phase or pass attribution.
+    `phase_waits.unit_waits` returns `UnitWait(target, by, reason, kind, started, wait_id)` in start order.
+    A newer wait on the same target replaces the earlier reason.
+    `wait_finished`, `wait_unclosed`, target phase start, and run finish close the reader's wait.
+    `start-phase` writes `wait_finished` for every open unit wait on its phase ID.
+    Phase waits and launcher waits keep their existing behavior.
+    Done work outside the merge line says `<id> is done; <by> keeps it from the merge until <reason>; since <time>.`
+    This sentence also covers a completed phase with no sent commit.
+    Merge line entries, running merges, results, and local main take priority over hold text.
+    Queue and pending plan targets append `<By> keeps it waiting until <reason>; since <time>.`
+    Queue placement takes priority when the same target also names pending plan work.
+    Unmatched targets say `<By> keeps <target> waiting until <reason>; since <time>.` under `Now` or `Also`.
+    With no open phase, the first next wait supplies this text:
+    `No task runs. <By> keeps <target> waiting until <reason>.`
+    Actor text stays unchanged in the event; a sentence start uses a capital letter.
+    The board reads unit waits from its cached run events.
   - **Merge groups:** `phase_sent_work` finds submission after the phase's last work start.
     Sent phases appear only under `Merge`.
     `unit_lands` keeps the direct and carried merge groups from the merge-once phase.
@@ -828,6 +850,8 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Dependencies use the local `origin/main`; the command never fetches.
     Satisfied dependencies say `Ready: <after> is on the local copy of main.`
     Unmet dependencies say `After <after>: <state>.`
+    `waits_on.PhaseSent` includes the dependency phase's open unit wait from the same run read.
+    Without merge evidence, its dependency text says `After <after>: done; <by> keeps it from the merge until <reason>.`
     Pending phases follow as `Plan next: <title> (<id>); then <remaining ids>.`
     The first pending phase preserves its `Waits for:` text and names unmet `Depends on:` phases.
     `plan_history.plan_phase_details` reads headings and these lines in one cached read per plan path.

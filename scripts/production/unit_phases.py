@@ -420,6 +420,7 @@ class UnitMergeNotes(NamedTuple):
     grouped_phases: frozenset[str]
     entries: tuple[str, ...]
     pending: bool
+    wait_targets: frozenset[str]
 
 
 def joined_names(names: Sequence[str]) -> str:
@@ -440,7 +441,8 @@ def sent_sentence(phase: str, state: land_queue.LandState, *, now: float, zone: 
 
 
 def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, PhaseSentWork], now: float, zone: ZoneInfo,
-               on_main: Callable[[str], bool]) -> UnitMergeNotes:
+               on_main: Callable[[str], bool], unit_waits: Sequence[phase_waits.UnitWait] = (),
+               done_ids: tuple[str, ...] = ()) -> UnitMergeNotes:
     """Describe each merge group once and retain failed results without open rows."""
     prefix = f"{unit} "
 
@@ -471,6 +473,24 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
         phase = result["phase"]
         if result["unit"] == unit and (phase not in newest or result["time"] > newest[phase]["time"]):
             newest[phase] = result
+    wait_targets: set[str] = set()
+    holds: dict[str, phase_waits.UnitWait] = {}
+    for wait in unit_waits:
+        sent = open_sent.get(wait.target, NoSentWork())
+        if (wait.target not in done_ids and isinstance(sent, NoSentWork)
+                and wait.target not in queued and wait.target not in merging and wait.target not in newest):
+            continue
+        wait_targets.add(wait.target)
+        result = newest.get(wait.target)
+        if (wait.target in queued or wait.target in merging
+                or result is not None and (not isinstance(sent, SentCommit) or result["commit"] == sent.commit)):
+            continue
+        if isinstance(sent, SentCommit) and not isinstance(land_queue.land_state(land, sent.commit),
+                                                          land_queue.NotInLine | land_queue.LineUnused):
+            continue
+        if isinstance(sent, SentCommit) and on_main(sent.commit):
+            continue
+        holds[wait.target] = wait
     parts: list[str] = []
     grouped: set[str] = set()
     pending = bool(merging or items)
@@ -495,14 +515,38 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
         if isinstance(sent, NoSentWork) or phase in shown:
             continue
         state = land_queue.land_state(land, sent.commit) if isinstance(sent, SentCommit) else land_queue.LineUnused()
-        parts.append(sent_sentence(phase, state, now=now, zone=zone))
+        parts.append(merge_hold_sentence(holds[phase], now=now, zone=zone) if phase in holds
+                     else sent_sentence(phase, state, now=now, zone=zone))
         pending = pending or not (isinstance(state, land_queue.LandEnded) and state.result["landed"])
+    for phase, wait in holds.items():
+        if isinstance(open_sent.get(phase, NoSentWork()), NoSentWork):
+            parts.append(merge_hold_sentence(wait, now=now, zone=zone))
+            pending = True
     for phase, result in newest.items():
         if (not result["landed"] and phase not in open_sent and phase not in queued and phase not in merging
                 and not on_main(result["commit"])):
             parts.append(f"{phase} did not merge: {try_text(result, now=now, zone=zone)}.")
             pending = True
-    return UnitMergeNotes(" · ".join(parts), frozenset(grouped), tuple(parts), pending)
+    return UnitMergeNotes(" · ".join(parts), frozenset(grouped), tuple(parts), pending, frozenset(wait_targets))
+
+
+def completed_unit_phases(events: Sequence[dict[str, object]]) -> dict[str, PhaseSentWork]:
+    """Read completed phases and their sent work from their latest instances."""
+    instances: dict[str, str] = {}
+    phases: dict[str, list[dict[str, object]]] = {}
+    completed: set[str] = set()
+    for event in events:
+        kind = event.get("event_type")
+        phase = str(event.get("phase_id") or instances.get(str(event.get("phase_instance_id", "")), ""))
+        if kind == "phase_started":
+            instances[str(event.get("phase_instance_id", ""))] = phase
+            phases[phase] = []
+            completed.discard(phase)
+        if phase in phases:
+            phases[phase].append(event)
+            if kind == "phase_finished" and event.get("status") == "completed":
+                completed.add(phase)
+    return {phase: phase_sent_work(history) for phase, history in phases.items() if phase in completed}
 
 
 class OpenRunPhase(NamedTuple):
@@ -614,8 +658,11 @@ def open_unit_runs(snapshot: staff.StaffSnapshot, *,
 def wait_text(found: waits_on.WaitState, land: land_queue.LandView, *, now: float, zone: ZoneInfo) -> str:
     """Describe a dependency from the existing local records."""
     match found:
-        case waits_on.PhaseSent(commit):
+        case waits_on.PhaseSent(commit, wait):
             state = land_queue.land_state(land, commit)
+            if (isinstance(wait, phase_waits.UnitWait)
+                    and isinstance(state, land_queue.NotInLine | land_queue.LineUnused)):
+                return f"done; {in_sentence(wait.by)} keeps it from the merge until {wait.reason.rstrip().rstrip('.')}"
             return land_text(state, now=now, zone=zone)
         case waits_on.NotOnMain(commit):
             state = land_queue.land_state(land, commit)
@@ -684,7 +731,7 @@ class TaskLine(NamedTuple):
     """One current task and its execution state."""
 
     text: str
-    state: Literal["running", "waiting", "unexplained", "result"]
+    state: Literal["running", "waiting", "unit_wait", "unexplained", "result"]
 
 
 class ReadyNext(NamedTuple):
@@ -697,6 +744,7 @@ class BlockedNext(NamedTuple):
     """A recorded dependency prevents the first next item."""
 
     reason: str
+    wait: phase_waits.UnitWait | phase_waits.NoUnitWait = phase_waits.NO_UNIT_WAIT
 
 
 class NoNextWork(NamedTuple):
@@ -714,6 +762,7 @@ class NextWork(NamedTuple):
     plan: str
     empty: str
     first: ReadyNext | BlockedNext | NoNextWork | NextUnavailable
+    wait_targets: frozenset[str]
 
 
 class UnitBoardState(NamedTuple):
@@ -738,13 +787,14 @@ class UnitBoardState(NamedTuple):
                 or self.busy and any(task.state in ("unexplained", "result") for task in self.tasks)):
             return "working"
         if self.held or (not self.busy and self.readable and not self.has_open and not self.merge.pending
+                         and not any(task.state == "unit_wait" for task in self.tasks)
                          and isinstance(self.next_work.first, NoNextWork)):
             return "idle"
         if any(task.state == "waiting" for task in self.tasks):
             return "waiting on other work"
         if self.merge.pending:
             return "waiting to merge"
-        if isinstance(self.next_work.first, BlockedNext):
+        if isinstance(self.next_work.first, BlockedNext) or any(task.state == "unit_wait" for task in self.tasks):
             return "waiting on other work"
         return "unknown"
 
@@ -764,6 +814,25 @@ def in_sentence(work: str) -> str:
     """Lower a title's first word inside a sentence when it is an article or a number; names keep their capital."""
     first, _, rest = work.partition(" ")
     return f"{first.lower()} {rest}" if rest and first in SENTENCE_START_WORDS else work
+
+
+def unit_wait_reason(wait: phase_waits.UnitWait, target: str) -> str:
+    """Name the actor and the condition that permits the target work."""
+    actor = wait.by[:1].upper() + wait.by[1:]
+    return f"{actor} keeps {in_sentence(target)} waiting until {wait.reason.rstrip().rstrip('.')}"
+
+
+def unit_wait_sentence(wait: phase_waits.UnitWait, target: str, *, now: float, zone: ZoneInfo) -> str:
+    """Add the wait's original start time to its reason."""
+    since = short_time(datetime.fromtimestamp(wait.started, zone), now=now, zone=zone)
+    return f"{unit_wait_reason(wait, target)}; since {since}."
+
+
+def merge_hold_sentence(wait: phase_waits.UnitWait, *, now: float, zone: ZoneInfo) -> str:
+    """Describe done work that its actor keeps from the merge."""
+    since = short_time(datetime.fromtimestamp(wait.started, zone), now=now, zone=zone)
+    return (f"{wait.target} is done; {in_sentence(wait.by)} keeps it from the merge until "
+            f"{wait.reason.rstrip().rstrip('.')}; since {since}.")
 
 
 def wait_sentence(work: str, wait: phase_waits.PhaseWait, *, snapshot: staff.StaffSnapshot,
@@ -897,13 +966,19 @@ def shell_waits(view: CensusView | census.CensusFailed, unit: live_units.LiveUni
 def next_work(queue: UnitWorkQueue | UnreadableWorkQueue, record: object, *, open_ids: tuple[str, ...],
               read_plan: Callable[[Path], list[plan_history.PlanPhase]],
               wait_state: Callable[[str], waits_on.WaitState], land: land_queue.LandView,
-              now: float, zone: ZoneInfo) -> NextWork:
+              now: float, zone: ZoneInfo, unit_waits: Sequence[phase_waits.UnitWait] = ()) -> NextWork:
     """Keep queue order and explain the first pending plan phase."""
     fields = record_fields(record)
     rows = plan_phase_rows(fields)
     pending = [row for row in rows if row.get("status") not in ("done", "running", "open")
                and row.get("phase") not in open_ids]
     plan = ""
+    waits = {wait.target: wait for wait in unit_waits}
+    wait_targets: set[str] = set()
+    prefixes = tuple(phase_id + ":" for phase_id in open_ids)
+    queue_targets = ({item.text.partition(":")[0] for item in queue.items
+                      if ":" in item.text and not item.text.startswith(prefixes)}
+                     if isinstance(queue, UnitWorkQueue) else set[str]())
     first: ReadyNext | BlockedNext | NoNextWork | NextUnavailable = NoNextWork()
     if pending:
         phase_id = pending[0].get("phase", "")
@@ -926,25 +1001,41 @@ def next_work(queue: UnitWorkQueue | UnreadableWorkQueue, record: object, *, ope
                     plan += f" After phase {dependency}: not done."
                     if isinstance(first, ReadyNext):
                         first = BlockedNext(f"The next plan phase waits for phase {dependency}.")
+        for row in pending:
+            target = row.get("phase", "")
+            if target in waits and target not in queue_targets:
+                wait = waits[target]
+                wait_targets.add(target)
+                plan += " " + unit_wait_sentence(wait, "it", now=now, zone=zone)
+                if target == phase_id:
+                    first = BlockedNext(unit_wait_reason(wait, target) + ".", wait)
     if isinstance(queue, UnreadableWorkQueue):
-        return NextWork((), plan, "Queue unavailable; next work cannot be determined.", NextUnavailable())
+        return NextWork((), plan, "Queue unavailable; next work cannot be determined.", NextUnavailable(),
+                        frozenset(wait_targets))
     items: list[str] = []
     unstarted: list[unit_queue.QueuedItem] = []
-    prefixes = tuple(phase_id + ":" for phase_id in open_ids)
     # A queue item that names current work is that work, not work after it.
     for item in queue.items:
         if item.text.startswith(prefixes):
             continue
-        items.append(queued_text(item, wait_state(item.after) if item.after else None, land, now=now, zone=zone))
+        text = queued_text(item, wait_state(item.after) if item.after else None, land, now=now, zone=zone)
+        target, colon, _ = item.text.partition(":")
+        if colon and target in waits:
+            wait_targets.add(target)
+            text = text.rstrip().rstrip(".") + ". " + unit_wait_sentence(waits[target], "it", now=now, zone=zone)
+        items.append(text)
         unstarted.append(item)
     if unstarted:
         item = unstarted[0]
         first = (BlockedNext(f"The first queued item waits for {item.after}.")
                  if item.after and not isinstance(wait_state(item.after), waits_on.OnMain) else ReadyNext(item.text))
+        target, colon, _ = item.text.partition(":")
+        if colon and target in waits:
+            first = BlockedNext(unit_wait_reason(waits[target], target) + ".", waits[target])
     empty = ("Nothing queued after the current work."
              if open_ids or any(row.get("status") in ("running", "open") for row in rows)
              else "Nothing queued. The plan is complete." if rows else "Nothing queued. No plan is assigned.")
-    return NextWork(tuple(items), plan, empty, first)
+    return NextWork(tuple(items), plan, empty, first, frozenset(wait_targets))
 
 
 def hold_text(member: staff.StaffRow, *, now: float, zone: ZoneInfo) -> str:
@@ -1087,19 +1178,30 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         show_plan_eta = show_plan_eta or plan_eta
         open_sent = {phase.phase: phase_sent_work([
             event for event in run_events if event.get("phase_instance_id") == phase.instance_id]) for phase in phases}
-        merge = unit_lands(unit.unit, land, open_sent=open_sent, now=now, zone=zone, on_main=on_main)
+        waits = phase_waits.unit_waits(run_events)
+        done = completed_unit_phases(run_events) if waits else {}
+        for wait in waits:
+            if wait.target in done and wait.target not in open_sent:
+                open_sent[wait.target] = done[wait.target]
+        merge = unit_lands(unit.unit, land, open_sent=open_sent, now=now, zone=zone, on_main=on_main,
+                           unit_waits=waits, done_ids=tuple(done))
         open_ids = tuple(phase.phase for phase in phases)
         next_item = next_work(queue, record, open_ids=open_ids, read_plan=read_plan, wait_state=wait_state,
-                              land=land, now=now, zone=zone)
+                              land=land, now=now, zone=zone,
+                              unit_waits=tuple(wait for wait in waits if wait.target not in merge.wait_targets))
         tasks = tuple(task for phase in phases if isinstance(open_sent[phase.phase], NoSentWork)
                       for task in phase_tasks(phase, run_events, workers=workers, busy=busy, snapshot=snapshot,
                                                now=now, zone=zone))
         shells = shell_waits(view, unit, now=now, zone=zone, snapshot=snapshot, events=run_events, phases=phases)
         # A shell and a phase can report the same resource wait.
         tasks += tuple(task for task in shells if not any(existing.text.startswith(task.text) for existing in tasks))
+        tasks += tuple(TaskLine(unit_wait_sentence(wait, wait.target, now=now, zone=zone), "unit_wait")
+                       for wait in waits if wait.target not in merge.wait_targets | next_item.wait_targets)
         fallback = hold
         if not fallback:
-            if busy:
+            if isinstance(next_item.first, BlockedNext) and isinstance(next_item.first.wait, phase_waits.UnitWait):
+                fallback = "No task runs. " + next_item.first.reason
+            elif busy:
                 fallback = "The director is busy, but its task is not recorded. No worker runs."
             elif isinstance(next_item.first, BlockedNext):
                 fallback = "No task runs. " + next_item.first.reason
