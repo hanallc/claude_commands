@@ -60,12 +60,12 @@ class ConsoleTests(unittest.TestCase):
         self.assertTrue((folder / change_page.BROWSER_MANIFEST).is_file())
         markup = ConsoleMarkup()
         markup.feed(source)
-        self.assertEqual(markup.pages, ["aws", "builds", "changes", "images", "questions"])
+        self.assertEqual(markup.pages, ["accounts", "aws", "builds", "changes", "images", "questions"])
         self.assertEqual(markup.sources, [])
         # Each page has its own icon and a hidden new mark; the menu button has one more mark.
-        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 15)
-        self.assertEqual(source.count('class="lucide lucide-sparkle"'), 6)
-        self.assertEqual(source.count('<span class="new-mark" hidden>'), 5)
+        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 17)
+        self.assertEqual(source.count('class="lucide lucide-sparkle"'), 7)
+        self.assertEqual(source.count('<span class="new-mark" hidden>'), 6)
         self.assertIn('<span class="new-mark" id="menu-new" hidden>', source)
         self.assertIn('data-news="/console/news"', source)
         self.assertIn("showNews();\n    loadNews();\n    if (navigate && phone.matches) collapse(true);", source)
@@ -117,7 +117,7 @@ class ConsoleTests(unittest.TestCase):
         _ = page.write_text("<!doctype html><title>Builds</title><h1>Builds</h1>")
         _ = (self.configuration / "memory_feed.conf").write_text(f"output_folder={folder}\n")
         pages = console.read_pages()
-        self.assertEqual(pages[1].destination, console.AvailablePage("/builds/memory_live.html"))
+        self.assertEqual(pages[2].destination, console.AvailablePage("/builds/memory_live.html"))
         self.assertIn('data-url="/builds/memory_live.html" data-title="Builds"', console.render(pages, console.UnavailablePage()).decode())
         self.assertEqual(page.read_text(), "<!doctype html><title>Builds</title><h1>Builds</h1>")
 
@@ -127,13 +127,13 @@ class ConsoleTests(unittest.TestCase):
         _ = (self.configuration / "console.conf").write_text("\n\n".join(reversed(blocks)))
         with patch.object(memory_feed, "page_url", side_effect=FileNotFoundError("fixture page absent"), create=True):
             pages = console.read_pages()
-        self.assertEqual([page.identity for page in pages], ["questions", "images", "changes", "builds", "aws"])
+        self.assertEqual([page.identity for page in pages], ["questions", "images", "changes", "builds", "aws", "accounts"])
         self.assertIsInstance(pages[1].destination, console.AvailablePage)
         self.assertIsInstance(pages[3].destination, console.UnavailablePage)
         markup = ConsoleMarkup()
         source = console.render(pages, console.UnavailablePage()).decode()
         markup.feed(source)
-        self.assertEqual(markup.pages, ["questions", "images", "changes", "builds", "aws"])
+        self.assertEqual(markup.pages, ["questions", "images", "changes", "builds", "aws", "accounts"])
         self.assertIn('data-page="rebuilds"\ndata-url="" data-title', source)
         self.assertIn('aria-label="Builds — Not available"', source)
         self.assertNotIn("fixture page absent", source)
@@ -145,9 +145,9 @@ class ConsoleTests(unittest.TestCase):
             "python:scripts.build_queue.memory_feed:fixture_page_url_absent")
         _ = configuration.write_text(source)
         pages = console.read_pages()
-        self.assertEqual([page.identity for page in pages], ["aws", "builds", "changes", "images", "questions"])
-        self.assertIsInstance(pages[1].destination, console.UnavailablePage)
-        self.assertIsInstance(pages[2].destination, console.AvailablePage)
+        self.assertEqual([page.identity for page in pages], ["accounts", "aws", "builds", "changes", "images", "questions"])
+        self.assertIsInstance(pages[2].destination, console.UnavailablePage)
+        self.assertIsInstance(pages[3].destination, console.AvailablePage)
         self.assertIn('aria-label="Builds — Not available"', console.render(pages, console.read_rebuilds()).decode())
 
     def test_url_functions_cannot_put_an_external_page_in_the_frame(self) -> None:
@@ -155,7 +155,7 @@ class ConsoleTests(unittest.TestCase):
                      "http://127.0.0.1:1/page", "https://127.0.0.1:8765/page"):
             with self.subTest(path=path), patch.object(memory_feed, "page_url", return_value=path, create=True):
                 pages = console.read_pages()
-                self.assertIsInstance(pages[1].destination, console.UnavailablePage)
+                self.assertIsInstance(pages[2].destination, console.UnavailablePage)
 
     def news_pages(self, changes: set[str], questions: set[str]) -> tuple[console.ConsolePage, ...]:
         with (patch.object(change_browser, "waiting_changes", return_value=frozenset(changes)),

@@ -1,10 +1,14 @@
 import type { ProcessRunResult } from 'claude-code';
-import type { StoredAccountsStatus } from '../types/accounts';
+import type { AccountsBoard, StoredAccountsStatus } from '../types/accounts';
 
 export type RefreshPaths =
   | { kind: 'discovery'; sources: string[]; loadedAt: number }
-  | { kind: 'liveness' };
-export interface RefreshFiles { stat(path: string): Promise<{ mtimeMs: number }> }
+  | { kind: 'liveness' }
+  | { kind: 'until'; at: number };
+export interface RefreshFiles {
+  stat(path: string): Promise<{ mtimeMs: number }>;
+  now(): Promise<number>;
+}
 /** Shared by panes; it owns neither a timer nor any pane's state. */
 export async function refreshIfChanged<T>(
   files: RefreshFiles,
@@ -19,6 +23,8 @@ export async function refreshIfChanged<T>(
     // Process exits can leave every registry file unchanged. Recheck counts on
     // the existing pane tick, without a separate timer or remote discovery.
     if (path.kind === 'liveness') { changed = true; continue; }
+    // Text that names a day, such as a reset time, changes at a set time with no file change.
+    if (path.kind === 'until') { if (await files.now() >= path.at) changed = true; continue; }
     const written = path.loadedAt;
     for (const source of path.sources) {
       if (!isOpen()) return false;
@@ -40,34 +46,17 @@ export interface AccountsLoader {
   stat(path: string): Promise<{ mtimeMs: number }>;
 }
 
-export interface UserZoneSettings {
-  override(): Promise<string | undefined>;
-  config(): Promise<string | undefined>;
-  home(): Promise<string | undefined>;
-  read(path: string): Promise<string>;
-}
-export type ZoneLookup = { kind: 'resolved'; name: string } | { kind: 'cancelled' };
-
-/** Matches scripts/lib/user_zone.py, including its configurable settings path. */
-export async function resolveUserZone(calls: UserZoneSettings, isActive: () => boolean): Promise<ZoneLookup> {
-  if (!isActive()) return { kind: 'cancelled' };
-  let name = await calls.override();
-  if (!isActive()) return { kind: 'cancelled' };
-  if (!name) {
-    const configured = await calls.config();
-    if (!isActive()) return { kind: 'cancelled' };
-    const home = configured ? '' : await calls.home();
-    if (!isActive()) return { kind: 'cancelled' };
-    let contents = '';
-    try { contents = await calls.read(configured || `${home}/.claude/config/user_zone.conf`); }
-    catch { /* An absent setting uses the repository's default. */ }
-    if (!isActive()) return { kind: 'cancelled' };
-    name = contents.split(/\r?\n/).find(line => line.startsWith('zone='))?.split('=').slice(1).join('=').trim();
-  }
-  name ||= 'America/New_York';
-  // Validate before storing the zone, as the Python resolver does.
-  new Intl.DateTimeFormat('en-US', { timeZone: name });
-  return { kind: 'resolved', name };
+const TONES: readonly string[] = ['default', 'success', 'error', 'warning', 'inactive'];
+const validLine = (line: unknown): boolean => Array.isArray(line) && line.every(part => part && typeof part === 'object'
+  && typeof part.text === 'string' && TONES.includes(part.tone) && (part.kind === 'fact' || part.kind === 'bold'));
+/** The board must name each column and give each row a line for each cell; the view only draws it. */
+export function validBoard(value: unknown): value is AccountsBoard {
+  if (!value || typeof value !== 'object') return false;
+  const board = value as AccountsBoard;
+  return typeof board.stale_at === 'string' && !Number.isNaN(Date.parse(board.stale_at)) && Array.isArray(board.columns) && board.columns.every(column => column && typeof column.key === 'string'
+    && typeof column.heading === 'string' && (column.align === 'left' || column.align === 'right'))
+    && Array.isArray(board.rows) && board.rows.every(row => row && typeof row.cells === 'object' && row.cells !== null
+      && Object.values(row.cells).every(validLine) && Array.isArray(row.facts) && row.facts.every(validLine));
 }
 
 /** Only stored-status inputs and their existing discovery directories are inspected. */
@@ -81,6 +70,9 @@ export async function loadAccounts(
   const loadedAt = await calls.now();
   const sources = new Set<string>();
   let refreshLiveness = false;
+  let staleAt: RefreshPaths[] = [];
+  const publish = () => watch([{ kind: 'discovery', sources: [...sources], loadedAt },
+    ...(refreshLiveness ? [{ kind: 'liveness' } as const] : []), ...staleAt]);
   const inputs = [`${home}/.local/state/agent-notes/usage.json`, `${home}/.local/state/accounts/groups.json`,
     `${home}/.claude/config/accounts.json`, `${home}/.local/state/accounts/role_map_cache.json`];
   const watchInputs = async (inputs: readonly string[]) => {
@@ -95,8 +87,7 @@ export async function loadAccounts(
         } catch { /* A missing input is discovered through its closest existing parent. */ }
         path = path.slice(0, path.lastIndexOf('/')) || (path === '/' ? '' : '/');
       }
-      watch([{ kind: 'discovery', sources: [...sources], loadedAt },
-        ...(refreshLiveness ? [{ kind: 'liveness' } as const] : [])]);
+      publish();
     }
   };
   await watchInputs(inputs);
@@ -108,17 +99,16 @@ export async function loadAccounts(
   if (result.exitCode !== 0) throw new Error('Stored accounts status could not be read.');
   try {
     const status = JSON.parse(result.stdout) as StoredAccountsStatus;
-    if (!Array.isArray(status.accounts) || !Array.isArray(status.problems)) throw new Error();
+    if (!validBoard(status.board) || !Array.isArray(status.problems)) throw new Error();
+    staleAt = [{ kind: 'until', at: Date.parse(status.board.stale_at) }];
+    publish();
     if (status.upcoming_moves !== undefined && (!Array.isArray(status.upcoming_moves)
       || !status.upcoming_moves.every(line => typeof line === 'string'))) throw new Error();
-    if (status.accounts.some(account => account.selected_roles !== undefined
-      && (!Array.isArray(account.selected_roles) || !account.selected_roles.every(role => typeof role === 'string')))) throw new Error();
     if (status.session_inputs) {
       if (!Array.isArray(status.session_inputs) || !status.session_inputs.every(path => typeof path === 'string')) throw new Error();
       refreshLiveness = status.session_inputs.length > 0;
       await watchInputs(status.session_inputs);
     }
-    // Keep Python's combined role_counts and separate machine records unchanged.
     return status;
   } catch { throw new Error('Stored accounts status is invalid.'); }
 }

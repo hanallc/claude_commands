@@ -754,129 +754,55 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `agents resume --production <showrunner name>` resumes the production's units.
     `since` uses the user zone. `by` uses the caller's staff name.
     Staff row copies retain the hold fields.
-  - **Phase productions:** `table()` builds one `UnitBoardState` per unit and derives its block and summary bucket from that state.
-    Unit blocks sort names without case distinctions.
-    The summary is `working N · waiting to merge N · waiting on other work N · idle N · <total> units`.
-    It adds `unknown N` before the total only when nonzero.
-    Each unit counts once; counts sum to the number of blocks.
-    `status_rows` builds each unit's rows for the status table; `status_table` renders them below the summary.
-    The columns are `Unit | Status | Machine | Progress | Phase | ETA Next | ETA Plan`, with one row per open phase.
-    `display_cells.wrapped` omits all-`—` columns and wraps cells to `display_cells.pane_columns()`.
-    The `Progress:` legend follows the table when any row shows progress. `ETA Plan` shows only while a plan runs.
-    A title is `**<unit>** — <bucket>`.
-    Titles include machines when `display_cells.machine_column` would show them.
-    One blank line separates each title from its `Item | Work | State` table.
-    `Now`, `Also`, and `Merge` use numbered labels only when the field has multiple items.
-    Queue rows always use `Next 1`, `Next 2`, and later numbers.
-    `Plan next` follows queue rows; empty Next and fallback Now rows use Work `—`.
-    Work and State come from separate entry fields; the renderer never splits sentences.
-    `TaskLine(work, state_text, kind)` keeps the task facts and bucket evidence together.
-    `WorkItem(work, state_text)` holds queue, plan, and merge facts.
-    States use short phrases separated by semicolons, an initial capital, and no final period.
-    `display_cells.escaped` escapes each cell.
-    `display_cells.wrapped(..., keep=(0, 1, 2))` uses the status table's width and keeps all columns.
-    Continuation rows preserve complete text without an ellipsis.
-  - **Bucket order:** Executing workers, commands, or director activities select `working` first.
-    A busy director with an unsent open phase also selects `working` unless a recorded task wait explains its activity.
-    A pause or stop then selects `idle`.
-    Readable empty records select `idle` when the director is not busy.
-    An open task wait selects `waiting on other work` before unresolved sent work selects `waiting to merge`.
-    The first next item's recorded dependency then selects `waiting on other work`.
-    A unit wait on done work selects `waiting to merge` at the merge rule.
-    A unit wait on the first next item, or an unmatched target, selects `waiting on other work` at the next-work rule.
-    An open unit wait prevents an otherwise empty unit from counting as idle.
-    Other units select `unknown`.
-    A later queue wait never adds another count.
-  - **Current tasks:** The staff current run takes priority; otherwise, the newest owned run supplies open phases.
-    Configured plan order precedes start order for work outside the plan.
-    A reopened run stays open until a later finish.
-    Work names use the full title and phase id, with a repeated leading id removed.
-    Titles keep their capital letters in Work.
-    Open pass events join `worker_id` to `CensusWorker.staff_id` before the phase assignment fallback.
-    Workers must belong to the displayed unit; finished passes supply no current work.
-    Pass roles supply State, such as `Implementation worker runs it` or `Review worker runs it`.
-    Other roles use the worker's name and `runs it`.
-    Running detached commands say `<Role> runs <label>; waits for the result`.
-    An unread result says `Worker finished; director has not read the result`.
-    An open director activity says `Director <activity>; no worker needed`.
-    A busy director says `Director works on it; no worker runs; step not recorded`.
-    An unexplained task says `Open; nothing runs; reason not recorded`.
-    Executing tasks appear under `Now`; other current tasks appear under `Also` when execution exists.
-  - **Resource waits:** `phase_waits.PhaseWait` retains wait ownership, attribution, kind, resource, holder, and original start.
-    Memory waits say `needs build memory in use by <holder>; since <time>`.
-    Slot waits say `waits for a build slot used by <holder>; since <time>`.
-    Other named resource waits say `waits for <reason>, in use by <holder>`.
-    Unnamed holders retain the reason and say `holder not recorded`.
-    Holder changes preserve the start; finished waits and passes close their waits.
-    A wait for one worker does not hide another worker's execution.
-    `shell_waits` preserves the director's commands and their recorded resource waits.
-    Each promise appears once, on the phase's first displayed task.
-    An overdue promise appends `ETA <time>, late <duration>` to State.
-    Times use the production zone and include a date outside today.
-  - **No current task:** Staff pauses and stops name their actor, reason, and time.
-    Busy directors without tasks say `Director is busy; task not recorded; no worker runs`.
-    Next work names its first wait or says it has not started, with `reason not recorded`.
-    Empty records distinguish a complete plan from no plan or assigned work.
-    Census failure adds a Now row: `Workers unavailable; who runs cannot be determined`.
-    No-worker mode adds a Now row: `Workers cannot start because no-worker mode is on`.
-    Both rows use Work `—`.
-  - **Unit waits and holds:** `start-wait --target WORK --by WHO --reason CONDITION --kind KIND` records one unit wait.
-    `--target` requires both `--by` and `--reason`.
-    The event has `wait_scope: unit`, `target_work`, `wait_by`, and `wait_attribution: {state: UnitTarget}`.
-    It has no phase or pass attribution.
-    `phase_waits.unit_waits` returns `UnitWait(target, by, reason, kind, started, wait_id)` in start order.
-    A newer wait on the same target replaces the earlier reason.
-    `wait_finished`, `wait_unclosed`, target phase start, and run finish close the reader's wait.
-    `start-phase` writes `wait_finished` for every open unit wait on its phase ID.
-    Phase waits and launcher waits keep their existing behavior.
-    Done work uses a Merge row with its ID in Work.
-    State says `Done; <by> keeps it from the merge until <reason>; since <time>`.
-    This row also covers a completed phase with no sent commit.
-    Merge line entries, running merges, results, and local main take priority over hold text.
-    Queue and pending plan rows append `<By> keeps it waiting until <reason>; since <time>` to State.
-    Queue placement takes priority when the same target also names pending plan work.
-    Unmatched targets use Now or Also rows, with the target in Work.
-    Their State says `<By> keeps it waiting until <reason>; since <time>`.
-    With no open phase, the first next wait supplies this text:
-    `Nothing runs; <By> keeps <target> waiting until <reason>`.
-    Actor text stays unchanged in the event; a sentence start uses a capital letter.
-    The board reads unit waits from its cached run events.
-  - **Merge groups:** `phase_sent_work` finds submission after the phase's last work start.
-    Sent phases appear only under `Merge`.
-    `unit_lands` keeps the direct and carried merge groups from the merge-once phase.
-    Active groups precede merge line order; every group appears once, including single open phases.
-    Work contains comma-separated phase IDs.
-    Single phases say `Done; <ordinal> in the merge line` in State.
-    Shared groups say `Done; merge together; <ordinal> in the merge line`.
-    Active merges say `Done; merging now`; carried single commits name their carrier unit and phase.
-    Failures retain their cause and time until local main contains the commit.
-    Submitted work without a line says `Submitted; not in the merge line; reason not recorded`.
-    `LineUnused` says `merge position not recorded`.
-    The command has no daily merge count or daily-result scan.
-  - **Next work:** Unstarted queue items keep their stored order.
-    An exact leading open or sent phase ID followed by `:` identifies started work.
-    `Next` leaves out that item, because `Now` or `Merge` already shows the work.
-    Work contains the text before the first colon, or the full text without a colon.
-    Step text after the colon does not appear.
-    The first unstarted queue item determines the queue wait.
-    Dependencies use the local `origin/main`; the command never fetches.
-    Satisfied or absent dependencies use State `Ready`.
-    Unmet dependencies say `After <dependency>; <short state>`.
-    Another unit's phase uses `handler phase 23`; this unit's own `devtools/acctcolor` uses `acctcolor`.
-    A merge rank uses `25th in the merge line`.
-    A sent dependency without a merge position uses `not in the merge line; reason not recorded`.
-    `waits_on.PhaseSent` includes the dependency phase's open unit wait from the same run read.
-    Without merge evidence, its State says `After <dependency>; done; <by> keeps it from the merge until <reason>`.
-    Pending phases follow in a Plan next row with `<title> (<id>)` in Work.
-    State contains remaining phase IDs, plan waits, and unit waits.
-    The first pending phase preserves its `Waits for:` text and names unmet `Depends on:` phases.
-    `plan_history.plan_phase_details` reads headings and these lines in one cached read per plan path.
-    A configured plan with phases takes priority over the selected run's plan.
-    Current work with nothing next says `Nothing queued`.
-    Other empty states say `Nothing queued; the plan is complete` or `Nothing queued; no plan is assigned`.
-    Queue failure says `Queue unavailable; next work cannot be determined`.
-    `table()` caches run, plan, queue, dependency, and ancestry reads and uses one merge view.
-    `main()` reads one census beside the other reads within `units_census_seconds`.
+  - **Phase productions:** The count line, status table, Progress bar, legend, and ETA cells retain their existing behavior.
+    `table()` creates one unit block from the same cached plan and run records that supply the bar.
+    `UnitTaskFacts` retains the plan source, plan phases, and scoped run attempts.
+    `PlanSource` distinguishes absent, unavailable, readable empty, and readable populated plans.
+    A failed fallback plan read retains its unavailable state.
+    Without a fallback plan, the configured source remains unchanged.
+    `TaskAttempt` retains the phase ID, plan scope, title, instance, outcome, finish time, and recorded stop reason.
+    The reader does not convert a stopped attempt into an unstarted task.
+  - **Unit rows:** Each title precedes a blank line and an `Item | Work | State` table.
+    `display_cells.wrapped(..., keep=(0, 1, 2))` preserves each cell before `display_cells.escaped` escapes it.
+    Rows follow this order: Now, Also, Next, Later, Stopped, Done.
+    Now names the current task and its recorded worker, director action, resource wait, or merge state.
+    The open phase takes priority over merge tasks for Now.
+    Each current task has one row with no equal states; `state_sentence` joins its actors' states with semicolons.
+    No row has an empty Work cell.
+    A busy session does not prove that the director works on a phase.
+    An unexplained task names the missing step and the latest matching finished step with its time, when recorded.
+    Also names each additional current task.
+    The first queue entry supplies Next; otherwise, the first unfinished plan phase supplies Next.
+    Every remaining queue entry and plan phase has its own Later row and dependency state.
+    Queue text uses the description after its first colon as the title and the prefix as the ID.
+    `queue_title` drops notes in parentheses and each clause after the first semicolon.
+    `capitalized` gives a capital only to a plain lowercase first word; file names and IDs stay as written.
+    A matching finished activity produces a queue conflict instead of an unstarted claim.
+    Missing next work uses `Not recorded` and `The director has not chosen the next task`.
+    Only a readable plan with every phase done permits `Nothing queued; the plan is complete`.
+  - **Stopped history:** `past_tasks` retains one row per stopped task in the selected run.
+    A later completed attempt resolves only the same plan scope and phase ID.
+    Its Done row supplies the completion date in the production time zone.
+    An explicit title containing `the <unit> unit owns <id>` names the unit that finished the work.
+    Equal titles with different IDs do not prove a replacement.
+    A newer unfinished attempt remains current after an earlier completion.
+    Unresolved attempts say `Stopped; reason not recorded` when the stop event supplies no reason.
+  - **Merge and wait facts:** Each merge phase has its title in Work.
+    State names the live merge rank, the production that merges it, or the short failure cause.
+    A second phase in the same merge names the first phase by ID (`Merges with phase 40`).
+    A phase's shrink and repair items have no separate rows.
+    The phase's live state takes priority over older failures from those items.
+    Merge grouping and bucket evidence retain the existing shared merge view.
+    Resource waits preserve the resource and holder; unit waits preserve the actor, condition, and target.
+    Phase ETA text retains its first-task placement and the production time zone.
+    Dependencies use local `origin/main` without a fetch.
+    Phase titles come from plan and dependency run records already in the command caches.
+    Local dependencies use their IDs, with `phase` before a numeric ID.
+    A local queue dependency adds `to merge`; `phase_reference` builds the ID text.
+    External merge dependencies use `Waits for <unit> to merge: <title>`.
+    Without a title, they use `Waits for <unit> phase <id> to merge`.
+    Other dependencies omit `to merge`.
+    The board adds no reads for historical outcomes, titles, or finished queue activities.
   - **Style productions:** `Kind: style` selects `style_units.table` for all staff units.
     Other productions use it for units named in their `Style units` table.
     `style_config.has_style_units` detects that table; `style_config.read_config` reads its assignments.

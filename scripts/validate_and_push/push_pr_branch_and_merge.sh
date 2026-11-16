@@ -14,15 +14,10 @@ DEFAULT_BRANCH="$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name
 CURRENT_BRANCH="$(git branch --show-current)"
 
 run_landed_hook() {
-  local landed_sha completed
+  local landed_sha
   landed_sha="$(git rev-parse HEAD)"
-  completed="$(git rev-parse --git-path post-push-completed)"
-  if [[ -f "$completed" && "$(cat "$completed")" == "$landed_sha" ]]; then
-    return 0
-  fi
-  bash "${SCRIPT_DIR}/post_push_hook.sh" "$DEFAULT_BRANCH" "$landed_sha"
-  printf '%s\n' "$landed_sha" > "$completed.tmp"
-  mv -f "$completed.tmp" "$completed"
+  "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/land_main.py" \
+    --checkout "$PWD" --commit "$landed_sha" --branch "$DEFAULT_BRANCH"
 }
 
 if ! git check-ref-format --branch "$BRANCH_NAME" >/dev/null; then
