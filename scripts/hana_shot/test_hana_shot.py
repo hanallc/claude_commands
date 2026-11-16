@@ -60,6 +60,7 @@ BLUR = "hana_catalyst::identity::Tool<hana_catalyst::effects::Blur>"
 NAMES = ((11, "Log"), (12, "Twin"), (13, "Twin"))
 TOOLS = ((30, GRAYSCALE, 3, "hana.effect.grayscale"), (20, GRAYSCALE, 1, "hana.effect.grayscale"), (40, BLUR, 2, "hana.effect.blur"))
 EXTRA_ENTITY = 77
+SLEEP_PATH = shutil.which("sleep") or "/bin/sleep"
 SHOT_SIZE = (4, 3)
 REMOTE_HOST = "natemccoy@mac"
 # Fake scp and ssh: the remote host is a local folder, and every call is logged as one JSON line.
@@ -1035,9 +1036,9 @@ class LaunchRecordRecoveryTests(HanaShotTest):
             state, _ = hana_shot.launch(self.port, str(self.root), str(self.executable), purpose=LAUNCH_RECORDING_PURPOSE, owner=owner)
         return state
 
-    def app_record(self, port: int, *, live: bool, binary: str = "sleep") -> None:
+    def app_record(self, port: int, *, live: bool, binary: str = SLEEP_PATH) -> None:
         """Save a launch record for another port; a live record names a running process."""
-        process = subprocess.Popen(["sleep", "300"], stdin=subprocess.DEVNULL)
+        process = subprocess.Popen([SLEEP_PATH, "300"], stdin=subprocess.DEVNULL)
         if live:
             self.addCleanup(process.wait, timeout=TEST_HANG_GUARD_SECS)
             self.addCleanup(process.kill)
@@ -1080,10 +1081,17 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         state = self.launch_without_starting_hana(owner="cap-test")
         self.assertEqual(state["pid"], 424242)
         self.assertEqual(hana_shot.live_launch_count(self.state_path.parent), 1)
+        for exit_error in (FileNotFoundError, ProcessLookupError):
+            with (
+                self.subTest(exit_during_read=exit_error.__name__),
+                mock.patch.object(sys, "platform", "linux"),
+                mock.patch.object(Path, "read_bytes", side_effect=exit_error),
+            ):
+                self.assertEqual(hana_shot.live_launch_count(self.state_path.parent), 0)
 
     def test_record_whose_pid_runs_another_program_does_not_count_toward_the_local_app_cap(self) -> None:
         self.app_record(self.port + 1, live=True)
-        self.app_record(self.port + 2, live=True, binary=str(self.scratch / "hana"))
+        self.app_record(self.port + 2, live=True, binary=SLEEP_PATH[:-1])
         for platform in ("linux", "darwin"):
             with self.subTest(platform=platform), mock.patch.object(sys, "platform", platform):
                 self.assertEqual(hana_shot.live_launch_count(self.state_path.parent), 1)

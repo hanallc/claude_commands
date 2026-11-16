@@ -2686,6 +2686,6 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `config/hana_shot.conf` `local_app_cap=2`.
 - `hana_shot.launch` holds `launch_slot` from the count until its own launch record is written. The slot takes a flock on the launches folder itself, so parallel launches count each other and no lock file stays.
 - `live_launch_count` counts the `<port>.json` records whose pid is alive and runs the recorded binary. A dead or unreadable record does not count.
-- `same_binary` checks the binary on macOS too (`ps -ww -p <pid> -o command=`), so a record whose pid the system gave to another program does not count, and `shutdown` signals no reused Mac pid. An app that exits during the read does not count.
+- `same_binary` matches the recorded binary as one whole argument of the pid (`/proc/<pid>/cmdline` on Linux, `ps -ww -p <pid> -o command=` on macOS), so a record whose pid the system gave to another program does not count, and `shutdown` signals no reused Mac pid. An app that exits during the read does not count.
 - At the cap the launch is refused before a start. The refusal names the count, the cap, the key and the shutdown command.
 - Tests in `LaunchRecordRecoveryTests`: at the cap, under the cap, and a dead app that does not count.
