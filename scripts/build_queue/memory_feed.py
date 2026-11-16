@@ -816,8 +816,10 @@ class PageUnavailable(TypedDict):
 
 
 def cargo_job(command: tuple[str, ...]) -> str:
-    """Return the job word from a Cargo command."""
+    """Return the job word from a Cargo command or from the CI cargo front's command."""
     for index, argument in enumerate(command):
+        if Path(argument).name == parse.CI_CARGO_FRONT:
+            return cargo_job(("cargo", *parse.cargo_front_call(command[index + 1:]).arguments))
         if Path(argument).name not in ("cargo", "cargo-tile-real", "cargo-nextest"):
             continue
         subcommand = parse.cargo_subcommand(command[index + 1:])
@@ -1808,6 +1810,9 @@ def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], qu
             continue
         inside = path.is_relative_to(builds)
         if isinstance(memory, admission_records.CompilerServiceMemory):
+            # Each step's compilers count in that step's queued use, not in the compiler cache.
+            jobs = sum(job.use.bytes for job in memory.jobs if isinstance(job.use, admission_records.AnonymousRunUse))
+            amount = max(0, amount - jobs)
             sccache += amount
         elif (not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice)
               or entry.step.step == SWAP_NAMES["between"]):

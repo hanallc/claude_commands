@@ -57,8 +57,8 @@ try {
   const base = readings.good;
   base.waiters = structuredClone(readings.spacing.waiters);
   base.walk.find(row => row.queued).progress = {kind:'RowProgress', phase:'testing', done:8, total:10, percent:80, unit:'modules'};
-  base.walk.find(row => row.queued).unit = 'fixture-unit';
-  base.walk.find(row => row.queued).showrunner = 'fixture-production';
+  base.walk.find(row => row.queued).unit = 'handler';
+  base.walk.find(row => row.queued).showrunner = 'sdlc';
   const swapRow = (name, kind, bytes, pool='outside', extra={}) => ({name, detail:'fixture owner', kind, pool,
     category:'', members:[], owner_count:0, bytes, swap:bytes/1024**3, ...extra});
   const swapOwners = Array.from({length:31}, (_, index) => swapRow('group '+index, 'owner', (31-index)*1024**3/64,
@@ -557,7 +557,7 @@ try {
             assert.ok(proof.lower.every(value => value < base.cap), 'The lower axis reaches the cap.');
             assert.ok(Math.abs(proof.rowLeft-proof.headingLeft)<=1, 'The rows miss the card text edge.');
             assert.equal(proof.reservedAmount,proof.dimColor);
-            assert.ok(!proof.owner.includes('fixture-unit'), 'The page repeats the unit beside the name.');
+            assert.ok(!proof.owner.includes('handler'), 'The page repeats the unit beside the name.');
             assert.ok(proof.amountHeader.includes('Used · reserved'), 'The memory amounts have no header.');
             assert.ok(proof.scroll <= proof.client, 'The page overflows. '+JSON.stringify({theme,width,scroll:proof.scroll,client:proof.client}));
             const roomLegend=proof.values.find(row=>row.label==='Free');
@@ -1217,7 +1217,7 @@ try {
             const beforeWait=await positions();
             const waiting=structuredClone(base);
             waiting.waiters=structuredClone(readings.spacing.waiters);
-            waiting.waiters[0].detail='fixture-unit';waiting.waiters[0].pid=51;
+            waiting.waiters[0].detail='handler';waiting.waiters[0].pid=51;
             await show(waiting);
             const afterWait=await positions();
             for(let index=0;index<beforeWait.length;index++) {
@@ -1974,6 +1974,7 @@ try {
                   machineColors:[...table.querySelectorAll('tr[data-tip^="row:"] .machine')].map(cell=>getComputedStyle(cell).color),
                   ciVisible:!!table.querySelector('tr[data-tip="' + proofTip('row', 3) + '"]'),
                   waiting:table.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .unit').textContent,
+                  waitingOwner:table.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .owner').textContent,
                   pageOverflow:document.documentElement.scrollWidth>document.documentElement.clientWidth};
               })()`);
               if(version==='after') {
@@ -1988,6 +1989,7 @@ try {
                 assert.equal(new Set(comparison.machineColors).size,3);
                 assert.equal(comparison.ciVisible,false);
                 assert.equal(comparison.waiting,'CI');
+                assert.equal(comparison.waitingOwner,'hana CI');
                 assert.equal(comparison.pageOverflow,false);
               } else {
                 assert.equal(comparison.ciVisible,true);
@@ -2366,14 +2368,17 @@ try {
         const gateIndex=gateReading.walk.findIndex(row=>row.queued);
         assert.ok(gateIndex>=0,'The base reading has no queued run.');
         const gateAbout='Merges the handler checkpoint into the sdlc branch, tests every module, then pushes sdlc.';
-        Object.assign(gateReading.walk[gateIndex],{name:'natemerge integrate',unit:'natemerge',about:gateAbout,changes:'branch sdlc',
-          started_at:gateReading.read_at-600});
+        Object.assign(gateReading.walk[gateIndex],{name:'natemerge integrate',unit:'natemerge',about:gateAbout,changes:'sdlc branch',
+          showrunner:'sdlc',machine:'natedev',used:6.2,reserved:2.8,counted:9,started_at:gateReading.read_at-600});
+        // The user, 11-16: "Uses 0.0 GiB? ... has to be a bug". The gate row shows a real use, not memory parts.
+        delete gateReading.walk[gateIndex].parts;
         await show(gateReading);
         await evaluate(`showTip(proofTip('row', ${gateIndex}),700,420)`);
         const gateTip=await evaluate("[...document.querySelectorAll('#tip dt, #tip dd')].map(cell=>cell.textContent)");
         assert.ok(gateTip[0].startsWith('natemerge · integrate'),'The gate tooltip title: '+gateTip[0]);
         assert.ok(gateTip.includes(gateAbout),'The gate tooltip omits its description.');
-        assert.equal(gateTip[gateTip.indexOf('Changes')+1],'branch sdlc');
+        assert.equal(gateTip[gateTip.indexOf('Changes')+1],'sdlc branch');
+        assert.equal(gateTip[gateTip.indexOf('Uses')+1],'6.2 GiB');
         const gateFit=await evaluate(`[...document.querySelectorAll('#tip dt, #tip dd')].every(cell=>cell.scrollWidth<=cell.clientWidth)
           && document.querySelector('#tip .tip').scrollWidth<=document.querySelector('#tip .tip').clientWidth`);
         assert.ok(gateFit,'The gate tooltip clips its text.');

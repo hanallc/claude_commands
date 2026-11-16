@@ -4599,6 +4599,52 @@ class ProgressKeepAsideTests(unittest.TestCase):
                 self.assertEqual(gate.reservation_need(row, adjusted), 10 * GIB)
                 self.assertEqual(gate.reservation_need(row, reading), 10 * GIB)
 
+    def test_compilers_that_sccache_runs_count_in_the_step_that_names_their_scope(self) -> None:
+        # The user, 11-16: "uses 0.0 has to be a bug". A build's compilers ran in sccache.service.
+        row = self.reservation(need=10 * GIB)
+        scope = Path("/cgroup/builds.slice/run-build.scope")
+        reading = admission_records.MeasuredMemory(GIB, anonymous=admission_records.AnonymousRunUse(GIB // 10),
+            anonymous_source=admission_records.ScopeSource(scope, frozenset({100})))
+        compilers = admission_records.CompilerServiceMemory(2 * GIB, pid=7, jobs=(
+            admission_records.CompilerJob(scope, admission_records.AnonymousRunUse(6 * GIB)),
+            admission_records.CompilerJob(Path("/cgroup/builds.slice/run-ended.scope"), admission_records.AnonymousRunUse(GIB))))
+        base = self.inputs((row,), (reading,))
+        inputs = replace(base, running=(*base.running, admission_records.RunningStep(
+            "", "sccache.service", "compile", "builds.slice", 0, compilers, pid=7)))
+        (_, _, use), = gate.attributed_step_uses(inputs)
+        self.assertEqual(use, gate.AttributedStepUse(admission_records.AnonymousRunUse(6 * GIB + GIB // 10), True))
+        room = gate.inputs_room(inputs, admission_policy_fixture())
+        assert isinstance(room, admission_records.MemoryRoom)
+        self.assertEqual((room.used, room.kept), (6 * GIB + GIB // 10, 10 * GIB - 6 * GIB - GIB // 10))
+
+    def test_sccache_reading_groups_its_compilers_by_step_scope_and_keeps_the_rest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = root / "builds.slice" / "sccache.service"
+            service.mkdir(parents=True)
+            _ = (service / "memory.current").write_text(str(9 * GIB) + "\n")
+            _ = (service / "memory.stat").write_text(f"anon {8 * GIB}\nshmem 0\ninactive_file 0\n")
+            _ = (service / "cgroup.procs").write_text("10\n11\n12\n13\n")
+            proc = root / "proc"
+            scope = "/cgroup/run-build.scope"
+            for pid, program, kib, environment in ((10, "sccache", 2 * 1024 * 1024, b"HOME=/h\0"),
+                    (11, "rustc", 3 * 1024 * 1024, b"HOME=/h\0BUILDLOG_STEP_SCOPE=" + scope.encode() + b"\0"),
+                    (12, "cc", 1024 * 1024, b"BUILDLOG_STEP_SCOPE=" + scope.encode() + b"\0"),
+                    (13, "rustc", 2 * 1024 * 1024, b"BUILDLOG_STEP_SCOPE=/cgroup/run-other.scope\0")):
+                folder = proc / str(pid)
+                folder.mkdir(parents=True)
+                _ = (folder / "comm").write_text(program + "\n")
+                _ = (folder / "environ").write_bytes(environment)
+                _ = (folder / "status").write_text(f"VmRSS:\t{kib} kB\nRssAnon:\t{kib} kB\nRssShmem:\t0 kB\n")
+            with patch.dict(os.environ, {"BUILDLOG_BUILDS_CGROUP": str(root / "builds.slice")}):
+                reading, = gate.sccache_memory(proc)
+            assert isinstance(reading, admission_records.CompilerServiceMemory)
+            self.assertEqual(reading.pid, 10)
+            self.assertEqual(reading.jobs, (
+                admission_records.CompilerJob(Path(scope), admission_records.AnonymousRunUse(4 * GIB)),
+                admission_records.CompilerJob(Path("/cgroup/run-other.scope"), admission_records.AnonymousRunUse(2 * GIB))))
+            self.assertEqual(reading.bytes, 3 * GIB)
+
     def test_shared_process_use_is_counted_once_before_distinct_step_profiles_are_grouped(self) -> None:
         rows = (self.reservation("build", identity="z-parent"), self.reservation("clippy", identity="a-child"))
         source = admission_records.ProcessSource((admission_records.ProcessAnonymousUse(100, admission_records.AnonymousRunUse(3 * GIB)),))

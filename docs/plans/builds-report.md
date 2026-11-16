@@ -1979,6 +1979,30 @@ As built:
 - `page.sessions_shown` is deleted from `config/disks.conf`.
 - Tests: `test_disks_page` (the published page holds the marked parts; the filter rows; the sessions card keeps its slider and limit across new data; the tooltip of each row kind, and a slot run tooltip equal to `tooltipHtml` of its Builds row on the right machine), `test_memory_feed` (`slot_folder` and `slot_machine`), `test_memory_hover`. A Chrome check on live data hovers each tooltip, checks that none is cut or outside the window, and saves the dark desktop shot.
 
+#### gatefix — A build's Uses counts its compilers; the tooltip names the branch first; CI rows say their job · status: done
+
+From the user (via the Images page, 2026-11-16), on the gate tooltip shot: "why do you say branch sdlc instead of sdlc branch which is more natural? SHowrunner - can you use a real one? i don't know what fixture-production is Runs on "fixture" what is fixture? Uses 0.0 GiB? why does it say that - uses 0.0 has to be a bug - isn't that the bug we have right now? please do better". On the Disks shot: "yes - it should use the same tooltip - a working, fixed tooltip, to be sure!".
+
+Cause of "Uses 0.0 GiB": `~/.cargo/config.toml` sets `rustc-wrapper = "sccache"`. The sccache server starts each compiler in `builds.slice/sccache.service`, not in the step scope. A build's Uses held only cargo, and the compile memory showed in the compiler cache row. The queue also kept the full need aside for that build while its compilers already took that RAM from MemAvailable. On 2026-11-16 the research build in `hana-slot4` showed 0.0 GiB at 778 of 831 units; its scope peak at the link was 13.7 GiB.
+
+As built:
+
+- `invoke.sh`: the step scope exports `BUILDLOG_STEP_SCOPE`, its cgroup folder. sccache gives each compiler its client's environment (checked on natedev with a marker variable). sccache hashes `CARGO_*` variables and the variables that rustc dependency data names. No crate reads `BUILDLOG_STEP_SCOPE`, so cache keys do not change.
+- `memory_admit.sccache_memory` groups the service's processes by the scope each one names (`CompilerJob`, a new field `jobs` on `CompilerServiceMemory`). The compiler cache bytes leave out the jobs.
+- `memory_admit.attributed_step_uses` adds a scope's jobs to the step that holds that scope. Uses, Build reserved, the cap and the progress profiles now count the step's compilers. A job whose scope has no reservation counts in "Other build tools".
+- `memory_feed.build_tool_ram` leaves the jobs out of the compiler cache line.
+- `config/build_steps.conf`: Changes reads "sdlc branch" and "main branch".
+- The Builds proof uses real names: showrunner sdlc, unit handler, machine natedev, and a real Uses for the gate row.
+- Steps that started before the merge keep the old reading until they end. The admission service and the review-links server load the new code on their own.
+
+From the user (via builds, 2026-11-16): "the \"showrunner\" underneath the CI steps in the build queue are messed up - too long - and the actual CI step  that says CI /run/hana-ci-admission/.. - i don't even know what that is but it has to be a bug".
+
+Cause: each hana runner's `cargo` is a store front, `ci_cargo_front.py --front <cargo> --shared-folder /run/hana-ci-admission/<runner> -- <words>`. `memory_feed.cargo_job` matched the `--front` value as cargo and read the shared folder as the job.
+
+- `parse.cargo_front_call` splits the front's options from cargo's words. `ci_cargo_front.main` and `memory_feed.cargo_job` both use it, so a CI row says its job ("CI build", "CI tests").
+- Under a CI step the Builds page shows the label's first part ("hana CI"). The tooltip title keeps the whole label with the runner and the job.
+- Tests: `test_memory_admit` (a step's use and kept bytes count its compilers; the sccache reading groups compilers by scope and leaves out the server), `test_invoke_scope` (the step sees `BUILDLOG_STEP_SCOPE`), `test_memory_feed`, `test_memory_hover`, and the Builds proof.
+
 ### Tokens — The Builds page shows the jobserver tokens · status: done
 
 From builds, relaying the user: "sometime i see the build is waiting for a token - what token? if they are used - we should show them in a column next to slots on the running on the builds page". The build folders are already named slots, so the user approved the name "tokens" on 2026-11-16.

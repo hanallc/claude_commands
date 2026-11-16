@@ -607,7 +607,7 @@ process.stdout.write(JSON.stringify({
                     self.assertEqual(job, expected)
                     notes = memory_feed.job_notes(job, "report", names)
                     self.assertTrue(notes.get("about"))
-                    self.assertEqual(notes.get("changes"), "branch sdlc" if expected.step == "integrate" else "no branch")
+                    self.assertEqual(notes.get("changes"), "sdlc branch" if expected.step == "integrate" else "no branch")
             self.assertIsInstance(memory_feed.step_job("nextest", 10, proc), memory_feed.NotGateStep)
             self.assertIsInstance(memory_feed.step_job("merge-gate", 99, proc), memory_feed.CommandUnreadable)
         for command, named in (
@@ -639,7 +639,7 @@ process.stdout.write(JSON.stringify({
             page = memory_feed.reading()
         running, = [row for row in page["walk"] if row.get("queued")]
         for row in (running, *page["waiters"]):
-            self.assertEqual(row.get("changes"), "branch sdlc")
+            self.assertEqual(row.get("changes"), "sdlc branch")
             self.assertIn("handler", row.get("about", ""))
             self.assertIn("integrate", row["name"])
 
@@ -715,6 +715,15 @@ process.stdout.write(JSON.stringify({
             self.assertNotIn(field, row)
         for field in ("used", "reserved", "taken", "room", "cap", "other", "shown_reserved"):
             self.assertEqual(page.get(field), before.get(field), field)
+
+    def test_cargo_job_reads_cargo_words_after_the_ci_front_options(self) -> None:
+        front = ("python3", "-I", "/store/scripts/build_queue/ci_cargo_front.py", "--front", "/store/bin/cargo",
+                 "--shared-folder", "/run/hana-ci-admission/hana-linux-1", "--")
+        for words, job in ((("build", "--release"), "release build"), (("nextest", "run"), "tests"),
+                           (("+nightly", "doc"), "doc"), ((), "")):
+            with self.subTest(words=words):
+                self.assertEqual(memory_feed.cargo_job((*front, *words)), job)
+                self.assertEqual(memory_feed.cargo_job(("/store/bin/cargo", *words)), job)
 
     def test_ci_runner_records_name_the_owner_in_running_and_waiting(self) -> None:
         base = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
