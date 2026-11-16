@@ -45,6 +45,30 @@ class WaitsOnTests(unittest.TestCase):
                 ("upper", "5"): waits_on.PhaseMerge("e" * 40, 500, "abcdef1")})
         read.assert_called_once_with(self.repo, "log", "origin/main", "--merges", "--format=%H%x00%ct%x00%s")
 
+    def test_main_commit_identities_use_one_read_and_ignore_bad_records(self) -> None:
+        output = "100\0Checkpoint delivery\n101\0Checkpoint delivery\n100\0Other delivery\nbad\0Invalid time\nmissing separator\n"
+        with patch.object(waits_on, "git", return_value=subprocess.CompletedProcess([], 0, output, "")) as read:
+            self.assertEqual(waits_on.main_commit_identities(self.repo), frozenset({
+                waits_on.CommitIdentity(100, "Checkpoint delivery"), waits_on.CommitIdentity(101, "Checkpoint delivery"),
+                waits_on.CommitIdentity(100, "Other delivery")}))
+        read.assert_called_once_with(self.repo, "log", "origin/main", "--no-merges", "--format=%at%x00%s")
+        with patch.object(waits_on, "git", return_value=subprocess.CompletedProcess([], 128, output, "unreadable")):
+            self.assertEqual(waits_on.main_commit_identities(self.repo), frozenset())
+
+    def test_copied_commit_requires_both_identity_fields_and_a_readable_commit(self) -> None:
+        identities = frozenset({waits_on.CommitIdentity(100, "Checkpoint delivery")})
+        for output, status, expected in (("100\0Checkpoint delivery\n", 0, True),
+                                         ("101\0Checkpoint delivery\n", 0, False),
+                                         ("100\0Other delivery\n", 0, False),
+                                         ("100\0Checkpoint delivery\n", 128, False), ("", 128, False)):
+            with self.subTest(output=output, status=status):
+                with patch.object(waits_on, "git", return_value=subprocess.CompletedProcess([], status, output, "")) as read:
+                    self.assertEqual(waits_on.copied_on_main(self.repo, "a" * 40, identities), expected)
+                read.assert_called_once_with(self.repo, "show", "-s", "--format=%at%x00%s", "a" * 40)
+        with patch.object(waits_on, "git") as read:
+            self.assertFalse(waits_on.copied_on_main(self.repo, "a" * 40, frozenset()))
+        read.assert_not_called()
+
     def test_each_kind_of_work_has_a_state(self) -> None:
         base = commit_repository(self.repo, "base", allow_empty=True)
         _ = self.git("switch", "-q", "-c", "builds-589")
@@ -201,7 +225,7 @@ class WaitsOnTests(unittest.TestCase):
             (waits_on.NotOnMain("c" * 40), frozenset(), {"c" * 40: failed},
              "After branch builds/589; 10th in the merge line; last attempt failed at red: test_x red; 13:30"),
             (waits_on.PhaseSent("c" * 40), frozenset({"c" * 9}), {}, "After builds phase 589; merging now"),
-            (waits_on.NotOnMain("d" * 40), frozenset(), {}, "After branch builds/589; absent from the local copy of main"),
+            (waits_on.NotOnMain("d" * 40), frozenset(), {}, "After branch builds/589; not on main yet"),
             (waits_on.PhaseOpen(now + 3600), frozenset(), {}, "After builds phase 589; started"),
             (waits_on.PhaseOpen(None), frozenset(), {}, "After builds phase 589; started"),
             (waits_on.PhaseNotStarted(), frozenset(), {}, "After builds phase 589; not started"),

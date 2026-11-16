@@ -711,10 +711,10 @@ def wait_text(found: waits_on.WaitState, land: land_queue.LandView, *, now: floa
         case waits_on.NotOnMain(commit):
             state = land_queue.land_state(land, commit)
             if isinstance(state, land_queue.NotInLine | land_queue.LineUnused):
-                return "absent from the local copy of main"
+                return "not on main yet"
             if isinstance(state, land_queue.InLine | land_queue.LandRunning):
                 return land_text(state, now=now, zone=zone)
-            return f"absent from the local copy of main; {land_text(state, now=now, zone=zone)}"
+            return f"not on main yet; {land_text(state, now=now, zone=zone)}"
         case waits_on.PhaseOpen():
             return "started"
         case waits_on.PhaseNotStarted():
@@ -1362,6 +1362,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     view = census_view(census_read)
     land = land_queue.land_view(REPOSITORY)
     phase_merges = waits_on.landed_phases(REPOSITORY)
+    main_identities = waits_on.main_commit_identities(REPOSITORY)
     merge_times = {key: float(merge.timestamp_epoch) for key, merge in phase_merges.items()}
     landed_commits: dict[tuple[str, str], set[str]] = {}
     for result in land.results.values():
@@ -1382,6 +1383,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     queues: dict[staff.StaffId, UnitWorkQueue | UnreadableWorkQueue] = {}
     wait_states: dict[str, waits_on.WaitState] = {}
     main_states: dict[str, bool] = {}
+    copied_states: dict[str, bool] = {}
 
     def read_run(path: Path) -> list[dict[str, object]]:
         if path not in events:
@@ -1411,6 +1413,11 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         if commit not in main_states:
             main_states[commit] = waits_on.on_main(REPOSITORY, commit)
         return main_states[commit]
+
+    def copied_on_main(commit: str) -> bool:
+        if commit not in copied_states:
+            copied_states[commit] = waits_on.copied_on_main(REPOSITORY, commit, main_identities)
+        return copied_states[commit]
 
     unit_snapshot = staff.StaffSnapshot(tuple(unit.member for unit in units if isinstance(unit.member, staff.StaffRow)))
     newest = newest_unit_runs(unit_snapshot)
@@ -1486,7 +1493,8 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         for phase, sent in done.items():
             if phase in open_sent or phase in merged_phases or not isinstance(sent, SentCommit):
                 continue
-            if sent.commit.lower() in landed_commits.get((unit.unit, phase), ()) or on_main(sent.commit):
+            if (sent.commit.lower() in landed_commits.get((unit.unit, phase), ())
+                    or on_main(sent.commit) or copied_on_main(sent.commit)):
                 merged_phases.add(phase)
             else:
                 open_sent[phase] = sent
