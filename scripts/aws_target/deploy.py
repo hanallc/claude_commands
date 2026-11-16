@@ -1338,7 +1338,9 @@ def region_gate_template() -> dict[str, object]:
     resources = ledger.mapping(source['Resources'])
     def rewrite(value: object) -> object:
         if isinstance(value, str):
-            return value.replace('cloud-claude-gate-${DeploymentId}', 'cloud-gate-${DeploymentId}-${AWS::Region}')
+            # IAM role, Lambda and schedule names allow 64 characters; the shorter expiry prefix fits a 19-character region.
+            return (value.replace('cloud-claude-gate-${DeploymentId}-expiry', 'gate-${DeploymentId}-${AWS::Region}-expiry')
+                    .replace('cloud-claude-gate-${DeploymentId}', 'cloud-gate-${DeploymentId}-${AWS::Region}'))
         if isinstance(value, list):
             return [rewrite(item) for item in cast(list[object], value)]
         if isinstance(value, dict):

@@ -1147,6 +1147,13 @@ The instance profile has no CloudFormation tag property.
 | Bucket, role, profile, security group, launch template | `cloud-claude-gate-${DeploymentId}` |
 | Expiry role, expiry function, schedule | `cloud-claude-gate-${DeploymentId}-expiry` |
 | Log group | `/aws/lambda/cloud-claude-gate-${DeploymentId}-expiry` |
+| Regional security group, launch template | `cloud-gate-${DeploymentId}-${AWS::Region}` |
+| Regional expiry role, expiry function, schedule | `gate-${DeploymentId}-${AWS::Region}-expiry` |
+| Regional log group | `/aws/lambda/gate-${DeploymentId}-${AWS::Region}-expiry` |
+
+IAM role, Lambda function and schedule names allow 64 characters.
+The regional expiry names use the shorter `gate-` prefix, so a region name of up to 19 characters fits.
+The 2026-11-16 deployment failed in `ap-northeast-1`: its 65-character `cloud-gate-` role name passed the limit.
 
 The box sends logs every `log_push_s=5` seconds.
 The route reads module counters from each log download.
