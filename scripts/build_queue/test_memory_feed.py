@@ -21,13 +21,16 @@ import textwrap
 import tempfile
 import time
 import unittest
-from typing import cast, override
+from typing import Literal, cast, override
 from unittest import mock
 
 from scripts.buildlog import charts, costs, moments
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view, target_availability
 from scripts.build_queue.test_queue_view import cloud_reading
+from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
+from scripts.build_targets import target_config, targets
+from scripts.build_queue.queue_view import refresh_mac_builds
 from scripts.build_queue.admission_test_support import AdmissionFixture, NOW as ADMISSION_NOW, only_admitted
 from scripts.build_queue.queue_fixture import write_process, write_scope
 from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
@@ -115,6 +118,87 @@ class MemoryFeedTests(unittest.TestCase):
     output: Path = Path()
     configuration: Path = Path()
 
+    def test_run_slot_numbers_use_the_run_machine_root(self) -> None:
+        mac_machine = "private-mac-host"
+        _ = (self.root / "machines.conf").write_text(f"mac.hosts={mac_machine}\n")
+        roots = {"natedev": self.root / "linux-slots", mac_machine: self.root / "mac-slots"}
+        roots["natedev"].mkdir()
+        linked_root = self.root / "linux-slot-link"
+        linked_root.symlink_to(roots["natedev"], target_is_directory=True)
+        mac_home = self.root / "remote-home"
+        for label, machine, folder, configured, expected in (
+            ("natedev slot", "natedev", roots["natedev"] / "hana-slot2", "machine", 2),
+            ("natedev common root", "natedev", roots["natedev"] / "hana-slot2", "common", 2),
+            ("natedev symlink root", "natedev", roots["natedev"] / "hana-slot2", "symlink", 2),
+            ("Mac host root", "mac", roots[mac_machine] / "hana-slot3", "machine", 3),
+            ("Mac tilde root", "mac", mac_home / "build/slot/hana-slot3", "~", 3),
+            ("Mac HOME root", "mac", mac_home / "build/slot/hana-slot3", "$HOME", 3),
+            ("Mac braced HOME root", "mac", mac_home / "build/slot/hana-slot3", "${HOME}", 3),
+            ("local tilde root", "natedev", Path.home() / "build/slot/hana-slot2", "~", 2),
+            ("local HOME root", "natedev", Path.home() / "build/slot/hana-slot2", "$HOME", 2),
+            ("Mac home unavailable", "mac", Path.home() / "build/slot/hana-slot3", "unknown-home", "—"),
+            ("outside root", "natedev", self.root / "worktree", "machine", "—"),
+            ("lookalike outside root", "natedev", self.root / "hana-slot2", "machine", "—"),
+            ("other machine root", "mac", roots["natedev"] / "hana-slot2", "machine", "—"),
+            ("nested folder", "natedev", roots["natedev"] / "hana-slot2" / "crate", "machine", "—"),
+            ("no roots", "natedev", roots["natedev"] / "hana-slot2", "none", "—"),
+            ("Mac without roots", "mac", roots[mac_machine] / "hana-slot3", "none", "—"),
+        ):
+            with self.subTest(label=label):
+                settings = ("".join(f"roots.slots.{host}={path}\n" for host, path in roots.items())
+                            if configured == "machine" else f"roots.slots={roots['natedev']}\n" if configured == "common" else "")
+                if configured in ("~", "$HOME", "${HOME}", "unknown-home"):
+                    selected_host = mac_machine if machine == "mac" else machine
+                    prefix = "~" if configured == "unknown-home" else configured
+                    settings = f"roots.slots.{selected_host}={prefix}/build/slot\n"
+                if configured == "symlink":
+                    settings = f"roots.slots.natedev={linked_root}\n"
+                _ = (self.root / "build_folders.conf").write_text(settings)
+                reading = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
+                step = replace(reading.view.running[0], folder=str(folder))
+                reading = replace(reading, view=replace(reading.view, running=(step,)),
+                    explanation=replace(reading.explanation,
+                        running=(replace(reading.explanation.running[0], step=step),)))
+                build = queue_view.MacBuild(710001, str(folder), reading.explanation.now - 30,
+                                           "cargo nextest run", "hana")
+                mac = queue_view.MacBuildReading(reading.explanation.now, (build,) if machine == "mac" else (),
+                                                home="" if configured == "unknown-home" else str(mac_home))
+                with (mock.patch.object(admission_client, "view", return_value=reading),
+                      mock.patch.object(memory_feed, "host_name", return_value="natedev"),
+                      mock.patch.object(queue_view, "read_mac_builds", return_value=mac)):
+                    page = memory_feed.reading()
+                rows = [row for row in page["walk"] if row.get("machine") == machine]
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0].get("slot"), expected)
+                payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+                shown_rows = cast(list[dict[str, object]], payload["walk"])
+                self.assertEqual(next(row["slot"] for row in shown_rows if row["machine"] == machine), expected)
+                self.assertTrue(all("slot" not in row for row in page["waiters"]))
+
+    def test_mac_reading_collects_and_preserves_the_remote_home(self) -> None:
+        mac_home = str(self.root / "remote-home")
+        script = queue_view.mac_build_script().replace("print(json.dumps(read_reading()))",
+            "read_processes = lambda: {}\n"
+            + "read_gate_records = lambda: {}\n"
+            + "read_captures = lambda processes: {}\n"
+            + "read_builds = lambda *args: []\n"
+            + "unplaced_runs = lambda *args: []\n"
+            + "print(json.dumps(read_reading()))")
+        result = subprocess.run(["sh", "-c", script], capture_output=True, text=True,
+                                env={**os.environ, "HOME": mac_home}, timeout=5, check=True)
+        data = cast(dict[str, object], json.loads(result.stdout.removesuffix("rc=0\n")))
+        self.assertEqual(data["home"], mac_home)
+        _ = (self.root / "mac_test.conf").write_text("host=private-mac\n# range: 5e-324..\nconnect_timeout_s=2\n")
+        with mock.patch.object(subprocess, "run", return_value=result) as remote:
+            refresh_mac_builds()
+            remote.assert_called_once()
+            self.assertEqual(queue_view.read_mac_builds().home, mac_home)
+            remote.side_effect = OSError("Mac is unavailable")
+            refresh_mac_builds()
+        reading = queue_view.read_mac_builds()
+        self.assertEqual(reading.home, mac_home)
+        self.assertEqual(reading.error, "Mac reading unavailable")
+
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -171,7 +255,7 @@ class MemoryFeedTests(unittest.TestCase):
                     row = next(row for row in page["walk"] if row["pid"] == build.pid)
                     if label.startswith("placement "):
                         self.assertNotIn("placement", row["name"])
-                        self.assertEqual(row["gate_label"], label)
+                        self.assertEqual(cast(memory_feed.MacBuildRow, row)["gate_label"], label)
                     else:
                         self.assertIn(label, row["name"])
                     if label == "unplaced":
@@ -298,6 +382,7 @@ process.stdout.write(JSON.stringify({
                           "started_at": 199_000, "job": "tests"}
                 step = admission_records.RunningStep("", "hana-ci.slice", "service", str(cgroup), 0,
                     admission_records.UnownedSliceMemory(admission_records.GIB // 8,
+                        anonymous=admission_records.AnonymousRunUse(admission_records.GIB // 8),
                         cgroup=str(cgroup), owner="hana-ci.slice", pid=701,
                         job_state=RunningServiceJob(199_000) if busy else IdleService()), pid=701)
                 reading = captured_reading(running=(step,))
@@ -309,6 +394,7 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(page["ci_ram"], 0.125)
                 self.assertEqual(page["taken"], page["used"] + page["ci_ram"] + page["reserved"])
                 self.assertEqual(page["taken"], 0.125)
+                self.assertEqual(page["taken"], cast(float, page["cap"]) - page["room"])
                 self.assertEqual(row.get("admitted"), busy)
 
     def test_the_feed_publishes_configured_colors_for_both_themes(self) -> None:
@@ -335,19 +421,20 @@ process.stdout.write(JSON.stringify({
             with self.subTest(state=state):
                 step = admission_records.RunningStep("", "hana-ci.slice", "service", "/ci", 0,
                     admission_records.UnownedSliceMemory(admission_records.GIB // 8, owner="hana-ci.slice",
+                        anonymous=admission_records.AnonymousRunUse(admission_records.GIB // 8),
                         job_state=RunningServiceJob(199_000), service_job_state=state, pid=701), pid=701)
                 reading = with_wait_reason(captured_reading(running=(step,)), admission_records.StartSpacingWait(110))
                 with mock.patch.object(admission_client, "view", return_value=reading):
                     page = memory_feed.reading()
                 ci, = [row for row in page["walk"] if row.get("ci")]
                 self.assertEqual(ci.get("admitted"), isinstance(state, RunningServiceJob))
-                self.assertIn("start spacing", page["waiters"][0]["reason"])
+                self.assertIn("another step just started; the queue waits a few seconds between starts", page["waiters"][0]["reason"])
                 self.assertEqual(page["taken"], 0.125)
                 self.assertEqual(page["ci_ram"], 0.125)
 
     def test_page_heading_shows_next_step_room_without_a_waiting_count(self) -> None:
         page = self.expected_page()
-        self.assertIn('id="answer" data-tip="room">Next step room</div>', page)
+        self.assertIn('id="answer" data-tip="room">Free for the next step</div>', page)
         self.assertNotIn("steps wait", page)
         self.assertNotIn("step waits", page)
 
@@ -1115,7 +1202,7 @@ process.stdout.write(JSON.stringify({
     def test_each_wait_state_keeps_its_reason_and_the_other_readings(self) -> None:
         reasons = (
             (admission_records.PressureUnavailable("cannot read /private/proc/pressure/memory"), "/private/proc/pressure/memory"),
-            (admission_records.StartSpacingWait(200_010), "start spacing"),
+            (admission_records.StartSpacingWait(200_010), "another step just started; the queue waits a few seconds between starts"),
             (admission_records.BehindHead("first", 1, "head-session"), "behind"),
         )
         for reason, expected in reasons:
@@ -1242,9 +1329,92 @@ process.stdout.write(JSON.stringify({
                     self.assertEqual(row.get("priority_text", ""), expected)
                 self.assertEqual(page["unmatched_priority_text"],
                     "queue priority: research (the user's bump)" if priority and unit == "other" else "")
-                notes = [row["head_text"] for row in page["waiters"] if "head_text" in row]
-                self.assertEqual(notes, [page["head_text"]])
-                self.assertIn("cloud 1 of 1 slots", notes[0])
+                self.assertEqual([row for row in page["waiters"] if "head_room" in row], [])
+                self.assertNotIn("head_text", page)
+
+    def test_can_run_on_names_the_mac_only_when_its_routes_allow_the_step(self) -> None:
+        for fit, expected in ((target_availability.Allowed("busy with nextest hana"), "natedev or Mac"),
+                              (target_availability.NotAllowed("makes natedev artifacts"), "natedev only"),
+                              (target_availability.FitUnreadable("Mac state unreadable"), "natedev only (Mac state unknown)"),
+                              (target_availability.NoMacTarget(), "natedev only")):
+            with self.subTest(fit=fit):
+                self.assertEqual(memory_feed.local_runs_on(fit), expected)
+
+    def test_can_run_on_names_a_route_that_limits_the_step_before_the_mac_routes(self) -> None:
+        routes = target_availability.MacRoutes((snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free())), {}, UTC)
+        for route, expected in ((target_config.LOCAL_CALLER, "natedev only (the run asks for it)"),
+                                (target_config.WRITES_TREE, "natedev only (step writes the tree)"),
+                                (target_config.MAC_ONLY, "Mac only"),
+                                (target_config.PinnedTarget("mac"), "Mac only"),
+                                (target_config.PinnedTarget("natedev"), "natedev only")):
+            with self.subTest(route=route), mock.patch.object(routes, "fit") as fit:
+                self.assertEqual(memory_feed.step_runs_on(route, routes, "nextest", "/fixture/hana", "hana"), expected)
+                self.assertEqual(memory_feed.mac_only_route(route, routes), expected == "Mac only")
+                fit.assert_not_called()
+        with mock.patch.object(routes, "fit", return_value=target_availability.Allowed("no block or claim recorded")):
+            self.assertEqual(memory_feed.step_runs_on(target_config.ANY_ELIGIBLE_TARGET, routes, "nextest",
+                                                      "/fixture/hana", "hana"), "natedev or Mac")
+
+    def test_a_mac_only_step_names_what_holds_the_mac_on_its_queued_run_and_waiting_rows(self) -> None:
+        reading = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
+        view, explanation = reading.view, reading.explanation
+        reading = replace(reading, view=replace(view,
+            running=tuple(replace(step, route=target_config.MAC_ONLY) for step in view.running),
+            waiting=tuple(replace(step, route=target_config.MAC_ONLY) for step in view.waiting)),
+            explanation=replace(explanation, running=tuple(replace(entry, step=replace(entry.step, route=target_config.MAC_ONLY))
+                                                           for entry in explanation.running)))
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(target_availability.MacRoutes, "holds", return_value="build hold by research (hana) until released")):
+            page = memory_feed.reading()
+        running, = [row for row in page["walk"] if row.get("queued")]
+        waiting, = page["waiters"]
+        for row in (running, waiting):
+            self.assertEqual((row.get("runs_on"), row.get("mac_state")), ("Mac only", "build hold by research (hana) until released"))
+
+    def test_target_notes_name_what_holds_the_mac_only_for_a_mac_only_step_while_something_holds_it(self) -> None:
+        routes = target_availability.MacRoutes((snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free())), {}, UTC)
+        with mock.patch.object(routes, "holds", return_value="busy with check cargo-handler"):
+            self.assertEqual(memory_feed.target_notes(target_config.PinnedTarget("mac"), routes, "nextest", "/r", "p"),
+                             {"runs_on": "Mac only", "mac_state": "busy with check cargo-handler"})
+            self.assertEqual(memory_feed.target_notes(target_config.LOCAL_CALLER, routes, "nextest", "/r", "p"),
+                             {"runs_on": "natedev only (the run asks for it)"})
+        with mock.patch.object(routes, "holds", return_value=""):
+            self.assertEqual(memory_feed.target_notes(target_config.MAC_ONLY, routes, "nextest", "/r", "p"),
+                             {"runs_on": "Mac only"})
+
+    def test_swapped_memory_of_other_programs_shows_as_free_ram_when_it_comes_back(self) -> None:
+        gib = admission_records.GIB
+        room = admission_records.MemoryRoom(28 * gib, 3 * gib, 0, 8 * gib, 7 * gib, 64 * gib, (), agent_swap_demand=10 * gib)
+        check = admission_records.RoomCheck(16 * gib, 7 * gib, False, basis=admission_records.DoesNotFit())
+        shown = memory_feed.head_room(check, room)
+        self.assertEqual([(row["label"], row["gib"]) for row in shown["rows"]], [
+            ("Free RAM", 28.0), ("− Safety net", 3.0), ("− Swap coming back", 10.0), ("− Build reserved", 8.0),
+            ("= Free", 7.0), ("need", 16.0)])
+        self.assertEqual(shown["note"], f"Other programs have 10.0 GiB of memory in swap. {memory_feed.SWAP_RETURN_NOTE}")
+
+    def test_only_a_head_that_memory_holds_shows_its_room_rows(self) -> None:
+        gib = admission_records.GIB
+        reading = with_wait_reason(reservation_reading(), admission_records.NeedsMemory())
+        room = admission_records.RoomCheck(20 * gib, 15 * gib, False, basis=admission_records.DoesNotFit())
+        expected_rows = [[("Free RAM", 30.0), ("− Safety net", 3.0), ("− Swap coming back", 0.0),
+                          ("− Build reserved", 9.0), ("− Held for earlier steps", 3.0),
+                          ("= Free", 15.0), ("need", 20.0)]]
+        states: tuple[tuple[Literal["admit", "hold"], admission_records.HeadCause], ...] = (
+            ("admit", admission_records.NeedsMemory()), ("hold", admission_records.NeedsMemory()),
+            ("hold", admission_records.StartSpacingWait(110)), ("hold", admission_records.GpuSlotWait(1, 1)))
+        for state, cause in states:
+            with self.subTest(state=state):
+                head = admission_records.HeadExplanation(reading.view.waiting[0], admission_records.NeedSourceNotRecorded(),
+                    admission_records.AdmissionDecision(state, 0, 0, 0, 0), room,
+                    admission_records.FreeCheck(30 * gib, 20 * gib, 0, 0, 0, True), False,
+                    cause=cause)
+                current = replace(reading, explanation=replace(reading.explanation, head=head))
+                with mock.patch.object(admission_client, "view", return_value=current):
+                    page = memory_feed.reading()
+                shown = [[(row["label"], row["gib"]) for row in waiter["head_room"]["rows"]]
+                         for waiter in page["waiters"] if "head_room" in waiter]
+                self.assertEqual(shown, expected_rows if state == "hold" else [])
+                self.assertNotIn("admission_check", page)
 
     def test_mac_idle_alert_reaches_the_feed_and_clears_with_the_watch_state(self) -> None:
         _ = write_idle_config(self.root)
@@ -1303,8 +1473,7 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(page["targets"], [{"target": "mac", "state": "Blocked", "reason": "P15 F11 L0 run",
                     "holder": "research", "unit": "research", "showrunner": "hana", "since": "since " + since.strftime("%H:%M UTC"),
                     "until": "until released"}])
-                self.assertEqual({waiter.get("mac_text") for waiter in page["waiters"]},
-                                 {"Mac: blocked by research (hana) until released"})
+                self.assertEqual({waiter.get("runs_on") for waiter in page["waiters"]}, {"natedev or Mac"})
 
     def test_cloud_rows_show_stage_and_location(self) -> None:
         reading = cloud_reading(reservation_reading())
@@ -1386,7 +1555,8 @@ process.stdout.write(JSON.stringify({
                 build = queue_view.MacBuild(90082, "/private/hana", 0, "cargo nextest run", "hana",
                     origin=queue_view.MacBuildOrigin.CI, ci_runner=runner, ci_job=job)
                 row = memory_feed.mac_work_row(build, queue_view.MacBuildReading(1, (build,)),
-                                              unit_labels.UnitLabels("unknown"), names=read_step_names())
+                                              unit_labels.UnitLabels("unknown"), names=read_step_names(),
+                                              slot_roots={}, slot_machine="private-mac-host")
                 self.assertEqual(row["name"], "CI nextest")
                 self.assertEqual(row.get("ci_label"), label)
 
@@ -1466,12 +1636,13 @@ process.stdout.write(JSON.stringify({
                 self.assertNotIn("cloud_heading", payload)
                 self.assertEqual(page["cloud_slots_used"], 1)
                 self.assertEqual(page["cloud_slots"], 1)
-                self.assertIn("cloud 1 of 1 slots", page["head_text"])
                 runs = cast(list[dict[str, object]], payload["walk"])
                 waits = cast(list[dict[str, object]], payload["waiters"])
                 remote, = [row for row in runs if row.get("kind") == "cloud"]
                 local, = [row for row in runs if row.get("kind") != "cloud"]
                 waiter, = [row for row in waits if row.get("kind") == "cloud"]
+                self.assertEqual(waiter["runs_on"], memory_feed.CLOUD_RUNS_ON)
+                self.assertNotIn("AWS", "".join(str(row.get("runs_on", "")) for row in waits if row.get("kind") != "cloud"))
                 self.assertEqual(remote["machine"], "aws")
                 self.assertEqual(remote["vcpus"], 32 if isinstance(cloud.progress, cloud_progress.CloudProgress)
                                  else {"kind": "UnknownCpuCount"})
@@ -1601,6 +1772,7 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(blocks["build_tools_bytes"], 5 * gib)
                 self.assertEqual(blocks["queued_builds_bytes"], gib)
                 self.assertEqual(blocks["ci_bytes"], 2 * gib)
+                self.assertEqual(blocks["cap_bytes"], gib + 5 * gib + 2 * gib + covered[2] + room)
                 self.assertEqual((blocks["agents_bytes"], blocks["desktop_bytes"]), (5 * gib, gib * 3 // 2))
                 self.assertEqual(blocks["desktop_protection_bytes"], 2 * gib)
                 self.assertEqual(blocks["programs"], [{"id": "chrome", "name": "Chrome", "bytes": 3 * gib}])
@@ -1686,6 +1858,10 @@ process.stdout.write(JSON.stringify({
         assert isinstance(head, admission_records.HeadExplanation)
         gpu_wait = replace(waiting, head=replace(head, cause=admission_records.GpuSlotWait(1, 1)))
         self.assertEqual(memory_feed.memory_status(gpu_wait, room, 0)["code"], "gpu_slot")
+        # Memory outside the queue that leaves nothing free is the cause, not the GPU slot.
+        for code, available in (("shortfall", 5 * gib), ("no_room", 12 * gib)):
+            with self.subTest(gpu_slot=code):
+                self.assertEqual(memory_feed.memory_status(gpu_wait, self.fixture_room(available), 0)["code"], code)
 
     def test_detached_python_counts_in_other_and_reserved_cargo_counts_once(self) -> None:
         for cargo_use in (0, 2 * admission_records.GIB):
@@ -1901,6 +2077,23 @@ def write_browser_fixture(folder: Path) -> None:
             leftover_step(19 * 60, small=True), leftover_step(2 * 24 * 60, small=True), live, compiler))
         base = gate.queue_read_from(inputs, admission_policy_fixture())
         readings: dict[str, admission_records.QueueRead] = {"good": base}
+        for name, available, swapped in (("head_memory", 8, 0), ("head_shortfall", 2, 0), ("head_swap_shortfall", 4, 6)):
+            held = gate.queue_read_from(replace(inputs, pressure=admission_records.NoPressureHold(),
+                host=admission_records.HostMemory(available * admission_records.GIB, 60 * admission_records.GIB,
+                    8 * admission_records.GIB, (8 - swapped) * admission_records.GIB)),
+                admission_policy_fixture())
+            held = with_wait_reason(held, admission_records.NeedsMemory())
+            held = replace(held, view=replace(held.view,
+                waiting=(replace(held.view.waiting[0], need=20 * admission_records.GIB),)))
+            held_room = held.explanation.room
+            assert isinstance(held_room, admission_records.MemoryRoom)
+            check = admission_records.RoomCheck(20 * admission_records.GIB, held_room.signed_room, False,
+                                               basis=admission_records.DoesNotFit())
+            head = admission_records.HeadExplanation(held.view.waiting[0], admission_records.NeedSourceNotRecorded(),
+                admission_records.AdmissionDecision("hold", 0, 0, 0, 0), check,
+                admission_records.FreeCheck(held_room.available, check.need, 0, 0, 0, False), False,
+                cause=admission_records.NeedsMemory())
+            readings[name] = replace(held, explanation=replace(held.explanation, head=head))
         for name, reason in (
             ("pressure", admission_records.PressureUnavailable("cannot read /private/proc/pressure/memory")),
             ("spacing", admission_records.StartSpacingWait(110)),

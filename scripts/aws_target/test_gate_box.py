@@ -425,6 +425,21 @@ else:
                         self.assertNotIn('started_at', module)
                         self.assertNotIn('ended_at', module)
 
+    def test_result_without_executions_reads_the_jobs_as_executions(self) -> None:
+        first = gate.GateJobResult('fixture', 'test_one.py', 1, 2, 'failed', wall_clock=gate_record.WallClockSpan(10, 12))
+        second = gate.GateJobResult('fixture', 'test_one.py', 0, 1, 'passed', wall_clock=gate_record.WallClockSpan(13, 14))
+        with self.subTest(form='with executions'):
+            run = gate.GateRun((second,), 4, 3, executions=(first, second))
+            self.assertEqual(gate_box.decode_run(gate_box.encode_run(run)), run)
+        with self.subTest(form='without executions'):
+            run = gate.GateRun((second,), 4, 3, executions=(second,))
+            encoded = gate_box.encode_run(run)
+            # The older writer encodes executions equal to jobs; the newer writer leaves them out.
+            _ = encoded.pop('executions', None)
+            decoded = gate_box.decode_run(encoded)
+            self.assertEqual(decoded, run)
+            self.assertEqual([job.output for job in gate_box.execution_records(decoded)], ['passed'])
+
     def test_result_rejects_missing_or_invalid_status_and_metrics(self) -> None:
         run = gate.GateRun((gate.GateJobResult('fixture', 'test_one.py', 0, 1, ''),), 1, 1)
         for field, value in (('returncode', False), ('seconds', -1), ('seconds', float('nan')),

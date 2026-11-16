@@ -1,7 +1,7 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Read unit commit trailers and write change review rows.
 
-A visible trailer has three fields, optional after <step>, and optional last image <id>.
+A visible trailer requires three fields and a final image <id>, with optional after <step> before the image.
 An invisible change uses Change-Review: none — <reason>.
 Every supplied review line must parse, whatever the commit subject.
 Only checkpoints that change more than Markdown require a review line.
@@ -35,6 +35,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from enum import Enum
+from functools import cached_property
 from pathlib import Path
 from typing import TypeVar, cast
 
@@ -68,11 +69,13 @@ IMAGE = "Image"
 KIND = "Kind"
 REVIEW_KINDS = ("See in action", "Read only")
 NOT_YET = "not yet"
-FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see> [| after <step>] [| image <id>]"
+FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see> [| after <step>] | image <id>"
 SEPARATOR = " | "
 SHORT = 8
 # Commits made before the rule landed carry no line and are not read: 2026-10-15 00:00 EDT.
 CHECKED_FROM = 1792036800
+# Commits made before the image rule landed need no image: 2026-11-16 00:00 EST.
+IMAGES_CHECKED_FROM = 1794805200
 LANDED = "2026-10-15"
 # Scan only merges made after the readiness rule starts.
 READY_FROM = "2026-11-06"
@@ -157,6 +160,7 @@ class Commit:
     subject: str
     message: str
     files: tuple[str, ...]
+    timestamp: int
     ancestry: Mapping[str, tuple[str, ...]] = field(default_factory=dict[str, tuple[str, ...]], repr=False, compare=False)
 
 
@@ -200,15 +204,19 @@ def needs_trailer(subject: str, files: tuple[str, ...]) -> bool:
     return subject.startswith("checkpoint(") and not (files and all(name.endswith(".md") for name in files))
 
 
-def problem(subject: str, message: str, files: tuple[str, ...]) -> str:
+def problem(subject: str, message: str, files: tuple[str, ...], *, timestamp: int = IMAGES_CHECKED_FROM) -> str:
     """Why a commit's message fails the rule, or the empty string."""
     found = entries(message)
     if not found and needs_trailer(subject, files):
         return f"no {TRAILER} line: add `{TRAILER}: {FORM}` or `{TRAILER}: none — <why nothing visible changes>`"
     bad = [item.text for item in found if isinstance(item, Malformed)]
     if bad:
-        return (f"{TRAILER} line {bad[0]!r} needs three parts split by {SEPARATOR.strip()!r}, optionally followed by ` | after <step>` and then ` | image <12-hex id>`: "
+        return (f"{TRAILER} line {bad[0]!r} needs three parts split by {SEPARATOR.strip()!r}, optional ` | after <step>`, and required ` | image <12-hex id>`: "
                 + f"`{TRAILER}: {FORM}`, or `{TRAILER}: none — <why nothing visible changes>`")
+    for line, item in zip(_LINE.finditer(message), found):
+        if timestamp >= IMAGES_CHECKED_FROM and isinstance(item, Visible) and not item.image:
+            return (f"{TRAILER} line {line.group(0)!r} has no image: register one with change_review.py image --image <png> "
+                    + "(or --output <text file> for terminal output), then end the line with | image <id>")
     return ""
 
 
@@ -296,7 +304,7 @@ def unit_commits(repo: Path, checkpoint: str, previous: str, merge_branch: str,
         if int(stamp) < checked_from:
             continue
         if len(parents) < 2:
-            commits.append(Commit(sha, message.partition("\n")[0], message, _files(repo, sha), ancestry))
+            commits.append(Commit(sha, message.partition("\n")[0], message, _files(repo, sha), int(stamp), ancestry))
         elif reason := merge_review_problem(message, is_merge=True):
             raise ChangeReviewError(f"{sha[:SHORT]}: {reason}. Make the merge again without the lines")
     return commits
@@ -308,9 +316,10 @@ def missing(commits: list[Commit]) -> list[str]:
     A pushed commit cannot be amended, so a later checkpoint carries the lines for one that missed them.
     """
     covered = [found.group("sha") for commit in commits if entries(commit.message)
-               and not problem(commit.subject, commit.message, commit.files) for found in _COVERS.finditer(commit.message)]
+               and not problem(commit.subject, commit.message, commit.files, timestamp=commit.timestamp)
+               for found in _COVERS.finditer(commit.message)]
     return [f"{commit.sha[:SHORT]} {commit.subject}: {reason}" for commit in commits
-            if (reason := problem(commit.subject, commit.message, commit.files))
+            if (reason := problem(commit.subject, commit.message, commit.files, timestamp=commit.timestamp))
             and not any(commit.sha.startswith(sha) for sha in covered)]
 
 
@@ -343,12 +352,13 @@ def visible(commits: list[Commit]) -> list[Visible]:
     return [item for _, item in _checkpoint_entries(commits)]
 
 
-def _line_value(doc: Path, *, sources: list[Path] | None = None) -> str | None:
+def _line_value(doc: Path, *, sources: list[Path] | None = None,
+                lines: list[str] | None = None) -> str | None:
     """The path the doc's Change review line names: its first `quoted` part, else the words before
     any ` — ` note. None when the doc has no line."""
     if sources is not None:
         sources.append(doc)
-    for line in doc.read_text(encoding="utf-8").splitlines():
+    for line in doc.read_text(encoding="utf-8").splitlines() if lines is None else lines:
         if line.startswith(LIST_HEADER):
             value = line.removeprefix(LIST_HEADER).strip()
             quoted = re.match(r"`([^`]+)`", value)
@@ -881,16 +891,24 @@ def pending(path: Path) -> list[dict[str, str]]:
 
 
 def scope_list(doc: Path, *, record: staff.StaffSnapshot | None = None,
-               sources: list[Path] | None = None) -> Path:
+               sources: list[Path] | None = None, prepared: PreparedChangeLists | None = None) -> Path:
     """The list that takes the production's rows: the one its Change review line names, else its root's."""
 
-    if doc.is_file() and (value := _line_value(doc, sources=sources)):
+    if prepared is not None:
+        record = prepared.routing.record
+    lines = prepared.routing.document_lines.get(doc, []) if prepared is not None else None
+    if doc.is_file() and (value := _line_value(doc, sources=sources, lines=lines)):
         return Path(value).expanduser()
     record = staff.snapshot() if record is None else record
     name = unit_lookup.doc_owner(doc, record).name
     if not doc.is_file():
         return list_file(name, sources=sources)
     root = showrunner_tree.root_of(name, record=record)
+    if prepared is not None:
+        for owner in (name, root):
+            if owner in prepared.routing.list_paths:
+                return prepared.routing.list_paths[owner]
+        raise ChangeReviewError(f"{doc} has no `{LIST_HEADER}` line")
     try:
         return (production_list(name, record=record) if sources is None
                 else production_list(name, record=record, sources=sources))
@@ -912,6 +930,20 @@ class ScopedReviewEntry:
     review_list: ProductionReviewList
     entry: urgency.Entry[dict[str, str]]
     owner: change_routing.ChangeOwner
+
+
+@dataclass(frozen=True)
+class PreparedChangeLists:
+    """Share the page's list reads and staff routing with the change queues."""
+
+    snapshots: dict[Path, ReviewListSnapshot]
+    routing: change_routing.StaffRouting
+
+    @cached_property
+    def routed(self) -> list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]:
+        names = {path.name for path in change_routing.review_root().glob(".review-link-delivery-*")}
+        lists = {path: ProductionReviewList(path, _owner(path)) for path in self.snapshots}
+        return _route_review_snapshots(lists, self.snapshots, self.routing, names)
 
 
 def scope_lists(path: Path, doc: Path, below: bool = False, *,
@@ -953,6 +985,13 @@ def _routed_review_entries(path: Path, doc: Path, below: bool, record: staff.Sta
     routing = change_routing.StaffRouting(record, documents, sources=sources)
     names = {path.name for path in issues.source_paths(
         change_routing.review_root(sources=sources), ".review-link-delivery-*", sources=sources)}
+    return _route_review_snapshots(listed, snapshots, routing, names, sources=sources)
+
+
+def _route_review_snapshots(listed: dict[Path, ProductionReviewList], snapshots: dict[Path, ReviewListSnapshot],
+                            routing: change_routing.StaffRouting, names: set[str], *,
+                            sources: list[Path] | None = None) -> list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]:
+    """Route waiting rows from one set of list reads."""
     routed: list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]] = []
     for source, snapshot in snapshots.items():
         rows = change_routing.waiting_rows(source, snapshot.pending, names, sources=sources)
@@ -976,13 +1015,23 @@ def review_scope(doc: Path, below: bool, record: staff.StaffSnapshot) -> set[str
     return scope
 
 
-def scoped_review_entries(path: Path, doc: Path, below: bool = False) -> list[ScopedReviewEntry]:
+def scoped_review_entries(path: Path, doc: Path, below: bool = False, *,
+                          prepared: PreparedChangeLists | None = None) -> list[ScopedReviewEntry]:
     """Use the same staff tab as the change page."""
-    record = staff.snapshot()
+    record = staff.snapshot() if prepared is None else prepared.routing.record
     scope = review_scope(doc, below, record)
     grouped: dict[Path, tuple[ProductionReviewList, list[dict[str, str]]]] = {}
     owners: dict[tuple[Path, str], change_routing.ChangeOwner] = {}
-    for review_list, owner, row in _routed_review_entries(path, doc, below, record):
+    if prepared is None:
+        routed = _routed_review_entries(path, doc, below, record)
+    else:
+        lists = dict.fromkeys(item.path.absolute() for item in scope_lists(path, doc, below, record=record))
+        lists.update(dict.fromkeys(source.absolute() for source in prepared.snapshots))
+        by_list: dict[Path, list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]] = {}
+        for item in prepared.routed:
+            by_list.setdefault(item[0].path.absolute(), []).append(item)
+        routed = [item for source in lists for item in by_list.get(source, [])]
+    for review_list, owner, row in routed:
         if owner.tab in scope:
             if review_list.path not in grouped:
                 grouped[review_list.path] = (review_list, [])
@@ -1006,10 +1055,11 @@ def scope_rows(path: Path, doc: Path, below: bool = False) -> list[dict[str, str
     return [row.entry.item for row in scoped_review_entries(path, doc, below)]
 
 
-def scope_entries(path: Path, doc: Path, below: bool = False) -> list[urgency.Entry[dict[str, str]]]:
+def scope_entries(path: Path, doc: Path, below: bool = False, *,
+                  prepared: PreparedChangeLists | None = None) -> list[urgency.Entry[dict[str, str]]]:
     """Show the responsible showrunner while retaining list-based queue keys and prerequisites."""
     entries: list[urgency.Entry[dict[str, str]]] = []
-    for scoped in scoped_review_entries(path, doc, below):
+    for scoped in scoped_review_entries(path, doc, below, prepared=prepared):
         entry = scoped.entry
         prefix = (f"{_owner(scoped.review_list.path)}/"
                   if scoped.review_list.path.absolute() != path.absolute() else "")
@@ -1034,7 +1084,8 @@ class ChangeQueue:
     entries: list[urgency.Entry[dict[str, str]]]
 
 
-def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False) -> ChangeQueue:
+def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False, *,
+                 prepared: PreparedChangeLists | None = None) -> ChangeQueue:
     """The same change rows and pin for /next and change_review show."""
     if isinstance(scope, WholeReviewList):
         routing = review_routing((path,))
@@ -1043,10 +1094,10 @@ def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False)
             "#": display_id(entry.item, routing.owner(entry.item, path).tab)},
             after=prerequisite_key(entry.after, path, path)) for entry in entries])
 
-    record = staff.snapshot()
+    record = staff.snapshot() if prepared is None else prepared.routing.record
     name = unit_lookup.doc_owner(scope, record).name
     name = queue(path) if name == showrunner_tree.root_of(name, record=record) else f"{queue(path)}-{name}"
-    return ChangeQueue(urgency.scope_queue(name, below), scope_entries(path, scope, below))
+    return ChangeQueue(urgency.scope_queue(name, below), scope_entries(path, scope, below, prepared=prepared))
 
 
 def row_production(production: Path, record: staff.StaffSnapshot) -> str:
@@ -1253,16 +1304,16 @@ def merge_commits(repo: Path, merge: str, *, excluded_refs: Sequence[str] = ()) 
     parents = _git(repo, "rev-list", "--parents", "-n", "1", merge, "--").split()[1:]
     if len(parents) < 2:
         return []
-    records = _git(repo, "log", "--topo-order", "--format=%x1e%H %P%x1f%B", parents[1], f"^{parents[0]}",
+    records = _git(repo, "log", "--topo-order", "--format=%x1e%H %ct %P%x1f%B", parents[1], f"^{parents[0]}",
                    *(f"^{ref}" for ref in excluded_refs), "--")
     commits: list[Commit] = []
     ancestry: dict[str, tuple[str, ...]] = {}
     for record in records.split("\x1e")[1:]:
         header, message = record.split("\x1f", 1)
-        sha, *parents = header.split()
+        sha, stamp, *parents = header.split()
         ancestry[sha] = tuple(parents)
         if len(parents) < 2:
-            commits.append(Commit(sha, message.split("\n", 1)[0], message, (), ancestry))
+            commits.append(Commit(sha, message.split("\n", 1)[0], message, (), int(stamp), ancestry))
     return commits
 
 

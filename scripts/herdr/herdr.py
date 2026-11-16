@@ -2492,14 +2492,27 @@ class Herdr:
         if isinstance(opening, OpeningPrompt):
             if isinstance(opening.transcript, SessionTranscript):
                 transcript = opening.transcript
-                if transcript.session_id and not check_target(
-                        transcript.session_id, action="keys", place=HerdrPlace(self.session, pane)):
-                    return PromptNotSubmitted("prompt target is unknown; session retained")
                 try:
-                    identity = self.native_session(pane, kind, max(0.1, deadline - time.monotonic()))
+                    while True:
+                        try:
+                            identity = self.native_session(pane, kind, max(0.1, deadline - time.monotonic()))
+                            break
+                        except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                            cause: BaseException | None = error
+                            while cause is not None and not isinstance(cause, NativeRegistryChanging):
+                                cause = cause.__cause__ or cause.__context__
+                            remaining = deadline - time.monotonic()
+                            if not isinstance(cause, NativeRegistryChanging) or remaining <= 0:
+                                raise
+                            time.sleep(operation_deadline.remaining(min(PANE_POLL_SECONDS, remaining)))
+                            if time.monotonic() >= deadline:
+                                raise
                 except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                     print(f"herdr {name}:{pane}: native session is unavailable: {error}; pane retained", file=sys.stderr)
                     return PromptNotSubmitted("native session is unavailable; pane retained")
+                if transcript.session_id and not check_target(
+                        identity, action="keys", place=HerdrPlace(self.session, pane)):
+                    return PromptNotSubmitted("prompt target is unknown; session retained")
                 transcript = SessionTranscript(transcript.config_dir, identity)
                 if isinstance(opening.cursor, TranscriptCursor):
                     opening.cursor.bind_transcript(transcript)

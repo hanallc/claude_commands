@@ -229,7 +229,7 @@ A failed load changes nothing; the next interval tries again.
 Button borders use light and dark colors with at least 3:1 contrast against the button fill and page background.
 The page shows one card at a time.
 The compact **Showrunner:** menu starts with **All (n)** and then lists each showrunner with its waiting count.
-All is the default and includes every showrunner in the existing item order.
+All is the default and lists each root showrunner's queue in turn.
 The menu keeps the existing showrunner order.
 The menu stays on one line at phone and desktop widths.
 The URL fragment records the showrunner and card.
@@ -244,8 +244,15 @@ Each change can hold one image id in its optional `Image` cell.
 It adds the `Image` column when needed and deletes the old image after writing the row.
 `change_review.py image --image <png>` registers a screenshot for a checkpoint line.
 `image --output <text file>` renders dark terminal output with headless Chrome in a temporary browser profile.
+It measures the wrapped text height before capture and uses that height for the image.
+The image height has a 160-pixel minimum because Chrome clips shorter screenshots.
+The image height has a 4096-pixel limit.
 The action prints the id for a final ` | image <id>` field, after optional ` | after <step>`.
 The parser accepts twelve lowercase hexadecimal characters.
+The commit hook requires an image on each visible Change-Review line through `change_review.problem`.
+Merge checks require the image for commits dated at or after 2026-11-16 00:00 EST, using the Git committer time (`%ct`).
+Malformed lines remain invalid at every date.
+Merged history remains readable without an image.
 `list-ready` and `live` leave the cell empty and print one line when the image is missing.
 
 Both review pages use `change_page.change_content` and `CHANGE_IMAGE_STYLE` for the thumbnail.
@@ -338,7 +345,7 @@ Answers to questions and changes both post to `changes.html`.
 
 ### Accounts page
 
-`/console/accounts.html` shows the accounts board that `/showrunner:accounts` shows.
+Hana console, Accounts (`/console/accounts.html`) shows the accounts board.
 The console lists it as **Accounts**, with the Lucide `users` icon.
 The server keeps the last good page and its render times under one lock.
 The first request waits for a render in a child process (`accounts_page.py`).
@@ -586,9 +593,17 @@ The selected type tab joins the content panel.
 Its keyboard focus outline stays inside the tab edges.
 Builds rows can remain in the natedev list while the builds filter shows them.
 
-Each showrunner group orders its prepared change rows with `urgency.queue_order`, the same order that `/next change` uses.
-The page keeps row entries during ordering and does not format the text that `/next` prints.
-The existing urgency order, pin, dependencies, and moved rows determine its order.
+Each showrunner view uses `next_item.change_queue` and `urgency.queue_order`, as `/next change` does without `--all-below`.
+The page shares its list reads and staff routing with `change_review.change_queue`.
+All lists each root's `/next change --all-below` order in turn through `urgency.queue_order`.
+It keeps each root queue's pin, moved rows, and dependencies.
+The page reads `changes_first_root` from `config/review_links.conf` at each render.
+The named root goes first, and other roots follow by name.
+The default is `natedev`.
+A name outside the live roots leaves the root order unchanged.
+Rows outside these queues go last.
+The server supplies each view's order for the first card, waiting list, and Skip for now.
+The browser uses these orders without sorting rows.
 Queue keys and prerequisites retain their list-based IDs.
 The `change` line and `/next` show the responsible showrunner's ID, such as `sdlc/C1514`.
 The shared staff resolver supplies the prefix used by the showrunner filter.

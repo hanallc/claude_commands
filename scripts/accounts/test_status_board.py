@@ -1,4 +1,4 @@
-"""The accounts board table: the columns, lines, tones and narrow facts that /showrunner:accounts shows."""
+"""Test the accounts board columns, lines, and tones for the Hana console Accounts page."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -35,7 +35,7 @@ def counts(busy: int, idle: int, paused: int, exited: int) -> accounts.RoleSessi
 
 
 def fixture() -> accounts.StatusReading:
-    """The unit-board plugin's readable fixture: deliberately unsorted and mixed case."""
+    """A readable status fixture for the board: deliberately unsorted and mixed case."""
     rows = (
         row("Gamma", ("workers",), (counts(1, 2, 0, 1),), 74, "2026-10-24T18:00:00+00:00", None),
         row("beta", ("workers",), (counts(7, 5, 0, 0),), 20.2, "2026-10-17T18:00:00+00:00", 13446.2, read=False),
@@ -88,13 +88,6 @@ class StatusBoardTests(unittest.TestCase):
                          {"aLpha": "default", "beta": "warning", "Charlie": "error", "Delta": "default", "Echo": "default",
                           "Foxtrot": "default", "Gamma": "default"})
         self.assertEqual(rows["total"]["cells"]["label"], [accounts.BoardSpan(text="total", tone="default", kind="bold")])
-
-    def test_facts_carry_each_value_for_a_narrow_pane(self) -> None:
-        board = accounts.status_board(fixture())
-        facts = [" · ".join(text(fact) for fact in line["facts"]) for line in board["rows"][:2]]
-        self.assertEqual(facts, [
-            "60% left · role showrunners ✓ · busy 1 · idle 0 · paused 0 · exited 1 · total 2 · resets 14:00 · credits unlimited · enabled",
-            "role unit directors · busy 2 · idle 1 · paused 0 · exited 0 · total 3"])
 
     def test_quota_boundaries_color_the_left_cell_and_keep_the_dot(self) -> None:
         rows = tuple(row(f"Level {value:02}", ("workers",), (counts(0, 0, 0, 0),), value, None, None) for value in (9, 10, 24, 25))

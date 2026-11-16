@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 from scripts.lib import conf, urgency
 from scripts.lib.user_zone import shown_time
-from scripts.production import change_review, change_routing, staff, update_registration
+from scripts.production import change_review, change_routing, next_item, staff, update_registration
 from scripts.production.production_doc import Production, read_production
 from scripts.production.issues import frontmatter
 from scripts.production.change_routing import UnavailableProduction
@@ -72,6 +72,7 @@ def question_order(questions: list[WaitingQuestion]) -> list[WaitingQuestion]:
 class PreparedReviews:
     changes: tuple[WaitingChange, ...]
     queues: dict[str, change_review.ChangeQueue]
+    orders: dict[str, tuple[str, ...]]
     questions: tuple[WaitingQuestion, ...]
     question_tabs: tuple[str, ...]
     record: staff.StaffSnapshot
@@ -140,17 +141,56 @@ def row_token(browser: ReviewBrowser, key: str) -> str:
     return hmac.new(browser.token.encode(), key.encode(), hashlib.sha256).hexdigest()
 
 
-def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> PreparedReviews:
+def change_orders(grouped: dict[str, list[WaitingChange]], source: change_review.PreparedChangeLists, first_root: str
+                  ) -> tuple[dict[str, change_review.ChangeQueue], dict[str, tuple[str, ...]]]:
+    """Use each /next queue in turn for All and each showrunner's queue for its view."""
+    routing = source.routing
+    waiting = {item.key: item for items in grouped.values() for item in items if item.waiting}
+    queues: dict[str, change_review.ChangeQueue] = {}
+    orders: dict[str, tuple[str, ...]] = {}
+    roots: dict[str, tuple[Path, next_item.Queue]] = {}
+    for tab in sorted(grouped):
+        runner = routing.runners_by_name.get(tab)
+        doc = routing.production_by_runner.get(runner.id) if runner is not None else None
+        if runner is None or doc is None:
+            queues[tab] = change_review.ChangeQueue("", [])
+            orders[tab] = tuple(item.key for item in grouped[tab] if item.waiting)
+            continue
+        path = change_review.scope_list(doc, prepared=source)
+        queue = change_review.change_queue(path, doc, prepared=source)
+        queues[tab] = queue
+        prefix = path.stem.removeprefix(change_review.PREFIX) + "/"
+        ordered = urgency.queue_order(next_item.change_queue(doc, prepared=queue).entries, queue.name)
+        orders[tab] = tuple(key for entry in ordered
+                            if (key := entry.key if "/" in entry.key else prefix + entry.key) in waiting
+                            and waiting[key].tab == tab)
+        if not isinstance(runner.parent, staff.ReportsTo) or runner.parent.id not in routing.runners:
+            roots[runner.name] = (path, next_item.change_queue(doc, below=True, prepared=source))
+    all_keys: dict[str, None] = {}
+    for name in sorted(roots, key=lambda name: (name != first_root, name)):
+        path, queue = roots[name]
+        prefix = path.stem.removeprefix(change_review.PREFIX) + "/"
+        for entry in urgency.queue_order(queue.entries, queue.name):
+            key = entry.key if "/" in entry.key else prefix + entry.key
+            if key in waiting:
+                all_keys[key] = None
+    orders[""] = tuple(all_keys) + tuple(key for key in waiting if key not in all_keys)
+    queues = dict(sorted(queues.items(), key=lambda item: (not any(change.waiting for change in grouped[item[0]]), item[0])))
+    return queues, orders
+
+
+def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus, *,
+            settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> PreparedReviews:
+    if isinstance(settings, conf.UseConfiguredValue):
+        settings = conf.read("review_links")
     delivery = status.read_view()
     snapshots = {path: change_review.review_snapshot(path)
                  for path in sorted(change_review.lists_directory().glob(change_review.PREFIX + "*.md"))}
     routing = change_page.list_routing(snapshots)
     grouped: dict[str, list[WaitingChange]] = {path.stem.removeprefix(change_review.PREFIX): [] for path in snapshots}
     grouped.update({runner.name: [] for runner in routing.runners.values()})
-    defaults: dict[str, Path] = {}
     for path, snapshot in snapshots.items():
         fallback = path.stem.removeprefix(change_review.PREFIX)
-        defaults[fallback] = path
         for row in snapshot.pending:
             assignment = routing.owner_and_production(path, row)
             owner = assignment.owner
@@ -163,38 +203,11 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
             grouped.setdefault(tab, []).append(WaitingChange(
                 key, tab, page, row, slots,
                 owner.note if isinstance(owner, change_routing.UnroutedChange) else ""))
-    queues: dict[str, change_review.ChangeQueue] = {}
-    changes: list[WaitingChange] = []
-    for tab, items in sorted(grouped.items()):
-        if not items:
-            queues[tab] = change_review.ChangeQueue("", [])
-            continue
-        page = items[0].page
-        runner = next((runner for runner in routing.runners.values() if runner.name == tab), None)
-        root = runner
-        while root is not None:
-            parent = root.parent
-            if not isinstance(parent, staff.ReportsTo) or parent.id not in routing.runners:
-                break
-            root = routing.runners[parent.id]
-        current = (defaults.get(root.name) if root is not None else None) or routing.list_paths.get(tab) or defaults.get(tab, page.review_list)
-        name = change_review.queue(current)
-        if runner is not None and isinstance(runner.parent, staff.ReportsTo) and isinstance(page, change_page.AssignedReviewPage):
-            name += "-" + runner.name
-        entries: list[urgency.Entry[dict[str, str]]] = []
-        by_key: dict[str, WaitingChange] = {}
-        for item in items:
-            key = item.row["#"] if item.page.review_list == current else item.key
-            by_key[key] = item
-            if item.waiting:
-                entry = change_review.row_entries([item.row])[0]
-                after = change_review.prerequisite_key(entry.after, item.page.review_list, current)
-                entries.append(replace(entry, key=key, item=item.row | {"#": key}, after=after))
-        prepared = change_review.ChangeQueue(name, entries)
-        changes.extend(by_key[entry.key] for entry in urgency.queue_order(prepared.entries, prepared.name))
-        changes.extend(item for item in items if not item.waiting)
-        queues[tab] = prepared
-    queues = dict(sorted(queues.items(), key=lambda item: not item[1].entries))
+    queues, orders = change_orders(grouped, change_review.PreparedChangeLists(snapshots, routing),
+                                  settings.text("changes_first_root"))
+    by_key = {item.key: item for items in grouped.values() for item in items}
+    changes = [by_key[key] for key in orders[""]]
+    changes.extend(item for item in by_key.values() if not item.waiting)
     identities = update_registration.QuestionStaff.for_record(routing.record)
     questions: list[WaitingQuestion] = []
     for document, lines in routing.document_lines.items():
@@ -218,7 +231,7 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
     questions = question_order(questions)
     question_tabs = tuple(sorted(set(queues) | {item.tab for item in questions},
                                  key=lambda tab: (not any(item.tab == tab for item in questions), tab)))
-    return PreparedReviews(tuple(changes), queues, tuple(questions), question_tabs, routing.record)
+    return PreparedReviews(tuple(changes), queues, orders, tuple(questions), question_tabs, routing.record)
 
 
 def section(change: WaitingChange, feedback_rows: int) -> str:
@@ -515,7 +528,7 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
     settings = conf.read("review_links")
     feedback_rows = settings.whole("feedback_rows")
     refresh_seconds = settings.number("page_refresh_seconds")
-    prepared = prepare(browser, status)
+    prepared = prepare(browser, status, settings=settings)
     kind = browser.kind
     names = prepared.queues if kind == "changes" else prepared.question_tabs
     menus: list[str] = []
@@ -532,6 +545,8 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
                + '<div data-showrunner-filter><label for="review-showrunner">Showrunner:</label>'
                + '<select id="review-showrunner" aria-label="Showrunner"><option value="">All</option></select></div>'
                + '<template data-runner-options>' + ''.join(menus) + '</template>'
+               + '<script type="application/json" data-change-orders>'
+               + json.dumps(prepared.orders if kind == "changes" else {}).replace('<', '\\u003c') + '</script>'
                + '<p hidden role="status" data-save-notice></p>' + cards
                + '<p hidden data-empty></p><div class="navigation"><button type="button" data-next hidden>Skip for now</button></div>'
                + '<noscript>Enable JavaScript to review items and use Skip for now.</noscript></div>'
@@ -684,11 +699,17 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
 SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + r'''
 const motion=createCardMotion();
 let content=document.querySelector('[data-review-content]');
-let rows,runnerOptions,showrunners,runnerMenu,next,empty,saveNotice;
+let rows,viewOrders,runnerOptions,showrunners,runnerMenu,next,empty,saveNotice;
 let shownPage=content.outerHTML, heldPage=null, newestRequest=0, activeLoads=0, activeSaves=0;
 const remembered=new Map(), kind=content.dataset.kind; let current=null, tab='', navigation=0, shownHash='';
+function ordersFor(page,cards){
+ const byKey=new Map(cards.map(row=>[row.dataset.key,row]));
+ return new Map(Object.entries(JSON.parse(page.querySelector('[data-change-orders]').textContent))
+  .map(([view,keys])=>[view,keys.map(key=>byKey.get(key)).filter(Boolean)]));
+}
 function bindPage(){
  rows=[...content.querySelectorAll('section[data-key]')];
+ viewOrders=ordersFor(content,rows);
  runnerOptions=[...content.querySelector('[data-runner-options]').content.children];
  showrunners=content.querySelector('[data-showrunner-filter]');runnerMenu=showrunners.querySelector('select');
  next=content.querySelector('[data-next]');empty=content.querySelector('[data-empty]');
@@ -708,7 +729,8 @@ function bindPage(){
   if(box && form.querySelector('[data-needs-text]')){box.addEventListener('input',needsText);needsText();}
  });
 }
-function waiting(){return rows.filter(r=>(tab==='' || r.dataset.tab===tab) && r.dataset.pending==='true');}
+function viewRows(){return viewOrders.get(tab) || rows.filter(r=>tab==='' || r.dataset.tab===tab);}
+function waiting(){return viewRows().filter(r=>r.dataset.pending==='true');}
 function show(){
  const previous=current;
  const place=new URLSearchParams(location.hash.slice(1));
@@ -743,8 +765,8 @@ function show(){
 function clearNotice(){saveNotice.hidden=true;saveNotice.textContent='';}
 function go(key){navigation++;clearNotice();location.hash=new URLSearchParams({showrunner:tab,row:key || ''});show();}
 function advance(row){
- const at=rows.indexOf(row), candidates=waiting();
- const following=candidates.find(r=>rows.indexOf(r)>at) || candidates[0];
+ const ordered=viewRows(), at=ordered.indexOf(row), candidates=waiting();
+ const following=candidates.find(r=>ordered.indexOf(r)>at) || candidates[0];
  go(following?.dataset.key || ''); }
 async function save(row,form,outcome){
  if(form.dataset.saving==='true') return;
@@ -806,8 +828,10 @@ function applyHeldPage(){
  const fieldRow=focused?.closest('[data-key]')?.dataset.key;
  const fieldName=focused?.matches('textarea,input[type=text]') ? focused.name : '';
  const selection=[focused?.selectionStart,focused?.selectionEnd,focused?.selectionDirection];
- const previous=rows.indexOf(current),following=rows.slice(previous+1).map(row=>row.dataset.key);
- const candidates=[...fresh.querySelectorAll('section[data-key]')].filter(row=>(tab==='' || row.dataset.tab===tab) && row.dataset.pending==='true');
+ const ordered=viewRows(), previous=ordered.indexOf(current),following=ordered.slice(previous+1).map(row=>row.dataset.key);
+ const freshRows=[...fresh.querySelectorAll('section[data-key]')];
+ const candidates=(ordersFor(fresh,freshRows).get(tab) || freshRows.filter(row=>tab==='' || row.dataset.tab===tab))
+  .filter(row=>row.dataset.pending==='true');
  const keep=candidates.find(row=>row.dataset.key===current?.dataset.key);
  const chosen=keep || following.map(key=>candidates.find(row=>row.dataset.key===key)).find(Boolean) || candidates[0];
  const notice=saveNotice.hidden ? '' : saveNotice.textContent;

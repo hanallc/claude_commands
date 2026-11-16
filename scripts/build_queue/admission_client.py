@@ -589,22 +589,23 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         return LeftQueue()
                     if CLOCK.monotonic() >= retry.deadline:
                         return _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
-                    if isinstance(cause, records.EstimateExpired) and isinstance(first, wire.ServiceEstimateRequest):
-                        break
                     if isinstance(cause, records.EstimateExpired):
-                        if refresh is None or not isinstance(first, (wire.AdmitRequest, wire.LaunchRequest)):
-                            raise CheckerFailure("estimate cannot be refreshed")
-                        estimate: Callable[[], wire.AdmitRequest | wire.LaunchRequest] = refresh
-                        refresh_pending = True
                         answered_expiry = cause.estimated_at
-                        try:
-                            request = replace(_refreshed(first, estimate, channel=EstimateConnection(connection, pending)),
-                                              code_version=LOADED_ADMISSION_CODE_VERSION)
-                            refresh_pending = False
-                        except (_QueueLeft, _QueueUnreachable, OSError, TransportUnavailable):
-                            raise
-                        except Exception as error:
-                            raise CheckerFailure(str(error)) from error
+                        if isinstance(first, wire.ServiceEstimateRequest):
+                            request = first
+                        else:
+                            if refresh is None or not isinstance(first, (wire.AdmitRequest, wire.LaunchRequest)):
+                                raise CheckerFailure("estimate cannot be refreshed")
+                            estimate: Callable[[], wire.AdmitRequest | wire.LaunchRequest] = refresh
+                            refresh_pending = True
+                            try:
+                                request = replace(_refreshed(first, estimate, channel=EstimateConnection(connection, pending)),
+                                                  code_version=LOADED_ADMISSION_CODE_VERSION)
+                                refresh_pending = False
+                            except (_QueueLeft, _QueueUnreachable, OSError, TransportUnavailable):
+                                raise
+                            except Exception as error:
+                                raise CheckerFailure(str(error)) from error
                         # A new connection would end this waiter's place, and a pass could start a later step in the gap.
                         connection.sendall(wire.encode_request(request).encode())
                         continue
@@ -1198,7 +1199,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
         # A Mac-only step is pinned to the Mac, so the routing rule lets a build leave natedev.
         selection = (step_selection.Pinned(args.target) if args.target else
                      step_selection.Pinned("mac") if args.mac_only else step_selection.ROUTED)
-        routing = target_config.LocalRequired("local caller") if args.local_only else target_config.ANY_ELIGIBLE_TARGET
+        routing = target_config.LOCAL_CALLER if args.local_only else target_config.ANY_ELIGIBLE_TARGET
         kind = args.kind or local.profile.step
         if kind == "nextest":
             kind = "test"
@@ -1222,7 +1223,9 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             local=wire.LocalAdmissionContext(local.argv, local.cwd, local.sidecar, local.call,
                 local.test_width, local.fresh_test, local.token_back_at), prerequisite=prerequisite,
             purpose=placement.SpeculativeCopy(args.parent_episode, args.call_started)
-                if args.parent_episode else placement.NormalStep())
+                if args.parent_episode else placement.NormalStep(),
+            route=target_config.step_route(local=args.local_only, mac_only=args.mac_only, target=args.target,
+                                           writes_tree=args.writes_tree))
         if already_queued:
             _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex, episode, owner, prerequisite))
         while True:

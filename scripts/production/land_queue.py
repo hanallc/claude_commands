@@ -54,6 +54,15 @@ class Place(NamedTuple):
     label: str
     owner: str
 
+    @property
+    def carrier_name(self) -> str:
+        """Use the recorded production for a queue unit's carried work."""
+        unit, separator, name = self.owner.partition(" ")
+        if unit == "queue" and separator:
+            production, labeled, _ = self.label.partition(" ")
+            return f"{production} {name}" if labeled and production and production != "queue" else name
+        return self.owner or self.label
+
 
 class LandView(NamedTuple):
     """The lands that run now, the land line, and the newest result of each land.

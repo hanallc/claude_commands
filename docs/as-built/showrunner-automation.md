@@ -742,6 +742,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `scripts/message/morty_identity.py` supplies the native ID on the producer staff row named `morty`.
     `CodexProcessThreads` reads it one time for each report. A process with that ID produces no anomaly.
     `unit_phases.send_anomalies` sends all lines once to `UNIT_ANOMALIES_TO` from `config/production.conf` (`sdlc`).
+    The same text to the same recipient sends once inside `units_anomaly_repeat_minutes`.
     A failed send adds one anomaly line and preserves the table and exit code.
   - **Pause and exit:** `agents pause <unit> --why "<why>"` records `paused: {since, by, why}` and stops the workers.
     The director finishes its current turn and holds at the prompt.
@@ -755,6 +756,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `since` uses the user zone. `by` uses the caller's staff name.
     Staff row copies retain the hold fields.
   - **Phase productions:** The count line, status table, Progress bar, legend, and ETA cells retain their existing behavior.
+    The top table names its session column `Director`; its census status values remain unchanged.
     `table()` creates one unit block from the same cached plan and run records that supply the bar.
     `UnitTaskFacts` retains the plan source, plan phases, and scoped run attempts.
     `PlanSource` distinguishes absent, unavailable, readable empty, and readable populated plans.
@@ -770,6 +772,16 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Each current task has one row with no equal states; `state_sentence` joins its actors' states with semicolons.
     No task row has an empty Work cell; a cell longer than the line limit continues on the next row.
     A busy session does not prove that the director works on a phase.
+    With readable sources and no current task, open phase, pending merge, hold, or next work, the unit is idle.
+    The director's busy status does not change this result.
+    Its only current row is `Now | Nothing to do | The plan is complete and the queue is empty` for a complete readable plan.
+    Otherwise, its only current row is `Now | Nothing to do | No plan or queued work`.
+    The block has no Next row.
+    Only events from an open phase can supply a finished-step fallback.
+    Unreadable sources never produce `Nothing to do`.
+    A missing plan file in an existing local worktree is an absent plan.
+    A missing plan file keeps its unavailable state when the worktree is missing or remote.
+    Other plan read errors keep the plan unavailable.
     An unexplained task names the missing step and the latest matching finished step with its time, when recorded.
     Also names each additional current task.
     The first queue entry supplies Next; otherwise, the first unfinished plan phase supplies Next.
@@ -793,6 +805,21 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `SentCommit` retains the checkpoint's `timestamp_epoch`, or `CheckpointTimeUnrecorded` when the event has no time.
     A checkpoint outside the line uses `Checkpoint <9 hash characters> at <time>; not in <production>'s merge line`.
     Without a production name, the text ends with `not in the merge line`.
+    A finished phase counts as merged through checkpoint ancestry, a successful result for its unit and phase, or a matching merge subject.
+    A finished phase also counts as merged when main has a non-merge commit with the same author time and subject as its checkpoint.
+    The board reads main's non-merge commits once per render and caches each unresolved checkpoint's identity check.
+    An unreadable checkpoint stays unmerged.
+    A successful result for the exact checkpoint hash counts, with or without a valid result time.
+    Other evidence needs a result time or merge commit time at or after the latest checkpoint time, when recorded.
+    Without a checkpoint time, the merge subject must name a prefix of the checkpoint hash, in any letter case.
+    The board ignores an invalid result time.
+    `waits_on.merged_phase_subject` requires the subject prefix `Merge <unit> phase <phase> (<hash>)`.
+    `waits_on.landed_phases` reads these subjects once per render.
+    Merged phases omit their checkpoint rows and older failed results.
+    Their rows use normal merge states when the checkpoints are in the merge line or currently merge.
+    `completed_unit_phases` supplies these checkpoints without a unit wait and excludes activity records after phase completion.
+    Carried work uses `merges with <owner> <name>`; queue work uses the production from its merge-line label.
+    Without a recorded owner, carried work uses `merges with <name>`.
     A second phase in the same merge names the first phase by ID (`Merges with phase 40`).
     A phase's shrink and repair items have no separate rows.
     The phase's live state takes priority over older failures from those items.
@@ -810,6 +837,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A local dependency uses its ID, with `phase` before a numeric ID.
     An external dependency uses `<unit> phase <id>` without its title.
     A bare commit dependency uses `After commit <first 9 hash characters>; <short state>`.
+    A missing commit, or a commit or branch not on main, uses `not on main yet`; other missing dependencies retain `dependency not found locally`.
     A git ref that is not hexadecimal, with or without `/`, uses `After branch <name>; <short state>`.
     A recorded phase ID keeps its phase form, even when it contains only hexadecimal characters.
     Recorded unit waits and plan `waits_for` conditions retain their text.

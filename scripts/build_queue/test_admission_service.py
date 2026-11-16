@@ -63,6 +63,43 @@ def setUpModule() -> None:
 
 
 class PlacementStatusTests(unittest.TestCase):
+    def test_repeated_placement_polls_share_the_pass_until_the_next_reading(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
+
+        for report_prerequisite in (False, True):
+            with self.subTest(report_prerequisite=report_prerequisite), PlacementFixture() as fixture:
+                fixture.free(0)
+                fixture.hold_starts()
+                request = placement_request(fixture)
+                request = replace(request, constraints=replace(request.constraints,
+                    candidates=(local_candidate(fixture),)))
+                initial, = fixture.connect(request).replies()
+                assert isinstance(initial, wire.PlacementWait)
+                assert isinstance(initial.wait, wire.Wait)
+                evidence = fixture.server.system_evidence
+                assert isinstance(evidence, service.SystemEvidence)
+                reader = FixedSystemReader(evidence)
+                fixture.server.system_reader = reader
+                state = fixture.state_text()
+                with mock.patch.object(fixture.server, "run_pass", wraps=fixture.server.run_pass) as passed:
+                    for index in range(20):
+                        fixture.clock.advance(0.02)
+                        if report_prerequisite:
+                            report = wire.PrerequisiteReport(f"same-prerequisite-{index}", request.episode,
+                                request.owner, request.prerequisite)
+                            self.assertEqual(fixture.connect(report).replies(), [wire.Ok()])
+                        reply, = fixture.connect(request).replies()
+                        self.assertEqual(reply, initial)
+                    passed.assert_not_called()
+                self.assertEqual(fixture.state_text(), state)
+                reader.latest = replace(evidence, host=records.HostMemory(60 * GIB, 60 * GIB),
+                    pressure=records.NO_PRESSURE_HOLD, read_at=fixture.clock.now(),
+                    started_monotonic=fixture.clock.monotonic())
+                os.eventfd_write(fixture.server.reading_events, 1)
+                admitted, = fixture.connect(request).replies()
+                self.assertIsInstance(admitted, wire.LocalPlacementGranted)
+                self.assertIn(request.episode, fixture.server.reservations)
+
     def read_only_status(self, fixture: AdmissionFixture, assignment: placement.PlacementAssignment
                          ) -> status_wire.KnownPlacementStatus | status_wire.UnknownPlacementStatus:
         fields = tuple(service.ServiceState.__dataclass_fields__)
@@ -3210,7 +3247,7 @@ class RoomAndSlotTests(unittest.TestCase):
     def test_a_held_head_keeps_one_cause_in_the_wait_line_view_and_client(self) -> None:
         for hold, status, client_reason in (
             ("pressure", "pressure", "memory pressure"),
-            ("spacing", "spacing", "start spacing"),
+            ("spacing", "spacing", "another step just started; the queue waits a few seconds between starts"),
             ("memory", "low room", "free memory"),
             ("expired", "estimate expired", "estimate expired"),
             ("unreadable", "memory reading unavailable", "memory reading unavailable"),
@@ -3655,28 +3692,40 @@ class QueueLifecycleTests(unittest.TestCase):
             self.assertFalse(self.events(fixture, "ended"))
 
     def test_estimate_refresh_on_its_connection_keeps_the_place(self) -> None:
-        with AdmissionFixture() as fixture:
-            fixture.free(0)
-            fixture.hold_starts()
-            age = records.read_memory_config().policy.timing.estimate_refresh_seconds + 1
-            request = fixture.request(step="merge-gate", age=age)
-            peer = fixture.connect(request)
-            expired = peer.replies()[-1]
-            assert isinstance(expired, wire.Wait)
-            self.assertIsInstance((expired.reason.cause if isinstance(expired.reason, records.HeadAdmissionStatus)
-                                   else expired.reason), records.EstimateExpired)
-            since = fixture.server.waiters[request.episode].row["since"]
-            places = set(fixture.server.places)
-            fixture.clock.advance(10)
-            refreshed = replace(request, profile=replace(request.profile, estimated_at=fixture.clock.now()))
-            peer.socket.sendall(wire.encode_request(refreshed).encode())
-            reply = peer.replies()[-1]
-            assert isinstance(reply, wire.Wait)
-            self.assertNotIsInstance((reply.reason.cause if isinstance(reply.reason, records.HeadAdmissionStatus)
-                                      else reply.reason), records.EstimateExpired)
-            self.assertEqual(self.events(fixture, "left"), [])
-            self.assertEqual(fixture.server.waiters[request.episode].row["since"], since)
-            self.assertEqual(set(fixture.server.places), places)
+        for estimator in ("client", "service"):
+            with self.subTest(estimator=estimator), AdmissionFixture() as fixture:
+                fixture.free(0)
+                fixture.hold_starts()
+                age = records.read_memory_config().policy.timing.estimate_refresh_seconds + 1
+                request = (fixture.request(step="merge-gate", age=age) if estimator == "client"
+                           else fixture.service_request())
+                peer = fixture.connect(request)
+                initial = peer.replies()[-1]
+                self.assertIsInstance(initial, wire.Wait)
+                if isinstance(request, wire.ServiceEstimateRequest):
+                    fixture.clock.advance(age)
+                    _ = fixture.run_pass()
+                    expired = peer.replies()[-1]
+                else:
+                    expired = initial
+                assert isinstance(expired, wire.Wait)
+                self.assertIsInstance((expired.reason.cause if isinstance(expired.reason, records.HeadAdmissionStatus)
+                                       else expired.reason), records.EstimateExpired)
+                since = fixture.server.waiters[request.episode].row["since"]
+                places = set(fixture.server.places)
+                estimated_at = fixture.server.waiters[request.episode].request.profile.estimated_at
+                fixture.clock.advance(10)
+                refreshed = (replace(request, profile=replace(request.profile, estimated_at=fixture.clock.now()))
+                             if isinstance(request, wire.AdmitRequest) else request)
+                peer.socket.sendall(wire.encode_request(refreshed).encode())
+                reply = peer.replies()[-1]
+                assert isinstance(reply, wire.Wait)
+                self.assertNotIsInstance((reply.reason.cause if isinstance(reply.reason, records.HeadAdmissionStatus)
+                                          else reply.reason), records.EstimateExpired)
+                self.assertGreater(fixture.server.waiters[request.episode].request.profile.estimated_at, estimated_at)
+                self.assertEqual(self.events(fixture, "left"), [])
+                self.assertEqual(fixture.server.waiters[request.episode].row["since"], since)
+                self.assertEqual(set(fixture.server.places), places)
 
     def test_restart_after_reservation_removal_keeps_the_completed_end(self) -> None:
         with AdmissionFixture() as fixture:
@@ -4454,19 +4503,29 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(explain.call_count, 1)
 
     def test_unchanged_passes_do_not_rewrite_durable_state(self) -> None:
-        with AdmissionFixture() as fixture:
-            fixture.free(0)
-            fixture.hold_starts()
-            _ = fixture.server.handle_request(fixture.request())
-            state = fixture.state_text()
-            with mock.patch.object(service, "write_text_atomic", wraps=write_text_atomic) as write:
-                for _ in range(3):
-                    fixture.clock.advance(1)
-                    _ = fixture.server.run_pass()
-                self.assertEqual(write.call_count, 0)
-                self.assertEqual(fixture.state_text(), state)
+        for ended_replies in (0, 64):
+            with self.subTest(ended_replies=ended_replies), AdmissionFixture() as fixture:
+                fixture.free(0)
+                fixture.hold_starts()
                 _ = fixture.server.handle_request(fixture.request())
-                self.assertGreater(write.call_count, 0)
+                for index in range(ended_replies):
+                    self.assertEqual(fixture.server.handle_request(
+                        wire.ReleaseRequest(f"ended-{index}", "absent", 0)), [wire.Ok()])
+                state = fixture.state_text()
+                with (mock.patch.object(service, "write_text_atomic", wraps=write_text_atomic) as write,
+                      mock.patch.object(fixture.server.progress_history, "prune",
+                                        wraps=fixture.server.progress_history.prune) as swept):
+                    with mock.patch.object(service.ReplayEntry, "__eq__", autospec=True,
+                                           side_effect=service.ReplayEntry.__eq__) as compared:
+                        for _ in range(20):
+                            fixture.clock.advance(1)
+                            _ = fixture.server.run_pass()
+                        compared.assert_not_called()
+                    self.assertLess(swept.call_count, 20)
+                    self.assertEqual(write.call_count, 0)
+                    self.assertEqual(fixture.state_text(), state)
+                    _ = fixture.server.handle_request(fixture.request())
+                    self.assertGreater(write.call_count, 0)
 
     def test_delivered_waits_leave_only_the_current_reply_and_no_pending_history(self) -> None:
         with AdmissionFixture() as fixture:

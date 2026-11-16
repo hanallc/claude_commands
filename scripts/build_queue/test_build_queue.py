@@ -98,7 +98,7 @@ class QueueTests(NotificationGuardedTestCase):
     def render_checks(self, model: queue_view.QueueModel) -> str:
         checks = queue_view.step_checks(model, 1)
         lines = queue_view.check_lines(checks, model)
-        if not isinstance(checks, records.ReadingUnavailable):
+        if not isinstance(checks, (records.ReadingUnavailable, records.NatedevHeld)):
             lines.insert(0, queue_view.check_line(*queue_view.pressure_check(checks.decision.pressure, model)))
         return plain(lines)
 

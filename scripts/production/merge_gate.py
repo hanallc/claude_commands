@@ -2717,6 +2717,40 @@ def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
         return 1
 
 
+def _sweep_nightly_slots() -> None:
+    """Sweep both slot pools without changing the nightly result."""
+    for machine in ("natedev", "Mac"):
+        try:
+            if machine == "natedev":
+                from scripts.lib import build_slots
+
+                build_slots.sweep_slots()
+            else:
+                settings = conf.read_or_repository("build_folders")
+                if not any(value for key, value in settings.values().items()
+                           if key == "roots.slots" or key.startswith("roots.slots.")):
+                    continue
+                scripts = Path(__file__).resolve().parents[1]
+                _ = subprocess.run([sys.executable, str(scripts / "mac_test/mac_queue_run.py"),
+                                    "--kind", "run", "--what", "Sweep Mac build slots", "--package=claude",
+                                    "--", "/bin/zsh", "-c",
+                                    '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/build_slots.py" sweep'],
+                                   check=True, capture_output=True, text=True)
+        except (Exception, KeyboardInterrupt) as error:
+            detail = f"Nightly slot sweep on {machine} failed: " + " ".join(str(error).splitlines())
+            if isinstance(error, subprocess.CalledProcessError):
+                detail += " " + " ".join(cast(str, error.stderr or error.stdout or "").splitlines())
+            print(detail, flush=True)
+            try:
+                from scripts.message import send_budget, session_send
+
+                _ = subprocess.run(session_send.send_argv("--to", "builds", "--from", "nightly", "--text", detail),
+                                   check=True, capture_output=True, text=True, timeout=send_budget.seconds())
+            except (Exception, KeyboardInterrupt) as notice_error:
+                print(f"Nightly slot sweep on {machine}: notice failed: "
+                      + " ".join(str(notice_error).splitlines()), flush=True)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] in {"nightly-assigned", "nightly-check"}:
@@ -2772,7 +2806,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkout = Path(args.main_repo if args.promote_only else args.repo).expanduser().resolve()
         with scratch.copy_lock(checkout):
             if args.nightly:
-                return nightly(args)
+                try:
+                    return nightly(args)
+                finally:
+                    _sweep_nightly_slots()
             if args.promote_only:
                 promote(args)
                 production, review_list = change_review_list(args)
