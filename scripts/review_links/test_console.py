@@ -92,6 +92,8 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn("target.pathname === new URL(base, location.href).pathname", source)
         self.assertIn("event.data !== 'console-place'", source)
         self.assertIn("if (opened) frame.contentWindow.postMessage('console-shown', location.origin);", source)
+        self.assertIn("frame.contentWindow.postMessage('console-space', location.origin);", source)
+        self.assertIn("if (event.target.closest?.('input, textarea, select, button, summary, [contenteditable]')) return;", source)
         for removed in ("<dialog", "showModal", "lucide-x"):
             self.assertNotIn(removed, source)
         self.assertIn('class="lucide lucide-refresh-cw"', source)

@@ -45,6 +45,10 @@ __PAGE_FRAME_STYLE__
 #status { flex: 1 1 12rem; min-width: 0; }
 .status.is-stale { position: sticky; top: 0; z-index: 5; background: var(--bg); }
 .dot.stale { background: var(--cap); }
+.paused-badge { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 9; display: inline-flex; gap: 8px; align-items: center;
+  padding: 4px 14px; border: 1px solid var(--cap); border-radius: 999px; background: var(--card); color: var(--cap); font-weight: 600; pointer-events: none; }
+.paused-badge[hidden] { display: none; }
+.paused-badge .pb { width: 10px; height: 11px; border-left: 3px solid currentColor; border-right: 3px solid currentColor; }
 .card, :root.layout-measuring .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 14px; margin: 0 0 16px; }
 .answer { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; margin-bottom: 6px; }
 .answer .big { font-size: 2.6rem; font-weight: 700; line-height: 1; letter-spacing: -0.02em; }
@@ -371,6 +375,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   <p class="error" id="mac-idle-alert" role="status" hidden></p>
   <h1 class="page-title">Builds</h1>
   <div class="queue-error" id="queue-error" role="status"></div>
+  <div class="paused-badge" id="paused" role="status" hidden><span class="pb"></span>Paused · press space to resume</div>
   <div class="status"><span class="dot" id="dot"></span><span id="status">Reading…</span><a class="pill" id="pill" href="#swap" data-tip="pill"><span class="pd"></span><span id="pill-t">pressure –</span></a></div>
 
   <section class="card targets" id="targets" aria-label="Target availability" hidden></section>
@@ -1664,7 +1669,7 @@ let lastRead = 0;
 let readingFailure = "";
 function showStatus(text, stale) {
   $("status").textContent = text;
-  $("dot").classList.toggle("stale", stale);
+  $("dot").classList.toggle("stale", stale || paused);
   $("status").closest(".status").classList.toggle("is-stale", stale);
 }
 
@@ -1676,6 +1681,7 @@ function updateReadingStatus(readAt) {
   const staleText = readingFailure
     ? `${readingFailure} Showing the reading from ${time}, ${Math.round(age)} s old.`
     : `Last reading ${time}, ${Math.round(age)} s old. The feed has stopped.`;
+  if (paused) { showStatus(`Paused · read at ${time}`, false); return; }
   showStatus(age > STALE ? staleText : `Live · read at ${time}`, age > STALE);
   if (age > STALE) {
     $("pill").className = "pill neutral as-of";
@@ -1694,19 +1700,37 @@ function recordReadFailure(message) {
 }
 
 const consoleHidden = () => window.frameElement?.hidden === true;
+// The user, 11-16: space pauses every update so tooltips can be read on a still page; space again resumes.
+let paused = false;
+function setPaused(on) {
+  paused = on;
+  $("paused").hidden = !on;
+  if (on) updateReadingStatus(lastRead);
+  else { tick(); reloadWhenPageChanges(); }
+}
+addEventListener("keydown", event => {
+  if (event.code !== "Space" || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
+  // Space keeps its own job on a control: it presses a button and opens the legend.
+  if (event.target.closest?.("input, textarea, select, button, summary, [contenteditable]")) return;
+  event.preventDefault();
+  setPaused(!paused);
+});
 
 async function tick() {
-  if (consoleHidden()) return;
+  if (consoleHidden() || paused) return;
   try {
     const r = await fetch(`memory.json?t=${Date.now()}`, { cache: "no-store" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
+    // A reading that arrives after a pause waits; the next tick after resume shows it.
+    if (paused) return;
     if (d.ok && !d.error) {
       render(d); lastRead = d.read_at; readingFailure = d.read_error ? "The queue did not answer." : "";
       if (d.report_version !== reportVersion) await loadReport(d.report_version);
     }
     else { recordReadFailure("The queue did not answer."); return; }
   } catch (e) {
+    if (paused) return;
     recordReadFailure(`Cannot load the reading: ${e.message}.`);
     return;
   }
@@ -1718,16 +1742,20 @@ async function loadReport(version) {
   try {
     const r = await fetch(`report.json?v=${encodeURIComponent(version)}`, { cache: "no-store" });
     if (!r.ok) return;
-    renderReport(await r.json());
+    const report = await r.json();
+    // A paused page keeps its charts; the first reading after resume loads this version again.
+    if (paused) return;
+    renderReport(report);
     reportVersion = version;
   } catch (e) { /* The next reading tries again. */ }
 }
 let pageStamp = null;
 async function reloadWhenPageChanges() {
-  if (consoleHidden()) return;
+  if (consoleHidden() || paused) return;
   try {
     const r = await fetch(location.pathname, { method: "HEAD", cache: "no-store" });
     const stamp = r.headers.get("Last-Modified");
+    if (paused) return;
     if (pageStamp && stamp && stamp !== pageStamp) location.reload();
     pageStamp = stamp || pageStamp;
   } catch (e) { /* The reading status already reports a lost server. */ }
@@ -1741,6 +1769,7 @@ addEventListener("message", event => {
     tick();
     reloadWhenPageChanges();
   }
+  if (event.source === parent && event.origin === location.origin && event.data === "console-space") setPaused(!paused);
 });
 </script>
 </body>

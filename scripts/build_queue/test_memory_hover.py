@@ -643,6 +643,54 @@ process.stdout.write(JSON.stringify([loaded, foreign, calls.length, calls.slice(
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(json.loads(result.stdout), expected)
 
+    def test_space_pauses_every_read_and_space_again_resumes(self) -> None:
+        html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
+        self.assertIn('<div class="paused-badge" id="paused" role="status" hidden>', html)
+        loop = html[html.index("const consoleHidden ="):html.index("</script>")]
+        javascript = """
+const calls = [];
+const handlers = {};
+const parent = {name: "console"};
+const location = {origin: "http://natedev:8080", pathname: "/memory_live.html"};
+const window = {frameElement: null};
+const SECONDS = 5;
+const fetch = url => { calls.push(String(url).split("?")[0]); return new Promise(() => {}); };
+const setInterval = () => 0;
+const badge = {hidden: true};
+const $ = () => badge;
+const lastRead = null;
+function updateReadingStatus() {}
+const addEventListener = (kind, handler) => { handlers[kind] = handler; };
+""" + loop + """
+const steps = [];
+const record = label => steps.push([label, calls.length, badge.hidden]);
+const outside = {closest: () => null};
+const press = (target, extra) => handlers.keydown({code: "Space", repeat: false, target, preventDefault() {}, ...extra});
+record("loaded");
+press(outside, {});
+tick();
+reloadWhenPageChanges();
+record("paused");
+const typed = [];
+press({closest: selector => { typed.push(selector); return {}; }}, {});
+press(outside, {repeat: true});
+press(outside, {ctrlKey: true});
+record("ignored");
+handlers.message({source: {}, origin: location.origin, data: "console-space"});
+record("foreign");
+handlers.message({source: parent, origin: location.origin, data: "console-space"});
+record("resumed");
+steps.push(typed);
+process.stdout.write(JSON.stringify(steps));
+"""
+        executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
+        result = subprocess.run([executable, "-e", javascript], text=True, capture_output=True,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout), [["loaded", 2, True], ["paused", 2, False],
+            ["ignored", 2, False], ["foreign", 2, False], ["resumed", 4, True],
+            ["input, textarea, select, button, summary, [contenteditable]"]])
+
     def page_expression(self, expression: str, data: object, *, walk: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("function field("):html.index("const tip =")]
