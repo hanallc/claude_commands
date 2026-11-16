@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 # Detect file changes before the first stamp, including changes during imports.
 STARTED_NS = time.time_ns()
 
+from scripts.disks import disks_page
 from scripts.lib import conf
 from scripts.production import change_routing, change_review
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, image_store, images
@@ -428,6 +429,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == f"/{change_page.CONSOLE_FOLDER}/{console.NEWS_NAME}":
             self.news_post()
             return
+        if self.is_disks_measure():
+            self.disks_measure_post()
+            return
         try:
             branches = branch_page.page_at(server.root, self.path)
         except FileNotFoundError:
@@ -594,6 +598,26 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.browser_failure(503, "The console is not available.", error)
             return
         self.json_response(200, {"new": list(fresh)})
+
+    def is_disks_measure(self) -> bool:
+        """Whether the request posts to the measure name beside the Disks page."""
+        path = urlsplit(self.path).path
+        if not path.endswith("/" + disks_page.MEASURE_NAME):
+            return False
+        try:
+            return path == disks_page.measure_path(cast(ReviewLinksServer, self.server).root)
+        except (OSError, ValueError) as error:
+            print(f"review-links disks: {error}", file=sys.stderr)
+            return False
+
+    def disks_measure_post(self) -> None:
+        """Start a Disks page measure in the background and answer at once."""
+        try:
+            started = disks_page.start_measure(time.time())
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            self.browser_failure(503, "The measure could not start.", error)
+            return
+        self.json_response(200, {"state": started.value})
 
     def browser_failure(self, status: int, reason: str, error: Exception) -> None:
         print(f"review-links browser answer: {error}", file=sys.stderr)

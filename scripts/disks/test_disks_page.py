@@ -8,14 +8,16 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast
+from unittest import mock
 
 from scripts.disks import disks_page
-from scripts.lib import test_hang_guard
+from scripts.lib import file_lock, test_hang_guard
 from scripts.review_links import page_frame
 
 GIB = 1 << 30
 KEEP = 256 << 20
-SETTINGS: disks_page.PageSettings = {"slider_min_gib": 1, "slider_default_gib": 10, "cache_seconds": 600,
+SETTINGS: disks_page.PageSettings = {"slider_min_gib": 1, "slider_default_gib": 10, "cache_seconds": 600, "poll_seconds": 5,
+                                     "wait_seconds": 3600,
                                      "names": {"/build": "Build </script> drive"}}
 
 
@@ -75,6 +77,30 @@ class DisksPageTests(unittest.TestCase):
         middle: float = result[4]
         self.assertAlmostEqual(middle, GIB * math.sqrt(60), delta=1)
         self.assertEqual(result[5], 10 * GIB)
+
+    def test_the_status_line_names_the_age_then_the_measure_then_a_problem(self) -> None:
+        recent = "statusText(Date.now() / 1000 - 120, Date.now() / 1000, {}).replace(/^Sizes from [^,]+, /, '')"
+        calls = ("statusText(null, 0, true, '', 600)", "statusText(null, 0, false, '', 600)",
+                 "statusText(null, 0, false, 'The measure did not finish.', 600)",
+                 recent.format("false, '', 600"), recent.format("true, 'The measure did not finish.', 600"))
+        self.assertEqual(self.run_page(f"[{', '.join(calls)}]"), [
+            "Measuring the drives. The first measure takes some minutes.", "No sizes yet.", "The measure did not finish.",
+            "2 minutes ago. The page measures again when you open it and the sizes are more than 10 minutes old.",
+            "2 minutes ago. Measuring… The measure did not finish."])
+
+    def test_a_measure_starts_only_when_the_sizes_are_old_and_no_measure_runs(self) -> None:
+        launches: list[str] = []
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(disks_page, "output_folder", return_value=Path(directory)):
+            folder = Path(directory)
+            self.assertIs(disks_page.start_measure(1000, lambda: launches.append("missing")), disks_page.MeasureStart.STARTED)
+            _ = (folder / disks_page.DATA_FILE).write_text(json.dumps({"measured_at": 900}))
+            self.assertIs(disks_page.start_measure(1000, lambda: launches.append("current")), disks_page.MeasureStart.CURRENT)
+            with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False):
+                self.assertIs(disks_page.start_measure(5000, lambda: launches.append("running")), disks_page.MeasureStart.RUNNING)
+            self.assertIs(disks_page.start_measure(5000, lambda: launches.append("old")), disks_page.MeasureStart.STARTED)
+            _ = (folder / disks_page.DATA_FILE).write_text("[]")
+            self.assertIsNone(disks_page.measured_at(folder))
+        self.assertEqual(launches, ["missing", "old"])
 
     def rows(self, limit: int, opened: list[str]) -> list[dict[str, object]]:
         return cast(list[dict[str, object]], self.run_page(

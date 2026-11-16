@@ -142,6 +142,17 @@ class ReviewLinksServerTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_the_disks_measure_answers_at_once_with_the_measure_state(self) -> None:
+        from scripts.disks import disks_page
+
+        _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
+        _ = self.enterContext(patch.object(disks_page, "output_folder", return_value=self.root / "disks"))
+        start = self.enterContext(patch.object(disks_page, "start_measure", return_value=disks_page.MeasureStart.STARTED))
+        self.assertEqual(self.post("/disks/measure", ""), (200, b'{"state": "started"}'))
+        self.assertEqual(start.call_count, 1)
+        self.assertNotEqual(self.post("/other/measure", "")[0], 200)
+        self.assertEqual(start.call_count, 1)
+
     def test_console_news_records_the_open_page_and_names_pages_with_new_items(self) -> None:
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "REVIEW_LINKS_ROOT": str(self.root), "REVIEW_LINKS_HOST": "127.0.0.1",

@@ -11,7 +11,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from typing import cast
 
-from scripts.disks import measure
+from scripts.disks import disks_page, measure
 from scripts.lib import file_lock
 
 GIB = 1 << 30
@@ -80,7 +80,7 @@ class MeasureTests(unittest.TestCase):
         return Path(self.enterContext(tempfile.TemporaryDirectory()))
 
     def data(self, folder: Path) -> measure.DisksData:
-        return cast(measure.DisksData, json.loads((folder / measure.DATA_FILE).read_text()))
+        return cast(measure.DisksData, json.loads((folder / disks_page.DATA_FILE).read_text()))
 
     def test_a_measure_writes_each_drive_with_capacity_floor_and_tree(self) -> None:
         folder = self.temporary()
@@ -126,11 +126,11 @@ class MeasureTests(unittest.TestCase):
         def runner(argv: Sequence[str], _timeout: int) -> subprocess.CompletedProcess[str]:
             self.fail(f"a busy lock ran {argv}")
 
-        with file_lock.exclusive(folder / measure.LOCK_FILE, wait=False) as held:
+        with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False) as held:
             self.assertIs(held, file_lock.LockResult.ACQUIRED)
             self.assertEqual(measure.measure(settings(folder, str(folder)), runner, no_floors),
                              measure.LOCK_BUSY_EXIT)
-        self.assertFalse((folder / measure.DATA_FILE).exists())
+        self.assertFalse((folder / disks_page.DATA_FILE).exists())
 
 
 if __name__ == "__main__":
