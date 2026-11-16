@@ -438,6 +438,7 @@ Mark read clears the dot and adds a log entry without sending a message.
 Remove, Park, and Tell morty send nate's words and the item number to morty's current session.
 These actions append a log entry without changing the item's state or parking time.
 Only morty changes those fields through `the_list.py`.
+The one-off `the_list.py clean-evidence --source morty` command removes migration JSON copies from Evidence and logs each change.
 The page can mark an item read or append a feedback request and its delivery state.
 The page uses signed forms and rejects invalid fields or tokens with HTTP 400.
 The List record saves the request ID, words, and pending state in one locked write.
