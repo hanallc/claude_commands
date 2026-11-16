@@ -1774,6 +1774,60 @@ class UnitPhasesTests(unittest.TestCase):
                       "Stopped; The user stopped the later attempt"),
         ])
 
+        with path.open("a") as stream:
+            for phase in (stopped[0][0], "gate-time-limit"):
+                _ = stream.write(json.dumps(self.phase_event(
+                    "phase_dropped", phase, reason="The user removed this task")) + "\n")
+        with patch.object(land_queue, "land_view", return_value=merge):
+            rendered = self.blocks([member], {})
+        self.assertEqual([row for row in detail_rows(rendered, member.name) if row.item == "Stopped"], [
+            *(DetailRow("Stopped", f"{title} ({phase})", "Stopped; reason not recorded")
+              for phase, title in stopped[1:3]),
+            DetailRow("Stopped", stopped[3][1] + " (gate-time-limit)",
+                      "Stopped; The user stopped the later attempt"),
+        ])
+
+        with path.open("a") as stream:
+            for event in (
+                self.phase_event("phase_finished", answer[0], status="stopped"),
+                self.phase_event("phase_dropped", answer[0], reason="The user removed this task"),
+                {"event_type": "wait_started", "wait_scope": "unit", "wait_id": "old-hold",
+                 "target_work": answer[0], "wait_by": "the user", "wait_reason": "old approval",
+                 "wait_kind": "WaitingForUser", "wait_started_epoch": finished + 400},
+            ):
+                _ = stream.write(json.dumps(event) + "\n")
+        dropped_views = (merge, land_queue.LandView({}, {}, {}, frozenset(), {}),
+                         land_queue.LandView({"c" * 40: member.name + " " + answer[0]}, {}, {}, frozenset(), {}))
+        for dropped_view in dropped_views:
+            with (self.subTest(land=dropped_view),
+                  patch.object(land_queue, "land_view", return_value=dropped_view),
+                  patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads):
+                rendered = self.blocks([member], {})
+            self.assertNotIn(answer[1] + " (answer-copy)", [row.work for row in detail_rows(rendered, member.name)])
+            self.assertNotIn("old approval", rendered)
+            self.assertNotIn("chart tests also fail", rendered)
+            self.assertIn("waiting to merge 0", rendered.splitlines()[0])
+            self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
+
+        with path.open("a") as stream:
+            for event in (
+                {"event_type": "phase_started", "phase_id": answer[0], "phase_instance_id": "answer-later",
+                 "phase_title": answer[1], "phase_started_at": finished + 500},
+                {"event_type": "checkpoint", "phase_id": answer[0], "phase_instance_id": "answer-later",
+                 "checkpoint_commit": "d" * 40},
+                {"event_type": "phase_finished", "phase_id": answer[0], "phase_instance_id": "answer-later",
+                 "status": "completed", "timestamp_epoch": finished + 560, "phase_elapsed_seconds": 60},
+            ):
+                _ = stream.write(json.dumps(event) + "\n")
+        later_failed: land_runs.LandResult = {**failed, "commit": "d" * 40, "detail": "new failed merge",
+                                              "time": "2026-11-15T18:00:00+00:00"}
+        later_merge = merge._replace(results={"c" * 40: failed, "d" * 40: later_failed})
+        with patch.object(land_queue, "land_view", return_value=later_merge):
+            rendered = self.blocks([member], {})
+        self.assertIn(("Now", answer[1] + " (answer-copy)", "sdlc cannot merge it: new failed merge"),
+                      detail_rows(rendered, member.name))
+        self.assertIn("waiting to merge 1", rendered.splitlines()[0])
+
     def test_summary_counts_units_once_by_the_first_matching_rule(self) -> None:
         working, merging, waiting, idle, unknown = [self.member(name) for name in
                                                    ("working", "merging", "waiting", "idle", "unknown")]
