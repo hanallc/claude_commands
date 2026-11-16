@@ -1,4 +1,4 @@
-"""Keep copy operations outside live slot and gate roots during tests."""
+"""Keep copy operations outside live slot, gate, and session roots during tests."""
 from __future__ import annotations
 
 import json
@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 from scripts.copies import copies
-from scripts.lib import conf
+from scripts.lib import conf, session_folder
 from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.production.cli_fixture import ImmutableGitSeed
 
@@ -19,9 +19,11 @@ class LiveRootsGuardTests(unittest.TestCase):
     def test_copy_operations_and_cleanup_use_only_private_roots(self) -> None:
         values = conf.read_or_repository("build_folders").values()
         live = [str(Path(value).expanduser().resolve()) for key, value in values.items()
-                if key == "roots.slots" or key.startswith("roots.slots.")]
+                if key in ("roots.slots", "roots.session") or key.startswith(("roots.slots.", "roots.session."))]
         live.append(str(Path.home() / "worktrees/gates"))
         live.append(str(Path.home() / "worktrees"))
+        live.append(str(session_folder.configured_root().resolve()))
+        live.append(str(session_folder.former_root().resolve()))
         registry = str(copies.remote_registry().resolve())
         live.append(registry)
         with tempfile.TemporaryDirectory() as folder:

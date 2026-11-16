@@ -1142,6 +1142,8 @@ def end_phase_scratch(request: MergeRequest) -> None:
         return
     if removed:
         checkpoint_gate.report("scratch", "ok", f"removed {len(removed)} folder(s) of {task}: " + ", ".join(map(str, removed)))
+    for folder in removed.kept:
+        checkpoint_gate.report("scratch", "warning", f"kept {folder.path}: {folder.reason}")
 
 
 def notify_style(checkout: Path, branch: str, tip: str) -> bool:
