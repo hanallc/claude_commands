@@ -1835,9 +1835,11 @@ As built:
 - Cause: `record_turn_wait` recorded no wait for a `blocked:` turn end that
   named no supplier address. A pause relayed by the showrunner counted as
   phase time. Hana phase 14 holds 180 h of such a pause.
-- Every `blocked:` turn end now opens a wait. The supplier is the named
-  address, else the run's showrunner. A run with no showrunner waits on the
-  user. A `peer` block with no address keeps `NoNamedSupplier`.
+- A `blocked: waiting on ...` turn end, or a `blocked:` turn end that names
+  a pause, now opens a wait. Any other `blocked:` turn end opens no wait, so
+  the Stop hook still wakes the director. The supplier is the named address,
+  else the run's showrunner. A run with no showrunner waits on the user. A
+  `peer` block with no address keeps `NoNamedSupplier`.
 - `finish-phase` writes `phase_active_seconds`: the phase time less the union
   of its `WaitingForUser` and `WaitingForSupplier` waits. An open wait ends at
   the finish. `phase_elapsed_seconds` is unchanged, so ETA bands do not change.

@@ -11,7 +11,6 @@ import os
 from pathlib import Path
 import select
 import shutil
-import socket
 import stat
 import subprocess
 import sys
@@ -22,6 +21,7 @@ import unittest
 from typing import ClassVar, TextIO, cast, override
 from unittest import mock
 
+from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue import admission_protocol as wire
@@ -1580,7 +1580,7 @@ class StandingTests(unittest.TestCase):
                     line = next(line for line in result.stdout.splitlines() if str(tree) in line)
                     for value in ('verify-unit', 'origin', self.head[:7], 'busy', str(os.getpid())):
                         self.assertIn(value, line)
-                    self.assertIn(socket.gethostname(), line)
+                    self.assertIn(f'\t{host_name()}\t', line)
                 result = self.cli('list')
                 self.assertEqual(result.returncode, 0, result.stderr)
                 line = next(line for line in result.stdout.splitlines() if str(tree) in line)
