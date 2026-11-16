@@ -411,15 +411,10 @@ def head_room(check: admission_records.RoomCheck,
     """Show the first waiting step's room as free memory less each term, then its need."""
     rows: list[RoomRow] = []
     if isinstance(room, admission_records.MemoryRoom):
-        terms = queue_evidence.room_terms(check, room)
-        rows.append({"label": "free RAM", "gib": gib(terms.available)})
-        rows.append({"label": "− safety net", "gib": gib(terms.safety)})
-        for label, amount in (("− swap coming back", terms.swapped), ("− build reserved", terms.reserved),
-                              ("− held for other waiting steps", terms.ahead)):
-            if amount:
-                rows.append({"label": label, "gib": gib(amount)})
-    rows.append({"label": "= free", "gib": gib(max(0, check.room))})
-    rows.append({"label": "needs", "gib": gib(check.need)})
+        rows.extend({"label": ("− " if index else "") + label, "gib": gib(amount)}
+                    for index, (label, amount) in enumerate(queue_evidence.head_room_values(check, room)))
+    rows.append({"label": "= Free", "gib": gib(max(0, check.room))})
+    rows.append({"label": "need", "gib": gib(check.need)})
     swap = (f"Other programs have {gib(room.agent_swap_demand):.1f} GiB of memory in swap. {SWAP_RETURN_NOTE}"
             if isinstance(room, admission_records.MemoryRoom) and room.agent_swap_demand else "")
     basis = ("It can start alone, because no build runs." if isinstance(check.basis, admission_records.StartsAlone) else

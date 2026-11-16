@@ -426,11 +426,11 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
      </div>
      <div class="legend-group">
       <div class="group-head" data-tip="g-free"><span class="name">Free RAM</span><span class="v num" id="v-g-free">–</span></div>
-      <div class="row" data-tip="reserved"><span class="sw res"></span><span class="name">Build reserved</span><span class="v num" id="v-reserved">–</span><span class="note">Running builds grow into it.</span></div>
+      <div class="row" data-tip="reserved"><span class="sw res"></span><span class="name">Build reserved</span><span class="v num" id="v-reserved">–</span><span class="note" id="reserved-note">Running builds grow into it.</span></div>
       <div class="row" data-tip="room"><span class="sw room"></span><span class="name">Free</span><span class="v num" id="v-room">–</span><span class="note">The next step can start here.</span></div>
       <div class="row" data-tip="system"><span></span><span class="name">System reserved</span><span class="v num" id="v-system">–</span></div>
-      <div class="row in" data-tip="safety"><span class="sw floor"></span><span class="name">Safety net</span><span class="v num" id="v-safety">–</span><span class="note">A fixed setting.</span></div>
-      <div class="row in" data-tip="swap"><span class="sw swap"></span><span class="name">Swap coming back</span><span class="v num" id="v-swap">–</span><span class="note">Empty now; held for swapped memory.</span></div>
+      <div class="row in" data-tip="safety"><span class="sw floor"></span><span class="name">Safety net</span><span class="v num" id="v-safety">–</span><span class="note" id="safety-note">A fixed setting.</span></div>
+      <div class="row in" data-tip="swap"><span class="sw swap"></span><span class="name">Swap coming back</span><span class="v num" id="v-swap">–</span><span class="note" id="swap-note">Empty now; held for swapped memory.</span></div>
       <div class="row" data-tip="shortfall"><span class="sw free"></span><span class="name">Shortfall</span><span class="v num" id="v-shortfall">–</span><span class="note">Reserves that free RAM does not cover.</span></div>
      </div>
      <div class="legend-group">
@@ -446,7 +446,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
       <details class="room-explainer">
         <summary><span class="chev">▶</span><span class="name">How free is worked out</span></summary>
         <div class="why">
-          <p class="num">Free = max(0, free RAM − safety net − swap coming back − build reserved)</p>
+          <p class="num">Free = max(0, Free RAM − Safety net − Swap coming back − Build reserved)</p>
           <p class="num" id="room-equation"></p>
           <p>A step starts when the memory it needs fits in free and memory pressure is none.</p>
           <p>Displayed amounts are rounded.</p>
@@ -512,23 +512,25 @@ const TIPS = {
   ci: (d) => [`hana CI · ${ramAmount(d.ram.ci_bytes)}`, "RAM used by hana CI programs.\nFile cache and kernel memory appear separately."],
   reserved: (d) => [`Build reserved · ${ramAmount(d.ram.build_covered_bytes)}`, lines(
     "RAM the queue holds for running builds.", "The queue predicts the peak of each build, and the build grows into it.",
+    `Build reserved: ${ramAmount(d.ram.build_target_bytes)}.`,
     optional(d.ram.build_missing_bytes, `Free RAM does not cover ${ramAmount(d.ram.build_missing_bytes)} of it.`))],
   room: (d) => [`Free · ${ramAmount(d.ram.room_bytes)}`, lines(
     "RAM where the next waiting step can start.", `Free RAM: ${ramAmount(d.ram.available_bytes)}.`, `− Safety net: ${ramAmount(d.ram.safety_target_bytes)}.`,
-    optional(d.ram.swap_target_bytes, `− Swap coming back: ${ramAmount(d.ram.swap_target_bytes)}.`),
-    optional(d.ram.build_target_bytes, `− Build reserved: ${ramAmount(d.ram.build_target_bytes)}.`))],
+    `− Swap coming back: ${ramAmount(d.ram.swap_target_bytes)}.`,
+    `− Build reserved: ${ramAmount(d.ram.build_target_bytes)}.`)],
   system: (d) => [`System reserved · ${ramAmount(d.ram.safety_covered_bytes + d.ram.swap_covered_bytes)}`, lines(
     "RAM the queue never gives to builds.", `Safety net: ${ramAmount(d.ram.safety_covered_bytes)}.`,
     optional(d.ram.swap_covered_bytes, `Swap coming back: ${ramAmount(d.ram.swap_covered_bytes)}.`))],
   safety: (d) => [`Safety net · ${ramAmount(d.ram.safety_covered_bytes)}`, lines(
     "RAM the queue always leaves free, so the machine does not run out of memory.",
-    `A fixed setting: ${ramAmount(d.ram.safety_target_bytes)}.`)],
+    `Safety net: ${ramAmount(d.ram.safety_target_bytes)}.`)],
   desktop: (d) => measuredTip("Desktop", d.ram.desktop_bytes, lines(
     "RAM that the desktop session uses, so the mouse and keyboard stay responsive.",
     optional(d.ram.desktop_protection_bytes, `The system never takes back the first ${ramAmount(d.ram.desktop_protection_bytes)}.`))),
   swap: (d) => [`Swap coming back · ${ramAmount(d.ram.swap_covered_bytes)}`, lines(
     "Empty RAM the queue holds for memory in swap, mostly agents' memory.",
     "That memory can come back into RAM at any time.",
+    `Swap coming back: ${ramAmount(d.ram.swap_target_bytes)}.`,
     optional(d.ram.swap_missing_bytes, `Free RAM does not cover ${ramAmount(d.ram.swap_missing_bytes)} of it.`))],
   agents: (d) => measuredTip("Agents", d.ram.agents_bytes,
     "RAM used by agent sessions and their tools.\nFile cache and kernel memory appear separately."),
@@ -553,9 +555,9 @@ const TIPS = {
     `+ Build reserved: ${ramAmount(d.ram.build_covered_bytes)}.`, `+ Free: ${ramAmount(d.ram.room_bytes)}.`,
     "A step starts when the memory it needs fits in free.")],
   shortfall: (d) => [`Shortfall · ${ramAmount(d.ram.shortfall_bytes)}`, lines("Reserves that free RAM does not cover.",
-    optional(d.ram.safety_missing_bytes, `Safety net: ${ramAmount(d.ram.safety_missing_bytes)}.`),
-    optional(d.ram.swap_missing_bytes, `Swap coming back: ${ramAmount(d.ram.swap_missing_bytes)}.`),
-    optional(d.ram.build_missing_bytes, `Build reserved: ${ramAmount(d.ram.build_missing_bytes)}.`))],
+    optional(d.ram.safety_missing_bytes, `Safety net: ${ramAmount(d.ram.safety_missing_bytes)} not covered.`),
+    optional(d.ram.swap_missing_bytes, `Swap coming back: ${ramAmount(d.ram.swap_missing_bytes)} not covered.`),
+    optional(d.ram.build_missing_bytes, `Build reserved: ${ramAmount(d.ram.build_missing_bytes)} not covered.`))],
   budget: (d) => [`RAM · ${ramAmount(d.ram.total_bytes)}`,
     "The bar divides this machine's RAM into builds, free RAM and everything else.\nFree RAM includes cache that Linux can take back."],
   waiting: () => ["Waiting step", "The dashed bar shows the memory the step needs.\nIt ends at the queue cap."],
@@ -847,8 +849,7 @@ function rawTipText(key, d) {
   return TIPS[key](d);
 }
 function memoryText(text) {
-  return text.replace(/kept aside|keep-asides?/gi, "reserved")
-    .replace(/([0-9]+(?:\.[0-9]+)?) MiB/g, (_, amount) => `${f1(Number(amount) / 1024)} GiB`)
+  return text.replace(/([0-9]+(?:\.[0-9]+)?) MiB/g, (_, amount) => `${f1(Number(amount) / 1024)} GiB`)
     .replace(/([0-9]+(?:\.[0-9]+)?) GiB/g, (_, amount) => `${f1(Number(amount))} GiB`);
 }
 function tipText(key, d) {
@@ -862,6 +863,9 @@ function tipText(key, d) {
   if (key === "walkhead") notes.push(d.unmatched_priority_text);
   text[1] = [text[1], ...notes].filter(Boolean).join("\n");
   return text.map(memoryText);
+}
+function reserveDescription(description, needed, covered) {
+  return description + (needed > covered ? ` Needs ${ramAmount(needed)}; free RAM covers ${ramAmount(covered)}.` : "");
 }
 function roomEquation(r) {
   const terms = [r.available_bytes, r.safety_target_bytes, r.swap_target_bytes, r.build_target_bytes].map(bytes => f1(bytes / GIB));
@@ -959,6 +963,11 @@ function render(d) {
   $("v-cap").textContent = !hasCap(d) ? "unavailable" : `${f1(d.cap)} GiB`;
   $("v-shortfall").textContent = ramAmount(r.shortfall_bytes);
   $("v-shortfall").closest(".row").hidden = !(r.shortfall_bytes > 0);
+  for (const [key, description] of [["build", "Running builds grow into it."],
+    ["safety", "A fixed setting."], ["swap", "Empty now; held for swapped memory."]]) {
+    $(key === "build" ? "reserved-note" : `${key}-note`).textContent =
+      reserveDescription(description, r[`${key}_target_bytes`], r[`${key}_covered_bytes`]);
+  }
   const compressed = recorded(r.compressed_swap_bytes) && r.compressed_swap_bytes > 0;
   $("kernel-note").textContent = compressed ? `Of which compressed swap: ${ramAmount(r.compressed_swap_bytes)}.` : "";
   $("kernel-note").hidden = !compressed;
