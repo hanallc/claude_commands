@@ -48,7 +48,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
         text = message["args"][message["args"].index("--text") + 1]
         self.assertIn("the gate fails", text)
         self.assertNotIn("runs again alone", text)
-        self.assertTrue(text.startswith("merge-gate gate integration checkpoint "), text)
+        self.assertTrue(text.startswith("gate gate integration checkpoint "), text)
         for detail in (self.base[:7], "hooks/test_first.py", "5.000 GiB", "limit 4 GiB"):
             self.assertIn(detail, text)
 

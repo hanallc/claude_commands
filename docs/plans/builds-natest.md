@@ -4530,3 +4530,96 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - No caller turns the error into an empty queue, empty results or no record; broad handlers raise again or keep the message in `GateRefused`. `land_queue.py list` and `next` exit 1 with the message.
 - The move program uses explicit paths and imports no guarded reader.
 - Reviews found nothing. Checkpoint 9871162ed; main merged at 8416aab51.
+
+### Phase 320 — the gate step names are gate and test-affected, and the gate mode is --affected  · status: done
+**Depends on:** Phase 319
+**Owner:** natest writes; sdlc owns (gate rename plan chunk 4 item 3). The user chose the names 11-16 17:23 ("Name 1 D Name 2 gate-box"), relayed by morty and builds. The one-off rewrite of the stored records is the next phase.
+
+#### Work Order
+
+**Goal:** the code and config write and read the step names `gate` (full run) and `test-affected` (affected-modules run), and `gate.py` takes `--affected`; no code or config writes `merge-gate` or `targeted-test` as a step name or mode.
+
+**Source:** user answer 11-16 17:23 via builds; queue inventory `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/steprename/inventory_for_natest.md`; report notes in `/tmp/claude/scratch/natest-probe/p89/phase319_notes.md`.
+
+**Spec:**
+1. Step names: every writer and reader of the step value `merge-gate` uses `gate`; of `targeted-test` uses `test-affected`. This covers the gate run record field, the admission and memory readers, the buildlog index query (`step = 'merge-gate'`), `memory_feed.py` `GATE_STEPS`, `memory_admit.py` progress-profile keys (about lines 1946 and 1948), and the AWS mode values that `cloud_gate.py` writes and `run_cost.py` groups.
+2. Mode flag: `gate.py --targeted` is `--affected`. Update every caller (`targeted_test.py` entry point, scripts, commands, docs). No alias for `--targeted`.
+3. Config keys, one key per name, no duplicates:
+   - `config/build_steps.conf`: `names.merge-gate` -> `names.gate`; `names.targeted-test` -> `names.test-affected` (value `test affected`; report's batch730 adds the same key under the gate jobs, so keep one line); `prose.merge-gate` -> `prose.gate`; `owned.merge-gate` -> `owned.gate`; `owned.targeted-test` -> `owned.test-affected`; `owned.showrunner-merge-gate` -> `owned.showrunner-gate`.
+   - `config/build_admission.conf`: `program_first_peak_gib.merge-gate` -> `.gate`; `program_first_peak_gib.targeted-test` -> `.test-affected`; `peak_hold_seconds.merge-gate` -> `.gate`; `peak_hold_seconds.targeted-test` -> `.test-affected`. Values stay. Update the comments near them and `scripts/lint/fixtures/build_admission.conf`.
+   - `config/README.md` where it names these keys.
+4. Do not change these (other work owns them): folder names and paths (`~/.local/state/merge-gate` in the phase 319 guard, `config/build_folders.conf` `prefixes.*`), `merge_gate_governor_gib`, the AWS box user and folder (`gate_box.py`, `deploy.py` box paths), script file names, prose "merge gate" outside the renamed keys (chunk 5), and the `merge_gate.py` / `targeted_test.py` entry points (chunk 6). Name each remaining `merge-gate` or `targeted-test` hit in `scripts/ config/ commands/` and why it stays.
+5. No dual read of the old names: stored records move once at deploy, in the next phase. List each stored record the old names reach, so the next phase covers it; compare with the queue inventory.
+6. Tests: update fixtures and expected values to the new names. Remove no assertion. Every behavior check stays.
+7. No signal handlers, masks or dispositions. No lazy imports.
+
+**Files:**
+- `scripts/production/gate.py`
+- `scripts/production/targeted_test.py`
+- `scripts/production/gate_test_support.py`
+- `scripts/buildlog/index.py`
+- `scripts/build_queue/admission_records.py`
+- `scripts/build_queue/admission_service.py`
+- `scripts/build_queue/memory_feed.py`
+- `scripts/lint/memory_admit.py`
+- `scripts/aws_target/cloud_gate.py`
+- `scripts/aws_target/run_cost.py`
+- `scripts/aws_target/gate_trial.py`
+- `scripts/lint/fixtures/build_admission.conf`
+- `config/build_steps.conf`
+- `config/build_admission.conf`
+- `config/README.md`
+
+**Workers:** 1 writer. The rename crosses every file at once; a split leaves a red tree.
+- impl: every file above and the test modules that hold the old names.
+- test: opens as impl.
+
+**Constraints from prior phases:** Phase 316: `gate.py` is the gate; `merge_gate.py` and `targeted_test.py` are entry points until chunk 6. Phase 317: variables are `GATE_*`; `config/gate.conf`. Phase 318: state folder `~/.local/state/gate`. Phase 319: the state readers refuse while only the old folder exists.
+
+**Acceptance gate:**
+1. `git grep -nE "merge-gate|targeted-test|--targeted" -- scripts config commands` finds only the hits Spec item 4 keeps, each named in the reply.
+2. Every test module that holds a renamed name passes on natedev, in batches of 4 under the hold rules.
+3. The reply lists the stored records of Spec item 5.
+4. basedpyright adds no finding on each touched Python file.
+
+### Phase 321 — the stored step names move to gate and test-affected once, at deploy  · status: todo
+**Depends on:** Phase 320
+**Owner:** natest writes; sdlc owns (gate rename plan chunk 4 item 3). Builds ships 320 and 321 as one item and takes the user's go for the service stops (11-16 ~17:30).
+
+#### Work Order
+
+**Goal:** one program outside the repository rewrites every stored `merge-gate` step value to `gate` and every `targeted-test` value to `test-affected`, once, at deploy; builds gets exact deploy steps with measured times.
+
+**Source:** queue inventory `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/steprename/inventory_for_natest.md`; phase 320 list `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/320/implementation/stored-records.md`; memory rule "migrate once at deploy".
+
+**Spec:**
+1. Write `/tmp/claude/scratch/natest-probe/p89/rename_step_names.py`. It is not committed. It takes the buildlog folder, the AWS state folder and the review page folder as arguments, with the live paths as defaults.
+2. Refusals, before any write:
+   1. No natedev drain hold in force (use `build_hold` as `move_gate_state.py` does).
+   2. `build-admission.service`, `build-admission.socket` or `build-memory-feed.service` is active, or `buildlog.service` is running.
+   3. A process of the user other than itself holds a file under the buildlog `admission/` folder open (reuse the `/proc` scan of `move_gate_state.py`).
+3. Convert each record of the phase 320 list. Match structured fields exactly; never replace text inside other strings. Write each file to a temporary file in the same folder, then `os.replace`. A rerun converts what is left and changes nothing when no old value remains.
+3a. Also convert these cloud attempt records (contract review of phase 320, F002): `<git-path cloud-gates>/current.json` retry `mode`; `<git-path cloud-gates>/<attempt>/request.json` `mode`; AWS `paired-trials/<trial>/<attempt>/request.json` `mode`; `remote-result.json` and legacy inline outcome results, nested `record.step`; `B/<host>/results/<YYYY-MM>/*.json.gz`, nested `record.step` (rewrite the gzip in place by temp file). Find each git-path folder for the live checkouts the gate uses. For uploaded cloud request and result objects, name their expiry or retention and whether any reader loads an old one; convert only when a reader does.
+4. Progress profiles: rename each `merge-gate` profile folder to the hash of the same key with `gate` (`memory_admit.py` key at about line 1946). Use the phase 320 hash function, not a copy. `targeted-test` keys cannot be listed: leave those folders, and report whether an existing cleanup removes unread folders. A rerun skips a folder already renamed.
+5. Index: after the jsonl rewrite, update `gate_runs.step` and `steps.step` in the index sqlite in one transaction, or rebuild it with the existing index command; name the choice and why.
+6. `queue.json`, `memory.json` and `report.json`: convert, or delete them when the started services write them again; name the choice.
+7. `.wait` files next to assignment files: find where they live; convert those found, and name the folders searched.
+8. Print each step with its time and the count of values changed per file. Exit 2 on a refusal, 0 on success.
+9. Prove it on a copy of the live records under `/tmp/claude/scratch/`: run it with the paths as arguments, then run it again (no change). Then show with the phase 320 code: the gate duration history (`gate_record.py`), the peak estimate for `gate` and `test-affected`, and the AWS run cost groups read the converted copy with the same counts as the old names had. Time the run on the copy. Make no change to live records.
+10. Write the deploy steps for builds in the reply: each stop (`build-admission.socket`, `build-admission.service`, `build-memory-feed.service`, the `buildlog` timer), the drain hold, the program, each start, the release, and the measured minutes builds stop. A system service stop needs sudo: name each command exactly.
+11. Do not edit `/etc/nixos`. No signal handlers, masks or dispositions.
+
+**Files:**
+- `scripts/lint/memory_admit.py`
+
+**Workers:** 1 writer. One program outside the repository; the listed file is read only, for the hash function.
+- impl: the program, the copy proof and the deploy steps.
+- test: opens as impl.
+
+**Constraints from prior phases:** Phase 320: code and config write and read only `gate` and `test-affected`; `gate.py --affected`; no dual read. Phase 318: `move_gate_state.py` holds the hold check and `/proc` scan to reuse. Phase 319: the gate state readers refuse while only `~/.local/state/merge-gate` exists.
+
+**Acceptance gate:**
+1. The copy proof of Spec item 9 passes and its output is in the reply, with the second run changing nothing.
+2. Each refusal of Spec item 2 is shown on the copy.
+3. The deploy steps of Spec item 10 are in the reply with measured times.
+4. basedpyright reports no finding on the program.

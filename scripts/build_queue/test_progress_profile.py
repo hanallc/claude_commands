@@ -333,7 +333,7 @@ class ProgressWindowTests(unittest.TestCase):
     def test_legacy_gate_records_are_not_anonymous_progress_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "gate.json"
-            _ = path.write_text('{"step":"merge-gate","anon_peak_bytes":99999999999,"at":100}')
+            _ = path.write_text('{"step":"gate","anon_peak_bytes":99999999999,"at":100}')
             self.assertIsInstance(progress.read_profile(path, cutoff=99), progress.NoMatchingProfile)
             self.assertIsInstance(progress.read_profile(path.with_name("missing.json"), cutoff=99), progress.NoMatchingProfile)
 

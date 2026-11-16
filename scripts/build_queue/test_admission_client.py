@@ -223,7 +223,7 @@ class ClientTests(unittest.TestCase):
     def test_cloud_admit_uses_the_private_service_and_releases_its_slot(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
-            request = replace(fixture.request(step="merge-gate"), place=wire.CloudPlace("aws"))
+            request = replace(fixture.request(step="gate"), place=wire.CloudPlace("aws"))
             with fixture.serving():
                 result = client.admit(request, lambda _wait: None, lambda: request)
                 assert isinstance(result, wire.Admitted)
@@ -233,7 +233,7 @@ class ClientTests(unittest.TestCase):
 
     def test_cloud_place_survives_client_reconnect_and_estimate_refresh(self) -> None:
         with AdmissionFixture() as fixture:
-            request = replace(fixture.request(step="merge-gate"), place=wire.CloudPlace("aws"))
+            request = replace(fixture.request(step="gate"), place=wire.CloudPlace("aws"))
             transport = self.use_transport(fixture,
                 Exchange(reply_bytes(EXPIRED), TimedChunk(0.1, b"")),
                 Exchange(reply_bytes(GRANTED)))
@@ -873,14 +873,14 @@ class ClientTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             original = fixture.request()
             checkout = str(fixture.root / "other-checkout")
-            profile = records.ProgramProfile("merge-gate", "repo", checkout, records.HistoryPeakSizing(6 * GIB, records.FirstProgramPeak(6 * GIB), fixture.clock.now()))
+            profile = records.ProgramProfile("gate", "repo", checkout, records.HistoryPeakSizing(6 * GIB, records.FirstProgramPeak(6 * GIB), fixture.clock.now()))
             with mock.patch.object(step_estimator, "git_identity", side_effect=AssertionError("program inferred cargo")), \
                  mock.patch.object(client, "CLOCK", fixture.clock):
                 request = client.step_request([], str(fixture.root), original.owner, original.since,
                                               "", original.episode, profile)
             self.assertEqual(request.identity.folder, checkout)
             self.assertEqual(request.profile, profile)
-            self.assertEqual(request.identity.step, "merge-gate")
+            self.assertEqual(request.identity.step, "gate")
             self.assertEqual(request.profile.peak, records.ExpectedPeak(6 * GIB, "fallback", 0))
 
     def test_failed_grant_file_write_releases_the_reservation_before_refusing(self) -> None:

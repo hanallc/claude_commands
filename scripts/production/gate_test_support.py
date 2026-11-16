@@ -457,7 +457,7 @@ class MergeGateFixture(unittest.TestCase):
         self.environment.update({
             "BUILDLOG_DIR": str(root / "buildlog"),
             "BUILDLOG_JOBSERVER_FIFO": str(root / "jobserver"),
-            "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "merge-gate",
+            "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "gate",
             "NOTIFIER_SESSIONS_DIR": str(home / "sessions"),
         })
         # The seed is copied with copytree; create the FIFO only in restored cases.
@@ -561,7 +561,7 @@ class MergeGateFixture(unittest.TestCase):
             vcpus = os.cpu_count() or 1
             connection.executemany("""INSERT INTO gate_runs
                 (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s)
-                VALUES (?, '2000-01-01', 'merge-gate', ?, ?, 0, 0, 'full', 1000000)""",
+                VALUES (?, '2000-01-01', 'gate', ?, ?, 0, 0, 'full', 1000000)""",
                 [(f"fixture-normal-{jobs}", vcpus, jobs) for jobs in range(1, vcpus + 1)]).close()
         (self.root / "home").mkdir()
         # A production with no Change review line: a gate always names one, and these write no rows.
@@ -659,7 +659,7 @@ class MergeGateFixture(unittest.TestCase):
              *([] if callers_production or "--production" in extra else ["--production", "quiet"]),
              *extra]
         if self.suite_mode is gate.SuiteMode.TARGETED:
-            arguments = ["--targeted", "--repo", str(self.checkout),
+            arguments = ["--affected", "--repo", str(self.checkout),
                          *(["--type-dirs", *type_dirs] if type_dirs else []), *extra]
         if own_process or ignored_signals:
             return subprocess.run(

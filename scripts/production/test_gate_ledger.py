@@ -101,7 +101,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_all_modules_started()
         record = self.gate_run_records()[-1]
-        self.assertEqual(record["step"], "merge-gate")
+        self.assertEqual(record["step"], "gate")
         self.assertEqual(record["selection"], "full")
 
     def test_dirty_path_record_keeps_fifty_names_and_the_total(self) -> None:

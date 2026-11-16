@@ -288,16 +288,16 @@ The completion case retains its strict socket send.
 
 The entry has its own parser and description.
 It shares the suite arguments, signal wrapper, copy lock, and suite runner with `merge_gate.py`.
-`SuiteMode.TARGETED_TEST` enables selection and takes the `targeted-test` admission step.
-`SuiteMode.MERGE_GATE` runs all modules and takes the `merge-gate` step.
+`SuiteMode.TARGETED` enables selection and takes the `test-affected` admission step.
+`SuiteMode.GATE` runs all modules and takes the `gate` step.
 Both modes accept `--full` because existing repository callers use it.
 
 The queue model reads `config/build_steps.conf` once through `read_step_names()`.
 Its `StepNames` value supplies names without file reads during rendering.
-Queue tables and cards use `[names]`; only `targeted-test` has the shown name `targeted test`.
+Queue tables and cards use `[names]`; `test-affected` has the shown name `test affected`.
 Other step IDs keep their display text.
 Sentences use `[prose]`, then the shown name as a fallback.
-The step column fits `targeted test`.
+The step column fits `test affected`.
 Build holds apply to both entries. Their test children keep the same hold rules.
 Temporary folders use each step's prefix from `config/build_folders.conf`.
 
@@ -509,9 +509,9 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
 - `test_modules(repo)` finds every `scripts/**/test_*.py` file outside `__pycache__`, sorted by path. A module belongs to its first folder under `scripts/`, including modules in nested `tests/` folders. A folder without test modules is no suite. New test folders need no registration.
 - Before any job starts it refuses (and the merge rolls back) if a `--type-dirs` path is absent from the checkout, the test list is empty, or `/dev/shm` is not writable.
 - Each module is one job: `python -c SUITE_BOOTSTRAP -m unittest discover -s <its folder> -p <its file>`, with the checkout as cwd, started in its own session and process group, stdin `/dev/null`. `SUITE_BOOTSTRAP` resets every signal disposition except KILL and STOP to `SIG_DFL`, then `execv`s, so a suite started from a background shell does not inherit SIGINT ignored.
-- **Shared admission.** After the build hold ends, `gate_reservation` obtains one `merge-gate` reservation through `queue_place`.
-  Targeted tests use step `targeted-test` through the same reservation path.
-  It reads `program_first_peak_gib.merge-gate` from `config/build_admission.conf` at use; the initial value is 4 GiB.
+- **Shared admission.** After the build hold ends, `gate_reservation` obtains one `gate` reservation through `queue_place`.
+  Targeted tests use step `test-affected` through the same reservation path.
+  It reads `program_first_peak_gib.gate` from `config/build_admission.conf` at use; the initial value is 4 GiB.
   The gate uses the first peak as its full need.
   A matching anonymous profile uses the first pass's progress window after admission.
   Reruns publish no progress counter and keep the full need.
@@ -520,7 +520,7 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   An admission error refuses the gate with its last reason line.
   Each new sampled peak updates the reservation's `.max` and `.wave` files through atomic writes.
   The gate releases the reservation on every exit while its private empty-scope sidecar still exists.
-  Release writes the run's `merge-gate` or `targeted-test` history row for reports.
+  Release writes the run's `gate` or `test-affected` history row for reports.
   Admission does not use that history to size the gate.
 - **Shared CPU slots.** Each module and the `types` job takes one byte from `/dev/steve` before launch.
   The gate returns the byte after the process group ends, including after failure, kill, or interruption.
@@ -1019,7 +1019,7 @@ The status line reads assignments from staff rows instead of these environment n
 
 | Item | Value |
 |---|---|
-| Queue reservation | `program_first_peak_gib.merge-gate=4`, with the progress window after admission |
+| Queue reservation | `program_first_peak_gib.gate=4`, with the progress window after admission |
 | Runner governor | `merge_gate_governor_gib=4`, read when the gate starts |
 | Recorded job reservation | Last sampled peak × 1.2 (`MEMORY_PEAK_MARGIN`) |
 | Unrecorded module reservation | Largest recorded module peak × 1.2, or 640 MiB without module records |

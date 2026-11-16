@@ -228,7 +228,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
                       mock.patch.object(gate, "select_affected", wraps=affected_modules.select_affected) as select,
                       contextlib.redirect_stdout(io.StringIO()) as output,
                       contextlib.redirect_stderr(io.StringIO()) as errors):
-                    result = gate.main(["--targeted", *arguments])
+                    result = gate.main(["--affected", *arguments])
                 self.assertEqual(result, status, output.getvalue() + errors.getvalue())
                 if type_dirs == ("missing-types",):
                     self.assertIn("type dirs not found", errors.getvalue())

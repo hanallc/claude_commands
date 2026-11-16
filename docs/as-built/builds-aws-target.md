@@ -687,7 +687,7 @@ The user asked for these page changes on 2026-11-14 through builds:
    `Cost per gate` shows a second switch, `Merge gates`, `Targeted runs` or `Both`, and it sets both cards.
    The cost cells are the estimate in USD for one run (`RunCosts.prices`), the estimate that gate placement uses.
    A type and region with no estimate shows a dash. GPU types have no runs, so their cost cells are dashes.
-   The run kind switch also sets the run tables below. The URL keeps both choices, as `?prices=cost&runs=merge-gate`.
+   The run kind switch also sets the run tables below. The URL keeps both choices, as `?prices=cost&runs=gate`.
 2. Each column has a three-color scale: green at the minimum, white at the median and red at the maximum.
    In dark mode the middle is the card color. A ban cell, a dash and a column with fewer than two values have no color.
    A white box marks the lowest and the highest cell of each type column, in both themes; the user asked for it on 2026-11-15 through builds.

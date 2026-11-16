@@ -55,7 +55,7 @@ class GateRecordTests(unittest.TestCase):
         for identity, vcpus, status, aborted, selection, seconds in rows:
             connection.execute("""INSERT INTO gate_runs
                 (id, started_at, step, vcpus, status, aborted, selection, wall_s, max_jobs, modules_run)
-                VALUES (?, ?, 'merge-gate', ?, ?, ?, ?, ?, 2, 1)""",
+                VALUES (?, ?, 'gate', ?, ?, ?, ?, ?, 2, 1)""",
                 (identity, identity, vcpus, status, aborted, selection, seconds)).close()
         self.assertEqual(gate_record.history_time_limit(connection, 8, (), 2, False), gate_record.GateTimeLimit(40))
         self.assertIsInstance(gate_record.history_time_limit(connection, 4, (), 2, False), gate_record.NoGateTimeLimit)
@@ -89,14 +89,14 @@ class GateRecordTests(unittest.TestCase):
         for identity, jobs, seconds in (("a", 32, 210), ("b", 32, 212), ("c", 32, 209)):
             connection.execute("""INSERT INTO gate_runs
                 (id, started_at, step, vcpus, status, aborted, selection, wall_s, max_jobs, modules_run)
-                VALUES (?, ?, 'merge-gate', 32, 0, 0, 'full', ?, ?, 790)""",
+                VALUES (?, ?, 'gate', 32, 0, 0, 'full', ?, ?, 790)""",
                 (identity, identity, seconds, jobs)).close()
         self.assertEqual(gate_record.history_time_limit(connection, 32, (), 32, False), gate_record.GateTimeLimit(315))
         self.assertEqual(gate_record.history_time_limit(connection, 32, (), 16, False), gate_record.NoGateTimeLimit(
             "no passing full gate history for 32 vCPUs at 16 jobs"))
         connection.execute("""INSERT INTO gate_runs
             (id, started_at, step, vcpus, status, aborted, selection, wall_s, max_jobs, modules_run)
-            VALUES ('d', 'd', 'merge-gate', 32, 0, 0, 'full', 420, 16, 790)""").close()
+            VALUES ('d', 'd', 'gate', 32, 0, 0, 'full', 420, 16, 790)""").close()
         self.assertEqual(gate_record.history_time_limit(connection, 32, (), 16, False), gate_record.GateTimeLimit(630))
 
     def test_full_time_limit_skips_runs_of_the_type_check_alone(self) -> None:
@@ -109,7 +109,7 @@ class GateRecordTests(unittest.TestCase):
         for identity, seconds, modules_run in (("a", 600, 790), ("b", 117, 0), ("c", 104, 0), ("d", 127, 0)):
             connection.execute("""INSERT INTO gate_runs
                 (id, started_at, step, vcpus, status, aborted, selection, wall_s, max_jobs, modules_run)
-                VALUES (?, ?, 'merge-gate', 32, 0, 0, 'full', ?, 16, ?)""",
+                VALUES (?, ?, 'gate', 32, 0, 0, 'full', ?, 16, ?)""",
                 (identity, identity, seconds, modules_run)).close()
         self.assertEqual(gate_record.history_time_limit(connection, 32, (), 16, False), gate_record.GateTimeLimit(900))
         connection.execute("DELETE FROM gate_runs WHERE id = 'a'").close()

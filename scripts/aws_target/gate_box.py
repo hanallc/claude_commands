@@ -17,7 +17,7 @@ import math
 from scripts.lib.python_startup import sitecustomize as python_startup
 
 if TYPE_CHECKING:
-    from scripts.production.merge_gate import GateRun
+    from scripts.production.gate import GateRun
     from scripts.test_times import gate_record
 
 
@@ -337,7 +337,10 @@ def run_guest(root: Path, links: dict[str, object], result: dict[str, object]) -
         request = cast(dict[str, object], json.loads((root / 'request.json').read_text()))
         namespace['gate_request'] = request
         if request.get('task') == 'paired':
-            from scripts.production import merge_gate
+            if TYPE_CHECKING:
+                from scripts.production import gate as merge_gate
+            else:
+                from scripts.production import merge_gate
             from scripts.lib.descendants import adopt_descendants
             from scripts.lib.process_group import send_process_group
             namespace.update(
@@ -594,7 +597,7 @@ nix --extra-experimental-features 'nix-command flakes' shell {tools} --command b
 def encode_run(run: object) -> dict[str, object]:
     """Return the complete gate result for object transfer."""
     from scripts.test_times import gate_record
-    from scripts.production.merge_gate import GateRun, GateJobResult
+    from scripts.production.gate import GateRun, GateJobResult
     from dataclasses import asdict
     from typing import cast
     if not isinstance(run, GateRun):
@@ -627,7 +630,7 @@ def decode_run(value: object) -> GateRun:
     """Validate the transferred result before computing its verdict."""
     from scripts.test_times import gate_record
     from scripts.aws_target.ledger import mapping, rows, text
-    from scripts.production.merge_gate import GateRun, GateJobResult, GateJobKind
+    from scripts.production.gate import GateRun, GateJobResult, GateJobKind
     import math
     from typing import cast
 
@@ -686,7 +689,7 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
     from scripts.test_times import gate_record
     from datetime import UTC
     from scripts.buildlog import record, store
-    from scripts.production.merge_gate import GateRun
+    from scripts.production.gate import GateRun
     import os
     if not isinstance(value, GateRun):
         raise TypeError('expected a completed gate')
@@ -697,7 +700,7 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
     return {'kind': 'gate_run', 'v': record.RECORD_VERSION, 'id': 'gate-' + attempt, 'host': host,
             'started_at': datetime.fromtimestamp(started, UTC).isoformat(),
             'ended_at': datetime.fromtimestamp(ended, UTC).isoformat(), 'wall_s': value.seconds,
-            'hold_wait_s': 0, 'selection': 'affected' if mode == 'targeted-test' else 'full',
+            'hold_wait_s': 0, 'selection': 'affected' if mode == 'test-affected' else 'full',
             'reason': 'time limit' if value.time_limit_report else 'cloud gate',
             'vcpus': os.cpu_count() or 1, 'status': int(not value.passed), 'max_jobs': os.cpu_count() or 1,
             'peak_mib': value.peak_memory_mib, 'cap_mib': 0, 'checkout': '/var/lib/gate-trial/repo',

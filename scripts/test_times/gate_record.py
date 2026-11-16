@@ -438,7 +438,7 @@ def history_time_limit(connection: sqlite3.Connection, vcpus: int, modules: Sequ
         walls = [float(row[0]) for row in cast(list[tuple[float]], connection.execute(
             """SELECT wall_s FROM gate_runs
                WHERE vcpus = ? AND max_jobs = ? AND status = 0 AND aborted = 0
-                 AND selection = 'full' AND step = 'merge-gate' AND wall_s > 0 AND modules_run > 0
+                 AND selection = 'full' AND step = 'gate' AND wall_s > 0 AND modules_run > 0
                ORDER BY started_at DESC, id DESC LIMIT ?""", (vcpus, jobs, count)).fetchall())]
         if walls:
             return GateTimeLimit(factor * statistics.median(walls))

@@ -130,7 +130,7 @@ class ProtocolTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             for place in (wire.LocalPlace(), wire.CloudPlace("aws")):
                 with self.subTest(place=place):
-                    request = replace(fixture.request(step="merge-gate"), place=place)
+                    request = replace(fixture.request(step="gate"), place=place)
                     parsed = wire.parse_request(wire.encode_request(request))
                     self.assertEqual(parsed, request)
                     assert isinstance(parsed, wire.AdmitRequest)
@@ -207,7 +207,7 @@ class ProtocolTests(unittest.TestCase):
             assert isinstance(reply, wire.ViewReply)
             base = reply.reading
             cloud_row = wire.CloudRow(wire.Owner(700001, "10"),
-                wire.Identity("cloud-session", "cloud-worker", "merge-gate", "/private", "cloud-unit"),
+                wire.Identity("cloud-session", "cloud-worker", "gate", "/private", "cloud-unit"),
                 wire.CloudPlace("aws"), NOW - 60, NOW - 50,
                 cloud_progress.CloudProgress("running", 32, 1, NOW - 20),
                 progress_profile.ProgressCounter("modules", 7, 12), records.ReadyForAdmission())
@@ -373,7 +373,7 @@ class ProtocolTests(unittest.TestCase):
         current["diagnostics"] = [{"kind": "ConfigurationDiagnostic", "diagnostic": "service warning"}]
         parsed = codec.parse_snapshot_value(current, records.QueueRead)
         self.assertEqual(parsed, replace(reading, diagnostics=(records.ConfigurationDiagnostic("service warning"),)))
-        step = records.RunningStep("owner", "worker", "merge-gate", "/tree", GIB, records.MeasuredMemory(0),
+        step = records.RunningStep("owner", "worker", "gate", "/tree", GIB, records.MeasuredMemory(0),
                                 run=LiveBuildRun(123, "456", NOW - 60), started_at=NOW - 30, pid=123)
         self.assertEqual(codec.parse_snapshot_value(codec.snapshot_value(step), records.RunningStep), step)
 
@@ -454,7 +454,7 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
         with AdmissionFixture() as fixture:
             request = fixture.request()
             requests: list[wire.Request] = [request, fixture.launch(),
-                replace(request, profile=records.ProgramProfile("merge-gate", "repo", "tree", records.HistoryPeakSizing(3 * GIB, records.FirstProgramPeak(3 * GIB), 0.0))),
+                replace(request, profile=records.ProgramProfile("gate", "repo", "tree", records.HistoryPeakSizing(3 * GIB, records.FirstProgramPeak(3 * GIB), 0.0))),
                 replace(request, profile=records.ProgramProfile("rust-analyzer", "repo", "tree",
                     records.HistoryPeakSizing(18 * GIB, records.FirstProgramPeak(18 * GIB), NOW))),
                 replace(request, profile=records.ProgramProfile("rust-analyzer", "repo", "tree",

@@ -24,8 +24,8 @@ CARGO_BUILDS = ("build", "b", "check", "c", "clippy", "test", "t", "nextest", "r
                 "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "mend", "miri")
 GATE_COMMANDS = (
     "python3 gate.py --tests-only",
-    "python3.13 -u '/work tree/gate.py' --targeted",
-    "scripts/lib/py scripts/production/gate.py --targeted",
+    "python3.13 -u '/work tree/gate.py' --affected",
+    "scripts/lib/py scripts/production/gate.py --affected",
     "python3 merge_gate.py --tests-only",
     "/usr/bin/python3 scripts/production/merge_gate.py --promote-only",
     "python3.13 -u '/work tree/merge_gate.py' --repo /repo",

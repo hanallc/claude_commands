@@ -1842,12 +1842,12 @@ def run_memories(inputs: QueueInputs) -> tuple[RunMemory, ...]:
     return tuple(groups.values())
 
 
-PROGRESS_STEPS = ("build", "check", "clippy", "mend", "nextest", "test", "t", "merge-gate", "targeted-test", "cargo")
+PROGRESS_STEPS = ("build", "check", "clippy", "mend", "nextest", "test", "t", "gate", "test-affected", "cargo")
 
 
 def reservation_profile_key(row: Reservation, host: str) -> str:
     """Use the history identity for each step rather than its run owner."""
-    if row["step"] == "merge-gate":
+    if row["step"] == "gate":
         return progress.profile_key((host, row["step"], row.get("shape", GATE_TESTS)))
     width = row["test_threads"].threads if isinstance(row["test_threads"], RequestedTestWidth) else "unknown"
     return progress.profile_key((host, row.get("repo_identity", row["repo"]), row["step"],

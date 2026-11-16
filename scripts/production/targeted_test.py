@@ -14,7 +14,7 @@ from scripts.production import gate
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
-    return gate.main(["--targeted", *arguments])
+    return gate.main(["--affected", *arguments])
 
 
 if __name__ == "__main__":

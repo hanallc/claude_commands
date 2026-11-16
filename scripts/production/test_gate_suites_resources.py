@@ -90,7 +90,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         self.assertEqual(len(messages), 1)
         self.assertEqual(messages[0]["args"][:2], ["--to", "sdlc"])
         text = messages[0]["args"][messages[0]["args"].index("--text") + 1]
-        for detail in ("lib/test_first.py", "2.500 GiB", "limit 2 GiB", "merge-gate", "integration", "runs again alone"):
+        for detail in ("lib/test_first.py", "2.500 GiB", "limit 2 GiB", "gate", "integration", "runs again alone"):
             self.assertIn(detail, text)
 
     def test_memory_stop_fails_even_when_the_module_exits_zero(self) -> None:

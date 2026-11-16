@@ -582,14 +582,14 @@ process.stdout.write(JSON.stringify({
 
 
     def test_local_test_counters_reach_the_page_through_admission(self) -> None:
-        for step in ("targeted-test", "merge-gate", "nextest", "test", "t"):
+        for step in ("test-affected", "gate", "nextest", "test", "t"):
             with self.subTest(step=step):
                 with AdmissionFixture() as fixture, fixture.loop_turn():
                     owner = fixture.proc.spawn()
                     sidecar = fixture.scope(owner)
                     request = replace(fixture.request(owner=owner, step=step), sidecar=str(sidecar))
                     grant = only_admitted(fixture.server.handle_request(request))
-                    phase = "suites:1" if step in ("targeted-test", "merge-gate") else "test:1"
+                    phase = "suites:1" if step in ("test-affected", "gate") else "test:1"
                     counter = progress_profile.ProgressCounter(phase, 7, 12)
                     progress_profile.publish_counter(sidecar, counter)
                     _ = fixture.run_pass()
@@ -1940,18 +1940,18 @@ process.stdout.write(JSON.stringify({
                                                 unit_labels.NoDirector())
         unknown = unit_labels.UnitLabels("unknown")
         for step, owner, expected in (
-            ("targeted-test", director, "panes targeted"),
-            ("merge-gate", runner, "showrunner merge"),
-            ("merge-gate", director, "panes merge"),
-            ("merge-gate", merge_staff, "sdlc-merge-gate merge"),
-            ("merge-gate", unit_worker, "panes merge"),
-            ("merge-gate", runner_worker, "showrunner merge"),
-            ("targeted-test", unknown, "targeted test"),
-            ("merge-gate", unknown, "merge gate"),
-            ("targeted-test", unit_labels.UnitLabels("worker", "sdlc", "panes"), "targeted test"),
-            ("merge-gate", unit_labels.UnitLabels("worker", "sdlc", "panes"), "merge gate"),
-            ("targeted-test", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "targeted test"),
-            ("merge-gate", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "merge gate"),
+            ("test-affected", director, "panes targeted"),
+            ("gate", runner, "showrunner merge"),
+            ("gate", director, "panes merge"),
+            ("gate", merge_staff, "sdlc-merge-gate merge"),
+            ("gate", unit_worker, "panes merge"),
+            ("gate", runner_worker, "showrunner merge"),
+            ("test-affected", unknown, "test affected"),
+            ("gate", unknown, "merge gate"),
+            ("test-affected", unit_labels.UnitLabels("worker", "sdlc", "panes"), "test affected"),
+            ("gate", unit_labels.UnitLabels("worker", "sdlc", "panes"), "merge gate"),
+            ("test-affected", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "test affected"),
+            ("gate", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "merge gate"),
         ):
             with self.subTest(step=step, owner=owner):
                 page = self.cloud_owner_page(step, owner)
@@ -2047,7 +2047,7 @@ process.stdout.write(JSON.stringify({
             ("nextest", "known-project", "/fixture", "known-project nextest"),
             ("nextest", "", "/fixture", "nextest"),
             ("nextest", "", "/absolute/repository", "nextest"),
-            ("merge-gate", "", "/fixture", "merge gate"),
+            ("gate", "", "/fixture", "merge gate"),
         ):
             with self.subTest(step=raw_step, project=project, folder=folder):
                 reading = reservation_reading(project=project)
@@ -2520,8 +2520,8 @@ def write_browser_fixture(folder: Path) -> None:
                 return model.names.shown(row.identity.step)
             naming = mock.patch.object(queue_view, "cloud_step_name", side_effect=recorded_name)
             with (naming if version == "before" else nullcontext()):
-                targeted = fixture.cloud_owner_page("targeted-test", director)
-                merge = fixture.cloud_owner_page("merge-gate", runner)
+                targeted = fixture.cloud_owner_page("test-affected", director)
+                merge = fixture.cloud_owner_page("gate", runner)
             targeted["walk"] = [row for page in (targeted, merge) for row in page["walk"] if row.get("kind") == "cloud"]
             targeted["waiters"] = [row for page in (targeted, merge) for row in page["waiters"] if row.get("kind") == "cloud"]
             pages[f"owner_names_{version}"] = json.loads(memory_feed.page_json(targeted))

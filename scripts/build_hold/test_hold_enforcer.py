@@ -892,7 +892,7 @@ class HoldEnforcerTests(unittest.TestCase):
         for argv in (
             ("/tree/merge_gate.py", "--tests-only"),
             ("/tree/gate.py", "--tests-only"),
-            ("python3", "-u", "/tree/gate.py", "--targeted"),
+            ("python3", "-u", "/tree/gate.py", "--affected"),
             ("python3", "-m", "scripts.production.gate", "--tests-only"),
             ("python3", "-u", "/tree/merge_gate.py", "--promote-only"),
             ("python3", "-m", "scripts.production.merge_gate", "--tests-only"),

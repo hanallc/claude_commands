@@ -161,7 +161,7 @@ class GateArguments(argparse.Namespace):
     mac_host: str = ""
     mac_repo: str = ""
     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S
-    targeted: bool = False
+    affected: bool = False
     tests_only: bool = False
     promote_only: bool = False
     full: bool = False
@@ -172,10 +172,10 @@ class GateArguments(argparse.Namespace):
 class SuiteMode(Enum):
     """Choose the step and whether the runner selects affected modules."""
     # Callers outside scripts/production use the old names; chunk 6 removes these aliases.
-    GATE = "merge-gate"
-    MERGE_GATE = "merge-gate"
-    TARGETED = "targeted-test"
-    TARGETED_TEST = "targeted-test"
+    GATE = "gate"
+    MERGE_GATE = "gate"
+    TARGETED = "test-affected"
+    TARGETED_TEST = "test-affected"
 
 
 class GateJobKind(Enum):
@@ -1568,8 +1568,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 record(1, aborted=True)
             raise
 
+    # Folder keys stay unchanged until chunk 6.
+    folder_tool = "merge-gate" if mode is SuiteMode.GATE else "targeted-test"
     with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
-          gate_temporary(recovery, mode.value, tmpfs) as temporary,
+          gate_temporary(recovery, folder_tool, tmpfs) as temporary,
           ExitStack() as module_folders,
           (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
           (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
@@ -2806,29 +2808,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--mac-host", default="mac")
     _ = parser.add_argument("--mac-repo", default="~/.claude")
     _ = parser.add_argument("--tests-only", action="store_true")
-    _ = parser.add_argument("--targeted", action="store_true", help="run affected tests in a temporary test folder")
+    _ = parser.add_argument("--affected", action="store_true", help="run affected tests in a temporary test folder")
     _ = parser.add_argument("--nightly", action="store_true", help="fetch and fully test origin/<merge-branch> in a shared clone")
     _ = parser.add_argument("--promote-only", action="store_true",
                             help="only promote origin/<merge-branch> to main and the Mac (needs --merge-branch)")
     args = cast(GateArguments, parser.parse_args(argv))
-    if args.targeted and (args.tests_only or args.nightly or args.promote_only or args.promote):
-        parser.error("--targeted cannot be combined with --tests-only, --nightly or promotion")
+    if args.affected and (args.tests_only or args.nightly or args.promote_only or args.promote):
+        parser.error("--affected cannot be combined with --tests-only, --nightly or promotion")
     if args.promote_only and not args.merge_branch:
         parser.error("--promote-only needs --merge-branch")
     if args.nightly and not args.merge_branch:
         parser.error("--nightly needs --merge-branch")
     if args.nightly and (args.tests_only or args.promote_only or args.promote):
         parser.error("--nightly cannot be combined with --tests-only or promotion")
-    if args.modules and not (args.tests_only or args.targeted):
-        parser.error("--module needs --tests-only or --targeted")
+    if args.modules and not (args.tests_only or args.affected):
+        parser.error("--module needs --tests-only or --affected")
     if args.nightly:
         args.type_dirs = list(NIGHTLY_TYPE_DIRS)
-    if not args.tests_only and not args.targeted and not args.promote_only and not args.nightly:
+    if not args.tests_only and not args.affected and not args.promote_only and not args.nightly:
         required = ("merge_branch", "unit_branch", "checkpoint", "previous_checkpoint", "unit", "phase")
         missing = [name.replace("_", "-") for name in required if not getattr(args, name)]
         if missing:
             parser.error(f"required: {', '.join('--' + name for name in missing)}")
-    if args.targeted:
+    if args.affected:
         with test_run_folder():
             return run_tests_only(args, SuiteMode.TARGETED)
     if args.tests_only:

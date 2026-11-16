@@ -40,7 +40,7 @@ class TargetedTestTests(MergeGateFixture):
 
         with mock.patch.dict(os.environ, {**self.environment, "TMPDIR": str(self.root)}):
             with mock.patch.object(gate, "run_tests_only", side_effect=run):
-                self.assertEqual(gate.main(["--targeted", "--repo", str(self.checkout)]), 7)
+                self.assertEqual(gate.main(["--affected", "--repo", str(self.checkout)]), 7)
             self.assertEqual(os.environ["TMPDIR"], str(self.root))
         path, = allocated
         self.assertFalse(path.exists())
@@ -68,6 +68,7 @@ argparse.ArgumentParser.exit = checked_exit
                                     text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("gate module identity: True", result.stdout)
+            self.assertIn("--affected", result.stdout)
 
     def test_a_changed_suite_set_cannot_reuse_or_certify_an_old_full_pass(self) -> None:
         first = self.run_gate()
@@ -113,7 +114,7 @@ argparse.ArgumentParser.exit = checked_exit
             self.assertIn("message: skipped (not affected)", result.stdout)
             self.assertNotIn("tests reused from", result.stdout)
         self.assertEqual([record["kind"] for record in self.pass_records()], ["full", "affected", "affected"])
-        self.assertEqual(self.gate_run_records()[-1]["step"], "targeted-test")
+        self.assertEqual(self.gate_run_records()[-1]["step"], "test-affected")
 
     @gate_suites("lib", "hooks", "message")
     def test_a_nightly_red_marker_keeps_selection_by_the_four_rules(self) -> None:
