@@ -434,7 +434,8 @@ else:
         with self.subTest(form='without executions'):
             run = gate.GateRun((second,), 4, 3, executions=(second,))
             encoded = gate_box.encode_run(run)
-            del encoded['executions']
+            # The older writer encodes executions equal to jobs; the newer writer leaves them out.
+            _ = encoded.pop('executions', None)
             decoded = gate_box.decode_run(encoded)
             self.assertEqual(decoded, run)
             self.assertEqual([job.output for job in gate_box.execution_records(decoded)], ['passed'])
