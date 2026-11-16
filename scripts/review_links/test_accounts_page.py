@@ -15,9 +15,10 @@ import unittest
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.review_links.test_page_frame import assert_status_states
 from scripts.accounts import accounts
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.review_links import accounts_page, console_theme, page_frame
+from scripts.review_links import accounts_page, console_theme, page_frame, serve
 from scripts.whoami import agent_accounts
 
 AT = datetime(2026, 11, 15, 15, tzinfo=timezone.utc)
@@ -64,6 +65,7 @@ class AccountsPageTests(unittest.TestCase):
                         page = accounts_page.page().decode()
                     source: object = status.call_args.kwargs["source"]  # pyright: ignore[reportAny]
                     self.assertIsInstance(source, accounts.StoredUsageOnly)
+                    assert_status_states(self, page, seconds)
                     self.assertIn("<div data-accounts>", page)
                     self.assertIn(console_theme.CSS, page)
                     self.assertIn(page_frame.STYLE, page)
@@ -73,17 +75,33 @@ class AccountsPageTests(unittest.TestCase):
                     self.assertEqual(page.count(page_frame.REFRESH_SCRIPT), 1)
                     self.assertIn("createPageRefresh(refresh, () => document.querySelector('main').dataset.refreshSeconds)", page)
 
+    def test_cached_render_failure_reaches_the_real_loader_and_keeps_the_board(self) -> None:
+        reading = accounts.StatusReading((), (), (), timezone.utc, AT)
+        with patch.object(accounts, "read_status", return_value=reading):
+            content = accounts_page.page()
+        content = content.replace(b'<div data-accounts>', b'<div data-accounts><p>board</p>')
+        cache = serve.AccountsPageCache()
+        with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(content, .1, time.time())):
+            good = cache.replace()
+        with patch.object(accounts_page, "render_with_facts", side_effect=OSError("private failure")):
+            failed = cache.replace()
+        self.assertIn(b'data-read-error="The Accounts render failed."', failed)
+        self.assertNotIn(b'private failure', failed)
+        self.assertEqual(cache.page, good)
+        self.assertEqual(tuple(cache.recent_times), (.1,))
+        assert_status_states(self, good.decode(), 15, failed_markup=failed.decode())
+
     def test_render_runs_the_page_in_a_child_and_names_its_failure(self) -> None:
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess((), 0, b"<p>page</p>", b"")) as run:
             self.assertEqual(accounts_page.render(), b"<p>page</p>")
         self.assertEqual(run.call_args.args[0], accounts_page.CHILD)
-        with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess((), 0, b'<p data-load-time></p>', b"")),
+        with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess((), 0, b'<p data-page-facts></p>', b"")),
               patch.object(time, "perf_counter", side_effect=[10, 10.75]),
               patch.object(time, "time", return_value=100)):
             rendered = accounts_page.render_with_facts()
         markup = rendered.with_recent_times((0.25, rendered.seconds))
         self.assertIn(b'data-render-seconds="0.750000"', markup)
-        self.assertIn(b'data-render-finished="100.000000"', markup)
+        self.assertIn(b'data-read-at="100.000000"', markup)
         self.assertIn(b'data-render-median="0.500000"', markup)
         self.assertIn(b'data-render-count="2"', markup)
         with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess((), 1, b"", b"Traceback\nOSError: no staff\n")),
@@ -104,8 +122,9 @@ class AccountsPageTests(unittest.TestCase):
 const realFetch=fetch, intervals=new Map();let nextTimer=0, calls=0, visible='visible', tick=0;
 Date.now=()=>214000;
 Object.defineProperty(performance,'getEntriesByType',{value:()=>[{requestStart:100,responseEnd:350}]});
-Object.defineProperty(performance,'now',{value:()=>{tick+=30;return tick;}});
+Object.defineProperty(performance,'now',{value:()=>{tick+=15001;return tick;}});
 Object.defineProperty(document,'visibilityState',{get:()=>visible});
+window.requestAnimationFrame=run=>setTimeout(()=>run(performance.now()),0);
 window.setInterval=(load,ms)=>{intervals.set(++nextTimer,{load,ms});return nextTimer;};
 window.clearInterval=id=>intervals.delete(id);
 window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
@@ -113,20 +132,24 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
         probe = '''<script>
 (async()=>{
  const failures=[], check=(ok,label)=>{if(!ok) failures.push(label);};
- const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
- const line=()=>document.querySelector('[data-load-time]').textContent;
+ const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>setTimeout(resolve,0))));
+ const line=()=>document.querySelector('[data-page-status]');
+ const state=()=>line().dataset.state;
+ const timer=()=>[...intervals.values()].find(value=>value.ms===15000);
  try{
   if(document.readyState!=='complete') await new Promise(resolve=>addEventListener('load',resolve,{once:true}));
-  check(line()==='Data from 14 s ago. Loaded in 0.25 s. The last render took 0.75 s (median 0.50 s of the last 2).','first timing');
-  check(intervals.size===1 && [...intervals.values()][0].ms===15000,'the Accounts interval');
-  [...intervals.values()][0].load();await flush();
+  await flush();
+  check(state()==='Live' && line().textContent.includes('14 s ago') && line().textContent.includes('render 0.75 s'),'first timing');
+  check(line().querySelector('[data-status-render]').title==='Median 0.50 s of the last 2 renders.','median hover text');
+  check(timer(),'the Accounts interval');
+  timer().load();await flush();
   check(calls===1,'the interval loads once');
-  check(line()==='Data from 0 s ago. Loaded in 0.03 s. The last render took 0.60 s (median 0.60 s of the last 1).','refresh timing and clock skew');
+  check(state()==='Live' && line().textContent.includes('0 s ago') && line().textContent.includes('render 0.60 s'),'refresh timing and clock skew');
   visible='hidden';document.dispatchEvent(new Event('visibilitychange'));await flush();
-  check(intervals.size===0 && calls===1,'a hidden tab stops its timer');
+  check(!timer() && calls===1,'a hidden tab stops its timer');
   visible='visible';document.dispatchEvent(new Event('visibilitychange'));await flush();
-  check(intervals.size===1 && calls===2,'a visible tab restarts and loads once');
-  frameElement.hidden=true;[...intervals.values()][0].load();await flush();
+  check(!!timer() && calls===2,'a visible tab restarts and loads once');
+  frameElement.hidden=true;timer().load();await flush();
   check(calls===2,'a hidden frame does not load');
   frameElement.hidden=false;
   const shown=(source,origin)=>dispatchEvent(new MessageEvent('message',{source,origin,data:'console-shown'}));
@@ -134,25 +157,26 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   check(calls===2,'other messages do not load');
   shown(parent,location.origin);await flush();
   check(calls===3,'the console shows the page and loads once');
-  const timers=intervals.size, loads=[];
-  const imagesRefresh=createPageRefresh(value=>loads.push(value));
-  check(intervals.size===timers,'a page without seconds has no timer');
-  imagesRefresh.refresh(true);check(loads.length===1 && loads[0]===true,'the helper keeps supersede');
+  const priorTimers=new Set(intervals.keys()),loads=[];
+  const imagesRefresh=createPageRefresh(value=>{loads.push(value);});
+  const added=[...intervals.entries()].filter(([id])=>!priorTimers.has(id));
+  check(added.length===1 && added[0][1].ms===1000,'a page without seconds adds only the age timer');
+  await imagesRefresh.refresh(true);check(loads.length===1 && loads[0]===true,'the helper keeps supersede');
   const pending=[];
   window.fetch=()=>new Promise(resolve=>pending.push(resolve));
-  const load=[...intervals.values()][0].load;
-  load();load();
+  const load=timer().load;
+  load();shown(parent,location.origin);
   check(pending.length===2,'two refreshes overlap');
   const response=(board,seconds,finished)=>({ok:true,text:async()=>
-   `<div data-accounts>${board}</div><p data-load-time data-render-seconds="${seconds}" `+
-   `data-render-finished="${finished}" data-render-median="1.10" data-render-count="2"></p>`});
+   `<div data-accounts>${board}</div><p data-page-status data-page-facts data-render-seconds="${seconds}" `+
+   `data-read-at="${finished}" data-render-median="1.10" data-render-count="2"></p>`});
   pending[1](response('newer board',1.2,210));await flush();
-  const latest='Data from 4 s ago. Loaded in 0.03 s. The last render took 1.20 s (median 1.10 s of the last 2).';
+  const latest=()=>state()==='Live' && line().textContent.includes('4 s ago') && line().textContent.includes('render 1.20 s');
   check(document.querySelector('[data-accounts]').textContent==='newer board','the newer response updates the board');
-  check(line()===latest,'the newer response updates the timing facts');
+  check(latest(),'the newer response updates the timing facts');
   pending[0](response('older board',0.8,190));await flush();
   check(document.querySelector('[data-accounts]').textContent==='newer board','a late older response keeps the newer board');
-  check(line()===latest,'a late older response keeps the newer timing facts');
+  check(latest(),'a late older response keeps the newer timing facts');
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''

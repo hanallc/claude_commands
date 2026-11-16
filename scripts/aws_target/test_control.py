@@ -17,6 +17,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
+from scripts.review_links.test_page_frame import assert_status_states
 from scripts.aws_target import admin_secrets, aws_page, aws_target, deploy, ledger, run_cost, spend, spot_table
 from scripts.aws_target import config as aws_config
 from scripts.aws_target.control_test_support import TestClock
@@ -448,11 +449,14 @@ class ControlTests(CostFixture):
         self.assertEqual(page.stat().st_mode & 0o777, 0o644)
         source = page.read_text()
         self.assertNotIn('__AWS_PRICES_DATA__', source)
+        assert_status_states(self, source, 0)
         self.assertIn(console_theme.CSS, source)
         payload = source.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
         data = cast(aws_page.PageData, json.loads(payload))
         tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
-        self.assertEqual(data, aws_page.page_data(tables, data["spend"], int(self.clock.now)))
+        expected = aws_page.page_data(tables, data["spend"], int(self.clock.now))
+        self.assertGreater(data["render_seconds"], 0)
+        self.assertEqual(data, {**expected, "render_seconds": data["render_seconds"]})
         self.assertEqual([(entry['scope'], entry['label']) for entry in data['runs']],
                          [('merge-gate', 'Merge gates'), ('targeted-test', 'Targeted runs'), ('both', 'Both')])
         self.assertEqual([table['right'] for table in data['prices']],

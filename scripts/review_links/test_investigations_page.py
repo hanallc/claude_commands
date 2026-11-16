@@ -13,6 +13,7 @@ from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import urlencode
 
+from scripts.review_links.test_page_frame import assert_status_states
 from scripts.production import investigation, staff
 from scripts.review_links import console, investigations_page
 
@@ -51,6 +52,7 @@ class InvestigationsPageTests(unittest.TestCase):
         _ = investigation.answer(ORPHAN, read.id, "An answer.")
         _ = investigation.mark_read(ORPHAN, read.id)
         body = investigations_page.render(self.root / "reviews").decode()
+        assert_status_states(self, body, 15)
         self.assertEqual(body.count("<article "), 3)
         self.assertEqual(body.count(">Mark read</button>"), 1)
         for part in ('Find the cause &lt;now&gt;', '<h3>Answer</h3>', '<ol>', 'Waiting for an answer',

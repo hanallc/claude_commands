@@ -15,6 +15,7 @@ from scripts.build_queue import memory_feed, progress_profile as progress
 from scripts.lint.memory_test_support import admission_policy_fixture
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import test_hang_guard
+from scripts.review_links import page_frame
 GIB = admission_records.GIB
 MIB = 1024 ** 2
 RAM_FIXTURE: dict[str, object] = {
@@ -38,7 +39,7 @@ class MemoryHoverTests(unittest.TestCase):
     def test_builds_page_has_no_navigation_or_framing_restriction(self) -> None:
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         self.assertIn("<title>Builds</title>", page)
-        self.assertIn('<h1 class="page-title">Builds</h1>', page)
+        self.assertIn('<h1 class="page-title">Builds</h1>', page_frame.template(page, "Builds", "builds"))
         elements: list[tuple[str, dict[str, str]]] = []
 
         def collect(tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -616,15 +617,19 @@ class MemoryHoverTests(unittest.TestCase):
         loop = html[html.index("const consoleHidden ="):html.index("</script>")]
         javascript = """
 const calls = [];
-let listener = null;
+const listeners = [];
 const parent = {name: "console"};
 const location = {origin: "http://natedev:8080", pathname: "/memory_live.html"};
 const window = {frameElement: JSON.parse(process.argv[1])};
 const SECONDS = 5;
 const fetch = url => { calls.push(String(url).split("?")[0]); return new Promise(() => {}); };
-const setInterval = () => 0;
-const addEventListener = (kind, handler) => { listener = handler; };
-""" + loop + """
+const setInterval = () => 0, clearInterval = () => {}, setTimeout = () => 0, clearTimeout = () => {};
+const performance = {now:()=>0,getEntriesByType:()=>[]};
+const document = {visibilityState:'visible',querySelector:()=>null,addEventListener:()=>{}};
+const addEventListener = (kind, handler) => { listeners.push(handler); };
+window.addEventListener = addEventListener;
+const listener = event => listeners.forEach(run=>run(event));
+""" + page_frame.REFRESH_SCRIPT + loop + """
 const loaded = calls.length;
 listener({source: {}, origin: location.origin, data: "console-shown"});
 listener({source: parent, origin: "http://other", data: "console-shown"});
@@ -649,7 +654,7 @@ process.stdout.write(JSON.stringify([loaded, foreign, calls.length, calls.slice(
         constants = html[html.index("const f1 ="):html.index("function setSeg(")]
         if walk:
             functions += html[html.index("function renderWalk(d)"):html.index("function fitAxisLabels()")]
-            functions += html[html.index("function esc(s)"):html.index("let lastRead =")]
+            functions += html[html.index("function esc(s)"):html.index("const consoleHidden =")]
             constants += """
 const elements = new Map();
 const $ = id => {

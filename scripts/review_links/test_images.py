@@ -18,6 +18,7 @@ from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode
 
+from scripts.review_links.test_page_frame import assert_status_states
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member
@@ -211,8 +212,9 @@ class ImagesTests(ImagesFixture):
         self.assertEqual(source.count(page_frame.ZOOM_STYLE), 1)
         self.assertEqual(source.count(page_frame.ZOOM_SCRIPT), 1)
         self.assertEqual(source.count(page_frame.MOTION_SCRIPT), 1)
+        assert_status_states(self, source, 0)
         self.assertEqual(source.count(page_frame.REFRESH_SCRIPT), 1)
-        self.assertIn("createPageRefresh(refresh);", source)
+        self.assertIn("createPageRefresh(refresh,()=>0);", source)
         self.assertIn("prefers-reduced-motion: reduce", source)
         self.assertLess(source.index(older["id"]), source.index(newer["id"]))
         self.assertIn('<nav data-image-groups aria-label="Image groups"></nav>', source)
