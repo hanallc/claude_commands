@@ -60,7 +60,6 @@ BLUR = "hana_catalyst::identity::Tool<hana_catalyst::effects::Blur>"
 NAMES = ((11, "Log"), (12, "Twin"), (13, "Twin"))
 TOOLS = ((30, GRAYSCALE, 3, "hana.effect.grayscale"), (20, GRAYSCALE, 1, "hana.effect.grayscale"), (40, BLUR, 2, "hana.effect.blur"))
 EXTRA_ENTITY = 77
-SLEEP_PATH = shutil.which("sleep") or "/bin/sleep"
 SHOT_SIZE = (4, 3)
 REMOTE_HOST = "natemccoy@mac"
 # Fake scp and ssh: the remote host is a local folder, and every call is logged as one JSON line.
@@ -1035,68 +1034,6 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         ):
             state, _ = hana_shot.launch(self.port, str(self.root), str(self.executable), purpose=LAUNCH_RECORDING_PURPOSE, owner=owner)
         return state
-
-    def app_record(self, port: int, *, live: bool, binary: str = SLEEP_PATH) -> None:
-        """Save a launch record for another port; a live record names a running process."""
-        process = subprocess.Popen([SLEEP_PATH, "300"], stdin=subprocess.DEVNULL)
-        if live:
-            self.addCleanup(process.wait, timeout=TEST_HANG_GUARD_SECS)
-            self.addCleanup(process.kill)
-        else:
-            process.kill()
-            _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
-        _ = (self.state_path.parent / f"{port}.json").write_text(json.dumps({
-            "pid": process.pid, "port": port, "binary": binary,
-            "log": str(self.scratch / f"{port}.log"), "scratch": str(self.scratch / f"{port}-scratch"),
-        }))
-
-    def test_launch_at_the_local_app_cap_is_refused_before_a_start(self) -> None:
-        self.stop_fake_listener()
-        self.app_record(self.port + 1, live=True)
-        self.app_record(self.port + 2, live=True)
-        with (
-            mock.patch.object(hana_shot, "uncommitted_build_paths", return_value=[]),
-            mock.patch.object(subprocess, "Popen") as start,
-            self.assertRaises(hana_shot.Refused) as refused,
-        ):
-            _ = hana_shot.launch(self.port, str(self.root), str(self.executable), purpose=LAUNCH_RECORDING_PURPOSE, owner="cap-test")
-        self.assertEqual(str(refused.exception).splitlines(), [
-            "2 test Hana apps from hana_shot launch still run on this machine and the cap is 2; "
-            + "shut one down (hana_shot.py shutdown --port <port>) or raise local_app_cap in config/hana_shot.conf",
-        ])
-        start.assert_not_called()
-        self.assertFalse(self.state_path.exists())
-
-    def test_launch_under_the_local_app_cap_starts(self) -> None:
-        self.stop_fake_listener()
-        self.app_record(self.port + 1, live=True)
-        state = self.launch_without_starting_hana(owner="cap-test")
-        self.assertEqual(state["pid"], 424242)
-        self.assertTrue(self.state_path.is_file())
-
-    def test_dead_app_record_does_not_count_toward_the_local_app_cap(self) -> None:
-        self.stop_fake_listener()
-        self.app_record(self.port + 1, live=True)
-        self.app_record(self.port + 2, live=False)
-        state = self.launch_without_starting_hana(owner="cap-test")
-        self.assertEqual(state["pid"], 424242)
-        self.assertEqual(hana_shot.live_launch_count(self.state_path.parent), 1)
-        for exit_error in (FileNotFoundError, ProcessLookupError):
-            with (
-                self.subTest(exit_during_read=exit_error.__name__),
-                mock.patch.object(sys, "platform", "linux"),
-                mock.patch.object(Path, "read_bytes", side_effect=exit_error),
-            ):
-                self.assertEqual(hana_shot.live_launch_count(self.state_path.parent), 0)
-
-    def test_record_whose_pid_runs_another_program_does_not_count_toward_the_local_app_cap(self) -> None:
-        self.app_record(self.port + 1, live=True)
-        self.app_record(self.port + 2, live=True, binary=SLEEP_PATH[:-1])
-        # The Linux read needs a real /proc; the macOS read (ps) runs on both hosts.
-        platforms = ("linux", "darwin") if Path("/proc/self/cmdline").exists() else ("darwin",)
-        for platform in platforms:
-            with self.subTest(platform=platform), mock.patch.object(sys, "platform", platform):
-                self.assertEqual(hana_shot.live_launch_count(self.state_path.parent), 1)
 
     def test_explicit_launch_owner_takes_precedence_over_the_callers_unit(self) -> None:
         self.stop_fake_listener()

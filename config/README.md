@@ -262,7 +262,6 @@ Mac host and SSH settings remain in `mac_test.conf`.
 | `dirty_path_limit` | Maximum dirty build paths in a label. |
 | `fit_iterations` | Maximum iterations when measuring the current margin. |
 | `default_margin` | Default clear viewport fraction on each side. |
-| `local_app_cap` | Maximum test Hana apps from `hana_shot.py launch` that run at once on this machine. A launch at the cap is refused. |
 
 ## mac_test.conf
 
