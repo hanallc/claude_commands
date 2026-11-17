@@ -503,13 +503,22 @@ def _prune_finished_locked(runs: Path) -> list[str]:
     return removed
 
 
+def _run_record_paths(runs: Path) -> list[Path]:
+    """List run records; only an absent folder counts as empty."""
+    try:
+        with os.scandir(runs) as entries:
+            return sorted(runs / entry.name for entry in entries if entry.name.endswith(".json"))
+    except FileNotFoundError:
+        return []
+
+
 def live_twin(runs: Path, worker: str, command: list[str], tree_key: str) -> RunRecord | None:
     """A running record of the same worker, command, folder and tree key whose supervisor lives.
     After an interrupt on 2026-10-21, hana_catalyst-inspectors started its lint run three times
     on one tree; each run took memory, the cargo token and build time."""
     if not tree_key:
         return None
-    for path in sorted(runs.glob("*.json")):
+    for path in _run_record_paths(runs):
         raw = worker_lifecycle.read_json_object(path)
         if (raw.get("status") == "running" and raw.get("worker") == worker and raw.get("command") == command
                 and raw.get("tree_key") == tree_key
@@ -521,7 +530,7 @@ def live_twin(runs: Path, worker: str, command: list[str], tree_key: str) -> Run
 def worker_runs(runs: Path, worker: str, *, since: float = 0) -> list[RunRecord]:
     """Read this worker's runs that started during the selected dispatch."""
     found: list[RunRecord] = []
-    for path in sorted(runs.glob("*.json")):
+    for path in _run_record_paths(runs):
         raw = worker_lifecycle.read_json_object(path)
         if raw.get("worker") == worker and _number(raw.get("started_at"), 0) >= since:
             found.append(cast(RunRecord, cast(object, raw)))
@@ -605,7 +614,11 @@ def _live_runs(runs: Path, owns: Callable[[dict[str, object]], bool]) -> LiveRun
     """Read each record once and check its owner and supervisor."""
     found: list[RunRecord] = []
     errors: list[LiveRunReadError] = []
-    for path in sorted(runs.glob("*.json")):
+    try:
+        paths = _run_record_paths(runs)
+    except OSError as error:
+        return LiveRunEvidence((), (LiveRunReadError(runs, error),))
+    for path in paths:
         try:
             raw = worker_lifecycle.read_json_object(path)
         except (OSError, ValueError) as error:
