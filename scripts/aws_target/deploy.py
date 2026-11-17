@@ -639,6 +639,8 @@ class Deployment:
             _ = api.call('wait', 'stack-create-complete' if kind == 'CREATE' else 'stack-update-complete',
                          '--stack-name', settings.stack_name, service='cloudformation', timeout_s=timeout)
         except (AwsUnavailable, subprocess.SubprocessError) as error:
+            # Read the failed resources before a stack delete makes the events unreadable by name.
+            reason = '\n'.join([str(error), *failed_stack_events(api, settings.stack_name, started)])
             tag = ('HanaDeployment', parameters['DeploymentId'])
             try:
                 ended = spot_end.end_boxes(api, tag, keep=keep)
@@ -650,8 +652,8 @@ class Deployment:
                                  service='cloudformation', timeout_s=timeout)
                 retained.delete(api, kept, wait_s=timeout)
             except (AwsUnavailable, subprocess.SubprocessError, spot_end.SpotEndIncomplete) as end_error:
-                raise AwsUnavailable(f'{error}\nthe failed Hana change did not remove what it made: {end_error}') from None
-            raise AwsUnavailable(f'{error}\nthe failed Hana change ended {ended} Spot boxes and their requests, '
+                raise AwsUnavailable(f'{reason}\nthe failed Hana change did not remove what it made: {end_error}') from None
+            raise AwsUnavailable(f'{reason}\nthe failed Hana change ended {ended} Spot boxes and their requests, '
                                  + f'and deleted {len(kept.volumes)} disks and {len(kept.buckets)} buckets') from None
 
     def hana_down(self, *, approve_destroy: bool = False) -> bool:
@@ -1572,7 +1574,7 @@ def failed_stack_events(api: AwsCli, stack: str, started: float) -> list[str]:
                 lines.append(f"{ledger.text(event, 'LogicalResourceId')} ({ledger.text(event, 'ResourceType')}): "
                              + f"{status}: {event.get('ResourceStatusReason', '')}")
         return lines
-    except (ValueError, AwsUnavailable, subprocess.SubprocessError):
+    except (ValueError, OSError, AwsUnavailable, subprocess.SubprocessError):
         return ['stack events are unavailable']
 
 
