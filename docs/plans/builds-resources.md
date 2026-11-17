@@ -2689,8 +2689,12 @@ The cutover removal commit deletes the script after the run.
 
 **Files:** `scripts/buildlog/test_record.py`, `scripts/buildlog/test_test_phase_peak.py`.
 
-### Phase 141 — Helper copies include scripts/aws_target  · status: todo
+### Phase 141 — Helper copies include scripts/aws_target  · status: done
 
-Since Hana E-G, `build_targets.py` imports `scripts.aws_target.hana_placement`. Tests that copy helper trees (`scripts/lib/helper_tree_test_support.py` `COPY_HELPERS`) lacked `scripts/aws_target`, and 197 tests failed in the 8–140 set on main. Row 140 of that set (`cc1002178`) adds the package; this phase brings the same line to this branch and gets it a blind review.
+#### As-built
+
+- `COPY_HELPERS` (`scripts/lib/helper_tree_test_support.py`) copies `scripts/aws_target`; `VERIFY_HELPERS` inherits it. Since Hana E-G, `build_targets.py` imports `scripts.aws_target.hana_placement`, and 197 tests in the 8–140 set failed without it. Row 140 of that set (`cc1002178`) carries the same line.
+- The copy adds 48 files (about 1 MB) per fixture; `hana_placement` loads other package modules on demand, so a smaller copy fails.
+- Checkpoint `5b376a860`: 30 importer modules, 399 tests pass; basedpyright 0. Blind review: APPROVE, no findings.
 
 **Files:** `scripts/lib/helper_tree_test_support.py`.
