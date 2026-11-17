@@ -10,18 +10,22 @@ import argparse
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 import re
+import select
 import shutil
 import subprocess
 import sys
 import time
 from typing import Literal, TypedDict, cast
 
-from scripts.lib import build_folders
+from scripts.lib import build_folders, conf
+from scripts.lib.descendants import adopt_descendants
 from scripts.lib.terminal_cells import print_table, seconds
 from scripts.production.merge_gate import test_module_environment
+from scripts.test_times import task_cpu
 
 
 @dataclass(frozen=True)
@@ -93,20 +97,57 @@ def runner_command(tree: Path, module: str) -> list[str]:
     return [sys.executable, str(tree / "scripts/test_times/module_run.py"), f"scripts/{folder}", filename]
 
 
-def measure(tree: Path, module: str, strace: str) -> ModuleCost:
+def reap_stage_children(child: subprocess.Popen[str]) -> None:
+    """Reap exited children, including orphans that this process adopted."""
+    while True:
+        try:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if not pid:
+            return
+        if pid == child.pid:
+            child.returncode = os.waitstatus_to_exitcode(status)
+
+
+def wait_for_stage(child: subprocess.Popen[str], timeout_s: float) -> tuple[int, float]:
+    """Return the stage status and CPU after a bounded wait."""
+    deadline = time.monotonic() + timeout_s
+    pending: tuple[str, ...] = ()
+    descriptor = os.pidfd_open(child.pid)
+    try:
+        ended = select.poll()
+        ended.register(descriptor, select.POLLIN)
+        if ended.poll(math.ceil(max(0, deadline - time.monotonic()) * 1000)):
+            pid, status, usage = os.wait4(child.pid, os.WNOHANG)
+            if pid:
+                child.returncode = os.waitstatus_to_exitcode(status)
+                return child.returncode, usage.ru_utime + usage.ru_stime
+    finally:
+        os.close(descriptor)
+        try:
+            if child.returncode is None:
+                pending = task_cpu.stop_pending()
+        finally:
+            reap_stage_children(child)
+    raise task_cpu.MeasurementTimeout(timeout_s, pending)
+
+
+def measure(tree: Path, module: str, strace: str, timeout_s: float) -> ModuleCost:
     command = runner_command(tree, module)
     with build_folders.tool_folder("module-cost") as temporary:
         root = Path(temporary)
         environment = test_module_environment(root, dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
         report = root / "times.json"
         environment["TEST_TIMES_OUT"] = str(report)
+        lock_fd = build_folders.build_folder_lock_fd(root)
         with (root / "time.log").open("w+") as output:
+            print(f"{module}: starting time run", file=sys.stderr, flush=True)
             started = time.perf_counter()
-            with subprocess.Popen(command, cwd=tree, env=environment,
-                                  stdout=output, stderr=subprocess.STDOUT,
-                                  pass_fds=(build_folders.build_folder_lock_fd(root),)) as child:
-                _, status, usage = os.wait4(child.pid, 0)
-                child.returncode = test_status = os.waitstatus_to_exitcode(status)
+            child = subprocess.Popen(command, cwd=tree, env=environment,
+                                     stdout=output, stderr=subprocess.STDOUT, text=True,
+                                     pass_fds=(lock_fd,), start_new_session=True)
+            test_status, cpu_s = wait_for_stage(child, timeout_s)
             wall_s = time.perf_counter() - started
             if test_status:
                 _ = output.seek(0)
@@ -119,17 +160,20 @@ def measure(tree: Path, module: str, strace: str) -> ModuleCost:
         trace = root / "starts.trace"
         trace.touch()
         with (root / "trace.log").open("w+") as output:
-            traced = subprocess.run(
-                [strace, "-f", "-e", "trace=fork,vfork,clone,clone3,execve", "-o", str(trace), *command],
-                cwd=tree, env=environment, stdout=output, stderr=subprocess.STDOUT, check=False,
-                pass_fds=(build_folders.build_folder_lock_fd(root),),
+            print(f"{module}: starting trace run", file=sys.stderr, flush=True)
+            traced = subprocess.Popen(
+                [strace, "--kill-on-exit", "-f", "-e", "trace=fork,vfork,clone,clone3,execve", "-o", str(trace),
+                 *command],
+                cwd=tree, env=environment, stdout=output, stderr=subprocess.STDOUT, text=True,
+                pass_fds=(lock_fd,), start_new_session=True,
             )
-            if traced.returncode:
+            trace_status, _ = wait_for_stage(traced, timeout_s)
+            if trace_status:
                 _ = output.seek(0)
                 _ = shutil.copyfileobj(output, sys.stderr)
         with trace.open() as lines:
             starts = count_starts(lines)
-    return ModuleCost(module, usage.ru_utime + usage.ru_stime, starts, wall_s, test_status, traced.returncode, tests)
+    return ModuleCost(module, cpu_s, starts, wall_s, test_status, trace_status, tests)
 
 
 @dataclass(init=False)
@@ -141,6 +185,7 @@ class CostArguments(argparse.Namespace):
 
 
 def main(argv: list[str] | None = None) -> int:
+    _ = adopt_descendants()
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--tree", type=Path, required=True)
     _ = parser.add_argument("--tests", type=int, default=0, metavar="N")
@@ -151,7 +196,16 @@ def main(argv: list[str] | None = None) -> int:
     if strace is None:
         print("module_cost: strace is not on PATH", file=sys.stderr)
         return 2
-    costs = [measure(request.tree.resolve(), module, strace) for module in request.modules]
+    try:
+        return report_costs(request, strace, task_cpu.measurement_timeout_s())
+    except (conf.Unusable, task_cpu.MeasurementTimeout, task_cpu.LeftoverProcesses) as error:
+        print(f"module_cost: {error}", file=sys.stderr, flush=True)
+        return 1
+
+
+def report_costs(request: CostArguments, strace: str, timeout_s: float) -> int:
+    tree = request.tree.resolve()
+    costs = [measure(tree, module, strace, timeout_s) for module in request.modules]
     passed = all(cost.passed for cost in costs)
     total = ["total", seconds(sum(cost.cpu_s for cost in costs)),
              str(sum(cost.starts.processes for cost in costs)), str(sum(cost.starts.execs for cost in costs)),
@@ -165,14 +219,13 @@ def main(argv: list[str] | None = None) -> int:
                 for row in sorted(cost.tests, key=lambda row: (-row["cpu_s"], row["test"]))[:request.tests]]
         print_table(["module", "test or fixture", "kind", "CPU s", "wall s"], rows)
     if request.commands:
-        from scripts.test_times import task_cpu
-
         for cost in costs:
-            command = runner_command(request.tree.resolve(), cost.module)
+            command = runner_command(tree, cost.module)
             with build_folders.tool_folder("module-cost-commands") as temporary:
                 environment = test_module_environment(Path(temporary), dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
                 _ = environment.pop("TEST_TIMES_OUT", None)
-                tasks = task_cpu.measure(command, cwd=request.tree.resolve(), environment=environment,
+                print(f"{cost.module}: starting command run", file=sys.stderr, flush=True)
+                tasks = task_cpu.measure(command, cwd=tree, environment=environment, timeout_s=timeout_s,
                                          pass_fds=(build_folders.build_folder_lock_fd(temporary),))
             print_table([cost.module + " command", "starts", "CPU s"],
                         [[row.command, str(row.starts), seconds(row.cpu_s)]

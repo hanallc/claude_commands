@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from scripts.lib.checkout_test_support import copy_test_runner
 
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout, suppress
 import io
 import os
 from pathlib import Path
@@ -14,9 +14,11 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
+from scripts.lib.descendants import adopt_descendants
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.test_times import module_cost, task_cpu
 
@@ -53,6 +55,124 @@ class ModuleCostTests(unittest.TestCase):
         for arguments, expected in samples:
             with self.subTest(arguments=arguments):
                 self.assertEqual(task_cpu.command_name(arguments), expected)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux is required")
+    def test_command_leftover_limit_names_and_stops_a_live_orphan(self) -> None:
+        _ = adopt_descendants()
+        with tempfile.TemporaryDirectory() as temporary:
+            tree = Path(temporary)
+            script = tree / "paused_orphan.py"
+            pid_file = tree / "orphan.pid"
+            _ = script.write_text(
+                "import os, signal\nfrom pathlib import Path\n"
+                + "reader, writer = os.pipe()\n"
+                + "if os.fork():\n    os.read(reader, 1)\n    os._exit(0)\n"
+                + "os.setsid()\n"
+                + f"Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+                + "os.write(writer, b'1')\nsignal.pause()\n", encoding="utf-8")
+            started = time.monotonic()
+            with self.assertRaises(task_cpu.LeftoverProcesses) as failure:
+                _ = task_cpu.measure([sys.executable, str(script)], cwd=tree,
+                                     environment=dict(os.environ), timeout_s=60)
+            self.assertLess(time.monotonic() - started, 10)
+            pid = int(pid_file.read_text())
+            self.assertIn(f"left processes after the test ended: {pid} ({sys.executable} {script})",
+                          str(failure.exception))
+            try:
+                state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            except FileNotFoundError:
+                state = "Z"
+            self.assertEqual(state, "Z")
+
+    @unittest.skipUnless(sys.platform == "linux" and shutil.which("strace"), "Linux and strace are required")
+    def test_stage_deadlines_remove_the_tool_folder_and_lock(self) -> None:
+        conditions = {
+            "time": "True",
+            "trace": "'TEST_TIMES_OUT' not in os.environ",
+            "command": "'module-cost-commands' in os.environ['BUILDLOG_DIR']",
+        }
+        for stage, condition in conditions.items():
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary:
+                tree = Path(temporary)
+                script = tree / "paused_stage.py"
+                _ = script.write_text(
+                    "import os, signal\n"
+                    + f"if {condition}:\n    signal.pause()\n", encoding="utf-8")
+                output = io.StringIO()
+                with (mock.patch.dict(os.environ, {"TMPDIR": temporary}),
+                      mock.patch.object(module_cost, "runner_command", return_value=[sys.executable, str(script)]),
+                      mock.patch.object(task_cpu, "measurement_timeout_s", return_value=0.5),
+                      redirect_stderr(output),
+                      redirect_stdout(io.StringIO())):
+                    status = module_cost.main(["--tree", temporary, "--commands", "10", "fixture/test_pause.py"])
+                self.assertEqual(status, 1, output.getvalue())
+                self.assertIn(f"starting {stage} run", output.getvalue())
+                failures = [line for line in output.getvalue().splitlines() if line.startswith("module_cost:")]
+                self.assertEqual(len(failures), 1, output.getvalue())
+                self.assertIn("timed out after 0.5 s", failures[0])
+                self.assertIn(f"{sys.executable} {script}", failures[0])
+                self.assertEqual(list(tree.iterdir()), [script])
+
+    @unittest.skipUnless(sys.platform == "linux" and shutil.which("strace"), "Linux and strace are required")
+    def test_time_deadline_stops_children_forked_during_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as sockets:
+            tree = Path(temporary)
+            address = "\0module-cost-" + tree.name
+            listener = sockets.enter_context(socket.socket(socket.AF_UNIX))
+            listener.bind(address)
+            listener.listen()
+            listener.settimeout(TEST_HANG_GUARD_SECS)
+            script = tree / "fork_during_cleanup.py"
+            _ = script.write_text(
+                "import os, signal, socket\n"
+                + "with socket.socket(socket.AF_UNIX) as peer:\n"
+                + f"    peer.connect({address!r})\n"
+                + "    while peer.recv(1):\n"
+                + "        if os.fork() == 0:\n"
+                + "            os.setsid()\n"
+                + "            peer.sendall(f'{os.getpid()}\\n'.encode())\n"
+                + "            peer.close()\n"
+                + "            signal.pause()\n"
+                + "            os._exit(0)\n", encoding="utf-8")
+            children: dict[int, int] = {}
+            send_signal = signal.pidfd_send_signal
+
+            def fork_before_kill(descriptor: int, sig: int) -> None:
+                if not children:
+                    # Cleanup already took its first process snapshot.
+                    peer = sockets.enter_context(listener.accept()[0])
+                    peer.settimeout(TEST_HANG_GUARD_SECS)
+                    with peer.makefile("r") as replies:
+                        for _ in range(3):
+                            peer.sendall(b"1")
+                            pid = int(replies.readline())
+                            children[pid] = os.pidfd_open(pid)
+                send_signal(descriptor, sig)
+
+            output = io.StringIO()
+            try:
+                with (mock.patch.dict(os.environ, {"TMPDIR": temporary}),
+                      mock.patch.object(module_cost, "runner_command", return_value=[sys.executable, str(script)]),
+                      mock.patch.object(task_cpu, "measurement_timeout_s", return_value=1),
+                      mock.patch.object(signal, "pidfd_send_signal", side_effect=fork_before_kill),
+                      redirect_stderr(output)):
+                    status = module_cost.main(["--tree", temporary, "fixture/test_fork.py"])
+                self.assertEqual(status, 1, output.getvalue())
+                self.assertIn("timed out after 1 s", output.getvalue())
+                self.assertEqual(len(children), 3)
+                for pid, descriptor in children.items():
+                    with self.subTest(pid=pid):
+                        ended = select.poll()
+                        ended.register(descriptor, select.POLLIN)
+                        self.assertTrue(ended.poll(0), f"Child {pid} is still alive")
+                        self.assertEqual(output.getvalue().count(f"{pid} ({sys.executable} {script})"), 1)
+                        with self.assertRaises(ChildProcessError):
+                            _ = os.waitpid(pid, os.WNOHANG)
+            finally:
+                for descriptor in children.values():
+                    with suppress(ProcessLookupError):
+                        send_signal(descriptor, signal.SIGKILL)
+                    os.close(descriptor)
 
     @unittest.skipUnless(sys.platform == "linux" and shutil.which("strace"), "Linux and strace are required")
     def test_command_measure_preserves_a_child_group_stop(self) -> None:

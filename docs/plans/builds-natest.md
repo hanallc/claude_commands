@@ -4725,3 +4725,53 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `copy2` keeps the source time, so the bytecode header stays valid; Python sets the code file name to the copy path at load. Stale or absent bytecode compiles as before.
 - aws pair, 3 rounds: `mac_test/test_offload_lifecycle.py` 25.72 to 23.66 CPU s. `production/test_fast_track.py` and 8 more copy helper users stay within 0.9 CPU s of base. natedev drops with a warm tree were larger, because the aws box gets less from it.
 - Main-based commit d1efb206e (branch `natest-bytecode337`) went to builds. Product-side costs went to builds for their owners: the status line process chain, the offload and mac_test import weight, and the fast track git reads.
+
+### Phase 338 — module_cost stops at a deadline and never waits on a hung trace  · status: done
+**Depends on:** none
+**Owner:** natest (test-time tool).
+
+#### Work Order
+
+**Goal:** `module_cost.py` always ends. A run that cannot finish stops at a deadline, names what it waited for, and releases its tool folder lock.
+
+**Spec:**
+1. Anomaly, 2026-11-17 13:08 EST: `module_cost.py --tree /home/natepiano/worktrees/phases production/test_fast_track.py --commands 10` hung 58 minutes with an empty log. It sat in `wait4` with no test child and held `/tmp/module-cost-commands.lock`. Run record: `/tmp/claude/unit/29fc6964-2d74-4547-8edd-8764df425c44/detached_runs/20261117T130814-2324224-3a1b.json`. The commands lock file has time 13:11, so the hang is in the `--commands` run: `task_cpu.measure`.
+2. `task_cpu.measure` traces with ptrace and loops on `os.waitpid(-1, __WALL)` until `ChildProcessError`. Every tracee stays a wait child of the tracer, also an orphan that the test left. The loop has no deadline.
+3. `measure` in `module_cost.py` calls `os.wait4(child.pid, 0)` with no deadline.
+4. First find the cause: reproduce, and name the process that kept the wait open, its state and its origin. Then repair it at the cause.
+5. Every wait in `module_cost.py` and `task_cpu.py` has a deadline from `config/test_times.conf`. At the deadline the tool stops what it started, names each process it still waited for, prints a failure line and exits nonzero. The tool folder and its lock go away when the run ends.
+6. The log is not empty while the tool runs: print one line when each module's time, trace and command runs start.
+7. The lock is in `/tmp` because the caller set `TMPDIR=/tmp` (`systemd-run -E TMPDIR=/tmp`). `build_folders.tool_folder` uses the caller's temporary parent. Change nothing there in this phase.
+
+**Files:** `scripts/test_times/task_cpu.py`, `scripts/test_times/module_cost.py`, `scripts/test_times/test_module_cost.py`, a new test for `task_cpu.py` if it has none, `config/test_times.conf`.
+
+**Workers:** 1 writer: `impl` holds all files; the files are one small tool.
+
+**Acceptance gate:**
+- A fixture command that leaves a live orphan makes `task_cpu.measure` stop at the deadline and name the orphan.
+- `module_cost.py production/test_fast_track.py --commands 10` on main ends, with the cause repaired.
+- The test_times tests pass; basedpyright reports 0 errors and 0 warnings on the changed files.
+
+### Phase 339 — module_cost measures in its own process and counts starts with one tracer
+**Depends on:** Phase 338
+
+#### Work Order
+
+**Goal:** module_cost cleanup can reach only the processes of its own measurement, and one tracer gives both the command rows and the start counts.
+
+**Spec:**
+1. Run the measurement stages in a dedicated child process that adopts orphans. Cleanup and zombie reaping act only in that process. An in-process caller of `module_cost.main` keeps its own children (finding F009 of phase 338).
+2. End cleanup only after a scan that follows a reap finds no live descendant, so a child forked during a scan cannot survive.
+3. Count process starts and execs with `task_cpu` ptrace events and remove the strace stage. The strace stage waits the whole stage limit for a leftover process, and it runs the module one more time.
+4. Every behavior check stays.
+
+**Files:** `scripts/test_times/task_cpu.py`, `scripts/test_times/module_cost.py`, `scripts/test_times/test_module_cost.py`.
+
+**Workers:** 1 writer. The files share one measurement path and do not split.
+- `impl`: all files.
+- `test`: opens as impl.
+
+**Acceptance gate:**
+- A caller child started before `module_cost.main` lives on after a measurement timeout and keeps its exit status.
+- `module_cost.py production/test_fast_track.py` reports the same start counts with no strace stage, and its own CPU is lower.
+- The test_times tests pass; basedpyright reports 0 errors and 0 warnings on the changed files.
