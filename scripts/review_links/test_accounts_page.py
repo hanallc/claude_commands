@@ -86,9 +86,10 @@ MENU_PROBE = '''<script>
   check(document.querySelectorAll('tr[data-move-group]').length===1 && groupRow().dataset.moveAccount==='claude1'
    && groupRow().dataset.moveGroup==='units','only the selected Claude group line takes the menu');
   check(document.querySelectorAll('[data-next-button]').length===1,'only the selected Claude line has a button');
-  const rightClick=new MouseEvent('contextmenu',{bubbles:true,cancelable:true});
-  groupRow().cells[3].dispatchEvent(rightClick);
-  check(!rightClick.defaultPrevented && menu.hidden,'a right click keeps the browser menu');
+  const keepsBrowserMenu=cell=>cell.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true})) && menu.hidden;
+  const unselected=document.querySelector('[data-color-key="account.claude2"]').closest('tr');
+  check(keepsBrowserMenu(groupRow().cells[3]),'the selected row keeps the browser menu');
+  check(keepsBrowserMenu(unselected.cells[1]),'the unselected row keeps the browser menu');
   open();
   check(!menu.hidden && button().getAttribute('aria-expanded')==='true','a click opens the menu');
   check(menu.querySelector('[data-move-title]').textContent==='When claude1 reaches 1%, move units to',
@@ -845,10 +846,14 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   const action=name=>popup.querySelector('[data-color-'+name+']');
   const original=label().style.color, originalSwatch=swatch.style.background;
   const row=swatch.closest('tr'), cell=swatch.closest('td');
-  const heads=[...document.querySelectorAll('thead th')].map(head=>head.textContent);
-  check(cell===row.cells[2] && row.cells[1].contains(label()) && heads[1].startsWith('account') && heads[2]==='' && heads[3].startsWith('left'),
+  const heads=[...document.querySelectorAll('thead th')].map(head=>{
+   const copy=head.cloneNode(true);
+   copy.querySelector('.sort-arrow')?.remove();
+   return copy.textContent;
+  });
+  check(cell===row.cells[2] && row.cells[1].contains(label()) && heads[1]==='account' && heads[2]==='' && heads[3]==='left',
    'the swatch column without a heading sits between account and left');
-  check(heads[4].startsWith('role') && heads[5]==='' && heads[6]==='next' && heads[7].startsWith('busy'),
+  check(heads[4]==='role' && heads[5]==='' && heads[6]==='next' && heads[7]==='busy',
    'the next column follows the role swatch and precedes busy');
   check(getComputedStyle(cell).textAlign==='left' && getComputedStyle(swatch).marginLeft==='0px' &&
    Math.abs(swatch.getBoundingClientRect().left-cell.getBoundingClientRect().left-parseFloat(getComputedStyle(cell).paddingLeft))<1,
