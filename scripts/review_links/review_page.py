@@ -227,9 +227,12 @@ def render(root: Path, *, show: str = 'open') -> bytes:
     settings = conf.read('review_links')
     words_rows = settings.whole('review_words_rows')
     entries = filter_index(records, members, now)
-    options = ''.join(f'<option value="{html.escape(owner, quote=True)}" data-owner-name="{html.escape(name, quote=True)}"'
-                     +f'{names.style(owner)}>{html.escape(name)}</option>'
-                     for owner, name in sorted(owners.items(), key=lambda pair:pair[1].casefold()))
+    owner_chips = '<button id="review-owner-all" type="button" data-owner-chip="" aria-pressed="true">All <b></b></button>'
+    for owner, name in sorted(owners.items(), key=lambda pair:pair[1].casefold()):
+        identity = html.escape(owner, quote=True)
+        owner_chips += (f'<button id="review-owner-id-{identity}" type="button" data-owner-chip="{identity}"'
+                        f' data-owner-name="{html.escape(name, quote=True)}" aria-pressed="false">'
+                        f'{names.html(owner, name)} <b></b></button>')
     chips = '<button id="review-type-all" type="button" data-type-chip="" aria-pressed="true">All <b></b></button>'
     chips += ''.join('<button id="review-type-'+kind+'" type="button" data-type-chip="'+kind+'" aria-pressed="false">'+icon(kind)+LABELS[kind]
                      +' <b></b></button>' for kind in TYPES)
@@ -241,8 +244,9 @@ def render(root: Path, *, show: str = 'open') -> bytes:
     content = (record_table.STYLE+STYLE+page_frame.title('Review', 'review')
         +f'<div data-review data-show="{show}" data-refresh-seconds="{settings.number("page_refresh_seconds")}">'
         +'<div class="review-types" role="group" aria-label="Type">'+chips+'</div>'
-        +'<div class="review-types review-shows" id="list-show" role="group" aria-label="Show">'+shows+'</div><div class="list-filters">'
-        +'<label for="list-owner">Owner</label><select id="list-owner"><option value="">All</option>'+options+'</select>'
+        +'<div class="review-types review-shows" id="list-show" role="group" aria-label="Show">'+shows+'</div>'
+        +'<div class="review-types" id="list-owner" role="group" aria-label="Owner">'+owner_chips+'</div>'
+        +'<div class="list-filters">'
         +'<label class="list-search-label" for="list-search">Search</label><input type="search" id="list-search" placeholder="Filter by id or words">'
         +'</div><script type="application/json" data-review-index>'+index_json(entries)+'</script>'
         +'<div class="list-table"><table aria-label="Review">'
@@ -341,16 +345,13 @@ let index=readIndex();
 function readIndex(){
  return new Map(JSON.parse(content.querySelector('[data-review-index]').textContent).map(entry=>[entry.key,entry]));
 }
-const ownerOptions=new WeakMap();
-function knownOwnerOptions(){
- const menu=content.querySelector('#list-owner');
- if(!ownerOptions.has(menu)) ownerOptions.set(menu,[...menu.options]);
- return ownerOptions.get(menu);
+function matchesOwner(entry,owner){
+ return !owner || entry.owner===owner || entry.type==='investigation' && entry.sourceOwner===owner;
 }
 function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys}){
  const linked=keys.has(entry.key);
  return (!keys.size || linked) && (linked || entry.hiddenUntil<=Date.now()) &&
-  (!owner || entry.owner===owner || entry.type==='investigation' && entry.sourceOwner===owner) &&
+  matchesOwner(entry,owner) &&
   (!type || entry.type===type) && (!sourceOwner || entry.sourceOwner===sourceOwner) &&
   (!query || entry.id.toLowerCase().includes(query) || entry.title.toLowerCase().includes(query)) &&
   (show==='all' || entry.state===(show==='open' ? 'Open' : show));
@@ -363,24 +364,11 @@ function savedEntry(key,result){
 const view=createRecordTable({content:()=>content,single:true,
  place:reviewPlace,
  resolveOwner:owner=>{
-  const option=knownOwnerOptions().find(option=>option.value===owner || option.dataset.ownerName===owner);
-  return option ? option.value : owner;
+  const button=[...content.querySelectorAll('[data-owner-chip]')].find(button=>
+   button.dataset.ownerChip===owner || button.dataset.ownerName===owner);
+  return button ? button.dataset.ownerChip : owner;
  },
  selectOwner:({owner,type,query,keys})=>matching({owner,type,query,keys}).length ? owner : '',
- filterOwner:(_items,{owner,show,type,query,sourceOwner,keys})=>{
-  const menu=content.querySelector('#list-owner');
-  const eligibleOwners=matching({type,query,keys});
-  const matchingOwners=matching({show,type,query,sourceOwner,keys});
-  const available=knownOwnerOptions().filter(option=>{
-   const count=matchingOwners.filter(entry=>!option.value || entry.owner===option.value ||
-    entry.type==='investigation' && entry.sourceOwner===option.value).length;
-   option.textContent=(option.dataset.ownerName || 'All')+' ('+count+')';
-   return !option.value || eligibleOwners.some(entry=>entry.owner===option.value ||
-    entry.type==='investigation' && entry.sourceOwner===option.value);
-  });
-  menu.replaceChildren(...available);
-  return available.some(option=>option.value===owner) ? owner : '';
- },
  shows:['open','Waiting','Done','all'],
  hasKey:key=>index.has(key),
  visible:(data,filters)=>!saved.has(data.key) && index.has(data.key) && matches(index.get(data.key),filters),
@@ -390,6 +378,13 @@ const view=createRecordTable({content:()=>content,single:true,
  },
  applied:(_items,{type,show,owner,query,sourceOwner,keys})=>{
   selectedShow=show;loadBodies();
+  const eligibleOwners=matching({type,query,keys});
+  const shownOwners=matching({show,type,query,keys});
+  content.querySelectorAll('[data-owner-chip]').forEach(button=>{
+   const value=button.dataset.ownerChip;
+   button.hidden=Boolean(value) && !eligibleOwners.some(entry=>matchesOwner(entry,value));
+   button.querySelector('b').textContent=shownOwners.filter(entry=>matchesOwner(entry,value)).length;
+  });
   content.querySelectorAll('[data-show-chip]').forEach(button=>{
    button.querySelector('b').textContent=matching({type,owner,query,sourceOwner,keys,show:button.dataset.showChip}).length;
   });
@@ -483,6 +478,8 @@ async function refresh(_supersede=false,current=()=>true){
  if(!fresh) throw new Error('The page has no review table.');
  if(saving || !current() || show!==selectedShow) return;
  const top=scrollY,restoreFocus=restoreFocusAfterRefresh();
+ const active=document.activeElement;
+ const focusedOwnerId=active?.hasAttribute('data-owner-chip') ? active.id : '';
  content.replaceWith(fresh);content=fresh;index=readIndex();
  for(const [key,result] of saved){
   const entry=index.get(key);
@@ -496,7 +493,10 @@ async function refresh(_supersede=false,current=()=>true){
  }
  for(const [key,result] of saved) savedEntry(key,result);
  bind();view.apply(false);
- restoreFocus();
+ const ownerChip=focusedOwnerId ? document.getElementById(focusedOwnerId) : null;
+ if(focusedOwnerId && (!ownerChip || ownerChip.hidden)){
+  content.querySelector('[data-owner-chip][aria-pressed="true"]')?.focus({preventScroll:true});
+ }else restoreFocus();
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
 }
 view.place();bind();view.apply();

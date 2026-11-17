@@ -31,6 +31,7 @@ from scripts.review_links import change_browser, change_page, console, record_ta
 from scripts.review_links import question_record
 from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, review_actions, review_later
+from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.statusline import counts_row
 
@@ -562,8 +563,9 @@ window.fetch=async(url,options)=>{
     [...document.querySelectorAll('[data-show-chip] b')].every(number=>!number.hidden),
     'All supplies the count for every Show chip');
   const groups=[...document.querySelectorAll('.review-types')],buttons=[...document.querySelectorAll('[data-show-chip]')];
-  check(groups.length===2 && groups[1].getBoundingClientRect().top>=groups[0].getBoundingClientRect().bottom,
-    'Show chips appear below the type chips');
+  check(groups.length===3 && groups[1].getBoundingClientRect().top>=groups[0].getBoundingClientRect().bottom &&
+    groups[2].getBoundingClientRect().top>=groups[1].getBoundingClientRect().bottom,
+    'Show follows Type and Owner follows Show');
   check(buttons.length===4 && buttons.every(button=>button.type==='button' && button.tabIndex===0),
     'Show chips use native keyboard buttons in tab order');
   chip('Waiting')?.focus();
@@ -571,7 +573,7 @@ window.fetch=async(url,options)=>{
   check(document.documentElement.scrollWidth<=innerWidth && groups.every(group=>
     getComputedStyle(group).gap==='8px' && [...group.querySelectorAll('button')].every(button=>{
      const box=button.getBoundingClientRect();return box.left>=0 && box.right<=innerWidth;
-    })),'both chip rows wrap with even spacing and no clipping');
+    })),'the three chip rows wrap with even spacing and no clipping');
 
   for(const spelling of ['For you','for-you','for you','FOR YOU']){
    const legacyShow=document.createElement('iframe');
@@ -585,45 +587,46 @@ window.fetch=async(url,options)=>{
     'the legacy Show spelling opens Open: '+spelling);
    legacyShow.remove();
   }
-  const menu=()=>document.querySelector('#list-owner');
-  const options=()=>[...menu().options];
-  const chooseOwner=value=>{menu().value=value;menu().dispatchEvent(new Event('change'));};
+  const ownerChip=(value,doc=document)=>doc.querySelector('[data-owner-chip="'+value+'"]');
+  const ownerChips=()=>[...document.querySelectorAll('[data-owner-chip]:not([hidden])')];
+  const selectedOwner=(doc=document)=>doc.querySelector('[data-owner-chip][aria-pressed="true"]');
+  const chooseOwner=value=>ownerChip(value).click();
   const chooseType=value=>document.querySelector('[data-type-chip="'+value+'"]').click();
   const builder=document.querySelector('[data-type="investigation"]').dataset.sourceOwner;
   chip('open').click();await flush();await flush();
   chooseOwner(builder);chooseType('question');
-  check(options().length===2 && options()[0].textContent==='All (1)' &&
-    options().some(option=>option.textContent==='page-owner (1)') &&
-    !options().some(option=>option.value===builder),
+  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 1' &&
+    ownerChips().some(button=>button.textContent==='page-owner 1') &&
+    ownerChip(builder).hidden,
     'F007: Owner lists only owners with the selected type and words in any Show.');
-  check(menu().value==='' && !new URLSearchParams(location.hash.slice(1)).get('owner') &&
+  check(selectedOwner().dataset.ownerChip==='' && !new URLSearchParams(location.hash.slice(1)).get('owner') &&
     ['open','Waiting','Done','all'].map(value=>count(value)?.textContent).join('|')==='1|0|0|1',
     'F007: an owner without the selected type resets to All with matching counts.');
   check([...document.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1,
     'F007: the question appears after the owner resets.');
   chooseType('investigation');
-  check(options().some(option=>option.value===builder) && options()[0].textContent==='All (1)',
+  check(ownerChips().some(button=>button.dataset.ownerChip===builder) && ownerChips()[0].textContent==='All 1',
     'a type change restores owners and counts');
   chooseOwner(builder);chip('Done').click();await flush();await flush();
-  check(options()[0].textContent==='All (1)' && menu().value===builder,
+  check(ownerChips()[0].textContent==='All 1' && selectedOwner().dataset.ownerChip===builder,
     'Show limits Owner counts and retains an owner with matching loaded rows');
   chip('open').click();await flush();await flush();
-  chooseType('question');chooseOwner(options().find(option=>option.dataset.ownerName==='page-owner')?.value);
+  chooseType('question');chooseOwner(ownerChips().find(button=>button.dataset.ownerName==='page-owner')?.dataset.ownerChip);
   chip('Waiting').click();await flush();await flush();
-  check(options().length===2 && options()[0].textContent==='All (0)' && menu().value!=='' &&
-    options()[1].textContent==='page-owner (0)',
+  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 0' && selectedOwner().dataset.ownerChip!=='' &&
+    ownerChips()[1].textContent==='page-owner 0',
     'Show retains the selected owner with a zero count.');
   chip('open').click();await flush();await flush();
-  check(options().length===2 && options()[0].textContent==='All (1)','Show restores matching owners');
+  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 1','Show restores matching owners');
   chooseType('investigation');chooseOwner(builder);
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
-  check(menu().value===builder && options()[0].textContent==='All (1)' &&
-    options().every(option=>!option.textContent.endsWith('(0)')),'refresh retains the matching owner list and selection');
+  check(selectedOwner().dataset.ownerChip===builder && ownerChips()[0].textContent==='All 1' &&
+    ownerChips().every(button=>button.querySelector('b').textContent!=='0'),'refresh retains the matching owner list and selection');
   const legacy=document.createElement('iframe');
   legacy.src='/reload#'+new URLSearchParams({owner:builder,type:'question',show:'open'});
   const legacyLoaded=new Promise(resolve=>legacy.addEventListener('load',resolve,{once:true}));document.body.append(legacy);
   await legacyLoaded;await flush();await flush();
-  check(legacy.contentDocument.querySelector('#list-owner').value==='' &&
+  check(selectedOwner(legacy.contentDocument).dataset.ownerChip==='' &&
     [...legacy.contentDocument.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1 &&
     !new URLSearchParams(legacy.contentWindow.location.hash.slice(1)).get('owner'),
     'F007: a legacy owner without the selected type resets to All.');legacy.remove();
@@ -631,31 +634,31 @@ window.fetch=async(url,options)=>{
   const navigated=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
   location.hash=new URLSearchParams({owner:'builder-unit',type:'investigation',show:'open'});
   await navigated;await flush();await flush();
-  check(menu().value===builder && [...document.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1,
-    'F004: hash navigation resolves an owner name whose option was hidden by Questions');
+  check(selectedOwner().dataset.ownerChip===builder && [...document.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1,
+    'F004: hash navigation resolves an owner name whose chip was hidden by Questions');
   const translated=document.createElement('iframe');
   translated.src='/reload#'+new URLSearchParams({legacy:'investigation',owner:'no-investigations',type:'investigation',show:'not-read'});
   const translatedLoaded=new Promise(resolve=>translated.addEventListener('load',resolve,{once:true}));
   document.body.append(translated);await translatedLoaded;await flush();await flush();
   const translatedPage=translated.contentDocument,translatedAddress=new URLSearchParams(translated.contentWindow.location.hash.slice(1));
-  check(translatedPage.querySelector('#list-owner').value==='' &&
-    translatedPage.querySelector('#list-owner').selectedOptions[0].textContent==='All (1)' &&
+  check(selectedOwner(translatedPage).dataset.ownerChip==='' &&
+    selectedOwner(translatedPage).textContent==='All 1' &&
     !translatedAddress.get('owner') && !translatedAddress.has('source-owner') &&
     [...translatedPage.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1 &&
     count('open',translatedPage)?.textContent==='1',
     'F003: a legacy investigation reset clears both owner constraints and shows the All rows');
   translated.remove();
-  chooseType('question');chooseOwner(options().find(option=>option.dataset.ownerName==='page-owner')?.value);
+  chooseType('question');chooseOwner(ownerChips().find(button=>button.dataset.ownerName==='page-owner')?.dataset.ownerChip);
   const question=document.querySelector('[data-type="question"]');question.querySelector('.list-toggle').click();
   const form=question.querySelector('[data-review-form]');form.elements.feedback.value='Use this layout.';
   form.querySelector('[value="answer"]').click();await new Promise(resolve=>nativeTimeout(resolve,1100));
-  check(options().length===2 && options()[0].textContent==='All (0)' && menu().value!=='' && question.hidden &&
+  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 0' && selectedOwner().dataset.ownerChip!=='' && question.hidden &&
     count('Done').textContent==='1',
     'A save retains the selected owner and moves its count to Done.');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
-  check(options().length===2 && options()[0].textContent==='All (0)' && menu().value!=='' &&
+  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 0' && selectedOwner().dataset.ownerChip!=='' &&
     count('Done').textContent==='1',
-    'Refresh retains the zero option for the selected owner.');
+    'Refresh retains the zero count for the selected owner.');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
@@ -733,26 +736,27 @@ window.fetch=async(url,options)=>{
   await flush();
   check(!document.querySelector('[data-list-count]'),'The Show chips replace the right count text.');
   check(counts('[data-show-chip]')==='3|1|1|5','The index counts states outside the rendered view.');
-  const owner=()=>document.querySelector('#list-owner');
+  const ownerChip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
+  const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
   const builder=document.querySelector('[data-type="change"]').dataset.sourceOwner;
-  const chooseOwner=value=>{owner().value=value;owner().dispatchEvent(new Event('change'));};
+  const chooseOwner=value=>ownerChip(value).click();
   show('all').click();await flush();await flush();
   chooseOwner(builder);
   check(counts('[data-show-chip]')==='0|1|0|1','Show counts use the selected owner.');
   check(type('change').querySelector('b').textContent==='0' && type('investigation').querySelector('b').textContent==='1',
    'Type counts use the selected owner.');
   type('change').click();
-  check(owner().value==='' && counts('[data-show-chip]')==='2|0|1|3',
+  check(selectedOwner().dataset.ownerChip==='' && counts('[data-show-chip]')==='2|0|1|3',
    'F007: an owner without the selected type resets to All.');
   type('investigation').click();
   chooseOwner(builder);show('open').click();await flush();await flush();
-  check(owner().value===builder && counts('[data-show-chip]')==='0|1|0|1' &&
+  check(selectedOwner().dataset.ownerChip===builder && counts('[data-show-chip]')==='0|1|0|1' &&
    [...document.querySelectorAll('[data-list-item]')].every(row=>row.hidden),
    'F007: the user case keeps an owner with rows in another Show.');
   show('all').click();await flush();await flush();
   check(counts('[data-show-chip]')==='0|1|0|1','Show counts combine the type and owner.');
   search('gate');
-  check(counts('[data-show-chip]')==='0|1|0|1' && owner().options[0].textContent==='All (1)',
+  check(counts('[data-show-chip]')==='0|1|0|1' && ownerChip('').textContent==='All 1',
    'All counts combine the words, owner, type and Show filters.');
   search('');chooseOwner('');type('').click();show('open').click();await flush();await flush();
   type('change').click();
@@ -761,11 +765,11 @@ window.fetch=async(url,options)=>{
   check(counts('[data-show-chip]')==='1|0|1|2','Show counts use the words filter.');
   check(type('change').querySelector('b').textContent==='1' && type('question').querySelector('b').textContent==='0',
    'Type counts use the words filter and Show.');
-  check(document.querySelector('#list-owner').selectedOptions[0].textContent==='All (1)',
+  check(selectedOwner().textContent==='All 1',
    'Owner counts use the type, Show and words.');
   search('no matching title');
   check(counts('[data-show-chip]')==='0|0|0|0' && [...document.querySelectorAll('[data-type-chip] b')].every(n=>n.textContent==='0') &&
-   document.querySelector('#list-owner').selectedOptions[0].textContent==='All (0)',
+   selectedOwner().textContent==='All 0',
    'An empty filtered view has zero in every applicable count.');
   search('');show('all').click();await flush();await flush();
   check(type('change').querySelector('b').textContent==='3','Type counts include the selected Show.');
@@ -828,144 +832,109 @@ window.fetch=async(url,options)=>{
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_owner_counts_follow_the_type_and_show_chips(self) -> None:
-        _ = self.investigation(False)
         _ = self.decisions()
-        kinds = tuple(review_items.ReviewType)
-        templates = {item.type: item for item in review_items.read(self.root)}
-        title = 'Which layout should the page use?'
-        asker = self.fixture.unit.id
-        question = update_registration.QuestionRecord(
-            self.fixture.temporary/'question.md', asker, asker,
-            update_registration.OutstandingItem(since='2026-11-12T12:00', text=title, question=title, asked_by=asker),
-            'open')
-        kind = review_items.ReviewType.QUESTION
-        templates[kind] = replace(templates[review_items.ReviewType.CHANGE], type=kind, title=title,
-                                  source=review_items.QuestionSource(question))
-        owners = {staff.StaffId(name): name for name in ('natedev', 'builder', 'reviewer')}
-        states: dict[str, review_items.ReviewState] = dict(
-            zip(('open', 'Waiting', 'Done'), review_items.ReviewState, strict=True))
+        _ = self.question()
+        _ = self.investigation()
+        examples = {item.type: item for item in review_items.read(self.root)}
+        owners = {fixture_member('showrunner', name=name).id: name
+                  for name in ('natedev', 'second-owner', 'third-owner')}
+        states = review_items.REVIEW_STATES
         records: list[review_items.ReviewItem] = []
         for owner_index, owner in enumerate(owners):
-            for type_index, kind in enumerate(kinds):
-                for state_index, state in enumerate(states.values()):
-                    for _ in range(1 + owner_index + (type_index + state_index) // 2):
-                        identity = f'{owner}/{kind}-{len(records)}'
-                        records.append(replace(templates[kind], key=identity, id=identity,
-                                               owner=owner, source_unit=owner, state=state, actions=()))
+            for type_index, kind in enumerate(review_items.REVIEW_TYPES):
+                record_states = list(states)
+                for offset in range(owner_index + type_index):
+                    record_states.append(states[(type_index + offset) % len(states)])
+                for number, state in enumerate(record_states, 1):
+                    key = f'{kind}/{owner}/{number}'
+                    records.append(replace(examples[kind], key=key, id=key, owner=owner, source_unit=owner,
+                                           state=state, actions=()))
 
-        def owner_counts(kind: str, show: str) -> dict[str, int]:
-            counts = {str(owner): sum(item.owner == owner and (not kind or item.type == kind)
-                                      and (show == 'all' or item.state == states[show])
-                                      for item in records) for owner in owners}
-            return {'': sum(counts.values()), **counts}
+        show_states = {'open': (review_items.ReviewState.OPEN,), 'Waiting': (review_items.ReviewState.WAITING,),
+                       'Done': (review_items.ReviewState.DONE,), 'all': states}
+        expected: dict[str, dict[str, dict[str, int]]] = {}
+        for show, selected_states in show_states.items():
+            expected[show] = {}
+            for kind in ('', *review_items.REVIEW_TYPES):
+                counts = {str(owner): sum(item.owner == owner and item.state in selected_states and
+                                          (not kind or item.type == kind) for item in records)
+                          for owner in owners}
+                expected[show][kind] = {'': sum(counts.values()), **counts}
 
-        expected = {kind: {show: owner_counts(kind, show) for show in (*states, 'all')}
-                    for kind in ('', *kinds)}
-
-        def read_records(_root: Path, *, owner_options: dict[staff.StaffId, str],
-                         **_view: object) -> list[review_items.ReviewItem]:
+        def read_fixture(_root: Path, *, owner_options: dict[staff.StaffId, str],
+                         **_filters: object) -> list[review_items.ReviewItem]:
             owner_options.update(owners)
             return records
 
-        with patch.object(review_items, 'read', side_effect=read_records):
-            pages = {show: review_page.render(self.root, show=show).decode() for show, _ in review_page.SHOWS}
+        with patch.object(review_items, 'read', side_effect=read_fixture):
+            pages = {show: review_page.render(self.root, show=show).decode() for show in show_states}
 
+        setup = r"""<script>
+const nativeFetch=fetch,showPages=PAGES;
+window.setInterval=()=>0;window.clearInterval=()=>{};
+window.fetch=async url=>{
+ const show=new URL(url,location.href).searchParams.get('show');
+ return new Response(showPages[show]);
+};
+</script>""".replace('PAGES', json.dumps(pages).replace('</', '<\\/'))
         probe = r"""<script>
 (async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
  const expected=EXPECTED;
- const review=()=>document.querySelector('[data-review]');
- const counts=()=>Object.fromEntries([...document.querySelector('#list-owner').options].map(option=>
-  [option.value, Number(option.textContent.match(/\((\d+)\)$/)?.[1])]));
- const chooseType=value=>document.querySelector('[data-type-chip="'+value+'"]').click();
- function chooseShow(value){
-  const control=document.querySelector('#list-show');
-  // The baseline page uses a select. Its For you option corresponds to the Open chip.
-  const legacy=control.matches('select');
-  const selection=legacy && value==='open' ? 'For you' : value;
-  if(review().dataset.show===selection) return Promise.resolve();
-  return new Promise((resolve,reject)=>{
-   const observer=new MutationObserver(()=>{
-    if(review().dataset.show!==selection) return;
-    observer.disconnect();clearTimeout(timeout);resolve();
-   });
-   const timeout=setTimeout(()=>{
-    observer.disconnect();reject(new Error('Show did not load '+value));
-   },4000);
-   observer.observe(review().parentElement,{childList:true});
-   if(legacy){
-    control.value=selection;control.dispatchEvent(new Event('change'));
-   }else control.querySelector('[data-show-chip="'+value+'"]').click();
-  });
- }
- function check(kind,show){
-  const actual=counts(), wanted=expected[kind][show];
-  if(Object.keys(actual).length!==Object.keys(wanted).length ||
-     Object.entries(wanted).some(([owner,count])=>actual[owner]!==count)){
-   const label=kind || 'All';
-   throw new Error('Owner counts for Type '+label+', Show '+show+
-    ': expected '+JSON.stringify(wanted)+', got '+JSON.stringify(actual));
+ const chip=(group,value)=>document.querySelector('[data-'+group+'-chip="'+value+'"]');
+ const selected=group=>document.querySelector('[data-'+group+'-chip][aria-pressed="true"]')
+  ?.getAttribute('data-'+group+'-chip');
+ const count=owner=>chip('owner',owner)?.querySelector('b')?.textContent;
+ const counts=()=>Object.keys(expected.open['']).map(count).join('|');
+ const checkCounts=(show,type)=>{
+  const wanted=expected[show][type];
+  const visible=[...document.querySelectorAll('[data-owner-chip]:not([hidden])')];
+  check(visible.length===Object.keys(wanted).length && visible.every(button=>Object.hasOwn(wanted,button.dataset.ownerChip)),
+   show+' / '+(type || 'All types')+': the Owner chips match the fixture owners.');
+  for(const [owner,total] of Object.entries(wanted)){
+   const label=chip('owner',owner)?.dataset.ownerName || owner || 'All';
+   check(count(owner)===String(total),
+    show+' / '+(type || 'All types')+' / '+label+': expected '+total+', got '+count(owner));
   }
- }
- function checkChange(before,filter){
-  if(before===JSON.stringify(counts())) throw new Error(filter+' did not change the Owner counts.');
- }
- const failures=[];
+ };
+ const changeShow=async show=>{
+  const replaced=new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{
+    if(document.querySelector('[data-review]').dataset.show===show){observer.disconnect();resolve();}
+   });
+   observer.observe(document.body,{childList:true,subtree:true});
+  });
+  chip('show',show).click();await replaced;
+ };
  try{
-  check('','all');
-  const allTypes=JSON.stringify(counts());
-  chooseType('change');check('change','all');checkChange(allTypes,'Type');
-  const allStates=JSON.stringify(counts());
-  await chooseShow('Waiting');check('change','Waiting');checkChange(allStates,'Show');
-  for(const [kind,views] of Object.entries(expected)){
-   chooseType(kind);
-   for(const show of Object.keys(views)){
-    await chooseShow(show);check(kind,show);
+  const beforeType=counts();
+  chip('type','change').click();
+  check(selected('type')==='change' && selected('show')==='open' && counts()!==beforeType,
+   'The Owner counts change when only Type changes.');
+  const beforeShow=counts();
+  await changeShow('all');
+  check(selected('type')==='change' && selected('show')==='all' && counts()!==beforeShow,
+   'The Owner counts change when only Show changes.');
+  checkCounts('all','change');
+  chip('type','').click();checkCounts('all','');
+  const allTypes=counts();
+  chip('type','change').click();checkCounts('all','change');
+  check(counts()!==allTypes,'Type alone changes the Owner counts in Show All.');
+  const allStates=counts();
+  await changeShow('Waiting');checkCounts('Waiting','change');
+  check(counts()!==allStates,'Show alone changes the Owner counts for Changes.');
+  for(const [show,types] of Object.entries(expected)){
+   if(selected('show')!==show) await changeShow(show);
+   for(const type of Object.keys(types)){
+    chip('type',type).click();
+    checkCounts(show,type);
    }
   }
  }catch(error){failures.push(String(error));}
- await fetch('/result',{method:'POST',body:JSON.stringify(failures)});
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>""".replace('EXPECTED', json.dumps(expected))
-        first = pages['all'].replace('</body>', probe+'</body>').encode()
-        results: list[list[str]] = []
-        complete = threading.Event()
-
-        class Probe(BaseHTTPRequestHandler):
-            def do_GET(self) -> None:
-                self.send_response(200)
-                self.send_header('Content-Type', 'text/html; charset=utf-8')
-                self.end_headers()
-                path, _, query = self.path.partition('?')
-                if path == '/':
-                    show = parse_qs(query).get('show', [])
-                    _ = self.wfile.write(pages[show[0]].encode() if show else first)
-
-            def do_POST(self) -> None:
-                results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
-                complete.set()
-                self.send_response(204)
-                self.end_headers()
-
-            @override
-            def log_message(self, format: str, *args: object) -> None:
-                pass
-
-        with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            try:
-                with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                    command = ['firefox', '--headless', '--no-remote', '--profile', profile,
-                               f'http://127.0.0.1:{server.server_port}/#show=all']
-                    with subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as browser:
-                        try:
-                            self.assertTrue(complete.wait(25), 'Firefox must report the Owner counts.')
-                        finally:
-                            browser.terminate()
-                            _ = browser.communicate(timeout=10)
-            finally:
-                server.shutdown()
-                thread.join(TEST_HANG_GUARD_SECS)
-        self.assertEqual(results, [[]])
+        markup = pages['open'].replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
     def test_server_renders_only_the_selected_show_view(self) -> None:
         ready = self.investigation()
@@ -990,9 +959,9 @@ window.fetch=async(url,options)=>{
                 source = review_page.render(self.root, show=show).decode()
                 self.assertIn(f'data-show="{show}"', source)
                 self.assertNotIn('data-state="Done"', source)
-                owner_menu = source.partition('<select id="list-owner">')[2].partition('</select>')[0]
-                self.assertIn(f'value="{waiting.owner}"', owner_menu,
-                              'F002: the unit Owner option remains when its Show view has no rows')
+                owner_row = source.partition('id="list-owner"')[2].partition('</div>')[0]
+                self.assertIn(f'data-owner-chip="{waiting.owner}"', owner_row,
+                              'F002: the unit Owner chip remains when its Show view has no rows')
 
     def test_open_read_skips_done_payloads_and_retains_full_selected_records(self) -> None:
         question_key = self.question()
@@ -1792,9 +1761,11 @@ window.fetch=async(_url,options={})=>{
  const shown=()=>rows().filter(row=>!row.hidden);
  const choose=(id,value,event='change')=>{
   if(id==='list-show'){document.querySelector('[data-show-chip="'+value+'"]').click();return;}
+  if(id==='list-owner'){document.querySelector('[data-owner-chip="'+value+'"]').click();return;}
   const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event(event,{bubbles:true}));
  };
  const showValue=(doc=document)=>doc.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip;
+ const selectedOwner=(doc=document)=>doc.querySelector('[data-owner-chip][aria-pressed="true"]');
  try{
   await flush();
   check(shown().length===5 && shown().every(row=>row.dataset.state==='Open'),'Open includes only Open records');
@@ -1848,13 +1819,13 @@ window.fetch=async(_url,options={})=>{
   const reloadComplete=new Promise(resolve=>reloaded.addEventListener('load',resolve,{once:true}));document.body.append(reloaded);await reloadComplete;
   const linkedTarget=reloaded.contentDocument.querySelector('[data-key="'+target.dataset.key+'"]');
   check(!linkedTarget.hidden && !linkedTarget.querySelector('[data-detail]').hidden,'a Review item link shows the saved row');
-  check(showValue(reloaded.contentDocument)==='all' && reloaded.contentDocument.getElementById('list-owner').value==='' &&
+  check(showValue(reloaded.contentDocument)==='all' && selectedOwner(reloaded.contentDocument).dataset.ownerChip==='' &&
     reloaded.contentDocument.getElementById('list-search').value==='','a Review item link clears filters');
   reloaded.remove();
   const retained={item:fresh.dataset.key,type:'question',owner:fresh.dataset.owner,show:'open',q:'Q1',sort:'Age',dir:'desc'};
   location.hash=new URLSearchParams(retained);await flush();
   fresh=rows().find(row=>row.dataset.type==='question');
-  check(document.getElementById('list-owner').value===retained.owner && showValue()==='open' &&
+  check(selectedOwner().dataset.ownerChip===retained.owner && showValue()==='open' &&
     document.getElementById('list-search').value==='Q1' && document.querySelector('[data-type-chip="question"]').getAttribute('aria-pressed')==='true',
     'F014: restore the filters with an open row');
   check(!fresh.hidden && !fresh.querySelector('[data-detail]').hidden,'F014: restore the open row');
@@ -1865,9 +1836,8 @@ window.fetch=async(_url,options={})=>{
   const loaded=new Promise(resolve=>legacy.addEventListener('load',resolve,{once:true}));document.body.append(legacy);await loaded;
   await flush();await flush();
   const restored=legacy.contentDocument;
-  const restoredOwner=restored.getElementById('list-owner');
-  check(restoredOwner.value===fresh.dataset.owner && restoredOwner.selectedOptions[0].textContent==='page-owner (0)' &&
-    showValue(restored)==='Waiting' &&
+  check(selectedOwner(restored).dataset.ownerChip===fresh.dataset.owner &&
+    selectedOwner(restored).textContent==='page-owner 0' && showValue(restored)==='Waiting' &&
     restored.getElementById('list-search').value==='layout' && restored.querySelector('[data-type-chip="question"]').getAttribute('aria-pressed')==='true',
     'F012: a legacy link retains the zero owner and its other filters.');
   check(restored.querySelector('[data-sort="5"]').parentElement.getAttribute('aria-sort')==='descending','F012: the legacy link keeps its sort');

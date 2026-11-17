@@ -14,7 +14,7 @@ from scripts.review_links import record_table, review_page
 class LinkedTableTests(unittest.TestCase):
     def render(self, fragment: str) -> dict[str, object]:
         node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
-        _, start, callbacks = review_page.SCRIPT.partition('const ownerOptions=')
+        _, start, callbacks = review_page.SCRIPT.partition('function matchesOwner(')
         callbacks = start + callbacks.split('\nfunction loadBodies()', 1)[0]
         source = 'const fragment=' + json.dumps(fragment) + ';\n' + r'''
 const element=()=>({hidden:false,textContent:'',dataset:{},value:'',
@@ -22,14 +22,16 @@ const element=()=>({hidden:false,textContent:'',dataset:{},value:'',
 let notice=null;
 const empty=element();empty.after=value=>{notice=value;};
 const search=element();
-const owners=['','one','two'].map(value=>({...element(),value,dataset:{ownerName:value || 'All'}}));
-const owner={...element(),options:owners,replaceChildren(...options){this.options=options;}};
-const makeChips=(name,values)=>values.map(value=>{
+const makeChips=(group,values)=>values.map(value=>{
  const count=element();
- return {...element(),dataset:{[name]:value},querySelector:()=>count};
+ return {...element(),dataset:{[group+'Chip']:value},
+  getAttribute:name=>name==='data-'+group+'-chip' ? value : null,
+  querySelector:selector=>selector==='b' ? count : null};
 });
-const chips=makeChips('typeChip',['','change','question']);
-const shows=makeChips('showChip',['open','Waiting','Done','all']);
+const owners=makeChips('owner',['','one','two']);
+const chips=makeChips('type',['','change','question']);
+const shows=makeChips('show',['open','Waiting','Done','all']);
+const owner={...element(),matches:()=>false,querySelectorAll:()=>owners};
 const show={...element(),matches:()=>false,querySelectorAll:()=>shows};
 const rows=[
  {key:'sdlc/C1830',state:'Open',type:'change',owner:'one',parked:'false'},
@@ -46,7 +48,7 @@ const table={append(){},getAttribute:()=> 'Review'};
 const content={
  querySelector:selector=>({'#list-owner':owner,'#list-show':show,'#list-search':search,
   '[data-empty]':empty,'table':table,'[data-missing-keys]':notice})[selector],
- querySelectorAll:selector=>({'[data-list-item]':rows,'[data-type-chip]':chips,'[data-show-chip]':shows})[selector] || [],
+ querySelectorAll:selector=>({'[data-list-item]':rows,'[data-owner-chip]':owners,'[data-type-chip]':chips,'[data-show-chip]':shows})[selector] || [],
 };
 const document={createElement:element};
 const location={search:'',hash:fragment,pathname:'/console/review.html'};
@@ -62,7 +64,10 @@ console.log(JSON.stringify({
  missing:notice && !notice.hidden ? notice.textContent : '',
  counts:Object.fromEntries(shows.map(chip=>[chip.dataset.showChip,chip.querySelector('b').textContent])),
  chips:Object.fromEntries(chips.map(chip=>[chip.dataset.typeChip,chip.querySelector('b').textContent])),
- owners:Object.fromEntries(owners.map(option=>[option.value,option.textContent])),
+ owners:Object.fromEntries(owners.map(chip=>{
+  const value=chip.dataset.ownerChip;
+  return [value,(value || 'All')+' ('+chip.querySelector('b').textContent+')'];
+ })),
 }));
 '''
         result = subprocess.run([node, '-e', source], capture_output=True, text=True, timeout=20)

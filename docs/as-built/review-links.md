@@ -353,17 +353,19 @@ One row can open its card in place.
 `record_table.py` supplies the table styles, filters, sorting and open-row controls for Review and The List.
 The shared `record-id` class keeps each ID and its expand arrow on one line.
 Each row becomes a card at phone width.
-Type chips and the Owner menu show counts.
-The Owner menu counts items for the selected type, Show and words.
-The menu lists owners with the selected type and words in any Show state.
+The Type, Show and Owner rows use native buttons with a count and a pressed state.
+The Owner row shows owners with the selected type and words in any Show state.
+It hides the other Owner chips.
+Each Owner count uses the selected type, Show and words across all sources.
 An owner without that type and words returns to All.
 An owner with matching rows in another Show stays selected with a zero count.
-All stays first and shows the total without an owner constraint.
+All stays first and counts every matching row.
 An unknown owner returns to All and clears both owner and source-owner constraints.
 Owner names resolve against all known owners before the type and Show filters apply.
 The address uses the resulting selection.
 Type and Show changes restore owners when their rows match again.
-A second chip row offers Open, Waiting, Done and All below the type chips.
+The Show row offers Open, Waiting, Done and All below the Type row.
+The Owner row follows the Show row.
 Exactly one Show chip stays selected. Pressing that chip changes nothing.
 Each type count uses the selected owner, Show and words.
 Each Show count uses the selected type, owner and words.
@@ -377,6 +379,7 @@ Each chip selects its state. All selects every state.
 Waiting includes active showrunner checks.
 A save changes its index entry to Waiting, Done or a Later time.
 The next refresh replaces the index.
+When a refresh excludes the focused Owner chip, focus moves to the selected Owner chip.
 The fresh index supplies each item's state and revision, including items outside the rendered Show.
 The browser removes a saved marker when the index moves beyond its submitted revision and saved state.
 An owner answer returns to Open after a refresh from Waiting or Done.
@@ -384,7 +387,7 @@ Stable chip IDs retain keyboard focus after a Show load or refresh.
 The shared table owns the Show state for both chip groups and selects.
 The List keeps its Show select.
 The address and refresh retain the selected Show view.
-Both chip rows wrap at phone width.
+The Type, Show and Owner chip rows wrap at phone width.
 All types that wait on the user have the state Open.
 The Open view shows only Open records.
 Legacy For you Show values select Open.

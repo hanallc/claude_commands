@@ -1,7 +1,7 @@
 """Check the Review contracts reported in the first review."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import json
 import shutil
@@ -18,6 +18,7 @@ from scripts.lib import conf, urgency
 from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, footer_counts, investigation, next_item, staff, update_registration
 from scripts.production.production_doc import read_production
+from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import change_page, console, review_actions, review_items, review_page, test_review_page
 from scripts.review_links import question_record
 
@@ -330,6 +331,183 @@ class ReviewRepairsTests(unittest.TestCase):
         return results[0]
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_owner_chips_count_reset_restore_and_refresh(self) -> None:
+        _ = self.case.question('Which layout should we use?')
+        _ = self.case.question('Which color should we use?')
+        waiting = self.case.investigation(False)
+        setup = """<script>
+const nativeFetch=fetch;
+window.fetch=(url,options)=>nativeFetch(options?.method==='POST' ? url : '/fresh'+new URL(url,location.href).search,options);
+</script>"""
+        markup = review_page.render(self.case.root).decode().replace('<head>', '<head>'+setup, 1)
+        probe = r'''
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const chip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
+ const count=value=>chip(value)?.querySelector('b')?.textContent;
+ const pressed=value=>chip(value)?.getAttribute('aria-pressed')==='true';
+ const address=()=>new URLSearchParams(location.hash.slice(1));
+ const visible=()=>[...document.querySelectorAll('[data-owner-chip]:not([hidden])')];
+ const navigate=async params=>{
+  const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  location.hash=new URLSearchParams(params);await changed;
+ };
+ try{
+  const group=document.querySelector('[role="group"][aria-label="Owner"]');
+  check(group?.firstElementChild===chip('') && pressed('') &&
+   visible().every(button=>button.type==='button' && button.tabIndex===0 && button.querySelector('b')),
+   'Owner uses native chips with All first and pressed.');
+  const search=document.querySelector('#list-search');
+  document.querySelector('[data-type-chip="question"]').click();
+  check(count('')==='2' && count(PAGE_OWNER)==='2','Owner counts use the selected Type.');
+  search.value='layout';search.dispatchEvent(new Event('input'));
+  check(count('')==='1' && count(PAGE_OWNER)==='1','Owner counts use the words filter.');
+  chip(PAGE_OWNER)?.click();
+  check(pressed(PAGE_OWNER) && count('')==='1' && address().get('owner')===PAGE_OWNER,
+   'An Owner chip sets the address and leaves the All count unchanged.');
+  await navigate({owner:UNIT_OWNER,type:'investigation',show:'open'});
+  check(pressed(UNIT_OWNER) && address().get('owner')===UNIT_OWNER,'The address restores the Owner chip.');
+  check(pressed(UNIT_OWNER) && !chip(UNIT_OWNER)?.hidden && count(UNIT_OWNER)==='0' && count('')==='0',
+   'The selected owner stays visible with zero in another Show.');
+  const previous=document.querySelector('[data-review]');
+  chip(UNIT_OWNER)?.focus();
+  const refreshed=new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{
+    if(document.querySelector('[data-review]')!==previous){observer.disconnect();resolve();}
+   });
+   observer.observe(document.body,{childList:true,subtree:true});
+  });
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  await refreshed;
+  check(pressed(UNIT_OWNER) && count(UNIT_OWNER)==='0' && document.activeElement===chip(UNIT_OWNER),
+   'Refresh keeps the selected Owner chip, its count and its focus.');
+  const unitChip=chip(UNIT_OWNER);
+  document.querySelector('[data-type-chip="question"]').click();
+  check(pressed('') && !address().get('owner') && unitChip && unitChip===chip(UNIT_OWNER) && unitChip.hidden,
+   'A Type without the selected owner resets to All and hides the same chip.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();'''
+        probe = probe.replace('UNIT_OWNER', json.dumps(str(waiting.owner))).replace(
+            'PAGE_OWNER', json.dumps(str(next(row.id for row in staff.snapshot().rows if row.name == 'page-owner'))))
+        self.assertEqual(self.browser(markup, probe), [])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_legacy_source_owner_does_not_limit_owner_chip_counts(self) -> None:
+        first = self.case.investigation()
+        owner = fixture_member('showrunner', name='second-owner')
+        second = investigation.file(
+            owner.id, 'Why did the second gate stop?', 'Read the log.',
+            waiting_why='The owner must complete the investigation.')
+        _ = investigation.answer(second.owner, second.id, 'The repair is ready.')
+        _ = self.case.investigation(False)
+        probe = r'''
+(()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const chip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
+ const counts=()=>['',FIRST,SECOND].map(value=>chip(value)?.querySelector('b').textContent).join('|');
+ const address=()=>new URLSearchParams(location.hash.slice(1));
+ const rows=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')];
+ check(chip(FIRST)?.getAttribute('aria-pressed')==='true' && address().get('source-owner')===FIRST &&
+  rows().length===1 && rows()[0].dataset.sourceOwner===FIRST,'The legacy link keeps its selected owner and source.');
+ check(counts()==='2|1|1','Expected Owner counts 2|1|1, got '+counts()+'.');
+ chip(SECOND)?.click();
+ check(chip(SECOND)?.getAttribute('aria-pressed')==='true' && !address().has('source-owner') &&
+  rows().length===1 && rows()[0].dataset.sourceOwner===SECOND,'The second chip selects its matching row.');
+ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();'''.replace('FIRST', json.dumps(str(first.owner))).replace('SECOND', json.dumps(str(second.owner)))
+        place = '/#'+urlencode({'legacy':'investigation', 'owner':first.owner, 'show':'not-read',
+                                 'type':'investigation', 'q':'gate'})
+        self.assertEqual(self.browser(review_page.render(self.case.root).decode(), probe, place), [])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_refresh_focuses_all_when_the_focused_owner_is_excluded(self) -> None:
+        without_owner = review_page.render(self.case.root).decode()
+        ready = self.case.investigation()
+        before = review_page.render(self.case.root).decode()
+        key = f'investigation/{ready.owner}/{ready.id}'
+        until = datetime.now(user_zone()) + timedelta(days=1)
+        body = self.case.body(key, 'later') + '&' + urlencode({'later':until.isoformat()})
+        _ = review_page.submit(self.case.root, body, self.case.status)
+        with_hidden_owner = review_page.render(self.case.root).decode()
+        setup = r"""<script>
+const nativeFetch=fetch;
+window.fetch=(url,options)=>options?.method==='POST' ? nativeFetch(url,options) :
+ Promise.resolve(new Response(FRESH));
+</script>"""
+        probe = r'''
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const chip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
+ const owner=chip(OWNER);
+ owner.focus();
+ check(document.activeElement===owner && owner.getAttribute('aria-pressed')==='true',
+  'The selected owner starts focused.');
+ const previous=document.querySelector('[data-review]');
+ const refreshed=new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   if(document.querySelector('[data-review]')!==previous){observer.disconnect();resolve();}
+  });
+  observer.observe(document.body,{childList:true,subtree:true});
+ });
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await refreshed;
+ const replacement=chip(OWNER),all=chip('');
+ check(HIDDEN ? replacement?.hidden : !replacement,'The fresh page excludes the owner.');
+ check(all.getAttribute('aria-pressed')==='true' && !new URLSearchParams(location.hash.slice(1)).get('owner'),
+  'A refresh with no matching owner selects All.');
+ check(document.activeElement===all,'Expected focus on All, got '+(document.activeElement.id || document.activeElement.tagName)+'.');
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();'''
+        place = '/#'+urlencode({'owner':ready.owner, 'show':'open', 'type':'investigation'})
+        for hidden, fresh in ((False, without_owner), (True, with_hidden_owner)):
+            with self.subTest(hidden=hidden):
+                script = setup.replace('FRESH', json.dumps(fresh).replace('</', '<\\/'))
+                markup = before.replace('<head>', '<head>'+script, 1)
+                check = probe.replace('HIDDEN', json.dumps(hidden)).replace('OWNER', json.dumps(str(ready.owner)))
+                self.assertEqual(self.browser(markup, check, place), [])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_refresh_focuses_selected_owner_when_another_chip_disappears(self) -> None:
+        selected = self.case.investigation()
+        fresh = review_page.render(self.case.root).decode()
+        other = fixture_member('showrunner', name='second-owner')
+        _ = investigation.file(
+            other.id, 'Why did the second gate stop?', 'Read the log.',
+            waiting_why='The owner must complete the investigation.')
+        setup = r"""<script>
+const nativeFetch=fetch;
+window.fetch=(url,options)=>options?.method==='POST' ? nativeFetch(url,options) :
+ Promise.resolve(new Response(FRESH));
+</script>""".replace('FRESH', json.dumps(fresh).replace('</', '<\\/'))
+        markup = review_page.render(self.case.root).decode().replace('<head>', '<head>'+setup, 1)
+        probe = r'''
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const chip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
+ const pressed=button=>button?.getAttribute('aria-pressed')==='true';
+ chip(OTHER).focus();
+ check(document.activeElement===chip(OTHER) && pressed(chip(SELECTED)) && !pressed(chip(OTHER)),
+  'The other chip has focus while the selected chip stays pressed.');
+ const previous=document.querySelector('[data-review]');
+ const refreshed=new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   if(document.querySelector('[data-review]')!==previous){observer.disconnect();resolve();}
+  });
+  observer.observe(document.body,{childList:true,subtree:true});
+ });
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await refreshed;
+ check(!chip(OTHER) && pressed(chip(SELECTED)) && new URLSearchParams(location.hash.slice(1)).get('owner')===SELECTED,
+  'Refresh removes the other chip and keeps the selected owner.');
+ check(document.activeElement===chip(SELECTED),
+  'Expected focus on the pressed Owner chip, got '+(document.activeElement.id || document.activeElement.tagName)+'.');
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();'''.replace('SELECTED', json.dumps(str(selected.owner))).replace('OTHER', json.dumps(str(other.id)))
+        place = '/#'+urlencode({'owner':selected.owner, 'show':'open', 'type':'investigation'})
+        self.assertEqual(self.browser(markup, probe, place), [])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_index_refresh_and_owner_constraints(self) -> None:
         _ = self.case.question()
         ready = self.case.investigation()
@@ -353,8 +531,10 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
   const loaded=nextView();chip.click();await loaded;
  };
  const count=value=>Number(document.querySelector('[data-show-chip="'+value+'"] b').textContent);
- const owner=()=>document.querySelector('#list-owner');
- const chooseOwner=value=>{owner().value=value;owner().dispatchEvent(new Event('change'));};
+ const ownerChip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
+ const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
+ const ownerChips=()=>[...document.querySelectorAll('[data-owner-chip]:not([hidden])')];
+ const chooseOwner=value=>ownerChip(value).click();
  const type=value=>document.querySelector('[data-type-chip="'+value+'"]').click();
  const search=value=>{const field=document.querySelector('#list-search');field.value=value;field.dispatchEvent(new Event('input'));};
  const save=async form=>{
@@ -380,23 +560,23 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
   location.hash=new URLSearchParams({legacy:'investigation',owner:'unknown',type:'investigation',show:'not-read'});
   await navigated;
   const address=new URLSearchParams(location.hash.slice(1));
-  check(owner().value==='' && owner().options[0].textContent==='All (1)' && count('open')===1 &&
+  check(selectedOwner().dataset.ownerChip==='' && ownerChip('').textContent==='All 1' && count('open')===1 &&
    !address.get('owner') && !address.has('source-owner') &&
    document.querySelectorAll('[data-list-item]:not([hidden])').length===1,
    'F006: hash navigation clears every owner constraint before it counts');
   chooseOwner(UNIT_OWNER);await show('Done');
-  check(owner().value===UNIT_OWNER && owner().selectedOptions[0].textContent===UNIT_NAME+' (0)' &&
+  check(selectedOwner().dataset.ownerChip===UNIT_OWNER && selectedOwner().textContent===UNIT_NAME+' 0' &&
    count('open')===1 && count('Done')===0,
    'F007: an owner with rows in another Show stays selected with zero');
-  check([...owner().options].some(option=>option.value===UNIT_OWNER),
+  check(!ownerChip(UNIT_OWNER).hidden,
    'F007: Owner lists matching type and words across every Show');
   type('question');
-  check(owner().value==='' && owner().options.length===2 &&
-   owner().options[1].dataset.ownerName==='page-owner' &&
+  check(selectedOwner().dataset.ownerChip==='' && ownerChips().length===2 &&
+   ownerChips()[1].dataset.ownerName==='page-owner' &&
    !new URLSearchParams(location.hash.slice(1)).get('owner'),
-   'F007: an owner without the selected type resets to All and leaves the menu');
+   'F007: an owner without the selected type resets to All and hides its chip');
   await show('open');type('investigation');chooseOwner(UNIT_OWNER);search('no matching title');
-  check(owner().value==='' && owner().options.length===1 && owner().options[0].textContent==='All (0)',
+  check(selectedOwner().dataset.ownerChip==='' && ownerChips().length===1 && ownerChip('').textContent==='All 0',
    'F007: words remove owners without matching rows and reset the selection');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
@@ -490,15 +670,15 @@ window.fetch=(url,options={})=>{
   const investigation=document.querySelector('[data-key="'+keys.at(-1)+'"]');
   investigation.querySelector('.list-toggle').click();await save(investigation.querySelector('form'),'read');
   await refresh();
-  const owner=document.getElementById('list-owner');
-  check(owner.value===UNIT_OWNER && owner.selectedOptions[0]?.textContent===UNIT_NAME+' (0)' &&
-    owner.options[0].textContent==='All (0)',
+  const ownerChip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
+  const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
+  check(selectedOwner().dataset.ownerChip===UNIT_OWNER && selectedOwner().textContent===UNIT_NAME+' 0' &&
+    ownerChip('').textContent==='All 0',
    'The selected owner remains with zero after its last Open row disappears.');
   check(!document.querySelector('[data-list-item]:not([hidden])'),'the selected type and Show still have no rows');
   await show('Done');
-  check(document.getElementById('list-owner').value===UNIT_OWNER &&
-    document.getElementById('list-owner').options[0]?.textContent==='All (1)' &&
-    [...document.getElementById('list-owner').options].some(option=>option.value===UNIT_OWNER),
+  check(selectedOwner().dataset.ownerChip===UNIT_OWNER &&
+    ownerChip('').textContent==='All 1' && !ownerChip(UNIT_OWNER).hidden,
    'Done counts the saved record for the selected owner.');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
@@ -537,7 +717,7 @@ window.fetch=(url,options={})=>{
   check(filters.get('type')==='question','the alias keeps the question type');
   const rows=[...frame.contentDocument.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
   check(rows.length===1 && rows[0].dataset.type==='question','the Review filters select the owner question');
-  check(frame.contentDocument.getElementById('list-owner').value===OWNER,'the owner name resolves to its staff ID');
+  check(frame.contentDocument.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip===OWNER,'the owner name resolves to its staff ID');
   const cases=CASES;
   for(const entry of cases){
    const legacy=document.createElement('iframe');legacy.src=entry.url;
