@@ -4622,30 +4622,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 ### Phase 328 — Measure which commands use the suite's CPU  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** a table that names the commands (Git, jq, each Python script, shells, helpers) that use the most CPU across all ~/.claude test modules, with the modules that start them, so the next cuts go where the suite spends its CPU.
-
-**Decision:** Phases 324-326 ended at floors: in each module the rest of the CPU is real product work (recorder, jq, Git). The aws total is about 4,040 CPU s over 812 modules; the top 30 modules hold only 888 s. A suite-wide view of command costs shows which product cut saves the most aws CPU across all modules. builds asks for a measured saving across every module that a shared change touches (2026-11-16).
-
-**Spec:**
-1. Run `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD <folder>/<file> ... --commands 40` over every live gate module (`show.py` lists them; the gate's `discover_test_modules` is the source). Run each batch under `systemd-run --user --scope -q -p MemoryMax=2G`, at most 4 modules at a time. Save one JSON result per module under `/tmp/claude/scratch/natest-census/`.
-2. Add the command rows across modules: for each command group, the total CPU s, the starts, the CPU per start, and the top 5 modules by that group's CPU.
-3. Rank the groups by total CPU. For the top 10 groups, name the product file and line that starts them, the owner unit, and what each start does (one line).
-4. For each of the top 5 groups, give a bound: the CPU that one fix in that product file could save across all modules (for example, a cheaper start, fewer starts, one call in place of several). Name it as a bound, not a saving.
-5. Give the module CPU sum of this census next to the aws sum for the same modules, so the ratio of natedev to aws is known.
-6. Change no repository file. Delete the raw results after the table is written.
-
-**Files:**
-- `/tmp/claude/scratch/natest-census/report.md`
-
-**Workers:** 1 writer; research only.
-- impl2: all files.
-
-**Constraints from prior phases:**
-- Phase 200 measured repeated Git metadata queries within one caller; Phase 205 measured build-target command starts. Reuse their method; do not repeat their tables.
-- The memory rule: heavy probes run only under `systemd-run --user --scope -q -p MemoryMax=2G`, at most 4 at a time.
-
-**Acceptance gate:**
-- The report holds the ranked group table, the top-10 sources with owners, the top-5 bounds and the natedev-to-aws ratio.
-- No repository file changed.
+- Research only; no repository file changed. Report: `phases/328/census_report.md` in the run folder. All 826 live gate modules ran under `module_cost.py --commands 40`, four at a time, each under MemoryMax=2G.
+- 14 modules failed a run under the census (nested ptrace, fixture hang guards in local routing waits). Their failed waits dominate the raw ranking (`local_release_wait.py` 1,898 s, `runner_lock.py` 824 s), so the ranking below uses only the 799 modules that pass every run.
+- Passing modules: 2,953 natedev CPU s against 3,980 aws CPU s (ratio 0.74). Gross groups: test processes (`module_run.py`, test bodies and fixtures) 1,135 s; Git 222 s over 260,444 starts (`rev-parse` 60 s over 79,174; `maintenance` 6 s over 12,279); inline Python through the `lib/py` shim 216 s over 3,417 starts (63 ms each); `verify_helper.py` 111 s over 491 starts (227 ms each); `verify.sh` 73 s; `admission_client.py` 48 s; `mac_test.py` 41 s; `assign.py` 36 s over 61 starts.
+- Each figure is a gross bound with useful work inside it, not a saving. The next step isolates start costs for the shim, `verify_helper.py` and the runner. Checkpoint 9afea5d14.
