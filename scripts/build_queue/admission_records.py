@@ -670,8 +670,27 @@ class NoQueuePriority:
 NO_QUEUE_PRIORITY = NoQueuePriority()
 
 
+@dataclass(frozen=True)
+class UserCaller:
+    """The verified peer environment contains no session id."""
+
+
+@dataclass(frozen=True)
+class ShowrunnerCaller:
+    name: str
+    session_id: str
+
+
+@dataclass(frozen=True)
+class RefusedCaller:
+    reason: str
+
+
+QueueCaller = UserCaller | ShowrunnerCaller | RefusedCaller
+
+
 def queue_command_actor() -> str:
-    """Identify the user command without a session-role check."""
+    """Send a caller hint; the service verifies the peer identity."""
     return os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or "user"
 
 

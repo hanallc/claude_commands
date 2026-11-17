@@ -33,6 +33,7 @@ from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import admission_wire as status_wire
 from scripts.lib import conf, inotify
+from scripts.production import staff
 from scripts.lib.boot_identity import boot_identity
 from scripts.build_queue import admission_code
 from scripts.build_queue import admission_protocol as wire
@@ -926,6 +927,47 @@ class ScopeWatch:
     episode: str
 
 
+@dataclass(frozen=True)
+class ConnectedPeerProcess:
+    """The pidfd holds the identity of the process that connected."""
+    descriptor: int
+
+
+@dataclass(frozen=True)
+class PeerProcessUnavailable:
+    """The connection has no peer identity that can authorize a priority change."""
+    reason: str = "peer process identity was not captured"
+
+
+def connected_peer_process(client: socket.socket) -> ConnectedPeerProcess | PeerProcessUnavailable:
+    """Capture the connecting process before reading any requests."""
+    if sys.platform != "linux":
+        return PeerProcessUnavailable("queue priority requires Linux peer pidfd support")
+    try:
+        # Linux defines SO_PEERPIDFD as 77 when Python does not expose the constant.
+        descriptor = client.getsockopt(socket.SOL_SOCKET, getattr(socket, "SO_PEERPIDFD", 77))
+    except OSError as error:
+        return PeerProcessUnavailable(f"peer pidfd is unavailable: {error}")
+    try:
+        os.set_inheritable(descriptor, False)
+    except OSError as error:
+        os.close(descriptor)
+        return PeerProcessUnavailable(f"peer pidfd is unreadable: {error}")
+    return ConnectedPeerProcess(descriptor)
+
+
+def peer_process_pid(peer: ConnectedPeerProcess) -> int:
+    """Read the live PID from the held process identity."""
+    fields = [line.split(":", 1)[1].strip()
+              for line in Path(f"/proc/self/fdinfo/{peer.descriptor}").read_text().splitlines()
+              if line.startswith("Pid:")]
+    if len(fields) != 1 or not fields[0].isdecimal() or int(fields[0]) <= 0:
+        raise ValueError("queue caller no longer exists or its pidfd is unreadable")
+    if select.select([peer.descriptor], [], [], 0)[0]:
+        raise ValueError("queue caller no longer exists")
+    return int(fields[0])
+
+
 @dataclass
 class Connection:
     socket: socket.socket
@@ -934,6 +976,13 @@ class Connection:
     request: wire.Request | NoRequest = NoRequest()
     finished: bool = False
     version: int = 1
+    peer_process: ConnectedPeerProcess | PeerProcessUnavailable = field(default_factory=PeerProcessUnavailable)
+
+    def close_peer_process(self) -> None:
+        """Release the peer identity once authorization or the connection ends."""
+        if isinstance(self.peer_process, ConnectedPeerProcess):
+            os.close(self.peer_process.descriptor)
+            self.peer_process = PeerProcessUnavailable("peer process identity is closed")
 
 
 @dataclass(frozen=True)
@@ -1106,6 +1155,71 @@ def peer_uid(connection: Connection | NoConnection) -> int:
         return os.getuid()
     credentials = connection.socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
     return struct.unpack("3i", credentials)[1]
+
+
+def queue_caller(connection: Connection | NoConnection, proc: Path) -> records.QueueCaller:
+    """Check the peer environment and the local staff record before any mutation."""
+    if sys.platform != "linux":
+        return records.RefusedCaller("queue priority requires Linux peer pidfd support")
+    if isinstance(connection, NoConnection):
+        try:
+            peer = ConnectedPeerProcess(os.pidfd_open(os.getpid()))
+        except OSError as error:
+            return records.RefusedCaller(f"queue caller pidfd is unavailable: {error}")
+    else:
+        if isinstance(connection.peer_process, PeerProcessUnavailable):
+            return records.RefusedCaller(connection.peer_process.reason)
+        peer = connection.peer_process
+    try:
+        pid = peer_process_pid(peer)
+        if isinstance(connection, NoConnection):
+            uid = os.getuid()
+        else:
+            credentials = connection.socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+            credential_pid, uid, _ = struct.unpack("3i", credentials)
+            if credential_pid != pid:
+                return records.RefusedCaller("queue caller pidfd does not match the socket peer")
+        if uid != os.getuid():
+            return records.RefusedCaller("queue priority requires the service account")
+        directory = proc / str(pid)
+        before = (directory / "stat").read_text().rsplit(") ", 1)[1].split()
+        if before[0] in ("Z", "X"):
+            return records.RefusedCaller("queue caller no longer exists")
+        start = before[19]
+        data = (directory / "environ").read_bytes()
+        if data and not data.endswith(b"\0"):
+            return records.RefusedCaller("queue caller environment is incomplete")
+        environment: dict[str, str] = {}
+        for item in data.split(b"\0"):
+            if not item:
+                continue
+            key, value = item.decode("utf-8").split("=", 1)
+            if key in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID") and key in environment:
+                return records.RefusedCaller("queue caller has duplicate session evidence")
+            environment[key] = value
+        # Claude takes precedence when both session variables contain a value.
+        session = environment.get("CLAUDE_CODE_SESSION_ID") or environment.get("CODEX_THREAD_ID", "")
+        caller: records.QueueCaller = records.UserCaller()
+        if session:
+            member = staff.local_snapshot().by_current_session(session)
+            if (member is None or member.kind != "showrunner" or not member.name.strip()
+                    or not isinstance(member.exited, staff.Active) or not isinstance(member.paused, staff.Active)):
+                caller = records.RefusedCaller("only the user or a current showrunner may change queue priority")
+            else:
+                caller = records.ShowrunnerCaller(member.name, session)
+        after = (directory / "stat").read_text().rsplit(") ", 1)[1].split()
+        if after[0] in ("Z", "X") or after[19] != start:
+            return records.RefusedCaller("queue caller changed during identity verification")
+        if peer_process_pid(peer) != pid:
+            return records.RefusedCaller("queue caller changed during identity verification")
+        return caller
+    except (OSError, ValueError, IndexError, UnicodeError, struct.error) as error:
+        return records.RefusedCaller(f"queue caller evidence is unreadable: {error}")
+    finally:
+        if isinstance(connection, NoConnection):
+            os.close(peer.descriptor)
+        else:
+            connection.close_peer_process()
 
 
 def process_uid(pid: int, proc: Path) -> int | OwnerProcessGone:
@@ -3439,6 +3553,15 @@ done
 
     def handle_request(self, request: wire.Request, connection: Connection | NoConnection = NO_CONNECTION
                        ) -> list[wire.Reply]:
+        if isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest)):
+            caller = queue_caller(connection, self.proc.path)
+            if isinstance(caller, records.RefusedCaller):
+                return [wire.Refused(caller.reason)]
+            actor = (f"{caller.name} ({caller.session_id})" if isinstance(caller, records.ShowrunnerCaller) else "user")
+            request = replace(request, actor=actor)
+            if (isinstance(request, wire.PrioritySetRequest) and isinstance(caller, records.ShowrunnerCaller)
+                    and request.why == "the user's bump"):
+                request = replace(request, why="showrunner bump")
         started, cpu_started = self.clock.monotonic(), time.thread_time()
         try:
             return self._handle_request(request, connection)
@@ -3757,6 +3880,7 @@ done
         self.parked_placements = [item for item in self.parked_placements if item.connection is not connection]
 
     def _disconnect(self, connection: Connection) -> None:
+        connection.close_peer_process()
         self._drop_deferred_requests(connection)
         removed = [episode for episode, waiting in self.repository_slot_waiters.items() if waiting.connection is connection]
         for episode in removed:
@@ -4059,9 +4183,15 @@ done
                         client = self.listener.accept()[0]
                     except BlockingIOError:
                         break
-                    client.setblocking(False)
-                    self.connections[client.fileno()] = Connection(client)
-                    self.epoll.register(client.fileno(), select.EPOLLIN)
+                    connection = Connection(client, peer_process=connected_peer_process(client))
+                    try:
+                        client.setblocking(False)
+                        self.epoll.register(client.fileno(), select.EPOLLIN)
+                    except BaseException:
+                        connection.close_peer_process()
+                        client.close()
+                        raise
+                    self.connections[client.fileno()] = connection
                     readable.add(client.fileno())
         for connection in list(self.connections.values()):
             if connection.socket.fileno() in readable and not connection.finished:
@@ -4100,6 +4230,7 @@ done
         os.close(self.config_events)
         os.close(self.priority_events)
         for connection in list(self.connections.values()):
+            connection.close_peer_process()
             connection.socket.close()
         self.connections.clear()
         self.deferred_requests.clear()

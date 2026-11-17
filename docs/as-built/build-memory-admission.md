@@ -408,14 +408,43 @@ An expired estimate requires a client refresh through the service.
 | `release` | Finalize one reservation |
 | `width` | Record the requested test width |
 | `token_wait` | Finalize a reservation and preserve its queue place |
-| `priority_set`, `priority_clear` | Change the one unit priority |
+| `priority_set`, `priority_clear` | Change unit priority after caller verification |
 | `view`, `explain`, `mine` | Read the stored pass |
 
-`/build:bump <position|session|folder>` selects a waiting step by position, session, or folder.
-It sets priority for that step's unit. An unmatched selector exits 3 without a priority change.
-The service refuses `priority_set` when no waiting step or current reservation belongs to the unit.
-`/build:bump` works from any session or a plain shell.
-`queue_command_actor()` selects `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`, then `"user"`.
+`build_queue.py [position|session|folder]` only reads queue cards.
+A bare command prints all running and waiting cards as JSON.
+A selector filters the cards. A numeric selector uses the waiting position.
+The word `clear` is a filter. The reader sends no priority mutation.
+
+`/build:bump` calls `build_bump.py` with the existing selector and clear syntax.
+A selector adds the waiting step's unit to the priority list.
+An unmatched selector exits 3 without a priority change.
+The service checks the unit against waiting steps, current reservations, and staff labels.
+Only the user and current, active showrunner sessions may set or clear priority.
+
+The service captures the connecting process with `SO_PEERPIDFD` when it accepts the socket.
+The service reads the PID from the pidfd and checks it against `SO_PEERCRED`.
+The service also reads the UID from `SO_PEERCRED`.
+The UID must match the service account.
+The service reads the peer's `/proc/<pid>/stat` and `/proc/<pid>/environ` files.
+It selects a nonempty `CLAUDE_CODE_SESSION_ID`, then a nonempty `CODEX_THREAD_ID`.
+No session id means the user.
+A session id must match a current, active showrunner in the service's local staff record.
+The service checks the process start time again after it reads the evidence.
+It then checks that the pidfd still identifies the same live process.
+An exited peer remains refused even when another process reuses its PID.
+The service closes the pidfd after verification or when the connection closes.
+Unavailable peer pidfd support causes refusal, including on macOS.
+Missing, unreadable, incomplete, or changed evidence causes refusal.
+The service checks permission before replay, caller-version recording, state changes, ledger changes, or logging.
+A refused caller cannot reuse an allowed caller's request id.
+
+`UserCaller`, `ShowrunnerCaller`, and `RefusedCaller` state the verification result.
+The service ignores `request.actor` as identity evidence.
+The ledger records `user` or `<staff name> (<session id>)`.
+The service replaces `the user's bump` with `showrunner bump` for a showrunner request.
+`build_bump.py` sends the neutral reason `queue bump`.
+`queue_command_actor()` sends a hint; it grants no permission.
 
 Mutation requests have replay ids. The service persists each terminal reply before delivery.
 A replay returns the same reply. Live grants remain in the ledger until their reservation ends.

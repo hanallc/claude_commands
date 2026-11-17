@@ -6,6 +6,9 @@ The `unit-board@nate-local` plugin has no pane and registers no command.
 Use `/build:page` for running steps, waiting steps, memory use, and Mac idle alerts.
 Use `/build:bump <position|session|folder>` to set a waiting unit's priority.
 Use `/build:bump clear [unit]` to remove priority.
+Only the user and current, active showrunner sessions may change priority.
+Use `build_queue.py [position|session|folder]` to read cards as JSON.
+The reader treats `clear` as a filter and sends no priority mutation.
 Use Hana console, Accounts to see the accounts board.
 `/showrunner:units` prints the Units table through `scripts/production/unit_phases.py`.
 

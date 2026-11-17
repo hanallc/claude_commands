@@ -370,6 +370,11 @@ class AdmissionFixture(ExitStack):
         self.fault: Faults = Faults()
         self.proc: TestProcesses = TestProcesses(self.root / "proc")
         _ = self.callback(self.proc.close)
+        # Socket callers use private user evidence unless a test supplies a session.
+        caller = self.proc.path / str(os.getpid())
+        caller.mkdir(parents=True, exist_ok=True)
+        _ = (caller / "stat").write_text(Path(f"/proc/{os.getpid()}/stat").read_text())
+        _ = (caller / "environ").write_bytes(b"PATH=/bin\0")
         pressure = self.root / "pressure"
         if not pressure.exists():
             write_pressure_reading(pressure)

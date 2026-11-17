@@ -246,7 +246,8 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
 | `/build:hold` | `build_hold.py` | Clear, drain, or release natedev; check quiet and show holds. Use `/build:mac block` for the Mac. |
 | `/build:mac` | `mac_test.py` | Block, unblock, settle and show the Mac; audit which packages belong on it; claim it for a job of one's own (released after 15 idle minutes). |
 | `/build:status` | `build_targets.py status [--probe]` | Each target's state, read only, with the holder's showrunner and unit when its session is known. |
-| `/build:bump <selector>`, `/build:bump clear [unit]` | `build_queue.py` | Changes unit priority. A bare command prints usage and the Builds page link. Use `/build:page` for the queue view. |
+| `/build:bump <selector>`, `/build:bump clear [unit]` | `build_bump.py` | Changes unit priority for the user or a current, active showrunner. The service verifies the caller. A bare command prints usage and the Builds page link. |
+| Queue read CLI | `build_queue.py [position|session|folder]` | Prints running and waiting cards as JSON. A selector filters cards. `clear` is a filter and changes nothing. |
 | `/build:page` | `memory_feed.py link` | Prints the shared build page link. Use the `buildlog` CLI for detailed records. |
 | `/build:mac_report` | `buildlog mac-report` | How often tests finish on the Mac when it is usable. |
 

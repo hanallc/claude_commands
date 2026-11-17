@@ -2316,7 +2316,7 @@ class PendingPriorityTests(unittest.TestCase):
                     applied = viewed.reading.explanation.priority
                     assert not isinstance(applied, records.NoQueuePriority)
                     self.assertEqual((applied.entries[-1]["unit"], applied.entries[-1]["why"], applied.entries[-1]["set_by"]),
-                                     ("chosen", "urgent", "director"))
+                                     ("chosen", "urgent", "user"))
                 finally:
                     finish.set()
 
@@ -5328,7 +5328,7 @@ class CutoverServiceTests(unittest.TestCase):
                 assert isinstance(saved, records.QueuePriority)
                 self.assertEqual([entry["unit"] for entry in saved.entries], ["demo", "cables"])
                 self.assertEqual([entry["why"] for entry in saved.entries], ["why-demo", "why-cables"])
-                self.assertEqual([entry["set_by"] for entry in saved.entries], ["actor-demo", "actor-cables"])
+                self.assertEqual([entry["set_by"] for entry in saved.entries], ["user", "user"])
                 self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
                     "repeat-demo", "demo", "replacement reason", "another actor")), [wire.Ok()])
                 self.assertEqual(fixture.server.priority, saved)
@@ -7147,3 +7147,251 @@ class AdmissionConfigurationTests(unittest.TestCase):
                 fixture.allow_next_start()
             self.assertEqual(only_admitted(fixture.server.handle_request(child)), granted)
             self.assertEqual(len([record for record in fixture.server.reservations.values() if record.owner == child.owner]), 1)
+
+
+class PriorityCallerTests(unittest.TestCase):
+    def caller(self, fixture: AdmissionFixture, session: str = "", role: str = "unit",
+               variable: str = "CLAUDE_CODE_SESSION_ID") -> None:
+        directory = fixture.proc.path / str(os.getpid())
+        directory.mkdir(parents=True, exist_ok=True)
+        _ = (directory / "stat").write_text(Path(f"/proc/{os.getpid()}/stat").read_text())
+        _ = (directory / "environ").write_bytes((f"{variable}={session}\0" if session else "PATH=/bin\0").encode())
+        parent = "10000000-0000-0000-0000-000000000001"
+        rows: list[dict[str, object]] = [{"id": parent, "current_session": parent,
+            "kind": "showrunner", "name": "builds", "parent": None}]
+        if role == "worker":
+            director = "30000000-0000-0000-0000-000000000003"
+            rows.append({"id": director, "current_session": director,
+                         "kind": "unit", "name": "director", "parent": parent})
+            parent = director
+        if session:
+            rows.append({"id": session, "current_session": session, "kind": role,
+                         "name": "queue", "parent": None if role == "showrunner" else parent})
+        _ = (fixture.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": rows}))
+        fixture.enter_context(mock.patch.dict(os.environ, {"STAFF_FILE": str(fixture.root / "staff.json")}))
+
+    def changes(self) -> tuple[wire.PrioritySetRequest | wire.PriorityClearRequest, ...]:
+        return (wire.PrioritySetRequest("caller-set", "demo", "the user's bump", "user"),
+                wire.PriorityClearRequest("caller-clear", "user", "demo"),
+                wire.PriorityClearRequest("caller-clear-all", "user"))
+
+    def saved_files(self, fixture: AdmissionFixture) -> dict[str, bytes]:
+        return {str(path.relative_to(fixture.state_dir.parent)): path.read_bytes()
+                for path in fixture.state_dir.parent.rglob("*") if path.is_file()}
+
+    def test_sessions_cannot_set_or_clear_even_with_actor_user(self) -> None:
+        for role in ("unit", "worker", "producer", "unrecorded"):
+            for variable in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+                with self.subTest(role=role, variable=variable), AdmissionFixture() as fixture:
+                    self.caller(fixture, "20000000-0000-0000-0000-000000000002",
+                                "unit" if role == "unrecorded" else role, variable)
+                    if role == "unrecorded":
+                        _ = (fixture.root / "staff.json").write_text('{"schema":2,"rows":[]}')
+                    fixture.server.priority = records.QueuePriority(({
+                        "unit": "demo", "why": "urgent", "set_at": fixture.clock.now(), "set_by": "user"},))
+                    fixture.server.persist()
+                    before, ledger = self.saved_files(fixture), dict(fixture.server.ledger)
+                    priority = fixture.server.priority
+                    versions = dict(fixture.server.caller_versions)
+                    for request in self.changes():
+                        with self.subTest(request=type(request).__name__, unit=request.unit):
+                            self.assert_refused_change(fixture, request, before, ledger, priority, versions)
+
+    def assert_refused_change(self, fixture: AdmissionFixture, request: wire.PrioritySetRequest | wire.PriorityClearRequest,
+                              before: dict[str, bytes], ledger: dict[str, service.ReplayEntry],
+                              priority: records.QueuePriority | records.NoQueuePriority,
+                              versions: dict[str, str]) -> None:
+        reply, = fixture.completed_queue_change(request)
+        self.assertIsInstance(reply, wire.Refused)
+        self.assertEqual(fixture.server.priority, priority)
+        self.assertEqual(fixture.server.ledger, ledger)
+        self.assertEqual(fixture.server.caller_versions, versions)
+        self.assertEqual(self.saved_files(fixture), before)
+
+    def test_unreadable_peer_or_staff_refuses_without_writes(self) -> None:
+        for missing in ("environ", "stat", "staff.json"):
+            with self.subTest(missing=missing), AdmissionFixture() as fixture:
+                self.caller(fixture, "20000000-0000-0000-0000-000000000002", "showrunner")
+                path = fixture.root / missing if missing == "staff.json" else fixture.proc.path / str(os.getpid()) / missing
+                path.unlink()
+                fixture.server.persist()
+                before = self.saved_files(fixture)
+                for request in self.changes():
+                    with self.subTest(request=type(request).__name__, unit=request.unit):
+                        reply, = fixture.completed_queue_change(request)
+                        self.assertIsInstance(reply, wire.Refused)
+                        self.assertEqual(self.saved_files(fixture), before)
+                        self.assertFalse(fixture.server.ledger)
+
+    def test_refused_caller_cannot_replay_an_allowed_request(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.caller(fixture)
+            request = self.changes()[2]
+            self.assertEqual(fixture.completed_queue_change(request), [wire.Ok()])
+            self.caller(fixture, "20000000-0000-0000-0000-000000000002", "unit")
+            before = self.saved_files(fixture)
+            ledger = dict(fixture.server.ledger)
+            reply, = fixture.completed_queue_change(request)
+            self.assertIsInstance(reply, wire.Refused)
+            self.assertEqual(self.saved_files(fixture), before)
+            self.assertEqual(fixture.server.ledger, ledger)
+
+    def test_user_and_showrunner_set_and_clear_with_verified_ledger_names(self) -> None:
+        for session, actor in (("", "user"), ("20000000-0000-0000-0000-000000000002",
+                "queue (20000000-0000-0000-0000-000000000002)")):
+            for variable in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+                with self.subTest(session=session, variable=variable), AdmissionFixture() as fixture:
+                    self.caller(fixture, session, "showrunner", variable)
+                    for index, clear in enumerate(self.changes()[1:]):
+                        with mock.patch.object(gate, "priority_labels", return_value={"waiting": UnitLabels("worker", unit="demo")}):
+                            request = replace(self.changes()[0], request_id=f"set-{index}", actor="forged")
+                            self.assertEqual(fixture.completed_queue_change(request), [wire.Ok()])
+                        priority = fixture.server.priority
+                        assert isinstance(priority, records.QueuePriority)
+                        with self.subTest(action="set", index=index):
+                            self.assertEqual(priority.entries[0]["set_by"], actor)
+                            if session:
+                                self.assertNotEqual(priority.entries[0]["why"], "the user's bump")
+                        self.assertEqual(fixture.completed_queue_change(clear), [wire.Ok()])
+                        self.assertIsInstance(fixture.server.priority, records.NoQueuePriority)
+                        events = [cast(dict[str, object], json.loads(line))
+                                  for path in fixture.state_dir.parent.glob("*/*.jsonl")
+                                  for line in path.read_text().splitlines() if '"queue_priority"' in line]
+                        with self.subTest(action="clear", index=index):
+                            self.assertEqual(events[-1]["set_by"], actor)
+
+    def test_exited_peer_with_reused_pid_is_refused_before_writes(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.caller(fixture, "20000000-0000-0000-0000-000000000002", "showrunner")
+            path = fixture.proc.path / str(os.getpid()) / "stat"
+            text = path.read_text()
+            fields = text.rsplit(") ", 1)[1].split()
+            fields[19] = "replacement-start"
+            _ = path.write_text(f"{os.getpid()} (replacement) {' '.join(fields)}")
+            read_text = Path.read_text
+
+            def read(chosen: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                if chosen.parent == Path("/proc/self/fdinfo"):
+                    return "Pid:\t-1\n"
+                return read_text(chosen, encoding=encoding, errors=errors)
+
+            fixture.server.persist()
+            before = self.saved_files(fixture)
+            with mock.patch.object(Path, "read_text", read):
+                reply, = fixture.completed_queue_change(self.changes()[2])
+            self.assertIsInstance(reply, wire.Refused)
+            self.assertEqual(self.saved_files(fixture), before)
+            self.assertFalse(fixture.server.ledger)
+
+    def test_changed_peer_start_refuses_before_writes(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.caller(fixture)
+            path = fixture.proc.path / str(os.getpid()) / "stat"
+            read_text = Path.read_text
+            count = 0
+
+            def read(chosen: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                nonlocal count
+                text = read_text(chosen, encoding=encoding, errors=errors)
+                if chosen == path:
+                    count += 1
+                    if count > 1:
+                        fields = text.rsplit(") ", 1)[1].split()
+                        fields[19] = "different-start"
+                        return f"{os.getpid()} (peer) {' '.join(fields)}"
+                return text
+
+            fixture.server.persist()
+            before = self.saved_files(fixture)
+            with mock.patch.object(Path, "read_text", read):
+                reply, = fixture.completed_queue_change(self.changes()[2])
+            self.assertIsInstance(reply, wire.Refused)
+            self.assertIn("changed", reply.reason if isinstance(reply, wire.Refused) else "")
+            self.assertEqual(self.saved_files(fixture), before)
+            self.assertFalse(fixture.server.ledger)
+
+    def test_peer_pidfd_must_still_identify_the_same_live_process_after_verification(self) -> None:
+        for evidence in ("Pid:\t-1\n", f"Pid:\t{os.getpid() + 1}\n", "", "Pid:\t1\nPid:\t2\n"):
+            with self.subTest(evidence=evidence), AdmissionFixture() as fixture:
+                self.caller(fixture, "20000000-0000-0000-0000-000000000002", "showrunner")
+                read_text = Path.read_text
+                descriptors: list[int] = []
+                closed: list[int] = []
+                real_close = os.close
+
+                def read(chosen: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                    if chosen.parent == Path("/proc/self/fdinfo"):
+                        descriptors.append(int(chosen.name))
+                        if len(descriptors) > 1:
+                            return evidence
+                    return read_text(chosen, encoding=encoding, errors=errors)
+
+                def close(descriptor: int) -> None:
+                    if os.readlink(f"/proc/self/fd/{descriptor}") == "anon_inode:[pidfd]":
+                        closed.append(descriptor)
+                    real_close(descriptor)
+
+                fixture.server.persist()
+                before = self.saved_files(fixture)
+                with mock.patch.object(Path, "read_text", read), mock.patch.object(os, "close", close):
+                    reply, = fixture.completed_queue_change(self.changes()[2])
+                self.assertIsInstance(reply, wire.Refused)
+                self.assertEqual(len(descriptors), 2)
+                self.assertEqual(closed.count(descriptors[0]), 1)
+                self.assertEqual(self.saved_files(fixture), before)
+                self.assertFalse(fixture.server.ledger)
+
+    def test_unavailable_peer_pidfd_refuses_without_writes(self) -> None:
+        getsockopt = socket.socket.getsockopt
+
+        def unavailable(peer: socket.socket, level: int, option: int, length: int = 0) -> int | bytes:
+            if level == socket.SOL_SOCKET and option == getattr(socket, "SO_PEERPIDFD", 77):
+                raise OSError(errno.ENOPROTOOPT, "peer pidfd is unavailable")
+            return getsockopt(peer, level, option, length)
+
+        with AdmissionFixture() as fixture:
+            self.caller(fixture)
+            fixture.server.persist()
+            before = self.saved_files(fixture)
+            with mock.patch.object(socket.socket, "getsockopt", unavailable):
+                reply, = fixture.completed_queue_change(self.changes()[2])
+            self.assertIsInstance(reply, wire.Refused)
+            self.assertEqual(self.saved_files(fixture), before)
+            self.assertFalse(fixture.server.ledger)
+
+    def test_peer_pidfd_closes_after_verification_disconnect_and_server_close(self) -> None:
+        for ending in ("allowed", "refused", "disconnect", "server-close"):
+            with self.subTest(ending=ending), AdmissionFixture() as fixture:
+                self.caller(fixture, "20000000-0000-0000-0000-000000000002" if ending == "refused" else "")
+                descriptors: list[int] = []
+                closed: list[int] = []
+                capture = service.connected_peer_process
+                real_close = os.close
+
+                def connected(peer: socket.socket) -> service.ConnectedPeerProcess | service.PeerProcessUnavailable:
+                    identity = capture(peer)
+                    if isinstance(identity, service.ConnectedPeerProcess):
+                        descriptors.append(identity.descriptor)
+                    return identity
+
+                def close(descriptor: int) -> None:
+                    if os.readlink(f"/proc/self/fd/{descriptor}") == "anon_inode:[pidfd]":
+                        closed.append(descriptor)
+                    real_close(descriptor)
+
+                with mock.patch.object(service, "connected_peer_process", connected), \
+                        mock.patch.object(os, "close", close):
+                    if ending in ("allowed", "refused"):
+                        reply, = fixture.completed_queue_change(self.changes()[2])
+                        self.assertIsInstance(reply, wire.Refused if ending == "refused" else wire.Ok)
+                    else:
+                        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+                            peer.connect(str(fixture.socket_path))
+                            fixture.server.run_once(0)
+                            if ending == "disconnect":
+                                peer.close()
+                                fixture.server.run_once(0)
+                            else:
+                                fixture.server.close()
+                self.assertEqual(len(descriptors), 1)
+                self.assertEqual(closed.count(descriptors[0]), 1)

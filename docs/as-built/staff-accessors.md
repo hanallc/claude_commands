@@ -169,7 +169,9 @@ The shared pane launch builder uses `set_home`.
 | `scripts/build_hold/owning_session.py` | read | local_snapshot, OpenRun; `run_resolution` matches the run folder to a row's open run and takes its current session |
 | `scripts/buildlog/mac_idle_test_support.py` | read | snapshot |
 | `scripts/copies/copies.py` | read | local_snapshot, caller_identity; current owner names by row id |
-| `scripts/build_queue/build_queue.py` | read | caller_identity |
+| `scripts/build_queue/build_queue.py` | read | queue card labels |
+| `scripts/build_queue/build_bump.py` | read | selected unit labels |
+| `scripts/build_queue/admission_service.py` | read | current showrunner role and name for a verified peer session |
 | `scripts/build_queue/admission_records.py` | read | caller_identity |
 | `scripts/build_queue/admission_client.py` | read | snapshot, by_id, StaffId; resolve BUILDLOG_OWNER_STAFF_ID only when the caller has no session identity |
 | `scripts/direct/assign.py` | read | runtime_id |

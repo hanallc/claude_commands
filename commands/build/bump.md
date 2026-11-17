@@ -2,7 +2,7 @@
 description: Change a waiting unit's build priority.
 ---
 
-Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py $ARGUMENTS`.
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_bump.py $ARGUMENTS`.
 Show its output in a `text` block.
 Use `/build:page` for the Builds page.
 
@@ -12,4 +12,6 @@ A unit already in the list keeps its place.
 `clear <unit>` removes one unit.
 An unmatched selector or unknown unit exits 3 with a refusal.
 A bare `/build:bump` prints the usage and the Builds page link.
-These controls work from any session or a plain shell.
+Only the user and current showrunner sessions may change priority.
+Use `build_queue.py [position|session|folder]` to read the queue.
+The reader treats `clear` as a filter.
