@@ -2762,6 +2762,16 @@ Move the other `copies.standing` callers to the 44ax order with the same code: m
 
 **Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44be/work_order.md`.
 
+### Phase 44bf — A nextest run holds one memory promise for each step  · status: todo
+**From builds, 2026-11-17 14:3x (ruling on the promise study):** the cargo step keeps its promise from the measured cargo peak. When cargo ends, the run changes its grant to the test promise in one request, with no gap: p90 or higher of the same repository's measured test peak. It keeps its slot and queue age and takes no CPU token while it waits. The wire keeps the step name `nextest` and marks the test part with a new field. Each admission pass logs the head, its need and the unused promise of the holders. The Builds page shows the real wait reason. Hash due 18:00 EST.
+
+**Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44bf/work_order.md`.
+
+### Phase 44bg — The doc verb takes its copy slot only after admission  · status: todo
+**From the 44ax live check, 2026-11-17:** a direct `verify.sh doc` call held a copy slot through `copies.py hold` while it waited for admission. The doc route now uses the 44ax first-step route: freeze the staged files, get admission, then take the slot. No other verb or caller fills a checkout before admission. Hash due 16:15 EST.
+
+**Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44bg/work_order.md`.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
