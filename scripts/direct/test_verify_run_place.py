@@ -1,6 +1,8 @@
 """Verify startup gives nested and detached steps one live run identity."""
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
 from scripts.lib.checkout_test_support import copy_runtime, fixture_shim_source, python_tool_source
 
 import json
@@ -46,9 +48,7 @@ class VerifyRunPlaceTests(unittest.TestCase):
         lint = scripts / "lint"
         lint.mkdir()
         _ = (lint / "invoke.sh").write_text("return 0\n")
-        home_scripts = fixture.root / ".claude/scripts"
-        home_scripts.parent.mkdir()
-        home_scripts.symlink_to(scripts, target_is_directory=True)
+        _ = copy_helpers(fixture.root, *VERIFY_HELPERS)
         probe = direct / "probe.py"
         _ = probe.write_text('''import json, os, sys
 print(json.dumps({"pid": int(sys.argv[1]), "run": os.environ.get("BUILDLOG_RUN", ""), "name": sys.argv[2]}), flush=True)
