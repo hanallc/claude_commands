@@ -904,6 +904,92 @@ class LocalHoldPlacementTests(unittest.TestCase):
                     self.assertEqual(probe.call_count, 1)
                     self.assertIsInstance(eligibility.read_backoff(time.time(), "linux"), eligibility.ActiveBackoff)
 
+    def test_execution_probe_script_failures_do_not_start_reach_backoff(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.build_targets import build_targets, target_config
+        from scripts.mac_test import claim_state, eligibility, mac_test, offload
+
+        for outcome in ("script", "unreachable", "timeout", "success"):
+            with self.subTest(outcome=outcome), AdmissionFixture() as fixture:
+                settings = fixture.root / "linux.conf"
+                _ = write_config_fixture(settings, "probe_timeout_s=1\nunreachable_backoff_s=30\n", template="mac_test")
+                target = target_config.SshTarget("linux", "linux", settings)
+                request = placement_request(fixture)
+                destination = replace(request.constraints.candidates[0].destination,
+                                      provider="ssh", target="linux", host="private-linux")
+                request = replace(request, constraints=replace(request.constraints, candidates=(
+                    placement.PlacementCandidate(destination, settings=placement.ExplicitProviderSettings(settings)),)))
+                paths = claim_state.StatePaths(fixture.root / "claims")
+                record: claim_state.RemoteJobClaim = {"claim_id": "retained", "episode": "old", "attempt": "old-attempt",
+                    "submitting_session": "", "pid": request.owner.pid, "proc_start": request.owner.start_time,
+                    "remote_host": destination.host, "what": "busy claim", "worktree": str(fixture.root), "since": "private"}
+                held = claim_state.HeldClaim(destination.scope, paths.run, record)
+                binaries = fixture.root / "bin"
+                binaries.mkdir()
+                calls = fixture.root / "ssh-calls"
+                stub = binaries / "ssh"
+                body = (f"#!{sys.executable}\nfrom pathlib import Path\nimport select, sys\n"
+                        f"with Path({str(calls)!r}).open('a') as calls:\n    _ = calls.write('probe\\n')\n")
+                if outcome == "timeout":
+                    body += "_ = select.select([], [], [])\n"
+                elif outcome == "success":
+                    body += "print('123\\tprivate start')\n"
+                else:
+                    code = 1 if outcome == "script" else 255
+                    body += f"print('private failure\\nsecond detail', file=sys.stderr)\nsys.exit({code})\n"
+                _ = stub.write_text(body)
+                stub.chmod(0o700)
+                journal = io.StringIO()
+                with mock.patch.dict(os.environ, {"PATH": str(binaries) + os.pathsep + os.environ["PATH"]}), \
+                     mock.patch.object(target_config, "read_targets", return_value=(target,)), \
+                     mock.patch.object(build_targets, "ssh_target_eligibility", return_value=target_config.ExcludedTarget(target, "busy")), \
+                     mock.patch.object(claim_state, "state_paths", return_value=paths), \
+                     mock.patch.object(claim_state, "read_claims", return_value=(held,)), \
+                     mock.patch.object(claim_state, "target_claim_scope", return_value=destination.scope), \
+                     mock.patch.object(mac_test, "run_is_live", return_value=False), \
+                     mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")), \
+                     mock.patch.object(offload, "write_backoff", wraps=offload.write_backoff) as backoff, \
+                     redirect_stderr(journal):
+                    key = fixture.server.host_evidence_key(request, destination)
+                    fixture.server.host_requests[key] = request
+                    first = fixture.server.read_provider_evidence(key)
+                    first_journal = journal.getvalue().splitlines()
+                    second = fixture.server.read_provider_evidence(key)
+                    active = eligibility.read_backoff(time.time(), "linux")
+                assert isinstance(first, placement.FreshHostEvidence)
+                assert isinstance(second, placement.FreshHostEvidence)
+                self.assertEqual(second.claims[0].reference.claim_id, "retained")
+                evidence = first.executions[0][1]
+                if outcome == "success":
+                    self.assertIsInstance(evidence, placement.ObservedExecution)
+                    self.assertEqual(first_journal, [])
+                    self.assertEqual(journal.getvalue(), "")
+                else:
+                    assert isinstance(evidence, placement.ExecutionEvidenceUnavailable)
+                    self.assertEqual(len(first_journal), 1)
+                    self.assertIn(destination.target, first_journal[0])
+                    self.assertIn(evidence.reason, first_journal[0])
+                    self.assertNotIn("second detail", journal.getvalue())
+                    if outcome == "timeout":
+                        self.assertIn("timed out", first_journal[0])
+                    else:
+                        code = 1 if outcome == "script" else 255
+                        self.assertIn(f"exit {code}: private failure", first_journal[0])
+                if outcome in ("unreachable", "timeout"):
+                    self.assertIn("reach failure", first_journal[0])
+                    self.assertIsInstance(active, eligibility.ActiveBackoff)
+                    backoff.assert_called_once()
+                    self.assertEqual(journal.getvalue().splitlines(), first_journal)
+                    self.assertEqual(calls.read_text().splitlines(), ["probe"])
+                    self.assertIsInstance(second.executions[0][1], placement.ExecutionEvidenceUnavailable)
+                else:
+                    if outcome == "script":
+                        self.assertIn("script failure", first_journal[0])
+                        self.assertEqual(journal.getvalue().splitlines(), first_journal * 2)
+                    self.assertNotIsInstance(active, eligibility.ActiveBackoff)
+                    backoff.assert_not_called()
+                    self.assertEqual(calls.read_text().splitlines(), ["probe", "probe"])
+
     def test_a_busy_mac_is_a_busy_exclusion_and_a_free_mac_is_allowed(self) -> None:
         from scripts.build_queue import placement
         from scripts.build_queue.test_placement import placement_request
@@ -2530,7 +2616,7 @@ class ProgressProfileServiceTests(unittest.TestCase):
             _ = (helper_proc / "comm").write_text("rustc-outlier\n")
             sidecar = fixture.scope(owner, members=(owner.pid, helper.pid), current=4 * GIB, anonymous=3 * GIB)
             scope = Path(sidecar.read_text().strip())
-            request = replace(fixture.request(owner=owner, step="merge-gate", need=4 * GIB), sidecar=str(sidecar))
+            request = replace(fixture.request(owner=owner, step="gate", need=4 * GIB), sidecar=str(sidecar))
             grant = only_admitted(fixture.server.handle_request(request))
             progress.publish_counter(sidecar, progress.ProgressCounter("suites:1", 20, 100))
             _ = fixture.run_pass()
@@ -2995,12 +3081,12 @@ class CloudAdmissionTests(unittest.TestCase):
         assert isinstance(reply, wire.ViewReply)
         return reply.reading
 
-    def cloud_request(self, fixture: AdmissionFixture, *, step: str = "merge-gate",
+    def cloud_request(self, fixture: AdmissionFixture, *, step: str = "gate",
                       run: wire.RunIdentity | wire.NoRun = wire.NO_RUN) -> wire.AdmitRequest:
         return replace(fixture.request(need=40 * GIB, step=step, run=run), place=wire.CloudPlace("aws"))
 
     def test_cloud_starts_with_full_local_memory_and_charges_zero(self) -> None:
-        for step in ("merge-gate", "targeted-test"):
+        for step in ("gate", "test-affected"):
             with self.subTest(step=step), AdmissionFixture() as fixture:
                 fixture.free(0)
                 fixture.hold_starts()
@@ -3130,7 +3216,7 @@ class CloudAdmissionTests(unittest.TestCase):
             cloud = self.cloud_request(fixture)
             grant = only_admitted(fixture.server.handle_request(cloud))
             fixture.release(grant)
-            local = fixture.request(need=4 * GIB, step="merge-gate")
+            local = fixture.request(need=4 * GIB, step="gate")
             reply, = fixture.server.handle_request(local)
             self.assertIsInstance(reply, wire.Wait)
             self.assertFalse(fixture.server.reservations)
@@ -3523,7 +3609,7 @@ class RoomAndSlotTests(unittest.TestCase):
             mend = fixture.request(need=int(7.3 * GIB), step="mend")
             self.assertIsInstance(fixture.server.handle_request(mend)[0], wire.Wait)
             fixture.clock.advance(1)
-            gates = [fixture.request(need=6 * GIB, step="merge-gate") for _ in range(3)]
+            gates = [fixture.request(need=6 * GIB, step="gate") for _ in range(3)]
             for request in gates:
                 self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
             fixture.free(11 * GIB)
@@ -3555,7 +3641,7 @@ class QueueLifecycleTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             fixture.free(0)
             fixture.hold_starts()
-            request = fixture.request(step="merge-gate", since=fixture.clock.now() - 30)
+            request = fixture.request(step="gate", since=fixture.clock.now() - 30)
             self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
             fixture.clock.advance(10)
             fixture.free(60 * GIB)
@@ -3577,7 +3663,7 @@ class QueueLifecycleTests(unittest.TestCase):
     def test_admission_recovery_keeps_one_event_for_the_durable_grant(self) -> None:
         for boundary in ("after_state_write", "after_admitted_append"):
             with self.subTest(boundary=boundary), AdmissionFixture() as fixture:
-                request = fixture.request(step="merge-gate", since=fixture.clock.now() - 7)
+                request = fixture.request(step="gate", since=fixture.clock.now() - 7)
                 fixture.fault.stage = boundary
                 with self.assertRaises(InjectedCrash):
                     _ = fixture.server.handle_request(request)
@@ -3597,7 +3683,7 @@ class QueueLifecycleTests(unittest.TestCase):
 
     def test_gate_exit_before_a_positive_sample_still_records_its_end(self) -> None:
         with AdmissionFixture() as fixture:
-            request = fixture.request(step="merge-gate")
+            request = fixture.request(step="gate")
             grant = only_admitted(fixture.server.handle_request(request))
             fixture.clock.advance(3)
             _ = fixture.server.handle_request(wire.ReleaseRequest("gate-end", grant.reservation, 0))
@@ -3647,7 +3733,7 @@ class QueueLifecycleTests(unittest.TestCase):
     def test_an_end_append_retry_preserves_the_saved_time_and_publishes_once(self) -> None:
         for sampled in (False, True):
             with self.subTest(sampled=sampled), AdmissionFixture() as fixture:
-                request = fixture.request(step="merge-gate")
+                request = fixture.request(step="gate")
                 if sampled:
                     request = replace(request, sidecar=str(fixture.scope(request.owner)))
                 grant = only_admitted(fixture.server.handle_request(request))
@@ -3674,7 +3760,7 @@ class QueueLifecycleTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             fixture.free(0)
             fixture.hold_starts()
-            request = fixture.request(step="merge-gate")
+            request = fixture.request(step="gate")
             peer = fixture.connect(request)
             self.assertIsInstance(peer.replies()[0], wire.Wait)
             fixture.clock.advance(10)
@@ -3698,7 +3784,7 @@ class QueueLifecycleTests(unittest.TestCase):
                 fixture.free(0)
                 fixture.hold_starts()
                 age = records.read_memory_config().policy.timing.estimate_refresh_seconds + 1
-                request = (fixture.request(step="merge-gate", age=age) if estimator == "client"
+                request = (fixture.request(step="gate", age=age) if estimator == "client"
                            else fixture.service_request())
                 peer = fixture.connect(request)
                 initial = peer.replies()[-1]
@@ -3730,7 +3816,7 @@ class QueueLifecycleTests(unittest.TestCase):
 
     def test_restart_after_reservation_removal_keeps_the_completed_end(self) -> None:
         with AdmissionFixture() as fixture:
-            request = fixture.request(step="merge-gate")
+            request = fixture.request(step="gate")
             grant = only_admitted(fixture.server.handle_request(request))
             fixture.clock.advance(5)
             ended_at = fixture.clock.now()
@@ -3759,7 +3845,7 @@ class QueueLifecycleTests(unittest.TestCase):
             with self.subTest(appended=appended), AdmissionFixture() as fixture:
                 fixture.free(0)
                 fixture.hold_starts()
-                request = fixture.request(step="merge-gate")
+                request = fixture.request(step="gate")
                 peer = fixture.connect(request)
                 self.assertIsInstance(peer.replies()[0], wire.Wait)
                 fixture.clock.advance(10)
@@ -3787,7 +3873,7 @@ class QueueLifecycleTests(unittest.TestCase):
             with self.subTest(reason=reason), AdmissionFixture() as fixture:
                 fixture.free(0)
                 fixture.hold_starts()
-                request = fixture.request(step="merge-gate")
+                request = fixture.request(step="gate")
                 peer = fixture.connect(request)
                 self.assertIsInstance(peer.replies()[0], wire.Wait)
                 fixture.clock.advance(4)
@@ -5261,7 +5347,7 @@ class CutoverServiceTests(unittest.TestCase):
 
     def test_policy_edits_reclassify_pressure_in_both_directions(self) -> None:
         with AdmissionFixture() as fixture:
-            request = fixture.request(step="merge-gate", need=8 * GIB)
+            request = fixture.request(step="gate", need=8 * GIB)
             request = replace(request, sidecar=str(fixture.scope(request.owner)))
             grant = only_admitted(fixture.server.handle_request(request))
             fixture.scoped_peak(grant, 8 * GIB)
@@ -6849,7 +6935,10 @@ class AdmissionConfigurationTests(unittest.TestCase):
 
     def test_drain_ignores_current_socket_waiters_and_counts_older_caller_code(self) -> None:
         scripts = Path(__file__).resolve().parents[1]
-        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/merge_gate.py", "build_queue/admission_client.py",
+        for name, expected in (("gate.py", True), ("cloud_gate.py", False), ("gate_box.py", False)):
+            with self.subTest(name=name):
+                self.assertEqual(name in service.ADMISSION_CALLERS, expected)
+        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/merge_gate.py", "production/gate.py", "build_queue/admission_client.py",
                          "build_queue/queue_place.py", "mac_test/offload.py", "mac_test/copy_watch.py"):
             with self.subTest(script=relative), AdmissionFixture() as fixture:
                 caller = fixture.proc.spawn()

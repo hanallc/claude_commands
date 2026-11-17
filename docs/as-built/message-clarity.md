@@ -293,7 +293,7 @@ New escalate holds retain their registered template and values.
   The result requires no action. The failure text includes an action.
   The gate says the next nightly run tries again. The cold credentials example directs the user to run `github-warmup`.
   Silence keeps only the newest push and delivers it when silence ends.
-  The gate reads `nightly_result_push=on` and `nightly_result_modules=8` from `merge_gate.conf` at use.
+  The gate reads `nightly_result_push=on` and `nightly_result_modules=8` from `gate.conf` at use.
   `off` disables both pushes. The module limit controls how many failed modules the result names.
   A run that never reaches merge_gate.py sends no push unless the timer script sends one.
 - `auto_mode.refused` has need `decision`. Auto mode refuses commands; the session continues its other work.

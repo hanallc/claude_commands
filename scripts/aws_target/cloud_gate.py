@@ -6,6 +6,7 @@ except FileNotFoundError:
     pass
 
 import argparse
+import ast
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
@@ -39,7 +40,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue import admission_records
 from scripts.production import affected_modules
 from scripts.production.gate_modules import GateRefused, discover_test_modules
-from scripts.production import merge_gate as gate
+from scripts.production import gate
 from scripts.test_times import gate_record
 
 
@@ -655,7 +656,7 @@ class GateWorker:
                 vcpus = int(size.split('.')[1].removesuffix('xlarge')) * 4
                 budget = (gate_record.NoGateTimeLimit('paired trial') if request.get('task') == 'paired'
                           else gate.read_time_limit(vcpus, cast(list[str], request['modules']), vcpus,
-                              request['mode'] == 'targeted-test' and not request.get('full', False)))
+                              request['mode'] == 'test-affected' and not request.get('full', False)))
                 seconds = budget.seconds if isinstance(budget, gate_record.GateTimeLimit) else 0.0
                 links['gate_time_limit_s'] = str(seconds)
                 credentials = self.api.call('export-credentials', '--format', 'process', service='configure')
@@ -1031,6 +1032,25 @@ def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
     return request
 
 
+def accepts_suite_mode(repo: Path, commit: str, mode: gate.SuiteMode) -> bool:
+    """Read the tested enum without executing code from the tested commit."""
+    for path in ('scripts/production/gate.py', 'scripts/production/merge_gate.py'):
+        source = subprocess.run(['git', 'show', f'{commit}:{path}'], cwd=repo,
+                                capture_output=True, text=True, check=False)
+        if source.returncode:
+            continue
+        try:
+            module = ast.parse(source.stdout)
+        except SyntaxError:
+            return False
+        for definition in module.body:
+            if isinstance(definition, ast.ClassDef) and definition.name == 'SuiteMode':
+                return any(isinstance(row, (ast.Assign, ast.AnnAssign))
+                           and isinstance(row.value, ast.Constant) and row.value.value == mode.value
+                           for row in definition.body)
+    return False
+
+
 def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
         selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES,
         service: Callable[[Sequence[str]], int] = lambda command: subprocess.call(command)) -> LocalFallback | CloudCompleted:
@@ -1120,6 +1140,9 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                                else prepare(repo, folder, mode, module_time_limit_s, selected=selected))
                     if request['tree'] != identity['tree'] or request['head'] != identity['commit']:
                         raise GateRefused('The checkout changed between cloud attempts')
+                    if not accepts_suite_mode(repo, ledger.text(request, 'commit'), mode):
+                        reservation.status = 0
+                        return LocalFallback(f'The tested commit does not declare SuiteMode value {mode.value!r}')
                     request['full'] = full
                     if retry_launch:
                         request['retry_launch'] = retry_launch

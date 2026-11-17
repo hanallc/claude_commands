@@ -62,7 +62,7 @@ class RecordedOwnerQueueTests(unittest.TestCase):
                     "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_NAME": "",
                     "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": str(owner.id),
                 }), mock.patch.object(unit_labels, "newest_sessions", return_value=[]):
-                    identity = admission_client.step_identity("targeted-test", "/private/tree")
+                    identity = admission_client.step_identity("test-affected", "/private/tree")
                     self.assertEqual(identity.session_id, owner.current_session)
                     labels = unit_labels.unit_labels_for([identity.session_id], os.environ)
                     waiter = replace(model.reading.view.waiting[0], session_id=identity.session_id,
@@ -94,7 +94,7 @@ class RecordedOwnerQueueTests(unittest.TestCase):
                     "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_NAME": "",
                     "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": reference,
                 }):
-                    identity = admission_client.step_identity("targeted-test", "")
+                    identity = admission_client.step_identity("test-affected", "")
                     self.assertEqual(identity.session_id, "")
                     for step in (model.reading.view.waiting[0], model.reading.view.running[0]):
                         label = queue_evidence.step_labels(replace(step, session_id="", session_name="", unit=""), {})
@@ -130,12 +130,12 @@ def cloud_reading(reading: admission_records.QueueRead) -> wire.CloudQueueRead:
     now = reading.explanation.now
     rows = (
         wire.CloudRow(wire.Owner(700001, "100"),
-            wire.Identity("cloud-session", "route-one", "merge-gate", "/private/cloud", "cloud-unit"),
+            wire.Identity("cloud-session", "route-one", "gate", "/private/cloud", "cloud-unit"),
             wire.CloudPlace("aws"), now - 245, now - 240,
             cloud_progress.CloudProgress("running", 32, 1, now - 120),
             progress_profile.ProgressCounter("modules", 7, 12), admission_records.ReadyForAdmission()),
         wire.CloudRow(wire.Owner(700002, "200"),
-            wire.Identity("cloud-waiter", "route-two", "targeted-test", "/private/waiting", "waiting-unit"),
+            wire.Identity("cloud-waiter", "route-two", "test-affected", "/private/waiting", "waiting-unit"),
             wire.CloudPlace("aws"), now - 60, 0,
             cloud_progress.NoCloudProgress(), progress_profile.NoCounter(), wire.CloudSlotWait(1, 1)),
     )
@@ -542,12 +542,12 @@ class CloudQueueViewTests(unittest.TestCase):
         director = unit_labels.make_labels("panes", unit_labels.NoShowrunner(), unit_labels.DirectsUnit("panes"))
         runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
         for step, owner, expected in (
-            ("targeted-test", director, "panes targeted"),
-            ("merge-gate", director, "panes merge"),
-            ("merge-gate", runner, "showrunner merge"),
-            ("merge-gate", unit_labels.UnitLabels("builds", "builds"), "merge gate"),
-            ("targeted-test", UnitLabels("worker", "sdlc", "panes"), "targeted test"),
-            ("merge-gate", UnitLabels("worker", "sdlc", "panes"), "merge gate"),
+            ("test-affected", director, "panes targeted"),
+            ("gate", director, "panes merge"),
+            ("gate", runner, "showrunner merge"),
+            ("gate", unit_labels.UnitLabels("builds", "builds"), "merge gate"),
+            ("test-affected", UnitLabels("worker", "sdlc", "panes"), "test affected"),
+            ("gate", UnitLabels("worker", "sdlc", "panes"), "merge gate"),
             ("build", director, "panes build"),
             ("literal{step}", director, "panes literal{step}"),
         ):
@@ -555,13 +555,13 @@ class CloudQueueViewTests(unittest.TestCase):
                 current = replace(row, identity=replace(row.identity, step=step))
                 labeled = replace(model, labels={row.identity.session_id: owner})
                 self.assertEqual(queue_view.cloud_step_name(current, labeled), expected)
-        current = replace(row, identity=replace(row.identity, step="targeted-test"))
+        current = replace(row, identity=replace(row.identity, step="test-affected"))
         settings = dict(model.names.settings)
-        settings["owned.targeted-test"] = "targeted for {unit}"
+        settings["owned.test-affected"] = "targeted for {unit}"
         configured = replace(model, names=type(model.names)(settings), labels={row.identity.session_id: director})
         self.assertEqual(queue_view.cloud_step_name(current, configured), "targeted for panes")
-        self.assertEqual(configured.names.shown("targeted-test"), "targeted test")
-        self.assertEqual(configured.names.prose("merge-gate"), "merge gate")
+        self.assertEqual(configured.names.shown("test-affected"), "test affected")
+        self.assertEqual(configured.names.prose("gate"), "merge gate")
 
     def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
         fixture = self.enterContext(QueueFixture(captured=False))

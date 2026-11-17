@@ -1,6 +1,8 @@
 """Check named assignment review with the shared loopback fixture."""
 from __future__ import annotations
 
+from scripts.direct import pass_record as pass_recorder
+
 import json
 import os
 import subprocess
@@ -96,7 +98,7 @@ class PaneAstraReviewTests(HeldRolePaneCase):
                     self.assertEqual(len(case.agent.notices), notices + 1)
                 passed = worker_panes.worker_pass(row, case.run_dir)
                 self.assertEqual(passed["status"], "completed")
-                delivery = progress_history.dispatch_delivery(passed)
+                delivery = pass_recorder.dispatch_delivery(passed)
                 self.assertEqual(Path(delivery.actions.status_file).read_text(), "done\n")
                 self.assertTrue(Path(delivery.reply_file).read_text().endswith(f"DONE {active.instance_id}\n"))
                 self.assertIn(f"{name}: phase 8: done", case.agent.notices[-1])

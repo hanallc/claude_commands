@@ -16,7 +16,7 @@ from scripts.aws_target import ledger
 from scripts.aws_target.measurement import number
 from scripts.lib import conf
 
-KINDS = (('merge-gate', 'merge gates'), ('targeted-test', 'targeted tests'))
+KINDS = (('gate', 'merge gates'), ('test-affected', 'targeted tests'))
 EVERY_KIND = tuple(mode for mode, _label in KINDS)
 # The mode of a launch request written before launch rows recorded a mode.
 NO_MODE = ''
@@ -33,8 +33,8 @@ class RunScope:
     modes: tuple[str, ...]
 
 
-SCOPES = (RunScope('merge-gate', 'Merge gates', 'merge gate', ('merge-gate',)),
-          RunScope('targeted-test', 'Targeted runs', 'targeted test', ('targeted-test',)),
+SCOPES = (RunScope('gate', 'Merge gates', 'merge gate', ('gate',)),
+          RunScope('test-affected', 'Targeted runs', 'targeted test', ('test-affected',)),
           RunScope('both', 'Both', 'run', EVERY_KIND))
 
 # AWS had no Spot box for this type and zone at this price.

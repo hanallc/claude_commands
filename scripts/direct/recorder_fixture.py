@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.direct import pass_record as pass_recorder
+
 from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
 from scripts.lib.checkout_test_support import copy_runtime
 
@@ -167,7 +169,7 @@ def prepare_launcher_runtime(root: Path) -> tuple[Path, Path, Path]:
     _ = (root / ".claude.json").write_text('{"oauthAccount":{"emailAddress":"worker@example.invalid"}}')
     for name in ("models_config.sh", "claude_account.sh", "heartbeat.sh", "heartbeat_watch.sh", "worker_lifecycle.py"):
         _ = shutil.copy2(source / "agents" / name, agents / name)
-    for name in ("assign.sh", "assign.py", "assign_claude.py", "claude_worker.py", "assign_gate.py", "workers.py", "end_session.sh", "remove_run_scratch.py", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py",
+    for name in ("assign.sh", "assign.py", "assign_claude.py", "claude_worker.py", "assign_gate.py", "workers.py", "end_session.sh", "remove_run_scratch.py", "worker_name.sh", "worker_state.py", "progress_history.py", "pass_record.py", "plan_history.py",
                  "phase_reservation.py", "recorder_state.py", "findings.py", "board.sh", "file_lock.sh"):
         _ = shutil.copy2(source / "direct" / name, direct / name)
     return direct, agents, lib
@@ -175,7 +177,7 @@ def prepare_launcher_runtime(root: Path) -> tuple[Path, Path, Path]:
 
 def configure_launcher_fixture(launcher: Path) -> None:
     """Keep legacy recorder calls and bounded fixture heartbeats in one place."""
-    recorder = launcher.with_name("progress_history.py")
+    recorder = launcher.with_name("pass_record.py")
     _ = recorder.write_text(recorder.read_text().replace(
         "from __future__ import annotations\n",
         "from __future__ import annotations\n" + LEGACY_RECORDER_ARGUMENTS, 1,
@@ -215,6 +217,7 @@ def communicate_launcher(process: subprocess.Popen[str], timeout: float = test_h
 def invoke_recorder(arguments: Sequence[str], environment: Mapping[str, str],
                     cwd: Path, *, check: bool = False) -> subprocess.CompletedProcess[str]:
     home = Path(environment["HOME"])
+    recorder = pass_recorder if arguments and arguments[0] in ("check-launch", "start-pass", "finish-pass") else progress_history
 
     def main() -> int:
         if arguments and arguments[0] == "start-pass" and "--worker-name" in arguments and "--worker-id" not in arguments:
@@ -224,20 +227,21 @@ def invoke_recorder(arguments: Sequence[str], environment: Mapping[str, str],
             matches = [row for row in session_staff.run_workers(state, staff.local_snapshot()) if row.name == name]
             if len(matches) == 1:
                 sys.argv.extend(("--worker-id", matches[0].id))
-        progress_history.main()
+        recorder.main()
         return 0
 
-    progress_history._config_digest.cache_clear()  # pyright: ignore[reportPrivateUsage]
+    pass_recorder.config_digest.cache_clear()
     try:
         with (
             patch.dict(os.environ, {"CONF_DIR": environment.get("CONF_DIR", str(home / ".claude/config"))}),
             patch.object(models_registry, "DEFAULT_PATH", home / ".claude/config/models.conf"),
+            patch.object(pass_recorder, "DEFAULT_MODELS_CONFIG_PATH", home / ".claude/config/models.conf"),
             patch.object(user_zone, "CONF", Path(environment.get("USER_ZONE_CONF") or
                                                str(Path(user_zone.__file__).parents[2] / "config/user_zone.conf"))),
         ):
-            result = invoke_cli(progress_history, main, list(arguments), environment, cwd)
+            result = invoke_cli(recorder, main, list(arguments), environment, cwd)
     finally:
-        progress_history._config_digest.cache_clear()  # pyright: ignore[reportPrivateUsage]
+        pass_recorder.config_digest.cache_clear()
     if check:
         result.check_returncode()
     return result

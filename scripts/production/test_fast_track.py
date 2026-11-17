@@ -256,7 +256,7 @@ class FastTrackTests(MergeCheckpointFixture):
             "scripts/sample/test_item.py": DIRECT_TEST,
             "scripts/sample/test_item_extra.py": DIRECT_TEST,
             "scripts/sample/test_unrelated.py": "raise AssertionError('full suite ran')\n",
-            "scripts/production/merge_gate.py": "raise AssertionError('gate ran')\n",
+            "scripts/production/gate.py": "raise AssertionError('gate ran')\n",
         }.items():
             self.write(self.checkout, path, content)
         copy_runtime(self.root, configuration=False)
@@ -1116,14 +1116,14 @@ class FastTrackTests(MergeCheckpointFixture):
                       "scripts/production/add_showrunner.py", "scripts/agents/shutdown.py",
                       "scripts/production/promote_showrunner.py", "scripts/production/transfer_unit.py",
                       "scripts/accounts/moves.py", "scripts/agents/shutdown.py",
-                      "scripts/agents/shutdown.py", "scripts/production/merge_gate.py",
+                      "scripts/agents/shutdown.py", "scripts/production/gate.py",
                       "scripts/production/merge_checkpoint.py", "scripts/direct/verify.sh",
                       "scripts/production/build_hold.py", "scripts/production/fast_track.py",
                       "config/fast_track.conf"})
         for path in sorted(paths):
             with self.subTest(path=path):
-                self.write(self.unit, path, "refused edit\n")
-                self.assert_refused(self.fast_track(path))
+                self.write(self.unit, path, "VALUE = 1\n")
+                self.assert_refused(self.fast_track(path), f"refused path: {path}")
         self.assertEqual(self.observations("types"), [])
 
     def test_missing_and_invalid_configuration_keys_name_the_key(self) -> None:

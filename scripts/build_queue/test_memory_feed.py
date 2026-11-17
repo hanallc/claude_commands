@@ -608,18 +608,43 @@ process.stdout.write(JSON.stringify({
                     (proc / str(pid)).mkdir()
                     command = gate_command[:2] + arguments + (gate_command[2:] if expected.branch else [])
                     _ = (proc / str(pid) / "cmdline").write_bytes(b"\0".join(part.encode() for part in command) + b"\0")
-                    job = memory_feed.step_job("merge-gate", pid, proc)
+                    job = memory_feed.step_job("gate", pid, proc)
                     self.assertEqual(job, expected)
                     notes = memory_feed.job_notes(job, "report", names)
                     self.assertTrue(notes.get("about"))
                     self.assertEqual(notes.get("changes"), "sdlc branch" if expected.step == "integrate" else "no branch")
             self.assertIsInstance(memory_feed.step_job("nextest", 10, proc), memory_feed.NotGateStep)
-            self.assertIsInstance(memory_feed.step_job("merge-gate", 99, proc), memory_feed.CommandUnreadable)
+            self.assertIsInstance(memory_feed.step_job("gate", 99, proc), memory_feed.CommandUnreadable)
         for command, named in (
             (["python3", "-X", "dev", "/repo/scripts/production/targeted_test.py"], StepJob("test-affected")),
             (["py", "targeted_test.py", "--full"], StepJob("test-all")),
             (["python3", "targeted_test.py", "--module", "a"], StepJob("test-modules", modules=1)),
             (["python3", "-m", "scripts.production.merge_gate", "--tests-only"], StepJob("test-all")),
+            (["python3", "/repo/scripts/production/gate.py", "--unit", "handler", "--merge-branch", "sdlc"],
+             StepJob("integrate", unit="handler", branch="sdlc")),
+            (["python3", "-m", "scripts.production.gate", "--unit", "handler", "--merge-branch=sdlc"],
+             StepJob("integrate", unit="handler", branch="sdlc")),
+            (["gate.py", "--tests-only"], StepJob("test-all")),
+            (["gate.py", "--tests-only", "--module=a", "--module", "b"], StepJob("test-modules", modules=2)),
+            (["gate.py", "--nightly", "--merge-branch", "sdlc"], StepJob("test-nightly", branch="sdlc")),
+            (["gate.py", "--promote-only", "--merge-branch", "sdlc"], StepJob("promote", branch="sdlc")),
+            (["python3", "-m", "scripts.production.gate", "--tests-only"], StepJob("test-all")),
+            (["python3", "-m", "scripts.production.gate", "--tests-only", "--module=a"],
+             StepJob("test-modules", modules=1)),
+            (["python3", "-mscripts.production.gate", "--nightly", "--merge-branch=sdlc"],
+             StepJob("test-nightly", branch="sdlc")),
+            (["python3", "-m", "scripts.production.gate", "--promote-only", "--merge-branch", "sdlc"],
+             StepJob("promote", branch="sdlc")),
+            (["python3", "/repo/scripts/production/gate.py", "--affected"], StepJob("test-affected")),
+            (["gate.py", "--affected", "--full"], StepJob("test-all")),
+            (["gate.py", "--affected", "--module", "a", "--module=b"], StepJob("test-modules", modules=2)),
+            (["python3", "-m", "scripts.production.gate", "--affected"], StepJob("test-affected")),
+            (["python3", "-m", "scripts.production.gate", "--affected", "--full"], StepJob("test-all")),
+            (["python3", "-m", "scripts.production.gate", "--affected", "--module=a"],
+             StepJob("test-modules", modules=1)),
+            (["merge_gate.py", "--affected"], StepJob("test-affected")),
+            (["python3", "-c", "pass", "gate.py"], OTHER_COMMAND),
+            (["python3", "tool.py", "gate.py", "--affected"], OTHER_COMMAND),
             (["verify.sh", "--session-dir", "/session", "lint"], StepJob("lint")),
             (["bash", "verify.sh", "test", "hana"], StepJob("test")),
             (["python3", "-c", "pass", "merge_gate.py"], OTHER_COMMAND),
@@ -650,14 +675,14 @@ process.stdout.write(JSON.stringify({
 
 
     def test_local_test_counters_reach_the_page_through_admission(self) -> None:
-        for step in ("targeted-test", "merge-gate", "nextest", "test", "t"):
+        for step in ("test-affected", "gate", "nextest", "test", "t"):
             with self.subTest(step=step):
                 with AdmissionFixture() as fixture, fixture.loop_turn():
                     owner = fixture.proc.spawn()
                     sidecar = fixture.scope(owner)
                     request = replace(fixture.request(owner=owner, step=step), sidecar=str(sidecar))
                     grant = only_admitted(fixture.server.handle_request(request))
-                    phase = "suites:1" if step in ("targeted-test", "merge-gate") else "test:1"
+                    phase = "suites:1" if step in ("test-affected", "gate") else "test:1"
                     counter = progress_profile.ProgressCounter(phase, 7, 12)
                     progress_profile.publish_counter(sidecar, counter)
                     _ = fixture.run_pass()
@@ -2049,18 +2074,18 @@ process.stdout.write(JSON.stringify({
                                                 unit_labels.NoDirector())
         unknown = unit_labels.UnitLabels("unknown")
         for step, owner, expected in (
-            ("targeted-test", director, "panes targeted"),
-            ("merge-gate", runner, "showrunner merge"),
-            ("merge-gate", director, "panes merge"),
-            ("merge-gate", merge_staff, "sdlc-merge-gate merge"),
-            ("merge-gate", unit_worker, "panes merge"),
-            ("merge-gate", runner_worker, "showrunner merge"),
-            ("targeted-test", unknown, "targeted test"),
-            ("merge-gate", unknown, "merge gate"),
-            ("targeted-test", unit_labels.UnitLabels("worker", "sdlc", "panes"), "targeted test"),
-            ("merge-gate", unit_labels.UnitLabels("worker", "sdlc", "panes"), "merge gate"),
-            ("targeted-test", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "targeted test"),
-            ("merge-gate", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "merge gate"),
+            ("test-affected", director, "panes targeted"),
+            ("gate", runner, "showrunner merge"),
+            ("gate", director, "panes merge"),
+            ("gate", merge_staff, "sdlc-merge-gate merge"),
+            ("gate", unit_worker, "panes merge"),
+            ("gate", runner_worker, "showrunner merge"),
+            ("test-affected", unknown, "test affected"),
+            ("gate", unknown, "merge gate"),
+            ("test-affected", unit_labels.UnitLabels("worker", "sdlc", "panes"), "test affected"),
+            ("gate", unit_labels.UnitLabels("worker", "sdlc", "panes"), "merge gate"),
+            ("test-affected", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "test affected"),
+            ("gate", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "merge gate"),
         ):
             with self.subTest(step=step, owner=owner):
                 page = self.cloud_owner_page(step, owner)
@@ -2156,7 +2181,7 @@ process.stdout.write(JSON.stringify({
             ("nextest", "known-project", "/fixture", "known-project nextest"),
             ("nextest", "", "/fixture", "nextest"),
             ("nextest", "", "/absolute/repository", "nextest"),
-            ("merge-gate", "", "/fixture", "merge gate"),
+            ("gate", "", "/fixture", "merge gate"),
         ):
             with self.subTest(step=raw_step, project=project, folder=folder):
                 reading = reservation_reading(project=project)
@@ -2629,8 +2654,8 @@ def write_browser_fixture(folder: Path) -> None:
                 return model.names.shown(row.identity.step)
             naming = mock.patch.object(queue_view, "cloud_step_name", side_effect=recorded_name)
             with (naming if version == "before" else nullcontext()):
-                targeted = fixture.cloud_owner_page("targeted-test", director)
-                merge = fixture.cloud_owner_page("merge-gate", runner)
+                targeted = fixture.cloud_owner_page("test-affected", director)
+                merge = fixture.cloud_owner_page("gate", runner)
             targeted["walk"] = [row for page in (targeted, merge) for row in page["walk"] if row.get("kind") == "cloud"]
             targeted["waiters"] = [row for page in (targeted, merge) for row in page["waiters"] if row.get("kind") == "cloud"]
             pages[f"owner_names_{version}"] = json.loads(memory_feed.page_json(targeted))

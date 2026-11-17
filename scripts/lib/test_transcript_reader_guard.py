@@ -10,9 +10,9 @@ import unittest
 
 
 ALLOW_LIST: dict[tuple[str, str], str] = {
-    ("scripts/direct/progress_history.py", "_main_identity_from_codex"):
+    ("scripts/direct/pass_record.py", "_main_identity_from_codex"):
         "Reads the current CODEX_THREAD_ID session.",
-    ("scripts/direct/progress_history.py", "_main_identity_from_claude"):
+    ("scripts/direct/pass_record.py", "_main_identity_from_claude"):
         "Reads the current CLAUDE_CODE_SESSION_ID session.",
     ("scripts/herdr/herdr.py", "TranscriptCursor.skip_existing_turns"):
         "Records byte offsets for a running worker.",

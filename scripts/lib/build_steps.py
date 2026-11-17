@@ -145,11 +145,11 @@ def command_job(argv: Sequence[str]) -> StepJob | OtherCommand:
     if isinstance(program, OtherCommand):
         return program
     name, arguments = program
-    if name == "targeted_test.py":
+    if name == "targeted_test.py" or (name in {"gate.py", "merge_gate.py"} and "--affected" in arguments):
         return _test_job(arguments, affected=True)
     if name == "verify.sh":
         return _verify_step(arguments)
-    if name != "merge_gate.py":
+    if name not in {"gate.py", "merge_gate.py"}:
         return OTHER_COMMAND
     branch = _option(arguments, "--merge-branch")
     if "--nightly" in arguments:

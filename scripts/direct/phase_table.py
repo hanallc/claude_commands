@@ -2,10 +2,13 @@
 """Build and render a unit run's plan-phase table from durable events."""
 
 from __future__ import annotations
+
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
 except FileNotFoundError:
     pass
+
+from scripts.direct import pass_record as pass_recorder
 
 import argparse
 import fcntl
@@ -529,7 +532,7 @@ def _open_instance(
         )
         eta: StatedEta | ProjectedEta | EtaUnavailable
         eta = stated_event.eta
-        now = datetime.fromtimestamp(plan_history.now_epoch(), UTC)
+        now = datetime.fromtimestamp(pass_recorder.now_epoch(), UTC)
         if eta.time < now:
             delay = now - eta.time
             eta_range = eta.range
@@ -1145,7 +1148,7 @@ def _build_phase_record(
         typical = UnknownDuration()
     gap_samples = _gap_samples(run_events)
     gap = int(statistics.median(gap_samples)) if gap_samples else 0
-    now = datetime.fromtimestamp(plan_history.now_epoch(), UTC)
+    now = datetime.fromtimestamp(pass_recorder.now_epoch(), UTC)
     gap_before_first = isinstance(current, OpenPhase)
     previous_finish = now
     if isinstance(current, OpenPhase):
@@ -1193,7 +1196,7 @@ def _build_phase_record(
     return PhaseRecord(
         plan=plan_path,
         updated=datetime.fromtimestamp(
-            plan_history.now_epoch(), UTC
+            pass_recorder.now_epoch(), UTC
         ),
         current=current,
         phases=rows,

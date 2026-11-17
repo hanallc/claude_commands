@@ -1,5 +1,7 @@
 # Work without workers
 
+Launchers run `check-launch`, `start-pass`, and `finish-pass` through `scripts/direct/pass_record.py`.
+
 <NoWorkerMode>
 Complete the current work directly.
 This exception covers implementation, repairs, code review, style review, and phase review.

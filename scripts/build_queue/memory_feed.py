@@ -524,7 +524,7 @@ class RunRow(RowQueueNotes, SlotPlace):
 
 
 # Queue steps whose job shows only in the command's arguments.
-GATE_STEPS = frozenset({"merge-gate", "targeted-test"})
+GATE_STEPS = frozenset({"gate", "test-affected"})
 
 
 @dataclass(frozen=True)

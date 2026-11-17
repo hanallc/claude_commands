@@ -87,7 +87,7 @@ class GpuTestSlots:
 
 
 # These steps run test binaries; a GPU repository's tests open render apps.
-GPU_TEST_STEPS = frozenset({"nextest", "test", "t", "targeted-test", "merge-gate"})
+GPU_TEST_STEPS = frozenset({"nextest", "test", "t", "test-affected", "gate"})
 NO_GPU_TESTS = GpuTestSlots(1, frozenset())
 
 

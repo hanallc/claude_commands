@@ -271,7 +271,7 @@ def _run(launch: ClaudeLaunch) -> int:
     phase_options = ["--phase-id", launch.phase] if launch.phase else []
     worker_options = ["--worker-id", slot.row.id] if isinstance(slot, worker_admission.ExistingWorkerSlot) else []
     if progress.is_file():
-        started = child([PYTHON, str(SCRIPTS / "progress_history.py"), "start-pass", "--session-dir", str(launch.run),
+        started = child([PYTHON, str(SCRIPTS / "pass_record.py"), "start-pass", "--session-dir", str(launch.run),
             "--pass-kind", launch.role, "--prompt-file", str(launch.prompt), "--fix-cause", launch.fix_cause,
             "--fix-pass", str(launch.fix_pass), "--activity", launch.role, "--called-task", task,
             "--worker-name", name, "--called-family", "claude", "--called-model", launch.model,
@@ -321,7 +321,7 @@ def _run(launch: ClaudeLaunch) -> int:
     resolves = env.get("UNIT_RESOLVES_ROUND", "1" if launch.role == "fix" and launch.slot == "impl" else "0") == "1"
     repair_options = ["--phase", launch.phase] if launch.phase else []
     if code == 0:
-        if progress.is_file() and child([PYTHON, str(SCRIPTS / "progress_history.py"), "finish-pass",
+        if progress.is_file() and child([PYTHON, str(SCRIPTS / "pass_record.py"), "finish-pass",
                 "--session-dir", str(launch.run), "--status", "completed"], check=False).returncode:
             print(f"ERROR: unable to record the {launch.role} pass completion.", file=sys.stderr)
             _ = status.write_text("error\n")
@@ -338,7 +338,7 @@ def _run(launch: ClaudeLaunch) -> int:
         board("done", f"launcher: {launch.role} finished; summary at impl_summary_{launch.slot}.txt")
     else:
         ledger_error = 0
-        if progress.is_file() and child([PYTHON, str(SCRIPTS / "progress_history.py"), "finish-pass",
+        if progress.is_file() and child([PYTHON, str(SCRIPTS / "pass_record.py"), "finish-pass",
                 "--session-dir", str(launch.run), "--status", "error"], check=False).returncode:
             print(f"ERROR: unable to record the {launch.role} pass error.", file=sys.stderr)
             ledger_error = 1

@@ -218,10 +218,10 @@ class AwsReportTests(MeasurementFixture):
         _ = (charges / '2026-01-14.json').write_text(json.dumps(ledger.charge_record(reading)))
         events: list[dict[str, object]] = []
         for attempt, mode, at, box_s, gate_s in (
-            ('merge-bill', 'merge-gate', MIDNIGHT - 3600, 120, 60),
-            ('target-bill', 'targeted-test', MIDNIGHT - 3600, 60, 30),
-            ('merge-today', 'merge-gate', NOW, 90, 45),
-            ('target-today', 'targeted-test', NOW, 30, 15),
+            ('merge-bill', 'gate', MIDNIGHT - 3600, 120, 60),
+            ('target-bill', 'test-affected', MIDNIGHT - 3600, 60, 30),
+            ('merge-today', 'gate', NOW, 90, 45),
+            ('target-today', 'test-affected', NOW, 30, 15),
         ):
             row: dict[str, object] = {'attempt': attempt, 'instance_type': 'm7a.8xlarge', 'mode': mode}
             events.extend(({**row, 'time': at - box_s, 'result': 'launched'},
@@ -300,14 +300,14 @@ class AwsReportTests(MeasurementFixture):
         numeric_settings(self.settings, {'gate_type_window_days': '2'})
         launches: list[dict[str, object]] = []
         for attempt, size, mode, at, box_s, gate_s in (
-            ('merge-m', 'm7a.8xlarge', 'merge-gate', MIDNIGHT - 3600, 100, 60),
-            ('target-m', 'm7a.8xlarge', 'targeted-test', MIDNIGHT - 3600, 200, 30),
-            ('merge-c', 'c7a.8xlarge', 'merge-gate', MIDNIGHT - 3600, 300, 180),
-            ('target-c', 'c7a.8xlarge', 'targeted-test', MIDNIGHT - 3600, 100, 90),
-            ('unbilled-m', 'm7a.8xlarge', 'merge-gate', NOW, 600, 120),
-            ('unbilled-c', 'c7a.8xlarge', 'targeted-test', NOW, 400, 150),
-            ('old', 'old.8xlarge', 'merge-gate', MIDNIGHT - 86401, 100, 90),
-            ('future', 'future.8xlarge', 'targeted-test', MIDNIGHT + 86400, 100, 90),
+            ('merge-m', 'm7a.8xlarge', 'gate', MIDNIGHT - 3600, 100, 60),
+            ('target-m', 'm7a.8xlarge', 'test-affected', MIDNIGHT - 3600, 200, 30),
+            ('merge-c', 'c7a.8xlarge', 'gate', MIDNIGHT - 3600, 300, 180),
+            ('target-c', 'c7a.8xlarge', 'test-affected', MIDNIGHT - 3600, 100, 90),
+            ('unbilled-m', 'm7a.8xlarge', 'gate', NOW, 600, 120),
+            ('unbilled-c', 'c7a.8xlarge', 'test-affected', NOW, 400, 150),
+            ('old', 'old.8xlarge', 'gate', MIDNIGHT - 86401, 100, 90),
+            ('future', 'future.8xlarge', 'test-affected', MIDNIGHT + 86400, 100, 90),
         ):
             launches.extend((
                 {'time': at - box_s, 'attempt': attempt, 'instance_type': size, 'mode': mode, 'result': 'launched',
@@ -315,10 +315,10 @@ class AwsReportTests(MeasurementFixture):
                 {'time': at, 'attempt': attempt, 'instance_type': size, 'mode': mode, 'result': 'finished', 'gate_s': gate_s}))
         launches.extend((
             {'time': NOW, 'instance_type': 'legacy.8xlarge', 'result': 'finished', 'gate_s': 10},
-            {'time': NOW, 'attempt': 'orphan', 'instance_type': 'orphan.8xlarge', 'mode': 'merge-gate', 'result': 'finished', 'gate_s': 30},
+            {'time': NOW, 'attempt': 'orphan', 'instance_type': 'orphan.8xlarge', 'mode': 'gate', 'result': 'finished', 'gate_s': 30},
             {'time': NOW - 60, 'attempt': 'legacy-launch', 'instance_type': 'orphan.8xlarge', 'result': 'launched'},
-            {'time': NOW, 'attempt': 'legacy-launch', 'instance_type': 'orphan.8xlarge', 'mode': 'targeted-test', 'result': 'finished', 'gate_s': 30},
-            {'time': NOW, 'instance_type': 'refused.8xlarge', 'mode': 'targeted-test', 'result': 'refused'}))
+            {'time': NOW, 'attempt': 'legacy-launch', 'instance_type': 'orphan.8xlarge', 'mode': 'test-affected', 'result': 'finished', 'gate_s': 30},
+            {'time': NOW, 'instance_type': 'refused.8xlarge', 'mode': 'test-affected', 'result': 'refused'}))
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in reversed(launches)))
         charges = self.state / 'charges'
         charges.mkdir(exist_ok=True)
@@ -349,13 +349,13 @@ class AwsReportTests(MeasurementFixture):
 
     def test_gate_fallback_lines_show_one_short_reason_per_event_in_the_window(self) -> None:
         events: list[dict[str, object]] = [
-            {'time': NOW, 'attempt': 'fixture-attempt', 'mode': 'targeted-test', 'result': 'fallback',
+            {'time': NOW, 'attempt': 'fixture-attempt', 'mode': 'test-affected', 'result': 'fallback',
              'reason': 'The checkout changed after the test selection\nfixture traceback'},
-            {'time': NOW - 1, 'attempt': '', 'mode': 'merge-gate', 'result': 'fallback',
+            {'time': NOW - 1, 'attempt': '', 'mode': 'gate', 'result': 'fallback',
              'reason': 'image or stack is absent'},
-            {'time': MIDNIGHT - 86401, 'attempt': 'old', 'mode': 'merge-gate', 'result': 'fallback',
+            {'time': MIDNIGHT - 86401, 'attempt': 'old', 'mode': 'gate', 'result': 'fallback',
              'reason': 'fixture old reason'},
-            {'time': MIDNIGHT + 86400, 'attempt': 'future', 'mode': 'merge-gate', 'result': 'fallback',
+            {'time': MIDNIGHT + 86400, 'attempt': 'future', 'mode': 'gate', 'result': 'fallback',
              'reason': 'fixture future reason'},
         ]
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
@@ -365,7 +365,7 @@ class AwsReportTests(MeasurementFixture):
         self.assertEqual(len(lines), 2)
         at = datetime.fromtimestamp(NOW, UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
         self.assertEqual(lines[0], '- Cloud gate uses natedev: The checkout changed after the test selection '
-                         + f'({at}, targeted-test).')
+                         + f'({at}, test-affected).')
         self.assertIn('image or stack is absent', lines[1])
         for hidden in ('fixture traceback', 'fixture old reason', 'fixture future reason'):
             self.assertNotIn(hidden, output)
@@ -373,7 +373,7 @@ class AwsReportTests(MeasurementFixture):
     def test_gate_fallback_line_handles_missing_and_long_reasons(self) -> None:
         events: list[dict[str, object]] = [
             {'time': NOW, 'attempt': '', 'result': 'fallback'},
-            {'time': NOW - 1, 'attempt': '', 'mode': 'merge-gate', 'result': 'fallback',
+            {'time': NOW - 1, 'attempt': '', 'mode': 'gate', 'result': 'fallback',
              'reason': 'fixture ' * 100},
         ]
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
@@ -387,8 +387,8 @@ class AwsReportTests(MeasurementFixture):
 
     def test_gate_type_comparison_shows_unbilled_and_empty_cells_for_one_type(self) -> None:
         launches = [
-            {'time': NOW - 120, 'attempt': 'one', 'instance_type': 'm7a.8xlarge', 'mode': 'targeted-test', 'result': 'launched'},
-            {'time': NOW, 'attempt': 'one', 'instance_type': 'm7a.8xlarge', 'mode': 'targeted-test', 'result': 'finished', 'gate_s': 60}]
+            {'time': NOW - 120, 'attempt': 'one', 'instance_type': 'm7a.8xlarge', 'mode': 'test-affected', 'result': 'launched'},
+            {'time': NOW, 'attempt': 'one', 'instance_type': 'm7a.8xlarge', 'mode': 'test-affected', 'result': 'finished', 'gate_s': 60}]
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in launches))
         comparison = aws_report.gate_type_report(self.state, DAY, 14)
         lines = comparison.tables
@@ -408,7 +408,7 @@ class AwsReportTests(MeasurementFixture):
     def test_gate_type_comparison_with_malformed_evidence_preserves_the_report(self) -> None:
         self.write_records(self.local_step('comparison-evidence', 60, 10))
         launched = {'time': NOW - 60, 'attempt': 'missing-time', 'instance_type': 'm7a.8xlarge',
-                    'mode': 'merge-gate', 'result': 'launched'}
+                    'mode': 'gate', 'result': 'launched'}
         finished = {**launched, 'time': NOW, 'result': 'finished'}
         missing_time = json.dumps(launched) + '\n' + json.dumps(finished) + '\n'
         for filename, content, reason in (
