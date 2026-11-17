@@ -134,7 +134,7 @@ def answer(owner: staff.StaffId, identity: str, text: str) -> Investigation:
         return item
 
 
-def mark_read(owner: staff.StaffId, identity: str) -> Investigation:
+def mark_read(owner: staff.StaffId, identity: str, words: str = "") -> Investigation:
     """Mark an answer read once; accept an exact repeat without writing."""
     _ = _path(owner, identity)
     with _store(owner).locked():
@@ -144,9 +144,33 @@ def mark_read(owner: staff.StaffId, identity: str) -> Investigation:
         if item.state != InvestigationState.ANSWER_READY:
             raise InvestigationError(f"{identity}: cannot read an investigation in state {item.state}")
         item = replace(item, state=InvestigationState.READ, read=_now(),
-                       log=(*item.log, ReviewLog(datetime.now(timezone.utc), "nate", "Marked read")))
+                       log=(*item.log, ReviewLog(datetime.now(timezone.utc), "nate", "Marked read"+(': '+words if words else ''))))
         _save(item)
         return item
+
+
+def review_action(owner: staff.StaffId, identity: str, action: str, words: str) -> Investigation:
+    """Record feedback or a question and keep each previous answer in the log."""
+    if not words.strip():
+        raise InvestigationError("enter your words")
+    with _store(owner).locked():
+        item = load(owner, identity)
+        if item.state != InvestigationState.ANSWER_READY:
+            raise InvestigationError(f"{identity}: the answer is no longer ready")
+        event = ReviewLog(datetime.now(timezone.utc), 'nate', ('feedback sent' if action == 'feedback' else action)+': '+words)
+        if action == 'question':
+            item = replace(item,state=InvestigationState.OPEN,answered='',read='',log=(*item.log,event))
+        else:
+            item = replace(item,state=InvestigationState.READ,read=_now(),log=(*item.log,event))
+        _save(item)
+        return item
+
+
+def record_review_log(owner: staff.StaffId, identity: str, words: str) -> None:
+    with _store(owner).locked():
+        item = load(owner, identity)
+        event = ReviewLog(datetime.now(timezone.utc), 'nate', words)
+        _save(replace(item,log=review_events.append(item.log,event)))
 
 
 def main(argv: list[str] | None = None) -> int:

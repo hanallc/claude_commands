@@ -6,8 +6,9 @@ import json
 import subprocess
 import tempfile
 import threading
+from datetime import datetime, timedelta, tzinfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import cast
+from typing import Self, cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
 import unittest
@@ -20,6 +21,7 @@ from urllib.parse import urlencode
 from scripts.production import change_review, investigation, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, record_table, review_items, review_page
 from scripts.review_links import test_change_page
+from scripts.review_links import review_later
 from scripts.review_links.test_page_frame import assert_status_states
 
 
@@ -125,7 +127,7 @@ class ReviewPageTests(unittest.TestCase):
         self.assertEqual(returned.state, review_items.ReviewState.FOR_YOU)
         self.assertIn('the spacing differs', returned.log[-1].words)
         _,answer = review_page.submit(self.root,self.body('page-owner/C2','feedback','Adjust the spacing.'),self.status)
-        self.assertIn('feedback:',answer)
+        self.assertEqual(answer,'feedback sent')
         self.assertEqual(next(item.state for item in review_items.read(self.root) if item.key == 'page-owner/C2'),review_items.ReviewState.DONE)
 
     def test_page_reuses_the_list_table_and_has_only_this_phases_actions(self) -> None:
@@ -138,9 +140,9 @@ class ReviewPageTests(unittest.TestCase):
             self.assertIn(label+'<span data-sort-mark',source)
         for kind in ('question','change','investigation'):
             self.assertIn(f'data-type-chip="{kind}"',source)
-        for action in ('Answer','Works','Does not work','Ask showrunner to check','Ask a question','Send feedback','Mark read'):
+        for action in ('Answer','Works','Does not work','Ask showrunner to check','Ask question','Send feedback','Mark read'):
             self.assertIn('>'+action+'</button>',source)
-        self.assertNotIn('>Later</button>',source)
+        self.assertIn('>Later</button>',source)
         self.assertIn('createPageRefresh(refresh,()=>content.dataset.refreshSeconds)',source)
         self.assertIn('class="lucide lucide-microscope"',source)
         self.assertIn('data-refresh-seconds="15.0"',source)
@@ -157,6 +159,111 @@ class ReviewPageTests(unittest.TestCase):
         self.assertFalse(any(key.startswith('investigation/') for key in waiting))
         self.assertTrue(any(key.startswith('question/') for key in waiting))
         self.assertEqual(review_page.legacy_url('/console/changes.html','type=questions'),'/console/review.html?type=question')
+
+    def test_each_type_has_the_approved_action_groups_and_later(self) -> None:
+        question = self.question()
+        ready = self.investigation()
+        expected = {question:('answer','feedback','question'),
+                    'page-owner/C1':('works','not works','validate','feedback','question'),
+                    f'investigation/{ready.owner}/{ready.id}':('read','feedback','question')}
+        token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
+        for item in review_items.read(self.root):
+            if item.key not in expected:
+                continue
+            with self.subTest(kind=item.type):
+                self.assertEqual(item.actions,expected[item.key])
+                form = review_page.form(item,change_page.ReviewBrowser(token,initial))
+                self.assertIn('Closes the item',form)
+                self.assertIn('The item returns to you',form)
+                self.assertIn('type="datetime-local"',form)
+                self.assertIn('value="later">Later',form)
+                self.assertNotIn('value="skip"',form)
+
+    def test_ask_question_and_one_owner_answer_command_for_each_type(self) -> None:
+        question = self.question()
+        ready = self.investigation()
+        keys = (question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}')
+        for key in keys:
+            with self.subTest(key=key):
+                item = next(item for item in review_items.read(self.root) if item.key == key)
+                delivery, result = review_page.submit(self.root,self.body(key,'question','Check the second case.'),self.status)
+                self.assertEqual(result,'question sent')
+                self.assertIsInstance(delivery,change_page.MessageDelivery)
+                assert isinstance(delivery,change_page.MessageDelivery)
+                self.assertIn(item.owner,delivery.recipients)
+                self.assertIn('change_page.py answer-question --item '+key,delivery.message)
+                change_page.deliver(delivery,self.status)
+                waiting = next(item for item in review_items.read(self.root) if item.key == key)
+                self.assertEqual(waiting.state,review_items.ReviewState.WAITING)
+                args = ['answer-question','--item',key,'--text','The second case passes.']
+                if isinstance(item.source,review_items.ChangeSource):
+                    request = self.status.slots(delivery.page,delivery.row).question
+                    assert isinstance(request,change_page.OpenQuestion)
+                    args += ['--question',request.question_id]
+                self.assertEqual(change_page.main(args),0)
+                returned = next(item for item in review_items.read(self.root) if item.key == key)
+                self.assertEqual(returned.state,review_items.ReviewState.FOR_YOU)
+                self.assertEqual(sum('The second case passes.' in entry.words for entry in returned.log),1)
+                self.assertEqual(sum('Check the second case.' in entry.words for entry in returned.log),1)
+
+    def test_feedback_closes_each_type_and_uses_startup_delivery_recovery(self) -> None:
+        question = self.question()
+        ready = self.investigation()
+        keys = (question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}')
+        for key in keys:
+            with self.subTest(key=key):
+                item = next(item for item in review_items.read(self.root) if item.key == key)
+                delivery,result = review_page.submit(self.root,self.body(key,'feedback','Use the second layout.'),self.status)
+                self.assertEqual(result,'feedback sent')
+                assert isinstance(delivery,change_page.MessageDelivery)
+                self.assertIn(item.owner,delivery.recipients)
+                self.assertEqual(next(item.state for item in review_items.read(self.root) if item.key == key),review_items.ReviewState.DONE)
+        restarted = change_page.DeliveryStatus(self.root)
+        change_page.recover_pending(restarted)
+        self.assertEqual(sum('Use the second layout.' in message for _,_,message in self.fixture.messages),4)
+        before = len(self.fixture.messages)
+        change_page.recover_pending(change_page.DeliveryStatus(self.root))
+        self.assertEqual(len(self.fixture.messages),before)
+
+    def test_later_hides_each_type_from_the_shared_queue_and_then_returns(self) -> None:
+        question = self.question()
+        ready = self.investigation()
+        keys = (question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}')
+        until = datetime.now(user_zone()).replace(second=0,microsecond=0)+timedelta(days=1)
+        for key in keys:
+            with self.subTest(key=key):
+                item = next(item for item in review_items.read(self.root) if item.key == key)
+                body = self.body(key,'later','Read this tomorrow.')+'&'+urlencode({'later':until.isoformat()})
+                _,result = review_page.submit(self.root,body,self.status)
+                self.assertIn('later until',result)
+                hidden = next(item for item in review_items.read(self.root) if item.key == key)
+                self.assertEqual(hidden.state,item.state)
+                self.assertFalse(hidden.for_you(datetime.now(user_zone())))
+                self.assertTrue(hidden.for_you(until+timedelta(seconds=1)))
+                self.assertTrue(any('Read this tomorrow.' in entry.words for entry in hidden.log))
+                _,entries = review_items.next_queue(item.type,self.fixture.production,False,staff.snapshot())
+                self.assertNotIn(item.queue_key,[entry.key for entry in entries])
+                self.assertEqual(review_later.times()[key],until)
+        class AfterLater(datetime):
+            @classmethod
+            @override
+            def now(cls, tz: tzinfo | None = None) -> Self:
+                return cls.fromtimestamp((until+timedelta(seconds=1)).timestamp(),tz)
+        with patch.object(review_items,'datetime',AfterLater):
+            for key in keys:
+                item = next(item for item in review_items.read(self.root) if item.key == key)
+                _,entries = review_items.next_queue(item.type,self.fixture.production,False,staff.snapshot())
+                self.assertIn(item.queue_key,[entry.key for entry in entries])
+
+    def test_question_answer_words_remain_after_the_answer_archive_expires(self) -> None:
+        key = self.question()
+        delivery,_ = review_page.submit(self.root,self.body(key,'answer','Keep these exact answer words.'),self.status)
+        change_page.deliver(delivery,self.status)
+        future = datetime.now(user_zone())+timedelta(days=3)
+        _ = update_registration.answered_items(self.fixture.temporary/'outstanding.json',future)
+        item = next(item for item in review_items.read(self.root) if item.key == key)
+        self.assertEqual(item.state,review_items.ReviewState.DONE)
+        self.assertIn('Keep these exact answer words.',item.log[-1].words)
 
     def test_legacy_links_keep_filters(self) -> None:
         self.assertEqual(review_page.legacy_url('/console/changes.html', 'type=questions&owner=page-owner&show=Waiting&q=layout&sort=Age&dir=desc'),
@@ -242,6 +349,7 @@ window.fetch=async(_url,options={})=>options.method==='POST' ?
   await flush();check(form.querySelector('[data-send-status]').textContent==='Saved: works','the row shows the saved result');
   await new Promise(resolve=>nativeTimeout(resolve,950));
   check(target.hidden,'the saved row leaves the view');
+  check(document.querySelector('[data-list-count]').textContent.startsWith('4 for you'),'the count excludes the saved row');
   check(rows().every(row=>row.querySelector('[data-detail]').hidden),'no next card opens');
   choose('list-show','all');
   const allTarget=rows().find(row=>row.dataset.type==='change' && row!==target);allTarget.querySelector('.list-toggle').click();
@@ -277,6 +385,16 @@ window.fetch=async(_url,options={})=>options.method==='POST' ?
 
   check(document.documentElement.scrollWidth<=innerWidth,'no horizontal overflow');
   if(innerWidth<960) check(getComputedStyle(shown()[0]).display==='block','phone rows are cards');
+  const laterForm=fresh.querySelector('form');laterForm.elements.later.value='2099-01-01T09:00';
+  laterForm.requestSubmit(laterForm.querySelector('[value="later"]'));
+  await new Promise(resolve=>nativeTimeout(resolve,1000));
+  check(fresh.hidden,'Later removes the question from the page');
+  check(document.querySelector('[data-list-count]').textContent.startsWith('2 for you'),'Later removes the question from the count');
+  const nativeNow=Date.now;Date.now=()=>new Date('2099-01-01T09:00').getTime()+1000;
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+  const returned=rows().find(row=>row.dataset.type==='question');
+  check(!returned.hidden && returned.dataset.state==='For you','Later returns the question with its original state');
+  Date.now=nativeNow;
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""

@@ -176,3 +176,13 @@ prints whom the answer goes to:
 `/next investigation` reads answer-ready records through `review_items.py`.
 Show the question and answer, then record the user's read result with `investigation.py read --owner <owner> --id <id>`.
 Open investigations wait for the owner and do not appear in `/next`.
+
+## Review actions
+
+Questions, changes and investigations share Send feedback, Ask question and Later on the Review page.
+Send feedback sends the words to the owner and closes the item.
+Ask question moves it to Waiting.
+Answer it with `change_page.py answer-question --item <Review key> --text "<answer>"`.
+For a change, include the `--question <id>` from its request message.
+The item returns to For you with the answer in its log.
+Later takes a date and time and hides the item from Review, the count and `/next` until then.

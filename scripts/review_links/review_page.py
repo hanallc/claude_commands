@@ -11,9 +11,10 @@ from urllib.parse import parse_qs, parse_qsl, urlencode
 
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
-from scripts.production import change_review, investigation, staff, update_registration
+from scripts.production import change_review, staff
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_link
 from scripts.review_links import review_legacy
+from scripts.review_links import review_actions
 from scripts.review_links.review_items import ReviewItem, ReviewState, ReviewType
 
 PAGE_PATH = '/console/review.html'
@@ -53,20 +54,21 @@ def section(heading: str, text: str) -> str:
 
 
 def form(item: ReviewItem, browser: change_page.ReviewBrowser) -> str:
-    if not item.actions:
-        return ''
     fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key)}
     hidden = ''.join(f'<input type="hidden" name="{key}" value="{html.escape(value, quote=True)}">' for key, value in fields.items())
     closes: list[str] = []
     returns: list[str] = []
     labels = {'answer': 'Answer', 'works': 'Works', 'not works': 'Does not work', 'validate': 'Ask showrunner to check',
-              'question': 'Ask a question', 'feedback': 'Send feedback', 'read': 'Mark read'}
+              'question': 'Ask question', 'feedback': 'Send feedback', 'read': 'Mark read'}
     for index, action in enumerate(item.actions):
         button = f'<button name="outcome" value="{action}"'+(' class="primary"' if index == 0 else '')+'>'+labels[action]+'</button>'
         (returns if action == 'question' else closes).append(button)
     groups = '<div class="review-action-group"><span>Closes the item</span><div>'+''.join(closes)+'</div></div>'
     if returns:
         groups += '<div class="review-action-group"><span>The item returns to you</span><div>'+''.join(returns)+'</div></div>'
+    groups += ('<div class="review-action-group review-later"><span>Hides it until</span><div>'
+               +'<input type="datetime-local" name="later" aria-label="Later, until">'
+               +'<button name="outcome" value="later">Later</button></div></div>')
     return ('<form method="post" data-review-form>'+hidden+f'<label for="words-{html.escape(item.key, quote=True)}">Your words</label>'
             + f'<textarea id="words-{html.escape(item.key, quote=True)}" name="feedback" rows="2" '
             + 'placeholder="Type your words. They go with the button that you press."></textarea>'
@@ -176,28 +178,32 @@ def render(root: Path) -> bytes:
 
 def submit(root: Path, body: str, status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
-    if set(fields) != {'row','token','outcome','feedback'} or any(len(values)!=1 for values in fields.values()):
+    if set(fields) not in ({'row','token','outcome','feedback'},{'row','token','outcome','feedback','later'}) or any(len(values)!=1 for values in fields.values()):
         raise change_page.AnswerRefused('use the answer form on this page')
     token, initial = change_browser.browser_manifest(change_page.console_folder(root))
     browser = change_page.ReviewBrowser(token,initial)
     key = fields['row'][0]
     if not secrets.compare_digest(fields['token'][0],change_browser.row_token(browser,key)):
         raise change_page.AnswerRefused('row or page token does not match this page')
-    if key.startswith('investigation/'):
-        _, owner, identity = key.split('/')
-        if fields['outcome'] != ['read']:
-            raise change_page.AnswerRefused('choose Mark read')
-        _ = investigation.mark_read(staff.StaffId(owner),identity)
-        return change_page.NoMessageDelivery(), 'marked read'
+    outcome, words = fields['outcome'][0], fields['feedback'][0]
+    if outcome == 'later' or key.startswith('investigation/'):
+        item = next((item for item in review_items.read(root) if item.key == key),None)
+        if item is None:
+            raise change_page.AnswerRefused('this item is not on the page')
+        if outcome == 'later':
+            return change_page.NoMessageDelivery(),review_actions.later(item,fields.get('later',[''])[0],words)
+        if outcome not in item.actions:
+            raise change_page.AnswerRefused('choose an action on this card')
+        return review_actions.investigation_action(item,outcome,words,status)
+    _ = fields.pop('later',None)
     delivery, answer = change_browser.submit(browser, urlencode({key:values[0] for key,values in fields.items()}), status,
                                                feedback_closes=True)
-    words = fields['outcome'][0]+(': '+fields['feedback'][0] if fields['feedback'][0] else '')
+    words = ('feedback sent' if outcome == 'feedback' else outcome)+(': '+fields['feedback'][0] if fields['feedback'][0] else '')
     if isinstance(delivery, change_page.MessageDelivery):
-        if isinstance(delivery.page, change_page.UserQuestionPage):
-            update_registration.record_review_log(delivery.page.review_list, words)
-        else:
+        if not isinstance(delivery.page, change_page.UserQuestionPage):
             change_review.record_review_log(delivery.page.review_list, delivery.row, words, delivery.page.production)
-    return delivery, answer or {'validate':'asked the showrunner to check', 'question':'question sent', 'feedback':'feedback sent'}.get(fields['outcome'][0],'answer')
+    return delivery, ('feedback sent' if outcome == 'feedback' else answer or
+                     {'validate':'asked the showrunner to check', 'question':'question sent'}.get(outcome,'answer'))
 
 
 STYLE = '''<style>
@@ -215,6 +221,9 @@ color:var(--ink);border:1px solid var(--line);border-radius:8px;resize:vertical}
 .review-actions{display:flex;align-items:flex-end;gap:26px;margin-top:12px;flex-wrap:wrap}
 .review-action-group>span{display:block;font-size:11px;color:var(--ink-3);text-transform:uppercase;margin-bottom:5px}
 .review-action-group>div{display:flex;gap:8px;flex-wrap:wrap}.review-action-group+.review-action-group{padding-left:26px;border-left:1px solid var(--line)}
+.review-later{margin-left:auto}.review-actions input{font:inherit;min-height:40px;max-width:100%;box-sizing:border-box;
+padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink)}
+.list-log span{white-space:pre-wrap}
 .review-actions button{margin:0;font:inherit;min-height:40px;padding:6px 14px;border:1px solid var(--ink-3);border-radius:8px;
 background:var(--card);color:var(--ink)}.review-actions .primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
 .review-source{grid-column:1/-1;color:var(--ink-3);font-size:12px;margin-top:16px!important}
@@ -240,13 +249,13 @@ const view=createRecordTable({content:()=>content,single:true,
   return owner;
  },
  shows:['open','For you','Waiting','Done','all'],
- visible:(data,{owner,show,query,type,sourceOwner})=>!saved.has(data.key) && (show==='all' || data.parked!=='true') &&
+ visible:(data,{owner,show,query,type,sourceOwner})=>!saved.has(data.key) && data.parked!=='true' &&
   !(show==='open' && data.state==='Waiting' && data.checking==='true') &&
   (!owner || data.owner===owner || data.type==='investigation' && data.sourceOwner===owner) && (!type || data.type===type) &&
   (!sourceOwner || data.sourceOwner===sourceOwner) &&
   (!query || data.number.includes(query) || data.title.includes(query)) &&
   (show==='all' || (show==='open' ? data.state!=='Done' : data.state===show)),
- counts:items=>['For you','Waiting','Done'].map(state=>items.filter(item=>item.dataset.state===state && item.dataset.parked!=='true').length+' '+state.toLowerCase()).join(' · '),
+ counts:items=>['For you','Waiting','Done'].map(state=>items.filter(item=>!saved.has(item.dataset.key) && item.dataset.state===state && item.dataset.parked!=='true').length+' '+state.toLowerCase()).join(' · '),
  applied:(items,{type})=>content.querySelectorAll('[data-type-chip]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.typeChip===type)))
 });
 function bind(){
@@ -259,6 +268,8 @@ function bind(){
   form.addEventListener('submit',async event=>{
    event.preventDefault();if(form.dataset.sending) return;
    const data=new URLSearchParams(new FormData(form));data.set('outcome',event.submitter.value);
+   form.elements.later.required=data.get('outcome')==='later';
+   if(!form.elements.later.reportValidity()) return;
    form.dataset.sending='true';saving++;pageRefresh.abandon();
    const buttons=[...form.querySelectorAll('button')],notice=form.querySelector('[data-send-status]');
    buttons.forEach(button=>button.disabled=true);notice.textContent='Saving…';
@@ -267,7 +278,9 @@ function bind(){
     const result=await response.json();if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
     notice.textContent='Saved: '+result.answer;drafts.delete(key);
     await new Promise(resolve=>setTimeout(resolve,900));
-    saved.set(key,{updated:form.closest('[data-list-item]').dataset.updated,closes:!['validate','question'].includes(data.get('outcome'))});
+    saved.set(key,{updated:form.closest('[data-list-item]').dataset.updated,
+     later:data.get('outcome')==='later' ? Date.parse(data.get('later')) : 0,
+     closes:!['validate','question','later'].includes(data.get('outcome'))});
     view.opened.delete(key);view.apply(false);
    }catch(error){notice.textContent='Not saved: '+error.message;buttons.forEach(button=>button.disabled=false);}
    finally{delete form.dataset.sending;saving--;}
@@ -284,6 +297,7 @@ async function refresh(_supersede=false,current=()=>true){
  const top=scrollY,focus=document.activeElement?.id,start=document.activeElement?.selectionStart,end=document.activeElement?.selectionEnd;
  content.replaceWith(fresh);content=fresh;
  for(const [key,result] of saved){
+  if(result.later){if(Date.now()>=result.later) saved.delete(key);continue;}
   if(result.closes) continue;
   const row=content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
   if(!row || row.dataset.state!=='For you' || row.dataset.updated!==result.updated) saved.delete(key);

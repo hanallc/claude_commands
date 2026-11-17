@@ -23,7 +23,7 @@ from scripts.production import proposals_folder, proposals_table
 from scripts.production.issues import Issue
 from scripts.production.proposal_issue import DeclinedDecision, InProgress, decision_answer, proposal_progress
 from scripts.production.production_doc import production_field, Refusal
-from scripts.review_links import review_events
+from scripts.review_links import review_events, review_later
 from scripts.review_links.review_events import ReviewLog as ReviewLog
 
 
@@ -126,7 +126,7 @@ class ReviewItem:
         return self.state == ReviewState.FOR_YOU and not self.hidden_until(now)
 
     def hidden_until(self, now: datetime) -> bool:
-        return isinstance(self.times.later, datetime) and self.times.later > now
+        return not isinstance(self.times.later, NoLaterTime) and self.times.later > now
 
 
 def moment(value: str) -> datetime:
@@ -181,22 +181,28 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
     entry = change_review.row_entries([row])[0]
     filed = entry.since.replace(tzinfo=user_zone()) if entry.since is not None else moment('1970-01-01')
     logs = [ReviewLog(filed, name(source, members), 'Filed for your check')]
+    saved_log = review_events.decode(row.get('Review log', ''))
+    words = {entry.words.casefold() for entry in saved_log}
     if isinstance(slots.question, delivery_state.OpenQuestion):
-        logs.append(ReviewLog(filed, 'nate', 'Question: ' + slots.question.text))
+        if ('question: '+slots.question.text).casefold() not in words:
+            logs.append(ReviewLog(filed, 'nate', 'Question: ' + slots.question.text))
     elif isinstance(slots.question, delivery_state.AnsweredQuestion):
-        logs.extend((ReviewLog(filed, 'nate', 'Question: ' + slots.question.text),
-                     ReviewLog(filed, name(identity, members), 'Answer: ' + slots.question.answer)))
-    if slots.validation_requested:
+        if ('question: '+slots.question.text).casefold() not in words:
+            logs.append(ReviewLog(filed, 'nate', 'Question: ' + slots.question.text))
+        if ('answer: '+slots.question.answer).casefold() not in words:
+            logs.append(ReviewLog(filed, name(identity, members), 'Answer: ' + slots.question.answer))
+    if slots.validation_requested and not any(entry.words.startswith('validate') for entry in saved_log):
         logs.append(ReviewLog(filed, 'nate', 'Asked the showrunner to check'))
-    if row.get('Verdict'):
+    if row.get('Verdict') and row['Verdict'].casefold() not in words and not any(
+            entry.words.startswith('feedback sent:') for entry in saved_log):
         logs.append(ReviewLog(filed, 'nate', row['Verdict']))
-    logs.extend(review_events.decode(row.get('Review log', '')))
+    logs.extend(saved_log)
     shown = change_review.display_id(row, routed.tab)
     after = entry.after if '/' in entry.after else prefix+'/'+entry.after if entry.after else ''
     local = path.absolute() == current.absolute()
     return ReviewItem(prefix+'/'+row['#'], shown, ReviewType.CHANGE, identity, source,
         row['Change'], state, ReviewTimes(filed, logs[-1].time), tuple(logs),
-        ('works', 'not works', 'validate', 'question', 'feedback') if state == ReviewState.FOR_YOU else (),
+        ('works', 'not works', 'validate', 'feedback', 'question') if state == ReviewState.FOR_YOU else (),
         ChangeSource(path, row, assignment, slots), entry.urgency, after, queue,
         row['#'] if local else prefix+'/'+row['#'], change_review.prerequisite_key(entry.after, path, current),
         entry.value, change_review.describe(row | {'#':shown},record=members))
@@ -253,19 +259,24 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
     after = fields.get('after','')
     later = moment(after) if after else NoLaterTime()
     logs = [ReviewLog(filed, name(asker, members), 'Asked')]
+    saved_log = review_events.decode(fields.get('review_log', ''))
+    words = {entry.words.casefold() for entry in saved_log}
     for exchange in fields.get('followups', []):
-        logs.extend((ReviewLog(filed, 'nate', exchange['followup']),
-                     ReviewLog(filed, name(asker, members), exchange['reply'])))
-    if 'followup' in fields:
+        if not any((prefix+exchange['followup']).casefold() in words for prefix in ('question: ','followup: ')):
+            logs.append(ReviewLog(filed,'nate',exchange['followup']))
+        if ('Answer: '+exchange['reply']).casefold() not in words:
+            logs.append(ReviewLog(filed,name(asker,members),exchange['reply']))
+    if 'followup' in fields and not any((prefix+fields['followup']['text']).casefold() in words
+                                      for prefix in ('question: ','followup: ')):
         logs.append(ReviewLog(moment(fields['followup']['sent']), 'nate', fields['followup']['text']))
-    logs.extend(review_events.decode(fields.get('review_log', '')))
+    logs.extend(saved_log)
     source = UnownedQuestionSource(record) if unowned else QuestionSource(record)
     key = 'question/'+owner+'/'+path.name
     identity = name(owner, members)+'/'+fields.get('review_id',path.stem)
     opened = update_registration.OpenItem(name(owner, members), parsed, name(asker, members) if asker else '')
     return ReviewItem(key, identity, ReviewType.QUESTION, owner, asker, fields['text'], state,
         ReviewTimes(filed, logs[-1].time, later), tuple(logs),
-        ('answer',) if state == ReviewState.FOR_YOU and not unowned else (), source, entry.urgency, '',
+        ('answer', 'feedback', 'question') if state == ReviewState.FOR_YOU and not unowned else (), source, entry.urgency, '',
         update_registration.question_queue_name(owner), entry.key, entry.after, entry.value, opened.line())
 
 
@@ -312,9 +323,9 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
         for record in investigation.records(identity, include_read=True, sources=sources):
             filed = moment(record.filed)
             logs = [ReviewLog(filed, name(record.owner, members), 'Filed')]
-            if record.answered:
+            if record.answered and not any(entry.words.startswith('Answer: ') for entry in record.log):
                 logs.append(ReviewLog(moment(record.answered), name(record.owner, members), 'Answer ready'))
-            if record.read:
+            if record.read and not any(entry.words.startswith(('Marked read','feedback sent:')) for entry in record.log):
                 logs.append(ReviewLog(moment(record.read), 'nate', 'Marked read'))
             logs.extend(record.log)
             state = investigation_state(record)
@@ -323,7 +334,7 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
             identity_text = name(record.owner, members)+'/'+record.id
             found.append(ReviewItem(key, identity_text, ReviewType.INVESTIGATION, owner, record.owner, record.title, state,
                 ReviewTimes(filed, logs[-1].time), tuple(logs),
-                ('read',) if state == ReviewState.FOR_YOU else (), InvestigationSource(record),
+                ('read', 'feedback', 'question') if state == ReviewState.FOR_YOU else (), InvestigationSource(record),
                 queue='investigation-'+owner, queue_key=key,
                 text=identity_text+' '+record.title+'\n'+record.question+'\n\nAnswer\n'+record.answer))
     return found
@@ -458,11 +469,22 @@ def read(root: Path, *, members: staff.StaffSnapshot | None = None) -> list[Revi
     members = staff.snapshot() if members is None else members
     documents = tuple(dict.fromkeys(member.doc.path for member in members.rows
                       if member.kind == 'showrunner' and isinstance(member.doc, staff.LiveDoc)))
-    return ordered([*question_items(members,documents,assign_ids=True),*change_items(root,members),
-        *investigation_items(members),*proposal_items(members,documents),*efficiency_items(members,documents)])
+    return ordered(with_later([*question_items(members,documents,assign_ids=True),*change_items(root,members),
+        *investigation_items(members),*proposal_items(members,documents),*efficiency_items(members,documents)]))
+
+
+def with_later(items: list[ReviewItem], sources: list[Path] | None = None) -> list[ReviewItem]:
+    times = review_later.times(sources)
+    return [replace(item,times=replace(item.times,later=times.get(item.key,item.times.later))) for item in items]
 
 
 def read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.StaffSnapshot, *,
+              below: bool = False, sources: list[Path] | None = None,
+              own: list[Issue] | None = None) -> list[ReviewItem]:
+    return with_later(_read_kind(kind,scope,members,below=below,sources=sources,own=own),sources)
+
+
+def _read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.StaffSnapshot, *,
               below: bool = False, sources: list[Path] | None = None,
               own: list[Issue] | None = None) -> list[ReviewItem]:
     """Read the selected store into ReviewItem records for all consumers."""
@@ -551,13 +573,13 @@ def question_counts(owner: staff.StaffRow, zone: ZoneInfo, identities: QuestionS
                     source: str = '') -> tuple[int,str]:
     items = read_kind(ReviewType.QUESTION,owner,identities.record,sources=sources)
     now = datetime.now(zone)
-    afters = [item.times.later for item in items if isinstance(item.times.later,datetime) and item.times.later > now]
+    afters = [item.times.later for item in items if not isinstance(item.times.later,NoLaterTime) and item.times.later > now]
     return (sum(item.for_you(now) and (not source or item.source_unit == source) for item in items),
             '' if not afters else str(int(min(afters).timestamp())))
 
 
 def ready_investigations(owner: staff.StaffId, *, sources: list[Path] | None = None) -> int:
-    items = investigation_items(staff.snapshot(),owners=(owner,),sources=sources)
+    items = with_later(investigation_items(staff.snapshot(),owners=(owner,),sources=sources),sources)
     return sum(item.for_you(datetime.now(user_zone())) for item in items)
 
 

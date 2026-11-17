@@ -1681,6 +1681,26 @@ class CountsRowTests(unittest.TestCase):
                 os.utime(self.cache, ns=(built, built))
                 self.assertEqual(self.lines(shell=shell)[-1], "For you: 1 question")
 
+    def test_review_later_hides_the_count_and_sets_its_cache_deadline(self) -> None:
+        from scripts.review_links import review_later
+        until = datetime.now(USER_ZONE)+timedelta(hours=1)
+        key = 'question/'+OWNER.id+'/question-fixture-0.md'
+        with patch.dict(os.environ,{'SHOWRUNNER_STATE_DIR':str(self.home/'.local/state/showrunner')}):
+            for shell in SHELLS:
+                with self.subTest(shell=shell):
+                    self.questions({'since':'2026-10-16T19:00','text':'A'})
+                    review_later.save(key,until)
+                    self.assertFalse(any(line.startswith('For you:') for line in self.lines(shell=shell)))
+                    row,due,*sources = self.cache.read_text().splitlines()
+                    self.assertEqual((row,int(due)),('',int(until.timestamp())))
+                    self.assertIn(str(review_later.path()),sources)
+                    began = self.cache.stat().st_mtime_ns
+                    review_later.save(key,datetime.now(USER_ZONE)-timedelta(seconds=2))
+                    os.utime(review_later.path(),ns=(began-10**9,began-10**9))
+                    _ = self.cache.write_text('\n'.join(['',str(int(time.time())-1),*sources])+'\n')
+                    os.utime(self.cache,ns=(began,began))
+                    self.assertEqual(self.lines(shell=shell)[-1],'For you: 1 question')
+
 
 class RebuildRowTests(unittest.TestCase):
     @override

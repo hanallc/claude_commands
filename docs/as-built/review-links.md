@@ -285,11 +285,25 @@ An address with only `item` selects All and clears the filters.
 The default order uses the existing urgency levels and age.
 Questions use a violet circle-help icon; Changes use a blue diff icon; Investigations use a teal microscope icon.
 
-Questions offer Answer.
-Changes offer Works, Does not work, Ask showrunner to check, Ask a question and Send feedback.
-Investigations with an answer offer Mark read.
-The shared sender handles Question and Change delivery, retries, alerts and recovery.
-Send feedback closes a change.
+Questions offer Answer and Send feedback in the closing group.
+Changes offer Works, Does not work, Ask showrunner to check and Send feedback in that group.
+Investigations with an answer offer Mark read and Send feedback in that group.
+Each card has Ask question in a separate return group and Later with a date and time.
+The primary button comes first.
+The shared sender handles all three types, including retries, owner alerts and startup recovery.
+Send feedback sends the words to the owner and finishes the item with the result **feedback sent**.
+Ask question sends the words to the owner and moves the item to Waiting.
+The owner's answer returns it to For you and stays in its log.
+Owners use `change_page.py answer-question --item <Review key> --text "<answer>"` for all three types.
+Change messages also supply `--question <id>` to identify the pending exchange.
+Every request message includes the complete answer command.
+Later keeps the state and hides the item from every page view, the For you count and `/next` until its time.
+`<SHOWRUNNER_STATE_DIR>/review-later.json` stores one ISO timestamp for each stable Review key across all five types.
+The shared reader applies that timestamp without copying the item or its state.
+The status cache watches that file and expires at the first pending Later time.
+The item returns after that time without a new action.
+Every action keeps its time, actor and words in the existing record log.
+Closed question records retain the user's words without the answer replay archive's 48-hour limit.
 Ask showrunner to check transfers the next action to the showrunner.
 A successful check closes the item; only a problem returns it to For you.
 After a save, the row shows its result and leaves every Show view.
@@ -300,7 +314,7 @@ Refresh retains the open row, scroll position and typed text.
 The Review navigation entry marks new For you items.
 Only Questions, Changes and Investigations can set this mark in this phase.
 Approved and declined proposals become Done in the shared reader.
-Cross-type feedback, questions, Later, and owner reply commands belong to the next phase.
+Proposals and efficiencies join the page in the next phase.
 
 ### Accounts page
 
@@ -604,7 +618,7 @@ An account move changes the next recipient address without changing the stored s
 The status line counts the same staff groups and shows a separate `unrouted` item.
 The `unrouted` count covers all page lists across independent production roots.
 The page and status line use the same waiting rule.
-Saved verdicts, validation requests, and open questions leave the waiting count and Skip for now order as soon as they save.
+Saved verdicts, validation requests and open questions leave the For you count and queue as soon as they save.
 The page, footer, and `/next` use this rule regardless of delivery results.
 Review shows one row per record and keeps one card open.
 The type, owner and state controls select the visible rows.
@@ -631,7 +645,7 @@ The message and a question keep the normalized line breaks.
 Works with text saves `works: <text>`.
 Does not work with text saves `not works: <text>`.
 Send feedback sends the words and closes the change.
-Each verdict saves the text from **Comment, question or feedback** as its comment.
+Each verdict saves the text from **Your words** as its comment.
 The existing `change_review.lands` function decides whether the verdict lands or returns the row.
 
 **Ask showrunner to check** sends the showrunner the row ID and **the user asks you to validate this**.
@@ -646,7 +660,7 @@ The CLI keeps its current form and still moves the pinned item.
 An unknown key raises `NextError` before the queue changes.
 Rows from an earlier list use their qualified keys.
 
-**Ask a question** uses the **Comment, question or feedback** field.
+**Ask question** uses the **Your words** field.
 The server refuses empty questions and questions that contain only whitespace.
 It saves no verdict and runs no feature-log command.
 The server stores the question before it sends one message to the row's showrunner.
@@ -657,7 +671,7 @@ An open question survives page loads and server restarts.
 A failed HTTP save keeps the row waiting with its typed question and answer form.
 A direct link shows the open question without verdict buttons.
 
-The showrunner answers with `scripts/review_links/change_page.py answer-question --production <showrunner name> --list <list> --row C<n> --question <id> --text "<answer>"`.
+The owner answers with `scripts/review_links/change_page.py answer-question --item <Review key> --question <id> --text "<answer>"`.
 The command refuses a row without an open question.
 The command refuses an old or unknown question ID.
 The same ID and answer text change nothing and exit 0 on a rerun.

@@ -582,7 +582,12 @@ Atomic replacement keeps each record complete.
 Frontmatter stores the id, fixed owner id, title, state, and filed, answered, and read times.
 The body contains the question and an `## Answer` section.
 A question length field preserves text that contains an Answer heading.
-The states are `open`, `answer ready`, and `read`, in that order.
+The states are `open`, `answer ready` and `read`.
+Review maps them to Waiting, For you and Done.
+Ask question returns an answered investigation to Waiting and preserves its previous answer in the log.
+Send feedback finishes it with the result **feedback sent**.
+The owner answers a Review question with `change_page.py answer-question --item investigation/<staff id>/I<n> --text "<answer>"`.
+The answer returns the record to For you.
 An exact repeat of an answer-ready or read operation changes nothing.
 Other state changes receive one refusal line.
 
@@ -643,7 +648,10 @@ A missing folder uses its nearest existing parent until the folder appears.
   `ProducerQuestions` retains its staff owner and user time zone without a production document.
   Its records use `<SHOWRUNNER_STATE_DIR>/<producer staff id>/questions` and pass the same question review.
   Its status count, `/next question`, and Review page filter read those records.
-  Answers and follow-ups use the existing retry, alert, and recovery paths to the producer's current session.
+  Answers, Send feedback and Ask question use the existing retry, alert and recovery paths.
+  Send feedback closes the question; Ask question waits for the owner's answer.
+  The owner runs `change_page.py answer-question --item <Review key> --text "<answer>"` to return it to For you.
+  The canonical question log keeps the user's words after the 48-hour replay archive expires.
   A missing showrunner owner gives `QuestionOwnerUnavailable`.
   A unit rename rewrites no question record.
   `questions-table` lists the open questions for `/showrunner:questions`.
@@ -654,7 +662,7 @@ A missing folder uses its nearest existing parent until the folder appears.
   More or fewer than one match exits 2.
   It prints `relay: to <unit>`, `relay: to the showrunner of <showrunner name>, for <unit>`, or `relay: none; …`.
   It then prints `answer: ok — <showrunner name>: <text>`.
-- `reply --item <text> --text <reply>` records the asker's reply to the user's follow-up from the Review page.
+- `reply --item <text> --text <reply>` remains the compatibility API behind the shared Review answer command.
   A question with a follow-up that waits for its reply is not due: `open` lists it as `waiting for the asker's reply since <time>`, and `/next` and the page leave it out.
   `reply` finds the one question with exactly that text and a waiting follow-up, in this production or a production below it.
   It keeps the follow-up and the reply in `followups`, and the question is due again with both shown.
