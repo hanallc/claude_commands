@@ -12,6 +12,7 @@ import signal
 import shlex
 import shutil
 import socketserver
+import subprocess
 import sys
 import tempfile
 import time
@@ -842,6 +843,21 @@ class MixedRestartTests(ShutdownTestCase):
             "    if sys.argv[3:5] == ['pane', 'read']:\n        response = json.loads(response)['result']['text']\n" +
             "    print('status: running' if sys.argv[-2:] == ['status', 'server'] else response, end='\\n')\n", new_file_mode=0o700)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_BIN": str(cli)})))
+        program = herdr.run_program
+
+        def run_program(argv: list[str], timeout: float = herdr.PROGRAM_TIMEOUT_SECONDS, *,
+                        environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            # The CLI script gives the same stdout; each start of it costs an interpreter.
+            if argv[:1] != [str(cli)]:
+                return program(argv, timeout, environment=environment)
+            with lock:
+                response = reply({"argv": argv[1:]})
+            if argv[3:5] == ["pane", "read"]:
+                output = str(response["text"])
+            else:
+                output = "status: running" if argv[-2:] == ["status", "server"] else json.dumps({"result": response})
+            return subprocess.CompletedProcess(argv, 0, output + "\n", "")
+        _ = self.enterContext(patch.object(herdr, "run_program", run_program))
         _ = cast(object, self.enterContext(patch.multiple(unit_runs, RUN_ROOT=root / "runs", FORMER_RUN_ROOT=root / "former", ASTRA_RUN_ROOT=root / "astra")))
         def role_account(role: str) -> accounts.AccountSelection:
             return (accounts.CodexWorkersAccount("codex1", root / ".codex1") if role == "workers" else

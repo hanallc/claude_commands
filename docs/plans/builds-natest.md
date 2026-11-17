@@ -4694,3 +4694,26 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Step 9 saves `moved_folder` before the move. Recovery after a failure at step 9 or 10 moves the folder back, then starts the services. A failed move back keeps the services down and the hold in force.
 - `drain_wait.sh` prints each kept run with its remaining time from the 7-day history, the largest remaining time, and the waiting gate count.
 - A fixture proof with one waiting gate passes 60 of 60 cases; basedpyright reports 0 errors and 0 warnings.
+
+### Phase 335 — The mixed restart tests answer herdr calls in the test process  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### Work Order
+
+**Goal:** `agents/test_restart.py` `MixedRestartTests` use less aws CPU; every behavior check stays.
+
+**Spec:**
+1. The 3 mixed restart tests start a Python fake `herdr` CLI 767 times (13.2 of 27.9 CPU s on natedev). Each start costs about 14 ms of interpreter start.
+2. Patch `herdr.run_program` in `linux_commands`: a call whose program is the fixture CLI gets the same reply from the in-process `reply` function, under the same lock, with the same stdout as the script. Every other program goes to the real `run_program`.
+3. Keep the CLI script and the socket server for calls from other modules and for the socket requests.
+4. Send builds a proposal: a restart or stop of all rows reads `pane list` about 90 times and `pane process-info` about 70 times per command for 5 panes.
+
+**Files:** `scripts/agents/test_restart.py`.
+
+**Workers:** none; no-worker mode. The director writes and proves it.
+
+**Acceptance gate:**
+- The module passes 3 times on natedev and in a copy merged onto origin/main.
+- basedpyright reports 0 errors and 0 warnings on the file.
+- natedev `module_cost.py` shows the CPU before and after; an aws pair shows the saving.
