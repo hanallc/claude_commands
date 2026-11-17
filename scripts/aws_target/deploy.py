@@ -438,6 +438,10 @@ class Deployment:
                            timeout_s=workload.whole('aws_timeout_s'))
         zone = workload.text('availability_zone')
         upload_timeout = workload.whole('image_upload_timeout_s')
+        wait_interval = max(workload.whole('image_wait_interval_s'),
+                            (upload_timeout + hana_image.COLDSNAP_MAX_WAIT_ATTEMPTS - 1)
+                            // hana_image.COLDSNAP_MAX_WAIT_ATTEMPTS)
+        wait_attempts = upload_timeout // wait_interval
         api = self._api(settings)
         with control_lock(self.directory):
             _ = self._guard()
@@ -448,27 +452,53 @@ class Deployment:
                                           '--filters', 'Name=name,Values=' + built.name), 'Images')
             if not images:
                 tag = conf.read(self.settings_path)
-                tags = '{Key=%s,Value=%s}' % (tag.text('cost_explorer_tag_key'), tag.text('cost_explorer_tag_value'))
+                cost_tag = 'Key=%s,Value=%s' % (tag.text('cost_explorer_tag_key'), tag.text('cost_explorer_tag_value'))
+                pending = hana_image.saved(self.directory)
+                resume = isinstance(pending, hana_image.PendingImageRegistration) and pending.name == built.name
+                if not resume:
+                    snapshots = ledger.rows(api.call('describe-snapshots', '--owner-ids', 'self', '--filters',
+                                                     'Name=description,Values=' + built.name), 'Snapshots')
+                    if snapshots:
+                        states = ', '.join(ledger.text(row, 'State') for row in snapshots)
+                        if len(snapshots) != 1 or snapshots[0].get('State') not in ('completed', 'pending'):
+                            raise DeploymentRefused(
+                                f'Hana snapshot adoption refused: {len(snapshots)} matching snapshots; states: {states}')
+                        pending = hana_image.PendingImageRegistration(built.name, ledger.text(snapshots[0], 'SnapshotId'))
+                        _ = hana_image.save(self.directory, pending)
+                        resume = True
                 raw = self.output / 'hana' / 'image.raw'
-                raw.parent.mkdir(parents=True, exist_ok=True)
                 try:
-                    with step('hana-image', 'converting the image to a raw disk', self.settings_path):
-                        _ = self.execute(['qemu-img', 'convert', '-f', built.source_format, '-O', 'raw',
-                                          str(built.file), str(raw)], capture_output=True, text=True,
-                                         timeout=upload_timeout, check=True)
+                    if not resume:
+                        raw.parent.mkdir(parents=True, exist_ok=True)
+                        with step('hana-image', 'converting the image to a raw disk', self.settings_path):
+                            _ = self.execute(['qemu-img', 'convert', '-f', built.source_format, '-O', 'raw',
+                                              str(built.file), str(raw)], capture_output=True, text=True,
+                                             timeout=upload_timeout, check=True)
                     tool = self.execute(['nix', 'build', '--no-link', '--print-out-paths',
                                          workload.text('image_upload_tool')], capture_output=True, text=True,
                                         timeout=upload_timeout, check=True).stdout.strip().splitlines()[-1]
-                    with step('hana-image', 'uploading the snapshot', self.settings_path, hint='can take several minutes'):
-                        upload = self.admin.executor(self.execute)(
-                            [tool + '/bin/coldsnap', '--region', settings.region, 'upload', '--wait', '--no-progress',
-                             '--omit-zero-blocks', '--description', built.name, str(raw)],
-                            capture_output=True, text=True, timeout=upload_timeout, check=False)
-                    if upload.returncode or not upload.stdout.strip():
-                        raise DeploymentRefused('the Hana snapshot upload failed: ' + upload.stderr.strip())
+                    if resume and isinstance(pending, hana_image.PendingImageRegistration):
+                        snapshot = pending.snapshot
+                    else:
+                        with step('hana-image', 'uploading the snapshot', self.settings_path, hint='can take several minutes'):
+                            upload = self.admin.executor(self.execute)(
+                                [tool + '/bin/coldsnap', '--region', settings.region, 'upload', '--no-progress',
+                                 '--omit-zero-blocks', '--description', built.name, '--tag', cost_tag, str(raw)],
+                                capture_output=True, text=True, timeout=upload_timeout, check=False)
+                        if upload.returncode or not upload.stdout.strip():
+                            raise DeploymentRefused('the Hana snapshot upload failed: ' + upload.stderr.strip())
+                        snapshot = upload.stdout.strip().splitlines()[-1]
+                        _ = hana_image.save(self.directory, hana_image.PendingImageRegistration(built.name, snapshot))
                 finally:
                     raw.unlink(missing_ok=True)
-                snapshot = upload.stdout.strip().splitlines()[-1]
+                with step('hana-image', 'waiting for the snapshot', self.settings_path):
+                    waited = self.admin.executor(self.execute)(
+                        [tool + '/bin/coldsnap', '--region', settings.region, 'wait',
+                         '--seconds-between-attempts', str(wait_interval),
+                         '--max-attempts', str(wait_attempts), snapshot],
+                        capture_output=True, text=True, timeout=upload_timeout, check=False)
+                    if waited.returncode:
+                        raise DeploymentRefused('the Hana snapshot wait failed: ' + waited.stderr.strip())
                 with step('hana-image', 'registering the image', self.settings_path):
                     image = ledger.text(api.call(
                         'register-image', '--name', built.name, '--architecture', 'x86_64',
@@ -476,8 +506,7 @@ class Deployment:
                         '--boot-mode', built.boot_mode, '--imds-support', 'v2.0',
                         '--root-device-name', settings.root_device_name, '--block-device-mappings',
                         f'DeviceName={settings.root_device_name},Ebs={{SnapshotId={snapshot},VolumeType=gp3,DeleteOnTermination=true}}',
-                        '--tag-specifications', f'ResourceType=image,Tags=[{tags}]',
-                        f'ResourceType=snapshot,Tags=[{tags}]'), 'ImageId')
+                        '--tag-specifications', f'ResourceType=image,Tags=[{{{cost_tag}}}]'), 'ImageId')
                     _ = api.call('wait', 'image-available', '--image-ids', image, timeout_s=upload_timeout)
                 images = ledger.rows(api.call('describe-images', '--image-ids', image), 'Images')
             if len(images) != 1 or images[0].get('State') != 'available':
