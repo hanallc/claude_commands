@@ -16,11 +16,12 @@ import secrets
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, urlsplit
@@ -148,6 +149,32 @@ class SentCloseoutAlerts(TypedDict):
     review_list: str
     row: str
     messages: list[str]
+    failed_delivery: NotRequired[StoredFailedDelivery]
+
+
+class StoredFailedDelivery(TypedDict):
+    attempt: str
+    review_list: str
+    row: str
+    last_error: str
+
+
+@dataclass(frozen=True)
+class FailedDelivery:
+    """The last attempt failed after all retries. A later success clears this result."""
+
+    attempt: str
+    review_list: Path
+    row: str
+    last_error: str
+
+
+@dataclass(frozen=True)
+class NoFailedDelivery:
+    """This row has no saved delivery failure."""
+
+
+NO_FAILED_DELIVERY = NoFailedDelivery()
 
 
 QuestionOutcome = Literal["answer", "followup", "skip", "question", "feedback"]
@@ -269,6 +296,7 @@ class AttemptOwnership:
 
     row_file: Path
     state: Literal["claimed", "sending"]
+    request_thread: threading.Thread = field(default_factory=threading.current_thread)
 
 
 class DeliveryStatus:
@@ -290,13 +318,50 @@ class DeliveryStatus:
     def path(self, page: ReviewPage, row: str) -> Path:
         return change_routing.delivery_path(self.root, page.review_list, row)
 
+    def owns_live_attempt(self, page: ReviewPage, row: str, intent: DeliveryIntent) -> bool:
+        """Check the sender while the caller holds the delivery lock."""
+        owner = self.request_attempts.get(intent.attempt)
+        return owner is not None and owner.row_file == self.path(page, row) and owner.request_thread.is_alive()
+
+    def closeout_path(self, page: ReviewPage, row: str) -> Path:
+        name = self.path(page, row).name.removeprefix(DELIVERY_PREFIX)
+        return self.root / (".review-link-closeout-alert-" + name + ".json")
+
+    def failed_delivery(self, page: ReviewPage, row: str) -> FailedDelivery | NoFailedDelivery:
+        """Read the failure from the existing closeout record, including after a server restart."""
+        try:
+            fields = cast(SentCloseoutAlerts, json.loads(self.closeout_path(page, row).read_text(encoding="utf-8")))
+        except FileNotFoundError:
+            return NoFailedDelivery()
+        failed = fields.get("failed_delivery")
+        if failed is None:
+            return NoFailedDelivery()
+        return FailedDelivery(failed["attempt"], Path(failed["review_list"]), failed["row"], failed["last_error"])
+
+    def record_result_locked(self, delivery: MessageDelivery, result: FailedDelivery | NoFailedDelivery) -> None:
+        """Keep alert history and the delivery result while the caller holds the delivery lock."""
+        path = self.closeout_path(delivery.page, delivery.row)
+        fields: SentCloseoutAlerts
+        try:
+            fields = cast(SentCloseoutAlerts, json.loads(path.read_text(encoding="utf-8")))
+        except FileNotFoundError:
+            fields = {"review_list": str(delivery.page.review_list.resolve()), "row": delivery.row, "messages": []}
+        if isinstance(result, FailedDelivery):
+            fields["failed_delivery"] = {"attempt": result.attempt, "review_list": str(result.review_list.resolve()),
+                                         "row": result.row, "last_error": result.last_error}
+        else:
+            _ = fields.pop("failed_delivery", None)
+            if not fields["messages"]:
+                path.unlink(missing_ok=True)
+                return
+        atomic_file.write_bytes_atomic(path, (json.dumps(fields) + "\n").encode("utf-8"), mode=0o600)
+
     def notify_closeout_failure(self, page: ReviewPage, row: str, message: str,
                                 recipients: tuple[staff.StaffId, ...]) -> None:
         """Send each row's failure once, including across server restarts."""
         if not recipients:
             return
-        name = self.path(page, row).name.removeprefix(DELIVERY_PREFIX)
-        path = self.root / (".review-link-closeout-alert-" + name + ".json")
+        path = self.closeout_path(page, row)
         with self.locked():
             try:
                 sent: SentCloseoutAlerts = cast(SentCloseoutAlerts, json.loads(path.read_text(encoding="utf-8")))
@@ -403,12 +468,13 @@ class DeliveryStatus:
             self.request_attempts[attempt] = AttemptOwnership(self.path(page, row), "claimed")
         return attempt
 
-    def record(self, delivery: MessageDelivery) -> None:
+    def record(self, delivery: MessageDelivery, result: FailedDelivery | NoFailedDelivery = NO_FAILED_DELIVERY) -> None:
         with self.locked():
             _ = self.request_attempts.pop(delivery.attempt, None)
             slots = self.slots(delivery.page, delivery.row)
             for current in slots.intents():
                 if current.attempt == delivery.attempt:
+                    self.record_result_locked(delivery, result)
                     if current.kind == "validation":
                         updated = replace(slots, validation=ValidationRequested(current.attempt, current.feedback))
                     else:
@@ -1163,9 +1229,11 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
         status.request_attempts[delivery.attempt] = AttemptOwnership(status.path(delivery.page, delivery.row), "sending")
     failures = (send_with_retries(SENDER, delivery.recipients, delivery.message, tries, pause) if delivery.recipients
                 else [DeliveryFailure(MissingRecipient(), "no showrunner to send to")])
+    result = (FailedDelivery(delivery.attempt, delivery.page.review_list, delivery.row, failures[-1].error)
+              if failures else NoFailedDelivery())
+    status.record(delivery, result)
     _ = alert_delivery_failures(failures, tries, source=delivery.page.review_list, row=delivery.row,
                             message=delivery.message, recipients=delivery.alert_recipients)
-    status.record(delivery)
 
 
 def alert_delivery_failures(failures: list[DeliveryFailure], tries: int, *, source: Path, row: str,

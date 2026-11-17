@@ -590,7 +590,7 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 3. basedpyright reports 0 errors and 0 warnings on the changed Python files.
 4. Live on natedev (director): the Review page shows spacetime/Q461 and Q462 (or a fixture copy when they are closed) as one line each. One dark desktop screenshot of those rows for the Change-Review line with `| after restart`.
 
-### Phase 47 — A rename of a unit to its own name keeps bare worker names quiet  · status: todo
+### Phase 47 — A rename of a unit to its own name keeps bare worker names quiet  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -623,6 +623,68 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 1. `scripts.agents.test_shutdown_cli` passes, with tests for: bare rows (`review`, `review2`, `style-ticket-1493`, `held-check-3`) print no per-row line and one summary line; a row with a recorded former-name prefix migrates; a row with an unrecorded foreign prefix stays and prints no hint.
    `scripts.production.test_unit_move` passes, with tests for items 5–7 and for a started move that still refuses.
 2. basedpyright reports 0 errors and 0 warnings on the changed files.
+
+### Phase 48 — An image can carry a question, and its answer comes back to the user  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the user (2026-11-17, via the showrunner, imageask): "images should have an ask question so that the image comes back with an answer - just like other things - if i say approved or not approved or send feedback those might not come back to me although they might - but ask a question must come back to me with an answer". unit-board's listask builds the same question flow into the List; the two pages share one module (agreed with unit-board 2026-11-17), with no second copy.
+
+**Spec:**
+- New `scripts/review_links/page_question.py`, the shared piece (form agreed with unit-board):
+  1. Typed records `Question(question_id, asked_at, words, answer: Answer | None)` and `Answer(text, answered_at)`. `question_id` is `Q<n>`, numbered per item. Each page stores the questions on the item's own record.
+  2. A `QuestionStore` protocol that each page implements on its own record under that record's lock: `questions(item)`, `add(item, Question)`, `set_answer(item, question_id, Answer)`.
+  3. `ask(store, item, owner, source_path, row, title, words, answer_command, status) -> MessageDelivery`. It takes the next id, saves the question under one delivery claim, and sends `<Page> <item>: Ask question` / title / words / `Answer with this command: <command with item and Q id>`. It reuses the Review page delivery (`change_page.DeliveryStatus` claim, `MessageDelivery`, retry), as `review_actions.send` does.
+  4. `answer(store, item, question_id, text) -> Answered | AnswerRefused`. It refuses an unknown or already-answered id, then writes the answer. Each page runs its own return step after it.
+  5. `open_question_html(question)` and `answered_question_html(question)` render the open line and the question-and-answer pair.
+- `scripts/review_links/images.py` and `image_store.py`:
+  1. Each card gets an **Ask question** button beside Send feedback. It uses the feedback text field; an empty field gives "Enter a question first."
+  2. The question goes to the image owner with the image id and the question id. The image is not deleted. The card stays on the page and shows the open question. While a question is open, the image does not count as waiting for the user (console new mark).
+  3. `images.py answer --id <image> --question Q<n> --text "<answer>"` calls `page_question.answer`. The card then shows the question and the answer, and the image counts as waiting for the user again (the return step: it clears `feedback_at` if set and marks the card new).
+  4. The image record type gains the questions field as `NotRequired`, so older records still read.
+- `commands/show_image.md` (or the command that tells owners about Images answers): one line naming the answer command.
+
+**Files:** `scripts/review_links/page_question.py` and `test_page_question.py` (new); `scripts/review_links/images.py`, `image_store.py`, `test_images.py`; the show_image command doc.
+
+**Workers:** 1 writer (`design`); the `test` worker takes the live shot.
+
+**State:** image records gain an optional questions field; no migration.
+
+**Constraints from prior phases:** tests write a fixture config; no test reads a tunable value. No mockup (showrunner). `page_question.py` is shared with unit-board's listask: keep its public surface to the form above; send unit-board its path as soon as its tests pass.
+
+**Acceptance gate:**
+1. `scripts.review_links.test_page_question` and `scripts.review_links.test_images` pass, with tests for: next id per item; ask saves and sends once under the claim; a failed send keeps the question with its delivery state; answer refuses an unknown and an answered id; the image card shows the open line, then the answered pair; the image leaves and re-enters the waiting set; an older record without questions reads.
+2. basedpyright reports 0 errors and 0 warnings on the changed Python files.
+3. Live on natedev (director, by the `test` worker on a copy): ask a question on a fixture image, answer it with the command, and the card shows the question and the answer. One dark desktop screenshot for the Change-Review line with `| after restart`.
+
+### Phase 49 — The fast-track recovery reads each Git object once, in one batch  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the showrunner (2026-11-17, fasttrackcost): "production/test_fast_track.py costs 55.6 aws CPU s ... most of the cost is about 6700 git calls from GitRunner recovery reads in fast_track.py. Batch the immutable object reads; keep the mutable ref reads and all writes as they are. ... Measure aws CPU before and after, and put both in the checkpoint."
+
+**Spec:**
+1. In `scripts/production/fast_track.py`, find which recovery reads make the Git calls in `test_fast_track.py`. Count them by command with `module_cost.py --commands`.
+2. Batch the reads of immutable objects (an object addressed by its full hash: `cat-file -e <hash>^{commit}`, blob and tree reads by hash). Use one `git cat-file --batch-check` or `--batch` process for each recovery pass, through `GitRunner`. Keep the `GitRunner.reconcile_reads` cache rules: no cached failed read, and no cache outside one pass.
+3. Keep each read of a mutable ref (`rev-parse HEAD`, `rev-parse origin/main`, `merge-base --is-ancestor`, ref lists) as one fresh call. Keep every write as it is.
+4. The behavior of `reconcile`, `push_patch` and `restore_prepared` does not change. No existing assertion changes.
+
+**Files:**
+- `scripts/production/fast_track.py`
+- `scripts/production/test_fast_track.py` — only a new test of the batch
+
+**Workers:** 1 writer (`repo-fix4`).
+
+**State:** none.
+
+**Constraints from prior phases:** tests write a fixture config; no test reads a tunable value.
+
+**Acceptance gate:**
+1. `scripts.production.test_fast_track` passes, with a test that one recovery pass starts one batch process for its object reads.
+2. basedpyright reports 0 errors and 0 warnings on the changed Python files.
+3. `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> production/test_fast_track.py --commands 10` before and after the change: CPU seconds and Git process starts. Both go in the checkpoint.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3

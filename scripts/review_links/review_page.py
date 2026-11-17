@@ -481,7 +481,7 @@ async function refresh(_supersede=false,current=()=>true){
  const page=new DOMParser().parseFromString(await response.text(),'text/html'),fresh=page.querySelector('[data-review]');
  if(!fresh) throw new Error('The page has no review table.');
  if(saving || !current() || show!==selectedShow) return;
- const top=scrollY,focus=document.activeElement?.id,start=document.activeElement?.selectionStart,end=document.activeElement?.selectionEnd;
+ const top=scrollY,restoreFocus=restoreFocusAfterRefresh();
  content.replaceWith(fresh);content=fresh;index=readIndex();
  for(const [key,result] of saved){
   const entry=index.get(key);
@@ -495,8 +495,7 @@ async function refresh(_supersede=false,current=()=>true){
  }
  for(const [key,result] of saved) savedEntry(key,result);
  bind();view.apply(false);
- if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
-  if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number') field.setSelectionRange(start,end);}
+ restoreFocus();
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
 }
 view.place();bind();view.apply();
