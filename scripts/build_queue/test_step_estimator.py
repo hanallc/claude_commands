@@ -2,12 +2,17 @@
 from __future__ import annotations
 
 import unittest
+import os
+from pathlib import Path
+import subprocess
+import tempfile
 from unittest import mock
 from typing import override
 
 from scripts.build_queue import step_estimator
 from scripts.build_queue.admission_records import RepositoryIdentity
 from scripts.buildlog import record, repository
+from scripts.buildlog import store
 
 
 class GitIdentityCacheTests(unittest.TestCase):
@@ -48,6 +53,65 @@ class GitIdentityCacheTests(unittest.TestCase):
                 assert isinstance(identity, RepositoryIdentity)
                 self.assertEqual(identity.key, after)
                 self.assertEqual(key.call_count, 2)
+
+
+class ManifestIdentityTests(unittest.TestCase):
+    def package(self, directory: Path, *, workspace: str = "") -> Path:
+        directory.mkdir(parents=True)
+        source = directory / "src"
+        source.mkdir()
+        _ = (source / "lib.rs").write_text("")
+        manifest = directory / "Cargo.toml"
+        _ = manifest.write_text('[package]\nname = "sample"\nversion = "0.1.0"\n' + workspace)
+        return manifest.resolve()
+
+    def test_gitless_steps_use_the_real_manifest_selected_by_cargo(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            single = self.package(base / "single")
+            workspace = base / "workspace"
+            workspace.mkdir()
+            _ = (workspace / "Cargo.toml").write_text('[workspace]\nmembers = ["member"]\nexclude = ["excluded"]\n')
+            member = self.package(workspace / "member")
+            excluded = self.package(workspace / "excluded")
+            detached = self.package(base / "detached", workspace='workspace = "../workspace"\n')
+            _ = (workspace / "Cargo.toml").write_text(
+                '[workspace]\nmembers = ["member", "../detached"]\nexclude = ["excluded"]\n')
+            alias = base / "alias"
+            alias.symlink_to(single.parent, target_is_directory=True)
+            cases: tuple[tuple[Path, list[str], Path], ...] = ((single.parent / "src", [], single),
+                     (alias, [], single),
+                     (base, ["--manifest-path", str(member)], workspace / "Cargo.toml"),
+                     (base, ["--manifest-path=" + str(detached)], workspace / "Cargo.toml"),
+                     (excluded.parent, [], excluded))
+            for cwd, options, manifest in cases:
+                with self.subTest(cwd=cwd, options=options):
+                    step_estimator.clear_git_identity_cache()
+                    identity, _ = step_estimator.git_identity(["cargo", "build", *options], str(cwd))
+                    self.assertEqual(identity, RepositoryIdentity("manifest-path:" + str(manifest), manifest.parent.name))
+                    self.assertEqual(record.repository_key(record.git_directory(["cargo", "build", *options], str(cwd))),
+                                     "manifest-path:" + str(manifest))
+
+    def test_git_keys_remain_separate_from_manifest_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            manifest = self.package(base / "gitless")
+            git = self.package(base / "git").parent
+            environment = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                           "GIT_AUTHOR_NAME": "Test", "GIT_COMMITTER_NAME": "Test",
+                           "GIT_AUTHOR_EMAIL": "test@example.invalid", "GIT_COMMITTER_EMAIL": "test@example.invalid"}
+            def command(*arguments: str) -> str:
+                return subprocess.run(["git", "-C", str(git), *arguments], env=environment,
+                                      capture_output=True, text=True, check=True, timeout=5).stdout.strip()
+            _ = command("init", "-q", "--template=")
+            self.assertEqual(repository.repository_key(str(git)), store.UNKNOWN_IDENTITY)
+            _ = command("-c", "commit.gpgSign=false", "-c", "core.hooksPath=/dev/null",
+                        "commit", "--allow-empty", "-qm", "first")
+            root = command("rev-parse", "HEAD")
+            self.assertEqual(repository.repository_key(str(git)), "git-root:" + root)
+            _ = command("remote", "add", "origin", "git@example.org:owner/project.git")
+            self.assertEqual((repository.repository_key(str(git)), repository.repository_key(str(manifest.parent))),
+                             ("https://example.org/owner/project", "manifest-path:" + str(manifest)))
 
 
 if __name__ == "__main__":

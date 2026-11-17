@@ -593,6 +593,18 @@ Merge-gate peaks keep their separate class and remain in the anonymous history.
 The gate uses its own cap, so Cargo estimates do not use those peaks.
 
 Five keyed rows exclude the older unkeyed rows for the same repository.
+`scripts/buildlog/repository.py` owns the repository identity rule for the recorder and estimator.
+A Git tree keeps its normalized origin key or its first root commit key.
+A directory without Git uses `manifest-path:<real Cargo.toml path>`.
+`cargo locate-project --workspace --offline` selects the package or workspace manifest without a build or network access.
+The identity resolves symbolic links and keeps separate manifest paths separate.
+An unreadable manifest or an unavailable Cargo command leaves the identity unknown.
+An empty Git repository keeps its unknown identity until a remote or root commit supplies a key.
+The estimator uses the manifest folder name without matching older rows by name alone.
+The first build keeps the configured Cargo fallback of 12 GiB.
+A recorded peak supplies the next estimate through the same identity and build shape.
+The estimate retains the configured headroom rules.
+Remote verify mirrors retain a supplied source identity when the local identity is unknown or comes from a manifest path.
 With one to four own rows, a non-build estimate uses their largest peak or a lower ranked pool peak.
 A repository without own history keeps the pool and fallback order.
 A full test estimate with a package keeps only rows whose package and scope match.

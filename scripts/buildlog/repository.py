@@ -10,6 +10,7 @@ from scripts.buildlog import store
 from scripts.lib import git_files
 
 GIT_TIMEOUT_S = 5
+MANIFEST_IDENTITY_PREFIX = "manifest-path:"
 
 def output(args: list[str], cwd: str, timeout: float) -> str | None:
     try:
@@ -45,13 +46,26 @@ def remote_identity(remote: str, directory: str) -> str:
 
 
 def repository_key(directory: str) -> str:
-    """Read the remote identity or the first root commit of a directory."""
+    """Keep Git identities or use Cargo's real workspace manifest without Git."""
     remote = output(["git", "-C", directory, "remote", "get-url", "origin"], directory, GIT_TIMEOUT_S)
     if remote and remote.strip():
         return remote_identity(remote.strip(), directory)
     roots = output(["git", "-C", directory, "rev-list", "--max-parents=0", "--reverse", "HEAD"],
                    directory, GIT_TIMEOUT_S)
-    return "git-root:" + roots.strip().splitlines()[0] if roots and roots.strip() else store.UNKNOWN_IDENTITY
+    if roots and roots.strip():
+        return "git-root:" + roots.strip().splitlines()[0]
+    if git_common_dir(directory) is not None:
+        return store.UNKNOWN_IDENTITY
+    folder = Path(directory).resolve()
+    if not any((parent / "Cargo.toml").is_file() for parent in (folder, *folder.parents)):
+        return store.UNKNOWN_IDENTITY
+    manifest = output(["cargo", "locate-project", "--workspace", "--message-format", "plain", "--offline"],
+                      directory, GIT_TIMEOUT_S)
+    if manifest and manifest.strip():
+        path = Path(manifest.strip()).resolve()
+        if path.is_file():
+            return MANIFEST_IDENTITY_PREFIX + str(path)
+    return store.UNKNOWN_IDENTITY
 
 
 GIT_DIR = ".git"
