@@ -987,25 +987,31 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
         status.request_attempts[delivery.attempt] = AttemptOwnership(status.path(delivery.page, delivery.row), "sending")
     failures = (send_with_retries(SENDER, delivery.recipients, delivery.message, tries, pause) if delivery.recipients
                 else [DeliveryFailure(MissingRecipient(), "no showrunner to send to")])
-    alert_delivery_failures(delivery, failures, tries)
+    _ = alert_delivery_failures(failures, tries, source=delivery.page.review_list, row=delivery.row,
+                            message=delivery.message, recipients=delivery.alert_recipients)
     status.record(delivery)
 
 
-def alert_delivery_failures(delivery: MessageDelivery, failures: list[DeliveryFailure], tries: int) -> None:
+def alert_delivery_failures(failures: list[DeliveryFailure], tries: int, *, source: Path, row: str,
+                            message: str, recipients: tuple[staff.StaffId, ...],
+                            title: str = "Change review delivery needs attention") -> bool:
+    reached = False
     for failure in failures:
         target = "no recipient" if isinstance(failure.recipient, MissingRecipient) else failure.recipient
         error = failure.error
-        alert = "\n".join(("Change review delivery needs attention", f"List: {delivery.page.review_list}",
-                           f"Row: {delivery.row}", f"Recipient: {target}", f"Tries: {tries}",
-                           f"Last error: {error}", "The user's answer is saved. Pass it on by hand.", delivery.message))
-        if not delivery.alert_recipients:
-            print(f"review-links delivery {delivery.row}: {error}; no showrunner for the alert", file=sys.stderr)
-        for runner in delivery.alert_recipients:
+        alert = "\n".join((title, f"List: {source}",
+                           f"Row: {row}", f"Recipient: {target}", f"Tries: {tries}",
+                           f"Last error: {error}", "The user's answer is saved. Pass it on by hand.", message))
+        if not recipients:
+            print(f"review-links delivery {row}: {error}; no showrunner for the alert", file=sys.stderr)
+        for runner in recipients:
             try:
                 send_to_staff(runner, SENDER, alert)
+                reached = True
             except SEND_ERRORS as failure:
-                print(f"review-links delivery alert {delivery.row}: " + " ".join(str(failure).splitlines()), file=sys.stderr)
-                return
+                print(f"review-links delivery alert {row}: " + " ".join(str(failure).splitlines()), file=sys.stderr)
+                return reached
+    return reached
 
 
 def recover_pending(status: DeliveryStatus) -> None:

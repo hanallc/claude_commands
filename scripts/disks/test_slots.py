@@ -50,10 +50,10 @@ class ReadSlotsTests(unittest.TestCase):
             _ = settings_file.write_text("".join(f"# whole: 1..\n{line}\n" for line in lines))
             root = Path(directory) / "slot"
             root.mkdir()
-            for name, purpose, days in (("hana-slot1", "fps", 0), ("hana-slot2", "verify", 9), ("hana-slot10", "", 2),
-                                        ("organon-slot1", "gate", 8)):
+            for name, work, days in (("hana-slot1", "integrate", 0), ("hana-slot2", "lint", 9), ("hana-slot10", "", 2),
+                                     ("organon-slot1", "", 8)):
                 (root / name).mkdir()
-                lease = {"showrunner": "builds", "unit": "report", "purpose": purpose,
+                lease = {"showrunner": "builds", "unit": "id-of-" + name, "work": work, "purpose": work or "verify",
                          "last_use": datetime.fromtimestamp(NOW - days * DAY, timezone.utc).isoformat()}
                 _ = build_slots.lease_path(root / name).write_text(json.dumps(lease))
             (root / "notes").mkdir()
@@ -61,17 +61,21 @@ class ReadSlotsTests(unittest.TestCase):
             def state(path: Path) -> Literal["held", "free"]:
                 return "held" if path.name in {"hana-slot1", "organon-slot1"} else "free"
 
-            report = slots.read_slots(root, Path("/build/cargo"), conf.read(settings_file), "host", DATA, NOW, state)
+            owners = {"id-of-hana-slot1": "natemerge"}.get
+            report = slots.read_slots(root, Path("/build/cargo"), conf.read(settings_file), "host", DATA, NOW, state,
+                                      owners=lambda owner: owners(owner, owner))
         self.assertEqual(report["root"], str(root))
         self.assertEqual([(group["repository"], group["maximum"], [row["name"] for row in group["slots"]])
                           for group in report["groups"]],
                          [("hana", 8, ["hana-slot1", "hana-slot2", "hana-slot10"]), ("organon", 2, ["organon-slot1"])])
         first, second, tenth = report["groups"][0]["slots"]
         self.assertEqual((first["size"], first["last_used"], first["used_by"], first["deleted_tonight"]),
-                         (70 * GIB, NOW, {"purpose": "fps", "unit": "report", "showrunner": "builds"}, False))
+                         (70 * GIB, NOW, {"name": "natemerge integrate", "showrunner": "builds"}, False))
         self.assertEqual((second["size"], second["used_by"], second["deleted_tonight"]), (40 * GIB, None, True))
         self.assertEqual((tenth["size"], tenth["last_used"], tenth["deleted_tonight"]), (0, NOW - 2 * DAY, False))
         self.assertFalse(report["groups"][1]["slots"][0]["deleted_tonight"])
+        # A lease with no step key keeps its owner and its purpose text.
+        self.assertEqual(report["groups"][1]["slots"][0]["used_by"], {"name": "id-of-organon-slot1 verify", "showrunner": "builds"})
 
     def test_slot_report_reads_the_common_or_machine_pool(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

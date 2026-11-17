@@ -203,6 +203,19 @@ class ColorTests(unittest.TestCase):
         line = status_lines({}, colors="role.showrunner=purple\n")[0]
         self.assertEqual(line.split(" | ")[0], "unassigned")
 
+    def test_account_hex_colors_preserve_hashes_and_strip_whitespace_comments(self) -> None:
+        for value, expected in (
+            ("#a0522d", "\x1b[38;2;160;82;45mclaude1\x1b[0m"),
+            ("#A0B1FF\t# comment", "\x1b[38;2;160;177;255mclaude1\x1b[0m"),
+            ("#000000 # comment", "\x1b[38;2;0;0;0mclaude1\x1b[0m"),
+            ("brown # comment", "\x1b[38;5;137mclaude1\x1b[0m"),
+            ("brown#fragment", "claude1"), ("#abcd", "claude1"),
+            ("#gg1122", "claude1"), ("#1234567", "claude1"),
+        ):
+            with self.subTest(value=value):
+                config = f"# account.claude1=red\n  # account.claude1=blue\naccount.claude1={value}\n"
+                self.assertEqual(status_lines({}, colors=config)[1].split(" | ")[0], expected)
+
     def test_named_extended_colors_render_their_256_color_codes(self) -> None:
         for color, code in (("orange", 208), ("purple", 141), ("pink", 211), ("teal", 30), ("brown", 137),
                             ("mauve", 139)):

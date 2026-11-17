@@ -288,6 +288,41 @@ class NewAccountTests(unittest.TestCase):
                          (before_stat.st_ino, before_stat.st_mtime_ns))
         replace.assert_not_called()
 
+    def test_existing_hex_color_is_reported_as_written_without_rewriting_the_file(self) -> None:
+        account = new_account.parse_account("claude", "claude5")
+        for value in ("#a0522d", "#A0522D"):
+            with self.subTest(value=value):
+                before = f"# account.claude5=blue\naccount.claude5={value}\t# keep this comment\n".encode()
+                _ = self.colors.write_bytes(before)
+                before_stat = self.colors.stat()
+                step = new_account.statusline_color_step(account)
+                self.assertEqual(step, new_account.Step(True, f"status line color {value} for claude5"))
+                self.assertEqual(self.colors.read_bytes(), before)
+                self.assertEqual((self.colors.stat().st_ino, self.colors.stat().st_mtime_ns),
+                                 (before_stat.st_ino, before_stat.st_mtime_ns))
+
+    def test_new_account_avoids_hex_colors_that_match_palette_names(self) -> None:
+        palette = [name for name in new_account.STATUSLINE_PALETTE
+                   if name not in new_account.STATUSLINE_EXCLUDED_COLORS]
+        for prefix in ("account", "role"):
+            for index, name in enumerate(palette):
+                with self.subTest(prefix=prefix, name=name):
+                    occupied = [accounts.account_color(color) for color in palette[:index + 1]]
+                    self.assertTrue(all(isinstance(color, accounts.AccountColor) for color in occupied))
+                    text = "".join(f"{prefix}.fixture{number}={color.css.upper()} # occupied\n"
+                                   for number, color in enumerate(occupied) if isinstance(color, accounts.AccountColor))
+                    _ = self.colors.write_text(text)
+                    step = new_account.statusline_color_step(new_account.parse_account("claude", "claude5"))
+                    expected = (palette[index + 1] if index + 1 < len(palette)
+                                else palette[0] if prefix == "role" else "")
+                    self.assertTrue(step.done, step.text)
+                    if expected:
+                        self.assertEqual(step.text, f"status line color {expected} for claude5")
+                        self.assertEqual(self.colors.read_text(), text + f"account.claude5={expected}\n")
+                    else:
+                        self.assertIn("claude5 stays uncolored", step.text)
+                        self.assertEqual(self.colors.read_text(), text)
+
     def test_exhausted_distinct_colors_fall_back_to_role_colors_then_leave_the_account_uncolored(self) -> None:
         _ = self.colors.write_text(
             "# Only the role color purple and three unused colors remain for accounts.\n"

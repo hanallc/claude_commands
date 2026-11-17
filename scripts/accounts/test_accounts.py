@@ -20,6 +20,7 @@ import errno
 import fcntl
 import json
 import os
+import re
 import selectors
 import shlex
 import shutil
@@ -5912,6 +5913,9 @@ with path.with_name(path.name + ".lock").open("a") as lock:
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_json_preserves_row_order_numeric_readings_roles_and_table_problems(self) -> None:
         read, reset = self.json_status_fixture()
+        colors = {"claude1": "brown", "codex1": "#A0522D"}
+        _ = (Path(os.environ["CONF_DIR"]) / "statusline.conf").write_text(
+            "account.claude1=brown # comment\naccount.codex1=#A0522D\n")
         code, table, error = self.run_cli("status")
         self.assertEqual((code, error), (0, ""))
         code, output, error = self.run_cli("status", "--json")
@@ -5921,7 +5925,11 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         rows = cast(list[dict[str, object]], document["accounts"])
         keys = {"label", "tool", "roles", "selected_roles", "role_counts", "sessions", "role_counts_by_machine", "weekly_left_percent", "resets_at", "login_ends_at", "credits", "use_credits", "read_at",
                 "read_ok", "credits_in_use"}
-        self.assertTrue(all(set(row) == keys for row in rows))
+        for row in rows:
+            label = cast(str, row["label"])
+            self.assertEqual(set(row), keys | ({"color"} if label in colors else set()))
+            if label in colors:
+                self.assertEqual(row["color"], colors[label])
         expected: list[tuple[str, str, list[str], float | None, str | None, float | str | None, bool, str | None]] = [
             ("claude1", "claude", [], None, None, None, False, None),
             ("claude2", "claude", ["units"], 70.6, reset.isoformat(), None, False, read.isoformat()),
@@ -9555,6 +9563,42 @@ class SharedStatusDocumentTests(unittest.TestCase):
         status = cast(dict[str, object], json.loads(accounts.render_status_json(self.reading(row))))
         self.assertEqual(status["problems"], ["Fixture problem."])
         return cast(list[dict[str, object]], status["accounts"])[0]
+
+    def test_account_colors_share_config_with_json_board_and_terminal_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "statusline.conf"
+            _ = (config.parent / "accounts.conf").write_bytes(
+                (Path(__file__).resolve().parents[2] / "config/accounts.conf").read_bytes())
+            for setting, css, escape in (
+                ("brown", "#af875f", "\x1b[38;5;137m"),
+                ("magenta", "#800080", "\x1b[35m"),
+                ("#A0522D", "#A0522D", "\x1b[38;2;160;82;45m"),
+                ("", "", ""), ("unknown", "", ""),
+            ):
+                with self.subTest(setting=setting), patch.dict(os.environ, {"CONF_DIR": temporary}):
+                    _ = config.write_text(f"account.fixture={setting} # comment\n" if setting else "# no account key\n")
+                    reading = self.reading(self.row())
+                    document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+                    item = document["accounts"][0]
+                    span = document["board"]["rows"][0]["cells"]["label"][0]
+                    if setting:
+                        self.assertEqual(item.get("color"), setting)
+                        self.assertEqual(span.get("color"), setting)
+                    else:
+                        self.assertNotIn("color", item)
+                        self.assertNotIn("color", span)
+                    color = accounts.account_color(span.get("color", ""))
+                    if css:
+                        self.assertEqual(color, accounts.AccountColor(escape, css))
+                    else:
+                        self.assertIsInstance(color, accounts.NoAccountColor)
+                    with patch.object(sys.stdout, "isatty", return_value=True):
+                        terminal = accounts.render_status_table(reading)
+                    with patch.object(sys.stdout, "isatty", return_value=False):
+                        plain = accounts.render_status_table(reading)
+                    expected = escape + "fixture\x1b[0m" if escape else "fixture"
+                    self.assertIn(f"| {expected} |", terminal)
+                    self.assertEqual(re.sub(r"\x1b\[[0-9;]*m", "", terminal), plain)
 
     def test_multiple_roles_have_separate_rows_without_repeated_account_cells(self) -> None:
         row = replace(self.row(), roles=("units", "showrunners"),

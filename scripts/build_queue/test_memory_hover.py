@@ -262,6 +262,22 @@ class MemoryHoverTests(unittest.TestCase):
                     self.assertNotIn("Unit", [pair[0] for pair in fields])
                     self.assertNotIn("not recorded", html)
 
+    def test_a_gate_hover_says_what_the_job_does_and_changes_below_its_title(self) -> None:
+        about = "Merges the handler checkpoint into the sdlc branch, tests every module, then pushes sdlc."
+        row = {"name": "natemerge integrate", "queued": True, "used": 1, "reserved": 0, "counted": 1,
+               "showrunner": "builds", "unit": "natemerge", "runner": "unit director",
+               "about": about, "changes": "sdlc branch"}
+        data = {"read_at": 200, "walk": [row], "waiters": [{**row, "need": 2, "since": 100, "why": "its turn"}]}
+        for key in ("row:fixture-run-0", "wait:fixture-wait-0"):
+            with self.subTest(key=key):
+                html = cast(str, self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True))
+                grid = ElementTree.fromstring(html)
+                cells = [(cell.text or "", cell.get("class") or "") for cell in grid]
+                self.assertTrue(cells[0][0].startswith("natemerge · integrate"))
+                self.assertIn((about, "caption"), cells[2:4])
+                fields = [(cell.text, grid[index+1].text) for index, cell in enumerate(grid) if cell.tag == "dt"]
+                self.assertEqual(fields[1:3], [("Changes", "sdlc branch"), ("Showrunner", "builds")])
+
     def test_a_ci_hover_keeps_its_ci_line(self) -> None:
         data = {"read_at": 200, "walk": [{"name": "hana CI", "ci": True, "ci_label": "hana CI · runner-1",
                 "detail": "busy", "unit": "", "keep_text": "", "runner": "unknown"}]}
@@ -733,7 +749,7 @@ process.stdout.write(JSON.stringify(steps));
     def page_expression(self, expression: str, data: object, *, walk: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("function field("):html.index("const tip =")]
-        constants = html[html.index("const f1 ="):html.index("function setSeg(")]
+        constants = ""
         if walk:
             functions += html[html.index("function renderWalk(d)"):html.index("function fitAxisLabels()")]
             functions += html[html.index("function esc(s)"):html.index("const consoleHidden =")]
@@ -822,9 +838,9 @@ function fitLabels() {}
         self.assertNotIn("How free is worked out", page)
         # The user, 11-15: braces name builds, free RAM and everything else; free RAM has three parts.
         self.assertEqual([part.split('"')[0] for part in bar.split('class="brace ')[1:]],
-                         ["l1", "l1 free", "l1", "l2 reserved", "l2 free", "l2", "cap"])
+                         ["l1", "l1 free", "l1", "l2 reserved", "l2 free", "l2", "cap", "cap over"])
         self.assertEqual([part.split('"')[0] for part in bar.split('id="b-')[1:]],
-                         ["builds", "free", "else", "reserved", "room", "system", "cap"])
+                         ["builds", "free", "else", "reserved", "room", "system", "overlay", "cap", "over"])
         # The user, 11-15: the queue cap starts at 0 and ends at the end of free.
         self.assertIn('<div class="brace cap" id="b-cap" data-tip="cap">', bar)
         for removed in ("updateNativeOwnerTips", "pageOwnerTipFields", "nativeTipText", 'id="mark"', 'id="marklabel"'):
@@ -884,6 +900,10 @@ function fitLabels() {}
             ("pressure", RAM_FIXTURE, "Memory pressure prevents a new start; free is 18.0 GiB."),
             ("shortfall", {**RAM_FIXTURE, "room_bytes": 0, "shortfall_bytes": 3 * GIB},
              "Nothing is free: reserves exceed free RAM by 3.0 GiB."),
+            # The user, 11-16: a build reserve over the cap is a promise, not RAM in use.
+            ("shortfall", {**RAM_FIXTURE, "room_bytes": 0, "shortfall_bytes": 3 * GIB, "build_missing_bytes": 3 * GIB,
+                           "safety_missing_bytes": 0, "swap_missing_bytes": 0},
+             "Nothing is free: build reserved is 3.0 GiB over the cap. A reserve is room a step may still grow into, not RAM in use."),
             ("no_room", {**RAM_FIXTURE, "room_bytes": 0},
              "Nothing is free: the safety net, swap coming back and build reserved use all free RAM."),
             ("one_running_memory_wait", RAM_FIXTURE, "One build runs; another needs 12.0 GiB, but free is 9.0 GiB."),
