@@ -5,6 +5,9 @@ Usage: candidates.py                   print the table
        candidates.py next              print the one candidate /next efficiency shows, and pin it
        candidates.py record <report>   add a night's report to the ledger: its proposal and each
                                        Also found and Noted item, one line each
+       candidates.py outcome E<n> <state> [--applied '<repo> <sha>'] [--ledger <path>]
+                                       write the outcome on ledger line n: accepted (with
+                                       --applied), declined, deferred, done or relayed
 
 The ledger is the one record, and every candidate is a line of its own:
 
@@ -296,8 +299,58 @@ def record(report: Path) -> int:
     return 0
 
 
+OUTCOMES = ("accepted", "declined", "deferred", "done", "relayed")
+EFFICIENCY_ID = re.compile(r"^(?:.*/)?E(?P<number>[1-9]\d*)$")
+
+
+def outcome_words(state: str, applied: str, today: str) -> str:
+    """The ledger ending that /next efficiency names for each outcome."""
+    return {"accepted": f"accepted {today}, applied ({applied})", "done": f"done {today}",
+            "relayed": f"relayed {today}"}.get(state, state)
+
+
+def outcome(identity: str, state: str, applied: str, ledger: Path) -> int:
+    """Write one candidate's outcome on its own ledger line; E<n> is the line's number."""
+    found = EFFICIENCY_ID.match(identity)
+    if found is None or state not in OUTCOMES or (state == "accepted") != bool(applied):
+        print(USAGE, file=sys.stderr)
+        return 2
+    lines = read_lines(ledger)
+    index = int(found["number"]) - 1
+    line = lines[index] if index < len(lines) else ""
+    words = outcome_words(state, applied, now().astimezone(user_zone()).strftime("%Y-%m-%d"))
+    if line.endswith(" — " + words):
+        print(f"E{index + 1} unchanged: {line}")
+        return 0
+    if open_candidate(line) is None:
+        print(f"candidates: E{index + 1} is not an open candidate in {ledger}", file=sys.stderr)
+        return 1
+    lines[index] = OPEN_END.sub(" — " + words, lines[index])
+    try:
+        write_text_atomic(ledger, "\n".join(lines) + "\n")
+    except OSError as error:
+        print(f"candidates: {error}", file=sys.stderr)
+        return 1
+    print(f"E{index + 1}: {lines[index]}")
+    if ledger == state_root() / "ledger.md":
+        open_candidates = ordered(lines)
+        write_note(table(open_candidates) if open_candidates else "no open candidates")
+    return 0
+
+
+USAGE = ("usage: candidates.py [next | record <report> | outcome <E<n>> "
+         "(accepted --applied '<repo> <sha>' | declined | deferred | done | relayed) [--ledger <path>]]")
+
+
 def main(arguments: list[str]) -> int:
     match arguments:
+        case ["outcome", identity, state, *options]:
+            settings = dict(zip(options[::2], options[1::2]))
+            if len(options) % 2 or set(settings) - {"--applied", "--ledger"}:
+                print(USAGE, file=sys.stderr)
+                return 2
+            ledger = Path(settings["--ledger"]).expanduser() if "--ledger" in settings else state_root() / "ledger.md"
+            return outcome(identity, state, settings.get("--applied", ""), ledger)
         case []:
             candidates = ordered(read_lines(state_root() / "ledger.md"))
             body = table(candidates) if candidates else "no open candidates"
@@ -312,7 +365,7 @@ def main(arguments: list[str]) -> int:
         case ["record", report]:
             return record(Path(report).expanduser())
         case _:
-            print("usage: candidates.py [next | record <report>]", file=sys.stderr)
+            print(USAGE, file=sys.stderr)
             return 2
 
 
