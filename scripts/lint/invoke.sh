@@ -101,8 +101,13 @@ fi
 # option), and run() runs it plainly.
 # The scope sets oom_score_adj from lint.conf, so earlyoom kills build steps before
 # CI (100) and sessions (200), the largest first.
+# The scope exports BUILDLOG_STEP_SCOPE, its cgroup folder. sccache runs each
+# compiler in sccache.service with the client's environment, so memory_admit
+# charges that compiler to the step that names its scope. sccache hashes CARGO_*
+# variables and the variables that rustc dependency data names. No crate reads
+# BUILDLOG_STEP_SCOPE, so the name keeps cache keys unchanged.
 BUILDLOG_RECORD="$HOME/.claude/scripts/buildlog/record.py"
-BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; printf "%s\n" "$cgroup" > "$0.cgroup"; { echo @BUILD_OOM_SCORE_ADJ@ > /proc/self/oom_score_adj; } 2>/dev/null || true; "$@"; s=$?; cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true; cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
+BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; printf "%s\n" "$cgroup" > "$0.cgroup"; { echo @BUILD_OOM_SCORE_ADJ@ > /proc/self/oom_score_adj; } 2>/dev/null || true; BUILDLOG_STEP_SCOPE="$cgroup"; export BUILDLOG_STEP_SCOPE; "$@"; s=$?; cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true; cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
 BUILDLOG_SCOPE_SH="${BUILDLOG_SCOPE_SH//@BUILD_OOM_SCORE_ADJ@/$BUILD_OOM_SCORE_ADJ}"
 source "$(dirname "${BASH_SOURCE[0]}")/memory_gate.sh" || {
     printf 'invoke.sh: cannot load admission and hold checks; step refused\n' >&2
@@ -422,6 +427,8 @@ run_step_attempt() {
     elif [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then
         nextest_thread_report "$@"
     fi
+    local LINT_PREBUILD_PREFIX=()
+    if [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then lint_prebuild_prefix; fi
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" && -n "${BUILDLOG_PEAK:-}" ]]; then
         BUILDLOG_TEST_PHASE_FILE="$BUILDLOG_PEAK.test-phase.json"
         buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "$BUILDLOG_MEM_MAX_PATH" "$parent_pid" \
@@ -441,7 +448,8 @@ run_step_attempt() {
     if [[ -t 1 ]]; then
         tty=1
         set +e
-        buildlog_exec_with_progress ${holder[@]+"${holder[@]}"} "$@" 9>&-
+        buildlog_exec_with_progress ${LINT_PREBUILD_PREFIX[@]+"${LINT_PREBUILD_PREFIX[@]}"} \
+            ${holder[@]+"${holder[@]}"} "$@" 9>&-
         status=$?
     else
         # $RANDOM too: a background sweep's run() shares this shell's $$.
@@ -451,7 +459,8 @@ run_step_attempt() {
         fi
         # Keep output streaming for heartbeat_watch.sh and the watching worker.
         set +e
-        buildlog_exec_with_progress ${holder[@]+"${holder[@]}"} "$@" 9>&- 2>&1 | tee "$log" | without_progress_frames
+        buildlog_exec_with_progress ${LINT_PREBUILD_PREFIX[@]+"${LINT_PREBUILD_PREFIX[@]}"} \
+            ${holder[@]+"${holder[@]}"} "$@" 9>&- 2>&1 | tee "$log" | without_progress_frames
         status=${PIPESTATUS[0]}
     fi
     set -e
@@ -657,6 +666,31 @@ nextest_token_width() {
 # Print the test threads and the load for a run that holds no tokens.
 nextest_thread_report() {
     buildlog_memory_python "$LINT_TEST_BUDGET_SCRIPT" report "$@"
+}
+
+# A workspace can declare artifacts that its tests need, under
+# workspace.metadata.dev.prebuild in its root Cargo.toml. prebuild.py goes in
+# front of the nextest command and its token holder, so the artifacts build
+# inside the step's own admission, on the host that runs the tests. LINT_WORKSPACE_MANIFEST names the
+# root manifest; without it, lint runs from the workspace root. A line that
+# holds the word "prebuild" adds the prefix, unless the word is after a "#" with
+# no quote before it (a comment). The check never misses a declaration in any
+# TOML form. The word in a value or another table starts Python once, which
+# reads no declaration and runs the tests unchanged. The shell reads the
+# manifest with no fork, so a manifest without the word starts no process.
+LINT_PREBUILD_SCRIPT="${BUILD_FOLDERS_SCRIPT%/*}/../lint/prebuild.py"
+lint_prebuild_prefix() {
+    local manifest=${LINT_WORKSPACE_MANIFEST:-$PWD/Cargo.toml} line before
+    LINT_PREBUILD_PREFIX=()
+    [[ -f "$manifest" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == *prebuild* ]] || continue
+        before=${line%%#*}
+        if [[ "$before" == *prebuild* || "$before" == *[\"\']* ]]; then
+            LINT_PREBUILD_PREFIX=("${BUILD_FOLDERS_SCRIPT%/*}/py" "$LINT_PREBUILD_SCRIPT" --manifest "$manifest" --)
+            return 0
+        fi
+    done < "$manifest"
 }
 
 run_nextest() {

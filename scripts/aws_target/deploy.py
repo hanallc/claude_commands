@@ -1227,7 +1227,7 @@ class Deployment:
 
     def gate_up(self, *, approve_resources: bool = False) -> bool:
         """Add the gate resources and preserve every Rust parameter."""
-        from scripts.aws_target import cloud_gate, gate_trial, gpu_size_trial
+        from scripts.aws_target import aws_trial, cloud_gate, gpu_size_trial
         self._authorize(approve_resources)
         with control_lock(self.directory / 'gate-up'):
             settings = read_deployment_settings(self.settings_path)
@@ -1239,7 +1239,7 @@ class Deployment:
             stack = ledger.rows(api.call('describe-stacks', '--stack-name', stack_id,
                                        service='cloudformation'), 'Stacks')[0]
             subnets = gate_subnets(api, settings.vpc_id)
-            revision = gate_trial.host_nixpkgs_revision()
+            revision = aws_trial.host_nixpkgs_revision()
             account = ledger.text(api.call('get-caller-identity', service='sts'), 'Account')
             partition = stack_id.split(':')[1]
             prefix = f'arn:{partition}:ec2:{settings.region}:{account}:'
@@ -1447,11 +1447,11 @@ class DeploymentArguments(argparse.Namespace):
 
 def main() -> int:
     os.environ['AWS_SHARED_CREDENTIALS_FILE'] = str(admin_secrets.credentials_file())
-    if sys.argv[1:2] == ['gate-trial']:
-        from scripts.aws_target import gate_trial
+    if sys.argv[1:2] == ['aws-trial']:
+        from scripts.aws_target import aws_trial
         settings_path = conf.path('aws_target')
-        with step('gate-trial', 'running the trial', settings_path):
-            return gate_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
+        with step('aws-trial', 'running the trial', settings_path):
+            return aws_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'apply'))
     _ = parser.add_argument('trial_action', nargs='?', choices=('run',))

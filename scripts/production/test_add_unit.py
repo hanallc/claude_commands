@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from scripts.production.staff_test_support import unit_membership, fixture_member, ClaudeBackendFixture, StaffTestCase, fixture_runtime_id
 
-from scripts.lib import names
+from scripts.lib import build_folders, names
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_names import fixture_names
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
@@ -349,6 +349,9 @@ class AddUnitLaunchTests(AddUnitTestCase):
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         worktree = self.root / "project-alpha"
         self.assertEqual(row.worktree, staff.PresentWorktree("natedev", worktree))
+        self.assertEqual(build_folders.build_folder_state(worktree), "free")
+        lease = cast(dict[str, object], json.loads(worktree.with_name(worktree.name + ".lease.json").read_text()))
+        self.assertEqual(lease["purpose"], worktree.name)
         self.assertEqual(unit_config.read(worktree), unit_config.UnitConfig(
             unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.AppPort(8123), ("nightly", "build-check")))
         ignored = subprocess.run(["git", "-C", str(worktree), "check-ignore", "-q", ".unit.toml"], check=False)

@@ -21,6 +21,16 @@ Use this command for a unit's question or your own question. Do not file questio
 
 Omit `--unit` for your own question. A current unit label is also accepted. The stored `asked_by` always holds the fixed staff id.
 
+A producer files its own question without `--production` or `--unit`:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py ask --ask "<question>" --context "<why now>"
+```
+
+The same question parts and review apply.
+The producer's fixed staff id owns its question folder, status count, and Questions page filter.
+Answers and follow-ups go to the producer's current session.
+
 `ask: ok` means the question is filed. Add nothing about it to your reply to the user.
 
 `question held for review:` means the question needs correction. Correct the named defects before you file it again.
@@ -42,3 +52,12 @@ The question then returns to the user with the follow-up and the reply.
 ## Question form
 
 @~/.claude/docs/question_template.md
+
+## Investigations
+
+File an investigation when the user wants you to find an answer.
+Use a question when you need the user's answer.
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/production/investigation.py file --title "<one line>" --question "<full question>"
+```

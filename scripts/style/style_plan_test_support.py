@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import shutil
 import sqlite3
@@ -31,6 +32,7 @@ from scripts.production import proposal_issue
 from scripts.lib import berth_board
 from scripts.style import fake_fmt
 from scripts.style.style_child_test_support import style_cli_command, unqueued_style_children
+from scripts.style.style_reader_test_support import oracle_reader
 from scripts.style import mechanical_classes
 from scripts.style import rules
 from scripts.style import style_ledger
@@ -48,6 +50,22 @@ CLASS_RULES = (
     "test-module-allow-boilerplate",
     "prefer-type-named-fields-and-bindings",
 )
+
+
+def install_unconfigured_board(folder: Path, repo: Path) -> Path:
+    """Install a board executable that also serves child processes."""
+    folder.mkdir(parents=True, exist_ok=True)
+    envelope: dict[str, object] = {
+        "output_contract_version": 6, "verb": "board", "status": "unconfigured", "exit_code": 4,
+        "reservations": [], "blocked_by": [],
+        "message": f"this repository has no cargo-berth configuration at {repo}/.claude/config/berth.toml; run `cargo-berth init` to create it",
+        "presentation": {"kind": "rendered_blocks", "blocks": []},
+        "payload": {"kind": "no_facts", "alerts": []},
+    }
+    executable = folder / "cargo-berth"
+    _ = executable.write_text(f"#!{sys.executable}\nimport sys\nprint({json.dumps(envelope)!r})\nsys.exit(4)\n")
+    executable.chmod(0o755)
+    return executable
 
 
 @contextmanager
@@ -192,6 +210,7 @@ class StylePlanFixture(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.run_command))
 
     def configure_fixture(self) -> None:
+        _ = self.enterContext(oracle_reader())
         _ = self.enterContext(unqueued_style_children())
         with private_class_catalog(self.fixture_root.parent):
             listed = mechanical_classes.classes()

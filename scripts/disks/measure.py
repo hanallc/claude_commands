@@ -50,6 +50,7 @@ class Drive(TypedDict):
 
 class DisksData(TypedDict):
     measured_at: float
+    render_seconds: float
     keep_bytes: int
     drives: list[Drive]
 
@@ -247,9 +248,11 @@ def measure(settings: MeasureSettings, runner: Runner = run_command,
         if lock is file_lock.LockResult.BUSY:
             print("a measure is already running")
             return LOCK_BUSY_EXIT
+        started = time.perf_counter()
         found = floors(settings.drives)
-        data: DisksData = {"measured_at": time.time(), "keep_bytes": settings.keep_bytes,
+        data: DisksData = {"measured_at": time.time(), "render_seconds": 0.0, "keep_bytes": settings.keep_bytes,
                            "drives": [measure_drive(mount, settings, found, runner) for mount in settings.drives]}
+        data["render_seconds"] = time.perf_counter() - started
         write_text_atomic(settings.output_folder / DATA_FILE, json.dumps(data) + "\n", new_file_mode=0o644)
     print(f"measured {len(settings.drives)} drives on {socket.gethostname()}")
     return 0

@@ -2,7 +2,7 @@
 
 ## Current model
 
-AWS runs temporary Spot boxes for merge gates, paired gate trials, and the GPU size trial.
+AWS runs temporary Spot boxes for merge gates, paired AWS trials, and the GPU size trial.
 Normal build jobs use `mac` and `natedev`, in that order.
 AWS has no permanent builder or build offload route.
 Cloud gates use `~/.local/state/build-targets/aws` without an `aws` target registration.
@@ -347,7 +347,7 @@ Teardown still checks retained claims before deletion.
 
 ## Paired speed trials
 
-Run `python3 -m scripts.aws_target.gate_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
+Run `python3 -m scripts.aws_target.aws_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
 Both refs can name local commits in `~/.claude`.
 The trial pushes each commit to a fresh `gate-trial-<expires>-<id>-base|changed` branch with a plain push.
 The expires field records the trial's fixed expiry epoch in seconds.
@@ -357,7 +357,7 @@ The trial installs no signal handler.
 Ctrl-C and terminal command exceptions stop the paired service.
 SIGTERM or SIGHUP to the terminal can skip branch cleanup.
 The separate trial service then runs to its normal end and cleans its boxes.
-The paired unit uses `ExecStopPost` with `gate_trial --paired-cleanup <folder>`.
+The paired unit uses `ExecStopPost` with `aws_trial --paired-cleanup <folder>`.
 After a service stop, systemd runs this cleanup after killing the coordinator and its children.
 Cleanup requests termination for all recorded boxes before searching uncertain launches.
 Cleanup requests termination for each discovered box before the next search.
@@ -453,7 +453,7 @@ The command terminates boxes after results, errors, or cancellation.
 Uncertain launches retain their requests and reservations for reconciliation and expiry cleanup.
 
 The paired trial replaces the size/start trials.
-The twelve `gate_trial_*` settings are removed.
+The old size/start trial settings are removed.
 The paired trial uses the existing `cloud_gate.conf` settings.
 
 ## Cloud gate region fallback
@@ -695,7 +695,7 @@ The AWS page shows the same tables, published by `aws_page.publish`.
 The user renamed it from AWS prices to AWS on 2026-11-15, because it holds spend, prices and quotas.
 The published file stays `aws_prices.html`, so older links still open it.
 A Spend card at the top shows today, yesterday and the month to date, with the month forecast below them.
-`spend.read_spend` and `spend.month_spend` give these numbers; `/aws_spend` reads the same functions, so both show the same values.
+`spend.read_spend` and `spend.month_spend` give these numbers; the buildlog report reads the same functions, so both show the same values. Read the spend on the console AWS page; the `/aws_spend` command was removed on 2026-11-16.
 The day is the UTC day. The hourly buildlog run publishes the page, so the spend is current to the last hour.
 After each push to main, `.claude/config/post_push.sh` publishes it again
 when the push changes the page code and the pushing checkout is at the pushed commit, as the promotion step's ~/.claude is.

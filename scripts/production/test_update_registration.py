@@ -27,6 +27,144 @@ from scripts.production import footer_counts
 from scripts.production import next_item
 from scripts.production import tidy_wrapped
 from scripts.hooks import showrunner_footer
+from scripts.production.cli_fixture import invoke_cli
+from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.review_links import change_browser, change_page
+from scripts.statusline import counts_row
+from scripts.lib import urgency
+
+
+class ProducerQuestionTests(RegistrationFixture):
+    producer: staff.StaffRow = staff.StaffRow(staff.StaffId(""), "producer", "", staff.StaffRoot(), current_session=staff.StaffId(""))
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.producer = fixture_member("producer", name="dwight")
+        listing = self.root / "reviews/change-review - example.md"
+        _ = self.doc.write_text(self.doc.read_text() + f"- **Change review:** `{listing}`\n")
+        config = self.root / "config"
+        _ = shutil.copytree(Path(__file__).parents[2] / "config", config)
+        settings = config / "review_links.conf"
+        _ = settings.write_text(settings.read_text().replace("delivery_pause_seconds=5", "delivery_pause_seconds=0"))
+        self.env.update({"CLAUDE_CODE_SESSION_ID": self.producer.current_session, "CODEX_THREAD_ID": "",
+                         "CHANGE_REVIEW_DIR": str(self.root / "reviews"), "REVIEW_LINKS_ROOT": str(self.root / "links"),
+                         "CONF_DIR": str(config)})
+        self.enterContext(mock.patch.dict(os.environ, self.env))
+
+    def file_question(self, title: str = "Choose the next project") -> None:
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(title + "?")):
+            result = invoke_cli(registration, registration.main, ["ask", "--text", title, "--ask", title + "?"],
+                                self.env, self.checkout, production_state=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_producers_file_reviewed_questions_without_a_production(self) -> None:
+        for name in ("dwight", "morty", "brain"):
+            with self.subTest(name=name):
+                self.producer = fixture_member("producer", name=name)
+                self.env.update({"CLAUDE_CODE_SESSION_ID": "" if name == "brain" else self.producer.current_session,
+                                 "CODEX_THREAD_ID": self.producer.current_session if name == "brain" else ""})
+                self.file_question(name)
+                identities = registration.QuestionStaff.read()
+                records = registration.question_records_for_document(self.producer, identities)
+                self.assertEqual(len(records), 1)
+                question = records[0]
+                self.assertEqual((question.owner, question.asker), (self.producer.id, self.producer.id))
+                self.assertEqual(question.path.parent, self.state / "showrunner" / self.producer.id / "questions")
+                self.assertEqual(question.item.get("reviewed"), name + "?")
+                self.assertFalse(list((self.root / "issues").glob("question-*.md")))
+
+    def test_producer_questions_use_the_existing_review_and_caller_rules(self) -> None:
+        held = review.QuestionAwaitingFacts("Which project?", ("Give the project names.",))
+        with mock.patch.object(review, "review_question", return_value=held):
+            result = invoke_cli(registration, registration.main, ["ask", "--ask", "Which project?"],
+                                self.env, self.checkout, production_state=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("question held for review", result.stdout)
+        self.assertFalse(list((self.state / "showrunner" / self.producer.id).glob("questions/*.md")))
+        for kind in ("showrunner", "unit"):
+            member = next(row for row in staff.snapshot().rows if row.kind == kind)
+            environment = {**self.env, "CLAUDE_CODE_SESSION_ID": member.current_session}
+            with mock.patch.object(review, "review_question", side_effect=AssertionError("No review without an owner")):
+                result = invoke_cli(registration, registration.main, ["ask", "--ask", "Which project?"],
+                                    environment, self.checkout, production_state=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("pass --unit", result.stdout)
+
+    def test_the_producer_page_count_and_next_share_the_question_store(self) -> None:
+        self.file_question()
+        status = change_page.DeliveryStatus(self.root / "links")
+        browser = change_page.ReviewBrowser("producer-test", kind="questions")
+        prepared = change_browser.prepare(browser, status)
+        self.assertEqual([question.tab for question in prepared.questions], ["dwight"])
+        body = change_browser.render(browser, status).decode()
+        self.assertIn('data-tab="dwight"', body)
+        self.assertIn('value="dwight">dwight (1)</option>', body)
+        self.assertIn('name="outcome" value="answer"', body)
+        self.assertNotIn("No showrunner owns this question.", body)
+        instance = self.state / "notifier" / f"showrunner-{self.producer.id}"
+        sources: list[Path] = []
+        self.assertEqual(counts_row.row(instance, sources, require_complete=True), ("For you: 1 question", ""))
+        question = prepared.questions[0].record
+        self.assertIn(question.path, sources)
+        self.assertIn("Choose the next project?", next_item.show("question", urgency.URGENT, None))
+        _ = staff.rename(self.producer.id, "renamed-dwight")
+        self.assertEqual([question.tab for question in change_browser.prepare(browser, status).questions], ["renamed-dwight"])
+
+    def test_producer_answers_retry_the_current_session_and_recover_after_restart(self) -> None:
+        for recovery in (False, True):
+            with self.subTest(recovery=recovery):
+                title = f"Project choice {recovery}"
+                self.file_question(title)
+                status = change_page.DeliveryStatus(self.root / "links")
+                browser = change_page.ReviewBrowser("producer-test", kind="questions")
+                question = next(item for item in change_browser.prepare(browser, status).questions if item.record.item["text"] == title)
+                delivery, answer = change_browser.submit_question(question, "answer", "Choose the first project.", status)
+                self.assertEqual(answer, "Choose the first project.")
+                current = staff.by_id(self.producer.id)
+                assert current is not None
+                replacement = staff.StaffId(fixture_runtime_id(f"producer-answer-{recovery}"))
+                _ = staff.update_current_session(current.current_session, replacement)
+                self.env["CLAUDE_CODE_SESSION_ID"] = replacement
+                calls: list[tuple[str, str]] = []
+
+                def sender(recipient: str, name: str, message: str) -> None:
+                    del name
+                    calls.append((recipient, message))
+                    if len(calls) == 1:
+                        raise RuntimeError("fixture sender unavailable")
+
+                with mock.patch.object(change_page, "send_message", side_effect=sender):
+                    if recovery:
+                        change_page.recover_question_answers(change_page.DeliveryStatus(self.root / "links"))
+                    else:
+                        change_page.deliver(delivery, status)
+                self.assertEqual([recipient for recipient, _ in calls], [f"session:{replacement}"] * 2)
+                self.assertTrue(all("Choose the first project." in message for _, message in calls))
+                self.assertEqual(status.slots(delivery.page, delivery.row).intents(), ())
+                self.assertEqual(registration.question_records_for_document(self.producer, registration.QuestionStaff.read())[-1].status,
+                                 "closed")
+
+    def test_producer_delivery_exhaustion_uses_the_existing_alert(self) -> None:
+        self.file_question()
+        status = change_page.DeliveryStatus(self.root / "links")
+        browser = change_page.ReviewBrowser("producer-test", kind="questions")
+        question = change_browser.prepare(browser, status).questions[0]
+        delivery, _ = change_browser.submit_question(question, "answer", "Choose the first project.", status)
+        calls: list[str] = []
+
+        def sender(recipient: str, name: str, message: str) -> None:
+            del name
+            self.assertEqual(recipient, f"session:{self.producer.current_session}")
+            calls.append(message)
+            if "delivery needs attention" not in message:
+                raise RuntimeError("fixture sender unavailable")
+
+        with mock.patch.object(change_page, "send_message", side_effect=sender):
+            change_page.deliver(delivery, status)
+        self.assertEqual(len(calls), 4)
+        self.assertIn("Tries: 3", calls[-1])
+        self.assertIn("Choose the first project.", calls[-1])
 
 
 class RegistrationTests(RegistrationFixture):
@@ -438,7 +576,7 @@ class QuestionIdentityTests(RegistrationFixture):
         from scripts.production.cli_fixture import invoke_cli
         owner = staff.by_id(self.fixture_staff_id())
         assert owner is not None
-        environment = {**self.env, "CLAUDE_CODE_SESSION_ID": owner.current_session}
+        environment = {**self.env, "CLAUDE_CODE_SESSION_ID": owner.current_session, "CODEX_THREAD_ID": ""}
         with (mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as snapshot,
               mock.patch.object(session_staff, "member_sources",
                                 wraps=session_staff.member_sources) as sources):

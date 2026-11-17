@@ -25,6 +25,7 @@ from scripts.style.style_config import StyleUnitAssignment
 from scripts.style import style_ledger
 from scripts.style.approved_renames import AppliedCheck, TYPE_NAMED_PARAMETER_RULE
 from scripts.style import style_rules
+from scripts.style.style_reader_test_support import oracle_reader
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 
@@ -259,6 +260,7 @@ class LedgerTestCase(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(oracle_reader())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.repo = self.root / "sample"
         self.rule_dir = self.root / "nate_style" / "rust"

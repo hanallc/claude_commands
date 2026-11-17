@@ -18,7 +18,7 @@ import hashlib
 import shlex
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import re
 import shutil
 import subprocess
@@ -40,6 +40,7 @@ from scripts.lib.copy_record import (
 from scripts.buildlog.store import host_name
 from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
+from scripts.lib.build_steps import StepJob, command_job, read_step_names
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
 from scripts.message import process_table, sessions
@@ -666,6 +667,8 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
                                         suffix_length=0, suffix=destination.name)
     with build_folders.leased_build_folder(spec) as path:
         scratch.write_record(path, task, moment, scratch_settings=scratch_settings)
+        if scratch.in_session_folder(path):
+            _ = scratch.hold(path, task, "task clone in the session folder", scratch_settings=scratch_settings)
         _ = scratch.update_record(path, lambda record: {
             **(record.fields if isinstance(record, copy_record.Registered) else {}),
             "test_hana_clone": True, "source_path": str(source.resolve()),
@@ -685,7 +688,9 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
                         **(record.fields if isinstance(record, copy_record.Registered) else {}),
                         "claude_trust_folder": str(path.resolve()),
                     }, scratch_settings=scratch_settings)
-                    accounts.set_claude_folder_trust(path, trusted=True)
+                    trust = accounts.set_claude_folder_trust(path, trusted=True)
+                    if isinstance(trust, accounts.FolderTrustFailed):
+                        trust.report()
                 source_commit = git(path, "rev-parse", "HEAD").decode().strip()
                 _ = scratch.update_record(path, lambda record: {
                     **(record.fields if isinstance(record, copy_record.Registered) else {}),
@@ -941,8 +946,7 @@ def end_workspaces(task: str, paths: list[Path], *,
                     if not idle:
                         raise CopyError(f"{tree}: workspace is busy during task completion")
                     validate()
-                    scratch.remove_with_cargo_output(tree, scratch.remove)
-                    scratch.removal_mark(tree).unlink(missing_ok=True)
+                    scratch.remove_marked(tree)
             hold = scratch.holds().get(str(tree.resolve()))
             if hold is not None and hold["task"] == task:
                 _ = scratch.release(tree)
@@ -950,23 +954,21 @@ def end_workspaces(task: str, paths: list[Path], *,
         if not isinstance(record, copy_record.Registered) or record.task != task:
             raise CopyError(f"{tree}: workspace task differs")
         with (workspace_removal_guard(tree, record, run_lock=run_lock) as validate,
-              build_folders.collector_lease(tree, wait=False) as free,
-              claim_tree(tree, create=False) as state):
-            if not free or state is not ClaimState.ACQUIRED:
+              scratch.removal_lock(tree) as idle,
+              scratch.copy_record_lock(tree)):
+            if not idle:
                 raise CopyError(f"{tree}: workspace is busy during task completion")
             def ended(current: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
                 if not isinstance(current, copy_record.Registered) or current.task != task:
                     raise CopyError(f"{tree}: workspace task differs")
                 return {**current.fields, "ended": time.time(), "ended_task": task}
             validate()
-            # A removal marker proves that the first attempt saved the rescue.
+            # A deletion intent preserves ownership but does not certify saved work.
             if isinstance(scratch.pending_removal(tree), copy_record.NotRegistered):
                 _ = scratch.update_record(tree, ended)
-                if "crate_run" in record.fields:
-                    rescue_workspace(tree, record)
             if "crate_run" not in record.fields:
                 continue
-            scratch.remove_marked(tree, scratch.remove)
+            scratch.remove_marked(tree)
         _ = scratch.release(tree)
 
 
@@ -1013,8 +1015,11 @@ def _slot_preparation() -> Generator[None]:
 
 @contextmanager
 def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
-             merge: MergePolicy = NO_MERGE) -> Generator[Path]:
-    """Hold one repository slot through preparation and the caller's use."""
+             merge: MergePolicy = NO_MERGE, step: str = "run") -> Generator[Path]:
+    """Hold one repository slot through preparation and the caller's use.
+
+    step is the build_steps key of the work, such as integrate or lint; the lease shows its configured name.
+    """
     from scripts.lib import build_slots
     from scripts.production import staff
 
@@ -1030,6 +1035,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
         canonical = slot_source(source)
         if main_checkout(source) != canonical:
             _ = git(canonical, "fetch", "-q", "--", str(source), base)
+    purpose = read_step_names().shown(step)
     unit = owner
     showrunner = owner_name(copy_owner(owner))
     try:
@@ -1044,7 +1050,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
     with ExitStack() as held_slot:
         with _slot_preparation():
             slot = held_slot.enter_context(build_slots.take_slot(canonical, base, showrunner=showrunner, unit=unit,
-                work="gate", purpose="gate", report=lambda line: print(line, file=sys.stderr)))
+                work=step, purpose=purpose, report=lambda line: print(line, file=sys.stderr)))
         tree = slot.path
         descriptor = build_folders.build_folder_lock_fd(tree)
         token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), descriptor))
@@ -1289,9 +1295,6 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
                 with workspace_removal_guard(tree, record) as validate:
                     def rescue_selected() -> None:
                         validate()
-                        if not tree.exists():
-                            return
-                        rescue_workspace(tree, record)
                     if not scratch.end_selected_copy(tree, record, time.time(), validate=rescue_selected):
                         with scratch.judgment_lock(tree) as idle:
                             if not idle:
@@ -1571,6 +1574,7 @@ def mirror_probe_setup(path: str) -> str:
 
 def mark_mirror(tree: Path, owner: str, repo: str, session: str, **extra: object) -> None:
     """Publish mirror metadata before removal authority can disappear."""
+    scratch.exclude_copy_metadata(tree, additional=floor_claims.MIRROR_METADATA)
     write_text_atomic(tree / floor_claims.MIRROR_RECORD, json.dumps({
         "kind": "remote-mirror", "owner": owner, "repo": repo, "session": session, **extra,
     }) + "\n")
@@ -1799,7 +1803,8 @@ def mirror_remove(args: CopyArguments) -> int:
     authority = floor_claims.removal_authority_path(tree)
     with local_mirror_lease(tree, args.session, create=False):
         with mirror_metadata_locks(tree) as claims:
-            if not tree.exists() and not authority.exists():
+            if (not tree.exists() and not authority.exists() and not scratch.removal_mark(tree).exists()
+                    and not scratch.cargo_removal_mark(tree).exists()):
                 return 0
             if tree.exists() and claims.holds(str(tree), tree.parent,
                     exemption=floor_claims.MirrorIdentity(args.host, args.path)):
@@ -1813,7 +1818,7 @@ def mirror_remove(args: CopyArguments) -> int:
                 task_record = copy_record.record_path(tree)
                 # A task clone or a temporary gate goes as one task folder; an editable copy keeps its folder rules.
                 if task_record is not None and copy_record.copy_folder(tree) != tree.resolve():
-                    scratch.remove_marked(task_record.parent, scratch.remove)
+                    scratch.remove_marked(task_record.parent)
                     # A task clone is its task folder, so its lock files sit in the scratch root.
                     if task_record.parent == tree.resolve():
                         for lock in (floor_claims.mirror_lock_path(tree), floor_claims.record_lock_path(tree)):
@@ -1821,6 +1826,8 @@ def mirror_remove(args: CopyArguments) -> int:
                 else:
                     clear_mirror_content(tree)
                     tree.rmdir()
+            if scratch.removal_mark(tree).exists() or scratch.cargo_removal_mark(tree).exists():
+                scratch.remove_marked(tree)
             authority.unlink(missing_ok=True)
     return 0
 
@@ -1990,7 +1997,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "hold":
             source = Path(args.repo or "").expanduser().resolve()
             staged = StagedSource(staged_tree(source))
-            with standing(source_owner(source), source, staged) as checkout:
+            with standing(source_owner(source), source, staged, step="hold") as checkout:
                 print(staged.tree)
                 print(checkout, flush=True)
                 _ = sys.stdin.read()
@@ -2016,7 +2023,9 @@ def main(argv: list[str] | None = None) -> int:
             policy: SourcePolicy = (WorktreeSource(args.commit, args.apply_uncommitted) if args.apply_uncommitted else
                                     CommittedSource(args.commit))
             merge: MergePolicy = MergeRevision(args.merge) if args.merge else NoMerge()
-            with standing(caller_owner(), args.repo or "", policy, merge=merge) as tree:
+            job = command_job(command)
+            with standing(caller_owner(), args.repo or "", policy, merge=merge,
+                          step=job.step if isinstance(job, StepJob) else PurePath(command[0]).name) as tree:
                 result = subprocess.run([part.replace("{tree}", str(tree)) for part in command],
                                         cwd=tree, pass_fds=COMMAND_LOCKS.get())
                 command_exit = result.returncode if result.returncode >= 0 else 128 - result.returncode

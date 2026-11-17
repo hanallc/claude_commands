@@ -204,7 +204,7 @@ Closed by the roles-unit rerun work: see `docs/as-built/script-rerun-recovery.md
 
 ## roles-unit (14)
 
-The `send.py`, `progress_history.py` and `workers.py` rows are closed: see `docs/as-built/script-rerun-recovery.md`. The `review_pool.py` rows are closed because the file is gone. The `codex_mesh.py` and `mesh_runs.py` rows are dropped because that code is being retired.
+The `send.py`, `progress_history.py` and `workers.py` rows are closed: see `docs/as-built/script-rerun-recovery.md`. The `review_pool.py` rows are closed because the file is gone. The transport rows below record faults found on 2026-10-29. Commit `ce529466f` removed the mesh implementation on 2026-11-08. These rows remain historical evidence and require no mesh repair.
 
 | Path:line | Q | On a rerun | Owner |
 |---|---|---|---|

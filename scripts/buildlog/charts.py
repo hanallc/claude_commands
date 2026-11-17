@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-import bisect
 import sqlite3
-from collections import defaultdict
 from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, time, timedelta
+from datetime import datetime, timedelta
 from enum import StrEnum
-from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
-from scripts.buildlog import cost_actions, costs, index, moments
+from scripts.buildlog import cost_actions, costs, index
 from scripts.lib.user_zone import user_zone
 from scripts.buildlog.costs import CostUnavailable as CostUnavailable
 
@@ -39,20 +36,9 @@ type ChartCost = MeasuredCost | MacIdleUpperBound | CostUnavailable | NoDataYet
 class DailyBucket:
     start: datetime
     end: datetime
-    thin: bool
     costs: costs.BuildCosts
     observed_machines: frozenset[str]
     first_sources: dict[str, float]
-
-
-@dataclass(frozen=True)
-class ChartSet:
-    start: datetime
-    end: datetime
-    zone: str
-    buckets: tuple[DailyBucket, ...]
-    machines: tuple[str, ...]
-    events: tuple[moments.Moment, ...]
 
 
 @dataclass(frozen=True)
@@ -90,17 +76,12 @@ class TopCosts:
 
 @dataclass(frozen=True)
 class PageData:
-    charts: ChartSet
     top: TopCosts
 
 
 @dataclass(frozen=True)
 class IndexUnavailable:
     reason: str
-
-
-CAUSES: tuple[costs.Cause, ...] = ("Memory wait", "Cold rebuilds", "Reruns after a pass", "Failed runs",
-                                   "Cancelled CI", "Mac idle while natedev waits")
 
 
 def with_first_sources(reading: costs.CostReading) -> costs.CostReading:
@@ -111,76 +92,12 @@ def with_first_sources(reading: costs.CostReading) -> costs.CostReading:
     return replace(reading, first_sources=first_sources)
 
 
-def build_bucket(reading: costs.CostReading, start: datetime, end: datetime, *, thin: bool = False) -> DailyBucket:
+def build_bucket(reading: costs.CostReading, start: datetime, end: datetime) -> DailyBucket:
     """Use the same coverage and cost rules for each window."""
     low, high = start.timestamp(), end.timestamp()
     observed = frozenset(item.machine for item in reading.observations if low <= item.at < high)
     covered = frozenset(item.machine for item in reading.coverage if item.start <= low and item.end >= high)
-    return DailyBucket(start, end, thin, costs.aggregate_costs(reading, start, end), observed | covered, reading.first_sources)
-
-
-def bucket_edges(start: datetime, end: datetime, zone: ZoneInfo) -> tuple[datetime, ...]:
-    """Clip local calendar days to the captured UTC window."""
-    if end <= start:
-        raise ValueError("chart window must have positive duration")
-    edges = [start.astimezone(UTC)]
-    day = start.astimezone(zone).date() + timedelta(days=1)
-    while True:
-        edge = datetime.combine(day, time(), zone).astimezone(UTC)
-        if edge >= end:
-            break
-        edges.append(edge)
-        day += timedelta(days=1)
-    edges.append(end.astimezone(UTC))
-    return tuple(edges)
-
-
-def build_series(reading: costs.CostReading, start: datetime, end: datetime, zone: ZoneInfo,
-                 configured: tuple[str, ...] = ()) -> ChartSet:
-    return chart_series(with_first_sources(reading), start, end, zone, configured)
-
-
-def chart_series(reading: costs.CostReading, start: datetime, end: datetime, zone: ZoneInfo,
-                 configured: tuple[str, ...]) -> ChartSet:
-    edges = bucket_edges(start, end, zone)
-    stamps = [edge.timestamp() for edge in edges]
-    count = len(edges)-1
-    contributions: defaultdict[int, list[costs.CostContribution]] = defaultdict(list)
-    observations: defaultdict[int, list[costs.SourceObservation]] = defaultdict(list)
-    phases: defaultdict[int, list[moments.ProgressFinish]] = defaultdict(list)
-    spans: defaultdict[int, list[costs.IdleSpan]] = defaultdict(list)
-    for contribution in reading.contributions:
-        position = bisect.bisect_right(stamps, contribution.at)-1
-        if 0 <= position < count:
-            contributions[position].append(contribution)
-    for observation in reading.observations:
-        position = bisect.bisect_right(stamps, observation.at)-1
-        if 0 <= position < count:
-            observations[position].append(observation)
-    for phase in reading.phases:
-        position = bisect.bisect_right(stamps, phase.timestamp_epoch)-1
-        if 0 <= position < count:
-            phases[position].append(phase)
-    for span in reading.idle_spans:
-        position = max(0, bisect.bisect_right(stamps, span.start)-1)
-        while position < count and stamps[position] < span.end:
-            spans[position].append(span)
-            position += 1
-    buckets: list[DailyBucket] = []
-    for position in range(count):
-        low, high = edges[position:position+2]
-        day = low.astimezone(zone).date()
-        full_low = datetime.combine(day, time(), zone).astimezone(UTC)
-        full_high = datetime.combine(day+timedelta(days=1), time(), zone).astimezone(UTC)
-        daily = costs.CostReading(tuple(contributions[position]), tuple(observations[position]),
-                                  tuple(spans[position]), tuple(phases[position]), reading.coverage, reading.first_sources)
-        buckets.append(build_bucket(daily, low, high, thin=low != full_low or high != full_high))
-    # A source folder with no step in the window is no chart machine: each cloud gate host has its own folder.
-    machines = sorted(set(configured) | {item.machine for item in reading.observations}
-                      | {item.machine for item in reading.contributions})
-    if reading.idle_spans and "mac" not in machines:
-        machines.append("mac")
-    return ChartSet(start, end, str(zone), tuple(buckets), tuple(sorted(machines)), moments.MOMENTS)
+    return DailyBucket(start, end, costs.aggregate_costs(reading, start, end), observed | covered, reading.first_sources)
 
 
 def read_snapshot(connection: sqlite3.Connection, start: datetime, end: datetime) -> costs.CostReading:
@@ -192,13 +109,6 @@ def read_snapshot(connection: sqlite3.Connection, start: datetime, end: datetime
         _ = connection.execute("ROLLBACK")
 
 
-def collect_charts(connection: sqlite3.Connection, start: datetime, end: datetime, zone: ZoneInfo) -> ChartSet:
-    """Keep one transaction and one shared read for the whole chart set."""
-    from scripts.buildlog import record
-
-    return build_series(read_snapshot(connection, start, end), start, end, zone, record.configured_targets())
-
-
 def read_index[T](read: Callable[[sqlite3.Connection], T]) -> T | IndexUnavailable:
     """Close the index after the read and preserve an index error as data."""
     try:
@@ -208,13 +118,11 @@ def read_index[T](read: Callable[[sqlite3.Connection], T]) -> T | IndexUnavailab
         return IndexUnavailable(str(error))
 
 
-def cost_value(bucket: DailyBucket, machine: str, cause: costs.Cause, *, per_phase: bool = False) -> ChartCost:
+def cost_value(bucket: DailyBucket, machine: str, cause: costs.Cause) -> ChartCost:
     idle = bucket.costs.mac_idle
     idle_wait = cause == "Mac idle while natedev waits" and machine == "mac" and idle.candidate_wait_seconds > 0
     if bucket.first_sources.get(machine, bucket.end.timestamp()) >= bucket.end.timestamp() and not idle_wait:
         return NoDataYet.VALUE
-    if per_phase and not bucket.costs.phases:
-        return CostUnavailable("no finished phases")
     if cause == "Mac idle while natedev waits" and machine == "mac":
         if idle_wait:
             return MacIdleUpperBound(idle.upper_bound_seconds-idle.unknown_seconds, idle.unknown_seconds)
@@ -275,8 +183,7 @@ def window_value(recent: ChartCost, window: ChartCost, recent_days: int, days: i
 
 
 def page_data(days: int, n: int = 3) -> PageData | IndexUnavailable:
-    """Read the charts and recent costs from one index snapshot."""
-    from scripts.buildlog import record
+    """Read the recent costs from one index snapshot."""
 
     settings = conf.read("buildlog")
     recent_days = settings.whole("TOP_COST_RECENT_DAYS")
@@ -289,7 +196,6 @@ def page_data(days: int, n: int = 3) -> PageData | IndexUnavailable:
 
     def collect(connection: sqlite3.Connection) -> PageData:
         reading = with_first_sources(read_snapshot(connection, start, end))
-        series = chart_series(reading, start, end, zone, record.configured_targets())
         recent = build_bucket(reading, recent_start, end)
         window = build_bucket(reading, start, end)
         slices = [build_bucket(reading, recent_start + timedelta(days=day), recent_start + timedelta(days=day + 1))
@@ -303,7 +209,7 @@ def page_data(days: int, n: int = 3) -> PageData | IndexUnavailable:
                                 cost_actions.largest_share(reading, row.machine, row.cause, recent_start, end),
                                 cost_actions.cost_action(connection, reading, row.machine, row.cause, recent_start, end)))
         top = TopCosts(recent_start, end, recent_days, tuple(rows) if rows else NoDataYet.VALUE)
-        return PageData(series, top)
+        return PageData(top)
 
     return read_index(collect)
 
@@ -322,47 +228,3 @@ def cost_json(value: ChartCost, divisor: float, *, machine: str = "") -> dict[st
         return {"state": "upper bound", "value": value.known_seconds/divisor,
                 "unknown": value.unknown_seconds/divisor, "upper": (value.known_seconds+value.unknown_seconds)/divisor}
     return {"state": "measured", "value": value.seconds/divisor}
-
-
-def chart_data(series: ChartSet) -> dict[str, object]:
-    buckets: list[dict[str, object]] = []
-    for bucket in series.buckets:
-        hana = [phase for phase in bucket.costs.phases if moments.hana_name(phase.working_dir) and phase.host == "natedev"]
-        durations = [phase.active_s for phase in hana if isinstance(phase.active_s, float)]
-        unrecorded = sum(isinstance(item.active_s, moments.WaitsNotRecorded) for item in hana)
-        phase: dict[str, object] = {"finished": len(hana), "valid": len(durations), "missing": len(hana)-len(durations),
-                                    "unrecorded": unrecorded}
-        if durations:
-            phase.update(state="measured", median=moments.nearest_rank(durations, 50), p90=moments.nearest_rank(durations, 90))
-        else:
-            phase.update(state="unavailable", reason=(
-                "phases ended before waits were recorded" if unrecorded
-                else "no valid durations" if hana else "no finished phases"))
-        rows: list[dict[str, object]] = []
-        days = (bucket.end-bucket.start).total_seconds()/86400
-        for machine in series.machines:
-            for cause in CAUSES:
-                rows.append({"machine": machine, "cause": cause,
-                             "daily": cost_json(cost_value(bucket, machine, cause), 3600*days, machine=machine),
-                             "perPhase": cost_json(cost_value(bucket, machine, cause, per_phase=True),
-                                                   3600*len(bucket.costs.phases) if bucket.costs.phases else 1,
-                                                   machine=machine)})
-        idle = bucket.costs.mac_idle
-        buckets.append({"start": bucket.start.timestamp()*1000, "end": bucket.end.timestamp()*1000,
-                        "label": bucket.start.astimezone(ZoneInfo(series.zone)).strftime("%a %b %d"),
-                        "thin": bucket.thin, "phase": phase, "allPhases": len(bucket.costs.phases), "rows": rows,
-                        "idle": {"candidate": idle.candidate_wait_seconds, "execution": idle.execution_overlap_seconds,
-                                 "holds": idle.recorded_hold_seconds, "known": idle.upper_bound_seconds-idle.unknown_seconds,
-                                 "unknown": idle.unknown_seconds, "upper": idle.upper_bound_seconds}})
-    live: list[dict[str, object]] = []
-    pending: list[str] = []
-    for event in series.events:
-        if isinstance(event, moments.PendingMemoryMoment):
-            pending.append(event.name+": not live yet")
-        elif series.start <= event.at < series.end:
-            scope = event.scope if isinstance(event, moments.BuildMoment) else event.track.value
-            live.append({"at": event.at.timestamp()*1000, "name": event.name, "scope": scope,
-                         "local": event.at.astimezone(ZoneInfo(series.zone)).strftime("%b %d %H:%M %Z")})
-    return {"start": series.start.timestamp()*1000, "end": series.end.timestamp()*1000,
-            "zone": series.zone, "machines": series.machines, "causes": CAUSES, "buckets": buckets,
-            "moments": live, "pending": pending}

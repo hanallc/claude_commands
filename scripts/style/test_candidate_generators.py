@@ -16,6 +16,12 @@ from scripts.style import candidate_generators, style_ledger
 from scripts.style.refill_facts import RefillFacts
 from scripts.style.refill_inputs import RefillInputs, UnstoredFact, regex_tool_identity
 
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
+
 
 @final
 class CandidateGeneratorTests(unittest.TestCase):

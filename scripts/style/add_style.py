@@ -10,6 +10,7 @@ except FileNotFoundError:
 import argparse
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from typing import cast
 SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.production import showrunners, staff
+from scripts.lib import build_folders
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.production import showrunner_tree
 from scripts.production.add_showrunner import NoEndingTab, herdr_tab_open
@@ -410,11 +412,20 @@ def main(argv: list[str]) -> int:
                 ["git", "-C", str(style.repository), "show-ref", "--verify", "--quiet", f"refs/heads/{style.merge_branch}"],
                 check=False, capture_output=True, text=True,
             )
+            branch: build_folders.NewWorktreeBranch | build_folders.ExistingWorktreeBranch
             if present.returncode == 1:
-                _ = _git(style.repository, "branch", style.merge_branch, style.branch_tip)
+                branch = build_folders.NewWorktreeBranch(style.merge_branch, style.branch_tip)
             elif present.returncode:
                 raise Refusal(present.stderr.strip())
-            _ = _git(style.repository, "worktree", "add", str(style.checkout), style.merge_branch)
+            else:
+                branch = build_folders.ExistingWorktreeBranch(style.merge_branch)
+            checkout_mode = stat.S_IMODE(style.checkout.stat().st_mode) if style.checkout.exists() else None
+            if checkout_mode is not None:
+                style.checkout.rmdir()
+            _ = build_folders.create_build_folder(build_folders.LinkedEditableRepository(
+                style.checkout, style.repository, branch))
+            if checkout_mode is not None:
+                style.checkout.chmod(checkout_mode)
         _write_missing(style.doc, _production_text(style))
         _update_destination(style)
         config = style_config.read_config(style.doc)

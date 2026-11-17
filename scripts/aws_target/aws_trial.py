@@ -439,7 +439,7 @@ def paired_service(command: Sequence[str], unit: str) -> int:
 
 def paired_main(argv: Sequence[str], directory: Path) -> int:
     parser = argparse.ArgumentParser(description='Compare two local revisions on disposable gate boxes',
-                                     epilog='gate_trial.py pushes and deletes its own trial branches; never push or delete a trial branch by hand.')
+                                     epilog='aws_trial.py pushes and deletes its own trial branches; never push or delete a trial branch by hand.')
     _ = parser.add_argument('--base', required=True)
     _ = parser.add_argument('--changed', required=True)
     _ = parser.add_argument('--modules', nargs='+', required=True)
@@ -480,7 +480,7 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
             path.mkdir()
             cloud_gate.save(path / 'request.json', module_request(trial, module, path.name, expires))
             cloud_gate.save(path / 'deployment.json', deployment)
-        command = cloud_gate.service_command('scripts.aws_target.gate_trial', ['--paired-worker', str(folder)],
+        command = cloud_gate.service_command('scripts.aws_target.aws_trial', ['--paired-worker', str(folder)],
                                              'cloud-paired-trial-' + folder.name, paired=True)
         return paired_service(command, 'cloud-paired-trial-' + folder.name)
     except (OSError, ValueError, GateRefused, subprocess.SubprocessError, KeyboardInterrupt) as error:

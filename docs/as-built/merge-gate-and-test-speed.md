@@ -487,7 +487,7 @@ Both modes use one launch loop with the same commands, test environments, timeou
 `WholeMachine` prints each completed job's name, exit status, and seconds.
 `WholeMachine.module_seconds` supplies recorded times to `module_order`, which places unknown modules first, then measured modules from slowest to fastest.
 Without recorded times, `WholeMachine` keeps the discovery order. It writes no module times file.
-The gate trial sends the host's module times as a separate S3 object.
+The AWS trial sends the host's module times as a separate S3 object.
 The trial host reads its root `nixpkgs` input revision from `/etc/nixos/flake.lock` before creating resources.
 The guest uses that revision for Python, SQLite, Chromium, and the other Nix packages.
 The guest links `google-chrome` to Chromium before the system profile bind mount for headless chart tests.

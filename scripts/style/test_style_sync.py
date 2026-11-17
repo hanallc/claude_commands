@@ -49,6 +49,12 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
+
 
 INITIAL_FILES = {
     "Cargo.toml": '[package]\nname="sample"\nversion="0.1.0"\n',
@@ -996,6 +1002,27 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
     def worktrees_with_slot(self, original: str) -> str:
         slot = self.standing_target().parent
         return original + f"\n\nworktree {slot}\nHEAD {self.tip}\ndetached"
+
+    def test_absent_checkout_keeps_recovery_marks_when_cargo_refuses_cleanup(self) -> None:
+        directory = self.stale_dir("cargo-recovery", 0, registered=True)
+        snapshot = directory / "checkout"
+        task_mark, cargo_mark = scratch.removal_mark(snapshot), scratch.cargo_removal_mark(snapshot)
+        scratch.atomic_record(cargo_mark, [])
+        with mock.patch.object(scratch, "finish_removal", side_effect=OSError("stop after source deletion")):
+            with redirect_stdout(io.StringIO()):
+                self.assertFalse(style_sync.remove_lint_dir(self.repo, directory))
+        self.assertFalse(snapshot.exists())
+        self.assertTrue(task_mark.is_file())
+        self.assertTrue(cargo_mark.is_file())
+        with (mock.patch.object(scratch, "clean_cargo_outputs", side_effect=scratch.CargoOutputKept("Cargo refuses recovery")),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertFalse(style_sync.remove_lint_dir(self.repo, directory))
+        self.assertIn("Cargo refuses recovery", output.getvalue())
+        self.assertTrue(task_mark.is_file())
+        self.assertTrue(cargo_mark.is_file())
+        self.assertTrue((directory / style_sync.OWNER_FILE).is_file())
+        self.assertTrue(style_sync.remove_lint_dir(self.repo, directory))
+        self.assertFalse(directory.exists())
 
     def standing_target(self) -> Path:
         return copies.gates_root() / f"{self.repo.name}-slot1/target"
