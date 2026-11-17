@@ -413,6 +413,7 @@ It stores no review states on the List record.
 The State cell shows “N changes for you” when every review that needs nate is a change.
 It shows “N reviews for you” for other review types or mixed types.
 Without a review for nate, unfinished reviews show “N reviews waiting on others”.
+A count of 1 takes the singular, for example “1 change for you”.
 When every linked review is Done, it shows “Reviews done — decide: close, keep or park”.
 A missing review key counts as Done.
 An item without links shows no review line.

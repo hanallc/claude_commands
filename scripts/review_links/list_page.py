@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, urlencode
 
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
-from scripts.production import change_review, record_store, session_staff, staff, the_list
+from scripts.production import change_review, footer_counts, record_store, session_staff, staff, the_list
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_link
 from scripts.review_links import review_items, review_page
@@ -121,10 +121,10 @@ def review_summary(item: the_list.ListItem, reviews: Mapping[str, review_items.R
     ready = [review for review in linked if review.for_you(today)]
     waiting = [review for review in linked if review.state != review_items.ReviewState.DONE and not review.for_you(today)]
     if ready:
-        kind = "changes" if all(review.type == review_items.ReviewType.CHANGE for review in ready) else "reviews"
-        text = f"{len(ready)} {kind} for you"
+        kind = "change" if all(review.type == review_items.ReviewType.CHANGE for review in ready) else "review"
+        text = footer_counts.plural(len(ready), kind) + " for you"
     elif waiting:
-        text = f"{len(waiting)} reviews waiting on others"
+        text = footer_counts.plural(len(waiting), "review") + " waiting on others"
     else:
         text = "Reviews done — decide: close, keep or park"
     return f'<a href="{review_page.PAGE_PATH}" target="_top">{text}</a>'
