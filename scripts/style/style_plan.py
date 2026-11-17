@@ -38,7 +38,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.copies import copies
 from scripts.direct import phase_reservation
-from scripts.lib import berth_board
+from scripts.lib import berth_board, build_folders
 from scripts.whoami import quota_state
 from scripts.lib.git_blob import git_blob_id
 from scripts.lib.process_failure import failure_detail
@@ -3794,7 +3794,8 @@ def restore_ticket_worker(run: Path, worktree: Path, plan: Path, ticket_id: str,
     phase_id = phase.group(1)
     slot = "style-ticket-" + ticket_id
     directory = phase_reservation.phase_directory(run, phase_id)
-    directory.mkdir(parents=True, exist_ok=True)
+    directory = build_folders.create_build_folder(build_folders.StableOwnerFolder(
+        directory.name, build_folders.ExplicitBuildParent(directory.parent)))
     prompt = directory / "ticket-work-order.md"
     if not prompt.exists():
         header = (
