@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import math
 import os
@@ -17,7 +18,7 @@ from scripts.build_queue.test_memory_hover import RAM_FIXTURE, SWAP_FIXTURE
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.disks import disks_page
 from scripts.lib import file_lock, test_hang_guard
-from scripts.review_links import page_frame
+from scripts.review_links import page_frame, test_page_frame
 
 GIB = 1 << 30
 KEEP = 256 << 20
@@ -136,9 +137,132 @@ class DisksPageTests(unittest.TestCase):
             page = disks_page.publish(Path(directory), SETTINGS).read_text()
         self.assertIn('</h1><p class="page-status"', page)
         self.assertIn(page_frame.REFRESH_SCRIPT, page)
-        self.assertIn('createPageRefresh(loadDisks,()=>settings.poll_seconds)', page)
+        self.assertIn("createPageRefresh(loadDisks,()=>settings.poll_seconds)", page)
         self.assertIn('readAt:data.measured_at,renderSeconds:data.render_seconds', page)
         self.assertIn('throw new Error("The measure did not finish.")', page)
+        scenario = r"""
+const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+let fileAt=now/1000-4200,measureState='current',stalled=false,failedReads=false;
+const pendingReads=[];
+const release=()=>pendingReads.splice(0).forEach(resolve=>resolve({ok:true,json:async()=>payload()}));
+function render(){}
+function renderCards(){}
+const payload=()=>({measured_at:fileAt,render_seconds:.03,drives:[]});
+const fetch=async(url)=>{
+ if(url==='measure') return {ok:true,json:async()=>({state:measureState})};
+ if(failedReads) return {ok:false,status:502};
+ if(stalled) return new Promise(resolve=>pendingReads.push(resolve));
+ return {ok:true,json:async()=>payload()};
+};
+START
+(async()=>{
+ await pageRefresh.refresh();
+ check(line.dataset.state==='Live' && parts.age.textContent.includes('70 min ago'),
+  'Old sizes without a measure must stay Live and keep their age.');
+ measureState='started';await pageRefresh.refresh();
+ check(line.dataset.state==='Paused' && parts.reason.textContent==='Measuring…',
+  'A measure with old sizes must show Paused and Measuring….');
+ check(parts.reason.textContent!=='The feed has stopped.','A running measure must not report a stopped feed.');
+ now+=180000;await pageRefresh.refresh();
+ check(line.dataset.state==='Paused' && parts.reason.textContent==='Measuring…',
+  'Measuring must remain visible during a three-minute measure.');
+ fileAt=now/1000;measureState='current';await pageRefresh.refresh();pageRefresh.changed();
+ await Promise.resolve();await Promise.resolve();
+ check(line.dataset.state==='Live' && parts.age.textContent==='0 s ago',
+  'A completed measure must return to Live with its new age.');
+ measureState='started';await pageRefresh.refresh();
+ now+=(settings.wait_seconds+1)*1000;await pageRefresh.refresh();pageRefresh.changed();
+ await Promise.resolve();await Promise.resolve();
+ check(line.dataset.state==='Failed' && parts.reason.textContent==='The measure did not finish.',
+  'A measure timeout must keep its failure after the age clock runs.');
+ measureState='current';await pageRefresh.refresh();
+ check(line.dataset.state==='Live','A server answer must recover with the old sizes.');
+ measureState='started';await pageRefresh.refresh();
+ failedReads=true;await pageRefresh.refresh();pageRefresh.changed();
+ await Promise.resolve();await Promise.resolve();
+ check(line.dataset.state==='Failed' && parts.reason.textContent==='HTTP 502',
+  'A failed read during a measure must show Failed and HTTP 502.');
+ check(measuring!==null,'A failed read before the wait limit must retain the measure start.');
+ now+=(settings.wait_seconds+1)*1000;await pageRefresh.refresh();pageRefresh.changed();
+ await Promise.resolve();await Promise.resolve();
+ check(measuring===null,'Failed reads after the wait limit must clear measuring.');
+ check(line.dataset.state==='Failed' && parts.reason.textContent==='HTTP 502',
+  'Failed reads after the wait limit must show Failed and HTTP 502.');
+ failedReads=false;measureState='current';await pageRefresh.refresh();
+ check(line.dataset.state==='Live','A good read after failed reads must return to Live.');
+ stalled=true;const pendingRead=pageRefresh.refresh();
+ now+=(JSON.parse(line.dataset.statusOptions).ageLimit+1)*1000;pageRefresh.changed();
+ check(line.dataset.state==='Late','A missing server answer must become Late.');
+ release();await pendingRead;
+ check(line.dataset.state==='Live','A later server answer must clear Late with the same sizes.');
+ stalled=false;measureState='started';await pageRefresh.refresh();
+ check(line.dataset.state==='Paused' && parts.reason.textContent==='Measuring…',
+  'The next measure must start before its reads stop answering.');
+ stalled=true;void pageRefresh.refresh();
+ now+=settings.wait_seconds*1000;pageRefresh.changed();
+ check(line.dataset.state==='Late' && !parts.age.hidden,
+  'A pending read at the wait limit must show Late with the data age.');
+ now+=1000;pageRefresh.changed();
+ check(line.dataset.state!=='Paused' && parts.reason.textContent!=='Measuring…',
+  'A pending read must not retain Paused or Measuring after 3601 seconds.');
+ check(line.dataset.state==='Late','A pending read past the wait limit must show Late.');
+ if(failures.length) throw new Error(failures.join('\n'));
+ console.log('PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+"""
+        self.assert_status_scenario(scenario)
+
+    def test_the_first_measure_keeps_its_data_age_when_the_next_read_stalls(self) -> None:
+        self.assert_status_scenario(r"""
+const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+const fileAt=now/1000-4200,pendingReads=[];
+let stalled=false;
+function render(){}
+function renderCards(){}
+const fetch=async(url)=>{
+ if(url==='measure') return {ok:true,json:async()=>({state:'started'})};
+ if(stalled) return new Promise(resolve=>pendingReads.push(resolve));
+ return {ok:true,json:async()=>({measured_at:fileAt,render_seconds:.03,drives:[]})};
+};
+START
+(async()=>{
+ await pageRefresh.refresh();
+ check(line.dataset.state==='Paused' && parts.reason.textContent==='Measuring…',
+  'The first measure must show Paused and Measuring.');
+ check(!parts.age.hidden && parts.age.textContent==='70 min ago',
+  'The first measure must record the old data age.');
+ stalled=true;void pageRefresh.refresh();
+ check(pendingReads.length===2,'The Disks and Builds reads must have separate pending resolvers.');
+ const ageLimit=JSON.parse(line.dataset.statusOptions).ageLimit;
+ now+=(Math.max(settings.wait_seconds,ageLimit)+1)*1000;pageRefresh.changed();
+ check(line.dataset.state==='Late' && parts.reason.textContent==='The feed has stopped.',
+  'The first measure must show Late after the wait and age limits.');
+ check(!parts.age.hidden && parts.age.textContent===Math.floor((now/1000-fileAt)/60)+' min ago',
+  'The stalled first measure must keep the data age.');
+ if(failures.length) throw new Error(failures.join('\n'));
+ console.log('PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
+
+    def assert_status_scenario(self, scenario: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            page = disks_page.publish(Path(directory), SETTINGS).read_text()
+        match = re.search(r'data-status-options="([^"]+)"', page)
+        assert match is not None
+        environment = test_page_frame.PageStatusTests.environment(html.unescape(match[1])) + """
+const settingsText=SETTINGS;
+document.getElementById=()=>({textContent:JSON.stringify(settingsText)});
+const localStorage={getItem:()=>null};
+""".replace("SETTINGS", json.dumps(SETTINGS))
+        functions = page[page.index("const GIB ="):page.index("const updateSessions =")]
+        start = re.search(r'const pageRefresh=createPageRefresh[^\n]+', page)
+        assert start is not None
+        scenario = scenario.replace("START", start[0])
+        node = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
+        done = subprocess.run([node, "--unhandled-rejections=strict", "-e",
+                               environment + functions + page_frame.REFRESH_SCRIPT + scenario],
+                              capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, "PASS"), done.stderr)
 
     def test_publish_writes_the_page_only_when_its_content_changes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

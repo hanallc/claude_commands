@@ -180,6 +180,16 @@ def assert_component_states(case: unittest.TestCase, markup: str) -> None:
  hold='';refresh.changed();await settle();
  check(line.dataset.state==='Live' && parts.render.textContent==='render 5.00 s','a released page uses its held data');
  check(parts.render.classList.has('page-status-slow'),'a slow render uses the warning color');
+ result={readAt:now/1000-10,answeredAt:now/1000,renderSeconds:.03,busy:'Measuring…'};
+ await refresh.refresh();
+ check(line.dataset.state==='Paused' && parts.reason.textContent===result.busy,'a busy answer shows its reason');
+ check(parts.age.textContent==='10 s ago','a busy answer records its data time');
+ now+=1000;result={...result,readAt:now/1000-2};await refresh.refresh();
+ check(parts.age.textContent==='2 s ago','a later busy answer records its new data time');
+ load=async()=>{throw new Error('HTTP 502');};await refresh.refresh();
+ check(line.dataset.state==='Failed' && parts.reason.textContent==='HTTP 502','a failed read overrides the busy reason');
+ result={readAt:now/1000,renderSeconds:.03};load=async()=>result;await refresh.refresh();
+ check(line.dataset.state==='Live','an answer without a busy reason clears the busy state');
  let calls=0;load=async()=>{calls++;return result;};visible='hidden';await refresh.refresh();
  check(calls===0 && line.dataset.state==='Paused','a hidden tab does not read');
  visible='visible';handlers.visibilitychange();await settle();check(calls===1,'a visible tab reads at once');
