@@ -132,6 +132,8 @@ A regional failure prints its error code and permits other regions to continue.
 Any regional failure makes the command exit with status 1.
 A requested quota does not prove an applied quota.
 
+On the AWS page, expand **How to open the quota cases in AWS** under **Quotas** for the sign-in steps.
+
 `quota-status` reports the applied quotas and their request history without creating a request or writing local state.
 It uses the same regions, quota codes, and encrypted administrator credentials as `quota-request`.
 Each region starts one block with its name as the heading.
