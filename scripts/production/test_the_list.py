@@ -239,8 +239,8 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(self.command("clean-evidence", "--source", "morty"), (0, "0 changed; 1 unchanged\n", ""))
 
     def test_review_links_keep_order_history_and_repeat_without_writes(self) -> None:
-        first = investigation.file(OWNER.id, "First review", "Read the first result.")
-        second = investigation.file(OWNER.id, "Second review", "Read the second result.")
+        first = investigation.file(OWNER.id, "First review", "Read the first result.", waiting_why='The owner must complete the investigation.')
+        second = investigation.file(OWNER.id, "Second review", "Read the second result.", waiting_why='The owner must complete the investigation.')
         identities = (f"{OWNER.name}/{first.id}", f"{OWNER.name}/{second.id}")
         keys = tuple(f"investigation/{OWNER.id}/{review.id}" for review in (first, second))
         item = self.add()
@@ -292,7 +292,7 @@ class TheListTests(unittest.TestCase):
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
     def test_review_commands_resolve_keys_and_refuse_ambiguous_shown_ids(self) -> None:
-        _ = investigation.file(OWNER.id, "First review", "Read the result.")
+        _ = investigation.file(OWNER.id, "First review", "Read the result.", waiting_why='The owner must complete the investigation.')
         first = review_items.investigation_items(staff.snapshot())[0]
         second = replace(first, key="proposal/other/I1", type=review_items.ReviewType.PROPOSAL,
                          source=review_items.ProposalLedgerSource(self.root / "proposals.md"))
@@ -341,7 +341,7 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(unlinked_item.log[-1].what, "Unlinked reviews: " + ", ".join((third.key, second.key, first.key)))
 
     def test_review_options_keep_shown_ids_separate_from_exact_keys(self) -> None:
-        _ = investigation.file(OWNER.id, "Review the result", "Read the result.")
+        _ = investigation.file(OWNER.id, "Review the result", "Read the result.", waiting_why='The owner must complete the investigation.')
         base = review_items.investigation_items(staff.snapshot())[0]
         first = replace(base, id="natedev/C1", key="natedev/C1")
         second = replace(base, id=first.id, key="hanadocs/C1", type=review_items.ReviewType.PROPOSAL,
@@ -553,7 +553,7 @@ class TheListTests(unittest.TestCase):
             self.assertEqual(self.command("list"), (1, "", "the_list: the current session must be the morty producer\n"))
 
     def test_shared_records_preserve_investigation_format_and_separate_folders(self) -> None:
-        investigation_item = investigation.file(MORTY.id, "Find the cause", "Why?\n\n## Answer\n\nKeep this text.")
+        investigation_item = investigation.file(MORTY.id, "Find the cause", "Why?\n\n## Answer\n\nKeep this text.", waiting_why='The owner must complete the investigation.')
         item = self.add()
         self.assertEqual((investigation_item.id, item.id), ("I1", "L1"))
         self.assertEqual(the_list.load(MORTY.id, item.id), item)

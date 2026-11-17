@@ -42,7 +42,7 @@ class InvestigationsPageTests(unittest.TestCase):
 
     def file(self, owner: staff.StaffId, title: str, moment: str) -> investigation.Investigation:
         with patch.object(investigation, "_now", return_value=moment):
-            return investigation.file(owner, title, "Read the report.\n\n1. Check the first result.\n2. Check the second result.")
+            return investigation.file(owner, title, "Read the report.\n\n1. Check the first result.\n2. Check the second result.", waiting_why='The owner must complete the investigation.')
 
     def test_review_question_returns_the_answer_and_feedback_keeps_each_exchange(self) -> None:
         for legacy in (False, True):

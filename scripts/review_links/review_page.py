@@ -8,6 +8,7 @@ import secrets
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 from urllib.parse import parse_qs, parse_qsl, urlencode
 
 from scripts.lib import conf
@@ -242,12 +243,23 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus) -> tuple[c
             return change_page.NoMessageDelivery(),review_actions.later(item,fields.get('later',[''])[0],words)
         if outcome not in item.actions:
             raise change_page.AnswerRefused('choose an action on this card')
-        if item.type == ReviewType.INVESTIGATION:
-            return review_actions.investigation_action(item,outcome,words,status)
-        return review_actions.decision_action(item,outcome,words,status)
+        delivery, answer = (review_actions.investigation_action(item,outcome,words,status)
+                            if item.type == ReviewType.INVESTIGATION else
+                            review_actions.decision_action(item,outcome,words,status))
+        if outcome == 'question' and isinstance(delivery, change_page.MessageDelivery):
+            delivery = review_actions.track_question(delivery, key, words, status)
+        return delivery, answer
     _ = fields.pop('later',None)
-    delivery, answer = change_browser.submit(browser, urlencode({key:values[0] for key,values in fields.items()}), status,
-                                               feedback_closes=True)
+    item = next((item for item in review_items.read(root, kinds=(ReviewType.QUESTION,)) if item.key == key), None) if key.startswith('question/') else None
+    if item is not None and item.state == ReviewState.WAITING:
+        if outcome not in item.actions:
+            raise change_page.AnswerRefused('choose an action on this card')
+        delivery, answer = review_actions.question_action(item, cast(change_page.QuestionOutcome, outcome), words, status)
+    else:
+        delivery, answer = change_browser.submit(browser, urlencode({key:values[0] for key,values in fields.items()}), status,
+                                                   feedback_closes=True)
+    if key.startswith('question/') and outcome == 'question' and isinstance(delivery, change_page.MessageDelivery):
+        delivery = review_actions.track_question(delivery, key, words, status)
     words = ('feedback sent' if outcome == 'feedback' else outcome)+(': '+fields['feedback'][0] if fields['feedback'][0] else '')
     if isinstance(delivery, change_page.MessageDelivery):
         if not isinstance(delivery.page, change_page.UserQuestionPage):
