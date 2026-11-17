@@ -418,7 +418,22 @@ A second schedule caller prints `already claimed by <id>` and exits with code 0.
 `StatusDocument` carries account rows, the board, problems, and session input paths.
 The `board` is `accounts.status_board()`: the table the console Accounts page draws.
 `config/statusline.conf` holds each account color under `account.<label>`.
-`ROLE_COLOR_KEYS` names the role color of each role group: units `role.unit-director`, showrunners `role.showrunner`, workers `role.worker`.
+`ROLE_COLOR_KEYS` maps each role group to its color key:
+
+1. Units use `role.unit-director`.
+2. Showrunners use `role.showrunner`.
+3. Workers use `role.worker`.
+4. Producers use `role.producer`.
+
+The producers role has a separate row under each account it uses.
+Producer rows follow the other role rows for that account.
+`account_details_in_row_order` accepts the complete rows in display order.
+It shows account details only on the first row of each consecutive account run.
+The account details include the dot, label, swatch, allowance, reset, credits, and credits setting.
+A separated row shows the account details again.
+A lone producer row shows all account details.
+The helper preserves the complete input rows for later sorts.
+The shipped value of `role.producer` is `pink`.
 The value accepts a color name or a six-digit hex color.
 A board span with a valid configured color carries its key as `color_key`; the role check mark is a separate span.
 Configured accounts and role groups have a color swatch on the console Accounts page.
@@ -461,8 +476,12 @@ The accounts board has no activity column, the same as the cargo-handler account
 The activity of each session shows only in the cargo-handler tiles, from `cargo-handler census --json`.
 An older peer's document holds waiting within busy and starting within idle, with separate `starting` and `waiting` fields.
 The decoder moves that peer's `starting` count from idle to busy.
-Claude producers count under `showrunners` with the same hold and activity rules.
-Without a live session, they count on the selected showrunners account.
+Claude and Codex producers count under `producers` with the same hold and activity rules.
+A live producer counts on the account from its process environment.
+Without a live Claude session, producers count on the selected showrunners account.
+Without a live Codex session, producers count on their recorded home or the selected workers account.
+Claude producers retain their showrunners move group.
+Codex producers retain their workers move group.
 `session-counts-read` prints the same live count document without publishing a file.
 Peer counts use the shared role-map transport in a detached fetch.
 One claim prevents concurrent fetches.
