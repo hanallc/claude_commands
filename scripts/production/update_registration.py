@@ -1634,14 +1634,16 @@ def change_open_question(production: QuestionScope, name: str, text: str, identi
     return found
 
 
-def followup(production: QuestionScope, text: str, words: str, *, identities: QuestionStaff | None = None,
-             waiting_why: str = "") -> AnswerRelay:
-    """Send the asker a follow-up: the question leaves the due list until the asker replies."""
+def followup(production: QuestionScope, text: str, words: str, *, identities: QuestionStaff | None = None) -> AnswerRelay:
+    """Send the asker a follow-up: the question leaves the due list until the asker replies.
+
+    The follow-up words are the item's why this is waiting text.
+    """
     from scripts.review_links.review_events import require_waiting_why
-    reason = require_waiting_why(waiting_why)
     identities = identities if identities is not None else QuestionStaff.read()
     if not words.strip():
         raise RegistrationFailure("followup", "the follow-up is empty")
+    reason = require_waiting_why(words)
     sent = datetime.now(production.zone).strftime("%Y-%m-%dT%H:%M")
 
     def add(entry: OutstandingItem) -> None:

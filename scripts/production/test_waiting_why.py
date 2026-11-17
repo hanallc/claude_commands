@@ -59,8 +59,7 @@ class WaitingWhyTests(unittest.TestCase):
             source = next(item.source for item in review_items.read(self.root, assign_ids=False) if item.key == self.question)
             assert isinstance(source, review_items.QuestionSource)
             production = update_registration.question_scope(source.record.owner, identities.record)
-            _ = update_registration.followup(production, source.record.item['text'], 'Which layout?',
-                                              identities=identities, waiting_why=reason)
+            _ = update_registration.followup(production, source.record.item['text'], reason, identities=identities)
         elif kind == review_items.ReviewType.INVESTIGATION:
             _ = investigation.file(self.fixture.unit.id, 'Find the cause', 'What caused this?', waiting_why=reason)
         elif kind == review_items.ReviewType.PROPOSAL:
@@ -100,15 +99,17 @@ class WaitingWhyTests(unittest.TestCase):
         _ = path.write_text(path.read_text().replace(WHY, ''))
 
     def check_refusal(self, kind: review_items.ReviewType) -> None:
+        if kind == review_items.ReviewType.QUESTION:
+            source = next(item.source for item in review_items.read(self.root) if item.key == self.question)
+            assert isinstance(source, review_items.QuestionSource)
+            identities = update_registration.QuestionStaff.read()
+            scope = update_registration.question_scope(source.record.owner, identities.record)
+            with self.assertRaisesRegex(update_registration.RegistrationFailure, 'the follow-up is empty'):
+                _ = update_registration.followup(scope, source.record.item['text'], ' ', identities=identities)
+            return
         with self.assertRaisesRegex(ValueError, 'Waiting items need'):
             if kind == review_items.ReviewType.CHANGE:
                 _ = change_page.DeliveryStatus(self.root).begin(self.fixture.page, 'C1', 'validation')
-            elif kind == review_items.ReviewType.QUESTION:
-                source = next(item.source for item in review_items.read(self.root) if item.key == self.question)
-                assert isinstance(source, review_items.QuestionSource)
-                identities = update_registration.QuestionStaff.read()
-                scope = update_registration.question_scope(source.record.owner, identities.record)
-                _ = update_registration.followup(scope, source.record.item['text'], 'Which layout?', identities=identities)
             elif kind == review_items.ReviewType.INVESTIGATION:
                 _ = investigation.file(self.fixture.unit.id, 'Find the cause', 'What caused this?')
             elif kind == review_items.ReviewType.PROPOSAL:

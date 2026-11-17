@@ -293,7 +293,7 @@ This command does not allocate question IDs or write records.
 The writer checks the current state under its lock before it stores the reason.
 Questions use the canonical owner lock, including questions without a current owner.
 The command prints one plain error line for a refused update.
-`investigation.py file` requires `--waiting-why`; the Python `followup` API requires `waiting_why`.
+`investigation.py file` requires `--waiting-why`. The Python `followup` API stores the follow-up words as the reason.
 `proposal_issue.record_review` and `efficiency_reviews.record` require `waiting_why` when setting the Waiting mark.
 `candidates.py outcome E<n> deferred --waiting-why "<reason>"` stores the reason beside the ledger.
 The states are **For you**, **Waiting** and **Done**.

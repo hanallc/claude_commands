@@ -665,7 +665,7 @@ def save_outcome(production: update_registration.QuestionScope, question: Waitin
     if outcome in ("answer", "feedback"):
         return update_registration.answer(production, text, identities=identities, only_open=True)
     if outcome in ("followup", "question"):
-        return update_registration.followup(production, text, words, identities=identities, waiting_why=words)
+        return update_registration.followup(production, text, words, identities=identities)
     urgency.move_to_end(update_registration.question_queue(production), update_registration.item_key(question.owner, text),
                         datetime.now(production.zone).replace(tzinfo=None))
     return update_registration.answer_relay(production, production.name, update_registration.question_asker(
