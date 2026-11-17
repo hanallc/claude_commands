@@ -25,6 +25,7 @@ import stat
 from statistics import median
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 import threading
 import time
 from typing import ClassVar, cast, final
@@ -142,6 +143,61 @@ class GateRegionTimings:
             write_text_atomic(self._path, record)
         except OSError:
             print(f'cloud-gate: warning: could not write {self._path.name}', flush=True)
+
+
+@dataclass
+class RegionalStackDigests:
+    """Store evidence for regional stacks that completed deployment."""
+
+    path: Path
+    entries: dict[str, object]
+    _warned: bool = False
+
+    @classmethod
+    def read(cls, directory: Path) -> RegionalStackDigests:
+        cache = cls(directory / 'regional-stack-digests.json', {})
+        try:
+            entries = remote.read_record(cache.path)
+            for value in entries.values():
+                entry = ledger.mapping(value)
+                if entry.keys() != {'digest', 'StackId', 'LastUpdatedTime'}:
+                    raise ValueError('Invalid regional stack digest fields')
+                if not re.fullmatch(r'[0-9a-f]{64}', ledger.text(entry, 'digest')):
+                    raise ValueError('Invalid regional stack digest')
+                _ = ledger.text(entry, 'StackId')
+                if entry['LastUpdatedTime'] is not None:
+                    _ = ledger.text(entry, 'LastUpdatedTime')
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            cache._warn()
+        else:
+            cache.entries = entries
+        return cache
+
+    def save(self) -> None:
+        try:
+            write_text_atomic(self.path, json.dumps(self.entries, sort_keys=True) + '\n', new_file_mode=0o600)
+        except OSError:
+            self._warn()
+
+    def _warn(self) -> None:
+        if not self._warned:
+            print(f'cloud-gate: warning: {self.path.name} is unavailable', flush=True)
+            self._warned = True
+
+
+def regional_stack_digest(digest: str, stack: dict[str, object]) -> dict[str, object]:
+    """Bind the digest to a complete stack with a known identity."""
+    status = stack.get('StackStatus')
+    stack_id = stack.get('StackId')
+    updated = stack.get('LastUpdatedTime')
+    if status not in ('CREATE_COMPLETE', 'UPDATE_COMPLETE') or not isinstance(stack_id, str) or not stack_id:
+        return {}
+    # CloudFormation omits LastUpdatedTime until the first update.
+    if (updated is None and status == 'CREATE_COMPLETE') or (isinstance(updated, str) and updated):
+        return {'digest': digest, 'StackId': stack_id, 'LastUpdatedTime': updated}
+    return {}
 
 
 def quota_targets(home: str) -> tuple[tuple[tuple[str, ...], str, int, str], ...]:
@@ -1237,7 +1293,8 @@ class Deployment:
         return RegionalNetwork(region, vpc, subnets, self.regional_image(api, settings, region))
 
     def regional_gate_stack(self, api: AwsCli, settings: DeploymentSettings, home: dict[str, str],
-                            parameters: dict[str, str], network: RegionalNetwork) -> dict[str, object]:
+                            parameters: dict[str, str], network: RegionalNetwork,
+                            digests: RegionalStackDigests) -> dict[str, object]:
         """Deploy only gate resources in the target region; the home stack's scaler policies cover every gate region."""
         region = network.region
         target = api.in_region(region)
@@ -1246,32 +1303,53 @@ class Deployment:
             'DeploymentId': deployment, 'CostTagKey': read_settings(self.settings_path).cost_explorer_tag_key,
             'CostTagValue': read_settings(self.settings_path).cost_explorer_tag_value,
             'RootDeviceName': settings.root_device_name, 'HomeGateProfileArn': home['GateProfileArn']}
-        template = self.output / ('region-gates-' + region + '.json')
-        write_text_atomic(template, json.dumps(region_gate_template(), sort_keys=True) + '\n')
-        definitions = ledger.mapping(region_gate_template()['Parameters'])
+        definition = region_gate_template()
+        template_text = json.dumps(definition, sort_keys=True) + '\n'
+        definitions = ledger.mapping(definition['Parameters'])
+        values = {key: value for key, value in values.items() if key in definitions}
         name = settings.stack_name + '-gates-' + region
+        digest = sha256(json.dumps({
+            'template': template_text, 'name': name, 'parameters': values,
+        }, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         stack_path = self.directory / 'regional-stacks.json'
         stacks = remote.read_record(stack_path) if stack_path.exists() else {}
         stacks[region] = name
         write_text_atomic(stack_path, json.dumps(stacks) + '\n')
-        wait_s = conf.read(self.settings_path).whole('stack_wait_timeout_s')
-        if rolled_back_create(target, name):
-            # A stack whose first create failed keeps no resources and cannot be updated; remove it and create it again.
-            print(f'cloud-gate: {region}: removing the gate stack whose first create failed')
-            _ = target.call('delete-stack', '--stack-name', name, service='cloudformation')
-            _ = target.call('wait', 'stack-delete-complete', '--stack-name', name, service='cloudformation', timeout_s=wait_s)
-        started = self.clock()
-        try:
-            _ = target.call('deploy', '--stack-name', name, '--template-file', str(template),
-                '--capabilities', 'CAPABILITY_NAMED_IAM', '--no-fail-on-empty-changeset', '--parameter-overrides',
-                *[key + '=' + value for key, value in values.items() if key in definitions], service='cloudformation',
-                timeout_s=wait_s)
-        except (AwsUnavailable, subprocess.SubprocessError) as error:
-            raise AwsUnavailable('\n'.join([f'{region}: {error}', *failed_stack_events(target, name, started)])) from error
-        stack = ledger.rows(target.call('describe-stacks', '--stack-name', name, service='cloudformation'), 'Stacks')[0]
+        stack = describe_regional_stack(target, name)
+        status = stack.get('StackStatus')
+        unchanged = digests.entries.get(region) == regional_stack_digest(digest, stack)
+        if unchanged:
+            print(f'cloud-gate: {region}: gate stack unchanged; skipped', flush=True)
+        else:
+            if region in digests.entries:
+                # A deploy that stops before it saves the new digest must run again.
+                del digests.entries[region]
+                digests.save()
+            wait_s = conf.read(self.settings_path).whole('stack_wait_timeout_s')
+            if status == 'ROLLBACK_COMPLETE':
+                print(f'cloud-gate: {region}: removing the gate stack whose first create failed')
+                _ = target.call('delete-stack', '--stack-name', name, service='cloudformation')
+                _ = target.call('wait', 'stack-delete-complete', '--stack-name', name, service='cloudformation', timeout_s=wait_s)
+            started = self.clock()
+            try:
+                with TemporaryDirectory(prefix='gate-region-') as folder:
+                    template = Path(folder) / 'template.json'
+                    _ = template.write_text(template_text, encoding='utf-8')
+                    _ = target.call('deploy', '--stack-name', name, '--template-file', str(template),
+                        '--capabilities', 'CAPABILITY_NAMED_IAM', '--no-fail-on-empty-changeset', '--parameter-overrides',
+                        *[key + '=' + value for key, value in values.items()], service='cloudformation', timeout_s=wait_s)
+            except (AwsUnavailable, subprocess.SubprocessError) as error:
+                raise AwsUnavailable('\n'.join([f'{region}: {error}', *failed_stack_events(target, name, started)])) from error
+            stack = ledger.rows(target.call('describe-stacks', '--stack-name', name, service='cloudformation'), 'Stacks')[0]
         outputs = {ledger.text(row, 'OutputKey'): ledger.text(row, 'OutputValue') for row in ledger.rows(stack, 'Outputs')}
-        return {'region': region, 'image': network.image, 'subnets': network.subnets, 'template': outputs['GateLaunchTemplate'],
+        result: dict[str, object] = {'region': region, 'image': network.image, 'subnets': network.subnets, 'template': outputs['GateLaunchTemplate'],
                 'version': outputs['GateLaunchVersion'], 'security_group': outputs['GateSecurityGroup'], 'stack': name}
+        if not unchanged:
+            entry = regional_stack_digest(digest, stack)
+            if entry:
+                digests.entries[region] = entry
+                digests.save()
+        return result
 
     def prices(self) -> None:
         """Print regional Spot prices without resource identities."""
@@ -1446,17 +1524,18 @@ class Deployment:
                 ledger.PricedResource('gate-shared', money(str(values.number('shared_usd_per_month')))),), 'gate deployment',
                 builder_removed=bool(inventory and inventory[-1].builder_removed)))
             # A parameter that the template no longer has must not be passed again.
-            known = ledger.mapping(ledger.mapping(cast(object, json.loads(TEMPLATE.read_text())))['Parameters'])
+            home_template = TEMPLATE.read_bytes()
+            known = ledger.mapping(ledger.mapping(cast(object, json.loads(home_template)))['Parameters'])
             changes: list[dict[str, object]] = [
                 {'ParameterKey': ledger.text(row, 'ParameterKey'), 'UsePreviousValue': True}
                 for row in ledger.rows(stack, 'Parameters')
                 if ledger.text(row, 'ParameterKey') not in parameters and ledger.text(row, 'ParameterKey') in known]
             changes.extend({'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items())
-            self.output.mkdir(parents=True, exist_ok=True)
-            template = self.output / 'gate-template.json'
-            write_bytes_atomic(template, TEMPLATE.read_bytes())
-            with step('up', 'updating the stack', self.settings_path, hint='can take several minutes'):
-                self._gate_change(api, stack_id, template, changes)
+            with TemporaryDirectory(prefix='gate-home-') as folder:
+                template = Path(folder) / 'template.json'
+                _ = template.write_bytes(home_template)
+                with step('up', 'updating the stack', self.settings_path, hint='can take several minutes'):
+                    self._gate_change(api, stack_id, template, changes)
             outputs = self._stack(settings)
             manifest: dict[str, object] = {
                 'deployment_id': ledger.text(saved, 'deployment_id'), 'revision': revision,
@@ -1469,9 +1548,10 @@ class Deployment:
             cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             regional = list(ledger.rows(manifest, 'regions'))
             timings.announce(GateRegionOperation.STACK, additional)
+            digests = RegionalStackDigests.read(self.directory)
             for position, network in enumerate(networks, 1):
                 with timings.measure(GateRegionOperation.STACK, network.region, position, len(networks), self.settings_path):
-                    regional.append(self.regional_gate_stack(api, settings, outputs, parameters, network))
+                    regional.append(self.regional_gate_stack(api, settings, outputs, parameters, network, digests))
                     manifest['regions'] = regional
                     cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             print('cloud-gate: deployed')
@@ -1576,15 +1656,15 @@ def failed_stack_events(api: AwsCli, stack: str, started: float) -> list[str]:
         return ['stack events are unavailable']
 
 
-def rolled_back_create(api: AwsCli, stack: str) -> bool:
-    """Whether the stack exists only as a failed first create."""
+def describe_regional_stack(api: AwsCli, stack: str) -> dict[str, object]:
+    """Read the stack status and outputs. Return an empty record for a missing stack."""
     try:
         stacks = ledger.rows(api.call('describe-stacks', '--stack-name', stack, service='cloudformation'), 'Stacks')
     except AwsUnavailable as error:
         if 'does not exist' in str(error):
-            return False
+            return {}
         raise
-    return any(row.get('StackStatus') == 'ROLLBACK_COMPLETE' for row in stacks)
+    return stacks[0] if stacks else {}
 
 
 def gate_subnets(api: AwsCli, vpc: str) -> list[dict[str, object]]:

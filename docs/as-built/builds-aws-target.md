@@ -558,6 +558,16 @@ No other statement in that policy may deny EC2 in these regions.
 Keep the existing home and US region permissions.
 The runbook gives the preparation steps.
 
+`deploy.py up` always checks and updates the home stack.
+For each additional region, it hashes the rendered template, stack name, and parameters passed to CloudFormation.
+The deployment state folder stores each successful regional digest with the live stack ID and last update time in `regional-stack-digests.json`.
+Deployment skips a stack when all three fields match and the live status is `CREATE_COMPLETE` or `UPDATE_COMPLETE`.
+Deployment reads the outputs from that status reply and records the elapsed time for the region.
+Deployment warns once if it cannot read the digest file or finds an invalid record.
+It then deploys every region.
+Each deployment call uses a private template file that it removes after the call.
+Run one `deploy.py up` at a time. Two runs from different state folders can save a digest for the other run's stack revision, and a later run can then skip that region.
+
 `buildlog.timer` runs the hourly Spot snapshot through `buildlog hourly` on natedev.
 The existing timer uses `OnUnitInactiveSec=3600s` and calls the installed scripts.
 The hourly job calls `aws_target.hourly`: the Spot snapshot, then the billed hours check.
