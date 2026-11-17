@@ -373,7 +373,7 @@ class CrateRunTests(CargoProjectTests):
                         self.assertTrue(idle)
                         with mock.patch.object(scratch, "remove", side_effect=RuntimeError("before deletion")):
                             with self.assertRaisesRegex(RuntimeError, "before deletion"):
-                                scratch.remove_marked(worker, scratch.remove)
+                                scratch.remove_marked(worker)
                 with self.assertRaisesRegex(copies.CopyError, "crate run") as refusal:
                     copies.remove_trees(batch.owner)
                 self.assertIn(str(batch.path), str(refusal.exception))
@@ -424,7 +424,7 @@ class CrateRunTests(CargoProjectTests):
             self.assertTrue(idle)
             with mock.patch.object(scratch, "remove", side_effect=RuntimeError("before deletion")):
                 with self.assertRaisesRegex(RuntimeError, "before deletion"):
-                    scratch.remove_marked(worker, scratch.remove)
+                    scratch.remove_marked(worker)
         shutil.rmtree(worker / ".git")
         with self.assertRaisesRegex(copies.CopyError, "not terminal"):
             copies.remove_trees(self.batch.owner)

@@ -110,7 +110,7 @@ with fake_cargo_output_roots():
     assert (clone / 'source.txt').read_text() == 'source\\n'
     with scratch.removal_lock(clone) as free:
         assert free
-        scratch.remove_marked(clone, scratch.remove)
+        scratch.remove_marked(clone)
     assert not clone.exists()
 print('standing, workspace, clone, and cleanup stayed in private roots')
 import unittest
