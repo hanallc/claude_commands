@@ -224,7 +224,7 @@ def question_delivery_view(status: change_page.DeliveryStatus, page: change_page
         if status.owns_live_claim(page, row, dispatch["attempt"]):
             return QuestionDeliveryView(QuestionDeliveryNotice.SENDING, poll=True)
         return QuestionDeliveryView(QuestionDeliveryNotice.UNCONFIRMED)
-    if isinstance(intent, change_page.DeliveryIntent):
+    if isinstance(intent, change_page.DeliveryIntent) or status.image_question_intent_was_not_saved(page, row):
         return QuestionDeliveryView(QuestionDeliveryNotice.RETRY)
     return QuestionDeliveryView(QuestionDeliveryNotice.NONE)
 

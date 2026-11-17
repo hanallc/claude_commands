@@ -137,9 +137,12 @@ class StoredDeliverySlots(TypedDict, total=False):
     review_message: StoredReviewMessage
 
 
+ImageQuestionDispatchState = Literal["started", "started_after_unconfirmed", "accepted"]
+
+
 class ImageQuestionDispatch(TypedDict):
     attempt: str
-    state: Literal["started", "accepted"]
+    state: ImageQuestionDispatchState
 
 
 @dataclass(frozen=True)
@@ -335,20 +338,30 @@ class DeliveryStatus:
         owner = self.request_attempts.get(attempt)
         return owner is not None and owner.row_file == self.path(page, row) and owner.request_thread.is_alive()
 
-    def image_question_dispatch(self, page: ReviewPage, row: str) -> ImageQuestionDispatch | NoImageQuestionDispatch:
+    def _image_question_message(self, page: ReviewPage, row: str) -> dict[str, object]:
         try:
             value = cast(object, json.loads(self.path(page, row).read_text(encoding="utf-8")))
         except (FileNotFoundError, ValueError):
-            return NoImageQuestionDispatch()
+            return {}
         if isinstance(value, dict):
             saved = cast(dict[str, object], value).get("review_message")
             if isinstance(saved, dict):
-                dispatch = cast(dict[str, object], saved).get("image_question_dispatch")
-                if isinstance(dispatch, dict):
-                    fields = cast(dict[str, object], dispatch)
-                    attempt, state = fields.get("attempt"), fields.get("state")
-                    if isinstance(attempt, str) and (state == "started" or state == "accepted"):
-                        return {"attempt": attempt, "state": cast(Literal["started", "accepted"], state)}
+                return cast(dict[str, object], saved)
+        return {}
+
+    def image_question_intent_was_not_saved(self, page: ReviewPage, row: str) -> bool:
+        """Read an explicit unsaved mark from the image question's delivery record."""
+        saved = self._image_question_message(page, row)
+        return (saved.get("saved") is False
+                and all(isinstance(saved.get(field), str) for field in ("source", "owner", "message")))
+
+    def image_question_dispatch(self, page: ReviewPage, row: str) -> ImageQuestionDispatch | NoImageQuestionDispatch:
+        dispatch = self._image_question_message(page, row).get("image_question_dispatch")
+        if isinstance(dispatch, dict):
+            fields = cast(dict[str, object], dispatch)
+            attempt, state = fields.get("attempt"), fields.get("state")
+            if isinstance(attempt, str) and state in ("started", "started_after_unconfirmed", "accepted"):
+                return {"attempt": attempt, "state": state}
         return NoImageQuestionDispatch()
 
     def closeout_path(self, page: ReviewPage, row: str) -> Path:
@@ -356,7 +369,7 @@ class DeliveryStatus:
         return self.root / (".review-link-closeout-alert-" + name + ".json")
 
     def failed_delivery(self, page: ReviewPage, row: str) -> FailedDelivery | NoFailedDelivery:
-        """Read the failure from the existing closeout record, including after a server restart."""
+        """Read a failure unless an earlier send may have reached the owner."""
         try:
             fields = cast(SentCloseoutAlerts, json.loads(self.closeout_path(page, row).read_text(encoding="utf-8")))
         except FileNotFoundError:
@@ -366,7 +379,7 @@ class DeliveryStatus:
             return NoFailedDelivery()
         dispatch = self.image_question_dispatch(page, row)
         if not isinstance(dispatch, NoImageQuestionDispatch) and (
-                dispatch["state"] == "accepted" or dispatch["attempt"] != failed["attempt"]):
+                dispatch["state"] != "started" or dispatch["attempt"] != failed["attempt"]):
             return NoFailedDelivery()
         return FailedDelivery(failed["attempt"], Path(failed["review_list"]), failed["row"], failed["last_error"])
 
@@ -507,7 +520,7 @@ class DeliveryStatus:
             slots = self.slots(page, row)
             if isinstance(page, ReviewMessagePage) and row.startswith(IMAGE_QUESTION_ROW_PREFIX):
                 dispatch = self.image_question_dispatch(page, row)
-                if (not isinstance(dispatch, NoImageQuestionDispatch) and dispatch["state"] == "started"
+                if (not isinstance(dispatch, NoImageQuestionDispatch) and dispatch["state"] != "accepted"
                         and dispatch["attempt"] == delivery.attempt):
                     if isinstance(result, NoFailedDelivery):
                         accepted = replace(page, saved={**page.saved, "image_question_dispatch": {
@@ -1271,8 +1284,11 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
             return
         page = delivery.page
         if isinstance(page, ReviewMessagePage) and delivery.row.startswith(IMAGE_QUESTION_ROW_PREFIX):
+            previous = status.image_question_dispatch(page, delivery.row)
+            unconfirmed = (not isinstance(previous, NoImageQuestionDispatch) and previous["state"] != "accepted"
+                           and isinstance(status.failed_delivery(page, delivery.row), NoFailedDelivery))
             started = replace(page, saved={**page.saved, "image_question_dispatch": {
-                "attempt": delivery.attempt, "state": "started"}})
+                "attempt": delivery.attempt, "state": "started_after_unconfirmed" if unconfirmed else "started"}})
             # Save the send mark before the sender can accept the message.
             status.write_slots(started, delivery.row, slots.updated("verdict", NoDelivery()))
         status.request_attempts[delivery.attempt] = AttemptOwnership(status.path(delivery.page, delivery.row), "sending")

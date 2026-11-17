@@ -753,6 +753,75 @@ class ImageQuestionTests(ImagesFixture):
         self.assertEqual(len(self.sent), 2)
         self.assertEqual(len(image_store.ImageQuestionStore(images.images_root(self.root)).questions(record['id'])), 1)
 
+    def test_refused_resends_keep_the_first_send_result_unknown(self) -> None:
+        record = self.register()
+        delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
+        write = self.status.write_slots
+
+        def fail_confirmation(page: change_page.ReviewPage, row: str, slots: change_page.DeliverySlots) -> None:
+            if self.sent:
+                raise OSError('Cannot write the send confirmation.')
+            write(page, row, slots)
+
+        with patch.object(self.status, 'write_slots', side_effect=fail_confirmation):
+            with self.assertRaisesRegex(OSError, 'Cannot write the send confirmation'):
+                change_page.deliver(delivery, self.status)
+
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                self.status = change_page.DeliveryStatus(self.root)
+                change_page.recover_review_messages(self.status)
+                self.assertEqual(len(self.sent), 1)
+                with patch.object(change_page, 'send_message', side_effect=RuntimeError('owner offline')) as send:
+                    self.ask(record)
+                self.assertEqual(send.call_count, 4)
+                content = images.render(change_page.DeliveryStatus(self.root)).decode()
+                self.assertIn('The send result is unknown.', content)
+                self.assertNotIn('Not sent.', content)
+
+        self.ask(record)
+        self.assertEqual(len(self.sent), 2)
+        self.assertNotIn('The send result is unknown.', images.render(self.status).decode())
+        questions = image_store.ImageQuestionStore(images.images_root(self.root)).questions(record['id'])
+        self.assertEqual([question.question_id for question in questions], ['Q1'])
+
+    def test_a_saved_question_without_a_send_intent_shows_the_resend_notice(self) -> None:
+        record = self.register()
+        write = self.status.write_slots
+
+        def fail_intent_update(page: change_page.ReviewPage, row: str, slots: change_page.DeliverySlots) -> None:
+            if isinstance(page, change_page.ReviewMessagePage) and page.saved['saved']:
+                raise OSError('Cannot update the send intent.')
+            write(page, row, slots)
+
+        with patch.object(self.status, 'write_slots', side_effect=fail_intent_update):
+            with self.assertRaisesRegex(OSError, 'Cannot update the send intent'):
+                self.ask(record)
+
+        self.status = change_page.DeliveryStatus(self.root)
+        change_page.recover_review_messages(self.status)
+        self.assertEqual(self.sent, [])
+        notice = 'Not sent. Press Ask question again with the same words.'
+        self.assertIn(notice, images.render(self.status).decode())
+        self.ask(record)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn('--question Q1', self.sent[0][2])
+        self.assertNotIn(notice, images.render(self.status).decode())
+
+    def test_malformed_question_delivery_metadata_renders_without_a_resend_notice(self) -> None:
+        record = self.register()
+        delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
+        change_page.deliver(delivery, self.status)
+        path = self.status.path(delivery.page, delivery.row)
+
+        for saved in (None, {'source': str(delivery.page.review_list)}):
+            with self.subTest(saved=saved):
+                _ = path.write_text(json.dumps({'review_message': saved}))
+                content = images.render(self.status).decode()
+                self.assertIn('Question Q1 — waiting for an answer', content)
+                self.assertNotIn('Not sent.', content)
+                self.assertNotIn('The send result is unknown.', content)
+
     def test_a_failed_send_mark_sync_allows_only_a_user_resend(self) -> None:
         record = self.register()
         words = 'Which check passed?'

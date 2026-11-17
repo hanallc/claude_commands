@@ -830,6 +830,35 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 3. The shim measure before and after shows 20 percent or more fewer Git starts and a CPU gain. If not, close with no change.
 4. The checkpoint carries the measured numbers in one line for builds.
 
+### Phase 55 — An image question card always says when a resend is needed  · status: done
+**Depends on:** Phase 51
+
+#### Work Order
+
+**Goal:** the showrunner (2026-11-17 15:09 EST): phase 51 add-ons F004 and F005 are next.
+
+**Spec:**
+1. F004: the first send succeeds, its acceptance write fails (unknown result), then a deliberate user resend is refused. The card now says "Not sent" and invites another resend, though the owner may have the question. Keep the first result unknown on the card: the refused resend must not replace it with "Not sent". change_page.py ~1274, images.py ~216.
+2. F005: after a failed slots write (phase 51 F003 cleanup), the card shows "waiting for an answer" with no resend notice. Show the resend notice that the unknown or failed state uses. images.py ~229, page_question.py ~121.
+3. Keep the phase 51 rule: the system never sends a duplicate on its own, the user is never stuck, and a retry of a saved question sends exactly one message.
+4. Add one test for each finding. Each test fails on the base.
+
+**Files:**
+- `scripts/review_links/change_page.py`
+- `scripts/review_links/images.py`
+- `scripts/review_links/page_question.py`
+- `scripts/review_links/test_images.py`
+- `scripts/review_links/test_page_question.py`
+
+**Workers:** 1 writer (`design`).
+
+**State:** none.
+
+**Acceptance gate:**
+1. basedpyright scripts/production scripts/review_links: 0 errors, 0 warnings.
+2. The review_links suites pass.
+3. Both new tests fail on the base.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
