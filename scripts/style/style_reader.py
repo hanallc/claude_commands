@@ -16,10 +16,12 @@ import platform
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import TYPE_CHECKING, BinaryIO, Literal, cast
 from uuid import uuid4
 import zlib
 
+from scripts.lib import time_limit
 from scripts.style import style_config
 from scripts.style.git_process import GitReadFailed, TreeEntry, run_git
 
@@ -423,18 +425,33 @@ class ReaderSourceChanged:
 
 
 def _build(folder: Path, tree: str) -> Path | ReaderSourceChanged:
-    command = ["bash", str(VERIFY_SCRIPT), *BUILD_ARGUMENTS]
+    limit = style_config.reader_build_limit_seconds()
+    grace = style_config.reader_build_stop_grace_seconds()
+    runner = Path(time_limit.__file__).resolve()
+    command = [str(runner.with_name("py")), str(runner), f"{limit:g}", f"{grace:g}",
+               "bash", str(VERIFY_SCRIPT), *BUILD_ARGUMENTS]
     if platform.system() == "Darwin":
         command.extend(("--mac", "build the local style reader"))
     environment = {key: value for key, value in os.environ.items() if key != "CONF_DIR"}
-    result = subprocess.run(command, cwd=CHECKOUT, capture_output=True, text=True, env=environment)
+    # The limit runner has its own session, so the limit holds after this process ends. Files, not pipes,
+    # take the output: a process that outlives the build cannot keep this call waiting.
+    with tempfile.TemporaryFile("w+") as output, tempfile.TemporaryFile("w+") as errors:
+        started = time.monotonic()
+        returncode = subprocess.run(command, cwd=CHECKOUT, stdin=subprocess.DEVNULL, stdout=output, stderr=errors,
+                                    env=environment, start_new_session=True, check=False).returncode
+        if returncode == time_limit.TIMED_OUT and time.monotonic() - started >= limit:
+            raise ReaderError(f"reader build passed its {limit:g} s limit (style_reader build_limit_seconds); "
+                              + "its process group was ended")
+        _ = output.seek(0)
+        _ = errors.seek(0)
+        stdout, stderr = output.read(), errors.read()
     if _source_tree() != tree:
         return ReaderSourceChanged()
-    if result.returncode:
-        raise ReaderError(f"reader build exited {result.returncode}: {result.stdout}\n{result.stderr}")
-    paths = [line.removeprefix("binary: ") for line in result.stdout.splitlines() if line.startswith("binary: ")]
+    if returncode:
+        raise ReaderError(f"reader build exited {returncode}: {stdout}\n{stderr}")
+    paths = [line.removeprefix("binary: ") for line in stdout.splitlines() if line.startswith("binary: ")]
     if len(paths) != 1 or not Path(paths[0]).is_absolute():
-        raise ReaderError(f"the reader build did not return one local binary path: {result.stdout}")
+        raise ReaderError(f"the reader build did not return one local binary path: {stdout}")
     with tempfile.TemporaryDirectory(prefix=".install-", dir=folder) as temporary:
         staged = Path(temporary) / "bundle"
         staged.mkdir()
