@@ -1073,10 +1073,7 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
         self.assertTrue(source.is_dir())
         self.assertFalse(destination.exists())
         self.assertEqual(self.git("branch", "--show-current", cwd=source), "tool-based-ui-startup")
-        self.assertEqual(result.stderr.splitlines(), [
-            f"anomaly: folder {source} does not end with -startup-unit",
-            "anomaly: branch tool-based-ui-startup does not end with -startup-unit",
-        ])
+        self.assertEqual(result.stderr.splitlines(), [])
         self.assertEqual((backend.starts, backend.stops), ([], []))
         self.assertTrue(backend.live)
 

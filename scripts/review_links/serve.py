@@ -36,6 +36,7 @@ from scripts.disks import disks_page, sessions, slots
 from scripts.lib import conf
 from scripts.production import change_routing, change_review
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, image_store, images, investigations_page, list_page, review_page
+from scripts.review_links import question_record
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
@@ -703,7 +704,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if length <= 0:
                 raise ValueError("empty image request")
             delivery = images.submit(root, self.rfile.read(length).decode("utf-8"), server.delivery_status)
-        except change_page.AnswerRefused as error:
+        except question_record.AnswerRefused as error:
             self.browser_failure(400, str(error), error)
             return
         except images.AnswerNotSent as error:

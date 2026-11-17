@@ -686,6 +686,119 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 2. basedpyright reports 0 errors and 0 warnings on the changed Python files.
 3. `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> production/test_fast_track.py --commands 10` before and after the change: CPU seconds and Git process starts. Both go in the checkpoint.
 
+### Phase 50 — A new change row fills an empty cell for each optional column  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the showrunner (2026-11-17, reviewlogcol, urgent): since about 10:25 EST no change row can be added to the natedev change list, for every production. Every merge prints "change review: failed — change-review - natedev.md: no value for the `Review log` column". A review event adds the `Review log` column to the To review table (`_add_column`), and the new-row code builds its values with no `Review log` key, so `_row` refuses the row.
+
+**Spec:**
+1. In `scripts/production/change_review.py`, a new To review row gets an empty cell for each table column it has no value for, as the Reviewed insert already does (`dict.fromkeys`). One rule for every optional column, not a special case for `Review log`.
+2. Keep `_row` as it is: it refuses a table column with no value and ignores a value with no column. Keep every value the new-row code writes today.
+3. Branch from origin/main 9d7badf17. No edit of the real change list.
+
+**Files:**
+- `scripts/production/change_review.py`
+- `scripts/production/test_change_review.py` — a test with a fixture list whose To review table has a `Review log` column
+
+**Workers:** 1 writer (`design`).
+
+**State:** none.
+
+**Constraints from prior phases:** tests write a fixture config; no test reads a tunable value.
+
+**Acceptance gate:**
+1. `scripts.production.test_change_review` passes, with a test that `add`, `list-ready` and `live` add a row to a fixture list whose To review table has a `Review log` column; the test fails on origin/main.
+2. basedpyright reports 0 errors and 0 warnings on the changed Python files.
+3. `git merge-tree` of the checkpoint against devtools reviewscan d0db535e2 and admin-console waitbuttons-2 cca12f3a3 reports the result.
+
+### Phase 51 — An image question never reads as unsent when it was sent  · status: todo
+**Depends on:** Phase 48
+
+#### Work Order
+
+**Goal:** the showrunner (2026-11-17) took both phase 48 add-ons as next work. Two edges of the image question delivery show a false `Not sent`.
+
+**Spec:**
+1. A page opened during server startup, before startup recovery claims a saved delivery intent, shows the question as sending, not `Not sent`, and keeps polling until recovery ends.
+2. A send that succeeds and then fails to write its result is not shown as `Not sent`, and a retry never sends the same question twice. Record the send before the result write, or check that record before a retry; pick the simplest rule that is always correct.
+
+**Files:**
+- `scripts/review_links/change_page.py`
+- `scripts/review_links/images.py`
+- `scripts/review_links/serve.py`
+- `scripts/review_links/test_images.py`
+- `scripts/review_links/test_change_page.py`
+- `scripts/review_links/test_serve.py`
+
+**Workers:** 1 writer (`design`).
+
+**State:** none.
+
+**Constraints from prior phases:** tests write a fixture config; no test reads a tunable value. Keep phase 48 behavior (F001–F011) unchanged.
+
+**Acceptance gate:**
+1. The review_links suites pass, with a test for each edge that fails on phase 48.
+2. basedpyright reports 0 errors and 0 warnings on the changed Python files.
+
+### Phase 52 — A rename to a name the folder and branch already carry prints no anomaly  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the showrunner (2026-11-17). hana ran `agents rename 556caf6e-713d-47c0-a8fc-5dd5e8c26ce4 startup` on the row named `startup-unit`. The rename was right: the row name is `startup`, and the folder `hana_catalyst-startup` and branch `tool-based-ui-startup` stay. But it printed two false anomaly lines: "folder … does not end with -startup-unit" and "branch … does not end with -startup-unit". The folder and branch already end with the new name, so nothing needs a move.
+
+**Spec:**
+1. In `rename_apply_unit` (`scripts/agents/shutdown.py` ~2276), a folder or branch that already ends with `-<new name>` needs no move and prints no anomaly.
+2. A folder or branch that ends with neither the old nor the new name still prints its anomaly line.
+3. Use the name rule from `unit_names` that phase 47 added (a name and that name plus `-unit` are the same name); do not write a second copy.
+
+**Files:**
+- `scripts/agents/shutdown.py`
+- `scripts/agents/test_shutdown_cli.py`
+
+**Workers:** 1 writer.
+
+**State:** none.
+
+**Constraints from prior phases:** tests write a fixture config and fixture staff rows; no test runs a live rename.
+
+**Acceptance gate:**
+1. `scripts.agents.test_shutdown_cli` passes, with a test for the `startup-unit` to `startup` case (no anomaly lines, folder and branch unchanged) and one for a folder that ends with neither name (anomaly kept).
+2. basedpyright reports 0 errors and 0 warnings on the changed Python files.
+
+### Phase 53 — The image question code has no import cycle, and page_question has its staff accessor row  · status: done
+**Depends on:** Phase 48
+
+#### Work Order
+
+**Goal:** the showrunner (2026-11-17, urgent): phase 48 cca97ba30 is red. (1) basedpyright reportImportCycles, 4 errors: `image_store.py` imports `change_page` and `page_question`; `change_page` imports `change_review`; `change_review` imports `image_store` (plus 3 longer chains through `update_registration`, `merge_checkpoint`, `merge_gate` and `next_item`). (2) `test_staff_accessors.test_document_lists_every_tracked_accessor` fails with rolenames 9ba1885e155f: `page_question.py` imports `staff` and has no row in `docs/as-built/staff-accessors.md`.
+
+**Spec:**
+1. Break the cycle at its cause: `image_store.py` is a low-level store that `change_review` uses, so it must not import `change_page`, `page_question` or any module that imports `change_review`. Move the image question store and its page-level types up, or move the shared record types down into a module with no page imports. No lazy import, no `TYPE_CHECKING` workaround.
+2. The `page_question` public surface stays as phase 48 shipped it (unit-board's listask uses it).
+3. Merge rolenames 9ba1885e155f and add the `page_question.py` row to `docs/as-built/staff-accessors.md`.
+
+**Files:**
+- `scripts/review_links/image_store.py`
+- `scripts/review_links/images.py`
+- `scripts/review_links/page_question.py`
+- `scripts/review_links/change_page.py`
+- `scripts/review_links/test_images.py`
+- `scripts/review_links/test_page_question.py`
+- `docs/as-built/staff-accessors.md`
+
+**Workers:** 1 writer (`test`).
+
+**State:** none.
+
+**Constraints from prior phases:** tests write a fixture config; no test reads a tunable value. Keep phase 48 behavior unchanged.
+
+**Acceptance gate:**
+1. basedpyright on `scripts/production` and `scripts/review_links` reports 0 errors and 0 warnings (reportImportCycles included).
+2. The full `scripts.production` suite and the review_links suites pass.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 

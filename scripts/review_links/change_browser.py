@@ -22,6 +22,7 @@ from scripts.production.production_doc import Production
 from scripts.production.issues import frontmatter
 from scripts.production.change_routing import UnavailableProduction
 from scripts.review_links import change_page, console, page_frame
+from scripts.review_links import question_record
 from scripts.review_links import staff_names
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
 from scripts.statusline import rebuild_row
@@ -609,10 +610,10 @@ section+section{border:0;margin:0;padding:0}
 def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus, *, feedback_closes: bool = False) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) != {"row", "token", "outcome", "feedback"} or any(len(value) != 1 for value in fields.values()):
-        raise change_page.AnswerRefused("use the answer form on this page")
+        raise question_record.AnswerRefused("use the answer form on this page")
     key = fields["row"][0]
     if not secrets.compare_digest(fields["token"][0].encode(), row_token(browser, key).encode()):
-        raise change_page.AnswerRefused("row or page token does not match this page")
+        raise question_record.AnswerRefused("row or page token does not match this page")
     prepared = prepare(browser, status)
     if key.startswith("question/"):
         question = next((item for item in prepared.questions if item.key == key), None)
@@ -620,9 +621,9 @@ def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus
             raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page")
         outcome = fields["outcome"][0]
         if outcome not in ("answer", "followup", "skip", "question", "feedback"):
-            raise change_page.AnswerRefused("use the answer form on this page")
+            raise question_record.AnswerRefused("use the answer form on this page")
         if outcome != "skip" and not fields["feedback"][0].strip():
-            raise change_page.AnswerRefused("enter an answer")
+            raise question_record.AnswerRefused("enter an answer")
         return submit_question(question, outcome, fields["feedback"][0], status)
     found = next((item for item in prepared.changes if item.key == key), None)
     if found is None:
@@ -631,22 +632,22 @@ def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus
         paths = {path.stem.removeprefix(change_review.PREFIX): path
                  for path in change_review.lists_directory().glob(change_review.PREFIX + "*.md")}
         if not separator or source not in paths or re.fullmatch(r"C\d+", row_id) is None:
-            raise change_page.AnswerRefused("this change is not on the page")
+            raise question_record.AnswerRefused("this change is not on the page")
         empty: dict[str, str] = {}
         row = next((row for row in change_review.review_rows(paths[source]) if row["#"] == row_id), empty)
         if not row.get("Verdict"):
-            raise change_page.AnswerRefused("this change is not on the page")
+            raise question_record.AnswerRefused("this change is not on the page")
         routing = change_page.list_routing({paths[source]: change_review.review_snapshot(paths[source])})
         assignment = routing.owner_and_production(paths[source], row)
         owner = assignment.owner
         tab = owner.tab
         doc = assignment.production
         if isinstance(doc, UnavailableProduction):
-            raise change_page.AnswerRefused("the production document is not available")
+            raise question_record.AnswerRefused("the production document is not available")
         page = change_page.AssignedReviewPage(paths[source], doc, (row_id,), row_token(browser, key), owner)
         found = WaitingChange(key, tab, page, row)
     if isinstance(found.page, UnavailableProduction):
-        raise change_page.AnswerRefused("the production document is not available")
+        raise question_record.AnswerRefused("the production document is not available")
     fields["row"] = [found.row["#"]]
     rewritten = urlencode({key: values[0] for key, values in fields.items()})
     delivery = change_page.submit(found.page, rewritten, status, prepared=prepared.queues[found.tab], feedback_closes=feedback_closes)

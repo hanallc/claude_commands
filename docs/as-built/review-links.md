@@ -585,7 +585,10 @@ The Producer menu beside it lists each producer that a record names.
 An address with a producer that no record names shows all producers.
 The Show menu contains Open, Needs me, Unread, Done, Parked, Closed, and All.
 Open excludes Done, Closed, and items with a future parking time.
-The search field matches an item number or title.
+The search field matches the item number, owner name, title, or state words.
+Numbers can include `L` or `#`.
+One match function ignores case for every field.
+Parked items also match the word `Parked`.
 The address retains the owner, producer, view, search, column, and direction.
 
 A row opens to show its latest status, completion condition, item links, and log.
@@ -605,18 +608,64 @@ Bold content is nonempty and cannot start or end with whitespace or `/`.
 Delimiters between word characters or slashes stay literal, so `src/**/test/**/file.py` stays literal while `**read/write**` becomes bold.
 Mark read appears only when the item has an unread update.
 Mark read clears the dot and adds a log entry without sending a message.
-Remove, Park, and Tell morty send nate's words and the item number to morty's current session.
-These actions append a log entry without changing the item's state or parking time.
-Only morty changes those fields through `the_list.py`.
+Tell morty also marks an unread update read through the same path.
+It saves the feedback before it marks the update read.
+Each request keeps the identity of the update it saw.
+A repeated request cannot mark a newer update read.
+The store checks the update identity under its lock.
+This check also preserves an update that arrives between feedback storage and the read write.
+An update identity includes its time and log history.
+Two updates with the same time keep separate identities.
+Tell morty adds no read entry when the item has no unread update.
+The POST response includes the current unread state.
+The page clears the dot and Mark read button when that state is false.
+It restores both controls when the response reports a new unread update.
+If the read write fails, the feedback remains saved and the sender can deliver it.
+The page shows “sent to morty; update remains unread” and keeps the unread controls.
+The same notice appears when a newer update remains unread.
+It applies the current filter again, so a read item leaves the Unread view at once.
+Tell morty with empty words changes no record.
+Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
+Park writes the chosen date through `the_list.park` with the same source.
+Park uses midnight in the user's time zone.
+The writer checks the date against the current time under the List lock.
+An exact retry can return the saved result after the date arrives.
+The page uses the date for Park and retains other words for Tell morty.
+Morty does not perform these two button actions.
+The shared item writer saves the action and its pending notice in one locked write.
+The notice tells morty which action nate completed.
+The existing sender delivers the notice with its retry and alert rules.
+A delivery failure does not reverse the completed item action.
+Tell morty sends the user's words without changing the item's state or parking time.
+Remove leaves Open at once when the user presses the button.
+Park leaves Open and enters Parked at once.
+The page disables all row buttons while the request runs.
+A second press sends no request.
+The page applies the saved state and parking status from the response.
+The page uses the saved date to update one parking label.
+A refusal restores the last state and parking status from the server.
+The page opens the restored row and shows the reason there.
+If the current filters hide the row, the page shows the reason above the table.
+If the connection fails, the page keeps the row in its new view and reports that it cannot confirm the save.
+A new action uses a new request ID, even if the previous response did not arrive.
+The page keeps each unconfirmed request ID for an exact retry, even after another action.
+The page discards each request ID when it receives a success or refusal for that request.
+A sent or alerted notice sends no second message.
 The one-off `the_list.py clean-evidence --source morty` command removes migration JSON copies and matching List row blocks from Evidence.
 It preserves other text and saves each changed record once, with one log entry per copy kind.
 The row block requires the record's own number, a List state line, and field bullets.
 Only field bullets and their continuation lines belong to the block.
 A continuation line starts with at least two spaces or a tab.
 A second run changes nothing.
-The page can mark an item read or append a feedback request and its delivery state.
+The page can mark an item read, close it, park it, or append feedback and delivery states.
 The page uses signed forms and rejects invalid fields or tokens with HTTP 400.
-The List record saves the request ID, words, and pending state in one locked write.
+The List record saves the request ID, action, and words with each change in one locked write.
+The same write saves a pending notice for actions that send one.
+Under the lock, each action checks the request ID against the saved actions.
+A retry changes no item fields and saves no second notice.
+The writer refuses a saved ID with a different action or different words.
+After an unconfirmed directory sync, the writer checks the stored record under the same lock.
+If the record holds the request, the server reports that it saved the action.
 The List sender uses the shared `change_page` retry and alert helpers.
 A successful send appends the same request ID with the sent state.
 Exhausted tries alert the item owner's showrunner.
