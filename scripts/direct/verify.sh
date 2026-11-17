@@ -2807,6 +2807,7 @@ route_test() {
             TOKEN_WAIT_HOLD_CHECK=""
             if (( token_status == 10 )); then
                 # A natedev hold started before the token came: give back the grant and place again.
+                record_token_wait
                 export BUILDLOG_SELECTED_LOCAL_GRANT="$PLACEMENT_GRANT_FILE"
                 export BUILDLOG_PLACEMENT_FILE="$PLACEMENT_ASSIGNMENT_FILE"
                 source "$PLACEMENT_GRANT_FILE" || return $?
@@ -3473,6 +3474,8 @@ acquire_token() {
             local hold_status=0
             "$TOKEN_WAIT_HOLD_CHECK" || hold_status=$?
             if (( hold_status != 0 )); then
+                token_wait_clock
+                TOKEN_WAITED=$(( TOKEN_CLOCK_NOW - started ))
                 token_wait_left
                 return "$hold_status"
             fi

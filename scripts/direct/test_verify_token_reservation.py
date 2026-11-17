@@ -73,6 +73,8 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
         lock = board / "locks/cargo.d"
         hold = self.root / "build-hold" / fixture_runtime_id("fixture-hold-owner")
         hold.parent.mkdir(exist_ok=True)
+        clock = self.root / "waiter-clock"
+        _ = clock.write_text("1000\n")
         environment = {**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl",
                        "BUILD_TARGETS_POLL_S": "0.5"}
         original_probe = self.admission.server.host_probe
@@ -104,10 +106,11 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
             held = set(self.admission.server.reservations)
             with output.open("wb") as stream:
                 waiter = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
-                                          env=environment, stdout=stream, stderr=subprocess.STDOUT,
-                                          start_new_session=True)
+                                          env={**environment, "UNIT_TOKEN_CLOCK_FILE": str(clock)},
+                                          stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
             self.started_groups.add(waiter.pid)
             self.wait_for_output(output, "waiting for the cargo token since", waiter)
+            _ = clock.write_text("1020\n")
             publish_local(placement.TemporaryExclusion("blocked"))
             _ = hold.write_text("private hold")
             self.wait_for_output(output, "natedev hold started during the cargo token wait", waiter)
@@ -124,6 +127,9 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
             self.assertEqual(waiter.wait(timeout=TEST_HANG_GUARD_SECS), 0, output.read_text())
             self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
             self.assertEqual(self.admission.server.reservations, {})
+            # The token wait before the hold counts in the call's record.
+            waited = [record["token_wait_s"] for record in self.records() if f"-{waiter.pid}-" in str(record["id"])]
+            self.assertEqual(waited, [20])
         finally:
             hold.unlink(missing_ok=True)
             _ = (self.root / "release").touch()
