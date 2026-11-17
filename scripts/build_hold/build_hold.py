@@ -539,6 +539,29 @@ def audit_command(process: AuditProcess) -> str:
     return executable if executable in AUDIT_COMMANDS | {"claude", "codex"} else process.command
 
 
+@dataclass(frozen=True)
+class RunAgent:
+    """The agent that runs this command receives its release notice."""
+    session_id: str
+
+
+@dataclass(frozen=True)
+class NoRunAgent:
+    """The command and its ancestors identify no agent."""
+
+
+def run_agent(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> RunAgent | NoRunAgent:
+    """Find the nearest agent independently of the unit director that owns the run."""
+    for item in (process, *ancestors):
+        thread_id = item.environment.get("CODEX_THREAD_ID", "")
+        if thread_id:
+            return RunAgent(f"codex:{thread_id}")
+        session_id = item.environment.get("CLAUDE_CODE_SESSION_ID", "")
+        if session_id:
+            return RunAgent(session_id)
+    return NoRunAgent()
+
+
 def audit_owner(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> session_owner.OwningSession | session_owner.NoOwningSession:
     for item in (process, *ancestors):
         session_id = item.environment.get("CLAUDE_CODE_SESSION_ID", "")
@@ -1595,9 +1618,14 @@ def release_notice(holders: Mapping[str, Mapping[str, str]]) -> str:
 
 def send_release(entry: ReleaseEntry, socket: str, notice: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
     """Tell a recipient to start its builds; the memory gate orders them."""
+    return send_release_to(entry, f"uds:{socket}", notice)
+
+
+def send_release_to(entry: ReleaseEntry, address: str, notice: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
+    """Send the same release text to a session socket or a Codex thread."""
     notice = f"{notice} Session {entry['session_id']}."
     try:
-        result = subprocess.run(session_send.send_argv("--to", f"uds:{socket}", "--text", notice), capture_output=True, text=True)
+        result = subprocess.run(session_send.send_argv("--to", address, "--text", notice), capture_output=True, text=True)
     except OSError as error:
         return ReleaseSendFailed(str(error))
     if result.returncode == 0:
@@ -1659,19 +1687,24 @@ def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> str
         # Save the pending entry before sending, and the outcome only after return.
         # A stop at any point between these saves may cause a harmless second notice.
         save_cycle(cycle)
-        recipient = socket_for(entry["session_id"])
-        if isinstance(recipient, RecipientGone):
-            entry["delivery"] = "RecipientGone"
-        elif isinstance(recipient, RecipientLive):
+        codex = entry["session_id"].startswith("codex:")
+        if codex:
+            result = send_release_to(entry, entry["session_id"], release_notice(cycle["holders"]))
+        else:
+            recipient = socket_for(entry["session_id"])
+            if not isinstance(recipient, RecipientLive):
+                entry["delivery"] = "RecipientGone" if isinstance(recipient, RecipientGone) else "DeliveryFailed"
+                save_cycle(cycle)
+                continue
             result = send_release(entry, recipient.socket, release_notice(cycle["holders"]))
-            if isinstance(result, ReleaseDelivered):
-                entry["delivery"] = "Delivered"
-            elif isinstance(result, ReleaseQueued):
-                entry["delivery"] = "QueuedUnconfirmed"
-            else:
-                entry["delivery"] = "DeliveryFailed"
+        if isinstance(result, ReleaseDelivered):
+            entry["delivery"] = "Delivered"
+        elif isinstance(result, ReleaseQueued):
+            entry["delivery"] = "QueuedUnconfirmed"
         else:
             entry["delivery"] = "DeliveryFailed"
+            if codex:
+                print(f"build_hold: release notice for {entry['session_id']}: {result.reason}", file=sys.stderr)
         save_cycle(cycle)
     return not_reached_detail(cycle)
 
