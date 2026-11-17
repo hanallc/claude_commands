@@ -231,6 +231,210 @@ for(const frame of document.querySelectorAll('iframe')) frame.addEventListener('
                         thread.join(5)
                 self.assertEqual(results, [[]])
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_list_links_show_the_target_inside_the_console(self) -> None:
+        source = self.add("Follow the linked items", number=1)
+        for number in range(2, 29):
+            _ = self.add(f"Fixture item {number}", number=number)
+        closed = self.add("Closed linked item", number=29, owner=OTHER.id)
+        _ = the_list.close(MORTY.id, closed.id, "The work is complete.", source="morty")
+        _ = self.add("Open blocker", number=30)
+        other_producer = self.add("Linked item from another producer", number=31)
+        _ = the_list.update(MORTY.id, other_producer.id, {"producer": DWIGHT.id}, source="morty")
+        _ = the_list.update(MORTY.id, source.id, {"related_to": (29,),
+            "blocked_by": (the_list.ItemDependency(30, "The blocker is complete."),)}, source="morty")
+        records = [
+            list_page.ListRecord(entry.keeper, replace(entry.item, related_to=(2, 29, 31, 99)))
+            if entry.item.id == source.id else entry
+            for entry in list_page.records()
+        ]
+        with patch.object(list_page, "records", return_value=records), patch.object(list_page, "counts_strip", return_value=""):
+            listing = list_page.render(self.root / "reviews")
+        listing = listing.replace(b'data-page-facts ', b'data-page-facts data-read-error="Test read failed" ', 1)
+        listing = listing.replace(b'</body>', b'''<script>
+addEventListener('message',event=>{
+ if(event.source!==parent || event.origin!==location.origin || !event.data.clickListLink) return;
+ const links=document.querySelectorAll('[data-number="1"] [data-detail] a');
+ [...links].find(link=>link.textContent==='#'+event.data.clickListLink).click();
+});
+</script></body>''')
+        page = console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(list_page.PAGE_PATH))
+        shell = console.render((page,), console.UnavailablePage()).decode()
+        probe = r'''<script>
+const params=new URLSearchParams(location.search),number=params.get('number'),scenario=params.get('case');
+const proof=scenario==='proof';
+const frame=document.querySelector('iframe');
+const frames=win=>new Promise(done=>win.requestAnimationFrame(()=>win.requestAnimationFrame(done)));
+const changed=win=>new Promise(done=>win.addEventListener('hashchange',done,{once:true}));
+frame.addEventListener('load',async()=>{
+ const failures=[];
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ try{
+  const doc=frame.contentDocument,win=frame.contentWindow;
+  const row=id=>doc.querySelector('[data-number="'+id+'"]');
+  const source=row(1),target=row(number),show=doc.querySelector('#list-show');
+  const owner=doc.querySelector('#list-owner'),producer=doc.querySelector('#list-producer'),search=doc.querySelector('#list-search');
+  const originalFilters=[owner.value,producer.value,search.value];
+  const link=[...source.querySelectorAll('a')].find(a=>a.textContent==='#'+number);
+  const expanded=item=>item.querySelector('.list-toggle').getAttribute('aria-expanded')==='true';
+  const inView=element=>{
+   const rect=element.getBoundingClientRect();
+   return rect.top>=0 && rect.bottom<=win.innerHeight;
+  };
+  check(!source.hidden && expanded(source) && show.value==='open','the source starts open in the Open view');
+  check(!!document.querySelector('.sidebar .nav-entry'),'the console navigator is visible');
+  link.scrollIntoView({block:'center'});
+  if(scenario==='history') win.scrollTo(0,120);
+  const banner=doc.querySelector('[data-page-status]');
+  if(scenario==='banner') banner.style.minHeight='60px';
+  const originalTop=win.scrollY,originalPlace=win.location.href;
+  const consolePlace=()=>new URL(new URLSearchParams(location.search).get('at.list'),location.href).href;
+  const updated=new Promise(resolve=>{
+   const done=()=>{
+    clearTimeout(timeout);removeEventListener('message',record);resolve();
+   };
+   const record=event=>{
+    if(event.source===win && event.data==='console-place' && win.location.href!==originalPlace &&
+       consolePlace()===win.location.href) done();
+   };
+   addEventListener('message',record);
+   const timeout=setTimeout(done,1500);
+  });
+  win.postMessage({clickListLink:number},location.origin);await updated;await frames(win);
+  const missing=doc.querySelector('[data-missing-item]');
+  check(doc===frame.contentDocument,'the click stays inside the same console frame');
+  check(consolePlace()===win.location.href,'the console recorded '+consolePlace()+' instead of '+win.location.href);
+  if(number==='99'){
+   check(!missing.hidden && missing.textContent==='Item #99 is not on the List' && inView(missing),'the missing message is in view');
+  }else{
+   const title=target.querySelector('.list-row');
+   check(show.value===(number==='29' ? 'all' : 'open'),'the view after the click is '+show.value);
+   check(!target.hidden && expanded(target),'the target is visible and open');
+   check(inView(title),'the target row is outside the viewport at '+title.getBoundingClientRect().top);
+   check(title.getAnimations().some(animation=>animation.playState==='running'),'the target row has a short highlight');
+   if(scenario==='banner'){
+    const bottom=banner.getBoundingClientRect().bottom,top=title.getBoundingClientRect().top;
+    check(win.getComputedStyle(banner).position==='sticky' && bottom>=60,'the tall status banner is sticky');
+    check(top>=bottom+15,'the target top '+top+' leaves a gap below the banner bottom '+bottom);
+   }
+  }
+  const filters=[owner.value,producer.value,search.value];
+  const expected=originalFilters.map((value,index)=>index===['closed','producer','open'].indexOf(scenario) ? '' : value);
+  check(filters.every((value,index)=>value===expected[index]),'the jump keeps each matching filter: '+JSON.stringify(filters));
+  if(scenario==='repeat'){
+   const jumpPlace=win.location.href,jumpHistoryLength=win.history.length;
+   link.click();await frames(win);
+   check(win.location.href===jumpPlace && win.history.length===jumpHistoryLength,'a second click stays in the same history entry');
+  }
+  if(scenario==='history'){
+   target.querySelector('.list-toggle').click();
+   row(3).querySelector('.list-toggle').click();
+   check(win.location.href===originalPlace && expanded(row(3)),'the new history entry has the original address and an extra open row');
+  }
+  if(!proof){
+   const back=scenario==='history' ? new Promise(done=>win.addEventListener('popstate',done,{once:true})) : changed(win);
+   history.back();await back;await frames(win);
+   check(win.location.href===originalPlace,'Back restores the frame address');
+   check(show.value==='open' && !source.hidden && expanded(source),'Back restores the open source');
+   check(!target || !expanded(target),'Back collapses the target row');
+   if(scenario==='history') check(!expanded(row(3)),'Back collapses the extra row even when the address stays the same');
+   check(inView(link) && Math.abs(win.scrollY-originalTop)<=1,'Back restored scroll '+win.scrollY+' instead of '+originalTop);
+  }
+  if(scenario==='missing'){
+   const missingKey=new URLSearchParams(link.hash.slice(1)).get('item');
+   const saved=new URLSearchParams(new URL(originalPlace).hash.slice(1));
+   saved.set('key',source.dataset.key);saved.set('item',missingKey);
+   const change=(field,value,event)=>()=>{field.value=value;field.dispatchEvent(new win.Event(event));};
+   const changes=[
+    ['Show',change(show,'all','change')],
+    ['Owner',change(owner,'','change')],
+    ['Producer',change(producer,'','change')],
+    ['Search',change(search,'','input')],
+    ['sort',()=>doc.querySelector('[data-sort]').click()],
+   ];
+   for(const [label,select] of changes){
+    const restored=changed(win);win.location.hash=String(saved);await restored;
+    check(!missing.hidden && doc.querySelector('[data-missing-keys]').hidden,'the restored missing item shows one notice');
+    select();
+    const after=new URLSearchParams(win.location.hash.slice(1));
+    check(missing.hidden && !doc.querySelector('[data-missing-keys]').textContent,label+' clears the missing item notice');
+    check(after.get('item')!==missingKey && after.getAll('key').join()===source.dataset.key,label+' omits the missing item from the address');
+   }
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/list-jump-result',{method:'POST',body:JSON.stringify(failures)});
+},{once:true});
+</script><img hidden src="/list-jump-ready">'''
+        shell = shell.replace('</body>', probe + '</body>')
+        results: list[list[str]] = []
+        complete = threading.Event()
+
+        class Probe(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                path = urlsplit(self.path).path
+                if path == '/list-jump-ready':
+                    _ = complete.wait(35)
+                body = listing if path == list_page.PAGE_PATH else shell.encode() if path == "/console/" else b'{}'
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8' if body != b'{}' else 'application/json')
+                self.end_headers()
+                try:
+                    _ = self.wfile.write(body)
+                except BrokenPipeError:
+                    pass
+
+            def do_POST(self) -> None:
+                if self.path == '/list-jump-result':
+                    results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                    complete.set()
+                self.send_response(204)
+                self.end_headers()
+
+            @override
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                proof = os.environ.get("LIST_JUMP_PROOF")
+                cases = [(30, "open"), (29, "closed"), (31, "producer"), (99, "missing"), (29, "repeat"),
+                         (2, "history"), (2, "banner")]
+                if proof:
+                    cases.append((29, "proof"))
+                for number, case in cases:
+                    with self.subTest(link=case):
+                        complete.clear()
+                        results.clear()
+                        profile = self.root / f"list-jump-{case}"
+                        profile.mkdir()
+                        _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
+                        filters = {"sort": "#", "item": f"{MORTY.id}/{source.id}"}
+                        if case in ("open", "closed", "producer", "missing"):
+                            filters.update(owner=OWNER.id, producer=MORTY.id, q="linked item")
+                        place = list_page.PAGE_PATH + "?show=open#" + urlencode(filters)
+                        url = "/console/" + console.place_query("list", place)
+                        destination = f'http://127.0.0.1:{server.server_port}{url}&number={number}&case={case}'
+                        command = ['firefox', '--headless', '--no-remote', '--profile', str(profile), '--window-size', '1440,1100']
+                        if case == "proof" and proof:
+                            result = subprocess.run([*command, '--screenshot', proof, destination],
+                                                    capture_output=True, text=True, timeout=45)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                        else:
+                            with subprocess.Popen([*command, destination], stdout=subprocess.DEVNULL,
+                                                  stderr=subprocess.DEVNULL) as browser:
+                                try:
+                                    self.assertTrue(complete.wait(30), "The browser must report the result of the link click.")
+                                finally:
+                                    browser.terminate()
+                                    _ = browser.wait(timeout=10)
+                        self.assertEqual(results, [[]])
+            finally:
+                complete.set()
+                server.shutdown()
+                thread.join(5)
+
     def test_staff_owner_and_producer_names_have_role_colors_but_nate_stays_plain(self) -> None:
         _ = self.add("Staff names")
         _ = self.add("User name", owner=the_list.UnassignedOwner.NATE)

@@ -46,6 +46,7 @@ border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;max-width
 .list-count-chip{border:1px solid var(--line);border-radius:999px;background:var(--card);padding:5px 12px}
 [data-empty],[data-missing-keys]{padding:16px;margin:0;color:var(--ink-2)}
 [data-missing-keys]{white-space:pre-line}
+[data-missing-item]{color:var(--ink-2);scroll-margin-top:16px}
 @media(max-width:960px){
 .list-table{border:0;background:none;border-radius:0}.list-table table,.list-table tbody{display:block;width:100%}
 .list-table colgroup{display:none}.list-table thead{display:flex;margin-bottom:12px}.list-table thead tr{display:flex;flex-wrap:wrap}
@@ -67,14 +68,17 @@ border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;max-width
 SCRIPT = r'''function createRecordTable(options){
 const contentProxy=()=>options.content();
 let content=contentProxy(),owner='',show='open',query='',sort='',direction='asc',type='',sourceOwner='',keys=new Set();
+let linkedItem='';
+let placeHash=location.hash;
 const opened=new Set(),filterNames=options.filters || [],filters={};
 const columns=[...content.querySelectorAll('[data-sort]')].map(button=>button.textContent);
 function filterControl(id,attribute){
  const control=content.querySelector(id);
  return {
   set(value){
-   if(control.matches('select')) control.value=value;
-   else control.querySelectorAll('['+attribute+']').forEach(button=>button.setAttribute('aria-pressed',String(button.getAttribute(attribute)===value)));
+   if(control.matches('select')){control.value=value;return control.value;}
+   control.querySelectorAll('['+attribute+']').forEach(button=>button.setAttribute('aria-pressed',String(button.getAttribute(attribute)===value)));
+   return value;
   },
   bind(change){
    if(control.matches('select')) control.addEventListener('change',event=>change(event.target.value));
@@ -83,6 +87,7 @@ function filterControl(id,attribute){
  };
 }
 function place(){
+ placeHash=location.hash;
  const params=new URLSearchParams(location.search);
  const fragment=new URLSearchParams(location.hash.slice(1));
  for(const key of new Set(fragment.keys())) params.delete(key);
@@ -102,28 +107,42 @@ function place(){
    owner='';show='all';query='';type='';for(const name of filterNames) filters[name]='';}
   if(options.single) opened.clear();opened.add(item);
  }
+ const saved=history.state?.recordTable;
+ linkedItem=options.missingItem ? saved?.linkedItem ?? item ?? '' : '';
+ if(saved){
+  opened.clear();
+  saved.opened.forEach(key=>opened.add(key));
+ }
  owner=options.resolveOwner?.(owner) ?? owner;
 }
 function compare(a,b){
  if(Array.isArray(a)) return a[0]-b[0] || compare(a[1],b[1]);
  return typeof a==='number' ? a-b : a.localeCompare(b,undefined,{numeric:true,sensitivity:'base'});
 }
-function apply(write=true){
+function isSelected(item){return !keys.size || keys.has(item.dataset.key);}
+function matches(item,selection={}){
+ return isSelected(item) &&
+  options.visible(item.dataset,{owner,show,query:query.trim().toLowerCase(),type,sourceOwner,keys,filters:{...filters},...selection});
+}
+function apply(write=true,{dismissMissingItem=false,pushPlace=false}={}){
+ const items=[...content.querySelectorAll('[data-list-item]')];
+ const hasKey=options.hasKey ?? (key=>items.some(item=>item.dataset.key===key));
+ const missingLinkedItem=linkedItem!=='' && !hasKey(linkedItem);
+ if(missingLinkedItem){
+  keys.delete(linkedItem);
+  opened.delete(linkedItem);
+  if(dismissMissingItem) linkedItem='';
+ }
  const previousOwner=owner;
  owner=options.resolveOwner?.(owner) ?? owner;
  const search=query.trim().toLowerCase();
  owner=options.selectOwner?.({owner,type,query:search,keys}) ?? owner;
  if(previousOwner && !owner) sourceOwner='';
- const items=[...content.querySelectorAll('[data-list-item]')];
  filterControl('#list-owner','data-owner-chip').set(owner);
  filterControl('#list-show','data-show-chip').set(show);
  content.querySelector('#list-search').value=query;
- for(const name of filterNames){
-  const menu=content.querySelector('#list-'+name);menu.value=filters[name];if(menu.value!==filters[name]) filters[name]='';
- }
- const selected=item=>!keys.size || keys.has(item.dataset.key);
- const visible=item=>selected(item) &&
-  options.visible(item.dataset,{owner,show,query:search,type,sourceOwner,keys,filters:{...filters}});
+ for(const name of filterNames)
+  filters[name]=filterControl('#list-'+name,'data-'+name+'-chip').set(filters[name]);
  const column=columns.indexOf(sort);
  items.sort((a,b)=>column<0 ? Number(a.dataset.order)-Number(b.dataset.order) :
   (compare((options.sortValues?.(a.dataset) ?? JSON.parse(a.dataset.sortValues))[column],
@@ -131,7 +150,7 @@ function apply(write=true){
    Number(a.dataset.order)-Number(b.dataset.order))*(direction==='desc' ? -1 : 1));
  const table=content.querySelector('table');let count=0;
  items.forEach(item=>{
-  item.hidden=!visible(item);if(!item.hidden) count++;
+  item.hidden=!matches(item);if(!item.hidden) count++;
   const expanded=opened.has(item.dataset.key);
   item.querySelector('[data-detail]').hidden=!expanded;
   item.querySelector('.list-toggle').setAttribute('aria-expanded',String(expanded));
@@ -143,10 +162,9 @@ function apply(write=true){
   button.querySelector('[data-sort-mark]').textContent=active ? direction==='desc' ? ' ↓' : ' ↑' : '';
  });
  const empty=content.querySelector('[data-empty]');
- const hasKey=options.hasKey ?? (key=>items.some(item=>item.dataset.key===key));
  const missing=[...keys].filter(key=>!hasKey(key));
  let notice=content.querySelector('[data-missing-keys]');
- if(missing.length || notice){
+ if(missing.length || notice || options.missingItem){
   if(!notice){
    notice=document.createElement('p');notice.dataset.missingKeys='';notice.setAttribute('role','status');
    empty.after(notice);
@@ -155,37 +173,100 @@ function apply(write=true){
   notice.hidden=!missing.length;
  }
  empty.hidden=count>0 || missing.length>0;
- const selection=keys.size ? items.filter(selected) : items;
+ const missingItem=content.querySelector('[data-missing-item]');
+ if(missingItem){
+  const message=linkedItem && missingLinkedItem ? options.missingItem(linkedItem) : '';
+  missingItem.textContent=message;
+  missingItem.hidden=!message;
+ }
+ const selection=keys.size ? items.filter(isSelected) : items;
  const countLine=content.querySelector('[data-list-count]');
  if(countLine) countLine.textContent=options.counts(selection,count,{show,keys});
  options.applied?.(selection,{owner,show,query:search,type,sourceOwner,keys});
- if(write || owner!==previousOwner){
-  const address=new URLSearchParams({owner,show,q:query,sort,dir:direction,...(type ? {type} : {}),...(sourceOwner ? {'source-owner':sourceOwner} : {}),
-   ...Object.fromEntries(filterNames.filter(name=>filters[name]).map(name=>[name,filters[name]])),...(opened.size ? {item:[...opened][0]} : {})});
-  keys.forEach(key=>address.append('key',key));
-  history.replaceState(null,'',location.pathname+'#'+address);
-  if(parent!==window) parent.postMessage('console-place',location.origin);}
+ if(write || owner!==previousOwner) writePlace(pushPlace);
+}
+function writePlace(push=false){
+ const place=new URLSearchParams({owner,show,q:query,sort,dir:direction,...(type ? {type} : {}),...(sourceOwner ? {'source-owner':sourceOwner} : {}),
+  ...Object.fromEntries(filterNames.filter(name=>filters[name]).map(name=>[name,filters[name]]))});
+ const item=linkedItem || [...opened][0];
+ if(item) place.set('item',item);
+ keys.forEach(key=>place.append('key',key));
+ const hash='#'+place,state={recordTable:{opened:[...opened],linkedItem}};
+ if(push && hash!==location.hash) history.pushState(state,'',location.pathname+hash);
+ else history.replaceState(state,'',location.pathname+hash);
+ placeHash=location.hash;
+ if(parent!==window) parent.postMessage('console-place',location.origin);
+}
+function restorePlace(event){
+ // A changed fragment sends hashchange after popstate.
+ if(event.type==='popstate' && location.hash!==placeHash) return;
+ place();
+ apply(false);
+ const top=history.state?.recordTable?.top;
+ if(Number.isFinite(top)) scrollTo({top,behavior:'instant'});
+}
+function jump(key){
+ history.replaceState({recordTable:{opened:[...opened],linkedItem,top:scrollY}},'');
+ const target=[...content.querySelectorAll('[data-list-item]')].find(item=>item.dataset.key===key);
+ linkedItem=key;
+ if(target){
+  if(keys.size) keys.add(key);
+  if(!matches(target)){
+   const unfiltered={owner:'',show:'all',query:'',type:'',sourceOwner:'',filters:{}};
+   if(owner && !matches(target,{...unfiltered,owner})) owner='';
+   if(query && !matches(target,{...unfiltered,query:query.trim().toLowerCase()})) query='';
+   if(type && !matches(target,{...unfiltered,type})) type='';
+   if(sourceOwner && !matches(target,{...unfiltered,sourceOwner})) sourceOwner='';
+   for(const name of filterNames)
+    if(filters[name] && !matches(target,{...unfiltered,filters:{[name]:filters[name]}})) filters[name]='';
+   if(!matches(target)) show='all';
+  }
+  if(options.single) opened.clear();
+  opened.add(key);
+ }
+ apply(true,{pushPlace:true});
+ if(!target){
+  content.querySelector('[data-missing-item]')?.scrollIntoView({block:'nearest',behavior:'instant'});
+  return;
+ }
+ const row=target.querySelector('.list-row');
+ const banner=document.querySelector('[data-page-status]');
+ const bannerHeight=banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
+ row.style.scrollMarginTop=(bannerHeight+16)+'px';
+ row.querySelector('.list-toggle').focus({preventScroll:true});
+ row.scrollIntoView({block:'start',behavior:'instant'});
+ row.animate([{backgroundColor:'color-mix(in srgb,var(--accent) 28%,var(--card))'},{backgroundColor:'var(--hover)'}],1200);
 }
 function bind(){
- filterControl('#list-owner','data-owner-chip').bind(value=>{if(value===owner) return;owner=value;sourceOwner='';apply();});
- filterControl('#list-show','data-show-chip').bind(value=>{if(value===show) return;show=value;apply();});
+ const changePlace=()=>apply(true,{dismissMissingItem:true});
+ content.addEventListener('click',event=>{
+  const link=event.target.closest('a[data-record-jump]');
+  if(!link || event.defaultPrevented || event.button!==0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  const key=new URLSearchParams(link.hash.slice(1)).get('item');
+  if(!key) return;
+  event.preventDefault();
+  jump(key);
+ });
+ filterControl('#list-owner','data-owner-chip').bind(value=>{if(value===owner) return;owner=value;sourceOwner='';changePlace();});
+ filterControl('#list-show','data-show-chip').bind(value=>{if(value===show) return;show=value;changePlace();});
  for(const name of filterNames)
-  content.querySelector('#list-'+name).addEventListener('change',event=>{filters[name]=event.target.value;apply();});
- content.querySelector('#list-search').addEventListener('input',event=>{query=event.target.value;apply();});
+  filterControl('#list-'+name,'data-'+name+'-chip').bind(value=>{filters[name]=value;changePlace();});
+ content.querySelector('#list-search').addEventListener('input',event=>{query=event.target.value;changePlace();});
  content.querySelectorAll('[data-sort]').forEach(button=>button.addEventListener('click',()=>{
   const selected=columns[Number(button.dataset.sort)];direction=sort===selected && direction==='asc' ? 'desc' : 'asc';
-  sort=selected;apply();
+  sort=selected;changePlace();
  }));
  content.querySelectorAll('.list-row').forEach(row=>row.addEventListener('click',event=>{
   if(event.target.closest('a') || (event.target.closest('button') && !event.target.closest('.list-toggle'))) return;
   const key=row.parentElement.dataset.key;
+  linkedItem='';
   if(opened.has(key)) opened.delete(key);else {if(options.single) opened.clear();opened.add(key);}
   apply();
  }));
  content.querySelectorAll('[data-type-chip]').forEach(button=>button.addEventListener('click',()=>{
-  type=button.dataset.typeChip;apply();
+  type=button.dataset.typeChip;changePlace();
  }));
 }
-return {place,apply,bind,opened,replace(){content=contentProxy();bind();apply(false);}};
+return {place,apply,bind,opened,restorePlace,replace(){content=contentProxy();bind();apply(false);}};
 }
 '''

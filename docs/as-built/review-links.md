@@ -573,6 +573,15 @@ The default order uses `the_list.order`, which the CLI also uses.
 User decisions come first, then unread updates, then the earliest next check.
 A column button sorts its values; a second click reverses that order.
 
+A link under Links opens the target item in the console.
+The table changes Show to All if the target is outside the current view.
+The table clears each filter that excludes the target and keeps each filter that matches it.
+The table scrolls to the target and highlights it briefly.
+The table leaves a gap below the sticky status banner when it shows.
+A missing target shows “Item #N is not on the List”.
+Changing a filter or the sort order clears this notice.
+Back restores the previous filters, open rows, and scroll position even when the address stays the same.
+
 Each List record stores unique `ReviewItem.key` values in link order, without duplicates.
 `the_list.py link L<n> --review <id> [--review <id> ...] --source <who>` adds links.
 `the_list.py unlink L<n> --review <id> [--review <id> ...] --source <who>` removes links.
