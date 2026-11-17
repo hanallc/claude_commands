@@ -2798,6 +2798,9 @@ A refused or failed release gives a nonzero exit, and the caller cancels the res
 ### Phase 44bm — A local gate after a cloud fallback shows the gate route  · status: todo
 **From the gaterename gate, 2026-11-17 14:47:** the cloud box failed on its mode value, and natedev ran the gate locally. The local ask has no route field, so the Builds page shows the default label "a direct cargo command runs where it starts". The fallback ask names the local gate route. After natest 314 (the gate folder move) is on main.
 
+### Phase 44bn — A memory sample counts only after cargo starts  · status: todo
+**From the 44bf design review, 2026-11-17:** when no populated cargo scope exists, the regular sampler measures the owner's process tree (memory_admit.py:1033). The CI cargo front waits for its grant before it starts cargo (ci_cargo_front.py:150), so a sample can record the front's own memory as a build peak and lower the next estimate. A sample counts toward the build peak only after the run shows that cargo started. After 44bf merges.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
