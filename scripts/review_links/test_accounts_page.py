@@ -1,5 +1,6 @@
 """The console Accounts page draws the accounts board table."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -154,14 +155,17 @@ class AccountsPageTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory())) / "config"
-        _ = shutil.copytree(Path(__file__).resolve().parents[2] / "config", configuration)
+        _ = copy_config_fixture(Path(__file__).resolve().parents[2] / 'config', configuration)
+        _ = write_config_fixture(configuration / "accounts.conf", "next_move_percent=1\nusage_stale_minutes=10\n")
+        _ = write_config_fixture(configuration / "review_links.conf",
+            "page_refresh_seconds=15\naccounts_page_seconds=30\n")
         _ = (configuration / "statusline.conf").write_text("account.claude1=#af875f\naccount.claude2=#b294bb\nrole.unit-director=#d7af00\n",
                                                             encoding="utf-8")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     def test_board_draws_the_board_table_with_moves_and_problems(self) -> None:
         config = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='accounts-board-config-')))
-        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / 'config/accounts.conf', config / 'accounts.conf')
+        _ = write_config_fixture(config / 'accounts.conf')
         _ = (config / 'statusline.conf').write_text('account.claude1=brown\nrole.unit-director=yellow\nrole.worker=#c0c0c0\n')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {'CONF_DIR': str(config)})))
         reading = accounts.StatusReading((status_row("claude1"),), ("* <stale>",), (), timezone.utc, AT,
@@ -203,8 +207,7 @@ class AccountsPageTests(unittest.TestCase):
         reading = accounts.StatusReading((status_row("claude1"),), (), (), timezone.utc, AT)
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "statusline.conf"
-            _ = (config.parent / "accounts.conf").write_bytes(
-                (Path(__file__).resolve().parents[2] / "config/accounts.conf").read_bytes())
+            _ = write_config_fixture(config.parent / 'accounts.conf')
             for value, expected in (("brown", "#af875f"), ("magenta", "#800080"),
                                     ("#A0522D", "#A0522D"), ("#af875f", "#af875f"), ("", ""),
                                     ('red;position:fixed', ""), ('\"><script>alert(1)</script>', "")):
@@ -302,11 +305,10 @@ class AccountsPageTests(unittest.TestCase):
         reading = accounts.StatusReading((), (), (), timezone.utc, AT)
         with tempfile.TemporaryDirectory() as temporary:
             settings = Path(temporary) / "review_links.conf"
-            original = (Path(__file__).resolve().parents[2] / "config/review_links.conf").read_text()
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/accounts.conf", Path(temporary) / "accounts.conf")
+            _ = write_config_fixture(Path(temporary) / 'accounts.conf')
             for seconds in (15, 37):
                 with self.subTest(refresh_seconds=seconds):
-                    _ = settings.write_text(original.replace("page_refresh_seconds=15", f"page_refresh_seconds={seconds}"))
+                    _ = write_config_fixture(settings, f"page_refresh_seconds={seconds}\n")
                     with (patch.object(accounts, "read_status", return_value=reading) as status,
                           patch.dict(os.environ, {"CONF_DIR": temporary})):
                         page = accounts_page.page().decode()
@@ -335,11 +337,10 @@ class AccountsPageTests(unittest.TestCase):
         reading = accounts.StatusReading((), (), (), timezone.utc, AT)
         with tempfile.TemporaryDirectory() as temporary:
             settings = Path(temporary) / "review_links.conf"
-            original = (Path(__file__).resolve().parents[2] / "config/review_links.conf").read_text()
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/accounts.conf", Path(temporary) / "accounts.conf")
+            _ = write_config_fixture(Path(temporary) / 'accounts.conf')
             for seconds in (15, 37):
                 with self.subTest(refresh_seconds=seconds):
-                    _ = settings.write_text(original.replace("page_refresh_seconds=15", f"page_refresh_seconds={seconds}"))
+                    _ = write_config_fixture(settings, f"page_refresh_seconds={seconds}\n")
                     with (patch.object(accounts, "read_status", return_value=reading),
                           patch.dict(os.environ, {"CONF_DIR": temporary})):
                         page = accounts_page.page().decode()

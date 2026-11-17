@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, urgency
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production import change_routing, change_review, footer_counts, next_item, showrunners, staff, unrouted_alert, update_registration
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
@@ -609,7 +610,6 @@ class ChangePageTests(unittest.TestCase):
 
     def test_publications_keep_the_html_and_manifest_under_one_configured_root(self) -> None:
         settings = Path(os.environ["CONF_DIR"]) / "change_review.conf"
-        original = settings.read_text()
         real_write = atomic_file.write_bytes_atomic
         publications: list[tuple[Callable[[], str], str]] = [
             (lambda: change_page.publish(self.production, self.review_list, ["C1"]), change_page.MANIFEST),
@@ -617,14 +617,12 @@ class ChangePageTests(unittest.TestCase):
         for index, (publish, manifest) in enumerate(publications):
             first = self.temporary / f"first-{index}"
             second = self.temporary / f"second-{index}"
-            configured = original.replace("review_links_directory=~/.local/share/review-links",
-                                          f"review_links_directory={first}")
-            _ = settings.write_text(configured)
+            _ = write_config_fixture(settings, f"review_links_directory={first}\n")
 
             def write(path: Path, content: bytes, *, mode: int = 0o600) -> None:
                 real_write(path, content, mode=mode)
                 if path.name == change_page.PAGE_NAME:
-                    _ = settings.write_text(configured.replace(str(first), str(second)))
+                    _ = write_config_fixture(settings, f"review_links_directory={second}\n")
 
             with (self.subTest(manifest=manifest), patch.dict(os.environ),
                   patch.object(atomic_file, "write_bytes_atomic", side_effect=write)):
@@ -638,7 +636,9 @@ class ChangePageTests(unittest.TestCase):
 
     def test_bare_command_prints_the_console_link_with_changes_selected(self) -> None:
         configuration = self.temporary / "config"
-        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/console.conf", configuration / "console.conf")
+        _ = write_config_fixture(configuration / "console.conf",
+            "page.review.title=Review\npage.review.url=python:scripts.review_links.review_page:page_url\n"
+            + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
         _ = (configuration / "memory_feed.conf").write_text(f"output_folder={self.root / 'builds'}\n")
         result = self.command(change_page, change_page.main, [])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -689,8 +689,7 @@ class ChangePageTests(unittest.TestCase):
         configuration = self.temporary / "config"
         configuration.mkdir()
         for stem in ("change_review", "nix_env"):
-            source = Path(__file__).resolve().parents[2] / f"config/{stem}.conf"
-            _ = (configuration / f"{stem}.conf").write_text(source.read_text())
+            _ = write_config_fixture(configuration / f'{stem}.conf')
         self.write_delivery_config()
         _ = self.enterContext(patch.object(unrouted_alert, "send_message"))
         self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)}))
@@ -760,11 +759,9 @@ class ChangePageTests(unittest.TestCase):
         self.addCleanup(server.shutdown)
 
     def write_delivery_config(self, tries: int = 3, pause: int = 0) -> None:
-        source = Path(__file__).resolve().parents[2] / "config/review_links.conf"
-        content = source.read_text()
-        content = re.sub(r"(?m)^delivery_tries=.*$", f"delivery_tries={tries}", content)
-        content = re.sub(r"(?m)^delivery_pause_seconds=.*$", f"delivery_pause_seconds={pause}", content)
-        _ = (self.temporary / "config/review_links.conf").write_text(content)
+        _ = write_config_fixture(self.temporary / "config/review_links.conf",
+                                 f"delivery_tries={tries}\ndelivery_pause_seconds={pause}\nfeedback_rows=5\n"
+                                 + "changes_first_root=natedev\nunrouted_alert_retry_seconds=60\npage_refresh_seconds=15\n")
 
     def fail_all_but_alerts(self, calls: list[str]) -> Callable[[str, str, str], None]:
         def send(recipient: str, sender: str, message: str) -> None:
@@ -1114,7 +1111,8 @@ class ChangePageTests(unittest.TestCase):
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Conflict", "Read", "Proof")],
                                       date(2026, 11, 2), "abcdef12", self.production, producers=[staff.StaffId("missing-producer")], record=staff.snapshot())
         config = self.temporary / "config/review_links.conf"
-        _ = config.write_text(config.read_text().replace("unrouted_alert_retry_seconds=60", ""))
+        _ = config.write_text("\n".join(line for line in config.read_text().splitlines()
+                                       if line.partition("=")[0].strip() != "unrouted_alert_retry_seconds") + "\n")
         path = change_page.page_url()
         with redirect_stderr(StringIO()) as errors:
             reply = self.legacy_browser_reply(path)
@@ -1330,8 +1328,7 @@ class ChangePageTests(unittest.TestCase):
             "| C1 | First orphan | | Read the first change |",
             "| C2 | Second orphan | | Read the second change |", "")))
         settings = Path(os.environ["CONF_DIR"]) / "review_links.conf"
-        _ = settings.write_text(settings.read_text().replace(
-            "unrouted_alert_recipient=natedev", "unrouted_alert_recipient=page-owner"))
+        _ = write_config_fixture(settings, "unrouted_alert_recipient=page-owner\n")
         runner = staff.snapshot().by_path("page-owner")
         assert runner is not None
         browser = change_page.ReviewBrowser("orphan-token")
@@ -2484,10 +2481,9 @@ class ChangePageTests(unittest.TestCase):
         urgency.move_to_end(hana_queue.name, "C1", datetime(2026, 11, 5))
         self.assertEqual(expected(doc, below=True), ["hana/C3", "hana/C2", "hana/C1"])
         settings = self.temporary / "config/review_links.conf"
-        original = settings.read_text()
         for first, roots in (("natedev", ("natedev", "hana")), ("hana", ("hana", "natedev")),
                              ("missing", ("hana", "natedev")), ("alpha", ("hana", "natedev"))):
-            _ = settings.write_text(original.replace("changes_first_root=natedev", f"changes_first_root={first}"))
+            _ = write_config_fixture(settings, f"changes_first_root={first}\n")
             _, forms, _ = self.browser()
             with self.subTest(first_root=first):
                 for name, production in docs.items():
@@ -2788,7 +2784,6 @@ class ChangePageTests(unittest.TestCase):
 
     def test_feedback_textareas_use_one_live_row_setting_per_page_render(self) -> None:
         settings = self.temporary / "config/review_links.conf"
-        original = settings.read_text()
         browser = change_page.ReviewBrowser("test")
         status = change_page.DeliveryStatus(self.root)
         renderers: tuple[Callable[[], bytes], ...] = (
@@ -2797,7 +2792,7 @@ class ChangePageTests(unittest.TestCase):
             lambda: change_page.fallback_answer(self.page, change_page.AnswerNotice("C1", "Try again")),
         )
         for height in (5, 8):
-            _ = settings.write_text(original.replace("feedback_rows=5", f"feedback_rows={height}"))
+            _ = write_config_fixture(settings, f"feedback_rows={height}\n")
             for render in renderers:
                 with self.subTest(height=height, render=render), patch.object(conf, "read", wraps=conf.read) as read:
                     content = render().decode()
@@ -2808,7 +2803,7 @@ class ChangePageTests(unittest.TestCase):
 
         for interval in (15, 5, 300):
             with self.subTest(page_refresh_seconds=interval):
-                _ = settings.write_text(original.replace("page_refresh_seconds=15", f"page_refresh_seconds={interval}"))
+                _ = write_config_fixture(settings, f"page_refresh_seconds={interval}\n")
                 path, _, content = self.browser()
                 del path
                 self.assertIn(f'data-refresh-seconds="{float(interval)}"', content)
@@ -2817,13 +2812,14 @@ class ChangePageTests(unittest.TestCase):
                 self.assertIn("if(fresh.dataset.script!==content.dataset.script){location.reload();return;}", content)
         for interval in ("4", "301", "nan"):
             with self.subTest(page_refresh_seconds=interval, range="invalid"):
-                _ = settings.write_text(original.replace("page_refresh_seconds=15", f"page_refresh_seconds={interval}"))
+                _ = write_config_fixture(settings, f"page_refresh_seconds={interval}\n")
                 with self.assertRaises(conf.Unusable), conf.diagnostics(report=False):
                     _ = conf.read(settings).number("page_refresh_seconds")
 
     def test_a_missing_feedback_rows_setting_refuses_the_render(self) -> None:
         settings = self.temporary / "config/review_links.conf"
-        _ = settings.write_text(settings.read_text().replace("feedback_rows=5", ""))
+        _ = settings.write_text("\n".join(line for line in settings.read_text().splitlines()
+                                         if line.partition("=")[0].strip() != "feedback_rows") + "\n")
         with self.assertRaisesRegex(conf.Unusable, "feedback_rows.*key is missing"):
             _ = change_page.render(self.page, change_page.DeliveryStatus(self.root))
 

@@ -1,6 +1,8 @@
 """Restart staff rows without a session journal."""
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_config_fixture
+
 from scripts.agents import remote
 from scripts.herdr import herdr_types
 
@@ -552,7 +554,7 @@ class RecordedResumeTests(RestartTestCase):
         super().setUp()
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            write_text_atomic(configuration / source.name, source.read_text())
+            _ = write_config_fixture(configuration / source.name)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     folder: Path = Path("/tmp/recorded-resume")
@@ -660,7 +662,7 @@ class MixedRestartTests(ShutdownTestCase):
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            write_text_atomic(root / "conf" / source.name, source.read_text())
+            _ = write_config_fixture(root / 'conf' / source.name)
         write_text_atomic(root / "conf/models.conf",
             Path(__file__).resolve().parents[1].joinpath("lib/test_models_registry.conf").read_text())
         directory = staff.PresentWorktree(remote.local_machine(), root)
@@ -1085,8 +1087,9 @@ class RestartTests(RestartTestCase):
         super().setUp()
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            write_text_atomic(configuration / source.name, source.read_text())
+            _ = write_config_fixture(configuration / source.name)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+        _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
         _ = write_registry(configuration / "models.conf", {"producers": {
             "unit-0": "claude:opus:max", "probe-codex": "codex:gpt-test:high",
             "morty": "claude:opus:max", "TEST-agent": "claude:opus:max",
@@ -2225,7 +2228,7 @@ class RestartTests(RestartTestCase):
 
     def test_saved_tab_waits_for_its_own_shell_and_never_splits(self) -> None:
         settings = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
-        write_text_atomic(settings, settings.read_text().replace("OWN_PANE_SHELL_SECONDS=30", "OWN_PANE_SHELL_SECONDS=0.2"))
+        _ = write_config_fixture(settings, "OWN_PANE_SHELL_SECONDS=0.2\n")
         layout: herdr.SavedLayout = {"at": 1, "workspaces": [{"name": "saved", "seen": 1,
             "tabs": [{"staff_id": "row-0", "seen": 1}]}]}
         self.rows = (self.rows[0], replace(self.rows[1], kind="worker", parent=staff.ReportsTo(self.rows[0].id)), self.rows[2])
@@ -3783,7 +3786,7 @@ class RetainedSplitRestartTests(RestartTestCase):
         root = fixture.root
         config = root / "conf"
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            write_text_atomic(config / source.name, source.read_text())
+            _ = write_config_fixture(config / source.name)
         write_text_atomic(config / "models.conf", registry_text())
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config),
             "MODELS_CONFIG_FILE": str(config / "models.conf"), "MODELS_CONFIG_PUBLISH": "0",

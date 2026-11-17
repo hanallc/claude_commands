@@ -1,6 +1,7 @@
 """Registration behavior against a private seeded fixture."""
 
 from __future__ import annotations
+from scripts.lint.memory_test_support import config_environment, copy_config_fixture
 
 import json
 import io
@@ -32,6 +33,7 @@ from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.review_links import change_browser, change_page
 from scripts.statusline import counts_row
 from scripts.lib import urgency
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class ProducerQuestionTests(RegistrationFixture):
@@ -44,9 +46,9 @@ class ProducerQuestionTests(RegistrationFixture):
         listing = self.root / "reviews/change-review - example.md"
         _ = self.doc.write_text(self.doc.read_text() + f"- **Change review:** `{listing}`\n")
         config = self.root / "config"
-        _ = shutil.copytree(Path(__file__).parents[2] / "config", config)
+        _ = copy_config_fixture(Path(__file__).parents[2] / 'config', config)
         settings = config / "review_links.conf"
-        _ = settings.write_text(settings.read_text().replace("delivery_pause_seconds=5", "delivery_pause_seconds=0"))
+        _ = write_config_fixture(settings, "delivery_pause_seconds=0\ndelivery_tries=3\n")
         self.env.update({"CLAUDE_CODE_SESSION_ID": self.producer.current_session, "CODEX_THREAD_ID": "",
                          "CHANGE_REVIEW_DIR": str(self.root / "reviews"), "REVIEW_LINKS_ROOT": str(self.root / "links"),
                          "CONF_DIR": str(config)})
@@ -317,6 +319,8 @@ class QuestionIdentityTests(RegistrationFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.env.update(config_environment(self.root / "fixture-config"))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env)))
         self.issues = self.root / "issues"
         self.issues.mkdir(exist_ok=True)
         self.timer("example")

@@ -1,5 +1,6 @@
 """Exercise guarded deployment with a private AWS executable and no network."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout
@@ -432,7 +433,7 @@ class DeploymentTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = cast(object, self.enterContext(mock.patch.object(box, 'urlopen', side_effect=AssertionError('tests require a fake tailnet transport'))))
-        _ = self.settings.write_text((deploy.TEMPLATE.parents[3] / 'config/aws_target.conf').read_text())
+        _ = write_config_fixture(self.settings)
         self.now = int(datetime.fromisoformat(DAY + "T23:59:00+00:00").timestamp())
         self.bundle = self.root / 'bundle'
         self.bundle.mkdir()
@@ -482,8 +483,8 @@ class DeploymentTests(CostFixture):
         for key, value in values.items():
             self.replace(key, value)
         gates = self.root / 'cloud_gate.conf'
-        _ = gates.write_bytes((deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
-        text_setting(gates, 'regions', 'us-east-1')
+        _ = write_config_fixture(gates,
+            "regions=us-east-1\nroot_gib=40\nspot_max_usd_per_hour=0.8\nshared_usd_per_month=1\n")
         # Quota cases assume these targets; pin them in place so a /tune of the shipped values never breaks a test.
         _ = gates.write_text(re.sub(r'^(gpu_spot_quota_request_vcpus)=.*$', r'\1=4',
                                     re.sub(r'^(spot_quota_request_vcpus)=.*$', r'\1=128', gates.read_text(), flags=re.M), flags=re.M))
@@ -885,9 +886,7 @@ sys.exit(7)
         subject = self.update_fixture()
         self.set_clock(self.now + 1)
         # The fixture keeps two sizes, so the shipped type list can change without these cases.
-        shipped = (deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_text()
-        _ = (self.root / 'cloud_gate.conf').write_text(
-            re.sub(r'(?m)^instance_types=.*$', 'instance_types=m7a.8xlarge m7a.4xlarge', shipped))
+        _ = write_config_fixture(self.root / 'cloud_gate.conf', 'instance_types=m7a.8xlarge m7a.4xlarge\n')
         text_setting(self.settings, 'region', 'us-east-2')
         text_setting(self.settings, 'availability_zone', 'us-east-2a')
         text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2')
@@ -992,7 +991,7 @@ sys.exit(7)
         subject = self.deployment()
         text_setting(self.settings, 'region', 'us-east-2')
         text_setting(self.settings, 'availability_zone', 'us-east-2a')
-        _ = (self.root / 'cloud_gate.conf').write_bytes((deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
+        _ = write_config_fixture(self.root / 'cloud_gate.conf')
         text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2')
         text_setting(self.root / 'cloud_gate.conf', 'spot_candidate_regions', 'us-west-2 us-east-1 us-east-2 us-west-2')
         gpu_types = ('g6.xlarge', 'g4dn.xlarge', 'g4ad.xlarge', 'g5.xlarge')
@@ -1830,14 +1829,14 @@ sys.exit(7)
         return len(attached) + len(blocks) + len(regional) * (regions - 1)
 
     def test_scaler_user_keeps_two_gate_policies_and_the_budget_block_in_every_region_count(self) -> None:
-        gates = conf.read(deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf')
+        gates = conf.read(self.root / 'cloud_gate.conf')
         for key in ('regions', 'spot_candidate_regions'):
             with self.subTest(regions=len(gates.words(key))):
                 # AWS attaches at most 10 managed policies to one IAM user; the budget block needs a free slot.
                 self.assertEqual(self.scaler_policy_count(len(gates.words(key))), 3)
 
     def test_gate_scaler_policy_for_every_candidate_region_fits_the_managed_policy_size(self) -> None:
-        gates = conf.read(deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf')
+        gates = conf.read(self.root / 'cloud_gate.conf')
         regions = gates.words('spot_candidate_regions')
         partition, account = 'aws', '1' * 12
         values: dict[str, object] = {
@@ -2532,6 +2531,7 @@ else: raise AssertionError(args)
 
     def test_down_removes_resources_and_preserves_spend_and_other_profiles(self) -> None:
         devices = self.removal_fixture()
+        _ = write_config_fixture(self.root / 'build_targets.conf', 'targets=mac,natedev\n')
         self.assertEqual([target.name for target in target_config.read_targets()], ['mac', 'natedev'])
         original = self.settings.read_bytes()
         before = ledger.CostLedger(self.state).read_snapshot()

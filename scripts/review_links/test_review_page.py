@@ -1,5 +1,6 @@
 """Check the shared review records, signed actions and table behavior."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
 
 import shutil
 import json
@@ -43,7 +44,10 @@ class ReviewPageTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
         config = self.fixture.temporary / 'config'
-        _ = shutil.copyfile(Path(__file__).resolve().parents[2]/'config/console.conf',config/'console.conf')
+        _ = write_config_fixture(config / "console.conf",
+            "page.review.url=python:scripts.review_links.review_page:page_url\n"
+            + "page.review.items=python:scripts.review_links.review_page:waiting_items\n"
+            + "page.review.icon=inbox\npage.review.title=Review\n")
         self.root = self.fixture.root
         self.status = change_page.DeliveryStatus(self.root)
 
@@ -573,8 +577,7 @@ class ReviewPageTests(unittest.TestCase):
             self.assertEqual(review_later.times()[key], until)
 
     def test_approve_and_decline_close_proposals_and_efficiencies(self) -> None:
-        _ = shutil.copyfile(Path(__file__).resolve().parents[2]/'config/nightly_review.conf',
-                            self.fixture.temporary/'config/nightly_review.conf')
+        _ = write_config_fixture(self.fixture.temporary / 'config/nightly_review.conf')
         proposal, efficiency = self.decisions()
         folder = self.fixture.temporary / 'decision-proposals'
         ledger = self.fixture.temporary / 'decision-efficiency.md'

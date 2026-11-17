@@ -26,6 +26,7 @@ from scripts.build_queue import admission_service, admission_records, placement
 from scripts.buildlog import store
 from scripts.agents import detached_runs
 from scripts.build_targets import target_config
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.mac_test import claim_state
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
@@ -64,8 +65,12 @@ class HoldEnforcerTests(unittest.TestCase):
         boot = self.proc / "sys/kernel/random/boot_id"
         boot.parent.mkdir(parents=True)
         _ = boot.write_text("test-boot\n")
+        configuration = self.root / "config"
+        environment = config_environment(configuration)
+        _ = write_config_fixture(configuration / "build_targets.conf", "default_target=natedev\n")
         self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "CONF_DIR": str(self.root / "config"), "BUILD_HOLD_DIR": str(self.holders),
+            **environment,
+            "HOME": str(self.root), "BUILD_HOLD_DIR": str(self.holders),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "BUILD_HOLD_ENFORCER_DIR": str(self.root / "enforcer"),
             "VERIFY_STEPS_DIR": str(self.root / "steps"),

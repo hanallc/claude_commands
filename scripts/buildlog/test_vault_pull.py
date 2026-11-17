@@ -17,6 +17,7 @@ from typing import cast, override
 from unittest import mock
 
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.buildlog import ci
 from scripts.buildlog import cli
 from scripts.lib import conf, land_main, main_push_lock
@@ -128,10 +129,9 @@ class VaultPullTests(unittest.TestCase):
             _ = self.git(repository, "remote", "set-url", "origin", str(self.github))
         settings = self.folder / "config"
         settings.mkdir()
-        production = Path(__file__).resolve().parents[2] / "config/build_targets.conf"
-        _ = (settings / "build_targets.conf").write_text(
+        _ = write_config_fixture(settings / "build_targets.conf",
             "# whole: 0..10\nvault.lock_retries=2\n# range: 0..5\nvault.lock_retry_delay_s=0\n"
-            + production.read_text())
+            + "vault.question_production=natedev\n")
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(settings)}))
         point_root_at(self, self.root)
         script = self.folder / "update_registration.py"

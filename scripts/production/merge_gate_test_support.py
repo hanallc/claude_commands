@@ -21,6 +21,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import tempfile
 from typing import ClassVar, ParamSpec, TypedDict, cast, override
 import unittest
 from unittest import mock
@@ -31,7 +32,7 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, caller_
 from scripts.lib import build_folders
 from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lint import memory_admit, sweep
-from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
+from scripts.lint.memory_test_support import config_environment, fake_memory_readings, write_config_fixture
 from scripts.production import merge_gate, staff, targeted_test
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.production.cli_fixture import invoke_cli
@@ -125,6 +126,7 @@ from pathlib import Path
 import signal
 import sys
 import time
+import tempfile
 import unittest
 
 TEST_HANG_GUARD_SECS = __TEST_HANG_GUARD_SECS__
@@ -314,6 +316,8 @@ class MergeGateFixture(unittest.TestCase):
     @override
     def setUpClass(cls) -> None:
         # A leased folder: a run that ends by a signal leaves it free, and the next allocation removes it.
+        configuration = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="gate-config-", dir="/tmp")))
+        _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, config_environment(configuration))))
         parent = merge_gate.gate_test_parent(build_folders.tmpfs_temporary_parent())
         parent.mkdir(mode=0o700, exist_ok=True)
         build_folders.sweep_temporary_build_folders(parent, wait=False)
@@ -355,6 +359,9 @@ class MergeGateFixture(unittest.TestCase):
             # to the seed's original path, with its private origin and refs.
             _ = shutil.copytree(self.fixture_seeds[folders].snapshot, self.fixture_root)
         self.bind_fixture(self.fixture_root)
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_folders.conf",
+                                 f"roots.gate={self.fixture_root.parent}\n")
+        self.configure_gate("program_first_peak_gib.merge-gate=4\n")
         seed = self.fixture_seeds[folders]
         self.base, self.checkpoint = seed.base, seed.checkpoint
         if restart_admission:

@@ -36,17 +36,13 @@ def _template(name: str) -> Path:
     return Path(__file__).resolve().parents[2] / "config" / name
 
 
-# Test clocks move only when a test moves them, so a test configuration has no pass gap unless the test sets one.
-TEST_CONFIG_DEFAULTS = {"build_admission.conf": "min_pass_gap_seconds=0\n"}
-
-
 def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
-    """Merge committed defaults, test defaults, existing settings, then explicit overrides. Keep each setting's explicit limit."""
+    """Merge the template, existing settings, and explicit overrides in order. Keep the limits."""
     source = _template(f"{template}.conf" if template else path.name)
     lines = source.read_text().splitlines() if source.exists() else []
     existing = path.read_text() if path.exists() else ""
     limit_prefixes = ("# whole:", "# range:", "# one of:")
-    for layer in (TEST_CONFIG_DEFAULTS.get(source.name, ""), existing, overrides):
+    for layer in (existing, overrides):
         previous = ""
         for raw in layer.splitlines():
             limit = previous if previous.startswith(limit_prefixes) else ""
@@ -69,6 +65,14 @@ def write_config_fixture(path: Path, overrides: str = "", *, template: str | Non
                 lines.append(raw)
     path.parent.mkdir(parents=True, exist_ok=True)
     return path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def copy_config_fixture(source: Path, destination: Path) -> Path:
+    """Copy a configuration folder into a private fixture."""
+    import shutil
+
+    _ = shutil.copytree(source, destination)
+    return destination
 
 
 def write_config_fault(path: Path, source: str) -> int:
@@ -131,11 +135,8 @@ def config_environment(root: Path) -> dict[str, str]:
         destination = folder / name
         if not destination.exists():
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if name in TEST_CONFIG_DEFAULTS:
-                _ = write_config_fixture(destination)
-            else:
-                _ = destination.write_bytes(_template(name).read_bytes())
-    return {"CONF_DIR": str(folder)}
+            _ = destination.write_bytes(_template(name).read_bytes())
+    return {"CONF_DIR": str(folder), "BUILD_TARGETS_CONFIG": str(folder / "build_targets.conf")}
 
 
 def gate_isolation_environment(root: Path) -> dict[str, str]:

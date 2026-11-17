@@ -16,6 +16,7 @@ from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
 from scripts.disks import disks_page
 from scripts.lib import conf
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import investigation, staff
 from scripts.production.change_routing import UnavailableProduction
 from scripts.review_links import change_browser, change_page, console, investigations_page, review_link
@@ -48,6 +49,22 @@ class ConsoleTests(unittest.TestCase):
         for stem in ("console", "review_links", "change_review"):
             _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf",
                                 self.configuration / f"{stem}.conf")
+        _ = write_config_fixture(self.configuration / "console.conf",
+            "page.accounts.label=Accounts\npage.accounts.title=Accounts\npage.accounts.icon=users\n"
+            + "page.accounts.url=python:scripts.review_links.accounts_page:page_url\n"
+            + "page.aws.label=AWS\npage.aws.title=AWS\npage.aws.icon=cloud\n"
+            + "page.aws.url=python:scripts.aws_target.aws_page:page_url\n"
+            + "page.builds.icon=hammer\npage.builds.label=Builds\npage.builds.title=Builds\n"
+            + "page.builds.url=python:scripts.build_queue.memory_feed:page_url\n"
+            + "page.disks.label=Disks\npage.disks.title=Disks\npage.disks.icon=hard-drive\n"
+            + "page.disks.url=python:scripts.disks.disks_page:page_url\n"
+            + "page.images.label=Images\npage.images.title=Images\npage.images.icon=image\n"
+            + "page.images.url=python:scripts.review_links.images:page_url\n"
+            + "page.list.label=List\npage.list.icon=list-checks\npage.list.title=The List\n"
+            + "page.list.url=python:scripts.review_links.list_page:page_url\n"
+            + "page.review.label=Review\npage.review.icon=inbox\npage.review.title=Review\n"
+            + "page.review.url=python:scripts.review_links.review_page:page_url\n"
+            + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(self.configuration), "REVIEW_LINKS_ROOT": str(self.root / "snapshots"),
             "REVIEW_LINKS_HOST": "127.0.0.1", "STAFF_FILE": str(self.root / "staff.json"),
@@ -159,8 +176,10 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn('aria-label="Builds — Not available"', console.render(pages, console.read_rebuilds()).decode())
 
     def test_url_functions_cannot_put_an_external_page_in_the_frame(self) -> None:
+        port = 8123
+        _ = write_config_fixture(self.configuration / "review_links.conf", f"server_port={port}\n")
         for path in ("https://example.invalid/page", "//example.invalid/page", "/../outside", "/%2e%2e/outside",
-                     "http://127.0.0.1:1/page", "https://127.0.0.1:8765/page"):
+                     "http://127.0.0.1:1/page", f"https://127.0.0.1:{port}/page"):
             with self.subTest(path=path), patch.object(memory_feed, "page_url", return_value=path, create=True):
                 pages = console.read_pages()
                 self.assertIsInstance(pages[2].destination, console.UnavailablePage)

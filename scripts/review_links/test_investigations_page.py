@@ -1,5 +1,6 @@
 """Test investigation cards with private staff records and state folders."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
 
 import io
 import json
@@ -32,8 +33,9 @@ class InvestigationsPageTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="investigations-page-test-")))
         config = self.root / "config"
         config.mkdir()
-        for name in ("review_links", "console", "change_review"):
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{name}.conf", config / f"{name}.conf")
+        for name in ("console", "change_review"):
+            _ = write_config_fixture(config / f"{name}.conf")
+        _ = write_config_fixture(config / "review_links.conf", "page_refresh_seconds=15\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.root / "state"),
             "STAFF_FILE": str(self.root / "staff.json"), "USER_ZONE": "America/New_York",

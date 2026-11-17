@@ -21,6 +21,7 @@ import tempfile
 import time
 import unittest.mock
 from pathlib import Path
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.script_envelope import script_prompt
 from scripts.herdr import herdr_types
 from types import SimpleNamespace
@@ -2806,7 +2807,11 @@ class HerdrTests(unittest.TestCase):
         self.proc = self.root / "proc"
         self.proc.mkdir()
         (self.root / "home/.claude/sessions").mkdir(parents=True)
+        configuration = self.root / "fixture-config"
+        environment = config_environment(configuration)
+        _ = write_config_fixture(configuration / "codex_daemon.conf", "agents_slice=app-agents.slice\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            **environment,
             "HERDR_BIN": str(self.fake), "SYSTEMD_RUN": str(self.fake), "SYSTEMCTL": str(self.fake),
             "HERDR_PROC": str(self.proc), "FAKE_HERDR_LOG": str(self.log),
             "FAKE_HERDR_RESPONSES": str(self.responses_path), "PATH": str(self.root / "no-tools"),

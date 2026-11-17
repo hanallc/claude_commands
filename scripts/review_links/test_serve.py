@@ -1,6 +1,8 @@
 """HTTP behavior on localhost and retention in disposable snapshot folders."""
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_config_fixture
+
 from scripts.lib.checkout_test_support import python_tool_source
 
 import importlib.util
@@ -45,8 +47,14 @@ class HttpReply:
 
 def setUpModule() -> None:
     configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
-    for stem in ("review_links", "change_review", "console"):
-        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf", configuration / f"{stem}.conf")
+    _ = write_config_fixture(configuration / "change_review.conf")
+    _ = write_config_fixture(configuration / "review_links.conf",
+        "code_check_seconds=5\ntailscale_check_seconds=60\nsnapshot_sweep_seconds=3600\n")
+    _ = write_config_fixture(configuration / "console.conf",
+        "page.review.title=Review\npage.review.url=python:scripts.review_links.review_page:page_url\n"
+        + "page.review.items=python:scripts.review_links.review_page:waiting_items\n"
+        + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n"
+        + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
     _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
 
@@ -684,8 +692,13 @@ class SnapshotSweepTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-sweep-test-")))
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        settings = configuration / "review_links.conf"
+        _ = write_config_fixture(settings, "snapshot_retention_seconds=604800\nsnapshot_sweep_seconds=3600\n")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     def test_change_image_sweep_keeps_named_and_recent_images(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "change_image_unclaimed_days=10\n")
         now = 1_800_000_000.0
         listing = self.root / "lists"
         listing.mkdir()
@@ -1024,8 +1037,7 @@ class ServerCodeRestartTests(unittest.TestCase):
         _ = server_file.write_text("# The server uses this temporary checkout.\n")
         module_file = checkout / "review_restart_fixture.py"
         _ = module_file.write_text("VALUE = 'before'\n")
-        settings = (Path(__file__).resolve().parents[2] / "config/review_links.conf").read_text()
-        _ = (checkout / "review_links.conf").write_text(settings.replace("code_check_seconds=5", "code_check_seconds=0.05"))
+        _ = write_config_fixture(checkout / "review_links.conf", "code_check_seconds=0.05\n")
         root = checkout / "snapshots"
         root.mkdir()
         _ = (root / "answer.txt").write_text("The server answers after the restart.\n")
@@ -1185,17 +1197,21 @@ class ReviewLinksConfigTests(unittest.TestCase):
                 self.assertEqual(serve.sweep_snapshots(root, 50), 1)
                 self.assertFalse(snapshot.exists())
 
-    def test_config_keeps_the_existing_values(self) -> None:
-        settings = conf.read(Path(__file__).resolve().parents[2] / "config/review_links.conf")
-        for key, expected in {'unrouted_alert_recipient': 'natedev'}.items():
+    def test_shipped_config_supplies_the_settings_used_by_review_links(self) -> None:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        path = folder / "review_links.conf"
+        _ = write_config_fixture(path)
+        settings = conf.read(path)
+        values = settings.values()
+        self.assertEqual(settings.text("unrouted_alert_recipient"), values["unrouted_alert_recipient"])
+        for key in ("delivery_tries", "server_port", "snapshot_allocation_tries"):
             with self.subTest(key=key):
-                self.assertEqual(settings.text(key), expected)
-        for key, expected in {'delivery_tries': 3, 'server_port': 8765, 'snapshot_allocation_tries': 10}.items():
+                self.assertEqual(settings.whole(key), int(values[key]))
+        for key in ("page_refresh_seconds", "delivery_pause_seconds", "unrouted_alert_retry_seconds",
+                    "tailscale_timeout_seconds", "snapshot_retention_seconds", "snapshot_sweep_seconds",
+                    "tailscale_check_seconds"):
             with self.subTest(key=key):
-                self.assertEqual(settings.whole(key), expected)
-        for key, expected in {'page_refresh_seconds': 15.0, 'delivery_pause_seconds': 5.0, 'unrouted_alert_retry_seconds': 60.0, 'tailscale_timeout_seconds': 10.0, 'snapshot_retention_seconds': 604800.0, 'snapshot_sweep_seconds': 3600.0, 'tailscale_check_seconds': 60.0}.items():
-            with self.subTest(key=key):
-                self.assertEqual(settings.number(key), expected)
+                self.assertEqual(settings.number(key), float(values[key]))
 
 if __name__ == "__main__":
     _ = unittest.main()

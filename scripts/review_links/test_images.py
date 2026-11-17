@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlencode
 
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import change_page, console, image_store, images, page_frame, serve
@@ -39,11 +40,12 @@ class ImagesFixture(unittest.TestCase):
         self.temporary = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="images-test-")))
         configuration = self.temporary / "config"
         configuration.mkdir()
-        for stem in ("console", "review_links", "change_review"):
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf",
-                                configuration / f"{stem}.conf")
+        _ = write_config_fixture(configuration / "change_review.conf")
+        _ = write_config_fixture(configuration / "console.conf",
+            "page.images.url=python:scripts.review_links.images:page_url\n"
+            + "page.images.items=python:scripts.review_links.images:waiting_images\n")
         settings = configuration / "review_links.conf"
-        _ = settings.write_text(settings.read_text().replace("delivery_pause_seconds=5", "delivery_pause_seconds=0"))
+        _ = write_config_fixture(settings, "delivery_pause_seconds=0\ndelivery_tries=3\nserver_port=8765\n")
         self.root = self.temporary / "snapshots"
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "REVIEW_LINKS_ROOT": str(self.root), "REVIEW_LINKS_HOST": "127.0.0.1",
