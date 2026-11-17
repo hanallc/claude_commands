@@ -36,11 +36,13 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
 - Each entry also holds `flags_read` (false when the hook found no Claude argv) and `ended`. `scripts/hooks/session-end-pane-record.py` sets `ended` at
   SessionEnd for any reason but `other`: `/exit` and logout mark it, a signal at a reboot or a
   crash does not. An end only marks the entry of the same conversation.
-- `pane_record.py seed [--session NAME]` writes the entries of the Claudes running now: the argv
-  and cwd from herdr's `pane process-info`, the environment of the process, and the
-  conversation id from `<config>/sessions/<pid>.json`. It needs no
-  `report-agent-session`: a restore takes the id from the entry and checks herdr's
-  `agent_session` only when the pane has one.
+- `pane_record.py seed [--session NAME]` writes the entry of each proved foreground owner.
+  It reads the owner's arguments and folder from `pane process-info`.
+  For Claude, it reads the environment and the conversation id in `<config>/sessions/<pid>.json`.
+  The process start time must match before and after these reads.
+  For Codex, it uses the proved owner's native conversation.
+- `session_staff.py repair` recovers a missing Claude launch only when its PID and native identity match the proved foreground owner.
+  A Claude child cannot replace its Codex parent's retained launch.
 - `scripts/agents/pane_restore.py [--session NAME] [--dry-run]` first starts or adopts the shared server.
   It resumes staff rows through `restart.start_row`.
   For a worker row, `start_row` resumes only that worker through `worker.restore` with the worker launch policy and the saved account. An idle worker prints `<name>: closed; its next assign resumes it` and stays closed.

@@ -891,6 +891,7 @@ class MixedRestartTests(ShutdownTestCase):
             with (patch.object(unit_runs, "held_by_session", wraps=unit_runs.held_by_session) as searches,
                   patch.object(herdr, "codex_conversations", wraps=herdr.codex_conversations) as scans,
                   patch.object(herdr, "_scan_herdr_processes", wraps=herdr._scan_herdr_processes) as processes,  # pyright: ignore[reportPrivateUsage]
+                  patch.object(restart, "ThreadPoolExecutor", side_effect=lambda **_: ThreadPoolExecutor(max_workers=1)),
                   patch.object(worker_panes, "start_or_resume", wraps=worker_panes.start_or_resume) as starts,
                   patch.object(pane_record, "seed", wraps=pane_record.seed) as seeds,
                   patch.object(herdr.Herdr, "order_tabs", autospec=True, side_effect=herdr.Herdr.order_tabs) as orders,

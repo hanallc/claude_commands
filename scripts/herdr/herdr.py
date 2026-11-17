@@ -31,6 +31,7 @@ import signal
 import socket
 import shlex
 import shutil
+import stat
 import subprocess
 import math
 import sys
@@ -46,7 +47,7 @@ from enum import Enum, StrEnum
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence, Set
-from typing import BinaryIO, TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, Protocol, cast, final, override
+from typing import BinaryIO, ClassVar, TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, Protocol, cast, final, override
 
 
 from scripts.herdr import pane_launch
@@ -2017,7 +2018,9 @@ class Herdr:
                 info = json_object(self.result("pane", "process-info", "--pane",
                     json_text(pane.get("pane_id"), "pane id")).get("process_info"), "native pane processes")
                 shell, foreground = _pane_process_ids(info, "native pane processes")
-                sessions: PaneSessions = frozenset(_pane_sessions(info, pane))
+                observed = _pane_sessions(info, pane)
+                sessions: PaneSessions = (frozenset({observed.session_id})
+                                          if isinstance(observed, CodexPaneSession) else observed)
                 if not sessions and foreground == shell:
                     run.shell_processes[key] = shell
             except CodexPaneStarting:
@@ -2302,8 +2305,8 @@ class Herdr:
             return False
         return True
 
-    def close_retained_pane(self, pane: str, *, terminal: str = "") -> bool:
-        """Retire an outside caller's record only after confirmed terminal closure."""
+    def close_retained_pane(self, pane: str, *, terminal: str = "", target: str = "") -> bool:
+        """Close the selected session and retire its record after closure."""
         path = pane_launch.record_directory() / f"{self.session}.json"
         try:
             original = pane_launch.read_valid_entries(path).get(pane)
@@ -2317,8 +2320,7 @@ class Herdr:
             if not observed or terminal and terminal != observed:
                 raise HerdrFailure(f"{pane}: terminal identity changed; would close another terminal", "wrong_target")
             terminal = observed
-        target = ""
-        if original is not None:
+        if not target and original is not None:
             if "staff_id" in original:
                 owner = staff.initial_snapshot().by_id(staff.StaffId(original["staff_id"]))
                 if owner is not None:
@@ -2379,25 +2381,17 @@ class Herdr:
         row = self.pane_row(pane)
         if isinstance(row, NoPane):
             raise HerdrFailure("producer pane is unavailable")
-        observed = pane_native_process(info, kind, row)
-        processes = [json_object(value, "producer process")
-                     for value in json_items(info.get("foreground_processes"), "producer processes")
-                     if _is_agent_process(_foreground_arguments(json_object(value, "producer process")), kind)]
-        if len(processes) != 1:
-            raise HerdrFailure("producer has no unique foreground process")
-        process = processes[0]
-        pid = process.get("pid")
-        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-            raise HerdrFailure("producer has no process id")
-        folder = json_text(process.get("cwd"), "producer folder")
+        owner = _require_foreground_kind(foreground_pane_owner(info), kind)
+        observed = read_foreground_pane_owner(owner, row)
+        folder = json_text(owner.cwd, "producer folder")
         if (not Path(folder).is_absolute() or observed.environment.get("HERDR_PANE_ID") != pane
                 or observed.environment.get("HERDR_SESSION", "default") != self.session):
             raise HerdrFailure("producer process does not match its pane")
         entry = pane_launch.launch(pane, observed.current_identity, folder, observed.environment,
-                                   _foreground_arguments(process), kind=kind)
+                                   owner.arguments, kind=kind)
         entry["config_dir"] = observed.environment.get("CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR") or str(
             Path.home() / (".codex" if kind == "codex" else ".claude"))
-        entry.update(pid=pid, proc_start=observed.started)
+        entry.update(pid=owner.pid, proc_start=observed.started)
         current = self.native_pane_process(pane, kind, PROGRAM_TIMEOUT_SECONDS, pane_row=row)
         if current != observed:
             raise HerdrFailure("producer process changed before admission")
@@ -2413,28 +2407,21 @@ class Herdr:
 
     def _codex_launch(self, pane: str, info: dict[str, object],
                       arguments: Sequence[str] | CodexArgumentsSource) -> pane_launch.CurrentLaunch:
-        matches: list[tuple[dict[str, object], list[str]]] = []
-        for value in json_items(info.get("foreground_processes"), "Codex launch processes"):
-            process = json_object(value, "Codex launch process")
-            argv = _foreground_arguments(process)
-            if is_codex_process(argv):
-                matches.append((process, argv))
-        if len(matches) != 1:
-            raise ValueError("Codex launch has no unique foreground process")
-        process, argv = matches[0]
+        owner = foreground_pane_owner(info)
+        if not isinstance(owner, ProvedCodexForeground):
+            reason = f": {owner.reason}" if isinstance(owner, UnprovedForegroundOwner) else ""
+            raise ValueError(f"Codex launch has no unique foreground process{reason}")
+        argv = owner.arguments
         if isinstance(arguments, CodexArgumentsSource):
             arguments = argv[2:] if Path(argv[0]).name in {"node", "nodejs"} else argv[1:]
-        pid = process.get("pid")
-        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-            raise ValueError("Codex launch has no process id")
-        observed = native_process(pid, "codex")
+        observed = native_process(owner.pid, "codex")
         session_id, started, environment = observed.identity.id, observed.started, observed.environment
-        cwd = json_text(process.get("cwd"), "Codex launch cwd")
+        cwd = json_text(owner.cwd, "Codex launch cwd")
         if not Path(cwd).is_absolute():
             raise ValueError("Codex launch working folder is unavailable")
         entry = pane_launch.launch(pane, session_id, cwd, legacy_identity.without_legacy_identity(environment),
                                    ["codex", *arguments], kind="codex")
-        entry["pid"], entry["proc_start"] = pid, started
+        entry["pid"], entry["proc_start"] = owner.pid, started
         return entry
 
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
@@ -2611,34 +2598,23 @@ class Herdr:
         payload = json_object(decode_object(result.stdout, "startup pane processes").get("result"), "startup pane result")
         info = json_object(payload.get("process_info"), "startup pane process info")
         shell, foreground = _pane_process_ids(info, "startup pane process info")
-        commands: list[str] = []
-        agent_present = False
-        identities: list[AgentProcessIdentity] = []
-        agent_pids: list[int] = []
-        for value in json_items(info.get("foreground_processes"), "startup foreground processes"):
-            process = json_object(value, "startup foreground process")
-            arguments = _foreground_arguments(process)
-            if not arguments:
-                continue
-            commands.append(json_text(process.get("name"), "startup process name"))
-            if _is_agent_process(arguments, kind):
-                agent_present = True
-                pid = process.get("pid")
-                if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
-                    agent_pids.append(pid)
-        if agent_pids:
+        owner = foreground_pane_owner(info)
+        if isinstance(owner, (ProvedCodexForeground, ProvedClaudeForeground)) and owner.kind == kind:
+            identities: tuple[AgentProcessIdentity, ...] = ()
             try:
-                reader = _startup_process_reader(deadline)
-                for pid in agent_pids:
-                    try:
-                        identities.append(reader.identity(pid))
-                    except (_StartupProcessGone, HerdrFailure, OSError, ValueError, IndexError):
-                        pass
+                identities = (_startup_process_reader(deadline).identity(owner.pid),)
             except subprocess.TimeoutExpired:
                 raise
-            except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+            except (_StartupProcessGone, HerdrFailure, OSError, ValueError, IndexError, subprocess.SubprocessError):
                 pass
-        activity = AgentProcessPresent(tuple(identities)) if agent_present else PaneAtShell() if foreground == shell else PaneRunning(tuple(commands))
+            activity = AgentProcessPresent(identities)
+        elif isinstance(owner, UnprovedForegroundOwner) and owner.kind == kind:
+            activity = AgentProcessPresent(())
+        elif foreground == shell:
+            activity = PaneAtShell()
+        else:
+            activity = PaneRunning(tuple(json_text(process.get("name"), "startup process name")
+                                         for process in _foreground_processes(info) if _foreground_arguments(process)))
         return PaneStartupObservation(PaneShell(shell), activity)
 
     def native_session(self, pane: str, kind: str, timeout: float, *,
@@ -2650,16 +2626,11 @@ class Herdr:
             raise HerdrFailure(str(error)) from error
 
     def pane_codex_pid(self, pane: str) -> int:
-        """Return the sole foreground Codex PID, or zero for other foreground work."""
+        """Return the proved foreground Codex PID, or zero when proof is unavailable."""
         info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
                            "pane process info")
-        foreground = _codex_foreground(info)
-        if len(foreground) != 1:
-            return 0
-        pid = foreground[0].get("pid")
-        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-            raise HerdrFailure("native process pid is unavailable")
-        return pid
+        owner = foreground_pane_owner(info)
+        return owner.pid if isinstance(owner, ProvedCodexForeground) else 0
 
     def native_pane_process(self, pane: str, kind: str, timeout: float, *,
                             pane_row: Mapping[str, object] | PaneNotRead = PANE_NOT_READ) -> NativeAgentProcess:
@@ -2669,37 +2640,35 @@ class Herdr:
         require_success(result, "native pane processes")
         payload = json_object(decode_object(result.stdout, "native pane processes").get("result"), "native pane result")
         info = json_object(payload.get("process_info"), "native pane process info")
-        if isinstance(pane_row, PaneNotRead) and kind == "codex" and codex_without_session(info):
+        owner = _require_foreground_kind(foreground_pane_owner(info), kind)
+        if isinstance(owner, ProvedCodexForeground) and isinstance(pane_row, PaneNotRead):
             try:
                 row = self.pane_row(pane)
                 if not isinstance(row, NoPane):
                     pane_row = row
             except HerdrFailure:
                 pass
-        return pane_native_process(info, kind, {} if isinstance(pane_row, PaneNotRead) else pane_row)
+        return read_foreground_pane_owner(owner, {} if isinstance(pane_row, PaneNotRead) else pane_row)
 
     def pane_agent_process(self, pane: str, terminal: str) -> AgentProcessIdentity:
         """Read the foreground agent identity, then confirm its terminal."""
         forget_pane_evidence(self.session, pane)
         info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
                            "pane process info")
-        processes: list[AgentProcessIdentity] = []
-        reader = _startup_process_reader(PROGRAM_TIMEOUT_SECONDS)
-        for value in json_items(info.get("foreground_processes"), "foreground processes"):
-            process = json_object(value, "foreground process")
-            arguments = _foreground_arguments(process)
-            if any(_is_agent_process(arguments, kind) for kind in ("claude", "codex")):
-                pid = cast(int, process["pid"])
-                try:
-                    processes.append(reader.identity(pid))
-                except _StartupProcessGone as error:
-                    raise HerdrFailure(f"{pane}: {error}") from error
-        if len(processes) != 1:
+        owner = foreground_pane_owner(info)
+        if isinstance(owner, UnprovedForegroundOwner):
+            raise HerdrFailure(f"{pane}: {owner.reason}")
+        if isinstance(owner, NoForegroundAgent):
             raise HerdrFailure(f"{pane}: expected one foreground agent process")
+        reader = _startup_process_reader(PROGRAM_TIMEOUT_SECONDS)
+        try:
+            process = reader.identity(owner.pid)
+        except _StartupProcessGone as error:
+            raise HerdrFailure(f"{pane}: {error}") from error
         row = self.pane_row(pane)
         if isinstance(row, NoPane) or row.get("terminal_id") != terminal:
             raise HerdrFailure(f"{pane}: terminal changed before process selection", "wrong_target")
-        return processes[0]
+        return process
 
     def readiness(self, pane: str) -> WorkerReadiness:
         agent = json_object(self.result("agent", "get", pane).get("agent"), "herdr agent get")
@@ -3099,69 +3068,307 @@ def pane_session(row: Mapping[str, object]) -> str:
     return session if isinstance(session, str) else ""
 
 
-def _codex_foreground(info: dict[str, object]) -> list[dict[str, object]]:
-    """Select a sole Codex process after excluding the turn-end hook."""
-    foreground: list[dict[str, object]] = []
-    for value in json_items(info.get("foreground_processes"), "native foreground processes"):
-        process = json_object(value, "native foreground process")
+class CodexTerminalInputUnavailable(HerdrFailure):
+    """A foreground child can hold the pane terminal."""
+
+
+class CodexTerminalInput(Enum):
+    UNCHECKED = "unchecked"
+    AVAILABLE = "available"
+
+
+@dataclass(frozen=True)
+class ForegroundProcessState:
+    parent: int
+    exited: bool
+
+
+@dataclass(frozen=True)
+class CodexForegroundDescendant:
+    pid: int
+    program: str
+    exited: bool
+
+
+@dataclass(frozen=True)
+class ProvedCodexForeground:
+    kind: ClassVar[Literal["codex"]] = "codex"
+    pid: int
+    arguments: list[str]
+    cwd: object
+    descendants: tuple[CodexForegroundDescendant, ...]
+    terminal_input: CodexTerminalInput | CodexTerminalInputUnavailable = CodexTerminalInput.UNCHECKED
+
+
+@dataclass(frozen=True)
+class ProvedClaudeForeground:
+    kind: ClassVar[Literal["claude"]] = "claude"
+    pid: int
+    arguments: list[str]
+    cwd: object
+
+
+type ForegroundPaneAgent = ProvedCodexForeground | ProvedClaudeForeground
+
+
+@dataclass(frozen=True)
+class UnprovedForegroundOwner:
+    kind: Literal["codex", "claude"]
+    reason: str
+
+
+@dataclass(frozen=True)
+class NoForegroundAgent:
+    pass
+
+
+def _foreground_processes(info: dict[str, object]) -> list[dict[str, object]]:
+    return [json_object(value, "native foreground process")
+            for value in json_items(info.get("foreground_processes"), "native foreground processes")]
+
+
+def _foreground_pid(process: dict[str, object]) -> int:
+    pid = process.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise HerdrFailure("native process pid is unavailable")
+    return pid
+
+
+def _codex_foreground(foreground: list[dict[str, object]], process: dict[str, object],
+                      arguments: list[str]) -> ProvedCodexForeground:
+    pid = _foreground_pid(process)
+    darwin = _platform() == "darwin"
+    proved = {pid}
+    states: dict[int, ForegroundProcessState] = {}
+    descendants: list[CodexForegroundDescendant] = []
+    for child in foreground:
+        if child is process:
+            continue
+        program = _foreground_program(child)
+        if not _foreground_arguments(child) and program == "codex":
+            raise HerdrFailure("another foreground Codex process has no arguments")
+        try:
+            current = _foreground_pid(child)
+            child_pid = current
+            path: set[int] = set()
+            while current > 1 and current not in proved and current not in path:
+                path.add(current)
+                if darwin:
+                    info = _darwin_process_bsd_info(current, include_zombies=True)
+                    state = ForegroundProcessState(info.pbi_ppid, info.pbi_status == _DARWIN_SZOMB)
+                else:
+                    fields = _linux_process_stat(current)
+                    state = ForegroundProcessState(int(fields[1]), fields[0] == "Z")
+                states[current] = state
+                current = state.parent
+        except (HerdrFailure, OSError, ValueError, IndexError, AttributeError) as error:
+            raise HerdrFailure("foreground process ancestry is unavailable") from error
+        if child_pid == pid:
+            raise HerdrFailure("foreground Codex PID appears twice")
+        if current not in proved:
+            raise HerdrFailure("foreground process is outside the Codex process tree")
+        proved.update(path)
+        descendants.append(CodexForegroundDescendant(child_pid, program, states[child_pid].exited))
+    return ProvedCodexForeground(pid, arguments, process.get("cwd"), tuple(descendants))
+
+
+def foreground_pane_owner(info: dict[str, object], *, for_input: bool = False
+                          ) -> ForegroundPaneAgent | NoForegroundAgent | UnprovedForegroundOwner:
+    """Prove the pane owner. Check for Codex terminal holders when input is pending."""
+    foreground = _foreground_processes(info)
+    claude: list[tuple[dict[str, object], list[str]]] = []
+    codex: list[tuple[dict[str, object], list[str]]] = []
+    missing_argv: set[str] = set()
+    for process in foreground:
         arguments = _foreground_arguments(process)
-        program = (arguments[1] if len(arguments) > 1 and Path(arguments[0]).name.startswith("python")
-                   else arguments[0] if arguments else "")
-        if Path(program).parts[-3:] != ("scripts", "herdr", "turn_end.py"):
-            foreground.append(process)
-    return foreground if len(foreground) == 1 and is_codex_process(_foreground_arguments(foreground[0])) else []
+        if is_codex_process(arguments):
+            codex.append((process, arguments))
+        elif is_claude_process(arguments):
+            claude.append((process, arguments))
+        elif not arguments:
+            missing_argv.add(_foreground_program(process))
+    if codex or "codex" in missing_argv:
+        try:
+            if not codex:
+                raise HerdrFailure("agent argv is unavailable")
+            if len(codex) != 1:
+                raise HerdrFailure(f"expected one foreground codex process, found {len(codex)}")
+            process, arguments = codex[0]
+            owner = _codex_foreground(foreground, process, arguments)
+        except HerdrFailure as error:
+            programs = ", ".join(_foreground_program(process) for process in foreground)
+            return UnprovedForegroundOwner("codex", f"{error}. Foreground programs are {programs}")
+        if not for_input:
+            return owner
+        if owner.descendants:
+            shell_pid, _ = _pane_process_ids(info, "target process info")
+            try:
+                _require_codex_terminal_input(shell_pid, owner)
+            except CodexTerminalInputUnavailable as error:
+                return replace(owner, terminal_input=error)
+        return replace(owner, terminal_input=CodexTerminalInput.AVAILABLE)
+    if len(claude) == 1:
+        process, arguments = claude[0]
+        try:
+            return ProvedClaudeForeground(_foreground_pid(process), arguments, process.get("cwd"))
+        except HerdrFailure as error:
+            return UnprovedForegroundOwner("claude", str(error))
+    if claude:
+        return UnprovedForegroundOwner("claude", f"expected one foreground claude process, found {len(claude)}")
+    if "claude" in missing_argv:
+        return UnprovedForegroundOwner("claude", "agent argv is unavailable")
+    return NoForegroundAgent()
+
+
+def _require_foreground_kind(owner: ForegroundPaneAgent | NoForegroundAgent | UnprovedForegroundOwner,
+                             kind: str) -> ForegroundPaneAgent:
+    if isinstance(owner, UnprovedForegroundOwner):
+        raise HerdrFailure(owner.reason)
+    if isinstance(owner, NoForegroundAgent) or owner.kind != kind:
+        raise HerdrFailure(f"expected one foreground {kind} process, found 0")
+    return owner
 
 
 def codex_without_session(info: dict[str, object]) -> bool:
-    """Identify one foreground Codex that can supply a session report."""
-    return len(_codex_foreground(info)) == 1
+    """Check foreground ownership before recovering a Codex session."""
+    return isinstance(foreground_pane_owner(info), ProvedCodexForeground)
+
+
+def _read_codex_pane_process(pid: int, pane: Mapping[str, object]) -> NativeAgentProcess:
+    reported = pane_session(pane)
+    try:
+        observed = native_process(pid, "codex", reported)
+    except CodexPaneStarting as error:
+        report = pane.get("agent_session")
+        value = cast(dict[str, object], report).get("value") if isinstance(report, dict) else pane.get("session_id")
+        if (report is not None and not isinstance(report, dict)) or (value is not None and value != ""):
+            raise HerdrFailure("Codex launch identity is unavailable") from error
+        raise
+    except (OSError, ValueError) as error:
+        raise HerdrFailure(str(error)) from error
+    if "pane_id" in pane and not reported and isinstance(observed.identity, LaunchArgument):
+        return replace(observed, identity=UnreportedResume(observed.identity.id))
+    return observed
+
+
+def read_foreground_pane_owner(owner: ForegroundPaneAgent, pane: Mapping[str, object]) -> NativeAgentProcess:
+    """Read the native identity of the proved pane owner."""
+    if isinstance(owner, ProvedCodexForeground):
+        return _read_codex_pane_process(owner.pid, pane)
+    try:
+        return native_process(owner.pid, owner.kind)
+    except (OSError, ValueError) as error:
+        raise HerdrFailure(str(error)) from error
 
 
 def pane_native_process(info: dict[str, object], kind: str,
                          pane: Mapping[str, object]) -> NativeAgentProcess:
-    foreground = json_items(info.get("foreground_processes"), "native foreground processes")
-    reported = pane_session(pane) if kind == "codex" and codex_without_session(info) else ""
-    processes: list[NativeAgentProcess] = []
-    for value in foreground:
-        process = json_object(value, "native foreground process")
-        arguments = _foreground_arguments(process)
-        if not _is_agent_process(arguments, kind):
-            continue
-        pid = process.get("pid")
-        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-            raise HerdrFailure("native process pid is unavailable")
+    owner = _require_foreground_kind(foreground_pane_owner(info), kind)
+    return read_foreground_pane_owner(owner, pane)
+
+
+def foreground_pane_conversation(
+    info: object, pane: Mapping[str, object],
+) -> pane_launch.ProvedPaneConversation | pane_launch.NoForegroundConversation:
+    """Read the native conversation of the proved foreground owner."""
+    owner = foreground_pane_owner(json_object(info, "foreground conversation process info"))
+    if isinstance(owner, UnprovedForegroundOwner):
+        raise HerdrFailure(owner.reason)
+    if isinstance(owner, NoForegroundAgent):
+        return pane_launch.NoForegroundConversation.FOUND
+    native = read_foreground_pane_owner(owner, pane)
+    return pane_launch.ProvedPaneConversation(native.current_identity, owner.kind, owner.pid)
+
+
+def _foreground_program(process: dict[str, object]) -> str:
+    name = process.get("name")
+    if isinstance(name, str) and name:
+        return Path(name).name or "unknown"
+    arguments = _foreground_arguments(process)
+    return Path(arguments[0]).name if arguments else "unknown"
+
+
+@dataclass(frozen=True)
+class CodexPaneSession:
+    session_id: str
+    terminal_input: CodexTerminalInput | CodexTerminalInputUnavailable
+
+
+def _pane_sessions(info: dict[str, object], pane: Mapping[str, object], *,
+                   for_input: bool = False) -> CodexPaneSession | frozenset[str]:
+    owner = foreground_pane_owner(info, for_input=for_input)
+    if isinstance(owner, UnprovedForegroundOwner):
+        raise HerdrFailure(owner.reason)
+    if isinstance(owner, NoForegroundAgent):
+        return frozenset()
+    if isinstance(owner, ProvedCodexForeground):
         try:
-            observed = native_process(pid, kind, reported) if kind == "codex" else native_process(pid, kind)
-        except CodexPaneStarting as error:
-            report = pane.get("agent_session")
-            value = cast(dict[str, object], report).get("value") if isinstance(report, dict) else pane.get("session_id")
-            if (not codex_without_session(info) or report is not None and not isinstance(report, dict)
-                    or value is not None and value != ""):
-                raise HerdrFailure("Codex launch identity is unavailable") from error
-            raise
-        except (OSError, ValueError) as error:
-            raise HerdrFailure(str(error)) from error
-        if (kind == "codex" and codex_without_session(info) and "pane_id" in pane
-                and not reported and isinstance(observed.identity, LaunchArgument)):
-            observed = NativeAgentProcess(UnreportedResume(observed.identity.id), observed.started, observed.environment)
-        processes.append(observed)
-    if len(processes) != 1:
-        raise HerdrFailure(f"expected one foreground {kind} process, found {len(processes)}")
-    return processes[0]
+            session = read_foreground_pane_owner(owner, pane)
+            return CodexPaneSession(session.current_identity, owner.terminal_input)
+        except (HerdrFailure, ValueError) as error:
+            programs = ", ".join(_foreground_program(process) for process in _foreground_processes(info))
+            raise HerdrFailure(f"{error}. Foreground programs are {programs}") from error
+    return frozenset({read_foreground_pane_owner(owner, pane).current_identity})
 
 
-def _pane_sessions(info: dict[str, object], pane: Mapping[str, object]) -> set[str]:
-    kinds: set[str] = set()
-    exited = False
-    for value in json_items(info.get("foreground_processes"), "foreground processes"):
-        process = json_object(value, "foreground process")
-        arguments = _foreground_arguments(process)
-        exited = exited or not arguments and Path(str(process.get("name", ""))).name in ("claude", "codex")
-        kinds.update(kind for kind in ("claude", "codex") if _is_agent_process(arguments, kind))
-    # An agent child that exits leaves its name without an argv; the live agent beside it still names the pane.
-    if exited and not kinds:
-        raise HerdrFailure("agent argv is unavailable")
-    return {pane_native_process(info, kind, pane).current_identity for kind in kinds}
+@dataclass(frozen=True)
+class StdinCharacterDevice:
+    number: int
+
+
+class NonTerminalStdin(Enum):
+    PROVED = "proved"
+
+
+def _stdin_device(pid: int, *, darwin: bool) -> StdinCharacterDevice | NonTerminalStdin:
+    if not darwin:
+        stdin = (proc_root() / str(pid) / "fd" / "0").stat()
+        return (StdinCharacterDevice(stdin.st_rdev) if stat.S_ISCHR(stdin.st_mode)
+                else NonTerminalStdin.PROVED)
+    result = run_program([os.environ.get("HERDR_LSOF", "lsof"), "-nP", "-a",
+                          "-p", str(pid), "-d", "0", "-Fftr"])
+    require_success(result, "foreground stdin")
+    fields = result.stdout.splitlines()
+    if fields[:2] == [f"p{pid}", "f0"]:
+        if len(fields) == 4:
+            raw_device, file_type = sorted(fields[2:])
+            if file_type == "tCHR" and raw_device.startswith("r0x"):
+                return StdinCharacterDevice(int(raw_device[1:], 16))
+        if len(fields) == 3 and fields[2] in {"tPIPE", "tFIFO", "tREG", "tDIR", "tunix", "tIPv4", "tIPv6"}:
+            return NonTerminalStdin.PROVED
+    raise HerdrFailure("foreground stdin is unavailable")
+
+
+def _require_codex_terminal_input(shell_pid: int, foreground: ProvedCodexForeground) -> None:
+    """Prove that no foreground descendant uses the pane terminal for stdin."""
+    darwin = _platform() == "darwin"
+
+    @cache
+    def pane_terminal() -> int:
+        if darwin:
+            terminal = _darwin_process_bsd_info(shell_pid).e_tdev
+            if terminal == 0xFFFFFFFF:
+                raise HerdrFailure("pane terminal is unavailable")
+            return terminal
+        terminal = int(_linux_process_stat(shell_pid)[4]) & 0xFFFFFFFF
+        if not terminal:
+            raise HerdrFailure("pane terminal is unavailable")
+        return terminal
+
+    for descendant in foreground.descendants:
+        if descendant.exited:
+            continue
+        try:
+            stdin = _stdin_device(descendant.pid, darwin=darwin)
+            if isinstance(stdin, NonTerminalStdin):
+                continue
+            # /dev/tty refers to the process's controlling terminal.
+            held = stdin.number == pane_terminal() or stdin.number == Path("/dev/tty").stat().st_rdev
+        except (HerdrFailure, OSError, ValueError, IndexError, AttributeError, subprocess.SubprocessError) as error:
+            raise CodexTerminalInputUnavailable(
+                f"anomaly: terminal may be held by {descendant.program} because its stdin is unavailable") from error
+        if held:
+            raise CodexTerminalInputUnavailable(f"anomaly: terminal held by {descendant.program}")
 
 
 _TARGET_PLACE_UNKNOWN = NotInHerdr()
@@ -3235,11 +3442,12 @@ def check_target(target: str | AgentProcessIdentity, *, action: Literal["signal"
             return action != "keys" or not target
         if not target:
             raise HerdrFailure(f"would {verb} a pane with other live work instead of the selected shell", "wrong_target")
-        observed = _pane_sessions(info, row)
-        if not observed:
+        observed = _pane_sessions(info, row, for_input=action == "keys")
+        sessions = {observed.session_id} if isinstance(observed, CodexPaneSession) else observed
+        if not sessions:
             print(f"herdr {name}: native session is unknown; target retained", file=sys.stderr)
             return False
-        if observed != {target}:
+        if sessions != {target}:
             raise HerdrFailure(f"would {verb} a process that does not run session {target}", "wrong_target")
         if action == "keys":
             if isinstance(recipient, PromptRecipientProcess):
@@ -3249,6 +3457,8 @@ def check_target(target: str | AgentProcessIdentity, *, action: Literal["signal"
                     return False
                 if current_recipient != recipient:
                     raise HerdrFailure(f"recipient changed; would {verb} another process in session {target}", "wrong_target")
+            if isinstance(observed, CodexPaneSession) and isinstance(observed.terminal_input, CodexTerminalInputUnavailable):
+                raise observed.terminal_input
             composer = client.composer(place.pane)
             if isinstance(composer, ComposerInput) and composer.text.strip() and not composer.contains(text):
                 raise HerdrFailure(f"would overwrite unsaved input in session {target}", "wrong_target")
@@ -3256,6 +3466,8 @@ def check_target(target: str | AgentProcessIdentity, *, action: Literal["signal"
     except CodexPaneStarting:
         print(f"herdr {name}: pane is starting; target retained", file=sys.stderr)
         return False
+    except CodexTerminalInputUnavailable:
+        raise
     except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         if isinstance(error, HerdrFailure) and error.code == "wrong_target":
             raise
@@ -4005,8 +4217,7 @@ def _codex_launch_argument(pid: int) -> LaunchArgument | StartingCodexPane | Cod
                 continue
             else:
                 fresh = False
-                name = option_name if option_name.startswith("--") else option_name[:2]
-                unknown = CodexLaunchIdentityUnknown(f"{unavailable}: unknown option {name}")
+                unknown = CodexLaunchIdentityUnknown(f"{unavailable}: unknown option")
         else:
             if fresh:
                 return StartingCodexPane(pid)
@@ -4024,16 +4235,16 @@ def codex_launch_identity(pid: int, reported: str) -> LaunchArgument | PaneSessi
 
 
 def codex_pane_process(pid: int, place: HerdrPlace) -> NativeAgentProcess:
-    """Read the report owned by this pane's sole foreground Codex process."""
+    """Read the report owned by this pane's proved foreground Codex process."""
     client = Herdr(place.session)
     info = json_object(client.result("pane", "process-info", "--pane", place.pane).get("process_info"),
                        "Codex pane process info")
-    foreground = _codex_foreground(info)
-    if len(foreground) == 1 and foreground[0].get("pid") == pid:
+    owner = foreground_pane_owner(info)
+    if isinstance(owner, ProvedCodexForeground) and owner.pid == pid:
         pane = client.pane_row(place.pane)
         if not isinstance(pane, NoPane):
             try:
-                return pane_native_process(info, "codex", pane)
+                return read_foreground_pane_owner(owner, pane)
             except CodexPaneStarting:
                 raise
             except HerdrFailure as error:
@@ -4446,7 +4657,7 @@ def _process_arguments(process: Path) -> list[str]:
 
 
 def _foreground_arguments(process: dict[str, object]) -> list[str]:
-    """Treat a process without an argv list as an exited process."""
+    """Read the supplied arguments. An empty list leaves the arguments unknown."""
     arguments = process.get("argv")
     if not isinstance(arguments, list):
         return []
@@ -4499,25 +4710,40 @@ class _DarwinProcessBSDInfo(ctypes.Structure):
         ("e_tpgid", ctypes.c_uint32), ("pbi_nice", ctypes.c_int32),
         ("pbi_start_tvsec", ctypes.c_uint64), ("pbi_start_tvusec", ctypes.c_uint64),
     ]
+    pbi_status: int = 0
     pbi_pid: int = 0
+    pbi_ppid: int = 0
+    e_tdev: int = 0
     pbi_start_tvsec: int = 0
     pbi_start_tvusec: int = 0
+
+
+_DARWIN_SZOMB = 5
+
+
+def _darwin_process_bsd_info(pid: int, *, include_zombies: bool = False) -> _DarwinProcessBSDInfo:
+    library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    read = cast(Callable[[int, int, int, object, int], int], ctypes.CFUNCTYPE(
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+        ctypes.c_void_p, ctypes.c_int)(("proc_pidinfo", library)))
+    info = _DarwinProcessBSDInfo()
+    size = ctypes.sizeof(info)
+    # A nonzero PROC_PIDTBSDINFO argument includes zombies.
+    count = read(pid, 3, int(include_zombies), ctypes.byref(info), size)
+    if count != size or info.pbi_pid != pid:
+        raise HerdrFailure(f"process {pid}: libproc returned no process information")
+    return info
 
 
 def _darwin_process_generation(pid: int) -> int | ProcessGenerationUnavailable:
     """Read the kernel start time without reading process environment values."""
     try:
-        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-        read = cast(Callable[[int, int, int, object, int], int], ctypes.CFUNCTYPE(
-            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
-            ctypes.c_void_p, ctypes.c_int)(("proc_pidinfo", library)))
-        info = _DarwinProcessBSDInfo()
-        size = ctypes.sizeof(info)
-        # PROC_PIDTBSDINFO is flavor 3 in libproc's public API.
-        count = read(pid, 3, 0, ctypes.byref(info), size)
+        info = _darwin_process_bsd_info(pid)
     except (OSError, AttributeError) as error:
         return ProcessGenerationUnavailable(f"process {pid}: libproc start time: {error}")
-    if count != size or info.pbi_pid != pid or not 0 <= info.pbi_start_tvusec < 1_000_000:
+    except HerdrFailure:
+        return ProcessGenerationUnavailable(f"process {pid}: libproc start time is unavailable")
+    if not 0 <= info.pbi_start_tvusec < 1_000_000:
         return ProcessGenerationUnavailable(f"process {pid}: libproc start time is unavailable")
     return info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
 
@@ -4987,8 +5213,12 @@ def pane_snapshot() -> Generator[Callable[[str], list[PaneIdentity]]]:
 
 def linux_process_parent(pid: int) -> int:
     """Read the parent pid from the Linux process root."""
-    stat = (proc_root() / str(pid) / "stat").read_text()
-    return int(stat[stat.rindex(")") + 1:].split()[1])
+    return int(_linux_process_stat(pid)[1])
+
+
+def _linux_process_stat(pid: int) -> list[str]:
+    fields = (proc_root() / str(pid) / "stat").read_text()
+    return fields[fields.rindex(")") + 1:].split()
 
 
 @pane_snapshot()
@@ -5431,24 +5661,18 @@ class OtherTab:
 class UnitTabClassifier:
     """Classify units through their current native sessions and staff parents."""
 
-    by_pane: dict[str, UnitTab]
-
-    def __init__(self, session: str, processes: Sequence[HerdrProcess], record: staff.StaffSnapshot) -> None:
+    def __init__(self, record: staff.StaffSnapshot) -> None:
         from scripts.production import staff
 
         parents = {row.id: row for row in staff.active(record, "showrunner")}
-        units: dict[str, UnitTab] = {row.current_session: UnitTab(row, parents[row.parent.id]) for row in staff.active(record, "unit")
-                                     if isinstance(row.parent, staff.ReportsTo) and row.parent.id in parents}
-        self.by_pane = {process.place.pane: units[ident] for process in processes
-                        if process.place.session == session
-                        and (ident := process.marks.get("CODEX_THREAD_ID")
-                             or process.marks.get("CLAUDE_CODE_SESSION_ID")) in units}
+        self.units: dict[str, UnitTab] = {
+            row.current_session: UnitTab(row, parents[row.parent.id])
+            for row in staff.active(record, "unit")
+            if isinstance(row.parent, staff.ReportsTo) and row.parent.id in parents
+        }
 
-    def classify(self, panes: Sequence[str]) -> UnitTab | OtherTab:
-        for pane in panes:
-            if pane in self.by_pane:
-                return self.by_pane[pane]
-        return OtherTab()
+    def classify(self, owner: pane_launch.ProvedPaneConversation) -> UnitTab | OtherTab:
+        return self.units.get(owner.identity, OtherTab())
 
 
 @observation_snapshot()

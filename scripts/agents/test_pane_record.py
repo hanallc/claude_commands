@@ -23,7 +23,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file
 from scripts.herdr import herdr, pane_launch
-from scripts.herdr.test_herdr import native_process_commands
+from scripts.herdr.test_herdr import codex_foreground_cases, native_process_commands
 from scripts.message import sessions
 from scripts.message import sessions as runtime_sessions
 from scripts.agents.test_pane_restore import FakeClient
@@ -248,11 +248,14 @@ class PaneRecordTests(unittest.TestCase):
                              [mock.call("pane", "process-info", "--pane", pane) for pane in ("w1:p1", "w1:p2", "w2:p1")])
 
     def seed_foreground(self, kind: Literal["claude", "codex"], reference: str,
-                        rows: tuple[staff.StaffRow, ...] = ()) -> str:
+                        rows: tuple[staff.StaffRow, ...] = (), *,
+                        generations: tuple[str, ...] = ("fixture-start",) * 2) -> str:
         process = self.root / "proc/4242"
         process.mkdir(parents=True, exist_ok=True)
         config = self.root / ".claude3"
         (config / "sessions").mkdir(parents=True, exist_ok=True)
+        registry = self.root / "sessions"
+        registry.mkdir(exist_ok=True)
         _ = (config / "sessions/4242.json").write_text(json.dumps({"sessionId": "claude-thread"}))
         _ = (process / "environ").write_bytes(
             f"CODEX_HOME={self.root / '.codex2'}\0CLAUDE_CONFIG_DIR={config}\0UNRELATED=secret\0".encode())
@@ -263,12 +266,12 @@ class PaneRecordTests(unittest.TestCase):
         write_text_atomic(process / "cmdline", "\0".join(arguments))
         output = io.StringIO()
         with (mock.patch.dict(os.environ, {"HOME": str(self.root), "HERDR_PROC": str(process.parent),
-                                          "HERDR_PLATFORM": "linux"}),
+                                          "HERDR_PLATFORM": "linux", "NOTIFIER_SESSIONS_DIR": str(registry)}),
               mock.patch.object(pane_record, "PROC", process.parent),
               mock.patch.object(pane_record, "RECORD_DIR", self.records),
               native_process_commands(4242),
-              mock.patch.object(sessions, "process_start", return_value="fixture-start"),
-              mock.patch.object(runtime_sessions, "process_start", return_value="fixture-start"),
+              mock.patch.object(runtime_sessions, "process_start", side_effect=generations if kind == "claude" else None,
+                                return_value="fixture-start"),
               mock.patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)),
               mock.patch.object(herdr, "Herdr", return_value=client),
               mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w2C:p1")),
@@ -300,6 +303,25 @@ class PaneRecordTests(unittest.TestCase):
                 self.assertEqual(entry["environment"], {})
                 self.assertIn(identity, output)
 
+    def test_seed_records_only_the_proved_pane_owner(self) -> None:
+        codex = fixture_runtime_id("seed-codex")
+        client = FakeClient([{"pane_id": "w1:p1", "workspace_id": "w1", "label": None, "session_id": codex}])
+        native = herdr.NativeAgentProcess(herdr.PaneSessionReport(codex), "fixture-start", {})
+        with (codex_foreground_cases(self.root) as cases,
+              mock.patch.object(herdr, "Herdr", return_value=client),
+              mock.patch.object(herdr, "native_process", return_value=native),
+              redirect_stdout(io.StringIO())):
+            for case in cases:
+                client.process_info = case.info
+                with self.subTest(case=case.name), mock.patch.object(pane_record, "write") as write:
+                    self.assertEqual(pane_record.seed("agents"), 0)
+                    if case.owner_proved:
+                        write.assert_called_once()
+                        entry = cast(pane_launch.CurrentLaunch, write.call_args.args[1])
+                        self.assertEqual((entry.get("kind"), entry["session_id"], entry.get("pid")), ("codex", codex, 456))
+                    else:
+                        write.assert_not_called()
+
     def test_seed_keeps_the_claude_registry_and_launch_flags(self) -> None:
         output = self.seed_foreground("claude", "unrelated-tab")
         entry = self.entries()["w2C:p1"]
@@ -307,6 +329,11 @@ class PaneRecordTests(unittest.TestCase):
                          ("claude", "claude-thread", str(self.root / ".claude3"), "claude-name", "opus"))
         self.assertEqual(entry["environment"], {})
         self.assertIn("claude-thread", output)
+
+    def test_seed_refuses_a_claude_process_when_its_generation_changes(self) -> None:
+        output = self.seed_foreground("claude", "unrelated-tab", generations=("original-start", "new-start"))
+        self.assertEqual(output, "w2C:p1: process start changed for 4242\n")
+        self.assertFalse((self.records / "agents.json").exists())
 
     def test_seed_skips_a_codex_client_without_process_identity_with_one_line(self) -> None:
         self.assertEqual(self.seed_foreground("codex", "unknown"), "w2C:p1: no conversation id for 4242\n")

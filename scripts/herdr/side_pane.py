@@ -95,29 +95,25 @@ def _helper_process(client: herdr.Herdr, pane: herdr.PaneIdentity) -> bool:
     entry = entries.get(identity)
     info = herdr.json_object(client.result("pane", "process-info", "--pane", identity).get("process_info"),
                              "consultation process info")
-    for value in herdr.json_items(info.get("foreground_processes"), "consultation processes"):
-        process = herdr.json_object(value, "consultation process")
-        arguments = [str(argument) for argument in herdr.json_items(process.get("argv"), "consultation arguments")]
-        kind = "codex" if herdr.is_codex_process(arguments) else "claude" if herdr.is_claude_process(arguments) else ""
-        if not kind:
-            continue
-        try:
-            native = herdr.pane_native_process(info, kind, pane)
-        except (herdr.CodexPaneStarting, herdr.CodexSessionPending):
-            # A pending consultation restart can replace its previous native launch.
-            return entry is None or "staff_id" not in entry and bool(entry.get("name"))
-        if entry is not None and "staff_id" not in entry and (
-                entry.get("session_id") == native.current_identity
-                or entry.get("pid") == process.get("pid") and entry.get("proc_start") == native.started):
-            return True
-        record = staff.initial_snapshot()
-        if record.by_member_reference(native.current_identity) is not None:
-            return False
-        if entry is None:
-            return False
-        return pane_launch.matching_launch({identity: entry}, herdr.HerdrPlace(client.session, identity),
-                                          native.current_identity) is not None
-    return entry is None
+    owner = herdr.foreground_pane_owner(info)
+    if isinstance(owner, herdr.UnprovedForegroundOwner):
+        raise herdr_types.HerdrFailure(owner.reason)
+    if isinstance(owner, herdr.NoForegroundAgent):
+        return entry is None
+    try:
+        native = herdr.read_foreground_pane_owner(owner, pane)
+    except (herdr.CodexPaneStarting, herdr.CodexSessionPending):
+        # A pending consultation restart can replace its previous native launch.
+        return entry is None or "staff_id" not in entry and bool(entry.get("name"))
+    if entry is not None and "staff_id" not in entry and (
+            entry.get("session_id") == native.current_identity
+            or entry.get("pid") == owner.pid and entry.get("proc_start") == native.started):
+        return True
+    record = staff.initial_snapshot()
+    if record.by_member_reference(native.current_identity) is not None or entry is None:
+        return False
+    return pane_launch.matching_launch({identity: entry}, herdr.HerdrPlace(client.session, identity),
+                                      native.current_identity) is not None
 
 
 def _find(client: herdr.Herdr, panes: list[herdr.PaneIdentity], caller: CallerPane, label: str) -> SidePane:

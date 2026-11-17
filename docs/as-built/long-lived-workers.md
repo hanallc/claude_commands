@@ -108,8 +108,19 @@ An empty turn reply writes no reply file and adds no `; reply <path>` text.
 
 A new Codex worker has no resume argument.
 Its pane session report supplies the first native identity.
-The identity reader excludes only `scripts/herdr/turn_end.py` from the foreground process count.
-Every other foreground process prevents the pane report from proving a sole Codex process.
+`herdr.foreground_pane_owner` proves the owner for pane actions, retained launches, and tab reports.
+Containment checks read the foreground list for a specific PID.
+Diagnostics read the foreground list to report the program names.
+`herdr_sessions.py list` uses the proved owner's native identity for unit and showrunner roles.
+The list reports `unknown` when it cannot prove the owner.
+A shell with an inherited thread id has no foreground agent.
+During an input check, the ancestry read supplies each descendant's exit state.
+The terminal check uses that state to skip zombie processes.
+The function requires one foreground Codex process with known arguments.
+All other foreground processes must descend from that Codex process.
+A Claude child cannot claim the Codex pane.
+If a foreground Codex process has no arguments, the pane owner stays unproved.
+If the identity remains unknown, the pane notice lists the foreground program names.
 After its first turn, the launcher clears the cached pane list before it checks the published worker.
 This refresh includes the pane session report and the process evidence within an observation snapshot.
 An incomplete final scan names the state, the scan reason, and membership in the parent's tabs.
@@ -611,6 +622,12 @@ The result carries `Detached run: <run_id>` as its stable marker.
 Under a per-run delivery lock, `detached_runs.deliver` checks the worker transcript for that marker.
 It skips delivery when a user entry already contains the marker.
 The sender submits to a proved worker pane or sends the result and cause to the current holder.
+Before Herdr sends keys to Codex, `foreground_pane_owner` checks which descendants can hold the terminal.
+The function reads the kernel process state and skips each confirmed exited child.
+It checks stdin for the other descendants before Herdr checks the composer for a draft.
+A pipe permits input to Codex.
+If a descendant uses the pane terminal or its stdin is unreadable, Herdr rejects the prompt.
+The holder receives the result with one anomaly line that names the program.
 `check_patch` checks patch paths against the binding generation and phase reservation.
 It rejects patches outside the bound paths or repository.
 The check does not cover arbitrary shell or Python writes.

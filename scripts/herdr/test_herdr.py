@@ -24,7 +24,7 @@ from pathlib import Path
 from scripts.lib.script_envelope import script_prompt
 from scripts.herdr import herdr_types
 from types import SimpleNamespace
-from typing import BinaryIO, Literal, cast, final, override
+from typing import BinaryIO, Literal, NamedTuple, cast, final, override
 from unittest.mock import Mock, call, patch
 
 
@@ -91,6 +91,38 @@ def native_process_commands(pid: int, *, generations: tuple[herdr.AgentProcessId
           patch.object(sessions, "process_start", side_effect=process_start),
           patch.object(session_records, "process_start", side_effect=process_start)):
         yield
+
+
+class CodexForegroundCase(NamedTuple):
+    name: str
+    info: dict[str, object]
+    owner_proved: bool
+
+
+@contextmanager
+def codex_foreground_cases(folder: Path) -> Generator[tuple[CodexForegroundCase, ...]]:
+    """Supply foreground observations and private parent reads."""
+    codex = {"pid": 456, "name": "codex", "argv": ["codex"], "cwd": str(folder)}
+    claude = {"pid": 457, "name": "claude", "argv": ["claude"], "cwd": str(folder)}
+    cases = tuple(CodexForegroundCase(name, {"shell_pid": 455, "foreground_process_group_id": 456,
+                                            "foreground_processes": processes}, proved)
+                  for name, processes, proved in (
+        ("Codex first", [codex, claude], True),
+        ("Claude first", [claude, codex], True),
+        ("missing Codex arguments", [claude, {"pid": 456, "name": "codex"}], False),
+        ("unrelated foreground process", [codex, claude, {"pid": 458, "name": "editor", "argv": ["editor"]}], False),
+        ("two Codex processes", [codex, claude, {**codex, "pid": 458}], False),
+    ))
+    read_stat = herdr._linux_process_stat  # pyright: ignore[reportPrivateUsage]
+
+    def process_stat(pid: int) -> list[str]:
+        if pid in (457, 458):
+            return ["S", "456" if pid == 457 else "1"]
+        return read_stat(pid)
+
+    with (patch.dict(os.environ, {"HERDR_PLATFORM": "linux"}),
+          patch.object(herdr, "_linux_process_stat", side_effect=process_stat)):
+        yield cases
 
 
 @contextmanager
@@ -330,7 +362,7 @@ class NativePaneSessionTests(StaffTestCase):
                         pane["tab_id"] = "w1:t1"
                         with redirect_stderr(io.StringIO()) as later_errors:
                             scan = client.scan_row_panes(staff.StaffSnapshot((owner,)), [pane])
-                        reason = "pid 998070: Codex launch identity is unavailable"
+                        reason = "pid 998070: Codex launch identity is unavailable. Foreground programs are codex"
                         self.assertEqual(scan, herdr.RowPaneScan({}, [herdr.UnknownPane("w1:p1", "w1:t1", reason)]))
                         self.assertEqual(later_errors.getvalue(),
                             f"herdr agents:w1:p1 tab w1:t1: pane evidence is unknown: {reason}; row placement retained\n")
@@ -379,6 +411,8 @@ class NativePaneSessionTests(StaffTestCase):
         completed = subprocess.CompletedProcess[str]([], 0, json.dumps({"result": {"process_info": info}}), "")
         client = herdr.Herdr("agents")
         with (patch.object(herdr, "run_program", return_value=completed),
+              patch.object(herdr, "_linux_process_stat", return_value=["S", "998075"]),
+              patch.object(herdr, "_PLATFORM", "linux"),
               patch.object(herdr, "native_process", return_value=observation) as native,
               native_process_commands(998075),
               patch.object(client, "panes", return_value=[
@@ -389,9 +423,9 @@ class NativePaneSessionTests(StaffTestCase):
             self.assertIsInstance(startup.activity, herdr.AgentProcessPresent)
             launch = client.codex_launch("w1:p1")
             self.assertEqual(launch["session_id"], identity)
-        self.assertEqual(native.call_args_list, [call(998075, "codex", ""), call(998075, "codex")])
+        self.assertEqual(native.call_args_list, [call(998075, "codex", identity), call(998075, "codex")])
 
-    def test_codex_report_ignores_the_hook_process_in_the_foreground_group(self) -> None:
+    def test_codex_report_accepts_its_hook_in_the_foreground_group(self) -> None:
         identity = fixture_runtime_id("codex-with-hook")
         row = {"pane_id": "w1:p1", "session_id": identity}
         info: dict[str, object] = {"foreground_processes": [
@@ -401,6 +435,8 @@ class NativePaneSessionTests(StaffTestCase):
         result = subprocess.CompletedProcess[str]([], 0, json.dumps({"result": {"process_info": info}}), "")
         client = herdr.Herdr("agents")
         with patch.object(herdr, "run_program", return_value=result), \
+                patch.object(herdr, "_linux_process_stat", return_value=["S", "998075"]), \
+                patch.object(herdr, "_PLATFORM", "linux"), \
                 patch.object(herdr, "native_process", return_value=observation) as native, \
                 patch.object(client, "result", return_value={"process_info": info}), \
                 patch.object(client, "pane_row", return_value=row), \
@@ -412,6 +448,85 @@ class NativePaneSessionTests(StaffTestCase):
         self.assertFalse(herdr.codex_without_session({"foreground_processes": [
             {"pid": 998075, "argv": ["codex"]}, {"pid": 998077, "argv": ["codex"]}]}))
 
+    def test_unknown_codex_option_does_not_appear_in_the_pane_anomaly(self) -> None:
+        arguments = ["codex", "--fixture-private-option=private-value"]
+        with codex_launch_evidence(self.root, arguments) as evidence:
+            pane = herdr.json_object(evidence["pane"], "fixture pane")
+            pane.update(session_id=None, tab_id="w1:t1")
+            info = herdr.json_object(evidence["process_info"], "fixture process info")
+            info.update(shell_pid=998069, foreground_process_group_id=998070)
+            with redirect_stderr(io.StringIO()) as errors:
+                scan = herdr.Herdr("agents").scan_row_panes(staff.initial_snapshot(), [pane])
+        reason = "pid 998070: Codex launch identity is unavailable: unknown option. Foreground programs are codex"
+        self.assertEqual(scan.unknown, [herdr.UnknownPane("w1:p1", "w1:t1", reason)])
+        self.assertEqual(errors.getvalue(),
+            f"herdr agents:w1:p1 tab w1:t1: pane evidence is unknown: {reason}; row placement retained\n")
+
+    def test_darwin_codex_prompt_uses_the_device_of_stdin(self) -> None:
+        identity = fixture_runtime_id("darwin-foreground-child")
+        client = herdr.Herdr("agents")
+        pane = "w1:p1"
+        row = {"pane_id": pane, "terminal_id": "fixture-terminal", "session_id": identity}
+        shell, codex, child = 998069, 998070, 998071
+        info = {"process_info": {"shell_pid": shell, "foreground_process_group_id": codex,
+            "foreground_processes": [{"pid": codex, "argv": ["codex"]},
+                                     {"pid": child, "name": "editor", "argv": ["editor", "private-argument"]}]}}
+        parent = DARWIN_BSD_INFO()
+        parent.pbi_ppid = codex
+        terminal = DARWIN_BSD_INFO()
+        terminal.e_tdev = 0x1000001
+        observed = herdr.NativeAgentProcess(herdr.PaneSessionReport(identity), "fixture-start", {})
+        def bsd_info(pid: int, *, include_zombies: bool = False) -> herdr._DarwinProcessBSDInfo:  # pyright: ignore[reportPrivateUsage]
+            if pid == child:
+                self.assertTrue(include_zombies)
+                return parent
+            self.assertEqual(pid, shell)
+            return terminal
+
+        for fields, error, state in (("r0x1000001\ntCHR\n", "terminal held by editor", 2),
+                                     ("tPIPE\n", "", 2), ("tCHR\n", "terminal may be held by editor", 2),
+                                     ("", "", 5)):
+            parent.pbi_status = state
+            with (self.subTest(fields=fields, state=state), patch.dict(os.environ, {"HERDR_PLATFORM": "darwin"}),
+                  patch.object(client, "pane_row", return_value=row),
+                  patch.object(client, "result", return_value=info),
+                  patch.object(client, "composer", return_value=herdr.NoComposer()),
+                  patch.object(client, "run") as command,
+                  patch.object(herdr, "_darwin_process_bsd_info", side_effect=bsd_info),
+                  patch.object(herdr, "native_process", return_value=observed),
+                  patch.object(herdr, "run_program", return_value=subprocess.CompletedProcess[str](
+                      [], 0, f"p{child}\nf0\n{fields}", "")) as lsof):
+                if error:
+                    with self.assertRaisesRegex(herdr_types.HerdrFailure, f"anomaly: {error}"):
+                        client.prompt(pane, "fixture result", target=identity)
+                    command.assert_not_called()
+                else:
+                    client.prompt(pane, "fixture result", target=identity)
+                    command.assert_called_once_with("agent", "prompt", pane, script_prompt("fixture result"))
+                if state == 5:
+                    lsof.assert_not_called()
+                else:
+                    lsof.assert_called_once_with([os.environ.get("HERDR_LSOF", "lsof"), "-nP", "-a",
+                                                  "-p", str(child), "-d", "0", "-Fftr"])
+
+    def test_foreground_input_reads_each_ancestor_and_descendant_once(self) -> None:
+        codex, ancestor, child = 456, 457, 458
+        processes = [{"pid": ancestor, "argv": ["claude"]}, {"pid": child, "argv": ["hook"]}]
+        stats = {ancestor: ["Z", str(codex)], child: ["S", str(ancestor)]}
+        for descendants in (processes, processes[::-1]):
+            with (self.subTest(descendants=descendants), patch.object(herdr, "_PLATFORM", "linux"),
+                  patch.object(herdr, "_linux_process_stat", side_effect=stats.__getitem__) as read,
+                  patch.object(herdr, "_stdin_device", return_value=herdr.NonTerminalStdin.PROVED) as stdin):
+                owner = herdr.foreground_pane_owner({
+                    "shell_pid": 455, "foreground_process_group_id": codex,
+                    "foreground_processes": [{"pid": codex, "argv": ["codex"]}, *descendants],
+                }, for_input=True)
+                self.assertIsInstance(owner, herdr.ProvedCodexForeground)
+                assert isinstance(owner, herdr.ProvedCodexForeground)
+                self.assertEqual(owner.terminal_input, herdr.CodexTerminalInput.AVAILABLE)
+                self.assertCountEqual(read.call_args_list, [call(ancestor), call(child)])
+                stdin.assert_called_once_with(child, darwin=False)
+
     def test_native_pane_process_returns_the_proved_account_and_launch_identity_for_the_exact_codex_pid(self) -> None:
         current = fixture_runtime_id("pane-current-thread")
         launch = fixture_runtime_id("pane-launch-thread")
@@ -421,8 +536,10 @@ class NativePaneSessionTests(StaffTestCase):
             {"pid": 998074, "argv": ["zsh"]}, {"pid": 998075, "argv": ["codex", "resume", launch]}]}}}
         completed = subprocess.CompletedProcess[str]([], 0, json.dumps(payload), "")
         with (patch.object(herdr, "run_program", return_value=completed),
+              patch.object(herdr, "_linux_process_stat", return_value=["S", "998075"]),
+              patch.object(herdr, "_PLATFORM", "linux"),
               patch.object(herdr, "native_process", return_value=observation) as native):
-            observed = herdr.Herdr("agents").native_pane_process("w1:p1", "codex", 1)
+            observed = herdr.Herdr("agents").native_pane_process("w1:p1", "codex", 1, pane_row={})
         self.assertEqual(observed, observation)
         native.assert_called_once_with(998075, "codex", "")
 
@@ -495,8 +612,8 @@ class NativePaneSessionTests(StaffTestCase):
             (["node", "/opt/@openai/codex/bin/codex.js"], True, ""),
             (["codex", "resume", "--last"], False, "bad resume id"),
             (["codex", "exec"], False, "subcommand exec"),
-            (["codex", "--future-option"], False, "unknown option --future-option"),
-            (["codex", "--future-option=private-value"], False, "unknown option --future-option"),
+            (["codex", "--future-option"], False, "unknown option"),
+            (["codex", "--future-option=private-value"], False, "unknown option"),
             (["codex", "--model"], False, "option --model has a missing or dash value"),
             (["codex", "--model", "--no-alt-screen"], False, "option --model has a missing or dash value"),
         )
@@ -2921,6 +3038,30 @@ class HerdrTests(unittest.TestCase):
                     with self.assertRaisesRegex(herdr_types.HerdrFailure,
                                                 "^expected one foreground codex process, found 0$"):
                         _ = self.herdr.native_session("w1:p1", "codex", 1, pane_row=pane)
+
+    def test_ambiguous_codex_foreground_reports_only_program_names(self) -> None:
+        current = fixture_runtime_id("uncertain-foreground")
+        row = staff.StaffRow(staff.native_id(fixture_runtime_id("uncertain-fixed")), "producer", "probe",
+                             staff.StaffRoot(), current_session=staff.native_id(current))
+        pane: dict[str, object] = {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1",
+                                   "agent_session": {"value": current}}
+        command = ["codex", "resume", current]
+        fake_unit_host.process(os.environ, 998075, 998070, command, {})
+        for name, parent in (("codex", 998075), ("git", 998070)):
+            with self.subTest(name=name):
+                args = [name, "private-argument"]
+                fake_unit_host.process(os.environ, 998076, parent, args, {})
+                self.configure_herdr(["pane", "process-info", "--pane", "w1:p1"], json.dumps({
+                    "result": {"process_info": {"shell_pid": 998070, "foreground_process_group_id": 998075,
+                    "foreground_processes": [{"pid": 998075, "name": "codex", "argv": command},
+                                             {"pid": 998076, "name": name, "argv": args}]}}}))
+                with fake_unit_host.private_process_registry(), redirect_stderr(io.StringIO()) as errors:
+                    scan = self.herdr.scan_row_panes(staff.StaffSnapshot((row,)), [pane])
+                self.assertEqual(scan.found, {})
+                self.assertEqual(len(scan.unknown), 1)
+                self.assertIn(f"Foreground programs are codex, {name}", errors.getvalue())
+                self.assertNotIn("private-argument", errors.getvalue())
+                self.assertNotIn(current, errors.getvalue())
 
     def test_pane_report_and_resume_accept_an_empty_or_matching_identity(self) -> None:
         current = fixture_runtime_id("herdr-codex-launch")
@@ -7096,7 +7237,7 @@ class SavedLayoutTests(unittest.TestCase):
             cached = client.scan_row_panes(record, panes)
             self.assertEqual(cached, herdr.RowPaneScan({}, []))
             tab["session_id"] = owner.current_session
-            with (patch.object(herdr, "pane_native_process",
+            with (patch.object(herdr, "read_foreground_pane_owner",
                                side_effect=herdr.NativeRegistryUnavailable("pid 992000: native registry identity is unavailable")) as decoded,
                   patch.object(client, "run_in_pane"),
                   patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired()) as started):
@@ -7217,16 +7358,17 @@ class SavedLayoutTests(unittest.TestCase):
         _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=retired.worktree)
         assert isinstance(old_child.parent, staff.ReportsTo)
         _ = staff.set_doc(old_child.parent.id, staff.WrappedDoc("natedev", self.root / "archive.md"))
-        processes = [herdr.HerdrProcess(1, herdr.HerdrPlace("fixture", "w1:p1"),
-                                       {"STAFF_ID": retired.id}, "claude", "/missing")]
-        classifier = herdr.UnitTabClassifier("fixture", processes, staff.snapshot())
-        self.assertIsInstance(classifier.classify(["w1:p1"]), herdr.OtherTab)
-        self.assertIsInstance(classifier.classify([]), herdr.OtherTab)
         active = unit_membership("current", "live-unit")
-        for title in (active.name, "another-title"):
-            with self.subTest(title=title):
-                classifier = herdr.UnitTabClassifier("fixture", [], staff.snapshot())
-                self.assertIsInstance(classifier.classify(["unowned-pane"]), herdr.OtherTab)
+        classifier = herdr.UnitTabClassifier(staff.snapshot())
+        for identity in (retired.current_session, old_child.current_session, fixture_runtime_id("unowned-pane")):
+            with self.subTest(identity=identity):
+                conversation = pane_launch.ProvedPaneConversation(identity, "claude", 1)
+                self.assertIsInstance(classifier.classify(conversation), herdr.OtherTab)
+        conversation = pane_launch.ProvedPaneConversation(active.current_session, "claude", 1)
+        selected = classifier.classify(conversation)
+        self.assertIsInstance(selected, herdr.UnitTab)
+        assert isinstance(selected, herdr.UnitTab)
+        self.assertEqual(selected.row.id, active.id)
 
     def test_session_names_restore_saved_tab_order_and_resolve_each_pane(self) -> None:
         old = LayoutHerdr()
@@ -7599,10 +7741,12 @@ class PaneSessionsTests(unittest.TestCase):
     LIVE: dict[str, object] = {"pid": 101, "name": "claude", "argv": ["claude", "--resume", "recorded-id"]}
     EXITED: dict[str, object] = {"pid": 102, "name": "claude"}
 
-    def sessions(self, *processes: dict[str, object]) -> set[str]:
+    def sessions(self, *processes: dict[str, object]) -> frozenset[str]:
         observed = herdr.NativeAgentProcess(herdr.EnvironmentThread("recorded-id"), "fixture-start", {})
         with patch.object(herdr, "native_process", return_value=observed):
-            return herdr._pane_sessions({"foreground_processes": list(processes)}, {"pane_id": "w1:p1"})  # pyright: ignore[reportPrivateUsage]
+            sessions = herdr._pane_sessions({"foreground_processes": list(processes)}, {"pane_id": "w1:p1"})  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(sessions, frozenset)
+        return sessions
 
     def test_an_exited_agent_child_beside_the_live_agent_is_ignored(self) -> None:
         self.assertEqual(self.sessions(self.LIVE, self.EXITED), {"recorded-id"})

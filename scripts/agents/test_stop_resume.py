@@ -43,6 +43,7 @@ from scripts.lib.resume_message import ClaudeChildResume
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker, fixture_runtime_id, isolated_staff_file
 from scripts.usage import agents_log
 from scripts.herdr import herdr, pane_launch
+from scripts.herdr.test_herdr import codex_foreground_cases
 from scripts.agents import pane_record, shutdown
 from scripts.message import codex_daemon, session_records, sessions
 from scripts.message import sessions as runtime_sessions
@@ -238,6 +239,25 @@ class WorkerResumeTests(unittest.TestCase):
 
 @final
 class StopResumeTests(unittest.TestCase):
+    def test_producer_adoption_requires_the_proved_pane_owner(self) -> None:
+        with producer_first_fixture("codex") as world, codex_foreground_cases(world.folder) as cases:
+            client = world.case.client
+            world.active = True
+            world.environment = {"HERDR_SESSION": client.session, "HERDR_PANE_ID": world.pane,
+                                 "CODEX_HOME": str(world.home)}
+            client.rows.append({"pane_id": world.pane, "terminal_id": "native-terminal",
+                                "workspace_id": "w1", "label": "producer", "session_id": world.identity})
+            for case in cases:
+                with (self.subTest(case=case.name),
+                      patch.object(world, "process_info", return_value={"process_info": case.info})):
+                    if case.owner_proved:
+                        entry = stop_resume.producer_adoption_launch(world.identity, world.pane, client)
+                        self.assertEqual((entry.get("kind"), entry["session_id"], entry.get("pid")),
+                                         ("codex", world.identity, 456))
+                    else:
+                        with self.assertRaisesRegex(ValueError, "no unique native foreground process"):
+                            _ = stop_resume.producer_adoption_launch(world.identity, world.pane, client)
+
     def test_configured_producer_first_start_and_live_resume_keep_one_native_conversation(self) -> None:
         for shown in (None, "old-producer-title"):
             with self.subTest(native_title=shown), producer_first_fixture("claude") as world:
@@ -3317,7 +3337,12 @@ class StopResumeTests(unittest.TestCase):
               patch.object(herdr, "native_process", side_effect=native_process) as native):
             self.assertEqual(stop_resume.stop("stable-row"), stop_resume.Stopped(identity, 123))
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
-        self.assertEqual(native.call_args_list, [call(123, "codex")] * 3)
+        self.assertEqual(native.call_args_list, [
+            call(123, "codex", identity),
+            call(123, "codex"),
+            call(123, "codex"),
+            call(123, "codex"),
+        ])
 
     def test_stop_finds_an_unnamed_resumed_codex_pane(self) -> None:
         identity = self.entry["session_id"]

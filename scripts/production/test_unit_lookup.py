@@ -22,7 +22,7 @@ from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_unit_host
 from scripts.production import showrunners
 from scripts.production import unit_lookup
-from scripts.herdr import herdr
+from scripts.herdr import herdr, pane_launch
 from scripts.message import sessions
 from scripts.production.fake_unit_host import HostedUnit, labeled
 from scripts.message.sessions import SessionRecord
@@ -442,10 +442,17 @@ print(observed.row.id)
         assert not isinstance(session, sessions.UnreadableSessionRecord)
         self.assertFalse((self.root / "pane-records/agents.json").exists())
 
-        # Tab sorting consumes the environments resolved by herdr_processes.
-        processes = herdr.herdr_processes()
-        classifier = herdr.UnitTabClassifier("agents", processes, staff.snapshot())
-        self.assertIsInstance(classifier.classify(["w4:p1"]), herdr.UnitTab)
+        # Classify the unit from the proved foreground conversation.
+        client = herdr.Herdr("agents")
+        pane = client.pane_row("w4:p1")
+        assert not isinstance(pane, herdr.NoPane)
+        info = client.result("pane", "process-info", "--pane", pane["pane_id"]).get("process_info")
+        conversation = herdr.foreground_pane_conversation(info, pane)
+        assert isinstance(conversation, pane_launch.ProvedPaneConversation)
+        classifier = herdr.UnitTabClassifier(staff.snapshot())
+        unit = classifier.classify(conversation)
+        assert isinstance(unit, herdr.UnitTab)
+        self.assertEqual(unit.row.id, owner.id)
         self.assertEqual(herdr.tab_order("show", ["show", "aaa-other", "organon"], [], {"organon"}), [0, 2, 1])
         grouped, _ = session_staff.session_staff_and_directors([session], self.environment)
         self.assertEqual(grouped.units["show"]["alpha"].identity, session_staff.LiveSession(owner.current_session))

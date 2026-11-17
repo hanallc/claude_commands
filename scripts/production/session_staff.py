@@ -24,7 +24,7 @@ from scripts.agents import remote
 from scripts.message.sessions import SessionRecord
 from scripts.herdr.place import HerdrPlace
 from scripts.herdr.pane_launch import without_staff_labels
-from scripts.herdr import pane_launch
+from scripts.herdr import pane_launch, herdr_types
 if TYPE_CHECKING:
     from scripts.herdr.pane_launch import PaneLaunch
 
@@ -985,26 +985,36 @@ def repair_marks() -> list[RepairedSessionLabels]:
     if live:
         from scripts.herdr import herdr
 
-        by_pid = {entry["pid"]: entry for entry in live}
+        places = herdr.herdr_places()
         seen: set[str] = set()
-        for process in herdr.herdr_processes():
-            session = by_pid.get(process.pid)
-            if session is None or session["sessionId"] in seen:
+        for session in live:
+            pid, identity = session["pid"], session["sessionId"]
+            place = places.get(pid)
+            if place is None or identity in seen or record.by_current_session(identity) is None:
                 continue
-            seen.add(session["sessionId"])
-            if pane_launch.matching_launch(pane_record.read(process.place.session), process.place, session["sessionId"]) is not None:
+            if pane_launch.matching_launch(pane_record.read(place.session), place, identity) is not None:
                 continue
+            client = herdr.Herdr(place.session)
+            herdr.forget_pane_evidence(place.session, place.pane)
             try:
-                entry = pane_record.running_launch(session, process.place, process.cwd)
-            except (OSError, ValueError):
+                info = herdr.json_object(client.result("pane", "process-info", "--pane", place.pane).get("process_info"),
+                                         "pane launch repair process info")
+                owner = herdr.foreground_pane_owner(info)
+                if not isinstance(owner, herdr.ProvedClaudeForeground) or owner.pid != pid:
+                    continue
+                native = herdr.read_foreground_pane_owner(owner, {})
+                if native.current_identity != identity:
+                    continue
+                entry = pane_record.running_launch(session, place, owner.cwd if isinstance(owner.cwd, str) else "")
+                if entry.get("proc_start") != native.started:
+                    continue
+            except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
                 continue
-            if record.by_current_session(entry["session_id"]) is None:
-                continue
-            pane_record.write(process.place.session, entry)
+            pane_record.write(place.session, entry)
+            seen.add(identity)
             newest[pane_launch.reference_id(entry)] = entry["written_at"]
             repaired.append(RepairedSessionLabels(
-                f"{process.place.session}:{process.place.pane}:{pane_launch.reference_id(entry)}",
-                (), ()))
+                f"{place.session}:{place.pane}:{pane_launch.reference_id(entry)}", (), ()))
     for path in sorted(pane_record.record_directory().glob("*.json")):
         with pane_record.locked(path.stem):
             entries = pane_record.read_strict(path.stem)

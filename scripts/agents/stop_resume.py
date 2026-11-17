@@ -203,30 +203,18 @@ def producer_conflicts(name: str, client: herdr.Herdr) -> list[tuple[str, str]]:
     return sorted(set(unresolved))
 
 
-def producer_pane_kinds(info: dict[str, object]) -> list[Literal["claude", "codex"]]:
-    """Read agent families from a pane's foreground processes."""
-    kinds: list[Literal["claude", "codex"]] = []
-    for value in herdr.json_items(info.get("foreground_processes"), "producer foreground processes"):
-        process = herdr.json_object(value, "producer foreground process")
-        argv = [herdr.json_text(argument, "producer argument")
-                for argument in herdr.json_items(process.get("argv"), "producer arguments")]
-        if herdr.is_claude_process(argv):
-            kinds.append("claude")
-        elif herdr.is_codex_process(argv):
-            kinds.append("codex")
-    return kinds
-
-
 def producer_adoption_launch(identity: str, pane: str, client: herdr.Herdr) -> pane_launch.CurrentLaunch:
     """Prove a named native conversation before staff admission."""
     pane = pane.removeprefix(client.session + ":")
     if any(row["pane_id"] == pane for row in client.panes()):
         info = herdr.json_object(client.result("pane", "process-info", "--pane", pane).get("process_info"),
                                  "producer adoption process info")
-        kinds = producer_pane_kinds(info)
-        if len(kinds) != 1:
+        owner = herdr.foreground_pane_owner(info)
+        if isinstance(owner, herdr.UnprovedForegroundOwner):
+            raise ValueError(f"producer has no unique native foreground process: {owner.reason}")
+        if isinstance(owner, herdr.NoForegroundAgent):
             raise ValueError("producer has no unique native foreground process")
-        entry = client.producer_admission_launch(pane, kinds[0])
+        entry = client.producer_admission_launch(pane, owner.kind)
         if entry["session_id"] != identity:
             raise ValueError("producer pane runs another conversation")
         return entry
