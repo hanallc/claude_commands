@@ -2788,6 +2788,16 @@ Move the other `copies.standing` callers to the 44ax order with the same code: m
 
 **Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44bk/work_order.md`.
 
+### Phase 44bl — A refused release never leaves a reservation active  · status: todo
+**From the 44bk and 44bf reviews, 2026-11-17:** three paths leave a reservation active after a release fails.
+1. `admission_client.py finish-step` exits 0 when the service refuses the release. A later cancel also returns `Ok` and releases nothing (44bk F005).
+2. After a disconnect, a failed release leaves the zero-byte handoff record. The same live shell then cannot get a new admission, because its owner still has that record (44bf F011).
+3. A rollback to an old service refuses the test request with `owner already has a reservation`. If the shell's release of the build grant also fails, that grant stays until the owner exits (44bf F008).
+A refused or failed release gives a nonzero exit, and the caller cancels the reservation or ends the owner. After 44bk and 44bf merge.
+
+### Phase 44bm — A local gate after a cloud fallback shows the gate route  · status: todo
+**From the gaterename gate, 2026-11-17 14:47:** the cloud box failed on its mode value, and natedev ran the gate locally. The local ask has no route field, so the Builds page shows the default label "a direct cargo command runs where it starts". The fallback ask names the local gate route. After natest 314 (the gate folder move) is on main.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
