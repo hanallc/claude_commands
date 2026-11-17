@@ -479,48 +479,29 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 ### Phase 44 — The Disks measure walks each drive in parallel, both drives at once  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** the Disks page status line showed `render 148 s` (sdlc, 2026-11-16, the user calls the page "pathologically slow"). The measure walks each drive with a parallel walker and measures both drives at the same time, so a measure takes the time of the slower drive's parallel walk, not the sum of two single-thread walks. The free-space numbers and the folder tree stay as they are now.
-
-**Measured cost (natedev, 2026-11-16 21:30–22:02 EST, load 20–60, each run under `systemd-run --user --scope -p MemoryMax=2G`):**
-
-| Walk | / (8.4M inodes) | /build (3.0M inodes) |
-| --- | --- | --- |
-| du as shipped (nice 19, ionice -c3) | 85.6 s | 101.8 s |
-| du at normal priority | 81.1 / 88.8 / 89.4 s | 93.7 / 120.3 / 121.0 s |
-| du over depth-1 folders, 16 at once | 97.7 s | 75.7 s |
-| du -sx over depth-3 folders, 32 at once | 35.4 / 21.9 s | 25.3 / 21.6 s |
-| Python threads (scandir + stat), 32 / 64 | 67.5 / 57.6 s | 24.0 / 25.2 s |
-| dust 1.2.4 (`-x -D -j -o b -z 268435456`) | 45.4 / 47.8 s | 13.8 / 21.1 s |
-
-- Priority is not the cost. Both drives are NVMe with IO scheduler `none`, so `ionice -c3` has no effect.
-- One du is one stat at a time, and each stat reads a cold inode through dm-crypt. Repeat runs are not faster: the walk's inode and dentry cache (about 1 KiB per inode) is larger than the 2 GiB cap, so the walk evicts its own cache.
-- dust counts a hard link once (its / total 1047.9 GB matches du's 1044.2 GB; the Nix store is not counted twice) and stays on one file system with `-x`. A du fan-out counts a hard link once per process, so it double counts the Nix store's `.links` and a cargo target's `deps/` links; it is not correct.
-- A full walk of 11.4M inodes under the cap does not reach "a few seconds" on natedev under build load. The floor is the slower drive's parallel walk, about 45 s.
-
-**Spec:**
-- `dust` comes from the NixOS config: `/etc/nixos` branch `phases-disks-dust` (550a77b88) adds it to `modules/common/development.nix` for natedev and the Mac. The showrunner pushes it; the user rebuilds.
-- `scripts/disks/measure.py`:
-  - `dust_command(mount, settings)` replaces `du_command`: `systemd-run --user --scope --quiet -p MemoryMax=<memory_max> -- nice -n 19 dust -x -D -j -P -o b -z <keep_bytes> <depth and line flags> <mount>`. Drop `ionice`. Check dust 1.2.4's defaults for `-d` and `-n` and pass the flags that list every folder at or above `keep_bytes`, at any depth. A tunable goes in `config/disks.conf`; no number in code.
-  - `parse_dust(output)` reads dust's JSON (`size` is a string such as `"2327020666880B"`; `name` is the full path; `children` nest) into the same `dict[str, int]` that `folder_tree` takes, so the tree, `other` and the collapse rule stay as they are. Delete `parse_du` and `DU_PARTIAL_EXIT` when nothing uses them.
-  - `measure` runs the drives at the same time, one thread for each drive. `drives` in `disks.json` keeps the config order. `render_seconds` is the time of the whole measure.
-  - Errors keep their current form: a timeout, a start failure (dust absent: `the measure did not start: …`), and a nonzero exit or no output (`dust exited N: <last stderr line>`). Read what dust does with a folder it cannot read and with a missing path, and keep a partial walk as a measure, as du exit 1 was.
-- `config/disks.conf`: the comment on `measure.memory_max` and any new key say dust.
-- `docs/plans/builds-report.md` lines 1699 and 1711–1715 (the as-built of the Disks measure, another unit's plan): the director corrects them in this phase's commit.
+- `scripts/disks/measure.py` walks each drive with dust, both drives at the same time (one `ThreadPoolExecutor` thread for each drive). `disks.json` keeps the config order of `drives`; `render_seconds` is the time of the whole measure. Live on natedev under build load: 52.0 s and 59.2 s (148 s with one du for each drive, one drive after the other); root totals match du within 0.1 %.
+- `dust_command(mount, settings)`: `systemd-run --user --scope --quiet -p MemoryMax=<measure.memory_max> -- nice -n 19 dust -x -D -j -P -o b -z <keep_bytes - 1> -d <measure.max_depth> -n <measure.max_lines> --config <scripts/disks/dust.toml> <mount>`.
+- `parse_dust(output)` reads dust's nested JSON (`size` such as `"2327020666880B"`, `name` a full path) into the `dict[str, int]` that `folder_tree` takes; the tree, `other` and the collapse rule are unchanged.
+- Errors: a timeout; `the measure did not start: dust is not on PATH` when `shutil.which("dust")` finds nothing; `dust exited N: <last stderr line>` for a nonzero exit or no output. A folder dust cannot read leaves out its size, and the walk still counts as a measure.
+- dust comes from nixos `modules/common/development.nix` (550a77b) on natedev and the Mac.
 
 **Files:**
-- `scripts/disks/measure.py` — the dust command, the dust parse, the concurrent drives
-- `scripts/disks/test_measure.py` — tests
-- `config/disks.conf` — dust flags that are tunables, comments
+- `scripts/disks/measure.py` — `dust_command`, `parse_dust`, the concurrent `measure`
+- `scripts/disks/dust.toml` — empty dust config; dust never reads a personal config
+- `scripts/disks/test_measure.py` — the dust command, the JSON parse, both drives at once, the error forms
+- `config/disks.conf` — `measure.max_depth` and `measure.max_lines` (1000000 each)
 
-**Workers:** 1 writer — `impl` writes `measure.py`, its tests and the config; the director writes the builds-report correction.
+**Gotchas:**
+- dust keeps a folder only when its size is above `-z`, so the measure passes `keep_bytes - 1` to keep a folder of exactly `keep_bytes`.
+- dust reads a personal config unless `--config` names a `.toml` file; it rejects `/dev/null` as a config.
+- dust gives partial JSON and exit 0 for unreadable folders; a missing path gives exit 1 and no output.
+- natedev's NVMe drives use IO scheduler `none`, so `ionice` has no effect. The walk's inode and dentry cache is larger than the 2 GiB cap, so repeat walks are not faster.
 
-**State:** none
-
-**Constraints from prior phases:** `measure.py` is run by `disks_page.launch_measure` in its own session, and `start_measure` never waits for it; the page shows the last data while a measure runs. Heavy probes on natedev run only under `systemd-run --user --scope -q -p MemoryMax=2G` (user). Every tunable goes in the config file (no hard-coded config).
-
-**Acceptance gate:** `scripts.disks.test_measure` passes, with tests for: the dust command (no `ionice`, `nice -n 19`, `-x`, the size floor, the memory cap); `parse_dust` on a nested fixture, giving the same tree as the former du fixture; both drives start before either ends (a runner that waits on a barrier); the error forms. basedpyright reports 0 errors and 0 warnings on `scripts/disks`. Live on natedev: `python -m scripts.disks.measure` with dust from the Nix store writes a `disks.json` whose root and top folders match a du run within 1 %, and its `render_seconds` is recorded with the load.
+**Ruled out:**
+- A du fan-out over subfolders: each du process counts a hard link again, so the Nix store and cargo `deps/` count twice.
+- A threaded Python walker: the GIL holds it near 130k entries/s (/ 58–68 s).
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
