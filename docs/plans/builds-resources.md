@@ -2657,21 +2657,13 @@ The cutover removal commit deletes the script after the run.
 **Files:** `override_guard.py`, `override_guard.sh`, `memory_gate.sh`, `invoke.sh`, `verify.sh`, `top_level.py`, `shutdown.py`, `admission_test_support.py`, `helper_tree_test_support.py`, about 40 test and fixture files (list in checkpoint `7fad3a152`), `docs/as-built/build-memory-admission.md`.
 
 ### Phase 138 — test_offload keeps its proof folder in a temp folder  · status: done
-**Source:** builds showrunner 2026-11-16 18:0x. A Phase 137 run without test startup showed the leak: `GeneratedSourceTests.test_no_envrc_source_requires_generated_source_outside_trusted_roots` (`scripts/mac_test/test_offload.py:54`) calls `scratch.new('gate:offload-generated-source', 'proof')`. It patches only `SCRATCH_ROOT`, so `scratch.new` puts `proof` under the live worker session (`/session/<worker>/proof`). Task cleanup by that name then removed a second worker's folder.
-**Depends on:** Phase 136 (queue order only).
 
-#### Work Order
+#### As-built
 
-**Goal:** the test writes its proof folder only under its own temp folder, with or without test startup. Its cleanup touches only that folder.
+- `GeneratedSourceTests` (`scripts/mac_test/test_offload.py`) sets `SESSION_TEMP_ROOT` to an absent folder before `scratch.new`. The proof folder is then always under the test's private `SCRATCH_ROOT`, with or without test startup. Before, the test patched only `SCRATCH_ROOT`, and without test startup `scratch.new` put `proof` under the live worker session.
+- The `TemporaryDirectory` removes the proof folder. The test runs no task cleanup.
+- A new row runs with a live session folder in place and checks that another worker's folder and sentinel file do not change.
+- No product file changed; `scratch.new` was correct.
+- Checkpoint `13f982741`: 73 tests alone and 537 with the other `mac_test` modules, with and without test startup; basedpyright 0.
 
-**Spec:**
-1. The test makes its `scratch.new` folder under its `TemporaryDirectory`, also when the live session folder resolves (no test startup).
-2. The test removes its own folder when it ends. It runs no task cleanup that can match another session's folder.
-3. One row runs the test with the live-session resolution in place and asserts that no path appears outside the temp folder.
-4. Change no product file unless the cause is in `scratch.new`; then fix it there and say so.
-
-**Files:** `scripts/mac_test/test_offload.py` (and `scripts/lib/scratch.py` only under Spec 4).
-
-**Workers:** `1 writer`
-
-**Acceptance gate:** `test_offload` passes alone and with the other `mac_test` modules, with and without test startup; no path appears under a live session folder; basedpyright reports zero on the changed files.
+**Files:** `scripts/mac_test/test_offload.py`.
