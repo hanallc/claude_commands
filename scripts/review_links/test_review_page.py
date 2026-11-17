@@ -21,7 +21,7 @@ from urllib.parse import urlencode
 from scripts.agents.remote import local_machine
 from scripts.production.production_doc import read_production
 from scripts.production.staff_test_support import fixture_member
-from scripts.production import change_review, investigation, staff, update_registration
+from scripts.production import change_review, change_routing, investigation, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, record_table, review_items, review_page
 from scripts.review_links import test_change_page
 from scripts.review_links import review_later
@@ -274,6 +274,10 @@ class ReviewPageTests(unittest.TestCase):
         self.assertEqual(len(self.fixture.messages),before)
 
     def test_later_hides_each_type_from_the_shared_queue_and_then_returns(self) -> None:
+        _ = change_review.append_rows(self.fixture.review_list,
+            [change_review.Visible('Unrouted change', 'Read the log.', 'The result is present.')],
+            datetime.now(user_zone()).date(), '', self.fixture.production,
+            producers=[staff.StaffId('missing-producer')], record=staff.snapshot())
         question = self.question()
         ready = self.investigation()
         keys = (question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}')
@@ -302,6 +306,54 @@ class ReviewPageTests(unittest.TestCase):
                 item = next(item for item in review_items.read(self.root) if item.key == key)
                 _,entries = review_items.next_queue(item.type,self.fixture.production,False,staff.snapshot())
                 self.assertIn(item.queue_key,[entry.key for entry in entries])
+
+        with self.subTest(finding='F026', case='unavailable production'):
+            key = 'page-owner/C2'
+            item = next(item for item in review_items.read(self.root) if item.key == key)
+            assert isinstance(item.source, review_items.ChangeSource)
+            assignment = replace(item.source.assignment, production=change_routing.UnavailableProduction(self.fixture.review_list))
+            unavailable = replace(item, source=replace(item.source, assignment=assignment))
+            before = review_later.path().read_bytes()
+            body = self.body(key, 'later', 'Keep these words.')+'&'+urlencode({'later':until.isoformat()})
+            with patch.object(review_items, 'read', return_value=[unavailable]), \
+                    patch.object(change_review, 'record_review_log') as log:
+                with self.assertRaisesRegex(change_page.AnswerRefused, '^the production document is not available$'):
+                    _ = review_page.submit(self.root, body, self.status)
+                log.assert_not_called()
+            self.assertNotIn(key, review_later.times())
+            self.assertEqual(review_later.path().read_bytes(), before)
+
+        with self.subTest(finding='F026', case='log write failure'):
+            key = 'page-owner/C3'
+            item = next(item for item in review_items.read(self.root) if item.key == key)
+            assert isinstance(item.source, review_items.ChangeSource)
+            self.assertIsInstance(item.source.assignment.production, Path)
+            before = review_later.path().read_bytes()
+            listing = self.fixture.review_list.read_bytes()
+            body = self.body(key, 'later', 'Keep these words after the failure.')+'&'+urlencode({'later':until.isoformat()})
+            with patch.object(change_review, 'record_review_log', side_effect=OSError('fixture log write failed')) as log:
+                with self.assertRaisesRegex(OSError, 'fixture log write failed'):
+                    _ = review_page.submit(self.root, body, self.status)
+                log.assert_called_once()
+            self.assertEqual(review_later.path().read_bytes(), before)
+            self.assertNotIn(key, review_later.times())
+            self.assertEqual(self.fixture.review_list.read_bytes(), listing)
+            visible = next(item for item in review_items.read(self.root) if item.key == key)
+            self.assertTrue(visible.for_you(datetime.now(user_zone())))
+
+        with self.subTest(finding='F026', case='unrouted owner with valid production'):
+            key = 'page-owner/C4'
+            item = next(item for item in review_items.read(self.root) if item.key == key)
+            assert isinstance(item.source, review_items.ChangeSource)
+            self.assertIsInstance(item.source.assignment.owner, change_routing.UnroutedChange)
+            self.assertEqual(item.source.assignment.production, self.fixture.production)
+            body = self.body(key, 'later', 'Read the unrouted change tomorrow.')+'&'+urlencode({'later':until.isoformat()})
+            _, result = review_page.submit(self.root, body, self.status)
+            self.assertIn('later until', result)
+            saved = next(item for item in review_items.read(self.root) if item.key == key)
+            self.assertTrue(any(entry.words == 'Later until '+until.isoformat()+': Read the unrouted change tomorrow.'
+                                for entry in saved.log))
+            self.assertEqual(review_later.times()[key], until)
 
     def test_question_answer_words_remain_after_the_answer_archive_expires(self) -> None:
         key = self.question()
