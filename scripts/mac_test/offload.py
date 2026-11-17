@@ -1299,7 +1299,7 @@ def write_backoff(until: float, target: str = "mac") -> None:
         return
 
 
-def ssh_options(config: SshConnectionSettings) -> list[str]:
+def ssh_options(config: SshConnectionSettings | eligibility.SshProbeSettings | OffloadConfig) -> list[str]:
     return [
         "-o",
         "BatchMode=yes",
@@ -1312,8 +1312,8 @@ def ssh_options(config: SshConnectionSettings) -> list[str]:
     ]
 
 
-def ssh_prefix(config: OffloadConfig) -> list[str]:
-    return ["ssh", *ssh_options(config.connection), config.host]
+def ssh_prefix(config: OffloadConfig | eligibility.SshProbeSettings) -> list[str]:
+    return ["ssh", *ssh_options(config), config.host]
 
 
 def linux_mirror_root() -> Path:
@@ -1322,7 +1322,12 @@ def linux_mirror_root() -> Path:
 
 def mac_mirror_root() -> MacMirrorRoot:
     """Read the remote mirror root without expanding the local home folder."""
-    return MacMirrorRoot.read(conf.read("mac_test"))
+    def mirror_root(value: str) -> MacMirrorRoot:
+        if not value.startswith("~/"):
+            raise ValueError("mirror_root must start with ~/")
+        return MacMirrorRoot(value[2:])
+
+    return conf.read("mac_test").value("mirror_root", mirror_root)
 
 
 def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
@@ -1486,7 +1491,7 @@ def read_claim_answer(result: CapturedCommandResult, *,
 
 def probe_reachability(
     controller: ProcessController,
-    config: OffloadConfig,
+    config: OffloadConfig | eligibility.SshProbeSettings,
 ) -> HostReachability:
     """Check SSH reachability without creating or inspecting a repository."""
     result = controller.capture(
@@ -1642,7 +1647,7 @@ def record_reachable(target: str = "mac") -> None:
 
 def probe_mac(
     controller: ProcessController,
-    config: OffloadConfig,
+    config: OffloadConfig | eligibility.SshProbeSettings,
     repository: KnownRepository,
     target: str = "mac",
     slot: int = 1,
@@ -1665,6 +1670,8 @@ def probe_mac(
 
     linux = not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform)
     if linux:
+        if not isinstance(config, OffloadConfig):
+            raise ValueError("The Linux shell probe requires execution settings")
         from scripts.mac_test import linux_runner
         script = linux_runner.probe_command_script(remote_mirror(repository, target, slot), runner_values(config, target),
                                                    repository.policy_name)
@@ -1700,7 +1707,7 @@ def probe_mac(
     else:
         probe = parse_probe(result.stdout)
         if isinstance(probe, ProbeSnapshot):
-            if not linux:
+            if not linux or not isinstance(config, OffloadConfig):
                 return succeeded(probe)
             expected = expected_linux_parity(controller, config)
             values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
@@ -1743,11 +1750,13 @@ class SweepFailed:
 
 
 def ensure_mac_disk_floor(
-    controller: ProcessController, config: OffloadConfig, repository: KnownRepository,
+    controller: ProcessController, config: OffloadConfig | eligibility.SshProbeSettings, repository: KnownRepository,
     probe: ProbeSnapshot, target: str = "mac", slot: int = 1,
 ) -> MacDiskReady | SweepShort | SweepFailed:
     """Run one shared floor sweep, then read the Mac disk space again."""
-    if probe.free_gib >= config.free_floor_gib:
+    floor = (config.free_floor_gib if isinstance(config, OffloadConfig)
+             else config.configuration.number("free_floor_gib"))
+    if probe.free_gib >= floor:
         return MacDiskReady(probe.free_gib)
     try:
         directory = eligibility.state_directory()
@@ -1764,8 +1773,11 @@ def ensure_mac_disk_floor(
                 _ = lock.truncate()
                 _ = lock.write("floor sweep was interrupted")
                 lock.flush()
-                settings = eligibility.config_path() if isinstance(config.source, DefaultMacSettings) else config.source
-                timeout = conf.read(settings).number("floor_sweep_timeout_s")
+                if isinstance(config, OffloadConfig):
+                    settings = eligibility.config_path() if isinstance(config.source, DefaultMacSettings) else config.source
+                    timeout = conf.read(settings).number("floor_sweep_timeout_s")
+                else:
+                    timeout = config.configuration.number("floor_sweep_timeout_s")
                 result = controller.capture(
                     [*ssh_prefix(config),
                      "~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --floor-only --host mac"],
@@ -1791,10 +1803,12 @@ def ensure_mac_disk_floor(
                 return SweepFailed(cause or "floor sweep result missing")
             if not isinstance(after, ProbeSnapshot):
                 return SweepFailed("Mac disk reading failed after the floor sweep")
-            if after.free_gib < config.free_floor_gib:
+            if after.free_gib < floor:
                 return SweepShort(after.free_gib)
             return MacDiskReady(after.free_gib)
     except (OSError, ValueError) as error:
+        if isinstance(error, conf.Unusable) and isinstance(config, eligibility.SshProbeSettings):
+            raise
         return SweepFailed(f"floor sweep unavailable: {error}")
 
 

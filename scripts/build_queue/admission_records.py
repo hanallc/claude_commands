@@ -20,6 +20,7 @@ from scripts.build_queue import placement
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
+from scripts.build_targets import target_config
 from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
 from scripts.lib import conf
@@ -28,6 +29,24 @@ from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as No
 
 GIB = 1 << 30
 DIRECT_CARGO = LocalRequired("a direct cargo command runs where it starts")
+
+
+@dataclass(frozen=True)
+class UnregisteredTarget:
+    """The target name has no registration."""
+
+
+def effective_target(name: str, settings: placement.ProviderSettings) -> target_config.Target | UnregisteredTarget:
+    """Select the registered target with the settings supplied by the request."""
+    for target in target_config.read_targets(selected=name, purpose=target_config.RegistryRead.PLACEMENT):
+        if target.name != name:
+            continue
+        if isinstance(target, target_config.SshTarget):
+            target_config.require_target_name(name)
+            if isinstance(settings, placement.ExplicitProviderSettings):
+                return replace(target, settings=settings.path)
+        return target
+    return UnregisteredTarget()
 
 
 @dataclass(frozen=True)

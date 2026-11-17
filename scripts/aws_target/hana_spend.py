@@ -12,7 +12,7 @@ from scripts.lib import conf
 
 
 @dataclass(frozen=True)
-class PermitSettings:
+class StartPermitSettings:
     enabled: bool
     region: str
     instance_type: str
@@ -22,25 +22,53 @@ class PermitSettings:
     daily_budget_usd: Decimal
     gp3_usd_per_gib_month: Decimal
     permit_max_seconds: int
-    guard_grace_seconds: int
 
     @property
     def storage_usd_per_month(self) -> Decimal:
         return (self.root_gib + self.data_gib) * self.gp3_usd_per_gib_month
 
 
+@dataclass(frozen=True)
+class PermitSettings(StartPermitSettings):
+    guard_grace_seconds: int
+
+
+def _positive_amount(value: str) -> Decimal:
+    amount = conf.decimal(value)
+    if amount <= 0:
+        raise ValueError("expected a positive amount")
+    return amount
+
+
+def read_permit_settings(configuration: conf.ConfigRead) -> StartPermitSettings:
+    """Read the limits for a projected or reserved start."""
+    return StartPermitSettings(
+        enabled=configuration.value('enabled', conf.on_off),
+        region=configuration.text('region'),
+        instance_type=configuration.text('instance_type'),
+        spot_max_usd_per_hour=configuration.value('spot_max_usd_per_hour', _positive_amount),
+        root_gib=configuration.value('root_gib', conf.positive_whole),
+        data_gib=configuration.value('data_gib', conf.positive_whole),
+        daily_budget_usd=configuration.value('daily_budget_usd', _positive_amount),
+        gp3_usd_per_gib_month=configuration.value('gp3_usd_per_gib_month', _positive_amount),
+        permit_max_seconds=configuration.value('permit_max_seconds', conf.positive_whole),
+    )
+
+
 def read_settings(configuration: conf.ConfigRead) -> PermitSettings:
-    """Read workload limits without reading AWS credentials or deployment state."""
-    safety = hana_guest.read_settings(configuration)
-    values = PermitSettings(safety.enabled, configuration.text('region'), configuration.text('instance_type'),
-        conf.decimal(configuration.text('spot_max_usd_per_hour')), configuration.whole('root_gib'), configuration.whole('data_gib'),
-        conf.decimal(configuration.text('daily_budget_usd')), conf.decimal(configuration.text('gp3_usd_per_gib_month')),
-        safety.permit_max_seconds, safety.guard_grace_seconds)
-    if (not values.region or not values.instance_type or min(values.root_gib, values.data_gib) <= 0
-            or any(not value.is_finite() or value <= 0 for value in
-                   (values.spot_max_usd_per_hour, values.daily_budget_usd, values.gp3_usd_per_gib_month))):
-        raise ValueError('Hana spending settings must have positive limits and complete identity')
-    return values
+    """Check guest settings before execution."""
+    start = read_permit_settings(configuration)
+    grace = configuration.value('guard_grace_seconds', conf.positive_whole)
+    guest: dict[str, object] = {
+        'enabled': start.enabled, 'permit_max_seconds': start.permit_max_seconds,
+        'guard_grace_seconds': grace,
+    }
+    for key in ('watchdog_check_seconds', 'step_cpu_limit', 'step_memory_gib', 'mount_timeout_seconds'):
+        guest[key] = configuration.whole(key)
+    _ = hana_guest.decode_settings(guest)
+    return PermitSettings(start.enabled, start.region, start.instance_type, start.spot_max_usd_per_hour,
+        start.root_gib, start.data_gib, start.daily_budget_usd, start.gp3_usd_per_gib_month,
+        start.permit_max_seconds, grace)
 
 
 @dataclass(frozen=True)
@@ -70,13 +98,13 @@ class StorageReserved:
     exposure: ledger.HanaStorageExposure
 
 
-class HanaSpending:
+class HanaSpending[Settings: StartPermitSettings = PermitSettings]:
     """Serialize permits and lifecycle evidence with the account ledger."""
 
-    def __init__(self, book: ledger.CostLedger, account_settings: Path, settings: PermitSettings):
+    def __init__(self, book: ledger.CostLedger, account_settings: Path, settings: Settings):
         self.book: ledger.CostLedger = book
         self.account_settings: Path = account_settings
-        self.settings: PermitSettings = settings
+        self.settings: Settings = settings
 
     def _check(self, state: ledger.LedgerEvidence, now: int) -> PermitRefused | ledger.SpendingAllowed:
         decision = self.book.spending_decision(state, self.account_settings, now)
@@ -202,7 +230,7 @@ class HanaSpending:
             state.hana_lifecycle_fence = ledger.HanaLifecycleFence(now, proposed.generation)
             return StartReserved(proposed)
 
-    def reconcile(self, now: int, observed: ledger.InstanceState, *, generation: int) -> None:
+    def reconcile(self: HanaSpending[PermitSettings], now: int, observed: ledger.InstanceState, *, generation: int) -> None:
         """Apply an observation only to its generation and after the saved lifecycle time."""
         if type(now) is not int or now < 0:
             raise ValueError('The observation time must use nonnegative integer seconds')

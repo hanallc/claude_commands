@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum, auto
 from pathlib import Path
 import os
-from typing import Literal, cast
-from collections.abc import Callable
-from scripts.build_targets.execution_transport import ExecutionTransport
+import re
+from typing import Literal
+from scripts.build_targets.execution_transport import ExecutionTransport, HanaControlTransport, SshCommandTransport
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
@@ -136,14 +136,29 @@ class MissingSlotCapacity(Enum):
     SINGLE_SLOT = auto()
 
 
-def slot_capacity(values: Mapping[str, str], repository: str, *,
+def slot_capacity(values: Mapping[str, str] | conf.ConfigRead, repository: str, *,
                   missing: MissingSlotCapacity) -> int:
-    """Read one positive slot capacity for claims and admission."""
-    value = values.get(f"slots.{repository}", values.get("slots", ""))
-    if f"slots.{repository}" not in values and "slots" not in values and missing is MissingSlotCapacity.SINGLE_SLOT:
+    """Read the repository capacity before the target default."""
+    key = f"slots.{repository}"
+    if isinstance(values, conf.ConfigRead):
+        scoped = values.value(key, positive_slot_capacity, default=MissingSlotCapacity.REQUIRE_CONFIGURED)
+        if isinstance(scoped, int):
+            return scoped
+        if missing is MissingSlotCapacity.SINGLE_SLOT:
+            return values.value("slots", positive_slot_capacity, default=1)
+        return values.value("slots", positive_slot_capacity)
+    value = values.get(key, values.get("slots", ""))
+    if key not in values and "slots" not in values and missing is MissingSlotCapacity.SINGLE_SLOT:
         return 1
+    try:
+        return positive_slot_capacity(value)
+    except ValueError as error:
+        raise ConfigError(f"{key}: {error}") from error
+
+
+def positive_slot_capacity(value: str) -> int:
     if not value.isascii() or not value.isdecimal() or int(value) < 1:
-        raise ConfigError(f"slots.{repository}: expected a positive integer")
+        raise ValueError("expected a positive integer")
     return int(value)
 
 
@@ -168,57 +183,121 @@ def uses_legacy_mac_layout(platform: Platform) -> bool:
     return platform == "macos"
 
 
-def read_targets(path: Path | None = None) -> tuple[Target, ...]:
-    config = conf.path("build_targets") if path is None else path
-    current = COMMAND_CONFIGURATION.get()
-    if isinstance(current, CommandConfiguration) and config in current.targets:
-        return current.targets[config]
-    values = conf.read(config).values()
-    names = tuple(name.strip() for name in values.get("targets", "").split(","))
+class RegistryRead(Enum):
+    REQUIRE_SETTINGS_FILES = auto()
+    PLACEMENT = auto()
+
+
+def _target_names(value: str) -> tuple[str, ...]:
+    names = tuple(name.strip() for name in value.split(","))
     if not all(names) or len(set(names)) != len(names):
-        raise ConfigError(f"targets: expected distinct target names in {config}")
+        raise ConfigError("expected distinct target names")
+    return names
+
+
+def _target_kind(value: str) -> Literal["local", "ssh"]:
+    if value not in ("local", "ssh"):
+        raise ValueError(f"expected local or ssh, got {value!r}")
+    return value
+
+
+def _target_platform(value: str) -> Platform:
+    if value not in ("linux", "macos"):
+        raise ValueError(f"expected linux or macos, got {value!r}")
+    return value
+
+
+def _settings_path(value: str, registry: Path) -> Path:
+    if not value:
+        raise ValueError("expected a settings file")
+    try:
+        return (registry.parent / Path(value).expanduser()).resolve()
+    except RuntimeError as error:
+        raise ValueError(str(error)) from error
+
+
+def _registry_value[Value](config: conf.ConfigRead, key: str, convert: Callable[[str], Value],
+                           purpose: RegistryRead) -> Value:
+    if purpose is RegistryRead.PLACEMENT:
+        return config.value(key, convert)
+    value = config.value(key, str, default="", allow_blank=True)
+    try:
+        return convert(value)
+    except (OSError, ValueError) as error:
+        raise ConfigError(f"{key}: {error} in {config.source}") from error
+
+
+def _read_target(config: conf.ConfigRead, name: str, purpose: RegistryRead) -> Target:
+    if purpose is RegistryRead.PLACEMENT:
+        require_target_name(name)
+    kind = _registry_value(config, f"kind.{name}", _target_kind, purpose)
+    platform = _registry_value(config, f"platform.{name}", _target_platform, purpose)
+    if kind == "local":
+        return LocalTarget(name, platform)
+    key = f"settings.{name}"
+    settings = _registry_value(config, key, lambda value: _settings_path(value, config.source), purpose)
+    if purpose is RegistryRead.REQUIRE_SETTINGS_FILES and not settings.is_file():
+        raise ConfigError(f"{key}: settings file does not exist: {settings}")
+    if name == "aws" or settings.name == "aws_target.conf":
+        raise ConfigError("The permanent AWS builder was removed; use cloud gates")
+    return SshTarget(name, platform, settings)
+
+
+def read_targets(path: Path | None = None, *, selected: str = "",
+                 purpose: RegistryRead = RegistryRead.REQUIRE_SETTINGS_FILES) -> tuple[Target, ...]:
+    registry = conf.path("build_targets") if path is None else path
+    current = COMMAND_CONFIGURATION.get()
+    complete = purpose is RegistryRead.REQUIRE_SETTINGS_FILES and not selected
+    if isinstance(current, CommandConfiguration) and registry in current.targets:
+        registered = current.targets[registry]
+        if selected:
+            return tuple(target for target in registered if target.name == selected)
+        if complete:
+            return registered
+    configuration = conf.read(registry)
+    names = _registry_value(configuration, "targets", _target_names, purpose)
     targets: list[Target] = []
     for name in names:
-        kind = values.get(f"kind.{name}", "")
-        if kind not in ("local", "ssh"):
-            raise ConfigError(f"kind.{name}: expected local or ssh, got {kind!r}")
-        platform = values.get(f"platform.{name}", "")
-        if platform not in ("linux", "macos"):
-            raise ConfigError(f"platform.{name}: expected linux or macos, got {platform!r}")
-        if kind == "local":
-            targets.append(LocalTarget(name, platform))
+        if selected and name != selected:
             continue
-        key = f"settings.{name}"
-        setting = values.get(key, "")
-        if not setting:
-            raise ConfigError(f"{key}: expected a settings file")
-        settings = (config.parent / Path(setting).expanduser()).resolve()
-        if not settings.is_file():
-            raise ConfigError(f"{key}: settings file does not exist: {settings}")
-        if name == 'aws' or settings.name == 'aws_target.conf':
-            raise ConfigError('The permanent AWS builder was removed; use cloud gates')
-        targets.append(SshTarget(name, platform, settings))
+        try:
+            targets.append(_read_target(configuration, name, purpose))
+        except ConfigError:
+            if selected or purpose is RegistryRead.REQUIRE_SETTINGS_FILES:
+                raise
     result = tuple(targets)
-    if isinstance(current, CommandConfiguration):
-        current.targets[config] = result
+    if complete and isinstance(current, CommandConfiguration):
+        current.targets[registry] = result
     return result
 
 
 def configured_ssh_target(target: str) -> SshTarget:
-    """Resolve an SSH target before access to its coordination state."""
-    for configured in read_targets():
+    """Resolve one SSH target before access to its coordination state."""
+    for configured in read_targets(selected=target, purpose=RegistryRead.PLACEMENT):
         if configured.name == target and isinstance(configured, SshTarget):
             require_target_name(target)
             return configured
     raise ConfigError(f"unknown SSH target: {target}")
 
 
-def read_execution_transport(target: SshTarget) -> ExecutionTransport:
+def read_execution_transport(target: SshTarget, *,
+                             configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                             ) -> ExecutionTransport:
     """Select the transport before reading connection settings."""
-    from importlib import import_module
-    read_transport = cast(Callable[[SshTarget], ExecutionTransport],
-        getattr(import_module('scripts.aws_target.hana_placement'), 'read_execution_transport'))
-    return read_transport(target)
+    def transport_kind(value: str) -> str:
+        if value != "ssh" and (value != "hana-control" or target.platform != "linux"):
+            raise ValueError("expected ssh or Linux hana-control")
+        return value
+
+    def reporting_host(value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value):
+            raise ValueError("expected a safe Hana reporting alias")
+        return value
+
+    settings = conf.read(target.settings) if isinstance(configuration, conf.UseConfiguredValue) else configuration
+    if settings.value("execution_transport", transport_kind, default="ssh") == "ssh":
+        return SshCommandTransport(target.settings)
+    return HanaControlTransport(target.settings, settings.value("host", reporting_host))
 
 
 def command_target_name(given: str | None) -> str:

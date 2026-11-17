@@ -4,12 +4,14 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 import io
 import json
 import os
+from pathlib import Path
 import select
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -26,6 +28,7 @@ from scripts.mac_test import claim_state, mac_test, offload
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.build_queue.queue_fixture import write_process
 from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
@@ -695,7 +698,9 @@ class PlacementTests(unittest.TestCase):
                                 release_program = """
 import os
 from pathlib import Path
+from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 from unittest import mock
@@ -792,6 +797,515 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                     self.assertEqual(reply.retry, placement.DoNotRetry("command"))
                 else:
                     self.assertEqual(assignment_for(fixture, request).destination, destination)
+
+    def target_settings_fixture(self, fixture: PlacementFixture, *, platform: str = "linux"
+                                ) -> tuple[Path, wire.PlacementRequest, placement.PlacementDestination]:
+        _ = (fixture.root / "build_targets.conf").write_text(
+            f"targets=fixture,healthy\nkind.fixture=ssh\nplatform.fixture={platform}\nsettings.fixture=target.conf\n"
+            + "kind.healthy=ssh\nplatform.healthy=linux\nsettings.healthy=mac_test.conf\n")
+        settings = fixture.root / "target.conf"
+        _ = write_config_fixture(settings, "host=fixture\nexecution_transport=ssh\n"
+                                 + "probe_timeout_s=10\nslots=1\nkinds=check\n", template="mac_test")
+        repository = fixture.root / "hana"
+        (repository / ".git").mkdir(parents=True)
+        request = placement_request(fixture)
+        destination = replace(request.constraints.candidates[0].destination,
+                              provider="mac" if platform == "macos" else "ssh", target="fixture", host="fixture")
+        request = replace(request, constraints=replace(request.constraints, repository=str(repository),
+            command_kind="check", candidates=(placement.PlacementCandidate(destination),)))
+        return settings, request, destination
+
+    def commit_settings(self, settings: Path) -> None:
+        git = ("git", "-C", str(settings.parent))
+        _ = subprocess.run((*git, "init", "-q"), check=True)
+        _ = subprocess.run((*git, "add", settings.name), check=True)
+        _ = subprocess.run((*git, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+                            "commit", "-qm", "Save the usable settings"), check=True)
+
+    def read_target(self, fixture: PlacementFixture, request: wire.PlacementRequest) -> placement.HostEvidence:
+        key = fixture.server.host_evidence_key(request, request.constraints.candidates[0].destination)
+        fixture.server.host_requests[key] = request
+        return fixture.read_host_evidence(key)
+
+    def test_bad_needed_key_uses_the_committed_value_with_one_anomaly(self) -> None:
+        with PlacementFixture() as fixture, fixture.loop_turn():
+            settings, request, destination = self.target_settings_fixture(fixture)
+            self.commit_settings(settings)
+            _ = settings.write_text(settings.read_text().replace("execution_transport=ssh", "execution_transport=broken"))
+            warnings = io.StringIO()
+            with (redirect_stderr(warnings), mock.patch.object(offload.ProcessController, "capture",
+                                                               return_value=offload.CommandOutput(0, "", ""))):
+                evidence = self.read_target(fixture, request)
+                fixture.server.publish_host_evidence(evidence)
+                self.assertEqual(assignment_for(fixture, request).destination, destination)
+            self.assertEqual(warnings.getvalue().count("execution_transport='broken'"), 1)
+
+    def test_bad_needed_key_only_excludes_its_target(self) -> None:
+        with PlacementFixture() as fixture, fixture.loop_turn():
+            settings, request, destination = self.target_settings_fixture(fixture)
+            _ = settings.write_text(settings.read_text().replace("probe_timeout_s=10", "probe_timeout_s=broken"))
+            healthy = replace(destination, target="healthy")
+            healthy_only = replace(request, constraints=replace(request.constraints,
+                candidates=(placement.PlacementCandidate(healthy),)))
+            request = replace(request, constraints=replace(request.constraints,
+                candidates=(*request.constraints.candidates, *healthy_only.constraints.candidates)))
+            with redirect_stderr(io.StringIO()):
+                evidence = self.read_target(fixture, request)
+                assert isinstance(evidence, placement.HostEvidenceUnavailable), evidence
+                self.assertIn("probe_timeout_s='broken'", evidence.reason)
+                _ = publish_candidate(fixture, healthy_only)
+                self.assertEqual(assignment_for(fixture, request).destination, healthy)
+            unavailable = fixture.server.host_evidence_key(request, destination)
+            self.assertNotIn(unavailable, fixture.server.host_readers)
+
+    def test_hana_retry_survives_bad_registered_transport(self) -> None:
+        with PlacementFixture() as fixture, fixture.loop_turn():
+            registered, request, destination = self.target_settings_fixture(fixture)
+            _ = registered.write_text("execution_transport=broken\n")
+            settings = fixture.root / "explicit.conf"
+            _ = write_config_fixture(settings, "enabled=on\n", template="hana_aws")
+            candidate = placement.PlacementCandidate(destination, settings=placement.ExplicitProviderSettings(settings))
+            request = replace(request, constraints=replace(request.constraints, candidates=(candidate,)))
+            starting = placement.TemporaryExclusion("starting")
+            fixture.server.placement_eligibility[request.episode] = (placement.CandidateEligibility(destination, starting),)
+            reply_to = cast(Callable[[wire.PlacementRequest, placement.ResourceHolder], wire.Reply],
+                            getattr(fixture.server, "_placement_reply"))
+
+            reply = reply_to(request, placement.ResourceHolderUnknown())
+
+            assert isinstance(reply, wire.PlacementWait)
+            self.assertEqual([(notice.target, notice.reason) for notice in reply.retry_notices], [("fixture", "starting")])
+            _ = publish_candidate(fixture, request, starting)
+            self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
+
+    def test_bad_probe_timeout_leaves_no_subscription_after_pruning(self) -> None:
+        with PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
+            settings, request, destination = self.target_settings_fixture(fixture)
+            good = settings.read_text()
+            bad = fixture.server.host_evidence_key(request, destination)
+            _ = settings.write_text(good.replace("probe_timeout_s=10", "probe_timeout_s=broken"))
+            reader = cast(Callable[[placement.HostEvidenceKey, float], service.HostEvidenceReader],
+                          getattr(fixture.server, "_host_evidence_reader"))
+            prune = cast(Callable[[], None], getattr(fixture.server, "_prune_host_evidence"))
+            with redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):
+                _ = reader(bad, 1)
+            _ = settings.write_text(good.replace("probe_timeout_s=10", "probe_timeout_s=12"))
+            repaired = fixture.server.host_evidence_key(request, destination)
+            fresh = reader(repaired, 1)
+            fixture.server.placement_requests[request.episode] = request
+            fixture.server.placement_host_keys[(request.episode, destination)] = repaired
+            prune()
+            self.assertEqual(set(fresh.worker.subscriptions), {repaired})
+
+    def test_hana_probe_recovers_an_overflowing_timeout(self) -> None:
+        with (PlacementFixture() as fixture, fixture.loop_turn(), redirect_stderr(io.StringIO()) as warnings,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            settings, request, destination = self.target_settings_fixture(fixture)
+            good = ("execution_transport=hana-control\nhost=fixture\n"
+                    "# whole: 1..\naws_timeout_s=7\n# whole: 1..\nstep_memory_gib=24\n")
+            _ = settings.write_text(good)
+            self.commit_settings(settings)
+            _ = settings.write_text(good.replace("aws_timeout_s=7", "aws_timeout_s=" + "9" * 400))
+
+            reply, = fixture.server.handle_request(request)
+
+            self.assertIsInstance(reply, wire.PlacementWait)
+            key = fixture.server.host_evidence_key(request, destination)
+            self.assertEqual(fixture.server.host_readers[key].timeout, 7.0)
+            self.assertEqual(warnings.getvalue().count("aws_timeout_s="), 1)
+
+    def test_repaired_key_reports_the_same_bad_value_again(self) -> None:
+        with PlacementFixture() as fixture:
+            settings, request, destination = self.target_settings_fixture(fixture)
+            self.commit_settings(settings)
+            good = settings.read_text()
+            bad = good.replace("probe_timeout_s=10", "probe_timeout_s=broken")
+            timeout = cast(Callable[[placement.HostEvidenceKey], float], getattr(fixture.server, "_host_probe_timeout"))
+            with redirect_stderr(io.StringIO()) as warnings:
+                for contents in (bad, good, bad):
+                    _ = settings.write_text(contents)
+                    key = fixture.server.host_evidence_key(request, destination)
+                    self.assertEqual(timeout(key), 10)
+                    self.assertEqual(timeout(key), 10)
+            self.assertEqual(warnings.getvalue().count("probe_timeout_s='broken'"), 2)
+
+    def test_mac_evidence_key_ignores_aws_settings(self) -> None:
+        from scripts.build_targets import target_config
+
+        with PlacementFixture() as fixture:
+            _settings, request, destination = self.target_settings_fixture(fixture, platform="macos")
+            before = fixture.server.host_evidence_key(request, destination)
+            _ = (fixture.root / "aws_target.conf").write_text("changed=1\n")
+            with mock.patch.object(target_config, "read_execution_transport", wraps=target_config.read_execution_transport) as read:
+                self.assertEqual(fixture.server.host_evidence_key(request, destination), before)
+            read.assert_not_called()
+
+    def idle_hana(self, fixture: PlacementFixture) -> tuple[Path, wire.PlacementRequest]:
+        from scripts.aws_target import hana_box
+
+        settings, request, _destination = self.target_settings_fixture(fixture)
+        settings.unlink()
+        _ = write_config_fixture(settings, "enabled=on\nrepository_identity=https://github.com/example/hana\n",
+                                 template="hana_aws")
+        assert isinstance(request.profile, records.StepProfile)
+        request = replace(request, profile=replace(request.profile, step="check"),
+            constraints=replace(request.constraints, command=("cargo", "check")))
+        account = fixture.root / "aws_target.conf"
+        _ = write_config_fixture(account, template="aws_target")
+        controller = hana_box.HanaController(fixture.root / "hana-state", account, settings,
+                                             hana_box.ProviderNotInstalled())
+        controller.register(hana_box.DeploymentIdentity("fixture", "box", "spot", "us-east-2"))
+        from scripts.aws_target import hana_placement_adapter
+        from scripts.mac_test import eligibility
+
+        _ = fixture.enter_context(mock.patch.object(hana_placement_adapter, "controller_for", return_value=controller))
+        _ = fixture.enter_context(mock.patch.object(eligibility, "repository_identity",
+            return_value=eligibility.KnownRepository("hana", "https://github.com/example/hana")))
+        return settings, request
+
+    def test_idle_hana_preview_uses_the_recovered_permit(self) -> None:
+        from scripts.aws_target import hana_spend
+
+        with PlacementFixture() as fixture:
+            settings, request = self.idle_hana(fixture)
+            good = settings.read_text()
+            self.commit_settings(settings)
+            _ = settings.write_text(good.replace("enabled=on", "enabled=broken"))
+            warnings = io.StringIO()
+
+            def preview(spending: hana_spend.HanaSpending, now: int, expires: int) -> hana_spend.StartAffordable:
+                self.assertTrue(spending.settings.enabled)
+                self.assertEqual(expires - now, spending.settings.permit_max_seconds)
+                return hana_spend.StartAffordable(expires)
+
+            with (redirect_stderr(warnings), mock.patch.object(hana_spend.HanaSpending, "preview_start",
+                                                               autospec=True, side_effect=preview) as start):
+                evidence = self.read_target(fixture, request)
+                assert isinstance(evidence, placement.FreshHostEvidence), evidence
+                self.assertEqual(evidence.eligibility, ALLOWED_HOST)
+                start.assert_called_once()
+                self.assertEqual(warnings.getvalue().count("enabled='broken'"), 1)
+                self.assertTrue(hana_spend.read_settings(conf.read(settings)).enabled)
+
+                _ = settings.write_text(good.replace("mount_timeout_seconds=15", "mount_timeout_seconds=broken"))
+                with mock.patch.object(conf, "_committed_files", return_value=()):
+                    evidence = self.read_target(fixture, request)
+                    assert isinstance(evidence, placement.FreshHostEvidence), evidence
+                    self.assertEqual(evidence.eligibility, ALLOWED_HOST)
+                    self.assertEqual(start.call_count, 2)
+                    with self.assertRaisesRegex(conf.Unusable, "mount_timeout_seconds"):
+                        _ = hana_spend.read_settings(conf.read(settings))
+
+    def test_linux_kinds_recovers_the_committed_command(self) -> None:
+        with PlacementFixture() as fixture:
+            settings, request, _destination = self.target_settings_fixture(fixture)
+            self.commit_settings(settings)
+            _ = settings.write_text(settings.read_text().replace("kinds=check", "kinds=broken"))
+            with (redirect_stderr(io.StringIO()) as warnings,
+                  mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", ""))):
+                evidence = self.read_target(fixture, request)
+            assert isinstance(evidence, placement.FreshHostEvidence), evidence
+            self.assertEqual(evidence.eligibility, ALLOWED_HOST)
+            self.assertEqual(warnings.getvalue().count("kinds='broken'"), 1)
+
+    def test_overlapping_snapshots_report_each_bad_edit_once(self) -> None:
+        with PlacementFixture() as fixture, conf.report_key_changes(), redirect_stderr(io.StringIO()) as warnings:
+            settings, _request, _destination = self.target_settings_fixture(fixture)
+            self.commit_settings(settings)
+            good = settings.read_text()
+            bad = good.replace("probe_timeout_s=10", "probe_timeout_s=broken")
+            old_valid = conf.read(settings)
+            _ = settings.write_text(bad)
+            old_bad = conf.read(settings)
+            self.assertEqual(old_bad.number("probe_timeout_s"), 10)
+            self.assertEqual(old_valid.number("probe_timeout_s"), 10)
+            self.assertEqual(conf.read(settings).number("probe_timeout_s"), 10)
+            self.assertEqual(warnings.getvalue().count("probe_timeout_s='broken'"), 1)
+
+            _ = settings.write_text(good)
+            self.assertEqual(conf.read(settings).number("probe_timeout_s"), 10)
+            _ = settings.write_text(bad)
+            self.assertEqual(conf.read(settings).number("probe_timeout_s"), 10)
+            self.assertEqual(old_bad.number("probe_timeout_s"), 10)
+            self.assertEqual(warnings.getvalue().count("probe_timeout_s='broken'"), 2)
+
+    def test_older_request_without_a_reader_cannot_hold_a_newer_reading(self) -> None:
+        with PlacementFixture() as fixture, fixture.loop_turn(), redirect_stderr(io.StringIO()):
+            settings, older, destination = self.target_settings_fixture(fixture)
+            _ = settings.write_text(settings.read_text().replace("probe_timeout_s=10", "probe_timeout_s=broken"))
+            server = fixture.server
+            request_evidence = cast(Callable[[wire.PlacementRequest, placement.PlacementDestination], placement.HostEvidence],
+                                    getattr(server, "_request_host_evidence"))
+            self.assertIsInstance(request_evidence(older, destination), placement.HostEvidenceUnavailable)
+            older_key = server.placement_host_keys[(older.episode, destination)]
+            self.assertNotIn(older_key, server.host_readers)
+            candidate = placement.CandidateEligibility(destination, placement.EvidenceNeeded("probe unavailable"))
+            make_hold = cast(Callable[[wire.PlacementRequest, placement.CandidateEligibility,
+                                      dict[tuple[str, placement.PlacementDestination], float]], service.PlacementHold | None],
+                             getattr(server, "_placement_hold"))
+            hold = make_hold(older, candidate, {})
+
+            fixture.clock.advance(1)
+            younger = replace(older, episode="younger",
+                constraints=replace(older.constraints, session=OwningSession("younger")))
+            evidence = publish_candidate(fixture, younger)
+            server.placement_host_keys[(younger.episode, destination)] = evidence.key
+            held_for_older = cast(Callable[[wire.PlacementRequest, placement.PlacementDestination, list[service.PlacementHold],
+                dict[tuple[str, placement.PlacementDestination], float]], bool], getattr(server, "_held_for_older"))
+            self.assertFalse(held_for_older(younger, destination, [hold] if hold is not None else [], {}))
+            self.assertIsNone(hold)
+
+    def client_constraints(self, request: wire.PlacementRequest) -> placement.PlacementConstraints:
+        from scripts.build_targets import build_targets
+
+        arguments = request.constraints
+        assert isinstance(arguments.command_kind, str)
+        return build_targets.fixed_placement_constraints(Path(arguments.repository), arguments.package,
+            arguments.command_kind, arguments.command, arguments.session, arguments.source_key)
+
+    def test_fixed_candidates_ignore_bad_cleanup_settings(self) -> None:
+        with PlacementFixture() as fixture, redirect_stderr(io.StringIO()) as warnings:
+            settings, request, _destination = self.target_settings_fixture(fixture)
+            before = self.client_constraints(request)
+            timeout = conf.read(settings).text("leftover_timeout_s")
+            _ = settings.write_text(settings.read_text().replace(
+                f"leftover_timeout_s={timeout}", "leftover_timeout_s=broken"))
+            self.assertEqual(self.client_constraints(request), before)
+            self.assertTrue(any(candidate.destination.target == "fixture" and candidate.eligibility == ALLOWED_HOST
+                                for candidate in before.candidates))
+            self.assertEqual(warnings.getvalue(), "")
+
+    def test_bad_registry_neighbor_does_not_stop_healthy_placement(self) -> None:
+        from scripts.build_targets import build_targets, target_config
+
+        with PlacementFixture() as fixture, redirect_stderr(io.StringIO()):
+            settings, request, destination = self.target_settings_fixture(fixture)
+            healthy_settings = fixture.root / "mac_test.conf"
+            _ = write_config_fixture(healthy_settings, "host=healthy\nkinds=check\n")
+            destination = replace(destination, target="healthy", host="healthy")
+            request = replace(request, constraints=replace(request.constraints,
+                candidates=(placement.PlacementCandidate(destination),)))
+            registry = fixture.root / "build_targets.conf"
+
+            def check_healthy() -> None:
+                target = records.effective_target("healthy", placement.ConfiguredProviderSettings())
+                self.assertEqual(target, target_config.SshTarget("healthy", "linux", healthy_settings))
+                self.assertEqual(claim_state.state_paths("healthy").platform, "linux")
+                with mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", "")):
+                    evidence = self.read_target(fixture, request)
+                assert isinstance(evidence, placement.FreshHostEvidence), evidence
+                self.assertEqual(evidence.eligibility, ALLOWED_HOST)
+                self.assertTrue(any(candidate.destination.target == "healthy" and candidate.eligibility == ALLOWED_HOST
+                                    for candidate in self.client_constraints(request).candidates))
+                args = build_targets.CliArguments()
+                args.target, args.kind, args.repo_root = "healthy", "check", request.constraints.repository
+                with redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(build_targets.command_constraints(args), 0)
+                self.assertIn("healthy\teligible", output.getvalue())
+
+            settings.unlink()
+            with self.subTest(neighbor="missing file"):
+                check_healthy()
+            _ = registry.write_text(registry.read_text().replace("platform.fixture=linux", "platform.fixture=broken"))
+            with self.subTest(neighbor="invalid registry entry"):
+                check_healthy()
+
+    def test_client_and_service_recover_the_same_linux_policy_and_capacity(self) -> None:
+        with PlacementFixture() as fixture, redirect_stderr(io.StringIO()) as warnings:
+            settings, request, _destination = self.target_settings_fixture(fixture)
+            _ = settings.write_text(settings.read_text() + "\nslots.hana=2\n")
+            self.commit_settings(settings)
+            _ = settings.write_text(settings.read_text().replace("slots.hana=2", "slots.hana=broken")
+                                    .replace("kinds=check", "kinds=broken"))
+            candidates = [candidate for candidate in self.client_constraints(request).candidates
+                          if candidate.destination.target == "fixture"]
+            self.assertEqual([candidate.destination.slot for candidate in candidates], [1, 2])
+            self.assertTrue(all(candidate.eligibility == ALLOWED_HOST for candidate in candidates))
+            with mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", "")):
+                evidence = self.read_target(fixture, request)
+            assert isinstance(evidence, placement.FreshHostEvidence), evidence
+            self.assertEqual(evidence.eligibility, ALLOWED_HOST)
+            self.assertEqual(warnings.getvalue().count("slots.hana='broken'"), 1)
+            self.assertEqual(warnings.getvalue().count("kinds='broken'"), 1)
+
+    def test_hana_preview_recovers_budget_and_ignores_guest_guard(self) -> None:
+        from decimal import Decimal
+        from scripts.aws_target import hana_spend
+
+        with PlacementFixture() as fixture:
+            settings, request = self.idle_hana(fixture)
+            good = settings.read_text()
+            self.commit_settings(settings)
+
+            def preview(spending: hana_spend.HanaSpending, _now: int, expires: int) -> hana_spend.StartAffordable:
+                self.assertEqual(spending.settings.daily_budget_usd, Decimal(6))
+                return hana_spend.StartAffordable(expires)
+
+            with mock.patch.object(hana_spend.HanaSpending, "preview_start", autospec=True, side_effect=preview) as start:
+                edits = (
+                    ("daily_budget_usd", good.replace("# range: 0.01..\ndaily_budget_usd=6", "daily_budget_usd=broken"), 1),
+                    ("guard_grace_seconds", good.replace("guard_grace_seconds=60", "guard_grace_seconds=broken"), 0),
+                )
+                for key, contents, count in edits:
+                    with self.subTest(key=key), redirect_stderr(io.StringIO()) as warnings:
+                        _ = settings.write_text(contents)
+                        evidence = self.read_target(fixture, request)
+                        assert isinstance(evidence, placement.FreshHostEvidence), evidence
+                        self.assertEqual(evidence.eligibility, ALLOWED_HOST)
+                        self.assertEqual(warnings.getvalue().count(f"{key}='broken'"), count)
+                self.assertEqual(start.call_count, 2)
+
+    def test_hana_client_and_service_recover_the_same_route_limit(self) -> None:
+        from scripts.aws_target import hana_spend
+
+        with PlacementFixture() as fixture, redirect_stderr(io.StringIO()) as warnings:
+            settings, request = self.idle_hana(fixture)
+            self.commit_settings(settings)
+            _ = settings.write_text(settings.read_text().replace("# whole: 1..1\nmax_steps=1", "# whole: 1..\nmax_steps=2"))
+            candidates = self.client_constraints(request).candidates
+            self.assertTrue(any(candidate.destination.target == "fixture" and candidate.eligibility == ALLOWED_HOST
+                                for candidate in candidates))
+            with mock.patch.object(hana_spend.HanaSpending, "preview_start", return_value=hana_spend.StartAffordable(0)):
+                evidence = self.read_target(fixture, request)
+            assert isinstance(evidence, placement.FreshHostEvidence), evidence
+            self.assertEqual(evidence.eligibility, ALLOWED_HOST)
+            self.assertEqual(warnings.getvalue().count("max_steps='2'"), 1)
+
+    def test_mac_probe_recovers_the_committed_mirror_root(self) -> None:
+        with PlacementFixture() as fixture, redirect_stderr(io.StringIO()) as warnings:
+            settings, request, _destination = self.target_settings_fixture(fixture, platform="macos")
+            _ = write_config_fixture(settings, "linux_only.hana=\n")
+            mac_settings = fixture.root / "mac_test.conf"
+            _ = write_config_fixture(mac_settings, "mirror_root=~/fixture-mirrors\n")
+            self.commit_settings(mac_settings)
+            _ = mac_settings.write_text(mac_settings.read_text().replace(
+                "mirror_root=~/fixture-mirrors", "mirror_root=/outside"))
+            reply = offload.CommandOutput(0, "free_gib=1000\nhost=fixture\nrc=0\n", "")
+            with mock.patch.object(offload.ProcessController, "capture", return_value=reply) as probe:
+                evidence = self.read_target(fixture, request)
+            assert isinstance(evidence, placement.FreshHostEvidence), evidence
+            self.assertEqual(evidence.eligibility, ALLOWED_HOST)
+            self.assertIn("fixture-mirrors/hana", str(probe.call_args))
+            self.assertEqual(warnings.getvalue().count("mirror_root='/outside'"), 1)
+
+    def test_edit_during_read_uses_the_stamp_of_the_read_contents(self) -> None:
+        with PlacementFixture() as fixture, conf.report_key_changes(), redirect_stderr(io.StringIO()) as warnings:
+            settings, _request, _destination = self.target_settings_fixture(fixture)
+            self.commit_settings(settings)
+            bad = settings.read_text().replace("probe_timeout_s=10", "probe_timeout_s=broken")
+            with settings.open(encoding="utf-8") as stream:
+                read = stream.read
+
+                def edit_and_read() -> str:
+                    with io.open(settings, "w", encoding="utf-8") as changed:
+                        _ = changed.write(bad)
+                    return read()
+
+                with (mock.patch.object(Path, "open", return_value=stream),
+                      mock.patch.object(stream, "read", side_effect=edit_and_read)):
+                    first = conf.read(settings)
+
+            self.assertEqual(first.number("probe_timeout_s"), 10)
+            self.assertEqual(conf.read(settings).number("probe_timeout_s"), 10)
+            self.assertEqual(warnings.getvalue().count("probe_timeout_s='broken'"), 1)
+
+    def test_bad_probe_timeout_leaves_no_request_after_pruning(self) -> None:
+        with PlacementFixture() as fixture, fixture.loop_turn(), redirect_stderr(io.StringIO()):
+            settings, request, destination = self.target_settings_fixture(fixture)
+            _ = settings.write_text(settings.read_text().replace("probe_timeout_s=10", "probe_timeout_s=broken"))
+            key = fixture.server.host_evidence_key(request, destination)
+
+            reply, = fixture.server.handle_request(request)
+
+            self.assertIsInstance(reply, wire.PlacementWait)
+            self.assertNotIn(key, fixture.server.host_requests)
+
+    def test_capacity_ignores_bad_leftover_timeout(self) -> None:
+        with PlacementFixture() as fixture, redirect_stderr(io.StringIO()) as warnings:
+            settings, request, destination = self.target_settings_fixture(fixture)
+            good = settings.read_text()
+            timeout = conf.read(settings).text("leftover_timeout_s")
+            _ = settings.write_text(good.replace(f"leftover_timeout_s={timeout}", "leftover_timeout_s=broken"))
+            paths = mac_test.state_paths(destination.target)
+            with self.subTest(reader="free_now"):
+                self.assertEqual(mac_test.free_now(paths, settings, Path(request.constraints.repository)), "free")
+            with self.subTest(reader="slot_capacity"):
+                self.assertEqual(mac_test.slot_capacity(paths, RepositoryScope("hana")), 1)
+            self.assertEqual(warnings.getvalue(), "")
+
+    def test_capacity_recovers_bad_repository_slot_count(self) -> None:
+        with PlacementFixture() as fixture:
+            settings, _request, destination = self.target_settings_fixture(fixture)
+            good = settings.read_text() + "\nslots.hana=2\n"
+            _ = settings.write_text(good)
+            self.commit_settings(settings)
+            _ = settings.write_text(good.replace("slots.hana=2", "slots.hana=broken"))
+            paths = mac_test.state_paths(destination.target)
+            with redirect_stderr(io.StringIO()) as warnings:
+                self.assertEqual(mac_test.slot_capacity(paths, RepositoryScope("hana")), 2)
+            self.assertEqual(warnings.getvalue().count("slots.hana='broken'"), 1)
+
+    def test_unreadable_aws_settings_confine_the_refusal_to_hana(self) -> None:
+        with PlacementFixture() as fixture:
+            _settings, request, _destination = self.target_settings_fixture(fixture, platform="macos")
+            mac = request.constraints.candidates[0].destination
+            mac_key = fixture.server.host_evidence_key(request, mac)
+            account = fixture.root / "aws_target.conf"
+            open_path = cast(Callable[..., object], Path.open)
+
+            def unreadable(path: Path, *args: object, **kwargs: object) -> object:
+                if path == account:
+                    raise PermissionError("The account settings are unreadable")
+                return open_path(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "open", autospec=True, side_effect=unreadable):
+                self.assertEqual(fixture.server.host_evidence_key(request, mac), mac_key)
+        with PlacementFixture() as fixture:
+            _settings, hana = self.idle_hana(fixture)
+            account = fixture.root / "aws_target.conf"
+            with mock.patch.object(Path, "open", autospec=True, side_effect=unreadable):
+                evidence = self.read_target(fixture, hana)
+                assert isinstance(evidence, placement.FreshHostEvidence), evidence
+                assert isinstance(evidence.eligibility, placement.TemporaryExclusion), evidence
+                self.assertIn("account settings are unreadable", evidence.eligibility.reason)
+
+    def test_admission_starts_probe_recovery_and_execution_keeps_the_host_override(self) -> None:
+        from scripts.build_targets import build_targets
+        from scripts.copies import copies
+        from scripts.mac_test import eligibility
+
+        with PlacementFixture() as fixture:
+            settings, request, destination = self.target_settings_fixture(fixture)
+            host = socket.gethostname().split(".", 1)[0]
+            good = settings.read_text() + f"\n# range: 1..\nshell_timeout_s=10\n# range: 1..\nshell_timeout_s.{host}=31\n"
+            _ = settings.write_text(good.replace("floor_sweep_timeout_s=180", "floor_sweep_timeout_s=broken"))
+            repository = eligibility.KnownRepository("hana")
+            with (mock.patch.object(eligibility, "repository_identity", return_value=repository),
+                  mock.patch.object(eligibility, "read_failed_probe", return_value=eligibility.FailedProbe()),
+                  mock.patch.object(build_targets, "start_probe_recovery") as start):
+                evidence = self.read_target(fixture, request)
+                assert isinstance(evidence, placement.FreshHostEvidence), evidence
+                self.assertEqual(evidence.eligibility, ALLOWED_HOST)
+                start.assert_called_once()
+
+            _ = settings.write_text(good)
+            args = build_targets.CliArguments()
+            args.target, args.repo_root, args.kind = destination.target, request.constraints.repository, "check"
+            with (mock.patch.object(eligibility, "repository_identity", return_value=repository),
+                  mock.patch.object(eligibility, "read_failed_probe", return_value=eligibility.FailedProbe()),
+                  mock.patch.object(copies, "remote_lease", return_value=nullcontext()),
+                  mock.patch.object(offload, "request_mirror"),
+                  mock.patch.object(offload, "claim_for_run", return_value=offload.FreshMacClaim(1)),
+                  mock.patch.object(offload, "copy_tracked_scripts", return_value=True),
+                  mock.patch.object(offload, "copy_tree_with_key", return_value=offload.CopiedTree(offload.KnownTreeKey("source"))),
+                  mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(100, "fixture")) as probe,
+                  mock.patch.object(offload, "release_claim")):
+                args.recovery_fd = os.open(os.devnull, os.O_RDONLY)
+                self.assertEqual(build_targets.command_recover_probe(args), 0)
+
+            probe.assert_called_once()
+            config = cast(eligibility.OffloadConfig, probe.call_args.args[1])
+            self.assertEqual(offload.runner_values(config, destination.target)["shell_timeout_s"], "31")
 
     def test_each_mac_run_kind_is_admitted_on_the_mac_and_refused_on_a_linux_target(self) -> None:
         cases: tuple[tuple[str, placement.CommandKind | placement.CommandKindNotSent, str], ...] = (
