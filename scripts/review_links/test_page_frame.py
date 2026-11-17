@@ -297,9 +297,11 @@ window.fetch=async(url,options={})=>{
   check(positions.length===4 && positions[0].matches('.page-status-state') && positions[1]===part('age') &&
    positions[2]===part('trip') && positions[3]===part('render'),'the Live line has the same four positions');
   const title=document.querySelector('.page-title'),titleBox=title.getBoundingClientRect(),lineBox=line.getBoundingClientRect();
-  const mainBox=document.querySelector('main').getBoundingClientRect(),width=document.documentElement.clientWidth;
-  check(mainBox.width===Math.min(width,1124) && Math.abs(mainBox.left-(width-mainBox.right))<1,
-   'the page uses the shared centered column');
+  const main=document.querySelector('main'),mainBox=main.getBoundingClientRect(),width=document.documentElement.clientWidth;
+  // A wide page uses the pane width; a text page keeps the 1124 px column.
+  check(mainBox.width===(main.classList.contains('page-wide')?width:Math.min(width,1124)) &&
+   Math.abs(mainBox.left-(width-mainBox.right))<1,'the page uses the shared centered column');
+  check(main.classList.contains('page-wide')===(document.title==='Builds'),'only the Builds page is wide');
   check(titleBox.x===mainBox.x+32 && titleBox.y+scrollY===32,'the title starts at the shared column edge');
   check(lineBox.x===titleBox.x && lineBox.y===titleBox.bottom+8,'the line follows the title in the same column');
   check(lineBox.width===titleBox.width && lineBox.height===21,'the line uses the full title width and shared height');

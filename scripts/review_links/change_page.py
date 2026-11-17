@@ -17,6 +17,7 @@ import shlex
 import subprocess
 import sys
 import time
+import unicodedata
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -551,8 +552,12 @@ def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
     return document(f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>' + answer_form(page, notice, feedback_rows))
 
 
-LINK = re.compile(r"(https?://[^\s<>\"']*[^\s<>\"'.,;:!?)\]])")
+LINK = re.compile(r"(https?://(?:[^\s<>\"'`]|`(?![^`\n]+`))*"
+                  + r"(?:[^\s<>\"'`*.,;:!?)\]]|`(?![^`\n]+`)))")
 CODE_SPAN = re.compile(r"`([^`\n]+)`")
+# Read code spans before URLs and bold delimiters.
+INLINE_MARKUP = re.compile(CODE_SPAN.pattern + "|(?P<url>" + LINK.pattern + r")|\*\*")
+HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)(?:[ \t]+#+[ \t]*)?$")
 
 
 def linked(text: str) -> str:
@@ -563,21 +568,62 @@ def linked(text: str) -> str:
 
 
 def inline_html(text: str) -> str:
-    """Escape text, show each backtick span as code, and make each address outside a code span a link."""
-    pieces = CODE_SPAN.split(text)
-    return "".join(f"<code>{html.escape(piece)}</code>" if index % 2 else linked(piece) for index, piece in enumerate(pieces))
+    """Escape text and render bold text, code spans, and address links."""
+    content: list[str] = []
+    start = 0
+    bold_start = -1
+    bold_content_start = 0
+    for part in INLINE_MARKUP.finditer(text):
+        plain = text[start:part.start()]
+        if "\n" in plain:
+            bold_start = -1
+        content.append(html.escape(plain))
+        if part[1] is not None:
+            content.append(f"<code>{html.escape(part[1])}</code>")
+        elif part["url"] is not None:
+            content.append(linked(part["url"]))
+        else:
+            before = text[part.start() - 1] if part.start() else ""
+            after = text[part.end()] if part.end() < len(text) else ""
+            literal = ((before.isalnum() or before in ("_", "/"))
+                       and (after.isalnum() or after in ("_", "/")))
+            opens = (bool(after) and not after.isspace() and after != "/"
+                     and (not before or before.isspace() or before in ("\"", "'")
+                          or unicodedata.category(before) in ("Ps", "Pi")))
+            closes = (bool(before) and not before.isspace() and before != "/"
+                      and (not after or after.isspace() or unicodedata.category(after).startswith("P")))
+            if not literal and bold_start >= 0 and part.start() > bold_content_start and closes:
+                content[bold_start] = "<strong>"
+                content.append("</strong>")
+                bold_start = -1
+            else:
+                if not literal and bold_start < 0 and opens:
+                    bold_start = len(content)
+                    bold_content_start = part.end()
+                content.append("**")
+        start = part.end()
+    content.append(html.escape(text[start:]))
+    return "".join(content)
 
 
 def review_text_html(text: str, *, inline: bool = False) -> str:
-    """Render review text as escaped text blocks and consecutive list runs; `inline` adds links and code spans."""
+    """Render escaped text blocks and lists; `inline` adds Markdown headings and inline formatting."""
     escape = inline_html if inline else html.escape
     lines = text.splitlines()
-    if not any(re.match(r"\s*(?:- |[0-9]+\. )", line) for line in lines):
+    if not any(re.match(r"\s*(?:- |[0-9]+\. )", line) or inline and HEADING.match(line.lstrip()) for line in lines):
         return f"<p>{escape(text)}</p>"
     content: list[str] = []
     current = ""
     for line in lines:
         line = line.lstrip()
+        heading = HEADING.match(line) if inline else None
+        if heading is not None:
+            if current:
+                content.append(f"</{current}>")
+                current = ""
+            level = len(heading[1])
+            content.append(f"<h{level}>{escape(heading[2])}</h{level}>")
+            continue
         numbered = re.match(r"([0-9]+)\. (.*)", line)
         tag = "ul" if line.startswith("- ") else "ol" if numbered else "p" if line else ""
         if tag != current:

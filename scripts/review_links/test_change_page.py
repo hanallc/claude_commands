@@ -258,6 +258,59 @@ class ReviewTextTests(unittest.TestCase):
                          + '<pre><code>deploy.py up --x &lt;y&gt;</code></pre>' + page_frame.COPY_BUTTON + '</div></li>'
                          + '<li>Run <code>ls</code> now</li><li><code>a</code> and <code>b</code></li></ol>')
 
+    def test_shared_inline_markdown_renders_bold_headings_and_lists(self) -> None:
+        text = '## Heading\n**Field:** <script> & ready\n- **Owner:** morty\n1. **Next:** `run`'
+        expected = ('<h2>Heading</h2><p><strong>Field:</strong> &lt;script&gt; &amp; ready</p>'
+                    + '<ul><li><strong>Owner:</strong> morty</li></ul>'
+                    + '<ol><li><strong>Next:</strong> <code>run</code></li></ol>')
+        self.assertEqual(change_page.review_text_html(text, inline=True), expected)
+        self.assertEqual(change_browser.question_paragraphs(text), expected)
+        self.assertEqual(change_page.review_text_html('## **Title** ###', inline=True), '<h2><strong>Title</strong></h2>')
+        self.assertEqual(change_page.inline_html('**Use `a <b>` now** and `**literal**`'),
+                         '<strong>Use <code>a &lt;b&gt;</code> now</strong> and <code>**literal**</code>')
+        self.assertEqual(change_page.inline_html('**One** and **Two**'), '<strong>One</strong> and <strong>Two</strong>')
+        self.assertEqual(change_page.inline_html('**a `**` b**'), '<strong>a <code>**</code> b</strong>')
+        self.assertEqual(change_page.inline_html('** ** and unmatched **word'), '** ** and unmatched **word')
+
+    def test_shared_inline_markdown_preserves_literal_urls_and_paths(self) -> None:
+        for text, expected in (
+            ('https://example.org/a**b**c',
+             '<a href="https://example.org/a**b**c" target="_top">https://example.org/a**b**c</a>'),
+            ('src/**/test/**/file.py', 'src/**/test/**/file.py'),
+            ('**word** and **Field:** ready', '<strong>word</strong> and <strong>Field:</strong> ready'),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(change_page.inline_html(text), expected)
+                self.assertEqual(change_browser.question_paragraphs(text), '<p>' + expected + '</p>')
+
+    def test_shared_inline_markdown_uses_bold_boundaries_and_code_before_urls(self) -> None:
+        for text, expected in (
+            ('Use **read/write** mode.', '<p>Use <strong>read/write</strong> mode.</p>'),
+            ('## **Read/write**', '<h2><strong>Read/write</strong></h2>'),
+            ('https://example.org/`id`',
+             '<p><a href="https://example.org/" target="_top">https://example.org/</a><code>id</code></p>'),
+            ('(**read/write**).', '<p>(<strong>read/write</strong>).</p>'),
+            ('word**bold** and **bold**word', '<p>word**bold** and **bold**word</p>'),
+            ('** word** and **word **', '<p>** word** and **word **</p>'),
+            ('**Use src/**/test/**/file.py now**', '<p><strong>Use src/**/test/**/file.py now</strong></p>'),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(change_page.review_text_html(text, inline=True), expected)
+                self.assertEqual(change_browser.question_paragraphs(text), expected)
+
+    def test_shared_inline_markdown_requires_content_and_keeps_url_endings(self) -> None:
+        for text, expected in (
+            ('src/{**/test/**,other}/file.py', 'src/{**/test/**,other}/file.py'),
+            ('**https://example.org**',
+             '<strong><a href="https://example.org" target="_top">https://example.org</a></strong>'),
+            ('Mask: ****', 'Mask: ****'),
+            ('https://example.org/a`tail',
+             '<a href="https://example.org/a`tail" target="_top">https://example.org/a`tail</a>'),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(change_page.inline_html(text), expected)
+                self.assertEqual(change_browser.question_paragraphs(text), '<p>' + expected + '</p>')
+
     def test_code_copy_markup_keeps_code_text_separate_from_the_control(self) -> None:
         code = '  first <tag> & value\tsecond  '
         rendered = change_browser.item_html('`' + code + '`')

@@ -105,16 +105,17 @@ def feedback_form(entry: ListRecord, secret: str) -> str:
             + '<button name="action" value="remove">Remove</button>'
             + f'<label for="park-{key}">Park until</label><input type="date" name="until" id="park-{key}">'
             + '<button name="action" value="park">Park</button></div>'
-            + f'<label for="words-{key}">Tell morty</label><textarea name="words" id="words-{key}" rows="2" maxlength="10000"></textarea>'
-            + '<button name="action" value="tell">Send</button><span role="status" data-send-status></span></form>')
+            + f'<textarea name="words" id="words-{key}" rows="2" maxlength="10000" '
+            + 'placeholder="Your words for morty about this item" aria-label="Your words for morty about this item"></textarea>'
+            + '<div class="list-tell"><span role="status" data-send-status></span>'
+            + '<button name="action" value="tell" disabled>Tell morty</button></div></form>')
 
 
 def details(entry: ListRecord, today: datetime, secret: str) -> str:
     item = entry.item
     sections = ''.join('<section><h3>' + heading + '</h3>'
                        + change_browser.question_paragraphs(text or "Not recorded") + '</section>'
-                       for heading, text in (("Latest status", item.latest_status), ("Done when", item.done_when),
-                                             ("Evidence", item.evidence)))
+                       for heading, text in (("Latest status", item.latest_status), ("Done when", item.done_when)))
     links = [f'<li><a href="{html.escape(item_link(entry.keeper, link.number), quote=True)}">#{link.number}</a>'
              + ' — ' + html.escape(link.condition) + '</li>' for link in item.blocked_by]
     links.extend(f'<li>Related: <a href="{html.escape(item_link(entry.keeper, number), quote=True)}">#{number}</a></li>'
@@ -169,7 +170,7 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
         if feedback.state == "alerted":
             notice = "not sent; " + feedback.alerted_to + " told" if feedback.alerted_to else "not sent; no showrunner for alert"
         update += '<small>' + html.escape(notice + ", " + local_time(sent, today)) + '</small>'
-    cells = (number, html.escape(owner), title, state, html.escape(item.next_step or "Not recorded"),
+    cells = (number, html.escape(owner), title, state, change_browser.question_paragraphs(item.next_step or "Not recorded"),
              html.escape(eta_text(item.eta, today)), update)
     row = ''.join(f'<td data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden = ' hidden' if parked or item.state in (the_list.ItemState.DONE, the_list.ItemState.CLOSED) else ''
@@ -352,7 +353,12 @@ def render(root: Path) -> bytes:
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
 
 
-STYLE = record_table.STYLE
+STYLE = record_table.STYLE + '''<style>
+.list-table td[data-label="Next step"]>:first-child{margin-top:0}.list-table td[data-label="Next step"]>:last-child{margin-bottom:0}
+.list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
+.list-tell button{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.list-tell button:disabled{opacity:.45;cursor:default}.list-tell [data-send-status]{margin-left:0}
+</style>'''
 
 SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + r'''(() => {
 let content=document.querySelector('[data-list]');
@@ -384,18 +390,21 @@ function bind(){
  content.querySelectorAll('[data-feedback-form]').forEach(form=>{
   const key=form.closest('[data-list-item]').dataset.key;
   const words=form.elements.words,until=form.elements.until;
+  const tell=form.querySelector('[value="tell"]');
+  const syncTell=()=>{tell.disabled=Boolean(form.dataset.sending) || !words.value.trim();};
   const fresh={request:form.elements.request.value,token:form.elements.token.value};
   const draft=drafts.get(key);if(draft){words.value=draft.words;until.value=draft.until;}
   let attempt=draft?.attempt;
   const same=action=>attempt && attempt.words===words.value && attempt.until===until.value &&
    (action===undefined || attempt.action===action);
   const identity=request=>{form.elements.request.value=request.request;form.elements.token.value=request.token;};
-  const retain=()=>{drafts.set(key,{words:words.value,until:until.value,attempt});identity(same() ? attempt : fresh);};
+  const retain=()=>{drafts.set(key,{words:words.value,until:until.value,attempt});identity(same() ? attempt : fresh);syncTell();};
   retain();
   words.addEventListener('input',retain);until.addEventListener('input',retain);
   form.addEventListener('submit',async event=>{
    event.preventDefault();if(form.dataset.sending) return;
    const action=event.submitter?.value || 'tell';identity(same(action) ? attempt : fresh);
+   if(action==='tell' && !words.value.trim()) return;
    const data=new URLSearchParams(new FormData(form));data.set('action',action);
    attempt={words:words.value,until:until.value,action,request:data.get('request'),token:data.get('token')};retain();
    form.dataset.sending='true';saving++;pageRefresh.abandon();
@@ -413,7 +422,7 @@ function bind(){
     }
    }catch(error){notice.textContent='Not saved: '+error.message;}
    finally{
-    delete form.dataset.sending;saving--;buttons.forEach(button=>button.disabled=false);
+    delete form.dataset.sending;saving--;buttons.forEach(button=>button.disabled=false);syncTell();
     void pageRefresh.refresh(true);
    }
   });
