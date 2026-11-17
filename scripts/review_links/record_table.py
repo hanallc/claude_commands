@@ -67,14 +67,16 @@ let content=contentProxy(),owner='',show='open',query='',sort='',direction='asc'
 const opened=new Set();
 const columns=[...content.querySelectorAll('[data-sort]')].map(button=>button.textContent);
 function place(){
- const params=new URLSearchParams(location.hash.slice(1));
- owner=params.get('owner') || '';show=params.get('show') || 'open';query=params.get('q') || '';
+ const params=new URLSearchParams(location.search);
+ for(const [key,value] of new URLSearchParams(location.hash.slice(1))) params.set(key,value);
+ owner=params.get('owner') || params.get('showrunner') || '';show=params.get('show') || 'open';query=params.get('q') || '';
  sort=params.get('sort') || '';direction=params.get('dir')==='desc' ? 'desc' : 'asc';
  type=params.get('type') || '';
  if(!options.shows.includes(show)) show='open';
  if(!columns.includes(sort)) sort='';
  const item=params.get('item');if(item){
-  owner='';show='all';query='';type='';if(options.single) opened.clear();opened.add(item);
+  if(!['owner','showrunner','show','q','sort','dir','type'].some(key=>params.has(key))){owner='';show='all';query='';type='';}
+  if(options.single) opened.clear();opened.add(item);
  }
  owner=options.resolveOwner?.(owner) ?? owner;
 }

@@ -523,11 +523,16 @@ try{
  check(visible().length===1 && visible()[0].dataset.number==='54','hash navigation restores the filters');
 
  for(const target of rows().filter(row=>['Done','Closed'].includes(row.dataset.state) || row.dataset.parked==='true')){
-  location.hash=new URLSearchParams({item:target.dataset.key,owner:'missing',show:'open',q:'missing'});await flush();
+  location.hash=new URLSearchParams({item:target.dataset.key});await flush();
   check(!target.hidden && !target.querySelector('[data-detail]').hidden,'an item link shows '+target.dataset.state);
   check(document.getElementById('list-show').value==='all' && document.getElementById('list-owner').value==='' &&
     document.getElementById('list-search').value==='','an item link clears filters');
  }
+ const retained=rows().find(row=>row.dataset.number==='106');
+ location.hash=new URLSearchParams({item:retained.dataset.key,owner:retained.dataset.owner,show:'open',q:'106',sort:'#',dir:'desc'});await flush();
+ check(document.getElementById('list-owner').value===retained.dataset.owner && document.getElementById('list-show').value==='open' &&
+   document.getElementById('list-search').value==='106','an address with an open item keeps its filters');
+ check(!retained.hidden && !retained.querySelector('[data-detail]').hidden,'an address restores its open item');
  check(document.querySelectorAll('[data-feedback-form]').length===6,'each row has feedback controls');
  check(document.documentElement.scrollWidth<=innerWidth,'the page has no horizontal overflow');
  if(innerWidth<960){check(getComputedStyle(visible()[0]).display==='block','a phone row is a card');}

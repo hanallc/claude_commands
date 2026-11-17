@@ -936,9 +936,19 @@ class CountsRowTests(unittest.TestCase):
 
 
     def questions(self, *items: OutstandingItem) -> None:
-        path = self.home / ".local/state/showrunner/outstanding" / f"{OWNER.id}.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(json.dumps(list(items)), encoding="utf-8")
+        folder = self.home / ".local/state/showrunner" / OWNER.id / "questions"
+        folder.mkdir(parents=True, exist_ok=True)
+        paths: set[Path] = set()
+        for index, item in enumerate(items):
+            path = folder / f"question-fixture-{index}.md"
+            paths.add(path)
+            fields = item | {"question": item["text"]+"?", "asked_by": OWNER.id}
+            _ = path.write_text("---\nrecord_type: question\nstatus: open\n"
+                + f"production_id: {OWNER.id}\nasked_by: {OWNER.id}\n"
+                + f"registration: {json.dumps(fields)}\n---\n", encoding="utf-8")
+        for path in folder.glob("question-fixture-*.md"):
+            if path not in paths:
+                path.unlink()
 
     def lines(self, session_id: str = OWNER.id, shell: str = "/bin/sh") -> list[str]:
         env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
@@ -1119,7 +1129,9 @@ class CountsRowTests(unittest.TestCase):
                 + f"registration: {json.dumps(fields)}\n---\n")
             _ = (folder / f"proposal-{source.id}.md").write_text(
                 f"---\nstatus: open\ntags: [proposal]\nproposed_by: {source.id}\n---\n")
-        self.questions({"since": "2000-01-01T08:00", "text": "Legacy reminder"})
+        reminder = self.home / ".local/state/showrunner/outstanding" / f"{OWNER.id}.json"
+        reminder.parent.mkdir(parents=True, exist_ok=True)
+        _ = reminder.write_text(json.dumps([{"since": "2000-01-01T08:00", "text": "Legacy reminder"}]))
         own_cache = self.cache.with_name(unit.id)
         other_cache = self.cache.with_name(other.id)
         self.cache.parent.mkdir(parents=True, exist_ok=True)
@@ -1155,7 +1167,7 @@ class CountsRowTests(unittest.TestCase):
                     self.assertEqual(self.lines(session_id, shell=shell)[-1],
                                      "For you: 1 question, 1 change, 2 efficiency, 1 proposal")
                     self.assertEqual(self.lines(shell=shell)[-1],
-                                     "For you: 3 questions, 3 changes, 3 efficiency, 3 proposals")
+                                     "For you: 2 questions, 3 changes, 3 efficiency, 3 proposals")
                     _ = efficiency.write_text(efficiency.read_text().split("- 2026-11-12 config: More")[0])
 
     def test_the_row_counts_efficiency_and_refreshes_when_the_ledger_changes(self) -> None:
@@ -1653,7 +1665,7 @@ class CountsRowTests(unittest.TestCase):
 
     def test_a_deferred_question_joins_the_row_when_its_time_comes(self) -> None:
         later = datetime.now(USER_ZONE) + timedelta(hours=1)
-        outstanding = self.home / ".local/state/showrunner/outstanding" / f"{OWNER.id}.json"
+        outstanding = self.home / ".local/state/showrunner" / OWNER.id / "questions/question-fixture-0.md"
         for shell in SHELLS:
             with self.subTest(shell=shell):
                 self.questions({"since": "2026-10-16T19:00", "text": "A", "after": later.strftime("%Y-%m-%dT%H:%M")})

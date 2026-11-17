@@ -22,7 +22,7 @@ PAGE_NAME = "console.html"
 NEWS_NAME = "news"
 # The console script's placeKey uses the same prefix for the place it keeps for each page.
 PLACE_PREFIX = "at."
-ICON_NAMES = frozenset(("list-checks", "hammer", "cloud", "hard-drive", "image", "message-circle-question", "panel-left-close",
+ICON_NAMES = frozenset(("list-checks", "inbox", "hammer", "cloud", "hard-drive", "image", "message-circle-question", "panel-left-close",
                         "panel-left-open", "menu", "refresh-cw", "sparkle", "users", "search"))
 REFERENCE = re.compile(r"python:([a-zA-Z_][\w.]*)\:([a-zA-Z_]\w*)")
 # The console folder keeps the items each page held when the user last opened it, for every browser.

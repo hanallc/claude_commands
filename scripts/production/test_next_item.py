@@ -6,6 +6,7 @@ from scripts.agents import remote
 
 import contextlib
 import io
+import json
 import os
 import re
 import tempfile
@@ -259,8 +260,12 @@ class NextItemTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}):
                 item = investigation.file(owner.id, f"{name}-item", "Find the cause.")
                 _ = investigation.answer(owner.id, item.id, "The cause is known.")
-            _ = (outstanding / f"{owner.id}.json").write_text(
-                f'[{{"since": "2026-10-06T09:00", "text": "{name}-item"}}]')
+            fields = {"since": "2026-10-06T09:00", "text": f"{name}-item", "question": f"{name}-item next step?",
+                      "asked_by": owner.id}
+            _ = (issues_folder / f"question-{owner.id}.md").write_text(
+                "---\nrecord_type: question\nstatus: open\n"
+                + f"production_id: {owner.id}\nasked_by: {owner.id}\n"
+                + f"registration: {json.dumps(fields)}\n---\n")
             timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{name}"
             timer.mkdir(parents=True)
             _ = (timer / "conf").write_text(f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {owner.id}\n")

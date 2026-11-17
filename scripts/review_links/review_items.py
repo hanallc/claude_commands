@@ -76,9 +76,8 @@ class ProposalSource:
 
 
 @dataclass(frozen=True)
-class LegacyQuestionSource:
-    item: update_registration.Outstanding
-    path: Path
+class UnownedQuestionSource:
+    record: update_registration.QuestionRecord
 
 
 @dataclass(frozen=True)
@@ -97,7 +96,7 @@ class EfficiencySource:
     line: str
 
 
-type ReviewSource = (ChangeSource | QuestionSource | LegacyQuestionSource | InvestigationSource
+type ReviewSource = (ChangeSource | QuestionSource | UnownedQuestionSource | InvestigationSource
                      | ProposalSource | ProposalLedgerSource | EfficiencySource)
 
 
@@ -243,14 +242,13 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, document: Path | N
     return found
 
 
-def question_item(owner: staff.StaffId, fields: update_registration.OutstandingItem, path: Path,
-                  members: staff.StaffSnapshot, record: update_registration.QuestionRecord | None = None) -> ReviewItem:
+def question_item(record: update_registration.QuestionRecord, members: staff.StaffSnapshot, *, unowned: bool = False) -> ReviewItem:
+    owner, fields, path = record.owner, record.item, record.path
     parsed = update_registration.parse_outstanding_entries([fields], path)[0]
     filed = moment(fields['since'])
     entry = update_registration.question_entry(owner, fields, path)
     asker = staff.StaffId(fields.get('asked_by', ''))
-    state = question_state(record) if record is not None else (
-        ReviewState.WAITING if isinstance(parsed.timing, update_registration.AwaitingReply) else ReviewState.FOR_YOU)
+    state = question_state(record)
     after = fields.get('after','')
     later = moment(after) if after else NoLaterTime()
     logs = [ReviewLog(filed, name(asker, members), 'Asked')]
@@ -260,19 +258,19 @@ def question_item(owner: staff.StaffId, fields: update_registration.OutstandingI
     if 'followup' in fields:
         logs.append(ReviewLog(moment(fields['followup']['sent']), 'nate', fields['followup']['text']))
     logs.extend(review_events.decode(fields.get('review_log', '')))
-    source: ReviewSource = QuestionSource(record) if record is not None else LegacyQuestionSource(parsed, path)
-    key = 'question/'+owner+'/'+path.name if record is not None else 'question/'+entry.key
-    identity = name(owner, members)+'/'+fields.get('review_id',path.stem) if record is not None else entry.key
+    source = UnownedQuestionSource(record) if unowned else QuestionSource(record)
+    key = 'question/'+owner+'/'+path.name
+    identity = name(owner, members)+'/'+fields.get('review_id',path.stem)
     opened = update_registration.OpenItem(name(owner, members), parsed, name(asker, members) if asker else '')
     return ReviewItem(key, identity, ReviewType.QUESTION, owner, asker, fields['text'], state,
         ReviewTimes(filed, logs[-1].time, later), tuple(logs),
-        ('answer',) if state == ReviewState.FOR_YOU and record is not None else (), source, entry.urgency, '',
+        ('answer',) if state == ReviewState.FOR_YOU and not unowned else (), source, entry.urgency, '',
         update_registration.question_queue_name(owner), entry.key, entry.after, entry.value, opened.line())
 
 
 def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                    owners: tuple[staff.StaffRow, ...] = (), sources: list[Path] | None = None,
-                   assign_ids: bool = False) -> list[ReviewItem]:
+                   assign_ids: bool = False, include_unowned: bool = True) -> list[ReviewItem]:
     identities = update_registration.QuestionStaff.for_record(members)
     selected = owners or tuple(member for member in members.rows if member.kind == 'producer' or
         member.kind == 'showrunner' and isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc)) and member.doc.path in documents)
@@ -290,12 +288,16 @@ def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
             if record.path not in seen:
                 seen.add(record.path)
                 if assign_ids:
-                    _ = update_registration.question_review_id(record)
-                found.append(question_item(record.owner, record.item, record.path, members, record))
-        legacy = update_registration.outstanding_file(owner.id, identities=identities)
-        if sources is not None:
-            sources.append(legacy)
-        found.extend(question_item(owner.id, fields, legacy, members) for fields in update_registration.stored_entries(legacy))
+                    record.item['review_id'] = update_registration.question_review_id(record)
+                found.append(question_item(record, members))
+    if include_unowned:
+        for record in update_registration.unowned_question_records(identities):
+            if record.path in seen:
+                continue
+            seen.add(record.path)
+            if assign_ids:
+                record.item['review_id'] = update_registration.question_review_id(record)
+            found.append(question_item(record, members, unowned=True))
     keys = {item.queue_key:item.key for item in found}
     return [replace(item, after=keys.get(item.queue_after,'')) for item in found]
 
@@ -463,7 +465,7 @@ def read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.Sta
     if kind == ReviewType.QUESTION:
         owners = (scope,) if isinstance(scope,staff.StaffRow) else tuple(member for member in members.rows
             if member.kind == 'showrunner' and isinstance(member.doc,(staff.LiveDoc,staff.WrappedDoc)) and member.doc.path in documents)
-        return question_items(members,documents,owners=owners,sources=sources)
+        return question_items(members,documents,owners=owners,sources=sources,include_unowned=False)
     if kind == ReviewType.INVESTIGATION:
         owners_ids = tuple(member.id for doc in documents for member in
             (unit_lookup.doc_owner(doc,members),*unit_lookup.doc_units(doc,members))) if documents else (cast(staff.StaffRow,owner).id,)

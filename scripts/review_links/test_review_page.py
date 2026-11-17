@@ -9,13 +9,15 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.user_zone import user_zone
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from typing import override
+from unittest.mock import patch
 from urllib.parse import urlencode
 
-from scripts.production import change_review, investigation, update_registration
+from scripts.production import change_review, investigation, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, record_table, review_items, review_page
 from scripts.review_links import test_change_page
 from scripts.review_links.test_page_frame import assert_status_states
@@ -63,9 +65,31 @@ class ReviewPageTests(unittest.TestCase):
         _ = investigation.mark_read(ready.owner,ready.id)
         self.assertEqual(next(item.state for item in review_items.read(self.root) if item.key.endswith('/'+ready.id)),review_items.ReviewState.DONE)
 
+    def test_reader_retains_questions_without_an_owner(self) -> None:
+        key = self.question()
+        members = staff.snapshot()
+        question_owner = next(row.id for row in members.rows if row.name == 'page-owner')
+        without_owner = staff.StaffSnapshot(tuple(row for row in members.rows if row.id != question_owner))
+        with patch.object(staff, 'snapshot', return_value=without_owner):
+            orphan = next((item for item in review_items.read(self.root) if item.key == key), None)
+            self.assertIsNotNone(orphan, 'F015: retain a question without an owner or production document')
+            assert orphan is not None
+            self.assertTrue(orphan.for_you(review_items.moment('2026-11-17T12:00')))
+            self.assertEqual(orphan.actions, ())
+            self.assertIn('Owner unavailable', review_page.render(self.root).decode())
+            self.assertTrue(any(item.startswith(key+'/') for item in review_page.waiting_items(console.NewsRequest(self.root))))
+
     def test_question_ids_remain_after_closure_and_later_registration(self) -> None:
         key = self.question('First question?')
+        identities = update_registration.QuestionStaff.for_record(staff.snapshot())
+        stored = update_registration.question_records_for_document(self.fixture.production, identities)[0]
+        fields = cast(dict[str, object], json.loads(stored.path.read_text().split('registration: ', 1)[1].splitlines()[0]))
+        _ = fields.pop('review_id', None)
+        text = stored.path.read_text()
+        registration = next(line for line in text.splitlines() if line.startswith('registration: '))
+        _ = stored.path.write_text(text.replace(registration, 'registration: '+json.dumps(fields)))
         original = next(item for item in review_items.read(self.root) if item.key == key)
+        self.assertEqual(original.id, 'page-owner/Q1', 'F013: show the allocated ID on the first read')
         self.assertIsInstance(original.source,review_items.QuestionSource)
         assert isinstance(original.source,review_items.QuestionSource)
         record = original.source.record
@@ -125,13 +149,18 @@ class ReviewPageTests(unittest.TestCase):
         _ = self.question()
         _ = self.investigation(False)
         pages = console.read_pages()
+        self.assertEqual(next(page.icon for page in pages if page.identity == 'review'), 'inbox', 'F009: use the Review icon')
         self.assertIn('review',[page.identity for page in pages])
         self.assertFalse({'changes','questions','investigations'} & {page.identity for page in pages})
         request = console.NewsRequest(self.root)
         waiting = review_page.waiting_items(request)
         self.assertFalse(any(key.startswith('investigation/') for key in waiting))
         self.assertTrue(any(key.startswith('question/') for key in waiting))
-        self.assertEqual(review_page.legacy_url('/console/changes.html','type=questions'),'/console/review.html#type=question')
+        self.assertEqual(review_page.legacy_url('/console/changes.html','type=questions'),'/console/review.html?type=question')
+
+    def test_legacy_links_keep_filters(self) -> None:
+        self.assertEqual(review_page.legacy_url('/console/changes.html', 'type=questions&owner=page-owner&show=Waiting&q=layout&sort=Age&dir=desc'),
+            '/console/review.html?type=question&owner=page-owner&show=Waiting&q=layout&sort=Age&dir=desc')
 
     def test_the_reader_counts_only_for_you_across_all_five_stores(self) -> None:
         _ = self.investigation()
@@ -146,7 +175,15 @@ class ReviewPageTests(unittest.TestCase):
         doc = self.fixture.production
         _ = doc.write_text(doc.read_text()+f'- **Proposals:** {proposals}\n- **Efficiency ledger:** {ledger}\n')
         _ = self.question()
+        identities = update_registration.QuestionStaff.for_record(staff.snapshot())
+        owner = next(row for row in identities.record.rows if row.name == 'page-owner')
+        reminder = update_registration.outstanding_file(owner.id, identities=identities)
+        reminder.parent.mkdir(parents=True, exist_ok=True)
+        _ = reminder.write_text(json.dumps([{'since':'2026-11-01T12:00', 'text':'Remind the owner to check the gate'}]))
         items = review_items.read(self.root)
+        self.assertFalse(any(item.title == 'Remind the owner to check the gate' for item in items), 'F011: reminders are not user questions')
+        count, _ = review_items.question_counts(owner, user_zone(), identities, None)
+        self.assertEqual(count, 1, 'F011: count the question without counting the reminder')
         self.assertEqual({item.type for item in items},set(review_items.ReviewType))
         self.assertEqual(review_items.efficiency(doc),1)
         deferred = next(item for item in items if 'deferred change' in item.title)
@@ -194,10 +231,32 @@ window.fetch=async(_url,options={})=>options.method==='POST' ?
   await new Promise(resolve=>nativeTimeout(resolve,950));
   check(target.hidden,'the saved row leaves the view');
   check(rows().every(row=>row.querySelector('[data-detail]').hidden),'no next card opens');
-  location.hash=new URLSearchParams({item:target.dataset.key,type:'question',owner:'missing',show:'open',q:'missing'});await flush();
+  choose('list-show','all');
+  const allTarget=rows().find(row=>row.dataset.type==='change' && row!==target);allTarget.querySelector('.list-toggle').click();
+  const allForm=allTarget.querySelector('form');allForm.requestSubmit(allForm.querySelector('[value="works"]'));
+  await new Promise(resolve=>nativeTimeout(resolve,1000));
+  check(allTarget.hidden,'F010: the saved row leaves All');
+  location.hash=new URLSearchParams({item:target.dataset.key});await flush();
   check(!target.hidden && !target.querySelector('[data-detail]').hidden,'a Review item link shows the saved row');
   check(document.getElementById('list-show').value==='all' && document.getElementById('list-owner').value==='' &&
     document.getElementById('list-search').value==='','a Review item link clears filters');
+  const retained={item:fresh.dataset.key,type:'question',owner:fresh.dataset.owner,show:'For you',q:'Q1',sort:'Age',dir:'desc'};
+  location.hash=new URLSearchParams(retained);await flush();
+  check(document.getElementById('list-owner').value===retained.owner && document.getElementById('list-show').value==='For you' &&
+    document.getElementById('list-search').value==='Q1' && document.querySelector('[data-type-chip="question"]').getAttribute('aria-pressed')==='true',
+    'F014: restore the filters with an open row');
+  check(!fresh.hidden && !fresh.querySelector('[data-detail]').hidden,'F014: restore the open row');
+  check(document.querySelector('[data-sort="5"]').parentElement.getAttribute('aria-sort')==='descending','F014: restore the sort');
+
+  const legacy=document.createElement('iframe');
+  legacy.src='/console/changes.html?type=questions#'+new URLSearchParams({showrunner:'page-owner',show:'Waiting',q:'layout',sort:'Age',dir:'desc'});
+  const loaded=new Promise(resolve=>legacy.addEventListener('load',resolve,{once:true}));document.body.append(legacy);await loaded;
+  const restored=legacy.contentDocument;
+  check(restored.getElementById('list-owner').value===fresh.dataset.owner && restored.getElementById('list-show').value==='Waiting' &&
+    restored.getElementById('list-search').value==='layout' && restored.querySelector('[data-type-chip="question"]').getAttribute('aria-pressed')==='true',
+    'F012: a direct legacy link keeps its fragment filters');
+  check(restored.querySelector('[data-sort="5"]').parentElement.getAttribute('aria-sort')==='descending','F012: the legacy link keeps its sort');
+  legacy.remove();
 
   check(document.documentElement.scrollWidth<=innerWidth,'no horizontal overflow');
   if(innerWidth<960) check(getComputedStyle(shown()[0]).display==='block','phone rows are cards');
@@ -211,13 +270,19 @@ window.fetch=async(_url,options={})=>options.method==='POST' ?
                 complete = threading.Event()
                 class Probe(BaseHTTPRequestHandler):
                     def do_GET(self) -> None:
+                        if self.path.startswith('/console/changes.html'):
+                            self.send_response(303)
+                            self.send_header('Location', review_page.legacy_url('/console/changes.html', self.path.partition('?')[2]))
+                            self.end_headers()
+                            return
                         self.send_response(200)
                         self.send_header('Content-Type','text/html; charset=utf-8')
                         self.end_headers()
                         if self.path == '/complete':
                             _ = complete.wait(20)
                         else:
-                            _ = self.wfile.write(body if self.path == '/page' else b'<iframe src="/page" style="border:0;width:100vw;height:100vh"></iframe><img hidden src="/complete">')
+                            _ = self.wfile.write(source.encode() if self.path.startswith('/console/review.html') else
+                                body if self.path == '/page' else b'<iframe src="/page" style="border:0;width:100vw;height:100vh"></iframe><img hidden src="/complete">')
                     def do_POST(self) -> None:
                         results.append(cast(list[str],json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
                         complete.set()

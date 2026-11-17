@@ -534,7 +534,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(self.store_snapshot(), before)
 
     def test_next_keeps_local_items_when_a_remote_child_has_a_local_reminder(self) -> None:
-        self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "Choose the layout"})
+        self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "Choose the layout", "question": "Choose the layout?"})
         parent = staff.by_id(self.asker_id)
         assert parent is not None
         child = fixture_member("showrunner", name="remote-child", parent=parent.parent,

@@ -248,6 +248,8 @@ The console inlines the icons and makes no CDN, font, script, or stylesheet requ
 
 `/console/review.html` replaces the Changes, Questions and Investigations navigation pages.
 The old addresses redirect to Review with the corresponding type filter.
+The redirect retains the owner, filters, sort and open item.
+The Review navigation entry uses the Lucide `inbox` icon.
 Selected-row snapshots retain their signed legacy forms.
 
 `review_items.py` reads the existing question, change, investigation, proposal and efficiency stores.
@@ -259,6 +261,11 @@ The count readers and `/next` use this shared reader.
 Only For you items count in the status line.
 An open investigation and a deferred efficiency item do not count.
 Questions receive a stable owner-local `Q<n>` ID in their existing registration record.
+The first read shows the allocated ID.
+Ordinary reminders serve the owner's session; Review excludes them from items and counts.
+Questions without an owner remain visible under Owner unavailable.
+These questions count as For you, as on the former Questions page.
+They have no answer control until an owner becomes available.
 
 This phase shows Questions, Changes and Investigations.
 The table columns are Id, Type, Owner, Item, State and Age.
@@ -270,6 +277,7 @@ Show offers Open, For you, Waiting, Done and All.
 Open puts For you records before Waiting records.
 The text filter matches the ID and title.
 The address retains the filters, sort and open item.
+An address with only `item` selects All and clears the filters.
 The default order uses the existing urgency levels and age.
 Questions use a violet circle-help icon; Changes use a blue diff icon; Investigations use a teal microscope icon.
 
@@ -280,7 +288,7 @@ The shared sender handles Question and Change delivery, retries, alerts and reco
 Send feedback closes a change.
 Ask showrunner to check transfers the next action to the showrunner.
 A successful check closes the item; only a problem returns it to For you.
-After a save, the row shows its result and leaves the view.
+After a save, the row shows its result and leaves every Show view.
 The page does not open another card automatically.
 The shared status component refreshes the page every `page_refresh_seconds`, initially 15 seconds.
 Refresh retains the open row, scroll position and typed text.
