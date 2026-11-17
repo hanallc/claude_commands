@@ -802,7 +802,7 @@ def is_owner() -> bool:
 
 def child_environment(environment: Mapping[str, str]) -> dict[str, str]:
     """Remove row lock proofs, staff hints, and operation state from agent environments."""
-    from scripts.lib.models_registry import agent_environment
+    from scripts.lib.operation_environment import agent_environment
 
     return {key: value for key, value in agent_environment(environment).items()
             if not key.startswith("STAFF_ROW_FD_") and key != "STAFF_ID"}
