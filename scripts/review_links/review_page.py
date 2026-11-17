@@ -6,13 +6,14 @@ import json
 import re
 import secrets
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TypedDict, cast
 from urllib.parse import parse_qs, parse_qsl, urlencode
 
 from scripts.lib import conf
-from scripts.lib.user_zone import user_zone
+from scripts.lib.user_zone import user_zone, user_zone_name
 from scripts.production import change_review, proposal_issue, staff
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_link
 from scripts.review_links import question_record
@@ -29,6 +30,11 @@ ICONS = {ReviewType.QUESTION: 'circle-help', ReviewType.CHANGE: 'diff', ReviewTy
 SHOWS = (('open', 'Open'), ('Waiting', 'Waiting'), ('Done', 'Done'), ('all', 'All'))
 LABELS = {ReviewType.QUESTION: 'Questions', ReviewType.CHANGE: 'Changes', ReviewType.INVESTIGATION: 'Investigations',
           ReviewType.PROPOSAL: 'Proposals', ReviewType.EFFICIENCY: 'Efficiencies'}
+# The Later menu's presets, in menu order; the client resolves each time when the menu opens.
+LATER_PRESETS = (('soon', ''), ('evening', 'This evening'), ('morning', 'Tomorrow morning'), ('week', 'Next week'))
+# Weekday names in the order of the browser's getUTCDay.
+WEEKDAYS = ('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')
+CLOCK = re.compile(r'([01][0-9]|2[0-3]):([0-5][0-9])')
 FRONT_MATTER = re.compile(r'\A\ufeff?---[ \t]*\r?\n.*?\r?\n---[ \t]*(?:\r?\n|\Z)', re.DOTALL)
 
 
@@ -60,6 +66,36 @@ def filter_index(records: list[ReviewItem], members: staff.StaffSnapshot, now: d
 def index_json(entries: list[ReviewIndexEntry]) -> str:
     """Encode the index for an HTML script element without executable text."""
     return json.dumps(entries, ensure_ascii=False, separators=(',', ':')).replace('&', '\\u0026').replace('<', '\\u003c').replace('>', '\\u003e')
+
+
+@dataclass(frozen=True)
+class CardSettings:
+    """Settings that every Review card form shares in one render."""
+    words_rows: int
+    soon_label: str
+
+
+def clock_minutes(settings: conf.ConfigRead, key: str) -> int:
+    value = settings.text(key)
+    match = CLOCK.fullmatch(value)
+    if match is None:
+        raise ValueError(f'review_links.conf: {key}={value!r} is not a time such as 09:00')
+    return int(match[1])*60+int(match[2])
+
+
+def later_settings(settings: conf.ConfigRead) -> dict[str, int]:
+    """Return the Later menu's preset settings for the page script, in minutes and getUTCDay numbers."""
+    day = settings.text('later_week_day')
+    if day not in WEEKDAYS:
+        raise ValueError(f'review_links.conf: later_week_day={day!r} is not a weekday name such as Monday')
+    return {'soon': settings.whole('later_soon_minutes'), 'evening': clock_minutes(settings, 'later_evening'),
+            'eveningUntil': clock_minutes(settings, 'later_evening_until'), 'morning': clock_minutes(settings, 'later_morning'),
+            'weekDay': WEEKDAYS.index(day), 'weekTime': clock_minutes(settings, 'later_week_time')}
+
+
+def soon_label(minutes: int) -> str:
+    count, unit = (minutes//60, 'hour') if minutes % 60 == 0 else (minutes, 'minute')
+    return f'In {count} {unit}'+('s' if count > 1 else '')
 
 
 def page_url() -> str:
@@ -100,7 +136,7 @@ def answer_section(text: str) -> str:
     return '<section><h3>Answer</h3>'+change_browser.answer_html(text)+'</section>'
 
 
-def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int) -> str:
+def form(item: ReviewItem, browser: change_page.ReviewBrowser, settings: CardSettings) -> str:
     fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key)}
     hidden = ''.join(f'<input type="hidden" name="{key}" value="{html.escape(value, quote=True)}">' for key, value in fields.items())
     closes: list[str] = []
@@ -114,16 +150,22 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int) 
     groups = '<div class="review-action-group"><span>Closes the item</span><div>'+''.join(closes)+'</div></div>' if closes else ''
     if returns:
         groups += '<div class="review-action-group"><span>The item returns to you</span><div>'+''.join(returns)+'</div></div>'
-    groups += ('<div class="review-action-group review-later"><span>Hides it until</span><div>'
+    presets = ''.join(f'<button type="button" role="menuitem" tabindex="-1" data-later-preset="{key}">'
+                      +f'<span>{html.escape(label or settings.soon_label)}</span><small></small></button>' for key, label in LATER_PRESETS)
+    groups += ('<div class="review-action-group review-later"><span>Hides it until</span><div class="later-menu">'
+               +'<button type="button" aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later <span aria-hidden="true">▾</span></button>'
+               +'<div role="menu" aria-label="Hide until" data-later-menu hidden>'+presets+'<hr>'
+               +'<button type="button" role="menuitem" tabindex="-1" data-later-choose><span>Choose a time…</span></button>'
+               +'<div class="later-custom" data-later-custom hidden>'
                +'<input type="datetime-local" name="later" aria-label="Later, until">'
-               +'<button name="outcome" value="later">Later</button></div></div>')
+               +'<button name="outcome" value="later">Save</button></div></div></div></div>')
     return ('<form method="post" data-review-form>'+hidden+f'<label for="words-{html.escape(item.key, quote=True)}">Your words</label>'
-            + f'<textarea id="words-{html.escape(item.key, quote=True)}" name="feedback" rows="{words_rows}" '
+            + f'<textarea id="words-{html.escape(item.key, quote=True)}" name="feedback" rows="{settings.words_rows}" '
             + 'placeholder="Type your words. They go with the button that you press."></textarea>'
             + '<div class="review-actions">'+groups+'</div><span role="status" data-send-status></span></form>')
 
 
-def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, words_rows: int,
+def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, settings: CardSettings,
             names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
     names = staff_names.for_page(names, members)
     source = item.source
@@ -166,7 +208,7 @@ def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff
     owner = owner_name(item, members)
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+'<div data-review-body>'+body
             +'</div></div><section><h3>Log · newest first</h3>'
-            +'<ol class="list-log">'+logs+'</ol></section>'+form(item, browser, words_rows)
+            +'<ol class="list-log">'+logs+'</ol></section>'+form(item, browser, settings)
             +'<p class="review-source">Owner: '+names.html(item.owner, owner)+' · Source: '
             +names.html(item.source_unit, review_items.name(item.source_unit, members))+'</p></div>')
 
@@ -181,7 +223,7 @@ def age(filed: datetime, now: datetime) -> str:
 
 
 def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, now: datetime, index: int,
-              title_limit: int, words_rows: int,
+              title_limit: int, settings: CardSettings,
               names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
     names = staff_names.for_page(names, members)
     owner = owner_name(item, members)
@@ -206,7 +248,7 @@ def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: sta
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden = ' hidden' if item.state == ReviewState.DONE or item.hidden_until(now) else ''
     return ('<tbody data-list-item'+attributes+hidden+'><tr class="list-row">'+row+'</tr>'
-            +f'<tr data-detail id="{panel}" hidden><td colspan="6">'+details(item, browser, members, words_rows, names)+'</td></tr></tbody>')
+            +f'<tr data-detail id="{panel}" hidden><td colspan="6">'+details(item, browser, members, settings, names)+'</td></tr></tbody>')
 
 
 def render(root: Path, *, show: str = 'open') -> bytes:
@@ -225,7 +267,8 @@ def render(root: Path, *, show: str = 'open') -> bytes:
     token, initial = change_browser.browser_manifest(change_page.console_folder(root))
     browser = change_page.ReviewBrowser(token, initial)
     settings = conf.read('review_links')
-    words_rows = settings.whole('review_words_rows')
+    later = later_settings(settings)
+    cards = CardSettings(settings.whole('review_words_rows'), soon_label(later['soon']))
     entries = filter_index(records, members, now)
     owner_chips = '<button id="review-owner-all" type="button" data-owner-chip="" aria-pressed="true">All <b></b></button>'
     for owner, name in sorted(owners.items(), key=lambda pair:pair[1].casefold()):
@@ -242,7 +285,8 @@ def render(root: Path, *, show: str = 'open') -> bytes:
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       +'<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
     content = (record_table.STYLE+STYLE+page_frame.title('Review', 'review')
-        +f'<div data-review data-show="{show}" data-refresh-seconds="{settings.number("page_refresh_seconds")}">'
+        +f'<div data-review data-show="{show}" data-refresh-seconds="{settings.number("page_refresh_seconds")}"'
+        +f' data-zone="{html.escape(user_zone_name(), quote=True)}" data-later="{html.escape(json.dumps(later), quote=True)}">'
         +'<div class="review-types" role="group" aria-label="Type">'+chips+'</div>'
         +'<div class="review-types review-shows" id="list-show" role="group" aria-label="Show">'+shows+'</div>'
         +'<div class="review-types" id="list-owner" role="group" aria-label="Owner">'+owner_chips+'</div>'
@@ -252,7 +296,7 @@ def render(root: Path, *, show: str = 'open') -> bytes:
         +'<div class="list-table"><table aria-label="Review">'
         +'<colgroup><col style="width:17%"><col style="width:13%"><col style="width:14%"><col style="width:37%">'
         +'<col style="width:12%"><col style="width:7%"></colgroup><thead><tr>'+headers+'</tr></thead>'
-        +''.join(item_rows(item,browser,members,now,index,title_limit,words_rows,names) for index,item in enumerate(items))
+        +''.join(item_rows(item,browser,members,now,index,title_limit,cards,names) for index,item in enumerate(items))
         +'</table><p data-empty hidden>No items in this view.</p></div></div><script>'+SCRIPT+'</script>')
     return page_frame.rendered(change_page.document(content, 'Review'), started, read_at)
 
@@ -329,6 +373,17 @@ color:var(--ink);border:1px solid var(--line);border-radius:8px;resize:vertical}
 .review-later{margin-left:auto}.review-actions input{font:inherit;min-height:40px;max-width:100%;box-sizing:border-box;
 padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink)}
 .list-log span{white-space:pre-wrap}
+.later-menu{position:relative}
+[data-later-menu]{position:absolute;right:0;bottom:calc(100% + 6px);z-index:5;min-width:260px;padding:5px;box-sizing:border-box;
+background:var(--card);border:1px solid var(--line);border-radius:10px;box-shadow:0 10px 28px rgba(0,0,0,.35)}
+[data-later-menu] [hidden]{display:none!important}
+.review-actions [data-later-menu] [role=menuitem]{display:flex;justify-content:space-between;align-items:center;gap:24px;width:100%;
+min-height:32px;padding:5px 10px;border:0;border-radius:6px;background:none;color:var(--ink);text-align:left}
+.review-actions [data-later-menu] [role=menuitem]:is(:hover,:focus){background:var(--accent);color:#fff;outline:none}
+[data-later-menu] small{font-size:12px;color:var(--ink-3)}
+[data-later-menu] [role=menuitem]:is(:hover,:focus) small{color:inherit;opacity:.85}
+[data-later-menu] hr{border:0;border-top:1px solid var(--line);margin:5px 4px}
+.later-custom{display:flex;gap:8px;padding:6px 4px 2px}
 .review-actions button{margin:0;font:inherit;min-height:40px;padding:6px 14px;border:1px solid var(--ink-3);border-radius:8px;
 background:var(--card);color:var(--ink)}.review-actions .primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
 .review-source{grid-column:1/-1;color:var(--ink-3);font-size:12px;margin-top:16px!important}
@@ -438,13 +493,10 @@ function bind(){
   const remember=()=>drafts.set(key,{feedback:words.value,later:later.value,choice:choices.find(choice=>choice.checked)?.value || ''});
   choices.forEach(choice=>choice.addEventListener('change',()=>{words.value=choice.value;remember();words.focus();}));
   [words,later].forEach(field=>{field.addEventListener('input',remember);field.addEventListener('change',remember);});
-  form.addEventListener('submit',async event=>{
-   event.preventDefault();if(form.dataset.sending) return;
-   const outcome=event.submitter.value;
+  const send=async(outcome,until)=>{
+   if(form.dataset.sending) return;
    const data=new URLSearchParams(new FormData(form));data.set('outcome',outcome);
-   later.required=data.get('outcome')==='later';
-   const valid=later.reportValidity();later.required=false;
-   if(!valid) return;
+   if(outcome==='later') data.set('later',until);
    form.dataset.sending='true';saving++;pageRefresh.abandon();
    const buttons=[...form.querySelectorAll('button')],notice=form.querySelector('[data-send-status]');
    buttons.forEach(button=>button.disabled=true);notice.textContent='Saving…';
@@ -466,11 +518,90 @@ function bind(){
     delete form.dataset.sending;saving--;
     if(!saving && selectedShow!==content.dataset.show) void pageRefresh.refresh(true);
    }
+  };
+  form.addEventListener('submit',event=>{
+   event.preventDefault();
+   const outcome=event.submitter.value;
+   if(outcome==='later'){
+    later.required=true;const valid=later.reportValidity();later.required=false;
+    if(!valid) return;
+    closeLater(form.querySelector('[data-later-menu]'),false);
+   }
+   void send(outcome,later.value);
   });
+  bindLater(form,until=>void send('later',until));
  });
 }
+// The Later menu: presets resolve in the user zone each time the menu opens.
+function zoneParts(epoch){
+ const parts=Object.fromEntries(new Intl.DateTimeFormat('en-US',{timeZone:content.dataset.zone,hourCycle:'h23',
+  year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'numeric',second:'numeric'})
+  .formatToParts(epoch).map(part=>[part.type,Number(part.value)]));
+ return parts;
+}
+function zoneEpoch(year,month,day,minutes){
+ // Convert a wall time in the user zone to an epoch. The second pass corrects for a daylight saving change near that time.
+ const wall=Date.UTC(year,month-1,day,0,minutes);
+ let epoch=wall;
+ for(let pass=0;pass<2;pass++){
+  const shown=zoneParts(epoch);
+  epoch=wall-(Date.UTC(shown.year,shown.month-1,shown.day,shown.hour,shown.minute,shown.second)-epoch);
+ }
+ return epoch;
+}
+function laterTimes(now){
+ const settings=JSON.parse(content.dataset.later),today=zoneParts(now);
+ const at=(days,minutes)=>zoneEpoch(today.year,today.month,today.day+days,minutes);
+ const weekday=new Date(Date.UTC(today.year,today.month-1,today.day)).getUTCDay();
+ return {soon:now+settings.soon*60000,
+  evening:today.hour*60+today.minute<settings.eveningUntil ? at(0,settings.evening) : 0,
+  morning:at(1,settings.morning),week:at((settings.weekDay-weekday+7)%7 || 7,settings.weekTime)};
+}
+function closeLater(menu,focus){
+ menu.hidden=true;menu.querySelector('[data-later-custom]').hidden=true;
+ const toggle=menu.parentElement.querySelector('[data-later-toggle]');toggle.setAttribute('aria-expanded','false');
+ if(focus) toggle.focus();
+}
+function bindLater(form,pick){
+ const toggle=form.querySelector('[data-later-toggle]'),menu=form.querySelector('[data-later-menu]');
+ const custom=menu.querySelector('[data-later-custom]'),items=()=>[...menu.querySelectorAll('[role=menuitem]:not([hidden])')];
+ const shown=new Intl.DateTimeFormat('en-US',{timeZone:content.dataset.zone,weekday:'short',hour:'2-digit',minute:'2-digit',hourCycle:'h23'});
+ toggle.addEventListener('click',()=>{
+  if(!menu.hidden){closeLater(menu,true);return;}
+  const times=laterTimes(Date.now());
+  menu.querySelectorAll('[data-later-preset]').forEach(item=>{
+   const at=times[item.dataset.laterPreset];item.hidden=!at;item.dataset.at=at ? String(at) : '';
+   item.querySelector('small').textContent=at ? shown.format(at) : '';
+  });
+  menu.hidden=false;toggle.setAttribute('aria-expanded','true');items()[0].focus();
+ });
+ menu.querySelectorAll('[data-later-preset]').forEach(item=>item.addEventListener('click',()=>{
+  // Resolve the time again at the click, so a menu left open does not send a stale time.
+  const at=laterTimes(Date.now())[item.dataset.laterPreset] || Number(item.dataset.at);
+  closeLater(menu,false);pick(new Date(at).toISOString());
+ }));
+ menu.querySelector('[data-later-choose]').addEventListener('click',()=>{custom.hidden=false;form.elements.later.focus();});
+ menu.addEventListener('keydown',event=>{
+  if(event.key==='Escape'){event.preventDefault();closeLater(menu,true);return;}
+  if(custom.contains(event.target)){
+   // Enter in the date and time field saves it; the form's first button is a different outcome.
+   if(event.key==='Enter' && event.target===form.elements.later){event.preventDefault();form.requestSubmit(custom.querySelector('[value="later"]'));}
+   return;
+  }
+  const list=items(),index=list.indexOf(document.activeElement);
+  const next={ArrowDown:index+1,ArrowUp:index-1+list.length,Home:0,End:list.length-1}[event.key];
+  if(next===undefined) return;
+  event.preventDefault();list[next%list.length].focus();
+ });
+}
+document.addEventListener('pointerdown',event=>{
+ content.querySelectorAll('[data-later-menu]:not([hidden])').forEach(menu=>{
+  if(!menu.parentElement.contains(event.target)) closeLater(menu,false);
+ });
+});
 async function refresh(_supersede=false,current=()=>true){
- if(saving) return;
+ // An open Later menu holds the page, so a refresh does not close it under the pointer.
+ if(saving || [...content.querySelectorAll('[data-later-menu]:not([hidden])')].some(menu=>menu.getClientRects().length)) return;
  const show=selectedShow;
  const response=await fetch(location.pathname+'?'+new URLSearchParams({show}),{cache:'no-store'});
  if(!response.ok) throw new Error('HTTP '+response.status);

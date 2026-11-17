@@ -58,7 +58,7 @@ class ReviewPageTests(unittest.TestCase):
         item = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.QUESTION)
         unknown = replace(item, owner=staff.StaffId('nate'), source_unit=staff.StaffId('unknown-source'))
         plain = review_page.item_rows(unknown, change_page.ReviewBrowser('private'), staff.snapshot(),
-                                      datetime.now(user_zone()), 0, 100, 3)
+                                      datetime.now(user_zone()), 0, 100, review_page.CardSettings(3, 'In 1 hour'))
         self.assertIn('<td data-label="Owner">nate<small>· unknown-source</small></td>', plain)
         self.assertIn('Owner: nate · Source: unknown-source</p>', plain)
 
@@ -136,7 +136,7 @@ class ReviewPageTests(unittest.TestCase):
         title = 'Check the spacing'
         token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
         browser = change_page.ReviewBrowser(token, initial)
-        row = review_page.item_rows(replace(item, title=title), browser, staff.snapshot(), datetime.now(user_zone()), 0, 100, 4)
+        row = review_page.item_rows(replace(item, title=title), browser, staff.snapshot(), datetime.now(user_zone()), 0, 100, review_page.CardSettings(4, 'In 1 hour'))
         detail = row.split('data-detail', 1)[1]
         self.assertIn('<h3>Item</h3><p>'+title+'</p>', detail)
         self.assertEqual(detail.count(title), 1)
@@ -167,7 +167,7 @@ class ReviewPageTests(unittest.TestCase):
         self.assertEqual(item.title, investigation_record.question)
         token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
         browser = change_page.ReviewBrowser(token, initial)
-        detail = review_page.details(item, browser, staff.snapshot(), 4).split('data-review-body>', 1)[1]
+        detail = review_page.details(item, browser, staff.snapshot(), review_page.CardSettings(4, 'In 1 hour')).split('data-review-body>', 1)[1]
         self.assertIn('<h3>You asked</h3>', detail)
         self.assertEqual(detail.count(html.escape(item.title)), 1)
         self.assertNotIn('<h3>Item</h3>', detail)
@@ -180,7 +180,7 @@ class ReviewPageTests(unittest.TestCase):
         source = replace(item.source, row={**item.source.row, 'What you see': title})
         token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
         browser = change_page.ReviewBrowser(token, initial)
-        detail = review_page.details(replace(item, title=title, source=source), browser, staff.snapshot(), 4).split('data-review-body>', 1)[1]
+        detail = review_page.details(replace(item, title=title, source=source), browser, staff.snapshot(), review_page.CardSettings(4, 'In 1 hour')).split('data-review-body>', 1)[1]
         self.assertIn('<h3>Proof</h3><p>'+title+'</p>', detail)
         self.assertEqual(detail.count(title), 1)
         self.assertNotIn('<h3>Item</h3>', detail)
@@ -195,7 +195,7 @@ class ReviewPageTests(unittest.TestCase):
         _ = self.decisions()
         for item in review_items.read(self.root):
             with self.subTest(kind=item.type):
-                row = review_page.item_rows(replace(item, title=title), browser, members, datetime.now(user_zone()), 0, 100, 4)
+                row = review_page.item_rows(replace(item, title=title), browser, members, datetime.now(user_zone()), 0, 100, review_page.CardSettings(4, 'In 1 hour'))
                 self.assert_row_title(row, title, title.splitlines()[0][:100]+'…')
                 detail = row.split('data-detail', 1)[1]
                 for line in title.splitlines():
@@ -373,7 +373,7 @@ class ReviewPageTests(unittest.TestCase):
             self.assertIn(f'data-type-chip="{kind}"',source)
         for action in ('Answer','Works','Does not work','Ask showrunner to check','Ask question','Send feedback','Mark read'):
             self.assertIn('>'+action+'</button>',source)
-        self.assertIn('>Later</button>',source)
+        self.assertIn('data-later-toggle>Later <span',source)
         self.assertIn('createPageRefresh(refresh,()=>content.dataset.refreshSeconds)',source)
         self.assertIn('class="lucide lucide-microscope"',source)
         self.assertIn('data-refresh-seconds="15.0"',source)
@@ -1155,12 +1155,33 @@ window.fetch=async url=>{
                 continue
             with self.subTest(kind=item.type):
                 self.assertEqual(item.actions,expected[item.key])
-                form = review_page.form(item,change_page.ReviewBrowser(token,initial),4)
+                form = review_page.form(item,change_page.ReviewBrowser(token,initial),review_page.CardSettings(4,'In 1 hour'))
                 self.assertIn('Closes the item',form)
                 self.assertIn('The item returns to you',form)
+                self.assertIn('aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later',form)
+                for label in ('In 1 hour','This evening','Tomorrow morning','Next week','Choose a time…'):
+                    self.assertIn('<span>'+label+'</span>',form)
                 self.assertIn('type="datetime-local"',form)
-                self.assertIn('value="later">Later',form)
+                self.assertIn('value="later">Save',form)
                 self.assertNotIn('value="skip"',form)
+
+    def test_later_presets_read_their_settings(self) -> None:
+        for minutes, label in ((1,'In 1 minute'),(90,'In 90 minutes'),(60,'In 1 hour'),(120,'In 2 hours')):
+            with self.subTest(minutes=minutes):
+                self.assertEqual(review_page.soon_label(minutes),label)
+        lines = ('# whole: 1..1440','later_soon_minutes=60','later_evening=18:00','later_evening_until=17:00','later_morning=09:00',
+                 'later_week_day=Monday','later_week_time=09:30')
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'review_links.conf'
+            _ = path.write_text('\n'.join(lines)+'\n',encoding='utf-8')
+            self.assertEqual(review_page.later_settings(conf.read(path)),
+                             {'soon':60,'evening':1080,'eveningUntil':1020,'morning':540,'weekDay':1,'weekTime':570})
+            for bad in ('later_week_day=Mon','later_morning=9:00'):
+                with self.subTest(bad=bad):
+                    key = bad.split('=')[0]
+                    _ = path.write_text('\n'.join(line for line in lines if not line.startswith(key+'='))+'\n'+bad+'\n',encoding='utf-8')
+                    with self.assertRaisesRegex(ValueError,key):
+                        _ = review_page.later_settings(conf.read(path))
 
     def test_ask_question_and_one_owner_answer_command_for_each_type(self) -> None:
         decisions = self.decisions()
@@ -1233,7 +1254,7 @@ window.fetch=async url=>{
         keys = (question, 'page-owner/C1', f'investigation/{report.owner}/{report.id}', *decisions)
         token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
         browser = change_page.ReviewBrowser(token, initial)
-        words_rows = conf.read('review_links').whole('review_words_rows')
+        cards = review_page.CardSettings(conf.read('review_links').whole('review_words_rows'), 'In 1 hour')
         for key in keys:
             opened = next(item for item in review_items.read(self.root) if item.key == key)
             delivery, _ = review_page.submit(self.root, self.body(key, 'question', 'Check the old case.'), self.status)
@@ -1242,7 +1263,7 @@ window.fetch=async url=>{
             with self.subTest(kind=opened.type):
                 self.assertEqual(waiting.state, review_items.ReviewState.WAITING)
                 self.assertEqual(waiting.actions, opened.actions)
-                self.assertEqual(review_page.form(waiting, browser, words_rows), review_page.form(opened, browser, words_rows))
+                self.assertEqual(review_page.form(waiting, browser, cards), review_page.form(opened, browser, cards))
 
     def waiting_actions(self, kind: review_items.ReviewType, actions: tuple[str, ...], wait: str = 'question') -> None:
         """Use a fresh record for each action and check the displaced answer."""
@@ -1748,8 +1769,9 @@ const refreshedForm=refreshed.querySelector('[data-type="question"] form');
 refreshedForm.elements.token.value+='-refreshed';refreshedForm.elements.row.value+='-refreshed';
 window.refreshMarkup=refreshed.documentElement.outerHTML;
 window.refreshRequests=[];
+window.posts=[];
 window.fetch=async(_url,options={})=>{
- if(options.method==='POST') return {ok:true,json:async()=>({answer:'works'})};
+ if(options.method==='POST'){window.posts.push(new URLSearchParams(options.body));return {ok:true,json:async()=>({answer:'works'})};}
  window.refreshRequests.push(_url);return {ok:true,text:async()=>new URL(_url,location.href).searchParams.get('show')==='Waiting' ? window.waitingMarkup : window.refreshMarkup};
 };
 </script>""".replace('WAITING_MARKUP',json.dumps(review_page.render(self.root, show='Waiting').decode()).replace('</','<\\/')).replace('DONE_MARKUP',json.dumps(done_source).replace('</','<\\/')).replace('MARKUP',json.dumps(source).replace('</','<\\/'))
@@ -1845,12 +1867,41 @@ window.fetch=async(_url,options={})=>{
 
   check(document.documentElement.scrollWidth<=innerWidth,'no horizontal overflow');
   if(innerWidth<960) check(getComputedStyle(shown()[0]).display==='block','phone rows are cards');
-  const laterForm=fresh.querySelector('form');laterForm.elements.later.value='2099-01-01T09:00';
-  laterForm.requestSubmit(laterForm.querySelector('[value="later"]'));
+  const laterToggle=fresh.querySelector('[data-later-toggle]'),laterMenu=fresh.querySelector('[data-later-menu]');
+  laterToggle.click();
+  const menuItems=()=>[...laterMenu.querySelectorAll('[role=menuitem]')].filter(item=>!item.hidden);
+  const presetTime=name=>laterMenu.querySelector('[data-later-preset="'+name+'"] small').textContent;
+  check(!laterMenu.hidden && laterToggle.getAttribute('aria-expanded')==='true' && document.activeElement===menuItems()[0],
+    'Later opens its menu with the first preset in focus');
+  check(/^[A-Z][a-z]{2} [0-9]{2}:[0-9]{2}$/.test(presetTime('soon')) && /^[A-Z][a-z]{2} 09:00$/.test(presetTime('morning')) &&
+    /^Mon 09:00$/.test(presetTime('week')),'each preset shows its resolved time in the user zone');
+  menuItems()[0].dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowUp',bubbles:true}));
+  check(document.activeElement===menuItems().at(-1),'ArrowUp moves from the first item to the last');
+  menuItems().at(-1).dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true}));
+  check(document.activeElement===menuItems()[0],'ArrowDown moves from the last item to the first');
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();
+  check(fresh.isConnected && !laterMenu.hidden,'an open Later menu holds the page refresh');
+  laterMenu.querySelector('[data-later-choose]').click();
+  check(!laterMenu.querySelector('[data-later-custom]').hidden && document.activeElement===fresh.querySelector('[name="later"]'),
+    'Choose a time shows the date and time field');
+  let submitter='';const watch=event=>{submitter=event.submitter.value;event.preventDefault();event.stopImmediatePropagation();};
+  fresh.querySelector('form').addEventListener('submit',watch,{capture:true});
+  document.activeElement.value='2099-01-01T09:00';
+  document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  fresh.querySelector('form').removeEventListener('submit',watch,{capture:true});
+  check(submitter==='later','Enter in the date and time field saves it as Later');
+  document.activeElement.value='';
+  document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+  check(laterMenu.hidden && laterMenu.querySelector('[data-later-custom]').hidden && document.activeElement===laterToggle,
+    'Escape closes the menu and returns focus to Later');
+  laterToggle.click();const week=laterMenu.querySelector('[data-later-preset="week"]'),weekAt=Number(week.dataset.at);
+  week.click();
   await new Promise(resolve=>nativeTimeout(resolve,1000));
+  check(window.posts.at(-1).get('outcome')==='later' && window.posts.at(-1).get('later')===new Date(weekAt).toISOString(),
+    'a preset sends its time at once');
   check(fresh.hidden,'Later removes the question from the page');
   check(document.querySelector('[data-show-chip="open"] b').textContent==='0','Later removes the question from the filtered count');
-  const nativeNow=Date.now;Date.now=()=>new Date('2099-01-01T09:00').getTime()+1000;
+  const nativeNow=Date.now;Date.now=()=>weekAt+1000;
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
   let returned=rows().find(row=>row.dataset.type==='question');
   check(!returned.hidden && returned.dataset.state==='Open','Later returns the question with its original state');

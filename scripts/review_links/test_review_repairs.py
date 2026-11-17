@@ -119,9 +119,12 @@ class ReviewRepairsTests(unittest.TestCase):
             assert isinstance(waiting.source, review_items.UnownedQuestionSource)
             before = waiting.source.record.path.read_bytes()
             self.assertEqual(waiting.actions, ())
-            form = review_page.form(waiting, change_page.ReviewBrowser('fixture-token'),
-                                    conf.read('review_links').whole('review_words_rows'))
-            self.assertIn('value="later">Later', form)
+            settings = conf.read('review_links')
+            cards = review_page.CardSettings(settings.whole('review_words_rows'),
+                                             review_page.soon_label(settings.whole('later_soon_minutes')))
+            form = review_page.form(waiting, change_page.ReviewBrowser('fixture-token'), cards)
+            self.assertIn('aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later', form)
+            self.assertIn('value="later">Save', form)
             for action in ('answer', 'feedback', 'question'):
                 with self.subTest(action=action):
                     self.assertNotIn(f'value="{action}"', form)
