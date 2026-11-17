@@ -13,6 +13,7 @@ from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, investigation, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_link
+from scripts.review_links import review_legacy
 from scripts.review_links.review_items import ReviewItem, ReviewState, ReviewType
 
 PAGE_PATH = '/console/review.html'
@@ -30,13 +31,16 @@ def page_url() -> str:
 
 def waiting_items(request: console.NewsRequest) -> frozenset[str]:
     now = datetime.now(user_zone())
-    return frozenset(item.key+'/'+item.times.updated.isoformat() for item in request.shared(review_items.read) if item.for_you(now))
+    return frozenset(item.key+'/'+item.times.updated.isoformat() for item in request.shared(review_items.read)
+                     if item.type in TYPES and item.for_you(now))
 
 
 def legacy_url(path: str, query: str) -> str:
     filters = dict(parse_qsl(query, keep_blank_values=True))
     filters['type'] = ('investigation' if path.endswith('investigations.html') else
                        'question' if path.endswith('questions.html') or filters.get('type') == 'questions' else 'change')
+    if filters['type'] == 'investigation':
+        filters['legacy'] = 'investigation'
     return PAGE_PATH + '?' + urlencode(filters)
 
 
@@ -120,6 +124,7 @@ def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: sta
         title += '<small>'+html.escape({'user': 'Important', 'blocks': 'Blocks work', 'soon': 'Due soon', 'later': 'Later'}[item.urgency.level])+'</small>'
     values = (item.id, item.type.value, owner, item.title, item.state.value, item.times.filed.timestamp())
     attrs = {'key':item.key, 'number':item.id.casefold(), 'title':item.title.casefold(), 'owner':str(item.owner),
+             'source-owner':str(item.source_unit), 'source-name':source,
              'state':item.state.value, 'type':item.type.value, 'order':str(index), 'sort-values':json.dumps(values),
              'parked':str(item.hidden_until(now)).lower(), 'updated':item.times.updated.isoformat(),
              'checking':str(isinstance(item.source, review_items.ChangeSource) and item.source.slots.validation_requested).lower()}
@@ -218,15 +223,27 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 .review-panel{grid-template-columns:1fr;padding:0 14px 16px}.review-action-group+.review-action-group{padding-left:0;border:0}}
 </style>'''
 
-SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + r'''(() => {
+SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + review_legacy.SCRIPT + r'''(() => {
 let content=document.querySelector('[data-review]'),saving=0;
 const drafts=new Map(),saved=new Map();
 const view=createRecordTable({content:()=>content,single:true,
- resolveOwner:owner=>[...content.querySelectorAll('#list-owner option')].find(option=>option.value===owner || option.dataset.ownerName===owner)?.value ?? owner,
+ place:reviewPlace,
+ resolveOwner:owner=>{
+  const menu=content.querySelector('#list-owner');
+  const option=[...menu.options].find(option=>option.value===owner || option.dataset.ownerName===owner);
+  if(option) return option.value;
+  const sources=[...content.querySelectorAll('[data-list-item]')].filter(row=>row.dataset.type==='investigation' && row.dataset.sourceOwner===owner);
+  if(sources.length){
+   const count=sources.filter(row=>row.dataset.state!=='Done' && row.dataset.parked!=='true').length;
+   menu.add(new Option(sources[0].dataset.sourceName+' ('+count+')',owner));
+  }
+  return owner;
+ },
  shows:['open','For you','Waiting','Done','all'],
- visible:(data,{owner,show,query,type})=>!saved.has(data.key) && (show==='all' || data.parked!=='true') &&
+ visible:(data,{owner,show,query,type,sourceOwner})=>!saved.has(data.key) && (show==='all' || data.parked!=='true') &&
   !(show==='open' && data.state==='Waiting' && data.checking==='true') &&
-  (!owner || data.owner===owner) && (!type || data.type===type) &&
+  (!owner || data.owner===owner || data.type==='investigation' && data.sourceOwner===owner) && (!type || data.type===type) &&
+  (!sourceOwner || data.sourceOwner===sourceOwner) &&
   (!query || data.number.includes(query) || data.title.includes(query)) &&
   (show==='all' || (show==='open' ? data.state!=='Done' : data.state===show)),
  counts:items=>['For you','Waiting','Done'].map(state=>items.filter(item=>item.dataset.state===state && item.dataset.parked!=='true').length+' '+state.toLowerCase()).join(' · '),
@@ -250,7 +267,8 @@ function bind(){
     const result=await response.json();if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
     notice.textContent='Saved: '+result.answer;drafts.delete(key);
     await new Promise(resolve=>setTimeout(resolve,900));
-    saved.set(key,form.closest('[data-list-item]').dataset.updated);view.opened.delete(key);view.apply(false);
+    saved.set(key,{updated:form.closest('[data-list-item]').dataset.updated,closes:!['validate','question'].includes(data.get('outcome'))});
+    view.opened.delete(key);view.apply(false);
    }catch(error){notice.textContent='Not saved: '+error.message;buttons.forEach(button=>button.disabled=false);}
    finally{delete form.dataset.sending;saving--;}
   });
@@ -265,13 +283,17 @@ async function refresh(_supersede=false,current=()=>true){
  if(saving || !current()) return;
  const top=scrollY,focus=document.activeElement?.id,start=document.activeElement?.selectionStart,end=document.activeElement?.selectionEnd;
  content.replaceWith(fresh);content=fresh;
- for(const [key,updated] of saved){const row=content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');if(!row || row.dataset.state!=='For you' || row.dataset.updated!==updated) saved.delete(key);}
+ for(const [key,result] of saved){
+  if(result.closes) continue;
+  const row=content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
+  if(!row || row.dataset.state!=='For you' || row.dataset.updated!==result.updated) saved.delete(key);
+ }
  bind();view.apply(false);
  if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
   if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number') field.setSelectionRange(start,end);}
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
 }
 view.place();bind();view.apply();
-addEventListener('hashchange',()=>{const item=new URLSearchParams(location.hash.slice(1)).get('item');if(item) saved.delete(item);view.place();view.apply(false);});
+addEventListener('hashchange',()=>{const item=new URLSearchParams(location.hash.slice(1)).get('item');if(item && !saved.get(item)?.closes) saved.delete(item);view.place();view.apply(false);});
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
 })();'''

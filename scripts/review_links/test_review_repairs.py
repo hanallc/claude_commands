@@ -11,11 +11,11 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import cast, override
 import unittest
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from scripts.lib import urgency
 from scripts.lib.user_zone import user_zone
-from scripts.production import change_review, footer_counts, next_item, staff
+from scripts.production import change_review, footer_counts, investigation, next_item, staff
 from scripts.review_links import change_page, console, review_items, review_page, test_review_page
 
 
@@ -85,6 +85,12 @@ class ReviewRepairsTests(unittest.TestCase):
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
+                route = urlsplit(self.path)
+                if route.path in ('/console/changes.html', '/console/questions.html', '/console/investigations.html'):
+                    self.send_response(303)
+                    self.send_header('Location', review_page.legacy_url(route.path, route.query))
+                    self.end_headers()
+                    return
                 if self.path == '/problem':
                     _ = change_review.save_verdict(case.fixture.review_list,'C1','not works: The spacing differs.',case.fixture.production)
                 if self.path == '/passed':
@@ -157,6 +163,15 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
   const second=row('C2').querySelector('form');second.requestSubmit(second.querySelector('[value="validate"]'));
   await pause(1100);await nativeFetch('/passed');await refresh();check(row('C2').hidden,'a passed check stays out of Open');
   show('Done');check(!row('C2').hidden && row('C2').dataset.state==='Done','a passed check records Done');
+  show('all');row('C3').querySelector('.list-toggle').click();
+  const third=row('C3').querySelector('form');third.requestSubmit(third.querySelector('[value="works"]'));
+  await pause(1100);check(row('C3').hidden,'F010: Works leaves All');
+  for(let pass=0;pass<2;pass++){
+   await refresh();
+   for(const choice of ['open','For you','Waiting','Done','all']){
+    show(choice);check(row('C3').hidden,'F010: refresh keeps Works hidden in '+choice);
+   }
+  }
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();'''
@@ -164,7 +179,14 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_legacy_list_count_links_keep_the_review_owner(self) -> None:
-        _ = self.case.question()
+        question_key = self.case.question()
+        ready = self.case.investigation()
+        _ = self.case.investigation(False)
+        read = self.case.investigation()
+        _ = investigation.mark_read(read.owner, read.id)
+        members = staff.snapshot()
+        owner = next(row for row in members.rows if row.name == 'page-owner')
+        _ = investigation.file(owner.id, 'Another owner', 'Read its log.')
         markup = console.render(console.read_pages(),console.read_rebuilds()).decode()
         probe = r'''
 (async()=>{
@@ -178,11 +200,53 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
   const rows=[...frame.contentDocument.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
   check(rows.length===1 && rows[0].dataset.type==='question','the Review filters select the owner question');
   check(frame.contentDocument.getElementById('list-owner').value===OWNER,'the owner name resolves to its staff ID');
+  const cases=CASES;
+  for(const entry of cases){
+   const legacy=document.createElement('iframe');legacy.src=entry.url;
+   const loaded=new Promise(resolve=>legacy.addEventListener('load',resolve,{once:true}));document.body.append(legacy);await loaded;
+   const page=legacy.contentDocument;
+   check(page.getElementById('list-show').value===entry.show,'F012: legacy Show '+entry.url);
+   const visible=[...page.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
+   check(visible.length===entry.count && visible.every(row=>row.dataset.type===entry.type),'F012: legacy records '+entry.url);
+   if(entry.item) check(!page.querySelector('[data-key="'+entry.item+'"] [data-detail]').hidden,'F012: legacy row opens its card');
+   legacy.remove();
+  }
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();'''.replace('OWNER',json.dumps(str(next(item.owner for item in review_items.read(self.case.root) if item.type == review_items.ReviewType.QUESTION))))
+        cases = [{'url':'/console/changes.html#'+urlencode({'showrunner':'page-owner','row':'page-owner/C2'}),
+                  'show':'open','count':3,'type':'change','item':'page-owner/C2'},
+                 {'url':'/console/changes.html?type=questions#'+urlencode({'showrunner':'page-owner','row':question_key}),
+                  'show':'open','count':1,'type':'question','item':question_key}]
+        cases.extend({'url':'/console/investigations.html#'+urlencode({'owner':ready.owner,'show':old}),
+                      'show':new,'count':count,'type':'investigation','item':''}
+                     for old,new,count in (('not-read','open',2),('answer ready','For you',1),
+                                           ('open','Waiting',1),('read','Done',1),('all','all',3)))
+        cases.extend(({'url':'/console/investigations.html#'+urlencode({'owner':owner.id,'show':'all'}),
+                       'show':'all','count':1,'type':'investigation','item':''},
+                      {'url':'/console/investigations.html#'+urlencode({'owner':ready.owner}),
+                       'show':'open','count':2,'type':'investigation','item':''},
+                      {'url':'/console/changes.html?'+urlencode({'type':'changes','showrunner':'page-owner','row':'page-owner/C2'}),
+                       'show':'open','count':3,'type':'change','item':'page-owner/C2'},
+                      {'url':'/console/questions.html#'+urlencode({'showrunner':'page-owner','row':question_key}),
+                       'show':'open','count':1,'type':'question','item':question_key}))
+        probe = probe.replace('CASES', json.dumps(cases))
         place='/?'+urlencode({'page':'questions','at.questions':'/console/changes.html?type=questions#showrunner=page-owner'})
         self.assertEqual(self.browser(markup,probe,place),[])
+        alias_probe = r'''
+(async()=>{
+ const failures=[];
+ try{
+  const frame=[...document.querySelectorAll('iframe')].find(frame=>!frame.hidden);
+  if(!frame.contentDocument.querySelector('[data-review]')) await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  const page=frame.contentDocument,rows=[...page.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
+  if(page.getElementById('list-show').value!=='Done' || rows.length!==1 || rows[0].dataset.state!=='Done')
+   failures.push('F012: the console alias retains Read and its exact owner');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();'''
+        place = '/?'+urlencode({'page':'investigations','at.investigations':'/console/investigations.html#'+urlencode({'owner':ready.owner,'show':'read'})})
+        self.assertEqual(self.browser(markup, alias_probe, place), [])
 
 
 if __name__ == '__main__':

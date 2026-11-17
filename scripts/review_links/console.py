@@ -15,7 +15,7 @@ from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 from scripts.lib import atomic_file, conf, file_lock
 from scripts.production.change_review import ChangeReviewError
 from scripts.production.production_doc import Refusal
-from scripts.review_links import change_page, page_frame, review_link
+from scripts.review_links import change_page, page_frame, review_link, review_legacy
 
 PAGE_NAME = "console.html"
 # The console posts the open page here and reads which other pages hold new items.
@@ -212,6 +212,7 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
     content = content.replace("<!-- CLOSE -->", icon_svg("panel-left-close"))
     content = content.replace("<!-- OPEN -->", icon_svg("panel-left-open"))
     content = content.replace("<!-- MENU -->", icon_svg("menu") + '<span class="new-mark" id="menu-new" hidden>' + new_mark + '</span>')
+    content = content.replace('<script>', '<script>'+review_legacy.SCRIPT, 1)
     return content.encode("utf-8")
 
 
@@ -412,9 +413,9 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
       const kind={changes:'change',questions:'question',investigations:'investigation'}[identity];
       const url=new URL(location.href);
       const previous=new URL(url.searchParams.get('at.'+identity) || '/console/changes.html',location.origin);
-      const filters=new URLSearchParams(previous.hash.slice(1));
-      const owner=filters.get('owner') || filters.get('showrunner');
-      filters.delete('showrunner');filters.set('type',kind);if(owner) filters.set('owner',owner);
+      const filters=new URLSearchParams(previous.search);
+      for(const [key,value] of new URLSearchParams(previous.hash.slice(1))) filters.set(key,value);
+      reviewPlace(filters,kind);filters.set('type',kind);
       url.searchParams.set('at.review','/console/review.html#'+filters);
       history.replaceState(null,'',url);identity='review';
     }
