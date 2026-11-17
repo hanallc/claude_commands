@@ -3,13 +3,39 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import unittest
+from unittest import mock
 
 from scripts.direct.verify_doc_test_support import CARGO_STUB, VerifyDocFixture
-from scripts.lib import build_folders
+from scripts.lib import build_folders, build_slots
 
 
 class VerifyDocCheckoutTests(VerifyDocFixture):
+    def test_doc_uses_the_prepared_copy_without_taking_a_second_slot(self) -> None:
+        original = self.repo
+        with mock.patch.dict(os.environ, self.environment), build_slots.take_slot(
+                original, "HEAD", showrunner="builds", unit="doc-test", work="prepared copy", purpose="doc") as slot:
+            self.repo: Path = slot.path
+            self.environment["BUILDLOG_PREPARED_COPY"] = str(slot.path)
+            self.environment["TEST_METADATA"] = self.environment["TEST_METADATA"].replace(str(original), str(slot.path))
+            result = self.verify()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.cargo_calls()[0]["cwd"], str(slot.path))
+            self.assertEqual(build_folders.build_folder_state(slot.path), "held")
+            self.assertEqual(list((self.root / "slots").glob("*-slot*.lease.json")),
+                             [build_slots.lease_path(slot.path)])
+
+    def test_doc_takes_its_own_slot_when_the_prepared_copy_names_another_tree(self) -> None:
+        self.environment["BUILDLOG_PREPARED_COPY"] = str(self.root / "another-copy")
+        result = self.verify()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        checkout = Path(self.cargo_calls()[0]["cwd"])
+        self.assertNotEqual(checkout, self.repo)
+        self.assertTrue(checkout.is_relative_to(self.root / "slots"))
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
+        self.assertEqual(len(list((self.root / "slots").glob("*-slot*.lease.json"))), 1)
+
     def test_doc_replaces_checkout_and_reuses_target_preserving_unchanged_mtimes(self) -> None:
         stamp = 1_000_000_000_000_000_000
         probe = '''
