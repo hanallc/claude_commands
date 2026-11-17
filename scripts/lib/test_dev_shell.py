@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import final, override
 
@@ -78,6 +79,20 @@ class DevShellTests(unittest.TestCase):
         _ = exports.write_text("PATH=${PATH:-}\nexport FOO='1'\n")
         shell = dev_shell.ShellEnvironment("key", exports, self.root)
         self.assertEqual(dev_shell.program_folders(shell), "")
+
+    def test_nix_receives_the_explicit_descriptors(self) -> None:
+        result = subprocess.CompletedProcess(['nix'], 0, "export TEST_SHELL=1\n", "")
+        with tempfile.TemporaryFile() as lease, mock.patch.object(subprocess, 'run', return_value=result) as evaluate:
+            descriptors = (lease.fileno(),)
+            _ = dev_shell.prepare_shell(self.root / 'workspace', self.root / 'cache', 'default', 3,
+                                        pass_fds=descriptors)
+        self.assertEqual(evaluate.call_args.kwargs['pass_fds'], descriptors)
+
+    def test_nix_receives_no_descriptors_by_default(self) -> None:
+        result = subprocess.CompletedProcess(['nix'], 0, "export TEST_SHELL=1\n", "")
+        with mock.patch.object(subprocess, 'run', return_value=result) as evaluate:
+            _ = dev_shell.prepare_shell(self.root / 'workspace', self.root / 'cache', 'default', 3)
+        self.assertEqual(evaluate.call_args.kwargs['pass_fds'], ())
 
     def test_invoke_adds_the_folders_last_and_only_outside_a_nix_shell(self) -> None:
         library = self.root / "lib"

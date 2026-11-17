@@ -232,6 +232,29 @@ class ReportTests(unittest.TestCase):
         with closing(index.read_only()) as connection:
             return report.report(connection, day or local_day(STAMP))
 
+    def test_report_uses_one_target_identity_for_all_sections(self) -> None:
+        from scripts.buildlog import record
+
+        self.write(self.root / 'natedev' / 'fixture.jsonl', cargo_build('local-step'))
+        _ = index.update()
+        identity = record.LocalStepIdentity(('natedev',), ('natedev',))
+        changed = record.LocalStepIdentity(('changed-target',), ('changed-host',))
+        snapshots: list[record.LocalStepIdentity] = []
+        local_identity = mac_outcome.local_identity
+
+        def predicate_identity() -> record.LocalStepIdentity:
+            current = local_identity()
+            snapshots.append(current)
+            return current
+
+        with closing(index.read_only()) as connection, mock.patch.object(
+                record, 'local_step_identity', side_effect=[identity, *([changed] * 100)]), mock.patch.object(
+                mac_outcome, 'local_identity', side_effect=predicate_identity):
+            text = report.report(connection, local_day(STAMP))
+        self.assertIn('## Builds,', text)
+        self.assertGreater(len(snapshots), 1)
+        self.assertEqual(set(snapshots), {identity})
+
     def poll_stamp(self, at: datetime, complete: bool = True) -> None:
         path = self.root / "ci" / "polled.json"
         path.parent.mkdir(parents=True, exist_ok=True)

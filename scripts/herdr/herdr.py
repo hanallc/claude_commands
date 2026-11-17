@@ -5201,11 +5201,30 @@ class UnreadableProcessArguments:
 
 
 @dataclass(frozen=True)
+class UnparsedProcessArguments:
+    """Retain a command line until the caller selects its process."""
+
+    command: str
+
+
+@dataclass(frozen=True)
 class _UserProcess:
     pid: int
     parent: int
     executable: str
-    arguments: ReadProcessArguments | UnreadableProcessArguments
+    argument_state: UnparsedProcessArguments | ReadProcessArguments | UnreadableProcessArguments
+
+    @cached_property
+    def arguments(self) -> ReadProcessArguments | UnreadableProcessArguments:
+        if not isinstance(self.argument_state, UnparsedProcessArguments):
+            return self.argument_state
+        command = self.argument_state.command
+        if command == self.executable or command.startswith(self.executable + " "):
+            try:
+                return ReadProcessArguments((self.executable, *shlex.split(command[len(self.executable):])))
+            except ValueError:
+                pass
+        return UnreadableProcessArguments(f"process {self.pid}: arguments are unreadable or changed")
 
 
 def _darwin_processes(*, complete: bool = False, timeout: float | _ProcessReadDeadline = PROGRAM_TIMEOUT_SECONDS) -> list[_UserProcess]:
@@ -5250,15 +5269,7 @@ def _darwin_processes(*, complete: bool = False, timeout: float | _ProcessReadDe
                 continue
             except HerdrFailure:
                 pass
-        command = commands.get(pid, "")
-        arguments: ReadProcessArguments | UnreadableProcessArguments = UnreadableProcessArguments(
-            f"process {pid}: arguments are unreadable or changed")
-        if command == executable or command.startswith(executable + " "):
-            try:
-                arguments = ReadProcessArguments((executable, *shlex.split(command[len(executable):])))
-            except ValueError:
-                pass
-        processes.append(_UserProcess(pid, parent, executable, arguments))
+        processes.append(_UserProcess(pid, parent, executable, UnparsedProcessArguments(commands.get(pid, ""))))
     if complete and set(commands) != {process.pid for process in processes}:
         raise HerdrFailure("user process descendants changed or are incomplete")
     return processes
@@ -5271,10 +5282,10 @@ def _darwin_attached_clients(name: str) -> ClientsAttached | NoClientAttached | 
         return ClientsUnreadable(str(error))
     count = 0
     for process in processes:
-        if isinstance(process.arguments, UnreadableProcessArguments):
-            if Path(process.executable).name == "herdr":
-                return ClientsUnreadable(process.arguments.reason)
+        if Path(process.executable).name != "herdr":
             continue
+        if isinstance(process.arguments, UnreadableProcessArguments):
+            return ClientsUnreadable(process.arguments.reason)
         arguments = list(process.arguments.argv)
         session, command = _herdr_command(arguments, "default")
         if session and not command:

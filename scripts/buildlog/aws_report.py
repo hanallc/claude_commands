@@ -38,9 +38,9 @@ def daily_spend_lines(spends: list[ledger.DailySpend], limit: Decimal, today: st
     source = daily_spend_source(latest)
     lines = [f'**{label} (UTC {latest.day}, {source}): ${latest.usd:.2f} of the ${limit:.2f} daily limit. '
              + f'{latest.runs} gate runs.**', '']
-    lines.extend(('| Day (UTC) | Total | 32-CPU compute | 16-CPU compute | Storage | Other | Gate runs | Source |',
-                  '|---|---:|---:|---:|---:|---:|---:|---|'))
-    groups = ledger.SPEND_GROUPS[:3]
+    lines.extend(('| Day (UTC) | Total | 32-CPU compute | 16-CPU compute | Kept-machine compute | Storage | Other | Gate runs | Source |',
+                  '|---|---:|---:|---:|---:|---:|---:|---:|---|'))
+    groups = (*ledger.SPEND_GROUPS[:2], 'kept-machine compute', 'storage')
     for spend in spends:
         amounts = {row.group: row.usd for row in spend.groups}
         cells = [f'${amounts.get(group, Decimal(0)):.2f}' for group in groups]

@@ -3740,7 +3740,7 @@ class HerdrTests(unittest.TestCase):
         self.darwin_process_table(
             f"70 1 {uid} herdr server\n71 70 {uid} zsh\n72 71 {uid} claude\n" +
             f"73 71 {uid + 1} claude\n74 71 {uid} claude HERDR_PANE_ID=forged\n" +
-            f"75 71 {uid} codex\n76 71 {uid} claude\n77 1 {uid} unrelated\n")
+            f"75 71 {uid} codex\n76 71 {uid} claude\n77 1 {uid} unrelated 'outside-herdr\n")
         self.darwin_sockets(f"p70\nf3\nn{self.root}/config/herdr/sessions/writing/herdr.sock\n")
         self.configure(["--session", "writing", "pane", "list"], json.dumps({"result": {"panes": [{'pane_id': 'w1:p1', 'workspace_id': 'w1'}, {'pane_id': 'w1:p2', 'workspace_id': 'w1'}]}}))
         self.darwin_environment(71, "zsh", "HERDR_PANE_ID=w1:p1 CODEX_THREAD_ID=unit")
@@ -3750,7 +3750,9 @@ class HerdrTests(unittest.TestCase):
         self.darwin_environment(76, "claude", "HERDR_PANE_ID=w1:p2")
         cwd_command = ["-a", "-p", "71,72,74,75,76", "-d", "cwd", "-Fpn"]
         self.configure(cwd_command, "p72\nfcwd\nn/work folder\np71\nfcwd\nn/work folder\n", code=1, stderr="gone")
-        rows = herdr.herdr_processes()
+        with patch.object(shlex, "split", wraps=shlex.split) as split:
+            rows = herdr.herdr_processes()
+        self.assertNotIn(call(" 'outside-herdr"), split.call_args_list)
         self.assertCountEqual(rows, [
             herdr.HerdrProcess(71, herdr.HerdrPlace("writing", "w1:p1"), {"CODEX_THREAD_ID": "unit"}, "zsh", "/work folder"),
             herdr.HerdrProcess(72, herdr.HerdrPlace("writing", "w1:p1"), {}, "claude", "/work folder"),

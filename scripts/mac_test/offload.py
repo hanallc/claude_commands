@@ -55,6 +55,7 @@ from scripts.direct.step_selection import Pinned
 
 if TYPE_CHECKING:
     from scripts.copies import copies
+    from scripts.aws_target import hana_execution, hana_placement, hana_provider, hana_result, hana_transport
 from scripts.direct import result_environment
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -387,6 +388,18 @@ class PendingStartOperation:
 @dataclass(frozen=True)
 class AcknowledgedStartOperation:
     """The remote command acknowledged execution; its local child still runs."""
+
+
+@dataclass(frozen=True)
+class PendingHanaOperation:
+    """The Hana lifecycle or command still owns its exact provider claim."""
+    outcome: placement.AttemptOutcome = field(default_factory=lambda: placement.AttemptOutcomeUnavailable(
+        'The Hana dispatch or cleanup remains unresolved'))
+
+
+@dataclass(frozen=True)
+class NoHanaSettlement:
+    """This controller has no settled Hana outcome."""
 
 
 @dataclass(frozen=True)
@@ -841,7 +854,8 @@ class ProcessController:
         self.attempt_evidence: AttemptEvidence = AttemptEvidence()
         self.copy_failure_detail: str = ""
         self.placement: DirectOffloadRequest | AssignedOffloadRequest = DirectOffloadRequest()
-        self.pending: SettledDispatchOperations | PendingClaimOperation | PendingStartOperation | AcknowledgedStartOperation = SettledDispatchOperations()
+        self.pending: SettledDispatchOperations | PendingClaimOperation | PendingStartOperation | AcknowledgedStartOperation | PendingHanaOperation = SettledDispatchOperations()
+        self.hana_settlement: hana_execution.HanaSettled | NoHanaSettlement = NoHanaSettlement()
         self.expected_claim: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY
         self.claim_identity: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY
         self.claim_settings: Path | DefaultMacSettings = eligibility.DEFAULT_MAC_SETTINGS
@@ -857,7 +871,7 @@ class ProcessController:
         process = active.process
         if process.poll() is not None:
             self.active = IDLE_PROCESS
-            if not isinstance(self.pending, PendingStartOperation):
+            if not isinstance(self.pending, (PendingStartOperation, PendingHanaOperation)):
                 self.pending = SettledDispatchOperations()
             return
         process.terminate()
@@ -867,7 +881,7 @@ class ProcessController:
             process.kill()
             _ = process.wait()
         self.active = IDLE_PROCESS
-        if not isinstance(self.pending, PendingStartOperation):
+        if not isinstance(self.pending, (PendingStartOperation, PendingHanaOperation)):
             self.pending = SettledDispatchOperations()
 
     def defer_claim_interrupt(self, signal_number: int) -> bool:
@@ -2420,11 +2434,15 @@ def observe_cleanup(evidence: AttemptEvidence, checked: LeftoverCheckResult) -> 
 
 def claimed_run(
     controller: ProcessController,
-    config: OffloadConfig,
+    config: OffloadConfig | hana_placement.HanaControlTransport,
     request: OffloadRequest,
     repository: KnownRepository,
     started: float,
 ) -> MacOffloadResult:
+    from scripts.aws_target.hana_placement import HanaControlTransport
+
+    if isinstance(config, HanaControlTransport):
+        return hana_claimed_run(controller, config, request, repository, started)
     from scripts.copies import copies
 
     release_allowed = True
@@ -2622,12 +2640,292 @@ def claimed_run(
                     buildlog_sync.sync_target(request.target)
 
 
+def hana_source_key(request: OffloadRequest) -> placement.SourceIdentity:
+    """Read the caller's current source without installing a remote snapshot."""
+    key = read_tree_key(request.source_root)
+    return (placement.SourceKeyKnown(key.value) if isinstance(key, KnownTreeKey)
+            else placement.SourceKeyUnavailable('The caller source key is unavailable'))
+
+
+class MeasuredHanaObjects:
+    """Measure application bytes without changing execution or spending authority."""
+    def __init__(self, objects: hana_execution.ExecutionObjects, traffic: buildlog_sync.TransferLedger):
+        self.objects: hana_execution.ExecutionObjects = objects
+        self.traffic: buildlog_sync.TransferLedger = traffic
+
+    def execution_access(self, key: hana_result.HanaAttemptKey) -> hana_execution.HanaExecutionAccess:
+        return self.objects.execution_access(key)
+
+    def publish_execution(self, envelope: hana_execution.HanaExecutionEnvelope) -> None:
+        from scripts.aws_target.hana_execution import encode_envelope
+
+        row: buildlog_sync.TransferBytes = {'operation': 'hana-control-put', 'sent_bytes': len(encode_envelope(envelope)),
+            'received_bytes': 0, 'complete': False}
+        self.traffic.transfers.append(row)
+        self.objects.publish_execution(envelope)
+        row['complete'] = True
+
+    def observe_execution(self, key: hana_result.HanaAttemptKey) -> hana_execution.HanaCommandObservation:
+        from scripts.aws_target.hana_execution import encode_observation
+
+        row: buildlog_sync.TransferBytes = {'operation': 'hana-observation-get', 'sent_bytes': 0,
+            'received_bytes': 0, 'complete': False}
+        self.traffic.transfers.append(row)
+        observation = self.objects.observe_execution(key)
+        row.update(received_bytes=len(encode_observation(observation)), complete=True)
+        return observation
+
+    def execution_result(self, key: hana_result.HanaAttemptKey) -> bytes:
+        row: buildlog_sync.TransferBytes = {'operation': 'hana-result-get', 'sent_bytes': 0,
+            'received_bytes': 0, 'complete': False}
+        self.traffic.transfers.append(row)
+        content = self.objects.execution_result(key)
+        row.update(received_bytes=len(content), complete=True)
+        return content
+
+
+class MeasuredHanaSource:
+    """Measure the immutable source body offered to the scoped source store."""
+    def __init__(self, objects: hana_transport.SourceObjects, traffic: buildlog_sync.TransferLedger):
+        self.objects: hana_transport.SourceObjects = objects
+        self.traffic: buildlog_sync.TransferLedger = traffic
+
+    def put_if_absent(self, sha256: str, source: Path) -> None:
+        row: buildlog_sync.TransferBytes = {'operation': 'hana-source-put', 'sent_bytes': source.stat().st_size,
+            'received_bytes': 0, 'complete': False}
+        self.traffic.transfers.append(row)
+        self.objects.put_if_absent(sha256, source)
+        row['complete'] = True
+
+    def signed_get(self, sha256: str) -> str:
+        return self.objects.signed_get(sha256)
+
+
+def run_hana_offload(controller: ProcessController, transport: hana_placement.HanaControlTransport,
+                     request: OffloadRequest, started: float) -> MacOffloadResult:
+    """Select Hana policy before any SSH probe, process scan, or mirror transfer."""
+    from scripts.aws_target import hana_placement as hana
+
+    repository = eligibility.repository_identity(request.repo_root)
+    if not isinstance(repository, KnownRepository):
+        return declined('repo', started)
+    kind = request.kind or eligibility.verb_kind(request.verb)
+    policy = hana.fixed_policy(transport, repository.key, kind)
+    if isinstance(policy, hana.HanaStepRefused):
+        return DeclinedMacRun('off', elapsed_seconds(started), policy.reason)
+    command = ('cargo', request.verb, *request.nextest_words)
+    step = hana.classify_command(request.verb, kind, command)
+    if (isinstance(step, hana.HanaStepRefused) or request.copy or isinstance(request.fetch, FetchFolder)
+            or not isinstance(request.source, RepositoryWorkingTree)):
+        return declined('target does not permit this command', started)
+    return claimed_run(controller, transport, request, repository, started)
+
+
+def hana_claimed_run(controller: ProcessController, transport: hana_placement.HanaControlTransport,
+                     request: OffloadRequest, repository: KnownRepository, started: float) -> MacOffloadResult:
+    """Keep the checked remote waiter until exact command and lifecycle settlement."""
+    from scripts.aws_target import hana_box as box, hana_execution as execution, hana_placement as hana
+    from scripts.aws_target import hana_result, hana_transport
+    from scripts.build_queue import admission_client
+    from scripts.buildlog import record
+
+    if not isinstance(request.placement, AssignedOffloadRequest):
+        return declined('state', started)
+    assignment = request.placement.assignment
+    owner = process_identity.process_start(os.getpid())
+    if not isinstance(owner, process_identity.Started):
+        return declined('state', started)
+    holder = placement.ClaimHolderIdentity(store.host_name(), os.getpid(), owner.start)
+    checked = hana.validate_assignment(assignment, holder)
+    if isinstance(checked, hana.HanaClaimRefused) or checked != transport:
+        return declined('state', started)
+    lifecycle = hana.controller_for(transport)
+    objects = MeasuredHanaObjects(cast(execution.ExecutionObjects, cast(object, lifecycle.provider)),
+                                  controller.attempt_evidence.traffic)
+    configuration = conf.read(transport.settings)
+    evidence = controller.attempt_evidence
+    evidence.slot = request.slot
+    controller.placement = request.placement
+    controller.pending = PendingHanaOperation()
+
+    def close_prelaunch(reason: str) -> MacOffloadResult:
+        reference = placement.ProviderClaimReference(assignment.destination.provider, assignment.destination.target,
+            assignment.destination.scope, placement.assigned_claim_id(assignment.episode, assignment.attempt),
+            assignment.episode, assignment.attempt)
+        closed = execution.settle_unpublished_claim(lifecycle.directory, reference,
+            release_claim=lambda: hana.release_assigned(assignment, holder, lifecycle), reason=reason)
+        if isinstance(closed, execution.HanaSettled):
+            controller.hana_settlement = closed
+            controller.pending = SettledDispatchOperations()
+            evidence.execution = closed.evidence
+            evidence.cleanup = 'confirmed'
+            evidence.unresolved_count = 0
+        elif execution.execution_command_settled(lifecycle.directory, reference.claim_id):
+            controller.pending = PendingHanaOperation(placement.PrelaunchRefused(reason))
+            evidence.execution = placement.ExecutionNotStarted()
+        return DeclinedMacRun('state', elapsed_seconds(started), reason)
+
+    claim = hana.claim_assigned(assignment, holder, lifecycle, worktree=str(request.repo_root))
+    while isinstance(claim, hana.HanaClaimPending) and time.time() < claim.deadline:
+        evidence.provider = claim.reference
+        evidence.execution = placement.ExecutionEvidenceUnavailable('The Hana lifecycle start remains pending', time.time())
+        time.sleep(configuration.whole('control_poll_seconds'))
+        claim = hana.claim_assigned(assignment, holder, lifecycle, worktree=str(request.repo_root))
+    if isinstance(claim, (hana.HanaClaimPending, hana.HanaClaimRetained)):
+        evidence.provider = claim.reference
+        return close_prelaunch('The Hana startup wait ended before command dispatch')
+    if isinstance(claim, hana.HanaClaimRefused):
+        return close_prelaunch(claim.reason)
+    evidence.provider = claim.reserved.claim.reference
+    # SourceSender owns source policy, snapshot creation, and immutable bundle publication.
+    sender = hana_transport.SourceSender(MeasuredHanaSource(hana_transport.AwsSourceObjects(
+        cast('hana_provider.AwsHanaProvider', lifecycle.provider), configuration,
+        claim.generation.deployment, clock=time.time), evidence.traffic),
+        lifecycle.directory / 'hana' / 'source', configuration)
+    command = ('cargo', request.verb, *request.nextest_words)
+    features: list[str] = []
+    for index, word in enumerate(request.nextest_words):
+        if word.startswith('--features='):
+            features.extend(word.removeprefix('--features=').replace(',', ' ').split())
+        elif word == '--features' and index + 1 < len(request.nextest_words):
+            features.extend(request.nextest_words[index + 1].replace(',', ' ').split())
+    try:
+        prepared = execution.prepare_execution(claim, sender, request.source_root, command,
+            hana_result.LogicalStepLink(request.call_id, assignment.episode),
+            current_source_key=lambda: hana_source_key(request), environment=dict(request.environment),
+            features=tuple(dict.fromkeys(features)))
+    except (OSError, ValueError, RuntimeError, ConnectionError):
+        prepared = execution.ExecutionPreparationRefused('The Hana source capture failed')
+    if isinstance(prepared, execution.ExecutionPreparationRefused):
+        closed = execution.settle_unpublished_claim(lifecycle.directory, claim.reserved.claim.reference,
+            release_claim=lambda: hana.release_assigned(assignment, holder, lifecycle), reason=prepared.reason)
+        if isinstance(closed, execution.HanaSettled):
+            controller.hana_settlement = closed
+            controller.pending = SettledDispatchOperations()
+            evidence.cleanup = 'confirmed'
+            evidence.unresolved_count = 0
+        return DeclinedMacRun('source_changed', elapsed_seconds(started), prepared.reason)
+
+    def permission() -> box.CommandPermission | box.ClaimRefused:
+        snapshot = lifecycle.inspect()
+        if not isinstance(snapshot, hana.HanaLifecycleEvidence) or not isinstance(snapshot.permit, box.DeliveredPermit):
+            return box.ClaimRefused('The Hana acknowledged permit is unavailable')
+        return lifecycle.permission(prepared.key.claim_id, prepared.key.generation.boot_id, snapshot.permit.generation)
+
+    def release() -> bool:
+        return hana.release_assigned(assignment, holder, lifecycle)
+
+    cancelled = False
+    reason = 'The Hana execution result is unavailable'
+    accepted: hana_result.AcceptedHanaResult | hana_result.RejectedHanaResult = hana_result.RejectedHanaResult(reason)
+    settlement: execution.HanaSettlement = execution.HanaSettlementPending(reason)
+    remote_started_at = time.time()
+    source_update_sent = False
+    try:
+        state = execution.dispatch_execution(lifecycle.directory, prepared, claim, objects,
+            consume=admission_client.consume_permission, current_permission=permission,
+            current_source_key=lambda: hana_source_key(request))
+        evidence.execution = state.evidence
+        if isinstance(state, execution.DispatchSettled):
+            accepted = execution.replay_accepted_result(lifecycle.directory, prepared, transport.host,
+                                                        lambda: hana_source_key(request))
+        deadline = time.monotonic() + configuration.whole('control_url_seconds')
+        while (not isinstance(state, (execution.DispatchFenced, execution.DispatchSettled))
+                and execution.dispatch_publication_attempted(lifecycle.directory, prepared) and time.monotonic() < deadline):
+            evidence.launch_authorized = True
+            evidence.execution = execution.observe_execution(lifecycle.directory, prepared, objects)
+            observation = execution.read_dispatch_observation(lifecycle.directory, prepared)
+            if isinstance(observation, execution.HanaCommandObservation) and observation.terminated and observation.lease_free:
+                if observation.source_updated:
+                    from scripts.aws_target.hana_source import SourceIdentity
+
+                    sender.acknowledge(SourceIdentity(prepared.manifest.repository, prepared.manifest.commit,
+                                                     prepared.manifest.toolchain))
+                    reason = 'The captured Hana source was repaired without another command'
+                    break
+                basis = execution.missing_basis(observation, prepared)
+                if isinstance(basis, execution.NoMissingBasis):
+                    pass
+                elif source_update_sent:
+                    time.sleep(configuration.whole('control_poll_seconds'))
+                    continue
+                else:
+                    reason = 'The captured Hana source needs a complete bundle'
+                    complete = sender.retry_complete(request.source_root, prepared.manifest, basis)
+                    source_update_sent = True
+                    try:
+                        _ = execution.publish_source_update(lifecycle.directory, prepared, complete, objects)
+                    except (OSError, ValueError, RuntimeError, ConnectionError):
+                        reason = 'The Hana source update publication is unresolved'
+                        break
+                    time.sleep(configuration.whole('control_poll_seconds'))
+                    continue
+                try:
+                    decision = execution.accept_result(lifecycle.directory, prepared, objects.execution_result(prepared.key),
+                        transport.host, lambda: hana_source_key(request))
+                    accepted = decision
+                    reason = decision.reason if isinstance(decision, hana_result.RejectedHanaResult) else 'The Hana command completed'
+                except (OSError, ValueError, RuntimeError, ConnectionError):
+                    reason = 'The Hana terminal result transfer failed'
+                break
+            time.sleep(configuration.whole('control_poll_seconds'))
+    except OffloadInterrupted:
+        cancelled = True
+        reason = 'The user cancelled the Hana command'
+        controller.stop()
+        raise
+    finally:
+        settlement = execution.settle_execution(lifecycle.directory, prepared, objects, release_claim=release,
+                                                reason=reason, cancelled=cancelled)
+        evidence.evidence_at = time.time()
+        if isinstance(settlement, execution.HanaSettled):
+            controller.hana_settlement = settlement
+            controller.pending = SettledDispatchOperations()
+            evidence.execution = settlement.evidence
+            evidence.cleanup = 'confirmed'
+            evidence.unresolved_count = 0
+        else:
+            controller.pending = PendingHanaOperation()
+    if not isinstance(settlement, execution.HanaSettled):
+        return LostMacRun(elapsed_seconds(started), settlement.reason)
+    execution.record_attempt_charge(lifecycle.directory, prepared, evidence.traffic.transfers,
+                                    remote_started_at, time.time())
+    context = record.HanaStepContext(request.target, request.verb, repository.key, str(request.repo_root), '')
+    if isinstance(accepted, hana_result.AcceptedHanaResult):
+        if hana_source_key(request) != prepared.source_key:
+            reason = 'The caller source changed before result publication'
+        else:
+            evidence.completion = 'confirmed'
+            result = accepted.result
+            _ = record.publish_hana_result(accepted, prepared.link, context)
+            _ = sys.stdout.buffer.write(result.stdout)
+            _ = sys.stderr.buffer.write(result.stderr)
+            return PassedOnTarget(result.execution_seconds) if result.status == 0 else FailedOnTarget(result.status, result.execution_seconds)
+    rejected = execution.reject_settled_result(lifecycle.directory, prepared, reason)
+    if isinstance(rejected, execution.HanaSettlementPending):
+        controller.hana_settlement = NoHanaSettlement()
+        controller.pending = PendingHanaOperation()
+        return LostMacRun(elapsed_seconds(started), rejected.reason)
+    controller.hana_settlement = rejected
+    if evidence.launch_authorized:
+        placement_file = os.environ.get('BUILDLOG_PLACEMENT_FILE', '')
+        if placement_file:
+            record.save_hana_fallback_link(Path(placement_file), prepared.key, prepared.link)
+        _ = record.publish_hana_loss(prepared.key, prepared.link, context, transport.host,
+                                    remote_started_at, time.time(), reason)
+    return LostMacRun(elapsed_seconds(started), reason)
+
+
 def run_offload(
     controller: ProcessController,
-    config: OffloadConfig,
+    config: OffloadConfig | hana_placement.HanaControlTransport,
     request: OffloadRequest,
     started: float,
 ) -> MacOffloadResult:
+    from scripts.aws_target.hana_placement import HanaControlTransport
+
+    if isinstance(config, HanaControlTransport):
+        return run_hana_offload(controller, config, request, started)
     from scripts.copies import copies
 
     decision = eligibility.mac_step_eligibility(config, request.repo_root, request.package, request.verb, request.target, kind=request.kind)
@@ -2899,9 +3197,11 @@ class DirectPlacementConstraintBuilder(Protocol):
                  *, selection: Pinned, provider_settings: placement.ProviderSettings) -> placement.PlacementConstraints: ...
 
 
-def submit_direct_placement(request: OffloadRequest, since: float, config: OffloadConfig) -> OffloadRequest:
+def submit_direct_placement(request: OffloadRequest, since: float,
+                            config: OffloadConfig | hana_placement.HanaControlTransport) -> OffloadRequest:
     """A direct caller keeps its fixed destination through queue placement."""
     from scripts.build_queue import admission_client, admission_protocol as wire, admission_records as records
+    from scripts.aws_target.hana_placement import HanaControlTransport
     start = process_identity.process_start(os.getpid())
     if not isinstance(start, process_identity.Started):
         raise wire.AdmissionUnavailable("the submitting process is unavailable")
@@ -2918,8 +3218,9 @@ def submit_direct_placement(request: OffloadRequest, since: float, config: Offlo
     constraints = builder(request.repo_root, request.package,
         cast(Literal["check", "lint", "doc", "test", "build", "example", "final"], request.kind or eligibility.verb_kind(request.verb)),
         command, session, source_key, selection=Pinned(request.target or "mac"),
-        provider_settings=placement.ExplicitProviderSettings(config.source.resolve())
-            if isinstance(config.source, Path) else placement.ConfiguredProviderSettings())
+        provider_settings=placement.ExplicitProviderSettings(config.settings.resolve()) if isinstance(config, HanaControlTransport)
+            else placement.ExplicitProviderSettings(config.source.resolve()) if isinstance(config.source, Path)
+            else placement.ConfiguredProviderSettings())
     submitted = wire.PlacementRequest(episode, placement.SubmittingOwner(store.host_name(), os.getpid(), start.start),
         since, local.profile, constraints, identity=local.identity, run=local.run,
         prerequisite=placement.TokenNotRequired())
@@ -2953,6 +3254,16 @@ def report_placement_result(controller: ProcessController, request: OffloadReque
     if isinstance(provider, placement.NoProviderClaim):
         reason = result.reason if isinstance(result, (DeclinedMacRun, BusyMacDecline)) else "claim unavailable"
         _ = admission_client.claim_failure(wire.ClaimFailure(uuid.uuid4().hex, assigned, reason))
+        return
+    if not isinstance(controller.hana_settlement, NoHanaSettlement):
+        settled = controller.hana_settlement
+        _ = admission_client.report_execution(wire.ExecutionReport(uuid.uuid4().hex, assigned, provider,
+            settled.evidence, settled.outcome, placement.DispatchPathSettled()))
+        return
+    if isinstance(controller.pending, PendingHanaOperation):
+        _ = admission_client.report_execution(wire.ExecutionReport(uuid.uuid4().hex, assigned, provider,
+            evidence.execution, controller.pending.outcome,
+            placement.DispatchPathPending('The Hana claim remains retained')))
         return
     outcome: placement.AttemptOutcome
     if isinstance(result, (PassedOnMac, PassedOnTarget)):
@@ -3009,7 +3320,11 @@ def main() -> int:
             cli.error(f"--settings {Path(settings).expanduser().resolve()} differs from "
                       + f"--target {arguments.target} settings {target_settings}")
         settings = str(target_settings)
-    config = eligibility.read_config(Path(settings)) if settings else eligibility.read_config()
+    from scripts.aws_target import hana_placement as hana
+
+    transport = hana.read_execution_transport(eligibility.configured_ssh_target(request.target or 'mac'))
+    config: OffloadConfig | hana.HanaControlTransport = (transport if isinstance(transport, hana.HanaControlTransport)
+        else eligibility.read_config(Path(settings)) if settings else eligibility.read_config())
     if isinstance(request.placement, AssignedOffloadRequest):
         request = replace(request, slot=request.placement.assignment.destination.slot or 1)
     controller = ProcessController()
@@ -3023,7 +3338,8 @@ def main() -> int:
         while True:
             with interrupt_handlers(controller), buildlog_sync.measure_transfers(controller.attempt_evidence.traffic):
                 result = run_offload(controller, config, request, started)
-            if not direct or not isinstance(result, DeclinedMacRun) or result.reason != "source_changed":
+            if (not direct or not isinstance(result, DeclinedMacRun) or result.reason != "source_changed"
+                    or isinstance(controller.pending, PendingHanaOperation)):
                 break
             from scripts.build_queue import admission_client
 
