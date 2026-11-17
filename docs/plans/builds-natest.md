@@ -4730,27 +4730,15 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (test-time tool).
 
-#### Work Order
+#### As-built
 
-**Goal:** `module_cost.py` always ends. A run that cannot finish stops at a deadline, names what it waited for, and releases its tool folder lock.
-
-**Spec:**
-1. Anomaly, 2026-11-17 13:08 EST: `module_cost.py --tree /home/natepiano/worktrees/phases production/test_fast_track.py --commands 10` hung 58 minutes with an empty log. It sat in `wait4` with no test child and held `/tmp/module-cost-commands.lock`. Run record: `/tmp/claude/unit/29fc6964-2d74-4547-8edd-8764df425c44/detached_runs/20261117T130814-2324224-3a1b.json`. The commands lock file has time 13:11, so the hang is in the `--commands` run: `task_cpu.measure`.
-2. `task_cpu.measure` traces with ptrace and loops on `os.waitpid(-1, __WALL)` until `ChildProcessError`. Every tracee stays a wait child of the tracer, also an orphan that the test left. The loop has no deadline.
-3. `measure` in `module_cost.py` calls `os.wait4(child.pid, 0)` with no deadline.
-4. First find the cause: reproduce, and name the process that kept the wait open, its state and its origin. Then repair it at the cause.
-5. Every wait in `module_cost.py` and `task_cpu.py` has a deadline from `config/test_times.conf`. At the deadline the tool stops what it started, names each process it still waited for, prints a failure line and exits nonzero. The tool folder and its lock go away when the run ends.
-6. The log is not empty while the tool runs: print one line when each module's time, trace and command runs start.
-7. The lock is in `/tmp` because the caller set `TMPDIR=/tmp` (`systemd-run -E TMPDIR=/tmp`). `build_folders.tool_folder` uses the caller's temporary parent. Change nothing there in this phase.
-
-**Files:** `scripts/test_times/task_cpu.py`, `scripts/test_times/module_cost.py`, `scripts/test_times/test_module_cost.py`, a new test for `task_cpu.py` if it has none, `config/test_times.conf`.
-
-**Workers:** 1 writer: `impl` holds all files; the files are one small tool.
-
-**Acceptance gate:**
-- A fixture command that leaves a live orphan makes `task_cpu.measure` stop at the deadline and name the orphan.
-- `module_cost.py production/test_fast_track.py --commands 10` on main ends, with the cause repaired.
-- The test_times tests pass; basedpyright reports 0 errors and 0 warnings on the changed files.
+- Cause: `task_cpu.measure` looped on `waitpid(-1, __WALL)` with no deadline. A process the test left alive stayed a traced wait child of the tracer, so the loop never ended and the tool folder lock stayed held. A fixture orphan reproduced it; the process of the 13:08 run is not known, because the rerun ended normally.
+- Each time, trace and command stage has the limit `MODULE_COST_STAGE_TIMEOUT_S=600`. At the limit, module_cost stops its processes, names each one (`pid (command)`), and exits 1 with `MeasurementTimeout`.
+- The command stage traces on its own thread; the main thread waits on that thread with the deadline. After the root exits, leftovers get `MODULE_COST_LEFTOVER_S=2`, then `LeftoverProcesses` names them.
+- The time and trace stages wait on a pidfd with `select.poll`. No wait polls. Each stage prints one start line.
+- `module_cost.main` adopts orphans with `adopt_descendants`. `task_cpu.stop_pending` stops every live descendant, waits on pidfds, and scans again, bounded by `CLEANUP_LIMIT_S`.
+- The lock was in `/tmp` because the caller set `TMPDIR=/tmp`; `build_folders.tool_folder` uses the caller's temporary parent.
+- module_cost own CPU on fast track: 7.3 to 3.7 s. Main-based commit f2850a915 (branch `natest-modulecost338`) went to builds. F009 (cleanup can reach an in-process caller's own children) went to phase 339.
 
 ### Phase 339 — module_cost measures in its own process and counts starts with one tracer
 **Depends on:** Phase 338
