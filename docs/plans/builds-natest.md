@@ -4628,3 +4628,13 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - 14 modules failed a run under the census (nested ptrace, fixture hang guards in local routing waits). Their failed waits dominate the raw ranking (`local_release_wait.py` 1,898 s, `runner_lock.py` 824 s), so the ranking below uses only the 799 modules that pass every run.
 - Passing modules: 2,953 natedev CPU s against 3,980 aws CPU s (ratio 0.74). Gross groups: test processes (`module_run.py`, test bodies and fixtures) 1,135 s; Git 222 s over 260,444 starts (`rev-parse` 60 s over 79,174; `maintenance` 6 s over 12,279); inline Python through the `lib/py` shim 216 s over 3,417 starts (63 ms each); `verify_helper.py` 111 s over 491 starts (227 ms each); `verify.sh` 73 s; `admission_client.py` 48 s; `mac_test.py` 41 s; `assign.py` 36 s over 61 starts.
 - Each figure is a gross bound with useful work inside it, not a saving. The next step isolates start costs for the shim, `verify_helper.py` and the runner. Checkpoint 9afea5d14.
+
+### Phase 329 — Measure the start costs that every test pays  · status: done
+**Depends on:** Phase 328
+
+#### As-built
+
+- Research only; no repository file changed. Summary: `phases/329/director_summary.md` in the run folder. impl measured; Codex lost capacity at 04:00 and the director finished the pass.
+- Isolated start CPU (natedev, 220 paired starts): `lib/py` shim +4.8 to 8.5 ms per start (bound 16-29 s over 3,417 starts); `verify_helper.py` ready 28-32 ms (bound about 15 s over 491); `module_run.py` runner +42 to 53 ms per module (bound 35-44 s over 826). None is a large lever.
+- Top `git rev-parse` callers in 20 Git-heavy modules: `style/git_process.py:162` 14,411 starts; `lib/build_slots.py:87` 7,944; `style/bulk_run.py:60` 3,570; `copies/copies.py:462` 3,410; `production/merge_checkpoint.py:180` 2,198.
+- Git auto maintenance off (`maintenance.auto=false`, `gc.auto=0` through `GIT_CONFIG_PARAMETERS`), paired natedev, 3 rounds, median saving: `test_models_conf_publish` 6.06 CPU s, `test_fast_track` 1.75, `test_style_footprint` 1.02, `test_style_ledger_findings` noise. Proposal to builds: the gate test environment turns auto maintenance off.
