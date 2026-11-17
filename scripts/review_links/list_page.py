@@ -105,16 +105,17 @@ def feedback_form(entry: ListRecord, secret: str) -> str:
             + '<button name="action" value="remove">Remove</button>'
             + f'<label for="park-{key}">Park until</label><input type="date" name="until" id="park-{key}">'
             + '<button name="action" value="park">Park</button></div>'
-            + f'<label for="words-{key}">Tell morty</label><textarea name="words" id="words-{key}" rows="2" maxlength="10000"></textarea>'
-            + '<button name="action" value="tell">Send</button><span role="status" data-send-status></span></form>')
+            + f'<textarea name="words" id="words-{key}" rows="2" maxlength="10000" '
+            + 'placeholder="Your words for morty about this item" aria-label="Your words for morty about this item"></textarea>'
+            + '<div class="list-tell"><span role="status" data-send-status></span>'
+            + '<button name="action" value="tell" disabled>Tell morty</button></div></form>')
 
 
 def details(entry: ListRecord, today: datetime, secret: str) -> str:
     item = entry.item
     sections = ''.join('<section><h3>' + heading + '</h3>'
                        + change_browser.question_paragraphs(text or "Not recorded") + '</section>'
-                       for heading, text in (("Latest status", item.latest_status), ("Done when", item.done_when),
-                                             ("Evidence", item.evidence)))
+                       for heading, text in (("Latest status", item.latest_status), ("Done when", item.done_when)))
     links = [f'<li><a href="{html.escape(item_link(entry.keeper, link.number), quote=True)}">#{link.number}</a>'
              + ' — ' + html.escape(link.condition) + '</li>' for link in item.blocked_by]
     links.extend(f'<li>Related: <a href="{html.escape(item_link(entry.keeper, number), quote=True)}">#{number}</a></li>'
@@ -169,7 +170,7 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
         if feedback.state == "alerted":
             notice = "not sent; " + feedback.alerted_to + " told" if feedback.alerted_to else "not sent; no showrunner for alert"
         update += '<small>' + html.escape(notice + ", " + local_time(sent, today)) + '</small>'
-    cells = (number, html.escape(owner), title, state, html.escape(item.next_step or "Not recorded"),
+    cells = (number, html.escape(owner), title, state, change_browser.question_paragraphs(item.next_step or "Not recorded"),
              html.escape(eta_text(item.eta, today)), update)
     row = ''.join(f'<td data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden = ' hidden' if parked or item.state in (the_list.ItemState.DONE, the_list.ItemState.CLOSED) else ''
@@ -370,6 +371,7 @@ min-height:44px;width:100%;text-align:left;border-radius:0}
 .list-table td{padding:12px 8px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere}
 .list-table tbody:last-child td{border-bottom:0}.list-row{cursor:pointer}.list-row:hover,.list-row.open{background:var(--hover)}
 .list-table td:nth-child(2),.list-table td:nth-child(5),.list-table td:nth-child(6){color:var(--ink-2)}
+.list-table td[data-label="Next step"]>:first-child{margin-top:0}.list-table td[data-label="Next step"]>:last-child{margin-bottom:0}
 .list-table small{display:block;color:var(--ink-3);font-size:12px;margin-top:4px}
 .list-toggle{display:flex;gap:4px;align-items:center;padding:0!important;background:none;border:0;color:var(--ink-2);
 font:inherit;font-variant-numeric:tabular-nums;margin:0;min-height:24px}
@@ -390,7 +392,10 @@ font:inherit;font-variant-numeric:tabular-nums;margin:0;min-height:24px}
 [data-feedback-form] input,[data-feedback-form] textarea{font:inherit;background:var(--card);color:var(--ink);
 border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;max-width:100%;box-sizing:border-box}
 [data-feedback-form] textarea{display:block;width:100%;resize:vertical;margin:6px 0 8px}
-[data-feedback-form] button{margin:0;min-height:44px}[data-send-status]{margin-left:10px;font-size:13px;color:var(--ink-2)}
+[data-feedback-form] button{margin:0;min-height:44px}
+.list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
+.list-tell button{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.list-tell button:disabled{opacity:.45;cursor:default}[data-send-status]{font-size:13px;color:var(--ink-2)}
 .list-counts{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:20px;color:var(--ink-2);font-size:13px}
 .list-count-chip{border:1px solid var(--line);border-radius:999px;background:var(--card);padding:5px 12px}
 [data-empty]{padding:16px;margin:0;color:var(--ink-2)}
@@ -488,18 +493,21 @@ function bind(){
  content.querySelectorAll('[data-feedback-form]').forEach(form=>{
   const key=form.closest('[data-list-item]').dataset.key;
   const words=form.elements.words,until=form.elements.until;
+  const tell=form.querySelector('[value="tell"]');
+  const syncTell=()=>{tell.disabled=Boolean(form.dataset.sending) || !words.value.trim();};
   const fresh={request:form.elements.request.value,token:form.elements.token.value};
   const draft=drafts.get(key);if(draft){words.value=draft.words;until.value=draft.until;}
   let attempt=draft?.attempt;
   const same=action=>attempt && attempt.words===words.value && attempt.until===until.value &&
    (action===undefined || attempt.action===action);
   const identity=request=>{form.elements.request.value=request.request;form.elements.token.value=request.token;};
-  const retain=()=>{drafts.set(key,{words:words.value,until:until.value,attempt});identity(same() ? attempt : fresh);};
+  const retain=()=>{drafts.set(key,{words:words.value,until:until.value,attempt});identity(same() ? attempt : fresh);syncTell();};
   retain();
   words.addEventListener('input',retain);until.addEventListener('input',retain);
   form.addEventListener('submit',async event=>{
    event.preventDefault();if(form.dataset.sending) return;
    const action=event.submitter?.value || 'tell';identity(same(action) ? attempt : fresh);
+   if(action==='tell' && !words.value.trim()) return;
    const data=new URLSearchParams(new FormData(form));data.set('action',action);
    attempt={words:words.value,until:until.value,action,request:data.get('request'),token:data.get('token')};retain();
    form.dataset.sending='true';saving++;pageRefresh.abandon();
@@ -517,7 +525,7 @@ function bind(){
     }
    }catch(error){notice.textContent='Not saved: '+error.message;}
    finally{
-    delete form.dataset.sending;saving--;buttons.forEach(button=>button.disabled=false);
+    delete form.dataset.sending;saving--;buttons.forEach(button=>button.disabled=false);syncTell();
     void pageRefresh.refresh(true);
    }
   });
