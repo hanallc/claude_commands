@@ -1,4 +1,4 @@
-"""Decode the durable delivery record for the page and all waiting counts."""
+"""Decode delivery records and check reply IDs."""
 from __future__ import annotations
 
 import json
@@ -52,6 +52,27 @@ class AnsweredQuestion:
     question_id: str
     text: str
     answer: str
+
+
+class StaleQuestionExchange(ValueError):
+    """The answer does not belong to the current question exchange."""
+
+
+def require_exchange_id(current_id: str | NoQuestion | NoDelivery, reply_id: str) -> None:
+    """Require the current exchange ID before a native answer saves."""
+    if not isinstance(current_id, str):
+        raise StaleQuestionExchange('this row has no open question')
+    if current_id != reply_id:
+        raise StaleQuestionExchange('this question id does not match the current question')
+
+
+def question_exchange_for_reply(question: NoQuestion | OpenQuestion | AnsweredQuestion,
+                                question_id: str, text: str) -> OpenQuestion | AnsweredQuestion:
+    """Check the exchange ID and answer without changing the record."""
+    require_exchange_id(question if isinstance(question, NoQuestion) else question.question_id, question_id)
+    if isinstance(question, AnsweredQuestion) and question.answer != text:
+        raise StaleQuestionExchange('this row has no open question')
+    return cast(OpenQuestion | AnsweredQuestion, question)
 
 
 @dataclass(frozen=True)

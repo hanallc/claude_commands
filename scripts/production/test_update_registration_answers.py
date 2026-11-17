@@ -22,7 +22,7 @@ from scripts.production.update_registration_test_support import RegistrationFixt
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.production import staff
+from scripts.production import delivery_state, staff
 from scripts.production.staff_test_support import fixture_member
 
 
@@ -115,7 +115,7 @@ class RegistrationTests(RegistrationFixture):
             self.assertIn('this question id does not match the current question', output.getvalue())
             self.assertEqual(path.read_bytes(), before)
             self.assertEqual(case.status.slots(new.page, new.row).question, new_request)
-            with self.assertRaisesRegex(registration.StaleQuestionExchange,
+            with self.assertRaisesRegex(delivery_state.StaleQuestionExchange,
                                        'this question id does not match the current question'):
                 registration.reply_record(item.source.record, 'The old case passes.', 'page-owner',
                     identities=registration.QuestionStaff.read(), question_id=old_request.question_id)
@@ -142,7 +142,7 @@ class RegistrationTests(RegistrationFixture):
             assert isinstance(item.source, review_items.QuestionSource)
             before = item.source.record.path.read_bytes()
             identities = registration.QuestionStaff.read()
-            with self.assertRaisesRegex(registration.StaleQuestionExchange,
+            with self.assertRaisesRegex(delivery_state.StaleQuestionExchange,
                                        'this question id does not match the current question'):
                 registration.reply_record(item.source.record, 'The old case passes.', 'page-owner', identities=identities)
             self.assertEqual(item.source.record.path.read_bytes(), before)
