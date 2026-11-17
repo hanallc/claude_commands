@@ -442,6 +442,11 @@ class BuildQueueUnreadable:
     reason: str
 
 
+@dataclass(frozen=True)
+class BuildMoveDeferred(StopFailed):
+    """The director remains running until build ownership permits its automatic move."""
+
+
 @contextmanager
 def detached_moves() -> Generator[None]:
     """Keep move batches outside the maintenance part's kill boundary."""
@@ -1656,6 +1661,62 @@ def _resume_move(identity: str, target: str, requester: str, why: str, began: fl
         _move_resume.reset(token)
 
 
+def _verify_build_holders(selected: list[str]) -> dict[str, tuple[str, ...]] | BuildQueueUnreadable:
+    """Keep live verify calls, including calls that have not entered the admission queue."""
+    from scripts.build_hold.owning_session import OwningSession, RunNotInStaff, RunOwner, owning_session, run_resolution
+    from scripts.direct import step_record
+    from scripts.lib import process_start
+
+    directory = step_record.record_directory()
+    try:
+        paths = sorted(path for path in directory.iterdir() if path.suffix == ".json")
+    except FileNotFoundError:
+        return {}
+    except OSError as error:
+        return BuildQueueUnreadable(f"verify records are unreadable: {error}")
+    owned: dict[str, list[str]] = {}
+    for path in paths:
+        record = step_record.read(path.stem)
+        if isinstance(record, (step_record.MissingRecord, step_record.StaleRecord)):
+            continue
+        if isinstance(record, step_record.UnreadableRecord):
+            return BuildQueueUnreadable(f"verify call {record.call_id} is unreadable: {record.reason}")
+        try:
+            if sys.platform == "darwin":
+                result = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(record.pid)],
+                    capture_output=True, text=True, timeout=5, check=False)
+                if result.returncode or "HOME=" not in result.stdout:
+                    raise OSError("process environment is unreadable")
+                entries = result.stdout.split()
+            else:
+                proc = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
+                entries = (proc / str(record.pid) / "environ").read_bytes().decode(errors="replace").split("\0")
+            environment = dict(entry.split("=", 1) for entry in entries if "=" in entry)
+            resolution = run_resolution(environment)
+            if isinstance(resolution, RunNotInStaff):
+                owner, reason = "", f"named run owner cannot be resolved: {resolution.run}"
+            else:
+                resolved = (OwningSession(resolution.session_id) if isinstance(resolution, RunOwner)
+                            else owning_session(environment))
+                owner = resolved.session_id if isinstance(resolved, OwningSession) else ""
+                reason = "verify call has no readable session identity" if not owner else ""
+        except (OSError, subprocess.SubprocessError) as error:
+            owner, reason = "", str(error)
+        # The environment belongs to this call only while its saved process identity still matches.
+        current = process_start.process_start(record.pid)
+        if isinstance(current, (process_start.Gone, process_start.Zombie)):
+            continue
+        if isinstance(current, process_start.Started) and current.start != record.proc_start:
+            continue
+        if isinstance(current, process_start.Unreadable):
+            return BuildQueueUnreadable(f"verify call {record.call_id} identity is unreadable: {current.reason}")
+        if reason:
+            return BuildQueueUnreadable(f"verify call {record.call_id}: {reason}")
+        if owner in selected:
+            owned.setdefault(owner, []).append(f"verify.sh {record.kind} in {record.repo}")
+    return {owner: tuple(steps) for owner, steps in owned.items()}
+
+
 def _build_holders(sessions: list[str]) -> dict[str, tuple[str, ...]] | BuildQueueUnreadable:
     """Name the running, waiting and cloud build steps that each session owns in the admission queue."""
     from scripts.build_queue import admission_client, admission_protocol as wire
@@ -1672,13 +1733,18 @@ def _build_holders(sessions: list[str]) -> dict[str, tuple[str, ...]] | BuildQue
     for session, step, folder in steps:
         if session in sessions:
             owned.setdefault(session, []).append(f"{step} in {folder}" if folder else step)
+    verify = _verify_build_holders(sessions)
+    if isinstance(verify, BuildQueueUnreadable):
+        return verify
+    for session, names in verify.items():
+        owned.setdefault(session, []).extend(names)
     return {session: tuple(names) for session, names in owned.items()}
 
 
 def _move_after_builds(selected: list[str], held: dict[str, tuple[str, ...]], target: str, *, why: str,
                        warn_seconds: int, requester: str, cause: moves.MoveCause,
                        source_accounts: Mapping[str, str]) -> list[MoveResult]:
-    """Move free sessions at once; move each build owner when its steps end or the wait limit passes."""
+    """Move free sessions and defer build owners until their steps end."""
     free = [session for session in selected if session not in held]
     if not _batch_process.get():
         # Only the detached batch waits, so no caller blocks on a build.
@@ -1710,9 +1776,9 @@ def _move_after_builds(selected: list[str], held: dict[str, tuple[str, ...]], ta
         if ended:
             results.update(move_now(ended))
     for session, steps in waiting.items():
-        print(f"build wait limit: {session}: the move ends {'; '.join(steps)}")
-    if waiting:
-        results.update(move_now(list(waiting)))
+        reason = f"move deferred: build ownership remains: {'; '.join(steps)}"
+        print(f"build wait limit: {session}: {reason}")
+        results[session] = BuildMoveDeferred(session, reason)
     return [results[session] for session in selected]
 
 
@@ -1730,7 +1796,9 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
     if cause != "by hand":
         held = _build_holders(selected)
         if isinstance(held, BuildQueueUnreadable):
-            print(f"build wait: the build queue is unreadable ({held.reason}); the move does not wait")
+            reason = f"move deferred: build ownership is unreadable ({held.reason})"
+            print(f"build wait: {reason}")
+            return [BuildMoveDeferred(session, reason) for session in selected]
         elif held:
             return _move_after_builds(selected, held, target, why=why, warn_seconds=warn_seconds,
                                       requester=requester, cause=cause, source_accounts=source_accounts)
