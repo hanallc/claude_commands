@@ -15,7 +15,7 @@ import tempfile
 import time
 from typing import TYPE_CHECKING, cast
 
-from scripts.aws_target import admin_secrets, gate_box, hana_box as box, hana_guest, ledger, remote
+from scripts.aws_target import admin_secrets, hana_box as box, hana_guest, ledger, remote, s3_presign
 from scripts.aws_target.aws_cli import AwsCli, AwsExecutor, AwsUnavailable, execute_command
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -113,11 +113,11 @@ class AwsHanaProvider:
 
         prefix = self._execution_prefix(key)
         credentials = self.api.call('export-credentials', '--format', 'process', service='configure')
-        signing = gate_box.SigningKey(ledger.text(credentials, 'AccessKeyId'), ledger.text(credentials, 'SecretAccessKey'),
+        signing = s3_presign.SigningKey(ledger.text(credentials, 'AccessKeyId'), ledger.text(credentials, 'SecretAccessKey'),
                                      str(credentials.get('SessionToken', '')))
         now = self.clock()
         def signed(suffix: str) -> str:
-            return gate_box.presign('PUT', self.bucket + '.s3.' + self.api.region + '.amazonaws.com',
+            return s3_presign.presign('PUT', self.bucket + '.s3.' + self.api.region + '.amazonaws.com',
                 prefix + suffix, self.api.region, signing, datetime.fromtimestamp(now, UTC), self.url_seconds)
         return HanaExecutionAccess(signed('/observation.json'), signed('/result.json'), now + self.url_seconds)
 
@@ -199,11 +199,11 @@ class AwsHanaProvider:
     def _bootstrap(self, identity: box.DeploymentIdentity, start: box.DemandStart) -> dict[str, object]:
         # URLs exist only in private runtime records and EC2 user data.
         credentials = self.api.call('export-credentials', '--format', 'process', service='configure')
-        signing = gate_box.SigningKey(ledger.text(credentials, 'AccessKeyId'), ledger.text(credentials, 'SecretAccessKey'),
+        signing = s3_presign.SigningKey(ledger.text(credentials, 'AccessKeyId'), ledger.text(credentials, 'SecretAccessKey'),
             str(credentials.get('SessionToken', '')))
         prefix = self._prefix(identity, start)
         def url(method: str, suffix: str) -> str:
-            return gate_box.presign(method, self.bucket + '.s3.' + self.api.region + '.amazonaws.com',
+            return s3_presign.presign(method, self.bucket + '.s3.' + self.api.region + '.amazonaws.com',
                 prefix + suffix, self.api.region, signing, datetime.fromtimestamp(self.clock(), UTC), self.url_seconds)
         return {'version': 1, 'deployment': identity.deployment, 'start_token': start.token, 'start_at': start.at,
             'expires': int(self.clock()) + self.url_seconds, 'control_url': url('GET', '/permit.json'),

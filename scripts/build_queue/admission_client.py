@@ -25,6 +25,8 @@ import uuid
 
 from scripts.build_queue import admission_code, placement, snapshot_codec
 from scripts.build_queue import admission_wire as status_wire
+from scripts.build_queue.admission_wire import read_assignment as read_assignment
+from scripts.build_queue.admission_wire import write_assignment as write_assignment
 from scripts.build_targets import target_config
 from scripts.direct import step_selection
 if TYPE_CHECKING:
@@ -204,17 +206,6 @@ def cancel_placement(request: wire.CancelPlacement) -> wire.Ok:
     if isinstance(reply, wire.Ok):
         return reply
     raise wire.AdmissionUnavailable("invalid cancellation answer")
-
-
-def read_assignment(path: Path) -> wire.Assignment | wire.LocalPlacementGranted:
-    reply = wire.parse_reply(path.read_text())
-    if isinstance(reply, (wire.Assignment, wire.LocalPlacementGranted)):
-        return reply
-    raise wire.AdmissionUnavailable("file contains no assigned attempt")
-
-
-def write_assignment(path: Path, reply: wire.Assignment | wire.LocalPlacementGranted) -> None:
-    write_text_atomic(path, wire.encode_reply(reply))
 
 
 @dataclass(frozen=True)

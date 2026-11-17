@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar, cast
 
 from scripts.build_queue import snapshot_codec as codec
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_targets import target_config
 
 if TYPE_CHECKING:
@@ -710,6 +711,17 @@ def parse_reply(line: str | bytes, request: Request | None = None) -> Reply:
 
 def encode_reply(reply: Reply, *, version: int = VERSION) -> str:
     return encode_envelope(reply, REPLY_TYPES, version)
+
+
+def read_assignment(path: Path) -> Assignment | LocalPlacementGranted:
+    reply = parse_reply(path.read_text())
+    if isinstance(reply, (Assignment, LocalPlacementGranted)):
+        return reply
+    raise AdmissionUnavailable("file contains no assigned attempt")
+
+
+def write_assignment(path: Path, reply: Assignment | LocalPlacementGranted) -> None:
+    write_text_atomic(path, encode_reply(reply))
 
 
 # JSON escapes one character into at most six ASCII bytes; include the newline.
