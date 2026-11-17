@@ -739,7 +739,9 @@ The test server joins its request handlers before fixture cleanup and gives each
 - `scripts/agents/shutdown.py` — the summary line.
 - `scripts/agents/test_shutdown_cli.py`, `scripts/production/test_unit_move.py` — the singular and plural summary assertions.
 
-### Phase 58 — Every validate message carries its validation id and command  · status: todo
+### Phase 58 — Every validate message carries its validation id and command  · status: done
+**Result (2026-11-17):** the C368–C370 validate messages came at 10:55 EST from a server that ran code from before de367d2b2, whose formatter had no id line. C368 and C369 saved before the id check shipped; C370's verdict came after it. de367d2b2 already sends the id and the full command on the first send and on recovery. This phase adds the test assertions for both, which fail on the old formatter, and the Validate section of `commands/change_review.md` points to the command in the message.
+
 **Depends on:** Phase 57 (order only)
 
 #### Work Order
