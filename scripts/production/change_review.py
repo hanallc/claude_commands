@@ -1744,7 +1744,9 @@ def end_row_scratch(path: Path, row: str) -> list[str]:
     A verdict ends the row either way: a row returned to its unit comes back as a new row.
     """
     try:
-        return [f"removed {folder}" for folder in scratch.end(f"row:{_owner(path)}-{row}")]
+        result = scratch.end(f"row:{_owner(path)}-{row}")
+        return ([f"removed {folder}" for folder in result]
+                + [f"kept {folder.path}: {folder.reason}" for folder in result.kept])
     except (scratch.ScratchError, OSError) as error:
         return [f"scratch not removed: {error}"]
 
