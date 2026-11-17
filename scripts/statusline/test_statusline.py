@@ -47,6 +47,10 @@ def shipped_account_label(label: str) -> str:
     key = f"account.{label}"
     if key not in colors:
         return label
+    color = colors[key]
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+        rgb = ";".join(str(int(color[index:index + 2], 16)) for index in (1, 3, 5))
+        return f"\x1b[38;2;{rgb}m{label}\x1b[0m"
     codes = {name: str(30 + index) for index, name in enumerate(
         ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"))}
     codes.update({f"bright-{name}": str(90 + index) for index, name in enumerate(
@@ -225,13 +229,16 @@ class ColorTests(unittest.TestCase):
 
     def test_shipped_roles_and_accounts_use_hues_and_accounts_have_distinct_colors(self) -> None:
         accounts: list[str] = []
-        for line in SHIPPED_COLORS.read_text(encoding="utf-8").splitlines():
-            key, separator, value = line.split("#", 1)[0].partition("=")
-            if not separator or not key.strip().startswith(("account.", "role.")):
+        for key, value in conf.read(SHIPPED_COLORS).values().items():
+            if not key.startswith(("account.", "role.")):
                 continue
-            color = value.strip()
+            color = value.lower()
             with self.subTest(key=key):
                 self.assertNotIn(color, ("white", "bright-white", "black", "bright-black"))
+                if color.startswith("#"):
+                    self.assertRegex(color, r"^#[0-9a-f]{6}$")
+                    channels = tuple(int(color[index:index + 2], 16) for index in (1, 3, 5))
+                    self.assertGreater(max(channels), min(channels))
             if key.strip().startswith("account."):
                 accounts.append(color)
         self.assertEqual(len(set(accounts)), len(accounts))

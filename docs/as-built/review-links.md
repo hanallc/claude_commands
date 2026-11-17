@@ -110,7 +110,8 @@ It shows the state, data time, round trip and server render time, in that order.
 Live uses `radio` and `--room`; Reading uses `loader-circle` and `--accent`.
 Late uses `clock-alert` and `--warning`; Failed uses `triangle-alert` and `--error`.
 Paused uses `circle-pause` and `--ink-3`.
-The state order is Paused, Failed, Late, Reading, Live.
+A hidden page or a replacement hold shows Paused before the other states.
+Otherwise, the state order is Failed, Late, a busy Paused state, Reading, Live.
 Late, Failed and Paused show a reason after the last data time instead of timings.
 Builds and Disks keep the shown data time when a later read or measure fails.
 A first read shows only Reading until data arrives.
@@ -133,6 +134,21 @@ An older response cannot replace a newer response.
 Accounts, List and Review read their rendered page at `page_refresh_seconds` intervals.
 Builds reads `memory.json` at its feed interval.
 Disks reads `disks.json` at `page.poll_seconds` intervals and requests a new measure when needed.
+Disks shows Paused with the reason **Measuring…** while a measure runs and reads succeed.
+The loader result carries `busy:'Measuring…'` while the measure runs within `wait_seconds`.
+The shared component records the data, age and answer time from each busy result.
+Failed and Late override this busy reason.
+The `hold` function delays page replacement; a busy result does not delay it.
+The old sizes remain visible during the measure.
+An unsuccessful read shows Failed with the read error while the measure runs.
+Old sizes alone do not make Disks Late because the page measures on demand.
+Disks supplies `answeredAt` to the shared status component after a server answer.
+The shared component uses that time for Late and keeps the size timestamp for the visible age.
+Other pages use their data timestamp for Late.
+A completed measure returns Disks to Live with the new size age.
+A measure that exceeds `wait_seconds` clears the measure state even when reads fail.
+The status shows Failed with **The measure did not finish.** or the read error.
+If a read remains pending past the age limit, the status shows Late with the retained data age.
 AWS reads its published page when shown; its hourly publisher sets the data time and render time.
 Images reads its rendered page when shown.
 Review retains typed text across refresh and holds replacement during an active save.
@@ -335,6 +351,22 @@ A failed or late first render gives 503 with **The Accounts page is not availabl
 A failed background render keeps the last good page and writes one line to stderr.
 Failed renders add no render time.
 A cached Accounts response carries its render failure to the status line.
+
+Each account with an `account.<label>` key in `config/statusline.conf` has a swatch beside its label.
+The swatch opens one popup with a native color picker and Try, Save, and Cancel buttons.
+The popup uses the console theme and stays inside the viewport.
+Try changes the label and swatch without a request.
+Cancel or Escape restores the saved color.
+The page pauses refresh while the popup is open, including after Try or a failed save.
+Save posts `label` and a lowercase `#rrggbb` value to `/console/accounts.html` as form data.
+The server validates the configured account and the hex color.
+It runs this checkout's `scripts/lib/tune.py` through `scripts/lib/py` to publish the value.
+The tune command records the user's Save action and commits the configuration change through its normal publication path.
+The popup disables its controls and shows **Saving…** during publication.
+Success closes the popup, clears the kept page, and refreshes the board.
+A refused request returns 400 with its reason.
+A failed publication returns 503 with tune's last stderr line.
+The popup shows the reason and keeps the tried color until Cancel.
 
 - The table comes from `accounts.status_board()`: the board columns, rows, total row and tones.
 - The upcoming moves and the problems follow the table.
