@@ -451,6 +451,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).query or self.headers.get_content_type() != "application/x-www-form-urlencoded":
             self.html_response(400, change_page.document("<p>Use the answer form on the review page.</p>"))
             return
+        if urlsplit(self.path).path == accounts_page.PAGE_PATH:
+            self.account_color_post()
+            return
         if urlsplit(self.path).path == images.PAGE_PATH:
             self.image_post()
             return
@@ -591,6 +594,27 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 change_page.deliver(delivery, server.delivery_status)
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
+
+    def account_color_post(self) -> None:
+        """Validate and publish one color from the Accounts page."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 4096:
+                raise ValueError("Invalid color request size.")
+            fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
+            if set(fields) != {"label", "value"} or any(len(values) != 1 for values in fields.values()):
+                raise ValueError("Use one label and one color value.")
+        except (ValueError, UnicodeError) as error:
+            self.json_response(400, {"reason": str(error)})
+            return
+        result = accounts_page.save_color(fields["label"][0], fields["value"][0])
+        if isinstance(result, accounts_page.ColorRefused):
+            self.json_response(400, {"reason": result.reason})
+        elif isinstance(result, accounts_page.ColorSaveFailed):
+            self.json_response(503, {"reason": result.reason})
+        else:
+            cast(ReviewLinksServer, self.server).accounts_cache = AccountsPageCache()
+            self.json_response(200, {"state": "saved"})
 
     def list_post(self) -> None:
         """Save List feedback before the shared sender starts."""

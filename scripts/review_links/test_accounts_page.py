@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.accounts import accounts
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.review_links import accounts_page, console_theme, page_frame, serve
 from scripts.whoami import agent_accounts
@@ -46,7 +47,10 @@ class AccountsPageTests(unittest.TestCase):
         self.assertIn(f"<thead><tr>{heads}</tr></thead>", markup)
         self.assertEqual(markup.count('<tr class="account">'), 2)
         self.assertEqual(markup.count("<tr>"), 1)
-        self.assertIn('<td class="left"><span class="default bold" style="color:#af875f">claude1</span></td>', markup)
+        self.assertIn('<td class="left"><span class="default bold" style="color:#af875f">claude1</span>'
+                      + '<button type="button" class="color-swatch" data-account-color="claude1" '
+                      + 'data-saved-color="#af875f" style="background:#af875f" '
+                      + 'aria-label="Change claude1 color" aria-haspopup="dialog"></button></td>', markup)
         self.assertIn('<td class="left"><span class="default bold">total</span></td>', markup)
         self.assertIn('<td class="right"><span class="default">60%</span></td>', markup)
         self.assertIn('<li>units → claude1</li>', markup)
@@ -59,7 +63,7 @@ class AccountsPageTests(unittest.TestCase):
             _ = (config.parent / "accounts.conf").write_bytes(
                 (Path(__file__).resolve().parents[2] / "config/accounts.conf").read_bytes())
             for value, expected in (("brown", "#af875f"), ("magenta", "#800080"),
-                                    ("#A0522D", "#A0522D"), ("", ""),
+                                    ("#A0522D", "#A0522D"), ("#af875f", "#af875f"), ("", ""),
                                     ('red;position:fixed', ""), ('\"><script>alert(1)</script>', "")):
                 with self.subTest(value=value), patch.dict(os.environ, {"CONF_DIR": temporary}):
                     _ = config.write_text(f"account.claude1={value}\n" if value else "# no account key\n")
@@ -68,6 +72,41 @@ class AccountsPageTests(unittest.TestCase):
                     self.assertIn(f'<span class="default bold"{style}>claude1</span>', markup)
                     self.assertNotIn("position:fixed", markup)
                     self.assertNotIn("<script>", markup)
+                    self.assertEqual('aria-label="Change claude1 color"' in markup, bool(value))
+                    if value == "#af875f":
+                        self.assertEqual(conf.read("statusline").values()["account.claude1"], value)
+                        self.assertEqual(accounts.account_color(value), accounts.AccountColor("\x1b[38;2;175;135;95m", value))
+                        shell = subprocess.run(["bash", "-c", 'source "$1"; conf_value statusline account.claude1',
+                            "hex-reader", str(Path(__file__).resolve().parents[1] / "lib/conf.sh")],
+                            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                        self.assertEqual((shell.returncode, shell.stdout), (0, value + "\n"), shell.stderr)
+                        from scripts.statusline.test_statusline import status_lines
+                        self.assertEqual(status_lines({}, colors=config)[1].split(" | ")[0],
+                                         "\x1b[38;2;175;135;95mclaude1\x1b[0m")
+
+    def test_color_save_validates_the_request_and_uses_this_checkouts_tune(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"CONF_DIR": temporary}):
+            _ = (Path(temporary) / "statusline.conf").write_text("account.claude1=brown\nrole.units=teal\n")
+            for label, value in (("unknown", "#af875f"), ("units", "#af875f"), ("claude1", "brown"),
+                                 ("claude1", "#AF875F"), ("claude1", "#fff"), ("claude1", "#af875f\n")):
+                with self.subTest(label=label, value=value), patch.object(subprocess, "run") as run:
+                    self.assertIsInstance(accounts_page.save_color(label, value), accounts_page.ColorRefused)
+                    run.assert_not_called()
+            for status, errors, expected in ((0, "", accounts_page.ColorSaved()),
+                    (2, "first line\ntune: cannot publish\n", accounts_page.ColorSaveFailed("tune: cannot publish")),
+                    (1, "", accounts_page.ColorSaveFailed("Tune exited 1."))):
+                with self.subTest(status=status), patch.object(subprocess, "run",
+                        return_value=subprocess.CompletedProcess((), status, "", errors)) as run:
+                    self.assertEqual(accounts_page.save_color("claude1", "#af875f"), expected)
+                    root = Path(accounts_page.__file__).resolve().parents[1]
+                    run.assert_called_once_with((str(root / "lib/py"), str(root / "lib/tune.py"),
+                        "statusline", "account.claude1", "#af875f", "--why",
+                        "The user chose this color with the Accounts page color chooser.", "--user-words",
+                        "claude1 color set to #af875f with Save on the console Accounts page"),
+                        capture_output=True, text=True, check=False)
+            with patch.object(subprocess, "run", side_effect=OSError("runner unavailable")):
+                self.assertEqual(accounts_page.save_color("claude1", "#af875f"),
+                                 accounts_page.ColorSaveFailed("runner unavailable"))
 
     def test_page_reads_stored_status_and_holds_the_refresh_root(self) -> None:
         reading = accounts.StatusReading((), (), (), timezone.utc, AT)
@@ -89,7 +128,10 @@ class AccountsPageTests(unittest.TestCase):
                     self.assertIn("'console-shown'", page)
                     self.assertIn(f'data-refresh-seconds="{float(seconds)}"', page)
                     self.assertEqual(page.count(page_frame.REFRESH_SCRIPT), 1)
-                    self.assertIn("createPageRefresh(refresh, () => document.querySelector('main').dataset.refreshSeconds)", page)
+                    self.assertIn("createPageRefresh(refresh, () => document.querySelector('main').dataset.refreshSeconds, hold)", page)
+                    self.assertIn('<input type="color"', page)
+                    for action in ("Try", "Save", "Cancel"):
+                        self.assertIn(f'>{action}</button>', page)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_page_status_uses_the_real_accounts_loader_with_configured_timing(self) -> None:
@@ -155,7 +197,7 @@ class AccountsPageTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_refresh_obeys_visibility_and_updates_the_load_time_and_data_age(self) -> None:
-        reading = accounts.StatusReading((), (), (), timezone.utc, AT)
+        reading = accounts.StatusReading((status_row("claude1"),), (), (), timezone.utc, AT)
         with patch.object(accounts, "read_status", return_value=reading):
             content = accounts_page.page()
         initial = accounts_page.AccountsRender(content, 0.75, 200).with_recent_times((0.25, 0.75)).decode()
@@ -184,6 +226,52 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   check(state()==='Live' && line().textContent.includes('14 s ago') && line().textContent.includes('render 0.75 s'),'first timing');
   check(line().querySelector('[data-status-render]').title==='Median 0.50 s of the last 2 renders.','median hover text');
   check(timer(),'the Accounts interval');
+  const swatch=document.querySelector('[data-account-color="claude1"]');
+  const popup=document.querySelector('[data-color-picker]'), picker=popup.querySelector('input');
+  const label=()=>swatch.previousElementSibling, action=name=>popup.querySelector('[data-color-'+name+']');
+  const original=label().style.color, originalSwatch=swatch.style.background;
+  const normalFetch=window.fetch;let pendingRead;
+  window.fetch=()=>new Promise(resolve=>pendingRead=resolve);
+  timer().load();
+  swatch.click();await flush();
+  pendingRead({ok:true,text:async()=>'<div data-accounts>old response</div>'});await flush();
+  check(swatch.isConnected && popup.open,'an in-flight refresh cannot replace an open chooser');
+  window.fetch=normalFetch;
+  check(popup.open && picker.value===swatch.dataset.savedColor,'the picker starts with the saved color');
+  check([...popup.querySelectorAll('input,button')].every(control=>
+   getComputedStyle(control).fontFamily===getComputedStyle(popup).fontFamily &&
+   getComputedStyle(control).fontSize===getComputedStyle(popup).fontSize),'the popup controls inherit its font');
+  const rect=popup.getBoundingClientRect();
+  check(rect.left>=0 && rect.right<=innerWidth && rect.top>=0 && rect.bottom<=innerHeight,'the popup fits a phone viewport');
+  document.documentElement.dataset.theme='light';const light=getComputedStyle(popup).backgroundColor;
+  document.documentElement.dataset.theme='dark';const dark=getComputedStyle(popup).backgroundColor;
+  check(light!==dark,'the popup uses both themes');delete document.documentElement.dataset.theme;
+  picker.value='#123456';action('try').click();timer().load();await flush();
+  check(calls===0 && label().style.color==='rgb(18, 52, 86)' && swatch.style.background==='rgb(18, 52, 86)','Try paints without a request');
+  check(state()==='Paused','the chooser pauses refresh');
+  action('cancel').click();
+  check(!popup.open && label().style.color===original && swatch.style.background===originalSwatch,'Cancel restores the saved color');
+  swatch.click();picker.value='#abcdef';action('try').click();
+  popup.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
+  check(!popup.open && label().style.color===original,'Escape restores the saved color');
+  const pageFetch=window.fetch, saves=[];let resolveSave;
+  window.fetch=(path,options)=>{saves.push({path,options});return new Promise(resolve=>resolveSave=resolve);};
+  swatch.click();picker.value='#123456';action('save').click();
+  check([...popup.querySelectorAll('button')].every(button=>button.disabled),'Save disables the buttons');
+  check(popup.textContent.includes('Saving…'),'Save shows progress');
+  check(saves.length===1 && saves[0].path===location.pathname && saves[0].options.method==='POST','Save posts to this page');
+  const form=new URLSearchParams(saves[0].options.body);
+  check(form.get('label')==='claude1' && form.get('value')==='#123456' &&
+   saves[0].options.headers['Content-Type']==='application/x-www-form-urlencoded','Save sends the form fields');
+  resolveSave({ok:false,json:async()=>({reason:'tune: cannot publish'})});await flush();
+  check(popup.open && popup.textContent.includes('tune: cannot publish') && !action('cancel').disabled,'a save failure keeps the popup');
+  check(label().style.color==='rgb(18, 52, 86)','a save failure keeps the tried color');
+  action('cancel').click();check(label().style.color===original,'Cancel restores after a failed save');
+  window.fetch=(path,options)=>options?.method==='POST' ?
+   Promise.resolve({ok:true,json:async()=>({state:'saved'})}) : pageFetch(path,options);
+  swatch.click();picker.value='#abcdef';action('save').click();await flush();
+  check(!popup.open && calls===1,'a successful save closes the popup and refreshes');
+  window.fetch=pageFetch;calls=0;
   timer().load();await flush();
   check(calls===1,'the interval loads once');
   check(state()==='Live' && line().textContent.includes('0 s ago') && line().textContent.includes('render 0.60 s'),'refresh timing and clock skew');

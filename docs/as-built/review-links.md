@@ -408,6 +408,22 @@ A failed background render keeps the last good page and writes one line to stder
 Failed renders add no render time.
 A cached Accounts response carries its render failure to the status line.
 
+Each account with an `account.<label>` key in `config/statusline.conf` has a swatch beside its label.
+The swatch opens one popup with a native color picker and Try, Save, and Cancel buttons.
+The popup uses the console theme and stays inside the viewport.
+Try changes the label and swatch without a request.
+Cancel or Escape restores the saved color.
+The page pauses refresh while the popup is open, including after Try or a failed save.
+Save posts `label` and a lowercase `#rrggbb` value to `/console/accounts.html` as form data.
+The server validates the configured account and the hex color.
+It runs this checkout's `scripts/lib/tune.py` through `scripts/lib/py` to publish the value.
+The tune command records the user's Save action and commits the configuration change through its normal publication path.
+The popup disables its controls and shows **Saving…** during publication.
+Success closes the popup, clears the kept page, and refreshes the board.
+A refused request returns 400 with its reason.
+A failed publication returns 503 with tune's last stderr line.
+The popup shows the reason and keeps the tried color until Cancel.
+
 - The table comes from `accounts.status_board()`: the board columns, rows, total row and tones.
 - The upcoming moves and the problems follow the table.
 - The page reads the stored usage only, as `accounts.py status --stored` does.
