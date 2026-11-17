@@ -2145,13 +2145,26 @@ class CloudRouteTests(CostFixture):
         _ = self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state))
         self.admission = caller_admission(self, self.root, {'BUILDLOG_DIR': str(self.root / 'buildlog')})
 
-    def test_old_checkout_modes_use_local_gate_without_starting_the_cloud_service(self) -> None:
-        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+    def test_old_checkout_modes_reach_the_box(self) -> None:
         runner = self.repo / 'scripts/production/gate.py'
         source = runner.read_text()
         _ = runner.write_text(source.replace('"gate"', '"merge-gate"').replace('"test-affected"', '"targeted-test"'))
         _ = gate.checked_git(self.repo, 'add', '.')
         _ = gate.checked_git(self.repo, 'commit', '-qm', 'Use the previous suite mode values')
+        head = gate.checked_git(self.repo, 'rev-parse', 'HEAD')
+        for mode in gate.SuiteMode:
+            with self.subTest(mode=mode):
+                self.assertTrue(cloud_gate.accepts_suite_mode(self.repo, head, mode))
+                self.assertIs(gate.SuiteMode(mode.wire), mode)
+
+    def test_unknown_checkout_modes_use_local_gate_without_starting_the_cloud_service(self) -> None:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        runner = self.repo / 'scripts/production/gate.py'
+        source = runner.read_text()
+        _ = runner.write_text(source.replace('"gate"', '"other-gate"').replace('"test-affected"', '"other-affected"')
+                              .replace('"merge-gate"', '"other-merge"').replace('"targeted-test"', '"other-targeted"'))
+        _ = gate.checked_git(self.repo, 'add', '.')
+        _ = gate.checked_git(self.repo, 'commit', '-qm', 'Use suite mode values this code does not read')
         passed = gate.GateRun((gate.GateJobResult('fixture', 'test_one.py', 0, 1, 'OK'),), 1, 0)
         for mode in gate.SuiteMode:
             with (self.subTest(mode=mode),

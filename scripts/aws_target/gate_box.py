@@ -252,7 +252,7 @@ try:
                                         module_time_limit_s=links['module_time_limit_s'])
         if links.get('production'):
             result['record'] = completion_record(gate, links['attempt'], links['commit'], links['tree'], os.uname().nodename,
-                                                 result['gate_started_at'], time.time(), links['mode'])
+                                                 result['gate_started_at'], time.time(), merge_gate.SuiteMode(links['mode']).value)
             dirty = gate_request['dirty_paths']
             result['record'].update(head=gate_request['head'], dirty=bool(dirty), dirty_paths=dirty,
                                     dirty_path_count=len(dirty))

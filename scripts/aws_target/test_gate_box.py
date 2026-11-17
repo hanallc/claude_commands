@@ -238,7 +238,7 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
                 self.assertFalse((library / 'python_startup/sitecustomize.py').exists())
                 _ = (library / 'cancellation.py').write_bytes((ROOT / 'scripts/lib/cancellation.py').read_bytes())
                 _ = (repo / 'scripts/production/merge_gate.py').write_text(
-                    'from types import SimpleNamespace\nfrom enum import Enum\nimport os\n'
+                    'from __future__ import annotations\nfrom types import SimpleNamespace\nfrom enum import Enum\nimport os\n'
                     + inspect.getsource(gate.SuiteMode)
                     + 'WholeMachine = lambda times: times\nSelectedModules = tuple\n'
                     + 'gate_record = SimpleNamespace(GateTimeLimit=lambda seconds: seconds, NoGateTimeLimit=lambda reason: reason)\n'

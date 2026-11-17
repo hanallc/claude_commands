@@ -455,7 +455,7 @@ class GateWorker:
                       result: Literal['launched', 'refused', 'finished'], reason: str = '', *, gate_s: float = 0) -> None:
         error_code = launch_error_code(reason)
         row: dict[str, object] = {'time': self.clock(), 'attempt': request['attempt'], 'instance_type': size,
-            'vcpus': self.size_vcpus, 'result': result, 'mode': request['mode'], 'region': self.box_region}
+            'vcpus': self.size_vcpus, 'result': result, 'mode': gate.SuiteMode(str(request['mode'])).value, 'region': self.box_region}
         if result != 'finished' and self.price_read_evidence:
             row['spot_price_reads'] = self.price_read_evidence
         if result == 'finished':
@@ -656,7 +656,7 @@ class GateWorker:
                 vcpus = int(size.split('.')[1].removesuffix('xlarge')) * 4
                 budget = (gate_record.NoGateTimeLimit('paired trial') if request.get('task') == 'paired'
                           else gate.read_time_limit(vcpus, cast(list[str], request['modules']), vcpus,
-                              request['mode'] == 'test-affected' and not request.get('full', False)))
+                              gate.SuiteMode(str(request['mode'])) is gate.SuiteMode.TARGETED and not request.get('full', False)))
                 seconds = budget.seconds if isinstance(budget, gate_record.GateTimeLimit) else 0.0
                 links['gate_time_limit_s'] = str(seconds)
                 credentials = self.api.call('export-credentials', '--format', 'process', service='configure')
@@ -1025,7 +1025,7 @@ def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
         source_key = 'source/' + digest + '.bundle'
     request: dict[str, object] = {'attempt': folder.name, 'commit': commit, 'head': head, 'tree': tree, 'dirty_paths': sorted(dirty), 'origin': origin,
         'origin_main': origin_main, 'clone_url': settings().text('clone_url'),
-        'mode': mode.value, 'modules': [str(p.relative_to(repo)) for _, p in modules], 'source_key': source_key,
+        'mode': mode.wire, 'modules': [str(p.relative_to(repo)) for _, p in modules], 'source_key': source_key,
         'expires': int(time.time()) + settings().whole('lifetime_minutes') * 60,
         'module_time_limit_s': min(limit, settings().number('module_time_limit_s'))}
     save(folder / 'request.json', request)
@@ -1046,7 +1046,7 @@ def accepts_suite_mode(repo: Path, commit: str, mode: gate.SuiteMode) -> bool:
         for definition in module.body:
             if isinstance(definition, ast.ClassDef) and definition.name == 'SuiteMode':
                 return any(isinstance(row, (ast.Assign, ast.AnnAssign))
-                           and isinstance(row.value, ast.Constant) and row.value.value == mode.value
+                           and isinstance(row.value, ast.Constant) and row.value.value in (mode.value, mode.wire)
                            for row in definition.body)
     return False
 

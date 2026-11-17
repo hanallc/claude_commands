@@ -177,6 +177,16 @@ class SuiteMode(Enum):
     TARGETED = "test-affected"
     TARGETED_TEST = "test-affected"
 
+    @classmethod
+    def _missing_(cls, value: object) -> SuiteMode | None:
+        # Box requests and older checkouts name the steps merge-gate and targeted-test.
+        return {"merge-gate": cls.GATE, "targeted-test": cls.TARGETED}.get(str(value))
+
+    @property
+    def wire(self) -> str:
+        """Name the step on a box request with the value that old and new box code both read."""
+        return "merge-gate" if self is SuiteMode.GATE else "targeted-test"
+
 
 class GateJobKind(Enum):
     TEST_MODULE = auto()
