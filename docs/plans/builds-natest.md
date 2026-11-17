@@ -4697,23 +4697,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 
 ### Phase 335 — The mixed restart tests answer herdr calls in the test process  · status: done
 **Depends on:** none
-**Owner:** natest (test-only change).
 
-#### Work Order
+#### As-built
 
-**Goal:** `agents/test_restart.py` `MixedRestartTests` use less aws CPU; every behavior check stays.
-
-**Spec:**
-1. The 3 mixed restart tests start a Python fake `herdr` CLI 767 times (13.2 of 27.9 CPU s on natedev). Each start costs about 14 ms of interpreter start.
-2. Patch `herdr.run_program` in `linux_commands`: a call whose program is the fixture CLI gets the same reply from the in-process `reply` function, under the same lock, with the same stdout as the script. Every other program goes to the real `run_program`.
-3. Keep the CLI script and the socket server for calls from other modules and for the socket requests.
-4. Send builds a proposal: a restart or stop of all rows reads `pane list` about 90 times and `pane process-info` about 70 times per command for 5 panes.
-
-**Files:** `scripts/agents/test_restart.py`.
-
-**Workers:** none; no-worker mode. The director writes and proves it.
-
-**Acceptance gate:**
-- The module passes 3 times on natedev and in a copy merged onto origin/main.
-- basedpyright reports 0 errors and 0 warnings on the file.
-- natedev `module_cost.py` shows the CPU before and after; an aws pair shows the saving.
+- `MixedRestartTests.linux_commands` in `scripts/agents/test_restart.py` patches `herdr.run_program`. A call to the fixture CLI gets its reply from the in-process `reply` function, under the same lock, with the stdout of the script. Other programs go to the real `run_program`. The CLI script and the socket server stay for the 9 other calls and the socket requests.
+- The 767 Python CLI starts (13.2 CPU s on natedev, 14 ms each; `-S` does not make a start cheaper) are gone.
+- natedev `module_cost.py`: 27.93 to 11.52 CPU s. aws pair, 3 rounds: 26.25 to 8.48 CPU s, a saving of 17.77 CPU s; all passed.
+- Main-based commit c7507d49c (branch `natest-restart335`) went to builds. The herdr call count of a stop or restart of all rows, and an existing flake in `test_count_fixture_selects_linux_readers_on_macos` (1 of 12 runs on main), went to the natedev showrunner through builds.
