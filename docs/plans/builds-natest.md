@@ -4608,3 +4608,69 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The module already copies its initial, frozen and single-file frozen class seeds and calls crate_run in process. The class fixture costs 0.23 CPU s.
 - Remaining cost is live crate_run.py, copies.py and Git work that the tests check: Git 13.0 to 14.9 CPU s over about 20,400 starts, module Python 9.1 to 10.6 s. Local module CPU varied 23.9 to 48.2 s with the same source, from host load.
 - The costly tests check moved refs, retained claims, standing caches, worker removal and private dirty bytes. Every behavior check stays. Checkpoint 5685b50dc.
+
+### Phase 327 — The Mac-only verify tests use less aws CPU  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `direct/test_verify_mac_only.py` uses less CPU in aws pairs, with the same tests and assertions, or the phase names its floor.
+
+**Decision:** Phases 324-326 ended at floors. The aws ranking (rows as of 2026-11-16 21:36) then puts this module next; `production/test_mac_run.py` ranks above it, but its Phase 313 cut is not on main yet. Median 41.7 CPU s; slowest kept test `VerifyMacOnlyTests.test_runner_refusals_never_fall_back_or_retry` 6.6 s. Phases 271, 276 and 278 cut it to 27.9 aws CPU s; it grew back, and two tests were added on 2026-11-16. Find what grew first. builds rejected new shared layers for one module's gain (2026-11-16): the change stays in the test file.
+
+**Spec:**
+1. Compare the module at Phase 278's commit 3f52df2c3 with the current tree: name each test and helper change since then that adds CPU. Then profile: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD direct/test_verify_mac_only.py --tests 15 --commands 15`, under `systemd-run --user --scope -q -p MemoryMax=2G`. Name the top costs by test, fixture and command.
+2. Remove the largest repeated cost in the test file that a test does not check, with the shared methods of Phases 235-238, 251, 254, 255, 271, 276 and 323: class seeds copied per test, in-process calls where no process boundary is asserted, a forked child with loaded modules where a boundary is asserted but a new interpreter is not, one render where several tests read the same output.
+3. Keep every full `verify.sh` call that a test asserts on, every refusal text, every signal and exit status. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
+4. If the largest remaining cost is product work (`verify.sh`, `verify_helper.py`, the runner), do not change product code. Report the cost and the floor.
+5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
+6. The director runs the aws pairs.
+
+**Files:**
+- `scripts/direct/test_verify_mac_only.py`
+
+**Workers:** 1 writer; one test module.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 232: no signal handlers anywhere. No lazy imports inside functions.
+- Phase 252: every fixture binds private run roots through `bind_private_run_roots`; keep it. Phase 242: in-process calls bind per call the module state that the real process reads at start.
+- Phase 271: `test_runner_refusals_never_fall_back_or_retry` checks the reason texts through the real `mac_only_refuse` in one shell; five full `verify.sh` calls cover each runner mode and each `placement.retry_decision` class. Phase 276: the Mac offload targets and record wrappers run inside verify_helper.
+- Phase 323: a forked child with loaded imports keeps a real kill point and exit status; create output files and child cleanup before the fork.
+- sdlc terms: test files only; every test and assertion stays; merge only on a measured aws gain; report paired peak memory.
+
+**Acceptance gate:**
+- The same test count and assertions; the module passes three times.
+- `module_cost.py` CPU before and after, with the top costs named.
+- aws pairs (3 rounds) show a gain, or the report names the floor; peak memory reported.
+
+### Phase 328 — Measure which commands use the suite's CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a table that names the commands (Git, jq, each Python script, shells, helpers) that use the most CPU across all ~/.claude test modules, with the modules that start them, so the next cuts go where the suite spends its CPU.
+
+**Decision:** Phases 324-326 ended at floors: in each module the rest of the CPU is real product work (recorder, jq, Git). The aws total is about 4,040 CPU s over 812 modules; the top 30 modules hold only 888 s. A suite-wide view of command costs shows which product cut saves the most aws CPU across all modules. builds asks for a measured saving across every module that a shared change touches (2026-11-16).
+
+**Spec:**
+1. Run `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD <folder>/<file> ... --commands 40` over every live gate module (`show.py` lists them; the gate's `discover_test_modules` is the source). Run each batch under `systemd-run --user --scope -q -p MemoryMax=2G`, at most 4 modules at a time. Save one JSON result per module under `/tmp/claude/scratch/natest-census/`.
+2. Add the command rows across modules: for each command group, the total CPU s, the starts, the CPU per start, and the top 5 modules by that group's CPU.
+3. Rank the groups by total CPU. For the top 10 groups, name the product file and line that starts them, the owner unit, and what each start does (one line).
+4. For each of the top 5 groups, give a bound: the CPU that one fix in that product file could save across all modules (for example, a cheaper start, fewer starts, one call in place of several). Name it as a bound, not a saving.
+5. Give the module CPU sum of this census next to the aws sum for the same modules, so the ratio of natedev to aws is known.
+6. Change no repository file. Delete the raw results after the table is written.
+
+**Files:**
+- `/tmp/claude/scratch/natest-census/report.md`
+
+**Workers:** 1 writer; research only.
+- impl2: all files.
+
+**Constraints from prior phases:**
+- Phase 200 measured repeated Git metadata queries within one caller; Phase 205 measured build-target command starts. Reuse their method; do not repeat their tables.
+- The memory rule: heavy probes run only under `systemd-run --user --scope -q -p MemoryMax=2G`, at most 4 at a time.
+
+**Acceptance gate:**
+- The report holds the ranked group table, the top-10 sources with owners, the top-5 bounds and the natedev-to-aws ratio.
+- No repository file changed.
