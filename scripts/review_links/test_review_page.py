@@ -400,7 +400,7 @@ class ReviewPageTests(unittest.TestCase):
                 continue
             with self.subTest(kind=item.type):
                 self.assertEqual(item.actions,expected[item.key])
-                form = review_page.form(item,change_page.ReviewBrowser(token,initial))
+                form = review_page.form(item,change_page.ReviewBrowser(token,initial),4)
                 self.assertIn('Closes the item',form)
                 self.assertIn('The item returns to you',form)
                 self.assertIn('type="datetime-local"',form)

@@ -344,8 +344,20 @@ def choice_list(choices: list[str]) -> str:
 def followup_sections(item: update_registration.OutstandingItem) -> str:
     """Show each follow-up the user sent and the asker's reply."""
     return "".join('<h2>Follow-up</h2>' + change_page.review_text_html(each["followup"], inline=True)
-                   + '<h2>Reply</h2>' + change_page.review_text_html(each["reply"], inline=True)
+                   + '<h2>Reply</h2>' + answer_html(each["reply"])
                    for each in item.get("followups", []))
+
+
+def answer_html(text: str) -> str:
+    """Show a showrunner reply or answer; a line that holds only a command is a code block with a copy button."""
+    content: list[str] = []
+    start = 0
+    for block in page_frame.CODE_BLOCK.finditer(text):
+        content.append(question_paragraphs(text[start:block.start()]))
+        content.append(page_frame.code_block_html(block))
+        start = block.end()
+    content.append(question_paragraphs(text[start:]))
+    return "".join(content)
 
 
 def question_text(item: update_registration.OutstandingItem) -> tuple[str, str]:
