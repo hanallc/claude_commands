@@ -72,6 +72,8 @@ class DisksPageTests(unittest.TestCase):
     def setUp(self) -> None:
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = (configuration / "disks.conf").write_text("# whole: 1..\ncache_seconds=600\n")
+        # The page reads staff names, and staff reads the machine list.
+        _ = shutil.copy(Path(__file__).parents[2] / "config" / "machines.conf", configuration)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     def test_current_builds_keep_staff_parts_in_slot_names(self) -> None:

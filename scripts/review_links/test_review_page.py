@@ -524,7 +524,7 @@ class ReviewPageTests(unittest.TestCase):
             with self.subTest(kind=opened.type):
                 self.assertEqual(waiting.state, review_items.ReviewState.WAITING)
                 self.assertEqual(waiting.actions, opened.actions)
-                self.assertEqual(review_page.form(waiting, browser), review_page.form(opened, browser))
+                self.assertEqual(review_page.form(waiting, browser, 3), review_page.form(opened, browser, 3))
 
     def waiting_actions(self, kind: review_items.ReviewType, actions: tuple[str, ...], wait: str = 'question') -> None:
         """Use a fresh record for each action and check the displaced answer."""
