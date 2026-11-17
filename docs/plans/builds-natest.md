@@ -4647,3 +4647,14 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `gate.py` `test_module_environment` appends `TEST_GIT_CONFIG` (`'maintenance.auto=false' 'gc.auto=0'`) to any inherited `GIT_CONFIG_PARAMETERS`. The gate, `gate_box.py` on aws, `fast_track.py` and `module_cost.py` share it.
 - `test_gate.py` checks that an inherited value stays first and the two settings follow it.
 - natedev: 20 Git-heavy and gate modules pass; fixture process starts drop (for example `test_models_conf_publish` 4,928 to 4,598). Every behavior check stays. Checkpoint ea4c5c8aa.
+- aws pair, 18 Git-heavy modules, 3 rounds: no saving; each module is within noise (-0.08 to +0.42 CPU s). The natedev saving does not occur on aws boxes. Sent to builds as a natedev-only saving, kept off the merge line.
+
+### Phase 331 — The models conf publish tests use less aws CPU  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Research only; no repository file changed except this plan. Summary: `phases/331/director_summary.md` in the run folder. Codex had no capacity; the director measured.
+- natedev: 24.1 CPU s (aws median 38.7). Git 12.9 s over 2,862 starts; `models_registry.py` 6.9 s over 129 starts (53 ms each).
+- Git starts by caller: `models_registry.py` publication 1,683 (about 13 per store); test bodies and `setUp` 582 (about 2.6 natedev CPU s). No large test-owned cost. Floor.
+- Proposal to builds: one registry store combines its Git reads (one `cat-file --batch` for the `show` reads, one `rev-parse` for HEAD, branch and Git paths). Bound: about half the product Git starts, about 5 aws CPU s in this module.
