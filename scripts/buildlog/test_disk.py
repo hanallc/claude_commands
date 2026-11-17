@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+
 from scripts.buildlog import cli, disk, filesystem, report
 from scripts.buildlog import store
 from scripts.lint import sweep
@@ -113,8 +115,7 @@ class DiskTests(unittest.TestCase):
         checkout.mkdir()
         _ = (checkout / "Cargo.toml").write_text('[workspace]\n')
         installed = base / ".claude"
-        installed.mkdir()
-        (installed / "scripts").symlink_to(Path(__file__).resolve().parents[1], target_is_directory=True)
+        _ = copy_helpers(base, *COPY_HELPERS)
         _ = (installed / ".build-target-script-commit").write_text("fixture\n")
         support = base / "support"
         support.mkdir()
