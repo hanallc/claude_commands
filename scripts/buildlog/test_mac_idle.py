@@ -204,7 +204,7 @@ class MacIdleTests(NotificationGuardedTestCase):
         self.assertEqual((saved["waiting"], saved["cause"], saved["detail"]), (1, "free", ""))
         messages = [cast(str, call.args[0]) for call in send.call_args_list]
         self.assertEqual(len(messages), 2)
-        self.assertIn("1 steps wait for the Mac", messages[0])
+        self.assertIn("1 step waits for the Mac", messages[0])
         self.assertIn("pid 125", messages[0])
         self.assertNotIn("pid 123", messages[0])
         self.assertNotIn("disk", messages[0])
@@ -333,6 +333,8 @@ done
             "holder_session": "research"}
         if remote:
             row["remote_host"] = "mac"
+            self.process(199, 1, "999", ("python3", "claim-holder"))
+            row["pid"], row["proc_start"] = 199, "999"
         if not working:
             row["idle_since"] = "2026-10-31T07:50:00-04:00"
             row["work_idle_since"] = datetime.fromtimestamp(work_idle_since, timezone.utc).isoformat()
@@ -907,7 +909,52 @@ done
             for record in step_record.record_directory().glob("waiting-*.json"):
                 record.unlink()
 
-    def test_dead_process_claim_is_free_and_remote_claim_is_always_live(self) -> None:
+    def test_dead_remote_holder_does_not_hide_the_idle_alert(self) -> None:
+        self.waiting_steps(1)
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                claim = self.claim(working=True)
+                row = mac_idle.read_record(claim)
+                row["proc_start"] = "ended-owner"
+                if legacy:
+                    claim.unlink()
+                    claim = self.paths.mac_state / "run.json"
+                mac_idle.write_record(claim, row)
+                before = claim.read_bytes()
+                self.assertIsInstance(mac_idle.mac_work(self.paths, 1600), mac_idle.FreeMac)
+                with mock.patch.object(mac_idle, "notify_showrunner", return_value=True):
+                    mac_idle.watch_once(self.paths, 1600)
+                saved = mac_idle.read_record(self.paths.state / "alert.json")
+                self.assertEqual((saved["state"], saved["cause"], saved["waiting"]), ("idle", "free", 1))
+                self.assertEqual(saved["kept_claims"], 1)
+                line = mac_idle_alert.alert_line(self.paths.state / "alert.json", 1600, ZoneInfo("UTC")) or ""
+                self.assertIn("1 step waits for the Mac", line)
+                self.assertIn("1 claim kept for cleanup", line)
+                self.assertIn("Kept claims hold no work", line)
+                self.assertNotIn("no claim", line)
+                self.assertEqual(claim.read_bytes(), before)
+                claim.unlink()
+
+    def test_idle_reading_counts_all_kept_claims(self) -> None:
+        self.waiting_steps(2)
+        before: dict[Path, bytes] = {}
+        for name in ("first", "second"):
+            path = self.claim(working=True, name=name)
+            row = mac_idle.read_record(path)
+            row["proc_start"] = "ended-owner"
+            mac_idle.write_record(path, row)
+            before[path] = path.read_bytes()
+        with mock.patch.object(mac_idle, "notify_showrunner", return_value=True):
+            mac_idle.watch_once(self.paths, 1600)
+        saved = mac_idle.read_record(self.paths.state / "alert.json")
+        self.assertEqual(saved["kept_claims"], 2)
+        line = mac_idle_alert.alert_line(self.paths.state / "alert.json", 1600, ZoneInfo("UTC")) or ""
+        self.assertIn("2 steps wait for the Mac", line)
+        self.assertIn("2 claims kept for cleanup", line)
+        self.assertIn("Kept claims hold no work", line)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_dead_process_claim_is_free_and_live_remote_holder_is_busy(self) -> None:
         _ = self.claim(working=True, remote=False)
         self.assertIsInstance(mac_idle.mac_work(self.paths, 1180), mac_idle.FreeMac)
         _ = self.claim(working=True)
