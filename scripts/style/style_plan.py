@@ -1323,7 +1323,7 @@ def candidate_source(repo: Path, commit: str) -> Generator[TicketSourceView]:
     """Use the unit's reused copy with the candidate changes visible against its parent."""
     with publication_path(repo, "candidate.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource(commit)) as tree:
+        with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource(commit), step="style") as tree:
             _ = git(tree, "config", "user.name", "Style gate")
             _ = git(tree, "config", "user.email", "style-gate@example.invalid")
             parent = git(tree, "rev-parse", commit + "^").strip()

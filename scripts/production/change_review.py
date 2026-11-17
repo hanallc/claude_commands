@@ -29,7 +29,6 @@ import re
 import shlex
 import subprocess
 import sys
-import tempfile
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -40,7 +39,7 @@ from pathlib import Path
 from typing import TypeVar, cast
 
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
-from scripts.lib import scratch, unit_runs  # noqa: E402
+from scripts.lib import build_folders, scratch, unit_runs  # noqa: E402
 from scripts.direct.progress_history import load_events  # noqa: E402
 from scripts.lib import urgency  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -574,7 +573,9 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
 
     def git(*arguments: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["git", "-C", str(folder), "--literal-pathspecs", *arguments],
-                              capture_output=True, text=True, check=False, env=env)
+                              capture_output=True, text=True, check=False, env=env,
+                              pass_fds=((build_folders.build_folder_lock_fd(Path(env["GIT_INDEX_FILE"]).parent),)
+                                        if env is not None and "GIT_INDEX_FILE" in env else ()))
 
     def checked(*arguments: str, env: dict[str, str] | None = None) -> str:
         result = git(*arguments, env=env)
@@ -592,10 +593,8 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
                   checked("hash-object", "-w", "--path", str(path.resolve().relative_to(root)), "--", str(path.resolve())))
                  for path in paths]
         subject = f"change-review: {what}"
-        with tempfile.NamedTemporaryFile(delete=False) as temporary:
-            index = Path(temporary.name)
-        try:
-            index.unlink()
+        with build_folders.tool_folder("change-review-index") as temporary:
+            index = temporary / "index"
             environment = {**os.environ, "GIT_INDEX_FILE": str(index)}
             for attempt in range(5):
                 head = git("rev-parse", "--verify", "-q", "HEAD").stdout.strip()
@@ -613,8 +612,6 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
                     return
                 if attempt == 4 or git("rev-parse", "--verify", "-q", "HEAD").stdout.strip() == head:
                     raise ChangeReviewError(updated.stderr.strip() or "git update-ref failed")
-        finally:
-            index.unlink(missing_ok=True)
     except (ChangeReviewError, OSError) as error:
         reason = str(error).splitlines()[0]
         report_warning(f"change review: {paths[0]} written but not committed: {reason}; the next write commits it")

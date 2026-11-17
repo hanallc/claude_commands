@@ -49,6 +49,12 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
+
 
 INITIAL_FILES = {
     "Cargo.toml": '[package]\nname="sample"\nversion="0.1.0"\n',

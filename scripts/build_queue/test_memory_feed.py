@@ -1,6 +1,7 @@
 """Check feed configuration and publication with private queue readings."""
 from __future__ import annotations
 
+from scripts.review_links.test_page_frame import assert_status_states
 from scripts.build_queue import admission_records
 from scripts.build_queue.test_queue_view import with_converted_executions
 
@@ -24,7 +25,7 @@ import unittest
 from typing import Literal, cast, override
 from unittest import mock
 
-from scripts.buildlog import charts, cost_actions, costs, moments
+from scripts.buildlog import charts, cost_actions, costs
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, target_availability
 from scripts.build_queue.test_queue_view import cloud_reading
@@ -38,7 +39,7 @@ from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, 
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import atomic_file, conf, test_hang_guard
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
-from scripts.lib.build_steps import read_step_names
+from scripts.lib.build_steps import OTHER_COMMAND, StepJob, command_job, read_step_names
 from scripts.message import unit_labels
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture, write_config_fixture
@@ -77,24 +78,14 @@ def queued_reading(reading: admission_records.QueueRead, units: tuple[str, ...])
     return with_queue_priority(current, units) if units else current
 
 
-def report_fixture(*, empty: bool = False, unrecorded: bool = False, startless: bool = False) -> charts.PageData:
+def report_fixture(*, empty: bool = False) -> charts.PageData:
     end = datetime(2026, 11, 8, tzinfo=UTC)
-    start = end - timedelta(days=7)
-    ranked = () if empty else (costs.RankedCost("fixture", "Memory wait", 120),)
-    # Two phase times keep the median and the p90 points apart, so the page proof reads one point alone.
-    phases = () if empty else tuple(moments.ProgressFinish(end.timestamp() - 1, f"fixture-phase-{seconds}",
-        "/fixture/hana", "natedev", moments.WaitsNotRecorded() if unrecorded else moments.PhaseStartUnavailable() if startless
-        else seconds) for seconds in (600.0, 6000.0))
-    build_costs = costs.BuildCosts(start, end, phases, ranked, costs.MacIdleEstimate(0, 0, 0, 0, 0))
-    bucket = charts.DailyBucket(start, end, False, build_costs, frozenset({"fixture"}),
-        {} if empty else {"fixture": start.timestamp()})
     rows = charts.NoDataYet.VALUE if empty else (charts.TopCost("fixture", "Memory wait",
         charts.MeasuredCost(120), charts.WindowDiffers(charts.MeasuredCost(240)),
         (charts.MeasuredCost(30), charts.MeasuredCost(60), charts.MeasuredCost(30)),
         cost_actions.LargestShare(costs.StepKind("fixture", "nextest"), 0.75),
         cost_actions.LowerMemoryPeak(costs.StepKind("fixture", "nextest"), 12.4, 3 << 30)),)
-    return charts.PageData(charts.ChartSet(start, end, "UTC", (bucket,), ("fixture",), ()),
-        charts.TopCosts(end - timedelta(days=3), end, 3, rows))
+    return charts.PageData(charts.TopCosts(end - timedelta(days=3), end, 3, rows))
 
 
 def reservation_reading(*, project: str = "fixture-project") -> admission_records.QueueRead:
@@ -286,6 +277,9 @@ class MemoryFeedTests(unittest.TestCase):
                 rows = [row for row in page["walk"] if row.get("machine") == machine]
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0].get("slot"), expected)
+                # A run in a slot names the slot folder and its machine, so the Disks page finds the run.
+                self.assertEqual((rows[0].get("slot_folder"), rows[0].get("slot_machine")),
+                                 (folder.name, mac_machine if machine == "mac" else "natedev") if expected != "—" else (None, None))
                 payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
                 shown_rows = cast(list[dict[str, object]], payload["walk"])
                 self.assertEqual(next(row["slot"] for row in shown_rows if row["machine"] == machine), expected)
@@ -405,8 +399,7 @@ class MemoryFeedTests(unittest.TestCase):
     def expected_page(self, seconds: float = 0.125) -> str:
         page = console_theme.with_theme(Path(memory_feed.__file__).with_name("memory_live.html").read_text())
         self.assertIn(console_theme.TOKENS, page)
-        return (page.replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
-                .replace("__PAGE_FRAME_STYLE__", page_frame.STYLE))
+        return page_frame.template(page, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
 
     def test_converted_rows_show_their_hosts_without_charging_remote_memory_locally(self) -> None:
         baseline = reservation_reading()
@@ -430,12 +423,25 @@ class MemoryFeedTests(unittest.TestCase):
               mock.patch.object(os, "cpu_count", return_value=4)):
             page = memory_feed.reading()
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+        rows = [*page["walk"], *page["waiters"]]
+        keys = [row.get("key") for row in rows]
+        self.assertEqual(len(set(keys)), len(rows))
+        for row in reversed(rows):
+            original = row.get("key")
+            cast(dict[str, object], cast(object, row))["name"] = "changed owner label"
+            self.assertEqual(memory_feed.step_key(row), original)
+        # Two CI rows with no runner differ only by their cgroup.
+        with tempfile.TemporaryDirectory() as folder:
+            ci_keys = set[str]()
+            for name in ("hana-linux-1.slice", "hana-linux-2.slice"):
+                (cgroup := Path(folder) / name).mkdir()
+                ci_keys.add(memory_feed.step_key(memory_feed.build_ci_row(0.0, 0.0, cgroup)))
+        self.assertEqual(len(ci_keys), 2)
         html = self.expected_page()
         functions = html[html.index("function field("):html.index("const tip =")]
-        constants = html[html.index("const f1 ="):html.index("function setSeg(")]
         render = html[html.index("function renderWalk("):html.index("function fitAxisLabels(")]
-        escape = html[html.index("function esc("):html.index("let lastRead =")]
-        javascript = functions + constants + render + escape + """
+        escape = html[html.index("function esc("):html.index("const consoleHidden =")]
+        javascript = functions + render + escape + """
 const elements = new Map();
 const $ = id => {
   if (!elements.has(id)) elements.set(id, {style:{}, classList:{toggle(){}}, innerHTML:""});
@@ -445,8 +451,8 @@ function fitLabels() {}
 const data = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 renderWalk(data);
 process.stdout.write(JSON.stringify({
-  walk:data.walk.map((row,index)=>tipText('row:'+index,data)),
-  waiters:data.waiters.map((row,index)=>tipText('wait:'+index,data)),
+  walk:data.walk.map(row=>tipText('row:'+row.key,data)),
+  waiters:data.waiters.map(row=>tipText('wait:'+row.key,data)),
   table:$("walk").innerHTML}));
 """
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
@@ -457,8 +463,8 @@ process.stdout.write(JSON.stringify({
         tips = {key: cast(list[list[str]], rendered[key]) for key in ("walk", "waiters")}
         table = cast(str, rendered["table"])
         matches = cast(list[tuple[str, str, str]],
-            re.findall(r'<tr[^>]*data-tip="(row|wait):([0-9]+)"[^>]*>(.*?)</tr>', table, flags=re.S))
-        cells = {f"{kind}:{index}": body for kind, index, body in matches}
+            re.findall(r'<tr[^>]*data-tip="(row|wait):([^"]+)"[^>]*>(.*?)</tr>', table, flags=re.S))
+        cells = {f"{kind}:{key}": body for kind, key, body in matches}
         for collection, kind in (("walk", "row"), ("waiters", "wait")):
             rows = cast(list[dict[str, object]], payload[collection])
             local_position = 0
@@ -469,7 +475,7 @@ process.stdout.write(JSON.stringify({
                     local_position += 1
                 with self.subTest(kind=kind, pid=row["pid"]):
                     text = "\n".join(tips[collection][index])
-                    cell = cells[f"{kind}:{index}"]
+                    cell = cells[f"{kind}:{row['key']}"]
                     progress = cast(dict[str, object], row.get("progress", {}))
                     place = (str(progress.get("phase", "—")) if kind == "row" else
                              "cloud" if row.get("kind") == "cloud" else str(local_position))
@@ -580,6 +586,63 @@ process.stdout.write(JSON.stringify({
             self.assertEqual(row["unit"], "—")
             self.assertTrue(row["name"].startswith("fixture-project "))
 
+    def test_gate_rows_name_the_job_from_the_command_arguments(self) -> None:
+        gate_command = ["python3", "/repo/scripts/production/merge_gate.py", "--merge-branch", "sdlc"]
+        cases = (
+            (["--unit", "handler", "--checkpoint", "abc"], StepJob("integrate", unit="handler", branch="sdlc")),
+            (["--tests-only", "--full"], StepJob("test-all", branch="")),
+            (["--tests-only", "--module", "a", "--module=b"], StepJob("test-modules", modules=2)),
+            (["--tests-only"], StepJob("test-all")),
+            (["--nightly"], StepJob("test-nightly", branch="sdlc")),
+        )
+        names = read_step_names()
+        with tempfile.TemporaryDirectory() as folder:
+            proc = Path(folder)
+            for pid, (arguments, expected) in enumerate(cases, start=10):
+                with self.subTest(arguments=arguments):
+                    (proc / str(pid)).mkdir()
+                    command = gate_command[:2] + arguments + (gate_command[2:] if expected.branch else [])
+                    _ = (proc / str(pid) / "cmdline").write_bytes(b"\0".join(part.encode() for part in command) + b"\0")
+                    job = memory_feed.step_job("merge-gate", pid, proc)
+                    self.assertEqual(job, expected)
+                    notes = memory_feed.job_notes(job, "report", names)
+                    self.assertTrue(notes.get("about"))
+                    self.assertEqual(notes.get("changes"), "sdlc branch" if expected.step == "integrate" else "no branch")
+            self.assertIsInstance(memory_feed.step_job("nextest", 10, proc), memory_feed.NotGateStep)
+            self.assertIsInstance(memory_feed.step_job("merge-gate", 99, proc), memory_feed.CommandUnreadable)
+        for command, named in (
+            (["python3", "-X", "dev", "/repo/scripts/production/targeted_test.py"], StepJob("test-affected")),
+            (["py", "targeted_test.py", "--full"], StepJob("test-all")),
+            (["python3", "targeted_test.py", "--module", "a"], StepJob("test-modules", modules=1)),
+            (["python3", "-m", "scripts.production.merge_gate", "--tests-only"], StepJob("test-all")),
+            (["verify.sh", "--session-dir", "/session", "lint"], StepJob("lint")),
+            (["bash", "verify.sh", "test", "hana"], StepJob("test")),
+            (["python3", "-c", "pass", "merge_gate.py"], OTHER_COMMAND),
+            (["python3", "-cpass", "merge_gate.py"], OTHER_COMMAND),
+            (["python3", "-Bc", "pass", "merge_gate.py"], OTHER_COMMAND),
+            (["python3", "-", "merge_gate.py"], OTHER_COMMAND),
+            (["bash", "-c", "true", "verify.sh"], OTHER_COMMAND),
+            (["python3", "-Xdev", "-mscripts.production.merge_gate", "--nightly"], StepJob("test-nightly")),
+            (["python3", "-u", "-W", "ignore", "merge_gate.py", "--tests-only", "--full"], StepJob("test-all")),
+            (["python3", "tool.py", "merge_gate.py"], OTHER_COMMAND),
+            (["cargo", "build"], OTHER_COMMAND),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(command_job(command), named)
+        about = names.about(StepJob("integrate", unit="handler", branch="sdlc"), "report")
+        self.assertIn("handler", about)
+        self.assertEqual(names.about(StepJob("test-all"), "—"), "")
+        reading = reservation_reading()
+        integrate = StepJob("integrate", unit="handler", branch="sdlc")
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(memory_feed, "step_job", return_value=integrate)):
+            page = memory_feed.reading()
+        running, = [row for row in page["walk"] if row.get("queued")]
+        for row in (running, *page["waiters"]):
+            self.assertEqual(row.get("changes"), "sdlc branch")
+            self.assertIn("handler", row.get("about", ""))
+            self.assertIn("integrate", row["name"])
+
 
     def test_local_test_counters_reach_the_page_through_admission(self) -> None:
         for step in ("targeted-test", "merge-gate", "nextest", "test", "t"):
@@ -652,6 +715,15 @@ process.stdout.write(JSON.stringify({
             self.assertNotIn(field, row)
         for field in ("used", "reserved", "taken", "room", "cap", "other", "shown_reserved"):
             self.assertEqual(page.get(field), before.get(field), field)
+
+    def test_cargo_job_reads_cargo_words_after_the_ci_front_options(self) -> None:
+        front = ("python3", "-I", "/store/scripts/build_queue/ci_cargo_front.py", "--front", "/store/bin/cargo",
+                 "--shared-folder", "/run/hana-ci-admission/hana-linux-1", "--")
+        for words, job in ((("build", "--release"), "release build"), (("nextest", "run"), "tests"),
+                           (("+nightly", "doc"), "doc"), ((), "")):
+            with self.subTest(words=words):
+                self.assertEqual(memory_feed.cargo_job((*front, *words)), job)
+                self.assertEqual(memory_feed.cargo_job(("/store/bin/cargo", *words)), job)
 
     def test_ci_runner_records_name_the_owner_in_running_and_waiting(self) -> None:
         base = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
@@ -924,6 +996,9 @@ process.stdout.write(JSON.stringify({
         for seconds, stale in ((0.125, 15), (60.0, 300)):
             with self.subTest(seconds=seconds):
                 self.configure(seconds=seconds)
+                console_settings = Path(__file__).resolve().parents[2] / "config/console.conf"
+                _ = (self.root / "console.conf").write_text(console_settings.read_text().replace(
+                    "status.builds.age_limit_seconds=15", f"status.builds.age_limit_seconds={stale}"))
                 _ = (self.output / "memory_live.html").write_text("previous page")
                 with mock.patch.object(admission_client, "view", return_value=captured_reading()):
                     self.assertEqual(memory_feed.main(["--once"]), 0)
@@ -931,11 +1006,27 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(page, self.expected_page(seconds))
                 constants = page[page.index("const SECONDS ="):page.index("const $ =")]
                 result = subprocess.run(
-                    [executable, "-e", constants + "\nprocess.stdout.write(String(STALE));"],
+                    [executable, "-e", constants + "\nprocess.stdout.write(String(SECONDS));"],
                     text=True, capture_output=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(float(result.stdout), stale)
+                self.assertEqual(float(result.stdout), seconds)
+                self.assertIn(f'&quot;ageLimit&quot;: {float(stale)}', page)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_page_status_uses_the_real_builds_loader_with_configured_timing(self) -> None:
+        self.output.mkdir()
+        for seconds, stale in ((0.125, 15), (60.0, 300)):
+            with self.subTest(seconds=seconds):
+                self.configure(seconds=seconds)
+                console_settings = Path(__file__).resolve().parents[2] / "config/console.conf"
+                _ = (self.root / "console.conf").write_text(console_settings.read_text().replace(
+                    "status.builds.age_limit_seconds=15", f"status.builds.age_limit_seconds={stale}"))
+                _ = (self.output / "memory_live.html").write_text("previous page")
+                with mock.patch.object(admission_client, "view", return_value=captured_reading()):
+                    _ = memory_feed.main(["--once"])
+                page = (self.output / "memory_live.html").read_text()
+                assert_status_states(self, page, seconds, cast(dict[str, object], json.loads((self.output / "memory.json").read_text())))
 
     def test_page_proof_removes_chrome_files_after_exit_and_a_killed_child(self) -> None:
         _ = write_config_fixture(self.root / "build_folders.conf")
@@ -1402,6 +1493,7 @@ process.stdout.write(JSON.stringify({
                 _ = shutil.copytree(source, installed / "scripts", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
                 (installed / "config").mkdir()
                 _ = shutil.copyfile(conf.path("memory_feed"), installed / "config/memory_feed.conf")
+                _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/console.conf", installed / "config/console.conf")
                 probe = textwrap.dedent("""
                     import builtins
                     import json
@@ -1752,6 +1844,18 @@ process.stdout.write(JSON.stringify({
                 first = page["waiters"][0]
                 self.assertEqual((first.get("place"), first.get("why")),
                                  (1, "memory"))
+                self.assertEqual([row.get("first_in_line", False) for row in page["waiters"]],
+                                 [index == 0 for index in range(len(page["waiters"]))])
+        # The step the queue admits next shows its room, even when another step is ahead of it in the list.
+        last = reading.view.waiting[-1]
+        head = admission_records.HeadExplanation(last, admission_records.NeedSourceNotRecorded(),
+            admission_records.AdmissionDecision("hold", 0, 0, 0, 0), room,
+            admission_records.FreeCheck(30 * gib, 20 * gib, 0, 0, 0, True), False, cause=admission_records.NeedsMemory())
+        with mock.patch.object(admission_client, "view", return_value=replace(reading, explanation=replace(reading.explanation, head=head))):
+            page = memory_feed.reading()
+        last_pid = last.run.pid if isinstance(last.run, LiveBuildRun) else last.pid
+        self.assertEqual([row.get("first_in_line", False) for row in page["waiters"]],
+                         [row["pid"] == last_pid for row in page["waiters"]])
 
     def test_each_wait_reason_says_why_in_the_same_form(self) -> None:
         gib = admission_records.GIB
@@ -1759,7 +1863,7 @@ process.stdout.write(JSON.stringify({
         cases: tuple[tuple[admission_records.WaitReason, str], ...] = (
             (admission_records.NeedsMemory(need=4 * gib, free=gib), "memory"),
             (admission_records.BehindHead("first", 0, "fixture"), "its turn"),
-            (admission_records.TokenWaitingWaiter(0), "its turn"),
+            (admission_records.TokenWaitingWaiter(0), "Cargo token"),
             (admission_records.StartSpacingWait(0), "its turn"),
             (admission_records.MemoryPressure(1.0), "memory pressure"),
             (admission_records.GpuSlotWait(1, 1), "GPU slot"),
@@ -2367,7 +2471,7 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(run_row["used"], missing)
         self.assertIn("RunUseUnavailable", memory_feed.page_json(page))
 
-    def test_one_report_call_supplies_both_sections(self) -> None:
+    def test_one_report_call_supplies_top_costs(self) -> None:
         with (mock.patch.object(charts, "page_data", return_value=report_fixture()) as provider,
               mock.patch.object(admission_client, "view", return_value=captured_reading())):
             report = memory_feed.report_reading(7)
@@ -2564,8 +2668,6 @@ def write_browser_fixture(folder: Path) -> None:
             pages["mac_idle"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         (fixture.root / "mac-idle" / "alert.json").unlink()
         for name, report in (("empty_report", report_fixture(empty=True)),
-                             ("unrecorded_report", report_fixture(unrecorded=True)),
-                             ("startless_report", report_fixture(startless=True)),
                              ("missing_report", charts.IndexUnavailable("private index is missing"))):
             with (mock.patch.object(charts, "page_data", return_value=report),
                   mock.patch.object(admission_client, "view", return_value=base)):

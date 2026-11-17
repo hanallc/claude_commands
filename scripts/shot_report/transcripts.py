@@ -1696,26 +1696,21 @@ def _message_text(value: object) -> str:
 def _outgoing_tool_message(name: str, value: object, command: str) -> str:
     if name == "SendMessage" or name.endswith(".SendMessage"):
         return _message_text(value)
-    if "send.py" not in command and "codex_mesh.py" not in command:
+    if "send.py" not in command:
         return ""
     messages: list[str] = []
     for tokens in _shell_segments(command):
         program, arguments = _program(tokens)
-        if program in ("send.py", "codex_mesh.py"):
+        if program == "send.py":
             options = arguments[1:]
-        elif program.startswith("python") and len(arguments) > 1 and Path(arguments[1]).name in ("send.py", "codex_mesh.py"):
-            program = Path(arguments[1]).name
+        elif program.startswith("python") and len(arguments) > 1 and Path(arguments[1]).name == "send.py":
             options = arguments[2:]
         else:
             continue
-        if program == "codex_mesh.py":
-            message_option = "--message"
-        else:
-            message_option = "--text"
         for index, option in enumerate(options):
-            if option == message_option and index + 1 < len(options):
+            if option == "--text" and index + 1 < len(options):
                 messages.append(options[index + 1])
-            elif option.startswith(message_option + "="):
+            elif option.startswith("--text="):
                 messages.append(option.partition("=")[2])
     return " ".join(messages)
 
@@ -2227,6 +2222,17 @@ def _file_inventory(claude_root: Path, codex_root: Path) -> dict[str, tuple[Agen
     return inventory
 
 
+def _archive_content_size_matches(path: Path, expected: int) -> bool:
+    """Read frame sizes without decompression, including concatenated frames."""
+    try:
+        result = subprocess.run(["zstd", "--list", "-v", "--", str(path)],
+                                capture_output=True, text=True, check=False)
+    except OSError:
+        return False
+    size = re.search(r"^Decompressed Size: .* \((\d+) B\)$", result.stdout, re.MULTILINE)
+    return result.returncode == 0 and size is not None and int(size[1]) == expected
+
+
 def _joined_calls(evidence: Iterable[TranscriptEvidence], records: list[InvocationRecord]) -> list[ToolCall]:
     files = list(evidence)
     calls = [call for item in files for call in item.calls]
@@ -2249,7 +2255,8 @@ def _joined_calls(evidence: Iterable[TranscriptEvidence], records: list[Invocati
             if matches:
                 call = replace(call, project=max(matches, key=len), project_attribution="removed_worktree")
         folded.append(call)
-    return folded
+    return sorted(folded, key=lambda call: (call.start, call.end, call.transcript_path,
+                                            call.session_id, call.tool_use_id))
 
 
 def _joined_tool_events(evidence: Iterable[TranscriptEvidence]) -> list[TranscriptToolEvent]:
@@ -2278,7 +2285,21 @@ def _cached_scan(claude_root: Path, codex_root: Path, timing_source: TimingSourc
                 initial_results = dict(zip((str(path) for _, path, _ in tasks), workers.map(parse_file, tasks)))
         else:
             initial_results = {str(task[1]): _new_file_evidence(task, scratchpad_roots) for task in tasks}
-    changed = False
+    renamed: dict[str, str] = {}
+    for name, (_, path, stat) in inventory.items():
+        if path.suffix != ".zst" or name in saved.files:
+            continue
+        logical = str(uncompressed_path(path))
+        prior = saved.files.get(logical)
+        if (prior is not None and prior.modified_ns == stat.st_mtime_ns
+                and prior.cursor == prior.observed_size
+                and _archive_content_size_matches(path, prior.observed_size)):
+            prior.device, prior.inode = stat.st_dev, stat.st_ino
+            prior.observed_size, prior.modified_ns = stat.st_size, stat.st_mtime_ns
+            renamed[logical] = name
+    if renamed:
+        saved.files = {renamed.get(name, name): prior for name, prior in saved.files.items()}
+    changed = bool(renamed)
     # Count unique source byte offsets inspected in this run. Cold prefilter and parser
     # passes over the same file contribute its size once, even if both touch it.
     bytes_read = sum(stat.st_size for _, _, stat in inventory.values()) if initial else 0
@@ -2291,7 +2312,8 @@ def _cached_scan(claude_root: Path, codex_root: Path, timing_source: TimingSourc
             stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
         ):
             continue
-        if (prior is not None and prior.device == stat.st_dev and prior.inode == stat.st_ino
+        if (prior is not None and path.suffix != ".zst"
+                and prior.device == stat.st_dev and prior.inode == stat.st_ino
                 and stat.st_size > prior.observed_size):
             if prior.candidate:
                 bytes_read += _append_file_evidence(prior, path, stat, scratchpad_roots)

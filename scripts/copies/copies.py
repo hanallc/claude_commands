@@ -18,10 +18,9 @@ import hashlib
 import shlex
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -39,7 +38,9 @@ from scripts.lib.copy_record import (
     ALL_REPOSITORIES as ALL_REPOSITORIES,
 )
 from scripts.buildlog.store import host_name
+from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
+from scripts.lib.build_steps import StepJob, command_job, read_step_names
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
 from scripts.message import process_table, sessions
@@ -244,19 +245,39 @@ MergePolicy = NoMerge | MergeRevision
 NO_MERGE = NoMerge()
 
 
-def staged_tree(source: Path) -> str:
-    """Read the staged tree without changing the source index."""
+def _private_index_git(source: Path, index: Path, *arguments: str) -> bytes:
+    """Run Git with the private index and retain its preparation errors."""
+    timeout = load_config().git_timeout_seconds
+    try:
+        result = subprocess.run(["git", "-C", str(source), *arguments],
+                                env={**os.environ, "GIT_INDEX_FILE": str(index)},
+                                capture_output=True, timeout=timeout,
+                                pass_fds=(build_folders.build_folder_lock_fd(index.parent),))
+    except subprocess.TimeoutExpired as error:
+        raise PreparationError(f"git {' '.join(arguments)} in {source}: timed out after {timeout:g} seconds") from error
+    if result.returncode:
+        raise PreparationError(result.stderr.decode(errors="replace"))
+    return result.stdout
+
+
+def staged_tree(source: Path, *, include_worktree: bool = False) -> str:
+    """Read staged or working files through a private index."""
     with build_folders.tool_folder("copies-index") as temporary:
         index = Path(git(source, "rev-parse", "--path-format=absolute", "--git-path", "index").decode().strip())
         private = temporary / "index"
         if index.exists():
             git_index.private_copy(index, private)
-        result = subprocess.run(["git", "-C", str(source), "write-tree"],
-                                env={**os.environ, "GIT_INDEX_FILE": str(private)},
-                                capture_output=True, timeout=load_config().git_timeout_seconds)
-        if result.returncode:
-            raise PreparationError(result.stderr.decode(errors="replace"))
-        return result.stdout.decode().strip()
+        if include_worktree:
+            _ = _private_index_git(source, private, "add", "--all", "--", ".")
+        tree = _private_index_git(source, private, "write-tree").decode().strip()
+        if include_worktree:
+            head_links = {row.split(b"\t", 1)[1] for row in git(source, "ls-tree", "-rz", "HEAD").split(b"\0")
+                          if row.startswith(b"160000 ")}
+            for row in git(source, "ls-tree", "-rz", tree).split(b"\0"):
+                if row.startswith(b"160000 ") and row.split(b"\t", 1)[1] not in head_links:
+                    path = os.fsdecode(row.split(b"\t", 1)[1])
+                    raise PreparationError(f"NestedRepository: {path}: new Git links cannot supply working files")
+        return tree
 
 
 def source_commit(source: Path, policy: SourcePolicy) -> str:
@@ -267,6 +288,20 @@ def source_commit(source: Path, policy: SourcePolicy) -> str:
     return git(source, "-c", "user.name=copies.py", "-c", "user.email=copies@localhost",
                "commit-tree", tree, "-p", commit_at(source, "HEAD"),
                data=b"copies: staged source\n").decode().strip()
+
+
+def capture_source(source: Path) -> str:
+    """Commit exact working files through the private index without changing caller refs."""
+    before = treekey.tree_key(str(source))
+    head = source_commit(source, WorktreeSource("HEAD", source))
+    index = staged_tree(source)
+    tree = staged_tree(source, include_worktree=True)
+    if (staged_tree(source, include_worktree=True) != tree or not before
+            or treekey.tree_key(str(source)) != before or staged_tree(source) != index
+            or commit_at(source, "HEAD") != head):
+        raise PreparationError("SourceChanged: inputs changed during source capture")
+    return git(source, "-c", "user.name=copies.py", "-c", "user.email=copies@localhost",
+               "commit-tree", tree, data=b"copies: source snapshot\n").decode().strip()
 
 
 class BusyCopy(CopyError):
@@ -669,31 +704,16 @@ def apply_changes(tree: Path, worktree: Path, base: str) -> None:
     try:
         changed = [os.fsdecode(name) for name in git(worktree, "diff", "--name-only", "-z", "HEAD").split(b"\0")
                    if name]
-        diff = git(worktree, "diff", "--binary", "HEAD", "--")
-        if diff:
-            _ = git(tree, "apply", "--index", "--3way", "--binary", "-", data=diff)
         for name in git(worktree, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0"):
             if not name:
                 continue
-            relative = Path(os.fsdecode(name))
-            changed.append(str(relative))
-            if relative.parts[0] in (scratch.BUSY, ".git", CLONE_STAGE):
-                raise CopyError(f"{relative}: path conflicts with gate metadata")
-            original, destination = worktree / relative, tree / relative
-            mode = original.lstat().st_mode
-            if not destination.parent.resolve().is_relative_to(tree.resolve()):
-                raise CopyError(f"{relative}: path escapes the gate checkout")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if destination.is_symlink():
-                destination.unlink()
-            if stat.S_ISLNK(mode):
-                destination.symlink_to(os.readlink(original))
-            elif stat.S_ISREG(mode):
-                _ = shutil.copyfile(original, destination)
-                shutil.copymode(original, destination)
-            else:
-                raise CopyError(f"{relative}: not a regular file or symlink")
-            _ = git(tree, "--literal-pathspecs", "add", "--force", "--", str(relative))
+            changed.append(os.fsdecode(name))
+            if Path(os.fsdecode(name)).parts[0] in (scratch.BUSY, ".git", CLONE_STAGE):
+                raise CopyError(f"{os.fsdecode(name)}: path conflicts with gate metadata")
+        snapshot = staged_tree(worktree, include_worktree=True)
+        diff = git(worktree, "diff", "--binary", "HEAD", snapshot, "--")
+        if diff:
+            _ = git(tree, "apply", "--index", "--3way", "--binary", "-", data=diff)
         short = git(tree, "rev-parse", "--short", base).decode().strip()
         _ = git(tree, "-c", "user.name=copies.py", "-c", "user.email=copies@localhost",
                 "-c", "commit.gpgsign=false", "commit", "--quiet", "--no-verify", "--allow-empty", "-m",
@@ -992,19 +1012,13 @@ def _slot_preparation() -> Generator[None]:
         raise CopyError(str(error)) from error
 
 
-def gate_purpose(subject: str) -> str:
-    """Name the gated work from its commit subject."""
-    phase = re.fullmatch(r"[^()\s]+\(([^()]+)\): phase ([0-9]+) — (.+)", subject)
-    if phase is not None:
-        slug, number, title = phase.groups()
-        return f"gate · {slug} phase {number} · {title}"
-    return f"gate · {subject}" if subject else "gate"
-
-
 @contextmanager
 def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
-             merge: MergePolicy = NO_MERGE) -> Generator[Path]:
-    """Hold one repository slot through preparation and the caller's use."""
+             merge: MergePolicy = NO_MERGE, step: str = "run") -> Generator[Path]:
+    """Hold one repository slot through preparation and the caller's use.
+
+    step is the build_steps key of the work, such as integrate or lint; the lease shows its configured name.
+    """
     from scripts.lib import build_slots
     from scripts.production import staff
 
@@ -1020,11 +1034,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
         canonical = slot_source(source)
         if main_checkout(source) != canonical:
             _ = git(canonical, "fetch", "-q", "--", str(source), base)
-    try:
-        subject = git(canonical, "log", "-1", "--format=%s", base).decode(errors="replace").strip()
-        purpose = gate_purpose(subject)
-    except (CopyError, OSError):
-        purpose = "gate"
+    purpose = read_step_names().shown(step)
     unit = owner
     showrunner = owner_name(copy_owner(owner))
     try:
@@ -1039,7 +1049,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
     with ExitStack() as held_slot:
         with _slot_preparation():
             slot = held_slot.enter_context(build_slots.take_slot(canonical, base, showrunner=showrunner, unit=unit,
-                work="gate", purpose=purpose, report=lambda line: print(line, file=sys.stderr)))
+                work=step, purpose=purpose, report=lambda line: print(line, file=sys.stderr)))
         tree = slot.path
         descriptor = build_folders.build_folder_lock_fd(tree)
         token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), descriptor))
@@ -1985,7 +1995,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "hold":
             source = Path(args.repo or "").expanduser().resolve()
             staged = StagedSource(staged_tree(source))
-            with standing(source_owner(source), source, staged) as checkout:
+            with standing(source_owner(source), source, staged, step="hold") as checkout:
                 print(staged.tree)
                 print(checkout, flush=True)
                 _ = sys.stdin.read()
@@ -2011,7 +2021,9 @@ def main(argv: list[str] | None = None) -> int:
             policy: SourcePolicy = (WorktreeSource(args.commit, args.apply_uncommitted) if args.apply_uncommitted else
                                     CommittedSource(args.commit))
             merge: MergePolicy = MergeRevision(args.merge) if args.merge else NoMerge()
-            with standing(caller_owner(), args.repo or "", policy, merge=merge) as tree:
+            job = command_job(command)
+            with standing(caller_owner(), args.repo or "", policy, merge=merge,
+                          step=job.step if isinstance(job, StepJob) else PurePath(command[0]).name) as tree:
                 result = subprocess.run([part.replace("{tree}", str(tree)) for part in command],
                                         cwd=tree, pass_fds=COMMAND_LOCKS.get())
                 command_exit = result.returncode if result.returncode >= 0 else 128 - result.returncode

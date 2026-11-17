@@ -320,10 +320,24 @@ class ModuleCostTests(unittest.TestCase):
             install_runner(tree)
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
+            leases = tree / "leases"
             _ = (folder / "test_children.py").write_text(
-                'import os\nimport subprocess\nimport sys\nimport unittest\n'
+                'import fcntl, os, pathlib, subprocess, sys, unittest\n'
                 + 'class Children(unittest.TestCase):\n'
                 + '    def test_children(self):\n'
+                + '        folder = pathlib.Path(os.environ["BUILDLOG_DIR"]).parent\n'
+                + '        lock_path = folder.with_name(folder.name + ".lock")\n'
+                + '        lock = lock_path.stat()\n'
+                + '        inherited = []\n'
+                + '        for entry in pathlib.Path("/dev/fd").iterdir():\n'
+                + '            try:\n'
+                + '                if os.path.samestat(os.fstat(int(entry.name)), lock): inherited.append(int(entry.name))\n'
+                + '            except OSError: pass\n'
+                + '        self.assertTrue(inherited, "The measurement child has no folder lease")\n'
+                + '        fcntl.flock(inherited[0], fcntl.LOCK_EX | fcntl.LOCK_NB)\n'
+                + '        with lock_path.open("r+") as probe:\n'
+                + '            with self.assertRaises(BlockingIOError): fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)\n'
+                + f'        with open({str(leases)!r}, "a") as log: log.write("held\\n")\n'
                 + '        self.assertEqual(os.environ["HERDR_BIN"], "/nonexistent/herdr")\n'
                 + '        self.assertTrue(sys.dont_write_bytecode)\n'
                 + '        for code in ("pass", "import os"):\n'
@@ -333,6 +347,7 @@ class ModuleCostTests(unittest.TestCase):
             output = io.StringIO()
             with redirect_stdout(output):
                 status = module_cost.main(["--tree", str(tree), "--commands", "10", "fixture/test_children.py"])
+            lease_states = leases.read_text().splitlines()
         self.assertEqual(status, 0, output.getvalue())
         lines = output.getvalue().splitlines()
         row = lines[1].split()
@@ -343,6 +358,7 @@ class ModuleCostTests(unittest.TestCase):
         self.assertGreater(float(row[4]), 0)
         self.assertEqual(row[5], "PASS")
         self.assertEqual(lines[2].split(), ["total", *row[1:]])
+        self.assertEqual(lease_states, ["held", "held", "held"])
 
 
 if __name__ == "__main__":

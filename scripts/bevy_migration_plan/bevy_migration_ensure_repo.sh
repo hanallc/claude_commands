@@ -35,7 +35,9 @@ else
     echo "Cloning Bevy ${VERSION} to ${BEVY_REPO_DIR}" >&2
     rm -rf "${BEVY_REPO_DIR}"
     mkdir -p "$(dirname "${BEVY_REPO_DIR}")"
-    git clone --depth 1 --branch "v${VERSION}" https://github.com/bevyengine/bevy.git "${BEVY_REPO_DIR}"
+    "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/build_folders.py" editable-repository \
+        --path "${BEVY_REPO_DIR}" --url https://github.com/bevyengine/bevy.git \
+        --ref "v${VERSION}" --depth 1 >&2
 fi
 
 # Resolve the migration-guides directory. The containing dir was renamed from
