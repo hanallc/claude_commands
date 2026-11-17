@@ -36,7 +36,10 @@ def status_row(label: str) -> accounts.StatusRow:
 class AccountsPageTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(Path(__file__).resolve().parents[2] / "config")})))
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory())) / "config"
+        _ = shutil.copytree(Path(__file__).resolve().parents[2] / "config", configuration)
+        _ = (configuration / "statusline.conf").write_text("account.claude1=#af875f\n", encoding="utf-8")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     def test_board_draws_the_board_table_with_moves_and_problems(self) -> None:
         reading = accounts.StatusReading((status_row("claude1"),), ("* <stale>",), (), timezone.utc, AT,
