@@ -1,7 +1,8 @@
 """Measure each configured drive into the Disks page data file.
 
 One measure at a time: a second call while a measure runs exits at once.
-Each drive's `du` runs at the lowest CPU and disk priority under a memory cap.
+Each drive's dust walk runs at the lowest CPU priority under a memory cap.
+The drives run at the same time.
 """
 from __future__ import annotations
 
@@ -9,10 +10,12 @@ import argparse
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import NotRequired, TypedDict, cast
@@ -23,8 +26,6 @@ from scripts.disks.disks_page import DATA_FILE, LOCK_FILE
 from scripts.lib import conf, file_lock
 from scripts.lib.atomic_file import write_text_atomic
 
-# du exits 1 when it cannot read some folders; the folders it read are still valid.
-DU_PARTIAL_EXIT = 1
 LOCK_BUSY_EXIT = 3
 MOUNT_TABLE = Path("/proc/self/mountinfo")
 # The mount table writes a space, a tab, a newline and a backslash in a path as an octal escape.
@@ -50,6 +51,7 @@ class Drive(TypedDict):
 
 class DisksData(TypedDict):
     measured_at: float
+    render_seconds: float
     keep_bytes: int
     drives: list[Drive]
 
@@ -126,35 +128,49 @@ class MeasureSettings:
     memory_max: str
     timeout_seconds: int
     output_folder: Path
+    max_depth: int
+    max_lines: int
 
 
 def read_settings() -> MeasureSettings:
     settings = conf.read("disks")
     return MeasureSettings(settings.words("drives"), settings.whole("measure.keep_bytes"),
                            settings.text("measure.memory_max"), settings.whole("measure.timeout_seconds"),
-                           Path(os.path.expanduser(settings.text("output_folder"))))
+                           Path(os.path.expanduser(settings.text("output_folder"))),
+                           settings.whole("measure.max_depth"), settings.whole("measure.max_lines"))
 
 
 Runner = Callable[[Sequence[str], int], subprocess.CompletedProcess[str]]
 
 
 def run_command(argv: Sequence[str], timeout_seconds: int) -> subprocess.CompletedProcess[str]:
+    if shutil.which("dust") is None:
+        raise FileNotFoundError("dust is not on PATH")
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout_seconds, check=False)
 
 
-def du_command(mount: str, settings: MeasureSettings) -> list[str]:
-    """du on one filesystem, at idle disk priority and the lowest CPU priority, inside a memory-capped scope."""
+def dust_command(mount: str, settings: MeasureSettings) -> list[str]:
+    """Walk one filesystem with dust under a memory cap at the lowest CPU priority."""
     return ["systemd-run", "--user", "--scope", "--quiet", "-p", f"MemoryMax={settings.memory_max}", "--",
-            "nice", "-n", "19", "ionice", "-c3",
-            "du", "-x", "-B1", f"--threshold={settings.keep_bytes}", mount]
+            "nice", "-n", "19", "dust", "-x", "-D", "-j", "-P", "-o", "b",
+            "-z", str(settings.keep_bytes - 1),  # Dust keeps sizes above this value, so include the floor.
+            "-d", str(settings.max_depth), "-n", str(settings.max_lines),
+            "--config", str(Path(__file__).with_name("dust.toml")), mount]
 
 
-def parse_du(output: str) -> dict[str, int]:
+class DustFolder(TypedDict):
+    name: str
+    size: str
+    children: list[DustFolder]
+
+
+def parse_dust(output: str) -> dict[str, int]:
     sizes: dict[str, int] = {}
-    for line in output.splitlines():
-        size, separator, path = line.partition("\t")
-        if separator and size.isdigit():
-            sizes[os.path.normpath(path)] = int(size)
+    pending = [cast(DustFolder, json.loads(output))]
+    while pending:
+        folder = pending.pop()
+        sizes[os.path.normpath(folder["name"])] = int(folder["size"].removesuffix("B"))
+        pending.extend(folder["children"])
     return sizes
 
 
@@ -224,18 +240,18 @@ def measure_drive(mount: str, settings: MeasureSettings, floors: dict[int, int |
     drive["used"], drive["free"] = usage.used, usage.free
     drive["floor"] = floors.get(device)
     try:
-        result = runner(du_command(mount, settings), settings.timeout_seconds)
+        result = runner(dust_command(mount, settings), settings.timeout_seconds)
     except subprocess.TimeoutExpired:
         drive["error"] = f"the measure stopped after {settings.timeout_seconds} seconds"
         return drive
     except OSError as error:
         drive["error"] = f"the measure did not start: {error}"
         return drive
-    sizes = parse_du(result.stdout)
-    if result.returncode not in (0, DU_PARTIAL_EXIT) or not sizes:
+    if result.returncode != 0 or not result.stdout.strip():
         last = (result.stderr.strip().splitlines() or ["no output"])[-1]
-        drive["error"] = f"du exited {result.returncode}: {last}"
+        drive["error"] = f"dust exited {result.returncode}: {last}"
         return drive
+    sizes = parse_dust(result.stdout)
     drive["tree"] = folder_tree(mount, sizes, settings.keep_bytes)
     return drive
 
@@ -247,9 +263,14 @@ def measure(settings: MeasureSettings, runner: Runner = run_command,
         if lock is file_lock.LockResult.BUSY:
             print("a measure is already running")
             return LOCK_BUSY_EXIT
+        started = time.perf_counter()
         found = floors(settings.drives)
-        data: DisksData = {"measured_at": time.time(), "keep_bytes": settings.keep_bytes,
-                           "drives": [measure_drive(mount, settings, found, runner) for mount in settings.drives]}
+        data: DisksData = {"measured_at": time.time(), "render_seconds": 0.0, "keep_bytes": settings.keep_bytes,
+                           "drives": []}
+        with ThreadPoolExecutor(max_workers=len(settings.drives)) as pool:
+            drives = [pool.submit(measure_drive, mount, settings, found, runner) for mount in settings.drives]
+            data["drives"] = [drive.result() for drive in drives]
+        data["render_seconds"] = time.perf_counter() - started
         write_text_atomic(settings.output_folder / DATA_FILE, json.dumps(data) + "\n", new_file_mode=0o644)
     print(f"measured {len(settings.drives)} drives on {socket.gethostname()}")
     return 0

@@ -90,6 +90,12 @@ class ReaderClientTests(unittest.TestCase):
             self.assertEqual(count.read_text(), "call\ncall\n")
 
     def test_missing_and_stale_stamps_build_once_and_current_stamp_builds_none(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / "selected-reader"
+            with (patch.dict(os.environ, {"STYLE_READER_BINARY": str(binary)}),
+                  patch.object(style_reader, "_source_tree", side_effect=AssertionError("Unexpected stamp read")),
+                  patch.object(style_reader, "_build", side_effect=AssertionError("Unexpected reader build"))):
+                self.assertEqual(style_reader.reader_binary(), binary)
         for previous in ("missing", "stale", "checkout moves during build", "checkout moves during failed build",
                          "private configuration"):
             with self.subTest(previous=previous), tempfile.TemporaryDirectory() as temporary:

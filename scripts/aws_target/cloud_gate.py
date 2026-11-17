@@ -545,7 +545,7 @@ class GateWorker:
         cap = values.whole('max_gate_minutes')
         def median_box_s(variant: GateLaunchVariant) -> Decimal | None:
             # A type with no measured runs has no median; the lifetime_minutes default is not a measurement.
-            seconds, _own = evidence.box_seconds(variant.instance_type, variant.region, (mode,))
+            seconds, _source = evidence.box_seconds(variant.instance_type, variant.region, (mode,))
             return Decimal(median(seconds)) if seconds else None
         slow = {(variant.instance_type, variant.region): box for variant in variants
                 if (box := median_box_s(variant)) is not None and box > cap * 60}

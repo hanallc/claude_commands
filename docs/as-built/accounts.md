@@ -417,6 +417,14 @@ A second schedule caller prints `already claimed by <id>` and exits with code 0.
 `StatusReading` separates stored facts from their display.
 `StatusDocument` carries account rows, the board, problems, and session input paths.
 The `board` is `accounts.status_board()`: the table the console Accounts page draws.
+`config/statusline.conf` holds each account color under `account.<label>`.
+The value accepts a color name or a six-digit hex color.
+Configured accounts have a color swatch on the console Accounts page.
+The swatch opens a color chooser with Try, Save, and Cancel.
+Try changes the label and swatch locally without a request.
+Cancel or Escape restores the saved color.
+Save publishes the color through this checkout's `scripts/lib/tune.py` and refreshes the board.
+The page pauses refresh while the chooser is open.
 Its `stale_at` is the next local midnight, when its reset text changes.
 The text table appends `Login ends` in the user's zone, with the same date format as `Weekly resets`.
 Each JSON account exports `login_ends_at` as an ISO 8601 UTC string, or null for an unknown date or Codex.

@@ -10,6 +10,12 @@ from scripts.style import style_ledger
 from scripts.style import test_style_ledger_sites
 from scripts.style.ledger_test_support import PARENT_FILE
 
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
+
 
 @final
 class FindingSitesTests(unittest.TestCase):

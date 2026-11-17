@@ -29,7 +29,6 @@ import re
 import shlex
 import subprocess
 import sys
-import tempfile
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -40,9 +39,9 @@ from pathlib import Path
 from typing import TypeVar, cast
 
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
-from scripts.lib import scratch, unit_runs  # noqa: E402
+from scripts.lib import build_folders, scratch, unit_runs  # noqa: E402
 from scripts.direct.progress_history import load_events  # noqa: E402
-from scripts.lib import urgency  # noqa: E402
+from scripts.lib import urgency, file_lock  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 from scripts.production import issues  # noqa: E402
@@ -574,7 +573,9 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
 
     def git(*arguments: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["git", "-C", str(folder), "--literal-pathspecs", *arguments],
-                              capture_output=True, text=True, check=False, env=env)
+                              capture_output=True, text=True, check=False, env=env,
+                              pass_fds=((build_folders.build_folder_lock_fd(Path(env["GIT_INDEX_FILE"]).parent),)
+                                        if env is not None and "GIT_INDEX_FILE" in env else ()))
 
     def checked(*arguments: str, env: dict[str, str] | None = None) -> str:
         result = git(*arguments, env=env)
@@ -592,10 +593,8 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
                   checked("hash-object", "-w", "--path", str(path.resolve().relative_to(root)), "--", str(path.resolve())))
                  for path in paths]
         subject = f"change-review: {what}"
-        with tempfile.NamedTemporaryFile(delete=False) as temporary:
-            index = Path(temporary.name)
-        try:
-            index.unlink()
+        with build_folders.tool_folder("change-review-index") as temporary:
+            index = temporary / "index"
             environment = {**os.environ, "GIT_INDEX_FILE": str(index)}
             for attempt in range(5):
                 head = git("rev-parse", "--verify", "-q", "HEAD").stdout.strip()
@@ -613,8 +612,6 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
                     return
                 if attempt == 4 or git("rev-parse", "--verify", "-q", "HEAD").stdout.strip() == head:
                     raise ChangeReviewError(updated.stderr.strip() or "git update-ref failed")
-        finally:
-            index.unlink(missing_ok=True)
     except (ChangeReviewError, OSError) as error:
         reason = str(error).splitlines()[0]
         report_warning(f"change review: {paths[0]} written but not committed: {reason}; the next write commits it")
@@ -1481,9 +1478,9 @@ def _list_lock(path: Path) -> Generator[None]:
         os.close(descriptor)
 
 
-def describe(row: dict[str, str]) -> str:
+def describe(row: dict[str, str], *, record: staff.StaffSnapshot | None = None) -> str:
     """One row in plain lines: its id and change, how to check it, then each other column that has a value."""
-    record = staff.initial_snapshot()
+    record = staff.initial_snapshot() if record is None else record
     shown = dict(row)
     member = record.by_id(staff.StaffId(row.get(PRODUCTION, "")))
     if member is not None and not row.get("Verdict"):
@@ -1642,6 +1639,8 @@ def _verdict_write(
             reviewed_rows = list[str](("\n" + BODY[BODY.index(REVIEWED):]).splitlines(keepends=True))
             _insert(lines, len(lines), reviewed_rows)
         _add_column(path, lines, REVIEWED, "Merged")
+        if cells.get("Review log"):
+            _add_column(path, lines, REVIEWED, "Review log")
         if member is not None:
             _add_column(path, lines, REVIEWED, PRODUCTION)
         if PRODUCER in cells:
@@ -1725,6 +1724,30 @@ def _review_snapshots(paths: Iterable[Path], *, sources: list[Path] | None = Non
     return snapshots
 
 
+def record_review_log(path: Path, row: str, words: str, production: Path, who: str = "nate") -> None:
+    """Keep the user's Review action in the authoritative table row."""
+    from scripts.review_links import review_events
+    now = datetime.now().astimezone(user_zone())
+    def write(lines: list[str]) -> None:
+        for section in (SECTION, REVIEWED):
+            if not any(line.strip() == section for line in lines):
+                continue
+            columns, first, end = _table(path, lines, section)
+            index = next((index for index in range(first, end) if lines[index].startswith(f"| {row} |")), None)
+            if index is None:
+                continue
+            _add_column(path, lines, section, "Review log")
+            columns, first, end = _table(path, lines, section)
+            index = next(index for index in range(first, end) if lines[index].startswith(f"| {row} |"))
+            cells = dict(zip(columns, _cells(lines[index])))
+            events = review_events.decode(_plain(cells.get("Review log", "")))
+            event = review_events.ReviewLog(now, who, words)
+            cells["Review log"] = _cell(review_events.encode(review_events.append(events, event)))
+            lines[index] = _row(path, columns, cells)+"\n"
+            return
+    _edit(path, production, now.date(), write, lambda _: f"review {row}")
+
+
 def set_row_kind(path: Path, row: str, kind: str, production: Path) -> str:
     """Classify by whether the change alters something the user runs or sees."""
     if kind not in REVIEW_KINDS:
@@ -1747,7 +1770,9 @@ def end_row_scratch(path: Path, row: str) -> list[str]:
     A verdict ends the row either way: a row returned to its unit comes back as a new row.
     """
     try:
-        return [f"removed {folder}" for folder in scratch.end(f"row:{_owner(path)}-{row}")]
+        result = scratch.end(f"row:{_owner(path)}-{row}")
+        return ([f"removed {folder}" for folder in result]
+                + [f"kept {folder.path}: {folder.reason}" for folder in result.kept])
     except (scratch.ScratchError, OSError) as error:
         return [f"scratch not removed: {error}"]
 
@@ -1775,6 +1800,19 @@ def save_verdict(path: Path, row: str, verdict: str, production: Path) -> Verdic
     local_row = _row_id("row", row.rpartition("/")[2])
     shown = row_display_id(path, local_row)
     warnings: list[str] = []
+    root = change_routing.review_root()
+    delivery = change_routing.delivery_path(root, path, local_row)
+    slots = change_routing.delivery_slots(delivery)
+    empty_row: dict[str, str] = {}
+    pending_row = next((item for item in pending(path) if item["#"] == local_row), empty_row)
+    if slots.validation_requested and not lands(verdict) and pending_row.get("Review log"):
+        with file_lock.exclusive(root / ".review-link-delivery.lock"):
+            fields = cast(dict[str, object], json.loads(delivery.read_text()))
+            record_review_log(path, local_row, "Check found a problem: "+verdict, production,
+                              unit_lookup.doc_owner(production, staff.snapshot()).name)
+            _ = fields.pop("validation", None)
+            write_text_atomic(delivery, json.dumps(fields)+"\n")
+        return VerdictSaved([f"{shown}: the check found a problem; returned to For you"])
     result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append)
     return _verdict_output(path, local_row, shown, verdict, result, warnings)
 

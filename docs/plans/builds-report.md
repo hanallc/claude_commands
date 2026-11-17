@@ -1696,7 +1696,7 @@ Files: a new `scripts/disks/` folder (report owns it) and `config/disks.conf`. T
 #### Phase 95 — Measure and data file
 
 1. `config/disks.conf` keys: `drives.<machine>` (the mount points, natedev `/build` and `/`), `cache_seconds=600`, `slider.default_gib=10`, `slider.min_gib=1`, `measure.keep_bytes` (the smallest folder the data keeps, below the slider minimum), `measure.memory_max=2G`, `measure.timeout_seconds`.
-2. `scripts/disks/measure.py` measures one drive at a time. It runs `du -x -B1 --threshold=<keep_bytes>` under `systemd-run --user --scope -p MemoryMax=<memory_max>`, `nice -n 19` and `ionice -c3`.
+2. `scripts/disks/measure.py` measures the drives at the same time. Each drive runs `dust -x -D -j -P -o b -z <keep_bytes - 1> --config scripts/disks/dust.toml` under `systemd-run --user --scope -p MemoryMax=<memory_max>` and `nice -n 19` (sdlc-phases phase 44 replaced one `du` for each drive, one drive after the other).
 3. A file lock lets only one measure run. A second request while one runs does nothing.
 4. The result is a tree for each drive: path, size and children. The size of a folder's "Other" is its size minus its named children, so each level adds up to its parent.
 5. A chain of single large children collapses into one row, such as `/home/natepiano`.
@@ -1706,13 +1706,13 @@ Files: a new `scripts/disks/` folder (report owns it) and `config/disks.conf`. T
 
 ##### Phase 95 as-built
 
-- `config/disks.conf`: `output_folder` (`ysbjmg` under the review root), `drives` with the host key `drives.natedev=/build /`, `cache_seconds`, `slider.default_gib`, `slider.min_gib`, `measure.keep_bytes` (256 MiB), `measure.memory_max`, `measure.timeout_seconds`.
+- `config/disks.conf`: `output_folder` (`ysbjmg` under the review root), `drives` with the host key `drives.natedev=/build /`, `cache_seconds`, `slider.default_gib`, `slider.min_gib`, `measure.keep_bytes` (256 MiB), `measure.memory_max`, `measure.max_depth` and `measure.max_lines` (dust's depth and line limits), `measure.timeout_seconds`.
 - `scripts/disks/measure.py`:
-  - `du_command` runs `systemd-run --user --scope --quiet -p MemoryMax=<max> -- nice -n 19 ionice -c3 du -x -B1 --threshold=<keep_bytes> <mount>`. du exit 1 with output counts as a measure; some folders cannot be read.
+  - `dust_command` runs `systemd-run --user --scope --quiet -p MemoryMax=<max> -- nice -n 19 dust -x -D -j -P -o b -z <keep_bytes - 1> -d <measure.max_depth> -n <measure.max_lines> --config <scripts/disks/dust.toml> <mount>`. dust keeps a folder only above `-z`, so `keep_bytes - 1` keeps a folder of exactly `keep_bytes`. The empty `scripts/disks/dust.toml` stops dust from reading a personal config. dust counts a hard link once. A folder it cannot read leaves out its size, and the walk still counts as a measure. `parse_dust` reads its JSON into the sizes that `folder_tree` takes. `ionice` is gone: natedev's IO scheduler is `none`, so it had no effect.
   - `folder_tree`: each folder hangs from its nearest listed ancestor, largest first. `other` is the size less the listed children. `collapse` joins a folder with its only child while the folder's own files are below `keep_bytes`, as `home/natepiano`. The drive root never joins.
   - `drive_floors`: the home disk floor from `disk.read_floor`, and the other floors from `sweep.filesystem_floors`, matched by device.
-  - `measure` takes `disks.lock` without a wait; a busy lock exits 3. A timeout, a start failure or a failed du gives the drive an `error`, and the next drive still runs. `disks.json` holds `measured_at`, `keep_bytes` and the drives, with total, used, free, floor and tree.
-- Tests: `scripts/disks/test_measure.py` (the tree, Other, the collapse, the root, the command, a measure, the timeout, a failed du, the lock).
+  - `measure` takes `disks.lock` without a wait; a busy lock exits 3. It walks the drives at the same time, one thread for each drive, and keeps the config order. A timeout, a start failure (dust not on PATH) or a failed dust gives the drive an `error`, and the other drive still runs. `disks.json` holds `measured_at`, `keep_bytes` and the drives, with total, used, free, floor and tree.
+- Tests: `scripts/disks/test_measure.py` (the tree, Other, the collapse, the root, the command, a measure, both drives at once, the timeout, a start failure, a failed dust, the lock).
 - First real measure on natedev: 261 seconds for `/build` and `/`.
 
 #### Phase 96 — Drive cards: slider and walk
@@ -1815,6 +1815,8 @@ Name each action only from the data the page has. Drop the h/day sum plots, or m
 
 #### Phase 100 — Top costs as sentences, sum plots under Details
 
+The Builds page no longer shows the Build history plots, details and moments (buildsteady, C1780); Top 3 costs remains. The as-built notes below describe the code from before that change.
+
 ##### Phase 100 as-built
 
 - `scripts/buildlog/cost_actions.py` (new) names the action from the rows behind each cost:
@@ -1886,10 +1888,134 @@ From builds, relaying the user on C1672: the memory and the queue should be alwa
 As built:
 
 - Cause: `charts.chart_series` made a chart machine of each buildlog source folder. Each cloud gate host has its own folder, so about 1475 hosts gave 6 causes × 8 days of empty rows: 19.8 MB of the 19.9 MB `memory.json`.
-- `charts.chart_series` now takes only configured targets and machines with a step in the window.
+- `charts.chart_series` took only configured targets and machines with a step in the window. buildsteady removed the chart data, so `report.json` now holds Top 3 costs only.
 - `memory_feed.main` writes `report.json` beside `memory.json`, only when the report text changes. It writes `report.json` first. `memory.json` carries `report_version`, a sha256 prefix of that text, in place of `report`.
 - `memory_live.html` reads `memory.json` each 3 s as before. It reads `report.json` only when `report_version` changes.
 - Tests: `test_charts` (a folder with no step is no machine), `test_memory_feed` (one `report.json` write for two equal reads, written before `memory.json`), `memory_page_proof.mjs` (serves `report.json`).
+
+#### Disks fold — top level first, a working slider, distinct slot bands
+
+From the user (via builds, 2026-11-16): "disks has issues - the top level should be what shows and the sub level should be dynamically expandable/contractable with useful icons (say from lucide) the slider filters do not seem to be working at all the slot titles should be a little more disticntive from the slot rows for each section"
+
+As built:
+
+- Slider cause: each input event rebuilt the whole card, slider included, so a drag stopped after one step. `driveView` now builds each drive card once and keeps it across new data; a slider step, a toggle or new data changes only the head, the slider ends, the value and the rows. `refill` keeps the focus on the same row. The Slots and Sessions cards are fixed elements too. One `onToggle` listener answers a click, Enter and space.
+- The drive cards start with only the top folders; each folder opens and closes at a click. The Slots card starts with one band per repository; a click opens the band and lists its slots.
+- Icons: the Lucide 0.468.0 `chevron-right` turns down on an open row; the `folder` icon marks a repository. Both are inline SVG in `disks.html`.
+- A repository band has an accent-tinted background, a bold name and the count and size; its slot rows are indented.
+- Tests: `test_disks_page` runs `driveView` on a fake document and checks one card write, the same slider after a step and new data, and the rows after a toggle and a slider step; it fails on the old page. The slot test checks the folded and open bands. Chrome check: a drag across the slider now ends at its far end; after new data the slider, the focused row and the open band stay.
+
+#### buildsteady — a refresh keeps the viewed row; no Build history; a shorter Free tooltip
+
+From the user (via builds, 2026-11-16): "changes in the data on the builds page - refreshes - should not change the line the viewer is currently viewing - the builds page constantly jumps around right now and it is disorienting". On C1780: "i think we should remove this history from the builds page for the time being - i'm not learning anything and i want to redesign it later". On C1802: "isn't free and kept for other steps always going to be the same value? that doesn't seem helpful to repeat that".
+
+As built:
+
+- Cause: `renderWalk` replaced all of `#walk`, so the browser lost its scroll anchor, and the tooltip keys were row indexes.
+- `memory_feed.step_key` gives each running and waiting row a stable `key`: machine, kind, pid, start time, group and the CI cgroup. The page uses it in `data-tip`, `data-run` and every `row:`/`wait:` reader. A gone step hides its tooltip.
+- Before each render the page saves an anchor that is in view: the tooltip row, else the focused row, else the first keyed row or section. After the render it scrolls by the anchor's move. `overflow-anchor` is off. The focus, the open `details` and the tooltip stay.
+- The Build history head, plots, details and moments are gone. The feed no longer builds chart data; `charts.chart_data` and its chart-only helpers are deleted. The card keeps Top 3 costs. The recording code is unchanged.
+- The queue admits one step at a time, so only the step it admits next shows Free, Kept, Given back and Short by. The feed marks that step `first_in_line` from the admission head, so a token waiter ahead of it in the list does not take its rows. Every other step shows only Needs. From the user on the Images page: "anything that can't run next doesn't need to show what it goes first to - we can remove Free, goes first to and short by from any item that is after the first in line".
+- Tests: `memory_page_proof.mjs` steady block (old page: the viewed row moved 352 px and the tooltip showed another step; new page: 0 px) and an out-of-view focus check (a rule that took the focused row out of view moved the viewed rows 528 px; new page: 0 px); `test_memory_feed` (stable and unique keys, two CI rows with empty cgroups); `test_memory_hover` (keys, room rows on the first step only).
+
+#### disksmemo — rows start closed and stay as the viewer left them; the filter names top folders only
+
+From the user (via builds, 2026-11-16): "disks should start out collapsed and should remember it's collapse points as long as they are still valid between data updates and page refreshes". Later: "1. the slider doesn't drag - you can only just click on the background - that needs to be fixed 2. the folder of at least size is a filter for the top level only - everything under the top level can always be expanded out 3. the other (now only showing on top level) should also be expandable".
+
+As built:
+
+- Every folder row and every repository band starts closed.
+- `localStorage` key `disks-open` holds the open folder paths and the open repository names. A reload and new data keep them. `forgetGone` drops a folder path that the tree no longer has and a repository that the slot report no longer has. A drive with no tree keeps its paths.
+- The slider names top folders only. An open folder lists every child, and its small files show as one "Files and small folders" row.
+- The top-level Other row opens and lists the top folders under the slider value. Its key is `other:<mount>`; a folder path starts with "/", so no folder has this key.
+- `knownFolders` walks each tree as `folderRows` does, so a joined name such as `cargo/project` stays known. The drive with the longest mount owns a path.
+- Slider: a drag works in Chrome and Firefox, on the page alone and inside the console frame. The user's failure did not show on natedev. These changes guard it: the label is a `div`, so a press on the text does not move the thumb; the ends and the value have fixed widths, so the track does not change size during a drag; the value is written only when it changes.
+- Tests: `test_disks_page` checks that only top folders are filtered and that Other opens, and that open rows stay across a reload until their folder or repository is gone, with rows for a joined name, a folder named `|other` and a drive inside a drive with no tree. Both fail on the old page.
+
+#### gatenames — gate steps get readable names and a description (#108, #109, #97) · status: done
+
+The user approved mockup version 2 at 13:58 EST on 2026-11-16 (`~/rust/hanadocs/morty/gate-tooltip-mockup-v2.png`). Use "integrate" for "land" and "test nightly" for "nightly". Promote gets no step.
+
+| Step name | Description in the tooltip | Changes | Called today as |
+| --- | --- | --- | --- |
+| integrate | Merges the `<unit>` checkpoint into the `<showrunner>` branch, tests every module, then pushes `<showrunner>`. | branch `<showrunner>` | `merge_gate.py --checkpoint` |
+| test all | Tests every module of `<unit>`. | no branch | `merge_gate.py --tests-only --full` |
+| test modules | Tests `<N>` named modules of `<unit>`. | no branch | `merge_gate.py --tests-only --module X` |
+| test affected | Tests the modules that the `<unit>` change affects. | no branch | `targeted_test.py` |
+| test nightly | Tests the `<showrunner>` branch each night and records a red result with its owner. | no branch | `merge_gate.py --nightly` |
+
+1. The row name is "`<unit>` `<step>`". The tooltip title is "`<unit>` · `<step>`".
+2. Under the title the tooltip shows the description, then a "Changes" row, then the rows it shows today.
+3. The names and description templates live in config, not in code.
+4. The feed reads the job from the pid's command line. The queue does not change.
+5. A `--promote` run shows integrate only.
+6. Disks "Used by" (#97) uses the same name source: "`<unit>` `<step>`", for example "handler integrate".
+7. From the user (via builds), on the Slots pane: "how could the cargo-liner slots both be showing the same merge?" Cause: `copies.py` `standing()` writes `work='gate'` and `purpose='gate · <base commit subject>'` for every slot take, so a `verify.sh test` or `lint` run shows as a gate of main's last merge. Fix at the source: the lease names the real work (the unit and the step, such as test or lint) from the same name source. Never "gate" for a run that is not a gate, and never the base commit subject.
+
+As built:
+
+- `build_steps.command_job` finds the script after a python or shell interpreter, then reads its arguments. `merge_gate.py` gives integrate, test all, test modules, test nightly or promote; `--tests-only` tests every module. `targeted_test.py` gives test affected, test all with `--full` or test modules with `--module`. `verify.sh [--session-dir <dir>] <step>` gives that step. `--promote` gives integrate. Any other command is `OtherCommand`.
+- `config/build_steps.conf` holds the step names, the `[about]` sentences and the `[changes]` text. `StepNames.about` and `StepNames.changes` fill them. An unknown unit gives no sentence.
+- The feed reads `/proc/<pid>/cmdline` for a merge-gate or targeted-test row (`memory_feed.step_job`). The result is a job or a named state: not a gate step, pid not recorded, command unreadable, or another command. The row name and the tooltip title use the job step; the row carries `about` and `changes`. The queue is unchanged.
+- The tooltip shows the description as a caption under the title, then a Changes row, then the rows it showed before.
+- Slot lease: `copies.standing` takes a `step` key. It writes `work=<step>` and `purpose=<shown step name>`. `copies.run` passes the job of its command, else the program name. Every other caller names its work: `merge_gate.py --nightly` test-nightly, `bump_gate.py` integrate, `fast_track.py` promote and fast-track, `ci_points` ci, `waiting.scratch_test` test, `rust_release` toolchain-trial, the style checks style, lint or test, and `copies.py hold` hold. Only test fixtures use the default step run. `gate_purpose` and the base commit subject are gone.
+- Disks Used by: `slots.slot_use` names the staff id from the staff record and builds "`<unit>` `<step>`" with the same owner template as the Builds page, then shows the showrunner.
+- Director calls: the names use the unit that runs the job ("natemerge integrate"), as the mockup shows. "test affected" has no module count; the Testing row shows it. An unknown command uses its program name as the step.
+- Tests: `test_memory_feed` (each gate command gives its job, description and changes; the feed puts them on running and waiting rows), `test_memory_hover` (the caption and Changes rows follow the title), `test_copies` (the lease names the step), `test_slots` and `test_disks_page` (Used by). `memory_page_proof.mjs` checks the gate tooltip and saves `gate-tooltip-dark-desktop.png`.
+
+#### diskpanels — Slots and Sessions get definitions and row tooltips; Sessions gets a size filter · status: done
+
+From the user (via sdlc and builds, 2026-11-16): "sessions and slots should show a hoverable definition of what they are and how they work / what they contain - every row should contain a tooltip that for slots should be the same tooltip that is shown in the build queue so they share code and data  sessions should show all sessions and have a filter that limits the minimum size - like disks". The showrunner's terms: reuse the Builds page slot tooltip code and data, with no copy; Sessions shows every session (it showed 10, then "24 more") with a minimum-size filter like the drive cards.
+
+As built:
+
+- Shared code: `memory_live.html` marks its tooltip rules and its tooltip code with `shared:step-tip:start` and `shared:step-tip:end`. The code part holds `field`, `tooltipRows`, `tooltipHtml`, a new `tipRowsHtml`, a new `placeTipAt` and a new `hoverTips`, which holds the hover and click handlers. The Builds page now calls `hoverTips`; `showTip`, `hideTip` and `placeTip` stay as names.
+- `disks_page.shared_step_tip` reads both marked parts from the Builds page source at publish. The Disks page puts the rules in its style and the code in one function, so the names of the two pages do not collide.
+- Shared data: each Builds row in a slot carries `slot_folder` and `slot_machine` beside `slot` (`memory_feed.build_slot`). The Disks settings carry `builds_data`, the link from the Disks folder to the Builds `memory.json`. The page reads it at start and at each poll interval while it shows.
+- `scripts/build_queue/memory_files.py` holds the Builds page source, its data file name and its output folder. The Disks publisher reads them without the 0.4 s import of `memory_feed`.
+- A held slot that a Builds step runs in shows that step's tooltip, the same HTML as on the Builds page. The Builds data must be newer than `page.builds_max_age_seconds` (30). Any other slot shows its name and state, repository, size, last use, its user and showrunner, and the nightly sweep note. A repository band shows its slot count, size, slots in use and limit.
+- The Slots and Sessions titles carry an info mark and a definition tooltip. The slot definition takes the sweep age from `slots.unused_days`; the slot report now carries `machine` and `unused_days`.
+- Sessions shows every session. A slider "Show sessions of at least" starts at "any size"; its other steps run on a log scale from the measure's least folder to the largest session. The smaller sessions join one row with its own tooltip. Each session row shows a tooltip with its state, size and held folders with their tasks. The card is built once, so a drag goes on across new data. When new data leaves the slider no range, the filter goes back to "any size".
+- `page.sessions_shown` is deleted from `config/disks.conf`.
+- Tests: `test_disks_page` (the published page holds the marked parts; the filter rows; the sessions card keeps its slider and limit across new data; the tooltip of each row kind, and a slot run tooltip equal to `tooltipHtml` of its Builds row on the right machine), `test_memory_feed` (`slot_folder` and `slot_machine`), `test_memory_hover`. A Chrome check on live data hovers each tooltip, checks that none is cut or outside the window, and saves the dark desktop shot.
+
+#### gatefix — A build's Uses counts its compilers; the tooltip names the branch first; CI rows say their job · status: done
+
+From the user (via the Images page, 2026-11-16), on the gate tooltip shot: "why do you say branch sdlc instead of sdlc branch which is more natural? SHowrunner - can you use a real one? i don't know what fixture-production is Runs on "fixture" what is fixture? Uses 0.0 GiB? why does it say that - uses 0.0 has to be a bug - isn't that the bug we have right now? please do better". On the Disks shot: "yes - it should use the same tooltip - a working, fixed tooltip, to be sure!".
+
+Cause of "Uses 0.0 GiB": `~/.cargo/config.toml` sets `rustc-wrapper = "sccache"`. The sccache server starts each compiler in `builds.slice/sccache.service`, not in the step scope. A build's Uses held only cargo, and the compile memory showed in the compiler cache row. The queue also kept the full need aside for that build while its compilers already took that RAM from MemAvailable. On 2026-11-16 the research build in `hana-slot4` showed 0.0 GiB at 778 of 831 units; its scope peak at the link was 13.7 GiB.
+
+As built:
+
+- `invoke.sh`: the step scope exports `BUILDLOG_STEP_SCOPE`, its cgroup folder. sccache gives each compiler its client's environment (checked on natedev with a marker variable). sccache hashes `CARGO_*` variables and the variables that rustc dependency data names. No crate reads `BUILDLOG_STEP_SCOPE`, so cache keys do not change.
+- `memory_admit.sccache_memory` groups the service's processes by the scope each one names (`CompilerJob`, a new field `jobs` on `CompilerServiceMemory`). The compiler cache bytes leave out the jobs.
+- `memory_admit.attributed_step_uses` adds a scope's jobs to the step that holds that scope. Uses, Build reserved, the cap and the progress profiles now count the step's compilers. A job whose scope has no reservation counts in "Other build tools".
+- `memory_feed.build_tool_ram` leaves the jobs out of the compiler cache line.
+- `config/build_steps.conf`: Changes reads "sdlc branch" and "main branch".
+- The Builds proof uses real names: showrunner sdlc, unit handler, machine natedev, and a real Uses for the gate row.
+- Steps that started before the merge keep the old reading until they end. The admission service and the review-links server load the new code on their own.
+
+From the user (via builds, 2026-11-16): "the \"showrunner\" underneath the CI steps in the build queue are messed up - too long - and the actual CI step  that says CI /run/hana-ci-admission/.. - i don't even know what that is but it has to be a bug".
+
+Cause: each hana runner's `cargo` is a store front, `ci_cargo_front.py --front <cargo> --shared-folder /run/hana-ci-admission/<runner> -- <words>`. `memory_feed.cargo_job` matched the `--front` value as cargo and read the shared folder as the job.
+
+- `parse.cargo_front_call` splits the front's options from cargo's words. `ci_cargo_front.main` and `memory_feed.cargo_job` both use it, so a CI row says its job ("CI build", "CI tests").
+- Under a CI step the Builds page shows the label's first part ("hana CI"). The tooltip title keeps the whole label with the runner and the job.
+
+#### overcap — The Builds bar draws build reserved over the queue cap · status: done
+
+From the user (via builds, 2026-11-16), on two Builds shots: "how am i to interpret this overage of 34.6 of 29.9 taken - i see the que cap of 29.9 - but where does it show that it has been overtaken in the memory bar above? I don't think it does". Then: "the rserved is actually a number that we're NOT taking we're just reporting it - we're eating back into the reserve but we're pretty safe because there is still so much of it". The user approved mockup 0f8ecf5d1a1c: "Go: report builds it as in the mockup".
+
+Cause: build reserved is room that running steps may still grow into, not RAM in use. Free RAM covers the safety net and swap coming back first. The bar drew only the covered part of the reserve and stopped at the cap line. Taken counts the full reserve, so it read 34.6 of 29.9 with no box for the 4.7. "builds 12.7" was 3.4 build tools + 9.1 queued builds + 0.2 hana CI, a part too narrow to see.
+
+As built:
+
+- `memory_live.html`: when build reserved is over the cap, a red dashed box (`b-overlay`) lies past the cap line over the safety net and swap, and a dashed "over cap" brace (`b-over`) sits beside "queue cap". The build reserved brace reads "<full> · <covered> covered".
+- The `over` tooltip shows Build reserved (full) − Free RAM after safety net and swap = Over cap. Then it shows what the reserve takes first if steps grow: the safety net, swap coming back, then cache and other programs.
+- `statusLine`: when only the build reserve is not covered, the line says it is over the cap and that a reserve is not RAM in use. An uncovered safety net or swap keeps "reserves exceed free RAM".
+- The hana CI part is at least 3 px wide. Bar parts can shrink, so the bar still ends at its right edge.
+- Tests: `test_memory_hover` (brace list, status line row), the Builds proof (box at the cap line, brace and box widths, labels, tooltip sums, no box when nothing is over the cap; the shot `over-cap-dark-desktop.png`).
+- Tests: `test_memory_admit` (a step's use and kept bytes count its compilers; the sccache reading groups compilers by scope and leaves out the server), `test_invoke_scope` (the step sees `BUILDLOG_STEP_SCOPE`), `test_memory_feed`, `test_memory_hover`, and the Builds proof.
 
 ### Tokens — The Builds page shows the jobserver tokens · status: done
 
@@ -1898,6 +2024,9 @@ From builds, relaying the user: "sometime i see the build is waiting for a token
 As built:
 
 - `memory_feed.token_pool` runs `stevie -a -t -j` (floor MiB, free, total) from the `stevie_program` path in `config/memory_feed.conf`; the feed service PATH does not hold the system programs folder. The pool is paused while the admission's MemAvailable is under the floor.
+- The memory bar legend starts collapsed; the page refresh keeps it open once the user opens it. It has no "How free is worked out" section: the Free tooltip explains free. The missing-readings fault shows under the RAM-disagree line.
+- Space toggles a pause on the Builds page. A paused page reads no data and does not reload; a "Paused" badge shows at the top, and tooltips still open. The console sends a space press outside a control to the open page as `console-space`, so the pause works before a click in the frame.
+- A queued step's tooltip shows Free as the page's Free row. When the step's own admission room differs, a "− Kept for other steps" or "+ Given back by other steps" line shows the difference, and Short by uses the step's room. A step that left to wait for the Cargo token says "Waits for: Cargo token".
 - The Running header shows "Tokens: N total, M free", or "Tokens: unavailable". Its hover says what a token is, that hana CI has its own pool, and the memory floor.
 - In the memory pause, a token wait stage reads "waiting for jobserver tokens (memory under 12 GiB)". A remote row keeps the plain stage.
 - The Running table has a Tokens column after Slot. Each `token_dump_seconds` (config, 10 s), the feed reads the newest steve dump from the journal, then runs `systemctl --no-ask-password reload steve` for the next one. Each holder pid counts for its nearest ancestor that is a local, non-CI run pid. A dump counts only when its holder lines add up to the taken tokens; an incomplete dump gives way to the one before it. The next request time starts after the request, so slow reads never shorten the interval.

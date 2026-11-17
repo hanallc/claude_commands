@@ -15,16 +15,15 @@ from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 from scripts.lib import atomic_file, conf, file_lock
 from scripts.production.change_review import ChangeReviewError
 from scripts.production.production_doc import Refusal
-from scripts.review_links import change_page, review_link
+from scripts.review_links import change_page, page_frame, review_link, review_legacy
 
 PAGE_NAME = "console.html"
 # The console posts the open page here and reads which other pages hold new items.
 NEWS_NAME = "news"
 # The console script's placeKey uses the same prefix for the place it keeps for each page.
 PLACE_PREFIX = "at."
-ICONS = Path(__file__).with_name("lucide")
-ICON_NAMES = frozenset(("list-checks", "hammer", "cloud", "hard-drive", "image", "message-circle-question", "panel-left-close",
-                        "panel-left-open", "menu", "refresh-cw", "sparkle", "users"))
+ICON_NAMES = frozenset(("list-checks", "inbox", "hammer", "cloud", "hard-drive", "image", "message-circle-question", "panel-left-close",
+                        "panel-left-open", "menu", "refresh-cw", "sparkle", "users", "search"))
 REFERENCE = re.compile(r"python:([a-zA-Z_][\w.]*)\:([a-zA-Z_]\w*)")
 # The console folder keeps the items each page held when the user last opened it, for every browser.
 SEEN_NAME = ".review-link-seen.json"
@@ -177,8 +176,7 @@ def icon_svg(name: str) -> str:
     """Read only the vendored icons used by the console."""
     if name not in ICON_NAMES:
         raise ValueError(f"unsupported console icon: {name}")
-    source = (ICONS / f"{name}.svg").read_text(encoding="utf-8")
-    return source[source.index("<svg"):].replace("<svg", '<svg aria-hidden="true" focusable="false"', 1)
+    return page_frame.icon_svg(name)
 
 
 def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | UnavailablePage) -> bytes:
@@ -212,6 +210,7 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
     content = content.replace("<!-- CLOSE -->", icon_svg("panel-left-close"))
     content = content.replace("<!-- OPEN -->", icon_svg("panel-left-open"))
     content = content.replace("<!-- MENU -->", icon_svg("menu") + '<span class="new-mark" id="menu-new" hidden>' + new_mark + '</span>')
+    content = content.replace('<script>', '<script>'+review_legacy.SCRIPT, 1)
     return content.encode("utf-8")
 
 
@@ -408,6 +407,16 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     } catch (_) {}
   }
   function select(identity, navigate = false) {
+    if (['changes','questions','investigations'].includes(identity) && entries.some(entry=>entry.dataset.page==='review')) {
+      const kind={changes:'change',questions:'question',investigations:'investigation'}[identity];
+      const url=new URL(location.href);
+      const previous=new URL(url.searchParams.get('at.'+identity) || '/console/changes.html',location.origin);
+      const filters=new URLSearchParams(previous.search);
+      for(const [key,value] of new URLSearchParams(previous.hash.slice(1))) filters.set(key,value);
+      reviewPlace(filters,kind);filters.set('type',kind);
+      url.searchParams.set('at.review','/console/review.html#'+filters);
+      history.replaceState(null,'',url);identity='review';
+    }
     const selected = pages.find(entry => entry.dataset.page === identity) || entries[0];
     if (!selected) return;
     pages.forEach(entry => {
@@ -450,6 +459,15 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
   phone.addEventListener('change', () => collapse(phone.matches || desktopCollapsed));
   document.getElementById('nav-dismiss').addEventListener('click', () => collapse(true, true));
   document.addEventListener('keydown', event => { if (event.key === 'Escape') collapse(true, true); });
+  // Space outside a control goes to the open page, so a page such as Builds can pause without a click in its frame first.
+  document.addEventListener('keydown', event => {
+    if (event.code !== 'Space' || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
+    if (event.target.closest?.('input, textarea, select, button, summary, [contenteditable]')) return;
+    const frame = [...frames.values()].find(candidate => !candidate.hidden);
+    if (!frame) return;
+    event.preventDefault();
+    frame.contentWindow.postMessage('console-space', location.origin);
+  });
   select(new URL(location.href).searchParams.get('page'));
   let rebuildTimer;
   async function loadRebuilds() {

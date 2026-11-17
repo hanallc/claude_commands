@@ -12,8 +12,6 @@ from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-import fcntl
-import hashlib
 import json
 import math
 import os
@@ -22,10 +20,16 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
-import tempfile
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 import uuid
 
+from scripts.lib.dev_shell import (
+    ShellEnvironment as ShellEnvironment,
+    exports_are_valid as exports_are_valid,
+    prepare_shell as prepare_shell,
+    shell_inputs as shell_inputs,
+    shell_key as shell_key,
+)
 from scripts.mac_test.abandoned_sessions import removal_script
 
 if TYPE_CHECKING:
@@ -59,95 +63,6 @@ def slot_boot(lease: SlotRun, current_boot: str, *, require_boot_identity: bool 
     if not identity:
         raise ValueError('invalid slot boot identity')
     return SlotBoot.CURRENT if identity == current_boot else SlotBoot.PREVIOUS
-
-
-@dataclass(frozen=True)
-class ShellEnvironment:
-    """Exports published after a successful shell evaluation."""
-
-    key: str
-    exports: Path
-    inputs: Path
-
-
-def shell_inputs(root: Path) -> tuple[Path, ...]:
-    """List the shell inputs without source files or build output."""
-    paths = [root / 'flake.nix', root / 'flake.lock']
-    nix = root / 'nix'
-    if nix.is_symlink():
-        raise ValueError('unsafe shell input directory: nix')
-    if nix.exists():
-        children = tuple(nix.rglob('*'))
-        if any(path.is_symlink() for path in children):
-            raise ValueError('shell inputs must not contain symbolic links')
-        paths.extend(path for path in children if not path.is_dir())
-    for path in paths:
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f'unsafe or missing shell input: {path}')
-        for parent in path.relative_to(root).parents:
-            if (root / parent).is_symlink():
-                raise ValueError(f'unsafe shell input directory: {parent}')
-    return tuple(sorted(paths, key=lambda path: path.relative_to(root).as_posix()))
-
-
-def shell_key(root: Path, selector: str) -> str:
-    digest = hashlib.sha256()
-    digest.update(selector.encode() + b'\0')
-    for path in shell_inputs(root):
-        name = path.relative_to(root).as_posix().encode()
-        content = path.read_bytes()
-        digest.update(len(name).to_bytes(8, 'big') + name)
-        digest.update(len(content).to_bytes(8, 'big') + content)
-    return digest.hexdigest()
-
-
-def exports_are_valid(exports: Path) -> bool:
-    """Reevaluate exports when a referenced store path no longer exists."""
-    text = exports.read_text()
-    roots: list[str] = re.findall(r'/nix/store/[a-z0-9]{32}-[A-Za-z0-9+._?=-]+', text)
-    return bool(text.strip()) and all(Path(root).exists() for root in roots)
-
-
-def prepare_shell(root: Path, cache: Path, selector: str, timeout_s: float) -> ShellEnvironment:
-    """Publish immutable shell inputs and exports under a content key."""
-    key = shell_key(root, selector)
-    cache.mkdir(parents=True, exist_ok=True)
-    destination = cache / key
-    with (cache / f'{key}.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        exports = destination / 'exports.sh'
-        if exports.is_file() and exports_are_valid(exports):
-            return ShellEnvironment(key, exports, destination / 'inputs')
-        if not destination.exists():
-            with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-                    f".{key}.", build_folders.ExplicitBuildParent(cache))) as stage:
-                inputs = stage / 'inputs'
-                inputs.mkdir()
-                for path in shell_inputs(root):
-                    target = inputs / path.relative_to(root)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    _ = shutil.copyfile(path, target)
-                if shell_key(inputs, selector) != key:
-                    raise ValueError('shell inputs changed during the copy')
-                os.replace(stage, destination)
-        inputs = destination / 'inputs'
-        if shell_key(inputs, selector) != key:
-            raise ValueError('cached shell inputs do not match their key')
-        result = subprocess.run(
-            ['nix', 'print-dev-env', f'path:{inputs}#{selector}'],
-            capture_output=True, text=True, check=True, timeout=timeout_s,
-        )
-        if not result.stdout.strip():
-            raise ValueError('nix returned no shell exports')
-        with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=destination, delete=False) as output:
-            temporary = Path(output.name)
-            try:
-                _ = output.write(result.stdout)
-                output.flush()
-                os.replace(temporary, exports)
-            finally:
-                temporary.unlink(missing_ok=True)
-    return ShellEnvironment(key, exports, destination / 'inputs')
 
 
 def positive_setting(values: dict[str, str], key: str) -> float:

@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import unittest
 from collections.abc import Sequence
 from contextlib import redirect_stdout
@@ -16,20 +17,24 @@ from scripts.lib import file_lock
 
 GIB = 1 << 30
 KEEP = 256 << 20
-DU_OUTPUT = "\n".join((
-    f"{40 * GIB}\t/fixture/home/natepiano/rust/target",
-    f"{50 * GIB}\t/fixture/home/natepiano/rust",
-    f"{2 * GIB}\t/fixture/home/natepiano/.cache",
-    f"{60 * GIB}\t/fixture/home/natepiano",
-    f"{60 * GIB + 100}\t/fixture/home",
-    f"{5 * GIB}\t/fixture/nix/store",
-    f"{5 * GIB + 10}\t/fixture/nix",
-    f"{70 * GIB}\t/fixture",
-)) + "\n"
+
+
+def dust_folder(name: str, size: int, *children: measure.DustFolder) -> measure.DustFolder:
+    return {"name": name, "size": f"{size}B", "children": list(children)}
+
+
+DUST_OUTPUT = json.dumps(dust_folder("/fixture/", 70 * GIB,
+    dust_folder("/fixture/home", 60 * GIB + 100,
+        dust_folder("/fixture/home/natepiano", 60 * GIB,
+            dust_folder("/fixture/home/natepiano/rust", 50 * GIB,
+                dust_folder("/fixture/home/natepiano/rust/target", 40 * GIB)),
+            dust_folder("/fixture/home/natepiano/.cache", 2 * GIB))),
+    dust_folder("/fixture/nix", 5 * GIB + 10,
+        dust_folder("/fixture/nix/store", 5 * GIB))))
 
 
 def settings(folder: Path, *drives: str) -> measure.MeasureSettings:
-    return measure.MeasureSettings(drives, KEEP, "2G", 30, folder)
+    return measure.MeasureSettings(drives, KEEP, "2G", 30, folder, 7, 128)
 
 
 def no_floors(mounts: Sequence[str]) -> dict[int, int | None]:
@@ -38,7 +43,7 @@ def no_floors(mounts: Sequence[str]) -> dict[int, int | None]:
 
 class TreeTests(unittest.TestCase):
     def tree(self) -> measure.Folder:
-        return measure.folder_tree("/fixture", measure.parse_du(DU_OUTPUT), KEEP)
+        return measure.folder_tree("/fixture", measure.parse_dust(DUST_OUTPUT), KEEP)
 
     def test_each_folder_hangs_from_its_nearest_listed_ancestor_by_size(self) -> None:
         root = self.tree()
@@ -66,11 +71,13 @@ class TreeTests(unittest.TestCase):
         root = measure.folder_tree("/fixture", {"/fixture": 3 * GIB, "/fixture/data": 3 * GIB}, KEEP)
         self.assertEqual([child["name"] for child in root["children"]], ["data"])
 
-    def test_du_command_runs_at_idle_priority_under_the_memory_cap(self) -> None:
-        command = measure.du_command("/build", settings(Path("/unused"), "/build"))
+    def test_dust_command_runs_at_idle_priority_under_the_memory_cap(self) -> None:
+        command = measure.dust_command("/build", settings(Path("/unused"), "/build"))
+        config = Path(measure.__file__).with_name("dust.toml")
         self.assertEqual(command[:7], ["systemd-run", "--user", "--scope", "--quiet", "-p", "MemoryMax=2G", "--"])
-        self.assertEqual(command[7:], ["nice", "-n", "19", "ionice", "-c3", "du", "-x", "-B1",
-                                       f"--threshold={KEEP}", "/build"])
+        self.assertEqual(command[7:], ["nice", "-n", "19", "dust", "-x", "-D", "-j", "-P", "-o", "b",
+                                       "-z", str(KEEP - 1), "-d", "7", "-n", "128", "--config", str(config), "/build"])
+        self.assertTrue(config.is_file())
 
 
 class MountTests(unittest.TestCase):
@@ -108,9 +115,11 @@ class MeasureTests(unittest.TestCase):
 
         def runner(argv: Sequence[str], timeout: int) -> subprocess.CompletedProcess[str]:
             self.assertEqual(timeout, 30)
-            return subprocess.CompletedProcess(argv, 1, f"{KEEP * 2}\t{argv[-1]}\n", "du: cannot read 'x'")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(dust_folder(argv[-1], KEEP * 2)),
+                                               "Did not have permissions for all directories")
 
         self.assertEqual(measure.measure(settings(folder, str(folder)), runner, no_floors), 0)
+        self.assertGreater(self.data(folder)["render_seconds"], 0)
         drive = self.data(folder)["drives"][0]
         self.assertEqual(drive.get("floor"), 300 * GIB)
         self.assertGreater(drive.get("total", 0), 0)
@@ -119,27 +128,60 @@ class MeasureTests(unittest.TestCase):
 
     def test_a_timeout_records_an_error_and_the_next_drive_still_runs(self) -> None:
         folder = self.temporary()
-        calls: list[str] = []
+        second_mount = folder / "second"
+        second_mount.mkdir()
 
         def runner(argv: Sequence[str], timeout: int) -> subprocess.CompletedProcess[str]:
-            calls.append(argv[-1])
-            if len(calls) == 1:
+            if argv[-1] == str(folder):
                 raise subprocess.TimeoutExpired(list(argv), timeout)
-            return subprocess.CompletedProcess(argv, 0, f"{KEEP}\t{argv[-1]}\n", "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(dust_folder(argv[-1], KEEP)), "")
 
-        self.assertEqual(measure.measure(settings(folder, str(folder), str(folder)), runner, no_floors), 0)
+        self.assertEqual(measure.measure(settings(folder, str(folder), str(second_mount)), runner, no_floors), 0)
         first, second = self.data(folder)["drives"]
         self.assertEqual(first.get("error"), "the measure stopped after 30 seconds")
         self.assertNotIn("error", second)
 
-    def test_a_failed_du_records_its_last_error_line(self) -> None:
+    def test_a_failed_dust_records_its_last_error_line(self) -> None:
+        folder = self.temporary()
+        for code, output, error, expected in (
+            (2, "", "first\nMemoryMax: bad value", "dust exited 2: MemoryMax: bad value"),
+            (1, "", "first\nNo such file or directory: /missing", "dust exited 1: No such file or directory: /missing"),
+            (0, "", "", "dust exited 0: no output"),
+            (2, json.dumps(dust_folder(str(folder), KEEP)), "walk failed", "dust exited 2: walk failed"),
+        ):
+            with self.subTest(code=code, error=error):
+                def runner(argv: Sequence[str], timeout: int) -> subprocess.CompletedProcess[str]:
+                    self.assertEqual(timeout, 30)
+                    return subprocess.CompletedProcess(argv, code, output, error)
+
+                _ = measure.measure(settings(folder, str(folder)), runner, no_floors)
+                self.assertEqual(self.data(folder)["drives"][0].get("error"), expected)
+
+    def test_both_drives_start_before_either_walk_ends_and_keep_the_config_order(self) -> None:
+        folder = self.temporary()
+        second_mount = folder / "second"
+        second_mount.mkdir()
+        barrier = threading.Barrier(2)
+
+        def runner(argv: Sequence[str], timeout: int) -> subprocess.CompletedProcess[str]:
+            _ = barrier.wait(timeout=min(timeout, 5))
+            size = KEEP if argv[-1] == str(folder) else KEEP * 2
+            return subprocess.CompletedProcess(argv, 0, json.dumps(dust_folder(argv[-1], size)), "")
+
+        self.assertEqual(measure.measure(settings(folder, str(folder), str(second_mount)), runner, no_floors), 0)
+        drives = self.data(folder)["drives"]
+        self.assertEqual([drive["mount"] for drive in drives], [str(folder), str(second_mount)])
+        self.assertEqual([drive.get("tree", {}).get("size") for drive in drives], [KEEP, KEEP * 2])
+
+    def test_a_start_failure_records_why_the_measure_did_not_start(self) -> None:
         folder = self.temporary()
 
-        def runner(argv: Sequence[str], _timeout: int) -> subprocess.CompletedProcess[str]:
-            return subprocess.CompletedProcess(argv, 2, "", "first\nMemoryMax: bad value")
+        def runner(argv: Sequence[str], timeout: int) -> subprocess.CompletedProcess[str]:
+            raise FileNotFoundError(f"dust absent: {argv[-1]} ({timeout} seconds)")
 
         _ = measure.measure(settings(folder, str(folder)), runner, no_floors)
-        self.assertEqual(self.data(folder)["drives"][0].get("error"), "du exited 2: MemoryMax: bad value")
+        self.assertEqual(self.data(folder)["drives"][0].get("error"),
+                         f"the measure did not start: dust absent: {folder} (30 seconds)")
 
     def test_a_second_measure_exits_while_one_holds_the_lock(self) -> None:
         folder = self.temporary()

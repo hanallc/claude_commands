@@ -437,6 +437,15 @@ class CargoSubcommandTests(unittest.TestCase):
                 self.assertEqual(parse.cargo_subcommand((option, "metadata", "check")), "check")
         self.assertEqual(parse.cargo_subcommand(("--config",)), "")
 
+    def test_cargo_front_call_splits_front_options_from_cargo_words(self) -> None:
+        for words, call in (
+                (("--front", "/f/cargo", "--shared-folder", "/run/x", "--cargo", "/c", "--", "build"),
+                 parse.CargoFrontCall("/f/cargo", "/run/x", "/c", ("build",))),
+                (("--front", "/f/cargo", "--", "--front", "test"), parse.CargoFrontCall("/f/cargo", "", "", ("--front", "test"))),
+                (("check",), parse.CargoFrontCall("", "", "", ("check",)))):
+            with self.subTest(words=words):
+                self.assertEqual(parse.cargo_front_call(words), call)
+
 
 if __name__ == "__main__":
     _ = unittest.main()

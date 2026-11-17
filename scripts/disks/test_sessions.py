@@ -33,7 +33,7 @@ class ReadSessionsTests(unittest.TestCase):
             _ = (root / "notes.txt").write_text("")
             # The measure finds the session root under the build drive, where the mount table puts it.
             backing = PurePath("/build") / root.relative_to("/")
-            data: DisksData = {"measured_at": 0, "keep_bytes": GIB // 4, "drives": [
+            data: DisksData = {"render_seconds": 0.01, "measured_at": 0, "keep_bytes": GIB // 4, "drives": [
                 {"mount": "/build", "tree": folder("/build", 500 * GIB, [folder(str(backing.relative_to("/build")), 40 * GIB, [
                     folder("fps", 28 * GIB, [folder("run", 21 * GIB)]), folder("lfo", 7 * GIB)])])}]}
             mounts = (Mount("254:0", PurePath("/"), PurePath("/build")), Mount("254:0", PurePath("/") / root.relative_to("/"), root))
