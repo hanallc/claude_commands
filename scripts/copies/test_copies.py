@@ -58,6 +58,29 @@ class WaitNotice(io.StringIO):
         return count
 
 
+class ImportTests(unittest.TestCase):
+    def test_import_loads_no_modules_from_unit_labels(self) -> None:
+        program = dedent("""
+            import sys
+            import scripts.copies.copies
+
+            forbidden = {
+                "scripts.message.unit_labels",
+                "scripts.production.showrunners",
+                "scripts.production.session_staff",
+                "scripts.lib.unit_runs",
+            }
+            unwanted = sorted(forbidden.intersection(sys.modules))
+            if unwanted:
+                raise SystemExit("Unexpected imports: " + ", ".join(unwanted))
+        """)
+        result = subprocess.run(
+            [sys.executable, "-c", program], cwd=Path(__file__).resolve().parents[2],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 class StandingTests(unittest.TestCase):
     source_seed: ClassVar[ImmutableGitSeed]
     base: Path = Path()
