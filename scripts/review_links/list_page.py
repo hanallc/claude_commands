@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, cast
 from urllib.parse import parse_qs, urlencode
 
 from scripts.lib import conf
@@ -27,7 +27,15 @@ from scripts.review_links import question_record
 from scripts.statusline import counts_row, rebuild_row
 
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/list.html"
-HEADERS = ("#", "Owner", "Producer", "Item", "State", "Next step", "ETA", "Update")
+FIELD_LABELS = {
+    "title": "Title", "owner": "Owner", "producer": "Producer", "unit": "Unit", "state": "State",
+    "next_check": "Next check", "eta": "ETA", "blocked_by": "Blocked by", "related_to": "Related to",
+    "requested_by": "Requested by", "next_step": "Next step", "latest_status": "Latest status",
+    "evidence": "Evidence", "done_when": "Done when", "parked_until": "Parked until",
+    "closing_words": "Closing words",
+}
+HEADERS = ("#", FIELD_LABELS["owner"], FIELD_LABELS["producer"], "Item",
+           *(FIELD_LABELS[field] for field in ("state", "next_step", "eta")), "Update")
 SHOWS = (("open", "Open"), ("needs-me", "Needs me"), ("unread", "Unread"), ("done", "Done"),
          ("parked", "Parked"), ("closed", "Closed"), ("all", "All"))
 
@@ -82,6 +90,64 @@ def eta_text(eta: the_list.Eta, today: datetime) -> str:
     if isinstance(eta, the_list.EtaRange):
         return local_time(eta.earliest, today) + " – " + local_time(eta.latest, today)
     return the_list.eta_text(eta)
+
+
+def field_html(field: str, value: object, today: datetime, names: staff_names.StaffNames) -> str:
+    if field in ("owner", "producer"):
+        owner = cast(the_list.ItemOwner, value)
+        return names.html(owner, owner_name(names.members, owner))
+    if field == "eta":
+        return html.escape(eta_text(cast(the_list.Eta, value), today))
+    if field == "parked_until":
+        if not isinstance(value, datetime):
+            return "Not parked"
+        zone = today.tzinfo
+        assert zone is not None
+        return the_list.parking_date(value, zone)
+    if isinstance(value, datetime):
+        return html.escape(local_time(value, today))
+    if isinstance(value, the_list.CheckCondition):
+        return html.escape(value.text)
+    if field in ("next_step", "latest_status", "done_when", "closing_words"):
+        return change_browser.question_paragraphs(cast(str, value) or "Not recorded")
+    if field == "unit":
+        return names.html(cast(str, value)) or "Not recorded"
+    if field == "blocked_by":
+        dependencies = cast(tuple[the_list.ItemDependency, ...], value)
+        return html.escape(", ".join(f"L{entry.number} ({entry.condition})" for entry in dependencies)) or "None"
+    if field == "related_to":
+        return ", ".join(f"L{number}" for number in cast(tuple[int, ...], value)) or "None"
+    return html.escape(cast(str, value)) or "Not recorded"
+
+
+def log_entry_html(change: the_list.ItemChange, today: datetime, names: staff_names.StaffNames) -> str:
+    content = change.what
+    by = " <small>— " + names.html(change.source, owner_name(names.members, staff.StaffId(change.source))) + "</small>"
+    if isinstance(content, the_list.FieldChange):
+        heading = content.action + by
+        fields = ''.join(f'<dt>{FIELD_LABELS[field]}</dt><dd>{field_html(field, value, today, names)}</dd>'
+                         for field, value in content.fields.items())
+        body = f'<strong>{heading}</strong><dl>{fields}</dl>'
+    elif isinstance(content, the_list.PageFeedback):
+        label = {"pending": "Feedback for morty", "sent": "Feedback sent to morty",
+                 "alerted": "Feedback could not reach morty"}[content.state]
+        body = label + by + change_browser.question_paragraphs(content.words)
+    elif isinstance(content, the_list.QuestionAnswered):
+        body = "Answered question " + html.escape(content.question_id) + by
+    elif isinstance(content, the_list.MarkedRead):
+        body = "Marked read" + by
+    elif isinstance(content, the_list.Reopened):
+        body = "Reopened" + by
+    elif isinstance(content, the_list.ReviewLinksChanged):
+        body = content.action + ": " + html.escape(", ".join(content.keys)) + by
+    elif isinstance(content, the_list.EvidenceCopyRemoved):
+        body = f"Removed the migration copy of {content.copy} from {FIELD_LABELS['evidence']}" + by
+    elif isinstance(content, str):
+        body = html.escape(content) + by
+    else:
+        return ""
+    return ('<li><time datetime="' + change.time.isoformat() + '">' + html.escape(local_time(change.time, today))
+            + '</time><div>' + body + '</div></li>')
 
 
 def item_link(keeper: staff.StaffId, number: int) -> str:
@@ -156,9 +222,8 @@ def review_card(identity: str, reviews: Mapping[str, review_items.ReviewItem]) -
 def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[str, review_items.ReviewItem],
             names: staff_names.StaffNames) -> str:
     item = entry.item
-    sections = ''.join('<section><h3>' + heading + '</h3>'
-                       + change_browser.question_paragraphs(text or "Not recorded") + '</section>'
-                       for heading, text in (("Latest status", item.latest_status), ("Done when", item.done_when)))
+    sections = ''.join(f'<section><h3>{FIELD_LABELS[field]}</h3>{field_html(field, value, today, names)}</section>'
+                       for field, value in (("latest_status", item.latest_status), ("done_when", item.done_when)))
     links = [f'<li><a data-record-jump href="{html.escape(item_link(entry.keeper, link.number), quote=True)}">#{link.number}</a>'
              + ' — ' + html.escape(link.condition) + '</li>' for link in item.blocked_by]
     links.extend(f'<li>Related: <a data-record-jump href="{html.escape(item_link(entry.keeper, number), quote=True)}">#{number}</a></li>'
@@ -166,15 +231,15 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[st
     if links:
         sections += '<section><h3>Links</h3><ul>' + ''.join(links) + '</ul></section>'
     if item.state == the_list.ItemState.CLOSED:
-        sections += '<section><h3>Closing words</h3>' + change_browser.question_paragraphs(item.closing_words) + '</section>'
+        sections += (f'<section><h3>{FIELD_LABELS["closing_words"]}</h3>'
+                     + field_html("closing_words", item.closing_words, today, names) + '</section>')
     if item.reviews:
         cards = (review_card(identity, reviews) for identity in item.reviews)
         sections += '<p>' + review_summary(item, reviews, today) + '</p><p>' + ' · '.join(cards) + '</p>'
     sections += ''.join(page_question.open_question_html(question) if question.answer is None
                         else page_question.answered_question_html(question) for question in item.questions)
-    log = ''.join('<li><time datetime="' + change.time.isoformat() + '">' + html.escape(local_time(change.time, today))
-                  + '</time><span>' + html.escape(change.what) + ' <small>— ' + names.html(change.source)
-                  + '</small></span></li>' for change in reversed(item.log) if not the_list.is_page_request_receipt(change))
+    log = ''.join(log_entry_html(change, today, names) for change in reversed(item.log)
+                  if not the_list.is_page_request_receipt(change))
     return ('<div class="list-panel"><div>' + sections + feedback_form(entry, secret)
             + '</div><section><h3>Log · newest first</h3><ol class="list-log">' + log + '</ol></section></div>')
 
@@ -203,19 +268,19 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
               + f'aria-label="Show item {item.number}"><span class="list-chevron" aria-hidden="true">›</span>{item.number}</button>')
     title = '<strong>' + html.escape(item.title) + '</strong>'
     if item.unit:
-        title += '<small>' + names.html(item.unit) + '</small>'
+        title += '<small>' + field_html("unit", item.unit, today, names) + '</small>'
     tone = {the_list.ItemState.WAITING_FOR_NATE: "warning", the_list.ItemState.BLOCKED: "error",
             the_list.ItemState.WORKING: "accent", the_list.ItemState.DELIVERED: "room",
             the_list.ItemState.DONE: "room"}.get(item.state, "muted")
-    state = f'<span class="list-state {tone}">{html.escape(item.state.value)}</span>'
+    state = f'<span class="list-state {tone}">' + field_html("state", item.state, today, names) + '</span>'
     if item.state != the_list.ItemState.CLOSED:
         if isinstance(item.next_check, datetime):
             label = "Check overdue " if item.next_check < today else "Check "
-            state += '<small>' + label + html.escape(local_time(item.next_check, today)) + '</small>'
+            state += '<small>' + label + field_html("next_check", item.next_check, today, names) + '</small>'
         elif isinstance(item.next_check, the_list.CheckCondition):
-            state += '<small>Check: ' + html.escape(item.next_check.text) + '</small>'
+            state += '<small>Check: ' + field_html("next_check", item.next_check, today, names) + '</small>'
     if parked and isinstance(item.parked_until, datetime):
-        state += '<small data-parked-note>Parked until ' + html.escape(local_time(item.parked_until, today)) + '</small>'
+        state += '<small data-parked-note>Parked until ' + field_html("parked_until", item.parked_until, today, names) + '</small>'
     if item.reviews:
         state += '<small>' + review_summary(item, reviews, today) + '</small>'
     update = '<span class="list-dot" role="img" aria-label="Unread update"></span>' if unread else '<span aria-label="No unread update">—</span>'
@@ -227,8 +292,8 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
             notice = ("not sent; " + names.html(feedback.alerted_to) + " told" if feedback.alerted_to
                       else "not sent; no showrunner for alert")
         update += '<small>' + notice + ", " + html.escape(local_time(sent, today)) + '</small>'
-    cells = (number, names.html(item.owner, owner), names.html(item.producer, producer), title, state, change_browser.question_paragraphs(item.next_step or "Not recorded"),
-             html.escape(eta_text(item.eta, today)), update)
+    cells = (number, field_html("owner", item.owner, today, names), field_html("producer", item.producer, today, names),
+             title, state, field_html("next_step", item.next_step, today, names), field_html("eta", item.eta, today, names), update)
     row = ''.join(f'<td' + (' class="record-id"' if label == '#' else '')
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden = ' hidden' if parked or item.state in (the_list.ItemState.DONE, the_list.ItemState.CLOSED) else ''
@@ -252,8 +317,10 @@ class ListQuestionDelivery:
 def fresh_request(root: Path, keeper: str, identity: str) -> dict[str, str]:
     request = secrets.token_hex(16)
     item = the_list.load(staff.StaffId(keeper), identity)
-    today = the_list.now().astimezone(user_zone())
-    parked_until = local_time(item.parked_until, today) if isinstance(item.parked_until, datetime) and item.parked_until > today else ""
+    zone = user_zone()
+    today = the_list.now()
+    parked_until = (the_list.parking_date(item.parked_until, zone)
+                    if isinstance(item.parked_until, datetime) and item.parked_until > today else "")
     return {"request": request, "token": request_token(root, keeper, identity, request),
             "unread": str(isinstance(item.unread_since, datetime)).lower(), "item_state": item.state.value,
             "parked": str(bool(parked_until)).lower(), "parked_until": parked_until}
@@ -459,6 +526,10 @@ STYLE = record_table.STYLE + '''<style>
 .list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
 .list-tell [value="tell"]{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
 .list-tell button:disabled{opacity:.45;cursor:default}.list-tell [data-send-status]{margin-left:0}
+.list-log dl{display:grid;grid-template-columns:min(7rem,42%) minmax(0,1fr);gap:2px 12px;margin:4px 0 0}
+.list-log dt{color:var(--ink-3)}.list-log dd{margin:0;overflow-wrap:anywhere}
+.list-log dd>:last-child{margin-bottom:0}
+.list-log dl li{display:list-item;padding:0;border:0}
 .page-question p{white-space:pre-wrap;overflow-wrap:anywhere}
 .list-table td[data-label="State"]{color:var(--ink)}
 .list-table td[data-label="Producer"],.list-table td[data-label="ETA"]{color:var(--ink-2)}

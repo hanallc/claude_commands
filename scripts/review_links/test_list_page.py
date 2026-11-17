@@ -443,6 +443,144 @@ frame.addEventListener('load',async()=>{
         self.assertRegex(body, r'data-color-text="role.producer"[^>]*>morty</span>')
         self.assertIn('<td data-label="Owner">nate</td>', body)
 
+    def test_added_log_shows_staff_colors_local_eta_and_field_labels(self) -> None:
+        _ = self.add("Log labels")
+        body = list_page.render(self.root / "reviews").decode()
+        log = body.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
+        self.assertRegex(log, r'Owner</dt><dd><span[^>]*data-color-text="role.showrunner"[^>]*>sdlc</span>')
+        self.assertRegex(log, r'Producer</dt><dd><span[^>]*data-color-text="role.producer"[^>]*>morty</span>')
+        self.assertIn("ETA</dt><dd>14:00 EST – 15:00 EST</dd>", log)
+        self.assertIn("State</dt><dd>Working</dd>", log)
+        self.assertIn("Next step</dt><dd>", log)
+        self.assertIn("Latest status</dt><dd>", log)
+        for text in (OWNER.id, MORTY.id, "EtaRange(", "next_step", "latest_status"):
+            self.assertNotIn(text, log)
+
+    def test_updated_log_shares_the_eta_and_next_step_renderers(self) -> None:
+        item = self.add("Log an update")
+        _ = the_list.update(MORTY.id, item.id, {
+            "eta": NOW + timedelta(hours=3), "next_step": "Read the **new** result <first>."}, source="morty")
+        body = list_page.render(self.root / "reviews").decode()
+        log = body.split('<ol class="list-log">', 1)[1].split("</li>", 1)[0]
+        self.assertIn("Updated", log)
+        for label, expected in (("ETA", "16:00 EST"), ("Next step", "Read the <strong>new</strong> result &lt;first&gt;.")):
+            cell = body.split(f'<td data-label="{label}">', 1)[1].split("</td>", 1)[0]
+            self.assertIn(expected, cell)
+            self.assertIn(f"{label}</dt><dd>{cell}</dd>", log)
+
+    def test_legacy_log_text_renders_with_a_new_field_change(self) -> None:
+        item = self.add("Keep the original log")
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        base, _, _ = path.read_text().partition("## Log\n\n")
+        _ = path.write_text(base + "## Log\n\n- 2026-11-16 17:30:00+00:00 Recorded <old words> — nate\n")
+        original = the_list.load(MORTY.id, item.id)
+        _ = the_list.update(MORTY.id, item.id, {"eta": NOW + timedelta(hours=3),
+            "evidence": 'Source checkins.json item:\n\n{"owner": "sdlc"}\n'}, source="morty")
+        _ = the_list.clean_evidence(MORTY.id, source="morty")
+        _ = the_list.link(MORTY.id, item.id, ("review<key>",), source="morty")
+        _ = the_list.unlink(MORTY.id, item.id, ("review<key>",), source="morty")
+        _ = the_list.close(MORTY.id, item.id, "Keep this record.", source="morty")
+        _ = the_list.reopen(MORTY.id, item.id, source="morty")
+        self.assertEqual(the_list.load(MORTY.id, item.id).log[0], original.log[0])
+        body = list_page.render(self.root / "reviews").decode()
+        log = body.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
+        self.assertIn("Recorded &lt;old words&gt;", log)
+        self.assertIn("ETA</dt><dd>16:00 EST</dd>", log)
+        self.assertIn("Linked reviews: review&lt;key&gt;", log)
+        self.assertIn("Unlinked reviews: review&lt;key&gt;", log)
+        self.assertIn("Reopened <small>", log)
+        self.assertIn("Removed the migration copy of checkins.json from Evidence", log)
+
+    def legacy_log(self, *lines: str) -> str:
+        item = self.add("Keep the original log")
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        body, marker, _ = path.read_text().partition("## Log\n\n")
+        _ = path.write_text(body + marker + "\n".join(lines) + "\n")
+        rendered = list_page.render(self.root / "reviews").decode()
+        return rendered.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
+
+    def test_old_added_log_uses_the_field_renderer(self) -> None:
+        fields = {"title": "Keep the original log", "owner": OWNER.id, "producer": MORTY.id,
+                  "state": "Working", "eta": repr(the_list.EtaRange(NOW + timedelta(hours=1), NOW + timedelta(hours=2))),
+                  "next_step": 'Read "the result"; then check the page.\nKeep the note.'}
+        note = "; ".join(f"{key}: {json.dumps(value)}" for key, value in fields.items())
+        log = self.legacy_log("- 2026-11-16 18:00:00+00:00 Added; " + note + " — nate")
+        self.assertRegex(log, r'Owner</dt><dd><span[^>]*data-color-text="role.showrunner"[^>]*>sdlc</span>')
+        self.assertRegex(log, r'Producer</dt><dd><span[^>]*data-color-text="role.producer"[^>]*>morty</span>')
+        self.assertIn("State</dt><dd>Working</dd>", log)
+        self.assertIn("ETA</dt><dd>14:00 EST – 15:00 EST</dd>", log)
+        self.assertIn("Next step</dt><dd>", log)
+        self.assertIn('Read &quot;the result&quot;; then check the page.', log)
+        self.assertNotIn("EtaRange", log)
+
+    def test_old_updated_log_reads_descriptions_and_datetimes(self) -> None:
+        log = self.legacy_log(
+            "- 2026-11-16 18:10:00+00:00 Updated eta: "
+            + json.dumps("EtaDescription(text='Pending (check 16:45 EST)')")
+            + '; next_step: "Wait for the check." — morty',
+            '- 2026-11-16 18:20:00+00:00 Updated eta: "2026-11-16 21:00:00+00:00" — morty',
+            '- 2026-11-17 16:54:58.780107+00:00 Updated next_check: "2026-11-17 16:00:00-05:00" — morty, 11:54 EST',
+            '- 2026-11-17 03:12:17.088559+00:00 Updated state: "Working" — builds, 22:12 EST')
+        self.assertIn("ETA</dt><dd>Pending (check 16:45 EST)</dd>", log)
+        self.assertIn("ETA</dt><dd>16:00 EST</dd>", log)
+        self.assertIn("Next check</dt><dd>2026-11-17 16:00 EST</dd>", log)
+        self.assertIn("State</dt><dd>Working</dd>", log)
+        self.assertNotIn("EtaDescription", log)
+
+    def test_old_feedback_log_uses_the_feedback_renderer(self) -> None:
+        rows = [
+            json.dumps({"request": "feedback", "words": "Read the **result** <today>.",
+                        "state": state, "alerted_to": alerted_to})
+            for state, alerted_to in (("pending", ""), ("sent", ""), ("alerted", "sdlc"))
+        ]
+        log = self.legacy_log(*(
+            "- 2026-11-16 18:10:00+00:00 Feedback to morty: " + row + " — nate via List" for row in rows))
+        for label in ("Feedback for morty", "Feedback sent to morty", "Feedback could not reach morty"):
+            self.assertIn(label, log)
+        self.assertEqual(log.count("Read the <strong>result</strong> &lt;today&gt;."), 3)
+        self.assertNotIn("&quot;request&quot;", log)
+
+    def test_old_park_log_uses_the_local_date_renderer(self) -> None:
+        log = self.legacy_log(
+            "- 2026-11-16 18:10:00+00:00 Parked until 2026-11-17T05:00:00+00:00 — nate",
+            "- 2026-11-16 18:20:00+00:00 Parked until not parked — nate")
+        self.assertIn("Parked until</dt><dd>2026-11-17</dd>", log)
+        self.assertIn("Parked until</dt><dd>Not parked</dd>", log)
+        self.assertNotIn("2026-11-17T05:00:00+00:00", log)
+
+    def test_park_date_matches_the_response_and_table(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Park this item")
+        _ = the_list.park(MORTY.id, item.id, the_list.time_value("2026-11-18T02:00:00+00:00"), source="nate")
+        with self.subTest(view="table"):
+            body = list_page.render(root).decode()
+            self.assertIn("Parked until 2026-11-17</small>", body)
+            self.assertIn("Parked until</dt><dd>2026-11-17</dd>", body)
+        with self.subTest(view="response"):
+            self.assertEqual(list_page.fresh_request(root, MORTY.id, item.id)["parked_until"], "2026-11-17")
+
+    def test_old_closed_log_uses_the_closing_words_renderer(self) -> None:
+        log = self.legacy_log("- 2026-11-16 18:10:00+00:00 Closed: The **check** passed. — nate")
+        self.assertIn("Closing words</dt><dd>", log)
+        self.assertIn("The <strong>check</strong> passed.", log)
+
+    def test_old_log_keeps_unparseable_notes_as_text(self) -> None:
+        log = self.legacy_log(
+            "- 2026-11-16 18:00:00+00:00 Added on sdlc's request <old words> — nate",
+            '- 2026-11-16 18:10:00+00:00 Updated state: "Working"; next_step: invalid — nate',
+            '- 2026-11-16 18:20:00+00:00 Updated state: "Done" — nate',
+            '- 2026-11-16 18:30:00+00:00 Updated title: "" — nate',
+            r'- 2026-11-16 18:40:00+00:00 Updated unit: "first\nsecond" — nate')
+        self.assertIn("Added on sdlc&#x27;s request &lt;old words&gt;", log)
+        self.assertIn("Updated title: &quot;&quot;", log)
+        self.assertIn(r"Updated unit: &quot;first\nsecond&quot;", log)
+        self.assertIn("next_step: invalid", log)
+        self.assertEqual(log.count("<dl>"), 1)
+        self.assertIn("State</dt><dd>Done</dd>", log)
+
+    def test_log_entries_share_one_label_column(self) -> None:
+        self.assertIn(".list-log dl{display:grid;grid-template-columns:min(7rem,42%) minmax(0,1fr)", list_page.STYLE)
+
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="list-page-test-")))
@@ -510,6 +648,10 @@ frame.addEventListener('load',async()=>{
                          [item.number for item in sorted(the_list.records(MORTY.id, include_closed=True), key=the_list.order)])
         closed = body.split(f'data-key="{MORTY.id}/L54"', 1)[1].split('</tbody>', 1)[0]
         self.assertNotIn('Check overdue', closed)
+        with patch.dict(list_page.FIELD_LABELS, {"closing_words": "Recorded closing words"}):
+            renamed = list_page.render(self.root / "reviews").decode()
+        self.assertIn("<h3>Recorded closing words</h3>", renamed)
+        self.assertIn("<dt>Recorded closing words</dt>", renamed)
         _ = the_list.update(MORTY.id, "L106", {"title": "New title <script>", "latest_status": "New status"}, source="morty")
         changed = list_page.render(self.root / "reviews").decode()
         self.assertIn('New title &lt;script&gt;', changed)
@@ -807,7 +949,8 @@ frame.addEventListener('load',async()=>{
             delivery = list_page.submit(root, urlencode(fields))
             closed = the_list.load(MORTY.id, item.id)
             self.assertEqual(closed.state, the_list.ItemState.CLOSED)
-            self.assertEqual(sum(entry.what.startswith("Closed:") for entry in closed.log), 1)
+            self.assertEqual(sum(isinstance(entry.what, the_list.FieldChange) and entry.what.action == "Closed"
+                                 for entry in closed.log), 1)
             send.assert_not_called()
             list_page.deliver(delivery)
             self.assertEqual(send.call_args.args[2], f"List page: nate removed item {item.number}.")
@@ -995,7 +1138,7 @@ window.fetch=async(_path,options={})=>{
  const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
  const labels=()=>[...row.querySelectorAll('[data-label="State"] small')].map(note=>note.textContent);
  try{
-  check(labels().join() === 'Parked until 2026-11-18 13:00 EST','starts with one saved date label');
+  check(labels().join() === 'Parked until 2026-11-18','starts with one saved date label');
   form.elements.until.value='2026-12-03';
   const park=submit('park');losePost();await flush();
   check(submit('park')===park,'an exact Park retry keeps its request ID');
@@ -1004,9 +1147,9 @@ window.fetch=async(_path,options={})=>{
   finishPost({reason:'Fixture refuses Remove'});await flush();
   form.elements.until.value='2026-12-04';
   check(submit('park')!==park,'a different Park date gets a different ID');
-  finishPost({item_state:'Working',parked:'true',parked_until:'2026-12-05 00:00 EST'});await flush();
+  finishPost({item_state:'Working',parked:'true',parked_until:'2026-12-05'});await flush();
   check(labels().length===1,'a successful Park keeps one date label');
-  check(labels().join()==='Parked until 2026-12-05 00:00 EST','the label uses the saved date from the response');
+  check(labels().join()==='Parked until 2026-12-05','the label uses the saved date from the response');
  }catch(error){failures.push(String(error));}
  const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
 })();
@@ -1147,6 +1290,9 @@ window.fetch=async(_path,options={})=>{
         self.assertIn("<h3>Answer</h3><p>The &lt;filter&gt; changed.</p>", answered)
         self.assertIn('aria-label="Unread update"', answered)
         self.assertIn('value="read">Mark read</button>', answered)
+        log = answered.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
+        self.assertIn("Answered question Q1 <small>", log)
+        self.assertIn("Marked read <small>", log)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_restores_open_row_and_shows_the_refusal_after_a_lost_remove(self) -> None:
@@ -1338,7 +1484,7 @@ window.fetch=async(_path,options={})=>{
             send.assert_not_called()
             item = the_list.load(MORTY.id, item.id)
             self.assertIs(item.unread_since, the_list.NoTimestamp.UNSET)
-            self.assertEqual(item.log[-1].what, "Marked read")
+            self.assertEqual(item.log[-1].what, the_list.MarkedRead())
             for action, extra, words in (
                     ("park", {"until": "2026-12-03"}, "List page: nate parked item 106 until 2026-12-03."),
                     ("tell", {"words": "Explain this simply.\nKeep these words."}, "Explain this simply.\nKeep these words."),
@@ -1347,14 +1493,19 @@ window.fetch=async(_path,options={})=>{
                     fields = self.fields(item, action, **extra)
                     delivery = list_page.submit(root, urlencode(fields))
                     item = the_list.load(MORTY.id, item.id)
-                    self.assertEqual(the_list.feedback_requests(item)[fields["request"]].words, words)
+                    feedback = the_list.feedback_requests(item)[fields["request"]]
+                    self.assertEqual(feedback.words, words)
                     if action == "tell":
-                        self.assertEqual(item.log[-1].what, "Marked read")
-                    self.assertIn(json.dumps(words), item.log[-2 if action == "tell" else -1].what)
+                        self.assertEqual(item.log[-1].what, the_list.MarkedRead())
+                    self.assertEqual(item.log[-2 if action == "tell" else -1].what, feedback)
                     self.assertEqual(the_list.sent_to_morty(item), NOW)
                     body = list_page.render(root).decode()
                     self.assertIn("sent to morty, 13:00 EST", without_role_colors(body))
                     self.assertIn('data-feedback-form', body)
+                    log = body.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
+                    self.assertIn("Feedback for morty", log)
+                    self.assertIn(html.escape(words.splitlines()[0]), log)
+                    self.assertNotIn(fields["request"], log)
                     list_page.deliver(delivery)
                     self.assertEqual(send.call_args.args[0], MORTY.id)
                     expected = "List page: nate's words for item 106\n" + words if action == "tell" else words
@@ -1386,20 +1537,20 @@ window.fetch=async(_path,options={})=>{
         mark.assert_called_once_with(MORTY.id, item.id, source=the_list.PAGE_SOURCE, update=the_list.unread_update(item))
         saved = the_list.load(MORTY.id, item.id)
         self.assertIs(saved.unread_since, the_list.NoTimestamp.UNSET)
-        self.assertEqual([(entry.what, entry.source) for entry in saved.log if entry.what == "Marked read"],
-                         [("Marked read", the_list.PAGE_SOURCE)])
+        self.assertEqual([(entry.what, entry.source) for entry in saved.log if isinstance(entry.what, the_list.MarkedRead)],
+                         [(the_list.MarkedRead(), the_list.PAGE_SOURCE)])
         self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].words, "Keep this result.")
 
     def test_tell_on_a_read_item_adds_no_read_log_entry(self) -> None:
         item = self.add("An update already read")
         item = the_list.mark_read(MORTY.id, item.id, source="nate")
-        before = tuple(entry for entry in item.log if entry.what == "Marked read")
+        before = tuple(entry for entry in item.log if isinstance(entry.what, the_list.MarkedRead))
         fields = self.fields(item, "tell", words="Keep this result.")
         with patch.object(the_list, "mark_read", wraps=the_list.mark_read) as mark:
             _ = list_page.submit(self.root / "reviews", urlencode(fields))
         mark.assert_not_called()
         saved = the_list.load(MORTY.id, item.id)
-        self.assertEqual(tuple(entry for entry in saved.log if entry.what == "Marked read"), before)
+        self.assertEqual(tuple(entry for entry in saved.log if isinstance(entry.what, the_list.MarkedRead)), before)
         self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].words, "Keep this result.")
 
     def test_refused_tell_keeps_the_unread_update_and_log(self) -> None:
@@ -1425,7 +1576,7 @@ window.fetch=async(_path,options={})=>{
             delivery = list_page.submit(root, urlencode(fields))
         saved = the_list.load(MORTY.id, item.id)
         self.assertEqual(saved.unread_since, item.unread_since)
-        self.assertFalse(any(entry.what == "Marked read" for entry in saved.log))
+        self.assertFalse(any(isinstance(entry.what, the_list.MarkedRead) for entry in saved.log))
         self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].words, "Keep this result.")
         self.assertEqual(list_page.fresh_request(root, MORTY.id, item.id)["unread"], "true")
         with patch.object(change_page, "send_to_staff") as send:
@@ -1442,7 +1593,7 @@ window.fetch=async(_path,options={})=>{
         saved = the_list.load(MORTY.id, item.id)
         self.assertEqual(saved, newer)
         self.assertEqual(len(the_list.feedback_requests(saved)), 1)
-        self.assertEqual(sum(entry.what == "Marked read" for entry in saved.log), 1)
+        self.assertEqual(sum(isinstance(entry.what, the_list.MarkedRead) for entry in saved.log), 1)
 
     def test_conflicting_tell_keeps_a_newer_update_unread(self) -> None:
         item = self.add("Refuse new words under the saved request")
@@ -1469,7 +1620,7 @@ window.fetch=async(_path,options={})=>{
         saved = the_list.load(MORTY.id, item.id)
         self.assertEqual(saved.unread_since, item.unread_since)
         self.assertEqual(saved.latest_status, "A newer result arrived.")
-        self.assertFalse(any(entry.what == "Marked read" for entry in saved.log))
+        self.assertFalse(any(isinstance(entry.what, the_list.MarkedRead) for entry in saved.log))
         self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].words, "Keep this result.")
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
