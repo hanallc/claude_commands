@@ -1835,6 +1835,9 @@ class ChangePageTests(unittest.TestCase):
         _ = self.file_other_change()
         _ = self.file_user_question()
         _, _, body = self.browser()
+        self.assertIn('</h1><p class="page-status"', body)
+        self.assertIn(page_frame.STYLE, body)
+        self.assertLess(body.index('data-page-status '), body.index('<div data-review-content'))
         assert_status_states(self, body, 15)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
@@ -1842,6 +1845,9 @@ class ChangePageTests(unittest.TestCase):
         _ = self.file_other_change()
         _ = self.file_user_question()
         _, _, body = self.browser("questions")
+        self.assertIn('</h1><p class="page-status"', body)
+        self.assertIn(page_frame.STYLE, body)
+        self.assertLess(body.index('data-page-status '), body.index('<div data-review-content'))
         assert_status_states(self, body, 15)
 
     def test_user_question_answers_follow_each_typed_relay(self) -> None:

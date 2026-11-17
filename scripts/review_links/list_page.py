@@ -345,7 +345,7 @@ def render(root: Path) -> bytes:
                + '<input type="search" id="list-search" placeholder="Filter by number or title">'
                + '<span data-list-count role="status" aria-live="polite"></span></div>'
                + '<div class="list-table"><table aria-label="The List"><colgroup><col style="width:5%"><col style="width:8%">'
-               + '<col style="width:22%"><col style="width:15%"><col style="width:27%"><col style="width:17%"><col style="width:6%">'
+               + '<col style="width:22%"><col style="width:15%"><col style="width:25%"><col style="width:17%"><col style="width:8%">'
                + '</colgroup><thead><tr>' + headers + '</tr></thead>'
                + ''.join(item_rows(entry, members, today, index, secret) for index, entry in enumerate(items)) + '</table>'
                + '<p data-empty hidden>No items in this view.</p></div>' + counts_strip(members) + '</div><script>' + SCRIPT + '</script>')

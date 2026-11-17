@@ -3,7 +3,7 @@ from __future__ import annotations
 
 STYLE = '''<style>
 [hidden]{display:none!important}body{background:var(--bg);color:var(--ink)}
-main{max-width:1440px;font-size:15px;line-height:1.5}
+main{font-size:15px;line-height:1.5}
 .list-filters{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
 .list-filters label{display:inline;color:var(--ink-2)}
 .list-filters select,.list-filters input{font:inherit;min-height:44px;padding:7px 10px;border:1px solid var(--line);

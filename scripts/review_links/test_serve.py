@@ -153,11 +153,11 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
         _ = self.enterContext(patch.object(disks_page, "output_folder", return_value=self.root / "disks"))
         start = self.enterContext(patch.object(disks_page, "start_measure", return_value=disks_page.MeasureStart.STARTED))
-        report: slots.SlotReport = {"root": "/build/slot", "groups": []}
+        report: slots.SlotReport = {"root": "/build/slot", "machine": "natedev", "unused_days": 7, "groups": []}
         _ = self.enterContext(patch.object(slots, "slot_report", return_value=report))
         folders: sessions.SessionReport = {"root": "/session", "sessions": []}
         _ = self.enterContext(patch.object(sessions, "session_report", return_value=folders))
-        answer = b'{"state": "started", "slots": {"root": "/build/slot", "groups": []}, "sessions": {"root": "/session", "sessions": []}}'
+        answer = b'{"state": "started", "slots": {"root": "/build/slot", "machine": "natedev", "unused_days": 7, "groups": []}, "sessions": {"root": "/session", "sessions": []}}'
         self.assertEqual(self.post("/disks/measure", ""), (200, answer))
         self.assertEqual(start.call_count, 1)
         self.assertNotEqual(self.post("/other/measure", "")[0], 200)
