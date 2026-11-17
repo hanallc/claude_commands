@@ -940,7 +940,8 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertGreaterEqual(cast(Mock, self.read).call_count, 2)
 
     def test_start_waits_for_a_changing_native_registry_before_checking_the_prompt_target(self) -> None:
-        for registry in ("ready after two reads", "identity changes after two reads", "changing until deadline", "unavailable"):
+        for registry in ("ready after two reads", "identity changes after two reads", "target unknown once",
+                         "changing until deadline", "unavailable"):
             with self.subTest(registry=registry):
                 self.elapsed = 0
                 self.typed.clear()
@@ -959,6 +960,8 @@ class PromptSubmissionTests(unittest.TestCase):
                     events.append("native")
                     if registry in {"ready after two reads", "identity changes after two reads"} and events.count("native") == 3:
                         return self.transcript.session_id
+                    if registry == "target unknown once":
+                        return self.transcript.session_id
                     try:
                         if registry == "unavailable":
                             raise herdr.NativeRegistryUnavailable("fixture registry unavailable")
@@ -967,8 +970,10 @@ class PromptSubmissionTests(unittest.TestCase):
                         raise herdr_types.HerdrFailure("fixture native identity unavailable") from error
 
                 def check_target(*_args: object, **_kwargs: object) -> object:
-                    self.assertEqual(events.count("native"), 3)
                     events.append("target")
+                    if registry == "target unknown once" and events.count("target") == 1:
+                        return False
+                    self.assertEqual(events.count("native"), 2 if registry == "target unknown once" else 3)
                     return cast(object, unittest.mock.DEFAULT)
 
                 with (patch.object(self.client, "native_session", side_effect=native_session) as native,
@@ -976,11 +981,14 @@ class PromptSubmissionTests(unittest.TestCase):
                       redirect_stderr(io.StringIO()) as errors):
                     outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
                         ["--resume", requested.session_id],
-                        herdr.OpeningPrompt("resume the saved work", requested, publications.append), 300)
-                if registry in {"ready after two reads", "identity changes after two reads"}:
+                        herdr.OpeningPrompt("resume the saved work", requested, publications.append), 1000)
+                if registry in {"ready after two reads", "identity changes after two reads", "target unknown once"}:
                     self.assertIsInstance(outcome, herdr.PromptSubmitted)
-                    self.assertEqual(native.call_count, 3)
-                    self.assertEqual(events[:4], ["native", "native", "native", "target"])
+                    if registry == "target unknown once":
+                        self.assertEqual(events[:4], ["native", "target", "native", "target"])
+                    else:
+                        self.assertEqual(native.call_count, 3)
+                        self.assertEqual(events[:4], ["native", "native", "native", "target"])
                     self.assertEqual(target.call_args_list[0], call(self.transcript.session_id,
                         action="keys", place=herdr.HerdrPlace(self.client.session, "destination:p1")))
                     self.assertEqual(publications, [self.transcript])
@@ -992,11 +1000,9 @@ class PromptSubmissionTests(unittest.TestCase):
                     target.assert_not_called()
                     self.assertEqual(self.typed, [])
                     self.assertIn("native session is unavailable", errors.getvalue())
-                    if registry == "changing until deadline":
-                        self.assertAlmostEqual(self.elapsed, 0.3)
-                    else:
-                        self.assertEqual(native.call_count, 1)
-                        self.assertEqual(self.elapsed, 0)
+                    self.assertAlmostEqual(self.elapsed, 1.0)
+                    self.assertEqual(native.call_count, 5)
+                    self.assertEqual(errors.getvalue().count("native session is unavailable"), 1)
 
     def test_slash_command_recorded_as_command_tags_is_submitted_once(self) -> None:
         text = "/showrunner:produce /x/doc.md resume"
