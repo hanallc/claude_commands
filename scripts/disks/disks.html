@@ -310,12 +310,14 @@ function cardTitle(name, about, root) {
 
 // The Slots card: one band per repository; an open band lists its slots with size, last use and holder.
 // A slot below the measure's least folder shows as below it; a slot on no measured drive shows no size.
-function slotsHtml(report, keepBytes, now, opened) {
+// step gives the Builds step in a held slot, or null.
+function slotsHtml(report, keepBytes, now, opened, step = () => null) {
   const slotSize = bytes => esc(measuredSize(bytes, keepBytes));
   const usedBy = row => {
     if (row.used_by) {
-      // The work as the Builds page names it, such as "report integrate", then its showrunner.
-      return (row.used_by.name ? `<span class="tag run">${esc(row.used_by.name)}</span>` : "")
+      // The name of the Builds step in the slot, else the lease's work with the Builds names; then the showrunner.
+      const name = step(row)?.name || row.used_by.name;
+      return (name ? `<span class="tag run">${esc(name)}</span>` : "")
         + (row.used_by.showrunner ? `<span class="dim">${esc(row.used_by.showrunner)}</span>` : "");
     }
     return row.deleted_tonight ? '<span class="tag go">deleted tonight</span>' : "";
@@ -574,10 +576,14 @@ function sessionsView(card) {
   };
 }
 
+let slotsShown = "";
 function renderSlots() {
   const card = document.getElementById("slots");
   card.hidden = !slotReport;
-  if (slotReport) refill(card, "data-group", slotsHtml(slotReport, data ? data.keep_bytes : 0, Date.now() / 1000, opened.groups));
+  if (!slotReport) return;
+  const html = slotsHtml(slotReport, data ? data.keep_bytes : 0, Date.now() / 1000, opened.groups, slotStep);
+  // New Builds data comes every few seconds; the card changes only when its text does.
+  if (html !== slotsShown) refill(card, "data-group", slotsShown = html);
 }
 
 function renderCards() {
@@ -604,7 +610,19 @@ function render() {
   renderCards();
 }
 
-// The tooltip of each Disks row and card title. A slot that a Builds page step runs in shows that step's tooltip.
+// The Builds step that runs or waits in a held slot, from Builds data that is current; null for any other slot.
+function slotStep(slot) {
+  const age = builds ? Date.now() / 1000 - builds.read_at : NaN;
+  // A missing read time gives NaN, which fails this check.
+  if (!slot.used_by || !(age <= settings.builds_max_age_seconds)) return null;
+  const here = row => row.key && row.slot_folder === slot.name && row.slot_machine === slotReport.machine;
+  const run = builds.walk?.find(here);
+  if (run) return {tip: "row:" + run.key, name: run.name};
+  const wait = builds.waiters?.find(here);
+  return wait ? {tip: "wait:" + wait.key, name: wait.name} : null;
+}
+
+// The tooltip of each Disks row and card title. A slot that a Builds page step runs or waits in shows that step's tooltip.
 function tipFor(key) {
   const at = key.indexOf(":"), kind = key.slice(0, at), name = key.slice(at + 1);
   const keepBytes = data ? data.keep_bytes : 0;
@@ -617,11 +635,8 @@ function tipFor(key) {
     for (const group of slotReport.groups) {
       const slot = group.slots.find(slot => slot.name === name);
       if (!slot) continue;
-      // Only a held slot shows a Builds step, and only from Builds data that is current.
-      const current = builds && Date.now() / 1000 - builds.read_at <= settings.builds_max_age_seconds;
-      const run = slot.used_by && current
-        ? builds.walk?.find(row => row.key && row.slot_folder === slot.name && row.slot_machine === slotReport.machine) : null;
-      return run ? stepTip.tooltipHtml("row:" + run.key, builds)
+      const step = slotStep(slot);
+      return step ? stepTip.tooltipHtml(step.tip, builds)
         : stepTip.tipRowsHtml(slotTip(slot, group, keepBytes, Date.now() / 1000, slotReport.unused_days));
     }
   }
@@ -680,14 +695,19 @@ function smallerTip(rows, limit, keepBytes) {
 }
 
 // The Builds page data, read again while the page shows, so a slot in use shows its step as it is now.
-async function readBuilds() {
+// A superseded refresh keeps the newer data.
+async function readBuilds(current) {
   if (document.visibilityState === "hidden") return;
+  let next = null;
   try {
     const response = await fetch(settings.builds_data + "?" + Date.now(), {cache: "no-store"});
-    builds = response.ok ? await response.json() : null;
+    next = response.ok ? await response.json() : null;
   } catch {
-    builds = null;
+    next = null;
   }
+  if (!current()) return;
+  builds = next;
+  renderSlots();
 }
 
 async function readData() {
@@ -715,8 +735,9 @@ async function askMeasure(current) {
     measuring={since:Date.now()/1000,before:data ? data.measured_at : null};
 }
 async function loadDisks(supersede=false,current=()=>true){
+ // The page reads the Builds data on its own refresh, so the page has one timer.
  let next;
- try{next=await readData();}
+ try{[next]=await Promise.all([readData(),readBuilds(current)]);}
  catch(error){
   if(current()){
    readFailed=true;
@@ -739,8 +760,6 @@ async function loadDisks(supersede=false,current=()=>true){
 }
 const updateSessions = sessionsView(document.getElementById("sessions"));
 stepTip.hoverTips(document.getElementById("tip"), tipFor);
-readBuilds();
-setInterval(readBuilds, settings.poll_seconds * 1000);
 onToggle(document.getElementById("slots"), "tr[data-group]", row => {
   toggleOpen(opened.groups, row.dataset.group);
   renderSlots();

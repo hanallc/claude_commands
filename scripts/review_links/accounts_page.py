@@ -39,8 +39,12 @@ def page_url() -> str:
 
 
 def _spans(spans: list[accounts.BoardSpan]) -> str:
-    return "".join(f'<span class="{span["tone"]}{" bold" if span["kind"] == "bold" else ""}">{html.escape(span["text"])}</span>'
-                   for span in spans)
+    parts: list[str] = []
+    for span in spans:
+        color = accounts.account_color(span.get("color", ""))
+        style = f' style="color:{color.css}"' if isinstance(color, accounts.AccountColor) else ""
+        parts.append(f'<span class="{span["tone"]}{" bold" if span["kind"] == "bold" else ""}"{style}>{html.escape(span["text"])}</span>')
+    return "".join(parts)
 
 
 def board(reading: accounts.StatusReading) -> str:

@@ -52,6 +52,8 @@ class InvestigationsPageTests(unittest.TestCase):
         _ = investigation.answer(ORPHAN, read.id, "An answer.")
         _ = investigation.mark_read(ORPHAN, read.id)
         body = investigations_page.render(self.root / "reviews").decode()
+        self.assertIn('</h1><p class="page-status"', body)
+        self.assertLess(body.index('data-page-status '), body.index('<div data-investigations'))
         self.assertEqual(body.count("<article "), 3)
         self.assertEqual(body.count(">Mark read</button>"), 1)
         for part in ('Find the cause &lt;now&gt;', '<h3>Answer</h3>', '<ol>', 'Waiting for an answer',
