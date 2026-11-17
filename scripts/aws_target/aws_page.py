@@ -11,7 +11,7 @@ from html import escape
 from pathlib import Path
 from typing import TypedDict
 
-from scripts.aws_target import config as aws_config, console_help, spend as aws_spend, spot_table
+from scripts.aws_target import config as aws_config, console_help, quota_requests, spend as aws_spend, spot_table
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.review_links import console_theme, page_frame, review_link
@@ -174,6 +174,39 @@ def quota_help() -> str:
     return '<ol>' + ''.join(steps) + '</ol>\n<p>' + escape(console_help.WRONG_ACCOUNT) + '</p>'
 
 
+def waiting_quota_requests(directory: Path) -> str:
+    """Render the saved requests without calling AWS."""
+    try:
+        snapshot = quota_requests.read(directory)
+        if not snapshot.requests:
+            return ''
+        as_of = quota_requests.shown_time(snapshot.read_at)
+        rows: list[str] = []
+        for request in snapshot.requests:
+            quota_url = escape(console_help.quota_page_url(request.region, request.quota_code))
+            updated = escape(quota_requests.shown_time(request.updated_at))
+            rows.append(
+                f'<tr><td>{escape(request.region)}</td>'
+                + f'<td><a href="{quota_url}">{escape(request.quota_name)}</a></td>'
+                + f'<td class="n">{escape(request.asked_vcpus)}</td><td>{escape(request.status)}</td>'
+                + f'<td>{updated}</td></tr>')
+    except FileNotFoundError:
+        command = f'<code>{escape(console_help.QUOTA_STATUS_COMMAND)}</code>'
+        return '<p>' + escape(console_help.NO_SAVED_QUOTA_REQUESTS).format(command=command) + '</p>'
+    except (OSError, ValueError, OverflowError):
+        return '<p>' + escape(console_help.QUOTA_REQUESTS_READ_FAILURE) + '</p>'
+    case_list = f'<a href="{escape(console_help.CASE_LIST_URL)}">{escape(console_help.CASE_LIST_LABEL)}</a>'
+    intro = (escape(console_help.QUOTA_RECORD_TIME).format(time=escape(as_of)) + ' '
+             + escape(console_help.QUOTA_CASE_STATUS).format(case_list=case_list))
+    headers = ''.join(f'<th class="n">{escape(title)}</th>' if index == 2 else f'<th>{escape(title)}</th>'
+                      for index, title in enumerate(console_help.QUOTA_REQUEST_COLUMNS))
+    return ('<section class="card quota-requests" aria-labelledby="waiting-quota-title">'
+            + f'<h3 id="waiting-quota-title">{escape(console_help.WAITING_QUOTA_HEADING)}</h3>'
+            + f'<p>{intro}</p>'
+            + '<div class="scroll"><table><thead><tr>' + headers
+            + '</tr></thead><tbody>' + ''.join(rows) + '</tbody></table></div></section>')
+
+
 def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | None = None) -> Path:
     """Write the page with the tables of the local snapshot and run ledger."""
     started = time.perf_counter()
@@ -183,11 +216,13 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     spend = spend_data(read, now, configuration.whole('spend_pace_days'))
     data = page_data(spot_table.spot_tables(directory, now, settings_path=settings_path), spend, now)
     source = console_theme.with_theme(Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8'))
+    requests = waiting_quota_requests(directory)
     # A '</' in a cell must not end the script element.
     data['render_seconds'] = time.perf_counter() - started
     page = (page_frame.template(source, 'AWS', 'aws')
+            .replace('__AWS_PRICES_DATA__', json.dumps(data).replace('</', '<\\/'), 1)
             .replace('__AWS_QUOTA_HELP__', quota_help(), 1)
-            .replace('__AWS_PRICES_DATA__', json.dumps(data).replace('</', '<\\/')))
+            .replace('__AWS_QUOTA_REQUESTS__', requests, 1))
     page_path = folder / PAGE_NAME
     folder.mkdir(parents=True, exist_ok=True)
     write_text_atomic(page_path, page, new_file_mode=0o644)

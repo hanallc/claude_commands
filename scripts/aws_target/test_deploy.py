@@ -5,6 +5,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
+import fcntl
 from functools import lru_cache
 from io import StringIO
 import json
@@ -24,7 +25,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 
-from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, ledger, remote
+from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, ledger, quota_requests, remote
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, text_setting
 from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.aws_target.test_box import SYSTEM, FakeTailnet, write_aws_claim
@@ -1321,7 +1322,7 @@ sys.exit(7)
                 self.assertNotIn('arn:', output.getvalue())
                 self.assertNotIn('123456789012', output.getvalue())
 
-    def test_quota_status_prints_aligned_regional_blocks_without_writes(self) -> None:
+    def test_quota_status_prints_aligned_regional_blocks_and_saves_open_requests(self) -> None:
         gates = self.root / 'cloud_gate.conf'
         home = conf.read(self.settings).text('region')
         other, candidate = 'us-west-2', 'eu-north-1'
@@ -1387,7 +1388,15 @@ sys.exit(7)
             self.assertEqual(deploy.main(), 0, errors.getvalue())
         after = {path.relative_to(self.root): path.read_bytes() if path.is_file() else None
                  for path in self.root.rglob('*')}
-        self.assertEqual(before, after)
+        record = self.state.relative_to(self.root) / quota_requests.RECORD_PATH
+        quota_paths = {record.parent, record, record.with_name('controller.lock')}
+        self.assertEqual(before, {path: value for path, value in after.items() if path not in quota_paths})
+        self.assertEqual(quota_requests.read(self.state), quota_requests.QuotaRequestSnapshot(self.now, (
+            quota_requests.OpenQuotaRequest(home, 'L-34B43A08', 'Standard Spot',
+                str(desired['L-34B43A08'] + 1), 'CASE_OPENED', 'case-fixture', updated.isoformat()),
+            quota_requests.OpenQuotaRequest(other, 'L-3819A6DF', 'G and VT Spot',
+                str(desired['L-3819A6DF']), 'PENDING', '', created.isoformat()),
+        )))
         # The candidate region has only a price read, so the report reads no quota there.
         self.assertEqual(calls, [(region, code, operation) for region, code in (
             (home, 'L-34B43A08'), (home, 'L-3819A6DF'), (other, 'L-34B43A08'), (other, 'L-3819A6DF'))
@@ -1585,6 +1594,119 @@ sys.exit(7)
                 self.assertEqual(output.getvalue(), '')
                 self.assertEqual(errors.getvalue(), 'aws_deploy: ' + message + '\n')
 
+    def test_quota_request_reconciles_saved_requests_after_a_successful_read(self) -> None:
+        region, code = 'us-east-1', 'L-34B43A08'
+        pending = quota_requests.OpenQuotaRequest(region, code, 'Standard Spot', '128', 'PENDING', '', '')
+        old_read_at = self.now - 100
+        cases = (
+            ('sufficient quota', ({'Quota': {'Value': 128}},), True, ()),
+            ('closed reply', ({'Quota': {'Value': 5}}, {'RequestedQuotas': [{'Status': 'CASE_CLOSED', 'DesiredValue': 128}]},
+                              {'RequestedQuota': {'Status': 'APPROVED'}}), True, ()),
+            ('failed history read', ({'Quota': {'Value': 5}}, aws_cli.AwsUnavailable('test error')), False, (pending,)),
+        )
+        for case, replies, success, expected in cases:
+            with self.subTest(case=case):
+                quota_requests.save(self.state, {pending.quota: (pending,)}, old_read_at, complete=True)
+                with (mock.patch.object(deploy, 'quota_targets', return_value=(((region,), code, 128, 'Spot'),)),
+                      mock.patch.object(aws_cli.AwsCli, 'call', side_effect=replies) as call,
+                      redirect_stdout(StringIO())):
+                    self.assertEqual(self.deployment().quota_request(), success)
+                self.assertEqual(call.call_count, len(replies))
+                snapshot = quota_requests.read(self.state)
+                self.assertEqual(snapshot.requests, expected)
+                self.assertEqual(snapshot.read_at, self.now if success else old_read_at)
+
+    def test_quota_request_clears_saved_request_when_submission_fails_after_empty_history(self) -> None:
+        region, code = 'us-east-1', 'L-34B43A08'
+        pending = quota_requests.OpenQuotaRequest(region, code, 'Standard Spot', '128', 'PENDING', '', '')
+        quota_requests.save(self.state, {pending.quota: (pending,)}, self.now - 100, complete=True)
+        replies: tuple[object, ...] = (
+            {'Quota': {'Value': 5}}, {'RequestedQuotas': []}, aws_cli.AwsUnavailable('fixture submission failed'))
+        with (mock.patch.object(deploy, 'quota_targets', return_value=(((region,), code, 128, 'Spot'),)),
+              mock.patch.object(aws_cli.AwsCli, 'call', side_effect=replies) as call,
+              redirect_stdout(StringIO())):
+            self.assertFalse(self.deployment().quota_request())
+        self.assertEqual(call.call_count, 3)
+        self.assertEqual(quota_requests.read(self.state), quota_requests.QuotaRequestSnapshot(self.now, ()))
+
+    def quota_command_lock_is_held(self) -> bool:
+        path = (self.state / quota_requests.RECORD_PATH).with_name('controller.lock')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+        return False
+
+    def test_quota_commands_hold_the_lock_across_aws_reads_and_save(self) -> None:
+        region, code = 'us-east-1', 'L-34B43A08'
+        for command in ('quota_request', 'quota_status'):
+            with self.subTest(command=command):
+                subject = self.deployment()
+                held: list[tuple[str, bool]] = []
+
+                def aws_call(operation: str, *_args: str, **_kwargs: object) -> dict[str, object]:
+                    held.append((operation, self.quota_command_lock_is_held()))
+                    if operation == 'get-service-quota':
+                        return {'Quota': {'Value': 128}}
+                    self.assertEqual(operation, 'list-requested-service-quota-change-history-by-quota')
+                    return {'RequestedQuotas': []}
+
+                def write_record(path: Path, value: str, *, new_file_mode: int | None = None) -> None:
+                    held.append(('save', self.quota_command_lock_is_held()))
+                    write_text_atomic(path, value, new_file_mode=new_file_mode)
+
+                with (mock.patch.object(deploy, 'quota_targets', return_value=(((region,), code, 128, 'Spot'),)),
+                      mock.patch.object(aws_cli.AwsCli, 'call', side_effect=aws_call),
+                      mock.patch.object(quota_requests, 'write_text_atomic', side_effect=write_record),
+                      redirect_stdout(StringIO())):
+                    self.assertTrue(subject.quota_request() if command == 'quota_request' else subject.quota_status())
+                expected = [('get-service-quota', True)]
+                if command == 'quota_status':
+                    expected.append(('list-requested-service-quota-change-history-by-quota', True))
+                self.assertEqual(held, [*expected, ('save', True)])
+                self.assertFalse(self.quota_command_lock_is_held())
+
+    def test_quota_request_restart_recovers_an_accepted_request_without_resubmitting(self) -> None:
+        region, code = 'us-east-1', 'L-34B43A08'
+        accepted: dict[str, object] = {'Status': 'PENDING', 'DesiredValue': 128}
+        history: list[dict[str, object]] = []
+        operations: list[str] = []
+        lock_at_exit: list[bool] = []
+
+        def aws_call(operation: str, *_args: str, **_kwargs: object) -> dict[str, object]:
+            operations.append(operation)
+            if operation == 'get-service-quota':
+                return {'Quota': {'Value': 5}}
+            if operation == 'list-requested-service-quota-change-history-by-quota':
+                return {'RequestedQuotas': history}
+            self.assertEqual(operation, 'request-service-quota-increase')
+            history.append(accepted)
+            return {'RequestedQuota': accepted}
+
+        def interrupt_save(*_args: object, **_kwargs: object) -> None:
+            lock_at_exit.append(self.quota_command_lock_is_held())
+            raise SystemExit(1)
+
+        with (mock.patch.object(deploy, 'quota_targets', return_value=(((region,), code, 128, 'Spot'),)),
+              mock.patch.object(aws_cli.AwsCli, 'call', side_effect=aws_call),
+              redirect_stdout(StringIO())):
+            with mock.patch.object(quota_requests, 'save', side_effect=interrupt_save), self.assertRaises(SystemExit):
+                _ = self.deployment().quota_request()
+            with self.assertRaises(FileNotFoundError):
+                _ = quota_requests.read(self.state)
+            self.assertFalse(self.quota_command_lock_is_held())
+            self.assertTrue(self.deployment().quota_request())
+        self.assertEqual(quota_requests.read(self.state), quota_requests.QuotaRequestSnapshot(self.now, (
+            quota_requests.OpenQuotaRequest(region, code, 'Standard Spot', '128', 'PENDING', '', ''),
+        )))
+        self.assertEqual(operations, [
+            'get-service-quota', 'list-requested-service-quota-change-history-by-quota', 'request-service-quota-increase',
+            'get-service-quota', 'list-requested-service-quota-change-history-by-quota',
+        ])
+        self.assertEqual(lock_at_exit, [True])
+
     def test_quota_request_uses_admin_credentials_and_continues_after_regional_failures(self) -> None:
         get_quota = 'get-service-quota'
         history = 'list-requested-service-quota-change-history-by-quota'
@@ -1611,9 +1733,9 @@ sys.exit(7)
         _ = path.write_text(re.sub(r'(?m)^regions=.*$', 'regions=us-east-1 us-west-2',
                                   re.sub(r'(?m)^spot_candidate_regions=.*$',
                                          'spot_candidate_regions=us-east-2 us-west-2', path.read_text())))
-        request_id = 'req-ab12cd34ef56'
-        case_id = '9876543210'
-        account_id = '123456789012'
+        request_id = 'fixture-request'
+        case_id = 'fixture-case'
+        account_id = 'fixture-account'
         for quota, history_status, request_status, failure, success in cases:
             with self.subTest(quota=quota, history=history_status, request=request_status, failure=failure):
                 subject = self.deployment()
@@ -1693,6 +1815,14 @@ sys.exit(7)
                     self.assertEqual(lines[0], f'us-east-1: Spot quota request 128 vCPUs; status {request_status}')
                 for private in ('fixture-admin-id', 'fixture-admin-secret', request_id, case_id, account_id):
                     self.assertNotIn(private, captured.getvalue())
+                if not failure and quota < 128 and (history_status in {'PENDING', 'CASE_OPENED', 'IN_PROGRESS'}
+                                                  or request_status in {'PENDING', 'CASE_OPENED'}):
+                    already_open = history_status in {'PENDING', 'CASE_OPENED', 'IN_PROGRESS'}
+                    self.assertEqual(quota_requests.read(self.state), quota_requests.QuotaRequestSnapshot(self.now, (
+                        quota_requests.OpenQuotaRequest('us-east-1', 'L-34B43A08', 'Standard Spot',
+                            '256' if already_open else '128', history_status if already_open else request_status,
+                            case_id, ''),
+                    )))
 
     def test_gpu_quota_request_cases_and_failures_in_each_gate_region(self) -> None:
         get_quota = 'get-service-quota'
@@ -1807,6 +1937,10 @@ sys.exit(7)
                         f'{region}: G and VT Spot quota 4 vCPUs; no request is needed for 4 vCPUs' for region in gates]])
                     for private in ('private-request', 'private-case', 'private-account', 'fixture-admin-id', 'fixture-admin-secret'):
                         self.assertNotIn(private, captured.getvalue())
+                    if request_status in {'PENDING', 'CASE_OPENED'}:
+                        snapshot = quota_requests.read(self.state)
+                        self.assertEqual(snapshot.requests, (quota_requests.OpenQuotaRequest(
+                            selected_region, 'L-3819A6DF', 'G and VT Spot', '4', request_status, 'private-case', ''),))
 
     def test_regional_gate_stack_reuses_home_resources_and_copies_missing_image(self) -> None:
         subject, commands = self.gate_fixture()

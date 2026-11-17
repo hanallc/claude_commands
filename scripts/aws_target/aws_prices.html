@@ -93,8 +93,10 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 #spend .note { margin-top: 12px; }
 #quota-help summary { font-weight: 600; cursor: pointer; }
 #quota-help li + li { margin-top: 4px; }
-#quota-help a { color: var(--ink); overflow-wrap: anywhere; }
-#quota-help p { margin: 0; color: var(--ink-2); }
+#quota-help a, #quota-requests a { color: var(--ink); overflow-wrap: anywhere; }
+#quota-help p, .quota-requests p { margin: 0; color: var(--ink-2); }
+#quota-requests > p { margin: 8px 0; color: var(--ink-2); }
+.quota-requests h3 { font-size: 1rem; margin: 0 0 4px; }
 </style>
 </head>
 <body>
@@ -119,6 +121,7 @@ __PAGE_TITLE__
 <p class="legend"><span><span class="swatch scale" aria-hidden="true"></span>Each column: green is the cheapest, red the most expensive.</span></p>
 <div id="prices"></div>
 <h2 class="section-title">Quotas</h2>
+<div id="quota-requests">__AWS_QUOTA_REQUESTS__</div>
 <details class="card" id="quota-help">
   <summary>How to open the quota cases in AWS</summary>
   __AWS_QUOTA_HELP__
@@ -493,6 +496,9 @@ async function loadAws(supersede=false,current=()=>true){
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
  const next=JSON.parse(page.querySelector('#aws-prices-data').textContent);
  if(!current()) return;data=next;
+ const requests=page.getElementById('quota-requests');
+ const displayed=document.getElementById('quota-requests');
+ if(requests && displayed.innerHTML!==requests.innerHTML) displayed.innerHTML=requests.innerHTML;
  drawSpend();draw();
  return {readAt:data.read_at,renderSeconds:data.render_seconds};
 }

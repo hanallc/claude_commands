@@ -23,3 +23,13 @@ def quota_page_url(region: str, quota_code: str) -> str:
     if not re.fullmatch(r'[A-Za-z][A-Za-z0-9-]+', quota_code):
         raise ValueError('Invalid AWS quota code')
     return f'https://{region}.console.aws.amazon.com/servicequotas/home/services/ec2/quotas/{quota_code}'
+
+
+WAITING_QUOTA_HEADING = 'Waiting on you'
+QUOTA_RECORD_TIME = 'Record updated {time}.'
+QUOTA_CASE_STATUS = 'See the {case_list} for the case status.'
+CASE_LIST_LABEL = 'case list'
+QUOTA_REQUEST_COLUMNS = ('Region', 'Quota', 'Asked vCPUs', 'Status', 'Updated')
+QUOTA_STATUS_COMMAND = 'deploy.py quota-status'
+NO_SAVED_QUOTA_REQUESTS = 'No saved quota requests. Run {command} to read them.'
+QUOTA_REQUESTS_READ_FAILURE = 'Could not read the saved quota requests.'

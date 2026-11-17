@@ -12,7 +12,7 @@ from io import StringIO
 from collections.abc import Callable, Sequence, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
@@ -31,18 +31,17 @@ from typing import ClassVar, cast, final
 from uuid import uuid4
 
 
-from scripts.aws_target import admin_secrets, box, hana_box, hana_image, hana_spend, ledger, remote, retained, spot_end, teardown
+from scripts.aws_target import admin_secrets, box, hana_box, hana_image, hana_spend, ledger, quota_requests, remote, retained, spot_end, teardown
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
 from scripts.aws_target.terminal_table import aligned_table
-from scripts.lib import conf, user_zone
+from scripts.lib import conf
 from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
 TEMPLATE = Path(__file__).resolve().parents[2] / 'docs/plans/builds-aws/cloudformation.json'
 HANA_TEMPLATE = TEMPLATE.with_name('hana-cloudformation.json')
-CLOSED_QUOTA_REQUEST_STATUSES = frozenset(('APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST'))
 
 
 
@@ -156,48 +155,40 @@ def quota_targets(home: str) -> tuple[tuple[tuple[str, ...], str, int, str], ...
     )
 
 
-def quota_timestamp(value: object) -> float:
-    """Convert AWS timestamps to seconds for request ordering."""
-    if value is None:
-        return float('-inf')
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        moment = datetime.fromtimestamp(value, UTC)
-    elif isinstance(value, str):
-        moment = datetime.fromisoformat(value.replace('Z', '+00:00'))
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=UTC)
-    else:
-        raise ValueError('The quota request date is invalid')
-    return moment.timestamp()
+def quota_display_name(label: str) -> str:
+    return 'Standard Spot' if label == 'Spot' else label
 
 
-def quota_date(value: object) -> str:
-    """Format AWS timestamps in the user's zone."""
-    if value is None:
-        return '-'
-    return datetime.fromtimestamp(quota_timestamp(value), UTC).astimezone(user_zone.user_zone()).strftime('%Y-%m-%d %H:%M:%S %Z')
-
-
-def request_spot_quota(api: AwsCli, code: str, desired: int, label: str) -> bool:
+def request_spot_quota(api: AwsCli, code: str, desired: int, label: str,
+                       histories: dict[quota_requests.RegionalQuota, tuple[quota_requests.OpenQuotaRequest, ...]]) -> bool:
     """Request one regional quota unless its value is sufficient or a request is open."""
     region = api.region
     try:
         quota = spot_quota(api, code)
         if quota >= desired:
+            histories[region, code] = ()
             print(f'{region}: {label} quota {quota.normalize():f} vCPUs; no request is needed for {desired} vCPUs')
             return True
         history = api.call('list-requested-service-quota-change-history-by-quota',
             '--service-code', 'ec2', '--quota-code', code, service='service-quotas')
-        opened = [row for row in ledger.rows(history, 'RequestedQuotas') if ledger.text(row, 'Status') not in CLOSED_QUOTA_REQUEST_STATUSES]
+        name = quota_display_name(label)
+        opened: list[quota_requests.OpenQuotaRequest] = []
+        for row in ledger.rows(history, 'RequestedQuotas'):
+            status = ledger.text(row, 'Status')
+            if status not in quota_requests.CLOSED_STATUSES:
+                opened.append(quota_requests.OpenQuotaRequest.from_reply(region, code, name, status, row))
+        histories[region, code] = tuple(opened)
         if opened:
-            for row in opened:
-                status = ledger.text(row, 'Status')
-                value = conf.decimal(str(row['DesiredValue']))
-                print(f'{region}: open {label} quota request {value.normalize():f} vCPUs; status {status}')
+            for request in opened:
+                print(f'{region}: open {label} quota request {request.asked_vcpus} vCPUs; status {request.status}')
             return True
         reply = api.call('request-service-quota-increase', '--service-code', 'ec2',
             '--quota-code', code, '--desired-value', str(desired), service='service-quotas')
-        status = ledger.text(ledger.mapping(reply['RequestedQuota']), 'Status')
+        row = ledger.mapping(reply['RequestedQuota'])
+        status = ledger.text(row, 'Status')
+        if status not in quota_requests.CLOSED_STATUSES:
+            histories[region, code] = (
+                quota_requests.OpenQuotaRequest.from_reply(region, code, name, status, {'DesiredValue': desired, **row}),)
         print(f'{region}: {label} quota request {desired} vCPUs; status {status}')
         return status not in {'DENIED', 'NOT_APPROVED', 'INVALID_REQUEST'}
     except (admin_secrets.SecretsRefused, DeploymentRefused):
@@ -1308,17 +1299,27 @@ class Deployment:
 
     def quota_request(self) -> bool:
         """Request both regional Spot quotas without duplicating open requests."""
+        with quota_requests.command_lock(self.directory):
+            return self._quota_request()
+
+    def _quota_request(self) -> bool:
         settings = read_deployment_settings(self.settings_path)
         api = self._api(settings)
         success = True
+        histories: dict[quota_requests.RegionalQuota, tuple[quota_requests.OpenQuotaRequest, ...]] = {}
         for regions, code, desired, label in quota_targets(settings.region):
             for region in regions:
-                if not request_spot_quota(api.in_region(region), code, desired, label):
+                if not request_spot_quota(api.in_region(region), code, desired, label, histories):
                     success = False
+        quota_requests.save(self.directory, histories, int(self.clock()), complete=False)
         return success
 
     def quota_status(self) -> bool:
-        """Report applied quotas and request history without changing AWS or local state."""
+        """Report applied quotas and save open requests without changing AWS."""
+        with quota_requests.command_lock(self.directory):
+            return self._quota_status()
+
+    def _quota_status(self) -> bool:
         from scripts.aws_target import gpu_size_trial
         settings = read_deployment_settings(self.settings_path)
         api = self._api(settings)
@@ -1326,13 +1327,14 @@ class Deployment:
         regional: dict[str, list[tuple[str, str]]] = {}
         for regions, code, _desired, label in quota_targets(settings.region):
             for region in dict.fromkeys(regions):
-                regional.setdefault(region, []).append((code, 'Standard Spot' if label == 'Spot' else label))
+                regional.setdefault(region, []).append((code, quota_display_name(label)))
         _ = self.admin.get()
         success = True
         ready: list[str] = []
         opened: list[str] = []
         unknown: list[str] = []
         unknown_quota: list[str] = []
+        histories: dict[quota_requests.RegionalQuota, tuple[quota_requests.OpenQuotaRequest, ...]] = {}
         for region, quotas in regional.items():
             print(region, flush=True)
             target = api.in_region(region)
@@ -1346,16 +1348,22 @@ class Deployment:
                     history = target.call('list-requested-service-quota-change-history-by-quota',
                         '--service-code', 'ec2', '--quota-code', code, service='service-quotas')
                     requests = sorted(ledger.rows(history, 'RequestedQuotas'),
-                        key=lambda row: quota_timestamp(row.get('LastUpdated') or row.get('Created')), reverse=True)
+                        key=lambda row: quota_requests.timestamp(row.get('LastUpdated') or row.get('Created')), reverse=True)
                     rows: list[list[str]] = []
+                    open_requests: list[quota_requests.OpenQuotaRequest] = []
                     for request in requests:
-                        asked = f'{conf.decimal(str(request["DesiredValue"])).normalize():f}'
                         status = ledger.text(request, 'Status')
-                        case = str(request.get('CaseId') or '-')
-                        date = quota_date(request.get('LastUpdated') or request.get('Created'))
-                        rows.append([asked, status, case, date])
-                        if status not in CLOSED_QUOTA_REQUEST_STATUSES:
+                        if status in quota_requests.CLOSED_STATUSES:
+                            asked = quota_requests.format_asked_vcpus(request['DesiredValue'])
+                        else:
+                            entry = quota_requests.OpenQuotaRequest.from_reply(region, code, name, status, request)
+                            open_requests.append(entry)
+                            asked = entry.asked_vcpus
                             opened.append(f'{region} {name} {asked} vCPUs ({status})')
+                        case = str(request.get('CaseId') or '-')
+                        date = quota_requests.shown_time(request.get('LastUpdated') or request.get('Created'))
+                        rows.append([asked, status, case, date])
+                    histories[region, code] = tuple(open_requests)
                     if rows:
                         for line in aligned_table(('Asked vCPUs', 'Status', 'Case ID', 'Updated'), rows,
                                                   right=frozenset((0,))):
@@ -1384,6 +1392,7 @@ class Deployment:
         incomplete = '; request history unavailable: ' + ', '.join(unknown) if unknown else ''
         print(f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; '
               + 'open requests: ' + requests_text + incomplete, flush=True)
+        quota_requests.save(self.directory, histories, int(self.clock()), complete=success)
         return success
 
     def gpu_size_trial(self, folder: Path, *, approve_resources: bool = False) -> bool:
