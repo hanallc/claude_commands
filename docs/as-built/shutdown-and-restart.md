@@ -547,8 +547,10 @@ The check uses the launched account home and native session identity.
 It reads only turns after that director's start.
 The opening prompt and the Claude resume check share a cursor positioned before launch.
 Herdr waits for the native session identity and uses that identity to check the opening prompt's target.
-It retries only when the native registry changes while the process starts or exits.
-The launch deadline bounds this wait.
+A starting agent can lack its registry record, its process start time or its argv.
+Herdr retries the identity read and the target check until the launch deadline.
+The pause between tries starts at `PANE_POLL_SECONDS` and doubles up to `START_RETRY_MAX_SECONDS`.
+Only a failure at the deadline prints the native session error.
 For a Claude launch with an opening prompt, restart uses the greater of `START_SECONDS` and `OPENING_PROMPT_SECONDS`.
 `config/shutdown.conf` sets these limits to 20 seconds and 90 seconds.
 The operation deadline can reduce either limit.
@@ -682,8 +684,14 @@ The supervisor uses default TERM, INT, and HUP dispositions.
 It installs no signal handler.
 `detached_runs.py stop` checks the supervisor and command identity, then signals the command group.
 The supervisor stays alive, records the exit status and delivers the result.
+The command gate starts a watcher in the command group. The watcher reads the supervisor pipe.
+The supervisor writes "done" to the pipe after the command ends.
+If the pipe closes without "done", the supervisor ended first: a signal, a SIGKILL or a crash.
+The watcher then runs `detached_runs.py supervisor-gone`. It leaves the command group and saves a stop reason.
+It sends TERM to the command group, waits for the command leader and reaps the record.
+So a supervisor end never leaves the command running, and the worker gets a STOPPED result.
 If the supervisor dies, the next start, worker restore, or explicit `detached_runs.py reap` finishes its record and delivers its result.
-The result reports no exit status unless the supervisor saved the command's status before it died.
+The result reports no exit status unless the command or the supervisor saved one. `verify.sh` saves its own status at exit.
 The record, the log and the exit code stay in the run folder's `detached_runs` directory.
 After the command ends, the supervisor starts a new Python process to deliver the result from the current code tree.
 The supervisor waits for delivery before it marks the run finished.

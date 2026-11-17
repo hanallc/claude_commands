@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import html
+import json
 from pathlib import Path
 import re
 from statistics import median
@@ -10,7 +11,7 @@ import subprocess
 import sys
 import time
 
-from scripts.accounts import accounts
+from scripts.accounts import accounts, next_moves
 from scripts.lib import conf
 from scripts.review_links import change_page, console_theme, page_frame, review_link
 
@@ -23,43 +24,58 @@ TUNE = (str(Path(__file__).resolve().parents[1] / "lib/py"),
 
 
 @dataclass(frozen=True)
-class ColorSaved:
-    """Tune published the account color."""
+class Saved:
+    """The page change is saved."""
 
 
 @dataclass(frozen=True)
-class ColorRefused:
-    """The request contains an unsupported account or color."""
+class Refused:
+    """The request names an unsupported account, color or group."""
     reason: str
 
 
 @dataclass(frozen=True)
-class ColorSaveFailed:
-    """Tune could not publish the account color."""
+class SaveFailed:
+    """The checked change could not be saved."""
     reason: str
 
 
-def save_color(label: str, value: str) -> ColorSaved | ColorRefused | ColorSaveFailed:
+def save_color(label: str, value: str) -> Saved | Refused | SaveFailed:
     """Validate the account color and publish it through this checkout's tune."""
     try:
         colors = conf.read("statusline").values()
     except (OSError, ValueError) as error:
-        return ColorSaveFailed(" ".join(str(error).split()))
+        return SaveFailed(" ".join(str(error).split()))
     if f"account.{label}" not in colors:
-        return ColorRefused("The account has no configured color.")
+        return Refused("The account has no configured color.")
     if not re.fullmatch(r"#[0-9a-f]{6}", value):
-        return ColorRefused("Use a color in #rrggbb format.")
+        return Refused("Use a color in #rrggbb format.")
     try:
         done = subprocess.run((*TUNE, "statusline", f"account.{label}", value,
             "--why", "The user chose this color with the Accounts page color chooser.",
             "--user-words", f"{label} color set to {value} with Save on the console Accounts page"),
             capture_output=True, text=True, check=False)
     except OSError as error:
-        return ColorSaveFailed(" ".join(str(error).split()))
+        return SaveFailed(" ".join(str(error).split()))
     if done.returncode:
         lines = done.stderr.strip().splitlines()
-        return ColorSaveFailed(" ".join(lines[-1].split()) if lines else f"Tune exited {done.returncode}.")
-    return ColorSaved()
+        return SaveFailed(" ".join(lines[-1].split()) if lines else f"Tune exited {done.returncode}.")
+    return Saved()
+
+
+def save_next_move(group: str, target: str) -> Saved | Refused | SaveFailed:
+    """Make the target the group's first next move at the configured percent."""
+    if group != "units" and group != "showrunners":
+        return Refused("Choose units or showrunners.")
+    try:
+        _ = accounts.claude_account_dir(target)
+    except accounts.AccountsError as error:
+        return Refused(" ".join(str(error).split()))
+    try:
+        _ = next_moves.set_first_next_move(group, next_moves.console_next_move_percent(), target)
+    except (OSError, ValueError) as error:
+        return SaveFailed(" ".join(str(error).split()))
+    return Saved()
 
 
 @dataclass(frozen=True)
@@ -90,28 +106,46 @@ def _spans(spans: list[accounts.BoardSpan]) -> str:
     return "".join(parts)
 
 
+def _row_open(row: accounts.BoardRow) -> str:
+    """Open a table line; a line of a Claude group carries the account and group its move menu needs."""
+    group = row.get("group")
+    move = (f' data-move-account="{html.escape(group["account"], quote=True)}" data-move-group="{group["group"]}"'
+            if group else "")
+    return f'<tr class="account"{move}>' if row["cells"]["label"] else f"<tr{move}>"
+
+
 def board(reading: accounts.StatusReading) -> str:
     """The accounts board table, then the upcoming moves and the problems."""
     table = accounts.status_board(reading)
-    def cell(key: str, spans: list[accounts.BoardSpan]) -> str:
-        content = _spans(spans)
-        if key == "label" and spans:
-            label = spans[0]["text"]
-            if "color" in spans[0]:
-                color = accounts.account_color(spans[0]["color"])
-                css = color.css if isinstance(color, accounts.AccountColor) else "#000000"
-                content += (f'<button type="button" class="color-swatch" data-account-color="{html.escape(label, quote=True)}" '
-                            + f'data-saved-color="{css.lower()}" style="background:{css}" '
-                            + f'aria-label="Change {html.escape(label, quote=True)} color" aria-haspopup="dialog"></button>')
-        return content
-    head = "".join(f'<th class="{column["align"]}">{html.escape(column["heading"])}</th>' for column in table["columns"])
+    claude = {row.label for row in reading.rows if row.tool == "claude"}
+    def target(spans: list[accounts.BoardSpan], left: list[accounts.BoardSpan]) -> list[str]:
+        color = accounts.account_color(spans[0].get("color", ""))
+        return [spans[0]["text"], "".join(span["text"] for span in left),
+                color.css if isinstance(color, accounts.AccountColor) else "", left[0]["tone"] if left else "default"]
+    targets = [target(spans, row["cells"]["left"]) for row in table["rows"]
+               if (spans := row["cells"]["label"]) and spans[0]["text"] in claude]
+    percent = next_moves.format_next_move_percent(next_moves.console_next_move_percent())
+    def swatch(spans: list[accounts.BoardSpan]) -> str:
+        if not spans or "color" not in spans[0]:
+            return ""
+        label = spans[0]["text"]
+        color = accounts.account_color(spans[0]["color"])
+        css = color.css if isinstance(color, accounts.AccountColor) else "#000000"
+        return (f'<button type="button" class="color-swatch" data-account-color="{html.escape(label, quote=True)}" '
+                + f'data-saved-color="{css.lower()}" style="background:{css}" '
+                + f'aria-label="Change {html.escape(label, quote=True)} color" aria-haspopup="dialog"></button>')
+    head = "".join(f'<th class="{column["align"]}">{html.escape(column["heading"])}</th>'
+                   for column in table["columns"]) + '<th class="left">Color</th>'
     rows = "".join(
-        ('<tr class="account">' if row["cells"]["label"] else "<tr>")
-        + "".join(f'<td class="{column["align"]}">{cell(column["key"], row["cells"][column["key"]])}</td>' for column in table["columns"])
+        _row_open(row)
+        + "".join(f'<td class="{column["align"]}"{" data-account-name" if column["key"] == "label" else ""}>'
+                  + f'{_spans(row["cells"][column["key"]])}</td>' for column in table["columns"])
+        + f'<td class="left">{swatch(row["cells"]["label"])}</td>'
         + "</tr>" for row in table["rows"])
     moves = "".join(f"<li>{html.escape(line)}</li>" for line in reading.upcoming_moves if line)
     problems = "".join(f"<li>{html.escape(note.removeprefix('* '))}</li>" for note in reading.notes)
-    return ('<section class="card"><div class="scroll"><table>'
+    return (f'<section class="card" data-move-percent="{percent}" '
+            + f'data-move-targets="{html.escape(json.dumps(targets), quote=True)}"><div class="scroll"><table>'
             + f"<thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></div>"
             + (f'<ul class="moves">{moves}</ul>' if moves else "")
             + (f'<h2>Problems</h2><ul class="problems">{problems}</ul>' if problems else "") + "</section>")
@@ -124,7 +158,7 @@ def page() -> bytes:
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             + '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Accounts</title>'
             + f'{STYLE}</head><body><main data-refresh-seconds="{refresh_seconds}">' + page_frame.title("Accounts", "accounts")
-            + f'<div data-accounts>{body}</div></main>' + POPUP
+            + f'<div data-accounts>{body}</div></main>' + POPUP + MENU
             + f"<script>{SCRIPT}</script></body></html>").encode()
 
 
@@ -165,45 +199,158 @@ tr.account td{border-top:1px solid var(--line)}tbody tr:last-child td{border-top
 tbody tr:hover td{background:var(--hover)}
 .bold{font-weight:600}.success{color:var(--room)}.error{color:var(--error)}.warning{color:var(--warning)}
 .inactive{color:var(--ink-3)}
-.color-swatch{width:18px;height:18px;vertical-align:middle;margin-left:8px;border:1px solid var(--ink-3);border-radius:4px;cursor:pointer}
-.color-picker{position:fixed;inset:auto;margin:0;padding:16px;width:260px;max-width:calc(100vw - 16px);
+.color-swatch{width:18px;height:18px;vertical-align:middle;border:1px solid var(--ink-3);border-radius:4px;cursor:pointer}
+.color-picker{position:fixed;inset:auto;margin:0;padding:16px;width:280px;box-sizing:border-box;max-width:calc(100vw - 16px);
+max-height:calc(100vh - 16px);overflow:auto;
 border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--ink);box-shadow:0 4px 20px var(--edge)}
-.color-picker label{display:block;font-weight:600;margin-bottom:10px}
+.color-picker label{display:block;margin:10px 0 6px}.color-title{font-weight:600;margin-bottom:12px}
 .color-picker input,.color-picker button{font:inherit}
-.color-picker input{display:block;width:100%;height:44px;margin-bottom:12px;background:var(--bg);border:1px solid var(--line)}
+.color-area{position:relative;height:132px;border:1px solid var(--ink-3);border-radius:6px;touch-action:none;
+background:linear-gradient(to top,#000,transparent),linear-gradient(to right,#fff,transparent),var(--picked-hue)}
+.color-cursor{position:absolute;width:10px;height:10px;box-sizing:border-box;border:2px solid #fff;
+border-radius:50%;box-shadow:0 0 0 1px #000;transform:translate(-50%,-50%);pointer-events:none}
+.color-picker .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%)}
+.color-picker input[type=range]{display:block;width:100%;height:16px;margin:4px 0;appearance:none;
+border:1px solid var(--ink-3);border-radius:8px;box-sizing:border-box;
+background:linear-gradient(to right,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00)}
+.color-picker input[type=range]::-moz-range-thumb{width:12px;height:22px;border:2px solid var(--ink);
+border-radius:4px;background:var(--card)}
+.color-picker input[type=range]::-webkit-slider-thumb{appearance:none;width:12px;height:22px;border:2px solid var(--ink);
+border-radius:4px;background:var(--card)}
+.color-preview{height:56px;margin-top:12px;border:1px solid var(--ink-3);border-radius:6px}
+.color-picker input[type=text]{box-sizing:border-box;width:100%;padding:8px;margin-bottom:12px;border-radius:6px;
+background:var(--bg);color:var(--ink);border:1px solid var(--line)}
 .color-actions{display:flex;gap:8px}.color-actions button{flex:1;padding:7px;border:1px solid var(--line);border-radius:6px;
 background:var(--bg);color:var(--ink);cursor:pointer}.color-actions button:hover{background:var(--hover)}
-.color-actions button:disabled{opacity:.6;cursor:wait}.color-picker [role=status]{font-size:.86rem;overflow-wrap:anywhere;margin:10px 0 0}
-.color-picker [role=status]:empty{display:none}
+.color-actions button:disabled{opacity:.5;cursor:default}
+.color-save-error{color:var(--error);overflow-wrap:anywhere}
 .color-swatch:focus-visible,.color-picker :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 /* A thin red or amber digit falls under 4.5:1; the heavier stroke keeps it at the token contrast. */
 .error,.warning{font-weight:600}
+tr[data-move-group]{cursor:context-menu}
+.move-menu{position:fixed;margin:0;padding:6px;width:max-content;min-width:220px;max-width:calc(100vw - 16px);box-sizing:border-box;
+border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink);box-shadow:0 4px 20px var(--edge);
+font-size:.86rem;font-variant-numeric:tabular-nums}
+.move-menu[hidden]{display:none}
+.move-title{padding:6px 10px 8px;margin-bottom:4px;color:var(--ink-2);border-bottom:1px solid var(--line)}
+.move-menu button{display:flex;justify-content:space-between;gap:24px;width:100%;padding:6px 10px;border:0;border-radius:6px;
+background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
+.move-menu button:hover,.move-menu button:focus-visible{background:var(--hover);outline:none}
+.move-name{font-weight:600}.move-left{color:var(--ink-2)}.move-left.warning{color:var(--warning)}.move-left.error{color:var(--error)}
+.move-empty{padding:6px 10px;color:var(--ink-3)}
 .moves,.problems{list-style:none;padding:0;margin:12px 0 0;font-size:.86rem;color:var(--ink-2)}
 .moves li,.problems li{padding:2px 0}.problems li{color:var(--warning)}.problems li::before{content:"• "}
 </style>"""
 
 POPUP = '''<dialog class="color-picker" aria-labelledby="color-title" data-color-picker>
-<label id="color-title" for="account-color-value">Account color</label>
-<input type="color" id="account-color-value">
+<div id="color-title" class="color-title">Account color</div>
+<div class="color-area" data-color-area role="slider" tabindex="0" aria-label="Saturation and brightness"
+aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
+aria-describedby="color-area-help"><span class="color-cursor" data-color-cursor></span></div>
+<span id="color-area-help" class="sr-only">Left and right change saturation. Up and down change brightness.</span>
+<label for="account-color-hue">Hue</label>
+<input type="range" id="account-color-hue" min="0" max="360" step="1" value="0">
+<div class="color-preview" data-color-preview role="img" aria-label="Picked color"></div>
+<label for="account-color-value">Hex color</label>
+<input type="text" id="account-color-value" value="#000000" pattern="#[0-9a-fA-F]{6}"
+maxlength="7" spellcheck="false" autocomplete="off" required>
 <div class="color-actions"><button type="button" data-color-try>Try</button>
-<button type="button" data-color-save>Save</button><button type="button" data-color-cancel>Cancel</button></div>
-<p role="status" aria-live="polite"></p></dialog>'''
+<button type="button" data-color-save>Save</button>
+<button type="button" data-color-cancel>Cancel</button></div></dialog>'''
+
+MENU = ('<div class="move-menu" role="menu" tabindex="-1" aria-labelledby="move-title" hidden data-move-menu>'
+        + '<div id="move-title" class="move-title" data-move-title></div><div data-move-items></div></div>')
 
 SCRIPT = page_frame.REFRESH_SCRIPT + r"""(() => {
 let view = document.querySelector('[data-accounts]');
 let newestRequest = 0;
-const popup=document.querySelector('[data-color-picker]'), picker=popup.querySelector('input');
-const message=popup.querySelector('[role=status]');
-let selected=null, saving=false, savedText='';
-const hold=()=>selected ? 'An account color is being edited.' : '';
+const popup=document.querySelector('[data-color-picker]'), picker=popup.querySelector('#account-color-value');
+const area=popup.querySelector('[data-color-area]'), hue=popup.querySelector('#account-color-hue');
+const cursor=popup.querySelector('[data-color-cursor]'), preview=popup.querySelector('[data-color-preview]');
+let saturation=0,brightness=0,dragging=null;
+const clamp=value=>Math.max(0,Math.min(1,value));
+function drawPick(value){
+ picker.value=value;picker.setCustomValidity('');
+ for(const action of popup.querySelectorAll('[data-color-try],[data-color-save]')) action.disabled=false;
+ area.style.setProperty('--picked-hue','hsl('+hue.value+' 100% 50%)');
+ cursor.style.left=saturation*100+'%';cursor.style.top=(1-brightness)*100+'%';
+ area.setAttribute('aria-valuenow',Math.round(saturation*100));
+ area.setAttribute('aria-valuetext','Saturation '+Math.round(saturation*100)+'%, brightness '+Math.round(brightness*100)+'%');
+ preview.style.background=value;preview.setAttribute('aria-label','Picked color '+value);
+}
+function readHex(){
+ if(!/^#[0-9a-f]{6}$/i.test(picker.value)){
+  picker.setCustomValidity('Use a color in #rrggbb format.');
+  for(const action of popup.querySelectorAll('[data-color-try],[data-color-save]')) action.disabled=true;
+  return false;
+ }
+ const value=picker.value.toLowerCase();
+ const rgb=[1,3,5].map(start=>parseInt(value.slice(start,start+2),16)/255);
+ const [red,green,blue]=rgb, high=Math.max(...rgb),low=Math.min(...rgb),delta=high-low;
+ if(delta){
+  const sector=high===red ? (green-blue)/delta : high===green ? (blue-red)/delta+2 : (red-green)/delta+4;
+  hue.value=(sector*60+360)%360;
+ }
+ saturation=high ? delta/high : 0;brightness=high;drawPick(value);return true;
+}
+function pickHSV(){
+ const sector=Number(hue.value)/60,chroma=brightness*saturation;
+ const second=chroma*(1-Math.abs(sector%2-1)),base=brightness-chroma;
+ const channels=[[chroma,second,0],[second,chroma,0],[0,chroma,second],
+  [0,second,chroma],[second,0,chroma],[chroma,0,second]][Math.floor(sector)%6];
+ drawPick('#'+channels.map(value=>Math.round((value+base)*255).toString(16).padStart(2,'0')).join(''));
+}
+function pickPoint(event){
+ const box=area.getBoundingClientRect();
+ saturation=clamp((event.clientX-box.left)/box.width);brightness=clamp(1-(event.clientY-box.top)/box.height);pickHSV();
+}
+area.addEventListener('pointerdown',event=>{
+ if(event.button!==0) return;
+ event.preventDefault();area.focus();dragging=event.pointerId;
+ if(event.isTrusted) area.setPointerCapture(event.pointerId);
+ pickPoint(event);
+});
+area.addEventListener('pointermove',event=>{if(dragging===event.pointerId) pickPoint(event);});
+for(const name of ['pointerup','pointercancel','lostpointercapture']) area.addEventListener(name,()=>{dragging=null;});
+area.addEventListener('keydown',event=>{
+ const step=event.shiftKey ? .1 : .01;
+ if(event.key==='ArrowLeft') saturation=clamp(saturation-step);
+ else if(event.key==='ArrowRight') saturation=clamp(saturation+step);
+ else if(event.key==='ArrowUp') brightness=clamp(brightness+step);
+ else if(event.key==='ArrowDown') brightness=clamp(brightness-step);
+ else return;
+ event.preventDefault();pickHSV();
+});
+hue.addEventListener('input',pickHSV);
+hue.addEventListener('keydown',event=>{
+ const step=event.shiftKey ? 10 : 1;
+ if(['ArrowRight','ArrowUp'].includes(event.key)) hue.value=Number(hue.value)+step;
+ else if(['ArrowLeft','ArrowDown'].includes(event.key)) hue.value=Number(hue.value)-step;
+ else if(event.key==='Home') hue.value=0;
+ else if(event.key==='End') hue.value=360;
+ else return;
+ event.preventDefault();pickHSV();
+});
+picker.addEventListener('input',readHex);
+const pendingSaves=new Set(), accountColors=new WeakMap();
+const message=document.createElement('span');
+message.className='color-save-error';message.dataset.colorSaveError='';message.hidden=true;
+message.setAttribute('role','status');message.setAttribute('aria-live','polite');
+document.querySelector('[data-page-status]').append(message);
+let selected=null;
+const menu=document.querySelector('[data-move-menu]'), menuItems=menu.querySelector('[data-move-items]');
+let menuRow=null;
+const pendingMoves=new Set();
+const hold=()=>selected ? 'An account color is being edited.' : menuRow ? 'An account move is being chosen.'
+ : pendingSaves.size ? 'Account colors are being saved.' : pendingMoves.size ? 'An account move is being saved.' : '';
 async function refresh(supersede=false,current=()=>true) {
-  if (selected) return;
+  if (hold()) return;
   const request = ++newestRequest;
   const response = await fetch(location.pathname, {cache: 'no-store'});
   if (!response.ok) throw new Error('HTTP ' + response.status);
   const page = new DOMParser().parseFromString(await response.text(), 'text/html');
   const fresh = page.querySelector('[data-accounts]');
-  if (request !== newestRequest || !current() || selected) return;
+  if (request !== newestRequest || !current() || hold()) return;
   if (!fresh) throw new Error('The page has no accounts.');
   const top = scrollY;
   view.replaceWith(fresh);view = fresh;
@@ -217,43 +364,142 @@ function position(){
  popup.style.left=Math.max(8,Math.min(box.left,innerWidth-size.width-8))+'px';
  popup.style.top=Math.max(8,Math.min(box.bottom+8,innerHeight-size.height-8))+'px';
 }
-function paint(value){
- selected.style.background=value;
- selected.previousElementSibling.style.color=value;
+function accountName(button=selected){return button.closest('tr').querySelector('[data-account-name] span');}
+function colors(button){
+ if(!accountColors.has(button)) accountColors.set(button,{savedText:accountName(button).style.color,queue:[]});
+ return accountColors.get(button);
 }
-function close(restore){
- if(restore){paint(selected.dataset.savedColor);selected.previousElementSibling.style.color=savedText;}
+function paint(value,button=selected){
+ button.style.background=value;
+ accountName(button).style.color=value;
+}
+function restore(button){
+ const state=colors(button), pending=state.queue.at(-1);
+ paint(pending ? pending.value : button.dataset.savedColor,button);
+ accountName(button).style.color=pending ? pending.value : state.savedText;
+}
+function close(restoreSaved){
+ if(restoreSaved) restore(selected);
  const button=selected;selected=null;popup.close();button.focus({preventScroll:true});updates.changed();
 }
 document.addEventListener('click',event=>{
  const button=event.target instanceof Element ? event.target.closest('[data-account-color]') : null;
- if(!button || saving) return;
+ if(!button) return;
  if(selected) close(true);
- selected=button;savedText=button.previousElementSibling.style.color;
- picker.value=button.dataset.savedColor;
- popup.querySelector('label').textContent='Change '+button.dataset.accountColor+' color';
- message.textContent='';popup.showModal();position();picker.focus();updates.abandon();
+ selected=button;
+ const state=colors(button);
+ picker.value=state.queue.at(-1)?.value || button.dataset.savedColor;
+ readHex();
+ popup.querySelector('#color-title').textContent='Change '+button.dataset.accountColor+' color';
+ popup.showModal();position();area.focus();updates.abandon();
 });
-popup.querySelector('[data-color-try]').addEventListener('click',()=>paint(picker.value));
+popup.querySelector('[data-color-try]').addEventListener('click',()=>{if(readHex()) paint(picker.value);});
 popup.querySelector('[data-color-cancel]').addEventListener('click',()=>close(true));
-popup.addEventListener('cancel',event=>{event.preventDefault();if(!saving) close(true);});
+popup.addEventListener('cancel',event=>{event.preventDefault();close(true);});
 popup.addEventListener('keydown',event=>{
- if(event.key==='Escape'){event.preventDefault();if(!saving) close(true);}
+ if(event.key==='Escape'){event.preventDefault();close(true);}
 });
-popup.querySelector('[data-color-save]').addEventListener('click',async()=>{
- saving=true;paint(picker.value);message.textContent='Saving…';
- popup.querySelectorAll('button,input').forEach(button=>button.disabled=true);
+async function publish(save,state){
  try{
   const response=await fetch(location.pathname,{method:'POST',
    headers:{'Content-Type':'application/x-www-form-urlencoded'},
-   body:new URLSearchParams({label:selected.dataset.accountColor,value:picker.value}).toString()});
+   body:new URLSearchParams({label:save.account,value:save.value}).toString()});
   const result=await response.json();
   if(!response.ok) throw new Error(result.reason || 'The color could not be saved.');
-  selected.dataset.savedColor=picker.value;close(false);void updates.refresh(true);
- }catch(error){message.textContent=error.message || 'The color could not be saved.';position();}
- finally{saving=false;popup.querySelectorAll('button,input').forEach(button=>button.disabled=false);}
+  save.button.dataset.savedColor=save.value;state.savedText=save.value;
+ }catch(error){
+  save.button.dataset.savedColor=save.oldColor;state.savedText=save.oldText;
+  paint(save.oldColor,save.button);accountName(save.button).style.color=save.oldText;
+  if(selected===save.button){picker.value=save.oldColor;readHex();}
+  message.textContent=save.account+': '+(error.message || 'The color could not be saved.');message.hidden=false;
+ }finally{
+  state.queue.shift();pendingSaves.delete(save);
+  const next=state.queue[0];
+  if(next){next.oldColor=save.button.dataset.savedColor;next.oldText=state.savedText;void publish(next,state);}
+  if(selected!==save.button) restore(save.button);
+  updates.changed();
+  if(!pendingSaves.size) void updates.refresh(true);
+ }
+}
+popup.querySelector('[data-color-save]').addEventListener('click',()=>{
+ if(!readHex()){picker.reportValidity();return;}
+ const button=selected,state=colors(button);
+ const save={button,account:button.dataset.accountColor,value:picker.value,
+  oldColor:button.dataset.savedColor,oldText:state.savedText};
+ paint(save.value);state.queue.push(save);pendingSaves.add(save);
+ message.textContent='';message.hidden=true;close(false);
+ if(state.queue.length===1) void publish(save,state);
 });
 addEventListener('resize',position);addEventListener('scroll',position,{passive:true});
+function closeMenu(){
+ if(!menuRow) return;
+ menuRow=null;menu.hidden=true;menuItems.replaceChildren();updates.changed();
+}
+function menuItem([label,left,color,tone]){
+ const item=document.createElement('button');
+ item.type='button';item.setAttribute('role','menuitem');item.dataset.moveTarget=label;
+ const name=document.createElement('span'), room=document.createElement('span');
+ name.className='move-name';name.textContent=label;if(color) name.style.color=color;
+ room.className='move-left'+(tone==='default' ? '' : ' '+tone);room.textContent=left && left!=='—' ? left+' left' : '';
+ item.append(name,room);return item;
+}
+function openMenu(row,x,y){
+ if(selected) close(true);
+ const card=view.querySelector('[data-move-targets]');
+ const account=row.dataset.moveAccount, group=row.dataset.moveGroup;
+ const targets=JSON.parse(card.dataset.moveTargets).filter(([label])=>label!==account);
+ menuRow=row;
+ menu.querySelector('[data-move-title]').textContent='When '+account+' reaches '+card.dataset.movePercent+'%, move '+group+' to';
+ const empty=document.createElement('div');
+ empty.className='move-empty';empty.textContent='No other Claude account';
+ menuItems.replaceChildren(...(targets.length ? targets.map(menuItem) : [empty]));
+ menu.hidden=false;
+ const size=menu.getBoundingClientRect();
+ menu.style.left=Math.max(8,Math.min(x,innerWidth-size.width-8))+'px';
+ menu.style.top=Math.max(8,Math.min(y,innerHeight-size.height-8))+'px';
+ (menuItems.querySelector('button') || menu).focus({preventScroll:true});
+ updates.abandon();
+}
+async function saveMove(group,target){
+ const save={group,target};
+ pendingMoves.add(save);message.textContent='';message.hidden=true;
+ try{
+  const response=await fetch(location.pathname,{method:'POST',
+   headers:{'Content-Type':'application/x-www-form-urlencoded'},
+   body:new URLSearchParams({group,to:target}).toString()});
+  const result=await response.json();
+  if(!response.ok) throw new Error(result.reason || 'The move could not be saved.');
+ }catch(error){
+  message.textContent=group+': '+(error.message || 'The move could not be saved.');message.hidden=false;
+ }finally{
+  pendingMoves.delete(save);updates.changed();
+  if(!hold()) void updates.refresh(true);
+ }
+}
+document.addEventListener('contextmenu',event=>{
+ const row=event.target instanceof Element ? event.target.closest('tr[data-move-group]') : null;
+ if(!row){closeMenu();return;}
+ event.preventDefault();closeMenu();openMenu(row,event.clientX,event.clientY);
+});
+document.addEventListener('pointerdown',event=>{
+ if(menuRow && !(event.target instanceof Node && menu.contains(event.target))) closeMenu();
+});
+menu.addEventListener('click',event=>{
+ const item=event.target instanceof Element ? event.target.closest('[data-move-target]') : null;
+ if(!item || !menuRow) return;
+ void saveMove(menuRow.dataset.moveGroup,item.dataset.moveTarget);closeMenu();
+});
+menu.addEventListener('keydown',event=>{
+ const items=[...menuItems.querySelectorAll('button')], at=items.indexOf(document.activeElement);
+ if(event.key==='Escape' || event.key==='Tab'){event.preventDefault();closeMenu();return;}
+ if(!items.length || !['ArrowDown','ArrowUp','Home','End'].includes(event.key)) return;
+ event.preventDefault();
+ const down=event.key==='ArrowDown';
+ const next=event.key==='Home' ? 0 : event.key==='End' ? items.length-1
+  : at<0 ? (down ? 0 : items.length-1) : (at+(down ? 1 : -1)+items.length)%items.length;
+ items[next].focus();
+});
+for(const name of ['resize','scroll','blur']) addEventListener(name,closeMenu,{passive:true});
 })();"""
 
 

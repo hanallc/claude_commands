@@ -353,21 +353,35 @@ A failed background render keeps the last good page and writes one line to stder
 Failed renders add no render time.
 A cached Accounts response carries its render failure to the status line.
 
-Each account with an `account.<label>` key in `config/statusline.conf` has a swatch beside its label.
-The swatch opens one popup with a native color picker and Try, Save, and Cancel buttons.
-The popup uses the console theme and stays inside the viewport.
+Each account with an `account.<label>` key in `config/statusline.conf` has a swatch in the last column, **Color**.
+A swatch click opens a dialog with a color picker built into the page: a saturation and brightness area, a hue slider, a large color box and a hex field.
+The dialog uses the console theme and stays inside the viewport.
 Try changes the label and swatch without a request.
 Cancel or Escape restores the saved color.
-The page pauses refresh while the popup is open, including after Try or a failed save.
-Save posts `label` and a lowercase `#rrggbb` value to `/console/accounts.html` as form data.
+The page pauses refresh while the dialog is open and while a save is pending.
+Save closes the dialog at once and posts `label` and a lowercase `#rrggbb` value to `/console/accounts.html` as form data.
 The server validates the configured account and the hex color.
 It runs this checkout's `scripts/lib/tune.py` through `scripts/lib/py` to publish the value.
 The tune command records the user's Save action and commits the configuration change through its normal publication path.
-The popup disables its controls and shows **Saving…** during publication.
-Success closes the popup, clears the kept page, and refreshes the board.
+Saves for one account publish in order.
+Success clears the kept page and refreshes the board after the last pending save.
 A refused request returns 400 with its reason.
 A failed publication returns 503 with tune's last stderr line.
-The popup shows the reason and keeps the tried color until Cancel.
+A failed save restores the old colors and shows `<account>: <reason>` in the status line.
+
+A right click on the line of a selected Claude group (`units ✓` or `showrunners ✓`) opens a menu, not the browser menu.
+The menu title is **When <account> reaches <percent>%, move <group> to**.
+`next_move_percent` in `config/accounts.conf` sets the percent.
+The menu lists the other Claude accounts in board order, each with its weekly percent left when known.
+Arrow keys, Home and End move between the items. Escape, Tab, a click outside, a scroll or a resize close the menu.
+The page pauses refresh while the menu is open and while a move save is pending.
+A choice posts `group` and `to` to `/console/accounts.html` as form data.
+The server checks the group and the account note, then calls `next_moves.set_first_next_move()`.
+The new entry replaces the group's first next move, or becomes its only one, with no hold.
+Success clears the kept page and refreshes the board, so the upcoming moves show the new entry.
+A refused request returns 400 and a failed write returns 503, each with its reason.
+A failed move shows `<group>: <reason>` in the status line.
+Codex workers keep their own moves; the menu shows no Codex account.
 
 - The table comes from `accounts.status_board()`: the board columns, rows, total row and tones.
 - The upcoming moves and the problems follow the table.

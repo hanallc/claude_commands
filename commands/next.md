@@ -140,10 +140,12 @@ End with one choice line, based on that check:
 `approve (recommended — reason) / decline / defer / elaborate`.
 For a fix that belongs to another session, offer `relay` in place of `approve`.
 
-Record the outcome on the candidate's own ledger line as soon as it is decided:
-its `— proposed` becomes `— accepted <date>, applied (<repo> <sha>)`,
-`— declined`, `— deferred`, `— done <date>` or `— relayed <date>`. Apply an
-approved change; commit and push only when the user says so.
+Record the outcome as soon as it is decided. Never edit the ledger by hand. Run:
+`~/.claude/scripts/lib/py ~/.claude/scripts/nightly_review/candidates.py outcome E<n> <state> [--ledger <path>]`.
+`E<n>` is the item's id. `<state>` is `accepted --applied '<repo> <sha>'`,
+`declined`, `deferred`, `done` or `relayed`. Pass `--ledger` with the ledger
+that the `Efficiency ledger` line names, when it is not the nightly review's own.
+Apply an approved change; commit and push only when the user says so.
 
 ## question
 

@@ -637,6 +637,10 @@ accounts.py next hold units 1 half-point --expect 1 claude4
 
 The list has showrunners, units and workers sections in that order, numbered from 1 within each group: “units 1: at 1% → claude4, hold 30 min”. Position 1 runs next; an empty log prints “nothing set up”. `move GROUP N M` moves position N to M, `remove GROUP N` removes it, and `add … --at N` inserts at positions 1 through the group’s size plus 1 (omission appends). Edits preserve other groups’ order and internal entry identities; ids are never shown or accepted in these commands. The Mac forwards group positions to natedev, which resolves and edits them under the watch and log locks; install both machines together. A head change immediately clears the displaced head’s hold and notice keys, so the new head starts its own hold on a later pass; an unchanged head keeps its hold.
 
+On the console Accounts page, right-click the `units ✓` or `showrunners ✓` line of a Claude account and choose another Claude account.
+The choice replaces the group's first entry, or adds one, at `next_move_percent` from `config/accounts.conf` (1%) with no hold.
+Codex workers have no menu.
+
 For units, showrunners and workers, agent-notes considers only the first entry per group.
 Later entries wait until it records and removes the first entry.
 A later pass can then process the next entry.

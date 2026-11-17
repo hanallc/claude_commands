@@ -425,6 +425,8 @@ Try changes the label and swatch locally without a request.
 Cancel or Escape restores the saved color.
 Save publishes the color through this checkout's `scripts/lib/tune.py` and refreshes the board.
 The page pauses refresh while the chooser is open.
+A board line of a selected Claude group (`units` or `showrunners`) carries `group`: its account and group.
+The Accounts page opens its next move menu on a right click of that line.
 Its `stale_at` is the next local midnight, when its reset text changes.
 The text table appends `Login ends` in the user's zone, with the same date format as `Weekly resets`.
 Each JSON account exports `login_ends_at` as an ISO 8601 UTC string, or null for an unknown date or Codex.
