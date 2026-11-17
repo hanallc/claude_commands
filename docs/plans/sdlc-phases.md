@@ -801,7 +801,9 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 1. basedpyright on `scripts/production` and `scripts/review_links` reports 0 errors and 0 warnings (reportImportCycles included).
 2. The full `scripts.production` suite and the review_links suites pass.
 
-### Phase 54 — One fast-track call finds each path and ref once  · status: todo
+### Phase 54 — One fast-track call finds each path and ref once  · status: dropped
+**Result (2026-11-17):** dropped with no code change. One fetch under the landing lock and a reused worktree root cut Git starts by 2.62 percent (7,185 to 6,997); CPU rose from 56.4 s to 60.2 s. Below the 20 percent rule.
+
 **Depends on:** phase 53, phase 51 (order only); natest phase 323 (a0463a3b9) merged to main if test_fast_track.py changes
 
 #### Work Order
@@ -858,6 +860,34 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 1. basedpyright scripts/production scripts/review_links: 0 errors, 0 warnings.
 2. The review_links suites pass.
 3. Both new tests fail on the base.
+
+### Phase 56 — The timed-refresh browser tests pass under load  · status: done
+**Result (2026-11-17):** the tests waited a fixed 12 s for a 5 s timed refresh. CPU load alone did not reproduce the timeout; a delayed refresh timer did, so the exact cause under load is not proven. The tests now run the page's scheduled refresh and wait on the DOM change, with a named 12 s limit per wait. The test server joins its handlers with a 5 s socket timeout before teardown. The phase 55 one-process errors had another cause: the shared worktree.
+
+**Depends on:** Phase 55
+
+#### Work Order
+
+**Goal:** the showrunner (2026-11-17): "test_images test_timed_refresh_keeps_focus_and_selection_on_another_image failed under load in admin-console's ownerchips run (774 tests, 773 pass) and passes alone. Find the cause." Phase 48 finding F014.
+
+**Spec:**
+1. Find the cause of the timeout under load in `test_timed_refresh_keeps_focus_and_selection_on_another_image` and `test_successful_question_retries_the_first_failed_refresh`. Both timed out once in the phase 53 runs.
+2. Reproduce it under load first (for example with CPU stress beside the test, under a MemoryMax=2G scope). Show the failure before the fix.
+3. Fix the cause. A longer deadline alone is not a fix: the test must wait on the event it checks, not on time.
+4. Say whether the 217 fixture config and socket errors in a one-process review_links run (phase 55) share the cause. Diagnose only; fix them here only if the cause is the same.
+
+**Files:**
+- `scripts/review_links/test_images.py`
+- `scripts/review_links/images.py` only if the cause is in the page script
+
+**Workers:** 1 writer (`design`).
+
+**State:** none.
+
+**Acceptance gate:**
+1. The two tests pass 10 times in a row under the same load that failed them before.
+2. basedpyright scripts/review_links: 0 errors, 0 warnings.
+3. The review_links suites pass.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
