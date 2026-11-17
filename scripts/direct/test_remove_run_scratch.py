@@ -45,13 +45,19 @@ class RemoveRunScratchTests(unittest.TestCase):
         _ = (run / "heartbeat.log").write_text("beat\n", encoding="utf-8")
         _ = (run / "board.json").write_text("{}", encoding="utf-8")
         # A gate copy: a clone with its own .git folder and a target inside it.
-        (run / "phases" / "p4" / "gate" / ".git").mkdir(parents=True)
-        (run / "phases" / "p4" / "gate" / "target").mkdir()
-        _ = (run / "phases" / "p4" / "gate" / "target" / "CACHEDIR.TAG").write_text("tag\n", encoding="utf-8")
+        gate = run / "phases" / "p4" / "gate"
+        _ = subprocess.run(["git", "init", "-q", str(gate)], check=True, capture_output=True)
+        _ = (gate / ".git/info/exclude").write_text("/target\n")
+        (gate / "target").mkdir()
+        _ = (gate / "target" / "CACHEDIR.TAG").write_text("tag\n", encoding="utf-8")
         _ = (run / "phases" / "p4" / "review.diff").write_text("diff\n", encoding="utf-8")
         # A worktree checkout: .git is a file.
-        (run / "scratch" / "export").mkdir(parents=True)
-        _ = (run / "scratch" / "export" / ".git").write_text("gitdir: /elsewhere\n", encoding="utf-8")
+        source = root / "source"
+        _ = subprocess.run(["git", "init", "-q", str(source)], check=True, capture_output=True)
+        _ = subprocess.run(["git", "-C", str(source), "-c", "user.name=t", "-c", "user.email=t@t",
+                            "commit", "-qm", "Create the fixture", "--allow-empty"], check=True, capture_output=True)
+        _ = subprocess.run(["git", "-C", str(source), "worktree", "add", "-q", "--detach",
+                            str(run / "scratch/export"), "HEAD"], check=True, capture_output=True)
         # A finished cargo target with no tag.
         (run / "p26_before" / "debug").mkdir(parents=True)
         _ = (run / "p26_before" / ".rustc_info.json").write_text("{}", encoding="utf-8")
@@ -98,6 +104,25 @@ class RemoveRunScratchTests(unittest.TestCase):
             remove_run_scratch.remove(checkout)
         self.assertEqual(events, ["guard"])
         self.assertFalse(checkout.exists())
+
+    def test_run_cleanup_finishes_both_marks_after_the_source_disappears(self) -> None:
+        run, _ = self.make_run()
+        checkout = run / "phases/p4/gate"
+        task_mark = scratch.removal_mark(checkout)
+        cargo_mark = scratch.cargo_removal_mark(checkout)
+        scratch.atomic_record(cargo_mark, [])
+        with mock.patch.object(scratch, "finish_removal", side_effect=OSError("stopped before completion")):
+            with self.assertRaisesRegex(OSError, "stopped before completion"):
+                remove_run_scratch.remove(checkout)
+        self.assertFalse(checkout.exists())
+        self.assertTrue(task_mark.is_file())
+        self.assertTrue(cargo_mark.is_file())
+        self.assertIn(checkout, remove_run_scratch.scratch_folders(run))
+        with (mock.patch.object(workers, "protected_working_directories", return_value=()),
+              mock.patch.object(sys, "argv", [str(SCRIPT), str(run)])):
+            self.assertEqual(remove_run_scratch.main(), 0)
+        self.assertFalse(task_mark.exists())
+        self.assertFalse(cargo_mark.exists())
 
     def test_cleanup_keeps_the_checkout_holding_a_paused_workers_live_command(self) -> None:
         run, _ = self.make_run()
