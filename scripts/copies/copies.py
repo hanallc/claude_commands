@@ -65,7 +65,6 @@ class ActiveGate:
     tree: Path
     source: Path
     owner: str
-    cargo_dir: Path
 
 
 ACTIVE_GATES: ContextVar[tuple[ActiveGate, ...]] = ContextVar("active_gate_checkouts", default=())
@@ -1054,10 +1053,10 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
         tree = slot.path
         descriptor = build_folders.build_folder_lock_fd(tree)
         token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), descriptor))
+        # A value under the slot cache root is another slot's lease, inherited from an outer gate or slot command.
         defaults = {key: value for key, value in slot.env.items()
-                    if key not in os.environ or any(os.environ[key] == str(active.cargo_dir)
-                                                   for active in ACTIVE_GATES.get())}
-        active_token = ACTIVE_GATES.set((*ACTIVE_GATES.get(), ActiveGate(tree, canonical, owner, slot.cargo_dir)))
+                    if key not in os.environ or Path(os.environ[key]).resolve().parent == slot.cargo_dir.parent}
+        active_token = ACTIVE_GATES.set((*ACTIVE_GATES.get(), ActiveGate(tree, canonical, owner)))
         previous = {key: os.environ.get(key) for key in defaults}
         os.environ.update(defaults)
         try:

@@ -72,6 +72,7 @@ if TYPE_CHECKING:
 _AGENT_START_TIMEOUT_MAXIMUM_MS = 300_000
 PROMPT_SETTLE_SECONDS = 10
 PANE_POLL_SECONDS = 0.1
+START_RETRY_MAX_SECONDS = 1.0
 _PLATFORM = sys.platform
 NO_ENVIRONMENT_REMOVALS: frozenset[str] = frozenset()
 SHARED_SESSION = "agents"
@@ -2492,27 +2493,10 @@ class Herdr:
         if isinstance(opening, OpeningPrompt):
             if isinstance(opening.transcript, SessionTranscript):
                 transcript = opening.transcript
-                try:
-                    while True:
-                        try:
-                            identity = self.native_session(pane, kind, max(0.1, deadline - time.monotonic()))
-                            break
-                        except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                            cause: BaseException | None = error
-                            while cause is not None and not isinstance(cause, NativeRegistryChanging):
-                                cause = cause.__cause__ or cause.__context__
-                            remaining = deadline - time.monotonic()
-                            if not isinstance(cause, NativeRegistryChanging) or remaining <= 0:
-                                raise
-                            time.sleep(operation_deadline.remaining(min(PANE_POLL_SECONDS, remaining)))
-                            if time.monotonic() >= deadline:
-                                raise
-                except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                    print(f"herdr {name}:{pane}: native session is unavailable: {error}; pane retained", file=sys.stderr)
-                    return PromptNotSubmitted("native session is unavailable; pane retained")
-                if transcript.session_id and not check_target(
-                        identity, action="keys", place=HerdrPlace(self.session, pane)):
-                    return PromptNotSubmitted("prompt target is unknown; session retained")
+                ready = self._started_target(name, pane, kind, deadline, checked=bool(transcript.session_id))
+                if isinstance(ready, PromptNotSubmitted):
+                    return ready
+                identity = ready
                 transcript = SessionTranscript(transcript.config_dir, identity)
                 if isinstance(opening.cursor, TranscriptCursor):
                     opening.cursor.bind_transcript(transcript)
@@ -2525,6 +2509,34 @@ class Herdr:
             return self.submit_opening_prompt(pane, opening, launched_at,
                                               max(0, int((deadline - time.monotonic()) * 1000)))
         return PromptSubmissionNotRequired()
+
+    def _started_target(self, name: str, pane: str, kind: str, deadline: float, *,
+                        checked: bool) -> str | PromptNotSubmitted:
+        """Read the started agent's identity and prove its pane, retrying while the process starts.
+
+        A starting agent can lack its registry record, process start time or argv. Reads retry
+        until the deadline; the pause doubles up to START_RETRY_MAX_SECONDS, which bounds the
+        evidence lines a lasting failure writes. Herdr runs restarts in threads, so stderr stays direct.
+        """
+        pause = PANE_POLL_SECONDS
+        while True:
+            try:
+                identity = self.native_session(pane, kind, max(0.1, deadline - time.monotonic()))
+            except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                unavailable = f"native session is unavailable: {error}"
+                failure = PromptNotSubmitted("native session is unavailable; pane retained")
+            else:
+                if not checked or check_target(identity, action="keys", place=HerdrPlace(self.session, pane)):
+                    return identity
+                unavailable = ""
+                failure = PromptNotSubmitted("prompt target is unknown; session retained")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if unavailable:
+                    print(f"herdr {name}:{pane}: {unavailable}; pane retained", file=sys.stderr)
+                return failure
+            time.sleep(operation_deadline.remaining(min(pause, remaining)))
+            pause = min(pause * 2, START_RETRY_MAX_SECONDS)
 
     def start_command(self, argv: list[str], kind: str, pane: str,
                       timeout: float) -> subprocess.CompletedProcess[str]:
