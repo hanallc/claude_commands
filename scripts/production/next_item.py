@@ -104,14 +104,19 @@ def efficiency_queue(doc: Path, below: bool = False) -> Queue:
     return read_queue(EFFICIENCY, doc, below)
 
 
+def review_scope(production: Path | None, record: staff.StaffSnapshot) -> Path | staff.StaffRow:
+    """Use the caller's producer scope unless a production is selected."""
+    caller = record.by_current_session(staff.caller_identity()) if production is None else None
+    return caller if caller is not None and caller.kind == "producer" else _doc(production)
+
+
 def read_queue(kind: str, production: Path | None, below: bool = False, *,
                record: staff.StaffSnapshot | None = None) -> Queue:
     """The waiting items of one list."""
     from scripts.review_links import review_items
     try:
         record = staff.snapshot() if record is None else record
-        caller = record.by_current_session(staff.caller_identity()) if kind == QUESTION and production is None else None
-        scope = caller if caller is not None and caller.kind == "producer" else _doc(production)
+        scope = review_scope(production, record)
         name, entries = review_items.next_queue(kind, scope, below, record)
         return Queue(name, entries)
     except (change_review.ChangeReviewError, RegistrationFailure, Refusal, OSError, ValueError) as error:
@@ -120,23 +125,24 @@ def read_queue(kind: str, production: Path | None, below: bool = False, *,
 
 def show(kind: str, order: str, production: Path | None, below: bool = False) -> str:
     """The one item /next shows, led by its kind; it is pinned."""
-    record = None if kind == EFFICIENCY else staff.snapshot()
+    record = staff.snapshot()
     if kind:
         queue = read_queue(kind, production, below, record=record)
         shown = urgency.top(queue.entries, queue.name, order)
         return f"{kind}\n{shown.item}" if shown is not None else f"no {kind} is waiting for you"
-    doc = _doc(production)
+    scope = review_scope(production, record)
     queues: dict[str, list[urgency.Entry[str]]] = {}
     kinds: dict[str, str] = {}
     for each in KINDS:
         try:
-            queue = read_queue(each, doc, below, record=record)
+            queue = read_queue(each, scope if isinstance(scope, Path) else None, below, record=record)
         except NextError as error:
             print(f"next_item: {error}", file=sys.stderr)
             continue
         queues[queue.name] = queue.entries
         kinds[queue.name] = each
-    found = urgency.top_across(queues, urgency.scope_queue(f"next-{document_id(doc, record=record)}", below), order)
+    owner = scope.id if isinstance(scope, staff.StaffRow) else document_id(scope, record=record)
+    found = urgency.top_across(queues, urgency.scope_queue(f"next-{owner}", below), order)
     if found is None:
         return "nothing is waiting for you"
     name, shown = found
