@@ -87,6 +87,21 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual(proc_root, self.proc)
         return build_hold.LiveClaims(self.claimed)
 
+    def test_drain_keeps_a_verified_remote_waiter_without_local_admission(self) -> None:
+        _ = self.process(700, 'bash', argv=('/bin/bash', '/scripts/direct/verify.sh'), session='other')
+        processes = build_hold.read_audit_processes(self.proc)
+        identity = processes[700].identity
+        claims = build_hold.LiveClaims(frozenset({identity}), remote_waiters=frozenset({identity}))
+        runs = hold_enforcer.classify_drain_runs(processes, frozenset(), claims)
+        assert isinstance(runs, tuple)
+        self.assertEqual(len(runs), 1)
+        self.assertIsInstance(runs[0], hold_enforcer.WorkingRun)
+        assert isinstance(runs[0], hold_enforcer.WorkingRun)
+        self.assertEqual(runs[0].reason, 'remote waiter')
+        unassigned = hold_enforcer.classify_drain_runs(processes, frozenset(), build_hold.LiveClaims(frozenset()))
+        assert isinstance(unassigned, tuple)
+        self.assertIsInstance(unassigned[0], hold_enforcer.WaitingRun)
+
     def write_holder(self, keep: tuple[build_hold.ProcessIdentity, ...] = ()) -> None:
         _ = (self.holders / "holder").write_text(json.dumps({
             "holder": "builder", "since": datetime.fromtimestamp(100, timezone.utc).isoformat(),

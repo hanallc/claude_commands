@@ -135,6 +135,28 @@ class NoOperation:
     """No provider response remains unresolved."""
 
 
+@dataclass(frozen=True)
+class HanaLifecycleEvidence:
+    deployment: DeploymentIdentity
+    state: Lifecycle
+    boot: VerifiedBoot | BootUnverified
+    operation: PendingOperation | NoOperation
+    permit: DeliveredPermit | NoDeliveredPermit
+    claims: tuple[WorkClaim, ...]
+    observed_at: int
+
+
+@dataclass(frozen=True)
+class HanaUnprovisioned:
+    """No approved deployment exists."""
+
+
+@dataclass(frozen=True)
+class HanaLifecycleUnavailable:
+    reason: str
+    observed_at: int
+
+
 @dataclass
 class BoxRecord:
     identity: DeploymentIdentity
@@ -338,6 +360,18 @@ class HanaController:
     def _save(self, row: BoxRecord) -> None:
         write_text_atomic(self.path, json.dumps(_record(row), sort_keys=True) + '\n')
 
+    def inspect(self) -> HanaLifecycleEvidence | HanaUnprovisioned | HanaLifecycleUnavailable:
+        """Read an immutable lifecycle projection without provider calls or journal changes."""
+        try:
+            with control_lock(self.directory):
+                row = self._read()
+                if isinstance(row, NoDeployment):
+                    return HanaUnprovisioned()
+                return HanaLifecycleEvidence(row.identity, row.state, row.boot, row.operation,
+                    row.delivered, tuple(row.claims), row.observed_at)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            return HanaLifecycleUnavailable(type(error).__name__, int(self.clock()))
+
     def _spending(self) -> hana_spend.HanaSpending:
         return hana_spend.HanaSpending(ledger.CostLedger(self.directory), self.settings_path,
             hana_spend.read_settings(conf.read(self.workload_path)))
@@ -385,12 +419,56 @@ class HanaController:
             claim = row.claims[0]
             return ClaimWaiting(claim, int(self.clock()) >= claim.requested_at + settings.start_timeout_seconds)
 
+    def bind_execution(self, execution: str) -> None:
+        """Retain an assigned execution before its dispatch journal exists."""
+        from importlib import import_module
+
+        execution_guard_path = cast(Callable[[Path, str], Path],
+            import_module('scripts.aws_target.hana_execution').execution_guard_path)
+
+        if not execution:
+            raise ValueError('The Hana execution identity is missing')
+        with control_lock(self.directory):
+            write_text_atomic(execution_guard_path(self.directory, execution), execution + '\n', new_file_mode=0o600)
+
+    def execution_bound(self, execution: str) -> bool:
+        """Retain ownership unless the guard and lifecycle prove that execution never bound."""
+        from importlib import import_module
+
+        execution_guard_path = cast(Callable[[Path, str], Path],
+            import_module('scripts.aws_target.hana_execution').execution_guard_path)
+        try:
+            with control_lock(self.directory):
+                try:
+                    _ = execution_guard_path(self.directory, execution).stat()
+                    return True
+                except FileNotFoundError:
+                    pass
+                row = self._read()
+                if isinstance(row, NoDeployment):
+                    return False
+                return (any(claim.execution == execution for claim in row.claims)
+                        or isinstance(row.operation, PendingOperation) and row.operation.execution == execution)
+        except (OSError, ValueError, KeyError, TypeError):
+            return True
+
     def release(self, execution: str) -> bool:
         """Keep unresolved starts owned until lifecycle recovery settles them."""
         with control_lock(self.directory):
+            from importlib import import_module
+
+            module = import_module('scripts.aws_target.hana_execution')
+            execution_guard_path = cast(Callable[[Path, str], Path], module.execution_guard_path)
+            execution_command_settled = cast(Callable[[Path, str], bool], module.execution_command_settled)
+
+            guarded = execution_guard_path(self.directory, execution).exists()
+            if guarded and not execution_command_settled(self.directory, execution):
+                return False
             row = self._read()
             if isinstance(row, NoDeployment) or not row.claims or row.claims[0].execution != execution:
-                return False
+                return (guarded and isinstance(row, BoxRecord) and not row.claims
+                        and row.state not in (Lifecycle.STARTING, Lifecycle.STOPPING)
+                        and not isinstance(row.operation, PendingOperation))
             if row.state in (Lifecycle.STARTING, Lifecycle.STOPPING) or isinstance(row.operation, PendingOperation):
                 return False
             row.claims = []

@@ -109,6 +109,25 @@ class BuildSlotsTests(unittest.TestCase):
         with self.take() as lowest:
             self.assertEqual(lowest.number, 1)
 
+    def test_exact_slot_preserves_affinity_and_refuses_without_scanning(self) -> None:
+        def exact(number: int):
+            return build_slots.take_slot(self.source, self.base, showrunner='builds', unit='queue',
+                work='assigned', purpose='test', selection=build_slots.ExactSlotRequest(number))
+
+        with exact(2) as selected:
+            self.assertEqual(selected.number, 2)
+            self.assertFalse((self.slot_root / 'widget-slot1').exists())
+            with self.assertRaises(build_slots.SlotsFull), exact(2):
+                self.fail('The assigned slot admitted another holder')
+            self.assertFalse((self.slot_root / 'widget-slot1').exists())
+            path, cargo = selected.path, selected.cargo_dir
+        with exact(2) as retained:
+            self.assertEqual((retained.path, retained.cargo_dir), (path, cargo))
+        for number in (0, 3):
+            with self.subTest(number=number), self.assertRaises(ValueError), exact(number):
+                self.fail('The request exceeded its configured pool')
+        self.assertFalse((self.slot_root / 'widget-slot3').exists())
+
     def test_missing_repository_limit_uses_the_default_and_prints_the_tune_key(self) -> None:
         _ = private_slot_config(self.root, repository="widget", maximum=UseDefaultMaximum())
         output = io.StringIO()

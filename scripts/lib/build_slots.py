@@ -42,6 +42,22 @@ class Slot:
     env: Mapping[str, str]
 
 
+@dataclass(frozen=True)
+class ExactSlotRequest:
+    """Acquire only the slot number assigned to this command."""
+
+    number: int
+
+
+@dataclass(frozen=True)
+class LowestFreeSlot:
+    """Acquire the lowest free number within the configured pool."""
+
+
+SlotSelection = ExactSlotRequest | LowestFreeSlot
+LOWEST_FREE_SLOT = LowestFreeSlot()
+
+
 class SlotsFull(RuntimeError):
     """Every slot in the pool has a holder."""
 
@@ -85,7 +101,9 @@ def _git(source: Path, *arguments: str, pass_fds: Sequence[int] = (), accepted: 
     timeout = build_folders.repository_git_timeout()
     try:
         result = subprocess.run(["git", "-C", str(source), *arguments],
-                                capture_output=True, text=True, pass_fds=pass_fds, timeout=timeout)
+                                capture_output=True, text=True,
+                                pass_fds=tuple(dict.fromkeys((*pass_fds, *build_folders.held_build_folder_descriptors()))),
+                                timeout=timeout)
     except subprocess.TimeoutExpired as error:
         raise SlotGitFailure(f"git {' '.join(arguments)} in {source}: timed out after {timeout:g} seconds") from error
     if result.returncode not in accepted:
@@ -162,7 +180,8 @@ def _pool(source: Path) -> RepositoryPool:
     root = configured_slot_root()
     main = source_checkout(source)
     origin = subprocess.run(["git", "-C", str(main), "remote", "get-url", "origin"],
-                            capture_output=True, text=True)
+                            capture_output=True, text=True,
+                            pass_fds=build_folders.held_build_folder_descriptors())
     if origin.returncode not in (0, 2):
         origin.check_returncode()
     repository = (origin.stdout.strip().rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1].removesuffix(".git")
@@ -185,7 +204,8 @@ def _rescue(path: Path) -> None:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     name = f"{path.name}-{stamp}"
     try:
-        _ = git_rescue.rescue(path, name, generated=[path / "target"])
+        _ = git_rescue.rescue(path, name, generated=[path / "target"],
+                             pass_fds=build_folders.held_build_folder_descriptors())
     except git_rescue.RescueError as error:
         if "status" not in error.command or "index" not in error.stderr:
             raise
@@ -196,7 +216,8 @@ def _rescue(path: Path) -> None:
         try:
             descriptor = build_folders.build_folder_lock_fd(path)
             _ = _git(path, "read-tree", "HEAD", pass_fds=(descriptor,))
-            _ = git_rescue.rescue(path, name, generated=[path / "target"])
+            _ = git_rescue.rescue(path, name, generated=[path / "target"],
+                                 pass_fds=build_folders.held_build_folder_descriptors())
         except BaseException:
             _ = saved_index.replace(index)
             raise
@@ -227,12 +248,19 @@ def _exclude_slot_target(source: Path, path: Path, descriptor: int) -> None:
 
 @contextmanager
 def _try_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: str,
-              purpose: str, report: Callable[[str], None]) -> Generator[Slot]:
-    """Take the lowest free slot and reset its source under the exclusive lock."""
+              purpose: str, report: Callable[[str], None],
+              selection: SlotSelection = LOWEST_FREE_SLOT) -> Generator[Slot]:
+    """Acquire a selected slot and reset its source under the exclusive lock."""
     pool = _pool(source)
     maximum = _maximum(pool, report)
     checkout = build_folders.SlotCheckout(pool.source, _git(pool.source, "rev-parse", f"{commit}^{{commit}}"))
-    for number in range(1, maximum + 1):
+    if isinstance(selection, ExactSlotRequest):
+        if type(selection.number) is not int or not 1 <= selection.number <= maximum:
+            raise ValueError('The assigned slot exceeds the configured pool')
+        numbers = (selection.number,)
+    else:
+        numbers = range(1, maximum + 1)
+    for number in numbers:
         spec = build_folders.BuildFolderSpec(kind="slot", parent=pool.root, suffix_length=0,
                                             repository=pool.repository, slot=number, showrunner=showrunner,
                                             unit=unit, work=work, purpose=purpose, slot_checkout=checkout,
@@ -317,7 +345,8 @@ def _wait_mac_slot(root: Path, repository: str, maximum: int, deadline: float) -
 @contextmanager
 def take_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: str,
               purpose: str, wait_policy: SlotWaitPolicy = SlotWaitPolicy.QUEUE,
-              report: Callable[[str], None] = print) -> Generator[Slot]:
+              report: Callable[[str], None] = print,
+              selection: SlotSelection = LOWEST_FREE_SLOT) -> Generator[Slot]:
     """Take the lowest free slot and wait through the queue at capacity."""
     from scripts.build_queue import slot_wait
 
@@ -329,9 +358,9 @@ def take_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
         with ExitStack() as held:
             try:
                 slot = held.enter_context(_try_slot(source, commit, showrunner=showrunner, unit=unit,
-                                                    work=work, purpose=purpose, report=report))
+                                                    work=work, purpose=purpose, report=report, selection=selection))
             except SlotsFull as error:
-                if wait_policy is SlotWaitPolicy.REFUSE:
+                if wait_policy is SlotWaitPolicy.REFUSE or isinstance(selection, ExactSlotRequest):
                     raise
                 if sys.platform == "darwin":
                     _ = sys.stderr.write(str(error) + "; waiting for a free slot\n")

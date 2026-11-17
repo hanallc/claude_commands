@@ -35,11 +35,14 @@ from scripts.test_times.gate_record import (
     folder_scan_strings, module_read_record,
 )
 
-SCHEMA_VERSION = 41
+SCHEMA_VERSION = 42
 
 
 # These indexes support repeated queries over the current schema.
 COST_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS steps_linked_started ON steps (started_at, host) WHERE step_link IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS steps_linked_result ON steps"
+    + " (step_link, is_final_result, ended_at DESC, id DESC) WHERE step_link IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS steps_session_previous ON steps (session, started_at_us DESC, id DESC) WHERE step = 'nextest'",
     "CREATE INDEX IF NOT EXISTS steps_execution_end ON steps ((unixepoch(started_at,'subsec') + duration_s)) WHERE duration_s > 0",
     "CREATE INDEX IF NOT EXISTS steps_wait_started ON steps ((unixepoch(started_at,'subsec'))) WHERE mem_wait_s > 0",
@@ -92,6 +95,19 @@ class JobRunState(StrEnum):
     CARRIED_OVER = "carried_over"
 
 
+PLACEMENT_COLUMNS: list[Column] = [
+    ("step_link", "TEXT", "call and placement episode; NULL for older rows"),
+    ("placement_episode", "TEXT", "queue placement episode"),
+    ("placement_attempt", "TEXT", "queue execution attempt"),
+    ("execution_generation", "TEXT", "verified deployment, start, and boot identity"),
+    ("source_key", "TEXT", "source key bound to the captured commit"),
+    ("source_commit", "TEXT", "full captured commit; distinct from the verify source key"),
+    ("toolchain_identity", "TEXT", "source toolchain fingerprint; distinct from rustc -V"),
+    ("attempt_role", "TEXT", "remote or fallback; NULL for older rows"),
+    ("is_final_result", "INTEGER", "1 for the selected result, 0 for a lost attempt; NULL for older rows"),
+]
+
+
 STEP_COLUMNS: list[Column] = [
     ("id", "TEXT PRIMARY KEY", "host-UTC time-random"),
     ("src", "TEXT", "the JSON lines file the row came from, relative to the root"),
@@ -130,7 +146,7 @@ STEP_COLUMNS: list[Column] = [
     ("tty", "INTEGER", "1 when a terminal watched it; then no log facts are recorded"),
     ("status", "INTEGER", "exit status; 128+n for signal n"),
     ("rustc", "TEXT", "rustc -V for the step's toolchain"),
-    ("peak_mem_bytes", "INTEGER", "cgroup memory.peak of the step (page cache included); natedev only"),
+    ("peak_mem_bytes", "INTEGER", "cgroup memory.peak on the execution host, including page cache"),
     ("test_phase_charge_bytes", "INTEGER", "charge admission used for the test phase; NULL when no charge was recorded"),
     ("mem_stall_some_s", "REAL", "seconds at least one task waited on memory; natedev only"),
     ("mem_stall_full_s", "REAL", "seconds every task waited on memory; natedev only"),
@@ -158,6 +174,7 @@ STEP_COLUMNS: list[Column] = [
     ("build_directory", "TEXT NOT NULL", "resolved Cargo intermediate root; unknown when the record has no output pair"),
     ("build_history_group", "TEXT", "real folder or legacy checkout group; NULL for none or unresolved"),
     ("identity_derived", "INTEGER NOT NULL DEFAULT 0", "1 when the index derives the repository key from the call"),
+    *PLACEMENT_COLUMNS,
 ]
 
 TEST_COLUMNS: list[Column] = [
@@ -479,6 +496,7 @@ SSH_ATTEMPT_COLUMNS: list[Column] = [
     ("cleanup", "TEXT", "confirmed or unconfirmed cleanup evidence"),
     ("unresolved_count", "INTEGER", "remaining processes; NULL when unavailable"),
     ("evidence_at", "REAL", "ownership evidence timestamp"),
+    *PLACEMENT_COLUMNS,
 ]
 
 TABLES: dict[str, tuple[list[Column], str, str]] = {
@@ -520,6 +538,13 @@ TABLES: dict[str, tuple[list[Column], str, str]] = {
 GATE_TABLES = tuple(table for table in TABLES if table.startswith("gate_"))
 
 VIEWS: dict[str, tuple[str, str]] = {
+    "logical_step_results": (
+        "one final result per linked call and episode; older unlinked steps retain their identities",
+        """SELECT * FROM steps WHERE coalesce(is_final_result, 1) = 1
+AND (step_link IS NULL OR id = (
+    SELECT final.id FROM steps AS final WHERE final.step_link = steps.step_link AND final.is_final_result = 1
+    ORDER BY final.ended_at DESC, final.id DESC LIMIT 1))""",
+    ),
     "holds": (
         "one interval per began row; ends when the next row of its key is ended; a next began or no later row leaves ended_at NULL; an ended row without a preceding began has began_at NULL; previous_at and next_at bound missing events; later_row is 1 when a later row exists; no row proves a hold is in force now",
         """WITH ordered AS (

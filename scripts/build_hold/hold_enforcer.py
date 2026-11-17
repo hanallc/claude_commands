@@ -180,20 +180,54 @@ def claimed_processes(proc_root: Path = build_hold.PROC_ROOT) -> build_hold.Live
     if isinstance(routed, build_hold.ClaimsUnreadable):
         return routed
     claimed: set[build_hold.ProcessIdentity] = set()
+    waiters: set[build_hold.ProcessIdentity] = set()
     try:
+        from scripts.build_queue import admission_service, admission_records, placement
+        from scripts.aws_target import hana_placement
+
+        state = admission_service.ServiceState({}, {}, {}, admission_records.ReadyToStart())
+        state_read = False
         for target in target_config.read_targets():
             if not isinstance(target, target_config.SshTarget):
                 continue
             paths = claim_state.state_paths(target.name)
+            hana = (target.platform == 'linux'
+                and isinstance(target_config.read_execution_transport(target), hana_placement.HanaControlTransport))
+            if hana and not state_read:
+                try:
+                    state = admission_service.read_state(store.root() / 'admission')
+                except FileNotFoundError:
+                    pass
+                state_read = True
             for claim in claim_state.read_claims(paths):
                 identity = build_hold.ProcessIdentity(claim.record["pid"], claim.record["proc_start"])
                 if build_hold.process_start_time(identity.pid, proc_root) == identity.start_time:
-                    claimed.add(identity)
+                    if not hana:
+                        claimed.add(identity)
+                    else:
+                        record = claim.record
+                        key = placement.attempt_key(record['episode'], record['attempt'])
+                        saved = state.assignments.get(key)
+                        if (saved is None or state.current_assignments.get(record['episode']) != key
+                                or not isinstance(saved.state, placement.CurrentAssignment)):
+                            continue
+                        assignment = saved.assignment
+                        if (assignment.destination.target != target.name or assignment.destination.scope != claim.scope
+                                or record['claim_id'] != placement.assigned_claim_id(assignment.episode, assignment.attempt)
+                                or record['submitting_session'] != claim_state.session_id(assignment.session)):
+                            continue
+                        coordinator = build_hold.ProcessIdentity(assignment.owner.pid, assignment.owner.start_time)
+                        if (assignment.owner.host == store.host_name()
+                                and build_hold.process_start_time(coordinator.pid, proc_root) == coordinator.start_time):
+                            waiters.update((identity, coordinator))
+                            claimed.add(identity)
     except claim_state.ClaimStateUnreadable as error:
         return build_hold.ClaimsUnreadable(f"{error.path}: {error}")
     except target_config.ConfigError as error:
         return build_hold.ClaimsUnreadable(str(error))
-    return build_hold.LiveClaims(frozenset(claimed | routed), routed - claimed)
+    except (OSError, ValueError) as error:
+        return build_hold.ClaimsUnreadable(str(error))
+    return build_hold.LiveClaims(frozenset(claimed | routed | waiters), routed - claimed - waiters, frozenset(waiters))
 
 
 def holds_claim(
@@ -235,7 +269,8 @@ def classify_drain_runs(
         family = [item for item in processes.values()
                   if item.identity == process.identity or process in ancestors[item.identity.pid]]
         identities = {item.identity for item in (*family, *ancestors[process.identity.pid])}
-        reason = ("cargo child" if any(build_hold.audit_command(item) in build_hold.CARGO_COMMANDS
+        reason = ("remote waiter" if holds_claim(process, processes, claimed.remote_waiters) else
+                  "cargo child" if any(build_hold.audit_command(item) in build_hold.CARGO_COMMANDS
                                         for item in family) else
                   "admission reservation" if identities & admitted else
                   "Mac or AWS claim" if holds_claim(process, processes, claimed.identities - claimed.routed) else "")
