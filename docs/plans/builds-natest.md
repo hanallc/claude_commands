@@ -4619,7 +4619,7 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Remaining cost is product work: `verify_helper.py` 9.0 to 9.9 CPU s over 29 starts, `verify.sh` 4.4 to 5.1 s. The class setup costs 0.1 s and already uses a class seed and the loaded targets and record wrappers.
 - `verify_helper.py` now checks the file stamps of its loaded sources before each request (2dd881828). This pass does not isolate that cost; Phase 328 measures `verify_helper.py` across all modules. Every behavior check stays. Checkpoint 7bfb419b0.
 
-### Phase 328 — Measure which commands use the suite's CPU  · status: todo
+### Phase 328 — Measure which commands use the suite's CPU  · status: done
 **Depends on:** none
 
 #### Work Order
