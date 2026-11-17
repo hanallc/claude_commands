@@ -196,7 +196,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())))
         owner = staff.StaffId("fixture-owner")
-        item = investigation.file(owner, "Find the cause", "Why?")
+        item = investigation.file(owner, "Find the cause", "Why?", waiting_why='The owner must complete the investigation.')
         fields = {"owner": owner, "id": item.id,
                   "token": investigations_page.request_token(self.root, owner, item.id)}
         self.assertEqual(self.request(investigations_page.PAGE_PATH).status, 303)

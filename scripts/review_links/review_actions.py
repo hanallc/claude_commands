@@ -110,7 +110,7 @@ def decision_action(item: review_items.ReviewItem, action: str, words: str,
                         +PY+f"nightly_review/candidates.py outcome {identity} accepted --applied '<repo> <sha>' "
                         +'--ledger '+shlex.quote(str(source.path)))
         delivery = send(item,efficiency_reviews.path(source.path),identity,message,
-                        lambda: decision_store.record(item,logged,mark),status)
+                        lambda: decision_store.record(item,logged,mark,waiting_why=words if action == 'question' else ''),status)
     else:
         assert isinstance(source, review_items.ProposalSource)
         issue = source.record.path
@@ -124,7 +124,8 @@ def decision_action(item: review_items.ReviewItem, action: str, words: str,
             if action == 'decline':
                 _ = proposal_issue.edit(issue,{'style_answer':'declined','style_answer_words':words},
                                         datetime.now(user_zone()).date())
-            _ = decision_store.record(item,logged,mark if action != 'decline' else NoMark())
+            _ = decision_store.record(item,logged,mark if action != 'decline' else NoMark(),
+                                      waiting_why=words if action == 'question' else '')
         delivery = send(item,issue,issue.stem,message,save,status)
     return delivery,{'approve':'approved, sent to '+review_items.name(item.owner,staff.snapshot()),'decline':'declined',
                      'feedback':'feedback sent','question':'question sent'}[action]

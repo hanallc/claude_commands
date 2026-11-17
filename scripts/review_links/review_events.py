@@ -35,6 +35,25 @@ class KeepMark:
 type MarkChange = ReviewMark | NoMark | KeepMark
 
 
+def require_waiting(is_waiting: bool) -> None:
+    """Refuse a reason update after the item leaves Waiting."""
+    if not is_waiting:
+        raise ValueError('The item is not Waiting.')
+
+
+def require_waiting_why(text: str) -> str:
+    """Require the filer's reason before an item enters Waiting."""
+    reason = ' '.join(text.split())
+    if not reason:
+        raise ValueError('Waiting items need a why this is waiting text.')
+    return reason
+
+
+def waiting_why(value: object) -> str:
+    """Read the stored reason; older records have no reason."""
+    return value.strip() if isinstance(value, str) else ''
+
+
 def changed_mark(before: ReviewMark | NoMark, change: MarkChange) -> ReviewMark | NoMark:
     return before if isinstance(change, KeepMark) else change
 

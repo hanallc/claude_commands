@@ -44,6 +44,7 @@ class Investigation:
     question: str
     answer: str
     log: tuple[ReviewLog, ...] = ()
+    waiting_why: str = ""
 
 
 def _store(owner: staff.StaffId) -> record_store.NumberedRecords:
@@ -68,7 +69,8 @@ def load(owner: staff.StaffId, identity: str, *, sources: list[Path] | None = No
         question, answer = record_store.split_section(body, int(fields["question_length"]), "Answer")
         item = Investigation(fields["id"], staff.StaffId(fields["owner"]), fields["title"],
                              InvestigationState(fields["state"]), fields["filed"], fields["answered"],
-                             fields["read"], question, answer, review_events.decode(fields.get("review_log", "")))
+                             fields["read"], question, answer, review_events.decode(fields.get("review_log", "")),
+                             review_events.waiting_why(fields.get("waiting_why", "")))
         if not item.title.strip() or item.title.splitlines() != [item.title]:
             raise ValueError("title must have one line")
         for name, value, required in (
@@ -98,7 +100,8 @@ def records(owner: staff.StaffId, *, include_read: bool = False,
 def _save(item: Investigation) -> None:
     fields = {"id": item.id, "owner": item.owner, "title": item.title, "state": item.state,
               "filed": item.filed, "answered": item.answered, "read": item.read,
-              "question_length": str(len(item.question)), "review_log": review_events.encode(item.log)}
+              "question_length": str(len(item.question)), "review_log": review_events.encode(item.log),
+              "waiting_why": item.waiting_why}
     _store(item.owner).write(item.id, fields, f"{item.question}{ANSWER_SECTION}{item.answer}")
 
 
@@ -106,15 +109,16 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def file(owner: staff.StaffId, title: str, question: str) -> Investigation:
+def file(owner: staff.StaffId, title: str, question: str, *, waiting_why: str = "") -> Investigation:
     """File an investigation with the next number for this owner."""
     if not title.strip() or title.splitlines() != [title]:
         raise InvestigationError("title must have one nonempty line")
     if not question.strip():
         raise InvestigationError("question must not be empty")
+    reason = review_events.require_waiting_why(waiting_why)
     with _store(owner).locked():
         number = _store(owner).next_number()
-        item = Investigation(f"I{number}", owner, title, InvestigationState.OPEN, _now(), "", "", question, "")
+        item = Investigation(f"I{number}", owner, title, InvestigationState.OPEN, _now(), "", "", question, "", waiting_why=reason)
         _save(item)
         return item
 
@@ -165,7 +169,8 @@ def review_action(owner: staff.StaffId, identity: str, action: str, words: str) 
             item = replace(item, log=tuple(sorted((*item.log, previous), key=lambda entry: entry.time)))
         event = ReviewLog(datetime.now(timezone.utc), 'nate', ('feedback sent' if action == 'feedback' else action)+': '+words)
         if action == 'question':
-            item = replace(item,state=InvestigationState.OPEN,answered='',read='',log=(*item.log,event))
+            item = replace(item,state=InvestigationState.OPEN,answered='',read='',log=(*item.log,event),
+                           waiting_why=review_events.require_waiting_why(words))
         else:
             item = replace(item,state=InvestigationState.READ,read=_now(),log=(*item.log,event))
         _save(item)
@@ -179,12 +184,22 @@ def record_review_log(owner: staff.StaffId, identity: str, words: str) -> None:
         _save(replace(item,log=review_events.append(item.log,event)))
 
 
+def set_waiting_why(owner: staff.StaffId, identity: str, text: str) -> None:
+    reason = review_events.require_waiting_why(text)
+    with _store(owner).locked():
+        item = load(owner, identity)
+        if item.state != InvestigationState.OPEN:
+            raise InvestigationError("The item is not Waiting.")
+        _save(replace(item, waiting_why=reason))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
     create = subcommands.add_parser("file")
     _ = create.add_argument("--title", required=True)
     _ = create.add_argument("--question", required=True)
+    _ = create.add_argument("--waiting-why", default="")
     respond = subcommands.add_parser("answer")
     _ = respond.add_argument("--id", required=True)
     _ = respond.add_argument("--text", required=True)
@@ -208,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise InvestigationError("owner has no staff row")
             owner = target.id
         if command == "file":
-            print(file(owner, cast(str, args.title), cast(str, args.question)).id)
+            print(file(owner, cast(str, args.title), cast(str, args.question), waiting_why=cast(str, args.waiting_why)).id)
         elif command == "answer":
             _ = answer(owner, cast(str, args.id), cast(str, args.text))
         elif command == "read":
@@ -217,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
             for item in records(owner, include_read=cast(bool, args.all)):
                 print(f"{item.id} | {item.state} | {item.title}")
         return 0
-    except (InvestigationError, staff.StaffRefused, OSError, UnicodeError) as error:
+    except (ValueError, staff.StaffRefused, OSError, UnicodeError) as error:
         print(f"investigation: {str(error).replace(chr(10), ' ')}", file=sys.stderr)
         return 1
 

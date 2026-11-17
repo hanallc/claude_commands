@@ -659,10 +659,10 @@ class QuestionIdentityTests(RegistrationFixture):
         self.file_question()
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):
             production = read_production("example")
-            relay = registration.followup(production, "Choose the layout", "Which file holds it?")
+            relay = registration.followup(production, "Choose the layout", "Which file holds it?", waiting_why="Which file holds it?")
             self.assertEqual(relay.recipient, self.asker_id)
             with self.assertRaises(registration.RegistrationFailure):
-                _ = registration.followup(production, "Choose the layout", "A second one")
+                _ = registration.followup(production, "Choose the layout", "A second one", waiting_why="A second one")
         waiting = self.run_command("open")
         self.assertEqual(waiting.returncode, 0, waiting.stdout + waiting.stderr)
         self.assertIn("waiting for the asker's reply since", waiting.stdout)
