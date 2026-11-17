@@ -412,6 +412,110 @@ class ReviewLinksServerTests(unittest.TestCase):
                 if started.is_set():
                     self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
 
+    def test_list_ask_saves_before_delivery_and_retries_the_same_question(self) -> None:
+        morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
+                               current_session=staff.StaffId("fixture-morty-session"))
+        item = the_list.add(morty.id, "The question item", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
+        words = "Which check passed?"
+        started, release, finished = threading.Event(), threading.Event(), threading.Event()
+        deliveries: list[tuple[staff.StaffId, str]] = []
+
+        def send(recipient: staff.StaffId, _sender: str, message: str) -> None:
+            deliveries.append((recipient, message))
+            started.set()
+            self.assertTrue(release.wait(TEST_HANG_GUARD_SECS))
+
+        real_deliver = change_page.deliver
+
+        def deliver(message: change_page.MessageDelivery | change_page.NoMessageDelivery,
+                    status: change_page.DeliveryStatus) -> None:
+            try:
+                real_deliver(message, status)
+            finally:
+                finished.set()
+
+        request = uuid4().hex
+        fields = {"keeper": morty.id, "id": item.id, "request": request, "words": words, "until": "",
+                  "token": list_page.request_token(self.root, morty.id, item.id, request), "action": "question"}
+        with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(change_page, "send_to_staff", side_effect=send),
+              patch.object(change_page, "deliver", side_effect=deliver)):
+            try:
+                code, body = self.post(list_page.PAGE_PATH, urlencode(fields))
+                self.assertEqual(code, 200)
+                self.assertEqual(json.loads(body)["state"], "saved")
+                self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
+                self.assertFalse(finished.is_set())
+                opened = the_list.load(morty.id, item.id)
+                self.assertEqual([(question.question_id, question.words) for question in opened.questions], [("Q1", words)])
+                self.assertEqual(len(deliveries), 1)
+                self.assertEqual(deliveries[0][0], morty.id)
+                self.assertIn("List item 1: Ask question\nThe question item\n" + words, deliveries[0][1])
+                self.assertIn('the_list.py answer L1 --question Q1 --text "<answer>"', deliveries[0][1])
+            finally:
+                release.set()
+                if started.is_set():
+                    self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
+            finished.clear()
+            self.assertEqual(self.post(list_page.PAGE_PATH, urlencode(fields))[0], 200)
+            self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
+            self.assertEqual(deliveries[0][0], morty.id)
+            self.assertEqual(len(deliveries), 1)
+            self.assertEqual(the_list.load(morty.id, item.id), opened)
+            for different in ({"action": "tell"}, {"words": "What else changed?"}):
+                self.assertEqual(self.post(list_page.PAGE_PATH, urlencode({**fields, **different}))[0], 400)
+            response = cast(dict[str, str], json.loads(body))
+            finished.clear()
+            self.assertEqual(self.post(list_page.PAGE_PATH, urlencode(
+                {**fields, "request": response["request"], "token": response["token"]}))[0], 200)
+            self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
+            self.assertEqual(len(deliveries), 1)
+            with (patch.object(staff, "caller_identity", return_value=morty.current_session),
+                  redirect_stdout(StringIO())):
+                self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The gate passed."]), 0)
+            self.assertEqual(self.post(list_page.PAGE_PATH, urlencode(fields))[0], 200)
+            saved = the_list.load(morty.id, item.id)
+            self.assertEqual([question.question_id for question in saved.questions], ["Q1"])
+            self.assertEqual(len(deliveries), 1)
+            new_request = uuid4().hex
+            finished.clear()
+            self.assertEqual(self.post(list_page.PAGE_PATH, urlencode({**fields, "request": new_request,
+                "token": list_page.request_token(self.root, morty.id, item.id, new_request), "words": "What else changed?"}))[0], 200)
+            self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
+            self.assertEqual(len(deliveries), 2)
+            self.assertEqual([question.question_id for question in the_list.load(morty.id, item.id).questions], ["Q1", "Q2"])
+
+    def test_list_ask_preserves_unicode_separators(self) -> None:
+        morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
+                               current_session=staff.StaffId("fixture-morty-session"))
+        item = the_list.add(morty.id, "The question item", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
+        words = "First check?\u2028Second check?\u2029Third check?"
+        request = uuid4().hex
+        fields = {"keeper": morty.id, "id": item.id, "request": request, "words": words, "until": "",
+                  "token": list_page.request_token(self.root, morty.id, item.id, request), "action": "question"}
+        finished = threading.Event()
+        real_deliver = change_page.deliver
+
+        def deliver(message: change_page.MessageDelivery | change_page.NoMessageDelivery,
+                    status: change_page.DeliveryStatus) -> None:
+            try:
+                real_deliver(message, status)
+            finally:
+                finished.set()
+
+        with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(change_page, "deliver", side_effect=deliver),
+              patch.object(change_page, "send_to_staff") as send):
+            for _ in range(2):
+                finished.clear()
+                self.assertEqual(self.post(list_page.PAGE_PATH, urlencode(fields))[0], 200)
+                self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
+            send.assert_called_once()
+        self.assertEqual([(question.question_id, question.words) for question in the_list.load(morty.id, item.id).questions],
+                         [("Q1", words)])
+
     def test_an_image_question_delivers_when_the_browser_response_fails(self) -> None:
         _ = self.enterContext(patch.object(serve, 'tailscale_ip', return_value='127.0.0.1'))
         page = change_page.ReviewPage(self.root / 'fixture-image', self.root, ('Images fixture/Q1',), '')

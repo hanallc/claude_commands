@@ -22,6 +22,7 @@ from typing import Literal, TypedDict, cast
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed
 from scripts.lib.user_zone import user_zone
 from scripts.production import record_store, staff
+from scripts.review_links import change_page, page_question
 
 
 class ListError(ValueError):
@@ -131,13 +132,19 @@ class PageRequest:
     """Identify a List action and the words it must match on retry."""
 
     request: str
-    action: Literal["tell", "remove", "park", "read"]
+    action: Literal["tell", "remove", "park", "read", "question"]
     words: str
     form_words: str = ""
 
 
 class NoPageRequest(StrEnum):
     ABSENT = ""
+
+
+@dataclass(frozen=True)
+class QuestionRequestReceipt:
+    request: PageRequest
+    question_id: str
 
 
 @dataclass(frozen=True)
@@ -195,6 +202,7 @@ class ListItem:
     done_when: str
     log: tuple[ItemChange, ...]
     reviews: tuple[str, ...] = ()
+    questions: tuple[page_question.Question, ...] = ()
 
     @property
     def id(self) -> str:
@@ -299,6 +307,11 @@ def _line(value: str, name: str) -> None:
         raise ListError(f"{name} must have one nonempty line")
 
 
+def _log_line(value: str, name: str) -> None:
+    if not value.strip() or "\n" in value or "\r" in value:
+        raise ListError(f"{name} must have one nonempty line")
+
+
 def _staff_id(value: str, name: str) -> None:
     if not value or Path(value).name != value or value in (".", ".."):
         raise ListError(f"invalid {name} staff id")
@@ -340,8 +353,8 @@ def _validate(item: ListItem) -> None:
     for review in item.reviews:
         _line(review, "review key")
     for change in item.log:
-        _line(change.what, "log text")
-        _line(change.source, "source")
+        _log_line(change.what, "log text")
+        _log_line(change.source, "source")
         if " — " in change.source or change.time.utcoffset() is None:
             raise ListError("a log source cannot contain its separator; its time must have a time zone")
 
@@ -381,6 +394,16 @@ def _review_keys(text: str) -> tuple[str, ...]:
     return tuple(cast(list[str], entries))
 
 
+def _read_questions(text: str) -> tuple[page_question.Question, ...]:
+    value = cast(object, json.loads(text))
+    if not isinstance(value, list):
+        raise ListError("invalid List questions")
+    questions = tuple(page_question.read(question) for question in cast(list[object], value))
+    if len({question.question_id for question in questions}) != len(questions):
+        raise ListError("duplicate question id")
+    return questions
+
+
 def load(keeper: staff.StaffId, identity: str, *, sources: list[Path] | None = None) -> ListItem:
     store = _store(keeper)
     fields, body = store.read(identity, sources=sources)
@@ -397,7 +420,9 @@ def load(keeper: staff.StaffId, identity: str, *, sources: list[Path] | None = N
             text, body = record_store.split_section(body, int(fields[key + "_length"]), name)
             texts.append(text)
         changes: list[ItemChange] = []
-        for line in body.splitlines():
+        log_lines = body.removesuffix("\n").split("\n") if body else []
+        for line in log_lines:
+            line = line.removesuffix("\r")
             dated, source = line.removeprefix("- ").rsplit(" — ", 1)
             date, clock, what = dated.split(" ", 2)
             if not line.startswith("- "):
@@ -412,7 +437,7 @@ def load(keeper: staff.StaffId, identity: str, *, sources: list[Path] | None = N
                         _dependencies(fields["blocked_by"]), _related(fields["related_to"]), RequestedBy(fields["requested_by"]),
                         time_value(fields["opened"]), time_value(fields["updated"]), time_value(fields["closed"]),
                         fields["closing_words"], texts[0], texts[1], texts[2], texts[3], tuple(changes),
-                        _review_keys(fields.get("reviews", "[]")))
+                        _review_keys(fields.get("reviews", "[]")), _read_questions(fields.get("questions", "[]")))
         if item.id != identity or not changes:
             raise ListError("the item number must match its path and the log must not be empty")
         _validate(item)
@@ -433,6 +458,8 @@ def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
               "requested_by": item.requested_by.value,
               "opened": _time_text(item.opened), "updated": _time_text(item.updated),
               "closed": _time_text(item.closed), "closing_words": item.closing_words}
+    if item.questions:
+        fields["questions"] = json.dumps([page_question.stored(question) for question in item.questions], ensure_ascii=False)
     body = "## Next step\n\n" + item.next_step
     log = "\n".join(f"- {entry.time.isoformat(sep=' ')} {entry.what} — {entry.source}" for entry in item.log)
     for key, text, heading, following in (("next_step", item.next_step, "Latest status", item.latest_status),
@@ -603,7 +630,7 @@ def _without_row_copy(evidence: str, number: int) -> str:
 
 def clean_evidence(keeper: staff.StaffId, *, source: str) -> tuple[int, int]:
     """Remove migration copies from each record's Evidence section."""
-    _line(source, "source")
+    _log_line(source, "source")
     store = _store(keeper)
     changed = unchanged = 0
     with store.locked():
@@ -714,8 +741,8 @@ def is_page_request_receipt(entry: ItemChange) -> bool:
     return entry.source == PAGE_SOURCE and entry.what.startswith(PAGE_REQUEST_RECEIPT)
 
 
-def _page_requests(item: ListItem) -> dict[str, PageFeedback | PageRequest]:
-    requests: dict[str, PageFeedback | PageRequest] = {}
+def _page_requests(item: ListItem) -> dict[str, PageFeedback | PageRequest | QuestionRequestReceipt]:
+    requests: dict[str, PageFeedback | PageRequest | QuestionRequestReceipt] = {}
     for entry in item.log:
         receipt = is_page_request_receipt(entry)
         if entry.source != PAGE_SOURCE or not (receipt or entry.what.startswith("Feedback to morty: ")):
@@ -730,9 +757,16 @@ def _page_requests(item: ListItem) -> dict[str, PageFeedback | PageRequest]:
         if not isinstance(request, str) or not isinstance(words, str) or not isinstance(form_words, str):
             raise ListError("invalid List request log")
         if receipt:
-            if action not in ("read", "remove", "park"):
+            if action not in ("read", "remove", "park", "question"):
                 raise ListError("invalid List request receipt")
-            requests[request] = PageRequest(request, action, words, form_words)
+            received = PageRequest(request, action, words, form_words)
+            if action == "question":
+                question_id = fields.get("question_id")
+                if not isinstance(question_id, str) or re.fullmatch(r"Q[1-9][0-9]*", question_id) is None:
+                    raise ListError("invalid List question receipt")
+                requests[request] = QuestionRequestReceipt(received, question_id)
+            else:
+                requests[request] = received
             continue
         state = fields.get("state")
         if state not in ("pending", "sent", "alerted"):
@@ -756,12 +790,18 @@ def feedback_requests(item: ListItem) -> dict[str, PageFeedback]:
     return {request: saved for request, saved in _page_requests(item).items() if isinstance(saved, PageFeedback)}
 
 
-def _previous_page_request(item: ListItem, request: PageRequest) -> PageFeedback | PageRequest | NoPageRequest:
+def _previous_page_request(
+        item: ListItem, request: PageRequest) -> PageFeedback | PageRequest | QuestionRequestReceipt | NoPageRequest:
     if not request.request:
         raise ListError("enter a request ID")
     previous = _page_requests(item).get(request.request, NoPageRequest.ABSENT)
     if previous is not NoPageRequest.ABSENT:
-        key = previous.key() if isinstance(previous, PageFeedback) else previous
+        if isinstance(previous, PageFeedback):
+            key = previous.key()
+        elif isinstance(previous, QuestionRequestReceipt):
+            key = previous.request
+        else:
+            key = previous
         if key != request:
             raise ListError("this request already has a different action or words")
     return previous
@@ -779,10 +819,73 @@ def _save_page_request(store: record_store.NumberedRecords, keeper: staff.StaffI
     return item
 
 
-def _request_receipt(request: PageRequest, moment: datetime) -> ItemChange:
+def _request_receipt(request: PageRequest, moment: datetime, *, question_id: str = "") -> ItemChange:
     return ItemChange(moment, PAGE_REQUEST_RECEIPT + json.dumps({
         "request": request.request, "action": request.action, "words": request.words,
-        "form_words": request.form_words}, ensure_ascii=False), PAGE_SOURCE)
+        "form_words": request.form_words, **({"question_id": question_id} if question_id else {})},
+        ensure_ascii=False), PAGE_SOURCE)
+
+
+@dataclass(frozen=True)
+class _ListQuestionStore:
+    keeper: staff.StaffId
+    ask_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT
+
+    def questions(self, item: str) -> tuple[page_question.Question, ...]:
+        return load(self.keeper, item).questions
+
+    def add(self, item: str, question: page_question.Question) -> None:
+        # ask_question holds the List lock from the receipt check through this write.
+        assert isinstance(self.ask_request, PageRequest)
+        current = load(self.keeper, item)
+        self.save_request(replace(current, questions=(*current.questions, question)), self.ask_request, question)
+
+    def save_request(self, item: ListItem, request: PageRequest, question: page_question.Question) -> None:
+        receipt = _request_receipt(request, now(), question_id=question.question_id)
+        _ = _save_page_request(_store(self.keeper), self.keeper, replace(item, log=(*item.log, receipt)), request)
+
+    def set_answer(self, item: str, question_id: str, answer: page_question.Answer) -> None:
+        store = _store(self.keeper)
+        with store.locked():
+            current = load(self.keeper, item)
+            question = next((question for question in current.questions if question.question_id == question_id), None)
+            if question is None or question.answer is not None:
+                raise change_page.AnswerRefused("This item has no open question with that id.")
+            questions = tuple(replace(question, answer=answer) if question.question_id == question_id else question
+                              for question in current.questions)
+            moment = now()
+            entry = ItemChange(moment, f"Answered question {question_id}", "morty")
+            changed = replace(current, questions=questions, updated=moment, unread_since=moment, log=(*current.log, entry))
+            try:
+                _save(store, changed)
+            except AtomicDurabilityUnconfirmed:
+                if load(self.keeper, item) != changed:
+                    raise
+
+
+def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
+                 status: change_page.DeliveryStatus) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
+    """Save the question and its signed request receipt before delivery."""
+    if request.action != "question" or not request.words.strip() or len(request.words) > 10000:
+        raise change_page.AnswerRefused("Enter a question first.")
+    request = replace(request, words=request.words.strip())
+    store = _store(keeper)
+    source = store.path(identity)
+    questions = _ListQuestionStore(keeper, request)
+    with store.locked():
+        item = load(keeper, identity)
+        previous = _previous_page_request(item, request)
+        open_question = next((question for question in item.questions
+                              if question.answer is None and question.words == request.words), None)
+        if isinstance(previous, QuestionRequestReceipt):
+            if open_question is None or open_question.question_id != previous.question_id:
+                return change_page.NoMessageDelivery()
+        elif open_question is not None:
+            questions.save_request(item, request, open_question)
+        command = ('~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py '
+                   + 'answer {item} --question {question_id} --text "<answer>"')
+        return page_question.ask(questions, identity, keeper, source, f"List item {item.number}", item.title,
+                                 request.words, command, status)
 
 
 def _feedback_entry(feedback: PageFeedback, moment: datetime) -> ItemChange:
@@ -941,6 +1044,10 @@ def _cli_changes(args: argparse.Namespace, members: staff.StaffSnapshot) -> Item
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    answer = commands.add_parser("answer", help="answer a List question and mark the item unread")
+    _ = answer.add_argument("id", help="the List item ID, such as L1")
+    _ = answer.add_argument("--question", required=True, help="the question ID, such as Q1")
+    _ = answer.add_argument("--text", required=True, help="the answer to show on The List")
     for name in ("add", "update", "park", "close", "reopen", "mark-read", "clean-evidence", "link", "unlink", "list"):
         command = commands.add_parser(name)
         if name != "list":
@@ -985,6 +1092,13 @@ def main(argv: list[str] | None = None) -> int:
         if name == "list":
             print(table(keeper, include_closed=cast(bool, args.all),
                         include_parked=cast(bool, args.all) or cast(bool, args.include_parked)))
+            return 0
+        if name == "answer":
+            identity, question = cast(str, args.id), cast(str, args.question)
+            result = page_question.answer(_ListQuestionStore(keeper), identity, question, cast(str, args.text))
+            if isinstance(result, page_question.AnswerRefused):
+                raise ListError(result.reason)
+            print(f"answered {identity} {question}")
             return 0
         source = cast(str, args.source)
         if name == "clean-evidence":

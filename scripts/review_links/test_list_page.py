@@ -12,7 +12,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -260,6 +260,7 @@ class ListPageTests(unittest.TestCase):
         self.assertIn('placeholder="Your words for morty about this item"', words)
         self.assertIn('aria-label="Your words for morty about this item"', words)
         self.assertIn('</textarea><div class="list-tell"><span role="status" data-send-status></span>'
+                      + '<button name="action" value="question" disabled>Ask question</button>'
                       + '<button name="action" value="tell" disabled>Tell morty</button></div>', words)
         self.assertIn("!words.value.trim()", list_page.SCRIPT)
         self.assertIn("words.addEventListener('input',retain)", list_page.SCRIPT)
@@ -658,6 +659,102 @@ window.fetch=async(_path,options={})=>{
 ''')
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_shows_a_lost_remove_notice_when_its_details_are_closed(self) -> None:
+        self.browser_action_sequence('''
+ show('all');
+ submit('remove');
+ check(!row.hidden,'the row stays visible in All during Remove');
+ row.querySelector('.list-row').click();
+ check(row.querySelector('[data-detail]').hidden,'the user can close the details while waiting');
+ losePost();await flush();
+ const hiddenStatus=document.querySelector('[data-hidden-action-status]');
+ check(!hiddenStatus.hidden && hiddenStatus.textContent==='Item 1: Save not confirmed: Fixture lost response',
+  'the table shows the lost response while the details are closed');
+ row.querySelector('.list-toggle').click();
+ check(hiddenStatus.hidden && form.querySelector('[data-send-status]').getClientRects().length>0,
+  'opening the details shows the inline notice only');
+ row.querySelector('.list-toggle').click();
+ check(!hiddenStatus.hidden,'closing the details restores the notice above the table');
+''')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_keeps_a_separate_notice_for_each_hidden_remove(self) -> None:
+        _ = self.add("Second List item", number=2)
+        self.browser_action_sequence('''
+ show('all');
+ const second=document.querySelector('[data-number="2"]');
+ second.querySelector('.list-toggle').click();
+ for(const item of [row,second]){
+  submit('remove',item.querySelector('form'));
+  item.querySelector('.list-row').click();
+  losePost();await flush();
+ }
+ const status=document.querySelector('[data-hidden-action-status]');
+ const message=number=>'Item '+number+': Save not confirmed: Fixture lost response';
+ const shows=number=>!status.hidden && status.textContent.includes(message(number));
+ check(shows(1) && shows(2),'both hidden notices appear above the table');
+ row.querySelector('.list-toggle').click();
+ check(!shows(1) && shows(2),'opening row one removes only its banner notice');
+ check(form.querySelector('[data-send-status]').textContent==='Save not confirmed: Fixture lost response',
+  'row one shows its notice inline');
+ second.querySelector('.list-toggle').click();
+ check(status.hidden,'opening both rows hides the banner');
+ row.querySelector('.list-toggle').click();
+ check(shows(1) && !shows(2),'closing row one restores only its banner notice');
+''')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_keeps_the_question_request_after_a_service_failure(self) -> None:
+        self.browser_action_sequence('''
+ form.elements.words.value='Which check passed?';
+ form.elements.words.dispatchEvent(new Event('input'));
+ const attempt=submit('question');
+ finishPost({status:503,reason:'Fixture delivery status unavailable'});await flush();
+ check(form.querySelector('[data-send-status]').textContent===
+  'Save not confirmed: Fixture delivery status unavailable','a service error leaves the save unconfirmed');
+ const retry=submit('question');
+ check(retry.id===attempt.id && retry.token===attempt.token,'the retry uses the original signature');
+ finishPost({item_state:'Working',parked:'false'});await flush();
+ check(form.elements.words.value==='','the confirmed reply clears the question');
+''')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_ask_uses_its_own_request_and_keeps_the_exact_retry(self) -> None:
+        self.browser_action_sequence('''
+ const words=form.elements.words,ask=form.querySelector('[value="question"]');
+ check(ask?.disabled,'Ask question starts disabled');
+ words.value=' ';words.dispatchEvent(new Event('input'));
+ check(ask?.disabled,'spaces keep Ask question disabled');
+ words.value='What changed?';words.dispatchEvent(new Event('input'));
+ check(!ask?.disabled,'words enable Ask question');
+ const question=submit('question');losePost();await flush();
+ const feedback=submit('tell');losePost();await flush();
+ check(question.id!==feedback.id,'Ask and Tell use different request IDs');
+ const retry=submit('question');
+ check(retry.id===question.id && retry.token===question.token,'an exact Ask retry keeps its signature');
+ finishPost({item_state:'Working',parked:'false'});await flush();
+ check(words.value==='' && ask.disabled,'a saved question clears the box');
+''')
+
+    def test_saved_question_and_answer_appear_on_the_item_and_the_answer_is_unread(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Inspect the List", number=106)
+        _ = the_list.mark_read(MORTY.id, item.id, source="nate")
+        _ = list_page.submit(root, urlencode(self.fields(item, "question", words="What changed in <List>?")))
+        opened = list_page.render(root).decode()
+        self.assertIn("Question Q1 — waiting for an answer", opened)
+        self.assertIn("What changed in &lt;List&gt;?", opened)
+        self.assertNotIn('aria-label="Unread update"', opened)
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": MORTY.current_session}),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The <filter> changed."]), 0)
+        answered = list_page.render(root).decode()
+        self.assertNotIn("<h3>Question Q1 — waiting for an answer</h3>", answered)
+        self.assertIn("<h3>Answer</h3><p>The &lt;filter&gt; changed.</p>", answered)
+        self.assertIn('aria-label="Unread update"', answered)
+        self.assertIn('value="read">Mark read</button>', answered)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_restores_open_row_and_shows_the_refusal_after_a_lost_remove(self) -> None:
         self.browser_action_sequence('''
  const remove=submit('remove');
@@ -680,7 +777,7 @@ window.fetch=async(_path,options={})=>{
 ''')
 
     def browser_action_sequence(self, steps: str) -> None:
-        _ = self.add("Test List action retries")
+        _ = self.add("Test List action retries", number=1)
         with patch.object(list_page, "counts_strip", return_value=""):
             markup = list_page.render(self.root / "reviews").decode()
         setup = '''<script>
@@ -690,7 +787,7 @@ window.fetch=async(_path,options={})=>{
  requests.push(new URLSearchParams(options.body));
  return new Promise((resolve,reject)=>{
   losePost=()=>reject(new Error('Fixture lost response'));
-  finishPost=result=>resolve({ok:!result.reason,status:result.reason ? 400 : 200,
+  finishPost=result=>resolve({ok:!result.reason,status:result.status ?? (result.reason ? 400 : 200),
    json:async()=>({request:String(requests.length).padStart(32,'0'),token:'b'.repeat(64),unread:'true',...result})});
  });
 };
@@ -698,10 +795,10 @@ window.fetch=async(_path,options={})=>{
         probe = '''<script>
 (async()=>{
  const failures=[],check=(ok,name)=>{if(!ok) failures.push(name);};
- const row=document.querySelector('[data-list-item]'),form=row.querySelector('form');
- const submit=action=>{
+ const row=document.querySelector('[data-number="1"]'),form=row.querySelector('form');
+ const submit=(action,target=form)=>{
   const count=requests.length;
-  form.requestSubmit(form.querySelector('[value="'+action+'"]'));
+  target.requestSubmit(target.querySelector('[value="'+action+'"]'));
   if(requests.length!==count+1) throw new Error('The test submission did not start.');
   const request=requests.at(-1);
   return {id:request.get('request'),token:request.get('token')};

@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 from scripts.lib import atomic_file
 from scripts.production import investigation, record_store, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
-from scripts.review_links import review_items
+from scripts.review_links import change_page, page_question, review_items
 
 MORTY = staff.StaffRow(staff.StaffId("536997b5-4415-4cb1-b683-d777e02e9a22"), "producer", "morty", staff.StaffRoot(),
                        current_session=staff.StaffId("20fa30c6-3cad-493a-b74a-0e408a93f865"))
@@ -405,6 +405,46 @@ class TheListTests(unittest.TestCase):
         with patch.object(the_list, "now", return_value=START + timedelta(minutes=1)):
             changed = the_list.update(MORTY.id, item.id, {"latest_status": "Morty acts."}, source="owner report")
         self.assertIs(the_list.sent_to_morty(changed), the_list.NoTimestamp.UNSET)
+
+    def test_answer_refusals_leave_the_record_unchanged(self) -> None:
+        item = self.add()
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        before = path.read_bytes()
+        for identity, text, error in (("Q2", "The check passed.", "Unknown question id."),
+                                      ("Q1", " \t ", "Enter an answer first.")):
+            with self.subTest(identity=identity, text=text):
+                self.assertEqual(self.command("answer", item.id, "--question", identity, "--text", text),
+                                 (1, "", f"the_list: {error}\n"))
+                self.assertEqual(path.read_bytes(), before)
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        _ = the_list.ask_question(MORTY.id, item.id, the_list.PageRequest("request-1", "question", "Which check passed?"), status)
+        opened = the_list.load(MORTY.id, item.id)
+        self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "The check passed."),
+                         (0, f"answered {item.id} Q1\n", ""))
+        answered = the_list.load(MORTY.id, item.id)
+        answer = answered.questions[0].answer
+        assert isinstance(answer, page_question.Answer)
+        self.assertEqual(answer.text, "The check passed.")
+        self.assertEqual(answered.unread_since, START)
+        self.assertEqual(len(answered.log), len(opened.log) + 1)
+        self.assertEqual(answered.log[-1].what, "Answered question Q1")
+        before = path.read_bytes()
+        self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "A second answer."),
+                         (1, "", "the_list: This question already has an answer.\n"))
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_answer_round_trips_unicode_separators(self) -> None:
+        item = self.add()
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        _ = the_list.ask_question(MORTY.id, item.id, the_list.PageRequest("ask", "question", "Which checks passed?"), status)
+        text = "First result\u2028Second result\u2029Third result"
+        self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", text),
+                         (0, f"answered {item.id} Q1\n", ""))
+        saved = the_list.load(MORTY.id, item.id)
+        answer = saved.questions[0].answer
+        assert isinstance(answer, page_question.Answer)
+        self.assertEqual(answer.text, text)
+        self.assertEqual(saved.unread_since, START)
 
     def test_feedback_keeps_its_original_update_target_across_delivery(self) -> None:
         item = self.add()
