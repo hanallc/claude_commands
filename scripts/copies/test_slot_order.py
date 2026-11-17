@@ -6,14 +6,16 @@ import json
 import os
 from pathlib import Path
 import select
-import shutil
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from typing import NotRequired, TypedDict, cast, override
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 import unittest
 from unittest import mock
 
@@ -22,7 +24,7 @@ from scripts.buildlog import repository, treekey
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_targets import target_config
 from scripts.copies import copies
-from scripts.copies.copies_test_support import copies_environment
+from scripts.copies.copies_test_support import AdmissionWaitReached, copies_environment, stop_before_slot
 from scripts.build_queue import step_estimator
 from scripts.mac_test import eligibility
 from scripts.disks import slots
@@ -33,6 +35,8 @@ from scripts.lib.shell_test_support import shell_functions
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production import bump_gate, checkpoint_gate, merge_gate, waiting
+from scripts.production.production_doc import Production
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
@@ -162,6 +166,85 @@ class SlotOrderTests(unittest.TestCase):
         return slots.read_slots(self.slot_root, self.root / "cargo", conf.read("build_folders"),
             self.queue.server.host, None, self.queue.clock.now(), build_folders.build_folder_state,
             owners=lambda owner: owner)
+
+    def test_nightly_waits_for_admission_before_it_creates_a_slot(self) -> None:
+        self.queue.hold_starts()
+        _ = subprocess.run(["git", "-C", str(self.source), "remote", "set-url", "origin", str(self.source)],
+                           check=True, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+
+        args = merge_gate.GateArguments(repo=str(self.source), merge_branch="main")
+        with (mock.patch.object(merge_gate, "nightly_owner", return_value=self.owner),
+              mock.patch.object(merge_gate, "push_nightly_result"),
+              mock.patch.object(merge_gate, "run_suites",
+                  side_effect=AssertionError("the nightly suites started before admission")),
+              self.assertRaises(AdmissionWaitReached), stop_before_slot(self, self.slot_root)):
+            _ = merge_gate.nightly(args)
+
+    def test_scratch_queue_command_waits_before_it_creates_a_slot(self) -> None:
+        self.queue.hold_starts()
+        owner = fixture_member("showrunner", name="scratch-owner")
+        production = Production(self.root / "production.md", owner.name, "main", self.source,
+                                self.root / "production.log", ZoneInfo("UTC"), owner)
+        unit = waiting.Unit("scratch-unit", "", "main", self.source, None, owner.id)
+        command = shlex.join((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"))
+        execute = mock.Mock(side_effect=AssertionError("the scratch command started before admission"))
+        with (mock.patch.object(waiting, "named_unit", return_value=unit),
+              mock.patch.object(waiting, "subprocess", SimpleNamespace(run=execute, STDOUT=subprocess.STDOUT)),
+              self.assertRaises(AdmissionWaitReached), stop_before_slot(self, self.slot_root)):
+            waiting.scratch_test(production, unit.name, command, self.root / "scratch-state")
+
+    def test_bump_queue_command_waits_before_it_creates_a_slot(self) -> None:
+        self.queue.hold_starts()
+        tip = subprocess.run(["git", "-C", str(self.source), "rev-parse", "HEAD"], check=True,
+            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
+        command = [sys.executable, str(self.source / "merge_gate.py"), "--tests-only"]
+        record: checkpoint_gate.BumpGateRecord = {
+            "tip": tip, "checkpoint": tip, "production_doc": str(self.root / "production.md"),
+            "owner_id": self.owner, "unit_id": self.owner, "name": "fixture", "merge_branch": "main",
+            "checkout": str(self.source), "production_log": "production.log", "zone": "UTC", "unit": "fixture",
+            "delivered_to": [], "paths": [], "merge_tests": [command], "flakes": [], "flaky_tests": [],
+            "started": "2026-11-17T00:00:00Z", "pid": 0, "proc_start": "", "result": "pending",
+            "detail": "", "log": str(self.root / "bump.log")}
+        path = self.root / "bump.json"
+        checkpoint_gate.save_record(path, record)
+        with (mock.patch.object(bump_gate, "run_checkpoint_test_steps",
+                  side_effect=AssertionError("the bump command started before admission")),
+              mock.patch.object(bump_gate, "complete_gate",
+                  side_effect=AssertionError("the pending bump gate sent a result")),
+              self.assertRaises(AdmissionWaitReached), stop_before_slot(self, self.slot_root)):
+            _ = bump_gate.run_gate(path)
+
+    def test_bump_admission_selects_the_package_from_its_tip(self) -> None:
+        tools = self.verify_source()
+        environment = self.verify_run_environment(tools)
+        _ = (Path(environment["CONF_DIR"]) / "build_targets.conf").write_text(
+            "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+        tip = copies.commit_at(self.source, "HEAD")
+        manifest = self.source / "Cargo.toml"
+        _ = manifest.write_text(manifest.read_text().replace('name = "sample"', 'name = "renamed"'))
+        _ = copies.git(self.source, "add", "Cargo.toml")
+        _ = copies.git(self.source, "-c", "user.name=Test", "-c", "user.email=slots@example.invalid",
+                       "commit", "-qm", "rename the current package")
+        record: checkpoint_gate.BumpGateRecord = {
+            "tip": tip, "checkpoint": tip, "production_doc": str(self.root / "production.md"),
+            "owner_id": self.owner, "unit_id": self.owner, "name": "fixture", "merge_branch": "main",
+            "checkout": str(self.source), "production_log": "production.log", "zone": "UTC", "unit": "fixture",
+            "delivered_to": [], "paths": ["src/lib.rs"], "merge_tests": [], "flakes": [], "flaky_tests": [],
+            "started": "2026-11-17T00:00:00Z", "pid": 0, "proc_start": "", "result": "pending",
+            "detail": "", "log": str(self.root / "bump.log")}
+        path = self.root / "bump.json"
+        checkpoint_gate.save_record(path, record)
+        self.queue.hold_starts()
+        write_pressure_reading(Path(environment["BUILDLOG_MEMORY_PRESSURE"]), full_avg10=99)
+        with (mock.patch.dict(os.environ, {**environment, "MERGE_CHECKPOINT_VERIFY": str(tools.root / "verify.sh")}),
+              mock.patch.object(bump_gate, "run_checkpoint_test_steps",
+                  side_effect=AssertionError("the bump command started before admission")),
+              mock.patch.object(bump_gate, "complete_gate",
+                  side_effect=AssertionError("the pending bump gate sent a result")),
+              self.assertRaises(AdmissionWaitReached), stop_before_slot(self, self.slot_root)):
+            _ = bump_gate.run_gate(path)
+        request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest))
+        self.assertEqual(request.constraints.package, "sample")
 
     def test_admitted_command_restores_its_detached_environment_after_success_and_error(self) -> None:
         for previous in ("", "caller-value"):

@@ -255,6 +255,7 @@ class NightlyPushTests(unittest.TestCase):
         _ = shutil.copytree(Path(__file__).resolve().parents[2] / "config", config)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "CONF_DIR": str(config),
+            "ADMISSION_SOCKET": str(self.root / "admission.sock"),
             "MERGE_GATE_STATE_DIR": str(self.root / "state"), "USER_ZONE": "America/New_York"})))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         owner = fixture_member("showrunner", name="sdlc")
@@ -265,7 +266,7 @@ class NightlyPushTests(unittest.TestCase):
         with (mock.patch.object(merge_gate, "nightly_git", return_value=""),
               mock.patch.object(merge_gate, "checked_git", return_value="fixture-tree"),
               mock.patch.object(merge_gate, "nightly_owner", return_value="sdlc"),
-              mock.patch.object(copies, "standing", return_value=nullcontext(self.root)),
+              mock.patch.object(copies, "command_tree", return_value=nullcontext(self.root)),
               mock.patch.object(merge_gate, "run_suites", return_value=run,
                                 side_effect=run if isinstance(run, Exception) else None),
               mock.patch.object(showrunners, "tell", return_value="told sdlc"),
@@ -585,7 +586,7 @@ class NightlyPushTests(unittest.TestCase):
             failure = GateRefused(stage + " failed\nconnection closed")
             with self.subTest(stage=stage), self.execution(good) as sent:
                 with (mock.patch.object(merge_gate, "nightly_git", side_effect=["", failure]) if stage == "fetch"
-                      else mock.patch.object(copies, "standing", side_effect=failure)):
+                      else mock.patch.object(copies, "command_tree", side_effect=failure)):
                     with self.assertRaises(GateRefused) as caught, redirect_stdout(io.StringIO()):
                         _ = self.nightly()
                 self.assertIs(caught.exception, failure)
@@ -634,7 +635,7 @@ class NightlyPushTests(unittest.TestCase):
                 raise OSError("cleanup failed")
 
         run = merge_gate.GateRun((merge_gate.GateJobResult("test", "ok", 0, 0, ""),), 0, 0)
-        with self.execution(run) as sent, mock.patch.object(copies, "standing", return_value=failing_cleanup()):
+        with self.execution(run) as sent, mock.patch.object(copies, "command_tree", return_value=failing_cleanup()):
             with self.assertRaisesRegex(OSError, "cleanup failed"), redirect_stdout(io.StringIO()):
                 _ = self.nightly()
             sent.assert_called_once()
