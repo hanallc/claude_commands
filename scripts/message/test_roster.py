@@ -611,7 +611,7 @@ class RosterTests(unittest.TestCase):
                 found = send.matching_recipients(old_name, send.LocalOnly(), observed, membership=staff.snapshot())
                 self.assertIsInstance(found, send.RecipientMatches)
                 assert isinstance(found, send.RecipientMatches)
-                self.assertEqual(found.entries, [])
+                self.assertEqual(found.entries, [unnamed] if unnamed.kind == "claude" else [])
                 addressed = send.matching_recipients(native, send.LocalOnly(), observed, membership=staff.snapshot())
                 self.assertIsInstance(addressed, send.RecipientMatches)
                 assert isinstance(addressed, send.RecipientMatches)
@@ -1447,6 +1447,9 @@ class RosterTests(unittest.TestCase):
         row = next(row for row in rows if row["address"] == address)
         self.assertEqual(row["shown_name"], "registry-name")
         self.assertEqual(row["name"], "staff-name")
+        observed = roster.Roster(list(self._entries().values()), [])
+        self.assertEqual(send.resolve_recipient(cast(str, row["shown_name"]), send.LocalOnly(), observed),
+                         send.ClaudeRecipient(address))
 
     def test_unit_rename_and_transfer_change_only_shown_location(self) -> None:
         original = replace(self._entry("fixed-address", "worker", "worker:run/fixed-address", kind="codex"),

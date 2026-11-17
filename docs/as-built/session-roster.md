@@ -226,7 +226,8 @@ A match only in another unit refuses delivery and lists the full paths.
 One selected staff row supplies its `current_session`. Several matching rows produce a named ambiguity error and no delivery.
 The repeat-notice owner follows staff parents to the showrunner. It uses the default owner for a non-staff sender.
 
-A non-staff name uses a unique live roster session. Lookup checks this machine before the peer.
+A staff name takes precedence over registry names, without regard to case.
+Without a staff match, a unique registry name selects a live freestanding Claude row, on this machine before the peer.
 A name without a staff row or live session prints `send.py: no staff row or live session for 'x'`.
 That refusal exits 2. It creates no relay or queue.
 
