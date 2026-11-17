@@ -484,10 +484,34 @@ The next durable write saves the version in the existing `ServiceState.caller_ve
 A crash before that write can lose a read's version record.
 The read grants no permission or durable promise.
 
+Each reservation grant records one `admission_promise` row in `<buildlog>/<host>/<UTC month>.jsonl`.
+The fixed row ID is `admission_promise:<host>:<reservation_id>`.
+The row keeps the episode, call, repository identity, repository, worktree, and step.
+It also keeps the estimated bytes, source, sample count, estimate basis, promised bytes, test width, and frozen test estimate.
+The local decision keeps the selected reserve and threshold.
+A cloud decision keeps the estimate and promises zero local bytes.
+Later width changes do not change the row.
+The pair `(host, reservation_id)` joins the promise to `admission/anon_peaks.jsonl`.
+A promise without a measured peak remains unmatched.
+
+The durable promise outbox keeps the frozen promise and the complete month row boundary.
+The loop first persists the reservation, replay reply, and pending promise.
+It completes the admission event and delivers the grant reply before publishing the promise.
+The loop then calls `buildlog.record.admission_promise`, which uses `append_row_once`.
+An append failure retains the pending promise without blocking grants, reads, releases, or startup.
+The retry delay doubles from one second to a maximum of 60 seconds.
+The service reports each publication failure kind once.
+The pending promise remains independent of its reservation and survives release before publication.
+Recovery uses the saved timestamp, host, month, row ID, and offset.
+`read_last_whole_row_end` protects the recovery offset from unfinished month rows.
+Reads never append promises, scan the month file, or drain pending promises.
+Promise publication adds no read-visible state and does not separately invalidate the snapshot.
+
 Shutdown stops the socket thread before closing connections or detaching an inherited listener.
 A socket thread failure wakes the loop and raises an error.
 The service closes the thread and sockets before exit or code replacement.
-The wire format and the saved state format remain unchanged.
+The wire format remains unchanged.
+Older saved states have an empty promise outbox by default.
 
 Mutation requests have replay ids. The service persists each terminal reply before delivery.
 A replay returns the same reply. Live grants remain in the ledger until their reservation ends.

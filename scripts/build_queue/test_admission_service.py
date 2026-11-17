@@ -2209,7 +2209,8 @@ class ReplyPublicationTests(unittest.TestCase):
             def assert_full_state() -> None:
                 expected = service.ServiceState(server.reservations, server.places, server.ledger,
                     server.spacing, server.priority, server.build_history_generation,
-                    server.run_places, server.caller_versions, server.lifecycle_outbox)
+                    server.run_places, server.caller_versions, server.lifecycle_outbox,
+                    server.placement_requests, server.assignments, server.current_assignments, server.pending_promises)
                 self.assertEqual((fixture.state_dir / "state.json").read_text(), wire.encode_record(expected))
 
             assert_full_state()
@@ -3954,6 +3955,237 @@ class RoomAndSlotTests(unittest.TestCase):
             _ = fixture.run_pass()
             self.assertEqual(set(fixture.server.reservations), {mend.episode})
             self.assertEqual(set(fixture.server.waiters), {request.episode for request in gates})
+
+
+class AdmissionPromiseTests(unittest.TestCase):
+    def rows(self, fixture: AdmissionFixture) -> list[dict[str, object]]:
+        paths = sorted(fixture.state_dir.parent.glob("*/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl"))
+        return [row for path in paths for row in store.locked_rows(path) if row.get("kind") == "admission_promise"]
+
+    def test_local_grant_records_the_selected_decision_and_frozen_estimate(self) -> None:
+        for source in ("measured", "buildlog", "pooled", "fallback"):
+            with self.subTest(source=source), AdmissionFixture() as fixture:
+                request = fixture.request()
+                peak = records.ExpectedPeak(8 * GIB, cast(records.NeedSource, source), 7)
+                request = replace(request, profile=replace(request.profile, peak=peak,
+                    repository=records.RepositoryIdentity("fixture-repository", "fixture")))
+                phase = records.TestPhaseNeed(6 * GIB, 4, 8, 4, "scaled_up", 1.2)
+                with mock.patch.object(gate, "test_phase_need", return_value=phase):
+                    grant = only_admitted(fixture.server.handle_request(request))
+                result = fixture.server.last_result
+                assert isinstance(result, gate.PassResult)
+                owner = records.waiter_owner(fixture.server.reservations[request.episode].queue_waiter)
+                selected = next(item.decision for item in result.rows if item.owner == owner)
+                fixture.server.run_once(0)
+                row, = self.rows(fixture)
+                self.assertEqual(row["id"], f"admission_promise:{fixture.server.host}:{grant.reservation}")
+                self.assertEqual(row["reservation_id"], grant.reservation)
+                self.assertEqual(row["host"], fixture.server.host)
+                self.assertEqual(row["at"], store.utc_iso(fixture.clock.now()))
+                self.assertEqual(row["episode"], request.episode)
+                self.assertEqual(row["call_id"], codec.snapshot_value(request.call))
+                self.assertEqual(row["repo_identity"], "fixture-repository")
+                self.assertEqual((row["repo"], row["worktree"], row["step"]),
+                                 (request.profile.repo, request.profile.worktree, request.profile.step))
+                self.assertEqual((row["estimated_peak_bytes"], row["need_source"], row["need_runs"], row["need_basis"]),
+                                 (peak.bytes, peak.source, peak.count, peak.basis))
+                self.assertEqual(row["promised_bytes"], grant.need)
+                self.assertEqual(row["decision"], codec.snapshot_value(selected))
+                self.assertEqual(row["test_width"], codec.snapshot_value(request.test_width))
+                self.assertEqual(row["test_phase_need"], codec.snapshot_value(phase))
+
+    def test_width_change_keeps_the_original_promise(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.server.run_once(0)
+            original, = self.rows(fixture)
+            self.assertEqual(fixture.server.handle_request(wire.WidthRequest("new-width", grant.reservation, 2)), [wire.Ok()])
+            self.assertEqual(self.rows(fixture), [original])
+            self.assertEqual(fixture.server.reservations[request.episode].test_width, records.RequestedTestWidth(2))
+
+    def test_reconnect_and_replay_keep_one_promise_per_reservation(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.server.run_once(0)
+            self.assertEqual(only_admitted(fixture.connect(request).replies()), grant)
+            fixture.restart()
+            self.assertEqual(only_admitted(fixture.server.handle_request(request)), grant)
+            row, = self.rows(fixture)
+            self.assertEqual(row["reservation_id"], grant.reservation)
+
+    def test_append_crashes_recover_one_promise_without_blocking_grant_replay(self) -> None:
+        for stage in ("before_promise_append", "after_promise_append", "after_admitted_append"):
+            with self.subTest(stage=stage), AdmissionFixture() as fixture:
+                request = fixture.request()
+                fixture.fault.stage = stage
+                with self.assertRaises(InjectedCrash):
+                    _ = fixture.server.handle_request(request)
+                    fixture.server.run_once(0)
+                state = service.read_state(fixture.state_dir)
+                self.assertIn(request.episode, state.reservations)
+                self.assertIsInstance(state.ledger[request.episode].reply, wire.Admitted)
+                self.assertTrue(state.pending_promises)
+                with mock.patch.object(buildlog_record, "admission_promise", side_effect=OSError("publication unavailable")) as append:
+                    fixture.restart()
+                    grant = only_admitted(fixture.server.handle_request(request))
+                    append.assert_not_called()
+                fixture.server.run_once(0)
+                row, = self.rows(fixture)
+                self.assertEqual(row["reservation_id"], grant.reservation)
+                fixture.restart()
+                fixture.server.run_once(0)
+                self.assertEqual(self.rows(fixture), [row])
+
+    def test_month_boundary_recovery_keeps_the_grant_timestamp_and_month(self) -> None:
+        for stage in ("before_promise_append", "after_promise_append"):
+            with self.subTest(stage=stage), AdmissionFixture() as fixture:
+                fixture.clock.epoch = datetime(2026, 10, 31, 23, 59, 59, tzinfo=ZoneInfo("UTC")).timestamp()
+                request = fixture.request()
+                at = fixture.clock.now()
+                month_file = store.host_file(fixture.server.host, at)
+                fixture.fault.stage = stage
+                with self.assertRaises(InjectedCrash):
+                    _ = fixture.server.handle_request(request)
+                    fixture.server.run_once(0)
+                fixture.clock.advance(2)
+                fixture.restart()
+                grant = only_admitted(fixture.server.handle_request(request))
+                fixture.server.run_once(0)
+                row, = self.rows(fixture)
+                self.assertEqual(row["at"], store.utc_iso(at))
+                self.assertEqual(row["reservation_id"], grant.reservation)
+                self.assertIn(row, list(store.locked_rows(month_file)))
+                self.assertFalse(store.host_file(fixture.server.host, fixture.clock.now()).exists())
+
+    def test_positive_peak_joins_the_original_promise(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            request = replace(request, sidecar=str(fixture.scope(request.owner)))
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.server.run_once(0)
+            fixture.scoped_peak(grant, 3 * GIB)
+            fixture.clock.advance(2)
+            fixture.release(grant)
+            fixture.server.run_once(0)
+            promise, = self.rows(fixture)
+            peak, = fixture.history()
+            self.assertEqual((promise["host"], promise["reservation_id"]), (peak["host"], peak["reservation_id"]))
+            self.assertEqual(promise["promised_bytes"], grant.need)
+            self.assertEqual(peak["anon_peak_bytes"], 3 * GIB)
+
+    def test_cloud_grant_keeps_the_estimate_and_promises_zero_local_bytes(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = replace(fixture.request(need=40 * GIB), place=wire.CloudPlace("aws"))
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.server.run_once(0)
+            row, = self.rows(fixture)
+            self.assertEqual(row["estimated_peak_bytes"], request.profile.peak.bytes)
+            self.assertEqual(row["need_source"], request.profile.peak.source)
+            self.assertEqual(row["need_runs"], request.profile.peak.count)
+            self.assertEqual(row["promised_bytes"], 0)
+            self.assertEqual(grant.need, 0)
+            self.assertEqual(row["decision"], {"kind": "CloudAdmission"})
+
+    def test_wait_refusal_and_launch_permission_produce_no_promise(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.hold_starts()
+            request = fixture.request()
+            self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            self.assertEqual(self.rows(fixture), [])
+            self.assertIsInstance(fixture.server.handle_request(wire.WidthRequest("invalid", "missing", 0))[0], wire.Refused)
+            self.assertEqual(self.rows(fixture), [])
+        with AdmissionFixture() as fixture:
+            launch = fixture.launch(need=GIB)
+            self.assertIsInstance(fixture.server.handle_request(launch)[0], wire.LaunchAdmitted)
+            self.assertEqual(self.rows(fixture), [])
+            fixture.allow_next_start()
+            grant = only_admitted(fixture.server.handle_request(fixture.request()))
+            fixture.server.run_once(0)
+            row, = self.rows(fixture)
+            self.assertEqual(row["reservation_id"], grant.reservation)
+
+    def test_unfinished_month_tail_recovers_one_promise_after_an_append_crash(self) -> None:
+        with AdmissionFixture() as fixture:
+            path = store.host_file(fixture.server.host, fixture.clock.now())
+            store.append_line(path, {"kind": "fixture", "id": "complete-row"})
+            with path.open("ab") as stream:
+                _ = stream.write(b'{"unfinished":"' + b"x" * 16384)
+            request = fixture.request()
+            fixture.fault.stage = "after_promise_append"
+            with self.assertRaises(InjectedCrash):
+                _ = fixture.server.handle_request(request)
+                fixture.server.run_once(0)
+            fixture.restart()
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.server.run_once(0)
+            row, = self.rows(fixture)
+            self.assertEqual(row["reservation_id"], grant.reservation)
+            self.assertNotIn(b"unfinished", path.read_bytes())
+
+    def test_unwritable_month_keeps_grants_reads_releases_and_restart_available(self) -> None:
+        with AdmissionFixture() as fixture:
+            path = store.host_file(fixture.server.host, fixture.clock.now())
+            path.mkdir(parents=True)
+            request = fixture.request()
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                grant = only_admitted(fixture.connect(request).replies())
+                fixture.server.run_once(0)
+                self.assertTrue(fixture.server.pending_promises)
+                first_retry = fixture.server.next_promise_retry
+                fixture.server.run_once(0)
+                self.assertEqual(fixture.server.next_promise_retry, first_retry)
+                fixture.clock.advance(1)
+                fixture.server.run_once(0)
+                self.assertEqual(fixture.server.next_promise_retry, fixture.clock.monotonic() + 2)
+                self.assertEqual(errors.getvalue().count("promise publication failed"), 1)
+                self.assertIsInstance(fixture.connect(wire.ViewRequest()).replies()[0], wire.ViewReply)
+                self.assertEqual(only_admitted(fixture.server.handle_request(request)), grant)
+                release = wire.ReleaseRequest("release-before-promise", grant.reservation, 0)
+                self.assertEqual(fixture.connect(release).replies(), [wire.Ok()])
+                self.assertNotIn(request.episode, fixture.server.reservations)
+                with mock.patch.object(buildlog_record, "admission_promise", side_effect=OSError("still unavailable")) as append:
+                    fixture.restart()
+                    append.assert_not_called()
+                    self.assertTrue(fixture.server.pending_promises)
+                    self.assertEqual(fixture.server.handle_request(release), [wire.Ok()])
+                path.rmdir()
+                fixture.clock.advance(61)
+                fixture.server.run_once(0)
+            row, = self.rows(fixture)
+            self.assertEqual(row["reservation_id"], grant.reservation)
+            self.assertFalse(fixture.server.pending_promises)
+            fixture.restart()
+            fixture.server.run_once(0)
+            self.assertEqual(self.rows(fixture), [row])
+
+    def test_cached_queries_never_publish_or_scan_promises(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.server.run_once(0)
+            row, = self.rows(fixture)
+            self.assertEqual(row["reservation_id"], grant.reservation)
+            fixture.server.next_pass = fixture.server.next_source_check = fixture.server.next_config_watch_retry = float("inf")
+            fixture.server.start_acceptor()
+            snapshot = fixture.server.read_state
+            with mock.patch.object(fixture.server, "_drain_promises", side_effect=AssertionError("a read drains promises")), \
+                    mock.patch.object(buildlog_record, "append_row_once", side_effect=AssertionError("a read appends promises")), \
+                    mock.patch.object(store, "locked_rows", side_effect=AssertionError("a read scans promises")), \
+                    mock.patch.object(os, "fsync", side_effect=AssertionError("a read syncs files")):
+                for query in (wire.ViewRequest(), wire.MineRequest("fixture"), wire.ExplainRequest(),
+                              wire.BuildHistoryRequest(), status_wire.PlacementStatusRequest("unknown", "unknown")):
+                    for _ in range(2):
+                        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+                            peer.settimeout(3)
+                            peer.connect(str(fixture.socket_path))
+                            peer.sendall(wire.encode_request(query).encode())
+                            with peer.makefile("rb") as stream:
+                                _ = wire.parse_reply(stream.readline())
+                self.assertIs(fixture.server.read_state, snapshot)
+            self.assertEqual(self.rows(fixture), [row])
 
 
 class QueueLifecycleTests(unittest.TestCase):

@@ -107,6 +107,32 @@ def setUpModule() -> None:
     time.tzset()
 
 
+class AdmissionPromiseRecordTests(unittest.TestCase):
+    def test_saved_grant_uses_a_fixed_id_and_the_original_host_month(self) -> None:
+        with AdmissionFixture() as fixture:
+            host, at = fixture.server.host, START
+            path = store.host_file(host, at)
+            store.append_line(path, {"kind": "fixture", "id": "earlier-row"})
+            start = path.stat().st_size
+            facts: Record = {"episode": "episode", "estimated_peak_bytes": 123, "promised_bytes": 123,
+                             "host": "wrong-host", "at": "wrong-time", "kind": "wrong-kind", "id": "wrong-id"}
+            self.assertTrue(recorder.admission_promise(host, "reservation", at, facts, start=start))
+            self.assertFalse(recorder.admission_promise(host, "reservation", at, facts, start=start))
+            rows = list(store.locked_rows(path))
+            self.assertEqual(len(rows), 2)
+            row = rows[1]
+            self.assertEqual((row["kind"], row["v"], row["id"]),
+                             ("admission_promise", recorder.RECORD_VERSION, f"admission_promise:{host}:reservation"))
+            self.assertEqual((row["host"], row["at"], row["reservation_id"]), (host, store.utc_iso(at), "reservation"))
+            self.assertEqual((row["estimated_peak_bytes"], row["promised_bytes"]), (123, 123))
+            self.assertEqual(facts["kind"], "wrong-kind")
+
+    def test_failed_promise_publication_raises_for_the_service_retry(self) -> None:
+        with AdmissionFixture() as fixture, mock.patch.object(recorder, "append_row_once", side_effect=OSError("disk unavailable")):
+            with self.assertRaisesRegex(OSError, "disk unavailable"):
+                _ = recorder.admission_promise(fixture.server.host, "reservation", START, {})
+
+
 class RecordTests(unittest.TestCase):
     repository_seed: ClassVar[Path]
     base: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -821,7 +847,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertIn("step", output)
         self.assertEqual(errors.count("waiting for memory since "), 1)
         self.assertNotIn("memory wait limit reached", errors)
-        record = self.records()[-1]
+        record = next(row for row in reversed(self.records()) if row.get("kind") == "step")
         wait = record["mem_wait_s"]
         duration = record["duration_s"]
         started = datetime.fromisoformat(str(record["started_at"]).replace("Z", "+00:00")).timestamp()

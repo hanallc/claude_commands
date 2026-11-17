@@ -1264,6 +1264,15 @@ def hold_event(args: list[str]) -> None:
 
 
 
+def admission_promise(host: str, reservation_id: str, at: float, facts: Mapping[str, object], *, start: int = 0) -> bool:
+    """Publish the saved grant facts once in the original admission month."""
+    return append_row_once(store.host_file(host, at), {
+        **facts, "kind": "admission_promise", "v": RECORD_VERSION,
+        "id": f"admission_promise:{host}:{reservation_id}", "host": host, "at": store.utc_iso(at),
+        "reservation_id": reservation_id,
+    }, start)
+
+
 def queue_priority(action: Literal["set", "clear"], unit: str,
                    why: str, set_by: str, at: float, *, transition_id: str = "", start: int = 0) -> None:
     host = store.host_name()

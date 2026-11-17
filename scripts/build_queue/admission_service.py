@@ -48,7 +48,7 @@ from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHol
 from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
 
-from scripts.buildlog import store
+from scripts.buildlog import store, record as buildlog_record
 from scripts.lib import test_phase
 
 from scripts.build_queue.scope_activity import (
@@ -377,6 +377,40 @@ class ReplayLedger(dict[str, ReplayEntry]):
 
 
 @dataclass(frozen=True)
+class CloudAdmission:
+    """The cloud grant promises no local memory."""
+
+
+@dataclass(frozen=True)
+class AdmissionPromise:
+    """These grant facts remain fixed through publication and recovery."""
+    host: str
+    at: float
+    reservation_id: str
+    episode: str
+    call_id: records.Call
+    repo_identity: str
+    repo: str
+    worktree: str
+    step: str
+    estimated_peak_bytes: int
+    need_source: records.NeedSource
+    need_runs: int
+    need_basis: records.NeedBasis | records.BasisNotRecorded
+    promised_bytes: int
+    decision: records.AdmissionDecision | CloudAdmission
+    test_width: records.TestWidth
+    test_phase_need: records.TestPhaseNeed | gate.NoTestPhaseNeed
+
+
+@dataclass(frozen=True)
+class PendingPromise:
+    """The durable grant record awaits publication at this complete row boundary."""
+    promise: AdmissionPromise
+    month_row_end: int
+
+
+@dataclass(frozen=True)
 class PendingAdmission:
     episode: str
     need_source: records.NeedSource
@@ -407,6 +441,7 @@ class ServiceState:
     placement_requests: dict[str, wire.PlacementRequest] = field(default_factory=dict)
     assignments: dict[str, records.SavedPlacementAssignment] = field(default_factory=dict)
     current_assignments: dict[str, str] = field(default_factory=dict)
+    pending_promises: tuple[PendingPromise, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1517,6 +1552,10 @@ class AdmissionServer:
         self.repository_slot_waiters: dict[str, WaitingRepositorySlot] = {}
         self.reservations: dict[str, ReservationRecord] = {}
         self.lifecycle_outbox: tuple[PendingAdmission | PendingLeft, ...] = ()
+        self.pending_promises: tuple[PendingPromise, ...] = ()
+        self.next_promise_retry: float = 0.0
+        self.promise_retry_seconds: float = 1.0
+        self.promise_failures: set[str] = set()
         self.places: dict[str, WaiterPlace] = {}
         self.run_places: dict[str, wire.RunPlace] = {}
         self.build_history_generation: int = 0
@@ -1645,6 +1684,7 @@ class AdmissionServer:
             self.build_history_generation = state.build_history_generation
             self.run_places = state.run_places
             self.lifecycle_outbox = state.lifecycle_outbox
+            self.pending_promises = state.pending_promises
             self.caller_versions = state.caller_versions
             self.placement_requests = state.placement_requests
             self.assignments = state.assignments
@@ -1707,7 +1747,7 @@ class AdmissionServer:
             self._prune_ended_placements(now - self.last_usable_configuration.ended_placement_seconds)
         state = ServiceState(self.reservations, self.places, self.ledger, self.spacing, self.priority,
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
-            self.placement_requests, self.assignments, self.current_assignments)
+            self.placement_requests, self.assignments, self.current_assignments, self.pending_promises)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
         changed = False
 
@@ -2375,7 +2415,7 @@ class AdmissionServer:
                 self.assignments[key] = replace(self.assignments[key], permission=placement.PermissionConsumed(inputs.now))
             proposed = cast(gate.ProposedAdmission, decision.admission)
             self.spacing = proposed.spacing
-            self._admit(waiting, config, self.configuration.peak_history_share_percent)
+            self._admit(waiting, config, self.configuration.peak_history_share_percent, decision.decision)
         self.persist()
         waiting_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
             row.get("step", ""), row.get("folder", ""), row["since"], row["need"], decision.reason, row.get("unit", ""))
@@ -2433,7 +2473,7 @@ class AdmissionServer:
         position = 0
         for waiting in waiting_cloud:
             if used < slots:
-                self._admit(waiting, config, configuration.peak_history_share_percent)
+                self._admit(waiting, config, configuration.peak_history_share_percent, CloudAdmission())
                 used += 1
                 started = True
                 continue
@@ -2737,6 +2777,36 @@ class AdmissionServer:
                 self.fault("after_left_append")
             self.lifecycle_outbox = self.lifecycle_outbox[1:]
 
+    def _drain_promises(self) -> None:
+        """Publish after replies and retain failed records for a later loop turn."""
+        if (not self.pending_promises or self.clock.monotonic() < self.next_promise_retry
+                or any(connection.sending for connection in self.connections.values())):
+            return
+        completed = False
+        while self.pending_promises:
+            pending = self.pending_promises[0]
+            promise = pending.promise
+            self.fault("before_promise_append")
+            try:
+                _ = buildlog_record.admission_promise(promise.host, promise.reservation_id, promise.at,
+                    cast(dict[str, object], codec.snapshot_value(promise)), start=pending.month_row_end)
+            except OSError as error:
+                failure = f"{type(error).__name__}:{error.errno}"
+                if failure not in self.promise_failures:
+                    self.promise_failures.add(failure)
+                    print(f"memory admission: promise publication failed: {error}", file=sys.stderr)
+                self.next_promise_retry = self.clock.monotonic() + self.promise_retry_seconds
+                self.promise_retry_seconds = min(60.0, self.promise_retry_seconds * 2)
+                break
+            self.fault("after_promise_append")
+            self.pending_promises = self.pending_promises[1:]
+            completed = True
+        if completed:
+            self.persist()
+        if not self.pending_promises:
+            self.next_promise_retry = 0.0
+            self.promise_retry_seconds = 1.0
+
     def _record_left(self, episode: str, identity: records.QueueLifeIdentity, reason: gate.LeftReason) -> None:
         self.lifecycle_outbox = (*self.lifecycle_outbox, PendingLeft(identity, episode, reason, self.clock.now()))
 
@@ -2749,7 +2819,8 @@ class AdmissionServer:
             history_path=self.state_dir / "anon_peaks.jsonl", config=config, share_percent=share_percent)
         return replace(record, test_phase_need=need)
 
-    def _admit(self, waiting: WaitingAdmission, config: records.MemoryConfig, share_percent: int) -> None:
+    def _admit(self, waiting: WaitingAdmission, config: records.MemoryConfig, share_percent: int,
+               decision: records.AdmissionDecision | CloudAdmission) -> None:
         request, profile = waiting.request, waiting.request.profile
         now = self.clock.now()
         if isinstance(request, wire.LaunchRequest):
@@ -2777,6 +2848,16 @@ class AdmissionServer:
                 record = self._freeze_test_phase_need(record, config, share_percent)
             result = self.last_result
             candidate = result.policy.queued_head if isinstance(result, gate.PassResult) else gate.NoQueuedHead()
+            promise = AdmissionPromise(self.host, now, record.reservation_id, record.episode, record.call,
+                record.repo_identity, record.repo, record.worktree, record.step,
+                profile.peak.bytes, profile.peak.source, profile.peak.count, profile.peak.basis, record.need,
+                decision, record.test_width, record.test_phase_need)
+            month_file = store.host_file(self.host, now)
+            try:
+                month_row_end = store.read_last_whole_row_end(month_file)
+            except OSError:
+                month_row_end = 0
+            self.pending_promises = (*self.pending_promises, PendingPromise(promise, month_row_end))
             self.lifecycle_outbox = (*self.lifecycle_outbox, PendingAdmission(request.episode, profile.peak.source,
                 isinstance(candidate, gate.QueuedHead)
                     and records.waiter_owner(candidate.waiter) == records.waiter_owner(waiting.row),
@@ -4519,7 +4600,8 @@ done
             self.acceptor.raise_failure()
         now = self.clock.monotonic()
         due = max(self.next_pass, self._pass_allowed_at())
-        delay = min(timeout, max(0, min(due, self.next_source_check, self.next_config_watch_retry) - now))
+        promise_due = self.next_promise_retry if self.pending_promises else float("inf")
+        delay = min(timeout, max(0, min(due, self.next_source_check, self.next_config_watch_retry, promise_due) - now))
         ready = self.epoll.poll(-1 if delay == float("inf") else delay)
         if any(descriptor == self.priority_events for descriptor, _events in ready):
             self.snapshot_dirty = True
@@ -4596,6 +4678,7 @@ done
             self._check_sources()
         self._check_outage_alert()
         self._flush_socket_replies()
+        self._drain_promises()
         if isinstance(self.acceptor, AdmissionAcceptor):
             self.acceptor.raise_failure()
         _notify("WATCHDOG=1")
