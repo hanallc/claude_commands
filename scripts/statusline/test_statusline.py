@@ -1193,7 +1193,7 @@ class CountsRowTests(ConfiguredShellTests):
                            read: bool = False) -> investigation.Investigation:
         """File a record in this test's private state folder."""
         with patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.home / ".local/state/showrunner")}):
-            item = investigation.file(owner.id, "Find the cause", "What caused this?")
+            item = investigation.file(owner.id, "Find the cause", "What caused this?", waiting_why='The owner must complete the investigation.')
             if answered or read:
                 item = investigation.answer(owner.id, item.id, "The cause is known.")
             if read:

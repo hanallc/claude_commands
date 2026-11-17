@@ -258,7 +258,7 @@ class NextItemTests(unittest.TestCase):
                 _ = staff.move(existing.id, staff.ReportsTo(parent) if parent is not None else staff.StaffRoot())
             owner = fixture_member("showrunner", name=name, parent=parent, doc=staff.LiveDoc(remote.local_machine(), doc))
             with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}):
-                item = investigation.file(owner.id, f"{name}-item", "Find the cause.")
+                item = investigation.file(owner.id, f"{name}-item", "Find the cause.", waiting_why='The owner must complete the investigation.')
                 _ = investigation.answer(owner.id, item.id, "The cause is known.")
             fields = {"since": "2026-10-06T09:00", "text": f"{name}-item", "question": f"{name}-item next step?",
                       "asked_by": owner.id}
@@ -320,7 +320,7 @@ class NextItemTests(unittest.TestCase):
             self.assertNotEqual(next_item.change_queue(docs["top"]).name, next_item.change_queue(docs["kid"]).name)
 
             producer = fixture_member("producer", name="planner")
-            ready = investigation.file(producer.id, "Producer investigation", "Read the producer log.")
+            ready = investigation.file(producer.id, "Producer investigation", "Read the producer log.", waiting_why='The owner must complete the investigation.')
             ready = investigation.answer(producer.id, ready.id, "The producer answer is ready.")
             with mock.patch.object(staff, "caller_identity", return_value=producer.current_session):
                 for arguments in (("show", "--kind", "investigation"), ("show",)):

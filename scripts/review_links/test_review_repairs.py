@@ -16,8 +16,10 @@ from unittest.mock import patch
 
 from scripts.lib import urgency
 from scripts.lib.user_zone import user_zone
-from scripts.production import change_review, footer_counts, investigation, next_item, staff
-from scripts.review_links import change_page, console, review_items, review_page, test_review_page
+from scripts.production import change_review, footer_counts, investigation, next_item, staff, update_registration
+from scripts.production.production_doc import read_production
+from scripts.review_links import change_page, console, review_actions, review_items, review_page, test_review_page
+from scripts.review_links import question_record
 
 
 class ReviewRepairsTests(unittest.TestCase):
@@ -100,6 +102,150 @@ class ReviewRepairsTests(unittest.TestCase):
         self.assertIn('Last error: fixture send failed',calls[-1])
         self.assertEqual(next(item.state for item in review_items.read(self.case.root) if item.key == key),review_items.ReviewState.DONE)
 
+    def test_waiting_unowned_question_keeps_only_later(self) -> None:
+        key = self.case.question()
+        members = staff.snapshot()
+        owner = next(row for row in members.rows if row.name == 'page-owner')
+        scope = read_production(owner, members)
+        identities = update_registration.QuestionStaff.for_record(members)
+        question = next(item for item in review_items.read(self.case.root) if item.key == key)
+        _ = update_registration.followup(scope, question.title, 'Check the old case.', identities=identities)
+        without_owner = staff.StaffSnapshot(tuple(row for row in members.rows if row.id != owner.id))
+        with patch.object(staff, 'snapshot', return_value=without_owner):
+            waiting = next(item for item in review_items.read(self.case.root) if item.key == key)
+            self.assertEqual(waiting.state, review_items.ReviewState.WAITING)
+            self.assertIsInstance(waiting.source, review_items.UnownedQuestionSource)
+            assert isinstance(waiting.source, review_items.UnownedQuestionSource)
+            before = waiting.source.record.path.read_bytes()
+            self.assertEqual(waiting.actions, ())
+            form = review_page.form(waiting, change_page.ReviewBrowser('fixture-token'), 3)
+            self.assertIn('value="later">Later', form)
+            for action in ('answer', 'feedback', 'question'):
+                with self.subTest(action=action):
+                    self.assertNotIn(f'value="{action}"', form)
+                    with self.assertRaises(question_record.AnswerRefused):
+                        _ = review_page.submit(self.case.root, self.case.body(key, action, 'Use the new case.'), self.case.status)
+                    self.assertEqual(waiting.source.record.path.read_bytes(), before)
+
+    def test_empty_actions_keep_each_wait_and_its_question_id(self) -> None:
+        proposal, efficiency = self.case.decisions()
+        question = self.case.question()
+        report = self.case.investigation()
+        keys = (question, 'page-owner/C1', f'investigation/{report.owner}/{report.id}', proposal, efficiency)
+        for key in keys:
+            delivery, _ = review_page.submit(self.case.root, self.case.body(key, 'question', 'Check the old case.'), self.case.status)
+            assert isinstance(delivery, change_page.MessageDelivery)
+            change_page.deliver(delivery, self.case.status)
+            waiting = next(item for item in review_items.read(self.case.root) if item.key == key)
+            slots = self.case.status.slots(delivery.page, delivery.row)
+            actions = ('answer', 'feedback', 'question') if waiting.type == review_items.ReviewType.QUESTION else ('feedback', 'question')
+            for action in actions:
+                with self.subTest(kind=waiting.type, action=action):
+                    with self.assertRaises((ValueError, update_registration.RegistrationFailure)):
+                        _ = review_page.submit(self.case.root, self.case.body(key, action, ' \n '), self.case.status)
+                    self.assertEqual(next(item for item in review_items.read(self.case.root) if item.key == key), waiting)
+                    self.assertEqual(self.case.status.slots(delivery.page, delivery.row), slots)
+
+    def test_native_question_followup_accepts_each_action(self) -> None:
+        for action in ('answer', 'feedback', 'question'):
+            with self.subTest(action=action):
+                case = test_review_page.ReviewPageTests('runTest')
+                case.setUp()
+                try:
+                    key = case.question()
+                    members = staff.snapshot()
+                    owner = next(row for row in members.rows if row.name == 'page-owner')
+                    scope = read_production(owner, members)
+                    identities = update_registration.QuestionStaff.for_record(members)
+                    question = next(item for item in review_items.read(case.root) if item.key == key)
+                    _ = update_registration.followup(scope, question.title, 'Check the old case.', identities=identities)
+                    waiting = next(item for item in review_items.read(case.root) if item.key == key)
+                    self.assertEqual(waiting.state, review_items.ReviewState.WAITING)
+                    delivery, _ = review_page.submit(case.root, case.body(key, action, 'Use the new case.'), case.status)
+                    change_page.deliver(delivery, case.status)
+                    updated = next(item for item in review_items.read(case.root) if item.key == key)
+                    expected = review_items.ReviewState.WAITING if action == 'question' else review_items.ReviewState.DONE
+                    self.assertEqual(updated.state, expected)
+                    assert isinstance(updated.source, review_items.QuestionSource)
+                    self.assertEqual('followup' in updated.source.record.item, action == 'question')
+                    self.assertEqual(updated.source.record.item.get('followups', []), [])
+                    self.assertTrue(any('superseded' in entry.words.casefold() for entry in updated.log))
+                    self.assertTrue(any('Check the old case.' in entry.words for entry in updated.log))
+                    self.assertIn('superseded', scope.log.read_text().casefold())
+                    before = updated.source.record.path.read_bytes()
+                    with self.assertRaises((ValueError, update_registration.RegistrationFailure)):
+                        _ = change_page.answer_item(key, 'The old case passes.', '', case.status)
+                    self.assertEqual(updated.source.record.path.read_bytes(), before)
+                finally:
+                    case.doCleanups()
+
+    def test_recovery_sends_only_the_action_that_replaced_the_pending_request(self) -> None:
+        for kind in review_items.REVIEW_TYPES:
+            with self.subTest(kind=kind):
+                case = test_review_page.ReviewPageTests('runTest')
+                case.setUp()
+                try:
+                    if kind == review_items.ReviewType.QUESTION:
+                        key = case.question()
+                    elif kind == review_items.ReviewType.CHANGE:
+                        key = 'page-owner/C1'
+                    elif kind == review_items.ReviewType.INVESTIGATION:
+                        report = case.investigation()
+                        key = f'investigation/{report.owner}/{report.id}'
+                    else:
+                        proposal, efficiency = case.decisions()
+                        key = proposal if kind == review_items.ReviewType.PROPOSAL else efficiency
+                    old, _ = review_page.submit(case.root, case.body(key, 'question', 'OBSOLETE_REQUEST'), case.status)
+                    _, _ = review_page.submit(case.root, case.body(key, 'feedback', 'CURRENT_ACTION'), case.status)
+                    restarted = change_page.DeliveryStatus(case.root)
+                    change_page.recover_pending(restarted)
+                    messages = tuple(case.fixture.messages)
+                    self.assertEqual(len(messages), 2 if kind == review_items.ReviewType.CHANGE else 1)
+                    self.assertTrue(all('CURRENT_ACTION' in text and 'OBSOLETE_REQUEST' not in text for _, _, text in messages))
+                    change_page.deliver(old, case.status)
+                    change_page.recover_pending(restarted)
+                    self.assertEqual(tuple(case.fixture.messages), messages)
+                    updated = next(item for item in review_items.read(case.root) if item.key == key)
+                    self.assertEqual(updated.state, review_items.ReviewState.DONE)
+                finally:
+                    case.doCleanups()
+
+    def test_question_recovery_keeps_the_id_before_tracking_finishes(self) -> None:
+        for kind in (review_items.ReviewType.QUESTION, review_items.ReviewType.INVESTIGATION,
+                     review_items.ReviewType.PROPOSAL, review_items.ReviewType.EFFICIENCY):
+            with self.subTest(kind=kind):
+                case = test_review_page.ReviewPageTests('runTest')
+                case.setUp()
+                try:
+                    if kind == review_items.ReviewType.QUESTION:
+                        key = case.question()
+                    elif kind == review_items.ReviewType.INVESTIGATION:
+                        report = case.investigation()
+                        key = f'investigation/{report.owner}/{report.id}'
+                    else:
+                        proposal, efficiency = case.decisions()
+                        key = proposal if kind == review_items.ReviewType.PROPOSAL else efficiency
+                    with patch.object(review_actions, 'track_question', side_effect=RuntimeError('fixture crash')):
+                        with self.assertRaisesRegex(RuntimeError, 'fixture crash'):
+                            _ = review_page.submit(case.root, case.body(key, 'question', 'Check this request.'), case.status)
+                    waiting = next(item for item in review_items.read(case.root) if item.key == key)
+                    page = review_actions.delivery_page(waiting, case.status)
+                    slots = case.status.slots(page, page.rows[0])
+                    self.assertIsInstance(slots.question, change_page.OpenQuestion)
+                    assert isinstance(slots.question, change_page.OpenQuestion)
+                    identity = slots.question.question_id
+                    fields = cast(change_page.StoredDeliverySlots, json.loads(case.status.path(page, page.rows[0]).read_text()))
+                    saved = fields.get('user_answer') or fields.get('review_message')
+                    assert saved is not None
+                    self.assertIn('--question '+identity, saved['message'])
+                    restarted = change_page.DeliveryStatus(case.root)
+                    change_page.recover_pending(restarted)
+                    self.assertEqual(len(case.fixture.messages), 1)
+                    self.assertIn('--question '+identity, case.fixture.messages[0][2])
+                    self.assertEqual(case.status.slots(page, page.rows[0]).question, slots.question)
+                finally:
+                    case.doCleanups()
+
     def test_automation_docs_name_review_and_only_answer_ready_counts(self) -> None:
         source = (Path(__file__).parents[2]/'docs/as-built/showrunner-automation.md').read_text()
         self.assertIn('The status line counts only answer-ready investigations after questions.',source)
@@ -124,13 +270,20 @@ class ReviewRepairsTests(unittest.TestCase):
                 if route.path == '/owner-answer':
                     key = parse_qs(route.query)['item'][0]
                     item = next(item for item in review_items.read(case.root) if item.key == key)
-                    question = item.source.slots.question if isinstance(item.source, review_items.ChangeSource) else change_page.NoQuestion()
+                    if isinstance(item.source, review_items.ChangeSource):
+                        question = item.source.slots.question
+                    else:
+                        page = review_actions.delivery_page(item, case.status)
+                        question = case.status.slots(page, page.rows[0]).question
                     identity = question.question_id if isinstance(question, change_page.OpenQuestion) else ''
                     _ = change_page.answer_item(key,'The owner checked the next case.',identity,case.status)
-                if self.path == '/problem':
-                    _ = change_review.save_verdict(case.fixture.review_list,'C1','not works: The spacing differs.',case.fixture.production)
-                if self.path == '/passed':
-                    _ = change_review.save_verdict(case.fixture.review_list,'C2','works',case.fixture.production)
+                if self.path in ('/problem', '/passed'):
+                    row, verdict = ('C1', 'not works: The spacing differs.') if self.path == '/problem' else ('C2', 'works')
+                    page = change_page.ReviewPage(case.fixture.review_list, case.fixture.production, (row,), '')
+                    validation = case.status.slots(page, row).validation
+                    assert isinstance(validation, (change_page.DeliveryIntent, change_page.ValidationRequested))
+                    _ = change_review.save_verdict(case.fixture.review_list, row, verdict, case.fixture.production,
+                                                   validation_id=validation.attempt)
                 self.send_response(200)
                 self.send_header('Content-Type','text/html; charset=utf-8')
                 self.end_headers()
@@ -268,7 +421,7 @@ window.fetch=(url,options={})=>{
         _ = investigation.mark_read(read.owner, read.id)
         members = staff.snapshot()
         owner = next(row for row in members.rows if row.name == 'page-owner')
-        _ = investigation.file(owner.id, 'Another owner', 'Read its log.')
+        _ = investigation.file(owner.id, 'Another owner', 'Read its log.', waiting_why='The owner must complete the investigation.')
         markup = console.render(console.read_pages(),console.read_rebuilds()).decode()
         probe = r'''
 (async()=>{

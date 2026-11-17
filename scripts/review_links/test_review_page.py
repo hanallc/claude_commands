@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import shutil
+import html
 import json
 import os
 import subprocess
@@ -11,6 +12,7 @@ from datetime import datetime, timedelta, tzinfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Self, TextIO, cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 import unittest
 from dataclasses import replace
@@ -26,8 +28,9 @@ from scripts.production import issues as issue_store
 from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, record_table, review_items, review_page
-from scripts.review_links import list_page, test_change_page
-from scripts.review_links import efficiency_reviews, review_later
+from scripts.review_links import question_record
+from scripts.review_links import list_page, staff_names, test_change_page
+from scripts.review_links import efficiency_reviews, review_actions, review_later
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.statusline import counts_row
 
@@ -37,21 +40,191 @@ class ReviewPageTests(unittest.TestCase):
     root: Path = Path()
     status: change_page.DeliveryStatus = change_page.DeliveryStatus(Path())
 
+    def test_review_ids_use_the_shared_no_wrap_cell(self) -> None:
+        _ = self.question()
+        body = review_page.render(self.root).decode()
+        self.assertIn('<td class="record-id" data-label="Id">', body)
+        self.assertIn('.list-table .record-id{white-space:nowrap;overflow-wrap:normal;width:1%}', body)
+        self.assertIn('.list-toggle{white-space:nowrap}', body)
+        self.assertIn('<col style="width:17%">', body)
+
+    def test_staff_owners_sources_and_log_names_have_role_colors(self) -> None:
+        _ = self.question()
+        body = review_page.render(self.root).decode()
+        self.assertRegex(body, r'data-color-text="role.showrunner"[^>]*>page-owner</span>')
+        self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>builder-unit</span>')
+        self.assertNotRegex(body, r'class="staff-name"[^>]*>nate</span>')
+        item = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.QUESTION)
+        unknown = replace(item, owner=staff.StaffId('nate'), source_unit=staff.StaffId('unknown-source'))
+        plain = review_page.item_rows(unknown, change_page.ReviewBrowser('private'), staff.snapshot(),
+                                      datetime.now(user_zone()), 0, 100, 3)
+        self.assertIn('<td data-label="Owner">nate<small>· unknown-source</small></td>', plain)
+        self.assertIn('Owner: nate · Source: unknown-source</p>', plain)
+
     @override
     def setUp(self) -> None:
         self.fixture = test_change_page.ChangePageTests('runTest')
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
         config = self.fixture.temporary / 'config'
+        _ = (config/'production.conf').write_text('# whole: 20..\nquestion_title_max_chars=100\n')
         _ = shutil.copyfile(Path(__file__).resolve().parents[2]/'config/console.conf',config/'console.conf')
         self.root = self.fixture.root
         self.status = change_page.DeliveryStatus(self.root)
+        document = self.fixture.production.read_text()
+        _ = self.fixture.production.write_text(document+'- **Merge branch:** main\n- **Log:** progress.log\n')
 
     def question(self, title: str = 'Which layout should the page use?') -> str:
         return self.fixture.file_user_question(title)
 
+    def assert_row_title(self, row: str, title: str, visible: str) -> None:
+        element = row.split('<strong', 1)[1].split('</strong>', 1)[0]
+        attributes, _, text = element.partition('>')
+        self.assertIn('class="review-title"', attributes)
+        self.assertIn('title="'+html.escape(title, quote=True)+'"', attributes)
+        self.assertEqual(text, html.escape(visible))
+        self.assertNotIn(html.escape(title), text)
+
+    def test_legacy_question_titles_are_short_but_search_and_details_keep_the_full_text(self) -> None:
+        key = self.question()
+        source = next(item.source for item in review_items.read(self.root) if item.key == key)
+        assert isinstance(source, review_items.QuestionSource)
+        path = source.record.path
+        original = path.read_text()
+        for title in ('Long <title> '+ 'x'*100, 'Short <title>\nThe full question follows.'):
+            with self.subTest(title=title):
+                item = source.record.item.copy()
+                item['text'] = title
+                item['parts'] = update_registration.QuestionParts(ask=title, context='Context remains visible.',
+                    items=[], choices=[], recommend='')
+                registration_line = next(line for line in original.splitlines() if line.startswith('registration: '))
+                _ = path.write_text(original.replace(registration_line, 'registration: '+json.dumps(item)))
+                rendered = review_page.render(self.root).decode()
+                row = rendered.split('data-key="'+html.escape(key, quote=True)+'"', 1)[1].split('</tbody>', 1)[0]
+                self.assert_row_title(row, title, title.splitlines()[0][:100]+'…')
+                self.assertIn('data-title="'+html.escape(title.casefold(), quote=True)+'"', row)
+                detail = row.split('data-detail', 1)[1]
+                for line in title.splitlines():
+                    self.assertIn(html.escape(line), detail)
+                self.assertIn('Context remains visible.', detail)
+
+    def test_question_at_the_title_limit_shows_its_full_text_once_in_details(self) -> None:
+        key = self.question()
+        source = next(item.source for item in review_items.read(self.root) if item.key == key)
+        assert isinstance(source, review_items.QuestionSource)
+        title = 'W'*100
+        for structured in (False, True):
+            with self.subTest(structured=structured):
+                source.record.item['text'] = title
+                source.record.item['question'] = title
+                if structured:
+                    source.record.item['parts'] = update_registration.QuestionParts(
+                        ask=title, context='', items=[], choices=[], recommend='')
+                else:
+                    _ = source.record.item.pop('parts', None)
+                update_registration.write_question_record(source.record)
+                rendered = review_page.render(self.root).decode()
+                row = rendered.split('data-key="'+html.escape(key, quote=True)+'"', 1)[1].split('</tbody>', 1)[0]
+                self.assertIn('>'+title+'</strong>', row)
+                detail = row.split('data-review-body>', 1)[1]
+                self.assertEqual(detail.count(title), 1)
+                self.assertNotIn('<h3>Item</h3>', detail)
+
+    def test_short_change_title_appears_in_the_item_section(self) -> None:
+        item = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        title = 'Check the spacing'
+        token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
+        browser = change_page.ReviewBrowser(token, initial)
+        row = review_page.item_rows(replace(item, title=title), browser, staff.snapshot(), datetime.now(user_zone()), 0, 100, 4)
+        detail = row.split('data-detail', 1)[1]
+        self.assertIn('<h3>Item</h3><p>'+title+'</p>', detail)
+        self.assertEqual(detail.count(title), 1)
+
+    def test_question_with_a_distinct_ask_shows_title_and_ask_once_in_details(self) -> None:
+        key = self.question()
+        source = next(item.source for item in review_items.read(self.root) if item.key == key)
+        assert isinstance(source, review_items.QuestionSource)
+        title, ask = 'Layout choice', 'Which width should the page use?'
+        source.record.item['text'] = title
+        source.record.item['parts'] = update_registration.QuestionParts(
+            ask=ask, context='Choose the width.', items=[], choices=[], recommend='')
+        update_registration.write_question_record(source.record)
+        rendered = review_page.render(self.root).decode()
+        row = rendered.split('data-key="'+html.escape(key, quote=True)+'"', 1)[1].split('</tbody>', 1)[0]
+        detail = row.split('data-detail', 1)[1]
+        self.assertIn('<h3>Item</h3><p>'+title+'</p>', detail)
+        self.assertEqual(detail.count(title), 1)
+        self.assertEqual(detail.count(ask), 1)
+        self.assertIn('Choose the width.', detail)
+
+    def test_investigation_shows_its_question_title_once_in_details(self) -> None:
+        title = 'Why did the gate stop?'
+        filed = investigation.file(self.fixture.unit.id, title, title, waiting_why='The owner must complete the investigation.')
+        investigation_record = investigation.answer(filed.owner, filed.id, 'The test failed. The repair is ready.')
+        item = next(item for item in review_items.read(self.root)
+                    if item.key == f'investigation/{investigation_record.owner}/{investigation_record.id}')
+        self.assertEqual(item.title, investigation_record.question)
+        token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
+        browser = change_page.ReviewBrowser(token, initial)
+        detail = review_page.details(item, browser, staff.snapshot(), 4).split('data-review-body>', 1)[1]
+        self.assertIn('<h3>You asked</h3>', detail)
+        self.assertEqual(detail.count(html.escape(item.title)), 1)
+        self.assertNotIn('<h3>Item</h3>', detail)
+        self.assertIn(html.escape(investigation_record.answer), detail)
+
+    def test_change_shows_its_title_once_when_the_proof_contains_it(self) -> None:
+        item = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        assert isinstance(item.source, review_items.ChangeSource)
+        title = 'The spacing agrees'
+        source = replace(item.source, row={**item.source.row, 'What you see': title})
+        token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
+        browser = change_page.ReviewBrowser(token, initial)
+        detail = review_page.details(replace(item, title=title, source=source), browser, staff.snapshot(), 4).split('data-review-body>', 1)[1]
+        self.assertIn('<h3>Proof</h3><p>'+title+'</p>', detail)
+        self.assertEqual(detail.count(title), 1)
+        self.assertNotIn('<h3>Item</h3>', detail)
+
+    def test_each_review_type_limits_the_title_and_keeps_it_in_details(self) -> None:
+        _ = self.question()
+        members = staff.snapshot()
+        token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
+        browser = change_page.ReviewBrowser(token, initial)
+        title = 'A full <title> '+ 'x'*100+'\nMore facts.'
+        _ = self.investigation()
+        _ = self.decisions()
+        for item in review_items.read(self.root):
+            with self.subTest(kind=item.type):
+                row = review_page.item_rows(replace(item, title=title), browser, members, datetime.now(user_zone()), 0, 100, 4)
+                self.assert_row_title(row, title, title.splitlines()[0][:100]+'…')
+                detail = row.split('data-detail', 1)[1]
+                for line in title.splitlines():
+                    self.assertIn(html.escape(line), detail)
+
+    def test_render_reads_the_title_limit_once_for_all_rows_and_details(self) -> None:
+        title = 'A title '+ 'x'*70
+        _ = self.question(title)
+        _ = self.investigation()
+        reads: list[str] = []
+        read_config = conf.read_or_repository
+
+        class TitleLimit:
+            def whole(self, key: str) -> int:
+                return {'question_title_max_chars':40}[key]
+
+        def config(stem: str) -> conf.ConfigRead | TitleLimit:
+            if stem == 'production':
+                reads.append(stem)
+                return TitleLimit()
+            return read_config(stem)
+
+        with patch.object(conf, 'read_or_repository', side_effect=config):
+            rendered = review_page.render(self.root).decode()
+        self.assertEqual(reads, ['production'])
+        self.assertIn(html.escape(title[:40])+'…</strong>', rendered)
+        self.assertIn(html.escape(title), rendered.split('data-detail', 1)[1])
+
     def investigation(self, ready: bool = True) -> investigation.Investigation:
-        item = investigation.file(self.fixture.unit.id, 'Why did the gate stop?', 'Read the gate log.')
+        item = investigation.file(self.fixture.unit.id, 'Why did the gate stop?', 'Read the gate log.', waiting_why='The owner must complete the investigation.')
         return investigation.answer(item.owner,item.id,'The test failed. The repair is ready.') if ready else item
 
     def decisions(self) -> tuple[str, str]:
@@ -156,13 +329,36 @@ class ReviewPageTests(unittest.TestCase):
         delivery,_ = review_page.submit(self.root,self.body(key,'validate'),self.status)
         change_page.deliver(delivery,self.status)
         self.assertEqual(next(item.state for item in review_items.read(self.root) if item.key == key),review_items.ReviewState.WAITING)
-        _ = change_review.save_verdict(self.fixture.review_list, 'C1', 'not works: the spacing differs', self.fixture.production)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        _ = change_review.save_verdict(self.fixture.review_list, 'C1', 'not works: the spacing differs',
+                                       self.fixture.production, validation_id=delivery.attempt)
         returned = next(item for item in review_items.read(self.root) if item.key == key)
         self.assertEqual(returned.state, review_items.ReviewState.FOR_YOU)
         self.assertIn('the spacing differs', returned.log[-1].words)
         _,answer = review_page.submit(self.root,self.body('page-owner/C2','feedback','Adjust the spacing.'),self.status)
         self.assertEqual(answer,'feedback sent')
         self.assertEqual(next(item.state for item in review_items.read(self.root) if item.key == 'page-owner/C2'),review_items.ReviewState.DONE)
+
+    def test_validation_messages_keep_the_exchange_id_after_recovery(self) -> None:
+        for recovered in (False, True):
+            with self.subTest(recovered=recovered):
+                case = ReviewPageTests('runTest')
+                case.setUp()
+                try:
+                    delivery, _ = review_page.submit(case.root, case.body('page-owner/C1', 'validate', 'Check this case.'), case.status)
+                    assert isinstance(delivery, change_page.MessageDelivery)
+                    if recovered:
+                        change_page.recover_pending(change_page.DeliveryStatus(case.root))
+                        message = case.fixture.messages[-1][2]
+                    else:
+                        message = delivery.message
+                    self.assertIn('Validation id: '+delivery.attempt, message)
+                    self.assertIn('--validation '+delivery.attempt, message)
+                    self.assertIn('--production page-owner', message)
+                    self.assertIn('--row C1', message)
+                    self.assertIn('Check this case.', message)
+                finally:
+                    case.doCleanups()
 
     def test_page_reuses_the_list_table_and_has_only_this_phases_actions(self) -> None:
         _ = self.question()
@@ -354,7 +550,7 @@ class ReviewPageTests(unittest.TestCase):
             questions = counts_row.question_counts(owner, user_zone(), identities, None)
             queues = [next_item.read_queue(kind, self.fixture.production)
                       for kind in ('question', 'change', 'investigation', 'proposal', 'efficiency')]
-            return counts, questions, queues, list_page.counts_strip(members)
+            return counts, questions, queues, list_page.counts_strip(members, staff_names.StaffNames(members))
 
         with patch.object(review_items, 'read_kind', side_effect=all_states):
             before = results()
@@ -400,7 +596,7 @@ class ReviewPageTests(unittest.TestCase):
                 continue
             with self.subTest(kind=item.type):
                 self.assertEqual(item.actions,expected[item.key])
-                form = review_page.form(item,change_page.ReviewBrowser(token,initial))
+                form = review_page.form(item,change_page.ReviewBrowser(token,initial),4)
                 self.assertIn('Closes the item',form)
                 self.assertIn('The item returns to you',form)
                 self.assertIn('type="datetime-local"',form)
@@ -425,10 +621,9 @@ class ReviewPageTests(unittest.TestCase):
                 waiting = next(item for item in review_items.read(self.root) if item.key == key)
                 self.assertEqual(waiting.state,review_items.ReviewState.WAITING)
                 args = ['answer-question','--item',key,'--text','The second case passes.']
-                if isinstance(item.source,review_items.ChangeSource):
-                    request = self.status.slots(delivery.page,delivery.row).question
-                    assert isinstance(request,change_page.OpenQuestion)
-                    args += ['--question',request.question_id]
+                request = self.status.slots(delivery.page,delivery.row).question
+                assert isinstance(request,change_page.OpenQuestion)
+                args += ['--question',request.question_id]
                 self.assertEqual(change_page.main(args),0)
                 returned = next(item for item in review_items.read(self.root) if item.key == key)
                 self.assertEqual(returned.state,review_items.ReviewState.FOR_YOU)
@@ -456,17 +651,127 @@ class ReviewPageTests(unittest.TestCase):
                                 if item.key == child_key and isinstance(item.source, review_items.QuestionSource))
             child_before = child_record.path.read_bytes()
             for key in (question, child_key):
-                self.assertEqual(change_page.main(['answer-question','--item',key,'--text','Answer for '+key]),0,
+                item = next(item for item in review_items.read(self.root) if item.key == key)
+                page = review_actions.delivery_page(item, self.status)
+                pending = self.status.slots(page, page.rows[0]).question
+                assert isinstance(pending, change_page.OpenQuestion)
+                self.assertEqual(change_page.main(['answer-question','--item',key,'--question',pending.question_id,'--text','Answer for '+key]),0,
                                  'F022: the exact item selects its record despite identical subtree text')
                 returned = next(item for item in review_items.read(self.root) if item.key == key)
                 self.assertEqual(returned.state,review_items.ReviewState.FOR_YOU)
                 self.assertIn('Answer for '+key, returned.log[-1].words)
                 if key == question:
-                    self.assertEqual(change_page.main(['answer-question','--item',key,'--text','Repeat parent answer']),1,
+                    self.assertEqual(change_page.main(['answer-question','--item',key,'--question',pending.question_id,'--text','Repeat parent answer']),1,
                                      'F022: a repeated parent answer cannot select the child')
                     self.assertEqual(child_record.path.read_bytes(),child_before,'F022: only the selected record changes')
                     self.assertEqual(next(item.state for item in review_items.read(self.root) if item.key == child_key),
                                      review_items.ReviewState.WAITING)
+
+    def test_waiting_cards_keep_the_for_you_action_groups(self) -> None:
+        decisions = self.decisions()
+        question = self.question()
+        report = self.investigation()
+        keys = (question, 'page-owner/C1', f'investigation/{report.owner}/{report.id}', *decisions)
+        token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
+        browser = change_page.ReviewBrowser(token, initial)
+        for key in keys:
+            opened = next(item for item in review_items.read(self.root) if item.key == key)
+            delivery, _ = review_page.submit(self.root, self.body(key, 'question', 'Check the old case.'), self.status)
+            change_page.deliver(delivery, self.status)
+            waiting = next(item for item in review_items.read(self.root) if item.key == key)
+            with self.subTest(kind=opened.type):
+                self.assertEqual(waiting.state, review_items.ReviewState.WAITING)
+                self.assertEqual(waiting.actions, opened.actions)
+                self.assertEqual(review_page.form(waiting, browser, 3), review_page.form(opened, browser, 3))
+
+    def waiting_actions(self, kind: review_items.ReviewType, actions: tuple[str, ...], wait: str = 'question') -> None:
+        """Use a fresh record for each action and check the displaced answer."""
+        for action in actions:
+            with self.subTest(kind=kind, wait=wait, action=action):
+                case = ReviewPageTests('runTest')
+                case.setUp()
+                try:
+                    if kind == review_items.ReviewType.CHANGE:
+                        key = 'page-owner/C1'
+                    elif kind == review_items.ReviewType.QUESTION:
+                        key = case.question()
+                    elif kind == review_items.ReviewType.INVESTIGATION:
+                        report = case.investigation(wait != 'native')
+                        key = f'investigation/{report.owner}/{report.id}'
+                    else:
+                        proposal, efficiency = case.decisions()
+                        key = proposal if kind == review_items.ReviewType.PROPOSAL else efficiency
+                        _ = shutil.copyfile(Path(__file__).resolve().parents[2]/'config/nightly_review.conf',
+                                            case.fixture.temporary/'config/nightly_review.conf')
+                    old_id = ''
+                    if wait in ('question', 'validate'):
+                        delivery, _ = review_page.submit(case.root, case.body(key, wait, 'Check the old case.'), case.status)
+                        assert isinstance(delivery, change_page.MessageDelivery)
+                        old = case.status.slots(delivery.page, delivery.row).question
+                        old_id = old.question_id if isinstance(old, change_page.OpenQuestion) else ''
+                        change_page.deliver(delivery, case.status)
+                    elif wait == 'deferred':
+                        item = next(item for item in review_items.read(case.root) if item.key == key)
+                        assert isinstance(item.source, review_items.EfficiencySource)
+                        _ = item.source.path.write_text(item.source.path.read_text().replace(' — proposed', ' — deferred'))
+                    before = next(item for item in review_items.read(case.root) if item.key == key)
+                    self.assertEqual(before.state, review_items.ReviewState.WAITING)
+                    delivery, _ = review_page.submit(case.root, case.body(key, action, 'Use the new case.'), case.status)
+                    change_page.deliver(delivery, case.status)
+                    updated = next(item for item in review_items.read(case.root) if item.key == key)
+                    expected = review_items.ReviewState.WAITING if action in ('question', 'validate') else review_items.ReviewState.DONE
+                    self.assertEqual(updated.state, expected)
+                    self.assertTrue(any('superseded' in event.words.casefold() for event in updated.log))
+                    self.assertTrue(any('Use the new case.' in event.words for event in updated.log))
+                    owner = staff.snapshot().by_id(updated.owner)
+                    assert owner is not None
+                    owner_log = read_production(owner, staff.snapshot()).log.read_text()
+                    self.assertIn('superseded', owner_log.casefold())
+                    if isinstance(updated.source, review_items.ChangeSource):
+                        self.assertEqual(updated.source.slots.validation_requested, action == 'validate')
+                        self.assertEqual(isinstance(updated.source.slots.question, change_page.OpenQuestion), action == 'question')
+                    if wait in ('question', 'native'):
+                        record_before = updated
+                        with self.assertRaises((ValueError, update_registration.RegistrationFailure)):
+                            _ = change_page.answer_item(key, 'An old answer.', old_id, case.status)
+                        after = next(item for item in review_items.read(case.root) if item.key == key)
+                        self.assertEqual(after, record_before)
+                    if action == 'question':
+                        assert isinstance(delivery, change_page.MessageDelivery)
+                        request = case.status.slots(delivery.page, delivery.row).question
+                        self.assertIsInstance(request, change_page.OpenQuestion)
+                        assert isinstance(request, change_page.OpenQuestion)
+                        self.assertNotEqual(request.question_id, old_id)
+                        self.assertIn('--question '+request.question_id, delivery.message)
+                        _ = change_page.answer_item(key, 'The new case passes.', request.question_id, case.status)
+                        self.assertEqual(next(item.state for item in review_items.read(case.root) if item.key == key),
+                                         review_items.ReviewState.FOR_YOU)
+                finally:
+                    case.doCleanups()
+
+    def test_waiting_change_question_accepts_each_action(self) -> None:
+        self.waiting_actions(review_items.ReviewType.CHANGE, ('works', 'not works', 'validate', 'feedback', 'question'))
+
+    def test_waiting_change_validation_accepts_each_action(self) -> None:
+        self.waiting_actions(review_items.ReviewType.CHANGE, ('works', 'not works', 'validate', 'feedback', 'question'), 'validate')
+
+    def test_waiting_question_accepts_each_action(self) -> None:
+        self.waiting_actions(review_items.ReviewType.QUESTION, ('answer', 'feedback', 'question'))
+
+    def test_waiting_investigation_question_accepts_each_action(self) -> None:
+        self.waiting_actions(review_items.ReviewType.INVESTIGATION, ('read', 'feedback', 'question'))
+
+    def test_open_investigation_accepts_each_action(self) -> None:
+        self.waiting_actions(review_items.ReviewType.INVESTIGATION, ('read', 'feedback', 'question'), 'native')
+
+    def test_waiting_proposal_accepts_each_action(self) -> None:
+        self.waiting_actions(review_items.ReviewType.PROPOSAL, review_items.DECISION_ACTIONS)
+
+    def test_waiting_efficiency_accepts_each_action(self) -> None:
+        self.waiting_actions(review_items.ReviewType.EFFICIENCY, review_items.DECISION_ACTIONS)
+
+    def test_deferred_efficiency_accepts_each_action(self) -> None:
+        self.waiting_actions(review_items.ReviewType.EFFICIENCY, review_items.DECISION_ACTIONS, 'deferred')
 
     def test_feedback_closes_each_type_and_uses_startup_delivery_recovery(self) -> None:
         decisions = self.decisions()
@@ -534,7 +839,7 @@ class ReviewPageTests(unittest.TestCase):
             body = self.body(key, 'later', 'Keep these words.')+'&'+urlencode({'later':until.isoformat()})
             with patch.object(review_items, 'read', return_value=[unavailable]), \
                     patch.object(change_review, 'record_review_log') as log:
-                with self.assertRaisesRegex(change_page.AnswerRefused, '^the production document is not available$'):
+                with self.assertRaisesRegex(question_record.AnswerRefused, '^the production document is not available$'):
                     _ = review_page.submit(self.root, body, self.status)
                 log.assert_not_called()
             self.assertNotIn(key, review_later.times())
@@ -597,7 +902,7 @@ class ReviewPageTests(unittest.TestCase):
                 approved = next(item for item in review_items.read(self.root) if item.key == key)
                 self.assertEqual(approved.state, review_items.ReviewState.DONE, 'Approve makes the item Done at once.')
                 self.assertEqual(approved.log[-1].words, 'Approve: Use it.')
-                with self.assertRaisesRegex(change_page.AnswerRefused, 'choose an action'):
+                with self.assertRaisesRegex(question_record.AnswerRefused, 'choose an action'):
                     _ = review_page.submit(self.root, self.body(key, 'decline'), self.status)
         with self.subTest(action='decline', kind='proposal'):
             delivery, result = review_page.submit(self.root, self.body(items['page-owner/P2'].key, 'decline', 'Not now.'),
@@ -676,6 +981,188 @@ class ReviewPageTests(unittest.TestCase):
                 self.assertEqual(len(review_items.next_queue('proposal', doc, False, staff.snapshot())[1]), 1)
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_title_fallback_checks_rendered_text_and_proposal_loads(self) -> None:
+        key = self.question()
+        question = next(item for item in review_items.read(self.root) if item.key == key)
+        _ = self.investigation()
+        _ = self.decisions()
+        records = review_items.read(self.root)
+        assert isinstance(question.source, review_items.QuestionSource)
+        question_source = question.source
+
+        def question_case(name: str, title: str, ask: str, context: str = '') -> review_items.ReviewItem:
+            fields = question_source.record.item.copy()
+            fields['text'] = title
+            fields['parts'] = update_registration.QuestionParts(
+                ask=ask, context=context, items=[], choices=[], recommend='')
+            source = replace(question_source, record=replace(question_source.record, item=fields))
+            return replace(question, key='question/'+name, title=title, source=source,
+                           log=(replace(question.log[0], words=title),))
+
+        equal = question_case('equal', 'W'*100, 'W'*100)
+        code = question_case('code', 'rust', 'Read the code.')
+        assert isinstance(code.source, review_items.QuestionSource)
+        assert 'parts' in code.source.record.item
+        code.source.record.item['parts']['items'] = ['```rust\nlet x = 1;\n```']
+        formatted = question_case('formatted', 'Use wide layout', 'Use **wide** layout')
+        investigation_item = next(item for item in records if isinstance(item.source, review_items.InvestigationSource))
+        assert isinstance(investigation_item.source, review_items.InvestigationSource)
+        investigation_source = investigation_item.source
+        same_title = 'Why did the gate stop?'
+        same = replace(investigation_item, key='investigation/equal', title=same_title,
+                       source=replace(investigation_source, record=replace(investigation_source.record, question=same_title)))
+        distinct = replace(investigation_item, key='investigation/distinct', title='Gate report')
+        paragraphs = replace(investigation_item, key='investigation/paragraphs',
+                             title='Which check failed? Which repair works?',
+                             source=replace(investigation_source, record=replace(
+                                 investigation_source.record, question='Which check failed?\n\nWhich repair works?')))
+        spaced = replace(investigation_item, key='investigation/spaced', title='Run a b',
+                         source=replace(investigation_source, record=replace(
+                             investigation_source.record, question='Run ab')))
+        change = next(item for item in records if isinstance(item.source, review_items.ChangeSource))
+        assert isinstance(change.source, review_items.ChangeSource)
+        image_title = 'Check the blue marker'
+        image = replace(change, key='change/image', title=image_title,
+                        source=replace(change.source, row={**change.source.row, 'Change': image_title, 'Image': 'fixture-image'}))
+        proposal = next(item for item in records if isinstance(item.source, review_items.ProposalSource))
+        proposals = [replace(proposal, key='proposal/'+name, title=title)
+                     for name, title in (('with-title', 'P1'), ('without-title', 'Other proposal'),
+                                         ('empty', 'Empty proposal'), ('failure', 'Failed proposal'))]
+        cases = [equal, code, formatted, same, distinct, paragraphs, spaced, image, *proposals]
+        with patch.object(review_items, 'read', return_value=cases), patch.object(
+                change_review, 'image_path', return_value='/fixture-image.svg'):
+            source = review_page.render(self.root).decode()
+        self.assertIn('<section data-title-fallback hidden>', source)
+        self.assertIn('<p data-title-ignore>Loading proposal…</p>', source)
+        setup = r'''<script>
+const nativeFetch=fetch,nativeTimeout=setTimeout;
+window.setInterval=()=>0;window.clearInterval=()=>{};
+window.refreshMarkup=MARKUP;window.bodyRequests=[];window.pendingBodies=new Map();
+window.fetch=async(url)=>{
+ const key=new URL(url,location.href).searchParams.get('body');
+ if(key){
+  window.bodyRequests.push(key);
+  return new Promise(resolve=>window.pendingBodies.set(key,resolve));
+ }
+ return {ok:true,text:async()=>window.refreshMarkup};
+};
+</script>'''.replace('MARKUP', json.dumps(source).replace('</', '<\\/'))
+        probe = r'''<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const flush=()=>new Promise(resolve=>nativeTimeout(resolve,80));
+ const row=key=>[...document.querySelectorAll('[data-list-item]')].find(row=>row.dataset.key===key);
+ const panel=key=>row(key).querySelector('.review-panel');
+ const fallback=key=>panel(key).querySelector('[data-title-fallback]');
+ const open=key=>{const button=row(key).querySelector('.list-toggle');if(button.getAttribute('aria-expanded')!=='true') button.click();};
+ const visibleText=key=>{
+  const copy=panel(key).cloneNode(true);
+  copy.querySelectorAll('[hidden],.list-log,form,.review-source').forEach(node=>node.remove());
+  return copy.textContent.replace(/\s+/g,' ').trim();
+ };
+ const refresh=async()=>{
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  await flush();await flush();await flush();
+ };
+ try{
+  await flush();
+  for(const [key,hidden,title] of [
+   ['question/equal',true,'W'.repeat(100)],['question/code',false,'rust'],
+   ['question/formatted',true,'Use wide layout'],
+   ['investigation/equal',true,'Why did the gate stop?'],['investigation/distinct',false,'Gate report'],
+   ['change/image',false,'Check the blue marker']]){
+   open(key);
+   check(fallback(key).hidden===hidden,key+': fallback follows rendered text');
+   check(visibleText(key).split(title).length-1===1,key+': one visible title');
+  }
+  check(panel('question/code').querySelector('code').textContent.includes('let x = 1;'),'the code block renders');
+  check(panel('question/formatted').querySelector('strong').textContent==='wide','the ask formatting renders');
+  check(panel('change/image').querySelector('img').alt.includes('Check the blue marker'),'the image alt contains the title');
+  open('investigation/paragraphs');
+  const paragraphs=[...panel('investigation/paragraphs').querySelectorAll('[data-review-body] p')];
+  check(paragraphs.some(p=>p.textContent==='Which check failed?'),'the first question paragraph renders');
+  check(paragraphs.some(p=>p.textContent==='Which repair works?'),'the second question paragraph renders');
+  check(fallback('investigation/paragraphs').hidden,'paragraph boundaries preserve the title');
+  open('investigation/spaced');
+  check([...panel('investigation/spaced').querySelectorAll('[data-review-body] p')]
+   .some(p=>p.textContent==='Run ab'),'the body keeps the joined word');
+  check(!fallback('investigation/spaced').hidden,'different word spacing keeps the fallback visible');
+  const outcomes=[
+   ['proposal/with-title','<h2>P1</h2><p>Use fewer checks.</p>',true],
+   ['proposal/without-title','<p>Use fewer checks.</p>',false],
+   ['proposal/empty','',false],['proposal/failure',null,false]];
+  for(const [key,body,hidden] of outcomes){
+   check(!fallback(key).hidden,key+': fallback shows before loading');
+   open(key);
+   check(!fallback(key).hidden,key+': fallback shows while loading');
+   check(panel(key).querySelector('[data-proposal-body]').textContent.includes('Loading proposal'),key+': loading text');
+   const resolve=window.pendingBodies.get(key);
+   check(typeof resolve==='function',key+': a body request starts');
+   resolve(body===null ? {ok:false,status:503} : {ok:true,text:async()=>body});
+   await flush();await flush();
+   check(fallback(key).hidden===hidden,key+': fallback follows the loaded body');
+   if(body===null) check(panel(key).textContent.includes('not available'),key+': failure stays visible');
+   else check(visibleText(key).split(row(key).querySelector('.review-title').textContent).length-1===1,key+': one title after loading');
+  }
+  for(const [key,body,hidden] of outcomes){
+   open('question/equal');
+   const before=window.bodyRequests.length;
+   await refresh();open(key);await flush();
+   if(body===null){
+    check(window.bodyRequests.length===before+1,key+': refresh retries the failed load');
+    check(!fallback(key).hidden,key+': fallback shows during the retry');
+    window.pendingBodies.get(key)({ok:false,status:503});await flush();
+   }else{
+    check(window.bodyRequests.length===before,key+': refresh uses the cached body');
+    check(panel(key).querySelector('[data-proposal-body]').innerHTML===body,key+': cache replaces the loading text');
+   }
+   check(fallback(key).hidden===hidden,key+': fallback follows the refreshed body');
+  }
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        body = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>').encode()
+        results: list[list[str]] = []
+        complete = threading.Event()
+
+        class Probe(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                if self.path == '/complete':
+                    _ = complete.wait(20)
+                elif self.path == '/fixture-image.svg':
+                    _ = self.wfile.write(b'<svg xmlns="http://www.w3.org/2000/svg"/>')
+                else:
+                    _ = self.wfile.write(body if self.path == '/page' else
+                        b'<iframe src="/page" style="width:100vw;height:100vh"></iframe><img hidden src="/complete">')
+
+            def do_POST(self) -> None:
+                results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                complete.set()
+                self.send_response(204)
+                self.end_headers()
+
+            @override
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
+                    done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
+                        '--window-size', '390,900', '--screenshot', str(self.fixture.temporary/'review-titles.png'),
+                        f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                self.assertEqual(done.returncode, 0, done.stderr)
+            finally:
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
+        self.assertEqual(results, [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_filters_single_card_refresh_drafts_and_saved_row_removal(self) -> None:
         question_key = self.question()
         question_item = next(item for item in review_items.read(self.root) if item.key == question_key)
@@ -722,16 +1209,24 @@ window.fetch=async(_url,options={})=>{
   choose('list-search','','input');document.querySelector('[data-type-chip=""]').click();
   choose('list-show','Waiting');check(shown().length===1,'Waiting filter');choose('list-show','open');
   const question=rows().find(row=>row.dataset.type==='question');question.querySelector('.list-toggle').click();
+  const title=question.querySelector('.review-title'),titleHeight=title.getBoundingClientRect().height;
+  title.textContent='A long review title '.repeat(20);
+  check(title.getBoundingClientRect().height===titleHeight && title.scrollWidth>title.clientWidth,
+    'a long row title stays on one line and hides its overflow');
   const change=rows().find(row=>row.dataset.type==='change');change.querySelector('.list-toggle').click();
   check(question.querySelector('[data-detail]').hidden,'only one card opens');
   question.querySelector('.list-toggle').click();
   const draftLater=question.querySelector('[name="later"]');draftLater.value='2098-12-31T16:30';
   draftLater.dispatchEvent(new Event('change',{bubbles:true}));
   const picked=question.querySelector('input[name=choice]');picked.click();
-  question.querySelector('textarea').value='Keep this draft';question.querySelector('textarea').dispatchEvent(new Event('input'));
+  const draft=question.querySelector('textarea');draft.value='Keep this draft';draft.dispatchEvent(new Event('input'));
+  draft.focus();draft.setSelectionRange(2,7,'backward');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
   let fresh=rows().find(row=>row.dataset.type==='question');
   check(!fresh.querySelector('[data-detail]').hidden && fresh.querySelector('textarea').value==='Keep this draft','refresh keeps the card and draft');
+  const refreshedDraft=fresh.querySelector('textarea');
+  check(document.activeElement===refreshedDraft && refreshedDraft.selectionStart===2 &&
+    refreshedDraft.selectionEnd===7 && refreshedDraft.selectionDirection==='backward','refresh keeps focus and selection');
   check(fresh.querySelector('[name="later"]').value==='2098-12-31T16:30','F018: refresh keeps the picked Later date and time');
   check(fresh.querySelector('input[name=choice]:checked')?.value===picked.value,'F018: refresh keeps the selected choice');
   check(fresh.querySelector('form').elements.row.value===fresh.dataset.key+'-refreshed' &&
