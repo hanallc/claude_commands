@@ -4745,26 +4745,14 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 ### Phase 339 — module_cost measures in its own process and counts starts with one tracer  · status: done
 **Depends on:** Phase 338
 
-#### Work Order
+#### As-built
 
-**Goal:** module_cost cleanup can reach only the processes of its own measurement, and one tracer gives both the command rows and the start counts.
-
-**Spec:**
-1. Run the measurement stages in a dedicated child process that adopts orphans. Cleanup and zombie reaping act only in that process. An in-process caller of `module_cost.main` keeps its own children (finding F009 of phase 338).
-2. End cleanup only after a scan that follows a reap finds no live descendant, so a child forked during a scan cannot survive.
-3. Count process starts and execs with `task_cpu` ptrace events and remove the strace stage. The strace stage waits the whole stage limit for a leftover process, and it runs the module one more time.
-4. Every behavior check stays.
-
-**Files:** `scripts/test_times/task_cpu.py`, `scripts/test_times/module_cost.py`, `scripts/test_times/test_module_cost.py`.
-
-**Workers:** 1 writer. The files share one measurement path and do not split.
-- `impl`: all files.
-- `test`: opens as impl.
-
-**Acceptance gate:**
-- A caller child started before `module_cost.main` lives on after a measurement timeout and keeps its exit status.
-- `module_cost.py production/test_fast_track.py` reports the same start counts with no strace stage, and its own CPU is lower.
-- The test_times tests pass; basedpyright reports 0 errors and 0 warnings on the changed files.
+- `module_cost.main` forks a supervisor child. The supervisor is the subreaper, starts the measurement worker, owns the stage deadline, and stops and reaps every descendant. It ends only after a scan that follows a reap finds none. A caller child lives on after a timeout and keeps exit status 37.
+- The caller reaps the supervisor with `waitid(P_PIDFD)` within its own deadline; on an exception a thread takes the pidfd. Children write to temporary files; the caller copies at most `OUTPUT_REPLAY_LIMIT_BYTES` (1 MiB) for each stream with `pread`.
+- One ptrace run gives the start and exec counts and the command rows; the strace stage is gone. A trace attach failure gives a RED row after a bounded `stop_trace` cleanup; a failed cleanup aborts.
+- Accepted limits, in the `main()` docstring: `main` runs as its own CLI process; a caller that stops the child, reaps its children or stops reading its output is out of contract (F011, F013).
+- fast_track: the same 7500 starts and 11837 execs; the tool run takes 75 s wall, down from 290 s. 152 test_times tests pass.
+- Main-based commit 0693f18db (branch `natest-modulecost339`, parent natest338 f2850a915, `merge_gate` import) went to builds as the second row of "builds natest338".
 
 ### Phase 340 — box requests keep the old step names and SuiteMode reads both  · status: done
 **Depends on:** none
