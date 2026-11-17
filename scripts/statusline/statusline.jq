@@ -144,7 +144,7 @@ def usage($config; $label; $window; $fmt):
       | usage($colors; "5-hour"; $five_hour; "%H:%M")),
      usage($colors; "weekly"; window("weekly"; .rate_limits.seven_day?); "%a %H:%M")
    ] | join(" | ")) as $second_line
-# The shell associates each unit cache with its current session before this selection.
+# assignment.py associates each unit cache with its current session before this selection.
 | ((.session_id // "") as $id
    | ([$ARGS.named.counts // "" | split("\n")[]
        | select($id != "" and startswith($id + " ")) | .[($id | length) + 1:]
