@@ -269,7 +269,7 @@ def recover_pending() -> None:
 
 def change_counts() -> dict[str, int]:
     """Count each Changes page tab from one read of the global lists."""
-    snapshots = {path: change_review.review_snapshot(path)
+    snapshots = {path: change_review.review_snapshot(path, include_reviewed=False)
                  for path in sorted(change_review.lists_directory().glob(change_review.PREFIX + "*.md"))}
     prepared = change_review.PreparedChangeLists(snapshots, change_page.list_routing(snapshots))
     totals: dict[str, int] = {}

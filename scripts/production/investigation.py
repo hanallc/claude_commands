@@ -86,9 +86,11 @@ def load(owner: staff.StaffId, identity: str, *, sources: list[Path] | None = No
 
 
 def records(owner: staff.StaffId, *, include_read: bool = False,
-            sources: list[Path] | None = None) -> list[Investigation]:
+            sources: list[Path] | None = None,
+            states: tuple[InvestigationState, ...] = ()) -> list[Investigation]:
     """Read investigations in numeric order and watch the folder and each record."""
-    items = _store(owner).records(lambda identity: load(owner, identity), sources=sources)
+    selected = states or (() if include_read else (InvestigationState.OPEN, InvestigationState.ANSWER_READY))
+    items = _store(owner).records(lambda identity: load(owner, identity), sources=sources, states=selected)
     return sorted((item for item in items if include_read or item.state != InvestigationState.READ),
                   key=lambda item: int(item.id[1:]))
 

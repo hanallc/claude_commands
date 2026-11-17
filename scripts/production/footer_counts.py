@@ -158,7 +158,7 @@ def sources(doc: Path, *, identities: QuestionStaff | None = None,
         if isinstance(questions, QuestionFolder):
             if questions.path not in found:
                 found.append(questions.path)
-            found.extend(record.path for record in question_records_for_document(doc, identities, sources=read_sources)
+            found.extend(record.path for record in question_records_for_document(doc, identities, sources=read_sources, statuses=("open",))
                          if record.status == "open")
     except (staff.StaffRefused, RegistrationFailure, OSError) as error:
         if read_sources is not None:
