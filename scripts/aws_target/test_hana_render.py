@@ -66,6 +66,11 @@ class HanaRenderTests(unittest.TestCase):
                 + '("scripts.aws_target.aws_cli", "scripts.aws_target.hana_provider", "scripts.aws_target.hana_box"))',
                 str(runtime)], cwd=runtime, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(imported.returncode, 0, imported.stdout + imported.stderr)
+            launcher = runtime / 'scripts/build_queue/program_start.py'
+            startup = subprocess.run([sys.executable, '-E', '-B', str(launcher)], cwd=runtime,
+                                     capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(startup.returncode, 2, startup.stdout + startup.stderr)
+            self.assertIn('program start: expected --program-start', startup.stderr)
             for path in runtime.rglob('*'):
                 if path.is_file() and '__pycache__' not in path.parts:
                     self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)

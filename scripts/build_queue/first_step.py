@@ -134,7 +134,8 @@ def _placement_grant(request: wire.PlacementRequest) -> wire.LocalPlacementGrant
 
 def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
                    position: SlotQueuePosition, run: wire.RunIdentity) -> wire.Admitted:
-    name = 'targeted-test' if command_program(command) == 'targeted_test.py' else 'merge-gate'
+    affected = command_program(command) == 'targeted_test.py' or '--affected' in command
+    name = 'test-affected' if affected else 'gate'
     config = records.read_memory_config()
     first = config.program_first_peaks.get(name)
     if first is None:
