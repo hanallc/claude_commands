@@ -86,8 +86,24 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(item.log[0], initial_log)
         self.assertEqual(item.next_step, "Review the page.")
         self.assertLess(path.read_text().index("Added; "), path.read_text().index("Marked read — nate"))
-        self.assertIn("| # | Owner | Item | State | Next step | ETA | Update |", self.command("list")[1])
-        self.assertIn('| 106 | show | The page: "List" | Delivered;', self.command("list")[1])
+        self.assertIn("| # | Owner | Producer | Item | State | Next step | ETA | Update |", self.command("list")[1])
+        self.assertIn('| 106 | show | morty | The page: "List" | Delivered;', self.command("list")[1])
+
+    def test_producer_takes_a_producer_name_or_staff_id_and_shows_its_name(self) -> None:
+        self.assertEqual(self.command("add", "--title", "Plan the year", "--owner", RUNNER.id, "--producer", "dwight",
+                                      "--source", "nate"), (0, "L1\n", ""))
+        self.assertEqual(the_list.load(MORTY.id, "L1").producer, OTHER.id)
+        self.assertEqual(self.command("add", "--title", "Ship it", "--owner", RUNNER.id, "--source", "nate"), (0, "L2\n", ""))
+        self.assertEqual(the_list.load(MORTY.id, "L2").producer, MORTY.id)
+        self.assertEqual(self.command("update", "--id", "L2", "--producer", OTHER.id, "--source", "morty"), (0, "", ""))
+        item = the_list.load(MORTY.id, "L2")
+        self.assertEqual(item.producer, OTHER.id)
+        self.assertIn("producer: " + json.dumps(OTHER.id), item.log[-1].what)
+        self.assertEqual(self.command("update", "--id", "L2", "--producer", "morty", "--source", "morty"), (0, "", ""))
+        self.assertEqual(the_list.load(MORTY.id, "L2").producer, MORTY.id)
+        table = self.command("list")[1]
+        self.assertIn("| 1 | show | dwight | Plan the year |", table)
+        self.assertIn("| 2 | show | morty | Ship it |", table)
 
     def test_close_reopen_and_repeats_keep_the_record_and_number(self) -> None:
         item = self.add(number=70)
@@ -239,8 +255,8 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(self.command("clean-evidence", "--source", "morty"), (0, "0 changed; 1 unchanged\n", ""))
 
     def test_review_links_keep_order_history_and_repeat_without_writes(self) -> None:
-        first = investigation.file(OWNER.id, "First review", "Read the first result.")
-        second = investigation.file(OWNER.id, "Second review", "Read the second result.")
+        first = investigation.file(OWNER.id, "First review", "Read the first result.", waiting_why='The owner must complete the investigation.')
+        second = investigation.file(OWNER.id, "Second review", "Read the second result.", waiting_why='The owner must complete the investigation.')
         identities = (f"{OWNER.name}/{first.id}", f"{OWNER.name}/{second.id}")
         keys = tuple(f"investigation/{OWNER.id}/{review.id}" for review in (first, second))
         item = self.add()
@@ -285,14 +301,14 @@ class TheListTests(unittest.TestCase):
     def test_old_records_without_reviews_load_without_writes(self) -> None:
         item = self.add()
         path = the_list.folder(MORTY.id) / f"{item.id}.md"
-        _ = path.write_text(path.read_text().replace('reviews: "[]"\n', ""))
+        _ = path.write_text(path.read_text().replace('reviews: "[]"\n', "").replace(f'producer: "{MORTY.id}"\n', ""))
         before = path.read_bytes(), path.stat().st_mtime_ns
         self.assertEqual(the_list.load(MORTY.id, item.id), item)
-        self.assertEqual(item.reviews, ())
+        self.assertEqual((item.reviews, item.producer), ((), MORTY.id))
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
     def test_review_commands_resolve_keys_and_refuse_ambiguous_shown_ids(self) -> None:
-        _ = investigation.file(OWNER.id, "First review", "Read the result.")
+        _ = investigation.file(OWNER.id, "First review", "Read the result.", waiting_why='The owner must complete the investigation.')
         first = review_items.investigation_items(staff.snapshot())[0]
         second = replace(first, key="proposal/other/I1", type=review_items.ReviewType.PROPOSAL,
                          source=review_items.ProposalLedgerSource(self.root / "proposals.md"))
@@ -341,7 +357,7 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(unlinked_item.log[-1].what, "Unlinked reviews: " + ", ".join((third.key, second.key, first.key)))
 
     def test_review_options_keep_shown_ids_separate_from_exact_keys(self) -> None:
-        _ = investigation.file(OWNER.id, "Review the result", "Read the result.")
+        _ = investigation.file(OWNER.id, "Review the result", "Read the result.", waiting_why='The owner must complete the investigation.')
         base = review_items.investigation_items(staff.snapshot())[0]
         first = replace(base, id="natedev/C1", key="natedev/C1")
         second = replace(base, id=first.id, key="hanadocs/C1", type=review_items.ReviewType.PROPOSAL,
@@ -423,7 +439,7 @@ class TheListTests(unittest.TestCase):
             _ = the_list.close(MORTY.id, closed.id, "The user removed it", source="nate")
             row = next(line for line in self.command("list", "--all")[1].splitlines()
                        if line.startswith(f"| {closed.number} |"))
-            self.assertEqual(row.split("|")[4].strip(), "Closed")
+            self.assertEqual(row.split("|")[5].strip(), "Closed")
 
     def test_item_links_keep_conditions_and_refuse_cycles(self) -> None:
         first, second, third = self.add("First"), self.add("Second"), self.add("Third")
@@ -537,6 +553,9 @@ class TheListTests(unittest.TestCase):
         for args in (("add", "--title", "Bad\ntitle", "--owner", RUNNER.id, "--source", "nate"),
                      ("add", "--title", "Title", "--owner", OWNER.id, "--source", "nate"),
                      ("add", "--title", "Title", "--owner", RUNNER.id, "--number", "1", "--source", "nate"),
+                     ("add", "--title", "Title", "--owner", RUNNER.id, "--producer", RUNNER.id, "--source", "nate"),
+                     ("update", "--id", "L1", "--producer", "show", "--source", "morty"),
+                     ("update", "--id", "L1", "--producer", "nobody", "--source", "morty"),
                      ("update", "--id", "../L1", "--title", "Title", "--source", "nate"),
                      ("update", "--id", "L1", "--next-check", "2026-11-16T19:00:00", "--source", "morty"),
                      ("update", "--id", "L1", "--eta", "2026-11-17T00:00:00+00:00/2026-11-16T00:00:00+00:00", "--source", "morty"),
@@ -553,7 +572,7 @@ class TheListTests(unittest.TestCase):
             self.assertEqual(self.command("list"), (1, "", "the_list: the current session must be the morty producer\n"))
 
     def test_shared_records_preserve_investigation_format_and_separate_folders(self) -> None:
-        investigation_item = investigation.file(MORTY.id, "Find the cause", "Why?\n\n## Answer\n\nKeep this text.")
+        investigation_item = investigation.file(MORTY.id, "Find the cause", "Why?\n\n## Answer\n\nKeep this text.", waiting_why='The owner must complete the investigation.')
         item = self.add()
         self.assertEqual((investigation_item.id, item.id), ("I1", "L1"))
         self.assertEqual(the_list.load(MORTY.id, item.id), item)

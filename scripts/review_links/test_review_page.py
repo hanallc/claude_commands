@@ -26,8 +26,8 @@ from scripts.production import issues as issue_store
 from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, record_table, review_items, review_page
-from scripts.review_links import list_page, test_change_page
-from scripts.review_links import efficiency_reviews, review_later
+from scripts.review_links import list_page, staff_names, test_change_page
+from scripts.review_links import efficiency_reviews, review_actions, review_later
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.statusline import counts_row
 
@@ -36,6 +36,19 @@ class ReviewPageTests(unittest.TestCase):
     fixture: test_change_page.ChangePageTests = test_change_page.ChangePageTests("runTest")
     root: Path = Path()
     status: change_page.DeliveryStatus = change_page.DeliveryStatus(Path())
+
+    def test_staff_owners_sources_and_log_names_have_role_colors(self) -> None:
+        _ = self.question()
+        body = review_page.render(self.root).decode()
+        self.assertRegex(body, r'data-color-text="role.showrunner"[^>]*>page-owner</span>')
+        self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>builder-unit</span>')
+        self.assertNotRegex(body, r'class="staff-name"[^>]*>nate</span>')
+        item = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.QUESTION)
+        unknown = replace(item, owner=staff.StaffId('nate'), source_unit=staff.StaffId('unknown-source'))
+        plain = review_page.item_rows(unknown, change_page.ReviewBrowser('private'), staff.snapshot(),
+                                      datetime.now(user_zone()), 0, 3)
+        self.assertIn('<td data-label="Owner">nate<small>· unknown-source</small></td>', plain)
+        self.assertIn('Owner: nate · Source: unknown-source</p>', plain)
 
     @override
     def setUp(self) -> None:
@@ -46,12 +59,14 @@ class ReviewPageTests(unittest.TestCase):
         _ = shutil.copyfile(Path(__file__).resolve().parents[2]/'config/console.conf',config/'console.conf')
         self.root = self.fixture.root
         self.status = change_page.DeliveryStatus(self.root)
+        document = self.fixture.production.read_text()
+        _ = self.fixture.production.write_text(document+'- **Merge branch:** main\n- **Log:** progress.log\n')
 
     def question(self, title: str = 'Which layout should the page use?') -> str:
         return self.fixture.file_user_question(title)
 
     def investigation(self, ready: bool = True) -> investigation.Investigation:
-        item = investigation.file(self.fixture.unit.id, 'Why did the gate stop?', 'Read the gate log.')
+        item = investigation.file(self.fixture.unit.id, 'Why did the gate stop?', 'Read the gate log.', waiting_why='The owner must complete the investigation.')
         return investigation.answer(item.owner,item.id,'The test failed. The repair is ready.') if ready else item
 
     def decisions(self) -> tuple[str, str]:
@@ -156,13 +171,36 @@ class ReviewPageTests(unittest.TestCase):
         delivery,_ = review_page.submit(self.root,self.body(key,'validate'),self.status)
         change_page.deliver(delivery,self.status)
         self.assertEqual(next(item.state for item in review_items.read(self.root) if item.key == key),review_items.ReviewState.WAITING)
-        _ = change_review.save_verdict(self.fixture.review_list, 'C1', 'not works: the spacing differs', self.fixture.production)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        _ = change_review.save_verdict(self.fixture.review_list, 'C1', 'not works: the spacing differs',
+                                       self.fixture.production, validation_id=delivery.attempt)
         returned = next(item for item in review_items.read(self.root) if item.key == key)
         self.assertEqual(returned.state, review_items.ReviewState.FOR_YOU)
         self.assertIn('the spacing differs', returned.log[-1].words)
         _,answer = review_page.submit(self.root,self.body('page-owner/C2','feedback','Adjust the spacing.'),self.status)
         self.assertEqual(answer,'feedback sent')
         self.assertEqual(next(item.state for item in review_items.read(self.root) if item.key == 'page-owner/C2'),review_items.ReviewState.DONE)
+
+    def test_validation_messages_keep_the_exchange_id_after_recovery(self) -> None:
+        for recovered in (False, True):
+            with self.subTest(recovered=recovered):
+                case = ReviewPageTests('runTest')
+                case.setUp()
+                try:
+                    delivery, _ = review_page.submit(case.root, case.body('page-owner/C1', 'validate', 'Check this case.'), case.status)
+                    assert isinstance(delivery, change_page.MessageDelivery)
+                    if recovered:
+                        change_page.recover_pending(change_page.DeliveryStatus(case.root))
+                        message = case.fixture.messages[-1][2]
+                    else:
+                        message = delivery.message
+                    self.assertIn('Validation id: '+delivery.attempt, message)
+                    self.assertIn('--validation '+delivery.attempt, message)
+                    self.assertIn('--production page-owner', message)
+                    self.assertIn('--row C1', message)
+                    self.assertIn('Check this case.', message)
+                finally:
+                    case.doCleanups()
 
     def test_page_reuses_the_list_table_and_has_only_this_phases_actions(self) -> None:
         _ = self.question()
@@ -354,7 +392,7 @@ class ReviewPageTests(unittest.TestCase):
             questions = counts_row.question_counts(owner, user_zone(), identities, None)
             queues = [next_item.read_queue(kind, self.fixture.production)
                       for kind in ('question', 'change', 'investigation', 'proposal', 'efficiency')]
-            return counts, questions, queues, list_page.counts_strip(members)
+            return counts, questions, queues, list_page.counts_strip(members, staff_names.StaffNames(members))
 
         with patch.object(review_items, 'read_kind', side_effect=all_states):
             before = results()
@@ -400,7 +438,7 @@ class ReviewPageTests(unittest.TestCase):
                 continue
             with self.subTest(kind=item.type):
                 self.assertEqual(item.actions,expected[item.key])
-                form = review_page.form(item,change_page.ReviewBrowser(token,initial))
+                form = review_page.form(item,change_page.ReviewBrowser(token,initial),4)
                 self.assertIn('Closes the item',form)
                 self.assertIn('The item returns to you',form)
                 self.assertIn('type="datetime-local"',form)
@@ -425,10 +463,9 @@ class ReviewPageTests(unittest.TestCase):
                 waiting = next(item for item in review_items.read(self.root) if item.key == key)
                 self.assertEqual(waiting.state,review_items.ReviewState.WAITING)
                 args = ['answer-question','--item',key,'--text','The second case passes.']
-                if isinstance(item.source,review_items.ChangeSource):
-                    request = self.status.slots(delivery.page,delivery.row).question
-                    assert isinstance(request,change_page.OpenQuestion)
-                    args += ['--question',request.question_id]
+                request = self.status.slots(delivery.page,delivery.row).question
+                assert isinstance(request,change_page.OpenQuestion)
+                args += ['--question',request.question_id]
                 self.assertEqual(change_page.main(args),0)
                 returned = next(item for item in review_items.read(self.root) if item.key == key)
                 self.assertEqual(returned.state,review_items.ReviewState.FOR_YOU)
@@ -456,17 +493,127 @@ class ReviewPageTests(unittest.TestCase):
                                 if item.key == child_key and isinstance(item.source, review_items.QuestionSource))
             child_before = child_record.path.read_bytes()
             for key in (question, child_key):
-                self.assertEqual(change_page.main(['answer-question','--item',key,'--text','Answer for '+key]),0,
+                item = next(item for item in review_items.read(self.root) if item.key == key)
+                page = review_actions.delivery_page(item, self.status)
+                pending = self.status.slots(page, page.rows[0]).question
+                assert isinstance(pending, change_page.OpenQuestion)
+                self.assertEqual(change_page.main(['answer-question','--item',key,'--question',pending.question_id,'--text','Answer for '+key]),0,
                                  'F022: the exact item selects its record despite identical subtree text')
                 returned = next(item for item in review_items.read(self.root) if item.key == key)
                 self.assertEqual(returned.state,review_items.ReviewState.FOR_YOU)
                 self.assertIn('Answer for '+key, returned.log[-1].words)
                 if key == question:
-                    self.assertEqual(change_page.main(['answer-question','--item',key,'--text','Repeat parent answer']),1,
+                    self.assertEqual(change_page.main(['answer-question','--item',key,'--question',pending.question_id,'--text','Repeat parent answer']),1,
                                      'F022: a repeated parent answer cannot select the child')
                     self.assertEqual(child_record.path.read_bytes(),child_before,'F022: only the selected record changes')
                     self.assertEqual(next(item.state for item in review_items.read(self.root) if item.key == child_key),
                                      review_items.ReviewState.WAITING)
+
+    def test_waiting_cards_keep_the_for_you_action_groups(self) -> None:
+        decisions = self.decisions()
+        question = self.question()
+        report = self.investigation()
+        keys = (question, 'page-owner/C1', f'investigation/{report.owner}/{report.id}', *decisions)
+        token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
+        browser = change_page.ReviewBrowser(token, initial)
+        for key in keys:
+            opened = next(item for item in review_items.read(self.root) if item.key == key)
+            delivery, _ = review_page.submit(self.root, self.body(key, 'question', 'Check the old case.'), self.status)
+            change_page.deliver(delivery, self.status)
+            waiting = next(item for item in review_items.read(self.root) if item.key == key)
+            with self.subTest(kind=opened.type):
+                self.assertEqual(waiting.state, review_items.ReviewState.WAITING)
+                self.assertEqual(waiting.actions, opened.actions)
+                self.assertEqual(review_page.form(waiting, browser, 3), review_page.form(opened, browser, 3))
+
+    def waiting_actions(self, kind: review_items.ReviewType, actions: tuple[str, ...], wait: str = 'question') -> None:
+        """Use a fresh record for each action and check the displaced answer."""
+        for action in actions:
+            with self.subTest(kind=kind, wait=wait, action=action):
+                case = ReviewPageTests('runTest')
+                case.setUp()
+                try:
+                    if kind == review_items.ReviewType.CHANGE:
+                        key = 'page-owner/C1'
+                    elif kind == review_items.ReviewType.QUESTION:
+                        key = case.question()
+                    elif kind == review_items.ReviewType.INVESTIGATION:
+                        report = case.investigation(wait != 'native')
+                        key = f'investigation/{report.owner}/{report.id}'
+                    else:
+                        proposal, efficiency = case.decisions()
+                        key = proposal if kind == review_items.ReviewType.PROPOSAL else efficiency
+                        _ = shutil.copyfile(Path(__file__).resolve().parents[2]/'config/nightly_review.conf',
+                                            case.fixture.temporary/'config/nightly_review.conf')
+                    old_id = ''
+                    if wait in ('question', 'validate'):
+                        delivery, _ = review_page.submit(case.root, case.body(key, wait, 'Check the old case.'), case.status)
+                        assert isinstance(delivery, change_page.MessageDelivery)
+                        old = case.status.slots(delivery.page, delivery.row).question
+                        old_id = old.question_id if isinstance(old, change_page.OpenQuestion) else ''
+                        change_page.deliver(delivery, case.status)
+                    elif wait == 'deferred':
+                        item = next(item for item in review_items.read(case.root) if item.key == key)
+                        assert isinstance(item.source, review_items.EfficiencySource)
+                        _ = item.source.path.write_text(item.source.path.read_text().replace(' — proposed', ' — deferred'))
+                    before = next(item for item in review_items.read(case.root) if item.key == key)
+                    self.assertEqual(before.state, review_items.ReviewState.WAITING)
+                    delivery, _ = review_page.submit(case.root, case.body(key, action, 'Use the new case.'), case.status)
+                    change_page.deliver(delivery, case.status)
+                    updated = next(item for item in review_items.read(case.root) if item.key == key)
+                    expected = review_items.ReviewState.WAITING if action in ('question', 'validate') else review_items.ReviewState.DONE
+                    self.assertEqual(updated.state, expected)
+                    self.assertTrue(any('superseded' in event.words.casefold() for event in updated.log))
+                    self.assertTrue(any('Use the new case.' in event.words for event in updated.log))
+                    owner = staff.snapshot().by_id(updated.owner)
+                    assert owner is not None
+                    owner_log = read_production(owner, staff.snapshot()).log.read_text()
+                    self.assertIn('superseded', owner_log.casefold())
+                    if isinstance(updated.source, review_items.ChangeSource):
+                        self.assertEqual(updated.source.slots.validation_requested, action == 'validate')
+                        self.assertEqual(isinstance(updated.source.slots.question, change_page.OpenQuestion), action == 'question')
+                    if wait in ('question', 'native'):
+                        record_before = updated
+                        with self.assertRaises((ValueError, update_registration.RegistrationFailure)):
+                            _ = change_page.answer_item(key, 'An old answer.', old_id, case.status)
+                        after = next(item for item in review_items.read(case.root) if item.key == key)
+                        self.assertEqual(after, record_before)
+                    if action == 'question':
+                        assert isinstance(delivery, change_page.MessageDelivery)
+                        request = case.status.slots(delivery.page, delivery.row).question
+                        self.assertIsInstance(request, change_page.OpenQuestion)
+                        assert isinstance(request, change_page.OpenQuestion)
+                        self.assertNotEqual(request.question_id, old_id)
+                        self.assertIn('--question '+request.question_id, delivery.message)
+                        _ = change_page.answer_item(key, 'The new case passes.', request.question_id, case.status)
+                        self.assertEqual(next(item.state for item in review_items.read(case.root) if item.key == key),
+                                         review_items.ReviewState.FOR_YOU)
+                finally:
+                    case.doCleanups()
+
+    def test_waiting_change_question_accepts_each_action(self) -> None:
+        self.waiting_actions(review_items.ReviewType.CHANGE, ('works', 'not works', 'validate', 'feedback', 'question'))
+
+    def test_waiting_change_validation_accepts_each_action(self) -> None:
+        self.waiting_actions(review_items.ReviewType.CHANGE, ('works', 'not works', 'validate', 'feedback', 'question'), 'validate')
+
+    def test_waiting_question_accepts_each_action(self) -> None:
+        self.waiting_actions(review_items.ReviewType.QUESTION, ('answer', 'feedback', 'question'))
+
+    def test_waiting_investigation_question_accepts_each_action(self) -> None:
+        self.waiting_actions(review_items.ReviewType.INVESTIGATION, ('read', 'feedback', 'question'))
+
+    def test_open_investigation_accepts_each_action(self) -> None:
+        self.waiting_actions(review_items.ReviewType.INVESTIGATION, ('read', 'feedback', 'question'), 'native')
+
+    def test_waiting_proposal_accepts_each_action(self) -> None:
+        self.waiting_actions(review_items.ReviewType.PROPOSAL, review_items.DECISION_ACTIONS)
+
+    def test_waiting_efficiency_accepts_each_action(self) -> None:
+        self.waiting_actions(review_items.ReviewType.EFFICIENCY, review_items.DECISION_ACTIONS)
+
+    def test_deferred_efficiency_accepts_each_action(self) -> None:
+        self.waiting_actions(review_items.ReviewType.EFFICIENCY, review_items.DECISION_ACTIONS, 'deferred')
 
     def test_feedback_closes_each_type_and_uses_startup_delivery_recovery(self) -> None:
         decisions = self.decisions()

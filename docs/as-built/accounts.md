@@ -454,6 +454,9 @@ Browser storage keeps each viewer's choice through refreshes and page visits.
 Failed storage reads use the default sort.
 Failed storage writes keep the current choice for the open page.
 The shipped value of `role.producer` is `pink`.
+`role_colors` reads the current settings for the Accounts board and the console name renderer.
+`staff_role_color` maps a staff row through those keys and `account_color`.
+Unknown or invalid colors use the normal text color.
 The value accepts a color name or a six-digit hex color.
 A board span with a valid configured color carries its key as `color_key`; the role check mark is a separate span.
 Configured accounts and role groups have a color swatch on the console Accounts page.

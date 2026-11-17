@@ -18,7 +18,7 @@ import os
 import re
 import sys
 import tempfile
-from collections.abc import Generator, Iterator, Mapping
+from collections.abc import Callable, Generator, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -152,14 +152,17 @@ def review_mark(issue: Issue) -> ReviewMark | NoMark:
     return ReviewMark(value) if value else NoMark()
 
 
-def record_review(path: Path, words: str, change: MarkChange, today: date, who: str = "nate") -> bool:
+def record_review(path: Path, words: str, change: MarkChange, today: date, who: str = "nate", *,
+                  waiting_why: str = "", check_state: Callable[[], None] = lambda: None) -> bool:
     """Append one Review page log line and change its mark. Returns False for an exact repeat."""
+    reason = review_events.require_waiting_why(waiting_why) if change == ReviewMark.WAITING or waiting_why else ""
     with issue_lock(path):
         issue = Issue(path, frontmatter(path))
+        check_state()
         before = review_log(issue)
         events = review_events.append(before, ReviewLog(datetime.now(timezone.utc), who, words))
         mark = review_events.changed_mark(review_mark(issue), change)
-        if events == before and mark == review_mark(issue):
+        if events == before and mark == review_mark(issue) and (not reason or reason == issue.value("waiting_why")):
             return False
         lines = read_issue(path).splitlines(keepends=True)
         end = _closing_fence(lines, path)
@@ -169,7 +172,8 @@ def record_review(path: Path, words: str, change: MarkChange, today: date, who: 
                              *(f"  - {json.dumps(row, ensure_ascii=False)}{newline}" for row in review_events.rows(events))]
         text, _ = remove_fields("".join(lines), (REVIEW_MARK_FIELD,), path)
         marked = {REVIEW_MARK_FIELD: mark.value} if isinstance(mark, ReviewMark) else {}
-        text, _ = set_fields(text, {**marked, "date_modified": _vault_date(today)}, path)
+        why = {"waiting_why": reason} if reason else {}
+        text, _ = set_fields(text, {**marked, **why, "date_modified": _vault_date(today)}, path)
         write_issue(path, text)
         return True
 

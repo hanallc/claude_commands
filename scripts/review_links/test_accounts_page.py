@@ -50,6 +50,16 @@ def sort_reading() -> accounts.StatusReading:
         upcoming_moves=("Upcoming moves:", "units → claude2"))
 
 
+class ProducerRoleColorTests(unittest.TestCase):
+    def test_the_producer_role_uses_its_color_and_account_names_keep_account_colors(self) -> None:
+        reading = accounts.StatusReading((replace(status_row("plain-account"), roles=("producers",)),), (), (),
+                                         timezone.utc, AT)
+        body = accounts_page.board(reading)
+        self.assertIn('data-color-text="role.producer"', body)
+        self.assertIn('>producers</span>', body)
+        self.assertNotRegex(body, r'data-color-text="role\.[^"]+"[^>]*>plain-account</span>')
+
+
 MENU_SETUP = '''<script>
 let reads=0;const saves=[];const realFetch=fetch;
 window.fetch=(path,options)=>options?.method==='POST' ? new Promise(resolve=>saves.push({options,resolve}))
