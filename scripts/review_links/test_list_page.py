@@ -145,7 +145,7 @@ class ListPageTests(unittest.TestCase):
         done = change("C4", review_items.ReviewState.DONE)
         later = replace(change("C5", review_items.ReviewState.FOR_YOU),
                         times=review_items.ReviewTimes(NOW, NOW, NOW + timedelta(days=1)))
-        question = investigation.file(OWNER.id, "Find the cause", "Why did it stop?")
+        question = investigation.file(OWNER.id, "Find the cause", "Why did it stop?", waiting_why='The owner must complete the investigation.')
         _ = investigation.answer(OWNER.id, question.id, "The cause is known.")
         answer = review_items.investigation_items(staff.snapshot())[0]
         reviews = [*ready, waiting, done, later, answer]

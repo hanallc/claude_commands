@@ -318,6 +318,22 @@ Selected-row snapshots retain their signed legacy forms.
 `review_items.py` reads the existing question, change, investigation, proposal and efficiency stores.
 It projects each record into one `ReviewItem`; it stores no second record.
 Each item has an ID, type, owner, source unit, title, state, times, log and permitted actions.
+Each item also exposes `waiting_why`, which is empty on older records without a reason.
+Waiting filers must supply a reason; one shared rule refuses empty or whitespace-only text.
+Changes store `waiting_why` with their delivery state; questions store it in their registration.
+Investigations and proposals store it in their frontmatter; efficiencies store it in the existing review file beside the ledger.
+The user's Ask question text becomes the reason automatically for every type.
+Validation uses the user's feedback when the feedback contains text.
+Validation uses the stated validation request when the feedback is empty or contains only spaces.
+`waiting_why.py list` lists Waiting items without a reason, with their key, type, title and filer.
+This command does not allocate question IDs or write records.
+`waiting_why.py set --item <key> --text "<reason>"` uses the filer's writer and refuses items outside Waiting.
+The writer checks the current state under its lock before it stores the reason.
+Questions use the canonical owner lock, including questions without a current owner.
+The command prints one plain error line for a refused update.
+`investigation.py file` requires `--waiting-why`. The Python `followup` API stores the follow-up words as the reason.
+`proposal_issue.record_review` and `efficiency_reviews.record` require `waiting_why` when setting the Waiting mark.
+`candidates.py outcome E<n> deferred --waiting-why "<reason>"` stores the reason beside the ledger.
 The states are **For you**, **Waiting** and **Done**.
 A future time hides an item without changing its state.
 The count readers and `/next` use this shared reader.
