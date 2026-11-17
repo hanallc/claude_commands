@@ -4638,3 +4638,35 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Isolated start CPU (natedev, 220 paired starts): `lib/py` shim +4.8 to 8.5 ms per start (bound 16-29 s over 3,417 starts); `verify_helper.py` ready 28-32 ms (bound about 15 s over 491); `module_run.py` runner +42 to 53 ms per module (bound 35-44 s over 826). None is a large lever.
 - Top `git rev-parse` callers in 20 Git-heavy modules: `style/git_process.py:162` 14,411 starts; `lib/build_slots.py:87` 7,944; `style/bulk_run.py:60` 3,570; `copies/copies.py:462` 3,410; `production/merge_checkpoint.py:180` 2,198.
 - Git auto maintenance off (`maintenance.auto=false`, `gc.auto=0` through `GIT_CONFIG_PARAMETERS`), paired natedev, 3 rounds, median saving: `test_models_conf_publish` 6.06 CPU s, `test_fast_track` 1.75, `test_style_footprint` 1.02, `test_style_ledger_findings` noise. Proposal to builds: the gate test environment turns auto maintenance off.
+
+### Phase 330 — Test runs start no Git auto maintenance  · status: done
+**Depends on:** Phase 329
+
+#### Work Order
+
+**Goal:** each gate test module runs Git with auto maintenance and auto gc off, so fixture commits start no `git maintenance` work.
+
+**Decision:** builds approved the change on Phase 329's paired natedev results. Measured savings ship.
+
+**Spec:**
+1. In `test_module_environment`, set `GIT_CONFIG_PARAMETERS` to the inherited value followed by `'maintenance.auto=false' 'gc.auto=0'`. Keep the inherited entries; do not replace them.
+2. Keep the settings in one module constant. Update the function docstring.
+3. Add a row to the existing module environment test: an inherited value stays first and the two settings follow it.
+4. Run the gate tests and the Git-heavy modules on natedev. Run an aws pair over 18 Git-heavy modules, 3 rounds.
+
+**Files:**
+- `scripts/production/gate.py`
+- `scripts/production/test_gate.py`
+
+**Workers:** 1 writer; the director writes it (no worker capacity).
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 329: paired natedev median savings with maintenance off: `test_models_conf_publish` 6.06 CPU s, `test_fast_track` 1.75, `test_style_footprint` 1.02.
+- `gate_box.py`, `module_cost.py` and `fast_track.py` call `test_module_environment`, so the change reaches aws runs and module cost probes.
+- No test checks that auto maintenance runs.
+
+**Acceptance gate:**
+- basedpyright reports no errors or warnings on both files.
+- `production/test_gate.py`, `production/test_staff.py` and the Git-heavy modules pass.
+- The aws pair shows the CPU change over the Git-heavy modules.
