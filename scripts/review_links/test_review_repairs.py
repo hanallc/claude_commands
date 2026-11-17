@@ -11,7 +11,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import cast, override
 import unittest
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 from unittest.mock import patch
 
 from scripts.lib import urgency
@@ -121,6 +121,12 @@ class ReviewRepairsTests(unittest.TestCase):
                     self.send_header('Location', review_page.legacy_url(route.path, route.query))
                     self.end_headers()
                     return
+                if route.path == '/owner-answer':
+                    key = parse_qs(route.query)['item'][0]
+                    item = next(item for item in review_items.read(case.root) if item.key == key)
+                    question = item.source.slots.question if isinstance(item.source, review_items.ChangeSource) else change_page.NoQuestion()
+                    identity = question.question_id if isinstance(question, change_page.OpenQuestion) else ''
+                    _ = change_page.answer_item(key,'The owner checked the next case.',identity,case.status)
                 if self.path == '/problem':
                     _ = change_review.save_verdict(case.fixture.review_list,'C1','not works: The spacing differs.',case.fixture.production)
                 if self.path == '/passed':
@@ -171,40 +177,68 @@ class ReviewRepairsTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_showrunner_check_stays_out_of_open_after_refresh_and_returns_only_for_a_problem(self) -> None:
+        question = self.case.question()
+        ready = self.case.investigation()
         markup = review_page.render(self.case.root).decode()
-        setup = '''<script>const nativeFetch=fetch;window.setInterval=()=>0;
-window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/fresh',options);</script>'''
+        setup = '''<script>const nativeFetch=fetch;window.setInterval=()=>0;window.reviewRead=Promise.resolve();
+window.fetch=(url,options={})=>{
+ const response=nativeFetch(options.method==='POST'?'/action':'/fresh',options);
+ if(options.method!=='POST') window.reviewRead=response.then(reply=>reply.clone().text());
+ return response;
+};</script>'''
         markup = markup.replace('<head>','<head>'+setup,1)
         probe = r'''
 (async()=>{
  const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
  const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
  const row=id=>document.querySelector('[data-key="page-owner/'+id+'"]');
- const refresh=async()=>{dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await pause(120);};
+ const refresh=async()=>{dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await window.reviewRead;await pause(120);};
+ const save=async(form,value)=>{
+  const complete=new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{if(!form.dataset.sending){observer.disconnect();resolve();}});
+   observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+  });
+  form.requestSubmit(form.querySelector('[value="'+value+'"]'));await complete;
+ };
  const show=value=>{const field=document.getElementById('list-show');field.value=value;field.dispatchEvent(new Event('change'));};
  try{
   row('C1').querySelector('.list-toggle').click();
-  const form=row('C1').querySelector('form');form.requestSubmit(form.querySelector('[value="validate"]'));
-  await pause(1100);check(row('C1').hidden,'the saved check leaves Open');
+  const form=row('C1').querySelector('form');await save(form,'validate');
+  check(row('C1').hidden,'the saved check leaves Open');
   await refresh();check(row('C1').hidden,'a refresh keeps the waiting check out of Open');
   show('Waiting');check(!row('C1').hidden,'Waiting can show the active check');show('open');
   await nativeFetch('/problem');await refresh();check(!row('C1').hidden,'a problem returns to For you');
   row('C2').querySelector('.list-toggle').click();
-  const second=row('C2').querySelector('form');second.requestSubmit(second.querySelector('[value="validate"]'));
-  await pause(1100);await nativeFetch('/passed');await refresh();check(row('C2').hidden,'a passed check stays out of Open');
+  const second=row('C2').querySelector('form');await save(second,'validate');
+  await nativeFetch('/passed');await refresh();check(row('C2').hidden,'a passed check stays out of Open');
   show('Done');check(!row('C2').hidden && row('C2').dataset.state==='Done','a passed check records Done');
   show('all');row('C3').querySelector('.list-toggle').click();
-  const third=row('C3').querySelector('form');third.requestSubmit(third.querySelector('[value="works"]'));
-  await pause(1100);check(row('C3').hidden,'F010: Works leaves All');
+  const third=row('C3').querySelector('form');await save(third,'works');
+  check(row('C3').hidden,'F010: Works leaves All');
   for(let pass=0;pass<2;pass++){
    await refresh();
    for(const choice of ['open','For you','Waiting','Done','all']){
     show(choice);check(row('C3').hidden,'F010: refresh keeps Works hidden in '+choice);
    }
   }
+  const keys=QUESTION_KEYS;
+  for(const key of keys){
+   show('open');
+   const asked=()=>document.querySelector('[data-key="'+key+'"]');
+   asked().querySelector('.list-toggle').click();
+   const asking=asked().querySelector('form');asking.elements.feedback.value='Check the next case.';
+   await save(asking,'question');
+   check(asked().hidden,'F021: Ask question leaves Open for '+key);
+   for(let pass=0;pass<2;pass++){
+    await refresh();check(asked().hidden,'F021: Waiting stays hidden after refresh for '+key);
+   }
+   await nativeFetch('/owner-answer?item='+encodeURIComponent(key));await refresh();
+   check(!asked().hidden && asked().dataset.state==='For you','F021: the owner answer returns '+key);
+  }
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();'''
+        probe = probe.replace('QUESTION_KEYS',json.dumps([question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}']))
         self.assertEqual(self.browser(markup,probe),[])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')

@@ -59,5 +59,3 @@ def investigation_action(item: review_items.ReviewItem, action: str, words: str,
             raise
     return change_page.MessageDelivery(page,record.id,(item.owner,),message,attempt,(item.owner,)),(
         'question sent' if action == 'question' else 'feedback sent')
-
-

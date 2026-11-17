@@ -45,16 +45,37 @@ class InvestigationsPageTests(unittest.TestCase):
             return investigation.file(owner, title, "Read the report.\n\n1. Check the first result.\n2. Check the second result.")
 
     def test_review_question_returns_the_answer_and_feedback_keeps_each_exchange(self) -> None:
-        record = self.file(UNIT.id,'Check both cases','2026-11-16T13:05:00+00:00')
-        _ = investigation.answer(UNIT.id,record.id,'The first case passes.')
-        waiting = investigation.review_action(UNIT.id,record.id,'question','Check the second case.')
-        self.assertEqual(waiting.state,investigation.InvestigationState.OPEN)
-        returned = investigation.answer(UNIT.id,record.id,'The second case passes.')
-        self.assertEqual(returned.state,investigation.InvestigationState.ANSWER_READY)
-        done = investigation.review_action(UNIT.id,record.id,'feedback','Keep both checks.')
-        self.assertEqual(done.state,investigation.InvestigationState.READ)
-        self.assertEqual([entry.words for entry in done.log],['Answer: The first case passes.',
-            'question: Check the second case.','Answer: The second case passes.','feedback sent: Keep both checks.'])
+        for legacy in (False, True):
+            with self.subTest(finding="F019", legacy=legacy):
+                record = self.file(UNIT.id,'Check both cases','2026-11-16T13:05:00+00:00')
+                _ = investigation.answer(UNIT.id,record.id,'The first case passes.')
+                if legacy:
+                    path = investigation.folder(UNIT.id) / (record.id+'.md')
+                    _ = path.write_text(''.join(line for line in path.read_text().splitlines(keepends=True)
+                                              if not line.startswith('review_log: ')))
+                waiting = investigation.review_action(UNIT.id,record.id,'question','Check the second case.')
+                self.assertEqual(waiting.state,investigation.InvestigationState.OPEN)
+                returned = investigation.answer(UNIT.id,record.id,'The second case passes.')
+                self.assertEqual(returned.state,investigation.InvestigationState.ANSWER_READY)
+                done = investigation.review_action(UNIT.id,record.id,'feedback','Keep both checks.')
+                self.assertEqual(done.state,investigation.InvestigationState.READ)
+                self.assertEqual([entry.words for entry in done.log],['Answer: The first case passes.',
+                    'question: Check the second case.','Answer: The second case passes.','feedback sent: Keep both checks.'])
+
+        with self.subTest(finding='F019', legacy='Later before question'):
+            first_time = '2026-11-16T13:10:00+00:00'
+            legacy_record = self.file(UNIT.id,'Keep the earlier answer','2026-11-16T13:05:00+00:00')
+            with patch.object(investigation,'_now',return_value=first_time):
+                _ = investigation.answer(UNIT.id,legacy_record.id,'Legacy answer A.')
+            path = investigation.folder(UNIT.id) / (legacy_record.id+'.md')
+            _ = path.write_text(''.join(line for line in path.read_text().splitlines(keepends=True)
+                                      if not line.startswith('review_log: ')))
+            investigation.record_review_log(UNIT.id,legacy_record.id,'Later until tomorrow')
+            _ = investigation.review_action(UNIT.id,legacy_record.id,'question','Check answer B.')
+            returned = investigation.answer(UNIT.id,legacy_record.id,'Answer B.')
+            self.assertEqual([entry.words for entry in returned.log],['Answer: Legacy answer A.',
+                'Later until tomorrow','question: Check answer B.','Answer: Answer B.'])
+            self.assertEqual(returned.log[0].time.isoformat(),first_time,'F019: keep the original answer time')
 
     def test_cards_show_the_state_text_footer_and_owner_filters(self) -> None:
         ready = self.file(UNIT.id, "Find the cause <now>", "2026-11-16T13:05:00+00:00")

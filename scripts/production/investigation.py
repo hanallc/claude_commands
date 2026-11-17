@@ -157,6 +157,10 @@ def review_action(owner: staff.StaffId, identity: str, action: str, words: str) 
         item = load(owner, identity)
         if item.state != InvestigationState.ANSWER_READY:
             raise InvestigationError(f"{identity}: the answer is no longer ready")
+        words_before = 'Answer: '+item.answer
+        if item.answer and not any(entry.words == words_before for entry in item.log):
+            previous = ReviewLog(datetime.fromisoformat(item.answered), str(owner), words_before)
+            item = replace(item, log=tuple(sorted((*item.log, previous), key=lambda entry: entry.time)))
         event = ReviewLog(datetime.now(timezone.utc), 'nate', ('feedback sent' if action == 'feedback' else action)+': '+words)
         if action == 'question':
             item = replace(item,state=InvestigationState.OPEN,answered='',read='',log=(*item.log,event))
