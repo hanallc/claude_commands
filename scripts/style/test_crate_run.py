@@ -726,10 +726,13 @@ class CrateRunTests(CargoProjectTests):
                 _ = spool.write(b"anonymous git read output")
                 self.assertEqual(os.fstat(spool.fileno()).st_nlink, 0)
             with self.assertRaisesRegex(AssertionError, "dry run attempted a file write"):
-                with tempfile.NamedTemporaryFile():
+                descriptor = os.open(self.root / "named-temporary-file-probe", os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+                try:
                     self.fail("a named temporary file must not be created")
+                finally:
+                    os.close(descriptor)
             with self.assertRaisesRegex(AssertionError, "dry run attempted a filesystem mutation: os.mkdir"):
-                _ = tempfile.mkdtemp()
+                (self.root / "directory-write-probe").mkdir()
             with self.assertRaisesRegex(AssertionError, "dry run attempted a file write"):
                 _ = (self.repo / "named-write-probe").write_bytes(b"must not be written")
         finally:
