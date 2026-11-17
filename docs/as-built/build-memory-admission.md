@@ -20,6 +20,13 @@ This work also hardened the example-test guard, Cargo token recovery, CI queue a
 
 ## How it works
 
+`lint/invoke.sh` exports `BUILDLOG_RESERVED_STEP` only into a reserved command.
+The marker contains the reservation ID, its holder PID, and the queue state folder.
+`admission_client.py` checks the marker against the current queue and its durable `state.json` before a new admission.
+It refuses a nested verify step while the same reservation and holder (pid and start time) remain live.
+The memory and cargo-token entry points use the same check before waiting.
+Markers for other queues, dead holders, reused pids, and released reservations do not block a step.
+
 The admission service keeps `/proc/vmstat` `pswpin` samples in memory.
 `agent_swap_window_seconds=600` sets the sample window.
 The window total is the newest page count minus the oldest page count inside the window, multiplied by the page size.

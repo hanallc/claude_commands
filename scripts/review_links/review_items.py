@@ -22,9 +22,10 @@ from scripts.production import change_review, change_routing, delivery_state, in
 from scripts.production import proposals_folder, proposals_table
 from scripts.production.issues import Issue, PROPOSAL_TAG, open_issues
 from scripts.production.proposal_issue import DeclinedDecision, InProgress, decision_answer, proposal_progress
+from scripts.production.proposal_issue import REVIEW_MARK_FIELD, review_log, review_mark
 from scripts.production.production_doc import production_field, Refusal
-from scripts.review_links import review_events, review_later
-from scripts.review_links.review_events import ReviewLog as ReviewLog
+from scripts.review_links import efficiency_reviews, review_events, review_later
+from scripts.review_links.review_events import ReviewLog as ReviewLog, ReviewMark
 
 
 class ReviewType(StrEnum):
@@ -43,7 +44,10 @@ class ReviewState(StrEnum):
 
 REVIEW_TYPES = tuple(ReviewType)
 REVIEW_STATES = tuple(ReviewState)
-PROPOSAL_STATE_FIELDS = frozenset(("status", "stage", "unit", "style_answer", "style_answer_words", "proposed_by", "record_type"))
+PROPOSAL_STATE_FIELDS = frozenset(("status", "stage", "unit", "style_answer", "style_answer_words", "proposed_by", "record_type",
+                                   REVIEW_MARK_FIELD))
+# Approve and Decline close the item; Send feedback closes it; Ask question returns it.
+DECISION_ACTIONS = ('approve', 'decline', 'feedback', 'question')
 
 
 def selected_states(show: str) -> tuple[ReviewState, ...]:
@@ -401,16 +405,34 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
 
 
 def proposal_state(issue: Issue) -> ReviewState:
-    """Finish the user's review when a proposal is approved, declined or closed."""
+    """Finish the user's review when a proposal is approved, declined, closed or answered on the page."""
+    mark = review_mark(issue)
     if (issue.value('status') != 'open' or isinstance(proposal_progress(issue), InProgress)
-            or isinstance(decision_answer(issue), DeclinedDecision)):
+            or isinstance(decision_answer(issue), DeclinedDecision) or mark == ReviewMark.DONE):
         return ReviewState.DONE
-    return ReviewState.FOR_YOU
+    return ReviewState.WAITING if mark == ReviewMark.WAITING else ReviewState.FOR_YOU
+
+
+def proposal_item(key: str, issue: Issue, owner: staff.StaffId, who: staff.StaffId, title: str, filed: datetime,
+                  members: staff.StaffSnapshot, entry: urgency.Entry[proposals_table.Row] | None = None,
+                  queue: str = '') -> ReviewItem:
+    """Project one proposal issue with its page log and its actions."""
+    state = proposal_state(issue)
+    logs = (ReviewLog(filed,name(who,members),'Proposed'), *review_log(issue))
+    identity = name(owner,members)+'/'+(issue.value('proposal_id') or issue.path.stem)
+    actions = DECISION_ACTIONS if state == ReviewState.FOR_YOU else ()
+    if entry is None:
+        return ReviewItem(key,identity,ReviewType.PROPOSAL,owner,who,title,state,ReviewTimes(filed,logs[-1].time),logs,
+                          actions,ProposalSource(issue))
+    return ReviewItem(key,identity,ReviewType.PROPOSAL,owner,who,title,state,ReviewTimes(filed,logs[-1].time),logs,
+                      actions,ProposalSource(issue),entry.urgency,'proposal/'+entry.after if entry.after else '',queue,
+                      entry.key,entry.after,entry.value,proposals_table.proposal_text(entry))
 
 
 def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                    sources: list[Path] | None = None, own: list[Issue] | None = None,
-                   states: tuple[ReviewState, ...] = REVIEW_STATES) -> list[ReviewItem]:
+                   states: tuple[ReviewState, ...] = REVIEW_STATES,
+                   owner_options: dict[staff.StaffId, str] | None = None) -> list[ReviewItem]:
     found: dict[str, ReviewItem] = {}
     owners: dict[Path, staff.StaffId] = {}
     for doc in documents:
@@ -453,7 +475,7 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
     for doc in documents:
         owner = owners[doc]
         issues = selected_issues[doc]
-        waiting, _ = proposals_table.waiting_entries(doc, sources=sources, issues=issues)
+        waiting, _ = proposals_table.waiting_entries(doc, sources=sources, issues=issues, record=members)
         by_key = {str(issue.path):issue for issue in issues}
         queue = 'proposal-'+owner
         for entry in waiting:
@@ -461,28 +483,33 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
             if issue is not None:
                 dependency = next(iter(issue.fields.get('depends_on', [])), '')
                 entry = replace(entry, after=references[doc].get(dependency, ''))
-            path = issue.path if issue is not None else Path(entry.key.removeprefix(proposals_table.BACKLOG_KEY).split(': ',1)[0])
-            source: ReviewSource = ProposalSource(issue) if issue is not None else ProposalLedgerSource(path)
-            who = staff.StaffId(issue.value('proposed_by')) if issue is not None else owner
             filed = entry.since.replace(tzinfo=user_zone()) if entry.since is not None else moment('1970-01-01')
             key = 'proposal/'+entry.key
-            state = proposal_state(issue) if issue is not None else ReviewState.FOR_YOU
-            if state not in states:
+            if issue is not None:
+                # The id column holds the P number, so the title is the issue name alone.
+                item = proposal_item(key,issue,owner,staff.StaffId(issue.value('proposed_by')),issue.path.stem,filed,
+                                     members,entry,queue)
+            else:
+                # A plan backlog line has no issue to hold a page answer; the user answers it in chat.
+                path = Path(entry.key.removeprefix(proposals_table.BACKLOG_KEY).split(': ',1)[0])
+                item = ReviewItem(key,entry.item.proposal,ReviewType.PROPOSAL,owner,owner,entry.item.proposal,
+                    ReviewState.FOR_YOU,ReviewTimes(filed,filed),(ReviewLog(filed,name(owner,members),'Proposed'),),(),
+                    ProposalLedgerSource(path),entry.urgency,'proposal/'+entry.after if entry.after else '',queue,
+                    entry.key,entry.after,entry.value,proposals_table.proposal_text(entry))
+            if item.state not in states:
                 continue
-            found[key] = ReviewItem(key, issue.value('proposal_id') or path.stem if issue is not None else entry.item.proposal,
-                ReviewType.PROPOSAL, owner, who, entry.item.proposal, state, ReviewTimes(filed,filed),
-                (ReviewLog(filed,name(who,members),'Proposed'),), (), source, entry.urgency,
-                'proposal/'+entry.after if entry.after else '', queue,entry.key,entry.after,entry.value,
-                proposals_table.proposal_text(entry))
+            found[key] = item
         waiting_keys = {entry.key for entry in waiting}
         for issue in issues:
             if str(issue.path) in waiting_keys:
                 continue
             filed = moment(issue.value('date_created') or '1970-01-01')
             key = 'proposal/'+str(issue.path)
-            who = staff.StaffId(issue.value('proposed_by') or owner)
-            found[key] = ReviewItem(key,issue.value('proposal_id') or issue.path.stem,ReviewType.PROPOSAL,
-                owner,who,issue.path.stem,proposal_state(issue),ReviewTimes(filed,filed),(),(),ProposalSource(issue))
+            found[key] = proposal_item(key,issue,owner,staff.StaffId(issue.value('proposed_by') or owner),issue.path.stem,
+                                       filed,members)
+    if owner_options is not None:
+        for item in found.values():
+            owner_options[item.owner] = name(item.owner,members)
     return list(found.values())
 
 
@@ -498,9 +525,19 @@ def efficiency_ledger(doc: Path) -> Path | NoEfficiencyLedger:
         return NoEfficiencyLedger()
 
 
+def efficiency_state(result: str, review: efficiency_reviews.EfficiencyReview) -> ReviewState:
+    """The ledger ending sets the state; a page mark changes only a proposed line."""
+    if not result.startswith(('proposed', 'deferred')):
+        return ReviewState.DONE
+    if result.startswith('deferred') or review.mark == ReviewMark.WAITING:
+        return ReviewState.WAITING
+    return ReviewState.DONE if review.mark == ReviewMark.DONE else ReviewState.FOR_YOU
+
+
 def efficiency_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                      sources: list[Path] | None = None,
-                     states: tuple[ReviewState, ...] = REVIEW_STATES) -> list[ReviewItem]:
+                     states: tuple[ReviewState, ...] = REVIEW_STATES,
+                     owner_options: dict[staff.StaffId, str] | None = None) -> list[ReviewItem]:
     found: list[ReviewItem] = []
     seen: set[Path] = set()
     for doc in documents:
@@ -515,23 +552,28 @@ def efficiency_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], 
         except FileNotFoundError:
             continue
         owner = next((member.id for member in members.rows if isinstance(member.doc,(staff.LiveDoc,staff.WrappedDoc)) and member.doc.path == doc),staff.StaffId(''))
+        reviews = efficiency_reviews.read(path, sources)
         for index,line in enumerate(lines):
             match = EFFICIENCY_LINE.match(line)
             if match is None:
                 continue
             head, _, result = line.partition(' — ')
-            state = (ReviewState.FOR_YOU if result.startswith('proposed') else
-                     ReviewState.WAITING if result.startswith('deferred') else ReviewState.DONE)
+            review = reviews.get(f'E{index+1}', efficiency_reviews.EfficiencyReview())
+            state = efficiency_state(result, review)
             if state not in states:
                 continue
+            if owner_options is not None:
+                owner_options[owner] = name(owner,members)
             filed = moment(head[2:12])
             candidates_found = candidates.entries([head+' — proposed'])
             entry = candidates_found[0] if candidates_found else urgency.Entry(head,line)
             candidate = candidates_found[0].item if candidates_found else None
             who = staff.StaffId(candidate.by if candidate is not None else '')
             key = f'efficiency/{path}/{index}'
+            logs = (ReviewLog(filed,name(owner,members),result), *review.log)
             found.append(ReviewItem(key,name(owner,members)+f'/E{index+1}',ReviewType.EFFICIENCY,owner,who,
-                head[13:],state,ReviewTimes(filed,filed),(ReviewLog(filed,name(owner,members),result),),(),
+                head[13:],state,ReviewTimes(filed,logs[-1].time),logs,
+                DECISION_ACTIONS if state == ReviewState.FOR_YOU else (),
                 EfficiencySource(path,line),entry.urgency,queue=candidates.QUEUE,queue_key=entry.key,
                 value=entry.value,text=line))
     return found
@@ -587,15 +629,15 @@ def read(root: Path, *, members: staff.StaffSnapshot | None = None,
     if ReviewType.INVESTIGATION in kinds:
         items.extend(investigation_items(members,states=states,owner_options=owner_options))
     if ReviewType.PROPOSAL in kinds:
-        items.extend(proposal_items(members,documents,states=states))
+        items.extend(proposal_items(members,documents,states=states,owner_options=owner_options))
     if ReviewType.EFFICIENCY in kinds:
-        items.extend(efficiency_items(members,documents,states=states))
+        items.extend(efficiency_items(members,documents,states=states,owner_options=owner_options))
     return ordered(with_later(items))
 
 
 def read_open(root: Path) -> list[ReviewItem]:
     """Share only open records during one console news request."""
-    return read(root, show='open', kinds=(ReviewType.QUESTION, ReviewType.CHANGE, ReviewType.INVESTIGATION))
+    return read(root, show='open')
 
 
 def with_later(items: list[ReviewItem], sources: list[Path] | None = None) -> list[ReviewItem]:

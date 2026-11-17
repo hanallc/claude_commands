@@ -181,7 +181,12 @@ Open investigations wait for the owner and do not appear in `/next`.
 
 ## Review actions
 
-Questions, changes and investigations share Send feedback, Ask question and Later on the Review page.
+All five kinds share Send feedback, Ask question and Later on the Review page.
+Proposals and efficiencies also have Approve and Decline.
+Approve and Decline make the item Done at once.
+Approve sends the user's words and the record command to the owner showrunner.
+Run that command when the message arrives.
+Decline records the answer at once: a proposal's declined answer, or an efficiency's `declined` outcome.
 Send feedback sends the words to the owner and closes the item.
 Ask question moves it to Waiting.
 Answer it with `change_page.py answer-question --item <Review key> --text "<answer>"`.

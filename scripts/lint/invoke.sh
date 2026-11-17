@@ -160,6 +160,12 @@ buildlog_step_compiles() {
 }
 
 buildlog_exec() {
+    local BUILDLOG_RESERVED_STEP="${BUILDLOG_RESERVED_STEP:-}"
+    if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" ]]; then
+        printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
+            "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}"
+        export BUILDLOG_RESERVED_STEP
+    fi
     if [[ -z "${BUILDLOG_PEAK:-}" ]]; then
         "$@"
         return
@@ -349,6 +355,7 @@ buildlog_exec_with_progress() {
 }
 
 run_step_attempt() {
+    buildlog_check_nested_step || return $?
     if [[ -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
         build_check_stop 2 'a prior admission or hold check failed'
         return 2

@@ -139,6 +139,8 @@ class StoredReviewMessage(TypedDict):
     source: str
     owner: str
     message: str
+    # A record saved before efficiencies has no row; its row is the source's stem.
+    row: NotRequired[str]
 
 
 class SentCloseoutAlerts(TypedDict):
@@ -1161,16 +1163,17 @@ def recover_review_messages(status: DeliveryStatus) -> None:
                 if saved is None:
                     continue
                 source = Path(saved['source'])
-                page = ReviewMessagePage(source,source.parent,(source.stem,),'',saved)
-                slots = status.slots(page,source.stem)
+                row = saved.get('row',source.stem)
+                page = ReviewMessagePage(source,source.parent,(row,),'',saved)
+                slots = status.slots(page,row)
                 if not saved['saved']:
-                    status.clear_locked(page,source.stem,slots,'verdict')
+                    status.clear_locked(page,row,slots,'verdict')
                     continue
                 claimed = tuple(intent.attempt for intent in slots.intents())
                 for attempt in claimed:
                     status.request_attempts[attempt] = AttemptOwnership(path,'claimed')
             for intent in slots.intents():
-                deliver(MessageDelivery(page,source.stem,intent.recipients,saved['message'],intent.attempt,
+                deliver(MessageDelivery(page,row,intent.recipients,saved['message'],intent.attempt,
                                         (staff.StaffId(saved['owner']),)),status)
         except (OSError,ValueError,KeyError,TypeError) as error:
             print(f'review-links recovery {path.name}: {error}',file=sys.stderr)
@@ -1275,7 +1278,7 @@ def reply_command(key: str, question: str = '') -> str:
 
 
 def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) -> bool:
-    from scripts.review_links import review_items
+    from scripts.review_links import decision_store, review_items
     from scripts.production import investigation
     item = next((item for item in review_items.read(status.root) if key in (item.key,item.id)),None)
     if item is None:
@@ -1289,6 +1292,11 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
     if isinstance(source,review_items.InvestigationSource):
         _ = investigation.answer(source.record.owner,source.record.id,words)
         return True
+    if isinstance(source,(review_items.ProposalSource,review_items.EfficiencySource)):
+        try:
+            return decision_store.answer(item,words,who)
+        except decision_store.NoOpenQuestion as error:
+            raise AnswerRefused(str(error)) from error
     if isinstance(source,review_items.ChangeSource):
         assert isinstance(source.assignment.production,Path)
         page = ReviewPage(source.path,source.assignment.production,(source.row['#'],),'')
