@@ -6837,6 +6837,40 @@ def _finish_phase_with_wait_lock(args: argparse.Namespace) -> InterruptedWorkerP
     return InterruptedWorkerPasses(tuple(dict.fromkeys(interrupted)))
 
 
+def _drop_phase(args: argparse.Namespace) -> InterruptedWorkerPasses:
+    """Close an open phase and record why its attempt leaves the board."""
+    reason = _arg_string(args, "reason").strip()
+    if not reason:
+        raise SystemExit("Cannot drop a phase: --reason is empty")
+    session_dir = _session_dir(args)
+    state = _read_state(session_dir)
+    phase_id = _arg_string(args, "phase_id")
+    passes = InterruptedWorkerPasses()
+    if _open_phase_named(state, phase_id) is not None:
+        passes = _finish_phase(argparse.Namespace(session_dir=str(session_dir), phase_id=phase_id, status="stopped"))
+        args.interrupted_worker_passes = passes
+        state = _read_state(session_dir)
+    events = _run_events(state)
+    finished = next((event for event in reversed(events)
+                     if event.get("event_type") == "phase_finished" and event.get("phase_id") == phase_id), None)
+    if finished is None:
+        raise SystemExit(f"Cannot drop Phase {phase_id}: no open or finished instance")
+    if finished.get("status") == "completed":
+        raise SystemExit(f"Cannot drop Phase {phase_id}: the newest instance completed")
+    instance = _string(finished.get("phase_instance_id"))
+    previous = next((event for event in reversed(events)
+                     if event.get("event_type") == "phase_dropped" and event.get("phase_instance_id") == instance), None)
+    if previous is not None and previous.get("reason") == reason:
+        return passes
+    phase = {"id": phase_id, "instance_id": instance, "title": finished.get("phase_title", ""),
+             "started_at": finished.get("phase_started_at", 0)}
+    event = _event(state, "phase_dropped", plan_history.now_epoch(), phase_record=phase)
+    event["reason"] = reason
+    _append_event(state, event)
+    _refresh_phase_table(session_dir)
+    return passes
+
+
 def _clear_run_pointer(session_dir: Path, *, record: staff.StaffSnapshot) -> None:
     folder = session_dir.resolve()
     for row in record.rows:
@@ -7296,6 +7330,12 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = finish_phase.add_argument("--finished-at", default="")
     finish_phase.set_defaults(handler=_finish_phase)
 
+    drop_phase = subparsers.add_parser("drop-phase")
+    _ = drop_phase.add_argument("--session-dir", required=True)
+    _ = drop_phase.add_argument("--phase-id", required=True)
+    _ = drop_phase.add_argument("--reason", required=True)
+    drop_phase.set_defaults(handler=_drop_phase)
+
     finish_run = subparsers.add_parser("finish-run")
     _ = finish_run.add_argument("--session-dir", required=True)
     _ = finish_run.add_argument(
@@ -7336,14 +7376,18 @@ def main() -> None:
         return
     session_dir = Path(session_text).expanduser().resolve()
     session_dir.mkdir(parents=True, exist_ok=True)
-    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            result = handler(args)
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-    if isinstance(result, InterruptedWorkerPasses):
-        _close_interrupted_workers(result)
+    result: object = None
+    try:
+        with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                result = handler(args)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    finally:
+        passes: object = getattr(args, "interrupted_worker_passes", result)
+        if isinstance(passes, InterruptedWorkerPasses):
+            _close_interrupted_workers(passes)
 
 
 if __name__ == "__main__":

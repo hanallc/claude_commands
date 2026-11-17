@@ -462,11 +462,22 @@ class ProgressAdjustedMemory(MeasuredMemory):
 
 
 @dataclass(frozen=True)
+class CompilerJob:
+    """The compilers that sccache runs for one step scope, which the scope's step owns."""
+    scope: Path
+    use: AnonymousRunUse | RunUseUnavailable
+
+
+@dataclass(frozen=True)
 class CompilerServiceMemory(MeasuredMemory):
-    """Compiler charge, without a build reservation or run-alone veto."""
+    """Compiler charge, without a build reservation or run-alone veto.
+
+    The bytes leave out the jobs: each job counts in the step that names its scope.
+    """
 
     job_state: IdleService = IdleService()
     pid: int | PidNotRecorded = field(kw_only=True)
+    jobs: tuple[CompilerJob, ...] = field(default=(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -586,7 +597,7 @@ class Waiter(TypedDict):
     need_runs: NotRequired[int]
     need_basis: NotRequired[dict[str, object]]
     test_threads: NotRequired[int | None]
-    # The placement request records the route. A direct command has no route.
+    # Requests can record a route. Direct commands without a reason use DIRECT_CARGO.
     route: NotRequired[StepRoute]
 
 
@@ -1432,6 +1443,12 @@ def pressure_text(pressure: MemoryPressure) -> str:
 def waiter_route(row: Waiter) -> StepRoute:
     """Return the placement route, or keep a direct command where it starts."""
     return row.get("route", DIRECT_CARGO)
+
+
+def direct_cargo_route() -> LocalRequired:
+    """Keep the caller's reason when a direct command must run locally."""
+    reason = os.environ.get("BUILD_QUEUE_LOCAL_REASON", "")
+    return LocalRequired(reason) if reason else DIRECT_CARGO
 
 
 def stored_waiter(row: Waiter) -> Waiter:

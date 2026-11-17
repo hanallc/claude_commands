@@ -127,6 +127,7 @@ class AdmitRequest(CallerCode):
     token_back_at: float = 0.0
     run: RunIdentity | NoRun = NO_RUN
     place: LocalPlace | CloudPlace = LocalPlace()
+    route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -186,6 +187,7 @@ class ServiceEstimateRequest(CallerCode):
     runner: str
     job: str
     test_width: records.TestWidth = field(default_factory=_no_test_width)
+    route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -596,6 +598,9 @@ def _write_wire_record(value: object) -> object:
     if not isinstance(value, dict):
         return value
     record = {key: _write_wire_record(item) for key, item in cast(dict[str, object], value).items()}
+    if (record.get("kind") in ("AdmitRequest", "ServiceEstimateRequest")
+            and record.get("route") == codec.snapshot_value(records.DIRECT_CARGO)):
+        del record["route"]
     # Phase 33: a config change introduces other shares after deployment of the new service.
     if record.get("kind") == "ShapeRankedPeak" and record.get("share_percent") == 10:
         record["kind"] = "ShapeP90"

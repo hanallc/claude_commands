@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from uuid import uuid4
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -139,12 +140,8 @@ class InstalledFrontEndFixture(unittest.TestCase):
     ) -> HookInvocation:
         """Run the canonical hook with a forwarding engine that records its argv."""
 
-        fixture_bin = Path(
-            tempfile.mkdtemp(
-                prefix="cargo-berth-hook-trace.",
-                dir=fixture.temporary_directory.name,
-            )
-        )
+        fixture_bin = Path(fixture.temporary_directory.name) / f"cargo-berth-hook-trace.{uuid4().hex}"
+        fixture_bin.mkdir()
         cargo_call_log = fixture_bin / "cargo-calls.txt"
         cargo_wrapper = fixture_bin / "cargo-berth"
         _ = cargo_wrapper.write_text(

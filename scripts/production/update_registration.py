@@ -25,6 +25,7 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import NamedTuple, NotRequired, TypedDict, cast
+from zoneinfo import ZoneInfo
 
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.checkpoint_gate import report
@@ -32,10 +33,12 @@ from scripts.production.checkpoint_gate import report
 from scripts.production import showrunners, session_staff, showrunner_tree, staff, unit_lookup
 from scripts.production.proposals_folder import issues_folder
 from scripts.production.store_owner import showrunner_id
+from scripts.production.record_store import state_root
 from scripts.production.issues import Issue, frontmatter
 from scripts.lib import urgency
 from scripts.lib.urgency import Urgency, UrgencyError
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.user_zone import user_zone
 
 from scripts.usage import agents_log
 
@@ -372,6 +375,41 @@ class StaffAsker:
 
 
 @dataclass(frozen=True)
+class ProducerQuestions:
+    """A producer owns questions without a production document."""
+
+    owner: staff.StaffRow
+
+    @property
+    def name(self) -> str:
+        return self.owner.name
+
+    @property
+    def zone(self) -> ZoneInfo:
+        return user_zone()
+
+
+QuestionScope = Production | ProducerQuestions
+
+
+def question_owner(reference: str, record: staff.StaffSnapshot) -> staff.StaffRow | None:
+    """Resolve a fixed staff reference or a producer's current name."""
+    return record.by_member_reference(reference) or next(
+        (row for row in record.rows if row.kind == "producer" and row.name == reference), None)
+
+
+def question_scope(reference: str | staff.StaffRow, record: staff.StaffSnapshot) -> QuestionScope:
+    """Read the question owner without requiring a producer to have a production."""
+    owner = reference if isinstance(reference, staff.StaffRow) else question_owner(reference, record)
+    return ProducerQuestions(owner) if owner is not None and owner.kind == "producer" else read_production(reference, record)
+
+
+def question_source(scope: QuestionScope) -> Path | staff.StaffRow:
+    """Select a production document or a producer's fixed staff row."""
+    return scope.owner if isinstance(scope, ProducerQuestions) else scope.doc
+
+
+@dataclass(frozen=True)
 class QuestionStaff:
     """One command's staff identities and current display labels."""
 
@@ -400,7 +438,7 @@ class QuestionStaff:
         except staff.StaffUnreadable as error:
             raise RegistrationFailure("questions", str(error)) from error
 
-    def asker(self, production: Production, unit: str = "") -> staff.StaffRow:
+    def asker(self, production: QuestionScope, unit: str = "") -> staff.StaffRow:
         parent = production.owner
         if not unit:
             return parent
@@ -416,7 +454,7 @@ class QuestionStaff:
         return found.row
 
     def display(self, row: staff.StaffRow) -> tuple[str, str]:
-        parent = row if row.kind == "showrunner" else self.record.parent_of(row)
+        parent = row if row.kind in ("showrunner", "producer") else self.record.parent_of(row)
         return parent.name if parent else "", row.name
 
     def documents(self) -> dict[str, staff.StaffRow]:
@@ -426,12 +464,15 @@ class QuestionStaff:
                 and row.doc.machine == local_machine()}
 
     def production_of(self, session_id: str) -> str | None:
-        """Return the current showrunner's staff name."""
+        """Return the current question owner's staff name."""
         row = self.record.by_current_session(session_id) if session_id else None
-        return row.name if row is not None and row.kind == "showrunner" else None
+        return row.name if row is not None and row.kind in ("showrunner", "producer") else None
 
     def names(self, name: str, below: bool = False) -> list[str]:
         """Select descendants through fixed parent ids, including owners without timers."""
+        owner = question_owner(name, self.record)
+        if owner is not None and owner.kind == "producer":
+            return [owner.name]
         return showrunner_tree.user_facing(name, below, record=self.record)
 
 
@@ -467,7 +508,7 @@ class AnswerRelay:
     unit: str = ""
 
 
-def answer_relay(production: Production, name: str, asker: QuestionAsker,
+def answer_relay(production: QuestionScope, name: str, asker: QuestionAsker,
                  identities: QuestionStaff | None = None) -> AnswerRelay:
     identities = identities if identities is not None else QuestionStaff.read()
 
@@ -487,6 +528,8 @@ def answer_relay(production: Production, name: str, asker: QuestionAsker,
         row = identities.record.by_member_reference(asker.member_id)
         if row is None:
             return target(f"relay: none; staff member {asker.member_id} is unavailable")
+        if row.kind == "producer":
+            return target(f"relay: to {row.name} (staff {row.id})", row.id)
         current_owner = production.owner
         current_name, label = identities.display(row)
         if row.kind == "showrunner":
@@ -512,7 +555,7 @@ def answer_relay(production: Production, name: str, asker: QuestionAsker,
 
 
 
-def relay_line(production: Production, name: str, asker: QuestionAsker,
+def relay_line(production: QuestionScope, name: str, asker: QuestionAsker,
                identities: QuestionStaff | None = None) -> str:
     return answer_relay(production, name, asker, identities).line
 
@@ -559,7 +602,7 @@ def record_answer(outstanding: Path, name: str, item: OutstandingItem, now: date
                       "".join(json.dumps(saved) + "\n" for saved in [*retained, entry]))
 
 
-def replay_answer(production: Production, item: AnsweredItem, identities: QuestionStaff | None = None) -> None:
+def replay_answer(production: QuestionScope, item: AnsweredItem, identities: QuestionStaff | None = None) -> None:
     dated = datetime.fromisoformat(item["time"].replace("Z", "+00:00"))
     print(f"already answered {dated:%a %b %d %H:%M}")
     print(relay_line(production, item["name"],
@@ -641,7 +684,7 @@ def notifier(arguments: list[str]) -> str:
 def remove_updates(owner: staff.StaffRow) -> None:
     """Remove the generated schedule files and retain reminders and history."""
     _ = notifier(["remove", f"showrunner-{owner.id}"])
-    root = _showrunner_state_root()
+    root = state_root()
     (root / "counts" / owner.id).unlink(missing_ok=True)
 
 
@@ -872,19 +915,16 @@ def report_items(fields: dict[str, object], path: Path, step: str) -> KeepReport
     return ReplaceReports(tuple(reports))
 
 
-def _showrunner_state_root() -> Path:
-    return Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
-
-
 def outstanding_file(reference: str, *, identities: QuestionStaff | None = None) -> Path:
-    root = _showrunner_state_root()
+    root = state_root()
     identities = identities if identities is not None else QuestionStaff.read()
-    identity = showrunner_id(reference, record=identities.record)
+    member = question_owner(reference, identities.record)
+    identity = member.id if member is not None and member.kind == "producer" else showrunner_id(reference, record=identities.record)
     return root / "outstanding" / f"{identity}.json"
 
 
-def outstanding_path(production: Production) -> Path:
-    root = _showrunner_state_root()
+def outstanding_path(production: QuestionScope) -> Path:
+    root = state_root()
     owner = production.owner
     return root / "outstanding" / f"{owner.id}.json"
 
@@ -904,15 +944,19 @@ class QuestionOwnerUnavailable:
     document: Path
 
 
-def question_folder(document: Path, identities: QuestionStaff, *,
+def question_folder(document: Path | staff.StaffRow, identities: QuestionStaff, *,
                     lines: list[str] | None = None) -> QuestionFolder | QuestionOwnerUnavailable:
     """Select the production's question folder from its document and staff context."""
+    if isinstance(document, staff.StaffRow):
+        if document.kind != "producer":
+            raise RegistrationFailure("questions", f"{document.id}: expected a producer")
+        return QuestionFolder(state_root() / document.id / "questions", document.id)
     owner = identities.record.by_doc(local_machine(), document)
     if owner is None or owner.kind != "showrunner":
         return QuestionOwnerUnavailable(document)
     assert isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
     folder = issues_folder(owner.doc.path, lines=lines)
-    root = _showrunner_state_root()
+    root = state_root()
     return QuestionFolder(folder if folder is not None else root / owner.id / "questions", owner.id)
 
 
@@ -927,17 +971,17 @@ class QuestionRecord:
     status: str
 
 
-def question_records(production: Production, identities: QuestionStaff) -> list[QuestionRecord]:
-    return question_records_for_document(production.doc, identities)
+def question_records(production: QuestionScope, identities: QuestionStaff) -> list[QuestionRecord]:
+    return question_records_for_document(question_source(production), identities)
 
 
-def question_records_for_document(doc: Path, identities: QuestionStaff, *, include_unrouted: bool = False,
+def question_records_for_document(doc: Path | staff.StaffRow, identities: QuestionStaff, *, include_unrouted: bool = False,
                                   lines: list[str] | None = None,
                                   sources: list[Path] | None = None) -> list[QuestionRecord]:
     """Read canonical question records without requiring unrelated checkpoint fields."""
     folder = question_folder(doc, identities, lines=lines)
     if isinstance(folder, QuestionOwnerUnavailable):
-        source = issues_folder(doc, lines=lines) if include_unrouted else None
+        source = issues_folder(folder.document, lines=lines) if include_unrouted else None
         if source is None:
             return []
     else:
@@ -952,9 +996,9 @@ def question_records_for_document(doc: Path, identities: QuestionStaff, *, inclu
 
 
 def unowned_question_records(identities: QuestionStaff) -> list[QuestionRecord]:
-    """Read state folders whose owners have no live showrunner row."""
+    """Read state questions, including producers without production documents."""
     owners = {row.id for row in identities.record.rows if row.kind == "showrunner"}
-    paths = sorted(_showrunner_state_root().glob("*/questions/question-*.md"))
+    paths = sorted(state_root().glob("*/questions/question-*.md"))
     return _question_records([Issue(path, frontmatter(path)) for path in paths if path.parent.parent.name not in owners])
 
 
@@ -1008,13 +1052,13 @@ def write_question_record(record: QuestionRecord) -> None:
         write_text_atomic(record.path, text)
 
 
-def store_questions(production: Production, entries: list[OutstandingItem], identities: QuestionStaff) -> None:
+def store_questions(production: QuestionScope, entries: list[OutstandingItem], identities: QuestionStaff) -> None:
     """Store questions in their records and close questions absent from the new list."""
     questions = [entry for entry in entries if "question" in entry]
     existing = question_records(production, identities)
     if not questions and not existing:
         return
-    folder = question_folder(production.doc, identities)
+    folder = question_folder(question_source(production), identities)
     if isinstance(folder, QuestionOwnerUnavailable):
         raise RegistrationFailure("questions", f"{folder.document}: no showrunner staff row")
     owner = folder.owner
@@ -1034,7 +1078,7 @@ def store_questions(production: Production, entries: list[OutstandingItem], iden
             write_question_record(QuestionRecord(record.path, record.owner, record.asker, record.item, "closed"))
 
 
-def question_member(production: Production, item: OutstandingItem, identities: QuestionStaff) -> staff.StaffRow:
+def question_member(production: QuestionScope, item: OutstandingItem, identities: QuestionStaff) -> staff.StaffRow:
     reference = item.get("asked_by", "")
     row = identities.record.by_member_reference(reference) if reference else None
     if row is None:
@@ -1064,7 +1108,7 @@ def migrate_questions(production: Production, *, identities: QuestionStaff | Non
     report("migrate-questions", "ok", "recorded")
 
 
-def questions_table(production: Production, *, identities: QuestionStaff | None = None) -> None:
+def questions_table(production: QuestionScope, *, identities: QuestionStaff | None = None) -> None:
     """Print question issues without including proposals or ordinary reminders."""
     identities = identities if identities is not None else QuestionStaff.read()
     records = [record for record in question_records(production, identities) if record.status == "open"]
@@ -1119,7 +1163,7 @@ def stored_entries(outstanding: Path) -> list[OutstandingItem]:
     return cast(list[OutstandingItem], reminders)
 
 
-def open_entries(production: Production, identities: QuestionStaff) -> list[OutstandingItem]:
+def open_entries(production: QuestionScope, identities: QuestionStaff) -> list[OutstandingItem]:
     """Read reminders and open question records from their owning stores."""
     return [*stored_entries(outstanding_path(production)),
             *(record.item.copy() for record in question_records(production, identities) if record.status == "open")]
@@ -1129,11 +1173,11 @@ class QuestionStoreUnreadable(InputError, ValueError):
     """The canonical question store or its reminder list is invalid."""
 
 
-def read_open_fields(path: Path | None, *, production: Production | None = None,
-                     identities: QuestionStaff | None = None, document: Path | None = None,
+def read_open_fields(path: Path | None, *, production: QuestionScope | None = None,
+                     identities: QuestionStaff | None = None, document: Path | staff.StaffRow | None = None,
                      sources: list[Path] | None = None) -> list[OutstandingItem]:
     """Read reminders and canonical questions. A source collector requires complete reads."""
-    document = production.doc if production is not None else document
+    document = question_source(production) if production is not None else document
     if path is None and document is None:
         return []
     try:
@@ -1143,11 +1187,11 @@ def read_open_fields(path: Path | None, *, production: Production | None = None,
         identities = identities if identities is not None else QuestionStaff.read(sources=sources)
         if document is None:
             row = identities.record.by_id(staff.StaffId(cast(Path, path).stem))
-            document = (row.doc.path if row is not None and isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))
-                        else None)
+            document = (row if row is not None and row.kind == "producer"
+                        else row.doc.path if row is not None and isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) else None)
             if document is None:
                 return entries
-        if sources is not None:
+        if sources is not None and isinstance(document, Path):
             sources.append(document)
         entries.extend(record.item.copy() for record in question_records_for_document(document, identities, sources=sources)
                        if record.status == "open")
@@ -1156,12 +1200,12 @@ def read_open_fields(path: Path | None, *, production: Production | None = None,
         raise QuestionStoreUnreadable(str(error)) from error
 
 
-def read_open_items(path: Path | None, *, production: Production | None = None,
-                    identities: QuestionStaff | None = None, document: Path | None = None,
+def read_open_items(path: Path | None, *, production: QuestionScope | None = None,
+                    identities: QuestionStaff | None = None, document: Path | staff.StaffRow | None = None,
                     sources: list[Path] | None = None) -> list[Outstanding]:
     """Parse open reminders and questions with the same source collector."""
     entries = read_open_fields(path, production=production, identities=identities, document=document, sources=sources)
-    location = path or document or (production.doc if production is not None else Path("questions"))
+    location = path or (document if isinstance(document, Path) else Path("questions"))
     return parse_outstanding_entries(entries, location)
 
 
@@ -1173,7 +1217,7 @@ def due(items: list[Outstanding], now: datetime) -> list[Outstanding]:
 
 def read_all_open_fields() -> list[OutstandingItem]:
     """Read local open fields with one staff context and skip unreadable stores."""
-    root = _showrunner_state_root()
+    root = state_root()
     paths = {path.stem: path for path in (root / "outstanding").glob("*.json")}
     fields: list[OutstandingItem] = []
     identities = QuestionStaff.for_record(staff.initial_snapshot())
@@ -1187,7 +1231,7 @@ def read_all_open_fields() -> list[OutstandingItem]:
     return fields
 
 
-def write_open_entries(production: Production, entries: list[OutstandingItem], identities: QuestionStaff) -> None:
+def write_open_entries(production: QuestionScope, entries: list[OutstandingItem], identities: QuestionStaff) -> None:
     """Keep unrecorded legacy questions before replacing their JSON list."""
     path = outstanding_path(production)
     legacy = [entry for entry in legacy_entries(path) if "question" in entry]
@@ -1236,7 +1280,7 @@ class OpenLists(NamedTuple):
     awaiting: list[OpenItem]
 
 
-def question_queue(production: Production, below: bool = False) -> str:
+def question_queue(production: QuestionScope, below: bool = False) -> str:
     """The queue name for the production question that /next displayed."""
     return question_queue_name(production.owner.id, below)
 
@@ -1257,7 +1301,7 @@ def item_key(name: str, text: str) -> str:
     return f"{name}: {text}"
 
 
-def open_lists(production: Production, below: bool = False, *, identities: QuestionStaff | None = None) -> OpenLists:
+def open_lists(production: QuestionScope, below: bool = False, *, identities: QuestionStaff | None = None) -> OpenLists:
     """Read due items, deferred items and unreadable lists from the selected productions."""
     identities = identities if identities is not None else QuestionStaff.read()
     now = datetime.now(production.zone).replace(tzinfo=None)
@@ -1266,6 +1310,7 @@ def open_lists(production: Production, below: bool = False, *, identities: Quest
     awaiting: list[OpenItem] = []
     unreadable: list[str] = []
     documents = identities.documents()
+    documents.update({row.name: row for row in identities.record.rows if row.kind == "producer"})
     for name in identities.names(production.name, below):
         if name not in documents:
             print(f"questions: {name}: ownership evidence is unavailable", file=sys.stderr)
@@ -1359,7 +1404,7 @@ def mark_important(production: Production, words: str) -> None:
 SHOWRUNNER_ASKER = "showrunner"
 
 
-def ask(production: Production, text: str, parts: QuestionParts, unit: str, rank: Ranking, *,
+def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, rank: Ranking, *,
         identities: QuestionStaff | None = None) -> None:
     """Review and file a question with its asker's fixed staff id; its parts keep their layout on the Questions page."""
     identities = identities if identities is not None else QuestionStaff.read()
@@ -1402,7 +1447,7 @@ def ask(production: Production, text: str, parts: QuestionParts, unit: str, rank
     report("ask", "ok", f"{text}: on the open-questions list of {production.name}, not shown to the user")
 
 
-def answer(production: Production, words: str, *, identities: QuestionStaff | None = None,
+def answer(production: QuestionScope, words: str, *, identities: QuestionStaff | None = None,
            only_open: bool = False) -> AnswerRelay:
     """Answer one item and resolve its asker's current staff row for relay."""
     identities = identities if identities is not None else QuestionStaff.read()
@@ -1445,7 +1490,7 @@ def answer(production: Production, words: str, *, identities: QuestionStaff | No
     return relay
 
 
-def remove_open_item(production: Production, name: str, text: str, identities: QuestionStaff, verb: str,
+def remove_open_item(production: QuestionScope, name: str, text: str, identities: QuestionStaff, verb: str,
                      record: Callable[[Path, OutstandingItem, datetime], None]) -> OutstandingItem:
     """Record and remove one open item under its owner's lock."""
     path = outstanding_file(name, identities=identities)
@@ -1463,7 +1508,7 @@ def remove_open_item(production: Production, name: str, text: str, identities: Q
     return removed
 
 
-def withdraw(production: Production, words: str, *, identities: QuestionStaff | None = None) -> None:
+def withdraw(production: QuestionScope, words: str, *, identities: QuestionStaff | None = None) -> None:
     """Remove one exact open item without an answer or a relay."""
     identities = identities if identities is not None else QuestionStaff.read()
     wanted = words.strip()
@@ -1479,7 +1524,7 @@ def withdraw(production: Production, words: str, *, identities: QuestionStaff | 
     report("withdraw", "ok", f"{name}: {text}")
 
 
-def change_open_question(production: Production, name: str, text: str, identities: QuestionStaff, verb: str,
+def change_open_question(production: QuestionScope, name: str, text: str, identities: QuestionStaff, verb: str,
                          change: Callable[[OutstandingItem], None]) -> OutstandingItem:
     """Change one open question under its owner's lock and write it back."""
     path = outstanding_file(name, identities=identities)
@@ -1494,7 +1539,7 @@ def change_open_question(production: Production, name: str, text: str, identitie
     return found
 
 
-def followup(production: Production, text: str, words: str, *, identities: QuestionStaff | None = None) -> AnswerRelay:
+def followup(production: QuestionScope, text: str, words: str, *, identities: QuestionStaff | None = None) -> AnswerRelay:
     """Send the asker a follow-up: the question leaves the due list until the asker replies."""
     identities = identities if identities is not None else QuestionStaff.read()
     if not words.strip():
@@ -1510,7 +1555,7 @@ def followup(production: Production, text: str, words: str, *, identities: Quest
     return answer_relay(production, production.name, question_asker(changed, OpenItemWithoutAsker(), identities), identities)
 
 
-def reply(production: Production, words: str, text: str, *, identities: QuestionStaff | None = None) -> None:
+def reply(production: QuestionScope, words: str, text: str, *, identities: QuestionStaff | None = None) -> None:
     """Record the asker's reply to the follow-up; the question returns to the user with both."""
     identities = identities if identities is not None else QuestionStaff.read()
     if not text.strip():
@@ -1812,19 +1857,54 @@ def main() -> int:
             prompt = scheduled_prompt(minutes, production)
             print(f"showrunner-timer-{production.owner.name}\n{prompt}" if action == "delivery" else prompt)
             return 0
-        identities = QuestionStaff.read() if action in ("ask", "questions-table") else None
+        identities = QuestionStaff.read() if action in ("ask", "reply", "answer", "withdraw", "questions-table") else None
         name = cast(str | None, args.production)
         if name is None:
             assert identities is not None
             if action == "ask":
                 unit = cast(str, args.unit)
-                if not unit:
+                caller = identities.record.by_current_session(staff.caller_identity())
+                if not unit and caller is not None and caller.kind == "producer":
+                    name = str(caller.id)
+                elif unit:
+                    name = unit_lookup.unit_parent(unit, session_staff.StoredReference(unit), record=identities.record).name
+                else:
                     raise RegistrationFailure(action, "pass --unit <staff id> or --production <name>")
-                name = unit_lookup.unit_parent(unit, session_staff.StoredReference(unit), record=identities.record).name
             else:
-                name = identities.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+                name = identities.production_of(staff.caller_identity())
                 if name is None:
                     raise RegistrationFailure(action, "this session is no production's showrunner; pass --production <name>")
+        if action == "ask":
+            assert identities is not None
+            scope = question_scope(name, identities.record)
+            if isinstance(scope, Production):
+                for line in adopt_moved_state(scope, record=identities.record):
+                    report("state-dir", "ok", line)
+            try:
+                level = urgency.read(cast(str, args.urgency), cast(str, args.due))
+            except urgency.UrgencyError:
+                raise RegistrationFailure("ask", "--urgency is user, blocks, soon with --due, normal or later") from None
+            asked = cast(str, args.ask)
+            parts = QuestionParts(ask=asked, context=cast(str, args.context), items=cast(list[str], args.items),
+                                  recommend=cast(str, args.recommend), choices=cast(list[str], args.choices))
+            ask(scope, cast(str, args.text) or asked, parts, cast(str, args.unit), Ranking(level),
+                identities=identities)
+            return 0
+        if action in ("reply", "answer", "withdraw", "questions-table"):
+            assert identities is not None
+            scope = question_scope(name, identities.record)
+            if isinstance(scope, Production):
+                for line in adopt_moved_state(scope, record=identities.record):
+                    report("state-dir", "ok", line)
+            if action == "reply":
+                reply(scope, cast(str, args.item), cast(str, args.text), identities=identities)
+            elif action == "answer":
+                _ = answer(scope, cast(str, args.item), identities=identities)
+            elif action == "withdraw":
+                withdraw(scope, cast(str, args.item), identities=identities)
+            else:
+                questions_table(scope, identities=identities)
+            return 0
         production = read_production(name, identities.record if identities else None)
         for line in adopt_moved_state(production, record=identities.record if identities is not None else None):
             report("state-dir", "ok", line)
@@ -1840,24 +1920,6 @@ def main() -> int:
             next_item(production)
         elif action == "mark-important":
             mark_important(production, cast(str, args.item))
-        elif action == "answer":
-            _ = answer(production, cast(str, args.item))
-        elif action == "withdraw":
-            withdraw(production, cast(str, args.item))
-        elif action == "reply":
-            reply(production, cast(str, args.item), cast(str, args.text))
-        elif action == "ask":
-            try:
-                level = urgency.read(cast(str, args.urgency), cast(str, args.due))
-            except urgency.UrgencyError:
-                raise RegistrationFailure("ask", "--urgency is user, blocks, soon with --due, normal or later") from None
-            asked = cast(str, args.ask)
-            parts = QuestionParts(ask=asked, context=cast(str, args.context), items=cast(list[str], args.items),
-                                  recommend=cast(str, args.recommend), choices=cast(list[str], args.choices))
-            ask(production, cast(str, args.text) or asked, parts, cast(str, args.unit), Ranking(level),
-                identities=identities)
-        elif action == "questions-table":
-            questions_table(production, identities=identities)
         elif action == "migrate-questions":
             migrate_questions(production)
         else:

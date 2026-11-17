@@ -73,8 +73,10 @@ StepRoute = AnyEligibleTarget | LocalRequired | MacOnly | PinnedTarget
 MAC_ONLY = MacOnly()
 
 
-def step_route(*, local: bool, mac_only: bool, target: str, writes_tree: bool) -> StepRoute:
+def step_route(*, local: bool, mac_only: bool, target: str, writes_tree: bool, local_reason: str = "") -> StepRoute:
     """Apply the placement client's order: tree writes and --local stay on natedev, then --mac-only, then a pin."""
+    if local_reason:
+        return LocalRequired(local_reason)
     if writes_tree:
         return WRITES_TREE
     if local:

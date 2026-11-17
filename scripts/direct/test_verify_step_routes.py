@@ -5,6 +5,11 @@ import json
 from pathlib import Path
 import unittest
 from typing import cast
+from unittest import mock
+
+from scripts.build_queue import admission_protocol as wire, admission_service as service
+from scripts.build_queue.admission_test_support import caller_admission
+from scripts.build_targets import target_config
 
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture, TARGETS as TARGETS, RUNNER as RUNNER
 
@@ -29,7 +34,21 @@ class VerifyStepRoutesTests(VerifyStepRoutesFixture):
     def test_natedev_only_waits_for_release_before_running(self) -> None:
         # A check is natedev_only only through --local; linux_only never keeps a check off the Mac.
         self.fixture.environment["TEST_MAC_ALLOWED"] = "0"
-        result = self.run_verify("check", "sample", "--local", "creates a Linux install")
+        admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
+        previous = admission.server.handle_request
+        submitted: list[wire.PlacementRequest] = []
+
+        def handle(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                   ) -> list[wire.Reply]:
+            if isinstance(request, wire.PlacementRequest):
+                submitted.append(request)
+            return previous(request, connection)
+
+        with mock.patch.object(admission.server, "handle_request", side_effect=handle):
+            result = self.run_verify("check", "sample", "--local", "creates a Linux install")
+        self.assertTrue(submitted)
+        self.assertTrue(all(request.route == target_config.LocalRequired("creates a Linux install")
+                            for request in submitted))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         commands = [cast(dict[str, object], json.loads(line))["command"] for line in self.events.read_text().splitlines()]
         self.assertTrue(self.fixture.local_waits)

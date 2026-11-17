@@ -39,15 +39,19 @@ if mode == "slow":
     time.sleep(10)
 if mode == "race":
     for answer in (root / ".local/state/mac-gate").glob("answer-*"):
-        if not answer.name.endswith(".timeout"):
+        if not answer.name.endswith((".timeout", ".errors")):
             answer.with_name(answer.name + ".timeout").write_text("timeout")
 if mode == "broken":
     print("not a tab record")
+elif mode in ("unreachable", "silent-failure"):
+    if mode == "unreachable":
+        print("memory admission check failed (no socket); step refused", file=sys.stderr)
+        print("admission service unavailable: no socket", file=sys.stderr)
+    raise SystemExit(2)
 else:
     state, target, reason, status = {
         "closed": ("closed", "mac", "placement episode/attempt closed", 1),
         "unknown": ("unknown", "mac", "placement not found", 1),
-        "unreachable": ("unknown", "mac", "service unavailable", 2),
         "linux": ("closed", "linux", "target is linux", 1),
     }.get(mode, ("current", "mac", "", 0))
     print("\\t".join((state, target, "fixture", "fixture", "claim", reason)))
@@ -137,13 +141,17 @@ class CargoGateTests(unittest.TestCase):
                     self.assertEqual(next((root / ".local/state/mac-gate/records").iterdir()).stat().st_mode & 0o777, 0o600)
 
     def test_agent_markers_and_failed_checks_refuse_without_starting_a_program(self) -> None:
-        cases = [(marker, "", "current", "no placement")
+        route = "; run it through mac_queue_run.py"
+        cases = [(marker, "", "current", "no placement" + route)
                  for marker in ("CLAUDECODE", "CODEX_HOME", "SSH_CONNECTION", "SSH_CLIENT")]
+        # A failed check names its own cause: a timeout only when the timer ended it.
         cases += [("SSH_CONNECTION", "episode/attempt", mode, reason) for mode, reason in (
-            ("closed", "placement episode/attempt closed"), ("linux", "target is linux"),
-            ("slow", "no answer in 1s"), ("broken", "no answer in 1s"),
-            ("unknown", "placement not found"), ("unreachable", "no answer in 1s"))]
-        cases += [("SSH_CONNECTION", value, "current", "no placement") for value in
+            ("closed", "placement episode/attempt closed" + route), ("linux", "target is linux" + route),
+            ("slow", "no answer in 1s"), ("broken", "invalid placement answer"),
+            ("unknown", "placement not found" + route),
+            ("unreachable", "placement check failed with status 2: admission service unavailable: no socket"),
+            ("silent-failure", "placement check failed with status 2"))]
+        cases += [("SSH_CONNECTION", value, "current", "no placement" + route) for value in
                   ("episode/a;touch injected", "e$(id)/a", "episode/a/b", "episode/a b")]
         for marker, placement, mode, reason in cases:
             with self.subTest(marker=marker, mode=mode), tempfile.TemporaryDirectory() as temporary:
@@ -151,7 +159,7 @@ class CargoGateTests(unittest.TestCase):
                 environment = {**self.fixture(root), marker: "1", "MAC_PLACEMENT": placement, "CHECK_MODE": mode}
                 result = self.run_gate(environment)
                 self.assertEqual(result.returncode, 125, result.stdout + result.stderr)
-                self.assertEqual(result.stderr, f"mac cargo gate refused: {reason}; run it through mac_queue_run.py\n")
+                self.assertEqual(result.stderr, f"mac cargo gate refused: {reason}\n")
                 self.assertFalse((root / "runs").exists())
                 if reason == "no placement":
                     self.assertFalse((root / "checks").exists())

@@ -1,12 +1,15 @@
 //! The facts of one blob, written as JSON lines.
 
 use std::collections::BTreeSet;
+use std::fmt::Write;
 
 use gix::ObjectId;
 #[cfg(test)]
 use libc::LC_CTYPE;
 use serde::Serialize;
 use serde_json::Error;
+use sha2::Digest;
+use sha2::Sha256;
 
 use crate::constants::CARRIAGE_RETURN_LINE_FEED;
 use crate::constants::MODULE_SITES_FACT;
@@ -19,11 +22,16 @@ use crate::module_sites;
 use crate::module_sites::ModuleSiteReading;
 use crate::module_sites::ModuleSitesQuery;
 use crate::name_sites;
+use crate::name_sites::BodyFacts;
+use crate::name_sites::BodyTokens;
 use crate::name_sites::NameSiteReading;
 use crate::request::FactKind;
 use crate::request::NameWordClass;
 use crate::tokenizer;
+use crate::tokenizer::CommentSpan;
 use crate::tokenizer::Token;
+use crate::tokenizer::TokenKind;
+use crate::tokenizer::TokenReading;
 use crate::unicode_tables::LINE_BOUNDARIES;
 
 /// One output line for one requested blob fact.
@@ -60,8 +68,9 @@ enum FactValue<'a> {
     Names(BTreeSet<String>),
     Tokens(&'a [Token]),
     ModuleScan(ModuleScan),
-    Declarations(&'a DeclaredFile),
-    NameSites(Vec<NameSiteReading>),
+    Declarations(DeclarationFacts<'a>),
+    NameSites(&'a [NameSiteReading]),
+    RustCode(String),
 }
 
 /// Why a blob has no facts.
@@ -76,7 +85,15 @@ enum Unreadable {
 /// Declarations read once for both declaration facts and name sites.
 enum DeclarationReading {
     NotRequested,
-    Read(DeclaredFile),
+    Read { file: DeclaredFile, body: BodyFacts },
+}
+
+/// Declaration structure and the normalized offsets share one blob reading.
+#[derive(Serialize)]
+struct DeclarationFacts<'a> {
+    #[serde(flatten)]
+    file:        &'a DeclaredFile,
+    body_tokens: &'a BodyTokens,
 }
 
 /// Facts and module queries share one token read of each blob.
@@ -103,38 +120,44 @@ pub(crate) fn blob_readings(
         )?;
         return Ok(lines);
     }
-    let text: Result<Vec<char>, Unreadable> = std::str::from_utf8(data)
-        .map(|text| text.chars().collect())
-        .map_err(|_| Unreadable::NotUtf8);
-    let Ok(text) = text else {
-        return not_utf8_readings(&blob, data, kinds, queries, word_class);
-    };
+    let valid_utf8 = std::str::from_utf8(data).is_ok();
+    let text: Vec<char> = String::from_utf8_lossy(data).chars().collect();
     let token_kinds = kinds
         .iter()
         .any(|kind| !matches!(kind, FactKind::Lines | FactKind::Names));
-    let tokens = if token_kinds || !queries.is_empty() {
-        tokenizer::tokenize(&text)
+    let reading = if token_kinds || !queries.is_empty() {
+        tokenizer::read_with_comments(&text)
     } else {
-        Vec::new()
+        TokenReading::default()
     };
+    let tokens = &reading.tokens;
     let declarations = if kinds
         .iter()
         .any(|kind| matches!(kind, FactKind::Declarations | FactKind::NameSites))
     {
-        DeclarationReading::Read(declarations::read_tokens(&text, &tokens))
+        let file = declarations::read_tokens(&text, tokens);
+        let body = name_sites::read_facts(&text, &file);
+        DeclarationReading::Read { file, body }
     } else {
         DeclarationReading::NotRequested
     };
     for &fact in kinds {
         let reading = match fact {
+            FactKind::Lines | FactKind::RustCode if !valid_utf8 => {
+                Reading::Unreadable(Unreadable::NotUtf8)
+            },
+            FactKind::Names if !valid_utf8 && matches!(word_class, NameWordClass::PosixAlnum) => {
+                Reading::Unreadable(Unreadable::NotUtf8)
+            },
             FactKind::Lines => Reading::Value(FactValue::Lines(line_count(&text))),
             FactKind::Names => Reading::Value(FactValue::Names(match word_class {
                 NameWordClass::PosixAlnum => names(&text),
                 NameWordClass::Ascii => ascii_names(data),
             })),
-            FactKind::Tokens => Reading::Value(FactValue::Tokens(&tokens)),
+            FactKind::Tokens => Reading::Value(FactValue::Tokens(tokens)),
+            FactKind::RustCode => rust_code(&text, tokens, &reading.comments)?,
             FactKind::ModuleScan => {
-                let scan = module_scan::read_tokens(&tokens);
+                let scan = module_scan::read_tokens(tokens);
                 match scan {
                     ModuleScanReading::Value(value) => Reading::Value(FactValue::ModuleScan(value)),
                     ModuleScanReading::TokenSpansUnreadable => {
@@ -143,11 +166,14 @@ pub(crate) fn blob_readings(
                 }
             },
             FactKind::Declarations | FactKind::NameSites => match &declarations {
-                DeclarationReading::Read(file) if fact == FactKind::Declarations => {
-                    Reading::Value(FactValue::Declarations(file))
+                DeclarationReading::Read { file, body } if fact == FactKind::Declarations => {
+                    Reading::Value(FactValue::Declarations(DeclarationFacts {
+                        file,
+                        body_tokens: &body.tokens,
+                    }))
                 },
-                DeclarationReading::Read(file) => {
-                    Reading::Value(FactValue::NameSites(name_sites::read(&text, file)))
+                DeclarationReading::Read { body, .. } => {
+                    Reading::Value(FactValue::NameSites(&body.sites))
                 },
                 DeclarationReading::NotRequested => continue,
             },
@@ -162,7 +188,7 @@ pub(crate) fn blob_readings(
         )?;
     }
     for query in queries {
-        let sites = module_sites::read_tokens(&text, &tokens, &query.path, &query.moves);
+        let sites = module_sites::read_tokens(&text, tokens, &query.path, &query.moves);
         append_line(
             &mut lines,
             &ModuleSitesLine {
@@ -173,27 +199,6 @@ pub(crate) fn blob_readings(
             },
         )?;
     }
-    Ok(lines)
-}
-
-/// Keep ASCII names readable when the other requested facts require UTF-8.
-fn not_utf8_readings(
-    blob: &str,
-    data: &[u8],
-    kinds: &[FactKind],
-    queries: &[&ModuleSitesQuery],
-    word_class: NameWordClass,
-) -> Result<String, Error> {
-    let mut lines = String::new();
-    let readings = kinds.iter().map(|&fact| {
-        let reading = if fact == FactKind::Names && matches!(word_class, NameWordClass::Ascii) {
-            Reading::Value(FactValue::Names(ascii_names(data)))
-        } else {
-            Reading::Unreadable(Unreadable::NotUtf8)
-        };
-        (fact, reading)
-    });
-    append_unreadable(&mut lines, blob, readings, queries, Unreadable::NotUtf8)?;
     Ok(lines)
 }
 
@@ -254,6 +259,52 @@ fn append_line(lines: &mut String, value: &impl Serialize) -> Result<(), Error> 
     lines.push_str(&serde_json::to_string(value)?);
     lines.push('\n');
     Ok(())
+}
+
+/// Port `_rust_code`: retain each token and each inner doc at its token position.
+fn rust_code(
+    text: &[char],
+    tokens: &[Token],
+    comments: &[CommentSpan],
+) -> Result<Reading<FactValue<'static>>, Error> {
+    if tokens.iter().any(|token| token.kind == TokenKind::Unknown) {
+        return Ok(Reading::Unreadable(Unreadable::TokenSpans));
+    }
+    let code: Vec<_> = tokens
+        .iter()
+        .map(|token| (&token.value, token.kind))
+        .collect();
+    let docs: Vec<_> = comments
+        .iter()
+        .filter(|comment| {
+            text[comment.start..].starts_with(&['/', '/', '!'])
+                || text[comment.start..].starts_with(&['/', '*', '!'])
+        })
+        .map(|comment| {
+            (
+                comment.token_position,
+                text[comment.start..comment.end].iter().collect::<String>(),
+            )
+        })
+        .collect();
+    let serialized = serde_json::to_string(&(code, docs))?;
+    let mut ascii = String::with_capacity(serialized.len());
+    for character in serialized.chars() {
+        if character <= '~' {
+            ascii.push(character);
+        } else {
+            // Python ensure_ascii escapes all non-ASCII code units, including DEL.
+            for unit in character.encode_utf16(&mut [0; 2]) {
+                write!(ascii, "\\u{unit:04x}")
+                    .map_err(std::io::Error::other)
+                    .map_err(Error::io)?;
+            }
+        }
+    }
+    Ok(Reading::Value(FactValue::RustCode(format!(
+        "{:x}",
+        Sha256::digest(ascii.as_bytes())
+    ))))
 }
 
 /// Python `len(text.replace("\r\n", "\n").replace("\r", "\n").splitlines())`.

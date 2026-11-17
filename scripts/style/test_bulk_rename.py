@@ -24,6 +24,7 @@ from unittest import mock
 
 from scripts.style import bulk_rename as bulk
 from scripts.style.style_child_test_support import StyleQueueFake, unqueued_style_children
+from scripts.style.style_reader_test_support import oracle_reader
 from scripts.style import approved_renames
 from scripts.style.approved_renames import OuterBindingBlocked, OuterBindingUnproved
 from scripts.lib import berth_board
@@ -106,6 +107,7 @@ class CargoProjectTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(oracle_reader())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="bulk-rename-test-")))
         self.set_up_tools()
         self.queue = self.enterContext(unqueued_style_children())

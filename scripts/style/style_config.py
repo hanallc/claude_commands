@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -27,6 +28,8 @@ class ReaderSource(StrEnum):
 
 def refill_reader() -> ReaderSource:
     """Read the configured reader for the next operation."""
+    if source := os.environ.get("STYLE_TEST_READER_SOURCE"):
+        return ReaderSource(source)
     return ReaderSource(conf.read_or_repository("style_reader").text("reader"))
 
 

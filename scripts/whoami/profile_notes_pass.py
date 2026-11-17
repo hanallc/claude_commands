@@ -24,7 +24,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections import Counter
@@ -37,6 +36,8 @@ from pathlib import Path
 from types import MappingProxyType, ModuleType
 from typing import Literal, cast, override
 from unittest.mock import patch
+
+from scripts.lib import build_folders
 
 
 
@@ -619,7 +620,7 @@ def profile_pass(stats: Path, peer_python: Mapping[str, str] = NO_PEER_PYTHON) -
     profiler = cProfile.Profile(timer=time.process_time)
     with ExitStack() as stack:
         # Each pass gets fresh state copies, removed when the pass ends.
-        private = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="notes-pass-")))
+        private = Path(stack.enter_context(build_folders.tool_folder("notes-pass")))
         _ = stack.enter_context(patch.object(sys, "dont_write_bytecode", True))
         pass_ = load_pass()
         redirect_state(pass_, private, stack)

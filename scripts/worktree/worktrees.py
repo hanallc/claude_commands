@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.lib.process_failure import failure_detail
+from scripts.lib import build_folders
 from scripts.production import session_staff, staff
 from scripts.agents import remote
 
@@ -394,12 +395,13 @@ def end_landed(repo: Path, merge_branch: str) -> list[Ended | Kept]:
 def make(path: Path, branch: str, caller: Path, repo: Path, snapshot: staff.StaffSnapshot) -> None:
     owner, merge_branch = caller_branch(repo, caller, snapshot)
     base = git(caller, "rev-parse", "HEAD").stdout.strip()
-    _ = git(caller, "worktree", "add", str(path), "-b", branch)
+    _ = build_folders.create_build_folder(build_folders.LinkedEditableRepository(
+        path, caller, build_folders.NewWorktreeBranch(branch, base)))
     record = new_record(path, branch, repo, base, owner, merge_branch)
     try:
         write_record(record)
     except OSError:
-        _ = git(caller, "worktree", "remove", str(path))
+        _ = build_folders.remove_build_folder(path, lambda: git(caller, "worktree", "remove", str(path)))
         _ = git(caller, "branch", "-D", branch)
         raise
     print(f"made worktree {path} on {branch}")

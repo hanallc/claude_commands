@@ -1800,6 +1800,32 @@ class ResumeUnitTests(ShutdownRepositoryFixture):
 
     def test_resumes_the_recorded_session_in_a_worktree_made_from_the_merge_branch(self) -> None:
         self.assert_resumed(*self.resume())
+        self.assertEqual(build_folders.build_folder_state(self.worktree), "free")
+
+    def test_recovery_worktree_uses_an_existing_branch_at_its_saved_tip(self) -> None:
+        _ = git(self.checkout, "branch", "alpha", "main")
+        unit = shutdown.recovery_find_unit("alpha", "alpha")
+        assert isinstance(unit, shutdown.RetiredUnitRecovery)
+        with redirect_stdout(io.StringIO()) as output:
+            shutdown.recovery_make_worktree(unit)
+        self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha")
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), git(self.checkout, "rev-parse", "alpha"))
+        self.assertIn(f"made: worktree {self.worktree} on alpha", output.getvalue())
+        self.assertEqual(build_folders.build_folder_state(self.worktree), "free")
+
+    def test_recovery_retries_after_a_checkout_hook_fails(self) -> None:
+        hook = self.checkout / ".git/hooks/post-checkout"
+        _ = hook.write_text("#!/bin/sh\nprintf 'checkout failed' >&2\nexit 1\n")
+        hook.chmod(0o755)
+        code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertIn("checkout failed", output)
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(git(self.checkout, "branch", "--list", "alpha"), "")
+        self.assertEqual(self.calls, [])
+        hook.unlink()
+        self.assert_resumed(*self.resume())
+        self.assertEqual(build_folders.build_folder_state(self.worktree), "free")
 
     def test_retired_as_built_without_a_header_is_passed_to_the_resume_launch(self) -> None:
         plan = "docs/as-built/alpha.md"

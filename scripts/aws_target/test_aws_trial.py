@@ -1,8 +1,7 @@
 """Measure trial lifecycles with a fake AWS command and clock."""
 from __future__ import annotations
 
-from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
-from scripts.lib.checkout_test_support import copy_startup
+from scripts.lib.checkout_test_support import copy_startup, copy_test_runner
 
 from collections.abc import Callable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
@@ -12,6 +11,7 @@ from io import StringIO
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import signal
@@ -27,7 +27,7 @@ import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
-from scripts.aws_target import admin_secrets, cloud_gate, gate_box, gate_trial as trial, ledger
+from scripts.aws_target import admin_secrets, aws_trial as trial, cloud_gate, gate_box, ledger
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.aws_target.aws_target import AwsCli
 from scripts.production import merge_gate
@@ -311,13 +311,16 @@ class PairedTrialTests(CostFixture):
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
         _ = self.enterContext(mock.patch.object(trial, 'account_settings_path', return_value=self.settings))
         shipped = Path(__file__).resolve().parents[2]
-        _ = (self.root / 'cloud_gate.conf').write_text((shipped / 'config/cloud_gate.conf').read_text())
+        # The fixture pins its branch prefix, so a tuned live prefix changes no test.
+        _ = (self.root / 'cloud_gate.conf').write_text(re.sub(
+            r'(?m)^trial_branch_prefix=.*$', 'trial_branch_prefix=gate-trial',
+            (shipped / 'config/cloud_gate.conf').read_text()))
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         for args in (('init', '-q'), ('config', 'user.name', 'Fixture'), ('config', 'user.email', 'fixture@example.invalid')):
             _ = trial.checked_git(self.repo, *args)
-        for relative in (*STARTUP_FILES, 'scripts/test_times/module_run.py', 'scripts/lib/descendants.py',
-                         'scripts/lib/process_group.py', 'scripts/aws_target/gate_box.py',
+        copy_test_runner(self.repo)
+        for relative in ('scripts/lib/process_group.py', 'scripts/aws_target/gate_box.py',
                          'scripts/aws_target/__init__.py'):
             path = self.repo / relative
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -328,7 +331,7 @@ class PairedTrialTests(CostFixture):
             + "    return {**environment, 'TMPDIR': str(root), 'TEST_TIMES_OUT': str(root / 'test-times.json')}\n"
             + "def process_memory_mib(roots):\n"
             + "    return {pid: 0.0 for pid in roots}\n")
-        (self.repo / 'config').mkdir()
+        (self.repo / 'config').mkdir(exist_ok=True)
         (self.repo / 'scripts/fixture').mkdir()
         _ = (self.repo / 'scripts/fixture/test_sample.py').write_text('''import json, os, pathlib, unittest
 class Sample(unittest.TestCase):
@@ -706,13 +709,13 @@ os.execv({git!r}, [{git!r}, *arguments])
         script = '''import ctypes, json, os, signal, sys
 from pathlib import Path
 from unittest import mock
-from scripts.aws_target import gate_trial
+from scripts.aws_target import aws_trial
 from scripts.lib.process_group import send_process_group
 assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
 repo, base, changed, state, settings, pids = sys.argv[1:]
-with (mock.patch.object(gate_trial, 'account_settings_path', return_value=Path(settings)),
-      mock.patch.object(gate_trial, 'paired_service', side_effect=AssertionError('unexpected service'))):
-    status = gate_trial.paired_main(['--repo', repo, '--base', base, '--changed', changed,
+with (mock.patch.object(aws_trial, 'account_settings_path', return_value=Path(settings)),
+      mock.patch.object(aws_trial, 'paired_service', side_effect=AssertionError('unexpected service'))):
+    status = aws_trial.paired_main(['--repo', repo, '--base', base, '--changed', changed,
                                    '--modules', 'fixture/test_sample.py'], Path(state))
 assert status == 1
 processes = json.loads(Path(pids).read_text())
@@ -912,9 +915,9 @@ pathlib.Path({str(box)!r}, 'uploaded-' + sys.argv[-1]).write_bytes(sys.stdin.buf
         for number in (signal.SIGINT,):
             script = '''import signal, sys
 from unittest import mock
-from scripts.aws_target import gate_trial
-with mock.patch.object(gate_trial.subprocess, 'call', side_effect=lambda command: signal.raise_signal(int(sys.argv[1]))), mock.patch.object(gate_trial.subprocess, 'run') as stop:
-    assert gate_trial.paired_service(['fixture'], 'fixture-unit') == 1
+from scripts.aws_target import aws_trial
+with mock.patch.object(aws_trial.subprocess, 'call', side_effect=lambda command: signal.raise_signal(int(sys.argv[1]))), mock.patch.object(aws_trial.subprocess, 'run') as stop:
+    assert aws_trial.paired_service(['fixture'], 'fixture-unit') == 1
     stop.assert_called_once_with(['systemctl', '--user', 'stop', 'fixture-unit'], check=False)
 '''
             reply = subprocess.run([sys.executable, '-c', script, str(number)], capture_output=True, text=True,

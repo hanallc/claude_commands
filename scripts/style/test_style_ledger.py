@@ -378,7 +378,7 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names"))), 1)
 
         for source_version, route in ((40, "sql"), (40, "ledger"), (41, "sql"), (41, "ledger"),
-                                      (42, "sql"), (42, "ledger")):
+                                      (42, "sql"), (42, "ledger"), (46, "sql"), (46, "ledger")):
             with self.subTest(candidate_migration=route, source_version=source_version):
                 database = self.root / f"phase-one-{source_version}-{route}.sqlite"
                 with closing(sqlite3.connect(database)) as connection:
@@ -388,6 +388,12 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                     _ = connection.execute(
                         "INSERT INTO refill_objects(object_store,object_id,reader_version,fact_kind,fact_key,line_count) "
                         + "VALUES ('store','blob',1,'line_count','',7)")
+                    if source_version >= 42:
+                        old_modules = json.dumps({"type": "scripts.style.style_plan.ModuleDeclarationText", "fields": {
+                            "words": {"tuple": ["mod", "child", ";"]}, "starts": {"set": [0]},
+                            "modules": {"tuple": []}, "declarations": {"tuple": []}}})
+                        _ = connection.execute(
+                            "INSERT INTO refill_inputs VALUES ('store','footprint_modules','blob',1,?)", (old_modules,))
                     _ = connection.execute("CREATE TABLE schema_version(version INTEGER NOT NULL)")
                     _ = connection.execute("INSERT INTO schema_version VALUES (?)", (source_version,))
                     connection.commit()
@@ -407,6 +413,8 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                     counts = cast(list[tuple[int]], connection.execute(
                         "SELECT line_count FROM refill_objects WHERE fact_kind='line_count'").fetchall())
                     self.assertEqual(counts, [(7,)])
+                    self.assertEqual(connection.execute(
+                        "SELECT result FROM refill_inputs WHERE input_kind='footprint_modules'").fetchall(), [])
 
     def pipeline_tickets(self) -> tuple[style_ledger.Ledger, str, str]:
         rule = self.rule("pipeline")

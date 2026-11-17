@@ -1571,6 +1571,7 @@ class AdmissionServer:
             "need_source": profile.peak.source, "need_runs": profile.peak.count,
             "need_basis": gate.need_basis_record(profile.peak.basis), "test_scope": profile.scope,
             "repository_name": profile.repo,
+            "route": request.route if isinstance(request, wire.AdmitRequest) else records.DIRECT_CARGO,
         }
         if isinstance(place, WaiterPlace) and not isinstance(place.priority_since, OrderNotStarted):
             row["priority_since"] = place.priority_since
@@ -2198,7 +2199,8 @@ class AdmissionServer:
         if ci_holds:
             held_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
                 row.get("step", ""), row.get("folder", ""), row["since"], row["need"], reason,
-                row.get("unit", "")) for episode, reason in ci_holds.items() for row in (self.waiters[episode].row,))
+                row.get("unit", ""), route=records.waiter_route(row))
+                for episode, reason in ci_holds.items() for row in (self.waiters[episode].row,))
             reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, *held_steps)),
                 ordered=[*reading.ordered, *((self.state_dir / records.waiter_owner(self.waiters[episode].row),
                     gate.rank_waiter(self.waiters[episode].row, records.NormalOrder())) for episode in ci_holds)])
@@ -3433,7 +3435,7 @@ done
         identity = wire.Identity("", label, estimate.profile.step, request.worktree, request.runner)
         return ServiceEstimatedAdmission(request.episode, request.owner, request.argv, request.cwd, request.since,
             request.sidecar, identity, records.NoCallRecord(), request.test_width, estimate.profile,
-            isinstance(estimate.cache, records.FreshTest), code_version=request.code_version)
+            isinstance(estimate.cache, records.FreshTest), route=request.route, code_version=request.code_version)
 
     def handle_request(self, request: wire.Request, connection: Connection | NoConnection = NO_CONNECTION
                        ) -> list[wire.Reply]:

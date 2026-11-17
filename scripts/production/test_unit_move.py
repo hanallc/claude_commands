@@ -966,9 +966,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
         world = PaneWorld()
         world.setup(self)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.home / ".claude")})))
-        config = self.root / "conf/direct.conf"
-        write_text_atomic(config.with_name("production.conf"), self.configuration.read_text())
-        write_text_atomic(config, config.read_text().replace("WORKER_TRANSPORT=mesh", "WORKER_TRANSPORT=herdr"))
+        write_text_atomic(self.root / "conf/production.conf", self.configuration.read_text())
         idle = fixture_worker("idle", self.owner.id)
         world.add(self.owner, "w1:p0")
         world.add(idle, "w1:p1")

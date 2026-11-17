@@ -1556,6 +1556,8 @@ def reader_payload(offsets: dict[str, int]) -> str:
 
 
 def collect_mac(db: sqlite3.Connection) -> None:
+    from scripts.lib import build_folders
+
     machine = "mac"
     progress = MacReadProgress()
     cursor_rows = db.execute("SELECT path, offset FROM cursors WHERE machine = ?", (machine,))
@@ -1566,7 +1568,7 @@ def collect_mac(db: sqlite3.Connection) -> None:
     ssh_detail = ""
     try:
         payload = reader_payload(offsets)
-        with tempfile.TemporaryDirectory(prefix="usage-mac-") as directory, tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as errors:
+        with build_folders.tool_folder("usage-mac") as directory, tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as errors:
             process: subprocess.Popen[str] = subprocess.Popen(
                 ["ssh", "-o", "BatchMode=yes", MAC_HOST, command],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors,

@@ -263,6 +263,23 @@ class TmpSweepCase(unittest.TestCase):
 
 
 class CopyTests(TmpSweepCase):
+    def test_busy_absent_copy_does_not_block_later_recovery_or_the_sweep(self) -> None:
+        pair = self.tmp / "copies/pair"
+        pair.mkdir(parents=True)
+        first, second = pair / "a-busy", pair / "b-ready"
+        for path in (first, second):
+            scratch.atomic_record(scratch.removal_mark(path), {"task": "gate:recover"})
+            scratch.atomic_record(scratch.cargo_removal_mark(path), [])
+        with first.with_name(first.name + ".lock").open("a") as lock, redirect_stderr(io.StringIO()):
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.sweep()
+        self.assertIn(str(first), result.kept[scratch.BUSY_REASON])
+        self.assertEqual(result.failed, [])
+        self.assertTrue(scratch.removal_mark(first).is_file())
+        self.assertTrue(scratch.cargo_removal_mark(first).is_file())
+        self.assertFalse(scratch.removal_mark(second).exists())
+        self.assertFalse(scratch.cargo_removal_mark(second).exists())
+
     now: float = 0.0
 
     def test_unregistered_checkout_removal_uses_the_cargo_output_guard(self) -> None:
@@ -376,6 +393,62 @@ class CopyTests(TmpSweepCase):
         self.assertTrue(child.exists())
         self.assertTrue(parent.exists())
         self.assertIn(str(parent), result.kept[f"borrowed: {child} still uses its git objects"])
+
+    def test_pending_removal_rechecks_new_work_for_current_and_legacy_marks(self) -> None:
+        for version in ("current", "legacy"):
+            with self.subTest(version=version):
+                path = self.copy(f"pending-{version}")
+                _ = subprocess.run(["git", "-C", str(path), "init", "-q"], check=True, capture_output=True)
+                scratch.exclude_copy_metadata(path)
+                entry = tmp_sweep.RemovableEntry(str(path), str(path.parent), self.now, 0)
+                result = tmp_sweep.Sweep()
+                with mock.patch.object(tmp_sweep, "delete_tree", side_effect=OSError("stopped after intent")):
+                    self.assertFalse(tmp_sweep.remove_entry(entry, result, False))
+                self.assertTrue(result.failed)
+                mark = scratch.removal_mark(path)
+                fields = cast(dict[str, object], json.loads(mark.read_text()))
+                self.assertEqual(fields["removal_version"], scratch.REMOVAL_VERSION)
+                if version == "legacy":
+                    for key in ("removal_version", "removal_repositories", "removal_files", "removal_intent_ns"):
+                        _ = fields.pop(key)
+                    _ = mark.write_text(json.dumps(fields))
+                work = path / "new-work.txt"
+                _ = work.write_text("work created after the deletion intent")
+                for dry_run in (True, False):
+                    result = tmp_sweep.Sweep()
+                    self.assertFalse(tmp_sweep.remove_entry(entry, result, dry_run))
+                    self.assertIn(str(path), result.kept[tmp_sweep.UNSAVED_WORK])
+                    self.assertEqual(work.read_text(), "work created after the deletion intent")
+                    self.assertTrue(mark.is_file())
+                    self.assertEqual(result.failed, [])
+
+    def test_sweep_resumes_unchanged_partial_git_removal_and_keeps_new_work(self) -> None:
+        for changed in (False, True):
+            with self.subTest(changed=changed):
+                path = self.copy(f"partial-git-{changed}")
+                _ = subprocess.run(["git", "-C", str(path), "init", "-q"], check=True, capture_output=True)
+                scratch.exclude_copy_metadata(path)
+
+                def interrupted(folder: str) -> None:
+                    (Path(folder) / ".git/HEAD").unlink()
+                    raise OSError("stop during Git deletion")
+
+                with mock.patch.object(tmp_sweep, "delete_tree", side_effect=interrupted):
+                    self.assertTrue(self.sweep().failed)
+                self.assertTrue(scratch.removal_mark(path).is_file())
+                work = path / "new-work.txt"
+                if changed:
+                    _ = work.write_text("keep work after partial deletion")
+                result = self.sweep()
+                self.assertEqual(result.failed, [])
+                if changed:
+                    reasons = [reason for reason, paths in result.kept.items() if str(path) in paths]
+                    self.assertTrue(any(str(work) in reason for reason in reasons), reasons)
+                    self.assertEqual(work.read_text(), "keep work after partial deletion")
+                    self.assertTrue(scratch.removal_mark(path).is_file())
+                else:
+                    self.assertFalse(path.exists())
+                    self.assertFalse(scratch.removal_mark(path).exists())
 
     def test_reused_path_with_unsaved_work_does_not_resume_the_old_copys_removal(self) -> None:
         path = self.copy("reused")

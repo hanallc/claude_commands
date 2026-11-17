@@ -29,6 +29,8 @@ pub(crate) enum FactKind {
     Names,
     /// The code tokens of the Python token reader.
     Tokens,
+    /// The SHA-256 identity of code tokens and inner documentation comments.
+    RustCode,
 }
 
 /// The character class used by a names search.

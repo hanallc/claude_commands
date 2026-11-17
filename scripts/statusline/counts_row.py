@@ -29,8 +29,9 @@ from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
 from scripts.hooks import showrunner_footer  # noqa: E402
-from scripts.production import staff
+from scripts.production import investigation, staff
 from scripts.production.update_registration import QuestionStaff
+from scripts.lib.user_zone import user_zone
 
 
 def cache_path(name: str) -> Path:
@@ -53,21 +54,43 @@ def retry_due(sources: list[Path]) -> str:
         return ""
 
 
+def question_counts(owner: staff.StaffRow, zone: ZoneInfo, identities: QuestionStaff, sources: list[Path] | None,
+                    source: str = "") -> tuple[int, str]:
+    """Count due questions and retain the next deferred deadline."""
+    from scripts.production.update_registration import DeferredUntil, OutstandingReminder, due, outstanding_file, read_open_items
+
+    items = read_open_items(outstanding_file(owner.id, identities=identities), identities=identities, sources=sources)
+    if source:
+        items[:] = [item for item in items if not isinstance(item, OutstandingReminder) and item.asked_by == source]
+    now = datetime.now(zone).replace(tzinfo=None)
+    afters = [item.timing.at for item in items if isinstance(item.timing, DeferredUntil) and item.timing.at > now]
+    return len(due(items, now)), "" if not afters else str(int(min(afters).replace(tzinfo=zone).timestamp()))
+
+
 def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None = None,
         source: str = "", require_complete: bool = False) -> tuple[str, str]:
     """Return counts and sources. Cache writes require complete reads; library callers retain available counts."""
+    from scripts.production import footer_counts, proposals_folder
+    read_sources = sources if require_complete else None
+    record = identities.record if identities is not None else staff.snapshot()
+    member = record.by_id(staff.StaffId(instance.name.removeprefix("showrunner-")))
+    if member is not None and member.kind == "producer":
+        identities = identities if identities is not None else QuestionStaff.for_record(record)
+        questions, deadline = question_counts(member, user_zone(), identities, sources)
+        count = len(investigation.records(member.id, sources=sources))
+        return footer_counts.counts_line(footer_counts.FooterCounts(questions=questions, investigations=count)) or "", deadline
     doc = showrunner_footer.production_doc(instance)
     if doc is not None:
         sources.append(doc)
     production = showrunner_footer.read_production(instance)
     if production is None:
-        return "", ""
-    from scripts.production import footer_counts, proposals_folder
-    from scripts.production.update_registration import (
-        DeferredUntil, OutstandingReminder, QuestionStaff, RegistrationFailure, due, read_open_items,
-    )
-
-    read_sources = sources if require_complete else None
+        if not source:
+            if member is None or member.kind != "showrunner":
+                return "", ""
+            source = member.id
+        count = len(investigation.records(staff.StaffId(source), sources=sources))
+        return footer_counts.counts_line(footer_counts.FooterCounts(investigations=count)) or "", ""
+    from scripts.production.update_registration import RegistrationFailure
     if identities is None:
         identities = QuestionStaff.read() if read_sources is None else QuestionStaff.read(sources=read_sources)
     own = None
@@ -92,14 +115,7 @@ def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None
     outstanding = showrunner_footer.outstanding_path(owner.id, identities=identities)
     sources.append(outstanding)
     if require_complete:
-        items = read_open_items(outstanding, document=production.doc, identities=identities, sources=read_sources)
-        if source:
-            items[:] = [item for item in items if not isinstance(item, OutstandingReminder) and item.asked_by == source]
-        zone = ZoneInfo(production.zone)
-        now = datetime.now(zone).replace(tzinfo=None)
-        questions = len(due(items, now))
-        afters = [item.timing.at for item in items if isinstance(item.timing, DeferredUntil) and item.timing.at > now]
-        deadline = "" if not afters else str(int(min(afters).replace(tzinfo=zone).timestamp()))
+        questions, deadline = question_counts(owner, ZoneInfo(production.zone), identities, read_sources, source)
     else:
         questions = showrunner_footer.open_questions([production], identities=identities, source=source)
         after = showrunner_footer.deferred_until([owner.id], production.zone, identities=identities)
@@ -127,17 +143,25 @@ def write(instance: Path) -> Path:
 def write_unit(identity: str) -> Path:
     """Write the unit's counts from its parent's production document."""
     cache = cache_path(identity)
+    cache.parent.mkdir(parents=True, exist_ok=True)
     began = time.time_ns()
     sources = [staff.record_path()]
     try:
-        identities = QuestionStaff.read(sources=sources)
-        unit = identities.record.by_id(staff.StaffId(identity))
-        owner = identities.record.parent_of(unit) if unit is not None else None
+        record = staff.snapshot()
+        unit = record.by_id(staff.StaffId(identity))
+        identities = QuestionStaff.for_record(record) if unit is not None and unit.kind == "producer" else QuestionStaff.read(sources=sources)
+        owner = (unit if unit is not None and unit.kind == "producer"
+                 else identities.record.parent_of(unit) if unit is not None else None)
         if owner is None:
-            raise ValueError(f"{identity}: no parent production")
-        instance = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier") / f"showrunner-{owner.id}"
-        sources.append(instance / "conf")
-        line, due = row(instance, sources, identities=identities, source=identity, require_complete=True)
+            if unit is None:
+                raise ValueError(f"{identity}: no staff row")
+            from scripts.production import footer_counts
+            count = len(investigation.records(unit.id, sources=sources))
+            line, due = footer_counts.counts_line(footer_counts.FooterCounts(investigations=count)) or "", ""
+        else:
+            instance = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier") / f"showrunner-{owner.id}"
+            sources.append(instance / "conf")
+            line, due = row(instance, sources, identities=identities, source=identity, require_complete=True)
     except (OSError, ValueError, staff.StaffRefused, showrunner_footer.FooterError):
         line = ""
         due = retry_due(sources)
