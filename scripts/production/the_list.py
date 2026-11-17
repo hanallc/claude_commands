@@ -7,6 +7,7 @@ except FileNotFoundError:
     pass
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -110,11 +111,27 @@ class ItemChange:
 
 
 @dataclass(frozen=True)
+class UnreadUpdate:
+    """Identify the unread update that a feedback request can mark read."""
+
+    fingerprint: str
+
+
+class NoUnreadUpdate(StrEnum):
+    ABSENT = ""
+
+
+class ReadCurrentUpdate(StrEnum):
+    CURRENT = "current update"
+
+
+@dataclass(frozen=True)
 class PageFeedback:
     request: str
     words: str
     state: Literal["pending", "sent", "alerted"] = "pending"
     alerted_to: str = ""
+    read_update: UnreadUpdate | NoUnreadUpdate = NoUnreadUpdate.ABSENT
 
 
 PAGE_SOURCE = "nate via List"
@@ -616,8 +633,24 @@ def reopen(keeper: staff.StaffId, identity: str, *, source: str) -> ListItem:
     return _change(keeper, identity, edit, "Reopened", source)
 
 
-def mark_read(keeper: staff.StaffId, identity: str, *, source: str) -> ListItem:
-    return _change(keeper, identity, lambda item, _: replace(item, unread_since=NoTimestamp.UNSET),
+def unread_update(item: ListItem) -> UnreadUpdate | NoUnreadUpdate:
+    """Keep an update identity stable when page feedback adds log entries."""
+    if not isinstance(item.unread_since, datetime):
+        return NoUnreadUpdate.ABSENT
+    changes = [(index, entry.time.isoformat(), entry.what, entry.source) for index, entry in enumerate(item.log)
+               if not (entry.source == PAGE_SOURCE and
+                       (entry.what == "Marked read" or entry.what.startswith("Feedback to morty: ")))]
+    text = json.dumps((item.unread_since.isoformat(), changes), ensure_ascii=False)
+    return UnreadUpdate(hashlib.sha256(text.encode()).hexdigest())
+
+
+def mark_read(keeper: staff.StaffId, identity: str, *, source: str,
+              update: UnreadUpdate | ReadCurrentUpdate = ReadCurrentUpdate.CURRENT) -> ListItem:
+    def edit(item: ListItem, _: datetime) -> ListItem:
+        if isinstance(update, UnreadUpdate) and unread_update(item) != update:
+            return item
+        return replace(item, unread_since=NoTimestamp.UNSET)
+    return _change(keeper, identity, edit,
                    "Marked read", source, unread=False)
 
 
@@ -637,13 +670,18 @@ def feedback_requests(item: ListItem) -> dict[str, PageFeedback]:
         alerted_to = fields.get("alerted_to", "")
         if not isinstance(alerted_to, str):
             raise ListError("invalid List feedback alert")
-        requests[request] = PageFeedback(request, words, state, alerted_to)
+        target = fields.get("read_update", "")
+        if not isinstance(target, str):
+            raise ListError("invalid List feedback read update")
+        requests[request] = PageFeedback(request, words, state, alerted_to,
+                                       UnreadUpdate(target) if target else NoUnreadUpdate.ABSENT)
     return requests
 
 
 def _feedback_entry(feedback: PageFeedback, moment: datetime) -> ItemChange:
+    target = {"read_update": feedback.read_update.fingerprint} if isinstance(feedback.read_update, UnreadUpdate) else {}
     return ItemChange(moment, "Feedback to morty: " + json.dumps({"request": feedback.request,
-        "words": feedback.words, "state": feedback.state, "alerted_to": feedback.alerted_to}, ensure_ascii=False), PAGE_SOURCE)
+        "words": feedback.words, "state": feedback.state, "alerted_to": feedback.alerted_to, **target}, ensure_ascii=False), PAGE_SOURCE)
 
 
 def save_feedback(keeper: staff.StaffId, identity: str, feedback: PageFeedback) -> PageFeedback:

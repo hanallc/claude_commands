@@ -406,6 +406,35 @@ class TheListTests(unittest.TestCase):
             changed = the_list.update(MORTY.id, item.id, {"latest_status": "Morty acts."}, source="owner report")
         self.assertIs(the_list.sent_to_morty(changed), the_list.NoTimestamp.UNSET)
 
+    def test_feedback_keeps_its_original_update_target_across_delivery(self) -> None:
+        item = self.add()
+        target = the_list.unread_update(item)
+        feedback = the_list.PageFeedback("request", "Keep this result.", read_update=target)
+        _ = the_list.save_feedback(MORTY.id, item.id, feedback)
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(the_list.feedback_requests(saved)["request"], feedback)
+        self.assertEqual(the_list.unread_update(saved), target)
+        the_list.deliver_feedback(MORTY.id, item.id, "request", lambda _item, pending: replace(pending, state="sent"))
+        sent = the_list.load(MORTY.id, item.id)
+        self.assertEqual(the_list.feedback_requests(sent)["request"].read_update, target)
+        self.assertEqual(the_list.unread_update(sent), target)
+
+    def test_mark_read_checks_the_update_target_inside_the_store_lock(self) -> None:
+        item = self.add()
+        target = the_list.unread_update(item)
+        self.assertIsInstance(target, the_list.UnreadUpdate)
+        assert isinstance(target, the_list.UnreadUpdate)
+        newer = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result arrived."}, source="morty")
+        self.assertEqual(newer.unread_since, item.unread_since)
+        self.assertNotEqual(the_list.unread_update(newer), target)
+        unchanged = the_list.mark_read(MORTY.id, item.id, source=the_list.PAGE_SOURCE, update=target)
+        self.assertEqual(unchanged, newer)
+        current = the_list.unread_update(newer)
+        assert isinstance(current, the_list.UnreadUpdate)
+        read = the_list.mark_read(MORTY.id, item.id, source=the_list.PAGE_SOURCE, update=current)
+        self.assertIs(read.unread_since, the_list.NoTimestamp.UNSET)
+        self.assertEqual(read.log[-1].what, "Marked read")
+
     def test_parking_hides_the_item_until_its_time_without_changing_state(self) -> None:
         item = self.add(changes={"state": the_list.ItemState.WORKING})
         with patch.object(the_list, "user_zone", return_value=ZoneInfo("America/New_York")):

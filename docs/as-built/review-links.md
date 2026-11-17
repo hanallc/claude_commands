@@ -523,6 +523,22 @@ Bold content is nonempty and cannot start or end with whitespace or `/`.
 Delimiters between word characters or slashes stay literal, so `src/**/test/**/file.py` stays literal while `**read/write**` becomes bold.
 Mark read appears only when the item has an unread update.
 Mark read clears the dot and adds a log entry without sending a message.
+Tell morty also marks an unread update read through the same path.
+It saves the feedback before it marks the update read.
+Each request keeps the identity of the update it saw.
+A repeated request cannot mark a newer update read.
+The store checks the update identity under its lock.
+This check also preserves an update that arrives between feedback storage and the read write.
+An update identity includes its time and log history.
+Two updates with the same time keep separate identities.
+Tell morty adds no read entry when the item has no unread update.
+The POST response includes the current unread state.
+The page clears the dot and Mark read button only when that state is false.
+If the read write fails, the feedback remains saved and the sender can deliver it.
+The page shows “sent to morty; update remains unread” and keeps the unread controls.
+The same notice appears when a newer update remains unread.
+It applies the current filter again, so a read item leaves the Unread view at once.
+Tell morty with empty words changes no record.
 Remove, Park, and Tell morty send nate's words and the item number to morty's current session.
 These actions append a log entry without changing the item's state or parking time.
 Only morty changes those fields through `the_list.py`.
