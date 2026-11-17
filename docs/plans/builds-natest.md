@@ -4707,22 +4707,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 
 ### Phase 336 — The lifecycle tests run the phase table archive in the test process  · status: done
 **Depends on:** none
-**Owner:** natest (test-only change).
 
-#### Work Order
+#### As-built
 
-**Goal:** `production/test_production_lifecycle.py` uses less aws CPU; every behavior check stays.
-
-**Spec:**
-1. Each in-process wrap starts `phase_table.py archive` as a new interpreter: 28 starts, 4.7 of 18.0 CPU s on natedev.
-2. `run_lifecycle` in `production_lifecycle_test_support.py` patches `production_lifecycle.command`. The phase table call runs `phase_table.main` through `invoke_cli` with the same environment, arguments and folder. A nonzero status raises the same `LifecycleStop`. Every other command runs as before.
-3. `test_in_process_cli_matches_process_output_and_status` keeps the real process path and compares it with the in-process path.
-
-**Files:** `scripts/production/production_lifecycle_test_support.py`.
-
-**Workers:** none; no-worker mode. The director writes and proves it.
-
-**Acceptance gate:**
-- The module passes 3 times in a copy of origin/main with the change.
-- basedpyright reports 0 errors and 0 warnings on the file.
-- An aws pair shows the saving.
+- `run_lifecycle` in `scripts/production/production_lifecycle_test_support.py` patches `production_lifecycle.command` with `phase_table_in_process`. The phase table call runs `phase_table.main` through `invoke_cli` with the current environment, arguments and folder; a nonzero status raises the same `LifecycleStop`. Every other command runs as before.
+- The 28 `phase_table.py archive` interpreter starts (4.7 CPU s on natedev) are gone. `test_in_process_cli_matches_process_output_and_status` still compares the real process path with the in-process one.
+- natedev `module_cost.py`: 18.02 to 15.48 CPU s. aws pair, 3 rounds: 23.88 to 18.98 CPU s, a saving of 4.90 CPU s; all passed.
+- Main-based commit 908816d60 (branch `natest-lifecycle336`) went to builds.
