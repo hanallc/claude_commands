@@ -479,7 +479,7 @@ if arguments[:1] == ["clippy"]:''')
 
 
 class LintKeyInputTests(unittest.TestCase):
-    def test_the_lint_tree_key_reads_verify_invoke_prebuild_fix_return_and_the_lint_config(self) -> None:
+    def test_the_lint_tree_key_reads_verify_invoke_prebuild_dev_shell_fix_return_and_the_lint_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             script = root / "verify.sh"
@@ -497,9 +497,10 @@ tree_key --with-tree-content
         words = result.stdout.split("\0")[:-1]
         separator = words.index("--")
         self.assertEqual(words[:2], ["--stdin", "tree_watch.py"])
-        self.assertEqual(words[separator - 5:separator],
+        self.assertEqual(words[separator - 6:separator],
                          [str(script), str(root / ".claude/scripts/lint/invoke.sh"),
-                          str(root / ".claude/scripts/lint/prebuild.py"), "fix_return.py", str(config)])
+                          str(root / ".claude/scripts/lint/prebuild.py"), str(root / ".claude/scripts/lib/dev_shell.py"),
+                          "fix_return.py", str(config)])
         self.assertEqual(words[separator + 1:], ["lint"])
 
 if __name__ == "__main__":

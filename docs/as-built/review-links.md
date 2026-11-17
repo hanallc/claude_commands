@@ -392,6 +392,34 @@ The default order uses `the_list.order`, which the CLI also uses.
 User decisions come first, then unread updates, then the earliest next check.
 A column button sorts its values; a second click reverses that order.
 
+Each List record stores unique `ReviewItem.key` values in link order, without duplicates.
+`the_list.py link L<n> --review <id> [--review <id> ...] --source <who>` adds links.
+`the_list.py unlink L<n> --review <id> [--review <id> ...] --source <who>` removes links.
+Both commands accept `--review <shown id>` and `--review-key <key>`.
+Both options can repeat and mix in one command.
+The record retains the order of the options.
+The `--review` option resolves only shown IDs.
+The `--review-key` option selects only an exact key.
+The commands resolve shown IDs through `review_items.read` before changing the record.
+An ambiguous shown ID refuses the command and lists the matching keys and their types.
+The link command refuses unknown IDs and keys.
+Closed items refuse both commands.
+Repeated links and absent links cause no write or log entry.
+Each changed record gets one log entry with the resolved keys.
+Old records without the reviews field load with no links.
+
+When List records have review links, the page reads review items once per render and indexes them by key.
+It stores no review states on the List record.
+The State cell shows “N changes for you” when every review that needs nate is a change.
+It shows “N reviews for you” for other review types or mixed types.
+Without a review for nate, unfinished reviews show “N reviews waiting on others”.
+When every linked review is Done, it shows “Reviews done — decide: close, keep or park”.
+A missing review key counts as Done.
+An item without links shows no review line.
+The open row repeats the line above its actions and shows each review's shown ID.
+Only types in `review_page.TYPES` link to Review cards.
+Other types and missing reviews show plain text.
+
 The Owner menu includes record owners without a current staff row.
 The Show menu contains Open, Needs me, Unread, Done, Parked, Closed, and All.
 Open excludes Done, Closed, and items with a future parking time.
