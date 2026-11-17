@@ -114,6 +114,14 @@ def feedback_form(entry: ListRecord, secret: str) -> str:
             + '<button name="action" value="tell" disabled>Tell morty</button></div></form>')
 
 
+def review_place(keys: tuple[str, ...]) -> str:
+    """Select linked cards through the console, including completed reviews."""
+    place = [("key", key) for key in keys]
+    if len(keys) == 1:
+        place.append(("item", keys[0]))
+    return review_page.PAGE_PATH + '?show=all#' + urlencode(place)
+
+
 def review_summary(item: the_list.ListItem, reviews: Mapping[str, review_items.ReviewItem], today: datetime) -> str:
     """Describe the current turn for the linked reviews without storing their states."""
     if not item.reviews:
@@ -128,7 +136,7 @@ def review_summary(item: the_list.ListItem, reviews: Mapping[str, review_items.R
         text = footer_counts.plural(len(waiting), "review") + " waiting on others"
     else:
         text = "Reviews done — decide: close, keep or park"
-    return f'<a href="{review_page.PAGE_PATH}" target="_top">{text}</a>'
+    return count_link("review", review_place(item.reviews), text)
 
 
 def review_card(identity: str, reviews: Mapping[str, review_items.ReviewItem]) -> str:
@@ -139,8 +147,7 @@ def review_card(identity: str, reviews: Mapping[str, review_items.ReviewItem]) -
     label = html.escape(review.id)
     if review.type not in review_page.TYPES:
         return label
-    href = review_page.PAGE_PATH + '#' + urlencode({"item": review.key})
-    return f'<a href="{html.escape(href, quote=True)}" target="_top">{label}</a>'
+    return count_link("review", review_place((review.key,)), label)
 
 
 def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[str, review_items.ReviewItem],
@@ -216,7 +223,8 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
         update += '<small>' + notice + ", " + html.escape(local_time(sent, today)) + '</small>'
     cells = (number, names.html(item.owner, owner), names.html(item.producer, producer), title, state, change_browser.question_paragraphs(item.next_step or "Not recorded"),
              html.escape(eta_text(item.eta, today)), update)
-    row = ''.join(f'<td data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
+    row = ''.join(f'<td' + (' class="record-id"' if label == '#' else '')
+                  + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden = ' hidden' if parked or item.state in (the_list.ItemState.DONE, the_list.ItemState.CLOSED) else ''
     return (f'<tbody data-list-item{attrs}{hidden}><tr class="list-row">' + row
             + f'</tr><tr data-detail id="{panel}" hidden><td colspan="{len(HEADERS)}">' + details(entry, today, secret, reviews, names) + '</td></tr></tbody>')
@@ -399,8 +407,8 @@ def render(root: Path) -> bytes:
                + '<label class="list-search-label" for="list-search">Search</label>'
                + '<input type="search" id="list-search" placeholder="Filter by number or title">'
                + '<span data-list-count role="status" aria-live="polite"></span></div>'
-               + '<div class="list-table"><table aria-label="The List"><colgroup><col style="width:5%"><col style="width:8%">'
-               + '<col style="width:10%"><col style="width:18%"><col style="width:14%"><col style="width:23%"><col style="width:14%">'
+               + '<div class="list-table"><table aria-label="The List"><colgroup><col style="width:6%"><col style="width:8%">'
+               + '<col style="width:10%"><col style="width:17%"><col style="width:14%"><col style="width:23%"><col style="width:14%">'
                + '<col style="width:8%"></colgroup><thead><tr>' + headers + '</tr></thead>'
                + ''.join(item_rows(entry, members, today, index, secret, reviews, names) for index, entry in enumerate(items)) + '</table>'
                + '<p data-empty hidden>No items in this view.</p></div>' + counts_strip(members, names) + '</div><script>' + SCRIPT + '</script>')

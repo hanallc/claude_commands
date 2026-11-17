@@ -17,6 +17,8 @@ background:var(--card);color:var(--ink);border-radius:8px;max-width:100%;min-wid
 min-height:44px;width:100%;text-align:left;border-radius:0}
 .list-table th[aria-sort=ascending],.list-table th[aria-sort=descending]{color:var(--accent)}
 .list-table td{padding:12px 8px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere}
+.list-table .record-id{white-space:nowrap;overflow-wrap:normal;width:1%}
+.list-toggle{white-space:nowrap}
 .list-table tbody:last-child td{border-bottom:0}.list-row{cursor:pointer}.list-row:hover,.list-row.open{background:var(--hover)}
 .list-table td:nth-child(2),.list-table td:nth-child(5),.list-table td:nth-child(6){color:var(--ink-2)}
 .list-table small{display:block;color:var(--ink-3);font-size:12px;margin-top:4px}
@@ -42,7 +44,8 @@ border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;max-width
 [data-feedback-form] button{margin:0;min-height:44px}[data-send-status]{margin-left:10px;font-size:13px;color:var(--ink-2)}
 .list-counts{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:20px;color:var(--ink-2);font-size:13px}
 .list-count-chip{border:1px solid var(--line);border-radius:999px;background:var(--card);padding:5px 12px}
-[data-empty]{padding:16px;margin:0;color:var(--ink-2)}
+[data-empty],[data-missing-keys]{padding:16px;margin:0;color:var(--ink-2)}
+[data-missing-keys]{white-space:pre-line}
 @media(max-width:960px){
 .list-table{border:0;background:none;border-radius:0}.list-table table,.list-table tbody{display:block;width:100%}
 .list-table colgroup{display:none}.list-table thead{display:flex;margin-bottom:12px}.list-table thead tr{display:flex;flex-wrap:wrap}
@@ -63,7 +66,7 @@ border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;max-width
 
 SCRIPT = r'''function createRecordTable(options){
 const contentProxy=()=>options.content();
-let content=contentProxy(),owner='',show='open',query='',sort='',direction='asc',type='',sourceOwner='';
+let content=contentProxy(),owner='',show='open',query='',sort='',direction='asc',type='',sourceOwner='',keys=new Set();
 const opened=new Set(),filterNames=options.filters || [],filters={};
 const columns=[...content.querySelectorAll('[data-sort]')].map(button=>button.textContent);
 function showControl(){
@@ -81,8 +84,11 @@ function showControl(){
 }
 function place(){
  const params=new URLSearchParams(location.search);
- for(const [key,value] of new URLSearchParams(location.hash.slice(1))) params.set(key,value);
+ const fragment=new URLSearchParams(location.hash.slice(1));
+ for(const key of new Set(fragment.keys())) params.delete(key);
+ for(const [key,value] of fragment) params.append(key,value);
  options.place?.(params);
+ keys=new Set(params.getAll('key'));
  owner=params.get('owner') || params.get('showrunner') || '';show=params.get('show') || 'open';query=params.get('q') || '';
  sort=params.get('sort') || '';direction=params.get('dir')==='desc' ? 'desc' : 'asc';
  type=params.get('type') || '';
@@ -91,6 +97,7 @@ function place(){
  if(!options.shows.includes(show)) show='open';
  if(!columns.includes(sort)) sort='';
  const item=params.get('item');if(item){
+  if(keys.size) keys.add(item);
   if(!['owner','showrunner','show','q','sort','dir','type','source-owner',...filterNames].some(key=>params.has(key))){
    owner='';show='all';query='';type='';for(const name of filterNames) filters[name]='';}
   if(options.single) opened.clear();opened.add(item);
@@ -105,16 +112,18 @@ function apply(write=true){
  const previousOwner=owner;
  owner=options.resolveOwner?.(owner) ?? owner;
  const search=query.trim().toLowerCase();
- owner=options.selectOwner?.({owner,type,query:search}) ?? owner;
+ owner=options.selectOwner?.({owner,type,query:search,keys}) ?? owner;
  if(previousOwner && !owner) sourceOwner='';
  const items=[...content.querySelectorAll('[data-list-item]')];
- options.filterOwner?.(items,{owner,show,type,query:search,sourceOwner});
+ options.filterOwner?.(items,{owner,show,type,query:search,sourceOwner,keys});
  content.querySelector('#list-owner').value=owner;showControl().set(show);
  content.querySelector('#list-search').value=query;
  for(const name of filterNames){
   const menu=content.querySelector('#list-'+name);menu.value=filters[name];if(menu.value!==filters[name]) filters[name]='';
  }
- const visible=item=>options.visible(item.dataset,{owner,show,query:search,type,sourceOwner,filters:{...filters}});
+ const selected=item=>!keys.size || keys.has(item.dataset.key);
+ const visible=item=>selected(item) &&
+  options.visible(item.dataset,{owner,show,query:search,type,sourceOwner,keys,filters:{...filters}});
  const column=columns.indexOf(sort);
  items.sort((a,b)=>column<0 ? Number(a.dataset.order)-Number(b.dataset.order) :
   (compare((options.sortValues?.(a.dataset) ?? JSON.parse(a.dataset.sortValues))[column],
@@ -133,13 +142,28 @@ function apply(write=true){
   button.parentElement.setAttribute('aria-sort',active ? direction==='desc' ? 'descending' : 'ascending' : 'none');
   button.querySelector('[data-sort-mark]').textContent=active ? direction==='desc' ? ' ↓' : ' ↑' : '';
  });
- content.querySelector('[data-empty]').hidden=count>0;
+ const empty=content.querySelector('[data-empty]');
+ const hasKey=options.hasKey ?? (key=>items.some(item=>item.dataset.key===key));
+ const missing=[...keys].filter(key=>!hasKey(key));
+ let notice=content.querySelector('[data-missing-keys]');
+ if(missing.length || notice){
+  if(!notice){
+   notice=document.createElement('p');notice.dataset.missingKeys='';notice.setAttribute('role','status');
+   empty.after(notice);
+  }
+  notice.textContent=missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n');
+  notice.hidden=!missing.length;
+ }
+ empty.hidden=count>0 || missing.length>0;
+ const selection=keys.size ? items.filter(selected) : items;
  const countLine=content.querySelector('[data-list-count]');
- if(countLine) countLine.textContent=options.counts(items,count,{show});
- options.applied?.(items,{owner,show,query:search,type,sourceOwner});
+ if(countLine) countLine.textContent=options.counts(selection,count,{show,keys});
+ options.applied?.(selection,{owner,show,query:search,type,sourceOwner,keys});
  if(write || owner!==previousOwner){
-  history.replaceState(null,'',location.pathname+'#'+new URLSearchParams({owner,show,q:query,sort,dir:direction,...(type ? {type} : {}),...(sourceOwner ? {'source-owner':sourceOwner} : {}),
-  ...Object.fromEntries(filterNames.filter(name=>filters[name]).map(name=>[name,filters[name]])),...(opened.size ? {item:[...opened][0]} : {})}));
+  const address=new URLSearchParams({owner,show,q:query,sort,dir:direction,...(type ? {type} : {}),...(sourceOwner ? {'source-owner':sourceOwner} : {}),
+   ...Object.fromEntries(filterNames.filter(name=>filters[name]).map(name=>[name,filters[name]])),...(opened.size ? {item:[...opened][0]} : {})});
+  keys.forEach(key=>address.append('key',key));
+  history.replaceState(null,'',location.pathname+'#'+address);
   if(parent!==window) parent.postMessage('console-place',location.origin);}
 }
 function bind(){

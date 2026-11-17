@@ -50,8 +50,10 @@ def filter_index(records: list[ReviewItem], members: staff.StaffSnapshot, now: d
     """Build the one index for Review counts, filters and column sorting."""
     return [ReviewIndexEntry(key=item.key, id=item.id, type=item.type, owner=str(item.owner),
             sourceOwner=str(item.source_unit), ownerName=owner_name(item, members), title=item.title,
-            state=item.state, filed=int(item.times.filed.timestamp()), updated=item.times.updated.isoformat(), hiddenUntil=0)
-            for item in records if not item.hidden_until(now)]
+            state=item.state, filed=int(item.times.filed.timestamp()), updated=item.times.updated.isoformat(),
+            hiddenUntil=item.times.later.timestamp() * 1000
+            if isinstance(item.times.later, datetime) and item.times.later > now else 0)
+            for item in records]
 
 
 def index_json(entries: list[ReviewIndexEntry]) -> str:
@@ -199,7 +201,8 @@ def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: sta
     state = '<span class="list-state '+('warning' if item.state == ReviewState.OPEN else 'muted')+'">'+item.state+'</span>'
     cells = (toggle, icon(item.type)+item.type.title(), names.html(item.owner, owner)+('<small>· '+names.html(item.source_unit, source)+'</small>' if source != owner else ''),
              title, state, age(item.times.filed, now))
-    row = ''.join(f'<td data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
+    row = ''.join(f'<td' + (' class="record-id"' if label == 'Id' else '')
+                  + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden = ' hidden' if item.state == ReviewState.DONE or item.hidden_until(now) else ''
     return ('<tbody data-list-item'+attributes+hidden+'><tr class="list-row">'+row+'</tr>'
             +f'<tr data-detail id="{panel}" hidden><td colspan="6">'+details(item, browser, members, words_rows, names)+'</td></tr></tbody>')
@@ -216,8 +219,7 @@ def render(root: Path, *, show: str = 'open') -> bytes:
     owners: dict[staff.StaffId, str] = {}
     records = review_items.read(root, members=members, kinds=TYPES, owner_options=owners)
     items = [item for item in records
-             if not item.hidden_until(now) and (show == 'all' or
-                 show == 'open' and item.state == ReviewState.OPEN or item.state == show)]
+             if show == 'all' or (show == 'open' and item.state == ReviewState.OPEN) or item.state == show]
     items.sort(key=lambda item: (item.state != ReviewState.OPEN, item.state == ReviewState.DONE))
     token, initial = change_browser.browser_manifest(change_page.console_folder(root))
     browser = change_page.ReviewBrowser(token, initial)
@@ -243,7 +245,7 @@ def render(root: Path, *, show: str = 'open') -> bytes:
         +'<label class="list-search-label" for="list-search">Search</label><input type="search" id="list-search" placeholder="Filter by id or words">'
         +'</div><script type="application/json" data-review-index>'+index_json(entries)+'</script>'
         +'<div class="list-table"><table aria-label="Review">'
-        +'<colgroup><col style="width:13%"><col style="width:13%"><col style="width:14%"><col style="width:41%">'
+        +'<colgroup><col style="width:17%"><col style="width:13%"><col style="width:14%"><col style="width:37%">'
         +'<col style="width:12%"><col style="width:7%"></colgroup><thead><tr>'+headers+'</tr></thead>'
         +''.join(item_rows(item,browser,members,now,index,title_limit,words_rows,names) for index,item in enumerate(items))
         +'</table><p data-empty hidden>No items in this view.</p></div></div><script>'+SCRIPT+'</script>')
@@ -344,8 +346,9 @@ function knownOwnerOptions(){
  if(!ownerOptions.has(menu)) ownerOptions.set(menu,[...menu.options]);
  return ownerOptions.get(menu);
 }
-function matches(entry,{owner='',show='all',query='',type='',sourceOwner=''}){
- return entry.hiddenUntil<=Date.now() &&
+function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys}){
+ const linked=keys.has(entry.key);
+ return (!keys.size || linked) && (linked || entry.hiddenUntil<=Date.now()) &&
   (!owner || entry.owner===owner || entry.type==='investigation' && entry.sourceOwner===owner) &&
   (!type || entry.type===type) && (!sourceOwner || entry.sourceOwner===sourceOwner) &&
   (!query || entry.id.toLowerCase().includes(query) || entry.title.toLowerCase().includes(query)) &&
@@ -362,11 +365,11 @@ const view=createRecordTable({content:()=>content,single:true,
   const option=knownOwnerOptions().find(option=>option.value===owner || option.dataset.ownerName===owner);
   return option ? option.value : owner;
  },
- selectOwner:({owner,type,query})=>matching({owner,type,query}).length ? owner : '',
- filterOwner:(_items,{owner,show,type,query,sourceOwner})=>{
+ selectOwner:({owner,type,query,keys})=>matching({owner,type,query,keys}).length ? owner : '',
+ filterOwner:(_items,{owner,show,type,query,sourceOwner,keys})=>{
   const menu=content.querySelector('#list-owner');
-  const eligibleOwners=matching({type,query});
-  const matchingOwners=matching({show,type,query,sourceOwner});
+  const eligibleOwners=matching({type,query,keys});
+  const matchingOwners=matching({show,type,query,sourceOwner,keys});
   const available=knownOwnerOptions().filter(option=>{
    const count=matchingOwners.filter(entry=>!option.value || entry.owner===option.value ||
     entry.type==='investigation' && entry.sourceOwner===option.value).length;
@@ -378,19 +381,20 @@ const view=createRecordTable({content:()=>content,single:true,
   return available.some(option=>option.value===owner) ? owner : '';
  },
  shows:['open','Waiting','Done','all'],
+ hasKey:key=>index.has(key),
  visible:(data,filters)=>!saved.has(data.key) && index.has(data.key) && matches(index.get(data.key),filters),
  sortValues:data=>{
   const entry=index.get(data.key);
   return [entry.id,entry.type,entry.ownerName,entry.title,entry.state,entry.filed];
  },
- applied:(_items,{type,show,owner,query,sourceOwner})=>{
+ applied:(_items,{type,show,owner,query,sourceOwner,keys})=>{
   selectedShow=show;loadBodies();
   content.querySelectorAll('[data-show-chip]').forEach(button=>{
-   button.querySelector('b').textContent=matching({type,owner,query,sourceOwner,show:button.dataset.showChip}).length;
+   button.querySelector('b').textContent=matching({type,owner,query,sourceOwner,keys,show:button.dataset.showChip}).length;
   });
   content.querySelectorAll('[data-type-chip]').forEach(button=>{
    button.setAttribute('aria-pressed',String(button.dataset.typeChip===type));
-   button.querySelector('b').textContent=matching({owner,show,query,sourceOwner,type:button.dataset.typeChip}).length;
+   button.querySelector('b').textContent=matching({owner,show,query,sourceOwner,keys,type:button.dataset.typeChip}).length;
   });
   if(show!==requestedShow){requestedShow=show;queueMicrotask(()=>pageRefresh.refresh(true));}
  }

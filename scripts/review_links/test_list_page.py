@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
 from xml.etree import ElementTree
 
@@ -50,6 +50,186 @@ NOW = datetime(2026, 11, 16, 18, tzinfo=UTC)
 
 class ListPageTests(unittest.TestCase):
     root: Path = Path()
+
+    def test_review_links_keep_the_console_and_select_exact_cards_in_every_state(self) -> None:
+        source = review_items.ProposalLedgerSource(self.root / "proposals.md")
+        ready = review_items.ReviewItem("proposal/sdlc/P10", "sdlc/P10", review_items.ReviewType.PROPOSAL,
+            OWNER.id, OWNER.id, "Check this proposal", review_items.ReviewState.OPEN,
+            review_items.ReviewTimes(NOW, NOW), (), (), source)
+        for state in review_items.ReviewState:
+            with self.subTest(state=state):
+                review = replace(ready, state=state)
+                link = ElementTree.fromstring(list_page.review_card(review.key, {review.key: review}))
+                query = parse_qs(urlsplit(link.attrib["href"]).query)
+                self.assertEqual(query["page"], ["review"])
+                place = urlsplit(query["at.review"][0])
+                self.assertEqual(place.path, review_page.PAGE_PATH)
+                self.assertEqual(parse_qs(place.query), {"show": ["all"]})
+                self.assertEqual(parse_qs(place.fragment), {"key": [review.key], "item": [review.key]})
+                self.assertEqual(link.attrib["target"], "_top")
+        item = replace(self.add("Linked work"), reviews=("proposal/sdlc/P10", "change/sdlc/C1830"))
+        for state in review_items.ReviewState:
+            with self.subTest(summary=state):
+                reviews = {key: replace(ready, key=key, state=state) for key in item.reviews}
+                link = ElementTree.fromstring(list_page.review_summary(item, reviews, NOW))
+                query = parse_qs(urlsplit(link.attrib["href"]).query)
+                self.assertEqual(query["page"], ["review"])
+                place = urlsplit(query["at.review"][0])
+                self.assertEqual(parse_qs(place.query), {"show": ["all"]})
+                self.assertEqual(parse_qs(place.fragment), {"key": list(item.reviews)})
+
+    def test_list_ids_use_the_shared_no_wrap_cell(self) -> None:
+        _ = self.add("Readable item number")
+        body = list_page.render(self.root / "reviews").decode()
+        self.assertIn('<td class="record-id" data-label="#">', body)
+        self.assertIn('.list-table .record-id{white-space:nowrap;overflow-wrap:normal;width:1%}', body)
+        self.assertIn('.list-toggle{white-space:nowrap}', body)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_review_links_open_exact_cards_inside_the_console(self) -> None:
+        source = review_items.ChangeSource(self.root / "changes.md", {"#": "C1830", "How to check": "Read the card."},
+            change_routing.ChangeAssignment(change_routing.ShowrunnerOwnChange(OWNER.id, OWNER.name), self.root / "sdlc.md"),
+            delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery()))
+        ready = review_items.ReviewItem("change/sdlc/C1830", "sdlc/C1830", review_items.ReviewType.CHANGE,
+            OWNER.id, OWNER.id, "Check the linked change", review_items.ReviewState.OPEN,
+            review_items.ReviewTimes(NOW, NOW), (), (), source)
+        reviews = [ready, replace(ready, key="change/hana/P10", id="hana/P10", state=review_items.ReviewState.DONE),
+                   replace(ready, key="change/sdlc/C1831", id="sdlc/C1831", state=review_items.ReviewState.WAITING),
+                   replace(ready, key="change/sdlc/C1832", id="sdlc/C1832",
+                           times=review_items.ReviewTimes(NOW, NOW, NOW + timedelta(days=1)))]
+        item = self.add("Linked review cards", number=111)
+        _ = the_list.link(MORTY.id, item.id, tuple(review.key for review in reviews), source="morty")
+        reviews.append(replace(ready, key="change/other/C9", id="other/C9", title="Unlinked review"))
+        with patch.object(review_items, "read", return_value=reviews), patch.object(list_page, "counts_strip", return_value=""):
+            listing = list_page.render(self.root / "reviews")
+            review = review_page.render(self.root / "reviews", show="all")
+        pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(list_page.PAGE_PATH)),
+                 console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage(review_page.PAGE_PATH)))
+        shell = console.render(pages, console.UnavailablePage()).decode()
+        list_url = "/console/" + console.place_query("list", list_page.PAGE_PATH + '#' + urlencode({"item": f"{MORTY.id}/{item.id}"}))
+        probe = r'''<script>
+const listUrl=LIST_URL,keys=KEYS,proof=new URLSearchParams(location.search).get('proof');
+let finished=false;
+const failures=JSON.parse(sessionStorage.getItem('link-failures') || '[]');
+const check=(ok,text)=>{
+ if(!ok){failures.push(text);sessionStorage.setItem('link-failures',JSON.stringify(failures));}
+};
+async function finish(){
+ if(finished) return;finished=true;
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+}
+function ids(doc){
+ for(const cell of doc.querySelectorAll('.record-id')){
+  if(cell.closest('tbody').hidden) continue;
+  const button=cell.querySelector('.list-toggle'),style=doc.defaultView.getComputedStyle(cell);
+  check(style.whiteSpace==='nowrap','the ID cell does not wrap');
+  check(button.scrollWidth<=cell.clientWidth-16,'the ID and arrow fit their column: '+button.textContent);
+  const range=doc.createRange();range.selectNodeContents(button.lastChild);
+  check(range.getClientRects().length===1,'the ID text has one line');
+ }
+}
+async function inspect(frame){
+ try{
+  const doc=frame.contentDocument;
+  if(!doc?.querySelector('[data-list-item]')) return;
+  check(!!document.querySelector('.sidebar .nav-entry'),'the console navigator remains visible');
+  const stage=proof==='review' ? keys.length : Number(sessionStorage.getItem('link-stage') || 0);
+  if(doc.querySelector('[data-list]')){
+   ids(doc);
+   const row=doc.querySelector('[data-number="111"]');
+   check(!row.hidden && !row.querySelector('[data-detail]').hidden,'List item 111 is open');
+   if(proof==='list'){await finish();return;}
+   const links=[...row.querySelector('[data-detail]').querySelectorAll('a')];
+   const link=stage<keys.length ? links.find(link=>{
+    const at=new URL(link.href).searchParams.get('at.review');
+    return at && new URLSearchParams(new URL(at,location.href).hash.slice(1)).get('item')===keys[stage];
+   }) : row.querySelector('[data-label="State"] a');
+   check(!!link,'the selected List link exists');
+   if(link) link.click();else await finish();
+  }else if(doc.querySelector('[data-review]')){
+   ids(doc);
+   const visible=[...doc.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
+   if(stage<keys.length){
+    check(visible.length===1 && visible[0].dataset.key===keys[stage],'the exact linked card is shown');
+    check(visible[0]?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true','the linked card is expanded');
+    check(!visible[0]?.querySelector('[data-detail]').hidden,'the linked card detail is open');
+    sessionStorage.setItem('link-stage',String(stage+1));location.href=listUrl;
+   }else{
+    check(visible.length===keys.length && visible.every(row=>keys.includes(row.dataset.key)),'the summary shows only linked cards');
+    const done=visible.find(row=>row.dataset.state==='Done');
+    if(done?.querySelector('.list-toggle').getAttribute('aria-expanded')!=='true') done?.querySelector('.list-toggle').click();
+    check(done?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true','the Done card can open in the linked view');
+    await finish();
+   }
+  }
+ }catch(error){failures.push(String(error));await finish();}
+}
+for(const frame of document.querySelectorAll('iframe')) frame.addEventListener('load',()=>inspect(frame));
+</script><img hidden src="/complete">'''.replace('LIST_URL', json.dumps(list_url)).replace(
+            'KEYS', json.dumps([entry.key for entry in reviews[:-1]]))
+        shell = shell.replace('</body>', probe + '</body>')
+        output = Path(os.environ.get("LISTLINKS_PROOF_DIR", str(self.root)))
+        output.mkdir(parents=True, exist_ok=True)
+        for shot in ("clicks", "review", "list"):
+            with self.subTest(shot=shot):
+                results: list[list[str]] = []
+                complete = threading.Event()
+
+                class Probe(BaseHTTPRequestHandler):
+                    def do_GET(self) -> None:
+                        path = urlsplit(self.path).path
+                        if path == '/complete':
+                            _ = complete.wait(30)
+                        body = (listing if path == list_page.PAGE_PATH else review if path == review_page.PAGE_PATH
+                                else b'{}' if path.endswith('.json') else shell.encode())
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'application/json' if path.endswith('.json') else 'text/html; charset=utf-8')
+                        self.end_headers()
+                        try:
+                            _ = self.wfile.write(body)
+                        except BrokenPipeError:
+                            pass
+
+                    def do_POST(self) -> None:
+                        if self.path == '/results':
+                            results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                            complete.set()
+                        self.send_response(204)
+                        self.end_headers()
+
+                    @override
+                    def log_message(self, format: str, *args: object) -> None:
+                        pass
+
+                with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    try:
+                        profile = self.root / f'links-profile-{shot}'
+                        profile.mkdir()
+                        _ = (profile / 'user.js').write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
+                        destination = list_url
+                        if shot == 'review':
+                            destination = '/console/' + console.place_query('review', review_page.PAGE_PATH + '?show=all#'
+                                + urlencode([('key', entry.key) for entry in reviews[:-1]] + [('item', reviews[1].key)]))
+                        url = f'http://127.0.0.1:{server.server_port}' + destination
+                        command = ['firefox', '--headless', '--no-remote', '--profile', str(profile), '--window-size', '1440,1100']
+                        if shot == 'clicks':
+                            with subprocess.Popen([*command, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as browser:
+                                try:
+                                    self.assertTrue(complete.wait(35), "The browser must report its click results")
+                                finally:
+                                    browser.terminate()
+                                    _ = browser.wait(timeout=10)
+                        else:
+                            done = subprocess.run([*command, '--screenshot', str(output / f'listlinks-{shot}-dark.png'),
+                                url + '&proof=' + shot], capture_output=True, text=True, timeout=45)
+                            self.assertEqual(done.returncode, 0, done.stderr)
+                    finally:
+                        complete.set()
+                        server.shutdown()
+                        thread.join(5)
+                self.assertEqual(results, [[]])
 
     def test_staff_owner_and_producer_names_have_role_colors_but_nate_stays_plain(self) -> None:
         _ = self.add("Staff names")
@@ -180,14 +360,18 @@ class ListPageTests(unittest.TestCase):
                     continue
                 self.assertIn(expected, state)
                 self.assertEqual(row.count(expected), 2)
-                self.assertIn(f'href="{review_page.PAGE_PATH}" target="_top">{expected}</a>', state)
+                place = review_page.PAGE_PATH + '?show=all#' + urlencode(
+                    [('key', key) for key in identities] + ([('item', identities[0])] if len(identities) == 1 else []))
+                href = html.escape('/console/' + console.place_query('review', place), quote=True)
+                self.assertIn(f'href="{href}" target="_top">{expected}</a>', state)
                 detail = row.split('<div class="list-panel"><div>', 1)[1]
                 self.assertLess(detail.index(expected), detail.index('<form'))
                 positions: list[int] = []
                 for identity in identities:
                     matching = [review for review in reviews if review.key == identity]
                     if matching:
-                        href = html.escape(review_page.PAGE_PATH + '#' + urlencode({"item": identity}), quote=True)
+                        place = review_page.PAGE_PATH + '?show=all#' + urlencode({'key': identity, 'item': identity})
+                        href = html.escape('/console/' + console.place_query('review', place), quote=True)
                         card = f'<a href="{href}" target="_top">{html.escape(matching[0].id)}</a>'
                     else:
                         card = html.escape(identity)
@@ -234,7 +418,8 @@ class ListPageTests(unittest.TestCase):
                 read.assert_called_once()
                 row = body.split(f'data-key="{MORTY.id}/{item.id}"', 1)[1].split('</tbody>', 1)[0]
                 self.assertIn(expected, row)
-                card = review_page.PAGE_PATH + '#' + urlencode({"item": review.key})
+                place = review_page.PAGE_PATH + '?show=all#' + urlencode({'key': review.key, 'item': review.key})
+                card = '/console/' + console.place_query('review', place)
                 if review.type in review_page.TYPES:
                     self.assertIn(f'<a href="{html.escape(card, quote=True)}" target="_top">{review.id}</a>', row)
                 else:
