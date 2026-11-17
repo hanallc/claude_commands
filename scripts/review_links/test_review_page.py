@@ -27,7 +27,7 @@ from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, record_table, review_items, review_page
 from scripts.review_links import list_page, test_change_page
-from scripts.review_links import review_later
+from scripts.review_links import efficiency_reviews, review_later
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.statusline import counts_row
 
@@ -53,6 +53,21 @@ class ReviewPageTests(unittest.TestCase):
     def investigation(self, ready: bool = True) -> investigation.Investigation:
         item = investigation.file(self.fixture.unit.id, 'Why did the gate stop?', 'Read the gate log.')
         return investigation.answer(item.owner,item.id,'The test failed. The repair is ready.') if ready else item
+
+    def decisions(self) -> tuple[str, str]:
+        """File one proposal and one efficiency for the page owner; return their Review keys."""
+        folder = self.fixture.temporary / 'decision-proposals'
+        folder.mkdir()
+        _ = (folder / 'P1.md').write_text('---\nstatus: open\ntags: [proposal]\nstage: backlog\n'
+            +f'proposed_by: {self.fixture.unit.id}\nproposal_id: P1\ndate_created: 2026-11-01\n---\n'
+            +'# Smaller checks\n\nRun fewer checks.\n')
+        ledger = self.fixture.temporary / 'decision-efficiency.md'
+        _ = ledger.write_text('- 2026-11-01 tests: Faster checks — proposed\n')
+        doc = self.fixture.production
+        _ = doc.write_text(doc.read_text()+f'- **Proposals:** {folder}\n- **Efficiency ledger:** {ledger}\n')
+        items = review_items.read(self.root)
+        return (next(item.key for item in items if item.type == review_items.ReviewType.PROPOSAL),
+                next(item.key for item in items if item.type == review_items.ReviewType.EFFICIENCY))
 
     def body(self, key: str, outcome: str, words: str = '') -> str:
         token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
@@ -283,7 +298,7 @@ class ReviewPageTests(unittest.TestCase):
         with patch.object(issue_store, 'frontmatter', wraps=issue_store.frontmatter) as read_header:
             opened = review_items.proposal_items(staff.snapshot(), (self.fixture.production, other_doc),
                                                 states=review_items.selected_states('open'))
-        self.assertEqual({item.id for item in opened}, {'P1', 'P2'})
+        self.assertEqual({item.id for item in opened}, {'page-owner/P1', 'other/P2'})
         calls = [call.args[0] for call in read_header.call_args_list]
         self.assertEqual({path:calls.count(path) for path in paths}, dict.fromkeys(paths, 1),
                          'Read each proposal header once when productions share a folder.')
@@ -303,7 +318,7 @@ class ReviewPageTests(unittest.TestCase):
                 with patch.object(issue_store, 'frontmatter', wraps=issue_store.frontmatter) as read_header:
                     opened = review_items.proposal_items(members, (document, other_doc),
                                                         states=review_items.selected_states('open'))
-                self.assertEqual({item.id for item in opened}, {'P1', 'P2'})
+                self.assertEqual({item.id for item in opened}, {'page-owner/P1', 'other/P2'})
                 calls = [call.args[0] for call in read_header.call_args_list]
                 self.assertEqual({path:calls.count(path) for path in paths}, dict.fromkeys(paths, 1),
                                  'F006: equivalent production paths keep one scan per shared folder.')
@@ -346,16 +361,16 @@ class ReviewPageTests(unittest.TestCase):
         self.assertEqual(results(), before, 'Counts, /next and The List keep the same results.')
         now = datetime.now(user_zone())
         expected_news = frozenset(item.key+'/'+item.times.updated.isoformat() for item in review_items.read(self.root)
-                                  if item.type in review_page.TYPES and item.for_you(now))
+                                  if item.for_you(now))
         self.assertEqual(review_page.waiting_items(console.NewsRequest(self.root)), expected_news,
                          'Console news and the nav new mark keep the same records and revisions.')
 
-    def test_review_reads_only_the_stores_that_the_page_shows(self) -> None:
-        with patch.object(review_items, 'proposal_items') as proposals, patch.object(
-                review_items, 'efficiency_items') as efficiency:
+    def test_review_reads_each_store_that_the_page_shows_once(self) -> None:
+        with patch.object(review_items, 'proposal_items', return_value=[]) as proposals, patch.object(
+                review_items, 'efficiency_items', return_value=[]) as efficiency:
             _ = review_page.render(self.root)
-        proposals.assert_not_called()
-        efficiency.assert_not_called()
+        proposals.assert_called_once()
+        efficiency.assert_called_once()
 
     def test_review_nav_replaces_the_three_pages_and_marks_only_for_you(self) -> None:
         _ = self.question()
@@ -371,11 +386,14 @@ class ReviewPageTests(unittest.TestCase):
         self.assertEqual(review_page.legacy_url('/console/changes.html','type=questions'),'/console/review.html?type=question')
 
     def test_each_type_has_the_approved_action_groups_and_later(self) -> None:
+        proposal, efficiency = self.decisions()
         question = self.question()
         ready = self.investigation()
         expected = {question:('answer','feedback','question'),
                     'page-owner/C1':('works','not works','validate','feedback','question'),
-                    f'investigation/{ready.owner}/{ready.id}':('read','feedback','question')}
+                    f'investigation/{ready.owner}/{ready.id}':('read','feedback','question'),
+                    proposal:('approve','decline','feedback','question'),
+                    efficiency:('approve','decline','feedback','question')}
         token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
         for item in review_items.read(self.root):
             if item.key not in expected:
@@ -390,9 +408,10 @@ class ReviewPageTests(unittest.TestCase):
                 self.assertNotIn('value="skip"',form)
 
     def test_ask_question_and_one_owner_answer_command_for_each_type(self) -> None:
+        decisions = self.decisions()
         question = self.question()
         ready = self.investigation()
-        keys = (question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}')
+        keys = (question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}',*decisions)
         for key in keys:
             with self.subTest(key=key):
                 item = next(item for item in review_items.read(self.root) if item.key == key)
@@ -450,9 +469,10 @@ class ReviewPageTests(unittest.TestCase):
                                      review_items.ReviewState.WAITING)
 
     def test_feedback_closes_each_type_and_uses_startup_delivery_recovery(self) -> None:
+        decisions = self.decisions()
         question = self.question()
         ready = self.investigation()
-        keys = (question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}')
+        keys = (question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}',*decisions)
         for key in keys:
             with self.subTest(key=key):
                 item = next(item for item in review_items.read(self.root) if item.key == key)
@@ -463,7 +483,8 @@ class ReviewPageTests(unittest.TestCase):
                 self.assertEqual(next(item.state for item in review_items.read(self.root) if item.key == key),review_items.ReviewState.DONE)
         restarted = change_page.DeliveryStatus(self.root)
         change_page.recover_pending(restarted)
-        self.assertEqual(sum('Use the second layout.' in message for _,_,message in self.fixture.messages),4)
+        self.assertEqual(sum('Use the second layout.' in message for _,_,message in self.fixture.messages),6,
+                         'One message for each type, and the change sends to two staff rows.')
         before = len(self.fixture.messages)
         change_page.recover_pending(change_page.DeliveryStatus(self.root))
         self.assertEqual(len(self.fixture.messages),before)
@@ -473,9 +494,10 @@ class ReviewPageTests(unittest.TestCase):
             [change_review.Visible('Unrouted change', 'Read the log.', 'The result is present.')],
             datetime.now(user_zone()).date(), '', self.fixture.production,
             producers=[staff.StaffId('missing-producer')], record=staff.snapshot())
+        decisions = self.decisions()
         question = self.question()
         ready = self.investigation()
-        keys = (question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}')
+        keys = (question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}',*decisions)
         until = datetime.now(user_zone()).replace(second=0,microsecond=0)+timedelta(days=1)
         for key in keys:
             with self.subTest(key=key):
@@ -550,6 +572,54 @@ class ReviewPageTests(unittest.TestCase):
                                 for entry in saved.log))
             self.assertEqual(review_later.times()[key], until)
 
+    def test_approve_and_decline_close_proposals_and_efficiencies(self) -> None:
+        _ = shutil.copyfile(Path(__file__).resolve().parents[2]/'config/nightly_review.conf',
+                            self.fixture.temporary/'config/nightly_review.conf')
+        proposal, efficiency = self.decisions()
+        folder = self.fixture.temporary / 'decision-proposals'
+        ledger = self.fixture.temporary / 'decision-efficiency.md'
+        _ = (folder / 'P2.md').write_text((folder / 'P1.md').read_text().replace('P1', 'P2'))
+        _ = ledger.write_text(ledger.read_text()+'- 2026-11-02 tests: Slower checks — proposed\n')
+        items = {item.id:item for item in review_items.read(self.root)}
+        self.assertEqual(items['page-owner/P1'].key, proposal)
+        self.assertEqual(items['page-owner/E1'].key, efficiency)
+        body = review_page.proposal_body(self.root, proposal).decode()
+        self.assertIn('Run fewer checks.', body, 'The open card loads the issue text.')
+        self.assertNotIn('proposal_id', body, 'The issue front matter stays off the card.')
+        commands = {proposal:'proposal_issue.py approve', efficiency:"candidates.py outcome E1 accepted --applied '<repo> <sha>'"}
+        for key, command in commands.items():
+            with self.subTest(key=key, action='approve'):
+                delivery, result = review_page.submit(self.root, self.body(key, 'approve', 'Use it.'), self.status)
+                self.assertEqual(result, 'approved, sent to page-owner')
+                assert isinstance(delivery, change_page.MessageDelivery)
+                self.assertIn('Use it.', delivery.message)
+                self.assertIn(command, delivery.message)
+                approved = next(item for item in review_items.read(self.root) if item.key == key)
+                self.assertEqual(approved.state, review_items.ReviewState.DONE, 'Approve makes the item Done at once.')
+                self.assertEqual(approved.log[-1].words, 'Approve: Use it.')
+                with self.assertRaisesRegex(change_page.AnswerRefused, 'choose an action'):
+                    _ = review_page.submit(self.root, self.body(key, 'decline'), self.status)
+        with self.subTest(action='decline', kind='proposal'):
+            delivery, result = review_page.submit(self.root, self.body(items['page-owner/P2'].key, 'decline', 'Not now.'),
+                                                  self.status)
+            self.assertEqual(result, 'declined')
+            assert isinstance(delivery, change_page.MessageDelivery)
+            self.assertIn('/close_issue', delivery.message)
+            self.assertIn('style_answer: "declined"', (folder / 'P2.md').read_text())
+            declined = next(item for item in review_items.read(self.root) if item.id == 'page-owner/P2')
+            self.assertEqual(declined.state, review_items.ReviewState.DONE)
+        with self.subTest(action='decline', kind='efficiency'):
+            delivery, result = review_page.submit(self.root, self.body(items['page-owner/E2'].key, 'decline', 'Too slow.'),
+                                                  self.status)
+            self.assertEqual(result, 'declined')
+            self.assertIsInstance(delivery, change_page.NoMessageDelivery)
+            self.assertRegex(ledger.read_text().splitlines()[1], ' — declined', 'Decline writes the ledger outcome at once.')
+            declined = next(item for item in review_items.read(self.root) if item.id == 'page-owner/E2')
+            self.assertEqual(declined.state, review_items.ReviewState.DONE)
+            stored = efficiency_reviews.path(ledger).read_text()
+            self.assertEqual(set(efficiency_reviews.read(ledger)), {'E1', 'E2'}, 'The review file is keyed by the E<n> id.')
+            self.assertNotIn('Slower checks', stored, 'The review file never copies the ledger line.')
+
     def test_question_answer_words_remain_after_the_answer_archive_expires(self) -> None:
         key = self.question()
         delivery,_ = review_page.submit(self.root,self.body(key,'answer','Keep these exact answer words.'),self.status)
@@ -594,13 +664,13 @@ class ReviewPageTests(unittest.TestCase):
         self.assertEqual(review_items.ready_investigations(self.fixture.unit.id),1)
         news = review_page.waiting_items(console.NewsRequest(self.root))
         with self.subTest(finding='F017'):
-            self.assertFalse(any(key.startswith(('proposal/', 'efficiency/')) for key in news),
-                             'F017: only visible types mark Review as new')
+            self.assertTrue(any(key.startswith('proposal/') for key in news), 'F017: every shown type marks Review as new')
+            self.assertTrue(any(key.startswith('efficiency/') for key in news), 'F017: every shown type marks Review as new')
         for fields in ('unit: implementer', 'stage: active', 'style_answer: declined'):
             with self.subTest(finding='F016', fields=fields):
                 _ = (proposals / 'approved.md').write_text('---\nstatus: open\ntags: [proposal]\n'
                     +f'proposed_by: {self.fixture.unit.id}\nproposal_id: P2\ndate_created: 2026-11-01\n{fields}\n---\n')
-                approved = next(item for item in review_items.read(self.root) if item.id == 'P2')
+                approved = next(item for item in review_items.read(self.root) if item.id == 'page-owner/P2')
                 self.assertEqual(approved.state, review_items.ReviewState.DONE, 'F016: approval finishes the Review item')
                 self.assertEqual(review_items.proposals(doc), 1)
                 self.assertEqual(len(review_items.next_queue('proposal', doc, False, staff.snapshot())[1]), 1)

@@ -282,6 +282,18 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path in (investigations_page.PAGE_PATH, "/console/questions.html", "/console/changes.html"):
             self.redirect(review_page.legacy_url(route.path, route.query))
             return None
+        if route.path == review_page.PAGE_PATH and 'body' in parse_qs(route.query):
+            try:
+                content = review_page.proposal_body(root, parse_qs(route.query)['body'][0])
+            except LookupError as error:
+                self.html_response(404, html.escape(str(error)).encode())
+                return None
+            except (OSError, ValueError) as error:
+                print(f"review-links proposal body: {error}", file=sys.stderr)
+                self.html_response(503, b"The proposal text is not available.")
+                return None
+            self.html_response(200, content)
+            return None
         if route.path == review_page.PAGE_PATH:
             try:
                 content = review_page.render(root, show=parse_qs(route.query).get('show', ['open'])[0])

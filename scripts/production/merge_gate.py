@@ -2743,13 +2743,15 @@ def _sweep_nightly_slots() -> None:
                 _ = subprocess.run([sys.executable, str(scripts / "lib/nix_env.py"), "exec",
                                     sys.executable, str(scripts / "mac_test/mac_queue_run.py"),
                                     "--kind", "run", "--what", "Sweep Mac build slots", "--package", "claude",
-                                    "--", "/bin/zsh", "-c",
+                                    # The nightly runs from $HOME, which is not a repository; the queue refuses that as "repo".
+                                    "--worktree", str(scripts.parent), "--", "/bin/zsh", "-c",
                                     '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/build_slots.py" sweep'],
                                    check=True, capture_output=True, text=True)
         except (Exception, KeyboardInterrupt) as error:
             detail = f"Nightly slot sweep on {machine} failed: " + " ".join(str(error).splitlines())
             if isinstance(error, subprocess.CalledProcessError):
-                detail += " " + " ".join(cast(str, error.stderr or error.stdout or "").splitlines())
+                # The queue prints its refusal on stdout and the Mac queue prints its heading on stderr.
+                detail += " " + " ".join((cast(str, error.stderr or "") + cast(str, error.stdout or "")).splitlines())
             print(detail, flush=True)
             try:
                 from scripts.message import send_budget, session_send
