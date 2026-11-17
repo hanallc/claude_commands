@@ -979,7 +979,8 @@ def question_records(production: QuestionScope, identities: QuestionStaff) -> li
 
 def question_records_for_document(doc: Path | staff.StaffRow, identities: QuestionStaff, *, include_unrouted: bool = False,
                                   lines: list[str] | None = None,
-                                  sources: list[Path] | None = None) -> list[QuestionRecord]:
+                                  sources: list[Path] | None = None, statuses: tuple[str, ...] = (),
+                                  owner_ids: set[staff.StaffId] | None = None) -> list[QuestionRecord]:
     """Read canonical question records without requiring unrelated checkpoint fields."""
     folder = question_folder(doc, identities, lines=lines)
     if isinstance(folder, QuestionOwnerUnavailable):
@@ -990,18 +991,36 @@ def question_records_for_document(doc: Path | staff.StaffRow, identities: Questi
         source = folder.path
     from scripts.production.issues import source_paths
 
-    issues = [Issue(path, frontmatter(path, sources=sources))
-              for path in sorted(source_paths(source, "question-*.md", sources=sources))]
-    if isinstance(folder, QuestionFolder):
-        issues = [issue for issue in issues if issue.value("production_id") == folder.owner]
+    paths = sorted(source_paths(source, "question-*.md", sources=sources))
+    return selected_question_records(paths, statuses, owner_ids, sources,
+                                    folder.owner if isinstance(folder, QuestionFolder) else "")
+
+
+def selected_question_records(paths: list[Path], statuses: tuple[str, ...], owner_ids: set[staff.StaffId] | None,
+                              sources: list[Path] | None = None, owner: str = "") -> list[QuestionRecord]:
+    """Select by status and owner before decoding the question registration."""
+    def wanted(issue: Issue) -> bool:
+        if issue.value("record_type") != "question" or owner and issue.value("production_id") != owner:
+            return False
+        if owner_ids is not None:
+            owner_ids.add(staff.StaffId(issue.value("production_id")))
+        return not statuses or issue.value("status") in statuses or issue.value("status") not in ("open", "closed")
+
+    issues: list[Issue] = []
+    for path in paths:
+        fields = frontmatter(path, sources=sources, keys=frozenset(("record_type", "status", "production_id")), select=wanted)
+        if fields:
+            issues.append(Issue(path, fields))
     return _question_records(issues)
 
 
-def unowned_question_records(identities: QuestionStaff) -> list[QuestionRecord]:
+def unowned_question_records(identities: QuestionStaff, *, statuses: tuple[str, ...] = (),
+                             owner_ids: set[staff.StaffId] | None = None) -> list[QuestionRecord]:
     """Read state questions, including producers without production documents."""
     owners = {row.id for row in identities.record.rows if row.kind == "showrunner"}
-    paths = sorted(state_root().glob("*/questions/question-*.md"))
-    return _question_records([Issue(path, frontmatter(path)) for path in paths if path.parent.parent.name not in owners])
+    paths = sorted(path for path in state_root().glob("*/questions/question-*.md")
+                   if path.parent.parent.name not in owners)
+    return selected_question_records(paths, statuses, owner_ids)
 
 
 def _question_records(issues: list[Issue]) -> list[QuestionRecord]:
@@ -1042,6 +1061,8 @@ def close_questions(document: Path, identities: QuestionStaff) -> None:
 
 def question_review_id(record: QuestionRecord) -> str:
     """Allocate the question's stable owner-local number in its existing record."""
+    if identity := record.item.get("review_id", ""):
+        return identity
     with outstanding_lock(record.path.parent / ".review-ids"):
         fields = frontmatter(record.path) if record.path.exists() else {}
         if fields:
@@ -1052,10 +1073,13 @@ def question_review_id(record: QuestionRecord) -> str:
             return identity
         highest = 0
         for path in record.path.parent.glob("question-*.md"):
-            for other in _question_records([Issue(path, frontmatter(path))]):
-                number = other.item.get("review_id", "")
-                if number.startswith("Q") and number[1:].isdigit():
-                    highest = max(highest, int(number[1:]))
+            fields = frontmatter(path, keys=frozenset(("record_type", "registration")))
+            if fields.get("record_type") != ["question"]:
+                continue
+            registration = next(iter(fields.get("registration", [])), "")
+            number = re.search(r'(?:^|[,{])\s*"review_id"\s*:\s*"Q([1-9][0-9]*)"', registration)
+            if number is not None:
+                highest = max(highest, int(number[1]))
         identity = f"Q{highest+1}"
         record.item["review_id"] = identity
         write_question_record(record)
@@ -1238,7 +1262,7 @@ def read_open_fields(path: Path | None, *, production: QuestionScope | None = No
                 return entries
         if sources is not None and isinstance(document, Path):
             sources.append(document)
-        entries.extend(record.item.copy() for record in question_records_for_document(document, identities, sources=sources)
+        entries.extend(record.item.copy() for record in question_records_for_document(document, identities, sources=sources, statuses=("open",))
                        if record.status == "open")
         return entries
     except (RegistrationFailure, InputError) as error:

@@ -21,6 +21,23 @@ class GitRescueTests(unittest.TestCase):
     slot: Path = Path()
     base: str = ""
 
+    def test_rescue_git_children_inherit_the_supplied_maker_descriptor(self) -> None:
+        descriptor = os.open(self.root / 'maker.lock', os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, descriptor)
+        run = subprocess.run
+        observed: list[tuple[int, ...]] = []
+
+        def execute(arguments: list[str], *, input: bytes, stdout: int, stderr: int,
+                    env: dict[str, str], check: bool, pass_fds: tuple[int, ...]) -> subprocess.CompletedProcess[bytes]:
+            observed.append(pass_fds)
+            return run(arguments, input=input, stdout=stdout, stderr=stderr,
+                       env=env, check=check, pass_fds=pass_fds)
+
+        with mock.patch.object(subprocess, 'run', side_effect=execute):
+            _ = git_rescue.rescue(self.slot, 'inherited', pass_fds=(descriptor,))
+        self.assertTrue(observed)
+        self.assertTrue(all(descriptor in descriptors for descriptors in observed))
+
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()

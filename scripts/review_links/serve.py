@@ -284,7 +284,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         if route.path == review_page.PAGE_PATH:
             try:
-                content = review_page.render(root)
+                content = review_page.render(root, show=parse_qs(route.query).get('show', ['open'])[0])
             except (OSError, ValueError) as error:
                 print(f"review-links review: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Review page is not available.</p>"))

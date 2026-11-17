@@ -2,12 +2,17 @@
 from __future__ import annotations
 
 import unittest
+import os
+from pathlib import Path
+import subprocess
+import tempfile
 from unittest import mock
 from typing import override
 
 from scripts.build_queue import step_estimator
 from scripts.build_queue.admission_records import RepositoryIdentity
 from scripts.buildlog import record, repository
+from scripts.buildlog import store
 
 
 class GitIdentityCacheTests(unittest.TestCase):
@@ -49,6 +54,87 @@ class GitIdentityCacheTests(unittest.TestCase):
                 self.assertEqual(identity.key, after)
                 self.assertEqual(key.call_count, 2)
 
+
+class ManifestIdentityTests(unittest.TestCase):
+    base: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        step_estimator.clear_git_identity_cache()
+        self.addCleanup(step_estimator.clear_git_identity_cache)
+        temporary = self.enterContext(tempfile.TemporaryDirectory())
+        self.base = Path(temporary).resolve()
+        self.enterContext(mock.patch.dict(os.environ, {
+            "GIT_CEILING_DIRECTORIES": str(self.base.parent), "MANIFEST_PATH": "",
+        }))
+        is_file = Path.is_file
+        def fixture_file(path: Path) -> bool:
+            if path.name == "Cargo.toml" and not path.is_relative_to(self.base):
+                return False
+            return is_file(path)
+        _ = self.enterContext(mock.patch.object(Path, "is_file", fixture_file))
+
+    def package(self, directory: Path) -> Path:
+        directory.mkdir(parents=True)
+        source = directory / "src"
+        source.mkdir()
+        _ = (source / "lib.rs").write_text("")
+        manifest = directory / "Cargo.toml"
+        _ = manifest.write_text('[package]\nname = "sample"\nversion = "0.1.0"\n')
+        return manifest.resolve()
+
+    def test_gitless_steps_use_the_nearest_real_manifest(self) -> None:
+        single = self.package(self.base / "single")
+        selected = self.package(self.base / "selected")
+        alias = self.base / "alias"
+        alias.symlink_to(single.parent, target_is_directory=True)
+        cases: tuple[tuple[Path, list[str], Path], ...] = (
+            (single.parent / "src", [], single),
+            (alias, [], single),
+            (single.parent, ["--manifest-path", str(selected)], selected),
+            (single.parent, ["--manifest-path=../selected/Cargo.toml"], selected),
+        )
+        for cwd, options, manifest in cases:
+            with self.subTest(cwd=cwd, options=options):
+                step_estimator.clear_git_identity_cache()
+                identity, _ = step_estimator.git_identity(["cargo", "build", *options], str(cwd))
+                self.assertEqual(identity, RepositoryIdentity("manifest-path:" + str(manifest), manifest.parent.name))
+                self.assertEqual(record.repository_key(record.git_directory(["cargo", "build", *options], str(cwd))),
+                                 "manifest-path:" + str(manifest))
+
+    def test_gitless_identity_needs_no_cargo_or_subprocess(self) -> None:
+        manifest = self.package(self.base / "single")
+        empty_path = self.base / "empty-path"
+        empty_path.mkdir()
+        for ceiling in (self.base.parent, manifest.parent):
+            with self.subTest(ceiling=ceiling), \
+                    mock.patch.dict(os.environ, {"PATH": str(empty_path), "GIT_CEILING_DIRECTORIES": str(ceiling)}), \
+                    mock.patch.object(subprocess, "run", side_effect=AssertionError("identity started a command")):
+                self.assertEqual(repository.repository_key(str(manifest.parent / "src")), "manifest-path:" + str(manifest))
+
+    def test_gitless_folder_without_a_manifest_keeps_unknown_identity(self) -> None:
+        empty = self.base / "empty"
+        empty.mkdir()
+        self.assertEqual(repository.repository_key(str(empty)), store.UNKNOWN_IDENTITY)
+
+    def test_git_keys_remain_separate_from_manifest_keys(self) -> None:
+        manifest = self.package(self.base / "gitless")
+        git = self.package(self.base / "git").parent
+        environment = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                       "GIT_AUTHOR_NAME": "Test", "GIT_COMMITTER_NAME": "Test",
+                       "GIT_AUTHOR_EMAIL": "test@example.invalid", "GIT_COMMITTER_EMAIL": "test@example.invalid"}
+        def command(*arguments: str) -> str:
+            return subprocess.run(["git", "-C", str(git), *arguments], env=environment,
+                                  capture_output=True, text=True, check=True, timeout=5).stdout.strip()
+        _ = command("init", "-q", "--template=")
+        self.assertEqual(repository.repository_key(str(git)), store.UNKNOWN_IDENTITY)
+        _ = command("-c", "commit.gpgSign=false", "-c", "core.hooksPath=/dev/null",
+                    "commit", "--allow-empty", "-qm", "first")
+        root = command("rev-parse", "HEAD")
+        self.assertEqual(repository.repository_key(str(git)), "git-root:" + root)
+        _ = command("remote", "add", "origin", "git@example.org:owner/project.git")
+        self.assertEqual((repository.repository_key(str(git)), repository.repository_key(str(manifest.parent))),
+                         ("https://example.org/owner/project", "manifest-path:" + str(manifest)))
 
 if __name__ == "__main__":
     _ = unittest.main()

@@ -188,8 +188,15 @@ The adapter uses that grant without a second admission request.
 `TokenRequired`, `TokenHeld`, and `TokenNotRequired` describe the local execution prerequisite.
 `PrerequisiteReport` updates that state separately from fixed constraints.
 Restart requires fresh token confirmation for requests that need a token.
-A token waiter holds no local reservation and can receive a remote assignment.
-The adapter keeps token renewal active during placement waits.
+A placement waiter holds no cargo token.
+`_placement_row` marks every `TokenRequired` row token-waiting, so `memory_admit.py` does not admit it.
+`verify.sh` sends `--token after-grant`: it takes the token after a local grant.
+Its first pass sends `TokenRequired(TokenReadinessUnchecked)`.
+That pass starts nothing on natedev, so a free remote target can take the step.
+The client shows no memory wait for that pass, and `verify.sh` sends the next pass at once.
+Later passes send `TokenNotRequired`, because the service needs no token before that grant.
+These are existing wire values, so a new `verify.sh` works with a service that started before this change.
+An older caller sends `--token required` (`TokenUnavailable`) and gets no local grant until it reports `TokenHeld`.
 
 Remote rows carry execution evidence and the assigned host.
 Physical grouping includes the host, generation, PID, and start time.
@@ -593,6 +600,21 @@ Merge-gate peaks keep their separate class and remain in the anonymous history.
 The gate uses its own cap, so Cargo estimates do not use those peaks.
 
 Five keyed rows exclude the older unkeyed rows for the same repository.
+`scripts/buildlog/repository.py` owns the repository identity rule for the recorder and estimator.
+A Git tree keeps its normalized origin key or its first root commit key.
+A directory without Git uses `manifest-path:<real Cargo.toml path>`.
+The step's `--manifest-path` selects its manifest folder when present.
+Otherwise, the reader selects the nearest `Cargo.toml` in the current folder or its parents.
+The reader starts no command for a manifest identity and does not require Cargo on `PATH`.
+Each manifest keeps its own key; the reader does not resolve a workspace root.
+The identity resolves symbolic links and keeps separate manifest paths separate.
+A folder without a manifest keeps the unknown identity.
+An empty Git repository keeps its unknown identity until a remote or root commit supplies a key.
+The estimator uses the manifest folder name without matching older rows by name alone.
+The first build keeps the configured Cargo fallback of 12 GiB.
+A recorded peak supplies the next estimate through the same identity and build shape.
+The estimate retains the configured headroom rules.
+Remote verify mirrors retain a supplied source identity when the local identity is unknown or comes from a manifest path.
 With one to four own rows, a non-build estimate uses their largest peak or a lower ranked pool peak.
 A repository without own history keeps the pool and fallback order.
 A full test estimate with a package keeps only rows whose package and scope match.
@@ -1001,21 +1023,22 @@ Durable `Waiter` rows keep their join and token clocks. `RankedWaiter.order` hol
 
 ### Cargo token reclaim (`scripts/direct/board.sh`)
 
-`verify.sh` takes the board's `cargo` token before each local compiling attempt requests memory.
+A local compiling attempt waits for placement and memory without the board's `cargo` token.
+A token from an earlier step of the same call is released before the next placement.
+After a local grant, `verify.sh` takes the token, then runs cargo. The grant keeps its reservation during that token wait.
+So a memory wait no longer holds the cargo token. The token wait after a grant lasts only while a peer of the same unit runs cargo.
+A step placed on the Mac or an SSH target never takes the natedev token.
 `acquire_token()` waits in the existing FIFO queue and reuses a token that this call already holds.
-The attempt makes one memory request and retains the token during its memory wait.
-The client's periodic leave hook renews the token with `board.sh renew` while the attempt waits.
-The hook starts before the first connection attempt, so connection retries also renew the token.
+When the token wait after a grant ends without the token, the call cancels its placement or releases its reservation.
+A natedev hold that starts during that wait ends it: the call releases its reservation and places the step again.
 The execution guard still checks the token owner before cargo starts.
 `unreachable_limit_seconds` limits missing-socket and refused-connection retries to 60 seconds by default.
 The client reports the retry interval once when a connection fails.
 A successful connection resets that interval.
-At the limit, the client exits with status 2, and verify releases the token without starting cargo.
-A blocked token caller has no memory waiter or reservation.
-A memory wait can delay peer calls on the same board until memory becomes available.
+At the limit, the client exits with status 2, and verify starts no cargo.
 
-Admission failure, cancellation, a hold, and departure for the Mac release the token.
-A later local attempt takes the token before its next memory request.
+Cancellation, a hold, and departure for the Mac release the token.
+A later local attempt takes the token again after its next grant.
 Each `run()` path releases tokens that it acquired, as required by verify Phase 36.
 Noncompiling local steps retain their existing token path and request no memory.
 The wait log names the holder and its PID, including holder files without a final newline.

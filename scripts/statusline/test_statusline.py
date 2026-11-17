@@ -15,7 +15,8 @@ from contextlib import ExitStack
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast, final, override
+from collections.abc import Callable
+from typing import NotRequired, TextIO, TypedDict, cast, final, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -24,6 +25,7 @@ from scripts.hooks import showrunner_footer
 from scripts.lib import conf
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production import footer_counts, investigation, session_labels, staff
+from scripts.production.issues import ALL_FIELDS, Issue
 from scripts.rebuild import need
 from scripts.agents import remote
 from scripts.statusline import adhoc_items, assignment, counts_row, rebuild_row
@@ -1252,7 +1254,7 @@ class CountsRowTests(unittest.TestCase):
         fields = {"since": "2000-01-01T08:00", "text": "Choose", "question": "Which?", "asked_by": OWNER.id}
         question = (f"---\nrecord_type: question\nstatus: open\nproduction_id: {OWNER.id}\n"
                     + f"asked_by: {OWNER.id}\nregistration: {json.dumps(fields)}\n---\n# Choose\n")
-        read_text = Path.read_text
+        open_path = Path.open
         for failure in ("unreadable proposal", "invalid proposal encoding", "unreadable question",
                         "invalid question encoding", "malformed question", "invalid registration",
                         # A proposal file is read once for its frontmatter; the late read is its body.
@@ -1280,16 +1282,17 @@ class CountsRowTests(unittest.TestCase):
 
                 reads = 0
 
-                def read(path_to_read: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                def read(path_to_read: Path, mode: str = "r", buffering: int = -1, encoding: str | None = None,
+                         errors: str | None = None, newline: str | None = None) -> TextIO:
                     nonlocal reads
                     if path_to_read == path:
                         reads += 1
                         if failure.startswith("unreadable") or (failure.startswith("late unreadable") and reads > 1):
                             raise PermissionError(f"{path}: unreadable")
-                    return read_text(path_to_read, encoding=encoding, errors=errors)
+                    return cast(TextIO, open_path(path_to_read, mode, buffering, encoding, errors, newline))
 
                 now = int(time.time()) - 100
-                with patch.dict(os.environ, environment), patch.object(Path, "read_text", read), \
+                with patch.dict(os.environ, environment), patch.object(Path, "open", read), \
                         patch.object(time, "time", return_value=now):
                     cache = counts_row.write(instance)
                 line, due, *sources = cache.read_text().splitlines()
@@ -1318,9 +1321,10 @@ class CountsRowTests(unittest.TestCase):
         frontmatter = issues.frontmatter
         reads: list[Path] = []
 
-        def read(path: Path, *, sources: list[Path] | None = None) -> dict[str, list[str]]:
+        def read(path: Path, *, sources: list[Path] | None = None, keys: frozenset[str] = ALL_FIELDS,
+                 select: Callable[[Issue], bool] | None = None) -> dict[str, list[str]]:
             reads.append(path)
-            return frontmatter(path, sources=sources)
+            return frontmatter(path, sources=sources, keys=keys, select=select)
 
         with patch.dict(os.environ, environment), patch.object(issues, "frontmatter", read):
             cache = counts_row.write(instance)
@@ -1338,7 +1342,7 @@ class CountsRowTests(unittest.TestCase):
         instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
         environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
                        "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent)}
-        read_text = Path.read_text
+        open_path = Path.open
         for failure in ("unreadable", "invalid encoding", "malformed table", "invalid urgency", "invalid merge date"):
             with self.subTest(failure=failure):
                 _ = listing.write_text(saved)
@@ -1353,13 +1357,14 @@ class CountsRowTests(unittest.TestCase):
                                            .replace("--- | --- | --- |", "--- | --- | --- | --- |")
                                            .replace("normal |", "normal | invalid |"))
 
-                def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                def read(path: Path, mode: str = "r", buffering: int = -1, encoding: str | None = None,
+                         errors: str | None = None, newline: str | None = None) -> TextIO:
                     if path == listing and failure == "unreadable":
                         raise PermissionError(f"{path}: unreadable")
-                    return read_text(path, encoding=encoding, errors=errors)
+                    return cast(TextIO, open_path(path, mode, buffering, encoding, errors, newline))
 
                 now = int(time.time()) - 100
-                with patch.dict(os.environ, environment), patch.object(Path, "read_text", read), \
+                with patch.dict(os.environ, environment), patch.object(Path, "open", read), \
                         patch.object(time, "time", return_value=now):
                     cache = counts_row.write(instance)
                 line, due, *sources = cache.read_text().splitlines()

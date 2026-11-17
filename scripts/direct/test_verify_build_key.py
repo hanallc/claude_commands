@@ -160,7 +160,7 @@ class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
         # ordering relative to invoke.sh's run_once and buildlog_begin.
         hold_wrapper = "# A build hold stops every natedev build," + source.split(
             "# A build hold stops every natedev build,", 1)[1].split(
-                "# Again with the token held:", 1)[0]
+                "# Again before the first step:", 1)[0]
         key_setup = source.split('TOKEN_WAIT_FILE="$(mktemp)"\n', 1)[1].split(
             'if [[ -n "${CACHE_DIR}" ]]', 1)[0]
         metadata = cast(dict[str, object], json.loads(self.environment["TEST_METADATA"]))
