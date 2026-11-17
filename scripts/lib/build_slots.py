@@ -27,6 +27,8 @@ from uuid import uuid4
 
 from scripts.buildlog.store import host_name
 from scripts.lib import build_folders, conf, copy_record, git_files, git_rescue
+from scripts.lib.slot_root import SlotsNotConfigured as SlotsNotConfigured, configured_slot_root as configured_slot_root
+from scripts.lib.slot_root import slot_root as slot_root
 
 
 SLOT_NAME = re.compile(r"(.+)-slot([1-9][0-9]*)")
@@ -77,13 +79,6 @@ class SlotRepositoryMismatch(ValueError):
         super().__init__(f"slots: {path} belongs to a different repository than {source}")
 
 
-class SlotsNotConfigured(ValueError):
-    """The user has not activated repository slots on this machine."""
-
-    def __init__(self, machine: str) -> None:
-        super().__init__(f"slots: roots.slots.{machine} is not configured; slots are not active")
-
-
 class SlotGitFailure(RuntimeError):
     """A slot Git command failed or exceeded its configured deadline."""
 
@@ -130,21 +125,6 @@ def source_checkout(source: Path) -> Path:
 
 def _root(settings: conf.ConfigRead, key: str) -> Path:
     return Path(os.path.expandvars(settings.text(key))).expanduser().resolve()
-
-
-def slot_root(values: Mapping[str, str], machine: str) -> str:
-    """Select the machine's slot root, with the common root as the default."""
-    return values.get(f"roots.slots.{machine}", values.get("roots.slots", ""))
-
-
-def configured_slot_root() -> Path:
-    """Read the machine's slot root without creating a folder."""
-    settings = conf.read_or_repository("build_folders")
-    machine = host_name()
-    root = slot_root(settings.values(), machine)
-    if not root:
-        raise SlotsNotConfigured(machine)
-    return Path(os.path.expandvars(root)).expanduser().resolve()
 
 
 def slot_cargo_root(settings: conf.ConfigRead) -> Path:
