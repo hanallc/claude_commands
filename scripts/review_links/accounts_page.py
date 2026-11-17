@@ -93,21 +93,22 @@ def _spans(spans: list[accounts.BoardSpan]) -> str:
 def board(reading: accounts.StatusReading) -> str:
     """The accounts board table, then the upcoming moves and the problems."""
     table = accounts.status_board(reading)
-    def cell(key: str, spans: list[accounts.BoardSpan]) -> str:
-        content = _spans(spans)
-        if key == "label" and spans:
-            label = spans[0]["text"]
-            if "color" in spans[0]:
-                color = accounts.account_color(spans[0]["color"])
-                css = color.css if isinstance(color, accounts.AccountColor) else "#000000"
-                content += (f'<button type="button" class="color-swatch" data-account-color="{html.escape(label, quote=True)}" '
-                            + f'data-saved-color="{css.lower()}" style="background:{css}" '
-                            + f'aria-label="Change {html.escape(label, quote=True)} color" aria-haspopup="dialog"></button>')
-        return content
-    head = "".join(f'<th class="{column["align"]}">{html.escape(column["heading"])}</th>' for column in table["columns"])
+    def swatch(spans: list[accounts.BoardSpan]) -> str:
+        if not spans or "color" not in spans[0]:
+            return ""
+        label = spans[0]["text"]
+        color = accounts.account_color(spans[0]["color"])
+        css = color.css if isinstance(color, accounts.AccountColor) else "#000000"
+        return (f'<button type="button" class="color-swatch" data-account-color="{html.escape(label, quote=True)}" '
+                + f'data-saved-color="{css.lower()}" style="background:{css}" '
+                + f'aria-label="Change {html.escape(label, quote=True)} color" aria-haspopup="dialog"></button>')
+    head = "".join(f'<th class="{column["align"]}">{html.escape(column["heading"])}</th>'
+                   for column in table["columns"]) + '<th class="left">Color</th>'
     rows = "".join(
         ('<tr class="account">' if row["cells"]["label"] else "<tr>")
-        + "".join(f'<td class="{column["align"]}">{cell(column["key"], row["cells"][column["key"]])}</td>' for column in table["columns"])
+        + "".join(f'<td class="{column["align"]}"{" data-account-name" if column["key"] == "label" else ""}>'
+                  + f'{_spans(row["cells"][column["key"]])}</td>' for column in table["columns"])
+        + f'<td class="left">{swatch(row["cells"]["label"])}</td>'
         + "</tr>" for row in table["rows"])
     moves = "".join(f"<li>{html.escape(line)}</li>" for line in reading.upcoming_moves if line)
     problems = "".join(f"<li>{html.escape(note.removeprefix('* '))}</li>" for note in reading.notes)
@@ -165,16 +166,31 @@ tr.account td{border-top:1px solid var(--line)}tbody tr:last-child td{border-top
 tbody tr:hover td{background:var(--hover)}
 .bold{font-weight:600}.success{color:var(--room)}.error{color:var(--error)}.warning{color:var(--warning)}
 .inactive{color:var(--ink-3)}
-.color-swatch{width:18px;height:18px;vertical-align:middle;margin-left:8px;border:1px solid var(--ink-3);border-radius:4px;cursor:pointer}
-.color-picker{position:fixed;inset:auto;margin:0;padding:16px;width:260px;max-width:calc(100vw - 16px);
+.color-swatch{width:18px;height:18px;vertical-align:middle;border:1px solid var(--ink-3);border-radius:4px;cursor:pointer}
+.color-picker{position:fixed;inset:auto;margin:0;padding:16px;width:280px;box-sizing:border-box;max-width:calc(100vw - 16px);
+max-height:calc(100vh - 16px);overflow:auto;
 border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--ink);box-shadow:0 4px 20px var(--edge)}
-.color-picker label{display:block;font-weight:600;margin-bottom:10px}
+.color-picker label{display:block;margin:10px 0 6px}.color-title{font-weight:600;margin-bottom:12px}
 .color-picker input,.color-picker button{font:inherit}
-.color-picker input{display:block;width:100%;height:44px;margin-bottom:12px;background:var(--bg);border:1px solid var(--line)}
+.color-area{position:relative;height:132px;border:1px solid var(--ink-3);border-radius:6px;touch-action:none;
+background:linear-gradient(to top,#000,transparent),linear-gradient(to right,#fff,transparent),var(--picked-hue)}
+.color-cursor{position:absolute;width:10px;height:10px;box-sizing:border-box;border:2px solid #fff;
+border-radius:50%;box-shadow:0 0 0 1px #000;transform:translate(-50%,-50%);pointer-events:none}
+.color-picker .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%)}
+.color-picker input[type=range]{display:block;width:100%;height:16px;margin:4px 0;appearance:none;
+border:1px solid var(--ink-3);border-radius:8px;box-sizing:border-box;
+background:linear-gradient(to right,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00)}
+.color-picker input[type=range]::-moz-range-thumb{width:12px;height:22px;border:2px solid var(--ink);
+border-radius:4px;background:var(--card)}
+.color-picker input[type=range]::-webkit-slider-thumb{appearance:none;width:12px;height:22px;border:2px solid var(--ink);
+border-radius:4px;background:var(--card)}
+.color-preview{height:56px;margin-top:12px;border:1px solid var(--ink-3);border-radius:6px}
+.color-picker input[type=text]{box-sizing:border-box;width:100%;padding:8px;margin-bottom:12px;border-radius:6px;
+background:var(--bg);color:var(--ink);border:1px solid var(--line)}
 .color-actions{display:flex;gap:8px}.color-actions button{flex:1;padding:7px;border:1px solid var(--line);border-radius:6px;
 background:var(--bg);color:var(--ink);cursor:pointer}.color-actions button:hover{background:var(--hover)}
-.color-actions button:disabled{opacity:.6;cursor:wait}.color-picker [role=status]{font-size:.86rem;overflow-wrap:anywhere;margin:10px 0 0}
-.color-picker [role=status]:empty{display:none}
+.color-actions button:disabled{opacity:.5;cursor:default}
+.color-save-error{color:var(--error);overflow-wrap:anywhere}
 .color-swatch:focus-visible,.color-picker :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 /* A thin red or amber digit falls under 4.5:1; the heavier stroke keeps it at the token contrast. */
 .error,.warning{font-weight:600}
@@ -183,27 +199,107 @@ background:var(--bg);color:var(--ink);cursor:pointer}.color-actions button:hover
 </style>"""
 
 POPUP = '''<dialog class="color-picker" aria-labelledby="color-title" data-color-picker>
-<label id="color-title" for="account-color-value">Account color</label>
-<input type="color" id="account-color-value">
+<div id="color-title" class="color-title">Account color</div>
+<div class="color-area" data-color-area role="slider" tabindex="0" aria-label="Saturation and brightness"
+aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
+aria-describedby="color-area-help"><span class="color-cursor" data-color-cursor></span></div>
+<span id="color-area-help" class="sr-only">Left and right change saturation. Up and down change brightness.</span>
+<label for="account-color-hue">Hue</label>
+<input type="range" id="account-color-hue" min="0" max="360" step="1" value="0">
+<div class="color-preview" data-color-preview role="img" aria-label="Picked color"></div>
+<label for="account-color-value">Hex color</label>
+<input type="text" id="account-color-value" value="#000000" pattern="#[0-9a-fA-F]{6}"
+maxlength="7" spellcheck="false" autocomplete="off" required>
 <div class="color-actions"><button type="button" data-color-try>Try</button>
-<button type="button" data-color-save>Save</button><button type="button" data-color-cancel>Cancel</button></div>
-<p role="status" aria-live="polite"></p></dialog>'''
+<button type="button" data-color-save>Save</button>
+<button type="button" data-color-cancel>Cancel</button></div></dialog>'''
 
 SCRIPT = page_frame.REFRESH_SCRIPT + r"""(() => {
 let view = document.querySelector('[data-accounts]');
 let newestRequest = 0;
-const popup=document.querySelector('[data-color-picker]'), picker=popup.querySelector('input');
-const message=popup.querySelector('[role=status]');
-let selected=null, saving=false, savedText='';
-const hold=()=>selected ? 'An account color is being edited.' : '';
+const popup=document.querySelector('[data-color-picker]'), picker=popup.querySelector('#account-color-value');
+const area=popup.querySelector('[data-color-area]'), hue=popup.querySelector('#account-color-hue');
+const cursor=popup.querySelector('[data-color-cursor]'), preview=popup.querySelector('[data-color-preview]');
+let saturation=0,brightness=0,dragging=null;
+const clamp=value=>Math.max(0,Math.min(1,value));
+function drawPick(value){
+ picker.value=value;picker.setCustomValidity('');
+ for(const action of popup.querySelectorAll('[data-color-try],[data-color-save]')) action.disabled=false;
+ area.style.setProperty('--picked-hue','hsl('+hue.value+' 100% 50%)');
+ cursor.style.left=saturation*100+'%';cursor.style.top=(1-brightness)*100+'%';
+ area.setAttribute('aria-valuenow',Math.round(saturation*100));
+ area.setAttribute('aria-valuetext','Saturation '+Math.round(saturation*100)+'%, brightness '+Math.round(brightness*100)+'%');
+ preview.style.background=value;preview.setAttribute('aria-label','Picked color '+value);
+}
+function readHex(){
+ if(!/^#[0-9a-f]{6}$/i.test(picker.value)){
+  picker.setCustomValidity('Use a color in #rrggbb format.');
+  for(const action of popup.querySelectorAll('[data-color-try],[data-color-save]')) action.disabled=true;
+  return false;
+ }
+ const value=picker.value.toLowerCase();
+ const rgb=[1,3,5].map(start=>parseInt(value.slice(start,start+2),16)/255);
+ const [red,green,blue]=rgb, high=Math.max(...rgb),low=Math.min(...rgb),delta=high-low;
+ if(delta){
+  const sector=high===red ? (green-blue)/delta : high===green ? (blue-red)/delta+2 : (red-green)/delta+4;
+  hue.value=(sector*60+360)%360;
+ }
+ saturation=high ? delta/high : 0;brightness=high;drawPick(value);return true;
+}
+function pickHSV(){
+ const sector=Number(hue.value)/60,chroma=brightness*saturation;
+ const second=chroma*(1-Math.abs(sector%2-1)),base=brightness-chroma;
+ const channels=[[chroma,second,0],[second,chroma,0],[0,chroma,second],
+  [0,second,chroma],[second,0,chroma],[chroma,0,second]][Math.floor(sector)%6];
+ drawPick('#'+channels.map(value=>Math.round((value+base)*255).toString(16).padStart(2,'0')).join(''));
+}
+function pickPoint(event){
+ const box=area.getBoundingClientRect();
+ saturation=clamp((event.clientX-box.left)/box.width);brightness=clamp(1-(event.clientY-box.top)/box.height);pickHSV();
+}
+area.addEventListener('pointerdown',event=>{
+ if(event.button!==0) return;
+ event.preventDefault();area.focus();dragging=event.pointerId;
+ if(event.isTrusted) area.setPointerCapture(event.pointerId);
+ pickPoint(event);
+});
+area.addEventListener('pointermove',event=>{if(dragging===event.pointerId) pickPoint(event);});
+for(const name of ['pointerup','pointercancel','lostpointercapture']) area.addEventListener(name,()=>{dragging=null;});
+area.addEventListener('keydown',event=>{
+ const step=event.shiftKey ? .1 : .01;
+ if(event.key==='ArrowLeft') saturation=clamp(saturation-step);
+ else if(event.key==='ArrowRight') saturation=clamp(saturation+step);
+ else if(event.key==='ArrowUp') brightness=clamp(brightness+step);
+ else if(event.key==='ArrowDown') brightness=clamp(brightness-step);
+ else return;
+ event.preventDefault();pickHSV();
+});
+hue.addEventListener('input',pickHSV);
+hue.addEventListener('keydown',event=>{
+ const step=event.shiftKey ? 10 : 1;
+ if(['ArrowRight','ArrowUp'].includes(event.key)) hue.value=Number(hue.value)+step;
+ else if(['ArrowLeft','ArrowDown'].includes(event.key)) hue.value=Number(hue.value)-step;
+ else if(event.key==='Home') hue.value=0;
+ else if(event.key==='End') hue.value=360;
+ else return;
+ event.preventDefault();pickHSV();
+});
+picker.addEventListener('input',readHex);
+const pendingSaves=new Set(), accountColors=new WeakMap();
+const message=document.createElement('span');
+message.className='color-save-error';message.dataset.colorSaveError='';message.hidden=true;
+message.setAttribute('role','status');message.setAttribute('aria-live','polite');
+document.querySelector('[data-page-status]').append(message);
+let selected=null;
+const hold=()=>selected ? 'An account color is being edited.' : pendingSaves.size ? 'Account colors are being saved.' : '';
 async function refresh(supersede=false,current=()=>true) {
-  if (selected) return;
+  if (selected || pendingSaves.size) return;
   const request = ++newestRequest;
   const response = await fetch(location.pathname, {cache: 'no-store'});
   if (!response.ok) throw new Error('HTTP ' + response.status);
   const page = new DOMParser().parseFromString(await response.text(), 'text/html');
   const fresh = page.querySelector('[data-accounts]');
-  if (request !== newestRequest || !current() || selected) return;
+  if (request !== newestRequest || !current() || selected || pendingSaves.size) return;
   if (!fresh) throw new Error('The page has no accounts.');
   const top = scrollY;
   view.replaceWith(fresh);view = fresh;
@@ -217,41 +313,71 @@ function position(){
  popup.style.left=Math.max(8,Math.min(box.left,innerWidth-size.width-8))+'px';
  popup.style.top=Math.max(8,Math.min(box.bottom+8,innerHeight-size.height-8))+'px';
 }
-function paint(value){
- selected.style.background=value;
- selected.previousElementSibling.style.color=value;
+function accountName(button=selected){return button.closest('tr').querySelector('[data-account-name] span');}
+function colors(button){
+ if(!accountColors.has(button)) accountColors.set(button,{savedText:accountName(button).style.color,queue:[]});
+ return accountColors.get(button);
 }
-function close(restore){
- if(restore){paint(selected.dataset.savedColor);selected.previousElementSibling.style.color=savedText;}
+function paint(value,button=selected){
+ button.style.background=value;
+ accountName(button).style.color=value;
+}
+function restore(button){
+ const state=colors(button), pending=state.queue.at(-1);
+ paint(pending ? pending.value : button.dataset.savedColor,button);
+ accountName(button).style.color=pending ? pending.value : state.savedText;
+}
+function close(restoreSaved){
+ if(restoreSaved) restore(selected);
  const button=selected;selected=null;popup.close();button.focus({preventScroll:true});updates.changed();
 }
 document.addEventListener('click',event=>{
  const button=event.target instanceof Element ? event.target.closest('[data-account-color]') : null;
- if(!button || saving) return;
+ if(!button) return;
  if(selected) close(true);
- selected=button;savedText=button.previousElementSibling.style.color;
- picker.value=button.dataset.savedColor;
- popup.querySelector('label').textContent='Change '+button.dataset.accountColor+' color';
- message.textContent='';popup.showModal();position();picker.focus();updates.abandon();
+ selected=button;
+ const state=colors(button);
+ picker.value=state.queue.at(-1)?.value || button.dataset.savedColor;
+ readHex();
+ popup.querySelector('#color-title').textContent='Change '+button.dataset.accountColor+' color';
+ popup.showModal();position();area.focus();updates.abandon();
 });
-popup.querySelector('[data-color-try]').addEventListener('click',()=>paint(picker.value));
+popup.querySelector('[data-color-try]').addEventListener('click',()=>{if(readHex()) paint(picker.value);});
 popup.querySelector('[data-color-cancel]').addEventListener('click',()=>close(true));
-popup.addEventListener('cancel',event=>{event.preventDefault();if(!saving) close(true);});
+popup.addEventListener('cancel',event=>{event.preventDefault();close(true);});
 popup.addEventListener('keydown',event=>{
- if(event.key==='Escape'){event.preventDefault();if(!saving) close(true);}
+ if(event.key==='Escape'){event.preventDefault();close(true);}
 });
-popup.querySelector('[data-color-save]').addEventListener('click',async()=>{
- saving=true;paint(picker.value);message.textContent='Saving…';
- popup.querySelectorAll('button,input').forEach(button=>button.disabled=true);
+async function publish(save,state){
  try{
   const response=await fetch(location.pathname,{method:'POST',
    headers:{'Content-Type':'application/x-www-form-urlencoded'},
-   body:new URLSearchParams({label:selected.dataset.accountColor,value:picker.value}).toString()});
+   body:new URLSearchParams({label:save.account,value:save.value}).toString()});
   const result=await response.json();
   if(!response.ok) throw new Error(result.reason || 'The color could not be saved.');
-  selected.dataset.savedColor=picker.value;close(false);void updates.refresh(true);
- }catch(error){message.textContent=error.message || 'The color could not be saved.';position();}
- finally{saving=false;popup.querySelectorAll('button,input').forEach(button=>button.disabled=false);}
+  save.button.dataset.savedColor=save.value;state.savedText=save.value;
+ }catch(error){
+  save.button.dataset.savedColor=save.oldColor;state.savedText=save.oldText;
+  paint(save.oldColor,save.button);accountName(save.button).style.color=save.oldText;
+  if(selected===save.button){picker.value=save.oldColor;readHex();}
+  message.textContent=save.account+': '+(error.message || 'The color could not be saved.');message.hidden=false;
+ }finally{
+  state.queue.shift();pendingSaves.delete(save);
+  const next=state.queue[0];
+  if(next){next.oldColor=save.button.dataset.savedColor;next.oldText=state.savedText;void publish(next,state);}
+  if(selected!==save.button) restore(save.button);
+  updates.changed();
+  if(!pendingSaves.size) void updates.refresh(true);
+ }
+}
+popup.querySelector('[data-color-save]').addEventListener('click',()=>{
+ if(!readHex()){picker.reportValidity();return;}
+ const button=selected,state=colors(button);
+ const save={button,account:button.dataset.accountColor,value:picker.value,
+  oldColor:button.dataset.savedColor,oldText:state.savedText};
+ paint(save.value);state.queue.push(save);pendingSaves.add(save);
+ message.textContent='';message.hidden=true;close(false);
+ if(state.queue.length===1) void publish(save,state);
 });
 addEventListener('resize',position);addEventListener('scroll',position,{passive:true});
 })();"""

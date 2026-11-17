@@ -1,6 +1,7 @@
 """The console Accounts page draws the accounts board table."""
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -38,7 +39,7 @@ class AccountsPageTests(unittest.TestCase):
     def setUp(self) -> None:
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory())) / "config"
         _ = shutil.copytree(Path(__file__).resolve().parents[2] / "config", configuration)
-        _ = (configuration / "statusline.conf").write_text("account.claude1=#af875f\n", encoding="utf-8")
+        _ = (configuration / "statusline.conf").write_text("account.claude1=#af875f\naccount.claude2=#b294bb\n", encoding="utf-8")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     def test_board_draws_the_board_table_with_moves_and_problems(self) -> None:
@@ -51,17 +52,25 @@ class AccountsPageTests(unittest.TestCase):
         markup = accounts_page.board(reading)
         table = accounts.status_board(reading)
         heads = "".join(f'<th class="{column["align"]}">{column["heading"]}</th>' for column in table["columns"])
-        self.assertIn(f"<thead><tr>{heads}</tr></thead>", markup)
+        self.assertIn(f'<thead><tr>{heads}<th class="left">Color</th></tr></thead>', markup)
         self.assertEqual(markup.count('<tr class="account">'), 2)
         self.assertEqual(markup.count("<tr>"), 1)
-        self.assertIn('<td class="left"><span class="default bold" style="color:#af875f">claude1</span>'
+        self.assertIn('<td class="left">'
                       + '<button type="button" class="color-swatch" data-account-color="claude1" '
                       + 'data-saved-color="#af875f" style="background:#af875f" '
-                      + 'aria-label="Change claude1 color" aria-haspopup="dialog"></button></td>', markup)
-        self.assertIn('<td class="left"><span class="default bold">total</span></td>', markup)
+                      + 'aria-label="Change claude1 color" aria-haspopup="dialog"></button></td></tr>', markup)
+        self.assertIn('<td class="left" data-account-name><span class="default bold" style="color:#af875f">claude1</span></td>', markup)
+        self.assertIn('<td class="left" data-account-name><span class="default bold">total</span></td>', markup)
+        self.assertIn('<td class="left"></td>', markup)
         self.assertIn('<td class="right"><span class="default">60%</span></td>', markup)
         self.assertIn('<li>units → claude1</li>', markup)
         self.assertIn('<h2>Problems</h2><ul class="problems"><li>&lt;stale&gt;</li></ul>', markup)
+        multiple_roles = replace(reading, rows=(replace(status_row("claude1"), roles=("units", "workers")),))
+        markup = accounts_page.board(multiple_roles)
+        self.assertRegex(markup, r'<tr>(?:(?!</tr>).)*<td class="left"></td></tr>')
+        self.assertEqual(markup.count('class="color-swatch"'), 1)
+        table = accounts.status_board(multiple_roles)
+        self.assertEqual(markup.count("<td "), len(table["rows"]) * (len(table["columns"]) + 1))
 
     def test_account_labels_use_terminal_colors_and_hex_without_css_injection(self) -> None:
         reading = accounts.StatusReading((status_row("claude1"),), (), (), timezone.utc, AT)
@@ -136,9 +145,15 @@ class AccountsPageTests(unittest.TestCase):
                     self.assertIn(f'data-refresh-seconds="{float(seconds)}"', page)
                     self.assertEqual(page.count(page_frame.REFRESH_SCRIPT), 1)
                     self.assertIn("createPageRefresh(refresh, () => document.querySelector('main').dataset.refreshSeconds, hold)", page)
-                    self.assertIn('<input type="color"', page)
+                    self.assertNotIn('<input type="color"', page)
+                    self.assertNotIn('showPicker', page)
+                    self.assertIn('data-color-area role="slider"', page)
+                    self.assertIn('type="range" id="account-color-hue"', page)
+                    self.assertIn('type="text" id="account-color-value"', page)
+                    self.assertIn('data-color-preview', page)
                     for action in ("Try", "Save", "Cancel"):
                         self.assertIn(f'>{action}</button>', page)
+                    self.assertNotIn('previousElementSibling', page)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_page_status_uses_the_real_accounts_loader_with_configured_timing(self) -> None:
@@ -204,7 +219,7 @@ class AccountsPageTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_refresh_obeys_visibility_and_updates_the_load_time_and_data_age(self) -> None:
-        reading = accounts.StatusReading((status_row("claude1"),), (), (), timezone.utc, AT)
+        reading = accounts.StatusReading((status_row("claude1"), status_row("claude2")), (), (), timezone.utc, AT)
         with patch.object(accounts, "read_status", return_value=reading):
             content = accounts_page.page()
         initial = accounts_page.AccountsRender(content, 0.75, 200).with_recent_times((0.25, 0.75)).decode()
@@ -234,13 +249,31 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   check(line().querySelector('[data-status-render]').title==='Median 0.50 s of the last 2 renders.','median hover text');
   check(timer(),'the Accounts interval');
   const swatch=document.querySelector('[data-account-color="claude1"]');
-  const popup=document.querySelector('[data-color-picker]'), picker=popup.querySelector('input');
-  const label=()=>swatch.previousElementSibling, action=name=>popup.querySelector('[data-color-'+name+']');
+  swatch.scrollIntoView({block:'nearest',inline:'nearest'});
+  frameElement.style.height='560px';
+  const popup=document.querySelector('[data-color-picker]'), picker=popup.querySelector('#account-color-value');
+  const area=popup.querySelector('[data-color-area]'), hue=popup.querySelector('#account-color-hue');
+  const preview=popup.querySelector('[data-color-preview]');
+  const pick=value=>{picker.value=value;picker.dispatchEvent(new Event('input',{bubbles:true}));};
+  const key=(control,value,shiftKey=false)=>control.dispatchEvent(new KeyboardEvent('keydown',
+   {key:value,shiftKey,bubbles:true,cancelable:true}));
+  const label=()=>swatch.closest('tr').querySelector('[data-account-name] span');
+  const action=name=>popup.querySelector('[data-color-'+name+']');
   const original=label().style.color, originalSwatch=swatch.style.background;
+  const row=swatch.closest('tr'), cell=swatch.closest('td');
+  check(cell===row.cells[row.cells.length-1] && row.cells[1].contains(label()),'the swatch occupies the last column');
+  check(document.querySelector('thead th:last-child').textContent==='Color','the last heading is Color');
+  check(getComputedStyle(cell).textAlign==='left' && getComputedStyle(swatch).marginLeft==='0px' &&
+   Math.abs(swatch.getBoundingClientRect().left-cell.getBoundingClientRect().left-parseFloat(getComputedStyle(cell).paddingLeft))<1,
+   'the swatch aligns with the cell content on the left');
+  const other=document.querySelector('[data-account-color="claude2"]');
+  const otherLabel=other.closest('tr').querySelector('[data-account-name] span'), otherColor=otherLabel.style.color;
   const normalFetch=window.fetch;let pendingRead;
   window.fetch=()=>new Promise(resolve=>pendingRead=resolve);
   timer().load();
-  swatch.click();await flush();
+  swatch.click();
+  check(popup.open && document.activeElement===area && area.getBoundingClientRect().height>=130,
+   'the swatch opens the visible picker before the click returns');await flush();
   pendingRead({ok:true,text:async()=>'<div data-accounts>old response</div>'});await flush();
   check(swatch.isConnected && popup.open,'an in-flight refresh cannot replace an open chooser');
   window.fetch=normalFetch;
@@ -250,33 +283,159 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
    getComputedStyle(control).fontSize===getComputedStyle(popup).fontSize),'the popup controls inherit its font');
   const rect=popup.getBoundingClientRect();
   check(rect.left>=0 && rect.right<=innerWidth && rect.top>=0 && rect.bottom<=innerHeight,'the popup fits a phone viewport');
+  frameElement.style.width='280px';dispatchEvent(new Event('resize'));
+  const narrow=popup.getBoundingClientRect();
+  check(narrow.left>=0 && narrow.right<=innerWidth && popup.scrollWidth<=popup.clientWidth,
+   'the picker fits a narrow phone without horizontal scrolling');
+  frameElement.style.width='420px';dispatchEvent(new Event('resize'));
+  swatch.scrollIntoView({block:'nearest',inline:'nearest'});dispatchEvent(new Event('scroll'));
+  const aligned=popup.getBoundingClientRect();
+  check(Math.abs(aligned.left-Math.max(8,Math.min(swatch.getBoundingClientRect().left,innerWidth-aligned.width-8)))<1,
+   'the popup stays beside the last-column swatch within the viewport');
+  frameElement.style.width='';dispatchEvent(new Event('resize'));
   document.documentElement.dataset.theme='light';const light=getComputedStyle(popup).backgroundColor;
   document.documentElement.dataset.theme='dark';const dark=getComputedStyle(popup).backgroundColor;
   check(light!==dark,'the popup uses both themes');delete document.documentElement.dataset.theme;
-  picker.value='#123456';action('try').click();timer().load();await flush();
-  check(calls===0 && label().style.color==='rgb(18, 52, 86)' && swatch.style.background==='rgb(18, 52, 86)','Try paints without a request');
+  check(!popup.querySelector('input[type=color]') && hue.type==='range','the picker uses page controls instead of a native color input');
+  check(preview.getBoundingClientRect().height>=56 && preview.getBoundingClientRect().width>200,
+   'the dialog shows a large box of color');
+  pick('#FF0000');
+  check(picker.value==='#ff0000' && hue.value==='0' && preview.style.background==='rgb(255, 0, 0)',
+   'typed hex updates the hue and the large color box');
+  hue.value='120';hue.dispatchEvent(new Event('input',{bubbles:true}));
+  check(picker.value==='#00ff00','the hue slider selects green');
+  hue.value='240';hue.dispatchEvent(new Event('input',{bubbles:true}));
+  check(picker.value==='#0000ff','the hue slider selects blue');
+  key(hue,'Home');check(picker.value==='#ff0000','the hue slider supports the Home key');
+  key(hue,'ArrowRight',true);check(hue.value==='10','the hue slider supports keyboard steps');
+  key(hue,'ArrowLeft');check(hue.value==='9','the hue slider supports reverse keyboard steps');
+  key(hue,'End');check(hue.value==='360' && picker.value==='#ff0000','the hue slider supports the End key');
+  key(area,'ArrowLeft',true);key(area,'ArrowDown',true);
+  check(area.getAttribute('aria-valuetext')==='Saturation 90%, brightness 90%' && picker.value==='#e61717',
+   'area keys change saturation and brightness with an accessible value');
+  key(area,'ArrowRight',true);key(area,'ArrowUp',true);
+  check(picker.value==='#ff0000','area keys return to full saturation and brightness');
+  const box=area.getBoundingClientRect();
+  const point=(type,x,y)=>area.dispatchEvent(new PointerEvent(type,{pointerId:7,button:0,
+   clientX:box.left+box.width*x,clientY:box.top+box.height*y,bubbles:true}));
+  point('pointerdown',0,0);check(picker.value==='#ffffff','the area selects white at the upper left');
+  point('pointermove',1,.5);check(picker.value==='#800000','a pointer drag changes saturation and brightness');
+  point('pointermove',2,2);check(picker.value==='#000000','a pointer drag clamps at the area edges');
+  point('pointerup',2,2);point('pointermove',1,0);
+  check(picker.value==='#000000','a released pointer stops changing the pick');
+  point('pointerdown',1,0);point('pointercancel',1,0);point('pointermove',0,0);
+  check(picker.value==='#ff0000','a cancelled pointer stops changing the pick');
+  pick('#234567');
+  check(preview.style.background==='rgb(35, 69, 103)' && label().style.color===original &&
+   swatch.style.background===originalSwatch,'a pick changes only the color box');
+  pick('invalid');
+  check(!picker.checkValidity() && action('try').disabled && action('save').disabled,
+   'an invalid hex value cannot be tried or saved');
+  pick('#123456');timer().load();await flush();
+  check(calls===0 && label().style.color===original && swatch.style.background===originalSwatch,
+   'picking a color keeps the page unchanged without a request');
+  action('try').click();
+  check(popup.open && label().style.color==='rgb(18, 52, 86)' && swatch.style.background==='rgb(18, 52, 86)' && calls===0,
+   'Try paints the account name and swatch without a request');
+  check(swatch.dataset.savedColor==='#af875f','Try keeps the saved color unchanged');
+  pick('#234567');
+  check(label().style.color==='rgb(18, 52, 86)' && preview.style.background==='rgb(35, 69, 103)',
+   'a later pick keeps the last tried color on the page');
+  check(otherLabel.style.color===otherColor,'Try keeps the other account color');
   check(state()==='Paused','the chooser pauses refresh');
   action('cancel').click();
   check(!popup.open && label().style.color===original && swatch.style.background===originalSwatch,'Cancel restores the saved color');
-  swatch.click();picker.value='#abcdef';action('try').click();
+  swatch.click();pick('#abcdef');action('try').click();
   popup.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
-  check(!popup.open && label().style.color===original,'Escape restores the saved color');
-  const pageFetch=window.fetch, saves=[];let resolveSave;
-  window.fetch=(path,options)=>{saves.push({path,options});return new Promise(resolve=>resolveSave=resolve);};
+  check(!popup.open && label().style.color===original && swatch.style.background===originalSwatch,'Escape restores the saved color');
+  swatch.click();
+  check(popup.open && picker.value===swatch.dataset.savedColor,'a reopened picker starts with the saved color');
+  pick('#654321');action('try').click();
+  check(label().style.color==='rgb(101, 67, 33)' && swatch.style.background==='rgb(101, 67, 33)','Try applies a typed hex value');
+  popup.dispatchEvent(new Event('cancel',{cancelable:true}));
+  check(!popup.open && label().style.color===original && swatch.style.background===originalSwatch,'dialog cancel restores both saved colors');
+  const beforeReopenedSaveFetch=window.fetch;let reopenedSave;
+  window.fetch=(path,options)=>options?.method==='POST' ?
+   new Promise(resolve=>reopenedSave=resolve) : beforeReopenedSaveFetch(path,options);
+  swatch.click();pick('#123456');action('save').click();swatch.click();
+  check(popup.open && picker.value==='#123456','the same account reopens with its pending color');
+  pick('#654321');action('try').click();pick('invalid');
+  reopenedSave({ok:false,json:async()=>({reason:'reopened save failed'})});await flush();
+  check(label().style.color===original && swatch.style.background===originalSwatch && swatch.dataset.savedColor==='#af875f',
+   'a failed save restores the account colors while its dialog remains open');
+  check(popup.open && picker.value==='#af875f' && preview.style.background===originalSwatch && picker.checkValidity() &&
+   !action('try').disabled && !action('save').disabled,'a failed save restores the reopened picker and its usable controls');
+  check(line().textContent.includes('claude1: reopened save failed') && !line().querySelector('[data-color-save-error]').hidden,
+   'a failed reopened save reports its error in the page status');
+  check(calls===0 && swatch.isConnected && state()==='Paused','the reopened dialog keeps refresh paused after a failed save');
+  pick('#234567');action('try').click();
+  check(label().style.color==='rgb(35, 69, 103)' && swatch.style.background==='rgb(35, 69, 103)',
+   'Try remains usable after the reopened save fails');
+  action('cancel').click();
+  check(!popup.open && label().style.color===original && swatch.style.background===originalSwatch,
+   'Cancel restores the saved colors after the reopened save fails');
+  window.fetch=beforeReopenedSaveFetch;
+  const pageFetch=window.fetch, saves=[];
+  window.fetch=(path,options)=>options?.method==='POST' ?
+   new Promise((resolve,reject)=>saves.push({path,options,resolve,reject})) : pageFetch(path,options);
   swatch.click();picker.value='#123456';action('save').click();
-  check([...popup.querySelectorAll('button')].every(button=>button.disabled),'Save disables the buttons');
-  check(popup.textContent.includes('Saving…'),'Save shows progress');
+  check(!popup.open && [...popup.querySelectorAll('input,button')].every(control=>!control.disabled),
+   'Save closes the dialog before the POST completes');
+  check(label().style.color==='rgb(18, 52, 86)' && swatch.style.background==='rgb(18, 52, 86)',
+   'Save retains the new name and swatch colors');
+  check(swatch.dataset.savedColor==='#af875f','a pending POST retains the previous saved color');
   check(saves.length===1 && saves[0].path===location.pathname && saves[0].options.method==='POST','Save posts to this page');
   const form=new URLSearchParams(saves[0].options.body);
   check(form.get('label')==='claude1' && form.get('value')==='#123456' &&
    saves[0].options.headers['Content-Type']==='application/x-www-form-urlencoded','Save sends the form fields');
-  resolveSave({ok:false,json:async()=>({reason:'tune: cannot publish'})});await flush();
-  check(popup.open && popup.textContent.includes('tune: cannot publish') && !action('cancel').disabled,'a save failure keeps the popup');
-  check(label().style.color==='rgb(18, 52, 86)','a save failure keeps the tried color');
-  action('cancel').click();check(label().style.color===original,'Cancel restores after a failed save');
-  window.fetch=(path,options)=>options?.method==='POST' ?
-   Promise.resolve({ok:true,json:async()=>({state:'saved'})}) : pageFetch(path,options);
-  swatch.click();picker.value='#abcdef';action('save').click();await flush();
+  timer().load();dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();
+  check(calls===0 && swatch.isConnected && state()==='Paused','a pending POST holds interval and visibility refreshes');
+  other.click();
+  check(popup.open && picker.value===other.dataset.savedColor,'another swatch opens while a save is pending');
+  picker.value='#fedcba';action('save').click();
+  check(!popup.open && saves.length===2,'another account saves without waiting for the first POST');
+  const otherForm=new URLSearchParams(saves[1].options.body);
+  check(otherForm.get('label')==='claude2' && otherForm.get('value')==='#fedcba','each pending POST retains its account and color');
+  saves[1].resolve({ok:true,json:async()=>({state:'saved'})});await flush();
+  check(other.dataset.savedColor==='#fedcba' && otherLabel.style.color==='rgb(254, 220, 186)',
+   'success stores the second account color');
+  check(calls===0 && swatch.isConnected,'refresh remains held until every POST completes');
+  other.click();
+  saves[0].resolve({ok:false,json:async()=>({reason:'tune: cannot publish'})});await flush();
+  check(popup.open && picker.value==='#fedcba','a failed earlier save keeps another account dialog open');
+  check(label().style.color===original && swatch.style.background===originalSwatch && swatch.dataset.savedColor==='#af875f',
+   'a failed POST restores its own name, swatch, and saved color');
+  check(otherLabel.style.color==='rgb(254, 220, 186)' && other.dataset.savedColor==='#fedcba',
+   'a failed earlier save preserves the other successful color');
+  check(line().textContent.includes('claude1: tune: cannot publish') && !line().querySelector('[data-color-save-error]').hidden,
+   'the page status line reports the save error');
+  action('cancel').click();
+  other.click();picker.value='#010203';action('save').click();
+  swatch.click();picker.value='#abcdef';action('save').click();
+  saves[2].reject(new Error('network unavailable'));await flush();
+  check(other.dataset.savedColor==='#fedcba' && otherLabel.style.color==='rgb(254, 220, 186)' &&
+   other.style.background==='rgb(254, 220, 186)','a network failure restores the second account prior colors');
+  check(label().style.color==='rgb(171, 205, 239)' && calls===0,'a network failure preserves another pending color and the refresh hold');
+  check(line().textContent.includes('claude2: network unavailable'),'the page status line reports network errors');
+  swatch.click();
+  saves[3].resolve({ok:true,json:async()=>({state:'saved'})});await flush();
+  check(popup.open && swatch.dataset.savedColor==='#abcdef' && calls===0,'success keeps a newly opened chooser intact');
+  action('cancel').click();
+  check(label().style.color==='rgb(171, 205, 239)','Cancel retains a color that saved while the chooser was open');
+  swatch.click();picker.value='#234567';action('save').click();
+  swatch.click();picker.value='#654321';action('save').click();
+  check(saves.length===5 && !popup.open,'the same account queues another save without holding the dialog open');
+  saves[4].resolve({ok:true,json:async()=>({state:'saved'})});await flush();
+  check(saves.length===6 && swatch.dataset.savedColor==='#234567' && label().style.color==='rgb(101, 67, 33)',
+   'the same account publishes in order and retains its latest preview');
+  other.click();
+  saves[5].resolve({ok:false,json:async()=>({reason:'later save failed'})});await flush();
+  check(popup.open && swatch.dataset.savedColor==='#234567' && label().style.color==='rgb(35, 69, 103)' &&
+   swatch.style.background==='rgb(35, 69, 103)','a queued failure restores the previous successful color');
+  action('cancel').click();
+  swatch.click();picker.value='#abcdef';action('save').click();
+  saves[6].resolve({ok:true,json:async()=>({state:'saved'})});await flush();
+  check(swatch.dataset.savedColor==='#abcdef','success stores the chosen color before refresh');
   check(!popup.open && calls===1,'a successful save closes the popup and refreshes');
   window.fetch=pageFetch;calls=0;
   timer().load();await flush();
