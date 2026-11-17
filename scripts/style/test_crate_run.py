@@ -8,14 +8,16 @@ import io
 import sqlite3
 import shutil
 import os
+import socket
 import sys
 import tempfile
+import unittest
 from dataclasses import replace
 from contextlib import closing, redirect_stderr
 from collections.abc import Callable, Sequence
 from functools import cached_property
 from pathlib import Path
-from typing import ClassVar, cast, override
+from typing import ClassVar, NoReturn, cast, override
 from unittest import mock
 
 
@@ -30,13 +32,30 @@ from scripts.style.approved_renames import BindingRename
 from scripts.style.ledger_test_support import machine_rename_fixture
 from scripts.style.test_bulk_rename import ScriptedServer, word_edits, CargoProjectTests
 from scripts.style.style_child_test_support import StyleQueueFake, install_refusal_tools, unqueued_style_children
-from scripts.build_queue import queue_place
+from scripts.build_queue import admission_protocol as wire, queue_place
+from scripts.build_queue import first_step
 from scripts.copies import copies
-from scripts.copies.copies_test_support import copies_environment
+from scripts.copies.copies_test_support import AdmissionWaitReached, copies_environment
 from scripts.lib import build_folders, copy_record, scratch
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 from scripts.style.style_reader_test_support import oracle_reader
+
+
+class StyleQueueIsolationTests(unittest.TestCase):
+    def test_the_style_fixture_replaces_an_inherited_admission_socket(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="style-socket-") as directory, socket.socket(socket.AF_UNIX) as outside:
+            inherited = Path(directory) / "outside.sock"
+            outside.bind(str(inherited))
+            outside.listen(1)
+            with mock.patch.dict(os.environ, {"ADMISSION_SOCKET": str(inherited)}):
+                with unqueued_style_children():
+                    private = wire.admission_socket_path()
+                    self.assertNotEqual(private, inherited)
+                    self.assertTrue(private.parent.is_dir())
+                    with socket.socket(socket.AF_UNIX) as connection, self.assertRaises(FileNotFoundError):
+                        connection.connect(str(private))
+                self.assertEqual(wire.admission_socket_path(), inherited)
 
 
 class Commands:
@@ -286,6 +305,27 @@ class CrateRunTests(CargoProjectTests):
 
     def advance(self, package: str) -> crates.Manifest:
         return self.batch.advance(package, renamed, self.commands, available, fixture_execute)
+
+    def test_worker_validation_waits_before_it_takes_a_validation_slot(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+
+        def pending(command: Sequence[str], source: Path) -> NoReturn:
+            self.assertEqual(command[-1], "final")
+            checkout = Path(self.batch.read()["crates"]["bulk_sample"]["checkout"])
+            self.assertNotEqual(source, checkout)
+            self.assertEqual(copies.commit_at(source, "HEAD"), copies.commit_at(checkout, "HEAD"))
+            self.assertEqual(copies.origin_url(source), copies.origin_url(checkout))
+            self.assertEqual(copies.slot_source(source), copies.slot_source(checkout))
+            leases = list(copies.gates_root().glob("*-slot*.lease.json"))
+            self.assertEqual(len(leases), 1, "validation took a slot before its admission wait")
+            planning = leases[0].with_name(leases[0].name.removesuffix(".lease.json"))
+            self.assertEqual(build_folders.build_folder_state(planning), "held")
+            self.assertEqual(copies.commit_at(planning, "HEAD"), self.base)
+            raise AdmissionWaitReached("the validation wait holds only its existing rule reader")
+
+        with (mock.patch.object(first_step, "admitted_run", new=pending),
+              self.assertRaises(AdmissionWaitReached)):
+            _ = self.advance("bulk_sample")
 
     def test_legacy_manifest_adopts_existing_worker_and_creates_missing_worker(self) -> None:
         for existing in (True, False):
