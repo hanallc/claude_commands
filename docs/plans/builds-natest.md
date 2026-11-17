@@ -4556,3 +4556,49 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - A copy of the live records converted with 15,237 changes in 169 seconds; a second run changed nothing. The readers kept the same counts under the new names.
 - An old unit worktree can write an old name until it merges main. A later run under the same conditions converts it.
 - Checkpoint 419ef8cad.
+
+### Phase 322 — one deploy command runs the gate folder move and the step-name conversion  · status: done
+**Depends on:** Phase 321
+**Owner:** natest writes; builds asked for it 11-16 18:45 before it asks the user for the go. The user runs one command, not a list of steps.
+
+#### Work Order
+
+**Goal:** one command outside the repository, `/tmp/claude/scratch/natest-probe/p89/deploy_gate_rename.sh`, runs item 1's state folder move and item 2's step-name conversion in one stop window, and a rerun after a stop at any step finishes the work.
+
+**Source:** builds' request 11-16 18:45; the item 2 deploy steps sent to builds 11-16 18:40 (`/tmp/claude/scratch/natest-probe/p89/msg_builds_item2.txt`); `move_gate_state.py` (phase 318) and `rename_step_names.py` (phase 321).
+
+**Spec:**
+1. Write `/tmp/claude/scratch/natest-probe/p89/deploy_gate_rename.sh` (bash, or a small Python program with a bash entry). It is not committed. It runs on natedev after builds merges items 1 and 2 to main.
+2. Before any change, it checks that `~/.claude` holds the new code by content, not by hash (builds rebases both items): for example `land_runs.DEFAULT_STATE_DIR` names `~/.local/state/gate` and `gate.py` `SuiteMode` has `test-affected`. It refuses when the code is old.
+3. Steps, in order. Print each step's name when it starts and its done time in the user's zone (`TZ=America/New_York`) when it ends. Print a heartbeat line every 30 s during a wait longer than 30 s.
+   1. Wait for unfinished old AWS attempts to finish or expire (the condition `rename_step_names.py` refuses on); check it before the hold, so builds do not stop while it waits.
+   2. Set the natedev drain hold with `scripts/build_hold/build_hold.py drain natedev --for ... --release-eta ... --zone America/New_York`, unless a hold is already in force. Record whether this command set it.
+   3. Wait for the kept builds to finish, with the heartbeat.
+   4. Stop `buildlog.timer` (user), then `build-memory-feed.service`, `build-admission.socket`, `build-admission.service` with `sudo systemctl stop`. sudo asks for the password in the terminal.
+   5. Require `buildlog.service` inactive or failed.
+   6. Run `move_gate_state.py` when `~/.local/state/merge-gate` exists and `~/.local/state/gate` does not; skip it when the move is done.
+   7. Run `rename_step_names.py` with the live paths; require exit 0.
+   8. Run it again; require `changed=0` on the last line.
+   9. Start the socket, the admission service, the feed (sudo), then the timer.
+   10. Release the hold only when this command set it.
+4. Rerun: keep a state file beside the script (or derive each step's state from the live system). A rerun after a stop at any step skips finished steps and finishes the rest. Every step is safe to repeat: stop and start are idempotent; the move and the conversion already skip done work.
+5. Refusal at step 6, 7 or 8 (exit 2): print the refusal line, the live caller it names and how to cancel that caller (Ctrl-C a foreground command; `detached_runs.py stop --reason ... <record.json>`; `systemctl --user stop <unit.scope>`). Then start the services, release the hold when this command set it, and exit 2. A rerun after the cancel starts again from step 2.
+6. Any other failure: start the services and release the hold as in item 5, print the failed step, exit 1.
+7. At the end, print the total stop time (first stop to last start) and one line: delete `deploy_gate_rename.sh`, `rename_step_names.py` and `move_gate_state.py`.
+8. No signal handlers, masks, dispositions or `trap` changes. An interrupt (Ctrl-C) leaves state the rerun finishes.
+9. Prove it on a copy under `/tmp/claude/scratch/`: copies of the live records and of a `merge-gate` state folder; fake `systemctl`, `sudo` and hold commands on `PATH` that record calls and model state. Show: a full run; a stop after each step, then a rerun that finishes with the same result; a refusal path that leaves services up and the hold released; a rerun after a full run that changes nothing. Measure the stop time on the copy. Change no live record, service or hold.
+10. basedpyright zero findings on any Python; `bash -n` and shellcheck clean on the script.
+
+**Files:**
+- `scripts/build_hold/build_hold.py`
+
+**Workers:** 1 writer. One command outside the repository; the listed file is read only.
+- impl: the command, the copy proof and the stop time.
+- test: opens as impl.
+
+**Constraints from prior phases:** Phase 318: `move_gate_state.py` requires a drain hold, waits for holders and renames once. Phase 319: the gate state readers refuse until the move runs. Phase 321: `rename_step_names.py` refuses without the hold, with services running, with a live hold or queue caller, or with an unfinished old AWS attempt; a rerun changes nothing.
+
+**Acceptance gate:**
+1. The copy proof of Spec item 9 passes; its output is in the reply.
+2. The stop time on the copy is in the reply.
+3. basedpyright, `bash -n` and shellcheck report no finding.
