@@ -14,32 +14,39 @@ from scripts.review_links import record_table, review_page
 class LinkedTableTests(unittest.TestCase):
     def render(self, fragment: str) -> dict[str, object]:
         node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
-        callbacks = review_page.SCRIPT.split('const view=createRecordTable(', 1)[1].split('\nfunction loadBodies()', 1)[0]
+        _, start, callbacks = review_page.SCRIPT.partition('const ownerOptions=')
+        callbacks = start + callbacks.split('\nfunction loadBodies()', 1)[0]
         source = 'const fragment=' + json.dumps(fragment) + ';\n' + r'''
 const element=()=>({hidden:false,textContent:'',dataset:{},value:'',
  setAttribute(key,value){this[key]=value;},classList:{toggle(){}}});
 let notice=null;
 const empty=element();empty.after=value=>{notice=value;};
-const count=element(),show=element(),search=element();
+const search=element();
 const owners=['','one','two'].map(value=>({...element(),value,dataset:{ownerName:value || 'All'}}));
-const owner={...element(),options:owners};
-const chips=['','change','question'].map(type=>({...element(),dataset:{typeChip:type},
- querySelector:()=>element()}));
-for(const chip of chips){const number=element();chip.querySelector=()=>number;}
+const owner={...element(),options:owners,replaceChildren(...options){this.options=options;}};
+const makeChips=(name,values)=>values.map(value=>{
+ const count=element();
+ return {...element(),dataset:{[name]:value},querySelector:()=>count};
+});
+const chips=makeChips('typeChip',['','change','question']);
+const shows=makeChips('showChip',['open','Waiting','Done','all']);
+const show={...element(),matches:()=>false,querySelectorAll:()=>shows};
 const rows=[
- {key:'sdlc/C1830',state:'For you',type:'change',owner:'one',parked:'false'},
- {key:'hana/Q10',state:'For you',type:'question',owner:'two',parked:'true'},
+ {key:'sdlc/C1830',state:'Open',type:'change',owner:'one',parked:'false'},
+ {key:'hana/Q10',state:'Open',type:'question',owner:'two',parked:'true'},
  {key:'other/C9',state:'Done',type:'change',owner:'two',parked:'false'},
 ].map((data,index)=>{
  const detail=element(),toggle=element(),row=element();
  return {...element(),dataset:{...data,order:String(index),sortValues:'[]',title:'fixture',number:data.key.toLowerCase()},
   querySelector:selector=>selector==='[data-detail]' ? detail : selector==='.list-toggle' ? toggle : row};
 });
+const index=new Map(rows.map(({dataset})=>[dataset.key,{...dataset,id:dataset.key,
+ hiddenUntil:dataset.parked==='true' ? Date.now()+60000 : 0}]));
 const table={append(){},getAttribute:()=> 'Review'};
 const content={
  querySelector:selector=>({'#list-owner':owner,'#list-show':show,'#list-search':search,
-  '[data-empty]':empty,'[data-list-count]':count,'table':table,'[data-missing-keys]':notice})[selector],
- querySelectorAll:selector=>selector==='[data-list-item]' ? rows : selector==='[data-type-chip]' ? chips : [],
+  '[data-empty]':empty,'table':table,'[data-missing-keys]':notice})[selector],
+ querySelectorAll:selector=>({'[data-list-item]':rows,'[data-type-chip]':chips,'[data-show-chip]':shows})[selector] || [],
 };
 const document={createElement:element};
 const location={search:'',hash:fragment,pathname:'/console/review.html'};
@@ -47,13 +54,13 @@ const history={replaceState(){}};
 const window={},parent=window,saved=new Map();
 let selectedShow='all',requestedShow='all';
 const reviewPlace=()=>{},loadBodies=()=>{},pageRefresh={refresh(){}};
-''' + record_table.SCRIPT + '\nconst view=createRecordTable(' + callbacks + r'''
+''' + record_table.SCRIPT + '\n' + callbacks + r'''
 view.place();view.apply(false);
 console.log(JSON.stringify({
  shown:rows.filter(row=>!row.hidden).map(row=>row.dataset.key),
  expanded:rows.filter(row=>!row.querySelector('[data-detail]').hidden).map(row=>row.dataset.key),
  missing:notice && !notice.hidden ? notice.textContent : '',
- counts:count.textContent,
+ counts:Object.fromEntries(shows.map(chip=>[chip.dataset.showChip,chip.querySelector('b').textContent])),
  chips:Object.fromEntries(chips.map(chip=>[chip.dataset.typeChip,chip.querySelector('b').textContent])),
  owners:Object.fromEntries(owners.map(option=>[option.value,option.textContent])),
 }));
@@ -79,7 +86,7 @@ console.log(JSON.stringify({
     def test_linked_counts_include_selected_parked_cards_and_exclude_other_rows(self) -> None:
         result = self.render('#show=all&key=hana%2FQ10')
         self.assertEqual(result['shown'], ['hana/Q10'])
-        self.assertEqual(result['counts'], '1 for you · 0 waiting · 0 done')
+        self.assertEqual(result['counts'], {'open': 1, 'Waiting': 0, 'Done': 0, 'all': 1})
         self.assertEqual(result['chips'], {'': 1, 'change': 0, 'question': 1})
         self.assertEqual(result['owners'], {'': 'All (1)', 'one': 'one (0)', 'two': 'two (1)'})
 

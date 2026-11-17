@@ -69,6 +69,19 @@ const contentProxy=()=>options.content();
 let content=contentProxy(),owner='',show='open',query='',sort='',direction='asc',type='',sourceOwner='',keys=new Set();
 const opened=new Set(),filterNames=options.filters || [],filters={};
 const columns=[...content.querySelectorAll('[data-sort]')].map(button=>button.textContent);
+function showControl(){
+ const control=content.querySelector('#list-show');
+ return {
+  set(value){
+   if(control.matches('select')) control.value=value;
+   else control.querySelectorAll('[data-show-chip]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.showChip===value)));
+  },
+  bind(change){
+   if(control.matches('select')) control.addEventListener('change',event=>change(event.target.value));
+   else control.querySelectorAll('[data-show-chip]').forEach(button=>button.addEventListener('click',()=>change(button.dataset.showChip)));
+  }
+ };
+}
 function place(){
  const params=new URLSearchParams(location.search);
  const fragment=new URLSearchParams(location.hash.slice(1));
@@ -96,19 +109,25 @@ function compare(a,b){
  return typeof a==='number' ? a-b : a.localeCompare(b,undefined,{numeric:true,sensitivity:'base'});
 }
 function apply(write=true){
+ const previousOwner=owner;
  owner=options.resolveOwner?.(owner) ?? owner;
- content.querySelector('#list-owner').value=owner;content.querySelector('#list-show').value=show;
+ const search=query.trim().toLowerCase();
+ owner=options.selectOwner?.({owner,type,query:search,keys}) ?? owner;
+ if(previousOwner && !owner) sourceOwner='';
+ const items=[...content.querySelectorAll('[data-list-item]')];
+ options.filterOwner?.(items,{owner,show,type,query:search,sourceOwner,keys});
+ content.querySelector('#list-owner').value=owner;showControl().set(show);
  content.querySelector('#list-search').value=query;
  for(const name of filterNames){
   const menu=content.querySelector('#list-'+name);menu.value=filters[name];if(menu.value!==filters[name]) filters[name]='';
  }
- const items=[...content.querySelectorAll('[data-list-item]')], search=query.trim().toLowerCase();
  const selected=item=>!keys.size || keys.has(item.dataset.key);
  const visible=item=>selected(item) &&
   options.visible(item.dataset,{owner,show,query:search,type,sourceOwner,keys,filters:{...filters}});
  const column=columns.indexOf(sort);
  items.sort((a,b)=>column<0 ? Number(a.dataset.order)-Number(b.dataset.order) :
-  (compare(JSON.parse(a.dataset.sortValues)[column],JSON.parse(b.dataset.sortValues)[column]) ||
+  (compare((options.sortValues?.(a.dataset) ?? JSON.parse(a.dataset.sortValues))[column],
+           (options.sortValues?.(b.dataset) ?? JSON.parse(b.dataset.sortValues))[column]) ||
    Number(a.dataset.order)-Number(b.dataset.order))*(direction==='desc' ? -1 : 1));
  const table=content.querySelector('table');let count=0;
  items.forEach(item=>{
@@ -123,24 +142,33 @@ function apply(write=true){
   button.parentElement.setAttribute('aria-sort',active ? direction==='desc' ? 'descending' : 'ascending' : 'none');
   button.querySelector('[data-sort-mark]').textContent=active ? direction==='desc' ? ' ↓' : ' ↑' : '';
  });
- const available=new Set(items.map(item=>item.dataset.key));
- const missing=[...keys].filter(key=>!available.has(key));
  const empty=content.querySelector('[data-empty]');
+ const hasKey=options.hasKey ?? (key=>items.some(item=>item.dataset.key===key));
+ const missing=[...keys].filter(key=>!hasKey(key));
  let notice=content.querySelector('[data-missing-keys]');
- if(!notice){notice=document.createElement('p');notice.dataset.missingKeys='';notice.setAttribute('role','status');empty.after(notice);}
- notice.textContent=missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n');
- notice.hidden=!missing.length;empty.hidden=count>0 || missing.length>0;
- const selection=items.filter(selected);
- content.querySelector('[data-list-count]').textContent=options.counts(selection,count,{keys});
- options.applied?.(selection,{owner,show,query,type,keys});
- if(write){const place=new URLSearchParams({owner,show,q:query,sort,dir:direction,...(type ? {type} : {}),...(sourceOwner ? {'source-owner':sourceOwner} : {}),
-  ...Object.fromEntries(filterNames.filter(name=>filters[name]).map(name=>[name,filters[name]])),...(opened.size ? {item:[...opened][0]} : {})});
-  keys.forEach(key=>place.append('key',key));history.replaceState(null,'',location.pathname+'#'+place);
+ if(missing.length || notice){
+  if(!notice){
+   notice=document.createElement('p');notice.dataset.missingKeys='';notice.setAttribute('role','status');
+   empty.after(notice);
+  }
+  notice.textContent=missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n');
+  notice.hidden=!missing.length;
+ }
+ empty.hidden=count>0 || missing.length>0;
+ const selection=keys.size ? items.filter(selected) : items;
+ const countLine=content.querySelector('[data-list-count]');
+ if(countLine) countLine.textContent=options.counts(selection,count,{show,keys});
+ options.applied?.(selection,{owner,show,query:search,type,sourceOwner,keys});
+ if(write || owner!==previousOwner){
+  const address=new URLSearchParams({owner,show,q:query,sort,dir:direction,...(type ? {type} : {}),...(sourceOwner ? {'source-owner':sourceOwner} : {}),
+   ...Object.fromEntries(filterNames.filter(name=>filters[name]).map(name=>[name,filters[name]])),...(opened.size ? {item:[...opened][0]} : {})});
+  keys.forEach(key=>address.append('key',key));
+  history.replaceState(null,'',location.pathname+'#'+address);
   if(parent!==window) parent.postMessage('console-place',location.origin);}
 }
 function bind(){
  content.querySelector('#list-owner').addEventListener('change',event=>{owner=event.target.value;sourceOwner='';apply();});
- content.querySelector('#list-show').addEventListener('change',event=>{show=event.target.value;apply();});
+ showControl().bind(value=>{if(value===show) return;show=value;apply();});
  for(const name of filterNames)
   content.querySelector('#list-'+name).addEventListener('change',event=>{filters[name]=event.target.value;apply();});
  content.querySelector('#list-search').addEventListener('input',event=>{query=event.target.value;apply();});
