@@ -261,15 +261,21 @@ const view=createRecordTable({content:()=>content,single:true,
 function bind(){
  view.replace();
  content.querySelectorAll('[data-review-form]').forEach(form=>{
-  const key=form.closest('[data-list-item]').dataset.key,words=form.elements.feedback;
-  if(drafts.has(key)) words.value=drafts.get(key);
-  form.closest('[data-list-item]').querySelectorAll('input[name=choice]').forEach(choice=>choice.addEventListener('change',()=>{words.value=choice.value;drafts.set(key,words.value);words.focus();}));
-  words.addEventListener('input',()=>drafts.set(key,words.value));
+  const row=form.closest('[data-list-item]'),key=row.dataset.key,words=form.elements.feedback,later=form.elements.later;
+  const choices=[...row.querySelectorAll('input[name=choice]')];
+  if(drafts.has(key)){
+   const draft=drafts.get(key);words.value=draft.feedback;later.value=draft.later;
+   choices.forEach(choice=>choice.checked=choice.value===draft.choice);
+  }
+  const remember=()=>drafts.set(key,{feedback:words.value,later:later.value,choice:choices.find(choice=>choice.checked)?.value || ''});
+  choices.forEach(choice=>choice.addEventListener('change',()=>{words.value=choice.value;remember();words.focus();}));
+  [words,later].forEach(field=>{field.addEventListener('input',remember);field.addEventListener('change',remember);});
   form.addEventListener('submit',async event=>{
    event.preventDefault();if(form.dataset.sending) return;
    const data=new URLSearchParams(new FormData(form));data.set('outcome',event.submitter.value);
-   form.elements.later.required=data.get('outcome')==='later';
-   if(!form.elements.later.reportValidity()) return;
+   later.required=data.get('outcome')==='later';
+   const valid=later.reportValidity();later.required=false;
+   if(!valid) return;
    form.dataset.sending='true';saving++;pageRefresh.abandon();
    const buttons=[...form.querySelectorAll('button')],notice=form.querySelector('[data-send-status]');
    buttons.forEach(button=>button.disabled=true);notice.textContent='Saving…';
@@ -280,6 +286,7 @@ function bind(){
     await new Promise(resolve=>setTimeout(resolve,900));
     saved.set(key,{updated:form.closest('[data-list-item]').dataset.updated,
      later:data.get('outcome')==='later' ? Date.parse(data.get('later')) : 0,
+     question:data.get('outcome')==='question',
      closes:!['validate','question','later'].includes(data.get('outcome'))});
     view.opened.delete(key);view.apply(false);
    }catch(error){notice.textContent='Not saved: '+error.message;buttons.forEach(button=>button.disabled=false);}
@@ -300,6 +307,10 @@ async function refresh(_supersede=false,current=()=>true){
   if(result.later){if(Date.now()>=result.later) saved.delete(key);continue;}
   if(result.closes) continue;
   const row=content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
+  if(result.question){
+   if(row?.dataset.state==='For you' && row.dataset.updated!==result.updated) saved.delete(key);
+   continue;
+  }
   if(!row || row.dataset.state!=='For you' || row.dataset.updated!==result.updated) saved.delete(key);
  }
  bind();view.apply(false);
@@ -308,6 +319,6 @@ async function refresh(_supersede=false,current=()=>true){
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
 }
 view.place();bind();view.apply();
-addEventListener('hashchange',()=>{const item=new URLSearchParams(location.hash.slice(1)).get('item');if(item && !saved.get(item)?.closes) saved.delete(item);view.place();view.apply(false);});
+addEventListener('hashchange',()=>{const item=new URLSearchParams(location.hash.slice(1)).get('item');if(item && !saved.get(item)?.closes && !saved.get(item)?.question) saved.delete(item);view.place();view.apply(false);});
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
 })();'''

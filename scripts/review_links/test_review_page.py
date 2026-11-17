@@ -18,6 +18,9 @@ from typing import override
 from unittest.mock import patch
 from urllib.parse import urlencode
 
+from scripts.agents.remote import local_machine
+from scripts.production.production_doc import read_production
+from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, investigation, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, record_table, review_items, review_page
 from scripts.review_links import test_change_page
@@ -206,6 +209,39 @@ class ReviewPageTests(unittest.TestCase):
                 self.assertEqual(sum('The second case passes.' in entry.words for entry in returned.log),1)
                 self.assertEqual(sum('Check the second case.' in entry.words for entry in returned.log),1)
 
+        with self.subTest(finding='F022'):
+            members = staff.snapshot()
+            parent = next(row for row in members.rows if row.name == 'page-owner')
+            child_doc = self.fixture.temporary / 'child-production.md'
+            _ = child_doc.write_text(self.fixture.production.read_text())
+            child = fixture_member('showrunner', name='child-owner', parent=parent.id,
+                                   doc=staff.LiveDoc(local_machine(), child_doc))
+            identities = update_registration.QuestionStaff.for_record(staff.snapshot())
+            scope = read_production(child, identities.record)
+            update_registration.store_questions(scope, [update_registration.OutstandingItem(
+                since='2026-11-12T12:00', text='Which layout should the page use?',
+                question='Choose the layout.', asked_by=child.id)], identities)
+            child_key = next(item.key for item in review_items.read(self.root)
+                             if isinstance(item.source, review_items.QuestionSource) and item.owner == child.id)
+            for key in (question, child_key):
+                delivery, _ = review_page.submit(self.root,self.body(key,'question','Check this exact record.'),self.status)
+                change_page.deliver(delivery,self.status)
+            child_record = next(item.source.record for item in review_items.read(self.root)
+                                if item.key == child_key and isinstance(item.source, review_items.QuestionSource))
+            child_before = child_record.path.read_bytes()
+            for key in (question, child_key):
+                self.assertEqual(change_page.main(['answer-question','--item',key,'--text','Answer for '+key]),0,
+                                 'F022: the exact item selects its record despite identical subtree text')
+                returned = next(item for item in review_items.read(self.root) if item.key == key)
+                self.assertEqual(returned.state,review_items.ReviewState.FOR_YOU)
+                self.assertIn('Answer for '+key, returned.log[-1].words)
+                if key == question:
+                    self.assertEqual(change_page.main(['answer-question','--item',key,'--text','Repeat parent answer']),1,
+                                     'F022: a repeated parent answer cannot select the child')
+                    self.assertEqual(child_record.path.read_bytes(),child_before,'F022: only the selected record changes')
+                    self.assertEqual(next(item.state for item in review_items.read(self.root) if item.key == child_key),
+                                     review_items.ReviewState.WAITING)
+
     def test_feedback_closes_each_type_and_uses_startup_delivery_recovery(self) -> None:
         question = self.question()
         ready = self.investigation()
@@ -312,15 +348,25 @@ class ReviewPageTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_filters_single_card_refresh_drafts_and_saved_row_removal(self) -> None:
-        _ = self.question()
+        question_key = self.question()
+        question_item = next(item for item in review_items.read(self.root) if item.key == question_key)
+        assert isinstance(question_item.source, review_items.QuestionSource)
+        question_item.source.record.item['parts'] = update_registration.QuestionParts(
+            ask='Which layout should the page use?',context='Choose a layout.',items=[],
+            recommend='',choices=['Compact layout','Wide layout'])
+        update_registration.write_question_record(question_item.source.record)
         _ = self.investigation()
         _ = self.investigation(False)
         source = review_page.render(self.root).decode()
         setup = r"""<script>
 const nativeFetch=fetch, nativeTimeout=setTimeout, original=MARKUP;
 window.setInterval=()=>0;window.clearInterval=()=>{};
+const refreshed=new DOMParser().parseFromString(original,'text/html');
+const refreshedForm=refreshed.querySelector('[data-type="question"] form');
+refreshedForm.elements.token.value+='-refreshed';refreshedForm.elements.row.value+='-refreshed';
+window.refreshMarkup=refreshed.documentElement.outerHTML;
 window.fetch=async(_url,options={})=>options.method==='POST' ?
- {ok:true,json:async()=>({answer:'works'})} : {ok:true,text:async()=>original};
+ {ok:true,json:async()=>({answer:'works'})} : {ok:true,text:async()=>window.refreshMarkup};
 </script>""".replace('MARKUP',json.dumps(source).replace('</','<\\/'))
         probe = r"""<script>
 (async()=>{
@@ -340,10 +386,17 @@ window.fetch=async(_url,options={})=>options.method==='POST' ?
   const change=rows().find(row=>row.dataset.type==='change');change.querySelector('.list-toggle').click();
   check(question.querySelector('[data-detail]').hidden,'only one card opens');
   question.querySelector('.list-toggle').click();
+  const draftLater=question.querySelector('[name="later"]');draftLater.value='2098-12-31T16:30';
+  draftLater.dispatchEvent(new Event('change',{bubbles:true}));
+  const picked=question.querySelector('input[name=choice]');picked.click();
   question.querySelector('textarea').value='Keep this draft';question.querySelector('textarea').dispatchEvent(new Event('input'));
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
   const fresh=rows().find(row=>row.dataset.type==='question');
   check(!fresh.querySelector('[data-detail]').hidden && fresh.querySelector('textarea').value==='Keep this draft','refresh keeps the card and draft');
+  check(fresh.querySelector('[name="later"]').value==='2098-12-31T16:30','F018: refresh keeps the picked Later date and time');
+  check(fresh.querySelector('input[name=choice]:checked')?.value===picked.value,'F018: refresh keeps the selected choice');
+  check(fresh.querySelector('form').elements.row.value===fresh.dataset.key+'-refreshed' &&
+    fresh.querySelector('form').elements.token.value.endsWith('-refreshed'),'F018: refresh supplies the row and token');
   const target=rows().find(row=>row.dataset.type==='change');target.querySelector('.list-toggle').click();
   const form=target.querySelector('form');form.requestSubmit(form.querySelector('[value="works"]'));
   await flush();check(form.querySelector('[data-send-status]').textContent==='Saved: works','the row shows the saved result');
@@ -395,6 +448,35 @@ window.fetch=async(_url,options={})=>options.method==='POST' ?
   const returned=rows().find(row=>row.dataset.type==='question');
   check(!returned.hidden && returned.dataset.state==='For you','Later returns the question with its original state');
   Date.now=nativeNow;
+  returned.querySelector('.list-toggle').click();
+  const answerForm=returned.querySelector('form');answerForm.elements.later.value='';
+  answerForm.requestSubmit(answerForm.querySelector('[value="later"]'));await flush();
+  answerForm.requestSubmit(answerForm.querySelector('[value="answer"]'));await flush();
+  check(answerForm.querySelector('[data-send-status]').textContent==='Saved: works',
+    'F023: an empty Later does not block Answer');
+  await new Promise(resolve=>nativeTimeout(resolve,1000));
+  choose('list-show','open');choose('list-search','','input');choose('list-owner','');
+  document.querySelector('[data-type-chip=""]').click();
+  const pending=rows().find(row=>row.dataset.number==='page-owner/c3'),pendingKey=pending.dataset.key;
+  pending.querySelector('.list-toggle').click();
+  const pendingForm=pending.querySelector('form');pendingForm.elements.feedback.value='Wait for a new answer.';
+  const initialCount=Number(document.querySelector('[data-list-count]').textContent.split(' ')[0]);
+  pendingForm.requestSubmit(pendingForm.querySelector('[value="question"]'));
+  await new Promise(resolve=>nativeTimeout(resolve,1000));
+  const revision=pending.dataset.updated;
+  for(const [state,updated,revealed] of [
+    ['For you',revision,false],['Waiting',revision,false],
+    ['Waiting','2099-02-01T09:00:00+00:00',false],['For you','2099-02-01T10:00:00+00:00',true]]){
+   const update=new DOMParser().parseFromString(original,'text/html');
+   const updatedRow=update.querySelector('[data-key="'+pendingKey+'"]');
+   updatedRow.dataset.state=state;updatedRow.dataset.updated=updated;
+   window.refreshMarkup=update.documentElement.outerHTML;
+   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+   const shownPending=rows().find(row=>row.dataset.key===pendingKey);
+   check(shownPending.hidden!==revealed,'F021: state and revision control return for '+state+' '+updated);
+   check(Number(document.querySelector('[data-list-count]').textContent.split(' ')[0])===initialCount-(revealed?0:1),
+     'F021: only the new For you response restores the count');
+  }
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""

@@ -1600,6 +1600,32 @@ def followup(production: QuestionScope, text: str, words: str, *, identities: Qu
     return answer_relay(production, production.name, question_asker(changed, OpenItemWithoutAsker(), identities), identities)
 
 
+def answer_followup(entry: OutstandingItem, text: str) -> None:
+    """Move one pending follow-up into its answered exchanges."""
+    pending = entry.pop("followup", None)
+    if pending is None:
+        raise RegistrationFailure("reply", f"{entry['text']}: no follow-up waits for a reply")
+    entry["followups"] = [*entry.get("followups", []), FollowupExchange(followup=pending["text"], reply=text.strip())]
+
+
+def reply_record(record: QuestionRecord, text: str, who: str, *, identities: QuestionStaff) -> None:
+    """Answer the exact record under its owner's lock and keep the answer in its log."""
+    from scripts.review_links import review_events
+    if not text.strip():
+        raise RegistrationFailure("reply", "the reply is empty")
+    scope = question_scope(record.owner, identities.record)
+    with outstanding_lock(outstanding_path(scope)):
+        current = _question_records([Issue(record.path, frontmatter(record.path))])[0]
+        if current.status != "open" or "followup" not in current.item:
+            raise RegistrationFailure("reply", f"{current.item['text']}: no open follow-up waits for a reply")
+        answer_followup(current.item, text)
+        events = review_events.decode(current.item.get("review_log", ""))
+        event = review_events.ReviewLog(datetime.now().astimezone(), who, 'Answer: '+text)
+        current.item["review_log"] = review_events.encode(review_events.append(events, event))
+        write_question_record(current)
+    report("reply", "ok", f"{scope.name}: {current.item['text']}: back on the open-questions list with the reply")
+
+
 def reply(production: QuestionScope, words: str, text: str, *, identities: QuestionStaff | None = None) -> None:
     """Record the asker's reply to the follow-up; the question returns to the user with both."""
     identities = identities if identities is not None else QuestionStaff.read()
@@ -1613,13 +1639,7 @@ def reply(production: QuestionScope, words: str, text: str, *, identities: Quest
     if len(found) != 1:
         raise RegistrationFailure("reply", f"{len(found)} questions with a follow-up match {wanted!r}; name one by its exact text")
 
-    def answer_followup(entry: OutstandingItem) -> None:
-        pending = entry.pop("followup", None)
-        if pending is None:
-            raise RegistrationFailure("reply", f"{wanted}: no follow-up waits for a reply")
-        entry["followups"] = [*entry.get("followups", []), FollowupExchange(followup=pending["text"], reply=text.strip())]
-
-    _ = change_open_question(production, found[0], wanted, identities, "reply", answer_followup)
+    _ = change_open_question(production, found[0], wanted, identities, "reply", lambda entry: answer_followup(entry, text))
     report("reply", "ok", f"{found[0]}: {wanted}: back on the open-questions list with the reply")
 
 

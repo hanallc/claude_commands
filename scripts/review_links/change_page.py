@@ -1238,9 +1238,7 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
     who = review_items.name(item.owner,staff.snapshot())
     if isinstance(source,review_items.QuestionSource):
         identities = update_registration.QuestionStaff.read()
-        scope = update_registration.question_scope(source.record.owner,identities.record)
-        update_registration.reply(scope,source.record.item['text'],words,identities=identities)
-        update_registration.record_review_log(source.record.path,'Answer: '+words,who)
+        update_registration.reply_record(source.record,words,who,identities=identities)
         return True
     if isinstance(source,review_items.InvestigationSource):
         _ = investigation.answer(source.record.owner,source.record.id,words)
