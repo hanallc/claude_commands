@@ -17,7 +17,7 @@ import json
 import os
 import fcntl
 from collections.abc import Callable, Generator, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import wraps
 from inspect import currentframe
@@ -572,18 +572,19 @@ def run_module(config_log: Path | NoConfigReadLog) -> None:
 @contextmanager
 def private_run_roots() -> Generator[Callable[[], None]]:
     """Keep imported run roots and child processes under one private folder."""
+    from scripts.lib import build_folders
+
     names = ("SCRATCH_ROOT", "ASTRA_REVIEW_DIR")
     previous = {name: os.environ[name] for name in names if name in os.environ}
-    temporary = tempfile.TemporaryDirectory(prefix="test-run-roots-", dir="/tmp")
-    try:
-        root = Path(temporary.name)
-        os.environ.update(SCRATCH_ROOT=str(root / "scratch"), ASTRA_REVIEW_DIR=str(root / "astra"))
-        yield temporary.cleanup
-    finally:
-        for name in names:
-            _ = os.environ.pop(name, None)
-        os.environ.update(previous)
-        temporary.cleanup()
+    with ExitStack() as cleanup:
+        root = cleanup.enter_context(build_folders.tool_folder("test-run-roots"))
+        try:
+            os.environ.update(SCRATCH_ROOT=str(root / "scratch"), ASTRA_REVIEW_DIR=str(root / "astra"))
+            yield cleanup.close
+        finally:
+            for name in names:
+                _ = os.environ.pop(name, None)
+            os.environ.update(previous)
 
 
 def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
