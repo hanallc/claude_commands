@@ -1,4 +1,5 @@
 config/build_folders.conf
+config/build_targets.conf
 config/copies.conf
 config/hana_aws.conf
 scripts/aws_target/__init__.py
@@ -28,6 +29,7 @@ scripts/lib/atomic_file.py
 scripts/lib/boot_identity.py
 scripts/lib/build_folders.py
 scripts/lib/build_slots.py
+scripts/lib/build_steps.py
 scripts/lib/cargo_output.py
 scripts/lib/conf.py
 scripts/lib/conf_reads.py

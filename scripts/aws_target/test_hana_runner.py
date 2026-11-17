@@ -88,6 +88,7 @@ class HanaRunnerTests(unittest.TestCase):
         self.access: execution.HanaExecutionAccess
         self.envelope: execution.HanaCommandEnvelope
         self.supervisor: PrivateSupervisor
+        self.compiler_version: Path
 
     @override
     def setUp(self) -> None:
@@ -95,6 +96,9 @@ class HanaRunnerTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
         self.root = self.fixture.root
+        self.compiler_version = self.root / 'compiler-version'
+        _ = self.compiler_version.write_text('1.2.3\n')
+        _ = self.enterContext(mock.patch.object(runner, 'IMAGE_COMPILER_VERSION', self.compiler_version))
         _ = self.enterContext(mock.patch.object(shutil, 'disk_usage',
             return_value=DiskReading(200 * 1024**3, 100 * 1024**3, 100 * 1024**3)))
         self.binaries = self.root / 'bin'
@@ -107,7 +111,7 @@ class HanaRunnerTests(unittest.TestCase):
         for name, body in {
             'nix': 'printf \'export TEST_SHELL_PROOF=ci\\n\'\n',
             'rustup': 'exit 0\n',
-            'rustc': 'printf \'rustc 1.99.1 (fixture)\\n\'\n',
+            'rustc': 'printf \'rustc 1.2.3 (fixture)\\n\'\n',
             'cargo': 'test -e /proc/$$/fd/$BUILD_FOLDER_LOCK_FD || exit 99\n'
                      + 'printf \'%s|%s|%s|%s\\n\' "$CARGO_BUILD_BUILD_DIR" "$RUST_BACKTRACE" '
                      + '"$TEST_SHELL_PROOF" "$*"\nexit 13\n',
@@ -188,7 +192,8 @@ class HanaRunnerTests(unittest.TestCase):
             + f'pathlib.Path({str(pids)!r}).write_text(str(os.getpid()) + " " + str(child.pid)); '
             + 'threading.Event().wait(60)')
         self.tool('cargo', 'exec ' + shlex.join([sys.executable, '-c', code]) + '\n')
-        _ = write_config_fixture(self.fixture.configuration.source, 'execution_command_timeout_s=0.25\n')
+        _ = write_config_fixture(self.fixture.configuration.source.with_name('build_targets.conf'),
+            '# range: 0.001..\nloopback.command_timeout_s=0.25\n')
         outcome = self.run_request(self.request)
         assert isinstance(outcome, runner.HanaExecutionLost)
         self.assertIn('execution deadline', outcome.reason)
@@ -201,7 +206,8 @@ class HanaRunnerTests(unittest.TestCase):
 
     def test_command_deadline_also_bounds_the_wait_after_output_closes(self) -> None:
         self.tool('cargo', 'exec >/dev/null 2>&1\nexec sleep 60\n')
-        _ = write_config_fixture(self.fixture.configuration.source, 'execution_command_timeout_s=0.1\n')
+        _ = write_config_fixture(self.fixture.configuration.source.with_name('build_targets.conf'),
+            '# range: 0.001..\nloopback.command_timeout_s=0.1\n')
         outcome = self.run_request(self.request)
         assert isinstance(outcome, runner.HanaExecutionLost)
         self.assertIn('execution deadline', outcome.reason)
@@ -270,6 +276,29 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
         self.tool('rustc', 'printf \'rustc 0.0.1 (wrong)\\n\'\n')
         self.assertIsInstance(self.run_request(self.request), runner.HanaExecutionRefused)
         self.assertFalse(cargo.exists())
+
+    def test_missing_or_invalid_image_compiler_refuses_before_source_and_cargo(self) -> None:
+        for value in (None, '', 'invalid', b'\xff'):
+            with self.subTest(value=value):
+                if value is None:
+                    self.compiler_version.unlink()
+                elif isinstance(value, bytes):
+                    _ = self.compiler_version.write_bytes(value)
+                else:
+                    _ = self.compiler_version.write_text(value)
+                with mock.patch.object(source, 'materialize') as materialize:
+                    outcome = self.run_request(self.request)
+                assert isinstance(outcome, runner.HanaExecutionRefused)
+                self.assertIn('HanaCompilerVersionUnavailable:', outcome.reason)
+                materialize.assert_not_called()
+
+    def test_execution_settings_use_the_image_and_shared_deadlines_and_disk_floor(self) -> None:
+        _ = write_config_fixture(self.fixture.configuration.source.with_name('build_targets.conf'),
+            'loopback.shell_timeout_s=7\nloopback.command_timeout_s=19\n')
+        _ = write_config_fixture(self.fixture.configuration.source, 'free_floor_gib=11\n')
+        settings = runner.read_settings(self.fixture.configuration)
+        self.assertEqual((settings.compiler_version, settings.shell_timeout_s,
+            settings.command_timeout_s, settings.free_floor_gib), ('1.2.3', 7, 19, 11))
 
     def test_missing_disk_space_refuses_before_cargo(self) -> None:
         cargo = self.root / 'cargo-started'
@@ -473,6 +502,7 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
         arguments = cast(list[str], launch.call_args.args[0])
         self.assertIn('--property=RuntimeMaxSec=600', arguments)
         self.assertIn('--property=TimeoutStopSec=10', arguments)
+        self.assertIn('--property=EnvironmentFile=/etc/hana-aws/runner-environment', arguments)
         content = (directory / 'input').read_bytes()
         self.assertNotIn(self.access.result_url.encode(), content)
         self.assertNotIn(self.access.observation_url.encode(), content)

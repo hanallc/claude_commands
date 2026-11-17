@@ -1,7 +1,8 @@
 # Hana F2 image proposal
 
-The natedev owner applies these changes in the NixOS branch.
-This worktree changes no NixOS file and runs no AWS command.
+F2 implements these changes in the NixOS branch `hana-image`.
+The branch requires the next `builds-aws` checkpoint for its `claude-commands` input.
+This work runs no image build, activation, or AWS command.
 Placement remains disabled.
 
 1. Add `git` and `curl` to the Hana image.
@@ -12,12 +13,11 @@ Placement remains disabled.
 6. Give runtime directories mode `0755` and runtime files mode `0644`.
 7. Preserve mode `0600` for the receiver, safety configuration, and control files.
 8. Give `hana-runner` the home `/var/lib/hana/runner` on the data filesystem.
-9. Create that home with `hana-runner` ownership after the data mount succeeds.
+9. Create that home in a oneshot unit after `var-lib-hana.mount`, with `RequiresMountsFor=/var/lib/hana`.
 10. Give `hana-runner` its approved slot, Cargo, mirror, shell, and temporary directories on the data filesystem.
 11. Install the approved `roots.slots.aws-hana`, `slots.aws-hana.hana.max`, and `slots.aws-hana.hana.max_bytes` settings.
 12. Preserve the root-only IMDS rule and the independent guard and watchdog units.
 13. Review the complete import closure in `scripts/aws_target/hana_render.files`.
-14. Build the image after the owner reviews the shared toolchain and slot capacity.
 
 The receiver reads signed command and fence objects beside the permit object.
 It keeps attempt journals outside the leased source directories.
@@ -41,18 +41,28 @@ The runner receives no observation PUT URL, result PUT URL, permit file, or cont
 Root captures the bounded result and publishes it through the signed result URL.
 Missing or uncertain command evidence retains the attempt.
 
-| New configuration key | Value | Source and reason |
+| Execution setting | Single source | Guest use |
 | --- | --- | --- |
-| `execution_shell` | `ci` | The existing Linux policy documents `devshell.hana=ci` in `config/README.md`. |
-| `execution_shell_timeout_s` | `120` | `loopback.shell_timeout_s` supplies the existing Linux shell deadline. |
-| `execution_compiler_version` | `1.99.1` | `hosts/aws-build.nix` supplies the shared AWS compiler release. |
-| `execution_command_timeout_s` | `600` | `loopback.command_timeout_s` supplies the existing Linux verify proof deadline in `build_targets.conf`. |
-| `free_floor_gib` | `30` | E supplies this shared host floor in `hana_aws.conf`. The guest uses the same floor. |
+| Shell selector | `execution_shell=ci` in `hana_aws.conf` | Preserve the existing Hana CI shell policy. |
+| Shell deadline | `loopback.shell_timeout_s` in `build_targets.conf` | Render that file and read it through `conf.py`. |
+| Command deadline | `loopback.command_timeout_s` in `build_targets.conf` | Use the same value for command capture and `RuntimeMaxSec`. |
+| Compiler version | `awsToolchain.compilerVersion` in `modules/linux/aws-toolchain.nix` | Read the root-owned `/etc/hana-aws/compiler-version` file. |
+| Disk floor | E's `free_floor_gib` in `hana_aws.conf` | Read the existing key without a second copy. |
+
+The shared NixOS module contains the only compiler release literal.
+The guest refuses a missing or invalid compiler file with `HanaCompilerVersionUnavailable`.
+The Hana configuration contains no compiler version or deadline copy.
+The renderer includes `build_targets.conf` in the guest runtime.
+The receiver reads that runtime configuration through `CONF_DIR`.
+The image installs `/etc/hana-aws/runner-environment` for the transient command and source-only units.
+That file supplies the runner home, Cargo home, rustup home, temporary path, configuration path, and shared sccache environment.
+The data directory unit installs the common Cargo configuration without a separate copy.
+The approved pool has one Hana slot with a 128 GiB size limit.
 
 The shell and compiler checks precede the requested Cargo judgment.
 The source toolchain hash still binds `rust-toolchain.toml` to the exact captured commit.
 The image owner reviews the disk floor before activation.
-This proposal changes no existing configuration value.
+The image leaves the existing builder and natedev derivations unchanged before any input pin update.
 
 F2 reports `MissingBasis` as a bounded refusal diagnostic.
 F1 calls `SourceSender.retry_complete` for the original captured commit.

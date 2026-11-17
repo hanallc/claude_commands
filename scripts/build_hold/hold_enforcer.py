@@ -26,6 +26,8 @@ from typing import Literal, cast
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import build_hold
+from scripts.build_queue import admission_service, admission_records, placement
+from scripts.aws_target import hana_placement
 from scripts.buildlog.parse import CARGO_BUILD_VERBS, cargo_subcommand
 from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
 
@@ -182,9 +184,6 @@ def claimed_processes(proc_root: Path = build_hold.PROC_ROOT) -> build_hold.Live
     claimed: set[build_hold.ProcessIdentity] = set()
     waiters: set[build_hold.ProcessIdentity] = set()
     try:
-        from scripts.build_queue import admission_service, admission_records, placement
-        from scripts.aws_target import hana_placement
-
         state = admission_service.ServiceState({}, {}, {}, admission_records.ReadyToStart())
         state_read = False
         for target in target_config.read_targets():
@@ -196,15 +195,14 @@ def claimed_processes(proc_root: Path = build_hold.PROC_ROOT) -> build_hold.Live
             if hana and not state_read:
                 try:
                     state = admission_service.read_state(store.root() / 'admission')
-                except FileNotFoundError:
+                except (OSError, ValueError):
                     pass
                 state_read = True
             for claim in claim_state.read_claims(paths):
                 identity = build_hold.ProcessIdentity(claim.record["pid"], claim.record["proc_start"])
                 if build_hold.process_start_time(identity.pid, proc_root) == identity.start_time:
-                    if not hana:
-                        claimed.add(identity)
-                    else:
+                    claimed.add(identity)
+                    if hana:
                         record = claim.record
                         key = placement.attempt_key(record['episode'], record['attempt'])
                         saved = state.assignments.get(key)
@@ -220,7 +218,6 @@ def claimed_processes(proc_root: Path = build_hold.PROC_ROOT) -> build_hold.Live
                         if (assignment.owner.host == store.host_name()
                                 and build_hold.process_start_time(coordinator.pid, proc_root) == coordinator.start_time):
                             waiters.update((identity, coordinator))
-                            claimed.add(identity)
     except claim_state.ClaimStateUnreadable as error:
         return build_hold.ClaimsUnreadable(f"{error.path}: {error}")
     except target_config.ConfigError as error:

@@ -283,6 +283,14 @@ The value must meet `free_floor_gib`. A missing or lower floor refuses the pass.
 Only marked build output and mirrors inside these roots are eligible.
 The on-demand command and the future timer use `sweep.py --floor-only --host mac`.
 
+The Hana guest reads its execution settings from these sources:
+
+| Execution setting | Source |
+| --- | --- |
+| Compiler version | The shared NixOS AWS toolchain installs `/etc/hana-aws/compiler-version`. A missing version causes `HanaCompilerVersionUnavailable`. |
+| Shell deadline | `loopback.shell_timeout_s` in `build_targets.conf`; the renderer includes this file in the guest runtime. |
+| Command deadline | `loopback.command_timeout_s` in `build_targets.conf`; the receiver uses this value for `RuntimeMaxSec`. |
+
 ## aws_target.conf
 
 This file defines the AWS SSH builder target.

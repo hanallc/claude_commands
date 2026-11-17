@@ -97,11 +97,12 @@ class GuestCommandSupervisor:
         payload = json.dumps({'action': action, 'request': cast(object, json.loads(execution.encode_request(request))),
                              'output_max_bytes': output_max_bytes}).encode()
         _ = (directory / 'input').write_bytes(payload)
-        settings = hana_runner.read_settings(conf.read_or_repository('hana_aws'))
+        timeouts = hana_runner.read_timeouts()
         with (directory / 'input').open('rb') as source, (directory / 'output').open('wb') as output, (
                 directory / 'error').open('wb') as error:
             command = [arguments[0], '--quiet', '--pipe', '--property=ExitType=cgroup',
-                       f'--property=RuntimeMaxSec={settings.command_timeout_s:g}',
+                       '--property=EnvironmentFile=/etc/hana-aws/runner-environment',
+                       f'--property=RuntimeMaxSec={timeouts.command_timeout_s:g}',
                        f'--property=TimeoutStopSec={self.timeout_s}',
                        '--unit=' + command_unit(directory),
                        *(word for word in arguments[1:] if not word.startswith('--unit=') and word != '--collect')]
@@ -489,6 +490,7 @@ Type=simple
 User=root
 UMask=0077
 Environment=PATH={guest.SYSTEM_BIN}
+Environment=CONF_DIR={RUNTIME}/config
 ExecStart={guest.SYSTEM_BIN}/python3 {guest.CONTROL}/receiver.py
 Restart=on-failure
 RestartSec={settings.control_poll_seconds}

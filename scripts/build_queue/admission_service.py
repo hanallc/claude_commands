@@ -707,6 +707,22 @@ class OperatingSystemReader:
         self.thread.join()
 
 
+@dataclass(frozen=True)
+class DispatchEvidenceProbe:
+    """The probe reads dispatch ownership for one saved assignment outside the service loop."""
+    key: placement.HostEvidenceKey
+    saved: records.SavedPlacementAssignment
+    read: Callable[[], bool]
+
+
+@dataclass(frozen=True)
+class DispatchEvidence:
+    """The reading applies only to the saved assignment that requested it."""
+    saved: records.SavedPlacementAssignment
+    pending: bool
+    observed_at: float
+
+
 class HostEvidenceWorker:
     """One target reader publishes evidence without blocking the service loop."""
 
@@ -720,6 +736,8 @@ class HostEvidenceWorker:
         self.interval: float = interval
         self.lock: threading.Lock = threading.Lock()
         self.observations: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
+        self.dispatch_probes: dict[str, DispatchEvidenceProbe] = {}
+        self.dispatch_observations: dict[str, DispatchEvidence] = {}
         self.due: dict[placement.HostEvidenceKey, float] = {key: 0.0}
         self.subscriptions: dict[placement.HostEvidenceKey, object] = {key: object()}
         self.stopped: threading.Event = threading.Event()
@@ -734,6 +752,20 @@ class HostEvidenceWorker:
     def publish(self, evidence: placement.HostEvidence) -> None:
         with self.lock:
             self.observations[evidence.key] = evidence
+
+    def dispatch_pending(self, probe: DispatchEvidenceProbe) -> bool:
+        """Request a worker reading and retain ownership until the exact reading arrives."""
+        assignment = probe.saved.assignment
+        attempt = placement.attempt_key(assignment.episode, assignment.attempt)
+        with self.lock:
+            previous = self.dispatch_probes.get(attempt)
+            if previous is None or previous.saved != probe.saved:
+                self.dispatch_probes[attempt] = probe
+                self.due[probe.key] = float('-inf')
+                self.requested.set()
+            observed = self.dispatch_observations.get(attempt)
+            return (observed is None or observed.saved != probe.saved
+                    or time.monotonic() - observed.observed_at > self.interval or observed.pending)
 
     def request(self, key: placement.HostEvidenceKey) -> None:
         with self.lock:
@@ -756,6 +788,10 @@ class HostEvidenceWorker:
             _ = self.due.pop(key, None)
             _ = self.subscriptions.pop(key, None)
             _ = self.observations.pop(key, None)
+            for attempt, probe in tuple(self.dispatch_probes.items()):
+                if probe.key == key:
+                    del self.dispatch_probes[attempt]
+                    _ = self.dispatch_observations.pop(attempt, None)
         self.requested.set()
 
     def _next_ready(self, now: float) -> tuple[placement.HostEvidenceKey, object] | float | None:
@@ -793,9 +829,21 @@ class HostEvidenceWorker:
         except Exception as error:
             evidence = placement.HostEvidenceUnavailable(key, self.clock.now(), str(error))
         with self.lock:
+            dispatches = tuple((attempt, probe) for attempt, probe in self.dispatch_probes.items() if probe.key == key)
+        dispatches_read: list[tuple[str, DispatchEvidenceProbe, DispatchEvidence]] = []
+        for attempt, probe in dispatches:
+            try:
+                pending = probe.read()
+            except Exception:
+                pending = True
+            dispatches_read.append((attempt, probe, DispatchEvidence(probe.saved, pending, time.monotonic())))
+        with self.lock:
             if self.subscriptions.get(key) is not subscription:
                 return True
             self.observations[key] = evidence
+            for attempt, probe, observed in dispatches_read:
+                if self.dispatch_probes.get(attempt) is probe:
+                    self.dispatch_observations[attempt] = observed
             self.due[key] = time.monotonic() + self.interval
             if self.stopped.is_set():
                 return False
@@ -2488,21 +2536,27 @@ class AdmissionServer:
         current = self.host_evidence(key)
         if isinstance(current, placement.FreshHostEvidence):
             return current
-        if key not in self.host_readers and isinstance(self.last_usable_configuration, records.MemoryConfig):
+        if isinstance(self.last_usable_configuration, records.MemoryConfig):
+            _ = self._host_evidence_reader(key, self.last_usable_configuration.waiting_pass_seconds)
+        return self.host_evidence(key)
+
+    def _host_evidence_reader(self, key: placement.HostEvidenceKey, interval: float) -> HostEvidenceReader:
+        """Keep host and dispatch readings on the same target worker."""
+        if key not in self.host_readers:
             previous = self.host_observations.get(key)
-            target = (destination.provider, destination.target)
+            target = (key.destination.provider, key.destination.target)
             reader = self.host_targets.get(target)
             if reader is None:
                 reader = HostEvidenceWorker(key, lambda current: self.host_probe(current), self.clock,
-                    self.reading_events, self.last_usable_configuration.waiting_pass_seconds)
+                    self.reading_events, interval)
                 self.host_targets[target] = reader
             else:
                 reader.request(key)
             self.host_readers[key] = HostEvidenceReader(key, reader,
-                0.0 if destination.provider == "local" else self._host_probe_timeout(key))
+                0.0 if key.destination.provider == "local" else self._host_probe_timeout(key))
             if previous is not None:
                 reader.publish(previous)
-        return self.host_evidence(key)
+        return self.host_readers[key]
 
     def read_provider_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
         """Read provider evidence without replacing the transport hook."""
@@ -2781,10 +2835,19 @@ done
                     reference = placement.ProviderClaimReference('ssh', destination.target, destination.scope,
                         placement.assigned_claim_id(saved.assignment.episode, saved.assignment.attempt),
                         saved.assignment.episode, saved.assignment.attempt)
-                    controller = hana_placement.controller_for(transport, read_only=True)
-                    if not controller.execution_bound(reference.claim_id):
-                        return False
-                    return claim_dispatch_pending(target_config.ssh_target_state_directory('aws'), reference)
+                    def read_dispatch() -> bool:
+                        controller = hana_placement.controller_for(transport, read_only=True)
+                        return (controller.execution_bound(reference.claim_id)
+                                and claim_dispatch_pending(controller.directory, reference))
+
+                    submitted = self.placement_requests.get(saved.assignment.episode)
+                    if submitted is None or not isinstance(self.last_usable_configuration, records.MemoryConfig):
+                        return True
+                    key = self.host_evidence_key(submitted, destination)
+                    self.host_requests[key] = submitted
+                    self.placement_host_keys[(submitted.episode, destination)] = key
+                    reader = self._host_evidence_reader(key, self.last_usable_configuration.waiting_pass_seconds)
+                    return reader.worker.dispatch_pending(DispatchEvidenceProbe(key, saved, read_dispatch))
             except (OSError, ValueError):
                 return True
         if not isinstance(provider, placement.ProviderClaimReference):
@@ -3297,6 +3360,15 @@ done
             if self.current_assignments.get(assignment.episode) != key:
                 continue
             report = saved.terminal_report
+            if (isinstance(report, placement.TerminalAttemptReport)
+                    and isinstance(report.path, placement.DispatchPathPending)
+                    and isinstance(report.outcome, (placement.PrelaunchRefused, placement.AttemptCancelled))
+                    and (isinstance(saved.provider, placement.NoProviderClaim)
+                        or isinstance(report.outcome, placement.PrelaunchRefused)
+                        and (saved.provider.episode, saved.provider.attempt) != (assignment.episode, assignment.attempt))
+                    and isinstance(saved.permission, placement.PermissionAvailable) and not self._start_pending(saved)):
+                report = replace(report, path=placement.DispatchPathSettled())
+                saved = replace(saved, terminal_report=report)
             if (isinstance(report, placement.TerminalAttemptReport) and isinstance(report.path, placement.DispatchPathSettled)
                     and not isinstance(report.outcome, placement.AttemptDeclined)):
                 self._close_for_report(saved, report)
@@ -3419,8 +3491,8 @@ done
             if (self.current_assignments.get(assignment.episode) == key
                     and isinstance(saved.permission, placement.PermissionAvailable)
                     and isinstance(saved.state, placement.CurrentAssignment)):
-                if self._start_pending(saved):
-                    return [self._placement_status(assignment, 'a pending dispatch requires a terminal execution report')]
+                if isinstance(saved.terminal_report, placement.TerminalAttemptReport):
+                    return [self._placement_status(assignment, 'the attempt already has a terminal report')]
                 if isinstance(request.claim, placement.ProviderClaimReference):
                     from scripts.mac_test.mac_test import scopes_overlap
 
@@ -3428,15 +3500,24 @@ done
                     if (request.claim.provider != destination.provider or request.claim.target != destination.target
                             or not scopes_overlap(request.claim.scope, destination.scope)):
                         return [self._placement_status(assignment, "retained claim does not match the assigned provider scope")]
-                terminal = placement.TerminalAttemptReport(placement.PrelaunchRefused(request.reason),
-                    placement.DispatchPathSettled(), self.clock.now())
+                pending = self._start_pending(saved)
+                path = (placement.DispatchPathPending('provider settlement remains pending')
+                    if pending else placement.DispatchPathSettled())
+                terminal = placement.TerminalAttemptReport(placement.PrelaunchRefused(request.reason), path, self.clock.now())
                 retained = request.claim if isinstance(request.claim, placement.ProviderClaimReference) else saved.provider
                 saved = replace(saved, terminal_report=terminal, provider=retained)
-                self._close_placement(saved, request.reason,
-                    placement.retry_decision(assignment.destination, request.reason, terminal.received_at))
+                retry = placement.retry_decision(assignment.destination, request.reason, terminal.received_at)
+                if pending:
+                    self.assignments[key] = replace(saved, retry=retry)
+                    self.persist()
+                else:
+                    self._close_placement(saved, request.reason, retry)
         elif (isinstance(saved.permission, placement.PermissionConsumed) and saved.provider == request.claim
                 or isinstance(saved.permission, placement.PermissionAvailable)
-                and isinstance(request.outcome, placement.PrelaunchRefused)
+                and (isinstance(request.outcome, placement.PrelaunchRefused)
+                    or isinstance(request.outcome, placement.AttemptCancelled)
+                    and isinstance(saved.terminal_report, placement.TerminalAttemptReport)
+                    and saved.terminal_report.outcome == request.outcome)
                 and isinstance(request.claim, placement.ProviderClaimReference)
                 and request.claim.episode == assignment.episode and request.claim.attempt == assignment.attempt
                 and request.claim.provider == assignment.destination.provider
@@ -3452,8 +3533,10 @@ done
                     if isinstance(outcome, placement.PrelaunchRefused) and not isinstance(retry, placement.RetryAt):
                         retry = placement.retry_decision(assignment.destination, outcome.reason, terminal.received_at)
                     self.assignments[key] = replace(saved, terminal_report=terminal, provider=request.claim, retry=retry)
-                elif isinstance(request.path, placement.DispatchPathSettled) and previous.outcome == outcome:
-                    self.assignments[key] = replace(saved, terminal_report=replace(previous, path=request.path))
+                elif previous.outcome == outcome:
+                    terminal = (replace(previous, path=request.path)
+                        if isinstance(request.path, placement.DispatchPathSettled) else previous)
+                    self.assignments[key] = replace(saved, provider=request.claim, terminal_report=terminal)
             self._settle_attempt_reports()
             self.persist()
         self._publish_replies()

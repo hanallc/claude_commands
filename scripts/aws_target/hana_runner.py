@@ -6,6 +6,7 @@ from contextlib import redirect_stdout
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -18,6 +19,23 @@ from scripts.mac_test import linux_runner
 
 if TYPE_CHECKING:
     from scripts.aws_target.hana_execution import HanaExecutionRequest
+
+
+IMAGE_COMPILER_VERSION = Path('/etc/hana-aws/compiler-version')
+
+
+class HanaCompilerVersionUnavailable(ValueError):
+    """The image has no usable shared compiler release."""
+
+
+def read_image_compiler_version() -> str:
+    try:
+        version = IMAGE_COMPILER_VERSION.read_text().strip()
+    except (OSError, UnicodeError) as error:
+        raise HanaCompilerVersionUnavailable('HanaCompilerVersionUnavailable: The image compiler version is unavailable') from error
+    if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
+        raise HanaCompilerVersionUnavailable('HanaCompilerVersionUnavailable: The image compiler version is invalid')
+    return version
 
 
 @dataclass(frozen=True)
@@ -60,13 +78,26 @@ class GuestExecutionSettings:
     command_timeout_s: float
 
 
+@dataclass(frozen=True)
+class GuestExecutionTimeouts:
+    shell_timeout_s: float
+    command_timeout_s: float
+
+
+def read_timeouts() -> GuestExecutionTimeouts:
+    values = conf.read_or_repository('build_targets').values()
+    return GuestExecutionTimeouts(linux_runner.positive_setting(values, 'loopback.shell_timeout_s'),
+        linux_runner.positive_setting(values, 'loopback.command_timeout_s'))
+
+
 def read_settings(configuration: conf.ConfigRead) -> GuestExecutionSettings:
     values = configuration.values()
+    timeouts = read_timeouts()
     settings = GuestExecutionSettings(configuration.text('execution_shell'),
-        linux_runner.positive_setting(values, 'execution_shell_timeout_s'),
-        configuration.text('execution_compiler_version'),
+        timeouts.shell_timeout_s,
+        read_image_compiler_version(),
         linux_runner.positive_setting(values, 'free_floor_gib'),
-        linux_runner.positive_setting(values, 'execution_command_timeout_s'))
+        timeouts.command_timeout_s)
     if not settings.shell or not settings.compiler_version:
         raise ValueError('The guest requires a shell and a compiler version')
     return settings

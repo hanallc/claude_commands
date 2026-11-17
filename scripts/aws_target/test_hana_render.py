@@ -51,6 +51,10 @@ class HanaRenderTests(unittest.TestCase):
                     self.assertEqual(stat.S_IMODE(actual.stat().st_mode), expected_modes[actual.name])
                     self.assertEqual(actual.read_bytes(), file.content.encode('utf-8'))
             runtime = output / 'runtime'
+            self.assertEqual((runtime / 'config/build_targets.conf').read_bytes(),
+                             (ROOT / 'config/build_targets.conf').read_bytes())
+            self.assertIn('Environment=CONF_DIR=/var/lib/hana-runtime/config',
+                          (output / 'hana-receiver.service').read_text())
             self.assertEqual({str(path.relative_to(runtime)) for path in runtime.rglob('*') if path.is_file()},
                              {*entries, 'runner.py'})
             imported = subprocess.run([sys.executable, '-I', '-c',
@@ -72,6 +76,13 @@ class HanaRenderTests(unittest.TestCase):
         for key in settings:
             with self.subTest(key=key):
                 self.assertNotIn('.', key)
+
+    def test_execution_values_have_no_copies_in_hana_configuration(self) -> None:
+        settings = conf.settings((ROOT / 'config/hana_aws.conf').read_text())
+        for key in ('execution_compiler_version', 'execution_shell_timeout_s', 'execution_command_timeout_s'):
+            self.assertNotIn(key, settings)
+        self.assertEqual(sum(line.startswith('free_floor_gib=')
+            for line in (ROOT / 'config/hana_aws.conf').read_text().splitlines()), 1)
 
 
 if __name__ == '__main__':

@@ -587,7 +587,9 @@ def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBui
     claims = hold_enforcer().claimed_processes(proc_root) if holders else LiveClaims(frozenset())
     if isinstance(claims, ClaimsUnreadable):
         print(f"claims unreadable: {claims.reason}", file=sys.stderr)
-    claimed: frozenset[ProcessIdentity] = claims.identities if isinstance(claims, LiveClaims) else frozenset()
+    # A remote waiter does not grant its local build children an audit exemption.
+    claimed: frozenset[ProcessIdentity] = (claims.identities - claims.remote_waiters
+        if isinstance(claims, LiveClaims) else frozenset())
     builds: list[AuditedBuild] = []
     children: dict[int, list[ProcessIdentity]] = {}
     roots: list[AuditProcess] = []
@@ -608,7 +610,7 @@ def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBui
         owner = audit_owner(process, ancestors)
         classification: BuildClass
         if (isinstance(claims, LiveClaims)
-                and hold_enforcer().holds_claim(process, processes, claims.remote_waiters)):
+                and process.identity in claims.remote_waiters):
             classification = "remote_waiter"
         elif hold_enforcer().holds_claim(process, processes, claimed):
             classification = "claimed"
