@@ -162,7 +162,7 @@ Codex rows:
   Next come `director not running: <session dir>` groups for workers with no listed director, freestanding Claude, and `your Codex sessions`.
   Each row uses `<role> <name>[ (you)][ (context)] — <kind>, <status>[, <slot role>][, <unit>][, <cwd with ~>]`.
   `(you)` marks the sender's row on this machine.
-  A freestanding Claude row without a staff name shows its registry name, then its address in brackets.
+  Every freestanding Claude row with a registry name shows that name, then its address in brackets.
   A row without a registry name shows its address alone.
   Rows omit pids and ports.
 - **`--kind`** keeps rows of that kind and adds each listed worker's unit director and showrunner (same machine) as `(context)` rows; `--json` includes them unmarked.
@@ -170,7 +170,7 @@ Codex rows:
   Each entry is flat: `machine`, `kind`, `role`, `name`, `status`, `address`, `cwd`, `production`, `showrunner`, `showrunner_address`, `unit`, `director`, `director_address`, `slot_role`, `session_dir`, `thread` (id or `null`).
   The `machine` field holds the SSH alias (`natedev` or `mac`) that `send.py --machine` accepts.
   `name` holds only the staff name.
-  `shown_name` uses the registry name for a freestanding Claude session without a staff name.
+  `shown_name` uses the registry name for every freestanding Claude session with a registry name.
   Link fields are empty for no-link states and for a showrunner's or director's own row.
   The `address` field is empty for `CannotReceiveMessages`.
   Entries omit the `session` field.

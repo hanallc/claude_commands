@@ -735,7 +735,12 @@ async function askMeasure(current) {
 }
 async function loadDisks(supersede=false,current=()=>true){
  // The page reads the Builds data on its own refresh, so the page has one timer.
- const [next]=await Promise.all([readData(),readBuilds(current)]);
+ let next;
+ try{[next]=await Promise.all([readData(),readBuilds(current)]);}
+ catch(error){
+  if(current() && measuring && Date.now()/1000-measuring.since>settings.wait_seconds) measuring=null;
+  throw error;
+ }
  if(!current()) return;
  if(next && (!data || next.measured_at!==data.measured_at)){measuring=null;show(next);}
  let failure='';
@@ -743,9 +748,11 @@ async function loadDisks(supersede=false,current=()=>true){
  catch(error){if(!data) throw error;failure=error.message;}
  if(!current()) return;
  if(measuring && Date.now()/1000-measuring.since>settings.wait_seconds){
-  measuring=null;throw new Error("The measure did not finish.");
+  measuring=null;failure="The measure did not finish.";
+  if(!data) throw new Error("The measure did not finish.");
  }
- if(data) return {readAt:data.measured_at,renderSeconds:data.render_seconds,failure};
+ if(data) return {readAt:data.measured_at,renderSeconds:data.render_seconds,answeredAt:Date.now()/1000,
+  busy:measuring ? 'Measuring…' : '',failure};
 }
 const updateSessions = sessionsView(document.getElementById("sessions"));
 stepTip.hoverTips(document.getElementById("tip"), tipFor);

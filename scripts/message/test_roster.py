@@ -1433,6 +1433,20 @@ class RosterTests(unittest.TestCase):
                 row = next(row for row in rows if row["address"] == address)
                 self.assertEqual(row["name"], "")
                 self.assertEqual(row["shown_name"], registry_name or address)
+        member = fixture_member("producer", name="staff-name", runtime_id=fixture_runtime_id("named-freestanding"))
+        address = f"session:{member.current_session}"
+        self._write_session("named-freestanding", "registry-name", member.current_session, self.home, status="idle")
+        status, lines, errors = self._run_main()
+        self.assertEqual((status, errors), (0, []))
+        self.assertIn(f"freestanding registry-name [{address}] — claude, idle, freestanding session, ~",
+                      [line.strip() for line in lines])
+        status, lines, errors = self._run_main("--json")
+        self.assertEqual((status, errors), (0, []))
+        document = cast(dict[str, object], json.loads("\n".join(lines)))
+        rows = cast(list[dict[str, object]], document["entries"])
+        row = next(row for row in rows if row["address"] == address)
+        self.assertEqual(row["shown_name"], "registry-name")
+        self.assertEqual(row["name"], "staff-name")
 
     def test_unit_rename_and_transfer_change_only_shown_location(self) -> None:
         original = replace(self._entry("fixed-address", "worker", "worker:run/fixed-address", kind="codex"),
