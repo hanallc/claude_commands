@@ -357,6 +357,19 @@ def supervisor_matches(argv: tuple[str, ...], path: Path, cwd: str) -> bool:
     return record_path.resolve() == path.resolve()
 
 
+def notice_recipients(
+    owner: OwningSession | NoOwningSession, agent: build_hold.RunAgent | build_hold.NoRunAgent,
+) -> tuple[str, ...]:
+    """Register each notice recipient once, with the Codex address when both identities name the same agent."""
+    if isinstance(agent, build_hold.NoRunAgent):
+        return (owner.session_id,) if isinstance(owner, OwningSession) else ()
+    if isinstance(owner, NoOwningSession):
+        return (agent.session_id,)
+    if agent.session_id in (owner.session_id, f"codex:{owner.session_id}"):
+        return (agent.session_id,)
+    return owner.session_id, agent.session_id
+
+
 def stop_waiting_run(
     run: WaitingRun, holder: build_hold.Holder, processes: Mapping[int, build_hold.AuditProcess], proc_root: Path,
     *, signal_process: Callable[[int, int], None] = os.kill,
@@ -414,8 +427,9 @@ def stop_waiting_run(
             signal_process(identity.pid, signal.SIGTERM)
 
     try:
-        if isinstance(run.owner, OwningSession):
-            _ = build_hold.register_wait(run.owner.session_id)
+        agent = build_hold.run_agent(process, build_hold.audit_ancestors(process, processes))
+        for recipient in notice_recipients(run.owner, agent):
+            _ = build_hold.register_wait(recipient)
         if isinstance(detached, DetachedRun):
             sent = detached_runs.stop_with_reason(detached.path, reason, still_current=still_current, signal_run=signal_run)
         else:
@@ -963,8 +977,9 @@ class StopBuildsAndTests:
         write_refusal(self.proc_root, build)
         classification: build_hold.BuildClass = "other_session" if isinstance(build.owner, OwningSession) else "no_session"
         self.record(build_hold.AuditedBuild(build.process, build.owner, classification, ()), build.holder, self.proc_root, "stopped")
-        if isinstance(build.owner, OwningSession):
-            _ = self.register(build.owner.session_id)
+        agent = build_hold.run_agent(build.process, ancestors)
+        for recipient in notice_recipients(build.owner, agent):
+            _ = self.register(recipient)
         # Include all descendants, not only compilers. Parents precede their children.
         children: dict[int, list[build_hold.AuditProcess]] = {}
         for process in processes.values():
