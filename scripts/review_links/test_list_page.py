@@ -377,6 +377,329 @@ class ListPageTests(unittest.TestCase):
                 "token": list_page.request_token(self.root / "reviews", MORTY.id, item.id, request),
                 "action": action, "words": "", "until": "", **changes}
 
+    def test_remove_closes_before_delivery_and_repeated_requests_do_nothing(self) -> None:
+        item = self.add("Remove this item now")
+        fields = self.fields(item, "remove")
+        root = self.root / "reviews"
+        with patch.object(change_page, "send_to_staff") as send:
+            delivery = list_page.submit(root, urlencode(fields))
+            closed = the_list.load(MORTY.id, item.id)
+            self.assertEqual(closed.state, the_list.ItemState.CLOSED)
+            self.assertEqual(sum(entry.what.startswith("Closed:") for entry in closed.log), 1)
+            send.assert_not_called()
+            list_page.deliver(delivery)
+            self.assertEqual(send.call_args.args[2], f"List page: nate removed item {item.number}.")
+            saved = the_list.load(MORTY.id, item.id)
+            list_page.deliver(list_page.submit(root, urlencode(fields)))
+            send.assert_called_once()
+            self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+
+    def test_park_writes_the_date_before_delivery_and_repeated_requests_do_nothing(self) -> None:
+        item = self.add("Park this item now")
+        fields = self.fields(item, "park", until="2026-12-03")
+        root = self.root / "reviews"
+        with patch.object(change_page, "send_to_staff") as send:
+            delivery = list_page.submit(root, urlencode(fields))
+            parked = the_list.load(MORTY.id, item.id)
+            self.assertEqual(parked.parked_until, the_list.time_value("2026-12-03"))
+            self.assertEqual(parked.state, item.state)
+            send.assert_not_called()
+            list_page.deliver(delivery)
+            self.assertEqual(send.call_args.args[2], f"List page: nate parked item {item.number} until 2026-12-03.")
+            saved = the_list.load(MORTY.id, item.id)
+            list_page.deliver(list_page.submit(root, urlencode(fields)))
+            send.assert_called_once()
+            self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+
+    def test_refused_remove_and_notice_write_failure_keep_the_item(self) -> None:
+        item = self.add("Keep this item when Remove fails")
+        root = self.root / "reviews"
+        with patch.object(the_list, "close", side_effect=the_list.ListError("The fixture refuses this close.")):
+            with self.assertRaisesRegex(the_list.ListError, "refuses this close"):
+                _ = list_page.submit(root, urlencode(self.fields(item, "remove")))
+        self.assertEqual(the_list.load(MORTY.id, item.id), item)
+        with patch.object(the_list, "_save", side_effect=OSError("The fixture refuses this write.")):
+            with self.assertRaises(OSError):
+                _ = list_page.submit(root, urlencode(self.fields(item, "remove")))
+        self.assertEqual(the_list.load(MORTY.id, item.id), item)
+
+    def test_read_rejects_a_saved_park_request_and_its_retry_preserves_newer_updates(self) -> None:
+        item = self.add("Keep each request with its action")
+        root = self.root / "reviews"
+        park = self.fields(item, "park", until="2026-12-03")
+        _ = list_page.submit(root, urlencode(park))
+        parked = the_list.load(MORTY.id, item.id)
+        with self.assertRaisesRegex(the_list.ListError, "different action or words"):
+            _ = list_page.submit(root, urlencode({**park, "action": "read"}))
+        self.assertEqual(the_list.load(MORTY.id, item.id), parked)
+
+        read = {**park, "action": "read", "request": park["request"] + "." + uuid4().hex}
+        _ = list_page.submit(root, urlencode(read))
+        newer = the_list.update(MORTY.id, item.id, {"latest_status": "Keep this newer update unread."}, source="morty")
+        _ = list_page.submit(root, urlencode(read))
+        self.assertEqual(the_list.load(MORTY.id, item.id), newer)
+        for changed in ({"action": "remove"}, {"words": "Different words."}):
+            with self.subTest(changed=changed), self.assertRaisesRegex(the_list.ListError, "different action or words"):
+                _ = list_page.submit(root, urlencode({**read, **changed}))
+        self.assertEqual(the_list.load(MORTY.id, item.id), newer)
+
+    def test_park_retry_succeeds_after_the_date_arrives(self) -> None:
+        item = self.add("Retry this Park after midnight")
+        root = self.root / "reviews"
+        fields = self.fields(item, "park", until="2026-12-03")
+        with patch.object(change_page, "send_to_staff") as send:
+            list_page.deliver(list_page.submit(root, urlencode(fields)))
+            saved = the_list.load(MORTY.id, item.id)
+            with patch.object(the_list, "now", return_value=datetime(2026, 12, 3, 5, tzinfo=UTC)):
+                list_page.deliver(list_page.submit(root, urlencode(fields)))
+            send.assert_called_once()
+        self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+
+    def test_new_park_checks_the_date_at_the_locked_write(self) -> None:
+        item = self.add("Refuse a Park that reaches the writer at midnight")
+        root = self.root / "reviews"
+        fields = self.fields(item, "park", until="2026-12-03")
+        midnight = datetime(2026, 12, 3, 5, tzinfo=UTC)
+        park = the_list.park
+
+        def at_midnight(keeper: staff.StaffId, identity: str, until: the_list.Timestamp, *,
+                        source: str, notice: the_list.PageItemNotice) -> the_list.ListItem:
+            with patch.object(the_list, "now", return_value=midnight):
+                return park(keeper, identity, until, source=source, notice=notice)
+
+        with patch.object(the_list, "park", side_effect=at_midnight):
+            with self.assertRaisesRegex(ValueError, "Choose a future parking date"):
+                _ = list_page.submit(root, urlencode(fields))
+        self.assertEqual(the_list.load(MORTY.id, item.id), item)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_item_actions_unread_sync_and_words_fields(self) -> None:
+        _ = self.fixture_items()
+        with patch.object(list_page, "counts_strip", return_value=""):
+            markup = list_page.render(self.root / "reviews").decode()
+        setup = '''<script>
+const requests=[];let finishPost;
+window.fetch=async(_path,options={})=>{
+ if(options.method!=='POST') throw new Error('Fixture refresh refused');
+ requests.push(new URLSearchParams(options.body));
+ return new Promise(resolve=>finishPost=result=>resolve({ok:result.ok!==false,status:result.ok===false ? 400 : 200,
+  json:async()=>({request:String(requests.length).padStart(32,'0'),token:'b'.repeat(64),unread:'false',...result})}));
+};
+</script>'''
+        probe = '''<script>
+(async()=>{
+ const failures=[],check=(ok,name)=>{if(!ok) failures.push(name);};
+ const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
+ const row=number=>document.querySelector('[data-number="'+number+'"]');
+ const change=(id,value,event='change')=>{const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event(event));};
+ const visible=()=>[...document.querySelectorAll('[data-list-item]')].filter(item=>!item.hidden).map(item=>item.dataset.number).sort().join(',');
+ const choose=(show,query)=>{change('list-show',show);change('list-search',query,'input');};
+ const submit=(number,action)=>{const form=row(number).querySelector('form');form.requestSubmit(form.querySelector('[value="'+action+'"]'));return form;};
+ try{
+  for(const [query,expected] of [['105','105'],['L105','105'],['#105','105'],['BUILDS','105'],
+    ['Straße','106'],['WORKING','105,106'],['Waiting','58'],['Parked','41'],['Closed','54']]){
+   choose('all',query);check(visible()===expected,'words filter: '+query);
+  }
+  choose('open','106');row('106').querySelector('.list-toggle').click();
+  const removed=submit('106','remove');
+  check(row('106').hidden,'Remove hides the row before the response');
+  check([...row('106').querySelectorAll('button')].every(button=>button.disabled),'Remove disables the row buttons');
+  submit('106','remove');check(requests.length===1,'a second Remove press sends nothing');
+  finishPost({item_state:'Closed',parked:'false'});await flush();await flush();
+  check(row('106').hidden,'Remove stays outside Open after success');
+  choose('closed','106');check(visible()==='106','Remove updates the Closed view');
+  check(row('106').querySelector('.list-state').textContent==='Closed','Remove updates the state text');
+  choose('open','105');row('105').querySelector('.list-toggle').click();
+  const refused=submit('105','remove');check(row('105').hidden,'a refused Remove hides the row while pending');
+  finishPost({ok:false,reason:'The fixture refuses this close.'});await flush();await flush();
+  check(!row('105').hidden && row('105').dataset.state==='Working','a refused Remove restores the row');
+  check(refused.querySelector('[data-send-status]').textContent==='Not saved: The fixture refuses this close.','a refused Remove shows its reason');
+  check(!refused.querySelector('[value="remove"]').disabled,'a refused Remove enables another attempt');
+  refused.elements.until.value='2026-12-03';const parked=submit('105','park');
+  check(row('105').hidden,'Park hides the row before the response');
+  submit('105','park');check(requests.length===3,'a second Park press sends nothing');
+  finishPost({item_state:'Working',parked:'true'});await flush();await flush();
+  check(row('105').hidden,'Park stays outside Open after success');
+  choose('parked','105');check(visible()==='105','Park updates the Parked view');
+  check(parked.querySelector('[data-send-status]').textContent==='Parked','Park shows its result');
+  choose('all','58');row('58').querySelector('.list-toggle').click();
+  const form=row('58').querySelector('form');
+  check(row('58').dataset.unread==='false' && !form.querySelector('[value="read"]'),'the unread sync case starts read');
+  form.elements.words.value='Keep this result.';form.elements.words.dispatchEvent(new Event('input'));
+  submit('58','tell');finishPost({item_state:'Waiting for nate',parked:'false',unread:'true'});await flush();await flush();
+  check(row('58').dataset.unread==='true' && row('58').querySelector('.list-dot'),'an unread response restores the dot');
+  check(Boolean(form.querySelector('[value="read"]')),'an unread response restores Mark read');
+  if(form.querySelector('[value="read"]')){
+   submit('58','read');finishPost({item_state:'Waiting for nate',parked:'false',unread:'false'});await flush();await flush();
+   check(!row('58').querySelector('.list-dot') && !form.querySelector('[value="read"]'),'the restored Mark read button works');
+  }
+ }catch(error){failures.push(String(error));}
+ const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
+})();
+</script>'''
+        self.browser_actions(markup, setup, probe)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_reserves_a_lost_park_id_and_updates_the_saved_date_label(self) -> None:
+        item = self.add("Change the parking date")
+        _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
+        with patch.object(list_page, "counts_strip", return_value=""):
+            markup = list_page.render(self.root / "reviews").decode()
+        setup = '''<script>
+const requests=[];let finishPost,losePost;
+window.fetch=async(_path,options={})=>{
+ if(options.method!=='POST') throw new Error('Fixture refresh refused');
+ requests.push(new URLSearchParams(options.body));
+ return new Promise((resolve,reject)=>{
+  losePost=()=>reject(new Error('Fixture lost response'));
+  finishPost=result=>resolve({ok:!result.reason,status:result.reason ? 400 : 200,
+   json:async()=>({request:'a'.repeat(32),token:'b'.repeat(64),unread:'true',...result})});
+ });
+};
+</script>'''
+        probe = '''<script>
+(async()=>{
+ const failures=[],check=(ok,name)=>{if(!ok) failures.push(name);};
+ const row=document.querySelector('[data-list-item]'),form=row.querySelector('form');
+ const submit=action=>{
+  form.requestSubmit(form.querySelector('[value="'+action+'"]'));
+  return requests.at(-1).get('request');
+ };
+ const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
+ const labels=()=>[...row.querySelectorAll('[data-label="State"] small')].map(note=>note.textContent);
+ try{
+  check(labels().join() === 'Parked until 2026-11-18 13:00 EST','starts with one saved date label');
+  form.elements.until.value='2026-12-03';
+  const park=submit('park');losePost();await flush();
+  check(submit('park')===park,'an exact Park retry keeps its request ID');
+  losePost();await flush();
+  check(submit('remove')!==park,'Remove gets a different ID after a lost Park response');
+  finishPost({reason:'Fixture refuses Remove'});await flush();
+  form.elements.until.value='2026-12-04';
+  check(submit('park')!==park,'a different Park date gets a different ID');
+  finishPost({item_state:'Working',parked:'true',parked_until:'2026-12-05 00:00 EST'});await flush();
+  check(labels().length===1,'a successful Park keeps one date label');
+  check(labels().join()==='Parked until 2026-12-05 00:00 EST','the label uses the saved date from the response');
+ }catch(error){failures.push(String(error));}
+ const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
+})();
+</script>'''
+        self.browser_actions(markup, setup, probe)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_retries_a_lost_tell_after_a_refused_park(self) -> None:
+        self.browser_action_sequence('''
+ form.elements.words.value='Tell morty once.';
+ const tell=submit('tell');losePost();await flush();
+ form.elements.until.value='2026-12-03';
+ const park=submit('park');
+ check(park.id!==tell.id,'Park uses its own request ID');
+ finishPost({reason:'Fixture refuses Park'});await flush();
+ check(submit('park').id!==park.id,'a refused Park leaves no unconfirmed request');
+ finishPost({reason:'Fixture refuses Park again'});await flush();
+ form.elements.until.value='';
+ const retry=submit('tell');
+ check(retry.id===tell.id && retry.token===tell.token,'Tell retains its signed ID across refusals');
+ finishPost({item_state:'Working',parked:'false'});await flush();
+ form.elements.words.value='Tell morty once.';
+ check(submit('tell').id!==tell.id,'a confirmed Tell leaves no unconfirmed request');
+ finishPost({item_state:'Working',parked:'false'});await flush();
+''')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_retries_two_lost_park_dates_after_a_confirmed_remove(self) -> None:
+        self.browser_action_sequence('''
+ form.elements.until.value='2026-12-03';
+ const first=submit('park');losePost();await flush();
+ form.elements.until.value='2026-12-04';
+ const second=submit('park');losePost();await flush();
+ check(first.id!==second.id,'each Park date gets its own request ID');
+ const remove=submit('remove');
+ check(remove.id!==second.id,'Remove uses its own request ID');
+ finishPost({item_state:'Closed',parked:'true'});await flush();
+ for(const [date,original] of [['2026-12-03',first],['2026-12-04',second]]){
+  form.elements.until.value=date;
+  const retry=submit('park');
+  check(retry.id===original.id && retry.token===original.token,'Park retains the signed ID for '+date);
+  finishPost({item_state:'Closed',parked:'true'});await flush();
+ }
+''')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_restores_open_row_and_shows_the_refusal_after_a_lost_remove(self) -> None:
+        self.browser_action_sequence('''
+ const remove=submit('remove');
+ check(row.hidden,'Remove immediately hides the row in Open');
+ losePost();await flush();
+ show('closed');
+ check(!row.hidden,'the unconfirmed row appears in Closed');
+ check(submit('remove').id===remove.id,'the exact Remove retry uses the same ID');
+ finishPost({reason:'Fixture refuses Remove'});await flush();
+ const hiddenStatus=document.querySelector('[data-hidden-action-status]');
+ check(row.hidden && hiddenStatus.getClientRects().length>0 &&
+  hiddenStatus.textContent==='Item 1: Not saved: Fixture refuses Remove',
+  'the refusal is visible when the Closed filter hides the restored row');
+ show('open');
+ check(!row.hidden && row.dataset.state==='Working','the refusal restores the confirmed row to Open');
+ const notice=form.querySelector('[data-send-status]');
+ check(notice.getClientRects().length>0 && notice.textContent==='Not saved: Fixture refuses Remove',
+  'the refusal is visible on the restored row');
+ check(hiddenStatus.hidden,'the page hides the extra notice when the restored row is visible');
+''')
+
+    def browser_action_sequence(self, steps: str) -> None:
+        _ = self.add("Test List action retries")
+        with patch.object(list_page, "counts_strip", return_value=""):
+            markup = list_page.render(self.root / "reviews").decode()
+        setup = '''<script>
+const requests=[];let finishPost,losePost;
+window.fetch=async(_path,options={})=>{
+ if(options.method!=='POST') throw new Error('Fixture refresh refused');
+ requests.push(new URLSearchParams(options.body));
+ return new Promise((resolve,reject)=>{
+  losePost=()=>reject(new Error('Fixture lost response'));
+  finishPost=result=>resolve({ok:!result.reason,status:result.reason ? 400 : 200,
+   json:async()=>({request:String(requests.length).padStart(32,'0'),token:'b'.repeat(64),unread:'true',...result})});
+ });
+};
+</script>'''
+        probe = '''<script>
+(async()=>{
+ const failures=[],check=(ok,name)=>{if(!ok) failures.push(name);};
+ const row=document.querySelector('[data-list-item]'),form=row.querySelector('form');
+ const submit=action=>{
+  const count=requests.length;
+  form.requestSubmit(form.querySelector('[value="'+action+'"]'));
+  if(requests.length!==count+1) throw new Error('The test submission did not start.');
+  const request=requests.at(-1);
+  return {id:request.get('request'),token:request.get('token')};
+ };
+ const show=value=>{
+  const filter=document.getElementById('list-show');
+  filter.value=value;filter.dispatchEvent(new Event('change'));
+ };
+ const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
+ try{
+  row.querySelector('.list-toggle').click();
+''' + steps + '''
+ }catch(error){failures.push(String(error));}
+ const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
+})();
+</script>'''
+        self.browser_actions(markup, setup, probe)
+
+    def browser_actions(self, markup: str, setup: str, probe: str) -> None:
+        page = self.root / 'actions.html'
+        _ = page.write_text(markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>'))
+        result = subprocess.run(['google-chrome', '--headless', '--no-sandbox', '--disable-gpu',
+            '--user-data-dir=' + str(self.root / 'chrome-actions'), '--virtual-time-budget=1500',
+            '--dump-dom', page.as_uri()], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        marker = '<p id="probe-results">'
+        self.assertIn(marker, result.stdout[-3000:], 'The browser must complete the item action checks.')
+        failures = cast(list[str], json.loads(html.unescape(result.stdout.split(marker, 1)[1].split('</p>', 1)[0])))
+        self.assertEqual(failures, [])
+
     def test_signed_feedback_logs_words_and_uses_the_shared_sender(self) -> None:
         root = self.root / "reviews"
         item = self.add("The feedback row", number=106)
@@ -388,27 +711,34 @@ class ListPageTests(unittest.TestCase):
             item = the_list.load(MORTY.id, item.id)
             self.assertIs(item.unread_since, the_list.NoTimestamp.UNSET)
             self.assertEqual(item.log[-1].what, "Marked read")
-            for action, extra, words in (("remove", {}, "Remove 106"),
-                    ("park", {"until": "2026-12-03"}, "Park 106 until 2026-12-03"),
-                    ("tell", {"words": "Explain this simply.\nKeep these words."}, "Explain this simply.\nKeep these words.")):
+            for action, extra, words in (
+                    ("park", {"until": "2026-12-03"}, "List page: nate parked item 106 until 2026-12-03."),
+                    ("tell", {"words": "Explain this simply.\nKeep these words."}, "Explain this simply.\nKeep these words."),
+                    ("remove", {}, "List page: nate removed item 106.")):
                 with self.subTest(action=action):
                     fields = self.fields(item, action, **extra)
                     delivery = list_page.submit(root, urlencode(fields))
                     item = the_list.load(MORTY.id, item.id)
-                    self.assertIn(json.dumps(words), item.log[-1].what)
+                    self.assertEqual(the_list.feedback_requests(item)[fields["request"]].words, words)
+                    if action == "tell":
+                        self.assertEqual(item.log[-1].what, "Marked read")
+                    self.assertIn(json.dumps(words), item.log[-2 if action == "tell" else -1].what)
                     self.assertEqual(the_list.sent_to_morty(item), NOW)
                     body = list_page.render(root).decode()
                     self.assertIn("sent to morty, 13:00 EST", body)
                     self.assertIn('data-feedback-form', body)
                     list_page.deliver(delivery)
                     self.assertEqual(send.call_args.args[0], MORTY.id)
-                    self.assertIn("nate's words for item 106\n" + words, cast(str, send.call_args.args[2]))
+                    expected = "List page: nate's words for item 106\n" + words if action == "tell" else words
+                    self.assertEqual(send.call_args.args[2], expected)
                     item = the_list.load(MORTY.id, item.id)
                     before = send.call_count, item.log
                     list_page.deliver(list_page.submit(root, urlencode(fields)))
                     self.assertEqual((send.call_count, the_list.load(MORTY.id, item.id).log), before)
-            self.assertEqual(item.state, initial.state)
-            self.assertEqual(item.parked_until, initial.parked_until)
+            self.assertEqual(item.state, the_list.ItemState.CLOSED)
+            self.assertEqual(item.parked_until, the_list.time_value("2026-12-03"))
+            self.assertEqual((item.title, item.owner, item.next_step), (initial.title, initial.owner, initial.next_step))
+            _ = the_list.reopen(MORTY.id, item.id, source="morty")
             _ = the_list.update(MORTY.id, item.id, {"latest_status": "Morty acts."}, source="morty")
             self.assertNotIn("<small>sent to morty,", list_page.render(root).decode())
             good = self.fields(item, "tell", words="Keep it.")
@@ -578,7 +908,7 @@ window.fetch=async(_path,options={})=>{
             tries = conf.read("review_links").whole("delivery_tries")
             self.assertEqual(send.call_count, tries + 1)
             self.assertIn("List feedback needs attention", cast(str, send.call_args.args[2]))
-            self.assertIn("Remove 1", cast(str, send.call_args.args[2]))
+            self.assertIn("nate removed item 1", cast(str, send.call_args.args[2]))
             self.assertEqual(send.call_args.args[0], OWNER.id)
             list_page.recover_pending()
             list_page.deliver(delivery)
@@ -587,9 +917,9 @@ window.fetch=async(_path,options={})=>{
             latest = tuple(the_list.feedback_requests(alerted).values())[-1]
             self.assertEqual((latest.state, latest.alerted_to), ("alerted", "sdlc"))
             self.assertIn("not sent; sdlc told", list_page.render(root).decode())
-            _ = the_list.update(MORTY.id, item.id, {"latest_status": "Alert handled"}, source="morty")
+            _ = the_list.mark_read(MORTY.id, item.id, source="morty")
             self.assertNotIn("not sent; sdlc told", list_page.render(root).decode())
-        self.assertEqual(the_list.load(MORTY.id, item.id).state, item.state)
+        self.assertEqual(the_list.load(MORTY.id, item.id).state, the_list.ItemState.CLOSED)
 
     def test_failed_alert_keeps_feedback_pending_for_post_and_startup_retries(self) -> None:
         root = self.root / "reviews"
@@ -721,6 +1051,15 @@ addEventListener('unhandledrejection',event=>errors.push(String(event.reason)));
 (async()=>{
 const failed=[],check=(ok,text)=>{if(!ok) failed.push(text);};
 const flush=()=>new Promise(resolve=>nativeTimeout(resolve,50));
+const submitted=(form,button)=>new Promise((resolve,reject)=>{
+ if(form.dataset.sending){reject(new Error('The test submission did not start.'));return;}
+ const observer=new MutationObserver(()=>{
+  if(!form.dataset.sending){observer.disconnect();resolve();}
+ });
+ observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+ form.requestSubmit(button);
+ if(!form.dataset.sending){observer.disconnect();reject(new Error('The test submission did not start.'));}
+});
 const rows=()=>[...document.querySelectorAll('[data-list-item]')];
 const visible=()=>rows().filter(row=>!row.hidden);
 const change=(id,value,event='change')=>{const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event(event,{bubbles:true}));};
@@ -792,14 +1131,12 @@ try{
  let retryForm=tellRow.querySelector('form');
  retryForm.elements.words.value='Deliver this feedback once';retryForm.elements.words.dispatchEvent(new Event('input'));
  const retryId=retryForm.elements.request.value,retryToken=retryForm.elements.token.value,startPosts=posts.length;
- retryForm.requestSubmit(retryForm.querySelector('[value="tell"]'));
- await flush();await flush();await flush();await flush();
+ await submitted(retryForm,retryForm.querySelector('[value="tell"]'));
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  await flush();await flush();
  retryForm=rows().find(row=>row.dataset.number==='105').querySelector('form');
  check(retryForm.elements.request.value===retryId && retryForm.elements.token.value===retryToken,'refresh keeps the failed request identity');
- retryForm.requestSubmit(retryForm.querySelector('[value="tell"]'));
- await flush();await flush();await flush();await flush();
+ await submitted(retryForm,retryForm.querySelector('[value="tell"]'));
  check(posts.length===startPosts+2,'the lost response has one retry');
  check(posts.at(-1).get('request')===retryId && posts.at(-1).get('token')===retryToken,'the retry uses its original signature');
  retryForm=rows().find(row=>row.dataset.number==='105').querySelector('form');
@@ -827,6 +1164,10 @@ try{
   check(!rows().find(row=>row.dataset.number==='106').querySelector('[data-detail]').hidden,'feedback keeps the row open');
  }
  check(new Set(requestIds).size===4,'each new action uses a fresh request');
+ realFeedback=true;failRefresh=false;
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await flush();await flush();await flush();await flush();
+ realFeedback=false;failRefresh=true;
  location.hash=new URLSearchParams({show:'closed',sort:'#',dir:'desc'});await flush();
  check(visible().length===1 && visible()[0].dataset.number==='54','hash navigation restores the filters');
 

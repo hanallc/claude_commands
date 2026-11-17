@@ -419,6 +419,31 @@ class TheListTests(unittest.TestCase):
         self.assertIs(read.unread_since, the_list.NoTimestamp.UNSET)
         self.assertEqual(read.log[-1].what, "Marked read")
 
+    def test_page_item_actions_save_the_notice_in_the_same_write(self) -> None:
+        for action in ("remove", "park"):
+            with self.subTest(action=action):
+                item = self.add("One write for " + action)
+                notice = the_list.PageItemNotice("request-" + action, "The item action is complete.", action)
+                with patch.object(record_store, "write_text_atomic", wraps=atomic_file.write_text_atomic) as save:
+                    if action == "remove":
+                        saved = the_list.close(MORTY.id, item.id, "Removed by nate.", source=the_list.PAGE_SOURCE, notice=notice)
+                    else:
+                        saved = the_list.park(MORTY.id, item.id, START + timedelta(days=1), source=the_list.PAGE_SOURCE, notice=notice)
+                save.assert_called_once()
+                feedback = the_list.feedback_requests(saved)[notice.request]
+                self.assertEqual((feedback.action, feedback.words, feedback.state), (action, notice.words, "pending"))
+                self.assertEqual(saved.log[-1].time, saved.log[-2].time)
+
+    def test_repeated_remove_request_does_not_close_a_reopened_item(self) -> None:
+        item = self.add()
+        notice = the_list.PageItemNotice("request", "The item was removed.", "remove")
+        _ = the_list.close(MORTY.id, item.id, "Removed by nate.", source=the_list.PAGE_SOURCE, notice=notice)
+        reopened = the_list.reopen(MORTY.id, item.id, source="morty")
+        with patch.object(record_store, "write_text_atomic", wraps=atomic_file.write_text_atomic) as save:
+            repeated = the_list.close(MORTY.id, item.id, "Removed by nate.", source=the_list.PAGE_SOURCE, notice=notice)
+        save.assert_not_called()
+        self.assertEqual(repeated, reopened)
+
     def test_parking_hides_the_item_until_its_time_without_changing_state(self) -> None:
         item = self.add(changes={"state": the_list.ItemState.WORKING})
         with patch.object(the_list, "user_zone", return_value=ZoneInfo("America/New_York")):

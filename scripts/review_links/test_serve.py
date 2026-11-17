@@ -266,7 +266,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             fields = {"keeper": morty.id, "id": item.id, "request": request,
                     "token": list_page.request_token(self.root, morty.id, item.id, request),
                     "action": "read", "words": "Explain this simply.", "until": "2026-12-03"}
-            for action in ("read", "remove", "park", "tell"):
+            for action in ("read", "park", "tell", "remove"):
                 fields["action"] = action
                 with self.subTest(action=action):
                     before = the_list.load(morty.id, item.id)
@@ -286,8 +286,12 @@ class ReviewLinksServerTests(unittest.TestCase):
                         delivery.assert_not_called()
                     else:
                         self.assertTrue(sent.wait(TEST_HANG_GUARD_SECS))
-                        self.assertIn("nate's words for item 1", cast(str, delivery.call_args.args[2]))
-            self.assertEqual(the_list.load(morty.id, item.id).state, item.state)
+                        expected = ("nate's words for item 1" if action == "tell" else
+                                "nate removed item 1." if action == "remove" else
+                                "nate parked item 1 until 2026-12-03.")
+                        self.assertIn(expected, cast(str, delivery.call_args.args[2]))
+            self.assertEqual(the_list.load(morty.id, item.id).state, the_list.ItemState.CLOSED)
+            fields["action"] = "tell"
             fields["request"] = uuid4().hex
             fields["token"] = list_page.request_token(self.root, morty.id, item.id, fields["request"])
             _ = list_page.submit(self.root, urlencode(fields))
@@ -306,6 +310,39 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertTrue(sent.is_set())
                 finally:
                     restarted.server_close()
+
+    def test_list_remove_reports_saved_when_directory_sync_fails_after_replace(self) -> None:
+        morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
+                               current_session=staff.StaffId("fixture-morty-session"))
+        item = the_list.add(morty.id, "Remove this item", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
+        request = uuid4().hex
+        fields = {"keeper": morty.id, "id": item.id, "request": request,
+                  "token": list_page.request_token(self.root, morty.id, item.id, request),
+                  "action": "remove", "words": "", "until": ""}
+        folder = the_list.folder(morty.id)
+        sync_folder = atomic_file.sync_folder
+        delivered = threading.Event()
+
+        def fail_list_sync(path: Path) -> None:
+            if path == folder:
+                raise OSError("Fixture directory sync failed after replacement.")
+            sync_folder(path)
+
+        def finish_delivery(_delivery: list_page.ListFeedbackDelivery | change_page.NoMessageDelivery) -> None:
+            delivered.set()
+
+        with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(atomic_file, "sync_folder", side_effect=fail_list_sync),
+              patch.object(list_page, "deliver", side_effect=finish_delivery) as deliver):
+            code, body = self.post(list_page.PAGE_PATH, urlencode(fields))
+            saved = the_list.load(morty.id, item.id)
+            self.assertEqual(saved.state, the_list.ItemState.CLOSED)
+            self.assertEqual(the_list.feedback_requests(saved)[request].state, "pending")
+            self.assertEqual(code, 200)
+            self.assertEqual(json.loads(body)["item_state"], "Closed")
+            self.assertTrue(delivered.wait(TEST_HANG_GUARD_SECS))
+            deliver.assert_called_once_with(list_page.ListFeedbackDelivery(morty.id, item.id, request))
 
     def test_undeletable_expired_snapshot_does_not_prevent_bind_or_other_links(self) -> None:
         expired = self.root / "aaaaaa"
