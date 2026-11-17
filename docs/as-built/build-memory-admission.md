@@ -189,10 +189,12 @@ The adapter uses that grant without a second admission request.
 `PrerequisiteReport` updates that state separately from fixed constraints.
 Restart requires fresh token confirmation for requests that need a token.
 A placement waiter holds no cargo token.
-On the first pass, before the caller reads its token (`TokenReadinessUnchecked`), `_placement_row` marks the row token-waiting.
+`verify.sh` sends `--token after-grant` (`TokenAfterGrant`): it takes the token after a local grant.
+`_placement_row` marks a `TokenRequired` row token-waiting for every readiness except `TokenAfterGrant`, so `memory_admit.py` does not admit it.
+The first pass, before the caller reads its token (`TokenReadinessUnchecked`), is marked.
 That pass starts nothing on natedev, so a free remote target can take the step.
 The client shows no memory wait for that pass, and `verify.sh` sends the next pass at once.
-On a later pass `_placement_row` never marks the row token-waiting, so `memory_admit.py` can admit it.
+An older caller sends `--token required` (`TokenUnavailable`) and gets no local grant until it reports `TokenHeld`.
 
 Remote rows carry execution evidence and the assigned host.
 Physical grouping includes the host, generation, PID, and start time.
@@ -1007,10 +1009,11 @@ Durable `Waiter` rows keep their join and token clocks. `RankedWaiter.order` hol
 A local compiling attempt waits for placement and memory without the board's `cargo` token.
 A token from an earlier step of the same call is released before the next placement.
 After a local grant, `verify.sh` takes the token, then runs cargo. The grant keeps its reservation during that token wait.
-So a memory wait never delays the unit's other calls. The token wait after a grant lasts only while a peer of the same unit runs cargo.
+So a memory wait no longer holds the cargo token. The token wait after a grant lasts only while a peer of the same unit runs cargo.
 A step placed on the Mac or an SSH target never takes the natedev token.
 `acquire_token()` waits in the existing FIFO queue and reuses a token that this call already holds.
 When the token wait after a grant ends without the token, the call cancels its placement or releases its reservation.
+A natedev hold that starts during that wait ends it: the call releases its reservation and places the step again.
 The execution guard still checks the token owner before cargo starts.
 `unreachable_limit_seconds` limits missing-socket and refused-connection retries to 60 seconds by default.
 The client reports the retry interval once when a connection fails.

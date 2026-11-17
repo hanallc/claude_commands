@@ -6,12 +6,15 @@ from scripts.build_queue import admission_records
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import placement
+from scripts.production.staff_test_support import fixture_runtime_id
 
 import os
 import shutil
 import signal
 import subprocess
 import time
+from dataclasses import replace
 from typing import cast, override
 import unittest
 from pathlib import Path
@@ -58,6 +61,71 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
             self.assertIn("waiting for the cargo token since", text)
             self.assertIn("took the cargo token after 0 min", text)
         finally:
+            _ = (self.root / "release").touch()
+            for process in (waiter, holder):
+                if process is not None:
+                    if process.poll() is None:
+                        self.end_group(process.pid)
+                    _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+
+    def test_a_hold_during_the_token_wait_after_a_grant_gives_back_the_grant(self) -> None:
+        board = self.root / "board"
+        lock = board / "locks/cargo.d"
+        hold = self.root / "build-hold" / fixture_runtime_id("fixture-hold-owner")
+        hold.parent.mkdir(exist_ok=True)
+        environment = {**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl",
+                       "BUILD_TARGETS_POLL_S": "0.5"}
+        original_probe = self.admission.server.host_probe
+
+        # The natedev probe reads the hold, as the real probe does.
+        def blocked_while_held(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+            evidence = original_probe(key)
+            if (hold.exists() and key.destination.provider == "local"
+                    and isinstance(evidence, placement.FreshHostEvidence)):
+                return replace(evidence, eligibility=placement.TemporaryExclusion("blocked"))
+            return evidence
+
+        def publish_local(eligibility: placement.HostEligibility) -> None:
+            with self.admission.loop_turn():
+                for reader in self.admission.server.host_readers.values():
+                    if (reader.key.destination.provider == "local"
+                            and isinstance(reader.latest, placement.FreshHostEvidence)):
+                        self.admission.server.publish_host_evidence(replace(reader.latest, eligibility=eligibility))
+
+        self.admission.server.host_probe = blocked_while_held
+        output = self.root / "waiter.out"
+        holder = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
+                                  env={**environment, "TEST_BLOCK": "1"},
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.started_groups.add(holder.pid)
+        waiter: subprocess.Popen[bytes] | None = None
+        try:
+            self.wait_for_running(self.root / "running", holder)
+            held = set(self.admission.server.reservations)
+            with output.open("wb") as stream:
+                waiter = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
+                                          env=environment, stdout=stream, stderr=subprocess.STDOUT,
+                                          start_new_session=True)
+            self.started_groups.add(waiter.pid)
+            self.wait_for_output(output, "waiting for the cargo token since", waiter)
+            publish_local(placement.TemporaryExclusion("blocked"))
+            _ = hold.write_text("private hold")
+            self.wait_for_output(output, "natedev hold started during the cargo token wait", waiter)
+            # The waiter gave back its grant and its queue entry, and it holds no token.
+            with self.admission.loop_turn():
+                self.assertEqual(set(self.admission.server.reservations), held)
+            self.assertEqual([entry.name for entry in (board / "token_waiters").iterdir()
+                              if entry.name.endswith(f".{waiter.pid}")], [])
+            self.assertEqual((lock / "holder_pid").read_text(), str(holder.pid))
+            hold.unlink()
+            publish_local(placement.AllowedHost())
+            _ = (self.root / "release").touch()
+            self.assertEqual(holder.wait(timeout=TEST_HANG_GUARD_SECS), 0)
+            self.assertEqual(waiter.wait(timeout=TEST_HANG_GUARD_SECS), 0, output.read_text())
+            self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
+            self.assertEqual(self.admission.server.reservations, {})
+        finally:
+            hold.unlink(missing_ok=True)
             _ = (self.root / "release").touch()
             for process in (waiter, holder):
                 if process is not None:

@@ -45,9 +45,14 @@ class TokenUnavailable:
 
 
 @dataclass(frozen=True)
+class TokenAfterGrant:
+    """The caller takes the required local token after a local grant."""
+
+
+@dataclass(frozen=True)
 class TokenRequired:
     """Local execution requires a token with this readiness state."""
-    readiness: TokenReadinessUnchecked | TokenUnavailable = TokenUnavailable()
+    readiness: TokenReadinessUnchecked | TokenUnavailable | TokenAfterGrant = TokenUnavailable()
 
 
 @dataclass(frozen=True)

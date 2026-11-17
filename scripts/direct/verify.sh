@@ -2627,7 +2627,7 @@ placement_once() {
     local token=none reply line route="" status=0 monitor=0
     local LINT_QUEUE_LEAVE_HOOK="" BUILDLOG_MAC_IDLE_HOOK=""
     # route_test released any token before placement; a local grant takes it.
-    if [[ "${TOKEN_USED:-0}" == 1 ]]; then token=required; fi
+    if [[ "${TOKEN_USED:-0}" == 1 ]]; then token=after-grant; fi
     export LINT_QUEUE_LEAVE_HOOK BUILDLOG_MAC_IDLE_HOOK
     local placement_args=(place-step --once --wait-events --episode "$PLACEMENT_EPISODE" --since "$PLACEMENT_SINCE"
         --pid $$ --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
@@ -2802,7 +2802,19 @@ route_test() {
             fi
             # The grant keeps its reservation while the call takes its unit's cargo token.
             local token_status=0
+            TOKEN_WAIT_HOLD_CHECK=build_hold_check_local
             acquire_token local || token_status=$?
+            TOKEN_WAIT_HOLD_CHECK=""
+            if (( token_status == 10 )); then
+                # A natedev hold started before the token came: give back the grant and place again.
+                export BUILDLOG_SELECTED_LOCAL_GRANT="$PLACEMENT_GRANT_FILE"
+                export BUILDLOG_PLACEMENT_FILE="$PLACEMENT_ASSIGNMENT_FILE"
+                source "$PLACEMENT_GRANT_FILE" || return $?
+                BUILDLOG_MEM_PRELAUNCH_REASON="local hold changed before execution"
+                buildlog_release_memory 10
+                echo 'verify.sh: natedev hold started during the cargo token wait; choosing its target again.' >&2
+                continue
+            fi
             if (( token_status != 0 )); then
                 verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
                     --pid $$ --reason "the cargo token wait ended" >/dev/null || true
@@ -2816,7 +2828,7 @@ route_test() {
         fi
         if [[ "${TOKEN_USED:-0}" == 1 ]]; then
             verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" report-prerequisite --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
-                --token required >/dev/null || return $?
+                --token after-grant >/dev/null || return $?
         fi
         local claim_status=0
         # reserve and recover-reservation take the same words.
@@ -3230,6 +3242,8 @@ TOKEN_HELD=0
 # A step routed to the Mac skips its first token acquisition.
 TOKEN_WAITED=0
 TOKEN_WAITER_PID=""
+# A local grant sets this to its hold check: a hold that starts during the token wait ends it.
+TOKEN_WAIT_HOLD_CHECK=""
 # shellcheck source=/dev/null
 source "${BASH_SOURCE[0]%/*}/../lib/conf.sh"
 TOKEN_HOLD_S="$(conf_value direct VERIFY_TOKEN_HOLD_SECONDS)" || exit 2
@@ -3248,6 +3262,15 @@ token_wait_clock() {
 # A run ended during its token wait stops the waiting acquire, gives back a
 # token that acquire took in the last instant, then ends by its caller's trap,
 # or by the signal itself when the caller has none.
+# A hold check ended the wait before the token came; this call holds no token.
+token_wait_left() {
+    phase_wait_finish token
+    [[ -z "$TOKEN_WAIT_ENTRY" ]] || rm -f "$TOKEN_WAIT_ENTRY"
+    TOKEN_WAIT_ENTRY=""
+    trap - INT TERM HUP
+    eval "$TOKEN_CALLER_TRAPS"
+}
+
 token_wait_interrupted() {
     local signal_name=$1
     trap - INT TERM HUP
@@ -3446,6 +3469,14 @@ acquire_token() {
             token_wait_superseded
         fi
         kill -0 "$$" 2>/dev/null || token_wait_orphaned
+        if [[ -n "$TOKEN_WAIT_HOLD_CHECK" ]]; then
+            local hold_status=0
+            "$TOKEN_WAIT_HOLD_CHECK" || hold_status=$?
+            if (( hold_status != 0 )); then
+                token_wait_left
+                return "$hold_status"
+            fi
+        fi
         count_token_waiters_ahead
         if (( noted >= 0 )); then phase_wait_start token "cargo token"; fi
         # The line goes out before the first try when the token is not free.
