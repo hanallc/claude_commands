@@ -2709,3 +2709,9 @@ The cutover removal commit deletes the script after the run.
 - Checkpoint `0d39e750f`. No repository code changed.
 
 **Files:** none.
+
+### Phase 143 — Measure what a slot-for-every-build model gains  · status: todo
+
+The user asked how best to use the slot model: disk allows many slots and caller affinity. Today verify.sh check, build, test and lint run in the caller's worktree with one Cargo directory under `/build/cargo/<folder>`; slots serve doc, copies.py run, bump gate, CI points and fast track. The proposal to test: every build takes a slot, and a caller gets its last slot when that slot is free. Analysis only: build records for the last 7 days, no code or config change, no new build.
+
+**Files:** none.
