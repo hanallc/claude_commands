@@ -79,6 +79,9 @@ def observe_whole_reads() -> Generator[Mock]:
         yield observed
 
 
+REAL_SESSION_MOVES = stop_resume.move_sessions
+
+
 NOW = datetime(2026, 10, 14, 12, tzinfo=timezone.utc)
 SOURCE_LOGIN = "source@example.invalid"
 TARGET_LOGIN = "target@example.invalid"
@@ -2157,6 +2160,34 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertFalse(accounts.roles_history_file().exists())
         self.assertEqual(len(self.moves.calls), 2)
         self.assertTrue(all("weekly limit" in command.why for command in self.moves.calls))
+
+    def test_deferred_build_move_keeps_its_destination_until_a_later_check(self) -> None:
+        _ = shutil.copy2(Path(__file__).resolve().parents[2] / "config/shutdown.conf",
+                         Path(os.environ["CONF_DIR"]) / "shutdown.conf")
+        _ = self.groups()
+        _ = self.owner("unit", host="unit")
+        _ = accounts.set_group_account("units", "claude3", why="auto: build", now=NOW, origin=accounts.AutoOrigin())
+        before = accounts.groups_file().read_bytes()
+        held = {"unit": ("verify.sh build in /w",)}
+
+        def move_now(selected: list[str], target: str, *, why: str, **_options: object) -> list[stop_resume.MoveResult]:
+            return self.moves(selected, target, why=why)
+
+        token = stop_resume._batch_process.set(True)  # pyright: ignore[reportPrivateUsage]
+        self.addCleanup(stop_resume._batch_process.reset, token)  # pyright: ignore[reportPrivateUsage]
+        with patch.object(stop_resume, "move_sessions", new=REAL_SESSION_MOVES), \
+                patch.object(stop_resume, "_build_holders", side_effect=[held, held, {}]), \
+                patch.object(stop_resume, "monotonic", side_effect=[0.0, 0.0, 1800.0]), \
+                patch("time.sleep"), \
+                patch.object(stop_resume, "_move_now", side_effect=move_now) as moved:
+            _ = self.cli()
+            self.assertEqual(moved.call_count, 0)
+            self.assertEqual(accounts.groups_file().read_bytes(), before)
+            self.assertEqual(self.moves.calls, [])
+            _ = self.cli()
+        self.assertEqual(len(self.moves.calls), 1)
+        self.assertEqual(self.moves.calls[0].target, "claude3")
+        self.assertEqual(accounts.groups_file().read_bytes(), before)
 
     def test_hand_group_selection_without_live_members_is_reused_for_a_later_member(self) -> None:
         _ = self.groups()
