@@ -5,9 +5,10 @@ The separate asyncRewake Stop entry runs this hook in the background.
 Exit 2 sends the reason from stderr to the agent in a system-reminder.
 The guards permit declared waits, background tasks, and stops without context measurements.
 The hook wakes above the threshold only when the final line differs from the last wake.
-A merge unit with no running work or queued message stops without a wake.
+A merge unit with no worker work, background task, or queued message stops without a wake.
+Own detached runs supply later notices and do not count as merge work.
 Unknown merge state permits the stop and reports one anomaly line.
-Other directors stop without a wake while their own detached runs remain live.
+A director can stop while only its own detached runs remain live.
 Paused status lines permit the stop without a wake.
 Exceptions permit the stop without output.
 """
@@ -77,7 +78,7 @@ type MergeWorkState = MergeWorkFound | MergeIdle | MergeWorkUnknown
 
 
 def merge_work_state(session_dir: Path, row: staff.StaffRow, payload: StopPayload) -> MergeWorkState:
-    """An open recorder phase alone does not prove that a merge unit has work."""
+    """Only worker work, background tasks, and queued messages count as merge work."""
     from scripts.agents.detached_runs import DETACHED_RUNS_DIR, live_run_evidence_for_staff
     from scripts.direct.progress_history import ActiveDispatch, ActiveDispatchUnavailable, active_dispatch
     from scripts.message import send
@@ -96,7 +97,7 @@ def merge_work_state(session_dir: Path, row: staff.StaffRow, payload: StopPayloa
             return MergeWorkFound(f"{worker.id}: active dispatch {dispatch.instance_id}")
         if isinstance(dispatch, ActiveDispatchUnavailable):
             errors.append(dispatch.reason)
-    identities = frozenset({row.id, *(worker.id for worker in workers)})
+    identities = frozenset(worker.id for worker in workers)
     runs = session_dir / DETACHED_RUNS_DIR
     try:
         evidence = live_run_evidence_for_staff(runs, identities)
