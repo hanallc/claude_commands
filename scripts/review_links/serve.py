@@ -35,7 +35,7 @@ STARTED_NS = time.time_ns()
 from scripts.disks import disks_page, sessions, slots
 from scripts.lib import conf
 from scripts.production import change_routing, change_review
-from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, image_store, images, investigations_page, list_page, review_page
+from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_page
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
@@ -270,6 +270,18 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                              + "style-src 'unsafe-inline'; frame-src 'self'; frame-ancestors 'self'; base-uri 'none'")
             self.end_headers()
             return BytesIO(content)
+        if route.path == "/console/for-you.json":
+            try:
+                if route.query == "view=count":
+                    payload = console.for_you_count(for_you.read())
+                else:
+                    payload = console.for_you_payload()
+            except (OSError, ValueError) as error:
+                print(f"review-links actions: {error}", file=sys.stderr)
+                self.json_response(503, {"available": False})
+            else:
+                self.json_response(200, payload)
+            return None
         if route.path == accounts_page.PAGE_PATH:
             try:
                 content = cast(ReviewLinksServer, self.server).accounts_cache.get()

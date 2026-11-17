@@ -2,7 +2,7 @@
 
 The action store holds steps that only the user can perform now.
 Questions and changes remain ordinary Review items.
-This phase adds no page behavior.
+The console shell shows the global action notifier on each page.
 
 `UserAction` is the typed record in `scripts/for_you/action.py`.
 Each action uses `~/.local/state/for-you/actions/<uuid>.json` on the console host.
@@ -59,3 +59,44 @@ Historical rows use `unknown` when the reader cannot confirm their current state
 `UnavailableSource` identifies each failed source.
 `KnownOpenCount` counts each open machine row and each open agent action once.
 `UnavailableOpenCount` retains the known open count without claiming a complete count.
+
+
+The shell reads `/console/for-you.json` through the shared reader.
+The response contains the complete count and at most two open action entries.
+The desktop button uses the approved amber style.
+The collapsed rail keeps the icon and badge.
+The phone header keeps the button visible.
+
+The button opens a nonmodal panel with machine names, copy buttons, and card links.
+Each card link selects Review with `type=for-you`, `show=open`, and the action key.
+The footer opens Review with the reserved parameters and no action key.
+Both links keep other pages’ saved locations.
+The foryou-page phase adds the For you filter and card expansion.
+Escape closes the panel and focuses the visible For you button.
+Copy writes the command to the clipboard.
+Copy does not complete the action.
+
+The shell uses `page_refresh_seconds` for timed reads.
+It pauses the timer while the tab is hidden.
+It also reads on visibility, window focus, and panel opening.
+A same-origin framed page can send `for-you-completed` after a successful completion.
+The shell accepts that message only from one of its page frames.
+If a read is in progress, the shell reads again when it ends.
+A refresh keeps focused commands and text selections until the user releases them.
+
+Before the first complete read, the badge shows `?` with an unavailable label.
+A transport failure keeps the last complete count and entries and marks them stale.
+The phone badge shows a dotted outline for a stale count in both navigation states.
+An explicit unavailable response clears the previous count, including with HTTP 503.
+At zero, the quiet button shows `For you 0`.
+The panel says `No actions required.`
+
+The status line shows session review counts under `Review:`.
+It retains adhoc items and the existing review count colors.
+A separate `For you:` row shows the global action count.
+The Mac requests only the count from the console host.
+The Mac resolves the peer in `console.conf` setting `for_you.host` with `tailscale ip -4`.
+The status line omits a known zero count and shows `Unavailable` for an incomplete read.
+Legacy review cache labels remain readable during the transition.
+The status line no longer inserts rebuild text into review counts.
+The Rebuilds page remains available at `?page=rebuilds` for commit details.

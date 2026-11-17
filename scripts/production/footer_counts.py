@@ -15,7 +15,7 @@ from scripts.production.issues import Issue, source_paths
 if TYPE_CHECKING:
     from scripts.production.update_registration import QuestionStaff
 
-COUNTS_HEAD = "For you: "
+COUNTS_HEAD = "Review: "
 
 
 class FooterCounts(NamedTuple):
@@ -172,10 +172,10 @@ def plural(count: int, word: str) -> str:
 
 
 def counts_line(counts: FooterCounts) -> str | None:
-    """`For you: 1 question, 1 investigation, 2 changes, 130 efficiency, 2 proposals`.
+    """`Review: 1 question, 1 investigation, 2 changes, 130 efficiency, 2 proposals`.
 
-    Questions come first because they need the user most (user, 2026-10-20). "efficiency" has
-    no plural. Zero counts are left out; None when all are zero.
+    Put questions first because they need the user's attention most (user, 2026-10-20).
+    Use "efficiency" for all counts. Omit zero counts. Return None when all counts are zero.
     """
     parts = [text for count, text in (
         (counts.questions, plural(counts.questions, "question")),

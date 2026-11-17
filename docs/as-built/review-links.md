@@ -223,18 +223,34 @@ That function returns the configured Builds page URL without publishing a readin
 The AWS entry calls `aws_page.page_url`.
 That function returns the AWS page URL without publishing the page.
 
-The bottom-left rebuild link shows only while the Rebuilds page names a machine.
-`rebuilds.url` in `config/console.conf` names its URL function, `change_page.rebuilds_url`.
+The bottom-left `For you` button shows the global action count.
+The collapsed rail keeps an icon and badge.
+The phone header keeps a compact button.
+The nonmodal panel shows two action entries with machine names, copy buttons, and card links.
+The panel footer opens Review with the reserved parameters `type=for-you` and `show=open`.
+The foryou-page phase adds the For you filter and card expansion.
+Notifier links preserve the console query entries for other pages.
+Escape closes the panel and focuses the visible For you button.
+
+`/console/for-you.json` reads the shared action reader and uses `Cache-Control: no-store`.
+The shell reads at each `page_refresh_seconds` interval while the tab is visible.
+It also reads on visibility, focus, panel opening, and a framed `for-you-completed` message.
+A completion message during a read schedules a second read.
+A hidden tab stops the timer.
+A refresh preserves focused commands and text selections.
+A transport failure keeps the last complete count and marks it stale.
+The phone badge shows a dotted outline for a stale count in both navigation states.
+An explicit unavailable response shows `?`, including with HTTP 503.
+A known zero uses a quiet button and shows `No actions required.` in the panel.
+
+`rebuilds.url` in `config/console.conf` still names `change_page.rebuilds_url`.
 That function returns `/console/rebuilds.html`.
-The link reads that page when the console loads, then at each `page_refresh_seconds` interval while the browser tab is visible.
-Its label names each machine, with no count: **Rebuild natedev**, **Rebuild the Mac** or **Rebuild natedev and the Mac**.
-A long label wraps to a second line and stays inside the sidebar.
-The collapsed rail shows the icon with a badge of the machine count, and hover or focus shows the label.
-At phone width the link fills a bar below the page, so it never covers the page content.
-A click opens the Rebuilds page in the frame, titled **Rebuilds needed**, as a navigation entry opens its page.
-`?page=rebuilds` selects it, and the link shows an inset outline while the page is open.
-Each read of the page for the link also replaces the list on an open Rebuilds page, so that page needs no refresh of its own.
-When no machine needs a rebuild, the link hides, and an open Rebuilds page shows `No rebuilds needed.`
+`?page=rebuilds` still selects that page for commit details.
+The shell refreshes its grouped details while that page is visible.
+The status line separates session `Review:` counts from the global `For you:` action count.
+The Mac requests `/console/for-you.json?view=count` to read the count without command text.
+The `for_you.host` setting in `console.conf` names the Tailscale peer that serves this count.
+`tailscale ip -4` returns the peer address.
 
 A navigation entry shows the Lucide `sparkle` icon when its page holds an item added after the user last opened that page.
 An optional `page.<id>.items` key names the page's items function, in the form `python:<module>:<function>`.
@@ -613,11 +629,12 @@ An agent deletes an image with this command:
 
 ### Rebuilds page
 
-`/console/rebuilds.html` lists the machines that the status line names for a rebuild, for the console's rebuild link.
+`/console/rebuilds.html` lists machines that require a rebuild and shows commit details.
+The status line shows an action count or Unavailable.
 Each render reads `rebuild_row.read()` once (`scripts/statusline/rebuild_row.py`), with `config/statusline.conf`.
-That answer joins the cached system comparison with the open rebuild needs, so the page and the status line name the same machines.
+The page combines the cached system comparison with open rebuild needs.
 The server serves it only in a folder that holds the browser manifest.
-It has no navigation entry; the rebuild link opens it.
+It has no navigation entry; `?page=rebuilds` opens it.
 A `data-rebuilds` block carries `data-count`, the number of machines, and `data-label`, the link label.
 The page shows one block per machine, with natedev first, then the Mac.
 Each block has the title `Rebuild natedev` or `Rebuild the Mac`, then the changes grouped by owner.

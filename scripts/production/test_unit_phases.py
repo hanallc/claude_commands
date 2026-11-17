@@ -193,7 +193,7 @@ class UnitPhasesTests(unittest.TestCase):
         with (patch.dict(os.environ, environment),
               patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources(()))):
             cache = counts_row.write_unit(member.id)
-            self.assertEqual(cache.read_text().splitlines()[:2], ["For you: 1 efficiency", ""])
+            self.assertEqual(cache.read_text().splitlines()[:2], ["Review: 1 efficiency", ""])
             with patch.object(Path, "read_text", read), patch.object(time, "time", return_value=1000):
                 cache = counts_row.write_unit(member.id)
             line, due, *sources = cache.read_text().splitlines()
@@ -202,7 +202,7 @@ class UnitPhasesTests(unittest.TestCase):
             self.assertIn(str(doc), sources)
             self.assertIn(f"source=unit:{member.id}", sources)
             cache = counts_row.write_unit(member.id)
-            self.assertEqual(cache.read_text().splitlines()[:2], ["For you: 1 efficiency", ""])
+            self.assertEqual(cache.read_text().splitlines()[:2], ["Review: 1 efficiency", ""])
 
     def member(self, name: str) -> staff.StaffRow:
         owner = fixture_member("showrunner", name="sdlc")
