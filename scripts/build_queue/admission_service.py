@@ -2637,7 +2637,7 @@ class AdmissionServer:
         scope = claim_state.target_claim_scope(paths, request.constraints.repository)
         for claim in held:
             if (mac_test.scopes_overlap(claim.scope, scope)
-                    and mac_test.run_is_live(claim.record)):
+                    and mac_test.run_holds_work(claim.record)):
                 diagnostic = placement.BusyProviderDiagnostic(destination.target, claim.record["what"], claim.record["since"])
                 session_id = claim.record.get("holder_session", "")
                 if session_id and session_id != claim_state.session_id(key.session):

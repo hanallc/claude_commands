@@ -1220,6 +1220,19 @@ class ClientArguments(argparse.Namespace):
     status: int = 0
 
 
+def constrained_step_route(route: target_config.StepRoute,
+                           constraints: placement.PlacementConstraints) -> target_config.StepRoute:
+    """Show the fixed local reason when every remote candidate is excluded."""
+    if not isinstance(route, target_config.AnyEligibleTarget):
+        return route
+    remote = tuple(candidate for candidate in constraints.candidates if candidate.destination.provider != "local")
+    if not remote or any(not isinstance(candidate.eligibility, placement.FixedExclusion) for candidate in remote):
+        return route
+    reasons = dict.fromkeys(candidate.eligibility.reason for candidate in remote
+                            if isinstance(candidate.eligibility, placement.FixedExclusion))
+    return target_config.LocalRequired("; ".join(reasons))
+
+
 def _place_step(args: ClientArguments, output: WaitOutput) -> int:
     output.local_reason = args.local_reason or output.local_reason
     if args.command == "cancel-placement":
@@ -1312,8 +1325,9 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                 local.test_width, local.fresh_test, local.token_back_at), prerequisite=prerequisite,
             purpose=placement.SpeculativeCopy(args.parent_episode, args.call_started)
                 if args.parent_episode else placement.NormalStep(),
-            route=target_config.step_route(local=args.local_only, mac_only=args.mac_only, target=args.target,
-                                           writes_tree=args.writes_tree, local_reason=args.local_reason))
+            route=constrained_step_route(target_config.step_route(
+                local=args.local_only, mac_only=args.mac_only, target=args.target,
+                writes_tree=args.writes_tree, local_reason=args.local_reason), constraints))
         if already_queued:
             _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex, episode, owner, prerequisite))
         while True:
