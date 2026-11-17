@@ -18,8 +18,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, NamedTuple, TypeVar, cast
 
+from scripts.build_queue.first_step import TREE_PLACEHOLDER
 from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.build_steps import VerifyCommand, verify_command
 from scripts.lib.process_failure import failure_detail
 
 from scripts.production import session_staff, staff, unit_lookup
@@ -264,13 +266,28 @@ def scratch_verdict(state: ScratchGreen | ScratchRed | ScratchConflict) -> bool:
 
 
 def command_words_need_no_shell_processing(command: str) -> bool:
-    """Accept literal words whose shell arguments match shlex.split."""
-    if any(character in command for character in "$`\\*?[]<>()|&;=~{}#!\n\r"):
+    """Accept words that the shell and first-step admission keep literal."""
+    if "\0" in command or re.match(r"[ \t]*[A-Za-z_][A-Za-z_0-9]*=", command):
         return False
+    quote = ""
+    for character in command:
+        if quote:
+            if character == quote:
+                quote = ""
+            elif quote == '"' and character in "$`\\":
+                return False
+        elif character in "'\"":
+            quote = character
+        elif character in "$`\\*?[]<>()|&;~{}#!\n\r":
+            return False
     try:
-        return bool(shlex.split(command))
+        words = shlex.split(command)
     except ValueError:
         return False
+    verify = verify_command(words)
+    if isinstance(verify, VerifyCommand):
+        return not any(TREE_PLACEHOLDER in word for word in verify.arguments)
+    return bool(words)
 
 
 def scratch_test(production: Production, name: str, tests: str, state_dir: Path) -> None:
@@ -281,7 +298,7 @@ def scratch_test(production: Production, name: str, tests: str, state_dir: Path)
     passed = False
     try:
         command = shlex.split(tests) if command_words_need_no_shell_processing(tests) else ["sh", "-c", tests]
-        # Commands that need shell processing keep the existing slot order.
+        # The shell runs other commands after the slot is ready.
         with copies.command_tree(str(production.owner.id), production.checkout, copies.CommittedSource(unit.branch),
                                  command, step="test", merge=copies.MergeRevision(production.merge_branch)) as worktree:
             try:

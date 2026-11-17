@@ -201,7 +201,7 @@ class SlotOrderTests(unittest.TestCase):
               self.assertRaises(AdmissionWaitReached), stop_before_slot(self, self.slot_root)):
             _ = bump_gate.run_gate(path)
 
-    def test_bump_admission_selects_the_package_from_its_tip(self) -> None:
+    def test_bump_admission_selects_the_package_from_one_tip_checkout(self) -> None:
         tools = self.verify_source()
         environment = self.verify_run_environment(tools)
         _ = (Path(environment["CONF_DIR"]) / "build_targets.conf").write_text(
@@ -224,6 +224,7 @@ class SlotOrderTests(unittest.TestCase):
         self.queue.hold_starts()
         write_pressure_reading(Path(environment["BUILDLOG_MEMORY_PRESSURE"]), full_avg10=99)
         with (mock.patch.dict(os.environ, {**environment, "MERGE_CHECKPOINT_VERIFY": str(tools.root / "verify.sh")}),
+              mock.patch.object(copies, "requested_source", wraps=copies.requested_source) as checkout,
               mock.patch.object(bump_gate, "run_checkpoint_test_steps",
                   side_effect=AssertionError("the bump command started before admission")),
               mock.patch.object(bump_gate, "complete_gate",
@@ -232,6 +233,7 @@ class SlotOrderTests(unittest.TestCase):
             _ = bump_gate.run_gate(path)
         request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest))
         self.assertEqual(request.constraints.package, "sample")
+        checkout.assert_called_once_with(self.source, copies.CommittedSource(tip), copies.NO_MERGE)
 
     def test_admitted_command_restores_its_detached_environment_after_success_and_error(self) -> None:
         for previous in ("", "caller-value"):

@@ -42,19 +42,20 @@ def run_gate(path: Path) -> int:
     try:
         production = ProductionDocument(Path(record["production_doc"]), record["name"], record["merge_branch"],
             Path(record["checkout"]), Path(record["checkout"]) / record["production_log"], ZoneInfo(record["zone"]))
-        with copies.requested_source(production.checkout, copies.CommittedSource(record["tip"]), copies.NO_MERGE) as source:
-            steps = test_steps(replace(production, checkout=source), tuple(record["paths"]),
-                               tuple(tuple(command) for command in record["merge_tests"]))
-            command = steps[0].command if steps else []
-            # Empty selections and OtherCommand keep the existing slot order.
-            with copies.command_tree(record["owner_id"], source, copies.CommittedSource("HEAD"),
-                                     command, step="integrate") as clone:
-                production = replace(production, checkout=clone)
-                os.environ["BUILDLOG_UNIT"] = record["unit"]
-                detail = run_checkpoint_test_steps(
-                    production, tuple(record["paths"]), tuple(tuple(command) for command in record["merge_tests"]),
-                    frozenset(record["flakes"]), frozenset(record["flaky_tests"]), Path(record["log"]),
-                )
+        paths = tuple(record["paths"])
+        merge_tests = tuple(tuple(command) for command in record["merge_tests"])
+
+        def first_command(source: Path) -> list[str]:
+            steps = test_steps(replace(production, checkout=source), paths, merge_tests)
+            return steps[0].command if steps else []
+
+        with copies.command_tree(record["owner_id"], production.checkout, copies.CommittedSource(record["tip"]),
+                                 first_command, step="integrate") as clone:
+            os.environ["BUILDLOG_UNIT"] = record["unit"]
+            detail = run_checkpoint_test_steps(
+                replace(production, checkout=clone), paths, merge_tests,
+                frozenset(record["flakes"]), frozenset(record["flaky_tests"]), Path(record["log"]),
+            )
         complete_gate(path, record, "green", detail)
         return 0
     except (Stop, copies.CopyError, OSError, ValueError, KeyError, TypeError) as error:

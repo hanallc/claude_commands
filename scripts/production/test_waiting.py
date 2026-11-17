@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from scripts.copies.copies_test_support import copies_environment
-from scripts.build_queue import first_step
-from scripts.lib import build_folders
+from scripts.build_queue import admission_protocol as wire, first_step, queue_place
+from scripts.lib import build_folders, build_slots
 
 from scripts.production.fake_unit_host import labeled as labeled_host
 from scripts.direct import progress_history
@@ -25,11 +25,12 @@ import sys
 import tempfile
 import traceback
 import unittest
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, nullcontext, redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timedelta
 from multiprocessing.process import BaseProcess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import ClassVar, TextIO, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
@@ -104,15 +105,22 @@ def setUpModule() -> None:
 class LiteralScratchCommandTests(unittest.TestCase):
     def test_only_literal_command_words_can_use_admission_before_the_slot(self) -> None:
         literal = ('bash verify.sh check sample', 'bash "verify.sh" check "sample package"',
-                   "python3 targeted_test.py --type-dirs scripts/production")
+                   "python3 targeted_test.py --type-dirs scripts/production",
+                   "python3 merge_gate.py --module-time-limit-s=300",
+                   "bash verify.sh nextest --filter 'case[1]'",
+                   'bash verify.sh nextest --filter "case[1]"')
         shell = ('bash verify.sh check "$PKG"', 'bash verify.sh check ${PKG}',
                  'bash verify.sh check $(printf sample)', 'bash verify.sh check `printf sample`',
                  'bash verify.sh check sample*', 'bash verify.sh check sample?',
-                 'bash verify.sh check [ab]', 'bash verify.sh check sample > output',
+                 'bash verify.sh check [ab]', "bash verify.sh check 'sample'[ab]",
+                 'bash verify.sh check "sample$PKG"', 'bash verify.sh check "`printf sample`"',
+                 'bash verify.sh check sample > output',
                  'bash verify.sh check sample < input', 'bash verify.sh check sample | cat',
                  'bash verify.sh check sample && true', 'bash verify.sh check sample; true',
                  'PKG=sample bash verify.sh check sample', 'bash verify.sh check ~',
                  'bash verify.sh check {sample,other}', 'bash verify.sh check sample # comment',
+                 "bash verify.sh --session-dir '{tree}/session' check sample",
+                 "bash verify.sh --session-dir '{'tree'}'/session check sample",
                  'bash verify.sh check sample\ntrue', 'bash verify.sh check "unterminated', '')
         for command in literal:
             with self.subTest(command=command):
@@ -450,6 +458,49 @@ class WaitingTests(unittest.TestCase):
         log = self.scratch_log(result.stdout)
         self.assertIn("scratch green marker", log.read_text(encoding="utf-8"))
         self.assert_scratch_clean(before, unit_tip, merge_tip, local_refs, origin_refs)
+
+    def test_scratch_admits_literal_options_with_the_shell_arguments(self) -> None:
+        _ = self.commit(self.alpha, "verify.sh", 'printf "<%s>\\n" "$@"\n')
+        self.push_scratch_branches()
+        command = "bash verify.sh test --module-time-limit-s=300 --filter 'case[1]'"
+        admission = first_step.FirstStepAdmission(build_slots.SlotQueuePosition("test", 0),
+                                                  first_step.HandedOff(), self.root / "assignment.json")
+        with mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admission)) as admitted:
+            result = self.run_waiting("scratch-test", ALPHA, "--tests", command, "--state-dir", str(self.state))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        arguments = ["test", "--module-time-limit-s=300", "--filter", "case[1]"]
+        self.assertEqual(self.scratch_log(result.stdout).read_text().splitlines(), [f"<{word}>" for word in arguments])
+        self.assertEqual([call.args[0] for call in admitted.call_args_list], [["bash", "verify.sh", *arguments]])
+
+    def test_scratch_passes_the_literal_tree_placeholder_to_verify(self) -> None:
+        _ = self.commit(self.alpha, "verify.sh", 'printf "<%s>\\n" "$@"\n')
+        self.push_scratch_branches()
+        command = "bash verify.sh --session-dir '{tree}/session' check sample"
+        prepare = mock.Mock(return_value=subprocess.CompletedProcess([], 0))
+        with mock.patch.object(first_step, "subprocess", SimpleNamespace(run=prepare)):
+            result = self.run_waiting("scratch-test", ALPHA, "--tests", command, "--state-dir", str(self.state))
+        self.assertEqual([call.args[0][2:] for call in prepare.call_args_list], [])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.scratch_log(result.stdout).read_text().splitlines(),
+                         ["<--session-dir>", "<{tree}/session>", "<check>", "<sample>"])
+
+    def test_scratch_targeted_test_admits_a_literal_tree_argument_before_its_slot(self) -> None:
+        _ = self.commit(self.alpha, "targeted_test.py", "print('targeted test fixture')\n")
+        self.push_scratch_branches()
+        self.env["ADMISSION_SOCKET"] = str(self.root / "admission.sock")
+        self.env["BUILDLOG_DIR"] = str(self.root / "buildlog")
+
+        def refuse(request: queue_place.RefreshedRequest, _output: object) -> wire.Refused:
+            self.assertEqual(request.refresh().argv, ("targeted-test", "--type-dirs", "scripts/{tree}"))
+            self.assertFalse((self.root / "slots").exists())
+            return wire.Refused("the fixture refused admission")
+
+        command = f"{shlex.quote(sys.executable)} targeted_test.py --type-dirs 'scripts/{{tree}}'"
+        with mock.patch.object(queue_place, "request_place", side_effect=refuse) as admission:
+            result = self.run_waiting("scratch-test", ALPHA, "--tests", command, "--state-dir", str(self.state))
+        admission.assert_called_once()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("the fixture refused admission", result.stdout)
 
     def test_scratch_shell_expansion_keeps_admission_inside_the_command(self) -> None:
         _ = self.commit(self.alpha, "verify.sh",

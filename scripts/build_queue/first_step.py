@@ -20,6 +20,9 @@ from scripts.lib.build_slots import SlotQueuePosition
 from scripts.lib.build_steps import VerifyCommand, verify_command, command_program
 
 
+TREE_PLACEHOLDER = '{tree}'
+
+
 class FirstStepRefused(RuntimeError):
     """The command did not receive permission to take a slot."""
 
@@ -81,7 +84,7 @@ def _verify_request(command: VerifyCommand, source: Path, folder: Path, owner: w
         'BUILDLOG_FIRST_STEP_EPISODE': position.episode, 'BUILDLOG_FIRST_STEP_SINCE': str(position.since),
         'BUILDLOG_MEM_ADMIT_SCRIPT': str(Path(__file__).with_name('admission_client.py'))}
     script = Path(__file__).resolve().parents[1] / 'direct/verify.sh'
-    arguments = [word.replace('{tree}', str(source)) for word in command.arguments]
+    arguments = [word.replace(TREE_PLACEHOLDER, str(source)) for word in command.arguments]
     result = subprocess.run(['bash', str(script), *arguments], cwd=source, env=environment)
     if result.returncode:
         raise FirstStepRefused('the first verify step could not prepare its admission request', result.returncode)

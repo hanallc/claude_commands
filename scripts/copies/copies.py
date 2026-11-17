@@ -1150,26 +1150,32 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
 
 
 @contextmanager
-def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
+def command_tree(owner: str, repo: str | Path, policy: SourcePolicy,
+                 command: Sequence[str] | Callable[[Path], Sequence[str]], *,
                  merge: MergePolicy = NO_MERGE, step: str = "") -> Generator[Path]:
-    """Admit a queue command before preparing its slot, then hold the slot through the caller scope."""
-    job = command_job(command)
-    label = step or (job.step if isinstance(job, StepJob) else PurePath(command[0]).name if command else "run")
+    """Admit the command before preparing its slot.
+
+    A command selector reads the same private checkout that admission uses.
+    """
     try:
         with ExitStack() as scope:
+            source = Path(repo).expanduser().resolve()
+            if callable(command) or (isinstance(verify_command(command), VerifyCommand)
+                                     and isinstance(command_job(command), StepJob)):
+                source = scope.enter_context(requested_source(source, policy, merge))
+                policy = CommittedSource(commit_at(source, "HEAD"))
+                merge = NO_MERGE
+            argv = command(source) if callable(command) else command
+            job = command_job(argv)
+            label = step or (job.step if isinstance(job, StepJob) else PurePath(argv[0]).name if argv else "run")
             if isinstance(job, StepJob):
-                source = Path(repo).expanduser().resolve()
-                if isinstance(verify_command(command), VerifyCommand):
-                    source = scope.enter_context(requested_source(source, policy, merge))
-                    policy = CommittedSource(commit_at(source, "HEAD"))
-                    merge = NO_MERGE
-                admitted = scope.enter_context(first_step.admitted_run(command, source))
+                admitted = scope.enter_context(first_step.admitted_run(argv, source))
                 tree = scope.enter_context(standing(owner, source, policy, merge=merge, step=label,
                     queue_position=admitted.queue_position))
                 admitted.handoff(tree)
             else:
                 # OtherCommand has no first queue step to admit.
-                tree = scope.enter_context(standing(owner, repo, policy, merge=merge, step=label))
+                tree = scope.enter_context(standing(owner, source, policy, merge=merge, step=label))
             yield tree
     except first_step.FirstStepRefused as error:
         failure = CopyError(str(error))
