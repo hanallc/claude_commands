@@ -476,6 +476,33 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 
 **Ruled out:** a triangle hit test; moving the camera to make a target clear.
 
+### Phase 44 — The Disks measure walks each drive in parallel, both drives at once  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/disks/measure.py` walks each drive with dust, both drives at the same time (one `ThreadPoolExecutor` thread for each drive). `disks.json` keeps the config order of `drives`; `render_seconds` is the time of the whole measure. Live on natedev under build load: 52.0 s and 59.2 s (148 s with one du for each drive, one drive after the other); root totals match du within 0.1 %.
+- `dust_command(mount, settings)`: `systemd-run --user --scope --quiet -p MemoryMax=<measure.memory_max> -- nice -n 19 dust -x -D -j -P -o b -z <keep_bytes - 1> -d <measure.max_depth> -n <measure.max_lines> --config <scripts/disks/dust.toml> <mount>`.
+- `parse_dust(output)` reads dust's nested JSON (`size` such as `"2327020666880B"`, `name` a full path) into the `dict[str, int]` that `folder_tree` takes; the tree, `other` and the collapse rule are unchanged.
+- Errors: a timeout; `the measure did not start: dust is not on PATH` when `shutil.which("dust")` finds nothing; `dust exited N: <last stderr line>` for a nonzero exit or no output. A folder dust cannot read leaves out its size, and the walk still counts as a measure.
+- dust comes from nixos `modules/common/development.nix` (550a77b) on natedev and the Mac.
+
+**Files:**
+- `scripts/disks/measure.py` — `dust_command`, `parse_dust`, the concurrent `measure`
+- `scripts/disks/dust.toml` — empty dust config; dust never reads a personal config
+- `scripts/disks/test_measure.py` — the dust command, the JSON parse, both drives at once, the error forms
+- `config/disks.conf` — `measure.max_depth` and `measure.max_lines` (1000000 each)
+
+**Gotchas:**
+- dust keeps a folder only when its size is above `-z`, so the measure passes `keep_bytes - 1` to keep a folder of exactly `keep_bytes`.
+- dust reads a personal config unless `--config` names a `.toml` file; it rejects `/dev/null` as a config.
+- dust gives partial JSON and exit 0 for unreadable folders; a missing path gives exit 1 and no output.
+- natedev's NVMe drives use IO scheduler `none`, so `ionice` has no effect. The walk's inode and dentry cache is larger than the 2 GiB cap, so repeat walks are not faster.
+
+**Ruled out:**
+- A du fan-out over subfolders: each du process counts a hard link again, so the Nix store and cargo `deps/` count twice.
+- A threaded Python walker: the GIL holds it near 130k entries/s (/ 58–68 s).
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 

@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import conf
+from scripts.aws_target import hana_result
 from scripts.message import session_send
 from scripts.aws_target.config import (
     LimitSettingEvidence, MeasurementUnavailable, SpendingConfigurationUnavailable, SpendingSettings, money, read_settings,
@@ -165,6 +166,8 @@ class HanaComputeExposure:
     generation: int
     usd_per_hour: Decimal
     state: HanaExposureOpen | HanaExposureClosed = HanaExposureOpen()
+    instance_type: str = ''
+    region: str = field(kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -494,6 +497,7 @@ class LedgerEvidence:
     hana_compute: list[HanaComputeExposure] = field(default_factory=list)
     hana_storage: list[HanaStorageExposure] = field(default_factory=list)
     hana_lifecycle_fence: HanaLifecycleFence | HanaLifecycleUnfenced = HanaLifecycleUnfenced()
+    hana_attempts: list[hana_result.HanaAttemptCharge] = field(default_factory=list)
 
 
 class ObservationRejected(ValueError):
@@ -578,10 +582,15 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
     for record in rows(row, 'hana_compute') if 'hana_compute' in row else ():
         evidence.hana_compute.append(HanaComputeExposure(
             instant(record, 'at'), instant(record, 'expires'), instant(record, 'generation'),
-            money(text(record, 'usd_per_hour')), _hana_exposure_state(record)))
+            money(text(record, 'usd_per_hour')), _hana_exposure_state(record),
+            text(record, 'instance_type') if 'instance_type' in record else '', region=text(record, 'region')))
     for record in rows(row, 'hana_storage') if 'hana_storage' in row else ():
         evidence.hana_storage.append(HanaStorageExposure(
             instant(record, 'at'), money(text(record, 'usd_per_month')), _hana_exposure_state(record)))
+    for record in rows(row, 'hana_attempts') if 'hana_attempts' in row else ():
+        evidence.hana_attempts.append(hana_result.decode_attempt_charge(record))
+    if len({r.key for r in evidence.hana_attempts}) != len(evidence.hana_attempts):
+        raise LedgerUnavailable('Duplicate Hana attempt charge')
     if 'hana_lifecycle_fence' in row:
         fence = mapping(row['hana_lifecycle_fence'])
         evidence.hana_lifecycle_fence = HanaLifecycleFence(instant(fence, 'at'), instant(fence, 'generation'))
@@ -674,7 +683,10 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
            if isinstance(state.hana_lifecycle_fence, HanaLifecycleFence) else {}),
         'hana_compute': [
             {'at': r.at, 'expires': r.expires, 'generation': r.generation,
-             'usd_per_hour': str(r.usd_per_hour), 'state': _hana_state_record(r.state)} for r in state.hana_compute],
+             'usd_per_hour': str(r.usd_per_hour), 'state': _hana_state_record(r.state),
+             'region': r.region,
+             **({'instance_type': r.instance_type} if r.instance_type else {})} for r in state.hana_compute],
+        'hana_attempts': [hana_result.encode_attempt_charge(r) for r in state.hana_attempts],
         'hana_storage': [
             {'at': r.at, 'usd_per_month': str(r.usd_per_month), 'state': _hana_state_record(r.state)}
             for r in state.hana_storage],
@@ -942,7 +954,8 @@ def charge_record(reading: ChargeRead) -> dict[str, object]:
                 'provisional': reading.provisional, 'excludes_credits': True} if reading.account_bill else {})}
 
 
-SPEND_GROUPS = ('gate compute at 32 CPU', 'compute at 16 CPU', 'storage', 'public IPv4', 'data transfer', 'other')
+SPEND_GROUPS = ('gate compute at 32 CPU', 'compute at 16 CPU', 'storage', 'public IPv4', 'data transfer', 'other',
+                'kept-machine compute')
 
 
 @dataclass(frozen=True)
@@ -1207,7 +1220,7 @@ def gate_compute_intervals(state: LedgerEvidence, now: int, minimum_seconds: int
 
 
 def hana_intervals(state: LedgerEvidence, now: int, minimum_seconds: int, *,
-                   reserve: bool = False) -> tuple[ChargedInterval, ...]:
+                   reserve: bool = False, readings: Sequence[ChargeRead] = ()) -> tuple[ChargedInterval, ...]:
     """Keep compute open until stop confirmation and storage open until deletion."""
     intervals: list[ChargedInterval] = []
     zone = ZoneInfo('UTC')
@@ -1216,8 +1229,9 @@ def hana_intervals(state: LedgerEvidence, now: int, minimum_seconds: int, *,
         end = min(now, row.state.at) if isinstance(row.state, HanaExposureClosed) else max(now, row.expires) if reserve else now
         if row.at > end:
             continue
+        rates = _bill_rates(readings, row.instance_type, now, row.region) if row.instance_type else _BillRates((), ())
         intervals.extend(day_compute_intervals(row.at, end, minimum_seconds,
-            lambda _day, rate=row.usd_per_hour: BoxRate(rate, 'Hana bid ceiling'), source='Hana compute'))
+            lambda day, rate=row.usd_per_hour, index=rates: index.for_day(day, rate), source='Hana compute'))
     for row in state.hana_storage:
         end = min(now, row.state.at) if isinstance(row.state, HanaExposureClosed) else (
             period_bounds(datetime.fromtimestamp(horizon, zone).date(), zone)[1] if reserve else now)
@@ -1279,7 +1293,15 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
     gate_compute: dict[str, list[ChargedInterval]] = {}
     for charge in gate_compute_intervals(state, now, settings.box_minimum_seconds, reserve=reserve):
         gate_compute.setdefault(charge.source, []).append(charge)
-    hana = hana_intervals(state, now, settings.box_minimum_seconds, reserve=reserve)
+    hana_readings = () if reserve else readings
+    # Older storage is already in the newest bill's account-wide storage estimate.
+    hana_storage = [r for r in state.hana_storage if latest is None or reserve or r.at >= latest.period_end]
+    hana = hana_intervals(replace(state, hana_storage=hana_storage), now,
+        settings.box_minimum_seconds, reserve=reserve, readings=hana_readings)
+    hana_by_region = {(kind, region): hana_intervals(replace(state, hana_storage=[],
+        hana_compute=[r for r in state.hana_compute if (r.instance_type, r.region) == (kind, region)]), now,
+        settings.box_minimum_seconds, reserve=reserve, readings=hana_readings)
+        for kind, region in {(r.instance_type, r.region) for r in state.hana_compute if r.instance_type}}
     if hana:
         last = max(last, datetime.fromtimestamp(max(r.end for r in hana) - 1, zone).date())
     days: list[DailySpend] = []
@@ -1307,8 +1329,16 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
         runs = sum(start <= r.at < end and isinstance(r.state, (GateRunning, GateTerminated))
                    for r in state.gate_reservations)
         if bill is not None:
+            kept_remaining = {key: period_cost(charges, start, end) for key, charges in hana_by_region.items()}
             for row in bill.usage_types:
                 groups[spend_group(row.usage_type)] += row.usd
+                kind = row.usage_type.partition('SpotUsage:')[2]
+                region = usage_region(row.usage_type, 'SpotUsage:')
+                if region is not None and (kind, region) in kept_remaining and row.quantity > 0:
+                    kept = min(row.usd, kept_remaining[kind, region])
+                    kept_remaining[kind, region] -= kept
+                    groups[spend_group(row.usage_type)] -= kept
+                    groups['kept-machine compute'] += kept
             groups['other'] += bill.actual_usd - sum(groups.values(), Decimal(0))
             include(ChargedInterval(start, end, bill.actual_usd, 'AWS bill', 'reconciliation'))
             source = 'AWS bill'
@@ -1337,7 +1367,7 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
                     include(charge)
         if bill is None:
             for charge in hana:
-                groups['storage' if charge.kind == 'fixed' else 'other'] += _overlap(charge, start, end)
+                groups['storage' if charge.kind == 'fixed' else 'kept-machine compute'] += _overlap(charge, start, end)
                 include(charge)
         for reservation in state.gate_reservations:
             if isinstance(reservation.state, GateAbsent) or not start <= reservation.at < end:
@@ -1456,6 +1486,17 @@ class CostLedger:
         """Read the published evidence without creating coordination files."""
         return self._read()
 
+    def record_hana_attempt(self, charge: hana_result.HanaAttemptCharge) -> None:
+        """Link transfer and query evidence without adding another dollar total."""
+        _ = hana_result.decode_attempt_charge(hana_result.encode_attempt_charge(charge))
+        with self.transaction() as state:
+            previous = next((row for row in state.hana_attempts if row.key == charge.key), None)
+            if previous is not None:
+                if previous != charge:
+                    raise LedgerUnavailable('Hana attempt charge differs from its saved evidence')
+                return
+            state.hana_attempts.append(charge)
+
     @contextmanager
     def _locked(self) -> Generator[LedgerEvidence]:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -1570,6 +1611,12 @@ class CostLedger:
                 return GateCapReached(reason)
             self._save(state)
             return GateReserved(state.gate_reservations[-1])
+
+    @contextmanager
+    def locked_snapshot(self) -> Generator[LedgerEvidence]:
+        """Read account evidence under its lock without saving it."""
+        with self._locked() as state:
+            yield state
 
     @contextmanager
     def transaction(self) -> Generator[LedgerEvidence]:

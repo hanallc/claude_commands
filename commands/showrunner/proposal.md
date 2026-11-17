@@ -57,6 +57,11 @@ A user approval replaces a showrunner approval.
 A showrunner approval preserves a user approval.
 Readers show current staff names.
 
+The Review page's Approve sends this command to the owner showrunner with the user's words.
+The words can change a ranking value.
+The page's Decline stores the declined answer and asks the owner to close the issue with `/close_issue`.
+The page keeps its log in the `review_log` front matter list and its mark in `review_state`.
+
 Use `unapprove <issue> [--dry-run]` from the approving showrunner to remove a showrunner approval.
 Only the user's decline removes a user approval.
 Use `decline-answer <issue> --words '<user words>'` for a style decision's declined answer.

@@ -703,9 +703,8 @@ Remote launch signals use `find_mac_runner_pid` and the rules in [Mac step offlo
 `config/direct.conf` supplies `VERIFY_TOKEN_HOLD_SECONDS` and `VERIFY_TOKEN_RENEW_SECONDS`.
 The shipped values are 3600 and 60 seconds.
 The renewal interval cannot exceed one third of the lease.
-`start_token_renewer`, `stop_token_renewer`, and `with_token_renewal` maintain one renewer per owned span.
-Nested spans reuse it.
-Renewal continues during memory admission, remote claim waits, and local hold waits while the call owns the token.
+`start_token_renewer` and `stop_token_renewer` maintain one renewer while a step command runs.
+No placement, memory, remote claim or hold wait holds the token, so no wait renews it.
 `renew_token` passes `--pid $$` to `board.sh renew`.
 An inconclusive busy guard returns 2 and does not end renewal.
 A different recorded holder PID refuses renewal.

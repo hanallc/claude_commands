@@ -41,7 +41,7 @@ from typing import TypeVar, cast
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.lib import build_folders, scratch, unit_runs  # noqa: E402
 from scripts.direct.progress_history import load_events  # noqa: E402
-from scripts.lib import urgency  # noqa: E402
+from scripts.lib import urgency, file_lock  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 from scripts.production import issues  # noqa: E402
@@ -983,7 +983,7 @@ def _routed_review_entries(path: Path, doc: Path, below: bool, record: staff.Sta
         _ = listed.setdefault(source.absolute(), ProductionReviewList(source, _owner(source)))
     documents = {row.name: row.doc.path for row in record.find(kind="showrunner")
                  if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))}
-    snapshots = _review_snapshots(listed, sources=sources)
+    snapshots = _review_snapshots(listed, sources=sources, include_reviewed=False)
     documents = change_routing.production_documents(documents,
         ((listed[source].default_production, snapshot.text) for source, snapshot in snapshots.items()))
     routing = change_routing.StaffRouting(record, documents, sources=sources)
@@ -1478,9 +1478,9 @@ def _list_lock(path: Path) -> Generator[None]:
         os.close(descriptor)
 
 
-def describe(row: dict[str, str]) -> str:
+def describe(row: dict[str, str], *, record: staff.StaffSnapshot | None = None) -> str:
     """One row in plain lines: its id and change, how to check it, then each other column that has a value."""
-    record = staff.initial_snapshot()
+    record = staff.initial_snapshot() if record is None else record
     shown = dict(row)
     member = record.by_id(staff.StaffId(row.get(PRODUCTION, "")))
     if member is not None and not row.get("Verdict"):
@@ -1639,6 +1639,8 @@ def _verdict_write(
             reviewed_rows = list[str](("\n" + BODY[BODY.index(REVIEWED):]).splitlines(keepends=True))
             _insert(lines, len(lines), reviewed_rows)
         _add_column(path, lines, REVIEWED, "Merged")
+        if cells.get("Review log"):
+            _add_column(path, lines, REVIEWED, "Review log")
         if member is not None:
             _add_column(path, lines, REVIEWED, PRODUCTION)
         if PRODUCER in cells:
@@ -1697,29 +1699,84 @@ class ReviewListSnapshot:
     text: str
     pending: list[dict[str, str]]
     reviewed: list[dict[str, str]]
+    owner_rows: list[dict[str, str]] = field(default_factory=list)
 
 
-def review_snapshot(path: Path) -> ReviewListSnapshot:
-    text = read(path)
+def review_snapshot(path: Path, *, include_reviewed: bool = True, collect_owners: bool = False) -> ReviewListSnapshot:
+    """Read selected tables and retain only owner fields from excluded history."""
+    owner_rows: list[dict[str, str]] = []
+    if include_reviewed or not path.exists():
+        text = read(path)
+    else:
+        lines: list[str] = []
+        reviewed = False
+        columns: list[str] = []
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                if line.strip() == REVIEWED:
+                    reviewed = True
+                    lines.append(line)
+                    continue
+                if not reviewed:
+                    lines.append(line)
+                elif line.startswith("| # |"):
+                    columns = _cells(line)
+                    lines.append(line)
+                elif line.startswith("| ---"):
+                    lines.append(line)
+                elif columns and line.startswith("| "):
+                    cells = _cells(line)
+                    owner = {column:_plain(value) for column,value in zip(columns,cells)
+                             if column in ("#", "Producer", "Production", "Verdict")}
+                    if collect_owners:
+                        owner_rows.append(owner)
+                    if not owner.get("Verdict"):
+                        lines.append(line)
+        text = "".join(lines)
     lines = text.splitlines(keepends=True)
     pending = _review_table(path, lines, SECTION)
-    reviewed = _review_table(path, lines, REVIEWED) if any(line.strip() == REVIEWED for line in lines) else []
-    return ReviewListSnapshot(text, pending, reviewed)
+    history = _review_table(path, lines, REVIEWED) if any(line.strip() == REVIEWED for line in lines) else []
+    return ReviewListSnapshot(text, pending, history, owner_rows)
 
 
-def _review_snapshots(paths: Iterable[Path], *, sources: list[Path] | None = None) -> dict[Path, ReviewListSnapshot]:
+def _review_snapshots(paths: Iterable[Path], *, sources: list[Path] | None = None,
+                      include_reviewed: bool = True) -> dict[Path, ReviewListSnapshot]:
     """Report unreadable lists once. A source collector requires complete reads."""
     snapshots: dict[Path, ReviewListSnapshot] = {}
     for path in paths:
         if sources is not None:
             sources.append(path)
         try:
-            snapshots[path] = review_snapshot(path)
+            snapshots[path] = review_snapshot(path) if include_reviewed else review_snapshot(path, include_reviewed=False)
         except (ChangeReviewError, OSError, UnicodeError) as error:
             if sources is not None:
                 raise ValueError(str(error)) from error
             print(f"change review: {path}: {error}", file=sys.stderr)
     return snapshots
+
+
+def record_review_log(path: Path, row: str, words: str, production: Path, who: str = "nate") -> None:
+    """Keep the user's Review action in the authoritative table row."""
+    from scripts.review_links import review_events
+    now = datetime.now().astimezone(user_zone())
+    def write(lines: list[str]) -> None:
+        for section in (SECTION, REVIEWED):
+            if not any(line.strip() == section for line in lines):
+                continue
+            columns, first, end = _table(path, lines, section)
+            index = next((index for index in range(first, end) if lines[index].startswith(f"| {row} |")), None)
+            if index is None:
+                continue
+            _add_column(path, lines, section, "Review log")
+            columns, first, end = _table(path, lines, section)
+            index = next(index for index in range(first, end) if lines[index].startswith(f"| {row} |"))
+            cells = dict(zip(columns, _cells(lines[index])))
+            events = review_events.decode(_plain(cells.get("Review log", "")))
+            event = review_events.ReviewLog(now, who, words)
+            cells["Review log"] = _cell(review_events.encode(review_events.append(events, event)))
+            lines[index] = _row(path, columns, cells)+"\n"
+            return
+    _edit(path, production, now.date(), write, lambda _: f"review {row}")
 
 
 def set_row_kind(path: Path, row: str, kind: str, production: Path) -> str:
@@ -1744,7 +1801,9 @@ def end_row_scratch(path: Path, row: str) -> list[str]:
     A verdict ends the row either way: a row returned to its unit comes back as a new row.
     """
     try:
-        return [f"removed {folder}" for folder in scratch.end(f"row:{_owner(path)}-{row}")]
+        result = scratch.end(f"row:{_owner(path)}-{row}")
+        return ([f"removed {folder}" for folder in result]
+                + [f"kept {folder.path}: {folder.reason}" for folder in result.kept])
     except (scratch.ScratchError, OSError) as error:
         return [f"scratch not removed: {error}"]
 
@@ -1772,6 +1831,19 @@ def save_verdict(path: Path, row: str, verdict: str, production: Path) -> Verdic
     local_row = _row_id("row", row.rpartition("/")[2])
     shown = row_display_id(path, local_row)
     warnings: list[str] = []
+    root = change_routing.review_root()
+    delivery = change_routing.delivery_path(root, path, local_row)
+    slots = change_routing.delivery_slots(delivery)
+    empty_row: dict[str, str] = {}
+    pending_row = next((item for item in pending(path) if item["#"] == local_row), empty_row)
+    if slots.validation_requested and not lands(verdict) and pending_row.get("Review log"):
+        with file_lock.exclusive(root / ".review-link-delivery.lock"):
+            fields = cast(dict[str, object], json.loads(delivery.read_text()))
+            record_review_log(path, local_row, "Check found a problem: "+verdict, production,
+                              unit_lookup.doc_owner(production, staff.snapshot()).name)
+            _ = fields.pop("validation", None)
+            write_text_atomic(delivery, json.dumps(fields)+"\n")
+        return VerdictSaved([f"{shown}: the check found a problem; returned to For you"])
     result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append)
     return _verdict_output(path, local_row, shown, verdict, result, warnings)
 

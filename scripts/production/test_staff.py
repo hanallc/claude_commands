@@ -1006,6 +1006,14 @@ class StaffTests(StaffCommandTestCase):
                   mock.patch.object(staff, "_remote", return_value=value)):
                 self.assertTrue(staff.snapshot().production)
 
+        supplied = staff.StaffSnapshot.decode(staff.snapshot().encode())
+        with (staff.supplied_snapshot(supplied),
+              mock.patch.object(staff, "is_owner", return_value=False),
+              mock.patch.object(staff, "_remote", side_effect=AssertionError("supplied staff reached ssh"))):
+            self.assertIs(staff.snapshot(), supplied)
+            self.assertIs(staff.initial_snapshot(), supplied)
+        self.assertFalse(staff.snapshot().production)
+
     def test_gate_module_writes_keep_the_inherited_staff_and_launch_folders_unchanged(self) -> None:
         from scripts.herdr import pane_launch
         from scripts.production import gate

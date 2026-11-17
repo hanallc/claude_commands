@@ -188,8 +188,15 @@ The adapter uses that grant without a second admission request.
 `TokenRequired`, `TokenHeld`, and `TokenNotRequired` describe the local execution prerequisite.
 `PrerequisiteReport` updates that state separately from fixed constraints.
 Restart requires fresh token confirmation for requests that need a token.
-A token waiter holds no local reservation and can receive a remote assignment.
-The adapter keeps token renewal active during placement waits.
+A placement waiter holds no cargo token.
+`_placement_row` marks every `TokenRequired` row token-waiting, so `memory_admit.py` does not admit it.
+`verify.sh` sends `--token after-grant`: it takes the token after a local grant.
+Its first pass sends `TokenRequired(TokenReadinessUnchecked)`.
+That pass starts nothing on natedev, so a free remote target can take the step.
+The client shows no memory wait for that pass, and `verify.sh` sends the next pass at once.
+Later passes send `TokenNotRequired`, because the service needs no token before that grant.
+These are existing wire values, so a new `verify.sh` works with a service that started before this change.
+An older caller sends `--token required` (`TokenUnavailable`) and gets no local grant until it reports `TokenHeld`.
 
 Remote rows carry execution evidence and the assigned host.
 Physical grouping includes the host, generation, PID, and start time.
@@ -593,6 +600,21 @@ Merge-gate peaks keep their separate class and remain in the anonymous history.
 The gate uses its own cap, so Cargo estimates do not use those peaks.
 
 Five keyed rows exclude the older unkeyed rows for the same repository.
+`scripts/buildlog/repository.py` owns the repository identity rule for the recorder and estimator.
+A Git tree keeps its normalized origin key or its first root commit key.
+A directory without Git uses `manifest-path:<real Cargo.toml path>`.
+The step's `--manifest-path` selects its manifest folder when present.
+Otherwise, the reader selects the nearest `Cargo.toml` in the current folder or its parents.
+The reader starts no command for a manifest identity and does not require Cargo on `PATH`.
+Each manifest keeps its own key; the reader does not resolve a workspace root.
+The identity resolves symbolic links and keeps separate manifest paths separate.
+A folder without a manifest keeps the unknown identity.
+An empty Git repository keeps its unknown identity until a remote or root commit supplies a key.
+The estimator uses the manifest folder name without matching older rows by name alone.
+The first build keeps the configured Cargo fallback of 12 GiB.
+A recorded peak supplies the next estimate through the same identity and build shape.
+The estimate retains the configured headroom rules.
+Remote verify mirrors retain a supplied source identity when the local identity is unknown or comes from a manifest path.
 With one to four own rows, a non-build estimate uses their largest peak or a lower ranked pool peak.
 A repository without own history keeps the pool and fallback order.
 A full test estimate with a package keeps only rows whose package and scope match.
@@ -934,6 +956,17 @@ The sender releases the claim only when both sends return `failed`, `refused`, o
 Every other outcome preserves the delivered claim.
 The sender prints each send outcome header to the journal.
 
+`build_queue/head_stall.py` watches for a stalled queue head. `buildlog sample` runs it each minute on natedev.
+It reads `queue.json` and the tail of `queue_times.jsonl`. It does not ask the service.
+A stall needs three facts: the head waited `head_stall_alert_minutes` (`build_admission.conf`), a step with a promise above zero runs, and no step with need above zero started in that time.
+Merge gates and targeted tests start with zero need, so they do not hide a stall.
+A snapshot older than `silence_seconds` is not a stall; `down-alert` covers a silent service.
+The watch sends one message to `builds` with the head and each holder's promise and use.
+It also sends one `alert.blocked` phone push with the key `head-stall-<pid>:<start time>:<last start>`.
+The push clears when `head_stall.py cleared --head <key>` exits 0: the head started, left, or no longer stalls.
+`~/.local/state/buildlog/head_stall.json` records the alerted key, so each stall alerts once. A step start ends a stall; a later stall alerts again. A failed send retries the next minute.
+The 2026-11-17 stall held the head from 00:36 to 03:46 EST; no alert reached anyone.
+
 The builds showrunner owns cut-over. Workers do not change live units or admission state.
 
 1. Stop and disable the socket and service before the prerequisite rebuild.
@@ -1001,21 +1034,22 @@ Durable `Waiter` rows keep their join and token clocks. `RankedWaiter.order` hol
 
 ### Cargo token reclaim (`scripts/direct/board.sh`)
 
-`verify.sh` takes the board's `cargo` token before each local compiling attempt requests memory.
+A local compiling attempt waits for placement and memory without the board's `cargo` token.
+A token from an earlier step of the same call is released before the next placement.
+After a local grant, `verify.sh` takes the token, then runs cargo. The grant keeps its reservation during that token wait.
+So a memory wait no longer holds the cargo token. The token wait after a grant lasts only while a peer of the same unit runs cargo.
+A step placed on the Mac or an SSH target never takes the natedev token.
 `acquire_token()` waits in the existing FIFO queue and reuses a token that this call already holds.
-The attempt makes one memory request and retains the token during its memory wait.
-The client's periodic leave hook renews the token with `board.sh renew` while the attempt waits.
-The hook starts before the first connection attempt, so connection retries also renew the token.
+When the token wait after a grant ends without the token, the call cancels its placement or releases its reservation.
+A natedev hold that starts during that wait ends it: the call releases its reservation and places the step again.
 The execution guard still checks the token owner before cargo starts.
 `unreachable_limit_seconds` limits missing-socket and refused-connection retries to 60 seconds by default.
 The client reports the retry interval once when a connection fails.
 A successful connection resets that interval.
-At the limit, the client exits with status 2, and verify releases the token without starting cargo.
-A blocked token caller has no memory waiter or reservation.
-A memory wait can delay peer calls on the same board until memory becomes available.
+At the limit, the client exits with status 2, and verify starts no cargo.
 
-Admission failure, cancellation, a hold, and departure for the Mac release the token.
-A later local attempt takes the token before its next memory request.
+Cancellation, a hold, and departure for the Mac release the token.
+A later local attempt takes the token again after its next grant.
 Each `run()` path releases tokens that it acquired, as required by verify Phase 36.
 Noncompiling local steps retain their existing token path and request no memory.
 The wait log names the holder and its PID, including holder files without a final newline.
@@ -1917,7 +1951,8 @@ Slots are not saved. Restart keeps active reservations and run order, but drops 
 The Builds page shows zero room during a shortfall and records the shortfall in the cap explanation.
 The memory page shows `Stage`, `Duration`, `Unit`, `Pid`, `Machine`, and `vCPU` for running rows.
 The first column shows `building` or `testing` from the recorded progress counter.
-A natedev row shows `waiting for jobserver tokens` while its nextest step waits for test tokens; its `Done` cell shows `—`.
+A natedev row shows the stage `waiting` while its nextest step waits for test tokens; its `Done` cell shows `—`.
+The row tooltip gives the full reason, `Waiting for jobserver tokens`.
 `progress_profile.token_wait_line` prints the wait line in `nextest_tokens.py`, and `CounterParser` reads it from the step log as `NoCounter.token_wait`.
 The wait ends at the next line, which reports the tokens taken.
 `NoCounter.token_wait` is an optional field, so the counter wire union does not change for pinned clients.
@@ -1930,12 +1965,14 @@ Idle or unreadable runners have no separate Running row.
 Their memory remains in the taken total, the cap, and the summary tooltip.
 Waiting rows use `#` in the first column for their queue place.
 Both sections use the same column widths.
-The narrow layout adds the `Step` column and shows each cell in full.
-When that table is wider than the card, each step uses two lines: Step, Stage and Done, then Dur, Unit, Pid, Target and vCPU.
-Text wraps only when it does not fit. The chart row names also wrap in the narrow layout.
-`memory_page_proof.mjs` fails when a narrow table cell or chart name is cut, and uses two lines only at 390 px.
-The narrow table leaves out the room row, because the chart above it shows free.
-Beside the chart, the table room row is empty and only keeps the rows aligned.
+The table is always beside the chart, and each step uses one row at every pane width.
+In a narrow pane the table cuts long unit names to 6rem and narrows its column gaps.
+A pane still too narrow for the chart and the table scrolls the Running and Queued card sideways; the page itself does not scroll.
+The label column is as wide as the widest running label.
+A longer queued name wraps at a space, so only its widest word counts.
+The chart, the top bar and the axis start one even gap after the label column.
+The table room row is empty and only keeps the rows aligned.
+`memory_page_proof.mjs` fails when the table leaves the chart's side, a Stage cell is cut, or the label column is wider than its labels.
 The red cap line in the Running chart stops at each line of chart text that it would cross, so no text shows on it.
 `cutCapLine` draws the line as parts after the bar labels are placed; text clipped by an ellipsis does not count.
 `memory_page_proof.mjs` fails when chart text shows on the cap line or the table room row shows text.

@@ -384,6 +384,7 @@ class LiveClaims:
     """
     identities: frozenset[ProcessIdentity]
     routed: frozenset[ProcessIdentity] = frozenset()
+    remote_waiters: frozenset[ProcessIdentity] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -420,7 +421,7 @@ FULL_BUILD_AUDIT = FullBuildAudit()
 SYSTEM_CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 
-BuildClass = Literal["holder", "admitted", "claimed", "other_session", "no_session"]
+BuildClass = Literal["holder", "admitted", "claimed", "remote_waiter", "other_session", "no_session"]
 AUDIT_COMMANDS = frozenset({"cargo-tile-real", "cargo", "cargo-nextest", "rustc", "rustdoc"})
 CARGO_COMMANDS = AUDIT_COMMANDS - {"rustc", "rustdoc"}
 
@@ -586,7 +587,9 @@ def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBui
     claims = hold_enforcer().claimed_processes(proc_root) if holders else LiveClaims(frozenset())
     if isinstance(claims, ClaimsUnreadable):
         print(f"claims unreadable: {claims.reason}", file=sys.stderr)
-    claimed: frozenset[ProcessIdentity] = claims.identities if isinstance(claims, LiveClaims) else frozenset()
+    # A remote waiter does not grant its local build children an audit exemption.
+    claimed: frozenset[ProcessIdentity] = (claims.identities - claims.remote_waiters
+        if isinstance(claims, LiveClaims) else frozenset())
     builds: list[AuditedBuild] = []
     children: dict[int, list[ProcessIdentity]] = {}
     roots: list[AuditProcess] = []
@@ -606,7 +609,10 @@ def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBui
             continue
         owner = audit_owner(process, ancestors)
         classification: BuildClass
-        if hold_enforcer().holds_claim(process, processes, claimed):
+        if (isinstance(claims, LiveClaims)
+                and process.identity in claims.remote_waiters):
+            classification = "remote_waiter"
+        elif hold_enforcer().holds_claim(process, processes, claimed):
             classification = "claimed"
         elif owner_is_sole_holder(owner, holders):
             classification = "holder"
@@ -647,7 +653,7 @@ def audit_hold(directory: Path, proc_root: Path) -> tuple[AuditedBuild, ...]:
         holders = state.holders if isinstance(state, ActiveHolders) else ()
     builds = audit_builds(proc_root, holders)
     for build in builds:
-        if build.classification in {"holder", "admitted", "claimed"}:
+        if build.classification in {"holder", "admitted", "claimed", "remote_waiter"}:
             continue
         for holder in holders:
             hold_enforcer().record_build(build, holder, proc_root, "audit")

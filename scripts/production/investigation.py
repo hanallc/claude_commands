@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import cast
 
 from scripts.production import record_store, staff
+from scripts.review_links import review_events
+from scripts.review_links.review_events import ReviewLog
 from scripts.production.record_store import state_root as state_root
 
 ANSWER_SECTION = record_store.section("Answer")
@@ -41,6 +43,7 @@ class Investigation:
     read: str
     question: str
     answer: str
+    log: tuple[ReviewLog, ...] = ()
 
 
 def _store(owner: staff.StaffId) -> record_store.NumberedRecords:
@@ -65,7 +68,7 @@ def load(owner: staff.StaffId, identity: str, *, sources: list[Path] | None = No
         question, answer = record_store.split_section(body, int(fields["question_length"]), "Answer")
         item = Investigation(fields["id"], staff.StaffId(fields["owner"]), fields["title"],
                              InvestigationState(fields["state"]), fields["filed"], fields["answered"],
-                             fields["read"], question, answer)
+                             fields["read"], question, answer, review_events.decode(fields.get("review_log", "")))
         if not item.title.strip() or item.title.splitlines() != [item.title]:
             raise ValueError("title must have one line")
         for name, value, required in (
@@ -83,9 +86,11 @@ def load(owner: staff.StaffId, identity: str, *, sources: list[Path] | None = No
 
 
 def records(owner: staff.StaffId, *, include_read: bool = False,
-            sources: list[Path] | None = None) -> list[Investigation]:
+            sources: list[Path] | None = None,
+            states: tuple[InvestigationState, ...] = ()) -> list[Investigation]:
     """Read investigations in numeric order and watch the folder and each record."""
-    items = _store(owner).records(lambda identity: load(owner, identity), sources=sources)
+    selected = states or (() if include_read else (InvestigationState.OPEN, InvestigationState.ANSWER_READY))
+    items = _store(owner).records(lambda identity: load(owner, identity), sources=sources, states=selected)
     return sorted((item for item in items if include_read or item.state != InvestigationState.READ),
                   key=lambda item: int(item.id[1:]))
 
@@ -93,7 +98,7 @@ def records(owner: staff.StaffId, *, include_read: bool = False,
 def _save(item: Investigation) -> None:
     fields = {"id": item.id, "owner": item.owner, "title": item.title, "state": item.state,
               "filed": item.filed, "answered": item.answered, "read": item.read,
-              "question_length": str(len(item.question))}
+              "question_length": str(len(item.question)), "review_log": review_events.encode(item.log)}
     _store(item.owner).write(item.id, fields, f"{item.question}{ANSWER_SECTION}{item.answer}")
 
 
@@ -125,12 +130,13 @@ def answer(owner: staff.StaffId, identity: str, text: str) -> Investigation:
             return item
         if item.state != InvestigationState.OPEN:
             raise InvestigationError(f"{identity}: cannot answer an investigation in state {item.state}")
-        item = replace(item, state=InvestigationState.ANSWER_READY, answered=_now(), answer=text)
+        item = replace(item, state=InvestigationState.ANSWER_READY, answered=_now(), answer=text,
+                       log=(*item.log, ReviewLog(datetime.now(timezone.utc), str(owner), "Answer: "+text)))
         _save(item)
         return item
 
 
-def mark_read(owner: staff.StaffId, identity: str) -> Investigation:
+def mark_read(owner: staff.StaffId, identity: str, words: str = "") -> Investigation:
     """Mark an answer read once; accept an exact repeat without writing."""
     _ = _path(owner, identity)
     with _store(owner).locked():
@@ -139,9 +145,38 @@ def mark_read(owner: staff.StaffId, identity: str) -> Investigation:
             return item
         if item.state != InvestigationState.ANSWER_READY:
             raise InvestigationError(f"{identity}: cannot read an investigation in state {item.state}")
-        item = replace(item, state=InvestigationState.READ, read=_now())
+        item = replace(item, state=InvestigationState.READ, read=_now(),
+                       log=(*item.log, ReviewLog(datetime.now(timezone.utc), "nate", "Marked read"+(': '+words if words else ''))))
         _save(item)
         return item
+
+
+def review_action(owner: staff.StaffId, identity: str, action: str, words: str) -> Investigation:
+    """Record feedback or a question and keep each previous answer in the log."""
+    if not words.strip():
+        raise InvestigationError("enter your words")
+    with _store(owner).locked():
+        item = load(owner, identity)
+        if item.state != InvestigationState.ANSWER_READY:
+            raise InvestigationError(f"{identity}: the answer is no longer ready")
+        words_before = 'Answer: '+item.answer
+        if item.answer and not any(entry.words == words_before for entry in item.log):
+            previous = ReviewLog(datetime.fromisoformat(item.answered), str(owner), words_before)
+            item = replace(item, log=tuple(sorted((*item.log, previous), key=lambda entry: entry.time)))
+        event = ReviewLog(datetime.now(timezone.utc), 'nate', ('feedback sent' if action == 'feedback' else action)+': '+words)
+        if action == 'question':
+            item = replace(item,state=InvestigationState.OPEN,answered='',read='',log=(*item.log,event))
+        else:
+            item = replace(item,state=InvestigationState.READ,read=_now(),log=(*item.log,event))
+        _save(item)
+        return item
+
+
+def record_review_log(owner: staff.StaffId, identity: str, words: str) -> None:
+    with _store(owner).locked():
+        item = load(owner, identity)
+        event = ReviewLog(datetime.now(timezone.utc), 'nate', words)
+        _save(replace(item,log=review_events.append(item.log,event)))
 
 
 def main(argv: list[str] | None = None) -> int:

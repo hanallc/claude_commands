@@ -5201,11 +5201,30 @@ class UnreadableProcessArguments:
 
 
 @dataclass(frozen=True)
+class UnparsedProcessArguments:
+    """Retain a command line until the caller selects its process."""
+
+    command: str
+
+
+@dataclass(frozen=True)
 class _UserProcess:
     pid: int
     parent: int
     executable: str
-    arguments: ReadProcessArguments | UnreadableProcessArguments
+    argument_state: UnparsedProcessArguments | ReadProcessArguments | UnreadableProcessArguments
+
+    @cached_property
+    def arguments(self) -> ReadProcessArguments | UnreadableProcessArguments:
+        if not isinstance(self.argument_state, UnparsedProcessArguments):
+            return self.argument_state
+        command = self.argument_state.command
+        if command == self.executable or command.startswith(self.executable + " "):
+            try:
+                return ReadProcessArguments((self.executable, *shlex.split(command[len(self.executable):])))
+            except ValueError:
+                pass
+        return UnreadableProcessArguments(f"process {self.pid}: arguments are unreadable or changed")
 
 
 def _darwin_processes(*, complete: bool = False, timeout: float | _ProcessReadDeadline = PROGRAM_TIMEOUT_SECONDS) -> list[_UserProcess]:
@@ -5250,15 +5269,7 @@ def _darwin_processes(*, complete: bool = False, timeout: float | _ProcessReadDe
                 continue
             except HerdrFailure:
                 pass
-        command = commands.get(pid, "")
-        arguments: ReadProcessArguments | UnreadableProcessArguments = UnreadableProcessArguments(
-            f"process {pid}: arguments are unreadable or changed")
-        if command == executable or command.startswith(executable + " "):
-            try:
-                arguments = ReadProcessArguments((executable, *shlex.split(command[len(executable):])))
-            except ValueError:
-                pass
-        processes.append(_UserProcess(pid, parent, executable, arguments))
+        processes.append(_UserProcess(pid, parent, executable, UnparsedProcessArguments(commands.get(pid, ""))))
     if complete and set(commands) != {process.pid for process in processes}:
         raise HerdrFailure("user process descendants changed or are incomplete")
     return processes
@@ -5271,10 +5282,10 @@ def _darwin_attached_clients(name: str) -> ClientsAttached | NoClientAttached | 
         return ClientsUnreadable(str(error))
     count = 0
     for process in processes:
-        if isinstance(process.arguments, UnreadableProcessArguments):
-            if Path(process.executable).name == "herdr":
-                return ClientsUnreadable(process.arguments.reason)
+        if Path(process.executable).name != "herdr":
             continue
+        if isinstance(process.arguments, UnreadableProcessArguments):
+            return ClientsUnreadable(process.arguments.reason)
         arguments = list(process.arguments.argv)
         session, command = _herdr_command(arguments, "default")
         if session and not command:
@@ -5290,16 +5301,36 @@ def _darwin_attached_clients(name: str) -> ClientsAttached | NoClientAttached | 
     return ClientsAttached(count) if count else NoClientAttached()
 
 
-def _darwin_process_cwd(pid: int) -> str | UnreadableCwd:
+def _darwin_process_cwds(pids: Sequence[int]) -> dict[int, str | UnreadableCwd]:
+    """Read candidate working directories with one lsof call; retain failures for each pid."""
+    if not pids:
+        return {}
+    command = [os.environ.get("HERDR_LSOF", "lsof"), "-a", "-p",
+               ",".join(str(pid) for pid in pids), "-d", "cwd", "-Fpn"]
     try:
-        result = run_program([os.environ.get("HERDR_LSOF", "lsof"), "-a", "-p", str(pid), "-d", "cwd", "-Fn"])
-        require_success(result, f"process {pid} cwd")
+        result = run_program(command)
     except (HerdrFailure, subprocess.TimeoutExpired) as error:
-        return UnreadableCwd(str(error))
-    directories = [field[1:] for field in result.stdout.splitlines() if field.startswith("n/")]
-    if len(directories) != 1:
-        return UnreadableCwd(f"process {pid}: expected one cwd, found {len(directories)}")
-    return directories[0]
+        return {pid: UnreadableCwd(str(error)) for pid in pids}
+    directories: dict[int, list[str]] = {pid: [] for pid in pids}
+    current_pid = 0
+    for field in result.stdout.splitlines():
+        if field.startswith("p"):
+            current_pid = int(field[1:]) if field[1:].isdecimal() else 0
+        elif field.startswith("n/") and current_pid in directories:
+            directories[current_pid].append(field[1:])
+    failure = subprocess.CompletedProcess(command, result.returncode, "", result.stderr)
+    working_directories: dict[int, str | UnreadableCwd] = {}
+    for pid, paths in directories.items():
+        if len(paths) == 1:
+            working_directories[pid] = paths[0]
+            continue
+        try:
+            require_success(failure, f"process {pid} cwd")
+        except HerdrFailure as error:
+            working_directories[pid] = UnreadableCwd(str(error))
+        else:
+            working_directories[pid] = UnreadableCwd(f"process {pid}: expected one cwd, found {len(paths)}")
+    return working_directories
 
 
 def _darwin_herdr_processes() -> list[HerdrProcess]:
@@ -5337,6 +5368,7 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
             sessions[pid] = session
             pending.extend(children.get(pid, []))
     processes: list[HerdrProcess] = []
+    working_directories = _darwin_process_cwds(sorted(sessions))
     for pid, session in sessions.items():
         try:
             arguments = by_pid[pid].arguments
@@ -5349,7 +5381,7 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
                 continue
             marks = _process_marks(pid, environment, list(arguments.argv), place)
             processes.append(HerdrProcess(pid, place, marks,
-                                          Path(by_pid[pid].executable).name, _darwin_process_cwd(pid)))
+                                          Path(by_pid[pid].executable).name, working_directories[pid]))
         except (HerdrFailure, subprocess.TimeoutExpired):
             continue
     return processes
@@ -5407,6 +5439,7 @@ class UnitTabClassifier:
         return OtherTab()
 
 
+@observation_snapshot()
 @pane_snapshot()
 def _scan_herdr_processes() -> list[HerdrProcess]:
     if _platform() == "darwin":

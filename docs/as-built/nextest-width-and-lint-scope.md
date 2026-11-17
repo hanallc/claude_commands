@@ -29,7 +29,7 @@ On natedev, compiles and test threads share one jobserver pool, `/dev/steve`. Ea
 1. `run_nextest` calls `nextest_token_pool` in `physical` and `logical` mode. It sets `LINT_NEXTEST_POOL` to the path in `CARGO_MAKEFLAGS` `--jobserver-auth=fifo:PATH` when that path is a readable and writable character device or FIFO. Otherwise the pool is empty.
 2. After the memory gate admits the step, `run_step_attempt` runs `nextest_tokens.py --pool P --width-file F --reservation R -- cargo nextest run --test-threads W ...` inside the step's scope.
 3. The holder builds first with `--no-run` and the selection arguments before `--`. The compile takes tokens as cargo always does, and the step holds no test token while it compiles.
-4. It takes `test_token_floor` tokens (`config/build_admission.conf`, 4), and waits for them with `nextest: waiting for K more jobserver tokens`. `progress_profile.token_wait_line` defines that line; the Builds page shows the wait as the stage `waiting for jobserver tokens`. Then it takes free tokens without a wait, up to W.
+4. It takes `test_token_floor` tokens (`config/build_admission.conf`, 4), and waits for them with `nextest: waiting for K more jobserver tokens`. `progress_profile.token_wait_line` defines that line; the Builds page shows the wait as the stage `waiting`, and the row tooltip gives the full reason. Then it takes free tokens without a wait, up to W.
 5. It writes the token count N to F. When N is not W, it sets the reservation's `test_threads` to N (`admission_client.width`).
 6. It prints `nextest: N of W test threads; load <one-minute load> on <cpu count> CPUs (<host>); one jobserver token for each thread`, then runs the tests with `--test-threads N`.
 7. Every token goes back when the tests end, on any exit or signal. TERM, INT and HUP go on to the child, and the holder exits 128 + the signal. steve also takes back the tokens of a process that dies.
@@ -43,6 +43,42 @@ On natedev, compiles and test threads share one jobserver pool, `/dev/steve`. Ea
 natedev has 16 physical and 32 logical cores. The Mac reads 12 for both and has no memory gate. GitHub CI and hand-run `cargo nextest` do not go through `invoke.sh` and keep nextest's default width.
 
 A step records its width through its argv: `invoke.sh` puts `--test-threads N` before the caller's arguments, so the first width in argv is the one the build log's `steps.argv`, the memory gate's reservation row and the `anon_peaks.jsonl` record all carry. A run that holds fewer tokens than its width records the width it ran at: the build log takes the argv with N, and the holder rewrites the reservation's `test_threads`.
+
+### Test prebuilds (`scripts/lint/prebuild.py`)
+
+A workspace can declare an artifact that its tests need, in its root `Cargo.toml`:
+
+```toml
+[workspace.metadata.dev.prebuild.hana_agora_server]
+target = "wasm32-unknown-unknown"
+env = "HANA_AGORA_SERVER_WASM"
+for = ["hana_agora", "hana"]
+```
+
+`platforms` is optional. It lists the platforms that build the artifact, `linux` and `macos`; the default is both.
+
+1. `run_step_attempt` calls `lint_prebuild_prefix` for a `cargo nextest run` step. When a line of the root manifest holds the word `prebuild`, it puts `prebuild.py --manifest M --` in front of the token holder and the nextest command. The word after a `#` with no quote before it is a comment and does not count. So the check finds a declaration in every TOML form: a header, a quoted or dotted key, or an inline table. The word in a value or another table starts Python once; `prebuild.py` reads no declaration and runs the tests unchanged. The shell reads the manifest without a fork, so a manifest without a declaration starts no process. `verify.sh` sets the manifest (`LINT_WORKSPACE_MANIFEST`) to the repository root `Cargo.toml`. A remote `lint nextest` runs in the mirror root and reads `$PWD/Cargo.toml`.
+2. `prebuild.py` reads the packages that the nextest arguments select. Plain `-p`/`--package` names select those packages; a `-E` filter can only narrow them. A glob, `--workspace`/`--all` (cargo then ignores `-p`), a short-option word other than `-p` that holds a `p` (`-phana`, `-rp`) or no `-p` selects the whole workspace. Filtersets are not read: a run that selects by `-E` alone builds every entry for its platform, and cargo's fingerprints make the extra builds cheap.
+3. For each entry whose `for` list holds a selected package, or for every entry on a whole-workspace run, it runs `cargo build --release --manifest-path M -p <package> --target <target>`. A `--target-dir` in the nextest arguments goes to the build too.
+4. It reads cargo's JSON messages for the `cdylib` or `bin` artifact whose `package_id` names the package, so a renamed `[lib]` target works. It needs exactly one such file, and sets `<env>` to its path. Then it runs the nextest command with `exec`.
+
+- The build runs inside the step's admission and memory scope, on the host that runs the tests: natedev, the Mac or an SSH target.
+- On a platform that `platforms` leaves out, it prints `prebuild: <package> builds only on <platforms>; not built on <platform>` and runs the tests without the build.
+- Cargo's fingerprints make an unchanged build a no-op. There is no second cache.
+- A failed build exits with cargo's status and prints `the tests did not run`. An invalid declaration exits 2 with one line. A `workspace`, `metadata` or `dev` value that is not a table declares nothing, and the tests run unchanged.
+- The profile is always `release`. The entry has no profile key.
+
+### Dev shell programs (`scripts/lib/dev_shell.py`)
+
+A test can need a program that the workspace's flake development shell declares, for example SpacetimeDB for hana_catalyst. `verify.sh` on natedev runs inside that shell (`nix_env.py exec`), and the Linux SSH runner sources the whole shell. The Mac route and a bare `lint` call do not.
+
+1. `run_step_attempt` makes `PATH` local, and for a `cargo nextest run` step it calls `lint_dev_shell_path` before admission.
+2. The workspace root is found as for prebuilds: the folder of `LINT_WORKSPACE_MANIFEST`, which `verify.sh` sets to the repository root, or else `$PWD` (a remote `lint nextest` runs in the mirror root). A bare `lint` from a member folder does not find the root flake. When `IN_NIX_SHELL` is not set and the workspace root has `flake.nix`, `dev_shell.py path --root R` prints the shell's `/nix/store` program folders. The step adds them to the END of `PATH`. Every tool the host has stays first: the Mac cargo gate, rustup's cargo and the system compiler. No other variable changes, so the step builds as before.
+3. The evaluation (`nix print-dev-env path:<inputs>#<selector>`) is cached per flake input change under `config/dev_shell.conf` `cache`. The inputs are `flake.nix`, `flake.lock` and the `nix/` folder, the same contract as the Linux SSH runner. A flake that reads another file, or has no `flake.lock`, fails the evaluation.
+4. A failed evaluation fails the step with one line from `dev_shell.py`: `dev_shell: <root>: nix print-dev-env failed: <nix's last error line>`, or the input problem. The tests do not run.
+5. A workspace without `flake.nix`, or a step inside a nix shell, starts no process. The next step starts from the caller's `PATH`.
+
+A program that the shell has and the host lacks is visible to build scripts too. Adding the folders last limits this to tools that the host does not have.
 
 ### Width in the reservation (`scripts/lint/memory_admit.py`)
 
@@ -94,6 +130,8 @@ Order: `require_taplo`, mend `--fix`, nightly fmt of the package and changed mem
 ## Invariants
 
 - `invoke.sh` is the only place nextest policy flags are composed; callers own scope.
+- The dev shell folders go at the end of `PATH`, never the start: the Mac cargo gate and the host's tools stay first.
+- The prebuild prefix goes before the token holder: `nextest_tokens.py` reads `cargo nextest run --test-threads W` at the start of its command.
 - The caller's width wins: a width flag before `--`, or `NEXTEST_TEST_THREADS`, means `invoke.sh` adds nothing. Such a run takes no test tokens.
 - No counter: a run's tokens are the bytes it holds, and steve takes back the tokens of a dead process.
 - Width selection never fails, prints or changes a status; an unreadable core count adds no flag, and a pool that does not open runs at the full width.

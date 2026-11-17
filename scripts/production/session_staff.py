@@ -16,19 +16,17 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import NamedTuple, cast
+from typing import TYPE_CHECKING, NamedTuple, cast
 
 from scripts.production import staff
-from scripts.production.session_labels import StaffLabels
 from scripts.production import unit_config as configuration
-from scripts.agents import remote, worker_lifecycle
-from scripts.message import process_table
+from scripts.agents import remote
 from scripts.message.sessions import SessionRecord
 from scripts.herdr.place import HerdrPlace
-from scripts.herdr.pane_launch import PaneLaunch, agent_kind, without_staff_labels
+from scripts.herdr.pane_launch import without_staff_labels
 from scripts.herdr import pane_launch
-from scripts.lib import legacy_identity
-from scripts.production import unit_names
+if TYPE_CHECKING:
+    from scripts.herdr.pane_launch import PaneLaunch
 
 
 @dataclass(frozen=True)
@@ -167,6 +165,7 @@ class WorkerRunEvidence(NamedTuple):
 def _worker_runs(record: staff.StaffSnapshot, rows: Iterable[staff.StaffRow]) -> dict[staff.StaffId, WorkerRunEvidence]:
     """Read records and staff run associations once."""
     from scripts.lib import unit_runs
+    from scripts.agents import worker_lifecycle
     rows = tuple(rows)
     owners = {owner.current_session: owner for row in rows if (owner := record.parent_of(row)) is not None}
     marked: dict[Path, set[staff.StaffId]] = {}
@@ -319,6 +318,56 @@ class RetiredUnit:
     worktree: RemovedWorktree
 
 
+@dataclass(frozen=True)
+class ProductionDocumentFacts:
+    """The production-document reads from one machine for one roster run."""
+
+    machine: str
+    values: Mapping[str, tuple[str, str]]
+
+    def to_json(self) -> dict[str, object]:
+        return {"machine": self.machine, "values": dict(self.values)}
+
+    @classmethod
+    def from_json(cls, value: object) -> ProductionDocumentFacts:
+        if not isinstance(value, dict):
+            raise ValueError("production-document facts must be an object")
+        document = cast(dict[str, object], value)
+        machine, raw_facts = document.get("machine"), document.get("values")
+        if not isinstance(machine, str) or not machine or not isinstance(raw_facts, dict):
+            raise ValueError("invalid production-document facts")
+        facts: dict[str, tuple[str, str]] = {}
+        for key, raw_fact in cast(dict[str, object], raw_facts).items():
+            if (not key.startswith("file:") or not isinstance(raw_fact, list)
+                    or len(cast(list[object], raw_fact)) != 2):
+                raise ValueError("invalid production-document fact")
+            state, text = cast(list[object], raw_fact)
+            if state not in ("value", "missing", "unavailable") or not isinstance(text, str):
+                raise ValueError("invalid production-document fact")
+            facts[key] = (cast(str, state), text)
+        return cls(machine, facts)
+
+
+@dataclass(frozen=True)
+class ReadProductionDocuments:
+    """Read production documents from their machines."""
+
+
+READ_PRODUCTION_DOCUMENTS = ReadProductionDocuments()
+_production_facts: ContextVar[ProductionDocumentFacts | ReadProductionDocuments] = ContextVar(
+    "production_document_facts", default=READ_PRODUCTION_DOCUMENTS)
+
+
+@contextmanager
+def supplied_production_facts(facts: ProductionDocumentFacts | ReadProductionDocuments) -> Generator[None]:
+    """Use the caller's production-document reads for this roster run only."""
+    token = _production_facts.set(facts)
+    try:
+        yield
+    finally:
+        _production_facts.reset(token)
+
+
 def _read_facts(requests: list[tuple[str, str]]) -> dict[str, tuple[str, str]]:
     """Read files and git branches on the machine that holds them."""
     facts: dict[str, tuple[str, str]] = {}
@@ -366,24 +415,42 @@ class RowResolver:
     def unit_worktree(self, row: staff.StaffRow) -> PresentWorktree | RemovedWorktree | WorktreeUnfilled:
         return self._holder(row).worktree
 
-    def _requests(self, machine: str) -> list[tuple[str, str]]:
+    def _requests(self, machine: str, *, production_documents_only: bool = False) -> list[tuple[str, str]]:
         requests: set[tuple[str, str]] = set()
         for row in self._rows:
-            tree = self._holder(row).worktree
-            if isinstance(tree, PresentWorktree) and tree.machine == machine:
+            try:
+                owner = self._holder(row)
+            except staff.StaffUnreadable:
+                if production_documents_only:
+                    continue
+                raise
+            tree = owner.worktree
+            if not production_documents_only and isinstance(tree, PresentWorktree) and tree.machine == machine:
                 requests.update((("git", str(tree.path)), ("file", str(tree.path / ".unit.toml"))))
-            elif isinstance(tree, RemovedWorktree) and tree.machine == machine:
-                requests.add(("file", str(configuration.parked_path(self._holder(row).id, home=Path("~")))))
-            owner = self._holder(row)
+            elif not production_documents_only and isinstance(tree, RemovedWorktree) and tree.machine == machine:
+                requests.add(("file", str(configuration.parked_path(owner.id, home=Path("~")))))
             if owner.kind == "unit" and isinstance(owner.parent, staff.ReportsTo):
                 owner = self.record.by_id(owner.parent.id) or owner
             if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) and owner.doc.machine == machine:
-                requests.update((("file", str(owner.doc.path)), ("git", str(owner.doc.path.parent))))
+                requests.add(("file", str(owner.doc.path)))
+                if not production_documents_only:
+                    requests.add(("git", str(owner.doc.path.parent)))
         return sorted(requests)
+
+    def production_document_facts(self) -> ProductionDocumentFacts:
+        """Read only this machine's production documents, once for each path."""
+        machine = remote.local_machine()
+        requests = self._requests(machine, production_documents_only=True)
+        return ProductionDocumentFacts(machine, _read_facts(requests))
 
     def _fact(self, machine: str, kind: str, path: Path) -> tuple[str, str]:
         if self.dependencies is not None:
             self.dependencies(path)
+        supplied = _production_facts.get()
+        if isinstance(supplied, ProductionDocumentFacts) and supplied.machine == machine:
+            fact = supplied.values.get(kind + ":" + str(path))
+            if fact is not None:
+                return fact
         if machine == remote.local_machine():
             key = (kind, str(path))
             if key not in self._local_facts:
@@ -601,6 +668,8 @@ def unit_match(selector: UnitMember | ObservedUnit, record: staff.StaffSnapshot,
             unit_owner = cast(Callable[[str], str], import_module("scripts.copies.copies").unit_owner)
             matches = [row for row in units if unit_owner(row.name) == reference.value]
     else:
+        from scripts.production import unit_names
+
         matches = [row for row in record.find(kind="unit") if row.name == unit_names.name(selector.unit)]
     if isinstance(selector, UnitMember):
         matches = [row for row in matches if isinstance(parent, RequiredParent) and row.parent == staff.ReportsTo(parent.row.id)]
@@ -758,6 +827,7 @@ def retained_session_labels(marked: Iterable[LabeledSession], row: staff.StaffRo
 def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.StaffSnapshot,
                         membership: dict[str, tuple[staff.StaffRow, ...]], launches: tuple[PaneLaunch, ...]) -> LabeledProductions:
     from scripts.herdr import herdr
+    from scripts.message import process_table
 
     shared_session = herdr.shared_session()
     parents = {row.id: production_name for production_name, rows in membership.items() for row in rows}
@@ -873,6 +943,10 @@ class LaunchMembership:
         return cls(record, member_sources())
 
     def environment(self, launch: PaneLaunch) -> dict[str, str]:
+        from scripts.herdr.pane_launch import agent_kind
+        from scripts.lib import legacy_identity
+        from scripts.production.session_labels import StaffLabels
+
         if agent_kind(launch, record=self.record) == "codex":
             return legacy_identity.without_legacy_identity(launch["environment"])
         labels = StaffLabels(self.record)

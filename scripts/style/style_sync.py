@@ -394,14 +394,15 @@ def remove_lint_dir(repo: Path, directory: Path) -> bool:
     try:
         if snapshot.is_symlink():
             snapshot.unlink()
-        elif snapshot.is_dir():
-            scratch.remove_with_cargo_output(snapshot, shutil.rmtree)
+        elif (snapshot.is_dir() or scratch.removal_mark(snapshot).exists()
+              or scratch.cargo_removal_mark(snapshot).exists()):
+            scratch.remove_with_cargo_output(snapshot)
         registered = {Path(line.removeprefix("worktree "))
                       for line in git(repo, "worktree", "list", "--porcelain").splitlines()
                       if line.startswith("worktree ")}
         if listed in registered:
             _ = git(repo, "worktree", "remove", "--force", "--force", str(listed))
-    except (Refusal, OSError) as error:
+    except (Refusal, OSError, scratch.ScratchError) as error:
         print(f"style_sync: kept {directory} for the next lint run; worktree registration: "
               + " ".join(str(error).splitlines()))
         return False

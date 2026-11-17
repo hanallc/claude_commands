@@ -6,7 +6,7 @@ from pathlib import PurePath
 from types import MappingProxyType
 
 from scripts.lib import conf
-from scripts.message.unit_labels import OwnerRole
+from scripts.message.owner_role import OwnerRole
 
 
 @dataclass(frozen=True)

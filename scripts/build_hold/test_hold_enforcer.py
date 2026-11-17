@@ -22,6 +22,8 @@ from unittest import mock
 
 from scripts.build_hold.owning_session import OwningSession
 from scripts.build_hold import build_hold, hold_enforcer
+from scripts.build_queue import admission_service, admission_records, placement
+from scripts.buildlog import store
 from scripts.agents import detached_runs
 from scripts.build_targets import target_config
 from scripts.mac_test import claim_state
@@ -86,6 +88,173 @@ class HoldEnforcerTests(unittest.TestCase):
     def read_claims(self, proc_root: Path) -> build_hold.LiveClaims:
         self.assertEqual(proc_root, self.proc)
         return build_hold.LiveClaims(self.claimed)
+
+    def test_drain_keeps_a_verified_remote_waiter_without_local_admission(self) -> None:
+        _ = self.process(700, 'bash', argv=('/bin/bash', '/scripts/direct/verify.sh'), session='other')
+        processes = build_hold.read_audit_processes(self.proc)
+        identity = processes[700].identity
+        claims = build_hold.LiveClaims(frozenset({identity}), remote_waiters=frozenset({identity}))
+        runs = hold_enforcer.classify_drain_runs(processes, frozenset(), claims)
+        assert isinstance(runs, tuple)
+        self.assertEqual(len(runs), 1)
+        self.assertIsInstance(runs[0], hold_enforcer.WorkingRun)
+        assert isinstance(runs[0], hold_enforcer.WorkingRun)
+        self.assertEqual(runs[0].reason, 'remote waiter')
+        unassigned = hold_enforcer.classify_drain_runs(processes, frozenset(), build_hold.LiveClaims(frozenset()))
+        assert isinstance(unassigned, tuple)
+        self.assertIsInstance(unassigned[0], hold_enforcer.WaitingRun)
+
+    def hana_claim(self) -> tuple[target_config.SshTarget, claim_state.StatePaths]:
+        _ = self.process(700, 'bash', argv=('bash', 'verify.sh', 'check'), session='other')
+        _ = self.process(701, 'python3', parent=700, argv=('python3', 'offload.py', 'check'))
+        settings = self.root / 'hana.conf'
+        _ = settings.write_text('execution_transport=hana-control\nhost=fixture-hana\n')
+        target = target_config.SshTarget('fixture-hana', 'linux', settings)
+        paths = claim_state.StatePaths(self.root / 'hana-claims')
+        paths.directory.mkdir()
+        record: claim_state.RemoteJobClaim = {
+            'claim_id': placement.assigned_claim_id('fixture-episode', 'fixture-attempt'),
+            'episode': 'fixture-episode', 'attempt': 'fixture-attempt',
+            'submitting_session': 'other', 'pid': 701, 'proc_start': '11000', 'what': 'Hana check',
+            'worktree': str(self.root), 'since': '2026-11-16T12:00:00+00:00', 'remote_host': 'fixture-hana',
+            'repo_name': 'hana', 'repo_key': 'fixture-repository', 'slot': 1,
+        }
+        _ = paths.run.write_text(json.dumps(record))
+        return target, paths
+
+    def test_live_hana_claim_stays_claimed_during_drain_without_an_assignment_or_admission_state(self) -> None:
+        target, paths = self.hana_claim()
+        table = self.table()
+        for admission in ('no matching assignment', 'missing state'):
+            with self.subTest(admission=admission):
+                state = admission_service.ServiceState({}, {}, {}, admission_records.ReadyToStart())
+                with (mock.patch.object(target_config, 'read_targets', return_value=(target,)),
+                        mock.patch.object(claim_state, 'state_paths', return_value=paths),
+                        mock.patch.object(admission_service, 'read_state', return_value=state,
+                            side_effect=FileNotFoundError('private admission state') if admission == 'missing state' else None)):
+                    claims = self.claim_reader(self.proc)
+                assert isinstance(claims, build_hold.LiveClaims)
+                self.assertIn(table[701].identity, claims.identities)
+                self.assertEqual(claims.remote_waiters, frozenset())
+                runs = hold_enforcer.classify_drain_runs(table, frozenset(), claims)
+                assert isinstance(runs, tuple)
+                self.assertEqual(len(runs), 1)
+                assert isinstance(runs[0], hold_enforcer.WorkingRun)
+                self.assertEqual(runs[0].reason, 'Mac or AWS claim')
+                with (mock.patch.object(hold_enforcer, 'claimed_processes', return_value=claims),
+                        mock.patch.object(hold_enforcer, 'admitted_processes', return_value=frozenset())):
+                    kept = hold_enforcer.drain_identities(self.proc, build_hold.HolderIdentity('holder', 'holder'))
+                self.assertIn(table[700].identity, kept)
+
+    def test_only_an_exact_current_hana_assignment_adds_the_claim_and_coordinator_as_remote_waiters(self) -> None:
+        target, paths = self.hana_claim()
+        table = self.table()
+        claim, = claim_state.read_claims(paths)
+        assignment = placement.PlacementAssignment('fixture-episode', 'fixture-attempt',
+            placement.PlacementDestination('ssh', target.name, 'fixture-hana', claim.scope, 1),
+            placement.SourceKeyKnown('fixture-source'),
+            placement.SubmittingOwner(store.host_name(), 700, '11000'), OwningSession('other'), 100)
+        key = placement.attempt_key(assignment.episode, assignment.attempt)
+        state = admission_service.ServiceState({}, {}, {}, admission_records.ReadyToStart())
+        state.current_assignments[assignment.episode] = key
+        for match in (True, False):
+            with self.subTest(match=match):
+                current = assignment if match else replace(assignment, session=OwningSession('another-session'))
+                state.assignments[key] = admission_records.SavedPlacementAssignment(current)
+                with (mock.patch.object(target_config, 'read_targets', return_value=(target,)),
+                        mock.patch.object(claim_state, 'state_paths', return_value=paths),
+                        mock.patch.object(admission_service, 'read_state', return_value=state)):
+                    claims = self.claim_reader(self.proc)
+                assert isinstance(claims, build_hold.LiveClaims)
+                self.assertIn(table[701].identity, claims.identities)
+                expected: frozenset[build_hold.ProcessIdentity] = (
+                    frozenset({table[700].identity, table[701].identity}) if match else frozenset())
+                self.assertEqual(claims.remote_waiters, expected)
+
+    def test_unreadable_admission_state_has_no_remote_waiters_and_does_not_pause_enforcement(self) -> None:
+        target, paths = self.hana_claim()
+        _ = self.process(800, 'cargo', argv=('cargo', 'check'), session='other')
+        admission = self.root / 'buildlog/admission/state.json'
+        admission.parent.mkdir(parents=True)
+        _ = admission.write_text('{')
+        sent: list[tuple[int, int]] = []
+
+        def release(_seconds: float) -> None:
+            (self.holders / 'holder').unlink()
+
+        errors = io.StringIO()
+        with (mock.patch.object(target_config, 'read_targets', return_value=(target,)),
+                mock.patch.object(claim_state, 'state_paths', return_value=paths),
+                mock.patch.object(hold_enforcer, 'claimed_processes', side_effect=self.claim_reader),
+                redirect_stderr(errors)):
+            claims = self.claim_reader(self.proc)
+            assert isinstance(claims, build_hold.LiveClaims)
+            self.assertEqual(claims.remote_waiters, frozenset())
+            self.assertIn(build_hold.ProcessIdentity(701, '11000'), claims.identities)
+            result = hold_enforcer.run(self.proc, self.holders, self.root / 'enforcer', uid=self.uid,
+                enforcer_pid=999, stopper=hold_enforcer.StopBuildsAndTests(self.proc,
+                    signal_process=lambda pid, signum: sent.append((pid, signum))),
+                sleep=release, cgroup_root=self.root / 'cgroup')
+        self.assertEqual(result, 0)
+        self.assertEqual(sent, [(800, signal.SIGTERM)])
+        self.assertNotIn('enforcement waits', errors.getvalue())
+
+    def test_hana_match_errors_keep_live_claims_and_do_not_pause_enforcement(self) -> None:
+        target, paths = self.hana_claim()
+        _ = self.process(800, 'cargo', argv=('cargo', 'check'), session='other')
+        claim, = claim_state.read_claims(paths)
+        assignment = placement.PlacementAssignment('fixture-episode', 'fixture-attempt',
+            placement.PlacementDestination('ssh', target.name, 'fixture-hana', claim.scope, 1),
+            placement.SourceKeyKnown('fixture-source'),
+            placement.SubmittingOwner(store.host_name(), 700, '11000'), OwningSession('other'), 100)
+        key = placement.attempt_key(assignment.episode, assignment.attempt)
+        state = admission_service.ServiceState({}, {}, {}, admission_records.ReadyToStart())
+        state.current_assignments[assignment.episode] = key
+        state.assignments[key] = admission_records.SavedPlacementAssignment(assignment)
+
+        def release(_seconds: float) -> None:
+            (self.holders / 'holder').unlink()
+
+        for module, operation in ((target_config, 'read_execution_transport'),
+                (placement, 'attempt_key'), (placement, 'assigned_claim_id')):
+            for error_type in (OSError, ValueError):
+                with self.subTest(operation=operation, error=error_type.__name__):
+                    self.write_holder()
+                    sent: list[tuple[int, int]] = []
+                    errors = io.StringIO()
+                    with (mock.patch.object(target_config, 'read_targets', return_value=(target,)),
+                            mock.patch.object(claim_state, 'state_paths', return_value=paths),
+                            mock.patch.object(admission_service, 'read_state', return_value=state),
+                            mock.patch.object(module, operation, side_effect=error_type('private Hana match failure')),
+                            mock.patch.object(hold_enforcer, 'claimed_processes', side_effect=self.claim_reader),
+                            redirect_stderr(errors)):
+                        claims = self.claim_reader(self.proc)
+                        assert isinstance(claims, build_hold.LiveClaims)
+                        self.assertEqual(claims.remote_waiters, frozenset())
+                        self.assertIn(build_hold.ProcessIdentity(701, '11000'), claims.identities)
+                        result = hold_enforcer.run(self.proc, self.holders, self.root / 'enforcer', uid=self.uid,
+                            enforcer_pid=999, stopper=hold_enforcer.StopBuildsAndTests(self.proc,
+                                signal_process=lambda pid, signum: sent.append((pid, signum))),
+                            sleep=release, cgroup_root=self.root / 'cgroup')
+                    self.assertEqual(result, 0)
+                    self.assertEqual(sent, [(800, signal.SIGTERM)])
+                    self.assertNotIn('enforcement waits', errors.getvalue())
+
+    def test_local_cargo_under_a_remote_coordinator_stays_an_audit_violation(self) -> None:
+        _ = self.hana_claim()
+        _ = self.process(800, 'cargo', parent=700, argv=('cargo', 'check'))
+        _ = self.process(801, 'rustc', parent=800)
+        table = self.table()
+        waiters = frozenset({table[700].identity, table[701].identity})
+        claims = build_hold.LiveClaims(waiters, remote_waiters=waiters)
+        with (mock.patch.object(hold_enforcer, 'claimed_processes', return_value=claims),
+                mock.patch.object(hold_enforcer, 'admitted_processes', return_value=frozenset())):
+            builds = build_hold.audit_hold(self.holders, self.proc)
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(builds[0].process.identity, table[800].identity)
+        self.assertEqual(builds[0].classification, 'other_session')
+        self.assertEqual(builds[0].children, (table[801].identity,))
+        self.assertEqual([(row['pid'], row['class']) for row in self.rows()], [(800, 'other_session')])
 
     def write_holder(self, keep: tuple[build_hold.ProcessIdentity, ...] = ()) -> None:
         _ = (self.holders / "holder").write_text(json.dumps({

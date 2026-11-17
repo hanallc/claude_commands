@@ -90,6 +90,14 @@ class HanaSpendTests(CostFixture):
         self.assertEqual(result, hana_spend.PermitRefused('hana_daily_budget_usd'))
         self.assertEqual(self.book.read_snapshot().hana_compute, [renewed.exposure])
 
+    def test_renewal_retains_the_original_machine_type_and_region(self) -> None:
+        first = self.issued(self.start)
+        self.controller.settings = replace(self.workload, region='us-west-2', instance_type='fixture-other-type')
+        renewed = self.issued(self.start + 1, generation=first.exposure.generation)
+        self.assertEqual(first.exposure.region, self.workload.region)
+        self.assertEqual(renewed.exposure.region, first.exposure.region)
+        self.assertEqual(renewed.exposure.instance_type, first.exposure.instance_type)
+
     def test_unconfirmed_stop_retains_full_exposure_after_expiry(self) -> None:
         issued = self.issued(self.start)
         now = issued.exposure.expires + 100
