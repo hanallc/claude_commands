@@ -258,6 +258,15 @@ class ReviewTextTests(unittest.TestCase):
                          '<h2>Items</h2><ol class="question-items"><li><div class="code-block">'
                          + '<pre><code>deploy.py up --x &lt;y&gt;</code></pre>' + page_frame.COPY_BUTTON + '</div></li>'
                          + '<li>Run <code>ls</code> now</li><li><code>a</code> and <code>b</code></li></ol>')
+        # A showrunner reply or answer shows a command line as a code block; a span inside a sentence stays inline.
+        for text, expected in (
+            ("Run this:\n`git push origin --delete a <b>`\nThen check.",
+             '<p>Run this:</p><div class="code-block"><pre><code>git push origin --delete a &lt;b&gt;</code></pre>'
+             + page_frame.COPY_BUTTON + '</div><p>Then check.</p>'),
+            ("Run `ls` now.", '<p>Run <code>ls</code> now.</p>'),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(change_browser.answer_html(text), expected)
 
     def test_shared_inline_markdown_renders_bold_headings_and_lists(self) -> None:
         text = '## Heading\n**Field:** <script> & ready\n- **Owner:** morty\n1. **Next:** `run`'
@@ -2078,7 +2087,7 @@ class ChangePageTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 status.path(page, "C1").unlink(missing_ok=True)
                 if kind == "validation":
-                    attempt = status.begin(page, "C1", "validation")
+                    attempt = status.begin(page, "C1", "validation", waiting_why="The owner must validate the change.")
                 else:
                     question = status.ask(page, "C1", "Which change?")
                     if not isinstance(question, change_page.QuestionDelivery):
@@ -4097,8 +4106,9 @@ class ChangePageTests(unittest.TestCase):
                         RuntimeError("interrupted before verdict")):
             interruption = isinstance(failure, RuntimeError)
             with self.subTest(failure=failure):
-                def fail_verdict(path: Path, row: str, verdict: str, production: Path) -> change_review.VerdictRefused:
-                    del path, row, verdict, production
+                def fail_verdict(path: Path, row: str, verdict: str, production: Path, *,
+                                 validation_id: str = '') -> change_review.VerdictRefused:
+                    del path, row, verdict, production, validation_id
                     if isinstance(failure, Exception):
                         raise failure
                     return failure
@@ -4124,10 +4134,11 @@ class ChangePageTests(unittest.TestCase):
         validation = status.slots(self.page, "C1").validation
         save = change_review.save_verdict
 
-        def interrupt_after_save(path: Path, row: str, verdict: str, production: Path) -> change_review.VerdictSaved | change_review.VerdictRefused:
+        def interrupt_after_save(path: Path, row: str, verdict: str, production: Path, *,
+                                 validation_id: str = '') -> change_review.VerdictSaved | change_review.VerdictRefused:
             self.assertEqual(status.slots(self.page, "C1").validation, validation)
             self.assertIsInstance(status.slots(self.page, "C1").verdict, change_page.DeliveryIntent)
-            result = save(path, row, verdict, production)
+            result = save(path, row, verdict, production, validation_id=validation_id)
             if isinstance(result, change_review.VerdictSaved):
                 raise RuntimeError("interrupted after verdict")
             return result

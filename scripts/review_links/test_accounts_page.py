@@ -209,6 +209,52 @@ class AccountsPageTests(unittest.TestCase):
         table = accounts.status_board(multiple_roles)
         self.assertEqual(markup.count("<td "), len(table["rows"]) * (len(table["columns"]) + 2))
 
+    def test_producer_rows_follow_existing_roles_and_show_details_once(self) -> None:
+        rows = tuple(replace(status_row(label), tool=tool, roles=("producers", role), selected_roles=(role,),
+            role_counts=(accounts.RoleSessionCounts(1, 2, 0, 0), accounts.RoleSessionCounts(4, 0, 0, 0)))
+            for label, tool, role in (("claude1", "claude", "showrunners"), ("codex1", "codex", "workers")))
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT)
+        table = accounts.status_board(reading)
+        def text(spans: list[accounts.BoardSpan]) -> str:
+            return "".join(span["text"] for span in spans)
+        self.assertEqual([(text(line["cells"]["label"]), text(line["cells"]["roles"]), text(line["cells"]["busy"]))
+                          for line in table["rows"]],
+                         [("claude1", "showrunners ✓", "4"), ("", "producers", "1"),
+                          ("codex1", "workers ✓", "4"), ("", "producers", "1"), ("total", "", "10")])
+        for index in (1, 3):
+            for key in ("dot", "label", "left", "resets", "credits", "enabled"):
+                self.assertEqual(table["rows"][index]["cells"][key], [])
+        markup = accounts_page.board(reading)
+        self.assertEqual(markup.count('data-color-key="account.claude1"'), 1)
+        self.assertEqual(markup.count('data-account-name></td><td class="left"></td><td class="right"></td>'), 2)
+
+    def test_account_details_follow_supplied_row_order(self) -> None:
+        reading = accounts.StatusReading((replace(status_row("claude1"), roles=("units", "producers")),
+                                          status_row("claude2")), (), (), timezone.utc, AT)
+        with patch.object(accounts, "account_details_in_row_order", side_effect=list):
+            first, producer, other, _total = accounts.status_board(reading)["rows"]
+        ordered = accounts.account_details_in_row_order([producer, first, other, first])
+        self.assertEqual([line["cells"]["label"] for line in ordered],
+                         [producer["cells"]["label"], [], other["cells"]["label"], first["cells"]["label"]])
+        self.assertTrue(all(ordered[0]["cells"][key] for key in ("dot", "label", "left", "resets", "credits", "enabled")))
+        self.assertTrue(first["cells"]["label"])
+        self.assertEqual(accounts.account_details_in_row_order([producer])[0], producer)
+
+    def test_lone_producer_row_has_full_details_and_fixture_swatch(self) -> None:
+        config = Path(os.environ["CONF_DIR"]) / "statusline.conf"
+        _ = config.write_text(config.read_text() + "role.producer=#123abc\n")
+        reading = accounts.StatusReading((replace(status_row("claude1"), roles=("producers",), use_credits=True),),
+                                         (), (), timezone.utc, AT)
+        cells = accounts.status_board(reading)["rows"][0]["cells"]
+        self.assertTrue(all(cells[key] for key in ("dot", "label", "left", "resets", "credits", "enabled")))
+        self.assertEqual(cells["roles"][0].get("color_key"), "role.producer")
+        markup = accounts_page.board(reading)
+        self.assertIn('data-color-key="role.producer" data-color-name="producers" data-saved-color="#123abc"', markup)
+        self.assertIn('style="background:#123abc"', markup)
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess((), 0, "", "")) as run:
+            self.assertEqual(accounts_page.save_color("role.producer", "#123abc"), accounts_page.Saved())
+            self.assertEqual(cast(tuple[str, ...], run.call_args.args[0])[2:5], ("statusline", "role.producer", "#123abc"))
+
     def test_account_labels_use_terminal_colors_and_hex_without_css_injection(self) -> None:
         reading = accounts.StatusReading((status_row("claude1"),), (), (), timezone.utc, AT)
         with tempfile.TemporaryDirectory() as temporary:

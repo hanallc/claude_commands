@@ -4632,19 +4632,33 @@ def _account_board_rows(row: StatusRow, reading: StatusReading, *, account_confi
     dot: BoardTone = "success" if _read_ok(row, reading, account_config=account_config) else "error"
     roles = list(row.roles) or [""]
     lines: list[BoardRow] = []
-    for index, role in enumerate(roles):
-        first = index == 0
+    for index, role in sorted(enumerate(roles), key=lambda item: item[1] == "producers"):
         counts = _count_cells(row.role_counts[index] if index < len(row.role_counts) else None)
-        cells = {"dot": [_span("●", dot)] if first else [], "label": [_account_label(row.label, colors)] if first else [],
-                 "left": [_span(left, tone)] if first else [], "roles": _role_spans(role, role in row.selected_roles, colors),
+        cells = {"dot": [_span("●", dot)], "label": [_account_label(row.label, colors)],
+                 "left": [_span(left, tone)], "roles": _role_spans(role, role in row.selected_roles, colors),
                  **{key: [_span(value)] for key, value in counts.items()},
-                 "resets": [_span(reset)] if first else [], "credits": [_span(balance)] if first else [],
-                 "enabled": [_span("yes" if row.use_credits else "")] if first else []}
+                 "resets": [_span(reset)], "credits": [_span(balance)],
+                 "enabled": [_span("yes" if row.use_credits else "")]}
         line = BoardRow(cells=cells)
         if row.tool == "claude" and role in row.selected_roles and (role == "units" or role == "showrunners"):
             line["group"] = BoardGroup(account=row.label, group=role)
         lines.append(line)
     return lines
+
+
+def account_details_in_row_order(rows: list[BoardRow]) -> list[BoardRow]:
+    """Show account details on the first row of each consecutive account run."""
+    result: list[BoardRow] = []
+    previous = ""
+    for row in rows:
+        label = "".join(span["text"] for span in row["cells"]["label"])
+        cells = dict(row["cells"])
+        if label and label == previous:
+            for key in ("dot", "label", "left", "resets", "credits", "enabled"):
+                cells[key] = []
+        result.append({**row, "cells": cells})
+        previous = label
+    return result
 
 
 def status_board(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> Board:
@@ -4660,7 +4674,8 @@ def _status_board(reading: StatusReading, *, account_config: conf.ConfigRead, co
     stale_at = datetime.combine(today + timedelta(days=1), datetime.min.time(), reading.zone).astimezone(timezone.utc).isoformat()
     if not rows:
         return Board(columns=list(BOARD_COLUMNS), rows=[], stale_at=stale_at)
-    lines = [line for row in rows for line in _account_board_rows(row, reading, account_config=account_config, colors=colors)]
+    lines = account_details_in_row_order([
+        line for row in rows for line in _account_board_rows(row, reading, account_config=account_config, colors=colors)])
     known = [count for row in rows for count in row.role_counts if isinstance(count, RoleSessionCounts)]
     total = {"busy": str(sum(count.busy for count in known)), "idle": str(sum(count.idle for count in known)),
              "paused": str(sum(count.paused for count in known)), "exited": str(sum(count.exited for count in known)),
@@ -5644,15 +5659,16 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool) -> 
             role = "showrunners" if owner.kind == "showrunner" else "workers"
         if owner is not None and owner.kind == "producer":
             settings = producer_settings(owner)
-            role = ("showrunners" if isinstance(settings, models_registry.LaunchSettings) and settings.kind == "claude"
+            role = ("producers" if isinstance(settings, models_registry.LaunchSettings) and settings.kind == "claude"
                     else "")
         setting = _session_config_dir(session["pid"])
         directory = setting.path if isinstance(setting, account.ConfiguredClaudeFolder) else None
         label = claude_config_label(directory) if directory is not None else "account unreadable"
-        suffix = _moving_role_suffix(role, label, groups)
+        move_role = "showrunners" if role == "producers" else role
+        suffix = _moving_role_suffix(move_role, label, groups)
         session_lines.append(f"session {identity} ({session['name']}): {label}{suffix}")
-        if role in CLAUDE_GROUPS and directory is not None:
-            group = role
+        if move_role in CLAUDE_GROUPS and directory is not None:
+            group = move_role
             members[group].append(LiveGroupMember(identity, session["name"], group, directory))
         if role and directory is not None:
             if role == "workers":
@@ -5671,8 +5687,9 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool) -> 
                      and settings.kind == "claude")):
         if member.current_session in live or not local_member(member):
             continue
-        role = "units" if member.kind == "unit" else "showrunners"
-        selected = group_label(groups, role)
+        group = "units" if member.kind == "unit" else "showrunners"
+        role = "producers" if member.kind == "producer" else group
+        selected = group_label(groups, group)
         if not isinstance(selected, str):
             continue
         directory = account_dir(selected)
@@ -5703,7 +5720,10 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool) -> 
     unobserved_workers = [member for member in staff.active(membership, "worker")
         if include_workers and member.id not in observed_workers and member.current_session not in observed_workers
         and isinstance(membership.backends.get(member.id), staff.CodexBackend) and local_member(member)]
-    if unobserved_workers:
+    codex_producers = [member for member in staff.active(membership, "producer")
+        if local_member(member) and isinstance(settings := producer_settings(member), models_registry.LaunchSettings)
+        and settings.kind == "codex"]
+    if unobserved_workers or codex_producers:
         codex_processes = _local_codex_processes()
         for member in unobserved_workers:
             if process := codex_processes.get(member.current_session):
@@ -5713,6 +5733,22 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool) -> 
                 directory = setting.home if isinstance(setting, account.ProcessCodexHome) else accounts_home() / ".codex"
                 counts.setdefault((directory, "workers"), {})[member.current_session] = session_state.classify(
                     member, session_state.LiveActivity(process.activity), detached=detached)
+        for member in codex_producers:
+            activity: session_state.LiveActivity | session_state.NoLiveSession = session_state.NoLiveSession()
+            if process := codex_processes.get(member.current_session):
+                setting = account.process_codex_home(process.pid)
+                if isinstance(setting, account.ProcessEnvironmentUnread):
+                    continue
+                directory = setting.home if isinstance(setting, account.ProcessCodexHome) else accounts_home() / ".codex"
+                activity = session_state.LiveActivity(process.activity)
+            else:
+                home = member.home.path if isinstance(member.home, staff.SessionHome) else agent_accounts.observe_workers_home()
+                if isinstance(home, agent_accounts.NoWorkersHome):
+                    session_lines.append(f"producer {member.name}: {home.reason}")
+                    continue
+                directory = home
+            counts.setdefault((directory, "producers"), {})[member.current_session] = session_state.classify(
+                member, activity, detached=detached)
     return LocalRoleSessions(counts, members, tuple(str(path) for path in sorted(inputs)),
                              tuple(session_lines), ())
 
@@ -5786,7 +5822,7 @@ def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
             raise ValueError("invalid account counts")
         checked[label] = {}
         for role, raw in cast(dict[str, object], roles).items():
-            if role not in ("units", "showrunners", "workers") or not isinstance(raw, dict):
+            if role not in ("units", "showrunners", "workers", "producers") or not isinstance(raw, dict):
                 raise ValueError("invalid role counts")
             count = cast(dict[str, object], raw)
             starting = count.get("starting", 0)
