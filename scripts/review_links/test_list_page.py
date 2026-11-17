@@ -132,12 +132,14 @@ class ListPageTests(unittest.TestCase):
         cases = (
             ((ready[0].key, ready[1].key), "2 changes for you"),
             ((ready[0].key, answer.key), "2 reviews for you"),
-            ((waiting.key, done.key, "missing/C9"), "1 reviews waiting on others"),
+            ((waiting.key, done.key, "missing/C9"), "1 review waiting on others"),
+            ((waiting.key, later.key), "2 reviews waiting on others"),
+            ((answer.key,), "1 review for you"),
             ((done.key,), "Reviews done — decide: close, keep or park"),
             (("missing/C9",), "Reviews done — decide: close, keep or park"),
             ((), ""),
-            ((later.key,), "1 reviews waiting on others"),
-            ((ready[0].key, waiting.key, done.key), "1 changes for you"),
+            ((later.key,), "1 review waiting on others"),
+            ((ready[0].key, waiting.key, done.key), "1 change for you"),
         )
         items: list[the_list.ListItem] = []
         for index, (identities, _) in enumerate(cases):
@@ -201,8 +203,8 @@ class ListPageTests(unittest.TestCase):
                            source=review_items.ProposalLedgerSource(self.root / "proposals.md"))
         efficiency = replace(proposal, key="efficiency/sdlc/E1", id="sdlc/E1", type=review_items.ReviewType.EFFICIENCY,
                              source=review_items.EfficiencySource(self.root / "efficiencies.md", "Result"))
-        for review, expected in ((ready, "1 changes for you"), (done, "Reviews done — decide: close, keep or park"),
-                                 (proposal, "1 reviews for you"), (efficiency, "1 reviews for you")):
+        for review, expected in ((ready, "1 change for you"), (done, "Reviews done — decide: close, keep or park"),
+                                 (proposal, "1 review for you"), (efficiency, "1 review for you")):
             with self.subTest(key=review.key):
                 item = self.add("Review " + review.key)
                 _ = the_list.link(MORTY.id, item.id, (review.key,), source="morty")
