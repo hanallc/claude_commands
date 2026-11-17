@@ -370,21 +370,27 @@ A failed background render keeps the last good page and writes one line to stder
 Failed renders add no render time.
 A cached Accounts response carries its render failure to the status line.
 
-Each account with an `account.<label>` key in `config/statusline.conf` has a swatch in the last column, **Color**.
-A swatch click opens a dialog with a color picker built into the page: a saturation and brightness area, a hue slider, a large color box and a hex field.
-The dialog uses the console theme and stays inside the viewport.
-Try changes the label and swatch without a request.
+The table has two swatch columns without a heading.
+The account swatch column is between **account** and **left**.
+The role swatch column is between **role** and **busy**.
+A swatch shows for each board span with a `color_key`.
+An account has one when `config/statusline.conf` has a valid `account.<label>` color.
+The units, showrunners and workers roles use `role.unit-director`, `role.showrunner` and `role.worker`.
+The colored words carry `data-color-text` with the same key.
+One click opens the picker: a saturation and brightness area, a hue slider, a large color box, a hex field, and Try, Save, and Cancel.
+The popup uses the console theme and stays inside the viewport.
+Try paints every swatch and word of that key without a request.
 Cancel or Escape restores the saved color.
-The page pauses refresh while the dialog is open and while a save is pending.
-Save closes the dialog at once and posts `label` and a lowercase `#rrggbb` value to `/console/accounts.html` as form data.
-The server validates the configured account and the hex color.
+The page pauses refresh while the popup is open or a save is pending.
+Save closes the popup at once and posts `key` and a lowercase `#rrggbb` value to `/console/accounts.html` as form data.
+Saves of one key publish in order; saves of different keys run at the same time.
+The server accepts only an `account.` key or one of the three role keys, and only when the key is in the configuration.
 It runs this checkout's `scripts/lib/tune.py` through `scripts/lib/py` to publish the value.
 The tune command records the user's Save action and commits the configuration change through its normal publication path.
-Saves for one account publish in order.
-Success clears the kept page and refreshes the board after the last pending save.
+Success clears the kept page and refreshes the board when no save is pending.
 A refused request returns 400 with its reason.
 A failed publication returns 503 with tune's last stderr line.
-A failed save restores the old colors and shows `<account>: <reason>` in the status line.
+A failed save restores the prior color and shows `<name>: <reason>` in the status line.
 
 A right click on the line of a selected Claude group (`units ✓` or `showrunners ✓`) opens a menu, not the browser menu.
 The menu title is **When <account> reaches <percent>%, move <group> to**.
