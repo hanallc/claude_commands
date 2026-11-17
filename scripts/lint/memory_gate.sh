@@ -21,6 +21,11 @@ buildlog_memory_python() {
     "$BUILDLOG_MEM_PY" "$@"
 }
 
+buildlog_check_nested_step() {
+    [[ -n "${BUILDLOG_RESERVED_STEP:-}" ]] || return 0
+    buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" check-nested
+}
+
 # Status 0 when the holder directory is missing or readable with no entry.
 # This shell must expand patterns unfiltered; any doubt starts Python.
 build_hold_nothing_held() {
@@ -159,6 +164,7 @@ buildlog_memory_refuse() {
 buildlog_memory_event() { :; }
 
 buildlog_wait_for_memory() {
+    buildlog_check_nested_step || return $?
     BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=MeminfoUnavailable BUILDLOG_MEM_RESERVATION=""
     if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
         source "$BUILDLOG_SELECTED_LOCAL_GRANT" || return $?

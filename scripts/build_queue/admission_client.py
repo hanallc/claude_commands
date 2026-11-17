@@ -406,11 +406,55 @@ def _refused(reason: str, *, checker: bool = False) -> wire.Refused:
     return wire.Refused(reason)
 
 
+def nested_reservation_reason() -> str:
+    """Refuse a child only when the same queue still holds its live parent's reservation.
+
+    The holder must match by pid and start time, so a reused pid never refuses a step.
+    """
+    marker = os.environ.get("BUILDLOG_RESERVED_STEP", "")
+    if not marker:
+        return ""
+    from scripts.build_queue import admission_records as records
+    from scripts.buildlog import store
+
+    try:
+        reservation, raw_pid, directory = marker.split("\t")
+        pid = int(raw_pid)
+        if not reservation or pid <= 0 or Path(directory).resolve() != (store.root() / "admission").resolve():
+            return ""
+        start = records.process_start_time(pid)
+        if start is None:
+            return ""
+        state = cast(object, json.loads((Path(directory) / "state.json").read_text()))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(state, dict):
+        return ""
+    reservations = cast(dict[str, object], state).get("reservations")
+    if not isinstance(reservations, dict):
+        return ""
+    for value in cast(dict[str, object], reservations).values():
+        if not isinstance(value, dict):
+            continue
+        row = cast(dict[str, object], value)
+        owner = row.get("owner")
+        if (row.get("reservation_id") == reservation and isinstance(owner, dict)
+                and cast(dict[str, object], owner).get("pid") == pid
+                and cast(dict[str, object], owner).get("start_time") == start):
+            return (f"verify step cannot run inside reserved step {reservation} (pid {pid}); "
+                    + "run it outside the outer step")
+    return ""
+
+
 def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
           refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None = None,
           *, attempt: Callable[[], None] = _no_attempt_hook, channel: EstimateConnection | None = None,
           configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE
           ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization | wire.RepositorySlotReady | wire.RepositorySlotExpired | status_wire.PlacementStatusReply:
+    if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.PlacementRequest)):
+        reason = nested_reservation_reason()
+        if reason:
+            return _refused(reason)
     acquisition = _is_placement_control(request) or isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest,
         wire.BuildHistoryRequest, wire.PlacementRequest, wire.PrerequisiteReport, wire.RepositorySlotRequest))
     retry = _ACQUISITION_RETRY.get() if acquisition else None
@@ -1341,7 +1385,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
-    for name in ("view", "explain", "down-alert", "priority-clear", "code-version"):
+    for name in ("view", "explain", "down-alert", "priority-clear", "code-version", "check-nested"):
         _ = subcommands.add_parser(name)
     status_parser = subcommands.add_parser("placement-status")
     _ = status_parser.add_argument("--episode", required=True)
@@ -1388,6 +1432,13 @@ def main(argv: list[str] | None = None) -> int:
     _ = priority_parser.add_argument("unit")
     _ = priority_parser.add_argument("--why", default="the user's bump")
     args = parser.parse_args(argv, namespace=ClientArguments())
+    if args.command in ("check-nested", "place-step"):
+        reason = nested_reservation_reason()
+        if reason:
+            print(reason, file=sys.stderr)
+            return 2
+        if args.command == "check-nested":
+            return 0
     if args.command == "code-version":
         print(LOADED_ADMISSION_CODE_VERSION)
         return 0

@@ -3432,6 +3432,7 @@ record_token_wait() {
 }
 
 acquire_token() {
+    buildlog_check_nested_step || return $?
     sync_token_state
     TOKEN_WAITED=0
     [[ "${TOKEN_USED}" -eq 1 && "${TOKEN_HELD}" -eq 0 ]] || return 0

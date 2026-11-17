@@ -51,6 +51,54 @@ def setUpModule() -> None:
 
 
 class ClientTests(unittest.TestCase):
+    def test_stale_outer_markers_do_not_refuse_admission(self) -> None:
+        for case in ("other-queue", "dead-holder", "released", "reused-pid"):
+            with self.subTest(case=case), AdmissionFixture() as fixture:
+                outer = fixture.request()
+                with fixture.loop_turn():
+                    grant, = fixture.server.handle_request(outer)
+                assert isinstance(grant, wire.Admitted)
+                directory = fixture.state_dir
+                if case == "other-queue":
+                    directory = fixture.root / "other-admission"
+                elif case == "dead-holder":
+                    fixture.proc.kill(outer.owner)
+                elif case == "released":
+                    fixture.release(grant)
+                marker = f"{grant.reservation}\t{outer.owner.pid}\t{directory.resolve()}"
+                nested = fixture.request()
+                start = "reused" if case == "reused-pid" else records.process_start_time(outer.owner.pid)
+                with mock.patch.dict(os.environ, {"BUILDLOG_RESERVED_STEP": marker}), \
+                        mock.patch.object(records, "process_start_time", return_value=start), \
+                        mock.patch.object(client, "_acquire", return_value=wire.Refused("fixture admission")) as acquire, \
+                        redirect_stderr(io.StringIO()) as errors:
+                    reply = client.admit(nested, lambda _wait: None, lambda: nested)
+                self.assertEqual(reply, wire.Refused("fixture admission"))
+                acquire.assert_called_once()
+                self.assertEqual(errors.getvalue(), "")
+
+    def test_nested_reserved_step_refuses_before_it_can_wait(self) -> None:
+        with AdmissionFixture() as fixture:
+            outer = fixture.request()
+            with fixture.loop_turn():
+                replies = fixture.server.handle_request(outer)
+            grant, = replies
+            assert isinstance(grant, wire.Admitted)
+            fixture.hold_starts()
+            marker = f"{grant.reservation}\t{outer.owner.pid}\t{fixture.state_dir.resolve()}"
+            nested = fixture.request()
+            def waiting(_wait: wire.Wait) -> None:
+                self.fail("the nested step waited for its outer reservation")
+            with mock.patch.dict(os.environ, {"BUILDLOG_RESERVED_STEP": marker}), fixture.serving(), \
+                    redirect_stderr(io.StringIO()) as errors, \
+                    mock.patch.object(client, "_connect", side_effect=AssertionError("nested admission opened a socket")) as connect:
+                reply = client.admit(nested, waiting, lambda: nested)
+            self.assertIsInstance(reply, wire.Refused)
+            self.assertEqual(errors.getvalue().splitlines(), [
+                f"verify step cannot run inside reserved step {grant.reservation} (pid {outer.owner.pid}); "
+                + "run it outside the outer step"])
+            connect.assert_not_called()
+
     def test_placement_status_cli_reads_current_closed_and_unknown_over_the_socket(self) -> None:
         from scripts.build_queue import admission_wire as status_wire, placement
         from scripts.build_queue.test_placement import placement_request
