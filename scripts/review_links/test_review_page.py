@@ -825,6 +825,147 @@ window.fetch=async(url,options)=>{
                         thread.join(TEST_HANG_GUARD_SECS)
                 self.assertEqual(results, [[]])
 
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_owner_counts_follow_the_type_and_show_chips(self) -> None:
+        _ = self.investigation(False)
+        _ = self.decisions()
+        kinds = tuple(review_items.ReviewType)
+        templates = {item.type: item for item in review_items.read(self.root)}
+        title = 'Which layout should the page use?'
+        asker = self.fixture.unit.id
+        question = update_registration.QuestionRecord(
+            self.fixture.temporary/'question.md', asker, asker,
+            update_registration.OutstandingItem(since='2026-11-12T12:00', text=title, question=title, asked_by=asker),
+            'open')
+        kind = review_items.ReviewType.QUESTION
+        templates[kind] = replace(templates[review_items.ReviewType.CHANGE], type=kind, title=title,
+                                  source=review_items.QuestionSource(question))
+        owners = {staff.StaffId(name): name for name in ('natedev', 'builder', 'reviewer')}
+        states: dict[str, review_items.ReviewState] = dict(
+            zip(('open', 'Waiting', 'Done'), review_items.ReviewState, strict=True))
+        records: list[review_items.ReviewItem] = []
+        for owner_index, owner in enumerate(owners):
+            for type_index, kind in enumerate(kinds):
+                for state_index, state in enumerate(states.values()):
+                    for _ in range(1 + owner_index + (type_index + state_index) // 2):
+                        identity = f'{owner}/{kind}-{len(records)}'
+                        records.append(replace(templates[kind], key=identity, id=identity,
+                                               owner=owner, source_unit=owner, state=state, actions=()))
+
+        def owner_counts(kind: str, show: str) -> dict[str, int]:
+            counts = {str(owner): sum(item.owner == owner and (not kind or item.type == kind)
+                                      and (show == 'all' or item.state == states[show])
+                                      for item in records) for owner in owners}
+            return {'': sum(counts.values()), **counts}
+
+        expected = {kind: {show: owner_counts(kind, show) for show in (*states, 'all')}
+                    for kind in ('', *kinds)}
+
+        def read_records(_root: Path, *, owner_options: dict[staff.StaffId, str],
+                         **_view: object) -> list[review_items.ReviewItem]:
+            owner_options.update(owners)
+            return records
+
+        with patch.object(review_items, 'read', side_effect=read_records):
+            pages = {show: review_page.render(self.root, show=show).decode() for show, _ in review_page.SHOWS}
+
+        probe = r"""<script>
+(async()=>{
+ const expected=EXPECTED;
+ const review=()=>document.querySelector('[data-review]');
+ const counts=()=>Object.fromEntries([...document.querySelector('#list-owner').options].map(option=>
+  [option.value, Number(option.textContent.match(/\((\d+)\)$/)?.[1])]));
+ const chooseType=value=>document.querySelector('[data-type-chip="'+value+'"]').click();
+ function chooseShow(value){
+  const control=document.querySelector('#list-show');
+  // The baseline page uses a select. Its For you option corresponds to the Open chip.
+  const legacy=control.matches('select');
+  const selection=legacy && value==='open' ? 'For you' : value;
+  if(review().dataset.show===selection) return Promise.resolve();
+  return new Promise((resolve,reject)=>{
+   const observer=new MutationObserver(()=>{
+    if(review().dataset.show!==selection) return;
+    observer.disconnect();clearTimeout(timeout);resolve();
+   });
+   const timeout=setTimeout(()=>{
+    observer.disconnect();reject(new Error('Show did not load '+value));
+   },4000);
+   observer.observe(review().parentElement,{childList:true});
+   if(legacy){
+    control.value=selection;control.dispatchEvent(new Event('change'));
+   }else control.querySelector('[data-show-chip="'+value+'"]').click();
+  });
+ }
+ function check(kind,show){
+  const actual=counts(), wanted=expected[kind][show];
+  if(Object.keys(actual).length!==Object.keys(wanted).length ||
+     Object.entries(wanted).some(([owner,count])=>actual[owner]!==count)){
+   const label=kind || 'All';
+   throw new Error('Owner counts for Type '+label+', Show '+show+
+    ': expected '+JSON.stringify(wanted)+', got '+JSON.stringify(actual));
+  }
+ }
+ function checkChange(before,filter){
+  if(before===JSON.stringify(counts())) throw new Error(filter+' did not change the Owner counts.');
+ }
+ const failures=[];
+ try{
+  check('','all');
+  const allTypes=JSON.stringify(counts());
+  chooseType('change');check('change','all');checkChange(allTypes,'Type');
+  const allStates=JSON.stringify(counts());
+  await chooseShow('Waiting');check('change','Waiting');checkChange(allStates,'Show');
+  for(const [kind,views] of Object.entries(expected)){
+   chooseType(kind);
+   for(const show of Object.keys(views)){
+    await chooseShow(show);check(kind,show);
+   }
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/result',{method:'POST',body:JSON.stringify(failures)});
+})();</script>""".replace('EXPECTED', json.dumps(expected))
+        first = pages['all'].replace('</body>', probe+'</body>').encode()
+        results: list[list[str]] = []
+        complete = threading.Event()
+
+        class Probe(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                path, _, query = self.path.partition('?')
+                if path == '/':
+                    show = parse_qs(query).get('show', [])
+                    _ = self.wfile.write(pages[show[0]].encode() if show else first)
+
+            def do_POST(self) -> None:
+                results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                complete.set()
+                self.send_response(204)
+                self.end_headers()
+
+            @override
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
+                    command = ['firefox', '--headless', '--no-remote', '--profile', profile,
+                               f'http://127.0.0.1:{server.server_port}/#show=all']
+                    with subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as browser:
+                        try:
+                            self.assertTrue(complete.wait(25), 'Firefox must report the Owner counts.')
+                        finally:
+                            browser.terminate()
+                            _ = browser.communicate(timeout=10)
+            finally:
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
+        self.assertEqual(results, [[]])
+
     def test_server_renders_only_the_selected_show_view(self) -> None:
         ready = self.investigation()
         waiting = self.investigation(False)
