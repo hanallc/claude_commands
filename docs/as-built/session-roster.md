@@ -179,6 +179,7 @@ It runs beside the local read and merges this machine's entries first.
   Entries omit the `session` field.
 - **`--snapshot`** (hidden from `--help`) prints `RosterSnapshot`: tagged JSON for exchange between machines.
   The peer receives one stdin document with the caller's encoded staff snapshot and role map for the whole run.
+  The document includes local production-document facts, so the peer reads those facts without SSH to the caller.
   Empty stdin keeps normal reads; invalid stdin adds a problem and uses normal reads.
   The `registry_name` field holds `RegistryName` or `NoRegistryName`.
   An older snapshot without this field decodes as `NoRegistryName`.
