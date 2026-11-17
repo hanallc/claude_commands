@@ -429,12 +429,26 @@ The setup command needs no active target or slot capacity.
 7. Confirm that the command reports a stopped box.
 
 `hana-image` converts the image to a raw disk and uploads it to one EBS snapshot with coldsnap.
-`image_upload_tool` names the coldsnap package, and `image_upload_timeout_s` bounds each long stage.
+Coldsnap applies the cost tag with `--tag Key=...,Value=...` during the upload.
+`image_upload_tool` names the coldsnap package.
+`image_upload_timeout_s` bounds each long stage, including the snapshot wait.
+`image_wait_interval_s` sets the minimum interval between snapshot checks.
+The command uses `max(image_wait_interval_s, ceil(image_upload_timeout_s / 255))` as the interval.
+Coldsnap uses `image_upload_timeout_s // interval` attempts within that wait bound and its 255-attempt limit.
+The defaults use a 15-second interval and 240 attempts.
+The command saves the image name and snapshot ID as a pending registration before it waits for the snapshot.
 The command registers the snapshot as an x86_64 image that requires IMDSv2.
+The registration applies the cost tag only to the image.
 It selects the public subnet of the gate VPC in `availability_zone`.
 It saves the image, owner, VPC, and subnet in the local `hana/image.json` record.
-An empty `ami_id`, `ami_owner_id`, `vpc_id`, or `subnet_id` in `config/hana_aws.conf` uses that record.
+An empty `ami_id`, `ami_owner_id`, `vpc_id`, or `subnet_id` in `config/hana_aws.conf` uses only a complete registration record.
 A rerun with the same image build finds the registered image by name and does not upload again.
+If AWS has no image with that name, a rerun waits for the saved pending snapshot and registers it.
+Without a matching pending record, the command checks snapshots owned by the account with a description equal to the image name.
+It saves one completed or pending snapshot as the pending record, then waits for it and registers it.
+It refuses multiple matching snapshots or a snapshot in state `error` and reports the count and states.
+It uploads a new snapshot only when no snapshot matches.
+A wait failure or registration failure keeps the pending record for the next run.
 
 The local plan makes no AWS call.
 Approved setup uses the existing encrypted admin session and progress display.
