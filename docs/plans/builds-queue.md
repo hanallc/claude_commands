@@ -2676,6 +2676,23 @@ Goal: no queue fixture calls bare `mkdtemp`, `git clone` or `git worktree add`. 
 1. Add a launch command prefix to bevy_brp_mcp, so `brp_launch` runs the app through the wrapper.
 2. Remove the refusal in the BRP hook that 44as adds.
 
+### Phase 44aw — A short reserve shows in red, and build reserved holds a share of growth  · status: todo
+**Depends on:** nothing. ETA 2026-11-17 11:30 EST. The user approved the three mockups on 2026-11-17 09:18 EST (images 37181607670d, ba10ddcb100f, b8e5bf2e39de; dwight agreed to the design). Codex workers are stopped, so the unit director writes and reviews the code.
+**User words:** "agreed - and also i would like to have a configurable setting for % of reserved to hold because most of the time i see the reserve hold is just held and not used - i want that to be started at 80%".
+
+1. Page (`scripts/build_queue/memory_live.html`):
+   1. A short reserve (safety net, swap coming back, build reserved) gets a solid inset red outline. A short reserve that holds 0 shows as a thin red block.
+   2. One red line in the `#mac-idle-alert` place: "Free RAM is short by Z GiB. <Name> holds X of Y GiB; …".
+   3. Remove the old drawing: `#b-overlay`, the `#b-over` brace, the over tooltip, the "· covered" text and the Shortfall legend row.
+   4. "Missing" replaces "Not covered" in the reserve tooltips.
+   5. The swap coming back tooltip shows "Swap-in, last N min", "× Share held P%", "= Target".
+   6. The build reserved tooltip shows "Room to grow", "× Share held P%", "+ Held between steps" (when not 0) and "= Target".
+2. Admission (`scripts/lint/memory_admit.py` `memory_room`): a new key `build_reserve_share_percent` in `config/build_admission.conf`, whole 0..100, start 80. A running step's hold is `ceil(max(0, need - use) * share / 100) + held`. The share applies only to growth: memory held between steps stays whole, because the next step reuses it. A run with no use reading keeps its whole need.
+3. Feed (`scripts/build_queue/memory_feed.py`): `swap` carries `window_seconds` and `swap_in_window_bytes`; `ram` carries `build_growth_bytes`, `build_between_steps_bytes` and `build_reserve_share_percent`.
+
+**Proof:** admission tests for the share (0, 80, 100; a run with no use reading; held between steps); feed tests for the new fields; page proof shots in dark desktop for the build short, swap and build short, and normal states; every `scripts/build_queue` test module.
+**Restart:** the admission service and the memory feed read the new key at use. A service restart needs builds' go and the user's go.
+
 ### Phase 45 — Merge gates take their route from the queue  · status: todo
 **Depends on:** 44 and aws-unit's repair of the uncertain cloud launch. Checkpoint 3 of section 8 in `docs/plans/builds-queue-placement.md`. `merge_gate --tests-only` takes the same queue route as a full gate and keeps its exit codes. Tell the sdlc showrunner before this phase edits `merge_gate.py`, because natest phase 119 changed `run_gate_suites`. Phase 119 is at 14581684f on builds-natest: merge builds first, keep its selection lines before the `cloud.route` call, and keep its empty-selection result. Tell the sdlc showrunner when this phase is on main. The Work Order follows at phase start.
 
