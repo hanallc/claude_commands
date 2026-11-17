@@ -2692,7 +2692,7 @@ Goal: no queue fixture calls bare `mkdtemp`, `git clone` or `git worktree add`. 
 
 **Proof:** admission tests for the share (0, 80, 100; a run with no use reading; held between steps); feed tests for the new fields; page proof shots in dark desktop for the build short, swap and build short, and normal states; every `scripts/build_queue` test module.
 **Restart:** the admission service and the memory feed read the new key at use. A service restart needs builds' go and the user's go.
-**Built:** d79209c46 on origin branch `builds-queue-reserveshare`, sent to builds 2026-11-17 09:43 EST. The review found one minor defect: a small shortage rounded to 0.0 GiB and hid the alert. A short reserve now shows at least 0.1 GiB missing. Proof image 57bbedb2a910.
+**Built:** checkpoint 5ff3631f2 on origin branch `builds-queue-reserveshare-cp`, sent to builds 2026-11-17 09:46 EST. The review found one minor defect: a small shortage rounded to 0.0 GiB and hid the alert. A short reserve now shows at least 0.1 GiB missing. Proof image 57bbedb2a910.
 
 ### Phase 45 — Merge gates take their route from the queue  · status: todo
 **Depends on:** 44 and aws-unit's repair of the uncertain cloud launch. Checkpoint 3 of section 8 in `docs/plans/builds-queue-placement.md`. `merge_gate --tests-only` takes the same queue route as a full gate and keeps its exit codes. Tell the sdlc showrunner before this phase edits `merge_gate.py`, because natest phase 119 changed `run_gate_suites`. Phase 119 is at 14581684f on builds-natest: merge builds first, keep its selection lines before the `cloud.route` call, and keep its empty-selection result. Tell the sdlc showrunner when this phase is on main. The Work Order follows at phase start.
