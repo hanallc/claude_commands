@@ -4658,3 +4658,72 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - natedev: 24.1 CPU s (aws median 38.7). Git 12.9 s over 2,862 starts; `models_registry.py` 6.9 s over 129 starts (53 ms each).
 - Git starts by caller: `models_registry.py` publication 1,683 (about 13 per store); test bodies and `setUp` 582 (about 2.6 natedev CPU s). No large test-owned cost. Floor.
 - Proposal to builds: one registry store combines its Git reads (one `cat-file --batch` for the `show` reads, one `rev-parse` for HEAD, branch and Git paths). Bound: about half the product Git starts, about 5 aws CPU s in this module.
+
+### Phase 332 — A registry store starts fewer Git commands  · status: todo
+**Depends on:** Phase 331
+
+#### Work Order
+
+**Goal:** one `models_registry.py` store starts fewer Git commands, with the same publication output and the same stored files.
+
+**Decision:** builds assigned this change to natest on the Phase 331 proposal (2026-11-17). Of 1,778 product Git starts in `test_models_conf_publish`, the reads below run in separate commands with no write between them.
+
+**Spec:**
+1. `_publish_repository` reads the top level and the absolute Git directory with one `rev-parse`. `SharedRegistry` keeps the Git directory; `_publish_lock_path` uses it with no Git command.
+2. `_preflight_fast_forward` reads the `MERGE_HEAD` path, the index path and the parent commit with one `rev-parse --path-format=absolute`. The check order and the refusal texts stay.
+3. `_publish` reads HEAD and its branch with one `rev-parse HEAD --symbolic-full-name HEAD`. A detached HEAD refuses publication as before.
+4. The `show` reads stay separate: a write or fetch is between each pair. Report this to builds in place of one `cat-file --batch`.
+5. Keep every publication message, exit status and stored file. Change no test assertion.
+6. Merge main after the builds import-cycle fix (7bc6a5842) merges, before the checkpoint.
+7. Run `test_models_conf_publish`, `lib/test_models_registry.py` and the other `models_registry` callers' tests. Run an aws pair on `agents/test_models_conf_publish.py`, 3 rounds.
+
+**Files:**
+- `scripts/lib/models_registry.py`
+
+**Workers:** 1 writer; the director writes it (no worker capacity).
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 331: product publication starts about 13 Git commands per store; the tests start 582 Git commands.
+- Phase 232: no signal handlers. No lazy imports inside functions.
+
+**Acceptance gate:**
+- basedpyright reports no errors or warnings on the file.
+- The registry and publication tests pass with no assertion change.
+- The aws pair shows the CPU change on `test_models_conf_publish`.
+
+### Phase 333 — The review launcher tests use less aws CPU  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `direct/test_review_launcher.py` uses less CPU in aws pairs, with the same tests and assertions, or the phase names its floor.
+
+**Decision:** after Phase 331 (a floor) and Phase 332 (the registry Git reads), the aws ranking (`show.py top --host aws`, rows as of 2026-11-17 05:51) puts this module next: median 32.1 CPU s, 18 tests; slowest kept test `ReviewLauncherPassTests.test_broad_lenses_and_retry_keep_the_same_fast_fix_snapshot` 9.5 s. Phase 315 cut the recorder start cost; no phase has cut the test file. builds rejected new shared layers for one module's gain (2026-11-16): the change stays in the test file. Codex has no capacity; the director writes it.
+
+**Spec:**
+1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD direct/test_review_launcher.py --tests 15 --commands 20`, under `systemd-run --user --scope -q -p MemoryMax=2G`. Name the top costs by test, fixture and command.
+2. Remove the largest repeated cost in the test file that a test does not check, with the shared methods of Phases 235-238, 251, 254, 255, 193 and 323: class seeds copied per test, in-process calls where no process boundary is asserted, a forked child with loaded modules where a boundary is asserted but a new interpreter is not, one render where several tests read the same output.
+3. Keep every Git state, lock, race and recovery that a test asserts on, and every exit status. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
+4. If the largest remaining cost is product work (the review launcher, recorder or Git), do not change product code. Report the cost and the floor.
+5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
+6. The director runs the aws pairs.
+
+**Files:**
+- `scripts/direct/test_review_launcher.py`
+
+**Workers:** 1 writer; one test module.
+- impl: all files (the director, no worker capacity).
+
+**Constraints from prior phases:**
+- Phase 232: no signal handlers anywhere. No lazy imports inside functions.
+- Phase 252: every fixture binds private run roots through `bind_private_run_roots`; keep it. Phase 242: in-process calls bind per call the module state that the real process reads at start.
+- Phase 315: the launcher's recorder commands load only what they use; do not measure that again.
+- Phase 330: Git auto maintenance off saves no aws CPU.
+- Phase 323: a forked child with loaded imports keeps a real kill point and exit status; create output files and child cleanup before the fork.
+- sdlc terms: test files only; every test and assertion stays; merge only on a measured aws gain; report paired peak memory.
+
+**Acceptance gate:**
+- The same test count and assertions; the module passes three times.
+- `module_cost.py` CPU before and after, with the top costs named.
+- aws pairs (3 rounds) show a gain, or the report names the floor; peak memory reported.
