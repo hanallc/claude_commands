@@ -12,6 +12,7 @@ from typing import cast
 from scripts.production import staff, showrunners
 from scripts.production import session_staff
 from scripts.lib import unit_runs
+from scripts.message.owner_role import OwnerRole as OwnerRole
 from scripts.message.sessions import SessionRecord, running_sessions
 from scripts.lib.user_zone import user_zone_name
 
@@ -72,14 +73,6 @@ class UnitWithoutRunningDirector:
 
 
 DirectorRelationship = DirectsUnit | UnderDirector | UnitWithoutRunningDirector | NoDirector
-
-
-class OwnerRole(StrEnum):
-    """The role of the owner for whom a session runs a step."""
-
-    UNKNOWN = "unknown"
-    SHOWRUNNER = "showrunner"
-    UNIT = "unit"
 
 
 class Runner(StrEnum):
