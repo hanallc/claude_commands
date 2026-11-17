@@ -1773,8 +1773,13 @@ refreshedForm.elements.token.value+='-refreshed';refreshedForm.elements.row.valu
 window.refreshMarkup=refreshed.documentElement.outerHTML;
 window.refreshRequests=[];
 window.posts=[];
+let nextPost;
 window.fetch=async(_url,options={})=>{
- if(options.method==='POST'){window.posts.push(new URLSearchParams(options.body));return {ok:true,json:async()=>({answer:'works'})};}
+ if(options.method==='POST'){
+  window.posts.push(new URLSearchParams(options.body));
+  if(nextPost){const response=nextPost;nextPost=null;return response;}
+  return {ok:true,json:async()=>({answer:'works'})};
+ }
  window.refreshRequests.push(_url);return {ok:true,text:async()=>new URL(_url,location.href).searchParams.get('show')==='Waiting' ? window.waitingMarkup : window.refreshMarkup};
 };
 </script>""".replace('WAITING_MARKUP',json.dumps(review_page.render(self.root, show='Waiting').decode()).replace('</','<\\/')).replace('DONE_MARKUP',json.dumps(done_source).replace('</','<\\/')).replace('MARKUP',json.dumps(source).replace('</','<\\/'))
@@ -1784,6 +1789,27 @@ window.fetch=async(_url,options={})=>{
  const flush=()=>new Promise(resolve=>nativeTimeout(resolve,60));
  const rows=()=>[...document.querySelectorAll('[data-list-item]')];
  const shown=()=>rows().filter(row=>!row.hidden);
+ const holdPost=()=>{
+  let resolve,reject;
+  nextPost=new Promise((resolvePost,rejectPost)=>{resolve=resolvePost;reject=rejectPost;});
+  return {
+   save:()=>resolve({ok:true,json:async()=>({answer:'works'})}),
+   fail:reason=>reject(new Error(reason))
+  };
+ };
+ const submitPending=row=>{
+  const response=holdPost();
+  const form=row.querySelector('form');
+  form.requestSubmit(form.querySelector('[value="works"]'));
+  return response.fail;
+ };
+ const expanded=row=>!row.querySelector('[data-detail]').hidden;
+ const leavingNow=row=>row.hidden && row.nextElementSibling?.matches('[data-record-motion]') &&
+  row.nextElementSibling.getAnimations({subtree:true}).length>0;
+ const visibleStatus=text=>{
+  const status=document.querySelector('[data-hidden-action-status]');
+  return status.getClientRects().length>0 && status.textContent.includes(text);
+ };
  const choose=(id,value,event='change')=>{
   if(id==='list-show'){document.querySelector('[data-show-chip="'+value+'"]').click();return;}
   if(id==='list-owner'){document.querySelector('[data-owner-chip="'+value+'"]').click();return;}
@@ -1826,16 +1852,58 @@ window.fetch=async(_url,options={})=>{
   check(fresh.querySelector('input[name=choice]:checked')?.value===picked.value,'F018: refresh keeps the selected choice');
   check(fresh.querySelector('form').elements.row.value===fresh.dataset.key+'-refreshed' &&
     fresh.querySelector('form').elements.token.value.endsWith('-refreshed'),'F018: refresh supplies the row and token');
-  const target=rows().find(row=>row.dataset.type==='change');target.querySelector('.list-toggle').click();
-  const form=target.querySelector('form');form.requestSubmit(form.querySelector('[value="works"]'));
+  const [target,other]=rows().filter(row=>row.dataset.type==='change');
+  target.querySelector('.list-toggle').click();
+  const rejectFirst=submitPending(target);
+  other.querySelector('.list-toggle').click();
+  rejectFirst('Fixture first refusal');await flush();
+  check(!target.hidden && !expanded(target) && expanded(other),'F003: a late failure keeps the newer card open');
+  check(visibleStatus('Not saved: Fixture first refusal'),'F003: the closed card has a visible reason');
+
+  target.querySelector('.list-toggle').click();
+  const rejectTarget=submitPending(target);
+  other.querySelector('.list-toggle').click();
+  const rejectOther=submitPending(other);
+  rejectTarget('Fixture overlapping refusal');rejectOther('Fixture newer refusal');await flush();
+  const targetMotion=target.nextElementSibling;
+  check(targetMotion?.matches('[data-record-motion]') &&
+    !targetMotion.querySelector('[data-detail]:not([hidden])'),
+    'F003: overlapping failures keep the returning copy of the older card closed');
+  check(!expanded(target) && expanded(other),'F003: overlapping failures keep the newer card open');
+
+  target.querySelector('.list-toggle').click();
+  const form=target.querySelector('form'),works=form.querySelector('[value="works"]');
+  const losePost=submitPending(target);
+  const leaving=target.nextElementSibling;
+  check(target.hidden && leaving?.getAnimations({subtree:true}).length,'Review starts the shared animation before the response');
+  check(leaving?.querySelector('[data-detail]:not([hidden])'),'Review fades the open details with the row');
+  losePost('Fixture lost Review response');await flush();
+  const returning=target.nextElementSibling;
+  check(!target.hidden && returning && returning!==leaving,'a lost Review response slides the card back');
+  check(!target.querySelector('[data-detail]').hidden && !works.disabled &&
+    form.querySelector('[data-send-status]').textContent==='Not saved: Fixture lost Review response',
+    'the restored Review card shows its reason and enables a retry');
+  other.querySelector('.list-toggle').click();
+  check(!expanded(target) && !target.nextElementSibling.querySelector('[data-detail]:not([hidden])'),
+    'F003: opening a card updates the copy of the returning card');
+  target.querySelector('.list-toggle').click();
+  form.requestSubmit(works);
   await flush();check(form.querySelector('[data-send-status]').textContent==='Saved: works','the row shows the saved result');
+  check(visibleStatus('Saved: works'),'F004: the Review result is visible above the table');
+  check(visibleStatus('Not saved: Fixture newer refusal'),'F003: saving one card preserves the other card’s reason');
   await new Promise(resolve=>nativeTimeout(resolve,950));
   check(target.hidden,'the saved row leaves the view');
+  check(visibleStatus('Saved: works'),'F004: the result remains visible after the animation');
   check(document.querySelector('[data-show-chip="open"] b').textContent==='4','the count excludes the saved row');
   check(rows().every(row=>row.querySelector('[data-detail]').hidden),'no next card opens');
   choose('list-show','all');
   const allTarget=rows().find(row=>row.dataset.type==='change' && row!==target);allTarget.querySelector('.list-toggle').click();
-  const allForm=allTarget.querySelector('form');allForm.requestSubmit(allForm.querySelector('[value="works"]'));
+  const allForm=allTarget.querySelector('form');allForm.elements.feedback.value='Use this change.';
+  const feedbackResponse=holdPost();
+  allForm.requestSubmit(allForm.querySelector('[value="feedback"]'));
+  check(window.posts.at(-1).get('outcome')==='feedback' && leavingNow(allTarget),
+    'Send feedback starts the departure before the response');
+  feedbackResponse.save();
   await new Promise(resolve=>nativeTimeout(resolve,1000));
   check(allTarget.hidden,'F010: the saved row leaves All');
   location.hash=new URLSearchParams({item:target.dataset.key});await flush();
@@ -1928,7 +1996,12 @@ window.fetch=async(_url,options={})=>{
     'Escape closes the menu and returns focus to Later');
   Date.now=chooserNow;
   laterToggle.click();const week=laterMenu.querySelector('[data-later-preset="week"]'),weekAt=Number(week.dataset.at);
+  const laterResponse=holdPost();
   week.click();
+  check(leavingNow(fresh),'Later starts the departure before the response');
+  check(document.querySelector('[data-show-chip="open"] b').textContent==='0' &&
+    selectedOwner().dataset.ownerChip===retained.owner,'Later updates the count and keeps the owner while the request runs');
+  laterResponse.save();
   await new Promise(resolve=>nativeTimeout(resolve,1000));
   check(window.posts.at(-1).get('outcome')==='later' && window.posts.at(-1).get('later')===new Date(weekAt).toISOString(),
     'a preset sends its time at once');
@@ -1975,7 +2048,12 @@ window.fetch=async(_url,options={})=>{
   pending.querySelector('.list-toggle').click();
   const pendingForm=pending.querySelector('form');pendingForm.elements.feedback.value='Wait for a new answer.';
   const initialCount=Number(document.querySelector('[data-show-chip="open"] b').textContent);
+  const questionResponse=holdPost();
   pendingForm.requestSubmit(pendingForm.querySelector('[value="question"]'));
+  check(window.posts.at(-1).get('outcome')==='question' && leavingNow(pending) &&
+    Number(document.querySelector('[data-show-chip="open"] b').textContent)===initialCount-1,
+    'Ask question starts the departure and updates the count before the response');
+  questionResponse.save();
   await new Promise(resolve=>nativeTimeout(resolve,1000));
   const revision=pending.dataset.updated;
   for(const [state,updated,revealed] of [
