@@ -20,10 +20,11 @@ from urllib.parse import parse_qs, urlencode
 
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
+from scripts.lib import atomic_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member
-from scripts.review_links import change_page, console, image_store, images, page_frame, serve
+from scripts.review_links import change_page, console, image_store, images, list_page, page_frame, serve
 from scripts.review_links import question_record
 
 PNG = bytes.fromhex('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c63606060f80f00010401005fe5c34b0000000049454e44ae426082')
@@ -728,6 +729,68 @@ class ImageQuestionTests(ImagesFixture):
         self.assertEqual(questions[0].question_id, 'Q1')
         self.assertEqual(images.waiting_records(self.root), [])
 
+    def test_an_unconfirmed_send_requires_a_user_resend_after_a_restart(self) -> None:
+        record = self.register()
+        delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
+        write = self.status.write_slots
+
+        def interrupt_after_send(page: change_page.ReviewPage, row: str, slots: change_page.DeliverySlots) -> None:
+            if self.sent:
+                raise OSError('Cannot write the send confirmation.')
+            write(page, row, slots)
+
+        with patch.object(self.status, 'write_slots', side_effect=interrupt_after_send):
+            with self.assertRaisesRegex(OSError, 'Cannot write the send confirmation'):
+                change_page.deliver(delivery, self.status)
+
+        self.status = change_page.DeliveryStatus(self.root)
+        change_page.recover_review_messages(self.status)
+        content = images.render(self.status).decode()
+        self.assertIn('The send result is unknown. Enter the same words and press Ask question to send it again.', content)
+        self.assertNotIn('Not sent.', content)
+        self.assertEqual(len(self.sent), 1)
+        self.ask(record)
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(len(image_store.ImageQuestionStore(images.images_root(self.root)).questions(record['id'])), 1)
+
+    def test_a_failed_send_mark_sync_allows_only_a_user_resend(self) -> None:
+        record = self.register()
+        words = 'Which check passed?'
+        delivery = images.ask_question(self.root, record['id'], words, self.status)
+        with patch.object(atomic_file, 'sync_folder', side_effect=OSError('Cannot sync the send mark.')):
+            with self.assertRaises(atomic_file.AtomicDurabilityUnconfirmed):
+                change_page.deliver(delivery, self.status)
+        change_page.deliver(delivery, self.status)
+        self.status = change_page.DeliveryStatus(self.root)
+        change_page.recover_review_messages(self.status)
+        self.assertEqual(self.sent, [])
+
+        retry = images.ask_question(self.root, record['id'], words, self.status)
+        self.assertIn('Question saved. Sending to the owner.', images.render(self.status).decode())
+        change_page.deliver(retry, self.status)
+        questions = image_store.ImageQuestionStore(images.images_root(self.root)).questions(record['id'])
+        self.assertEqual([question.question_id for question in questions], ['Q1'])
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn('--question Q1', self.sent[0][2])
+
+    def test_a_failed_failure_receipt_allows_only_a_user_resend(self) -> None:
+        record = self.register()
+        delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
+        with (patch.object(change_page, 'send_message', side_effect=RuntimeError('owner offline')) as send,
+              patch.object(self.status, 'record_result_locked', side_effect=OSError('Cannot write the failure.'))):
+            with self.assertRaisesRegex(OSError, 'Cannot write the failure'):
+                change_page.deliver(delivery, self.status)
+        self.assertEqual(send.call_count, 3)
+        self.status = change_page.DeliveryStatus(self.root)
+        change_page.recover_review_messages(self.status)
+        self.assertEqual(self.sent, [])
+
+        self.ask(record)
+        questions = image_store.ImageQuestionStore(images.images_root(self.root)).questions(record['id'])
+        self.assertEqual([question.question_id for question in questions], ['Q1'])
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn('--question Q1', self.sent[0][2])
+
     def test_empty_questions_and_unknown_or_answered_ids_preserve_the_image(self) -> None:
         record = self.register()
         with self.assertRaisesRegex(question_record.AnswerRefused, 'Enter a question first'):
@@ -773,7 +836,8 @@ class ImageQuestionTests(ImagesFixture):
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
  const pause=()=>new Promise(resolve=>setTimeout(resolve,30));
  const until=async predicate=>{
-  for(let attempt=0;attempt<300;attempt++){if(predicate()) return;await pause();}
+  const deadline = performance.now() + 12000;
+  while (performance.now() < deadline) {if(predicate()) return;await pause();}
   throw new Error('The page did not reach the expected state.');
  };
  const card=()=>document.querySelector('[data-image]');
@@ -811,7 +875,7 @@ class ImageQuestionTests(ImagesFixture):
   const receipt=await fetch('/fixture-failure',{method:'POST'});
   check(receipt.ok,'the fixture records the delivery failure');
   document.dispatchEvent(new Event('visibilitychange'));
-  await until(()=>card()?.querySelector('[data-question="Q2"] [role="status"]'));
+  await until(()=>notice('Q2')==='Not sent. Press Ask question again with the same words.');
   check(notice('Q2')==='Not sent. Press Ask question again with the same words.',
         'the delivery failure shows the retry notice');
   check(card().querySelector('[data-image-status]').textContent==='','the form has no conflicting notice');
@@ -879,7 +943,7 @@ async (find, until, check) => {
         _ = self.run_question_browser(self.question_probe(probe))
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser questions')
-    def test_delivery_result_write_failure_stops_refresh_and_offers_retry(self) -> None:
+    def test_a_sent_question_stops_refresh_and_does_not_send_again_after_the_result_write_fails(self) -> None:
         probe = r'''
 async (find, until, check) => {
  const form = () => find('Question fixture').querySelector('form');
@@ -889,17 +953,17 @@ async (find, until, check) => {
  };
  const notice = () => document.querySelector('[data-question="Q1"] [role="status"]')?.textContent;
  ask();
- await until(() => notice() === 'Question saved. Sending to the owner.');
+ await until(() => notice() === 'Question saved. Sending to the owner.', 'the sending notice');
  check((await fetch('/fixture-delivery', {method: 'POST'})).ok, 'The fixture interrupts the result write.');
- await until(() => notice() === 'Not sent. Press Ask question again with the same words.');
- check(document.querySelector('[data-images]').dataset.refreshSeconds === '0', 'The abandoned attempt stops the timer.');
+ await until(() => document.querySelector('[data-images]').dataset.refreshSeconds === '0', 'that polling stopped');
+ check(!notice(), 'The sent question has no delivery notice.');
  ask();
- await until(() => !notice());
+ await until(() => form().elements.feedback.value === '', 'that the second submission cleared the draft');
  check(document.querySelectorAll('[data-question]').length === 1, 'The retry preserves the question ID.');
 }'''
         requests = self.run_question_browser(self.question_probe(probe), fail_result_write=True)
         self.assertEqual([request['feedback'] for request in requests], [['Is this ready?'], ['Is this ready?']])
-        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(len(self.sent), 1)
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser questions')
     def test_successful_question_retries_the_first_failed_refresh(self) -> None:
@@ -909,9 +973,9 @@ async (find, until, check) => {
  const status = () => form().querySelector('[data-image-status]').textContent;
  form().elements.feedback.value = 'Is this ready?';
  form().requestSubmit(form().querySelector('button[value="question"]'));
- await until(() => status().startsWith('Update failed:'));
+ await until(() => status().startsWith('Update failed:'), 'the first refresh error');
  check(!document.querySelector('[data-question]'), 'The first refresh fails before the question appears.');
- await until(() => document.querySelector('[data-question]')?.textContent.includes('Is this ready?'));
+ await until(() => document.querySelector('[data-question]')?.textContent.includes('Is this ready?'), 'the saved question');
  check(status() === '', 'The automatic refresh clears the refresh error.');
  check(form().elements.feedback.value === '', 'The saved draft stays clear.');
  check((await fetch('/fixture-delivery', {method: 'POST'})).ok, 'The fixture completes delivery.');
@@ -926,12 +990,13 @@ async (find, until, check) => {
  const check = (ok, message) => {if (!ok) failures.push(message);};
  const find = caption => [...document.querySelectorAll('[data-image]')]
   .find(card => card.querySelector('.caption').textContent === caption);
- const until = async predicate => {
-  for (let attempt = 0; attempt < 300; attempt++) {
+ const until = async (predicate, state = 'the expected state') => {
+  const deadline = performance.now() + 12000;
+  while (performance.now() < deadline) {
    if (predicate()) return;
    await new Promise(resolve => setTimeout(resolve, 30));
   }
-  throw new Error('The page did not reach the expected state.');
+  throw new Error('The page did not show ' + state + '.');
  };
  try {await (CHECK_PAGE)(find, until, check);}
  catch (error) {failures.push(String(error));}
@@ -954,8 +1019,12 @@ async (find, until, check) => {
         first_delivery_released = threading.Event()
         first_delivery_done = threading.Event()
         second_delivery_done = threading.Event()
-        second_deliveries: list[change_page.MessageDelivery] = []
         fixture = self
+
+        def refuse_question(recipient: str, sender: str, message: str) -> None:
+            if message.startswith(f'Images {identity}: Ask question\n'):
+                raise RuntimeError('The owner is unavailable.')
+            fixture.capture(recipient, sender, message)
 
         class Probe(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
@@ -1000,18 +1069,12 @@ async (find, until, check) => {
                     if not second_delivery_done.wait(5):
                         self.send_error(504, 'The fixture delivery did not finish.')
                         return
-                    second = second_deliveries[0]
-                    with delivery_status.locked():
-                        delivery_status.record_result_locked(second, change_page.FailedDelivery(
-                            second.attempt, second.page.review_list, second.row, 'The owner is unavailable.'))
                 else:
                     requests.append(parse_qs(payload))
                     delivery = images.submit(root, payload, delivery_status)
                     if isinstance(delivery, change_page.MessageDelivery):
                         body = response_body
                         is_first_delivery = len(requests) == 1
-                        if delivery.row.endswith('/Q2'):
-                            second_deliveries.append(delivery)
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
@@ -1029,10 +1092,12 @@ async (find, until, check) => {
                             else:
                                 change_page.deliver(delivery, delivery_status)
                             first_delivery_done.set()
+                    elif isinstance(delivery, change_page.MessageDelivery) and delivery.row.endswith('/Q2'):
+                        with patch.object(change_page, 'send_message', side_effect=refuse_question):
+                            change_page.deliver(delivery, delivery_status)
+                        second_delivery_done.set()
                     else:
                         change_page.deliver(delivery, delivery_status)
-                    if isinstance(delivery, change_page.MessageDelivery) and delivery.row.endswith('/Q2'):
-                        second_delivery_done.set()
 
             @override
             def log_message(self, format: str, *args: object) -> None:
@@ -1188,6 +1253,48 @@ class ImagesServerTests(ImagesFixture):
             return response.status, response.getheader("Content-Type") or "", response.read()
         finally:
             connection.close()
+
+    def test_a_saved_question_shows_sending_before_startup_recovery_claims_it(self) -> None:
+        record = self.register()
+        _ = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
+        started, release, completed = threading.Event(), threading.Event(), threading.Event()
+        recover = change_page.recover_pending
+
+        def recover_after_first_read(status: change_page.DeliveryStatus) -> None:
+            started.set()
+            if release.wait(TEST_HANG_GUARD_SECS):
+                recover(status)
+
+        with (patch.object(change_page, 'recover_pending', side_effect=recover_after_first_read),
+              patch.object(change_page.change_review, 'lists_directory', return_value=self.temporary / 'empty'),
+              patch.object(list_page, 'recover_pending', side_effect=completed.set),
+              serve.ReviewLinksServer(('127.0.0.1', 0), self.root) as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)
+            thread.start()
+            self.port = server.server_port
+            try:
+                self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
+                code, _, content = self.http('GET', images.PAGE_PATH)
+                self.assertEqual(code, 200)
+                self.assertIn(b'Question saved. Sending to the owner.', content)
+                self.assertNotIn(b'Not sent.', content)
+                self.assertRegex(content, rb'data-refresh-seconds="[1-9][0-9.]*"')
+                self.assertEqual(self.sent, [])
+
+                release.set()
+                self.assertTrue(completed.wait(TEST_HANG_GUARD_SECS))
+                code, _, content = self.http('GET', images.PAGE_PATH)
+                self.assertEqual(code, 200)
+                self.assertIn(b'data-refresh-seconds="0"', content)
+                self.assertIn(b'waiting for an answer', content)
+                self.assertNotIn(b'Sending to the owner.', content)
+                self.assertNotIn(b'Not sent.', content)
+                self.assertEqual(len(self.sent), 1)
+            finally:
+                release.set()
+                _ = completed.wait(TEST_HANG_GUARD_SECS)
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
 
     def test_server_shows_the_page_serves_the_image_and_hides_the_record(self) -> None:
         record = self.register()

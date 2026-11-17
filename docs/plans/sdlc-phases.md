@@ -658,7 +658,9 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 2. basedpyright reports 0 errors and 0 warnings on the changed Python files.
 3. Live on natedev (director, by the `test` worker on a copy): ask a question on a fixture image, answer it with the command, and the card shows the question and the answer. One dark desktop screenshot for the Change-Review line with `| after restart`.
 
-### Phase 49 — The fast-track recovery reads each Git object once, in one batch  · status: todo
+### Phase 49 — The fast-track recovery reads each Git object once, in one batch  · status: dropped
+**Result (2026-11-17):** dropped with no code change. test_fast_track makes 7,185 Git starts, and only 112 are cat-file. The batch saved no CPU (61.934 s to 61.910 s). No single call shape dominates.
+
 **Depends on:** none
 
 #### Work Order
@@ -713,7 +715,7 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 2. basedpyright reports 0 errors and 0 warnings on the changed Python files.
 3. `git merge-tree` of the checkpoint against devtools reviewscan d0db535e2 and admin-console waitbuttons-2 cca12f3a3 reports the result.
 
-### Phase 51 — An image question never reads as unsent when it was sent  · status: todo
+### Phase 51 — An image question never reads as unsent when it was sent  · status: done
 **Depends on:** Phase 48
 
 #### Work Order
@@ -798,6 +800,35 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 **Acceptance gate:**
 1. basedpyright on `scripts/production` and `scripts/review_links` reports 0 errors and 0 warnings (reportImportCycles included).
 2. The full `scripts.production` suite and the review_links suites pass.
+
+### Phase 54 — One fast-track call finds each path and ref once  · status: todo
+**Depends on:** phase 53, phase 51 (order only); natest phase 323 (a0463a3b9) merged to main if test_fast_track.py changes
+
+#### Work Order
+
+**Goal:** the showrunner with builds (2026-11-17 14:40 EST): "remove repeated path and ref discovery inside one fast-track call (the gain counts for each real fast-track call too)." test_fast_track makes 7,185 Git starts on bab921f45. The top shapes are `rev-parse --path-format=absolute` 476, `fetch origin` 383, `rev-parse --show-toplevel` 350, `rev-parse HEAD` 303, `remote get-url` 156.
+
+**Spec:**
+1. Measure first with a PATH `git` shim that logs argv: Git starts by shape, CPU and wall time of `production/test_fast_track.py`, on the base.
+2. In one fast-track call, find the top-level folder, the common Git folder and the `origin` URL once, and pass them down. Fetch `origin` once for each step that needs a fresh ref.
+3. Keep each read of a mutable ref where its value can change inside the call. Keep every write as it is.
+4. The behavior of `reconcile`, `push_patch`, `restore_prepared` and `land_main.land` does not change.
+5. Out of scope: which tests need the full merge flow.
+6. natest owns `test_fast_track.py`. Change no line of it unless the base is main after natest phase 323 merges.
+
+**Files:**
+- `scripts/production/fast_track.py`
+- `scripts/lib/land_main.py` and the copy and slot helpers only where they repeat the same discovery inside one call
+
+**Workers:** 1 writer.
+
+**State:** none.
+
+**Acceptance gate:**
+1. `scripts.production.test_fast_track` passes.
+2. basedpyright reports 0 errors and 0 warnings on `scripts/production` and `scripts/lib`.
+3. The shim measure before and after shows 20 percent or more fewer Git starts and a CPU gain. If not, close with no change.
+4. The checkpoint carries the measured numbers in one line for builds.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
