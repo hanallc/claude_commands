@@ -4719,20 +4719,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (test-only change).
 
-#### Work Order
+#### As-built
 
-**Goal:** tests that copy the runtime into a temporary checkout use less aws CPU; every behavior check stays.
-
-**Spec:**
-1. `copy_runtime`, `copy_startup` and `copy_test_runner` in `scripts/lib/checkout_test_support.py` copy source files only. Each Python start in the copy compiles every module it imports from source again: 1.3 CPU s in `mac_test/test_offload_lifecycle.py` alone.
-2. Add one helper, `copy_with_bytecode(source, destination)`. It copies the file with `shutil.copy2`. For a `.py` file, it also copies the cached bytecode at `importlib.util.cache_from_source(source)` to `cache_from_source(destination)` when that file exists.
-3. The three copy functions use the helper. `copy2` keeps the source time, so the bytecode header stays valid; Python sets the code file name to the copy path when it loads. Stale or absent bytecode makes Python compile, as before.
-
-**Files:** `scripts/lib/checkout_test_support.py`.
-
-**Workers:** 1 writer: `impl` holds the one file.
-
-**Acceptance gate:**
-- The importers of `checkout_test_support` pass in a copy of origin/main with the change.
-- basedpyright reports 0 errors and 0 warnings on the file.
-- An aws pair shows the saving. natedev, 3 runs, bytecode on: offload lifecycle 20.87 to 15.40, fast track 44.76 to 33.26, and 5 more modules lower.
+- `copy_with_bytecode` in `scripts/lib/checkout_test_support.py` copies a file with `shutil.copy2`. For a `.py` file it also copies the cached bytecode at `importlib.util.cache_from_source` to the matching path in the copy, when that file exists. `copy_runtime`, `copy_startup` and, on main, `copy_test_runner` use it. The impl worker wrote it.
+- `copy2` keeps the source time, so the bytecode header stays valid; Python sets the code file name to the copy path at load. Stale or absent bytecode compiles as before.
+- aws pair, 3 rounds: `mac_test/test_offload_lifecycle.py` 25.72 to 23.66 CPU s. `production/test_fast_track.py` and 8 more copy helper users stay within 0.9 CPU s of base. natedev drops with a warm tree were larger, because the aws box gets less from it.
+- Main-based commit d1efb206e (branch `natest-bytecode337`) went to builds. Product-side costs went to builds for their owners: the status line process chain, the offload and mac_test import weight, and the fast track git reads.
