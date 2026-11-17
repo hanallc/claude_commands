@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import html
+import io
 import json
 import math
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 from unittest import mock
 
 from scripts.build_queue import memory_files
@@ -62,10 +65,21 @@ SESSIONS: dict[str, object] = {"root": "/session", "sessions": [
 
 
 class DisksPageTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = (configuration / "disks.conf").write_text("# whole: 1..\ncache_seconds=600\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+
     def test_publish_writes_the_frame_style_and_settings_into_the_page(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             page = disks_page.publish(Path(directory) / "page", SETTINGS).read_text()
         self.assertIn(page_frame.STYLE, page)
+        button = re.search(r'<button type="button" id="measure-now"[^>]*>.*?</button>', page, re.DOTALL)
+        assert button is not None
+        self.assertIn('aria-label="Measure now" title="Measure now"', button[0])
+        self.assertIn(page_frame.icon_svg("refresh-cw"), button[0])
+        self.assertIn('<span class="page-status-state">' + button[0], page)
         self.assertIn('</h1><p class="page-status"', page)
         self.assertIn('data-status-age hidden></span><span data-status-trip hidden></span>', page)
         self.assertIn('data-status-render hidden></span><span data-status-reason hidden></span>', page)
@@ -139,17 +153,17 @@ class DisksPageTests(unittest.TestCase):
         self.assertIn(page_frame.REFRESH_SCRIPT, page)
         self.assertIn("createPageRefresh(loadDisks,()=>settings.poll_seconds)", page)
         self.assertIn('readAt:data.measured_at,renderSeconds:data.render_seconds', page)
-        self.assertIn('throw new Error("The measure did not finish.")', page)
+        self.assertIn('setMeasuring(null,"The measure did not finish.")', page)
         scenario = r"""
 const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
-let fileAt=now/1000-4200,measureState='current',stalled=false,failedReads=false;
+let generation=0,fileAt=now/1000-4200,measureState='current',stalled=false,failedReads=false;
 const pendingReads=[];
 const release=()=>pendingReads.splice(0).forEach(resolve=>resolve({ok:true,json:async()=>payload()}));
 function render(){}
 function renderCards(){}
-const payload=()=>({measured_at:fileAt,render_seconds:.03,drives:[]});
+const payload=()=>({generation,measured_at:fileAt,render_seconds:.03,drives:[]});
 const fetch=async(url)=>{
- if(url==='measure') return {ok:true,json:async()=>({state:measureState})};
+ if(url==='measure') return {ok:true,json:async()=>({state:measureState,target:generation+(measureState==='current' ? 0 : 1)})};
  if(failedReads) return {ok:false,status:502};
  if(stalled) return new Promise(resolve=>pendingReads.push(resolve));
  return {ok:true,json:async()=>payload()};
@@ -166,12 +180,12 @@ START
  now+=180000;await pageRefresh.refresh();
  check(line.dataset.state==='Paused' && parts.reason.textContent==='Measuring…',
   'Measuring must remain visible during a three-minute measure.');
- fileAt=now/1000;measureState='current';await pageRefresh.refresh();pageRefresh.changed();
+ generation++;fileAt=now/1000;measureState='current';await pageRefresh.refresh();pageRefresh.changed();
  await Promise.resolve();await Promise.resolve();
  check(line.dataset.state==='Live' && parts.age.textContent==='0 s ago',
   'A completed measure must return to Live with its new age.');
  measureState='started';await pageRefresh.refresh();
- now+=(settings.wait_seconds+1)*1000;await pageRefresh.refresh();pageRefresh.changed();
+ advanceTime((settings.wait_seconds+1)*1000);pageRefresh.changed();
  await Promise.resolve();await Promise.resolve();
  check(line.dataset.state==='Failed' && parts.reason.textContent==='The measure did not finish.',
   'A measure timeout must keep its failure after the age clock runs.');
@@ -183,7 +197,7 @@ START
  check(line.dataset.state==='Failed' && parts.reason.textContent==='HTTP 502',
   'A failed read during a measure must show Failed and HTTP 502.');
  check(measuring!==null,'A failed read before the wait limit must retain the measure start.');
- now+=(settings.wait_seconds+1)*1000;await pageRefresh.refresh();pageRefresh.changed();
+ advanceTime((settings.wait_seconds+1)*1000);await pageRefresh.refresh();pageRefresh.changed();
  await Promise.resolve();await Promise.resolve();
  check(measuring===null,'Failed reads after the wait limit must clear measuring.');
  check(line.dataset.state==='Failed' && parts.reason.textContent==='HTTP 502',
@@ -220,7 +234,7 @@ let stalled=false;
 function render(){}
 function renderCards(){}
 const fetch=async(url)=>{
- if(url==='measure') return {ok:true,json:async()=>({state:'started'})};
+ if(url==='measure') return {ok:true,json:async()=>({state:'started',target:1})};
  if(stalled) return new Promise(resolve=>pendingReads.push(resolve));
  return {ok:true,json:async()=>({measured_at:fileAt,render_seconds:.03,drives:[]})};
 };
@@ -244,6 +258,244 @@ START
 })().catch(error=>{console.error(error);process.exitCode=1;});
 """)
 
+    def test_the_refresh_button_forces_a_measure_and_recovers_after_completion_timeout_or_failure(self) -> None:
+        self.assert_status_scenario(r"""
+const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+let generation=0,fileAt=now/1000,failed=false;
+const posts=[];
+function render(){}
+function renderCards(){}
+const fetch=async(url,options)=>{
+ if(url==='measure'){
+  posts.push(options.body);
+  if(options.body==='force=1' && failed) return {ok:false,status:503,json:async()=>({reason:'Launch failed.'})};
+  return {ok:true,json:async()=>({state:options.body==='force=1' ? 'started' : 'current',target:generation+(options.body==='force=1' ? 1 : 0)})};
+ }
+ return {ok:true,json:async()=>({generation,measured_at:fileAt,render_seconds:.03,drives:[]})};
+};
+START
+(async()=>{
+ await pageRefresh.refresh();
+ check(!measureButton.disabled && line.dataset.state==='Live','Current data enables the button.');
+ const press=measureButton.press();
+ check(measureButton.disabled,'A press disables the button before the request ends.');
+ await press;
+ check(posts.filter(body=>body==='force=1').length===1,'A press sends force=1 with current data.');
+ check(line.dataset.state==='Paused' && parts.reason.textContent==='Measuring…','A press shows Measuring.');
+ await measureButton.press();
+ check(posts.filter(body=>body==='force=1').length===1,'A disabled button sends no second request.');
+ now+=1000;generation++;fileAt=now/1000;await pageRefresh.refresh();
+ check(!measureButton.disabled && line.dataset.state==='Live','New data enables the button.');
+ failed=true;await measureButton.press();
+ check(!measureButton.disabled && line.dataset.state==='Failed' && parts.reason.textContent==='Launch failed.',
+  'A failed press shows its reason and enables the button.');
+ failed=false;await measureButton.press();
+ advanceTime((settings.wait_seconds+1)*1000);
+ check(!measureButton.disabled && line.dataset.state==='Failed' && parts.reason.textContent==='The measure did not finish.',
+  'The wait limit enables the button and shows the failure.');
+ if(failures.length) throw new Error(failures.join('\n'));
+ console.log('PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
+
+    def test_a_press_owns_its_request_and_its_deadline_despite_stalled_or_older_reads(self) -> None:
+        self.assert_status_scenario(r"""
+const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+let generation=0,fileAt=now/1000,stallBuilds=false,stallData=false,missing=false,stallPost=false;
+const pendingBuilds=[],pendingData=[],pendingPosts=[],posts=[];
+const flush=async()=>{for(let i=0;i<20;i++) await Promise.resolve();};
+const payload=()=>({generation,measured_at:fileAt,render_seconds:.03,drives:[]});
+const dataReply=()=>({ok:true,json:async()=>payload()});
+const postReply=()=>({ok:true,json:async()=>({state:'started',target:generation+1})});
+function render(){}
+function renderCards(){}
+const fetch=async(url,options)=>{
+ if(url==='measure'){
+  posts.push(options.body);
+  if(options.body==='force=1'){
+   check(measuring!==null && measureButton.disabled && line.dataset.state==='Paused'
+    && parts.reason.textContent==='Measuring…','The press must set its state before the POST.');
+   if(stallPost) return new Promise(resolve=>pendingPosts.push(resolve));
+   return postReply();
+  }
+  return {ok:true,json:async()=>({state:'current',target:generation})};
+ }
+ if(url.startsWith(settings.builds_data)){
+  if(stallBuilds) return new Promise(resolve=>pendingBuilds.push(resolve));
+  return dataReply();
+ }
+ if(missing) return {ok:false,status:404};
+ if(stallData) return new Promise(resolve=>pendingData.push(resolve));
+ return dataReply();
+};
+const forced=()=>posts.filter(body=>body==='force=1').length;
+START
+(async()=>{
+ await pageRefresh.refresh();
+ stallBuilds=true;const older=pageRefresh.refresh();
+ check(pendingBuilds.length===1,'The older refresh must wait for Builds.');
+ stallPost=true;const press=measureButton.press();
+ check(forced()===1 && pendingPosts.length===1,'The press must POST before the Builds read ends.');
+ check(measuring.since===now/1000 && measuring.target===null,'The press must record its start before the target arrives.');
+ pendingBuilds.shift()(dataReply());await older;
+ check(measureButton.disabled && measuring!==null,'The older refresh must not enable the button.');
+ await measureButton.press();
+ check(forced()===1,'A second press must not send another POST.');
+ stallBuilds=false;stallPost=false;pendingPosts.shift()(postReply());await press;
+ now+=1000;generation++;fileAt=now/1000;await pageRefresh.refresh();
+ check(!measureButton.disabled && measuring===null,'New data must end the measure state.');
+
+ missing=true;await pageRefresh.refresh();
+ check(line.dataset.state==='Failed' && parts.reason.textContent==='HTTP 404','The data read must fail after earlier data.');
+ const after404=measureButton.press();
+ check(forced()===2 && line.dataset.state==='Paused','A missing data file must not stop the forced POST.');
+ await after404;
+ missing=false;now+=1000;generation++;fileAt=now/1000;await pageRefresh.refresh();
+ check(!measureButton.disabled,'New data must recover from the missing file.');
+
+ stallData=true;const timedPress=measureButton.press();await flush();
+ check(forced()===3 && pendingData.length===1,'The next read must remain pending after the forced POST.');
+ advanceTime(settings.wait_seconds*1000);
+ check(measuring===null && !measureButton.disabled,'The timer must end the measure state at the wait limit.');
+ check(line.dataset.state==='Failed' && parts.reason.textContent==='The measure did not finish.',
+  'The timer must show the failure before the stalled read ends.');
+ stallData=false;pendingData.shift()(dataReply());await timedPress;
+ check(!measureButton.disabled && line.dataset.state==='Failed','The abandoned read must not replace the timeout failure.');
+ if(failures.length) throw new Error(failures.join('\n'));
+ console.log('PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
+
+    def test_polls_keep_a_pending_press_and_only_newer_data_ends_an_answered_press(self) -> None:
+        self.assert_status_scenario(r"""
+const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+let generation=0,fileAt=now/1000;
+const pendingPosts=[],posts=[];
+function render(){}
+function renderCards(){}
+const fetch=async(url,options)=>{
+ if(url==='measure'){
+  posts.push(options.body);
+  if(options.body==='force=1') return new Promise(resolve=>pendingPosts.push(resolve));
+  return {ok:true,json:async()=>({state:'current',target:generation})};
+ }
+ return {ok:true,json:async()=>({generation,measured_at:fileAt,render_seconds:.03,drives:[]})};
+};
+START
+(async()=>{
+ await pageRefresh.refresh();
+ const failedPress=measureButton.press(),pending=measuring;
+ fileAt+=1;await pageRefresh.refresh();
+ check(data.measured_at===fileAt,'A poll may show data during a pending POST.');
+ check(measuring===pending && measureButton.disabled,'A poll must retain the pending press and disabled button.');
+ check(line.dataset.state==='Paused' && parts.reason.textContent==='Measuring…',
+  'A poll must retain Measuring during the pending POST.');
+ await measureButton.press();
+ check(posts.filter(body=>body==='force=1').length===1,'A poll must not permit another press.');
+ pendingPosts.shift()({ok:false,status:503,json:async()=>({reason:'Forced launch failed.'})});
+ await failedPress;
+ check(measuring===null && !measureButton.disabled,'A failed POST must clear the press after a poll.');
+ check(line.dataset.state==='Failed' && parts.reason.textContent==='Forced launch failed.',
+  'The failed POST must show its reason after a poll.');
+
+ const answeredPress=measureButton.press(),before=fileAt;
+ fileAt=before-1;
+ pendingPosts.shift()({ok:true,json:async()=>({state:'started',target:1})});
+ await answeredPress;
+ check(measuring!==null && measureButton.disabled && line.dataset.state==='Paused',
+  'Older data must not end an answered press.');
+ fileAt=before;await pageRefresh.refresh();
+ check(measuring!==null && measureButton.disabled && parts.reason.textContent==='Measuring…',
+  'Data at the prior measure time must not end an answered press.');
+ generation=1;fileAt=before+1;await pageRefresh.refresh();
+ check(measuring===null && !measureButton.disabled && line.dataset.state==='Live',
+  'Newer data must end an answered press.');
+
+ generation=1;fileAt=100;await pageRefresh.refresh();
+ const polledPress=measureButton.press();
+ generation=2;fileAt=150;await pageRefresh.refresh();
+ pendingPosts.shift()({ok:true,json:async()=>({state:'started',target:3})});
+ await polledPress;
+ await pageRefresh.refresh();
+ check(measuring!==null && measureButton.disabled && line.dataset.state==='Paused'
+  && parts.reason.textContent==='Measuring…',
+  'Data below the target must not end the press after the reply.');
+ generation=3;fileAt=200;await pageRefresh.refresh();
+ check(measuring===null && !measureButton.disabled && line.dataset.state==='Live',
+  'Data at the target generation must end the press.');
+ if(failures.length) throw new Error(failures.join('\n'));
+ console.log('PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
+
+    def test_the_target_ends_a_press_at_the_reply_or_data_arrival_without_waiting_for_builds(self) -> None:
+        self.assert_status_scenario(r"""
+const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+let generation=0,stallBuilds=false,omitGeneration=true;
+const pendingPosts=[],pendingBuilds=[];
+const flush=async()=>{for(let i=0;i<20;i++) await Promise.resolve();};
+const payload=()=>({...(omitGeneration ? {} : {generation}),measured_at:100-generation,render_seconds:.03,drives:[]});
+const reply=()=>({ok:true,json:async()=>payload()});
+function render(){}
+function renderCards(){}
+const fetch=async(url,options)=>{
+ if(url==='measure'){
+  if(options.body==='force=1') return new Promise(resolve=>pendingPosts.push(resolve));
+  return {ok:true,json:async()=>({state:'current',target:generation})};
+ }
+ if(url.startsWith(settings.builds_data) && stallBuilds)
+  return new Promise(resolve=>pendingBuilds.push(resolve));
+ return reply();
+};
+START
+(async()=>{
+ await pageRefresh.refresh();
+ const delayed=measureButton.press();
+ await pageRefresh.refresh();
+ check(measuring!==null && measureButton.disabled,'Legacy data must count as generation zero during a press.');
+ omitGeneration=false;generation=1;await pageRefresh.refresh();
+ check(measuring!==null && measureButton.disabled,'Target data must wait for the POST target.');
+ pendingPosts.shift()({ok:true,json:async()=>({state:'started',target:1})});
+ await delayed;
+ check(measuring===null && !measureButton.disabled && line.dataset.state==='Live',
+  'Target data received before the reply must end the press at the reply.');
+
+ const press=measureButton.press();
+ pendingPosts.shift()({ok:true,json:async()=>({state:'running',target:2})});
+ await press;
+ generation=1;stallBuilds=true;const older=pageRefresh.refresh();await flush();
+ check(measuring!==null && measureButton.disabled,'Older data received after the reply must retain the press.');
+ generation=3;const newer=pageRefresh.refresh(true);await flush();
+ check(pendingBuilds.length===2,'Both Builds reads must remain pending.');
+ check(measuring===null && !measureButton.disabled && line.dataset.state==='Live',
+  'A later generation must end the press before the Builds read ends.');
+ stallBuilds=false;pendingBuilds.splice(0).forEach(resolve=>resolve(reply()));
+ await Promise.all([older,newer]);
+ if(failures.length) throw new Error(failures.join('\n'));
+ console.log('PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
+
+    def test_the_wait_timer_reports_failure_without_earlier_data(self) -> None:
+        self.assert_status_scenario(r"""
+const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+function render(){}
+function renderCards(){}
+const fetch=async(url)=>url==='measure'
+ ? {ok:true,json:async()=>({state:'started',target:1})} : {ok:false,status:404};
+START
+(async()=>{
+ await pageRefresh.refresh();
+ check(data===null && measuring!==null && measureButton.disabled,'The first measure must start without earlier data.');
+ advanceTime(settings.wait_seconds*1000);
+ check(measuring===null && !measureButton.disabled,'The timer must clear the first measure at the wait limit.');
+ check(line.dataset.state==='Failed' && parts.reason.textContent==='The measure did not finish.',
+  'The timer must report failure without earlier data.');
+ if(failures.length) throw new Error(failures.join('\n'));
+ console.log('PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
+
     def assert_status_scenario(self, scenario: str) -> None:
         with tempfile.TemporaryDirectory() as directory:
             page = disks_page.publish(Path(directory), SETTINGS).read_text()
@@ -251,11 +503,14 @@ START
         assert match is not None
         environment = test_page_frame.PageStatusTests.environment(html.unescape(match[1])) + """
 const settingsText=SETTINGS;
-document.getElementById=()=>({textContent:JSON.stringify(settingsText)});
+const measureButton={disabled:false,addEventListener:(key,run)=>{
+ measureButton.press=()=>measureButton.disabled ? undefined : run({currentTarget:measureButton});
+}};
+document.getElementById=key=>key==='measure-now' ? measureButton : {textContent:JSON.stringify(settingsText)};
 const localStorage={getItem:()=>null};
 """.replace("SETTINGS", json.dumps(SETTINGS))
         functions = page[page.index("const GIB ="):page.index("const updateSessions =")]
-        start = re.search(r'const pageRefresh=createPageRefresh[^\n]+', page)
+        start = re.search(r'const pageRefresh=createPageRefresh.*?(?=void pageRefresh.refresh\(\);)', page, re.DOTALL)
         assert start is not None
         scenario = scenario.replace("START", start[0])
         node = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
@@ -394,15 +649,196 @@ const localStorage={getItem:()=>null};
         launches: list[str] = []
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(disks_page, "output_folder", return_value=Path(directory)):
             folder = Path(directory)
-            self.assertIs(disks_page.start_measure(1000, lambda: launches.append("missing")), disks_page.MeasureStart.STARTED)
+            self.assertIs(disks_page.start_measure(1000, lambda _generation, _lock: launches.append("missing")).state, disks_page.MeasureStart.STARTED)
             _ = (folder / disks_page.DATA_FILE).write_text(json.dumps({"measured_at": 900}))
-            self.assertIs(disks_page.start_measure(1000, lambda: launches.append("current")), disks_page.MeasureStart.CURRENT)
+            self.assertIs(disks_page.start_measure(1000, lambda _generation, _lock: launches.append("current")).state, disks_page.MeasureStart.CURRENT)
+            _ = (folder / disks_page.ACTIVE_FILE).write_text("1\n")
             with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False):
-                self.assertIs(disks_page.start_measure(5000, lambda: launches.append("running")), disks_page.MeasureStart.RUNNING)
-            self.assertIs(disks_page.start_measure(5000, lambda: launches.append("old")), disks_page.MeasureStart.STARTED)
+                self.assertIs(disks_page.start_measure(5000, lambda _generation, _lock: launches.append("running")).state, disks_page.MeasureStart.RUNNING)
+            self.assertIs(disks_page.start_measure(5000, lambda _generation, _lock: launches.append("old")).state, disks_page.MeasureStart.STARTED)
             _ = (folder / disks_page.DATA_FILE).write_text("[]")
             self.assertIsNone(disks_page.measured_at(folder))
         self.assertEqual(launches, ["missing", "old"])
+
+    def test_a_forced_measure_starts_with_current_data_but_keeps_the_running_lock(self) -> None:
+        launches: list[str] = []
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(disks_page, "output_folder", return_value=Path(directory)):
+            folder = Path(directory)
+            _ = (folder / disks_page.DATA_FILE).write_text(json.dumps({"measured_at": 900}))
+            self.assertIs(disks_page.start_measure(1000, lambda _generation, _lock: launches.append("forced"), force=True).state,
+                          disks_page.MeasureStart.STARTED)
+            _ = (folder / disks_page.ACTIVE_FILE).write_text("1\n")
+            with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False):
+                self.assertIs(disks_page.start_measure(1000, lambda _generation, _lock: launches.append("running"), force=True).state,
+                              disks_page.MeasureStart.RUNNING)
+        self.assertEqual(launches, ["forced"])
+
+    def test_a_measure_request_selects_the_published_or_active_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(disks_page, "output_folder", return_value=Path(directory)):
+            folder = Path(directory)
+            published = folder / disks_page.DATA_FILE
+            _ = published.write_text(json.dumps({"measured_at": 900, "generation": 7}))
+            launch = mock.Mock()
+            self.assertEqual(disks_page.start_measure(1000, launch),
+                             disks_page.MeasureRequest(disks_page.MeasureStart.CURRENT, 7))
+            with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False):
+                _ = (folder / disks_page.ACTIVE_FILE).write_text("8\n")
+                self.assertEqual(disks_page.start_measure(1000, launch, force=True),
+                                 disks_page.MeasureRequest(disks_page.MeasureStart.RUNNING, 8))
+            launch.assert_not_called()
+
+    def test_a_started_request_passes_its_lock_and_target_to_the_child(self) -> None:
+        child_code = """
+import json
+import subprocess
+import sys
+from pathlib import Path
+from scripts.disks import measure
+from scripts.disks.test_measure import settings, no_floors
+from scripts.lib import file_lock
+folder, generation, descriptor = Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+assert sys.stdin.read(1) == 'x'
+reservation = measure.MeasureReservation(generation, file_lock.ExclusiveLock(descriptor))
+raise SystemExit(measure.measure(settings(folder, str(folder)), floors=no_floors,
+    runner=lambda argv, timeout: subprocess.CompletedProcess(argv, 0, json.dumps({"name": str(folder), "size": "1B", "children": []}), ''),
+    reservation=reservation))
+"""
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(disks_page, "output_folder", return_value=Path(directory)):
+            folder = Path(directory)
+            _ = (folder / disks_page.DATA_FILE).write_text('{"generation":7}')
+            children: list[subprocess.Popen[str]] = []
+
+            def launch(generation: int, lock: file_lock.ExclusiveLock) -> None:
+                self.assertEqual(generation, 8)
+                self.assertEqual((folder / disks_page.ACTIVE_FILE).read_text(), "8\n")
+                with file_lock.exclusive(folder / disks_page.COORD_FILE, wait=False) as coordination:
+                    self.assertIs(coordination, file_lock.LockResult.BUSY)
+                children.append(subprocess.Popen(
+                    [sys.executable, "-c", child_code, str(folder), str(generation), str(lock.descriptor)],
+                    pass_fds=(lock.descriptor,), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True))
+
+            try:
+                first = disks_page.start_measure(1000, launch, force=True)
+                self.assertEqual(first, disks_page.MeasureRequest(disks_page.MeasureStart.STARTED, 8))
+                self.assertEqual(json.loads((folder / disks_page.DATA_FILE).read_text()), {"generation": 7})
+                with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False) as held:
+                    self.assertIs(held, file_lock.LockResult.BUSY)
+                second = disks_page.start_measure(1000, launch, force=True)
+                self.assertEqual(second, disks_page.MeasureRequest(disks_page.MeasureStart.RUNNING, 8))
+                self.assertEqual(len(children), 1)
+            finally:
+                for child in children:
+                    output, error = child.communicate("x", timeout=10)
+                    self.assertEqual(child.returncode, 0, output + error)
+            self.assertEqual(json.loads((folder / disks_page.DATA_FILE).read_text())["generation"], 8)
+            self.assertFalse((folder / disks_page.ACTIVE_FILE).exists())
+            with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False) as released:
+                self.assertIs(released, file_lock.LockResult.ACQUIRED)
+
+    def test_a_stale_active_file_does_not_change_the_next_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(disks_page, "output_folder", return_value=Path(directory)):
+            folder = Path(directory)
+            _ = (folder / disks_page.DATA_FILE).write_text('{"generation":7}')
+            _ = (folder / disks_page.ACTIVE_FILE).write_text("99\n")
+
+            def launch(generation: int, lock: file_lock.ExclusiveLock) -> None:
+                self.assertEqual(generation, 8)
+                self.assertEqual((folder / disks_page.ACTIVE_FILE).read_text(), "8\n")
+                with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False) as held:
+                    self.assertIs(held, file_lock.LockResult.BUSY)
+                self.assertGreaterEqual(lock.descriptor, 0)
+
+            self.assertEqual(disks_page.start_measure(1000, launch, force=True),
+                             disks_page.MeasureRequest(disks_page.MeasureStart.STARTED, 8))
+
+    def test_a_reaper_failure_keeps_the_child_lock_and_target(self) -> None:
+        child_code = """
+import sys
+from pathlib import Path
+from scripts.disks import disks_page
+from scripts.lib import file_lock
+folder, descriptor = Path(sys.argv[1]), int(sys.argv[2])
+assert sys.stdin.buffer.read(1) == b'x'
+with file_lock.exclusive(folder / disks_page.COORD_FILE):
+    (folder / disks_page.ACTIVE_FILE).unlink()
+    file_lock.ExclusiveLock(descriptor).release()
+"""
+        for failure in ("construct", "start"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(disks_page, "output_folder", return_value=Path(directory)):
+                folder = Path(directory)
+                _ = (folder / disks_page.DATA_FILE).write_text('{"generation":7}')
+                children: list[subprocess.Popen[bytes]] = []
+
+                def launch(_generation: int, lock: file_lock.ExclusiveLock) -> None:
+                    child = subprocess.Popen(
+                        [sys.executable, "-c", child_code, str(folder), str(lock.descriptor)],
+                        pass_fds=(lock.descriptor,), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE)
+                    children.append(child)
+                    disks_page.reap_measure(child)
+
+                start_reaper = mock.Mock(side_effect=RuntimeError("cannot start reaper"))
+                reaper = mock.Mock(start=start_reaper)
+                make_reaper = mock.Mock(return_value=reaper)
+                if failure == "construct":
+                    make_reaper.side_effect = RuntimeError("cannot construct reaper")
+                errors = io.StringIO()
+                try:
+                    with mock.patch("scripts.disks.disks_page.threading.Thread", make_reaper), redirect_stderr(errors):
+                        first = disks_page.start_measure(1000, launch, force=True)
+                    self.assertEqual(first, disks_page.MeasureRequest(disks_page.MeasureStart.STARTED, 8))
+                    self.assertIn(f"review-links disks reaper: cannot {failure} reaper", errors.getvalue())
+                    self.assertEqual((folder / disks_page.ACTIVE_FILE).read_text(), "8\n")
+                    with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False) as held:
+                        self.assertIs(held, file_lock.LockResult.BUSY)
+                    second = disks_page.start_measure(1000, launch, force=True)
+                    self.assertEqual(second, disks_page.MeasureRequest(disks_page.MeasureStart.RUNNING, 8))
+                    self.assertEqual(len(children), 1)
+                finally:
+                    for child in children:
+                        output, error = child.communicate(b"x", timeout=10)
+                        self.assertEqual(child.returncode, 0, (output + error).decode())
+                self.assertFalse((folder / disks_page.ACTIVE_FILE).exists())
+                with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False) as released:
+                    self.assertIs(released, file_lock.LockResult.ACQUIRED)
+
+    def test_a_launch_failure_keeps_a_stale_active_file_and_releases_the_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(disks_page, "output_folder", return_value=Path(directory)):
+            folder = Path(directory)
+            with mock.patch.object(disks_page, "REPOSITORY", folder / "missing"), self.assertRaises(FileNotFoundError):
+                _ = disks_page.start_measure(1000, force=True)
+            self.assertEqual((folder / disks_page.ACTIVE_FILE).read_text(), "1\n")
+            self.assertFalse((folder / disks_page.DATA_FILE).exists())
+            with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False) as held:
+                self.assertIs(held, file_lock.LockResult.ACQUIRED)
+            launch = mock.Mock()
+            self.assertEqual(disks_page.start_measure(1000, launch, force=True),
+                             disks_page.MeasureRequest(disks_page.MeasureStart.STARTED, 1))
+            launch.assert_called_once_with(1, mock.ANY)
+
+    def test_the_launcher_passes_the_reserved_descriptor_and_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lock = file_lock.take_exclusive(Path(directory) / disks_page.LOCK_FILE)
+            assert isinstance(lock, file_lock.ExclusiveLock)
+            collect_exit = mock.Mock()
+            start_collector = mock.Mock()
+            process = mock.Mock(wait=collect_exit)
+            collector = mock.Mock(start=start_collector)
+            try:
+                with mock.patch("scripts.disks.disks_page.subprocess.Popen", return_value=process) as launch, \
+                        mock.patch("scripts.disks.disks_page.threading.Thread", return_value=collector) as thread:
+                    disks_page.launch_measure(8, lock)
+                    launch.assert_called_once_with(
+                        [sys.executable, "-m", "scripts.disks.measure", "--generation", "8",
+                         "--lock-fd", str(lock.descriptor)], cwd=disks_page.REPOSITORY, stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                        pass_fds=(lock.descriptor,))
+                    thread.assert_called_once_with(target=collect_exit, name="disks-measure", daemon=True)
+                    start_collector.assert_called_once_with()
+            finally:
+                lock.release()
 
     def test_a_slider_step_a_toggle_and_new_data_keep_the_card_so_a_drag_goes_on(self) -> None:
         # The browser ends a drag when the slider it moves leaves the page.

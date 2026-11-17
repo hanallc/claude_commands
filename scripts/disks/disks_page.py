@@ -20,6 +20,8 @@ from scripts.review_links import console_theme, page_frame, review_link
 PAGE_NAME = "disks.html"
 DATA_FILE = "disks.json"
 LOCK_FILE = "disks.lock"
+ACTIVE_FILE = "disks.active"
+COORD_FILE = "disks.coord"
 # The page posts to this name beside it to ask for a measure.
 MEASURE_NAME = "measure"
 NAME_KEY = "name."
@@ -33,6 +35,11 @@ class MeasureStart(enum.Enum):
     STARTED = "started"
     RUNNING = "running"
     CURRENT = "current"
+
+
+class MeasureRequest(NamedTuple):
+    state: MeasureStart
+    target: int
 
 
 class PageSettings(TypedDict):
@@ -92,6 +99,11 @@ def publish(folder: Path, settings: PageSettings) -> Path:
     source = Path(__file__).with_name(PAGE_NAME).read_text(encoding="utf-8")
     tip = shared_step_tip(memory_files.PAGE_SOURCE.read_text(encoding="utf-8"))
     source = source.replace("__PAGE_FRAME_STYLE__", console_theme.TOKENS + "__PAGE_FRAME_STYLE__")
+    button = ('<button type="button" id="measure-now" aria-label="Measure now" title="Measure now">'
+              + page_frame.icon_svg("refresh-cw") + '</button>')
+    title = page_frame.title("Disks", "disks").replace('<span class="page-status-state">',
+                                                    '<span class="page-status-state">' + button)
+    source = source.replace("__PAGE_TITLE__", title)
     # A '</' in a name must not end the script element.
     page = (page_frame.template(source, "Disks", "disks")
             .replace("__STEP_TIP_STYLE__", tip.style).replace("__STEP_TIP_SCRIPT__", tip.script)
@@ -128,25 +140,52 @@ def measured_at(folder: Path) -> float | None:
     return float(value) if isinstance(value, int | float) else None
 
 
-def launch_measure() -> None:
-    """Start measure.py in its own session; a thread reaps it, so the server keeps no finished child."""
-    process = subprocess.Popen([sys.executable, "-m", "scripts.disks.measure"], cwd=REPOSITORY, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    threading.Thread(target=process.wait, name="disks-measure", daemon=True).start()
+def launch_measure(generation: int, lock: file_lock.ExclusiveLock) -> None:
+    """Start measure.py with its reserved generation and inherited lock; a thread collects its exit status."""
+    process = subprocess.Popen([sys.executable, "-m", "scripts.disks.measure", "--generation", str(generation),
+                                "--lock-fd", str(lock.descriptor)], cwd=REPOSITORY, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                               pass_fds=(lock.descriptor,))
+    reap_measure(process)
 
 
-def start_measure(now: float, launch: Callable[[], None] = launch_measure) -> MeasureStart:
-    """Start a measure unless the data is current or a measure runs. The caller never waits for the measure."""
+def reap_measure(process: subprocess.Popen[bytes]) -> None:
+    """Collect the child's exit status without delaying the request."""
+    try:
+        threading.Thread(target=process.wait, name="disks-measure", daemon=True).start()
+    except Exception as error:
+        print(f"review-links disks reaper: {error}", file=sys.stderr)
+
+
+def published_generation(folder: Path) -> int:
+    """Read the last published generation. Legacy data has generation 0."""
+    try:
+        data = cast(object, json.loads((folder / DATA_FILE).read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return 0
+    return cast(int, cast(dict[str, object], data).get("generation", 0)) if isinstance(data, dict) else 0
+
+
+def start_measure(now: float, launch: Callable[[int, file_lock.ExclusiveLock], None] = launch_measure,
+                  *, force: bool = False) -> MeasureRequest:
+    """Start a measure without waiting. Force skips the cache check; a running measure still prevents a launch."""
     folder = output_folder()
     last = measured_at(folder)
-    if last is not None and now - last < conf.read("disks").whole("cache_seconds"):
-        return MeasureStart.CURRENT
+    if not force and last is not None and now - last < conf.read("disks").whole("cache_seconds"):
+        return MeasureRequest(MeasureStart.CURRENT, published_generation(folder))
     folder.mkdir(parents=True, exist_ok=True)
-    with file_lock.exclusive(folder / LOCK_FILE, wait=False) as lock:
+    with file_lock.exclusive(folder / COORD_FILE):
+        lock = file_lock.take_exclusive(folder / LOCK_FILE)
         if lock is file_lock.LockResult.BUSY:
-            return MeasureStart.RUNNING
-    launch()
-    return MeasureStart.STARTED
+            target = int((folder / ACTIVE_FILE).read_text(encoding="utf-8"))
+            return MeasureRequest(MeasureStart.RUNNING, target)
+        try:
+            target = published_generation(folder) + 1
+            write_text_atomic(folder / ACTIVE_FILE, str(target) + "\n", new_file_mode=0o644)
+            launch(target, lock)
+        finally:
+            lock.close()
+    return MeasureRequest(MeasureStart.STARTED, target)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
