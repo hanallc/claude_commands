@@ -57,8 +57,8 @@ try {
   const base = readings.good;
   base.waiters = structuredClone(readings.spacing.waiters);
   base.walk.find(row => row.queued).progress = {kind:'RowProgress', phase:'testing', done:8, total:10, percent:80, unit:'modules'};
-  base.walk.find(row => row.queued).unit = 'fixture-unit';
-  base.walk.find(row => row.queued).showrunner = 'fixture-production';
+  base.walk.find(row => row.queued).unit = 'handler';
+  base.walk.find(row => row.queued).showrunner = 'sdlc';
   const swapRow = (name, kind, bytes, pool='outside', extra={}) => ({name, detail:'fixture owner', kind, pool,
     category:'', members:[], owner_count:0, bytes, swap:bytes/1024**3, ...extra});
   const swapOwners = Array.from({length:31}, (_, index) => swapRow('group '+index, 'owner', (31-index)*1024**3/64,
@@ -564,7 +564,7 @@ try {
             assert.ok(proof.lower.every(value => value < base.cap), 'The lower axis reaches the cap.');
             assert.ok(Math.abs(proof.rowLeft-proof.headingLeft)<=1, 'The rows miss the card text edge.');
             assert.equal(proof.reservedAmount,proof.dimColor);
-            assert.ok(!proof.owner.includes('fixture-unit'), 'The page repeats the unit beside the name.');
+            assert.ok(!proof.owner.includes('handler'), 'The page repeats the unit beside the name.');
             assert.ok(proof.amountHeader.includes('Used · reserved'), 'The memory amounts have no header.');
             assert.ok(proof.scroll <= proof.client, 'The page overflows. '+JSON.stringify({theme,width,scroll:proof.scroll,client:proof.client}));
             const roomLegend=proof.values.find(row=>row.label==='Free');
@@ -1005,13 +1005,13 @@ try {
             proof.overCap=overCap;
             // Build reserves that do not fit under the cap: the Running header names the amount over the cap.
             const shortReading=structuredClone(base);
-            // The running build reserves all of free and 1 GiB more, so its reserve fills the cap.
+            // The running build reserves all of free and 4 GiB more, so its reserve fills the cap.
             const shortRun=shortReading.walk.find(row=>row.kind!=='cloud'&&!row.ci&&typeof row.reserved==='number');
-            shortRun.reserved+=shortReading.room+1;
-            if(typeof shortReading.reserved==='number') shortReading.reserved+=shortReading.room+1;
+            shortRun.reserved+=shortReading.room+4;
+            if(typeof shortReading.reserved==='number') shortReading.reserved+=shortReading.room+4;
             Object.assign(shortReading.ram,{build_covered_bytes:shortReading.ram.build_covered_bytes+shortReading.ram.room_bytes,room_bytes:0});
-            Object.assign(shortReading.ram,{build_target_bytes:shortReading.ram.build_covered_bytes+gib,build_missing_bytes:gib,shortfall_bytes:gib});
-            Object.assign(shortReading,{room:0,taken:shortReading.cap,shortfall:1});
+            Object.assign(shortReading.ram,{build_target_bytes:shortReading.ram.build_covered_bytes+4*gib,build_missing_bytes:4*gib,shortfall_bytes:4*gib});
+            Object.assign(shortReading,{room:0,taken:shortReading.cap,shortfall:4});
             await show(shortReading);
             if(theme==='dark'&&width===1400) {
               const shortClip=await evaluate(`(()=>{
@@ -1022,16 +1022,35 @@ try {
               const shortShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:shortClip});
               await writeFile(join(folder,'over-cap-dark-desktop.png'),Buffer.from(shortShot.data,'base64'));
             }
+            // The bar draws the uncovered reserve past the cap line, with a dashed brace and a tooltip.
+            const overBar=await evaluate(`(() => {
+              const box=id=>{const r=document.getElementById(id).getBoundingClientRect();return {left:r.left,right:r.right,width:r.width};};
+              const tip=Object.fromEntries(tooltipRows('over',latest).map(row=>[row.label,row.value]));
+              return {hidden:document.getElementById('b-overlay').hidden,overlay:box('b-overlay'),cap:box('b-cap'),over:box('b-over'),
+                brace:document.getElementById('b-over').textContent,reserved:document.getElementById('b-reserved').textContent,tip};
+            })()`);
+            assert.equal(overBar.hidden,false,'The bar draws no over-cap box.');
+            // A small hana CI part stays visible, so the builds parts add up on screen.
+            assert.equal(await evaluate(`getComputedStyle(document.getElementById('s-ci')).minWidth`),'3px');
+            assert.ok(Math.abs(overBar.overlay.left-overBar.cap.right)<=3,'The over-cap box does not start at the cap line. '+JSON.stringify(overBar));
+            assert.ok(Math.abs(overBar.overlay.width-overBar.over.width)<=1,'The over-cap box and its brace differ in width. '+JSON.stringify(overBar));
+            assert.equal(overBar.brace,'over cap 4.0');
+            assert.match(overBar.reserved,/^build reserved [0-9.]+ · [0-9.]+ covered$/);
+            assert.equal(overBar.tip['Over cap'],'4.0 GiB');
+            assert.equal(overBar.tip['= Over cap'],'4.0 GiB');
+            assert.ok(Math.abs(parseFloat(overBar.tip['Build reserved (full)'])-parseFloat(overBar.tip['− Free RAM after safety net and swap'])-4)<=0.1+1e-9,
+              'Build reserved (full) − covered is not the amount over the cap. '+JSON.stringify(overBar.tip));
+            proof.overBar=overBar;
             const overHeader=await evaluate(`(() => ({sum:document.querySelector('#walk-sum').textContent,
               sumColor:getComputedStyle(document.querySelector('#walk-sum')).color,hover:tipText('walksum',latest)[1],rows:tooltipRows('walksum',latest),
               cap:getComputedStyle(document.querySelector('#walk .walk-bud .cap-part')||document.querySelector('#walk .walk-bud')).borderLeftColor}))()`);
-            // Taken counts the full reserve, so it reads 1 GiB more than the cap.
-            assert.equal(overHeader.sum,(shortReading.cap+1).toFixed(1)+' of '+shortReading.cap.toFixed(1)+' GiB taken · 1.0 GiB over cap');
+            // Taken counts the full reserve, so it reads 4 GiB more than the cap.
+            assert.equal(overHeader.sum,(shortReading.cap+4).toFixed(1)+' of '+shortReading.cap.toFixed(1)+' GiB taken · 4.0 GiB over cap');
             assert.equal(overHeader.sumColor,overHeader.cap,'The over-cap total is not in the cap color.');
             const fields=Object.fromEntries(overHeader.rows.map(row=>[row.label,row.value]));
-            assert.equal(fields.Taken,(shortReading.cap+1).toFixed(1)+' GiB');
+            assert.equal(fields.Taken,(shortReading.cap+4).toFixed(1)+' GiB');
             assert.equal(fields['Queue cap'],shortReading.cap.toFixed(1)+' GiB');
-            assert.equal(fields['Over cap'],'1.0 GiB');
+            assert.equal(fields['Over cap'],'4.0 GiB');
             assert.ok('+ Build reserved (full)' in fields,overHeader.hover);
             // Taken includes the full reserve. The difference from the cap is the uncovered reserve.
             const number=(text,pattern)=>Number.parseFloat(text.match(pattern)[1]);
@@ -1043,6 +1062,7 @@ try {
             assert.deepEqual([header.taken,header.cap,header.over],[tip.taken,tip.cap,tip.over],'The header and its tooltip differ.');
             const plainHeader=await (async()=>{await show(base);return evaluate(`document.querySelector('#walk-sum').textContent`);})();
             assert.ok(!plainHeader.includes('over cap'),'The header names an over-cap amount when nothing is over the cap.');
+            assert.equal(await evaluate(`document.getElementById('b-overlay').hidden`),true,'The bar draws an over-cap box when nothing is over the cap.');
             proof.overHeader=overHeader;
             // Cloud status text and bar labels are as wide as on the live page; none of it may show on the cap line.
             const cloudReading=structuredClone(base);
@@ -1224,7 +1244,7 @@ try {
             const beforeWait=await positions();
             const waiting=structuredClone(base);
             waiting.waiters=structuredClone(readings.spacing.waiters);
-            waiting.waiters[0].detail='fixture-unit';waiting.waiters[0].pid=51;
+            waiting.waiters[0].detail='handler';waiting.waiters[0].pid=51;
             await show(waiting);
             const afterWait=await positions();
             for(let index=0;index<beforeWait.length;index++) {
@@ -1984,6 +2004,7 @@ try {
                   machineColors:[...table.querySelectorAll('tr[data-tip^="row:"] .machine')].map(cell=>getComputedStyle(cell).color),
                   ciVisible:!!table.querySelector('tr[data-tip="' + proofTip('row', 3) + '"]'),
                   waiting:table.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .unit').textContent,
+                  waitingOwner:table.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .owner').textContent,
                   pageOverflow:document.documentElement.scrollWidth>document.documentElement.clientWidth};
               })()`);
               if(version==='after') {
@@ -1998,6 +2019,7 @@ try {
                 assert.equal(new Set(comparison.machineColors).size,3);
                 assert.equal(comparison.ciVisible,false);
                 assert.equal(comparison.waiting,'CI');
+                assert.equal(comparison.waitingOwner,'hana CI');
                 assert.equal(comparison.pageOverflow,false);
               } else {
                 assert.equal(comparison.ciVisible,true);
@@ -2369,8 +2391,28 @@ try {
           comparisons.push({swapShare:version,rows});
         }
 
+        // A gate job's tooltip says what the job does and what it changes, below its title (#109).
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
         await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1100,deviceScaleFactor:1,mobile:false});
+        const gateReading=structuredClone(base);
+        const gateIndex=gateReading.walk.findIndex(row=>row.queued);
+        assert.ok(gateIndex>=0,'The base reading has no queued run.');
+        const gateAbout='Merges the handler checkpoint into the sdlc branch, tests every module, then pushes sdlc.';
+        Object.assign(gateReading.walk[gateIndex],{name:'natemerge integrate',unit:'natemerge',about:gateAbout,changes:'sdlc branch',
+          showrunner:'sdlc',machine:'natedev',used:6.2,reserved:2.8,counted:9,started_at:gateReading.read_at-600});
+        // The user, 11-16: "Uses 0.0 GiB? ... has to be a bug". The gate row shows a real use, not memory parts.
+        delete gateReading.walk[gateIndex].parts;
+        await show(gateReading);
+        await evaluate(`showTip(proofTip('row', ${gateIndex}),700,420)`);
+        const gateTip=await evaluate("[...document.querySelectorAll('#tip dt, #tip dd')].map(cell=>cell.textContent)");
+        assert.ok(gateTip[0].startsWith('natemerge · integrate'),'The gate tooltip title: '+gateTip[0]);
+        assert.ok(gateTip.includes(gateAbout),'The gate tooltip omits its description.');
+        assert.equal(gateTip[gateTip.indexOf('Changes')+1],'sdlc branch');
+        assert.equal(gateTip[gateTip.indexOf('Uses')+1],'6.2 GiB');
+        const gateFit=await evaluate(`[...document.querySelectorAll('#tip dt, #tip dd')].every(cell=>cell.scrollWidth<=cell.clientWidth)
+          && document.querySelector('#tip .tip').scrollWidth<=document.querySelector('#tip .tip').clientWidth`);
+        assert.ok(gateFit,'The gate tooltip clips its text.');
+        await capture('gate-tooltip-dark-desktop','#tip');
         await show(base);
         await evaluate('hideTip()');
         const endClip=await evaluate(`(() => {

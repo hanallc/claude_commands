@@ -131,7 +131,8 @@ Helpers use `ConfigRead | UseConfiguredValue` with that named default.
 Each new `conf.read` observes the file again.
 Fault recovery occurs when a setting is used.
 
-The reader ignores section headers and text after `#`.
+The reader ignores section headers and comments.
+A `#` starts a comment only at the line start or after whitespace.
 The first key wins, and `key.<host>` overrides `key`.
 The comment immediately above a key defines its whole-number range, numeric range, or allowed words.
 An invalid setting warns on stderr and uses the newest usable committed value under that revision's limits.
@@ -143,6 +144,8 @@ Its `conf_value` uses shell builtins for valid integer and text settings and cal
 
 `/tune` publishes one user-approved setting through `scripts/lib/tune.py`.
 It validates the requested value and preserves the line's comments and spacing.
+Tune accepts a hex value such as `#af875f`.
+It refuses a `#` after whitespace and refuses outer whitespace.
 `scripts/lib/live_settings.py` writes the value live on natedev before any Git step.
 It records the change in `$XDG_STATE_HOME/live-settings/waiting.json` under a lock.
 `/tune` writes the value live on the Mac over ssh in the same step.

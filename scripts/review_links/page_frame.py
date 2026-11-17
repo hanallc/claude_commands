@@ -73,16 +73,16 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
  function draw(){
   if(!line) return;
   const reason=held(),age=last ? Math.max(0,Math.floor(Date.now()/1000-last.readAt)) : 0;
-  const next=reason ? 'Paused' : failure ? 'Failed' : last && age>options.ageLimit ? 'Late' : reading || !last ? 'Reading' : 'Live';
+  // An on-demand page can report a server answer separately from the data time.
+  const unanswered=last ? Math.max(0,Math.floor(Date.now()/1000-(last.answeredAt ?? last.readAt))) : 0;
+  const next=reason ? 'Paused' : failure ? 'Failed' : last && unanswered>options.ageLimit ? 'Late' : last?.busy ? 'Paused' : reading || !last ? 'Reading' : 'Live';
   line.dataset.state=next;
   line.querySelectorAll('[data-status-icon]').forEach(icon=>icon.hidden=icon.dataset.statusIcon!==next);
   line.querySelector('[data-status-word]').textContent=next==='Reading' ? 'Reading…' : next;
   if(next!==state){line.querySelector('[data-status-announcement]').textContent=next;state=next;}
   const part=(key,text)=>{const node=line.querySelector('[data-status-'+key+']');node.hidden=!text;node.textContent=text;return node;};
-  const time=last ? new Intl.DateTimeFormat('en-US',{timeZone:options.zone,hour:'2-digit',minute:'2-digit',second:'2-digit',
-   hour12:false,timeZoneName:'short'}).format(new Date(last.readAt*1000)) : '';
-  part('age',last ? age<60 ? age+' s ago' : time+', '+Math.floor(age/60)+' min ago' : '');
-  const why=next==='Paused' ? reason : next==='Failed' ? failure : next==='Late' ? 'The feed has stopped.' : '';
+  part('age',last ? age<60 ? age+' s ago' : Math.floor(age/60)+' min ago' : '');
+  const why=next==='Paused' ? reason || last.busy : next==='Failed' ? failure : next==='Late' ? 'The feed has stopped.' : '';
   part('reason',why);
   const timings=last && !why;
   const round=part('trip',timings && trip!==null ? 'round trip '+duration(trip)+' s' : '');
@@ -155,12 +155,13 @@ def code_block_html(block: re.Match[str]) -> str:
             + '</code></pre>' + COPY_BUTTON + '</div>')
 
 
-# Every console page centers its main column in the frame, with the same top
-# gutter, so each page title has the same place and style in its column. A page
-# sets only its own max-width. A page that measures its layout puts
-# layout-measuring on the root element, so it measures with the desktop gutter.
-STYLE = ('main{box-sizing:border-box;margin:0 auto;padding:32px 32px 64px}'
-         + '.page-title{font:700 26px/1.25 system-ui,sans-serif;letter-spacing:normal;margin:0 0 8px}'
+# The title, status and content share one centered column and page background.
+# A page that measures its layout uses the desktop gutter.
+STYLE = (':root{scrollbar-gutter:stable}'
+         + 'body{background:var(--bg,Canvas);color:var(--ink,CanvasText)}'
+         + 'main{box-sizing:border-box;margin:0 auto;padding:32px 32px 64px}'
+         + 'main:has(>.page-status){max-width:1124px}'
+         + '.page-title{font:700 26px/1.25 system-ui,sans-serif;letter-spacing:normal;margin:0 0 8px;color:var(--ink,CanvasText)}'
          + '@media (max-width:560px){:root:not(.layout-measuring) main{padding:24px 16px 48px}}'
          + r'''
 .page-status{display:flex;align-items:center;flex-wrap:wrap;gap:6px 0;font:14px/1.5 system-ui,sans-serif;

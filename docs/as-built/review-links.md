@@ -96,20 +96,28 @@ Its title is **Hana console**, followed by the selected page title.
 
 The left navigation has icons and labels for Accounts, AWS, Builds, Changes, Disks, Images, Investigations, List and Questions, in alphabetical order.
 The desktop has no top bar: each page shows its title once, as its own heading.
-Every page uses `page_frame.STYLE`. The content column is centered in the frame, 32px below its top edge, with at least 32px at each side.
+Every page uses `page_frame.STYLE`.
+Each page centers its main column in the console frame, with a maximum width of 1124px.
+The title starts 32px from the top and left edges of that column.
 Each navigation page places `page_frame.title()` directly above its content.
+The title, status line and content use the same centered column on all nine pages.
+Cards and form controls keep their page styles.
+Every page uses the shared background and text colors.
+The status line has the same background as the page.
+The frame reserves scrollbar space, so short and long pages keep the same column position.
 The shared `.page-status` line follows the title.
 It shows the state, data time, round trip and server render time, in that order.
 Live uses `radio` and `--room`; Reading uses `loader-circle` and `--accent`.
 Late uses `clock-alert` and `--warning`; Failed uses `triangle-alert` and `--error`.
 Paused uses `circle-pause` and `--ink-3`.
-The state order is Paused, Failed, Late, Reading, Live.
+A hidden page or a replacement hold shows Paused before the other states.
+Otherwise, the state order is Failed, Late, a busy Paused state, Reading, Live.
 Late, Failed and Paused show a reason after the last data time instead of timings.
 Builds and Disks keep the shown data time when a later read or measure fails.
 A first read shows only Reading until data arrives.
 A slow read retains the last data time and timings.
 The age increases each second without a request.
-After one minute, the age includes the data time and zone.
+After one minute, the line shows the age in whole minutes, without a clock time or zone.
 Round trip covers request start through the first frame after the data appears.
 Render time comes from the server or the data writer.
 The browser does not estimate render time.
@@ -125,13 +133,28 @@ An older response cannot replace a newer response.
 Accounts, Changes, Investigations, List and Questions read their rendered page at `page_refresh_seconds` intervals.
 Builds reads `memory.json` at its feed interval.
 Disks reads `disks.json` at `page.poll_seconds` intervals and requests a new measure when needed.
+Disks shows Paused with the reason **Measuring…** while a measure runs and reads succeed.
+The loader result carries `busy:'Measuring…'` while the measure runs within `wait_seconds`.
+The shared component records the data, age and answer time from each busy result.
+Failed and Late override this busy reason.
+The `hold` function delays page replacement; a busy result does not delay it.
+The old sizes remain visible during the measure.
+An unsuccessful read shows Failed with the read error while the measure runs.
+Old sizes alone do not make Disks Late because the page measures on demand.
+Disks supplies `answeredAt` to the shared status component after a server answer.
+The shared component uses that time for Late and keeps the size timestamp for the visible age.
+Other pages use their data timestamp for Late.
+A completed measure returns Disks to Live with the new size age.
+A measure that exceeds `wait_seconds` clears the measure state even when reads fail.
+The status shows Failed with **The measure did not finish.** or the read error.
+If a read remains pending past the age limit, the status shows Late with the retained data age.
 AWS reads its published page when shown; its hourly publisher sets the data time and render time.
 Images reads its rendered page when shown.
 The Changes and Questions pages show Paused while text or an active save holds a replacement.
 
 The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
-AWS, Builds, Changes, Images, Investigations, List, Questions and Rebuilds put the title in the same place.
+Accounts, AWS, Builds, Changes, Disks, Images, Investigations, List and Questions put the title and status line in the same place.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
@@ -400,6 +423,22 @@ A failed or late first render gives 503 with **The Accounts page is not availabl
 A failed background render keeps the last good page and writes one line to stderr.
 Failed renders add no render time.
 A cached Accounts response carries its render failure to the status line.
+
+Each account with an `account.<label>` key in `config/statusline.conf` has a swatch beside its label.
+The swatch opens one popup with a native color picker and Try, Save, and Cancel buttons.
+The popup uses the console theme and stays inside the viewport.
+Try changes the label and swatch without a request.
+Cancel or Escape restores the saved color.
+The page pauses refresh while the popup is open, including after Try or a failed save.
+Save posts `label` and a lowercase `#rrggbb` value to `/console/accounts.html` as form data.
+The server validates the configured account and the hex color.
+It runs this checkout's `scripts/lib/tune.py` through `scripts/lib/py` to publish the value.
+The tune command records the user's Save action and commits the configuration change through its normal publication path.
+The popup disables its controls and shows **Saving…** during publication.
+Success closes the popup, clears the kept page, and refreshes the board.
+A refused request returns 400 with its reason.
+A failed publication returns 503 with tune's last stderr line.
+The popup shows the reason and keeps the tried color until Cancel.
 
 - The table comes from `accounts.status_board()`: the board columns, rows, total row and tones.
 - The upcoming moves and the problems follow the table.

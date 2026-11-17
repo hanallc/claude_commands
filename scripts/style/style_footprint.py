@@ -18,13 +18,13 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import tomllib
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Literal, TypedDict, cast
 
+from scripts.lib import build_folders
 from scripts.lib import git_index
 from scripts.style.candidate_generators import boilerplate_allows, mask_source
 
@@ -4163,8 +4163,8 @@ def worktree_commit(repo: Path, source: WholeWorktree | TicketSourcePaths = _WHO
     """Capture source paths through a disposable index without changing the real index."""
     head = git(repo, "rev-parse", "--verify", "HEAD^{commit}").strip()
     index = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index").strip())
-    with tempfile.TemporaryDirectory(prefix="style-footprint-") as directory:
-        temporary_index = Path(directory) / "index"
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder("style-footprint-")) as directory:
+        temporary_index = directory / "index"
         if isinstance(source, WholeWorktree) and index.exists():
             git_index.private_copy(index, temporary_index)
         environment = {**os.environ, "GIT_INDEX_FILE": str(temporary_index)}

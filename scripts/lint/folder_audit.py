@@ -402,8 +402,9 @@ def resume_pending_prunes(*, lint_settings: conf.ConfigRead | UseConfiguredValue
                 pending = read_pending_prune(record)
                 # A partial delete must pass the normal removal checks again.
                 if not os.path.lexists(pending.removed_path):
+                    scratch.remove_marked(pending.removed_path)
                     finish_pending_prune(record, pending)
-            except (OSError, ValueError, subprocess.SubprocessError) as error:
+            except (OSError, ValueError, scratch.ScratchError, subprocess.SubprocessError) as error:
                 print(f"folder audit: pending prune {record}: {error}", file=sys.stderr)
 
 
@@ -435,7 +436,7 @@ def remove(path: Path, changed: float, now: float, *,
                     os.replace(temporary, record)
                 finally:
                     temporary.unlink(missing_ok=True)
-            scratch.remove_marked(path, lambda folder: tmp_sweep.delete_tree(str(folder)), scratch_settings=scratch_settings)
+            scratch.remove_marked(path, source_deletion=scratch.SourceDeletion.SWEEP, scratch_settings=scratch_settings)
             if sources:
                 finish_pending_prune(record, PendingWorktreePrune(path, sources))
         except (OSError, ValueError, scratch.ScratchError, subprocess.SubprocessError) as error:

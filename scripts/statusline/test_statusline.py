@@ -47,6 +47,10 @@ def shipped_account_label(label: str) -> str:
     key = f"account.{label}"
     if key not in colors:
         return label
+    color = colors[key]
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+        rgb = ";".join(str(int(color[index:index + 2], 16)) for index in (1, 3, 5))
+        return f"\x1b[38;2;{rgb}m{label}\x1b[0m"
     codes = {name: str(30 + index) for index, name in enumerate(
         ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"))}
     codes.update({f"bright-{name}": str(90 + index) for index, name in enumerate(
@@ -203,6 +207,19 @@ class ColorTests(unittest.TestCase):
         line = status_lines({}, colors="role.showrunner=purple\n")[0]
         self.assertEqual(line.split(" | ")[0], "unassigned")
 
+    def test_account_hex_colors_preserve_hashes_and_strip_whitespace_comments(self) -> None:
+        for value, expected in (
+            ("#a0522d", "\x1b[38;2;160;82;45mclaude1\x1b[0m"),
+            ("#A0B1FF\t# comment", "\x1b[38;2;160;177;255mclaude1\x1b[0m"),
+            ("#000000 # comment", "\x1b[38;2;0;0;0mclaude1\x1b[0m"),
+            ("brown # comment", "\x1b[38;5;137mclaude1\x1b[0m"),
+            ("brown#fragment", "claude1"), ("#abcd", "claude1"),
+            ("#gg1122", "claude1"), ("#1234567", "claude1"),
+        ):
+            with self.subTest(value=value):
+                config = f"# account.claude1=red\n  # account.claude1=blue\naccount.claude1={value}\n"
+                self.assertEqual(status_lines({}, colors=config)[1].split(" | ")[0], expected)
+
     def test_named_extended_colors_render_their_256_color_codes(self) -> None:
         for color, code in (("orange", 208), ("purple", 141), ("pink", 211), ("teal", 30), ("brown", 137),
                             ("mauve", 139)):
@@ -212,13 +229,16 @@ class ColorTests(unittest.TestCase):
 
     def test_shipped_roles_and_accounts_use_hues_and_accounts_have_distinct_colors(self) -> None:
         accounts: list[str] = []
-        for line in SHIPPED_COLORS.read_text(encoding="utf-8").splitlines():
-            key, separator, value = line.split("#", 1)[0].partition("=")
-            if not separator or not key.strip().startswith(("account.", "role.")):
+        for key, value in conf.read(SHIPPED_COLORS).values().items():
+            if not key.startswith(("account.", "role.")):
                 continue
-            color = value.strip()
+            color = value.lower()
             with self.subTest(key=key):
                 self.assertNotIn(color, ("white", "bright-white", "black", "bright-black"))
+                if color.startswith("#"):
+                    self.assertRegex(color, r"^#[0-9a-f]{6}$")
+                    channels = tuple(int(color[index:index + 2], 16) for index in (1, 3, 5))
+                    self.assertGreater(max(channels), min(channels))
             if key.strip().startswith("account."):
                 accounts.append(color)
         self.assertEqual(len(set(accounts)), len(accounts))
