@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 from typing import cast, override
 from unittest import mock
+from urllib.parse import urlsplit
 
 from scripts.aws_target import aws_target, hana_box as box, hana_guest, hana_provider as provider, hana_receiver, deploy, ledger
 from scripts.aws_target.control_test_support import TestClock
@@ -68,7 +69,7 @@ class FakeAws:
             if operation == 'put-object':
                 self.objects[key] = ledger.mapping(cast(object, json.loads(Path(arguments[arguments.index('--body') + 1]).read_text())))
             elif key in self.objects:
-                _ = Path(arguments[arguments.index('--key') + 2]).write_text(json.dumps(self.objects[key]))
+                _ = Path(arguments[-3]).write_text(json.dumps(self.objects[key]))
             else:
                 return subprocess.CompletedProcess(list(arguments), 1, '', 'NoSuchKey')
         else:
@@ -142,7 +143,9 @@ class HanaProviderTests(CostFixture):
         self.assertTrue(actions <= granted)
         self.assertEqual(set(provider.PROVIDER_OPERATIONS.values()), granted)
         self.assertTrue(all(timeout == conf.read(self.workload).whole('aws_timeout_s') for _, _, timeout in self.fake.calls))
-        self.assertEqual([op for _, op, _ in self.fake.calls].count('put-object'), 2)
+        self.assertEqual([op for _, op, _ in self.fake.calls].count('put-object'), 4)
+        self.assertIn('command_url', descriptor)
+        self.assertIn('fence_url', descriptor)
 
     def test_lost_start_response_recovers_without_another_start(self) -> None:
         operation, start = self.operation(box.Action.START), self.start()
@@ -152,6 +155,33 @@ class HanaProviderTests(CostFixture):
         self.assertIsInstance(self.provider.recover(IDENTITY, start, operation), box.MutationSettled)
         _ = self.provider.step(IDENTITY, start, operation)
         self.assertEqual([op for _, op, _ in self.fake.calls].count('start-instances'), 1)
+
+    def test_execution_objects_use_the_exact_boot_and_scoped_policy(self) -> None:
+        from scripts.aws_target import hana_execution, test_hana_execution as fixtures
+
+        fixture = fixtures.HanaExecutionTests()
+        request = fixture.request
+        access = self.provider.execution_access(request.key)
+        envelope = hana_execution.HanaCommandEnvelope(request,
+            hana_guest.WorkPermit(access.expires_at, '3', request.key.generation.boot_id), access)
+        self.provider.publish_execution(envelope)
+        prefix = 'control/' + request.key.generation.deployment + '/' + request.key.generation.start_token
+        self.assertEqual(self.fake.objects[prefix + '/command.json']['action'], 'execute')
+        observation = fixture.objects.observe_execution(request.key)
+        observation_key = urlsplit(access.observation_url).path.lstrip('/')
+        self.fake.objects[observation_key] = ledger.mapping(cast(object, json.loads(hana_execution.encode_observation(observation))))
+        self.assertEqual(self.provider.observe_execution(request.key), observation)
+        self.assertTrue(all(operation in provider.PROVIDER_OPERATIONS or operation == 'export-credentials'
+                            for _, operation, _ in self.fake.calls))
+
+    def test_execution_observation_rejects_oversized_objects(self) -> None:
+        from scripts.aws_target import hana_execution, test_hana_execution as fixtures
+
+        fixture = fixtures.HanaExecutionTests()
+        key = urlsplit(self.provider.execution_access(fixture.key).observation_url).path.lstrip('/')
+        self.fake.objects[key] = {'oversized': 'x' * (hana_execution.CONTROL_MAX_BYTES + 1)}
+        with self.assertRaises(provider.ProviderPending):
+            _ = self.provider.observe_execution(fixture.key)
 
     def test_uncertain_stopped_start_remains_unresolved(self) -> None:
         operation, start = self.operation(box.Action.START), self.start()
@@ -220,10 +250,10 @@ class HanaProviderTests(CostFixture):
         with self.assertRaisesRegex(ValueError, 'shutdown is fenced'):
             _ = hana_receiver.receive(settings, descriptor, control, paths=paths, clock=self.clock)
 
-    def test_receiver_program_compiles_without_repository_imports(self) -> None:
+    def test_receiver_program_compiles_with_the_reviewed_runtime_entry_point(self) -> None:
         rendered = hana_receiver.receiver_program()
         _ = compile(rendered, '<hana receiver>', 'exec')
-        self.assertNotIn('scripts.', rendered)
+        self.assertIn('from scripts.aws_target.hana_receiver import installed_main', rendered)
 
     def test_no_approval_prints_only_the_plan_and_makes_no_external_call(self) -> None:
         subject = deploy.Deployment(self.settings, self.state, self.root / 'output', execute=self.fake)

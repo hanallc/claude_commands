@@ -2492,6 +2492,26 @@ def recorder_health_lines(day: str) -> list[str]:
     return lines
 
 
+def linked_steps_section(connection: sqlite3.Connection, day: str) -> list[str]:
+    """Count selected logical results while retaining every execution host."""
+    start, end = day_range(day)
+    rows = fetch(connection,
+        'SELECT host, count(*), count(DISTINCT CASE WHEN is_final_result=1 THEN step_link END),'
+        + ' sum(CASE WHEN is_final_result=0 THEN duration_s ELSE 0 END), sum(duration_s), max(peak_mem_bytes)'
+        + ' FROM steps WHERE step_link IS NOT NULL AND started_at>=? AND started_at<? GROUP BY host ORDER BY host',
+        start, end)
+    if not rows:
+        return []
+    total = fetch(connection,
+        'SELECT count(DISTINCT step_link) FROM steps WHERE step_link IS NOT NULL'
+        + ' AND is_final_result=1 AND started_at>=? AND started_at<?',
+        start, end)[0][0]
+    body = [[str(host), count(attempts), count(finals), seconds(lost), seconds(elapsed), gib(peak)]
+            for host, attempts, finals, lost, elapsed, peak in rows]
+    return ['### Linked placement steps', '', f'{total} logical results. Lost attempts retain their execution time.', '',
+            *table(['Execution host', 'Attempts', 'Final results', 'Lost time', 'Execution time', 'Peak GiB'], body), '']
+
+
 @target_predicate_scope()
 def report(connection: sqlite3.Connection, day: str, *, usage_day: str | None = None) -> str:
     found = kinds(connection, day)
@@ -2512,6 +2532,7 @@ def report(connection: sqlite3.Connection, day: str, *, usage_day: str | None = 
     lines += lead_block(connection, day, test_calls, waits, copies)
     lines += waiting_lines(waits)
     lines += rebuilds_section(connection, day)
+    lines += linked_steps_section(connection, day)
     lines += launches_section(connection, day)
     for kind in found:
         lines += kind_section(connection, day, kind, hosts)
@@ -2540,7 +2561,7 @@ def report(connection: sqlite3.Connection, day: str, *, usage_day: str | None = 
     lines += [calls_line, *port_lint_line, ci_line, *rust_release.report_line()]
     notes = [
         *peer_sync_lines(),
-        "Peak memory is measured on natedev only. It counts files the step read or wrote that stayed in RAM, so it runs above what the step's processes used.",
+        "Peak memory belongs to the execution host. It includes files that remain in RAM after the step reads or writes them.",
     ]
     lines += ["", *(f"- {note}" for note in notes)]
     return "\n".join(lines)

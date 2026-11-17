@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 import os
@@ -11,6 +12,8 @@ import subprocess
 import tempfile
 
 from scripts.lib import git_files, git_index
+
+RESCUE_DESCRIPTORS: ContextVar[tuple[int, ...]] = ContextVar('rescue_descriptors', default=())
 
 
 _OPERATION_HEAD_FILES = (
@@ -62,7 +65,8 @@ def _git(work_tree: Path, *arguments: str, data: bytes = b"", index: Path | None
         environment["GIT_INDEX_FILE"] = str(index)
     try:
         result = subprocess.run(command, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                env=environment, check=False)
+                                env=environment, check=False,
+                                pass_fds=RESCUE_DESCRIPTORS.get())
     except OSError as error:
         raise RescueError(command, str(error)) from error
     if result.returncode not in accepted:
@@ -242,6 +246,16 @@ def _build_rescue(work_tree: Path, name: str, checkout: git_files.Checkout, excl
 
 
 def rescue(work_tree: Path, name: str, *, generated: Sequence[Path] = (),
+           retain_local_refs: bool = False, pass_fds: Sequence[int] = ()) -> RescueResult:
+    """Retain the caller's maker descriptors through every rescue Git command."""
+    token = RESCUE_DESCRIPTORS.set(tuple(dict.fromkeys((*RESCUE_DESCRIPTORS.get(), *pass_fds))))
+    try:
+        return _rescue(work_tree, name, generated=generated, retain_local_refs=retain_local_refs)
+    finally:
+        RESCUE_DESCRIPTORS.reset(token)
+
+
+def _rescue(work_tree: Path, name: str, *, generated: Sequence[Path] = (),
            retain_local_refs: bool = False) -> RescueResult:
     """Retain work in the common object store without changing the checkout or its index."""
     work_tree = work_tree.absolute()

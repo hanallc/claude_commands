@@ -16,11 +16,14 @@ import json
 import math
 import os
 import re
+import selectors
+import signal
 from pathlib import Path
 import shlex
 import shutil
 import subprocess
-from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
+import time
+from typing import TYPE_CHECKING, BinaryIO, NotRequired, TypedDict, cast
 import uuid
 
 from scripts.lib.dev_shell import (
@@ -31,10 +34,11 @@ from scripts.lib.dev_shell import (
     shell_key as shell_key,
 )
 from scripts.mac_test.abandoned_sessions import removal_script
+from scripts.lib.process_group import send_process_group
 
 if TYPE_CHECKING:
     from scripts.copies import copies
-    from scripts.lib import build_folders
+    from scripts.lib import build_folders, build_slots
     from scripts.lib.boot_identity import boot_identity as boot_identity
     from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
 else:
@@ -63,6 +67,135 @@ def slot_boot(lease: SlotRun, current_boot: str, *, require_boot_identity: bool 
     if not identity:
         raise ValueError('invalid slot boot identity')
     return SlotBoot.CURRENT if identity == current_boot else SlotBoot.PREVIOUS
+
+
+@dataclass(frozen=True)
+class LeasedSlotExecution:
+    """Execute with the maker's held slot and its Cargo environment."""
+
+    slot: build_slots.Slot
+    descriptors: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class LeasedCommandResult:
+    status: int
+    stdout: bytes
+    stderr: bytes
+    started_at: float
+    finished_at: float
+    execution_seconds: float
+
+
+class LeasedCommandLost(RuntimeError):
+    """A started command cannot return its complete output."""
+
+
+def execution_descriptors() -> tuple[int, ...]:
+    """Keep mirror locks and maker locks through every command child."""
+    return tuple(dict.fromkeys((*copies.inherited_mirror_descriptors(),
+                               *build_folders.held_build_folder_descriptors())))
+
+
+def capture_leased_command(command: list[str], execution: LeasedSlotExecution,
+                           environment: Mapping[str, str], output_max_bytes: int, *, timeout_s: float) -> LeasedCommandResult:
+    """Capture bounded output while every child retains the maker lease."""
+    if output_max_bytes <= 0 or not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValueError('The command output bound and deadline must be positive')
+    started_at, started = time.time(), time.monotonic()
+    deadline = started + timeout_s
+    output = [bytearray(), bytearray()]
+    child = subprocess.Popen(command, cwd=execution.slot.path, env=dict(environment),
+            pass_fds=tuple(dict.fromkeys((*execution_descriptors(), *execution.descriptors))),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    assert child.stdout is not None and child.stderr is not None
+    try:
+        try:
+            with selectors.DefaultSelector() as streams:
+                _ = streams.register(child.stdout, selectors.EVENT_READ, 0)
+                _ = streams.register(child.stderr, selectors.EVENT_READ, 1)
+                while streams.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise LeasedCommandLost('The Hana command exceeded its execution deadline')
+                    for event, _ in streams.select(remaining):
+                        stream = cast(BinaryIO, event.fileobj)
+                        content = os.read(stream.fileno(), 65536)
+                        if not content:
+                            _ = streams.unregister(stream)
+                            continue
+                        if sum(map(len, output)) + len(content) > output_max_bytes:
+                            raise LeasedCommandLost('The command output exceeds its transport bound')
+                        output[cast(int, event.data)].extend(content)
+            try:
+                status = child.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                raise LeasedCommandLost('The Hana command exceeded its execution deadline') from None
+        except BaseException:
+            try:
+                send_process_group(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                _ = child.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                # Root enforces the same deadline on the entire command cgroup.
+                pass
+            raise
+    finally:
+        child.stdout.close()
+        child.stderr.close()
+    return LeasedCommandResult(status if status >= 0 else 128 - status, bytes(output[0]), bytes(output[1]),
+                               started_at, time.time(), time.monotonic() - started)
+
+
+def run_slot(execution: LeasedSlotExecution, argv: tuple[str, ...], environment: Mapping[str, str], *,
+             shell: ShellEnvironment, compiler_version: str, free_floor_gib: float,
+             output_max_bytes: int, timeout_s: float) -> LeasedCommandResult:
+    """Check shell and compiler parity before running the exact judgment command."""
+    slot = execution.slot
+    descriptor = build_folders.build_folder_lock_fd(slot.path)
+    if descriptor not in execution.descriptors:
+        raise ValueError('The command lacks its maker slot descriptor')
+    if (argv[:2] not in (('cargo', 'check'), ('cargo', 'clippy'))
+            or any(word == '--fix' or word.startswith('--fix=') for word in argv)
+            or any('\0' in word for word in argv)):
+        raise ValueError('The guest accepts only Cargo judgment commands')
+    for index, word in enumerate(argv):
+        if word == '--target-dir':
+            if index + 1 >= len(argv):
+                raise ValueError('The Cargo target directory is missing')
+            target = (slot.path / argv[index + 1]).resolve()
+        elif word.startswith('--target-dir='):
+            target = (slot.path / word.partition('=')[2]).resolve()
+        else:
+            continue
+        if not target.is_relative_to(slot.path.resolve()) and target != slot.cargo_dir.resolve():
+            raise ValueError('The command output escapes its maker slot')
+    command_environment = {**os.environ, **environment, **slot.env,
+        'CARGO_TARGET_DIR': str(slot.path / 'target'), 'BUILD_FOLDER': str(slot.path),
+        'BUILD_FOLDER_LOCK_FD': str(descriptor)}
+    if min(shutil.disk_usage(slot.path).free, shutil.disk_usage(slot.cargo_dir).free) < free_floor_gib * 1024**3:
+        raise ValueError('The command lacks the required free disk space')
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+            '.leased-step-', build_folders.ExplicitBuildParent(slot.path))) as stage:
+        started = stage / 'started'
+        assignments = ' '.join(f'{name}={shlex.quote(value)}' for name, value in
+                               {**environment, **slot.env, 'CARGO_TARGET_DIR': str(slot.path / 'target')}.items())
+        script = (shell_environment_script(shell)
+            + '\nunset RUSTUP_TOOLCHAIN\n'
+            + toolchain_install_script('rustc ' + compiler_version, 'hana') + '\n'
+            + 'actual=$(rustc -V) || exit 75\n'
+            + f'[[ "$actual" == {shlex.quote("rustc " + compiler_version)} '
+            + f'|| "$actual" == {shlex.quote("rustc " + compiler_version + " ")}* ]] || exit 75\n'
+            + f'export {assignments}\n'
+            + f': > {shlex.quote(str(started))} || exit 75\n'
+            + 'exec ' + shlex.join(argv))
+        result = capture_leased_command(['bash', '-e', '-c', script], execution,
+                                        command_environment, output_max_bytes, timeout_s=timeout_s)
+        if not started.exists():
+            raise ValueError('The guest shell or compiler parity check failed')
+        return result
 
 
 def positive_setting(values: dict[str, str], key: str) -> float:
@@ -424,12 +557,13 @@ def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
         with slot_run(mirror):
             shell = prepare_shell(mirror, Path.home() / values['shell_cache'],
                                   policy_setting(values, 'devshell', repository),
-                                  positive_setting(values, 'shell_timeout_s'))
+                                  positive_setting(values, 'shell_timeout_s'),
+                                  pass_fds=execution_descriptors())
             command = (shell_environment_script(shell)
                        + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
                        + probe_script(str(mirror.relative_to(Path.home())), shell_environment=True))
             return subprocess.run(['bash', '-c', command], cwd=mirror, check=False,
-                                   pass_fds=copies.inherited_mirror_descriptors()).returncode
+                                   pass_fds=execution_descriptors()).returncode
     except SlotStartupRefused:
         print(STARTUP_REFUSAL_RECORD, flush=True)
         return 75
@@ -488,7 +622,8 @@ def trim_build_folder(target: Path, environment: dict[str, str]) -> int:
         'sys.exit(sweep.sweep_workspace(selected, config, False, recent_seconds / 60))',
     ))
     return subprocess.run([str(Path.home() / '.claude/scripts/lib/py'), '-c', code, str(target)],
-                          env={**os.environ, **environment}, check=False).returncode
+                          env={**os.environ, **environment}, check=False,
+                          pass_fds=execution_descriptors()).returncode
 
 
 def version_mismatch(target: str, actual: Mapping[str, str], expected: Mapping[str, str], pin_file: str) -> str:
@@ -559,7 +694,7 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         raise ValueError(f'{kind}: target does not permit this command')
     selector = policy_setting(values, 'devshell', repository)
     shell = prepare_shell(mirror, Path.home() / values['shell_cache'], selector,
-                          positive_setting(values, 'shell_timeout_s'))
+                          positive_setting(values, 'shell_timeout_s'), pass_fds=execution_descriptors())
     build_budget = positive_setting(values, 'build_budget_gib')
     budget = float(policy_setting(values, 'target_budget_gib', repository))
     if not math.isfinite(budget) or not 0 < budget <= build_budget:
@@ -636,7 +771,7 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
                     + f': > {shlex.quote(str(started))} || exit 75\n'
                     + f'exec "$HOME/.claude/scripts/lint/lint" {shlex.join([verb, *words])}')
         completed = subprocess.run(['bash', '-c', command], cwd=mirror, check=False,
-                                   pass_fds=copies.inherited_mirror_descriptors())
+                                   pass_fds=execution_descriptors())
         status = completed.returncode if completed.returncode >= 0 else 128 - completed.returncode
         step_started = started.exists()
         toolchain = toolchain_environment.read_text()

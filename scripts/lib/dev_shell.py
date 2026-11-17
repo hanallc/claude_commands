@@ -84,7 +84,8 @@ def exports_are_valid(exports: Path) -> bool:
     return bool(text.strip()) and all(Path(root).exists() for root in roots)
 
 
-def prepare_shell(root: Path, cache: Path, selector: str, timeout_s: float) -> ShellEnvironment:
+def prepare_shell(root: Path, cache: Path, selector: str, timeout_s: float, *,
+                  pass_fds: tuple[int, ...] = ()) -> ShellEnvironment:
     """Publish immutable shell inputs and exports under a content key."""
     key = shell_key(root, selector)
     cache.mkdir(parents=True, exist_ok=True)
@@ -111,7 +112,7 @@ def prepare_shell(root: Path, cache: Path, selector: str, timeout_s: float) -> S
             raise ValueError('cached shell inputs do not match their key')
         result = subprocess.run(
             ['nix', 'print-dev-env', f'path:{inputs}#{selector}'],
-            capture_output=True, text=True, check=True, timeout=timeout_s,
+            capture_output=True, text=True, check=True, timeout=timeout_s, pass_fds=pass_fds,
         )
         if not result.stdout.strip():
             raise ValueError('nix returned no shell exports')

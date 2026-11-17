@@ -1,22 +1,338 @@
 """Receive signed control objects as root without guest AWS credentials."""
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, replace
+import fcntl
+import hashlib
 from http.client import HTTPResponse
-import inspect
 import json
+import os
 from pathlib import Path
+import subprocess
 import time
-from typing import cast
+from typing import Protocol, cast
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from scripts.aws_target import hana_guest as guest
-from scripts.lib import conf
+from scripts.aws_target import hana_execution as execution, hana_result, hana_runner, hana_source
+from scripts.build_queue import placement
+from scripts.lib import build_folders, build_slots, conf
 
 # Control messages have a fixed protocol size limit.
 CONTROL_MAX_BYTES = 65536
+RUNTIME = Path('/var/lib/hana-runtime')
+MOUNTINFO = Path('/proc/self/mountinfo')
+
+
+@dataclass(frozen=True)
+class CommandDeparture:
+    terminated: bool
+    lease_free: bool
+
+
+class CommandSupervisor(Protocol):
+    def mounted(self) -> bool: ...
+    def start(self, envelope: execution.HanaCommandEnvelope, directory: Path, arguments: list[str]) -> None: ...
+    def stop(self, directory: Path) -> None: ...
+    def departure(self, directory: Path, slot: int) -> CommandDeparture: ...
+    def outcome(self, directory: Path) -> hana_runner.HanaRunOutcome: ...
+    def start_source_update(self, request: execution.HanaExecutionRequest, directory: Path, arguments: list[str]) -> None: ...
+    def source_outcome(self, directory: Path) -> hana_runner.HanaSourceUpdateOutcome: ...
+
+
+def data_mount_ready(mountinfo: Path = MOUNTINFO) -> bool:
+    """Require the data directory to be a separate mounted filesystem."""
+    try:
+        return any(len(fields := line.split()) > 6 and fields[4] == str(guest.DATA)
+                   for line in mountinfo.read_text().splitlines())
+    except OSError:
+        return False
+
+
+@contextmanager
+def command_lock(paths: guest.GuestPaths) -> Generator[None]:
+    """Serialize command acceptance and fences outside all source leases."""
+    directory = paths.directory / 'commands'
+    directory.mkdir(mode=0o700, exist_ok=True)
+    descriptor = os.open(directory / 'accept.lock', os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(descriptor, 'a') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        yield
+
+
+def command_directory(paths: guest.GuestPaths, key: hana_result.HanaAttemptKey) -> Path:
+    content = json.dumps(hana_result.encode_attempt_key(key), sort_keys=True).encode()
+    return paths.directory / 'commands' / hashlib.sha256(content).hexdigest()
+
+
+def command_unit(directory: Path) -> str:
+    return 'hana-command-' + directory.name + '.service'
+
+
+def source_update_directory(directory: Path) -> Path:
+    return directory.with_name(directory.name + '-source')
+
+
+class GuestCommandSupervisor:
+    """Root supervises the unit while the unit owns all source and compiler processes."""
+
+    def __init__(self, timeout_s: int) -> None:
+        self.timeout_s: int = timeout_s
+        self.children: dict[Path, subprocess.Popen[bytes]] = {}
+
+    def mounted(self) -> bool:
+        return data_mount_ready()
+
+    def start(self, envelope: execution.HanaCommandEnvelope, directory: Path, arguments: list[str]) -> None:
+        self._start(envelope.request, directory, arguments, 'execute', envelope.access.output_max_bytes)
+
+    def start_source_update(self, request: execution.HanaExecutionRequest, directory: Path, arguments: list[str]) -> None:
+        self._start(request, directory, arguments, 'source-update', CONTROL_MAX_BYTES)
+
+    def _start(self, request: execution.HanaExecutionRequest, directory: Path, arguments: list[str],
+               action: str, output_max_bytes: int) -> None:
+        payload = json.dumps({'action': action, 'request': cast(object, json.loads(execution.encode_request(request))),
+                             'output_max_bytes': output_max_bytes}).encode()
+        _ = (directory / 'input').write_bytes(payload)
+        timeouts = hana_runner.read_timeouts()
+        with (directory / 'input').open('rb') as source, (directory / 'output').open('wb') as output, (
+                directory / 'error').open('wb') as error:
+            command = [arguments[0], '--quiet', '--pipe', '--property=ExitType=cgroup',
+                       '--property=EnvironmentFile=/etc/hana-aws/runner-environment',
+                       f'--property=RuntimeMaxSec={timeouts.command_timeout_s:g}',
+                       f'--property=TimeoutStopSec={self.timeout_s}',
+                       '--unit=' + command_unit(directory),
+                       *(word for word in arguments[1:] if not word.startswith('--unit=') and word != '--collect')]
+            child = subprocess.Popen(command, stdin=source, stdout=output, stderr=error, start_new_session=True)
+        self.children[directory] = child
+        from scripts.mac_test.linux_runner import process_fields
+
+        guest.atomic_record(directory / 'launcher.json', {'pid': child.pid,
+            'start_time': int(process_fields(child.pid)[19])})
+
+    def _launcher_ended(self, directory: Path) -> bool:
+        child = self.children.get(directory)
+        if child is not None:
+            status = child.poll()
+            if status == 0:
+                guest.atomic_record(directory / 'launcher-finished.json', {'status': status})
+            return status is not None
+        from scripts.mac_test.linux_runner import process_fields
+
+        try:
+            row = hana_result.object_fields(cast(object, json.loads((directory / 'launcher.json').read_text())))
+            pid = hana_result.integer_field(row, 'pid')
+            fields = process_fields(pid)
+            return fields[0] in ('Z', 'X') or int(fields[19]) != hana_result.integer_field(row, 'start_time')
+        except (FileNotFoundError, ProcessLookupError):
+            # A missing launch record cannot prove that publication did not start.
+            return (directory / 'launcher.json').exists()
+        except (OSError, ValueError, KeyError):
+            return False
+
+    def stop(self, directory: Path) -> None:
+        """Keep an uncertain launcher owned until its unit confirms departure."""
+        result = subprocess.run(['systemctl', 'stop', command_unit(directory)], capture_output=True,
+                                timeout=self.timeout_s, check=False)
+        if result.returncode == 0:
+            guest.atomic_record(directory / 'stopped.json', {'stopped': True})
+
+    def departure(self, directory: Path, slot: int) -> CommandDeparture:
+        try:
+            response = subprocess.run(['systemctl', 'show', command_unit(directory),
+                '--property=LoadState,ActiveState,ControlGroup,Job,Result'], capture_output=True,
+                text=True, timeout=self.timeout_s, check=False)
+            fields = dict(line.split('=', 1) for line in response.stdout.splitlines() if '=' in line)
+            group = fields.get('ControlGroup', '')
+            group_path = Path('/sys/fs/cgroup') / group.lstrip('/')
+            empty_group = False
+            if group and '..' not in Path(group).parts:
+                try:
+                    empty_group = 'populated 0' in (group_path / 'cgroup.events').read_text().splitlines()
+                except FileNotFoundError:
+                    empty_group = True
+            if fields.get('Result') == 'timeout' and fields.get('ActiveState') == 'failed':
+                guest.atomic_record(directory / 'timed-out.json', {'timed_out': True})
+                if not group and fields.get('LoadState') == 'loaded':
+                    empty_group = True
+            launcher_ended = self._launcher_ended(directory)
+            if fields.get('LoadState') == 'not-found':
+                empty_group = ((directory / 'launcher-finished.json').exists()
+                               or (directory / 'stopped.json').exists())
+            ended = (launcher_ended and empty_group
+                and fields.get('ActiveState') in ('inactive', 'failed') and fields.get('Job', '') in ('', '0'))
+            root = build_slots.configured_slot_root()
+            lease_free = build_folders.build_folder_state(root / f'hana-slot{slot}') == 'free'
+            return CommandDeparture(ended, ended and lease_free)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return CommandDeparture(False, False)
+
+    def outcome(self, directory: Path) -> hana_runner.HanaRunOutcome:
+        if (directory / 'timed-out.json').exists():
+            return hana_runner.HanaExecutionLost('The Hana command exceeded its execution deadline')
+        try:
+            with (directory / 'output').open('rb') as output:
+                content = output.read(hana_result.RESULT_MAX_BYTES + 1)
+            if len(content) > hana_result.RESULT_MAX_BYTES:
+                return hana_runner.HanaExecutionLost('The runner result exceeds its transport bound')
+            return hana_runner.decode_outcome(content)
+        except (OSError, ValueError, KeyError):
+            return hana_runner.HanaExecutionLost('The runner has no complete result')
+
+    def source_outcome(self, directory: Path) -> hana_runner.HanaSourceUpdateOutcome:
+        try:
+            with (directory / 'output').open('rb') as output:
+                content = output.read(CONTROL_MAX_BYTES + 1)
+            if len(content) > CONTROL_MAX_BYTES:
+                raise ValueError('The source update result exceeds its protocol bound')
+            return hana_runner.decode_source_outcome(content)
+        except (OSError, ValueError, KeyError) as error:
+            return hana_runner.HanaSourceUpdateRefused(str(error))
+
+
+def receive_source_update(settings: guest.SafetySettings, envelope: execution.HanaSourceUpdateEnvelope,
+        record: dict[str, object], directory: Path, supervisor: CommandSupervisor, *,
+        paths: guest.GuestPaths, clock: Callable[[], float], uptime: Callable[[], float]) -> None:
+    """Prepare source once under the original attempt without command authority."""
+    if record['accepted'] is not True or record['fenced'] is True or record['refused'] is True:
+        raise ValueError('The source update requires an unfenced accepted attempt')
+    original = execution.decode_request(json.dumps(record['request']).encode())
+    expected = replace(original.manifest, bundle_sha256=envelope.manifest.bundle_sha256,
+                       bundle_url=envelope.manifest.bundle_url, basis_commits=())
+    if envelope.manifest != expected:
+        raise ValueError('The source update changes the captured source or command binding')
+    if record.get('source_update_started') is True:
+        return
+    outcome = supervisor.outcome(directory)
+    if not isinstance(outcome, hana_runner.HanaExecutionRefused) or not outcome.reason.startswith('MissingBasis: '):
+        raise ValueError('The source update requires a MissingBasis outcome')
+    departure = supervisor.departure(directory, envelope.slot)
+    if not (departure.terminated and departure.lease_free):
+        raise ValueError('The original unit must release its exact slot before source preparation')
+    permission = hana_result.object_fields(record['permission'])
+    boot = hana_result.string_field(permission, 'boot_id')
+    generation = hana_result.string_field(permission, 'generation')
+    updated = replace(original, manifest=envelope.manifest)
+    update_directory = source_update_directory(directory)
+    update_directory.mkdir(mode=0o700, exist_ok=True)
+    record['source_update_started'] = True
+    guest.atomic_record(directory / 'command.json', record)
+    launch_attempted = False
+
+    def start(arguments: list[str]) -> None:
+        nonlocal launch_attempted
+        current = guest.read_permit(paths.permit)
+        if (not isinstance(current, guest.WorkPermit) or current.boot_id != boot
+                or not generation.isdecimal() or not current.generation.isdecimal()
+                or int(current.generation) < int(generation)):
+            raise ValueError('The original execution permission is no longer current')
+        launch_attempted = True
+        supervisor.start_source_update(updated, update_directory, arguments)
+
+    try:
+        guest.admit_command(settings, (guest.SYSTEM_BIN + '/python3', '-E', str(RUNTIME / 'runner.py')), guest.DATA,
+            mounted=supervisor.mounted(), start=start, paths=paths, clock=clock, uptime=uptime)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        record['source_update_launch_refused'] = not launch_attempted
+        record['reason'] = str(error)
+        guest.atomic_record(directory / 'command.json', record)
+
+
+def receive_execution(settings: guest.SafetySettings, descriptor: dict[str, object],
+                      envelope: execution.HanaExecutionEnvelope, supervisor: CommandSupervisor, *,
+                      paths: guest.GuestPaths = guest.GUEST_PATHS,
+                      clock: Callable[[], float] = time.time,
+                      uptime: Callable[[], float] = time.monotonic) -> execution.HanaCommandObservation:
+    """Accept once or fence the exact attempt under one durable command lock."""
+    key = envelope.request.key if isinstance(envelope, execution.HanaCommandEnvelope) else envelope.key
+    slot = envelope.request.slot if isinstance(envelope, execution.HanaCommandEnvelope) else envelope.slot
+    if (key.generation.deployment != descriptor.get('deployment')
+            or key.generation.start_token != descriptor.get('start_token')
+            or key.generation.boot_id != guest.read_identity(paths.boot_id)
+            or envelope.access.expires_at <= clock()):
+        raise ValueError('The Hana command identity or publication access expired')
+    directory = command_directory(paths, key)
+    with command_lock(paths):
+        directory.mkdir(mode=0o700, exist_ok=True)
+        record_path = directory / 'command.json'
+        record: dict[str, object]
+        try:
+            record = hana_result.object_fields(cast(object, json.loads(record_path.read_text())))
+            if record['slot'] != slot or hana_result.decode_attempt_key(record['key']) != key:
+                raise ValueError('The saved command identity differs')
+            if (any(type(record.get(name)) is not bool for name in ('accepted', 'fenced', 'refused'))
+                    or not (record['accepted'] or record['fenced'])):
+                raise ValueError('The saved command state is invalid')
+            if any(name in record and type(record[name]) is not bool for name in
+                   ('source_update_started', 'source_updated', 'source_update_launch_refused')):
+                raise ValueError('The saved source update state is invalid')
+        except FileNotFoundError:
+            record = {'key': hana_result.encode_attempt_key(key), 'slot': slot,
+                      'accepted': False, 'fenced': False, 'refused': False,
+                      'source_update_started': False, 'source_updated': False}
+        if isinstance(envelope, execution.HanaFenceEnvelope):
+            record['fenced'] = True
+            guest.atomic_record(record_path, record)
+            if record['accepted'] is True and record['refused'] is not True:
+                supervisor.stop(directory)
+            if record.get('source_update_started') is True and record.get('source_update_launch_refused') is not True:
+                supervisor.stop(source_update_directory(directory))
+        elif isinstance(envelope, execution.HanaSourceUpdateEnvelope):
+            receive_source_update(settings, envelope, record, directory, supervisor,
+                                  paths=paths, clock=clock, uptime=uptime)
+        elif record['accepted'] is not True and record['fenced'] is not True:
+            record['accepted'] = True
+            record['request'] = cast(object, json.loads(execution.encode_request(envelope.request)))
+            record['permission'] = asdict(envelope.permission)
+            guest.atomic_record(record_path, record)
+            launch_attempted = False
+
+            def start(arguments: list[str]) -> None:
+                nonlocal launch_attempted
+                if guest.read_permit(paths.permit) != envelope.permission:
+                    raise ValueError('The acknowledged command permit changed')
+                launch_attempted = True
+                supervisor.start(envelope, directory, arguments)
+
+            try:
+                guest.admit_command(settings, (guest.SYSTEM_BIN + '/python3', '-E',
+                    str(RUNTIME / 'runner.py')), guest.DATA,
+                    mounted=supervisor.mounted(), start=start, paths=paths, clock=clock, uptime=uptime)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                if not launch_attempted:
+                    record['refused'] = True
+                record['reason'] = str(error)
+                guest.atomic_record(record_path, record)
+        accepted, fenced = record['accepted'] is True, record['fenced'] is True
+        departure = (CommandDeparture(True, True) if not accepted or record['refused'] is True
+                     else supervisor.departure(directory, slot))
+        if record.get('source_update_started') is True:
+            update_directory = source_update_directory(directory)
+            source_departure = (CommandDeparture(True, True) if record.get('source_update_launch_refused') is True
+                                else supervisor.departure(update_directory, slot))
+            departure = CommandDeparture(departure.terminated and source_departure.terminated,
+                                         departure.lease_free and source_departure.lease_free)
+            if departure.terminated and departure.lease_free and not fenced:
+                source_outcome = supervisor.source_outcome(update_directory)
+                original = execution.decode_request(json.dumps(record['request']).encode())
+                identity = hana_source.SourceIdentity(original.manifest.repository,
+                    original.manifest.commit, original.manifest.toolchain)
+                if isinstance(source_outcome, hana_runner.HanaSourceUpdated) and source_outcome.identity == identity:
+                    record['source_updated'] = True
+                    guest.atomic_record(record_path, record)
+        outcome = supervisor.outcome(directory) if accepted else hana_runner.HanaExecutionLost('The command never started')
+        reason = str(record.get('reason', 'The command result is pending'))
+        if isinstance(outcome, hana_runner.HanaExecutionRefused):
+            reason = outcome.reason
+        elif isinstance(outcome, hana_runner.HanaExecutionLost) and 'reason' not in record:
+            reason = outcome.reason
+        evidence = (placement.ExecutionEvidenceUnavailable(reason, clock()) if accepted
+                    else placement.ExecutionNotStarted())
+        return execution.HanaCommandObservation(key, slot, accepted, fenced, departure.terminated,
+                                                departure.lease_free, clock(), evidence, record.get('source_updated') is True)
 
 
 @dataclass(frozen=True)
@@ -116,31 +432,50 @@ def run_receiver(settings: guest.SafetySettings, transport: ReceiverSettings,
     if descriptor.get('setup_only') is True:
         return
     get_url, put_url = signed_url(descriptor.get('control_url')), signed_url(descriptor.get('report_url'))
+    supervisor = GuestCommandSupervisor(transport.aws_timeout_s)
     while keep_running():
         control = read_document(fetch(Request(get_url), transport.aws_timeout_s))
         reply = receive(settings, descriptor, control, paths=paths, clock=clock)
         _ = fetch(Request(put_url, data=json.dumps(reply).encode(), method='PUT'), transport.aws_timeout_s)
+        for name in ('fence_url', 'command_url'):
+            if name not in descriptor:
+                continue
+            content = fetch(Request(signed_url(descriptor[name])), transport.aws_timeout_s)
+            document = read_document(content)
+            if document.get('version') == 1 and document.get('action') == 'idle':
+                continue
+            envelope = execution.decode_envelope(content)
+            observation = receive_execution(settings, descriptor, envelope, supervisor, paths=paths, clock=clock)
+            if observation.accepted and observation.terminated and observation.lease_free and not observation.fenced:
+                outcome = supervisor.outcome(command_directory(paths, observation.key))
+                if isinstance(outcome, hana_runner.HanaCommandFinished):
+                    _ = fetch(Request(signed_url(envelope.access.result_url),
+                        data=hana_result.encode_result(outcome.result), method='PUT'), transport.aws_timeout_s)
+            _ = fetch(Request(signed_url(envelope.access.observation_url),
+                data=execution.encode_observation(observation), method='PUT'), transport.aws_timeout_s)
         pause(transport.control_poll_seconds)
 
 
 def receiver_program() -> str:
-    """Render the reviewed receiver beside the existing standalone safety program."""
-    prefix = ('from __future__ import annotations\nfrom collections.abc import Callable\n'
-        'from dataclasses import asdict, dataclass\nfrom pathlib import Path\nfrom typing import cast\n'
-        'from urllib.parse import urlsplit\nfrom urllib.request import Request, urlopen\n'
-        'import json, time\nimport safety as guest\nCONTROL_MAX_BYTES = 65536\n')
-    definitions = (ReceiverSettings, read_document, signed_url, receive, transfer, run_receiver)
-    program = prefix + '\n'.join(inspect.getsource(item) for item in definitions)
-    return program + '''
+    """Load the reviewed runtime while keeping safety services independent."""
+    return f'''import sys
+sys.path.insert(0, {str(RUNTIME)!r})
+from scripts.aws_target.hana_receiver import installed_main
 if __name__ == '__main__':
+    installed_main()
+'''
+
+
+def installed_main() -> None:
     try:
-        values = json.loads((guest.CONTROL / 'receiver.json').read_text())
-        safety = guest.decode_settings(json.loads((guest.CONTROL / 'safety.json').read_text()))
-        run_receiver(safety, ReceiverSettings(**values))
+        values = hana_result.object_fields(cast(object, json.loads((guest.CONTROL / 'receiver.json').read_text())))
+        safety = guest.decode_settings(hana_result.object_fields(cast(object,
+            json.loads((guest.CONTROL / 'safety.json').read_text()))))
+        run_receiver(safety, ReceiverSettings(hana_result.integer_field(values, 'aws_timeout_s'),
+                                            hana_result.integer_field(values, 'control_poll_seconds')))
     except Exception:
         # The independent guard stops the box after a receiver failure.
         raise SystemExit('Hana receiver refused the control message') from None
-'''
 
 
 def render_files(settings: ReceiverSettings) -> tuple[guest.GuestFile, ...]:
@@ -155,6 +490,7 @@ Type=simple
 User=root
 UMask=0077
 Environment=PATH={guest.SYSTEM_BIN}
+Environment=CONF_DIR={RUNTIME}/config
 ExecStart={guest.SYSTEM_BIN}/python3 {guest.CONTROL}/receiver.py
 Restart=on-failure
 RestartSec={settings.control_poll_seconds}
