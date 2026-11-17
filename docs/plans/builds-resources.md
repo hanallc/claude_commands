@@ -2698,3 +2698,9 @@ The cutover removal commit deletes the script after the run.
 - Checkpoint `5b376a860`: 30 importer modules, 399 tests pass; basedpyright 0. Blind review: APPROVE, no findings.
 
 **Files:** `scripts/lib/helper_tree_test_support.py`.
+
+### Phase 142 — Name what holds natedev memory outside the build and CI slices  · status: todo
+
+At 13:48 EST, 34.65 GiB of natedev memory (61 GiB total) was in use outside the build and CI slices, and the queue head waited 148 minutes for 7.9 GiB. A read-only probe groups those processes by PSS and names what is safe to reclaim. Nothing is stopped or changed.
+
+**Files:** none.
