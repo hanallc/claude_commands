@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import unittest
 from pathlib import Path
 from typing import final
@@ -10,6 +11,7 @@ from typing import final
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
 
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, configure_test_environment
 from scripts.style.style_reader_test_support import oracle_reader
 
@@ -38,6 +40,17 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                          (0, f"hand-off {checkpoint[:7]} already merged as {merge[:7]}\n", ""))
         self.assertEqual(self.handoff_ledger_row(checkpoint), ("merged", merge))
         self.assertEqual(len(self.events("send.py")), 2)
+    def test_home_verify_stub_answers_when_bash_runs_it(self) -> None:
+        """11-16 15:26: the style reader build ran the home verify.sh stub with bash; it waited a day for a click."""
+        verify = self.root / "home/.claude/scripts/direct/verify.sh"
+        # Without a display, a stub that bash reads as shell fails at once and does not wait.
+        environment = {key: value for key, value in self.env.items() if key not in ("DISPLAY", "WAYLAND_DISPLAY")}
+        result = subprocess.run(["bash", str(verify), "build", "style_reader", "--release", "--attached"],
+                                env=environment, capture_output=True, text=True, check=False,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.events("verify.sh")[-1], ["build", "style_reader", "--release", "--attached"])
+
     def test_duplicate_child_notice_records_a_ledger_write_missed_at_the_merge(self) -> None:
         _ = self.child_production()
         checkpoint = self.checkpoint()
