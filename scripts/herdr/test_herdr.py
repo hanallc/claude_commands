@@ -5865,6 +5865,16 @@ class HerdrTests(unittest.TestCase):
         with self.assertRaisesRegex(herdr_types.HerdrFailure, "process vanished"):
             _ = herdr.darwin_process_identity(42)
 
+    def test_darwin_process_birth_names_an_exited_process_as_changing(self) -> None:
+        self.darwin()
+        self.configure(["-o", "lstart=,tty=", "-p", "42"], code=1)
+        with self.assertRaises(herdr.NativeRegistryChanging) as raised:
+            _ = herdr._process_birth(42)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(str(raised.exception), "pid 42: process exited")
+        self.configure(["-o", "lstart=,tty=", "-p", "42"], code=1, stderr="ps refused")
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "ps refused"):
+            _ = herdr._process_birth(42)  # pyright: ignore[reportPrivateUsage]
+
 
     def test_darwin_environment_refuses_a_changed_command_or_failed_ps(self) -> None:
         self.darwin()
