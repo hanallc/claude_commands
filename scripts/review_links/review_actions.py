@@ -248,7 +248,7 @@ def decision_action(item: review_items.ReviewItem, action: str, words: str,
                         +'--ledger '+shlex.quote(str(source.path)))
         def save_efficiency() -> None:
             supersede()
-            _ = decision_store.record(item, logged, mark)
+            _ = decision_store.record(item, logged, mark, waiting_why=words if action == 'question' else '')
         delivery = send(item,efficiency_reviews.path(source.path),identity,message,save_efficiency,status,
                         question_text=words if action == 'question' else '')
     else:
@@ -265,7 +265,8 @@ def decision_action(item: review_items.ReviewItem, action: str, words: str,
             if action == 'decline':
                 _ = proposal_issue.edit(issue,{'style_answer':'declined','style_answer_words':words},
                                         datetime.now(user_zone()).date())
-            _ = decision_store.record(item,logged,mark if action != 'decline' else NoMark())
+            _ = decision_store.record(item,logged,mark if action != 'decline' else NoMark(),
+                                      waiting_why=words if action == 'question' else '')
         delivery = send(item,issue,issue.stem,message,save,status,question_text=words if action == 'question' else '')
     return delivery,{'approve':'approved, sent to '+review_items.name(item.owner,staff.snapshot()),'decline':'declined',
                      'feedback':'feedback sent','question':'question sent'}[action]

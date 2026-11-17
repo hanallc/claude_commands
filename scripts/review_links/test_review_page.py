@@ -53,7 +53,7 @@ class ReviewPageTests(unittest.TestCase):
         return self.fixture.file_user_question(title)
 
     def investigation(self, ready: bool = True) -> investigation.Investigation:
-        item = investigation.file(self.fixture.unit.id, 'Why did the gate stop?', 'Read the gate log.')
+        item = investigation.file(self.fixture.unit.id, 'Why did the gate stop?', 'Read the gate log.', waiting_why='The owner must complete the investigation.')
         return investigation.answer(item.owner,item.id,'The test failed. The repair is ready.') if ready else item
 
     def decisions(self) -> tuple[str, str]:

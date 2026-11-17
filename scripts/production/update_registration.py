@@ -232,7 +232,7 @@ def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
             raise InputError(f"{where}: expected an object")
         fields = cast(dict[str, object], entry)
         check_keys(fields, {"since", "text", "after", "question", "parts", "reviewed", "review_unavailable", "urgency",
-                            "due", "marked", "follows", "asked_by", "followup", "followups", "review_id", "review_log"}, where)
+                            "due", "marked", "follows", "asked_by", "followup", "followups", "review_id", "review_log", "waiting_why"}, where)
         if "parts" in fields:
             _ = read_parts(fields["parts"], where)
         rank = read_ranking(fields, where)
@@ -317,6 +317,7 @@ class FollowupExchange(TypedDict):
 
 
 class OutstandingItem(TypedDict):
+    waiting_why: NotRequired[str]
     review_id: NotRequired[str]
     review_log: NotRequired[str]
     since: str
@@ -1088,6 +1089,10 @@ def question_review_id(record: QuestionRecord) -> str:
 
 def write_question_record(record: QuestionRecord) -> None:
     item = record.item
+    if "waiting_why" not in item and record.path.exists():
+        stored = _question_records([Issue(record.path, frontmatter(record.path))])
+        if stored and stored[0].item.get("waiting_why"):
+            item["waiting_why"] = stored[0].item.get("waiting_why", "")
     if "review_id" not in item and record.path.exists():
         stored = _question_records([Issue(record.path, frontmatter(record.path))])
         if stored and stored[0].item.get("review_id"):
@@ -1609,19 +1614,36 @@ def change_open_question(production: QuestionScope, name: str, text: str, identi
 
 
 def followup(production: QuestionScope, text: str, words: str, *, identities: QuestionStaff | None = None) -> AnswerRelay:
-    """Send the asker a follow-up: the question leaves the due list until the asker replies."""
+    """Send the asker a follow-up: the question leaves the due list until the asker replies.
+
+    The follow-up words are the item's why this is waiting text.
+    """
+    from scripts.review_links.review_events import require_waiting_why
     identities = identities if identities is not None else QuestionStaff.read()
     if not words.strip():
         raise RegistrationFailure("followup", "the follow-up is empty")
+    reason = require_waiting_why(words)
     sent = datetime.now(production.zone).strftime("%Y-%m-%dT%H:%M")
 
     def add(entry: OutstandingItem) -> None:
         if "followup" in entry:
             raise RegistrationFailure("followup", f"{text}: a follow-up already waits for the asker's reply")
         entry["followup"] = PendingFollowup(text=words.strip(), sent=sent)
+        entry["waiting_why"] = reason
 
     changed = change_open_question(production, production.name, text, identities, "followup", add)
     return answer_relay(production, production.name, question_asker(changed, OpenItemWithoutAsker(), identities), identities)
+
+
+def set_waiting_why(record: QuestionRecord, text: str) -> None:
+    from scripts.review_links.review_events import require_waiting_why
+    reason = require_waiting_why(text)
+    with outstanding_lock(state_root() / "outstanding" / (record.owner + ".json")):
+        current = _question_records([Issue(record.path, frontmatter(record.path))])[0]
+        if current.status != "open" or "followup" not in current.item:
+            raise RegistrationFailure("waiting-why", "The item is not Waiting.")
+        current.item["waiting_why"] = reason
+        write_question_record(current)
 
 
 def answer_followup(entry: OutstandingItem, text: str) -> None:
@@ -1788,6 +1810,8 @@ def keep_layout_fields(entry: OutstandingItem, stored: OutstandingItem) -> None:
         entry["followup"] = stored["followup"]
     if "followups" in stored:
         entry["followups"] = stored["followups"]
+    if "waiting_why" in stored:
+        entry["waiting_why"] = stored["waiting_why"]
 
 
 class HeldRegistrationQuestion(NamedTuple):

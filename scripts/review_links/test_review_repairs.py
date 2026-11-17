@@ -420,7 +420,7 @@ window.fetch=(url,options={})=>{
         _ = investigation.mark_read(read.owner, read.id)
         members = staff.snapshot()
         owner = next(row for row in members.rows if row.name == 'page-owner')
-        _ = investigation.file(owner.id, 'Another owner', 'Read its log.')
+        _ = investigation.file(owner.id, 'Another owner', 'Read its log.', waiting_why='The owner must complete the investigation.')
         markup = console.render(console.read_pages(),console.read_rebuilds()).decode()
         probe = r'''
 (async()=>{
