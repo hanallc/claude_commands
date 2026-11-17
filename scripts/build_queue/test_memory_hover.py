@@ -613,6 +613,14 @@ class MemoryHoverTests(unittest.TestCase):
                     self.assertEqual(rows[labels.index("Share held")]["value"], f"{share}%")
                     self.assertLess(labels.index("Share held"), labels.index("Target"))
 
+    def test_a_small_shortage_still_shows_as_short(self) -> None:
+        # Review 44aw: a 20 MiB shortage rounded to 0.0 GiB and hid the alert and the red outline.
+        ram = {**RAM_FIXTURE, "build_covered_bytes": 3 * GIB, "build_missing_bytes": 20 * MIB, "shortfall_bytes": 20 * MIB}
+        shown = self.page_expression(
+            "(() => { const r = shownReading(data).ram; return [r.build_missing_bytes / GIB, reserveAlert(r)]; })()",
+            {"ram": ram})
+        self.assertEqual(shown, [0.1, "Free RAM is short by 0.1 GiB. Build reserved holds 3.0 of 3.1 GiB."])
+
     def test_reserve_tooltips_show_the_basis_of_each_target(self) -> None:
         # The user, 11-17: the swap tooltip shows the swap-in it takes a share of; build reserved shows its share of growth.
         swap = {**SWAP_FIXTURE, "reserve_share_percent": 20, "window_seconds": 600, "swap_in_window_bytes": 3 * GIB}

@@ -506,6 +506,9 @@ function shownReading(data) {
   ram.unnamed_bytes = leaf(source.unattributed_bytes - source.kernel_no_counter_bytes);
   ram.unattributed_bytes = recorded(source.unattributed_bytes)
     ? sum([ram.kernel_no_counter_bytes,ram.unnamed_bytes]) : source.unattributed_bytes;
+  // A reserve short by less than 0.05 GiB still shows as short: its missing amount is at least 0.1 GiB.
+  for (const key of ['safety','swap','build'])
+    if (source[key+'_missing_bytes'] > 0) ram[key+'_missing_bytes'] = Math.max(ram[key+'_missing_bytes'], GIB / 10);
   for (const key of ['safety','swap','build'])
     ram[key+'_target_bytes'] = sum([ram[key+'_covered_bytes'],ram[key+'_missing_bytes']]);
   ram.shortfall_bytes = sum([ram.safety_missing_bytes,ram.swap_missing_bytes,ram.build_missing_bytes]);
