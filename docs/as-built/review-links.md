@@ -125,6 +125,14 @@ An older response cannot replace a newer response.
 Accounts, Changes, Investigations, List and Questions read their rendered page at `page_refresh_seconds` intervals.
 Builds reads `memory.json` at its feed interval.
 Disks reads `disks.json` at `page.poll_seconds` intervals and requests a new measure when needed.
+Disks shows Paused with the reason **Measuring…** while a measure runs.
+The old sizes remain visible during the measure.
+Old sizes alone do not make Disks Late because the page measures on demand.
+Disks supplies `answeredAt` to the shared status component after a server answer.
+The shared component uses that time for Late and keeps the size timestamp for the visible age.
+Other pages use their data timestamp for Late.
+A completed measure returns Disks to Live with the new size age.
+A measure that exceeds `wait_seconds` shows Failed with **The measure did not finish.**
 AWS reads its published page when shown; its hourly publisher sets the data time and render time.
 Images reads its rendered page when shown.
 The Changes and Questions pages show Paused while text or an active save holds a replacement.

@@ -73,7 +73,9 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
  function draw(){
   if(!line) return;
   const reason=held(),age=last ? Math.max(0,Math.floor(Date.now()/1000-last.readAt)) : 0;
-  const next=reason ? 'Paused' : failure ? 'Failed' : last && age>options.ageLimit ? 'Late' : reading || !last ? 'Reading' : 'Live';
+  // An on-demand page can report a server answer separately from the data time.
+  const unanswered=last ? Math.max(0,Math.floor(Date.now()/1000-(last.answeredAt ?? last.readAt))) : 0;
+  const next=reason ? 'Paused' : failure ? 'Failed' : last && unanswered>options.ageLimit ? 'Late' : reading || !last ? 'Reading' : 'Live';
   line.dataset.state=next;
   line.querySelectorAll('[data-status-icon]').forEach(icon=>icon.hidden=icon.dataset.statusIcon!==next);
   line.querySelector('[data-status-word]').textContent=next==='Reading' ? 'Reading…' : next;

@@ -722,9 +722,10 @@ async function loadDisks(supersede=false,current=()=>true){
  catch(error){if(!data) throw error;failure=error.message;}
  if(!current()) return;
  if(measuring && Date.now()/1000-measuring.since>settings.wait_seconds){
-  measuring=null;throw new Error("The measure did not finish.");
+  measuring=null;failure="The measure did not finish.";
+  if(!data) throw new Error("The measure did not finish.");
  }
- if(data) return {readAt:data.measured_at,renderSeconds:data.render_seconds,failure};
+ if(data) return {readAt:data.measured_at,renderSeconds:data.render_seconds,answeredAt:Date.now()/1000,failure};
 }
 const updateSessions = sessionsView(document.getElementById("sessions"));
 stepTip.hoverTips(document.getElementById("tip"), tipFor);
@@ -735,7 +736,7 @@ onToggle(document.getElementById("slots"), "tr[data-group]", row => {
   renderSlots();
 });
 __PAGE_REFRESH_SCRIPT__
-const pageRefresh=createPageRefresh(loadDisks,()=>settings.poll_seconds);
+const pageRefresh=createPageRefresh(loadDisks,()=>settings.poll_seconds,()=>measuring ? 'Measuring…' : '');
 void pageRefresh.refresh();
 </script>
 </body>
