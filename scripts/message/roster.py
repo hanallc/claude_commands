@@ -829,18 +829,7 @@ def _worker_assignment(run: Path | str, slot: str, record: Mapping[str, object],
     member = session_staff.worker_row(record, membership)
     if member is None or not isinstance(member.role, staff.KnownWorkerRole):
         return WorkerAssignment("no role", str(run), AssignmentUnrecorded(), slot)
-    label = member.role.value
-    if member.role.value == "review":
-        from scripts.direct import progress_history
-
-        try:
-            with progress_history.dispatch_reads(membership, (Path(run),)):
-                dispatch = progress_history.last_dispatch(member.id)
-        except (OSError, ValueError):
-            dispatch = progress_history.NoDispatchRecorded()
-        if isinstance(dispatch, progress_history.RecordedDispatch) and isinstance(dispatch.lens, str):
-            label = f"review ({dispatch.lens})"
-    return WorkerAssignment(label, str(run), member.role.value, slot)
+    return WorkerAssignment(member.role.value, str(run), member.role.value, slot)
 
 
 def _held_location(parent: staff.StaffRow, membership: staff.StaffSnapshot,
@@ -1196,7 +1185,6 @@ def _review_workers(
         process = _reviewer_process(launcher_pid, table)
         if isinstance(process, _ReviewerProcessNotFound):
             continue
-        slot_role = f"review ({lens})" if lens else "review"
         entries.append(RosterEntry(
             machine=machine,
             kind=process.kind,
@@ -1207,7 +1195,7 @@ def _review_workers(
             cwd=_reviewer_cwd(process, place.cwd),
             showrunner=place.showrunner,
             director=place.director,
-            assignment=WorkerAssignment(slot_role, str(run.path), "review", lens or "review"),
+            assignment=WorkerAssignment("review", str(run.path), "review", lens or "review"),
             account=_process_account(process.pid, process.kind, home_state=home_state),
         ))
     return entries
@@ -1266,13 +1254,17 @@ def _unit_workers(
                                   f"unknown; pane {state.pane}: {state.reason}" if isinstance(state, worker_panes.ProcessUnknownWorker) else
                                   f"incomplete: {state.reason}")
                         reach = CannotReceiveMessages(status)
+                    assignment = (WorkerAssignment(row.role.value if isinstance(row.role, staff.KnownWorkerRole) else "no role",
+                                                   str(run), AssignmentUnrecorded())
+                                  if isinstance(state, worker_panes.ClosedWorker)
+                                  else _worker_assignment(run, _worker_slot(run, row.name, {"staff_id": row.id}, problems),
+                                                          {"staff_id": row.id}, membership))
                     entries.append(RosterEntry(
                         machine=machine, kind="codex" if isinstance(backend, staff.CodexBackend) else "claude",
                         role="worker", name=row.name, status=status, reach=reach,
                         cwd=str(session_staff.worker_directory(membership, row.id)),
                         showrunner=showrunner, director=director,
-                        assignment=_worker_assignment(run, _worker_slot(run, row.name, {"staff_id": row.id}, problems),
-                                                      {"staff_id": row.id}, membership),
+                        assignment=assignment,
                         thread=CodexThread(row.current_session) if isinstance(backend, staff.CodexBackend) else NoCodexThread(),
                         session=ClaudeSession(row.current_session) if isinstance(backend, staff.ClaudeBackend) else NoClaudeSession(),
                         account=_codex_home_account(backend.codex_home) if isinstance(backend, staff.CodexBackend)
@@ -1709,6 +1701,7 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--json", action="store_true", dest="as_json")
     _ = parser.add_argument("--kind", choices=("claude", "codex"))
     _ = parser.add_argument("--here", action="store_true", help="read this machine only")
+    _ = parser.add_argument("--all", action="store_true", help="include closed workers; hide them by default")
     _ = parser.add_argument("--snapshot", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args(argv)
     result = roster(os.environ, ThisMachine() if getattr(arguments, "here", False) is True else AllMachines())
@@ -1717,7 +1710,9 @@ def main(argv: list[str]) -> int:
         return 1 if result.problems else 0
     raw_kind = getattr(arguments, "kind", None)
     kind = raw_kind if raw_kind in ("claude", "codex") else None
-    entries, contexts = _chosen_entries(result.entries, kind)
+    visible = (result.entries if getattr(arguments, "all", False) is True else
+               [entry for entry in result.entries if not (entry.role == "worker" and entry.status == "closed")])
+    entries, contexts = _chosen_entries(visible, kind)
     if getattr(arguments, "as_json", False) is True:
         print(json.dumps({
             "entries": [_serialized_entry(entry) for entry in entries],

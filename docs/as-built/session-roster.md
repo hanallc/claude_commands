@@ -25,8 +25,7 @@ other machine: ssh roster.py --here --snapshot ──►├─► Roster(entries
 
 The roster joins staff, run records, and process evidence.
 Staff supplies each worker's current session, parent, and task role.
-`progress_history.last_dispatch` supplies an addressed reviewer's lens.
-An unavailable lens keeps the worker with a plain `review` label.
+Each worker row shows its plain staff role without a review lens.
 The roster reads no current role from the agents log.
 The [worker design](long-lived-workers.md#staff-membership-and-dispatch) defines stored run fields.
 
@@ -82,11 +81,11 @@ Codex rows:
   The fixed staff id resolves the current thread and parent through one staff snapshot.
   A worker whose backend is Claude appears only as a Claude row.
   The staff row supplies the task role through `KnownWorkerRole`.
-  Dispatch evidence supplies the review lens.
-  A failed lens lookup keeps this worker and later workers in the roster.
+  A review worker shows `review` without a lens lookup.
   An unknown staff role produces an unrecorded assignment without a history fallback.
   Open workers show the native status and pane.
   Other workers show stopped, closed, unknown or incomplete evidence.
+  Closed workers use an unrecorded assignment without a slot or launch-file lookup.
   `session_staff.worker_directory` supplies the working directory.
   Staff parents supply the director and showrunner relationships.
 - **Held Astra role.** `_durable_roles` lists opened roles that have not ended.
@@ -103,7 +102,7 @@ Codex rows:
   Without either descendant, the roster adds no reviewer.
   A known native registry identity supplies its current staff name.
   Other reviewers have an empty name.
-  The assignment remains `review (<lens>)` or `review`.
+  The assignment shows `review`.
 - **freestanding** — each daemon thread that is not a worker's or held role's thread (such a thread is listed once, as the worker or held role).
   A native Codex pane uses its reported session when available.
   Without a report, `native_pane_process(...).current_identity` supplies its thread.
@@ -153,7 +152,11 @@ Codex rows:
 
 ### `roster.py` command
 
-`roster.py [--json] [--kind claude|codex] [--here]`. Without `--here` it reads `AllMachines`: `ssh -o BatchMode=yes <other machine> '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/roster.py" --here --snapshot'`. The command has a 20 s timeout and removes session identity variables. It runs beside the local read and merges entries with this machine first.
+`roster.py [--json] [--kind claude|codex] [--here] [--all]` hides closed workers by default in text and JSON.
+`--all` includes closed workers; library callers and `--snapshot` retain them.
+Without `--here`, the command reads both machines through the existing peer snapshot route.
+The peer command has a 20 s timeout and removes session identity variables.
+It runs beside the local read and merges this machine's entries first.
 
 - **Text** starts each machine's section with its SSH alias (`natedev` or `mac`).
   `send.py --machine` accepts this alias or a host name from `config/machines.conf`, without regard to case.
@@ -226,7 +229,8 @@ A match only in another unit refuses delivery and lists the full paths.
 One selected staff row supplies its `current_session`. Several matching rows produce a named ambiguity error and no delivery.
 The repeat-notice owner follows staff parents to the showrunner. It uses the default owner for a non-staff sender.
 
-A non-staff name uses a unique live roster session. Lookup checks this machine before the peer.
+A staff name takes precedence over registry names, without regard to case.
+Without a staff match, a unique registry name selects a live freestanding Claude row, on this machine before the peer.
 A name without a staff row or live session prints `send.py: no staff row or live session for 'x'`.
 That refusal exits 2. It creates no relay or queue.
 

@@ -94,9 +94,11 @@ class ListPageTests(unittest.TestCase):
             self.assertIn(f'<option value="{value}">{label}</option>', body)
         self.assertIn('<option value="' + OWNER.id + '">sdlc</option>', body)
         self.assertIn('<option value="' + OTHER.id + '">builds</option>', body)
-        for text in ('Latest status', 'Done when', 'Evidence', 'Log · newest first', 'Links', 'Closing words',
-                     'Check overdue', '14:00 EST', '15:00 EST', 'https://example.invalid/proof?x=1&amp;y=2'):
+        for text in ('Latest status', 'Done when', 'Log · newest first', 'Links', 'Closing words',
+                     'Check overdue', '14:00 EST', '15:00 EST'):
             self.assertIn(text, body)
+        self.assertNotIn('<h3>Evidence</h3>', body)
+        self.assertEqual(the_list.load(MORTY.id, items[0].id).evidence, items[0].evidence)
         self.assertEqual(body.count('<form method="post" data-feedback-form>'), 6)
         self.assertEqual(body.count('value="read">Mark read</button>'), 6)
         self.assertEqual([entry.item.number for entry in list_page.records()],
@@ -118,6 +120,45 @@ class ListPageTests(unittest.TestCase):
             self.assertIn('>' + label + '</option>', body)
         _ = (self.root / "staff.json").write_text('{"schema":1,"rows":[]}')
         self.assertEqual(len(list_page.records()), 3)
+
+    def test_feedback_button_belongs_to_the_words_box_and_starts_disabled(self) -> None:
+        item = self.add("Explain this item")
+        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret")
+        actions, words = form.split('</div>', 1)
+        self.assertNotIn('value="tell"', actions)
+        self.assertNotIn('<label for="words-', words)
+        self.assertIn('placeholder="Your words for morty about this item"', words)
+        self.assertIn('aria-label="Your words for morty about this item"', words)
+        self.assertIn('</textarea><div class="list-tell"><span role="status" data-send-status></span>'
+                      + '<button name="action" value="tell" disabled>Tell morty</button></div>', words)
+        self.assertIn("!words.value.trim()", list_page.SCRIPT)
+        self.assertIn("words.addEventListener('input',retain)", list_page.SCRIPT)
+        self.assertIn("buttons.forEach(button=>button.disabled=false);syncTell()", list_page.SCRIPT)
+
+    def test_record_fields_share_the_markdown_formatter(self) -> None:
+        item = self.add("Formatted record")
+        names = (("latest_status", "Status"), ("done_when", "Completion"), ("next_step", "Next"))
+
+        def text(heading: str) -> str:
+            return f"## {heading}\n\n**{heading} field:** Ready.\n- One\n- Two"
+
+        _ = the_list.update(MORTY.id, item.id, {"latest_status": text("Status"), "done_when": text("Completion"),
+            "evidence": text("Evidence"), "next_step": text("Next")}, source="morty")
+        _ = the_list.close(MORTY.id, item.id, "## Closing\n\n**Closing field:** Closed.\n1. First\n2. Second", source="nate")
+        body = list_page.render(self.root / "reviews").decode()
+        next_step = body.split('<td data-label="Next step">', 1)[1].split('</td>', 1)[0]
+        details = body.split('<div class="list-panel"><div>', 1)[1].split('<section><h3>Log · newest first', 1)[0]
+        self.assertNotIn('<h3>Evidence</h3>', details)
+        self.assertNotIn('<h2>Evidence</h2>', details)
+        self.assertEqual(the_list.load(MORTY.id, item.id).evidence, text("Evidence"))
+        for _, heading in (*names, ("closing_words", "Closing")):
+            rendered = next_step if heading == "Next" else details
+            self.assertIn(f'<h2>{heading}</h2>', rendered)
+            self.assertIn(f'<strong>{heading} field:</strong>', rendered)
+            self.assertNotIn('**', rendered)
+            self.assertNotIn('## ', rendered)
+        self.assertIn('<ul><li>One</li><li>Two</li></ul>', details)
+        self.assertIn('<ol><li>First</li><li>Second</li></ol>', details)
 
     def test_bad_records_leave_valid_rows_and_nav_news(self) -> None:
         good = self.add("Valid item")
@@ -262,7 +303,8 @@ class ListPageTests(unittest.TestCase):
             self.assertNotIn("<small>sent to morty,", list_page.render(root).decode())
             good = self.fields(item, "tell", words="Keep it.")
             for body in (urlencode({**good, "token": "bad"}), urlencode(good) + '&id=L2',
-                         urlencode({**good, "words": ""}), urlencode({**good, "action": "unknown"}),
+                         urlencode({**good, "words": ""}), urlencode({**good, "words": " \t\n "}),
+                         urlencode({**good, "action": "unknown"}),
                          urlencode({**good, "action": "park", "until": "2026-02-30"})):
                 with self.subTest(body=body), self.assertRaises(ValueError):
                     _ = list_page.submit(root, body)
@@ -473,7 +515,20 @@ try{
  change('list-search','console','input');
  const selected=visible().find(row=>row.dataset.number==='106');selected.querySelector('.list-toggle').click();
  check(!selected.querySelector('[data-detail]').hidden,'a row opens');
- const words=selected.querySelector('textarea');words.value='Keep my draft';words.dispatchEvent(new Event('input'));
+ const words=selected.querySelector('textarea'),tell=selected.querySelector('[value="tell"]');
+ check(tell.textContent==='Tell morty','the button names its recipient');
+ check(words.placeholder==='Your words for morty about this item' && words.getAttribute('aria-label')===words.placeholder,'the words box has its accessible name');
+ check(!selected.querySelector('label[for="'+words.id+'"]'),'the words box has no repeated visible label');
+ check(!tell.closest('.list-actions') && tell.parentElement.querySelector('[data-send-status]'),'the status stays beside the separate primary button');
+ const wordsRect=words.getBoundingClientRect(),tellRect=tell.getBoundingClientRect();
+ check(tellRect.top>=wordsRect.bottom && Math.abs(tellRect.right-wordsRect.right)<1,'the button sits below the box at its right edge');
+ check(tell.disabled,'empty words disable Tell morty');
+ words.value=' \t\n ';words.dispatchEvent(new Event('input'));
+ check(tell.disabled,'spaces disable Tell morty');
+ const emptyPosts=posts.length;tell.click();check(posts.length===emptyPosts,'empty words cannot send');
+ words.value='x';words.dispatchEvent(new Event('input'));check(!tell.disabled,'typed text enables Tell morty immediately');
+ words.value='';words.dispatchEvent(new Event('input'));check(tell.disabled,'cleared words disable Tell morty immediately');
+ words.value='Keep my draft';words.dispatchEvent(new Event('input'));
  const field=document.querySelector('#list-search');field.focus();field.setSelectionRange(1,3);
  document.body.style.minHeight='2400px';scrollTo(0,100);
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
@@ -484,6 +539,7 @@ try{
  check(document.activeElement.selectionStart===1 && document.activeElement.selectionEnd===3,'refresh keeps the selection');
  check(!refreshed.querySelector('[data-detail]').hidden,'refresh keeps open rows');
  check(refreshed.querySelector('textarea').value==='Keep my draft','refresh keeps feedback words');
+ check(!refreshed.querySelector('[value="tell"]').disabled,'a restored draft enables Tell morty');
  check(scrollY===100,'refresh keeps scroll');
  realFeedback=true;loseResponse=true;
  let retryForm=rows().find(row=>row.dataset.number==='106').querySelector('form');
@@ -501,6 +557,7 @@ try{
  check(posts.at(-1).get('request')===retryId && posts.at(-1).get('token')===retryToken,'the retry uses its original signature');
  retryForm=rows().find(row=>row.dataset.number==='106').querySelector('form');
  check(retryForm.elements.request.value!==retryId,'success clears the saved retry identity');
+ check(retryForm.elements.words.value==='' && retryForm.querySelector('[value="tell"]').disabled,'a successful send clears the box and disables Tell morty');
  realFeedback=false;failRefresh=true;
  const requestIds=[];
  for(const action of ['read','remove','park','tell']){
@@ -509,18 +566,34 @@ try{
   requestIds.push(form.elements.request.value);
   holdPost=action==='tell';
   form.requestSubmit(form.querySelector('[value="'+action+'"]'));
-  if(holdPost){await flush();form.elements.words.value='New draft during send';form.elements.words.dispatchEvent(new Event('input'));finishPost();}
+  if(holdPost){await flush();form.elements.words.value='New draft during send';form.elements.words.dispatchEvent(new Event('input'));
+   check(form.querySelector('[value="tell"]').disabled,'editing words during delivery keeps Tell morty disabled');finishPost();}
   check(form.querySelector('[data-send-status]').textContent===(action==='read' ? 'Saving…' : 'Sending…'),'immediate response '+action);
   await flush();await flush();
   check(posts.at(-1).get('action')===action && posts.at(-1).get('id')==='L106','signed feedback '+action);
   check(posts.at(-1).get('token').length===64,'the form carries its token');
   check(form.elements.request.value!==requestIds.at(-1),'success renews the request without refresh');
-  if(action==='tell') check(form.elements.words.value==='New draft during send','a newer draft survives the send');
+  if(action==='tell'){
+   check(form.elements.words.value==='New draft during send','a newer draft survives the send');
+   check(!form.querySelector('[value="tell"]').disabled,'the newer draft enables Tell morty after delivery');
+  }
   check(!rows().find(row=>row.dataset.number==='106').querySelector('[data-detail]').hidden,'feedback keeps the row open');
  }
  check(new Set(requestIds).size===4,'each new action uses a fresh request');
  location.hash=new URLSearchParams({show:'closed',sort:'#',dir:'desc'});await flush();
  check(visible().length===1 && visible()[0].dataset.number==='54','hash navigation restores the filters');
+
+ for(const target of rows().filter(row=>['Done','Closed'].includes(row.dataset.state) || row.dataset.parked==='true')){
+  location.hash=new URLSearchParams({item:target.dataset.key});await flush();
+  check(!target.hidden && !target.querySelector('[data-detail]').hidden,'an item link shows '+target.dataset.state);
+  check(document.getElementById('list-show').value==='all' && document.getElementById('list-owner').value==='' &&
+    document.getElementById('list-search').value==='','an item link clears filters');
+ }
+ const retained=rows().find(row=>row.dataset.number==='106');
+ location.hash=new URLSearchParams({item:retained.dataset.key,owner:retained.dataset.owner,show:'open',q:'106',sort:'#',dir:'desc'});await flush();
+ check(document.getElementById('list-owner').value===retained.dataset.owner && document.getElementById('list-show').value==='open' &&
+   document.getElementById('list-search').value==='106','an address with an open item keeps its filters');
+ check(!retained.hidden && !retained.querySelector('[data-detail]').hidden,'an address restores its open item');
  check(document.querySelectorAll('[data-feedback-form]').length===6,'each row has feedback controls');
  check(document.documentElement.scrollWidth<=innerWidth,'the page has no horizontal overflow');
  if(innerWidth<960){check(getComputedStyle(visible()[0]).display==='block','a phone row is a card');}

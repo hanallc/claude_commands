@@ -201,6 +201,47 @@ class DetachedRunsTests(unittest.TestCase):
                     _ = detached_runs.live_runs_for_staff(path.parent, frozenset({self.worker_id}))
             self.assertEqual(raised.exception.path, damaged)
 
+    def test_run_folder_errors_remain_unknown_and_list_readers_raise(self) -> None:
+        runs = self.session / detached_runs.DETACHED_RUNS_DIR
+        identities = frozenset({self.worker_id})
+        absent = detached_runs.live_run_evidence_for_staff(runs, identities)
+        self.assertEqual((absent.runs, absent.read_errors), ((), ()))
+        self.assertEqual(detached_runs.live_runs(runs, WORKER), [])
+        self.assertEqual(detached_runs.live_runs_for_staff(runs, identities), [])
+        runs.mkdir()
+        for error in (PermissionError(13, "Permission denied", str(runs)),
+                      NotADirectoryError(20, "Not a directory", str(runs)),
+                      OSError(5, "Input/output error", str(runs))):
+            with (patch("os.scandir", side_effect=error),
+                  patch.object(detached_run_process, "supervisor_records",
+                               return_value=detached_run_process.ProcessTableUnavailable())):
+                with self.subTest(error=type(error).__name__, reader="evidence"):
+                    evidence = detached_runs.live_run_evidence_for_staff(runs, identities)
+                    self.assertEqual(evidence.runs, ())
+                    self.assertEqual(len(evidence.read_errors), 1)
+                    self.assertEqual(evidence.read_errors[0].path, runs)
+                    self.assertIs(evidence.read_errors[0].error, error)
+                for name, reader in (
+                        ("live_runs", lambda: detached_runs.live_runs(runs, WORKER)),
+                        ("live_runs_for_staff", lambda: detached_runs.live_runs_for_staff(runs, identities)),
+                        ("live_runs_in_folders", lambda: detached_runs.live_runs_in_folders({self.session: identities}))):
+                    with self.subTest(error=type(error).__name__, reader=name):
+                        with self.assertRaises(type(error)) as raised:
+                            _ = reader()
+                        self.assertIs(raised.exception, error)
+
+    def test_twin_and_worker_records_require_a_readable_folder(self) -> None:
+        runs = self.session / detached_runs.DETACHED_RUNS_DIR
+        runs.mkdir()
+        error = PermissionError(13, "Permission denied", str(runs))
+        for name, reader in (
+                ("live_twin", lambda: detached_runs.live_twin(runs, WORKER, ["fixture"], "key-1")),
+                ("worker_runs", lambda: detached_runs.worker_runs(runs, WORKER))):
+            with self.subTest(reader=name), patch("os.scandir", side_effect=error):
+                with self.assertRaises(PermissionError) as raised:
+                    _ = reader()
+                self.assertIs(raised.exception, error)
+
     def seat_runs(self, count: int) -> list[Path]:
         """Create live supervisors for distinct runs for the fixture worker."""
         source = self.record(["fixture", "run"])

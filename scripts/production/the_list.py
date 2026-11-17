@@ -457,35 +457,61 @@ def _open(item: ListItem) -> None:
         raise ListError(f"{item.id}: reopen the Closed item before changing it")
 
 
+def _without_evidence_block(evidence: str, start: int, end: int) -> str:
+    before = re.sub(r"(?:\r?\n[ \t]*)+\Z", "", evidence[:start])
+    if not before.strip():
+        before = ""
+    after = re.sub(r"\A(?:[ \t]*\r?\n)+", "", evidence[end:])
+    return before + (("\n\n" if before else "") + after if after.strip() else "")
+
+
+def _without_checkins_copy(evidence: str) -> str:
+    marker = re.search(r"(?m)^Source checkins\.json item:\r?\n", evidence)
+    if marker is None:
+        return evidence
+    tail = evidence[marker.end():]
+    copied_text = tail.lstrip()
+    try:
+        copied, end = cast(tuple[object, int], json.JSONDecoder().raw_decode(copied_text))
+    except ValueError:
+        return evidence
+    if not isinstance(copied, dict) or re.match(r"[ \t]*(?:\r?\n|\Z)", copied_text[end:]) is None:
+        return evidence
+    return _without_evidence_block(evidence, marker.start(), marker.end() + len(tail) - len(copied_text) + end)
+
+
+def _without_row_copy(evidence: str, number: int) -> str:
+    heading = (rf"(?m)^## {number}\. [^\r\n]+\r?\n(?:[ \t]*\r?\n)+"
+               + r"\*\*List state:\*\*[^\r\n]*\r?\n(?:[ \t]*\r?\n)+(?=- \*\*[^*\r\n]+:\*\*)")
+    for match in reversed(list(re.finditer(heading, evidence))):
+        end = match.end()
+        for line in evidence[end:].splitlines(keepends=True):
+            if line.strip() and re.match(r"(?:- \*\*[^*\r\n]+:\*\*|(?: {2,}|\t)[ \t]*\S)", line) is None:
+                break
+            end += len(line)
+        evidence = _without_evidence_block(evidence, match.start(), end)
+    return evidence
+
+
 def clean_evidence(keeper: staff.StaffId, *, source: str) -> tuple[int, int]:
-    """Remove the one-off migration copy from each record's Evidence section."""
+    """Remove migration copies from each record's Evidence section."""
     _line(source, "source")
     store = _store(keeper)
     changed = unchanged = 0
     with store.locked():
         for item in records(keeper, include_closed=True):
-            marker = re.search(r"(?m)^Source checkins\.json item:\r?\n", item.evidence)
-            if marker is None:
+            evidence = _without_checkins_copy(item.evidence)
+            cleaned = _without_row_copy(evidence, item.number)
+            if cleaned == item.evidence:
                 unchanged += 1
                 continue
-            copied_text = item.evidence[marker.end():].lstrip()
-            try:
-                copied, end = cast(tuple[object, int], json.JSONDecoder().raw_decode(copied_text))
-            except ValueError:
-                unchanged += 1
-                continue
-            if not isinstance(copied, dict) or re.match(r"[ \t]*(?:\r?\n|\Z)", copied_text[end:]) is None:
-                unchanged += 1
-                continue
-            evidence = re.sub(r"(?:\r?\n[ \t]*)+\Z", "", item.evidence[:marker.start()])
-            if not evidence.strip():
-                evidence = ""
-            remaining = re.sub(r"\A(?:[ \t]*\r?\n)+", "", copied_text[end:])
-            if remaining.strip():
-                evidence += ("\n\n" if evidence else "") + remaining
             moment = now()
-            entry = ItemChange(moment, "Removed the migration copy of checkins.json from Evidence", source)
-            _save(store, replace(item, evidence=evidence, updated=moment, log=(*item.log, entry)))
+            entries: list[ItemChange] = []
+            if evidence != item.evidence:
+                entries.append(ItemChange(moment, "Removed the migration copy of checkins.json from Evidence", source))
+            if cleaned != evidence:
+                entries.append(ItemChange(moment, "Removed the migration copy of the List row from Evidence", source))
+            _save(store, replace(item, evidence=cleaned, updated=moment, log=(*item.log, *entries)))
             changed += 1
     return changed, unchanged
 

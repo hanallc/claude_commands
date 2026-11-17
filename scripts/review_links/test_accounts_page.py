@@ -42,6 +42,10 @@ class AccountsPageTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     def test_board_draws_the_board_table_with_moves_and_problems(self) -> None:
+        config = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='accounts-board-config-')))
+        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / 'config/accounts.conf', config / 'accounts.conf')
+        _ = (config / 'statusline.conf').write_text('account.claude1=brown\n')
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {'CONF_DIR': str(config)})))
         reading = accounts.StatusReading((status_row("claude1"),), ("* <stale>",), (), timezone.utc, AT,
                                          upcoming_moves=("Upcoming moves:", "units → claude1"))
         markup = accounts_page.board(reading)
