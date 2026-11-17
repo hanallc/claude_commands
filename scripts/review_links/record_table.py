@@ -72,6 +72,20 @@ let linkedItem='';
 let placeHash=location.hash;
 const opened=new Set(),filterNames=options.filters || [],filters={};
 const columns=[...content.querySelectorAll('[data-sort]')].map(button=>button.textContent);
+function filterControl(id,attribute){
+ const control=content.querySelector(id);
+ return {
+  set(value){
+   if(control.matches('select')){control.value=value;return control.value;}
+   control.querySelectorAll('['+attribute+']').forEach(button=>button.setAttribute('aria-pressed',String(button.getAttribute(attribute)===value)));
+   return value;
+  },
+  bind(change){
+   if(control.matches('select')) control.addEventListener('change',event=>change(event.target.value));
+   else control.querySelectorAll('['+attribute+']').forEach(button=>button.addEventListener('click',()=>change(button.getAttribute(attribute))));
+  }
+ };
+}
 function place(){
  placeHash=location.hash;
  const params=new URLSearchParams(location.search);
@@ -105,28 +119,34 @@ function compare(a,b){
  if(Array.isArray(a)) return a[0]-b[0] || compare(a[1],b[1]);
  return typeof a==='number' ? a-b : a.localeCompare(b,undefined,{numeric:true,sensitivity:'base'});
 }
+function isSelected(item){return !keys.size || keys.has(item.dataset.key);}
 function matches(item,selection={}){
- return (!keys.size || keys.has(item.dataset.key)) &&
+ return isSelected(item) &&
   options.visible(item.dataset,{owner,show,query:query.trim().toLowerCase(),type,sourceOwner,keys,filters:{...filters},...selection});
 }
-function apply(write=true,{dismissMissingItem=false}={}){
- owner=options.resolveOwner?.(owner) ?? owner;
- content.querySelector('#list-owner').value=owner;content.querySelector('#list-show').value=show;
- content.querySelector('#list-search').value=query;
- for(const name of filterNames){
-  const menu=content.querySelector('#list-'+name);menu.value=filters[name];if(menu.value!==filters[name]) filters[name]='';
- }
+function apply(write=true,{dismissMissingItem=false,pushPlace=false}={}){
  const items=[...content.querySelectorAll('[data-list-item]')];
- const available=new Set(items.map(item=>item.dataset.key));
- if(linkedItem && !available.has(linkedItem)){
+ const hasKey=options.hasKey ?? (key=>items.some(item=>item.dataset.key===key));
+ const missingLinkedItem=linkedItem!=='' && !hasKey(linkedItem);
+ if(missingLinkedItem){
   keys.delete(linkedItem);
   opened.delete(linkedItem);
   if(dismissMissingItem) linkedItem='';
  }
- const selected=item=>!keys.size || keys.has(item.dataset.key);
+ const previousOwner=owner;
+ owner=options.resolveOwner?.(owner) ?? owner;
+ const search=query.trim().toLowerCase();
+ owner=options.selectOwner?.({owner,type,query:search,keys}) ?? owner;
+ if(previousOwner && !owner) sourceOwner='';
+ filterControl('#list-owner','data-owner-chip').set(owner);
+ filterControl('#list-show','data-show-chip').set(show);
+ content.querySelector('#list-search').value=query;
+ for(const name of filterNames)
+  filters[name]=filterControl('#list-'+name,'data-'+name+'-chip').set(filters[name]);
  const column=columns.indexOf(sort);
  items.sort((a,b)=>column<0 ? Number(a.dataset.order)-Number(b.dataset.order) :
-  (compare(JSON.parse(a.dataset.sortValues)[column],JSON.parse(b.dataset.sortValues)[column]) ||
+  (compare((options.sortValues?.(a.dataset) ?? JSON.parse(a.dataset.sortValues))[column],
+           (options.sortValues?.(b.dataset) ?? JSON.parse(b.dataset.sortValues))[column]) ||
    Number(a.dataset.order)-Number(b.dataset.order))*(direction==='desc' ? -1 : 1));
  const table=content.querySelector('table');let count=0;
  items.forEach(item=>{
@@ -141,22 +161,29 @@ function apply(write=true,{dismissMissingItem=false}={}){
   button.parentElement.setAttribute('aria-sort',active ? direction==='desc' ? 'descending' : 'ascending' : 'none');
   button.querySelector('[data-sort-mark]').textContent=active ? direction==='desc' ? ' ↓' : ' ↑' : '';
  });
- const missing=[...keys].filter(key=>!available.has(key));
  const empty=content.querySelector('[data-empty]');
+ const missing=[...keys].filter(key=>!hasKey(key));
  let notice=content.querySelector('[data-missing-keys]');
- if(!notice){notice=document.createElement('p');notice.dataset.missingKeys='';notice.setAttribute('role','status');empty.after(notice);}
- notice.textContent=missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n');
- notice.hidden=!missing.length;empty.hidden=count>0 || missing.length>0;
+ if(missing.length || notice || options.missingItem){
+  if(!notice){
+   notice=document.createElement('p');notice.dataset.missingKeys='';notice.setAttribute('role','status');
+   empty.after(notice);
+  }
+  notice.textContent=missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n');
+  notice.hidden=!missing.length;
+ }
+ empty.hidden=count>0 || missing.length>0;
  const missingItem=content.querySelector('[data-missing-item]');
  if(missingItem){
-  const message=linkedItem && !available.has(linkedItem) ? options.missingItem(linkedItem) : '';
+  const message=linkedItem && missingLinkedItem ? options.missingItem(linkedItem) : '';
   missingItem.textContent=message;
   missingItem.hidden=!message;
  }
- const selection=items.filter(selected);
- content.querySelector('[data-list-count]').textContent=options.counts(selection,count,{keys});
- options.applied?.(selection,{owner,show,query,type,keys});
- if(write) writePlace();
+ const selection=keys.size ? items.filter(isSelected) : items;
+ const countLine=content.querySelector('[data-list-count]');
+ if(countLine) countLine.textContent=options.counts(selection,count,{show,keys});
+ options.applied?.(selection,{owner,show,query:search,type,sourceOwner,keys});
+ if(write || owner!==previousOwner) writePlace(pushPlace);
 }
 function writePlace(push=false){
  const place=new URLSearchParams({owner,show,q:query,sort,dir:direction,...(type ? {type} : {}),...(sourceOwner ? {'source-owner':sourceOwner} : {}),
@@ -197,8 +224,7 @@ function jump(key){
   if(options.single) opened.clear();
   opened.add(key);
  }
- apply(false);
- writePlace(true);
+ apply(true,{pushPlace:true});
  if(!target){
   content.querySelector('[data-missing-item]')?.scrollIntoView({block:'nearest',behavior:'instant'});
   return;
@@ -221,10 +247,10 @@ function bind(){
   event.preventDefault();
   jump(key);
  });
- content.querySelector('#list-owner').addEventListener('change',event=>{owner=event.target.value;sourceOwner='';changePlace();});
- content.querySelector('#list-show').addEventListener('change',event=>{show=event.target.value;changePlace();});
+ filterControl('#list-owner','data-owner-chip').bind(value=>{if(value===owner) return;owner=value;sourceOwner='';changePlace();});
+ filterControl('#list-show','data-show-chip').bind(value=>{if(value===show) return;show=value;changePlace();});
  for(const name of filterNames)
-  content.querySelector('#list-'+name).addEventListener('change',event=>{filters[name]=event.target.value;changePlace();});
+  filterControl('#list-'+name,'data-'+name+'-chip').bind(value=>{filters[name]=value;changePlace();});
  content.querySelector('#list-search').addEventListener('input',event=>{query=event.target.value;changePlace();});
  content.querySelectorAll('[data-sort]').forEach(button=>button.addEventListener('click',()=>{
   const selected=columns[Number(button.dataset.sort)];direction=sort===selected && direction==='asc' ? 'desc' : 'asc';
