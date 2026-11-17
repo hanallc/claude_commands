@@ -1,8 +1,6 @@
 """Independent tools, state and process cleanup for verify token tests."""
 from __future__ import annotations
 
-from scripts.build_queue import admission_records
-
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from dataclasses import replace
@@ -11,7 +9,6 @@ from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.lint.memory_test_support import config_environment, write_pressure_reading, write_config_fixture
 
-from collections.abc import Callable
 
 import json
 import os
@@ -381,41 +378,8 @@ esac
         wait_until(lambda: path.exists() or process.poll() is not None, path.parent, processes=(process,))
         self.assertTrue(path.exists(), "verify never reached its expected state")
 
-    def defer_memory_waiter_for_peer(self) -> Callable[[], None]:
-        """Keep the first waiter held while a peer uses the same host reading."""
-        admission = caller_admission(self, self.root, self.environment)
-        with admission.loop_turn():
-            waiting, = admission.server.waiters.values()
-            episode = waiting.request.episode
-            submitted = admission.server.placement_requests[episode]
-            deferred = replace(submitted.profile, peak=replace(submitted.profile.peak, bytes=60 * admission_records.GIB))
-            admission.server.placement_requests[episode] = replace(submitted, profile=deferred)
-            admission.free(48 * admission_records.GIB)
-        previous = admission.server.handle_request
-        paused = True
-
-        def handle(request: wire.Request,
-                   connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
-            if paused and isinstance(request, wire.PlacementRequest) and request.episode == episode:
-                request = replace(request, profile=deferred)
-            return previous(request, connection)
-
-        _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=handle))
-
-        def resume() -> None:
-            nonlocal paused
-            if not paused:
-                return
-            with admission.loop_turn():
-                paused = False
-                admission.server.placement_requests[episode] = submitted
-                admission.free(48 * admission_records.GIB)
-
-        self.addCleanup(resume)
-        return resume
-
     def start_memory_waiter(self, environment: dict[str, str], errors: Path) -> subprocess.Popen[bytes]:
-        """Start a verify that takes the token and then waits on the held meminfo.
+        """Start a verify that waits on the held meminfo without the token.
 
         verify.sh tees its step output to stdout, so both streams go to `errors`.
         """
@@ -462,7 +426,7 @@ esac
                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def hold_environment(self, board: Path, wait_status: int) -> dict[str, str]:
-        """Add a private hold after the first local prerequisite report."""
+        """Add a private hold at the first placement request."""
         admission = caller_admission(self, self.root, self.environment)
         holds = self.root / "build-hold"
         holds.mkdir(exist_ok=True)
@@ -485,7 +449,8 @@ esac
                 "VERIFY_MAC_RUNNER": str(runner), "TEST_MAC_EVENTS": str(self.root / "mac-events")})
 
         def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
-            if released.exists():
+            # In the Mac case the natedev hold stays, so only the freed Mac can take the step.
+            if released.exists() and wait_status != 75:
                 hold.unlink(missing_ok=True)
             evidence = original_provider(key)
             if key.destination.provider == "mac":
@@ -498,7 +463,7 @@ esac
                    connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
             nonlocal held_episode
             if isinstance(request, (wire.PlacementRequest, wire.PrerequisiteReport)):
-                if not held_episode and isinstance(request.prerequisite, placement.TokenHeld):
+                if not held_episode:
                     held_episode = request.episode
                     _ = hold.write_text("private hold")
                     for reader in admission.server.host_readers.values():

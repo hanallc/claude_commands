@@ -213,7 +213,7 @@ buildlog_release_memory() {
             finish_args+=(--reason "execution token ownership changed")
         fi
         if [[ -s "${HOLD_WAIT_DIR:-/nonexistent}/token-lost" ]]; then
-            finish_args+=(--token required)
+            finish_args+=(--token after-grant)
         fi
         buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" "${finish_args[@]}" >/dev/null 2>&1 || true
         BUILDLOG_MEM_PRELAUNCH_REASON=""
