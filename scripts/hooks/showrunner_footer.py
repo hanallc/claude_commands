@@ -106,7 +106,7 @@ def open_questions(productions: list[Production], *, identities: QuestionStaff |
             print(f"questions: unavailable — {production.doc}: no showrunner staff row", file=sys.stderr)
             continue
         try:
-            items = review_items.read_kind(review_items.ReviewType.QUESTION, owner, identities.record)
+            items = review_items.read_kind(review_items.ReviewType.QUESTION, owner, identities.record, show='open')
             count += review_items.count_items(items, datetime.now(ZoneInfo(production.zone)), source)
         except (InputError, OSError, ValueError, RegistrationFailure, staff.StaffRefused) as error:
             print(f"questions: unavailable — {error}", file=sys.stderr)

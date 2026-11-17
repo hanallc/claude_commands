@@ -1,12 +1,13 @@
 """Find proposal stores and join their proposers to the production's staff members."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 
 from scripts.production import staff, unit_lookup
 from scripts.production import showrunner_tree
-from scripts.production.issues import Issue, open_issues
+from scripts.production.issues import ALL_FIELDS, Issue, open_issues
 # Callers such as rename read the tag here.
 from scripts.production.issues import PROPOSAL_TAG as PROPOSAL_TAG
 from scripts.production.production_doc import Refusal, production_field
@@ -73,12 +74,13 @@ def proposer(issue: Issue) -> str:
     return issue.value("proposed_by")
 
 
-def proposal_issues(doc: Path, *, sources: list[Path] | None = None) -> list[Issue]:
+def proposal_issues(doc: Path, *, sources: list[Path] | None = None,
+                    select: Callable[[Issue], bool] | None = None, keys: frozenset[str] = ALL_FIELDS) -> list[Issue]:
     """The open proposal issues in the production's folder, of any proposer."""
     folder = issues_folder(doc)
     if folder is None or (sources is None and not folder.is_dir()):
         return []
-    return [issue for issue in open_issues(folder, PROPOSAL_TAG, sources=sources) if issue.value("record_type") != "question"]
+    return [issue for issue in open_issues(folder, PROPOSAL_TAG, sources=sources, select=select, keys=keys | {"record_type"}) if issue.value("record_type") != "question"]
 
 
 def open_proposals(doc: Path, *, sources: list[Path] | None = None) -> list[Issue]:

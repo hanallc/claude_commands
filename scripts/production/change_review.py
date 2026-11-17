@@ -983,7 +983,7 @@ def _routed_review_entries(path: Path, doc: Path, below: bool, record: staff.Sta
         _ = listed.setdefault(source.absolute(), ProductionReviewList(source, _owner(source)))
     documents = {row.name: row.doc.path for row in record.find(kind="showrunner")
                  if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))}
-    snapshots = _review_snapshots(listed, sources=sources)
+    snapshots = _review_snapshots(listed, sources=sources, include_reviewed=False)
     documents = change_routing.production_documents(documents,
         ((listed[source].default_production, snapshot.text) for source, snapshot in snapshots.items()))
     routing = change_routing.StaffRouting(record, documents, sources=sources)
@@ -1699,24 +1699,55 @@ class ReviewListSnapshot:
     text: str
     pending: list[dict[str, str]]
     reviewed: list[dict[str, str]]
+    owner_rows: list[dict[str, str]] = field(default_factory=list)
 
 
-def review_snapshot(path: Path) -> ReviewListSnapshot:
-    text = read(path)
+def review_snapshot(path: Path, *, include_reviewed: bool = True, collect_owners: bool = False) -> ReviewListSnapshot:
+    """Read selected tables and retain only owner fields from excluded history."""
+    owner_rows: list[dict[str, str]] = []
+    if include_reviewed or not path.exists():
+        text = read(path)
+    else:
+        lines: list[str] = []
+        reviewed = False
+        columns: list[str] = []
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                if line.strip() == REVIEWED:
+                    reviewed = True
+                    lines.append(line)
+                    continue
+                if not reviewed:
+                    lines.append(line)
+                elif line.startswith("| # |"):
+                    columns = _cells(line)
+                    lines.append(line)
+                elif line.startswith("| ---"):
+                    lines.append(line)
+                elif columns and line.startswith("| "):
+                    cells = _cells(line)
+                    owner = {column:_plain(value) for column,value in zip(columns,cells)
+                             if column in ("#", "Producer", "Production", "Verdict")}
+                    if collect_owners:
+                        owner_rows.append(owner)
+                    if not owner.get("Verdict"):
+                        lines.append(line)
+        text = "".join(lines)
     lines = text.splitlines(keepends=True)
     pending = _review_table(path, lines, SECTION)
-    reviewed = _review_table(path, lines, REVIEWED) if any(line.strip() == REVIEWED for line in lines) else []
-    return ReviewListSnapshot(text, pending, reviewed)
+    history = _review_table(path, lines, REVIEWED) if any(line.strip() == REVIEWED for line in lines) else []
+    return ReviewListSnapshot(text, pending, history, owner_rows)
 
 
-def _review_snapshots(paths: Iterable[Path], *, sources: list[Path] | None = None) -> dict[Path, ReviewListSnapshot]:
+def _review_snapshots(paths: Iterable[Path], *, sources: list[Path] | None = None,
+                      include_reviewed: bool = True) -> dict[Path, ReviewListSnapshot]:
     """Report unreadable lists once. A source collector requires complete reads."""
     snapshots: dict[Path, ReviewListSnapshot] = {}
     for path in paths:
         if sources is not None:
             sources.append(path)
         try:
-            snapshots[path] = review_snapshot(path)
+            snapshots[path] = review_snapshot(path) if include_reviewed else review_snapshot(path, include_reviewed=False)
         except (ChangeReviewError, OSError, UnicodeError) as error:
             if sources is not None:
                 raise ValueError(str(error)) from error

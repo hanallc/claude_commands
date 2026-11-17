@@ -964,17 +964,18 @@ class AttachedListTest(unittest.TestCase):
         self.assertIn(str(self.current), errors.getvalue())
 
     def test_a_collector_retains_unreadable_lists_while_default_readers_skip_them(self) -> None:
-        read_text = Path.read_text
+        open_path = Path.open
 
-        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        def read(path: Path, mode: str = "r", buffering: int = -1, encoding: str | None = None,
+                 errors: str | None = None, newline: str | None = None) -> TextIO:
             if path == self.current:
                 raise PermissionError(f"{path}: unreadable")
-            return read_text(path, encoding=encoding, errors=errors)
+            return cast(TextIO, open_path(path, mode, buffering, encoding, errors, newline))
 
         record = staff.snapshot()
         errors = io.StringIO()
         sources: list[Path] = []
-        with mock.patch.object(Path, "read_text", read), redirect_stderr(errors):
+        with mock.patch.object(Path, "open", read), redirect_stderr(errors):
             routed = change_review.routed_review_entries(self.current, self.doc, record=record)
             with self.assertRaises(ValueError) as raised:
                 _ = change_review.routed_review_entries(self.current, self.doc, record=record, sources=sources)

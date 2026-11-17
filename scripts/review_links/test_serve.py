@@ -96,6 +96,15 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(reply.content_type, content_type)
                 self.assertEqual(reply.body.decode("utf-8"), text)
 
+    def test_review_request_passes_the_selected_show_view(self) -> None:
+        for query, show in (('', 'open'), ('?show=Done', 'Done'), ('?show=all', 'all'),
+                            ('?show=For+you', 'For you'), ('?show=Waiting', 'Waiting')):
+            with self.subTest(show=show), patch.object(review_page, 'render', return_value=b'Review') as render:
+                reply = self.request('/console/review.html'+query)
+                self.assertEqual(reply.status, 200)
+                self.assertEqual(reply.body, b'Review')
+                render.assert_called_once_with(self.root, show=show)
+
     def test_other_text_files_are_readable_as_utf8(self) -> None:
         text = "a report with no standard text extension — café\n"
         _ = (self.root / "report.log").write_text(text, encoding="utf-8")
