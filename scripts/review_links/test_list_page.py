@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -18,9 +19,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlencode
+from uuid import uuid4
 
 from scripts.agents.remote import local_machine
 from scripts.lib import conf
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import change_review, change_routing, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page
@@ -93,8 +97,8 @@ class ListPageTests(unittest.TestCase):
         for text in ('Latest status', 'Done when', 'Evidence', 'Log · newest first', 'Links', 'Closing words',
                      'Check overdue', '14:00 EST', '15:00 EST', 'https://example.invalid/proof?x=1&amp;y=2'):
             self.assertIn(text, body)
-        self.assertNotIn('<form', body)
-        self.assertNotIn('Mark read</button>', body)
+        self.assertEqual(body.count('<form method="post" data-feedback-form>'), 6)
+        self.assertEqual(body.count('value="read">Mark read</button>'), 6)
         self.assertEqual([entry.item.number for entry in list_page.records()],
                          [item.number for item in sorted(the_list.records(MORTY.id, include_closed=True), key=the_list.order)])
         closed = body.split(f'data-key="{MORTY.id}/L54"', 1)[1].split('</tbody>', 1)[0]
@@ -216,6 +220,176 @@ class ListPageTests(unittest.TestCase):
         self.assertNotIn("proposals", body)
         self.assertNotIn("efficiencies", body)
 
+    def fields(self, item: the_list.ListItem, action: str, **changes: str) -> dict[str, str]:
+        request = uuid4().hex
+        return {"keeper": MORTY.id, "id": item.id, "request": request,
+                "token": list_page.request_token(self.root / "reviews", MORTY.id, item.id, request),
+                "action": action, "words": "", "until": "", **changes}
+
+    def test_signed_feedback_logs_words_and_uses_the_shared_sender(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("The feedback row", number=106)
+        initial = item
+        with patch.object(change_page, "send_to_staff") as send:
+            delivery = list_page.submit(root, urlencode(self.fields(item, "read")))
+            list_page.deliver(delivery)
+            send.assert_not_called()
+            item = the_list.load(MORTY.id, item.id)
+            self.assertIs(item.unread_since, the_list.NoTimestamp.UNSET)
+            self.assertEqual(item.log[-1].what, "Marked read")
+            for action, extra, words in (("remove", {}, "Remove 106"),
+                    ("park", {"until": "2026-12-03"}, "Park 106 until 2026-12-03"),
+                    ("tell", {"words": "Explain this simply.\nKeep these words."}, "Explain this simply.\nKeep these words.")):
+                with self.subTest(action=action):
+                    fields = self.fields(item, action, **extra)
+                    delivery = list_page.submit(root, urlencode(fields))
+                    item = the_list.load(MORTY.id, item.id)
+                    self.assertIn(json.dumps(words), item.log[-1].what)
+                    self.assertEqual(the_list.sent_to_morty(item), NOW)
+                    body = list_page.render(root).decode()
+                    self.assertIn("sent to morty, 13:00 EST", body)
+                    self.assertIn('data-feedback-form', body)
+                    list_page.deliver(delivery)
+                    self.assertEqual(send.call_args.args[0], MORTY.id)
+                    self.assertIn("nate's words for item 106\n" + words, cast(str, send.call_args.args[2]))
+                    item = the_list.load(MORTY.id, item.id)
+                    before = send.call_count, item.log
+                    list_page.deliver(list_page.submit(root, urlencode(fields)))
+                    self.assertEqual((send.call_count, the_list.load(MORTY.id, item.id).log), before)
+            self.assertEqual(item.state, initial.state)
+            self.assertEqual(item.parked_until, initial.parked_until)
+            _ = the_list.update(MORTY.id, item.id, {"latest_status": "Morty acts."}, source="morty")
+            self.assertNotIn("<small>sent to morty,", list_page.render(root).decode())
+            good = self.fields(item, "tell", words="Keep it.")
+            for body in (urlencode({**good, "token": "bad"}), urlencode(good) + '&id=L2',
+                         urlencode({**good, "words": ""}), urlencode({**good, "action": "unknown"}),
+                         urlencode({**good, "action": "park", "until": "2026-02-30"})):
+                with self.subTest(body=body), self.assertRaises(ValueError):
+                    _ = list_page.submit(root, body)
+
+    def test_feedback_recovers_after_restart_and_alerts_after_failed_tries(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Recover the message")
+        _ = list_page.submit(root, urlencode(self.fields(item, "tell", words="Ask sdlc for an ETA.")))
+        saved = the_list.load(MORTY.id, item.id)
+        with (patch.object(change_page, "send_to_staff") as send,
+              patch.object(change_review, "lists_directory", return_value=self.root / "lists")):
+            list_page.recover_pending()
+            send.assert_called_once()
+            self.assertIn("Ask sdlc for an ETA.", cast(str, send.call_args.args[2]))
+            list_page.recover_pending()
+            send.assert_called_once()
+        self.assertEqual(the_list.feedback_requests(the_list.load(MORTY.id, item.id)),
+                         {key: replace(value, state="sent") for key, value in the_list.feedback_requests(saved).items()})
+        delivery = list_page.submit(root, urlencode(self.fields(item, "remove")))
+        def fail_message(recipient: staff.StaffId, _sender: str, _message: str) -> None:
+            if recipient == MORTY.id:
+                raise RuntimeError("fixture offline")
+        with (patch.object(change_page, "send_to_staff", side_effect=fail_message) as send,
+              patch.object(time, "sleep"), redirect_stderr(io.StringIO())):
+            list_page.deliver(delivery)
+            tries = conf.read("review_links").whole("delivery_tries")
+            self.assertEqual(send.call_count, tries + 1)
+            self.assertIn("List feedback needs attention", cast(str, send.call_args.args[2]))
+            self.assertIn("Remove 1", cast(str, send.call_args.args[2]))
+            self.assertEqual(send.call_args.args[0], OWNER.id)
+            list_page.recover_pending()
+            list_page.deliver(delivery)
+            self.assertEqual(send.call_count, tries + 1)
+            alerted = the_list.load(MORTY.id, item.id)
+            latest = tuple(the_list.feedback_requests(alerted).values())[-1]
+            self.assertEqual((latest.state, latest.alerted_to), ("alerted", "sdlc"))
+            self.assertIn("not sent; sdlc told", list_page.render(root).decode())
+            _ = the_list.update(MORTY.id, item.id, {"latest_status": "Alert handled"}, source="morty")
+            self.assertNotIn("not sent; sdlc told", list_page.render(root).decode())
+        self.assertEqual(the_list.load(MORTY.id, item.id).state, item.state)
+
+    def test_failed_alert_keeps_feedback_pending_for_post_and_startup_retries(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Retry when the alert fails")
+        fields = self.fields(item, "tell", words="Keep trying until someone receives this.")
+        delivery = list_page.submit(root, urlencode(fields))
+        pending = the_list.load(MORTY.id, item.id)
+        with (patch.object(change_page, "send_to_staff", side_effect=RuntimeError("all sends fail")) as send,
+              patch.object(time, "sleep"), redirect_stderr(io.StringIO())):
+            list_page.deliver(delivery)
+            tries = conf.read("review_links").whole("delivery_tries")
+            self.assertEqual(send.call_count, tries + 1)
+            self.assertEqual(the_list.feedback_requests(the_list.load(MORTY.id, item.id))[fields["request"]].state, "pending")
+            self.assertNotIn("not sent; sdlc told", list_page.render(root).decode())
+            list_page.deliver(list_page.submit(root, urlencode(fields)))
+            self.assertEqual(send.call_count, 2 * (tries + 1))
+            list_page.recover_pending()
+            self.assertEqual(send.call_count, 3 * (tries + 1))
+            self.assertEqual(the_list.load(MORTY.id, item.id), pending)
+        with patch.object(change_page, "send_to_staff") as send:
+            list_page.deliver(list_page.submit(root, urlencode(fields)))
+            send.assert_called_once()
+            list_page.recover_pending()
+            send.assert_called_once()
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].state, "sent")
+
+    def test_feedback_save_failures_leave_recoverable_requests_only(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Save before sending")
+        for published in (False, True):
+            with self.subTest(published=published):
+                fields = self.fields(item, "tell", words="Keep these words.")
+                original = the_list.save_feedback
+                def failed_save(keeper: staff.StaffId, identity: str, feedback: the_list.PageFeedback) -> the_list.PageFeedback:
+                    if published:
+                        _ = original(keeper, identity, feedback)
+                    raise OSError("fixture save failed")
+                with patch.object(the_list, "save_feedback", side_effect=failed_save):
+                    with self.assertRaisesRegex(OSError, "fixture save failed"):
+                        _ = list_page.submit(root, urlencode(fields))
+                saved = the_list.load(MORTY.id, item.id)
+                self.assertEqual(isinstance(the_list.sent_to_morty(saved), datetime), published)
+                self.assertEqual(fields["request"] in the_list.feedback_requests(saved), published)
+                with patch.object(change_page, "send_to_staff") as send:
+                    if published:
+                        list_page.deliver(list_page.submit(root, urlencode(fields)))
+                        send.assert_called_once()
+                    list_page.recover_pending()
+                    list_page.recover_pending()
+                    self.assertEqual(send.call_count, int(published))
+                    if published:
+                        list_page.deliver(list_page.submit(root, urlencode(fields)))
+                        self.assertEqual(send.call_count, 1)
+                if published:
+                    item = the_list.update(MORTY.id, item.id, {"latest_status": "Recorded"}, source="morty")
+
+    def test_feedback_claim_releases_the_list_lock_during_delivery(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Send without blocking edits")
+        other = self.add("Mark this item read")
+        delivery = list_page.submit(root, urlencode(self.fields(item, "tell", words="Keep these words.")))
+        entered, release = threading.Event(), threading.Event()
+        def send(_recipient: staff.StaffId, _sender: str, _message: str) -> None:
+            entered.set()
+            if not release.wait(TEST_HANG_GUARD_SECS):
+                raise RuntimeError("the test did not release delivery")
+        def edit_items() -> None:
+            _ = the_list.update(MORTY.id, item.id, {"latest_status": "Morty edited during delivery"}, source="morty")
+            _ = the_list.mark_read(MORTY.id, other.id, source=the_list.PAGE_SOURCE)
+        with patch.object(change_page, "send_to_staff", side_effect=send) as sends, ThreadPoolExecutor(max_workers=2) as pool:
+            sending = pool.submit(list_page.deliver, delivery)
+            try:
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                list_page.deliver(delivery)
+                edited = pool.submit(edit_items)
+                edited.result(TEST_HANG_GUARD_SECS)
+                self.assertIs(the_list.load(MORTY.id, other.id).unread_since, the_list.NoTimestamp.UNSET)
+                self.assertEqual(sends.call_count, 1)
+            finally:
+                release.set()
+            sending.result(TEST_HANG_GUARD_SECS)
+        current = the_list.load(MORTY.id, item.id)
+        self.assertEqual(current.latest_status, "Morty edited during delivery")
+        self.assertEqual(tuple(the_list.feedback_requests(current).values())[-1].state, "sent")
+        self.assertIs(the_list.sent_to_morty(current), the_list.NoTimestamp.UNSET)
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_shared_page_status_uses_the_real_list_loader(self) -> None:
         _ = self.fixture_items()
@@ -228,13 +402,34 @@ class ListPageTests(unittest.TestCase):
 
     def browser(self, markup: str) -> None:
         setup = r'''<script>
-const nativeFetch=fetch, nativeTimeout=setTimeout, errors=[], reads=[];
-const original=MARKUP;
+const nativeFetch=fetch, nativeTimeout=setTimeout, errors=[], reads=[],posts=[];
+let original=MARKUP,holdPost=false,finishPost,failRefresh=false,realFeedback=false,loseResponse=false;
 window.setInterval=()=>0;window.clearInterval=()=>{};
-window.fetch=async()=>{reads.push(1);return {ok:true,status:200,text:async()=>original};};
+window.fetch=async(_path,options={})=>{
+ if(options.method==='POST'){
+  const fields=new URLSearchParams(options.body);posts.push(fields);
+  if(realFeedback){
+   const result=await nativeFetch('/feedback',options);
+   if(loseResponse){loseResponse=false;throw new Error('fixture lost response');}
+   return result;
+  }
+  if(fields.get('action')==='read'){
+   const page=new DOMParser().parseFromString(original,'text/html');
+   const row=[...page.querySelectorAll('[data-list-item]')].find(row=>row.dataset.number==='106');
+   row.dataset.unread='false';row.querySelector('.list-dot')?.remove();row.querySelector('[value="read"]')?.remove();
+   original=page.documentElement.outerHTML;
+  }
+  const result={ok:true,status:200,json:async()=>({state:'sent',request:String(posts.length).padStart(32,'0'),token:'b'.repeat(64)})};
+  if(holdPost) return await new Promise(resolve=>finishPost=()=>resolve(result));
+  return result;
+ }
+ reads.push(1);if(failRefresh) throw new Error('fixture refresh failed');
+ if(realFeedback) return await nativeFetch('/fresh');
+ return {ok:true,status:200,text:async()=>original};
+};
 addEventListener('error',event=>errors.push(event.message));
 addEventListener('unhandledrejection',event=>errors.push(String(event.reason)));
-</script>'''.replace('MARKUP', json.dumps(markup).replace('</', '<\\/'))
+</script>'''
         probe = r'''<script>
 (async()=>{
 const failed=[],check=(ok,text)=>{if(!ok) failed.push(text);};
@@ -271,6 +466,7 @@ try{
  change('list-search','console','input');
  const selected=visible().find(row=>row.dataset.number==='106');selected.querySelector('.list-toggle').click();
  check(!selected.querySelector('[data-detail]').hidden,'a row opens');
+ const words=selected.querySelector('textarea');words.value='Keep my draft';words.dispatchEvent(new Event('input'));
  const field=document.querySelector('#list-search');field.focus();field.setSelectionRange(1,3);
  document.body.style.minHeight='2400px';scrollTo(0,100);
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
@@ -280,10 +476,45 @@ try{
  check(document.activeElement.id==='list-search','refresh keeps focus');
  check(document.activeElement.selectionStart===1 && document.activeElement.selectionEnd===3,'refresh keeps the selection');
  check(!refreshed.querySelector('[data-detail]').hidden,'refresh keeps open rows');
+ check(refreshed.querySelector('textarea').value==='Keep my draft','refresh keeps feedback words');
  check(scrollY===100,'refresh keeps scroll');
+ realFeedback=true;loseResponse=true;
+ let retryForm=rows().find(row=>row.dataset.number==='106').querySelector('form');
+ retryForm.elements.words.value='Deliver this feedback once';retryForm.elements.words.dispatchEvent(new Event('input'));
+ const retryId=retryForm.elements.request.value,retryToken=retryForm.elements.token.value,startPosts=posts.length;
+ retryForm.requestSubmit(retryForm.querySelector('[value="tell"]'));
+ await flush();await flush();await flush();await flush();
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await flush();await flush();
+ retryForm=rows().find(row=>row.dataset.number==='106').querySelector('form');
+ check(retryForm.elements.request.value===retryId && retryForm.elements.token.value===retryToken,'refresh keeps the failed request identity');
+ retryForm.requestSubmit(retryForm.querySelector('[value="tell"]'));
+ await flush();await flush();await flush();await flush();
+ check(posts.length===startPosts+2,'the lost response has one retry');
+ check(posts.at(-1).get('request')===retryId && posts.at(-1).get('token')===retryToken,'the retry uses its original signature');
+ retryForm=rows().find(row=>row.dataset.number==='106').querySelector('form');
+ check(retryForm.elements.request.value!==retryId,'success clears the saved retry identity');
+ realFeedback=false;failRefresh=true;
+ const requestIds=[];
+ for(const action of ['read','remove','park','tell']){
+  const row=rows().find(row=>row.dataset.number==='106'),form=row.querySelector('form');
+  form.elements.until.value='2026-12-03';form.elements.words.value='Explain this simply';
+  requestIds.push(form.elements.request.value);
+  holdPost=action==='tell';
+  form.requestSubmit(form.querySelector('[value="'+action+'"]'));
+  if(holdPost){await flush();form.elements.words.value='New draft during send';form.elements.words.dispatchEvent(new Event('input'));finishPost();}
+  check(form.querySelector('[data-send-status]').textContent===(action==='read' ? 'Saving…' : 'Sending…'),'immediate response '+action);
+  await flush();await flush();
+  check(posts.at(-1).get('action')===action && posts.at(-1).get('id')==='L106','signed feedback '+action);
+  check(posts.at(-1).get('token').length===64,'the form carries its token');
+  check(form.elements.request.value!==requestIds.at(-1),'success renews the request without refresh');
+  if(action==='tell') check(form.elements.words.value==='New draft during send','a newer draft survives the send');
+  check(!rows().find(row=>row.dataset.number==='106').querySelector('[data-detail]').hidden,'feedback keeps the row open');
+ }
+ check(new Set(requestIds).size===4,'each new action uses a fresh request');
  location.hash=new URLSearchParams({show:'closed',sort:'#',dir:'desc'});await flush();
  check(visible().length===1 && visible()[0].dataset.number==='54','hash navigation restores the filters');
- check(document.querySelectorAll('form').length===0,'this phase has no feedback forms');
+ check(document.querySelectorAll('[data-feedback-form]').length===6,'each row has feedback controls');
  check(document.documentElement.scrollWidth<=innerWidth,'the page has no horizontal overflow');
  if(innerWidth<960){check(getComputedStyle(visible()[0]).display==='block','a phone row is a card');}
 }catch(error){failed.push(String(error));}
@@ -291,7 +522,10 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
 })();</script>'''.replace('OWNER', json.dumps(OWNER.id))
         for width in (1440, 390):
             with self.subTest(width=width):
-                page = markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>').encode()
+                markup = list_page.render(self.root / "reviews").decode()
+                setup_for_width = setup.replace('MARKUP', json.dumps(markup).replace('</', '<\\/'))
+                page = markup.replace('<head>', '<head>' + setup_for_width, 1).replace('</body>', probe + '</body>').encode()
+                root = self.root / "reviews"
                 results: list[list[str]] = []
                 complete = threading.Event()
 
@@ -300,12 +534,25 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
                         self.send_response(200)
                         self.send_header('Content-Type', 'text/html; charset=utf-8')
                         self.end_headers()
-                        if self.path == '/complete':
+                        if self.path == '/fresh':
+                            _ = self.wfile.write(list_page.render(root).decode().encode())
+                        elif self.path == '/complete':
                             _ = complete.wait(40)
                         else:
                             _ = self.wfile.write(page if self.path == '/page' else b'<iframe style="border:0;width:100vw;height:100vh" src="/page"></iframe><img hidden src="/complete">')
 
                     def do_POST(self) -> None:
+                        if self.path == '/feedback':
+                            body = self.rfile.read(int(self.headers['Content-Length'])).decode()
+                            delivery = list_page.submit(root, body)
+                            list_page.deliver(delivery)
+                            fields = parse_qs(body)
+                            result = {"state": "sent", **list_page.fresh_request(root, fields["keeper"][0], fields["id"][0])}
+                            self.send_response(200)
+                            self.send_header('Content-Type', 'application/json')
+                            self.end_headers()
+                            _ = self.wfile.write(json.dumps(result).encode())
+                            return
                         results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
                         complete.set()
                         self.send_response(204)
@@ -321,9 +568,11 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
                     try:
                         profile = self.root / f'profile-{width}'
                         profile.mkdir()
-                        done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
-                            '--window-size', f'{width},900', '--screenshot', str(self.root / f'page-{width}.png'),
-                            f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=45)
+                        with patch.object(change_page, "send_to_staff") as sends:
+                            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                                '--window-size', f'{width},900', '--screenshot', str(self.root / f'page-{width}.png'),
+                                f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=45)
+                            sends.assert_called_once()
                         self.assertEqual(done.returncode, 0, done.stderr)
                     finally:
                         server.shutdown()

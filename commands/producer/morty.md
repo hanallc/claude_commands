@@ -124,6 +124,8 @@ For reviews, provide the material or a working review link. For behavior checks,
 If nothing needs nate and no unread update remains, say so. Continue authorized coordination.
 Do not advance automatically after nate answers. Record the answer and act within its scope.
 Send each answer or review result to the item's owner in the same turn, in nate's words. Do not send nate to another tab to answer.
+Treat List page feedback as nate's words for the named item.
+Act through `the_list.py` and tell the owner, as for any instruction from nate.
 
 ## Lists and unread updates
 
