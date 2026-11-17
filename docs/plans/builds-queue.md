@@ -2715,7 +2715,7 @@ Goal: no queue fixture calls bare `mkdtemp`, `git clone` or `git worktree add`. 
 **Depends on:** 44ax. builds asked for it at once after 44ax, so two orders do not stay in place.
 Move the other `copies.standing` callers to the 44ax order with the same code: merge_gate nightly, ci_points, fast_track, waiting.py, style crate_run, bump_gate, simplify_daily and rust_release. A caller whose work is not one queue step keeps the old order and says why in a comment.
 
-**Built:** checkpoint 338d18d93 on origin branch `builds-queue-otherslots-cp`, one commit on 2e49fd46c, sent to builds 2026-11-17. All eight callers share the `copies` command_tree entry point; `phases/44ay/callers.md` lists each one. Two review passes closed three findings: the bump gate reads its command from the recorded tip, scratch tests ask the queue first only when the shell keeps the words, and style fixtures use a private `ADMISSION_SOCKET`. During the build, an old nightly fixture reached the live queue for a short time; every fixture now sets a private socket.
+**Built:** part 1 checkpoint 384ee9fd5 on origin branch `builds-queue-otherslots-p1`, one commit on 2e49fd46c, on the merge line 2026-11-17. It holds every caller except the nightly merge gate, because the gate folder move also changes `merge_gate.py`. It replaces 338d18d93 (all of 44ay), which conflicted with that move. Phase 44be carries the nightly merge gate. All eight callers share the `copies` command_tree entry point; `phases/44ay/callers.md` lists each one. Two review passes closed three findings: the bump gate reads its command from the recorded tip, scratch tests ask the queue first only when the shell keeps the words, and style fixtures use a private `ADMISSION_SOCKET`. During the build, an old nightly fixture reached the live queue for a short time; every fixture now sets a private socket.
 
 ### Phase 44az — A waiting step says why it stays off the Mac, and a dead holder's claim no longer looks busy  · status: todo
 **Depends on:** nothing; urgent. builds gave the go on 2026-11-17 11:15 EST. ETA 2026-11-17 13:45 EST.
@@ -2753,8 +2753,18 @@ Move the other `copies.standing` callers to the 44ax order with the same code: m
 
 **Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44bc/work_order.md`. Clone `/session/queue/otherslots`.
 
+### Phase 44be — The nightly merge gate takes its slot after admission, and no test reaches the live queue  · status: todo
+**Depends on:** the gate folder move (natest 4e448078d, 835695d37) on main. builds accepted it on 2026-11-17.
+
+1. The nightly merge gate uses `copies.command_tree`, the 44ay change in `merge_gate.py`.
+2. `merge_gate.test_module_environment` gives every test module a private `ADMISSION_SOCKET`. Before this, a fixture without its own socket used the live one; NightlyPushTests did on 2026-11-17.
+3. The hash message carries the promise study: measured nextest use in the build step and the test step, and a proposal.
+
+**Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44be/work_order.md`.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
+**Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
 
 ### Phase 45 — Merge gates take their route from the queue  · status: todo
 **Depends on:** 44 and aws-unit's repair of the uncertain cloud launch. Checkpoint 3 of section 8 in `docs/plans/builds-queue-placement.md`. `merge_gate --tests-only` takes the same queue route as a full gate and keeps its exit codes. Tell the sdlc showrunner before this phase edits `merge_gate.py`, because natest phase 119 changed `run_gate_suites`. Phase 119 is at 14581684f on builds-natest: merge builds first, keep its selection lines before the `cloud.route` call, and keep its empty-selection result. Tell the sdlc showrunner when this phase is on main. The Work Order follows at phase start.
