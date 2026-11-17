@@ -2724,12 +2724,27 @@ Move the other `copies.standing` callers to the 44ax order with the same code: m
 2. build_targets.py status shows a dead-holder claim as kept for cleanup, not running, and prints the MAC IDLE line. The claim stays.
 3. A test shows that a true AnyEligibleTarget step still moves to a free Mac past a dead kept claim.
 
-**Built:** checkpoint ab6bfb6e5 on origin branch `builds-queue-macidle-cp2`, sent to builds 2026-11-17 12:20 EST. It replaces db645f5c0, whose proof image named a "final" step that does not exist. Five readers of running work share `mac_test.run_holds_work`. The review found two minor defects: two more readers counted a kept claim as busy. Proof image 444f6e564073 shows a waiting cargo-liner check step from a `verify.sh final` run. The admission_service.py diagnostic takes effect at the next service reload.
+**Built:** checkpoint 7a20eab20 on origin branch `builds-queue-macidle-cp3`, one commit on the 44ax checkpoint 654dcfcf0, sent to builds 2026-11-17. It replaces db645f5c0, whose proof image named a "final" step that does not exist, and ab6bfb6e5, which conflicted with 44ax. The user released it on 2026-11-17. It waits for the gate folder move (natest 314-319) on main; then merge main, resolve `scripts/build_queue/test_admission_service.py` and send a new hash. Five readers of running work share `mac_test.run_holds_work`. The review found two minor defects: two more readers counted a kept claim as busy. Proof image 444f6e564073 shows a waiting cargo-liner check step from a `verify.sh final` run. The admission_service.py diagnostic takes effect at the next service reload.
 
 ### Phase 44ba — The admission loop does not stop when a placement ends during its own pass
 **Depends on:** nothing; urgent outage risk. Found by natest's gaterename bisect on 2026-11-17: "dictionary changed size during iteration" in the admission service.
 **Cause:** `_prepare_placements` walked `placement_requests` while `_close_placement` -> `persist` -> `_prune_ended_placements` removed entries. The error ended the service process.
 **Built:** checkpoint 7ed14c03d on origin branch `builds-queue-loopfix-cp`, sent to builds 2026-11-17. Four loops walk a snapshot and skip an entry removed during the pass. The review audited every service loop that removes entries. The fix takes effect when the admission service reloads after the merge.
+
+### Phase 44bb — The Builds page shows the verify verb of each call  · status: todo
+**Depends on:** 44az (the branch sits on 7a20eab20). List item #119. The user approved the mockup (image 7dcfb7d1792d) on 2026-11-17, and builds assigned all of it to queue. Hash due 2026-11-17 16:30 EST.
+**User words:** "we could add a column - and tooltip for verify for calls to verify that says what was the verify verb used"; "the tooltip should show the actual verify call that was made so there is no ambiguity".
+
+1. `verify.sh` sends the verb, the call text and the step position ("n of m") with every queue request.
+2. The facts pass through the client, the wire, the service record, `queue.json` and the feed to the page.
+3. The Builds page shows a "Verify" column. The row label keeps the repository and the current step. The tooltip of a verify row gains "Step" and, as its last line, "Call".
+4. A row that is not a verify call has an empty cell. An old client, an old service and old stored state all keep working.
+
+**Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44bb/work_order.md`. Clone `/session/queue/macidle`, branch `builds-queue-verifyverb`.
+**Held user items, not approved for work:** style crate integration, `validate_and_push` and the buildlog tools run their Cargo work through `verify.sh`, so every Rust row has a verb.
+
+### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
+**From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 
 ### Phase 45 — Merge gates take their route from the queue  · status: todo
 **Depends on:** 44 and aws-unit's repair of the uncertain cloud launch. Checkpoint 3 of section 8 in `docs/plans/builds-queue-placement.md`. `merge_gate --tests-only` takes the same queue route as a full gate and keeps its exit codes. Tell the sdlc showrunner before this phase edits `merge_gate.py`, because natest phase 119 changed `run_gate_suites`. Phase 119 is at 14581684f on builds-natest: merge builds first, keep its selection lines before the `cloud.route` call, and keep its empty-selection result. Tell the sdlc showrunner when this phase is on main. The Work Order follows at phase start.
