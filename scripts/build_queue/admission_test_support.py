@@ -424,7 +424,7 @@ class AdmissionFixture(ExitStack):
         self.server = self.new_server()
 
     @contextmanager
-    def serving(self) -> Generator[AdmissionFixture]:
+    def serving(self, *, threaded: bool = False) -> Generator[AdmissionFixture]:
         """Run the private loop while a caller uses the socket or starts a child."""
         stopped = threading.Event()
         failures: list[BaseException] = []
@@ -445,6 +445,8 @@ class AdmissionFixture(ExitStack):
                 failures.append(error)
                 stopped.set()
 
+        if threaded:
+            self.server.start_acceptor()
         worker = threading.Thread(target=serve, name="private-admission-loop")
         self.serving_active.set()
         try:

@@ -50,7 +50,7 @@ from scripts.message.roster import UnitLabels
 from scripts.lint.build_shape import build_shape
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service
 from scripts.build_queue import admission_wire as status_wire
-from scripts.build_queue import admission_code, queue_snapshot, queue_view, head_facts, placement
+from scripts.build_queue import admission_code, queue_snapshot, queue_view, head_facts, placement, slot_wait
 from scripts.build_queue import admission_records as records, progress_profile as progress, step_estimator
 from zoneinfo import ZoneInfo
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
@@ -1319,6 +1319,421 @@ class ProcessRunEvidenceTests(unittest.TestCase):
                 self.assertEqual(actual[88], actual[17])
 
 
+class ReadDuringSyncTests(unittest.TestCase):
+    def test_new_caller_reads_wait_until_the_next_mutation_to_save_versions(self) -> None:
+        requests = (wire.ViewRequest(code_version="read-version"), wire.ExplainRequest(code_version="read-version"),
+                    wire.MineRequest("fixture", code_version="read-version"), wire.BuildHistoryRequest(code_version="read-version"))
+        for request in requests:
+            with self.subTest(request=type(request).__name__), AdmissionFixture() as fixture:
+                server = fixture.server
+                before = (fixture.state_dir / "state.json").read_bytes()
+                with mock.patch.object(server, "persist", wraps=server.persist) as persisted:
+                    self.assertTrue(fixture.connect(request).replies())
+                    persisted.assert_not_called()
+                self.assertEqual((fixture.state_dir / "state.json").read_bytes(), before)
+                self.assertIn("read-version", server.caller_versions.values())
+                self.assertNotIn("read-version", service.read_state(fixture.state_dir).caller_versions.values())
+                _ = server.handle_request(wire.PriorityClearRequest("save-read-version", "fixture"))
+                self.assertIn("read-version", service.read_state(fixture.state_dir).caller_versions.values())
+
+    def assert_view_during_sync(self, fixture: AdmissionFixture, request: wire.Request,
+                                ready: Callable[[int], bool], reply_type: type[wire.Reply]) -> None:
+        entered, release = threading.Event(), threading.Event()
+        real_sync = os.fsync
+        blocked: list[int] = []
+
+        def sync(descriptor: int) -> None:
+            if not entered.is_set() and ready(descriptor):
+                blocked.append(threading.get_ident())
+                entered.set()
+                if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
+                    raise AssertionError("the test did not release the fake fsync")
+            real_sync(descriptor)
+
+        with fixture.serving(threaded=True), mock.patch.object(os, "fsync", side_effect=sync):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as mutation:
+                mutation.settimeout(3)
+                mutation.connect(str(fixture.socket_path))
+                mutation.sendall(wire.encode_request(request).encode())
+                try:
+                    self.assertTrue(entered.wait(3), "the mutation did not reach its fsync")
+                    self.assertFalse(select.select([mutation], [], [], 0)[0], "the mutation replied before its fsync")
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as view:
+                        view.settimeout(1)
+                        view.connect(str(fixture.socket_path))
+                        view.sendall(wire.encode_request(wire.ViewRequest(code_version="")).encode())
+                        try:
+                            with view.makefile("rb") as stream:
+                                reply = wire.parse_reply(stream.readline())
+                        except TimeoutError:
+                            self.fail("the view waited for the mutation fsync")
+                        self.assertIsInstance(reply, wire.ViewReply)
+                    self.assertFalse(select.select([mutation], [], [], 0)[0], "the mutation replied during its fsync")
+                finally:
+                    release.set()
+                with mutation.makefile("rb") as stream:
+                    reply = wire.parse_reply(stream.readline())
+                self.assertIsInstance(reply, reply_type)
+        self.assertEqual(len(blocked), 1)
+        self.assertNotEqual(blocked[0], threading.get_ident())
+
+    def test_view_returns_during_grant_fsync_without_delivering_the_grant(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = replace(fixture.request(), code_version="")
+            self.assert_view_during_sync(fixture, request,
+                lambda _descriptor: request.episode in fixture.server.reservations, wire.Admitted)
+
+    def test_view_returns_during_release_history_fsync(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            request = replace(request, sidecar=str(fixture.scope(request.owner)))
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.scoped_peak(grant)
+            history_path = fixture.state_dir / "anon_peaks.jsonl"
+            self.assert_view_during_sync(fixture, wire.ReleaseRequest("release-sync", grant.reservation, 0),
+                lambda descriptor: Path(os.readlink(f"/proc/self/fd/{descriptor}")) == history_path, wire.Ok)
+
+    def test_view_returns_during_priority_fsync(self) -> None:
+        with AdmissionFixture() as fixture:
+            running = fixture.request()
+            running = replace(running, identity=replace(running.identity, unit="fixture"))
+            _ = only_admitted(fixture.server.handle_request(running))
+            request = wire.PrioritySetRequest("priority-sync", "fixture", "test", "user", code_version="")
+            self.assert_view_during_sync(fixture, request,
+                lambda _descriptor: request.request_id in fixture.server.ledger, wire.Ok)
+
+    def test_view_returns_during_permission_consumption_fsync(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
+        )
+        with PlacementFixture() as fixture:
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            claim = adopt_assignment(fixture, request, assignment)
+            consumed = consume_permission("consume-sync", assignment, claim)
+            key = placement.attempt_key(assignment.episode, assignment.attempt)
+            self.assert_view_during_sync(fixture, consumed,
+                lambda _descriptor: isinstance(fixture.server.assignments[key].permission, placement.PermissionConsumed),
+                wire.FirstAuthorization)
+
+    def test_pending_configuration_read_uses_the_last_pass_without_running_a_pass(self) -> None:
+        with AdmissionFixture() as fixture:
+            server = fixture.server
+            configuration = server.configuration
+            assert isinstance(configuration, gate.UsableAdmissionConfiguration)
+            server.pending_configuration = replace(configuration, config=replace(configuration.config,
+                policy=replace(configuration.config.policy, safety_bytes=9 * GIB)))
+            with mock.patch.object(server, "run_pass", side_effect=AssertionError("read ran a pass")), \
+                    mock.patch.object(server, "persist", side_effect=AssertionError("read wrote state")):
+                reply, = server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            self.assertEqual(reply.reading.explanation.policy.safety_bytes, configuration.config.policy.safety_bytes)
+            self.assertNotIsInstance(server.pending_configuration, service.NoPass)
+
+    def test_socket_thread_failure_wakes_the_loop_and_closes_every_socket(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.server.start_acceptor()
+            acceptor = fixture.server.acceptor
+            assert isinstance(acceptor, service.AdmissionAcceptor)
+            with mock.patch.object(acceptor, "_client_event", side_effect=RuntimeError("fixture socket failure")):
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+                    peer.connect(str(fixture.socket_path))
+                    peer.sendall(wire.encode_request(wire.ViewRequest()).encode())
+                    with self.assertRaisesRegex(RuntimeError, "fixture socket failure"):
+                        acceptor.failure.result(timeout=3)
+            with self.assertRaisesRegex(RuntimeError, "socket thread failed"):
+                fixture.server.run_once(0)
+            fixture.server.close()
+            self.assertFalse(acceptor.thread.is_alive())
+            self.assertFalse(fixture.server.connections)
+            self.assertFalse(acceptor.clients)
+
+    def test_socket_thread_stops_before_an_inherited_listener_is_detached(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.server.start_acceptor()
+            acceptor = fixture.server.acceptor
+            assert isinstance(acceptor, service.AdmissionAcceptor)
+            listener = fixture.server.listener
+            assert isinstance(listener, socket.socket)
+            descriptor = listener.fileno()
+            fixture.server.replace_in_place = True
+            fixture.server.close()
+            self.assertFalse(acceptor.thread.is_alive())
+            self.assertEqual(listener.fileno(), -1)
+            with socket.socket(fileno=descriptor) as inherited:
+                self.assertEqual(inherited.getsockname(), str(fixture.socket_path))
+
+    def test_slot_disconnect_removes_the_waiter_from_the_read_snapshot(self) -> None:
+        with AdmissionFixture() as fixture:
+            original = fixture.request()
+            request = wire.RepositorySlotRequest(original.episode, original.owner, original.since,
+                "fixture", "natedev", str(fixture.root / "slots"), 1, fixture.clock.now() + 60, original.identity)
+            fixture.server.next_pass = fixture.server.next_source_check = float("inf")
+            closed, seen_waiter = threading.Event(), threading.Event()
+            run_once = fixture.server.run_once
+
+            def observed_turn(timeout: float = 0) -> None:
+                run_once(timeout)
+                if seen_waiter.is_set() and request.episode not in fixture.server.repository_slot_waiters:
+                    closed.set()
+
+            with fixture.serving(threaded=True), \
+                    mock.patch.object(slot_wait, "read_pool", return_value=wire.RepositorySlotWaiting(
+                        "fixture", (1,), 1, "slots.natedev.fixture.max")), \
+                    mock.patch.object(fixture.server, "run_once", side_effect=observed_turn):
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as waiter:
+                    waiter.settimeout(3)
+                    waiter.connect(str(fixture.socket_path))
+                    waiter.sendall(wire.encode_request(request).encode())
+                    with waiter.makefile("rb") as stream:
+                        self.assertIsInstance(wire.parse_reply(stream.readline()), wire.RepositorySlotWaiting)
+                    snapshot = fixture.server.read_state.reply(wire.ViewRequest())
+                    assert isinstance(snapshot, wire.ViewReply)
+                    assert isinstance(snapshot.reading, wire.CloudQueueRead)
+                    self.assertEqual(len(snapshot.reading.repository_slots), 1)
+                    seen_waiter.set()
+                self.assertTrue(closed.wait(3), "the socket close did not reach the loop")
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as view:
+                    view.settimeout(3)
+                    view.connect(str(fixture.socket_path))
+                    view.sendall(wire.encode_request(wire.ViewRequest()).encode())
+                    with view.makefile("rb") as stream:
+                        reply = wire.parse_reply(stream.readline())
+                    assert isinstance(reply, wire.ViewReply)
+                    slots = reply.reading.repository_slots if isinstance(reply.reading, wire.CloudQueueRead) else ()
+                    self.assertEqual(slots, ())
+
+    def test_a_refresh_cannot_change_the_wire_version_of_an_active_request(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = replace(fixture.request(), code_version="")
+            fixture.server.start_acceptor()
+            acceptor = fixture.server.acceptor
+            assert isinstance(acceptor, service.AdmissionAcceptor)
+            entered, refreshed, release = threading.Event(), threading.Event(), threading.Event()
+            handle = fixture.server.handle_request
+            post = cast(Callable[[service.SocketAccepted | service.SocketRequest | service.ReadCallerVersion | service.SocketClosed], None],
+                        getattr(acceptor, "_post"))
+            requests: list[service.SocketRequest] = []
+
+            def observe_request(event: service.SocketAccepted | service.SocketRequest | service.ReadCallerVersion | service.SocketClosed) -> None:
+                post(event)
+                if isinstance(event, service.SocketRequest):
+                    requests.append(event)
+                    if len(requests) == 2:
+                        refreshed.set()
+
+            def blocked_request(message: wire.Request,
+                                connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+                if isinstance(message, wire.AdmitRequest) and not entered.is_set():
+                    entered.set()
+                    if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
+                        raise AssertionError("the test did not release the first request")
+                return handle(message, connection)
+
+            def versioned_request(version: int) -> bytes:
+                envelope = cast(dict[str, object], json.loads(wire.encode_request(request)))
+                envelope["v"] = version
+                return (json.dumps(envelope) + "\n").encode()
+
+            with fixture.serving(threaded=True), mock.patch.object(acceptor, "_post", side_effect=observe_request), \
+                    mock.patch.object(fixture.server, "handle_request", side_effect=blocked_request):
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+                    peer.settimeout(3)
+                    peer.connect(str(fixture.socket_path))
+                    peer.sendall(versioned_request(1))
+                    try:
+                        self.assertTrue(entered.wait(3))
+                        peer.sendall(versioned_request(2))
+                        self.assertTrue(refreshed.wait(3))
+                    finally:
+                        release.set()
+                    with peer.makefile("rb") as stream:
+                        line = stream.readline()
+                    self.assertIsInstance(wire.parse_reply(line), wire.Admitted)
+                    envelope = cast(dict[str, object], json.loads(line))
+                    self.assertEqual(envelope["v"], 1)
+
+    def test_detached_waiter_leaves_all_reads_before_the_pass_gap_opens(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(min_pass_gap_seconds=120)
+            fixture.hold_starts()
+            request = fixture.request()
+            self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            peer = fixture.connect(request)
+            _ = peer.replies()
+            before = fixture.server.read_state.reply(wire.ViewRequest())
+            assert isinstance(before, wire.ViewReply)
+            self.assertEqual([row.pid for row in before.reading.view.waiting], [request.owner.pid])
+            last_pass = fixture.server.last_pass_started
+            peer.close()
+            with mock.patch.object(fixture.server, "run_pass", side_effect=AssertionError("the pass gap is closed")):
+                fixture.server.run_once(0)
+                for query in (wire.ViewRequest(), wire.MineRequest("fixture"), wire.ExplainRequest()):
+                    with self.subTest(query=type(query).__name__):
+                        reply = fixture.server.read_state.reply(query)
+                        if isinstance(reply, wire.ExplainReply):
+                            self.assertEqual(list(reply.explanation.decided_from.ordered), [])
+                        else:
+                            assert isinstance(reply, (wire.ViewReply, wire.MineReply))
+                            self.assertEqual(list(reply.reading.ordered), [])
+                            self.assertEqual(reply.reading.view.waiting, ())
+            self.assertNotIn(request.episode, fixture.server.waiters)
+            self.assertEqual(fixture.server.last_pass_started, last_pass)
+
+    def test_repeated_socket_reads_keep_the_snapshot_and_encoded_replies(self) -> None:
+        with AdmissionFixture() as fixture:
+            server = fixture.server
+            server.next_pass = server.next_source_check = server.next_config_watch_retry = float("inf")
+            server.start_acceptor()
+            acceptor = server.acceptor
+            assert isinstance(acceptor, service.AdmissionAcceptor)
+            closed = threading.Event()
+            post = cast(Callable[[service.SocketAccepted | service.SocketRequest | service.ReadCallerVersion | service.SocketClosed], None],
+                        getattr(acceptor, "_post"))
+
+            def observe(event: service.SocketAccepted | service.SocketRequest | service.ReadCallerVersion | service.SocketClosed) -> None:
+                post(event)
+                if isinstance(event, service.SocketClosed):
+                    closed.set()
+
+            publish = cast(Callable[[], None], getattr(server, "_publish_replies"))
+            snapshot = server.read_state
+            requests = (wire.ViewRequest(), wire.MineRequest("fixture"), wire.ExplainRequest(),
+                        wire.BuildHistoryRequest(), status_wire.PlacementStatusRequest("unknown", "unknown"))
+            encoded: dict[tuple[int, type[wire.Request]], bytes] = {}
+            with mock.patch.object(acceptor, "_post", side_effect=observe), \
+                    mock.patch.object(server, "_publish_replies", wraps=publish) as published:
+                for _ in range(3):
+                    for request in requests:
+                        with self.subTest(request=type(request).__name__):
+                            closed.clear()
+                            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+                                peer.settimeout(3)
+                                peer.connect(str(fixture.socket_path))
+                                peer.sendall(wire.encode_request(request).encode())
+                                with peer.makefile("rb") as stream:
+                                    _ = wire.parse_reply(stream.readline())
+                            self.assertTrue(closed.wait(3), "the socket close did not reach the loop")
+                            server.run_once(0)
+                            published.assert_not_called()
+                            self.assertIs(server.read_state, snapshot)
+                            self.assertIs(acceptor.encoded_state, snapshot)
+                            for key, data in encoded.items():
+                                self.assertIs(acceptor.read_bytes[key], data)
+                            encoded = dict(acceptor.read_bytes)
+                self.assertFalse(server.connections)
+
+    def test_changed_turn_publishes_once_and_unchanged_turn_reuses_the_snapshot(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.hold_starts()
+            _ = fixture.connect(fixture.request())
+            publish = cast(Callable[[], None], getattr(fixture.server, "_publish_replies"))
+            with mock.patch.object(fixture.server, "_publish_replies", wraps=publish) as published:
+                fixture.server.run_once(0)
+                published.assert_called_once()
+                snapshot = fixture.server.read_state
+                published.reset_mock()
+                fixture.server.next_pass = float("inf")
+                fixture.server.run_once(0)
+                for _ in range(10):
+                    _ = fixture.server.handle_request(wire.ViewRequest())
+                published.assert_not_called()
+                self.assertIs(fixture.server.read_state, snapshot)
+
+    def test_acknowledged_release_is_visible_while_the_next_mutation_syncs(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            grant = only_admitted(fixture.server.handle_request(request))
+            _ = fixture.run_pass()
+            initial = fixture.server.read_state.reply(wire.ViewRequest())
+            assert isinstance(initial, wire.ViewReply)
+            self.assertTrue(any(step.pid == request.owner.pid for step in initial.reading.view.running))
+            fixture.server.start_acceptor()
+            acceptor = fixture.server.acceptor
+            assert isinstance(acceptor, service.AdmissionAcceptor)
+            received, syncing, release = threading.Event(), threading.Event(), threading.Event()
+            posted: list[service.SocketRequest] = []
+            post = cast(Callable[[service.SocketAccepted | service.SocketRequest | service.ReadCallerVersion | service.SocketClosed], None],
+                        getattr(acceptor, "_post"))
+            real_sync = os.fsync
+            blocking = wire.WidthRequest("blocking-sync", "missing-reservation", 1, code_version="")
+
+            def observe(event: service.SocketAccepted | service.SocketRequest | service.ReadCallerVersion | service.SocketClosed) -> None:
+                post(event)
+                if isinstance(event, service.SocketRequest):
+                    posted.append(event)
+                    if len(posted) == 2:
+                        received.set()
+
+            def sync(descriptor: int) -> None:
+                if blocking.request_id in fixture.server.ledger and not syncing.is_set():
+                    syncing.set()
+                    if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
+                        raise AssertionError("the test did not release the second mutation")
+                real_sync(descriptor)
+
+            with fixture.serving(threaded=True), mock.patch.object(acceptor, "_post", side_effect=observe), \
+                    mock.patch.object(os, "fsync", side_effect=sync):
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as first, \
+                        socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as second:
+                    first.settimeout(3)
+                    second.settimeout(3)
+                    try:
+                        with fixture.loop_turn():
+                            first.connect(str(fixture.socket_path))
+                            first.sendall(wire.encode_request(wire.ReleaseRequest(
+                                "acknowledged-release", grant.reservation, 0, code_version="")).encode())
+                            second.connect(str(fixture.socket_path))
+                            second.sendall(wire.encode_request(blocking).encode())
+                            self.assertTrue(received.wait(3))
+                        self.assertTrue(syncing.wait(3))
+                        with first.makefile("rb") as stream:
+                            self.assertIsInstance(wire.parse_reply(stream.readline()), wire.Ok)
+                        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as view:
+                            view.settimeout(3)
+                            view.connect(str(fixture.socket_path))
+                            view.sendall(wire.encode_request(wire.ViewRequest()).encode())
+                            with view.makefile("rb") as stream:
+                                reply = wire.parse_reply(stream.readline())
+                            assert isinstance(reply, wire.ViewReply)
+                            self.assertFalse(any(step.pid == request.owner.pid for step in reply.reading.view.running))
+                        self.assertFalse(select.select([second], [], [], 0)[0])
+                    finally:
+                        release.set()
+                    with second.makefile("rb") as stream:
+                        self.assertIsInstance(wire.parse_reply(stream.readline()), wire.Ok)
+
+    def test_lifetime_evidence_closes_published_placement_status_during_the_pass_gap(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, placement_request, local_candidate
+
+        with PlacementFixture() as fixture:
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(local_candidate(fixture),)))
+            granted, = fixture.connect(request).replies()
+            assert isinstance(granted, wire.LocalPlacementGranted)
+            fixture.configure(min_pass_gap_seconds=120)
+            _ = fixture.run_pass()
+            evidence = fixture.server.system_evidence
+            assert isinstance(evidence, service.SystemEvidence)
+            reader = FixedSystemReader(evidence)
+            fixture.server.system_reader = reader
+            query = status_wire.PlacementStatusRequest(request.episode, granted.assignment.attempt)
+            initial = fixture.server.read_state.reply(query)
+            assert isinstance(initial, status_wire.PlacementStatusReply)
+            assert isinstance(initial.status, status_wire.KnownPlacementStatus)
+            self.assertIsInstance(initial.status.state, placement.CurrentAssignment)
+            reader.latest = replace(evidence, lifetimes={**evidence.lifetimes, request.episode: gate.EndedStep()})
+            os.eventfd_write(fixture.server.reading_events, 1)
+            with mock.patch.object(fixture.server, "run_pass", side_effect=AssertionError("the pass gap is closed")):
+                fixture.server.run_once(0)
+            reply = fixture.server.read_state.reply(query)
+            assert isinstance(reply, status_wire.PlacementStatusReply)
+            assert isinstance(reply.status, status_wire.KnownPlacementStatus)
+            self.assertEqual(reply.status.state, placement.ClosedAssignment("local execution has ended"))
+            self.assertIn(request.episode, fixture.server.reservations)
+
+
 class ReplyPublicationTests(unittest.TestCase):
     def test_view_and_explain_reuse_the_bytes_of_the_completed_pass(self) -> None:
         with AdmissionFixture() as fixture:
@@ -1345,7 +1760,7 @@ class ReplyPublicationTests(unittest.TestCase):
                 self.assertEqual(server.reply_bytes(explain), expected_explain)
                 encode.assert_not_called()
 
-    def test_pending_configuration_uses_new_values_with_the_published_reading(self) -> None:
+    def test_pending_configuration_changes_only_after_the_next_pass(self) -> None:
         with AdmissionFixture() as fixture:
             server = fixture.server
             evidence = server.system_evidence
@@ -1358,8 +1773,13 @@ class ReplyPublicationTests(unittest.TestCase):
             server.pending_configuration = replace(configuration, config=replace(configuration.config, policy=policy))
             reply, = server.handle_request(wire.ViewRequest())
             assert isinstance(reply, wire.ViewReply)
-            self.assertEqual(reply.reading.explanation.policy.safety_bytes, 9 * GIB)
+            self.assertEqual(reply.reading.explanation.policy.safety_bytes, configuration.config.policy.safety_bytes)
             self.assertEqual(server.reply_bytes(reply), wire.encode_reply(reply).encode())
+            self.assertNotIsInstance(server.pending_configuration, service.NoPass)
+            _ = server.run_pass()
+            current, = server.handle_request(wire.ViewRequest())
+            assert isinstance(current, wire.ViewReply)
+            self.assertEqual(current.reading.explanation.policy.safety_bytes, 9 * GIB)
             self.assertIsInstance(server.pending_configuration, service.NoPass)
 
     def test_pass_uses_the_reader_evidence_without_operating_system_reads(self) -> None:
@@ -1650,6 +2070,8 @@ class ReplyPublicationTests(unittest.TestCase):
             server.pending_configuration = replace(configuration, config=replace(configuration.config, policy=policy))
             reply, = server.handle_request(wire.ViewRequest())
             assert isinstance(reply, wire.ViewReply)
+            self.assertNotIsInstance(server.pending_configuration, service.NoPass)
+            _ = server.run_pass()
             inputs = server.last_inputs
             assert isinstance(inputs, records.QueueInputs)
             memory, = (step.measured for step in inputs.running if gate.running_has_reservation(step))
@@ -1846,6 +2268,8 @@ class RunnerAuthorizationTests(unittest.TestCase):
             self.assertIsInstance(reply, wire.BuildHistoryReply)
             start = records.process_start_time(os.getpid())
             self.assertEqual(fixture.server.caller_versions[records.run_owner(os.getpid(), str(start))], "allowed-version")
+            self.assertNotEqual(service.read_state(fixture.state_dir).caller_versions, fixture.server.caller_versions)
+            fixture.server.persist()
             self.assertEqual(service.read_state(fixture.state_dir).caller_versions, fixture.server.caller_versions)
 
     def test_invalid_ci_label_uses_committed_configuration_and_keeps_serving(self) -> None:
@@ -6832,7 +7256,7 @@ class AdmissionConfigurationTests(unittest.TestCase):
             before = fixture.server.last_inputs
             assert isinstance(before, records.QueueInputs)
             other_running = tuple(step for step in before.running if step.session_id != first.identity.session_id)
-            with mock.patch.object(gate, "admission_pass", side_effect=AssertionError("release ran admission")):
+            with mock.patch.object(fixture.server, "run_pass", side_effect=AssertionError("release started a pass")):
                 self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("release", grant.reservation, 0)), [wire.Ok()])
             after = fixture.server.last_inputs
             assert isinstance(after, records.QueueInputs)
@@ -6842,7 +7266,7 @@ class AdmissionConfigurationTests(unittest.TestCase):
             fixture.allow_next_start()
             with mock.patch.object(gate, "admission_pass", wraps=gate.admission_pass) as passed:
                 self.assertIsInstance(fixture.server.handle_request(wire.ViewRequest())[0], wire.ViewReply)
-            self.assertEqual(passed.call_count, 1)
+            self.assertEqual(passed.call_count, 0)
             self.assertNotIn(waiting.episode, fixture.server.reservations)
             fixture.server.run_once(0)
             self.assertIn(waiting.episode, fixture.server.reservations)

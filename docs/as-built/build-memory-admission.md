@@ -446,6 +446,49 @@ The service replaces `the user's bump` with `showrunner bump` for a showrunner r
 `build_bump.py` sends the neutral reason `queue bump`.
 `queue_command_actor()` sends a hint; it grants no permission.
 
+Each mutation, pass, evidence event, and timer check marks the read snapshot dirty.
+A disconnect marks the snapshot dirty only when it removes queue state.
+Pure reads keep the snapshot clean.
+The loop rebuilds a dirty snapshot before sending any mutation reply.
+It also rebuilds a dirty snapshot at the end of a successful outer turn.
+Nested handlers do not publish separately.
+A clean snapshot keeps its cached replies and encoded bytes.
+The loop uses one publication function and no read-field comparison list.
+The rebuild also reads each active cloud sidecar once.
+The projection uses current queue membership and the last memory evidence.
+A disconnected waiter leaves View, Mine, and Explain before the next admission pass.
+A local lifetime event updates PlacementStatus before the next admission pass.
+The projection grants no work and writes no state.
+
+The production service gives `AdmissionAcceptor` one socket thread.
+The thread owns socket acceptance, request parsing, reply buffers, and socket readiness.
+The state loop owns every mutation and durable write.
+Direct `run_once` test instances can keep the socket transport on their calling thread.
+
+`PublishedQueueState` contains a separate copy of the completed pass, placement statuses, and build-history generation.
+The loop replaces this state after it completes durable work.
+The socket thread uses this state for `view`, `explain`, `mine`, `build_history`, and `placement_status`.
+A read can return the previous completed state while the loop waits for a disk sync.
+A read never persists state or runs an admission pass.
+A pending configuration change waits for a loop pass.
+An unusable published configuration still refuses queue reads.
+
+The socket thread sends all mutations to the loop through a queue and an eventfd.
+Each queued request keeps its wire version.
+The socket thread keeps its parsed version separate from the loop connection.
+The loop keeps each file sync, folder sync, history write, and replay write in its previous order.
+It sends the mutation reply only after those writes complete.
+A queue view or history read records its caller version in memory through the loop.
+A placement status read keeps its existing behavior and records no caller version.
+The next durable write saves the version in the existing `ServiceState.caller_versions` field.
+A crash before that write can lose a read's version record.
+The read grants no permission or durable promise.
+
+Shutdown stops the socket thread before closing connections or detaching an inherited listener.
+A socket thread failure wakes the loop and raises an error.
+The service closes the thread and sockets before exit or code replacement.
+The wire format and the saved state format remain unchanged.
+
 Mutation requests have replay ids. The service persists each terminal reply before delivery.
 A replay returns the same reply. Live grants remain in the ledger until their reservation ends.
 Ended replies expire under `replay_retention_seconds`. Wait replies remain only on their connection.
@@ -1785,7 +1828,8 @@ It encodes View and Explain replies on the first request after each pass.
 It keeps those bytes until the next pass ends.
 Mine keeps the full reading and reuses the View encoding.
 The protocol encodes each reply tree once.
-A pending configuration still causes a pass before a query reply.
+A query uses the last completed pass while the loop processes a pending configuration.
+The service reuses each unchanged read snapshot.
 One reader thread collects process, scope, pressure, and memory evidence.
 The reader publishes physical memory and sampler observations under a lock and wakes the service loop.
 Each reading contains the monotonic time when its read started.

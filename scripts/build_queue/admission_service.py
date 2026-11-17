@@ -16,6 +16,7 @@ import json
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
 import os
+from queue import Empty, SimpleQueue
 from pathlib import Path
 import select
 import shlex
@@ -976,6 +977,7 @@ class Connection:
     request: wire.Request | NoRequest = NoRequest()
     finished: bool = False
     version: int = 1
+    threaded: bool = False
     peer_process: ConnectedPeerProcess | PeerProcessUnavailable = field(default_factory=PeerProcessUnavailable)
 
     def close_peer_process(self) -> None:
@@ -983,6 +985,262 @@ class Connection:
         if isinstance(self.peer_process, ConnectedPeerProcess):
             os.close(self.peer_process.descriptor)
             self.peer_process = PeerProcessUnavailable("peer process identity is closed")
+
+
+ReadRequest = wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.BuildHistoryRequest | status_wire.PlacementStatusRequest
+READ_REQUESTS = (wire.ViewRequest, wire.ExplainRequest, wire.MineRequest, wire.BuildHistoryRequest,
+                 status_wire.PlacementStatusRequest)
+
+
+@dataclass(frozen=True)
+class PublishedQueueState:
+    """One completed loop state supplies every socket read."""
+    replies: PublishedReplies | NoPass
+    configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
+    history_generation: int
+    placements: Mapping[str, status_wire.KnownPlacementStatus]
+    request_limit: int
+
+    def reply(self, request: ReadRequest) -> wire.Reply:
+        if isinstance(request, wire.BuildHistoryRequest):
+            return wire.BuildHistoryReply(self.history_generation)
+        if isinstance(request, status_wire.PlacementStatusRequest):
+            status = self.placements.get(placement.attempt_key(request.episode, request.attempt),
+                status_wire.UnknownPlacementStatus(request.episode, request.attempt))
+            return status_wire.PlacementStatusReply(status)
+        if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
+            return wire.Refused(self.configuration.reason)
+        if isinstance(self.replies, NoPass):
+            return wire.Refused("service has no published pass")
+        if isinstance(request, wire.ViewRequest):
+            return self.replies.view
+        if isinstance(request, wire.ExplainRequest):
+            return self.replies.explain
+        return wire.MineReply(self.replies.view.reading)
+
+
+@dataclass(frozen=True)
+class CloudSidecarReading:
+    """One loop observation supplies the cloud progress and counter."""
+    progress: cloud_progress.CloudProgress | cloud_progress.NoCloudProgress
+    counter: progress.ProgressCounter | progress.NoCounter
+
+
+@dataclass(frozen=True)
+class SocketAccepted:
+    connection: Connection
+
+
+@dataclass(frozen=True)
+class SocketRequest:
+    connection: Connection
+    request: wire.Request
+    version: int
+
+
+@dataclass(frozen=True)
+class ReadCallerVersion:
+    pid: int
+    version: str
+
+
+@dataclass(frozen=True)
+class SocketClosed:
+    connection: Connection
+
+
+@dataclass(frozen=True)
+class SocketReply:
+    connection: Connection
+    data: bytes
+    finished: bool
+
+
+@dataclass
+class SocketClient:
+    """The acceptor owns these transport buffers."""
+    connection: Connection
+    version: int = 1
+    received: bytes = b""
+    sending: bytes = b""
+    request: wire.Request | NoRequest = NoRequest()
+    finished: bool = False
+
+
+class AdmissionAcceptor:
+    """Serve published reads while the loop keeps each durable write."""
+
+    def __init__(self, listener: socket.socket, loop_event: int, state: PublishedQueueState) -> None:
+        self.listener: socket.socket = listener
+        self.loop_event: int = loop_event
+        self.state: PublishedQueueState = state
+        self.encoded_state: PublishedQueueState = state
+        self.read_bytes: dict[tuple[int, type[wire.Request]], bytes] = {}
+        self.incoming: SimpleQueue[SocketAccepted | SocketRequest | ReadCallerVersion | SocketClosed] = SimpleQueue()
+        self.outgoing: SimpleQueue[SocketReply] = SimpleQueue()
+        self.clients: dict[int, SocketClient] = {}
+        self.stopped: threading.Event = threading.Event()
+        self.failure: Future[None] = Future()
+        self.wake: int = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+        self.epoll: select.epoll = select.epoll()
+        self.epoll.register(listener.fileno(), select.EPOLLIN)
+        self.epoll.register(self.wake, select.EPOLLIN)
+        self.thread: threading.Thread = threading.Thread(target=self._serve, name="admission-sockets", daemon=True)
+        self.thread.start()
+
+    def _post(self, event: SocketAccepted | SocketRequest | ReadCallerVersion | SocketClosed) -> None:
+        self.incoming.put(event)
+        os.eventfd_write(self.loop_event, 1)
+
+    def send(self, connection: Connection, data: bytes, finished: bool) -> None:
+        self.outgoing.put(SocketReply(connection, data, finished))
+        os.eventfd_write(self.wake, 1)
+
+    def _remove(self, client: SocketClient) -> None:
+        descriptor = client.connection.socket.fileno()
+        self.epoll.unregister(descriptor)
+        del self.clients[descriptor]
+        # The loop closes the socket after all earlier requests use its peer identity.
+        self._post(SocketClosed(client.connection))
+
+    def _read(self, client: SocketClient) -> None:
+        state = self.state
+        limit = max(state.request_limit, wire.CLEANUP_REQUEST_MAX_BYTES)
+        while not client.finished:
+            chunk = client.connection.socket.recv(min(65536, limit + 1 - len(client.received)))
+            if not chunk:
+                self._remove(client)
+                return
+            client.received += chunk
+            if len(client.received) > limit:
+                raise ValueError(f"admission request exceeds {limit} bytes")
+            if b"\n" in client.received:
+                line, _, tail = client.received.partition(b"\n")
+                if tail:
+                    raise ValueError("one request per connection")
+                version, request = wire.parse_request_envelope(line)
+                cleanup = isinstance(request, (wire.ReleaseRequest, wire.TokenWaitRequest))
+                request_limit = wire.CLEANUP_REQUEST_MAX_BYTES if cleanup else state.request_limit
+                if len(line) + 1 > request_limit:
+                    raise ValueError(f"admission request exceeds {request_limit} bytes")
+                if not isinstance(request, wire.BuildHistoryRequest):
+                    if not (isinstance(client.request, NoRequest) or _refreshes(client.request, request)):
+                        raise ValueError("one request for admission per connection")
+                    client.request = request
+                client.received = b""
+                client.version = version
+                if isinstance(request, READ_REQUESTS):
+                    if request.code_version and not isinstance(request, status_wire.PlacementStatusRequest):
+                        pid, _uid, _gid = struct.unpack("3i", client.connection.socket.getsockopt(
+                            socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                        self._post(ReadCallerVersion(pid, request.code_version))
+                    reply = state.reply(request)
+                    if self.encoded_state is not state:
+                        self.read_bytes.clear()
+                        self.encoded_state = state
+                    key = version, type(request)
+                    data = self.read_bytes.get(key)
+                    if data is None or isinstance(request, status_wire.PlacementStatusRequest):
+                        data = wire.encode_reply(reply, version=version).encode()
+                        if not isinstance(request, status_wire.PlacementStatusRequest):
+                            self.read_bytes[key] = data
+                    client.sending += data
+                    client.finished = not isinstance(reply, wire.BuildHistoryReply)
+                    self.epoll.modify(client.connection.socket.fileno(), select.EPOLLIN | select.EPOLLOUT)
+                else:
+                    self._post(SocketRequest(client.connection, request, version))
+                return
+            if (len(client.received) > state.request_limit
+                    and wire.noncleanup_request_started(client.received)):
+                raise ValueError(f"admission request exceeds {state.request_limit} bytes")
+
+    def _client_event(self, client: SocketClient, events: int) -> None:
+        try:
+            if events & select.EPOLLIN and not client.finished:
+                self._read(client)
+                if client.connection.socket.fileno() not in self.clients:
+                    return
+            if client.sending and events & (select.EPOLLIN | select.EPOLLOUT):
+                sent = client.connection.socket.send(client.sending)
+                client.sending = client.sending[sent:]
+                if not client.sending:
+                    if client.finished:
+                        self._remove(client)
+                        return
+                    self.epoll.modify(client.connection.socket.fileno(), select.EPOLLIN)
+            if events & (select.EPOLLHUP | select.EPOLLERR):
+                self._remove(client)
+        except BlockingIOError:
+            pass
+        except (ValueError, TypeError) as error:
+            client.received = b""
+            client.sending = wire.encode_reply(wire.Refused(str(error)), version=client.version).encode()
+            client.finished = True
+            self.epoll.modify(client.connection.socket.fileno(), select.EPOLLOUT)
+        except (BrokenPipeError, ConnectionResetError):
+            self._remove(client)
+
+    def _serve(self) -> None:
+        try:
+            while not self.stopped.is_set():
+                for descriptor, events in self.epoll.poll():
+                    if descriptor == self.wake:
+                        _ = os.eventfd_read(self.wake)
+                        while True:
+                            try:
+                                reply = self.outgoing.get_nowait()
+                            except Empty:
+                                break
+                            client = self.clients.get(reply.connection.socket.fileno())
+                            if client is not None and client.connection is reply.connection:
+                                client.sending += reply.data
+                                client.finished = reply.finished
+                                self.epoll.modify(reply.connection.socket.fileno(),
+                                    select.EPOLLOUT if client.finished else select.EPOLLIN | select.EPOLLOUT)
+                    elif descriptor == self.listener.fileno():
+                        while True:
+                            try:
+                                accepted = self.listener.accept()[0]
+                            except BlockingIOError:
+                                break
+                            connection = Connection(accepted, peer_process=connected_peer_process(accepted), threaded=True)
+                            try:
+                                accepted.setblocking(False)
+                                self.epoll.register(accepted.fileno(), select.EPOLLIN)
+                            except BaseException:
+                                connection.close_peer_process()
+                                accepted.close()
+                                raise
+                            self.clients[accepted.fileno()] = SocketClient(connection)
+                            self._post(SocketAccepted(connection))
+                    elif descriptor in self.clients:
+                        self._client_event(self.clients[descriptor], events)
+        except BaseException as error:
+            self.failure.set_exception(error)
+            os.eventfd_write(self.loop_event, 1)
+        else:
+            self.failure.set_result(None)
+
+    def raise_failure(self) -> None:
+        if self.failure.done():
+            try:
+                self.failure.result()
+            except BaseException as error:
+                raise RuntimeError("the admission socket thread failed") from error
+            if not self.stopped.is_set():
+                raise RuntimeError("the admission socket thread stopped unexpectedly")
+
+    def close(self) -> None:
+        self.stopped.set()
+        os.eventfd_write(self.wake, 1)
+        self.thread.join()
+        self.epoll.close()
+        os.close(self.wake)
+
+
+@dataclass(frozen=True)
+class NoAcceptor:
+    """The caller pumps sockets directly through run_once."""
 
 
 @dataclass(frozen=True)
@@ -995,6 +1253,7 @@ class DeferredOwnerRequest:
     request: wire.AdmitRequest | wire.LaunchRequest | wire.ServiceEstimateRequest | wire.RepositorySlotRequest
     connection: Connection
     arrived_monotonic: float
+    version: int = wire.VERSION
 
 
 @dataclass(frozen=True)
@@ -1326,6 +1585,14 @@ class AdmissionServer:
         self.epoll.register(self.priority_events, select.EPOLLIN)
         self.reading_events: int = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
         self.epoll.register(self.reading_events, select.EPOLLIN)
+        self.socket_events: int = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+        self.epoll.register(self.socket_events, select.EPOLLIN)
+        self.acceptor: AdmissionAcceptor | NoAcceptor = NoAcceptor()
+        self.read_state: PublishedQueueState = PublishedQueueState(NoPass(), self.configuration, 0, MappingProxyType({}),
+            wire.CLEANUP_REQUEST_MAX_BYTES)
+        self.snapshot_dirty: bool = True
+        self.publication_depth: int = 0
+        self.cloud_observations: dict[str, CloudSidecarReading] = {}
         self.listener: socket.socket | NoConnection = NoConnection()
         self.inherited_listener: bool = False
         # A source change under systemd runs the new code in this process and keeps the socket.
@@ -1944,7 +2211,8 @@ class AdmissionServer:
         return replace(inputs, running=tuple(running))
 
     def run_pass(self) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
-        return self._run_pass(self._take_configuration())
+        with self._publication_turn():
+            return self._run_pass(self._take_configuration())
 
     def _read_configuration(self) -> gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration:
         configuration = gate.read_admission_configuration()
@@ -2027,6 +2295,7 @@ class AdmissionServer:
                   ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
         from scripts.build_targets import target_config
 
+        self.snapshot_dirty = True
         # One pass reads the target list once; each placement check in the pass uses that read.
         with target_config.command_configuration():
             result = self._pass(configuration)
@@ -2142,7 +2411,6 @@ class AdmissionServer:
         except OSError:
             # An old snapshot expires without changing the admission result.
             pass
-        self._publish_replies()
         if self.reader_requested:
             self.start_reader()
         if not isinstance(self.system_reader, NoSystemReader):
@@ -2189,10 +2457,10 @@ class AdmissionServer:
             waiter = record.queue_waiter
             identity = wire.Identity(waiter.get("session_id", ""), waiter.get("session_name", ""),
                 record.step, record.worktree, waiter.get("unit", ""))
-            sidecar = Path(record.sidecar)
+            observed = self.cloud_observations.get(record.sidecar,
+                CloudSidecarReading(cloud_progress.NoCloudProgress(), progress.NoCounter()))
             rows.append(wire.CloudRow(record.owner, identity, record.place, waiter["since"],
-                step_estimator.epoch(record.admitted_at), cloud_progress.read(sidecar) if record.sidecar else cloud_progress.NoCloudProgress(),
-                progress.read_counter(sidecar) if record.sidecar else progress.NoCounter(), records.ReadyForAdmission()))
+                step_estimator.epoch(record.admitted_at), observed.progress, observed.counter, records.ReadyForAdmission()))
         used = len(rows)
         waiting_cloud = self._cloud_waiters()
         slot_rows = tuple(wire.RepositorySlotRow(waiting.request.owner, waiting.request.identity,
@@ -2205,10 +2473,10 @@ class AdmissionServer:
         for waiting in waiting_cloud:
             request = waiting.request
             assert isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace)
-            sidecar = Path(request.sidecar)
+            observed = self.cloud_observations.get(request.sidecar,
+                CloudSidecarReading(cloud_progress.NoCloudProgress(), progress.NoCounter()))
             rows.append(wire.CloudRow(request.owner, request.identity, request.place, waiting.row["since"], 0.0,
-                cloud_progress.read(sidecar) if request.sidecar else cloud_progress.NoCloudProgress(),
-                progress.read_counter(sidecar) if request.sidecar else progress.NoCounter(), wire.CloudSlotWait(used, slots)))
+                observed.progress, observed.counter, wire.CloudSlotWait(used, slots)))
         return wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered, reading.diagnostics,
             tuple(rows), slots, cloud_gate_stale_pushes=configuration.cloud_gate_stale_pushes, repository_slots=slot_rows)
 
@@ -2258,7 +2526,6 @@ class AdmissionServer:
         else:
             waiting.connection = connection
         self._advance_repository_slots()
-        self._publish_replies()
         if isinstance(waiting.reply, NoWaitReply):
             return [wire.Refused("slot waiter owner no longer exists")]
         return [waiting.reply]
@@ -2306,10 +2573,14 @@ class AdmissionServer:
                 or not isinstance(self.last_inputs, records.QueueInputs)
                 or not isinstance(self.last_policy, records.AdmissionPolicy)
                 or not isinstance(self.last_result, gate.PassResult)):
+            self.published = NoPass()
             return
-        reading = replace(gate.queue_read_from_pass(self.last_inputs, self.last_policy, self.last_result),
-                          diagnostics=self.last_diagnostics)
         ci_holds = self._ci_hold_reasons()
+        inputs = self._publication_inputs(ci_holds)
+        result = (self.last_result if inputs is self.last_inputs and not self.pass_stale else
+                  gate.admission_pass(inputs, inputs.now, self.last_policy))
+        reading = replace(gate.queue_read_from_pass(inputs, self.last_policy, result),
+                          diagnostics=self.last_diagnostics)
         if ci_holds:
             held_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
                 row.get("step", ""), row.get("folder", ""), row["since"], row["need"], reason,
@@ -2323,6 +2594,82 @@ class AdmissionServer:
         view = wire.ViewReply(reading)
         explain = wire.ExplainReply(reading.explanation, self.last_diagnostics)
         self.published = PublishedReplies(view, explain)
+
+    @contextmanager
+    def _publication_turn(self) -> Generator[None]:
+        """Publish once after a successful outer loop turn."""
+        self.publication_depth += 1
+        try:
+            yield
+        except BaseException:
+            raise
+        else:
+            if self.publication_depth == 1:
+                self._publish_read_state()
+        finally:
+            self.publication_depth -= 1
+
+    def _read_cloud_observations(self) -> None:
+        sidecars = dict.fromkeys([record.sidecar for record in self.reservations.values()
+            if isinstance(record.place, wire.CloudPlace) and record.sidecar]
+            + [waiting.request.sidecar for waiting in self._cloud_waiters()
+               if isinstance(waiting.request, wire.AdmitRequest) and waiting.request.sidecar])
+        self.cloud_observations = {sidecar: CloudSidecarReading(cloud_progress.read(Path(sidecar)), progress.read_counter(Path(sidecar)))
+                                   for sidecar in sidecars}
+
+    def _publication_inputs(self, ci_holds: Mapping[str, records.NatedevHeld | records.ReadingUnavailable]) -> records.QueueInputs:
+        """Project current membership onto the last memory evidence without granting work."""
+        assert isinstance(self.last_inputs, records.QueueInputs)
+        assert isinstance(self.last_result, gate.PassResult)
+        inputs = gate.inputs_after_reservations_end(self.last_inputs, self._live_reservation_ids())
+        live_rows = {records.waiter_owner(row): (path, row) for path, row in self._ordered_waiters()}
+        held = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
+        granted = {records.run_owner(record.owner.pid, record.owner.start_time)
+                   for record in self.reservations.values()}
+        proposed = {decision.owner for decision in self.last_result.rows
+                    if isinstance(decision.admission, gate.ProposedAdmission) and decision.owner in granted}
+        ordered: list[tuple[Path, records.RankedWaiter]] = []
+        represented: set[str] = set()
+        for path, previous in inputs.ordered:
+            owner = records.waiter_owner(previous)
+            if owner in held or owner not in live_rows and owner not in proposed:
+                continue
+            row = live_rows[owner][1] if owner in live_rows else previous
+            ordered.append((path, gate.rank_waiter(row, inputs.waiter_orders.get(owner, records.NormalOrder()))))
+            represented.add(owner)
+        for episode, waiting in self.waiters.items():
+            owner = records.waiter_owner(waiting.row)
+            if owner in represented or owner in held:
+                continue
+            if isinstance(waiting.request, wire.AdmitRequest) and isinstance(waiting.request.place, wire.CloudPlace):
+                continue
+            if episode in self.placement_requests and not self._local_placement_ready(self.placement_requests[episode]):
+                continue
+            path, row = live_rows[owner]
+            ordered.append((path, gate.rank_waiter(row, inputs.waiter_orders.get(owner, records.NormalOrder()))))
+        projected = replace(inputs, ordered=ordered)
+        return self.last_inputs if projected == self.last_inputs else projected
+
+    def _publish_read_state(self) -> None:
+        """Rebuild a dirty snapshot before delivery or at the turn boundary."""
+        if not self.snapshot_dirty:
+            return
+        self._read_cloud_observations()
+        self._publish_replies()
+        placements = {key: status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider)
+                      for key, saved in self.assignments.items()}
+        replies: PublishedReplies | NoPass = NoPass()
+        if isinstance(self.published, PublishedReplies):
+            view = cast(wire.ViewReply, durable_copy(self.published.view))
+            replies = PublishedReplies(view, wire.ExplainReply(view.reading.explanation, view.reading.diagnostics))
+        configuration = self.configuration if isinstance(self.pending_configuration, NoPass) else self.pending_configuration
+        limit = (self.last_usable_configuration.request_max_bytes
+                 if isinstance(self.last_usable_configuration, records.MemoryConfig) else wire.CLEANUP_REQUEST_MAX_BYTES)
+        self.read_state = PublishedQueueState(replies, configuration,
+            self.build_history_generation, MappingProxyType(placements), limit)
+        if isinstance(self.acceptor, AdmissionAcceptor):
+            self.acceptor.state = self.read_state
+        self.snapshot_dirty = False
 
     def reply_bytes(self, reply: wire.Reply, *, version: int = wire.VERSION) -> bytes:
         if version != wire.VERSION:
@@ -3489,7 +3836,6 @@ done
                     self.assignments[key] = replace(saved, terminal_report=replace(previous, path=request.path))
             self._settle_attempt_reports()
             self.persist()
-        self._publish_replies()
         return [self._placement_status(assignment)]
 
     def _authorize(self, request: wire.Request, uid: int) -> str:
@@ -3553,6 +3899,10 @@ done
 
     def handle_request(self, request: wire.Request, connection: Connection | NoConnection = NO_CONNECTION
                        ) -> list[wire.Reply]:
+        with self._publication_turn():
+            return self._verified_request(request, connection)
+
+    def _verified_request(self, request: wire.Request, connection: Connection | NoConnection) -> list[wire.Reply]:
         if isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest)):
             caller = queue_caller(connection, self.proc.path)
             if isinstance(caller, records.RefusedCaller):
@@ -3562,6 +3912,8 @@ done
             if (isinstance(request, wire.PrioritySetRequest) and isinstance(caller, records.ShowrunnerCaller)
                     and request.why == "the user's bump"):
                 request = replace(request, why="showrunner bump")
+        if not isinstance(request, READ_REQUESTS):
+            self.snapshot_dirty = True
         started, cpu_started = self.clock.monotonic(), time.thread_time()
         try:
             return self._handle_request(request, connection)
@@ -3586,11 +3938,20 @@ done
         refusal = self._authorize(request, peer_uid(connection))
         if refusal:
             return [wire.Refused(refusal)]
-        if isinstance(request, status_wire.PlacementStatusRequest):
-            saved = self._saved_assignment(request.episode, request.attempt)
-            status = (saved if isinstance(saved, status_wire.UnknownPlacementStatus) else
-                status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider))
-            return [status_wire.PlacementStatusReply(status)]
+        if isinstance(request, READ_REQUESTS):
+            if isinstance(connection, Connection) and not isinstance(request, status_wire.PlacementStatusRequest):
+                self._record_caller_version(request, connection, persist_change=False)
+            if not isinstance(self.pending_configuration, NoPass) or self.pass_stale:
+                self.next_pass = min(self.next_pass, self.clock.monotonic())
+            if isinstance(request, status_wire.PlacementStatusRequest):
+                saved = self._saved_assignment(request.episode, request.attempt)
+                status = (saved if isinstance(saved, status_wire.UnknownPlacementStatus) else
+                    status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider))
+                return [status_wire.PlacementStatusReply(status)]
+            state = replace(self.read_state, replies=self.published,
+                configuration=self.configuration if isinstance(self.pending_configuration, NoPass) else self.pending_configuration,
+                history_generation=self.build_history_generation)
+            return [state.reply(request)]
         if isinstance(request, wire.RepositorySlotRequest):
             return self._repository_slot(request, connection)
         if isinstance(connection, Connection):
@@ -3614,30 +3975,6 @@ done
             self.pending_configuration = configuration
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)) and request.code_version:
             self.caller_versions[records.run_owner(request.owner.pid, request.owner.start_time)] = request.code_version
-        if isinstance(request, wire.BuildHistoryRequest):
-            return [wire.BuildHistoryReply(self.build_history_generation)]
-        if isinstance(request, (wire.ViewRequest, wire.ExplainRequest, wire.MineRequest)):
-            if not isinstance(self.pending_configuration, NoPass):
-                _ = self.run_pass()
-            elif self.pass_stale and isinstance(self.last_inputs, records.QueueInputs):
-                if isinstance(self.last_policy, records.AdmissionPolicy):
-                    self.last_inputs = self._inputs_with_current_slots(self.last_inputs)
-                    self.last_result = gate.admission_pass(self.last_inputs, self.last_inputs.now, self.last_policy)
-                self.pass_stale = False
-                self._publish_replies()
-            if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
-                return [wire.Refused(self.configuration.reason)]
-            if (not isinstance(self.last_inputs, records.QueueInputs)
-                    or not isinstance(self.last_policy, records.AdmissionPolicy)):
-                raise RuntimeError("service has no pass")
-            published = self.published
-            if not isinstance(published, PublishedReplies):
-                raise RuntimeError("service has no published pass")
-            if isinstance(request, wire.ExplainRequest):
-                return [published.explain]
-            if isinstance(request, wire.ViewRequest):
-                return [published.view]
-            return [wire.MineReply(published.view.reading)]
         key = request.episode if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)) else request.request_id
         replay = self.ledger.get(key)
         if replay is not None:
@@ -3749,6 +4086,7 @@ done
 
     def _complete_queue_change(self, change: OrderedQueueChange,
                                apply: Callable[[], list[wire.Reply]]) -> None:
+        self.snapshot_dirty = True
         try:
             replies = apply()
         except (ValueError, TypeError) as error:
@@ -3833,8 +4171,9 @@ done
         connection.finished = not isinstance(reply, (wire.Wait, wire.BuildHistoryReply, wire.RepositorySlotWaiting))
         if connection.finished:
             self._drop_deferred_requests(connection)
-        self.epoll.modify(connection.socket.fileno(), select.EPOLLOUT if connection.finished
-                          else select.EPOLLIN | select.EPOLLOUT)
+        if not connection.threaded:
+            self.epoll.modify(connection.socket.fileno(), select.EPOLLOUT if connection.finished
+                              else select.EPOLLIN | select.EPOLLOUT)
 
     def start(self) -> None:
         if not isinstance(self.listener, NoConnection):
@@ -3883,15 +4222,16 @@ done
         connection.close_peer_process()
         self._drop_deferred_requests(connection)
         removed = [episode for episode, waiting in self.repository_slot_waiters.items() if waiting.connection is connection]
+        if removed:
+            self.snapshot_dirty = True
         for episode in removed:
             del self.repository_slot_waiters[episode]
-        if removed:
-            self._publish_replies()
         descriptor = connection.socket.fileno()
         if descriptor < 0:
             return
-        self.epoll.unregister(descriptor)
-        del self.connections[descriptor]
+        if not connection.threaded:
+            self.epoll.unregister(descriptor)
+        _ = self.connections.pop(descriptor, None)
         connection.socket.close()
         if self._detach_admission(connection):
             _ = self._pass_when_open(self._take_configuration())
@@ -3907,10 +4247,12 @@ done
                 del self.waiters[episode]
                 changed = True
         if changed:
+            self.snapshot_dirty = True
             self.persist()
         return changed
 
     def _refuse_connection(self, connection: Connection, reason: str) -> None:
+        self.snapshot_dirty = True
         self._drop_deferred_requests(connection)
         _ = self._detach_admission(connection)
         connection.received = b""
@@ -3923,15 +4265,18 @@ done
             return
         pid, uid, gid = struct.unpack("3i", connection.socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         del uid, gid
+        self._record_version(pid, request.code_version)
+        if persist_change:
+            self.persist()
+
+    def _record_version(self, pid: int, version: str) -> None:
         if isinstance(self.system_reader, NoSystemReader):
             identity = self.proc.owner_start(pid)
         else:
             process = self.system_reader.latest.processes.get(pid)
             identity = LiveOwnerIdentity(process.start) if process is not None else OwnerProcessGone()
         if isinstance(identity, LiveOwnerIdentity):
-            self.caller_versions[records.run_owner(pid, identity.start_time)] = request.code_version
-            if persist_change:
-                self.persist()
+            self.caller_versions[records.run_owner(pid, identity.start_time)] = version
 
     def _read_request(self, connection: Connection) -> None:
         config = (self.configuration if isinstance(self.pending_configuration, NoPass)
@@ -3968,7 +4313,7 @@ done
                         and isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.RepositorySlotRequest))
                         and ((process := self.system_reader.latest.processes.get(request.owner.pid)) is None
                              or process.start != request.owner.start_time)):
-                    self.deferred_requests.append(DeferredOwnerRequest(request, connection, self.clock.monotonic()))
+                    self.deferred_requests.append(DeferredOwnerRequest(request, connection, self.clock.monotonic(), connection.version))
                     self.system_reader.request_read()
                     return
                 replies = self.handle_request(request, connection)
@@ -3988,6 +4333,7 @@ done
                     return
             # Send the reply before a later admission pass can delay it.
             if connection.sending and events & (select.EPOLLIN | select.EPOLLOUT):
+                self._publish_read_state()
                 sent = connection.socket.send(connection.sending)
                 connection.sending = connection.sending[sent:]
                 if not connection.sending:
@@ -4105,15 +4451,81 @@ done
         except (OSError, ValueError) as error:
             print(f"memory admission: cannot clear outage alert: {error}", file=sys.stderr)
 
-    def run_once(self, timeout: float = 0) -> None:
+    def start_acceptor(self) -> None:
+        """Give the socket thread transport ownership before serving requests."""
         self.start()
+        if isinstance(self.acceptor, NoAcceptor):
+            if self.connections:
+                raise RuntimeError("start the socket thread before accepting connections")
+            assert isinstance(self.listener, socket.socket)
+            with self._publication_turn():
+                pass
+            self.epoll.unregister(self.listener.fileno())
+            self.acceptor = AdmissionAcceptor(self.listener, self.socket_events, self.read_state)
+
+    def _socket_requests(self) -> None:
+        acceptor = self.acceptor
+        if isinstance(acceptor, NoAcceptor):
+            return
+        acceptor.raise_failure()
+        while True:
+            try:
+                event = acceptor.incoming.get_nowait()
+            except Empty:
+                break
+            if isinstance(event, SocketAccepted):
+                self.connections[event.connection.socket.fileno()] = event.connection
+            elif isinstance(event, ReadCallerVersion):
+                self._record_version(event.pid, event.version)
+            elif isinstance(event, SocketClosed):
+                self._disconnect(event.connection)
+            else:
+                connection, request = event.connection, event.request
+                if connection.finished or connection.socket.fileno() < 0:
+                    continue
+                connection.version = event.version
+                if not isinstance(request, wire.BuildHistoryRequest):
+                    connection.request = request
+                if (not isinstance(self.system_reader, NoSystemReader)
+                        and isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.RepositorySlotRequest))
+                        and ((process := self.system_reader.latest.processes.get(request.owner.pid)) is None
+                             or process.start != request.owner.start_time)):
+                    self.deferred_requests.append(DeferredOwnerRequest(request, connection, self.clock.monotonic(), connection.version))
+                    self.system_reader.request_read()
+                    continue
+                try:
+                    for reply in self.handle_request(request, connection):
+                        if not connection.sending:
+                            self._send(connection, reply)
+                except (ValueError, TypeError) as error:
+                    self._refuse_connection(connection, str(error))
+                self._flush_socket_replies()
+
+    def _flush_socket_replies(self) -> None:
+        if isinstance(self.acceptor, AdmissionAcceptor):
+            for connection in self.connections.values():
+                if connection.sending:
+                    self._publish_read_state()
+                    self.acceptor.send(connection, connection.sending, connection.finished)
+                    connection.sending = b""
+
+    def run_once(self, timeout: float = 0) -> None:
+        with self._publication_turn():
+            self._run_once(timeout)
+
+    def _run_once(self, timeout: float) -> None:
+        self.start()
+        if isinstance(self.acceptor, AdmissionAcceptor):
+            self.acceptor.raise_failure()
         now = self.clock.monotonic()
         due = max(self.next_pass, self._pass_allowed_at())
         delay = min(timeout, max(0, min(due, self.next_source_check, self.next_config_watch_retry) - now))
         ready = self.epoll.poll(-1 if delay == float("inf") else delay)
         if any(descriptor == self.priority_events for descriptor, _events in ready):
+            self.snapshot_dirty = True
             _ = os.eventfd_read(self.priority_events)
         if any(descriptor == self.reading_events for descriptor, _events in ready):
+            self.snapshot_dirty = True
             _ = os.eventfd_read(self.reading_events)
             if not isinstance(self.system_reader, NoSystemReader):
                 self.system_reader.raise_failure()
@@ -4126,28 +4538,37 @@ done
                             and self.system_reader.latest.started_monotonic < pending.arrived_monotonic):
                         self.deferred_requests.append(pending)
                         continue
+                    connection.version = pending.version
                     for reply in self.handle_request(pending.request, connection):
                         if not connection.sending:
                             self._send(connection, reply)
+        if any(descriptor == self.socket_events for descriptor, _events in ready):
+            _ = os.eventfd_read(self.socket_events)
         configuration_changed = (any(descriptor == self.config_events for descriptor, _events in ready)
                                  and self._configuration_changed())
         if self.clock.monotonic() >= self.next_config_watch_retry:
+            self.snapshot_dirty = True
             self._arm_config_watch()
             configuration_changed = True
         if configuration_changed:
+            self.snapshot_dirty = True
             self.pending_configuration = self._read_configuration()
             self.next_pass = self.clock.monotonic()
         # Drain ready requests before any expiry pass, including requests queued
         # on a connection accepted this turn. A silent peer cannot delay expiry.
         self.receiving_requests = True
         try:
-            self._receive_requests(ready)
+            if isinstance(self.acceptor, NoAcceptor):
+                self._receive_requests(ready)
+            else:
+                self._socket_requests()
         finally:
             self.receiving_requests = False
         for descriptor, events in ready:
             if descriptor in self.connections:
                 self._connection_event(self.connections[descriptor], events & ~select.EPOLLIN)
             elif descriptor in self.watchers:
+                self.snapshot_dirty = True
                 watch = self.watchers[descriptor]
                 if isinstance(watch, ScopeWatch):
                     try:
@@ -4167,11 +4588,16 @@ done
                 self._prune_watches()
                 self.next_pass = self.clock.monotonic()
         self._finish_priority_roster()
+        self._flush_socket_replies()
         if self.clock.monotonic() >= self.next_pass and self._pass_gap_open():
             _ = self.run_pass()
         if self.clock.monotonic() >= self.next_source_check:
+            self.snapshot_dirty = True
             self._check_sources()
         self._check_outage_alert()
+        self._flush_socket_replies()
+        if isinstance(self.acceptor, AdmissionAcceptor):
+            self.acceptor.raise_failure()
         _notify("WATCHDOG=1")
 
     def _receive_requests(self, ready: list[tuple[int, int]]) -> None:
@@ -4211,17 +4637,33 @@ done
                     self._unwatch(descriptor)
 
     def serve_forever(self) -> None:
-        self.start_reader()
-        watchdog = int(os.environ.get("WATCHDOG_USEC", "0"))
-        timeout = watchdog / 2_000_000 if watchdog > 0 else float("inf")
-        while not self.stopped:
-            self.run_once(timeout)
+        try:
+            self.start_acceptor()
+            self.start_reader()
+            watchdog = int(os.environ.get("WATCHDOG_USEC", "0"))
+            timeout = watchdog / 2_000_000 if watchdog > 0 else float("inf")
+            while not self.stopped:
+                self.run_once(timeout)
+        finally:
+            self.close()
 
     def close(self) -> None:
         if self.closed:
             return
         self.closed = True
         self.stopped = True
+        if isinstance(self.acceptor, AdmissionAcceptor):
+            self.acceptor.close()
+            # Accepted sockets can precede the loop's final incoming drain.
+            while True:
+                try:
+                    event = self.acceptor.incoming.get_nowait()
+                except Empty:
+                    break
+                if isinstance(event, SocketAccepted):
+                    self.connections[event.connection.socket.fileno()] = event.connection
+            self.acceptor.clients.clear()
+        os.close(self.socket_events)
         for worker in self.host_targets.values():
             worker.close()
         if not isinstance(self.system_reader, NoSystemReader):
