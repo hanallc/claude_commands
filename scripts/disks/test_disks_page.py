@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from xml.etree import ElementTree
 from typing import cast
 from unittest import mock
 
@@ -17,6 +18,8 @@ from scripts.build_queue import memory_files
 from scripts.build_queue.test_memory_hover import RAM_FIXTURE, SWAP_FIXTURE
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.disks import disks_page
+from scripts.production import staff
+from scripts.review_links import staff_names
 from scripts.lib import file_lock, test_hang_guard
 from scripts.review_links import page_frame, test_page_frame
 
@@ -62,6 +65,85 @@ SESSIONS: dict[str, object] = {"root": "/session", "sessions": [
 
 
 class DisksPageTests(unittest.TestCase):
+    def test_current_builds_keep_staff_parts_in_slot_names(self) -> None:
+        member = staff.StaffRow(staff.StaffId("builder"), "unit", "builder", staff.StaffRoot(),
+                                current_session=staff.StaffId("builder"))
+        setup = "globalThis.window=globalThis;" + staff_names.script(
+            staff_names.StaffNames(staff.StaffSnapshot((member,))).registry())[8:-9]
+        for waiting in (False, True):
+            with self.subTest(waiting=waiting):
+                row = {"key": "current", "name": "builder check", "slot_folder": "hana-slot1",
+                    "slot_machine": "natedev", "name_parts": [{"kind": "staff", "text": "builder"},
+                                                               {"kind": "text", "text": " check"}]}
+                result = str(self.run_drive(setup + """
+                    Date.now = () => input.now * 1000;
+                    slotReport = input.slots;
+                    builds = input.builds;
+                    result = slotsHtml(slotReport, KEEP, input.now, new Set(['hana']), slotStep);
+                """, extra={"slots": {**SLOTS, "machine": "natedev"}, "now": NOW,
+                            "builds": {"read_at": NOW, "walk": [] if waiting else [row],
+                                       "waiters": [row] if waiting else []}}))
+                self.assertEqual(re.findall(r'<span class="staff-name"[^>]*>([^<]*)</span>', result),
+                                 ["builder", "builder"])
+                self.assertEqual(result.count('</span> check</span>'), 2)
+
+    def test_slot_work_parts_color_only_the_recorded_staff_reference(self) -> None:
+        members = staff.StaffSnapshot(tuple(staff.StaffRow(staff.StaffId(name), "unit", name,
+            staff.StaffRoot(), current_session=staff.StaffId(name)) for name in ("builder", "helper")))
+        setup = "globalThis.window=globalThis;" + staff_names.script(staff_names.StaffNames(members).registry())[8:-9]
+        report = {"root": "/slots", "groups": [{"repository": "repo", "maximum": 1, "slots": [
+            {"name": "slot1", "number": 1, "size": 0, "last_used": NOW, "deleted_tonight": False,
+             "used_by": {"name": "builder helper", "showrunner": "", "name_parts": [
+                 {"kind": "staff", "text": "builder"}, {"kind": "text", "text": " helper"}]}}]}]}
+        body = str(self.run_page("(()=>{" + setup + "return slotsHtml(" + json.dumps(report)
+            + ",0," + str(NOW) + ",new Set(['repo']),()=>null);})()"))
+        self.assertEqual(re.findall(r'<span class="staff-name"[^>]*>([^<]*)</span>', body), ["builder", "builder"])
+        plain = str(self.run_page("(()=>{const report=" + json.dumps(report)
+            + ";delete report.groups[0].slots[0].used_by.name_parts;return slotsHtml(report,0,"
+            + str(NOW) + ",new Set(['repo']),()=>null);})()"))
+        self.assertEqual(re.sub(r'<[^>]+>', '', body), re.sub(r'<[^>]+>', '', plain))
+        current = str(self.run_page("(()=>{" + setup + "return slotsHtml(" + json.dumps(report)
+            + ",0," + str(NOW) + ",new Set(['repo']),()=>({name:'Current work'}));})()"))
+        self.assertEqual(current.count('>Current work</span>'), 2)
+        self.assertNotIn('class="staff-name"', current)
+
+    def test_slot_staff_names_have_role_colors_and_task_names_stay_plain(self) -> None:
+        runner = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(), current_session=staff.StaffId("builds"))
+        names = staff_names.StaffNames(staff.StaffSnapshot((runner,)))
+        setup = "globalThis.window=globalThis;" + staff_names.script(names.registry())[8:-9]
+        body = str(self.run_page("(()=>{" + setup + "return slotsHtml(" + json.dumps(SLOTS)
+                                + ", 0, " + str(NOW) + ", new Set(['hana']), ()=>null);})()"))
+        self.assertRegex(body, r'data-color-text="role.showrunner"[^>]*>builds</span>')
+        self.assertIn('>report integrate</span>', body)
+        self.assertNotRegex(body, r'class="staff-name"[^>]*>report integrate</span>')
+
+    def test_tooltip_keeps_task_and_repository_text_plain_when_it_matches_staff(self) -> None:
+        runner = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
+                                current_session=staff.StaffId("builds"))
+        names = staff_names.StaffNames(staff.StaffSnapshot((runner,)))
+        page = self.page_html()
+        functions = page[page.index("function slotTip("):page.index("function smallerTip(")]
+        setup = "globalThis.window=globalThis;" + staff_names.script(names.registry())[8:-9] + functions
+        body = str(self.run_page("(()=>{" + setup + "return stepTip.tipRowsHtml(slotTip("
+            + "{name:'builds',size:0,last_used:0,used_by:{name:'builds',showrunner:'builds'}},"
+            + "{repository:'builds'},0,100,30));})()"))
+        grid = ElementTree.fromstring(body)
+        self.assertEqual(grid[0].text, "builds")
+        self.assertEqual(list(grid[0]), [])
+        for label in ("Repository", "Used by"):
+            value = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == label)
+            self.assertEqual(value.text, "builds")
+            self.assertEqual(list(value), [])
+        value = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == "Showrunner")
+        self.assertEqual(value.findtext("span"), "builds")
+        session_body = str(self.run_page("(()=>{" + setup
+            + "return stepTip.tipRowsHtml(sessionTip({name:'builds',state:'running',size:0,"
+            + "held:[{name:'builds',task:'builds'}]},0));})()"))
+        session_grid = ElementTree.fromstring(session_body)
+        self.assertEqual(session_grid[0].findtext("span"), "builds")
+        folder = next(cell for cell in session_grid if cell.tag == "dt" and cell.text == "builds")
+        self.assertEqual(list(folder), [])
+
     def test_publish_writes_the_frame_style_and_settings_into_the_page(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             page = disks_page.publish(Path(directory) / "page", SETTINGS).read_text()

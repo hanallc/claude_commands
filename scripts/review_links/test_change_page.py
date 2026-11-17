@@ -29,6 +29,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, urgency
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
@@ -503,6 +504,26 @@ class ReviewTextTests(unittest.TestCase):
                              '<p>Steps:</p><h2>Items</h2><ol class="question-items"><li>open</li><li>close</li></ol>')
 
 class ChangePageTests(unittest.TestCase):
+    def test_rebuild_staff_requesters_have_role_colors_and_user_names_stay_plain(self) -> None:
+        records = [change_browser.Rebuild("2026-11-17T12:00:00+00:00", self.unit.name + " (unit)", "Read the result"),
+                   change_browser.Rebuild("2026-11-17T12:01:00+00:00", "nate", "Keep this reason")]
+        body = change_browser.owner_groups(records)
+        self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>builder-unit \(unit\)</span>')
+        self.assertIn('<h3>nate</h3>', body)
+
+    def test_legacy_question_sources_have_role_colors_and_free_names_stay_plain(self) -> None:
+        key = self.file_user_question("Read this result?", asker=self.unit)
+        body = self.browser("questions")[2]
+        self.assertIn(key, body)
+        self.assertRegex(body, r'data-color-text="role.showrunner"[^>]*>page-owner</span>')
+        self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>builder-unit</span>')
+        self.assertNotRegex(body, r'class="staff-name"[^>]*>nate</span>')
+        browser = change_page.ReviewBrowser('private', kind='questions')
+        question = next(item for item in change_browser.prepare(browser, change_page.DeliveryStatus(self.root)).questions
+                        if item.key == key)
+        unknown = replace(question, asker='nate', record=replace(question.record, asker=staff.StaffId('nate')))
+        self.assertIn('<dt>source:</dt><dd>nate</dd>', change_browser.question_section(unknown, browser, 2))
+
     temporary: Path = Path()
     root: Path = Path()
     repo: Path = Path()
@@ -1711,14 +1732,14 @@ class ChangePageTests(unittest.TestCase):
                 body = self.browser("questions")[2]
                 section = next(part for part in body.split('<section ') if f'data-key="{key}"' in part)
                 section = section.split('</section>', 1)[0]
-                self.assertIn(footer, section)
+                self.assertIn(footer, without_role_colors(section))
                 self.assertNotIn("Asked by", section)
-                self.assertLess(section.index('</form>'), section.index(footer))
+                self.assertLess(without_role_colors(section).index('</form>'), without_role_colors(section).index(footer))
                 unrouted = replace(question, tab="unrouted", record=record)
                 section = change_browser.question_section(unrouted, browser, 4)
                 self.assertNotIn('<form', section)
-                self.assertIn(footer, section)
-                self.assertLess(section.index('No showrunner owns this question.'), section.index(footer))
+                self.assertIn(footer, without_role_colors(section))
+                self.assertLess(without_role_colors(section).index('No showrunner owns this question.'), without_role_colors(section).index(footer))
 
     def file_other_change(self) -> Path:
         other = self.temporary / "change-review - another.md"
@@ -1757,7 +1778,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("Which layout gives each review card enough space for its controls?", body)
         self.assertNotIn("Choose the layout", body)
         self.assertIn("Compact &lt;layout&gt;", body)
-        self.assertIn('<dt>source:</dt><dd>page-owner · builder-unit</dd>', body)
+        self.assertIn('<dt>source:</dt><dd>page-owner · builder-unit</dd>', without_role_colors(body))
         self.assertNotIn("Asked by", body)
         self.assertNotIn("The old and new comments agree with the tests", body)
         self.assertEqual(forms.tabs[question], "page-owner")
@@ -1816,7 +1837,7 @@ class ChangePageTests(unittest.TestCase):
             self.assertIn('<div data-owner><h3>second-session (unit)</h3>'
                           + '<dl><dt><time datetime="2026-11-12T13:00:00+00:00">Nov 12, 2026, 08:00</time></dt>'
                           + '<dd>Apply the second settings.</dd></dl></div><div data-owner><h3>page-owner (showrunner)</h3>',
-                          natedev)
+                          without_role_colors(natedev))
             self.assertIn('<h3>Unknown session: unknown-requester</h3>', mac)
             for control in ('<form', '<textarea', 'data-showrunner', 'data-next', 'data-key'):
                 self.assertNotIn(control, block)
@@ -1832,7 +1853,7 @@ class ChangePageTests(unittest.TestCase):
                 content = change_browser.rebuild_list(
                     rebuild_row.RebuildAnswer(("natedev",), False, needs=(summary,)), {}, staff.snapshot())
                 self.assertIn('data-count="1" data-label="Rebuild natedev"', content)
-                self.assertIn('<h3>second-session (unit)</h3>', content)
+                self.assertIn('<h3>second-session (unit)</h3>', without_role_colors(content))
 
             with self.subTest(rebuilds="status line comparison"):
                 configuration = Path(os.environ["CONF_DIR"]) / "statusline.conf"

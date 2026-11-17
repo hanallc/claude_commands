@@ -16,6 +16,7 @@ from scripts.production import change_review, proposal_issue, staff
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_link
 from scripts.review_links import review_legacy
 from scripts.review_links import review_actions
+from scripts.review_links import staff_names
 from scripts.review_links.review_items import ReviewItem, ReviewState, ReviewType
 
 PAGE_PATH = '/console/review.html'
@@ -80,7 +81,9 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser) -> str:
             + '<div class="review-actions">'+groups+'</div><span role="status" data-send-status></span></form>')
 
 
-def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot) -> str:
+def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot,
+            names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
+    names = staff_names.for_page(names, members)
     source = item.source
     if isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
         content, choices = change_browser.question_parts(source.record.item)
@@ -112,12 +115,12 @@ def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff
         body = ''
     logs = ''.join('<li><time datetime="'+entry.time.isoformat()+'">'
         +entry.time.astimezone(user_zone()).strftime('%b %d %H:%M')+'</time><span>'+html.escape(entry.words)
-        +' <small>— '+html.escape(entry.who)+'</small></span></li>' for entry in reversed(item.log))
+        +' <small>— '+names.html(entry.who)+'</small></span></li>' for entry in reversed(item.log))
     owner = owner_name(item, members)
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+body+'</div><section><h3>Log · newest first</h3>'
             +'<ol class="list-log">'+logs+'</ol></section>'+form(item, browser)
-            +'<p class="review-source">Owner: '+html.escape(owner)+' · Source: '
-            +html.escape(review_items.name(item.source_unit, members))+'</p></div>')
+            +'<p class="review-source">Owner: '+names.html(item.owner, owner)+' · Source: '
+            +names.html(item.source_unit, review_items.name(item.source_unit, members))+'</p></div>')
 
 
 def owner_name(item: ReviewItem, members: staff.StaffSnapshot) -> str:
@@ -129,7 +132,9 @@ def age(filed: datetime, now: datetime) -> str:
     return f'{seconds//86400} d' if seconds >= 86400 else f'{seconds//3600} h' if seconds >= 3600 else f'{seconds//60} min'
 
 
-def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, now: datetime, index: int) -> str:
+def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, now: datetime, index: int,
+              names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
+    names = staff_names.for_page(names, members)
     owner = owner_name(item, members)
     source = review_items.name(item.source_unit, members)
     title = '<strong>'+html.escape(item.title)+'</strong>'
@@ -146,17 +151,18 @@ def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: sta
     toggle = (f'<button type="button" class="list-toggle" aria-expanded="false" aria-controls="{panel}">'
               +'<span class="list-chevron" aria-hidden="true">›</span>'+html.escape(item.id)+'</button>')
     state = '<span class="list-state '+('warning' if item.state == ReviewState.FOR_YOU else 'muted')+'">'+item.state+'</span>'
-    cells = (toggle, icon(item.type)+item.type.title(), html.escape(owner)+('<small>· '+html.escape(source)+'</small>' if source != owner else ''),
+    cells = (toggle, icon(item.type)+item.type.title(), names.html(item.owner, owner)+('<small>· '+names.html(item.source_unit, source)+'</small>' if source != owner else ''),
              title, state, age(item.times.filed, now))
     row = ''.join(f'<td data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden = ' hidden' if item.state == ReviewState.DONE or item.hidden_until(now) else ''
     return ('<tbody data-list-item'+attributes+hidden+'><tr class="list-row">'+row+'</tr>'
-            +f'<tr data-detail id="{panel}" hidden><td colspan="6">'+details(item, browser, members)+'</td></tr></tbody>')
+            +f'<tr data-detail id="{panel}" hidden><td colspan="6">'+details(item, browser, members, names)+'</td></tr></tbody>')
 
 
 def render(root: Path, *, show: str = 'open') -> bytes:
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
+    names = staff_names.StaffNames(members)
     now = datetime.fromtimestamp(read_at, user_zone())
     if show not in dict(SHOWS):
         show = 'open'
@@ -171,7 +177,7 @@ def render(root: Path, *, show: str = 'open') -> bytes:
     token, initial = change_browser.browser_manifest(change_page.console_folder(root))
     browser = change_page.ReviewBrowser(token, initial)
     visible = items
-    options = ''.join(f'<option value="{html.escape(owner, quote=True)}" data-owner-name="{html.escape(name, quote=True)}">{html.escape(name)} '
+    options = ''.join(f'<option value="{html.escape(owner, quote=True)}" data-owner-name="{html.escape(name, quote=True)}"{names.style(owner)}>{html.escape(name)} '
                      +f'({sum(item.owner == owner or item.type == ReviewType.INVESTIGATION and item.source_unit == owner for item in visible)})</option>'
                      for owner, name in sorted(owners.items(), key=lambda pair:pair[1].casefold()))
     chips = '<button type="button" data-type-chip="" aria-pressed="true">All <b>'+str(len(visible))+'</b></button>'
@@ -189,7 +195,7 @@ def render(root: Path, *, show: str = 'open') -> bytes:
         +'<span data-list-count role="status"></span></div><div class="list-table"><table aria-label="Review">'
         +'<colgroup><col style="width:13%"><col style="width:13%"><col style="width:14%"><col style="width:41%">'
         +'<col style="width:12%"><col style="width:7%"></colgroup><thead><tr>'+headers+'</tr></thead>'
-        +''.join(item_rows(item,browser,members,now,index) for index,item in enumerate(items))
+        +''.join(item_rows(item,browser,members,now,index,names) for index,item in enumerate(items))
         +'</table><p data-empty hidden>No items in this view.</p></div></div><script>'+SCRIPT+'</script>')
     return page_frame.rendered(change_page.document(content, 'Review'), started, read_at)
 

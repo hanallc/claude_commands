@@ -9546,6 +9546,15 @@ class PickerTests(unittest.TestCase):
 class SharedStatusDocumentTests(unittest.TestCase):
     """The stored JSON adds access and spending signals without changing its text view."""
 
+    def test_staff_kind_uses_the_board_role_color_keys(self) -> None:
+        from scripts.production import staff
+
+        row = staff.StaffRow(staff.StaffId("producer"), "producer", "morty", staff.StaffRoot(), current_session=staff.StaffId("producer"))
+        self.assertEqual(accounts.staff_role_color(row, {"role.producer": "pink"}),
+                         accounts.StaffRoleColor(accounts.ROLE_COLOR_KEYS["producers"], "#ff87af"))
+        self.assertIsInstance(accounts.staff_role_color(row, {}), accounts.NoAccountColor)
+        self.assertIsInstance(accounts.staff_role_color(row, {"role.producer": "invalid"}), accounts.NoAccountColor)
+
     at: datetime = datetime(2026, 10, 16, 18, tzinfo=timezone.utc)
 
     def row(self) -> accounts.StatusRow:

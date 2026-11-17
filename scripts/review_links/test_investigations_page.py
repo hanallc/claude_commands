@@ -14,6 +14,7 @@ from unittest.mock import patch
 from urllib.parse import urlencode
 
 from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.test_staff_names import without_role_colors
 from scripts.production import investigation, staff
 from scripts.review_links import console, investigations_page
 
@@ -26,6 +27,14 @@ ORPHAN = staff.StaffId("f5636030-6745-4ff4-aeda-4c2773d18da8")
 
 class InvestigationsPageTests(unittest.TestCase):
     root: Path = Path()
+
+    def test_staff_sources_have_separate_role_colors_and_missing_sources_stay_plain(self) -> None:
+        _ = self.file(UNIT.id, "Known source", "2026-11-16T12:00:00+00:00")
+        _ = self.file(ORPHAN, "Missing source", "2026-11-16T12:01:00+00:00")
+        body = investigations_page.render(self.root / "reviews").decode()
+        self.assertRegex(body, r'data-color-text="role.showrunner"[^>]*>Alpha</span>')
+        self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>Builder</span>')
+        self.assertIn('<dd>' + ORPHAN + '</dd>', body)
 
     @override
     def setUp(self) -> None:
@@ -84,7 +93,7 @@ class InvestigationsPageTests(unittest.TestCase):
         read = self.file(ORPHAN, "Read answer", "2026-11-16T12:00:00+00:00")
         _ = investigation.answer(ORPHAN, read.id, "An answer.")
         _ = investigation.mark_read(ORPHAN, read.id)
-        body = investigations_page.render(self.root / "reviews").decode()
+        body = without_role_colors(investigations_page.render(self.root / "reviews").decode())
         self.assertIn('</h1><p class="page-status"', body)
         self.assertLess(body.index('data-page-status '), body.index('<div data-investigations'))
         self.assertEqual(body.count("<article "), 3)

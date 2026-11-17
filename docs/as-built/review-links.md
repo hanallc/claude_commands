@@ -85,6 +85,44 @@ The lock file stays on disk. Closing it releases the lock, also on an error. If 
 
 ### Hana console
 
+Staff names use the current role colors from the Accounts reader.
+`staff_names.StaffNames` shares one staff snapshot and one color reading across each server render.
+It resolves fixed IDs, session IDs, and unambiguous staff names.
+The shared renderer escapes unknown names and free text without a role color.
+The List colors Owner, Producer, supporting unit names, staff names in log sources, and showrunner names in the count strip.
+List delivery notices color morty and the recorded showrunner through the same page renderer.
+They keep the notice words and time.
+Review colors Owner, Source, staff log names, and owner menu options.
+Images colors card owners and copies those colored names into the group links.
+Legacy question pages color each source and its parent separately.
+Branch pages color unit names. Rebuilds colors recorded requesters.
+Builds shares the same rendered name spans in each current data reading.
+Its tables, charts, target owners, queue priorities, and marked staff fields in tooltips use those spans.
+The tooltip renderer escapes other fields as plain text.
+The swap reader marks titles that name staff and keeps those markers in smaller-group members.
+The swap chart and tooltips color only marked staff titles.
+Program titles stay plain.
+Swap details carry separate staff references and context text.
+The swap display applies the existing public text filter and keeps the staff markers.
+Grouped process labels and Disks lease labels also keep those parts separate.
+Gate descriptions and Mac hold reasons keep their staff fields separate from the recorded prose.
+The reader marks each staff field before it joins the display text.
+The renderer colors marked staff parts and escapes paths, programs, and other context text.
+Old readings without marked parts stay plain.
+It renders each priority name before it joins the names.
+Empty target role labels use the recorded holder. Only the holder name can have a role color.
+Disks uses the same spans for slot holders, sessions, and shared tooltip fields.
+Current Builds rows carry their name parts through `slotStep` to the Disks slot label.
+Its existing Builds refresh updates the name spans without a new timer.
+AWS and the console navigation show no staff name fields.
+The Units board emits Markdown through `unit_phases.py`; this checkout has no Units console route.
+
+Saved role colors apply after the next page render or Builds data reading.
+Color changes need no console restart.
+The console and Builds processes need their normal code reload when this implementation is installed.
+The renderer preserves each configured color in both themes.
+It does not choose a different color when contrast is low.
+
 `change_page.py` without rows prints one fixed link, `http://<host>:<server_port>/console/`.
 `/console` without the final slash forwards to `/console/` with the same query.
 The server renders `/console/` from the current code and configuration at each GET.
