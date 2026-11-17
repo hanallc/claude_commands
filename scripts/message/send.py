@@ -36,7 +36,8 @@ An absent staff recipient keeps its queue without selecting a session family.
 One staff snapshot selects each staff recipient.
 Unit names also accept the form from copies.unit_owner. Ambiguous staff names stop delivery.
 A staff recipient uses its current_session, including for an explicit address.
-A name without a staff row is refused without a relay or queue.
+A name without a staff row matches a live freestanding Claude session's registry name.
+An unmatched name is refused without a relay or queue.
 Explicit non-staff addresses keep their transport and queue behavior.
 Worker addresses use native IDs from the local or peer roster for staff lookup.
 Each message records its runtime sender ID separately from `--from`.
@@ -2307,6 +2308,17 @@ def _native_address_matches(to: str, entries: list[roster.RosterEntry]) -> list[
     return []
 
 
+def _registry_name_matches(to: str, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
+    from scripts.message import roster
+
+    if to.startswith(("session:", "worker:", "codex:", "uds:")):
+        return []
+    return [entry for entry in entries
+            if entry.kind == "claude" and entry.role == "freestanding"
+            and isinstance(entry.registry_name, roster.RegistryName)
+            and entry.registry_name.value.casefold() == to.casefold()]
+
+
 def _matched_recipient(
     to: str, matches: list[roster.RosterEntry], destination: LocalOnly | NamedMachine,
 ) -> SessionRecipient | RemoteDelivery:
@@ -2333,12 +2345,17 @@ def matching_recipients(
     member = _staff_recipient_match(to, membership, observed=observed.entries)
     if isinstance(member, RecipientLookupFailed):
         return RecipientSearchFailed(member.reason, [member.reason])
+    staff_alias = (resolve_staff_recipient(to, membership, observed=observed.entries)
+                   if isinstance(member, NoStaffRecipient) else member)
+    if isinstance(staff_alias, RecipientLookupFailed):
+        return RecipientSearchFailed(staff_alias.reason, [staff_alias.reason])
     if isinstance(member, staff.StaffRow):
         for anomaly in observed.row_anomalies:
             if anomaly.row.id == member.id:
                 return RecipientSearchFailed(anomaly.diagnostic, observed.diagnostics)
     matches = (_staff_transport_matches(member, observed.entries) if isinstance(member, staff.StaffRow)
-               else _native_address_matches(to, observed.entries))
+               else _native_address_matches(to, observed.entries)
+               or (_registry_name_matches(to, observed.entries) if isinstance(staff_alias, NoStaffRecipient) else []))
     if matches or isinstance(scope, LocalOnly):
         return RecipientMatches(matches, LocalOnly(), observed.diagnostics)
     addressed = to.startswith(("session:", "worker:", "codex:"))
@@ -2355,7 +2372,8 @@ def matching_recipients(
             return RecipientMatches(matches, LocalOnly(), problems)
         matches = _staff_transport_matches(member, peer.entries)
     else:
-        matches = _native_address_matches(to, peer.entries)
+        matches = (_native_address_matches(to, peer.entries)
+                   or (_registry_name_matches(to, peer.entries) if isinstance(staff_alias, NoStaffRecipient) else []))
     if not matches and peer.problems:
         return RecipientSearchFailed("; ".join(peer.problems), problems)
     return RecipientMatches(matches, NamedMachine(roster.remote.other_machine()), problems)
