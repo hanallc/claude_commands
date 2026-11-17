@@ -117,7 +117,7 @@ class ReviewRepairsTests(unittest.TestCase):
             assert isinstance(waiting.source, review_items.UnownedQuestionSource)
             before = waiting.source.record.path.read_bytes()
             self.assertEqual(waiting.actions, ())
-            form = review_page.form(waiting, change_page.ReviewBrowser('fixture-token'))
+            form = review_page.form(waiting, change_page.ReviewBrowser('fixture-token'), 3)
             self.assertIn('value="later">Later', form)
             for action in ('answer', 'feedback', 'question'):
                 with self.subTest(action=action):
