@@ -99,8 +99,6 @@ from scripts.build_queue.queue_place import (  # noqa: E402
 
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
 TEST_HERDR_BIN = "/nonexistent/herdr"
-# Fixture commits would start Git auto maintenance; it checks nothing and costs aws CPU.
-TEST_GIT_CONFIG = "'maintenance.auto=false' 'gc.auto=0'"
 # The largest measured module was 0.52 GiB; this includes the 1.2 growth margin.
 UNRECORDED_MODULE_RESERVATION_MIB = 640
 # A module still running this long is killed and the run is red: a hung module holds every gate
@@ -1117,7 +1115,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
 
 
 def test_module_environment(root: Path, environment: dict[str, str]) -> dict[str, str]:
-    """Give a module a private build log, tripwires for tools and live memory, and no Git auto maintenance."""
+    """Give a module a private build log and tripwires for tools and live memory."""
     buildlog = root / "buildlog"
     buildlog.mkdir()
     tools = root / "build-tool-tripwires"
@@ -1142,8 +1140,6 @@ raise SystemExit(99)
             session_folder.ROOT_ENV: str(root / "session"),
             "TEST_TIMES_OUT": str(root / "test-times.json"),
             "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(root / "live-memory-reads.jsonl"),
-            "GIT_CONFIG_PARAMETERS": " ".join(
-                part for part in (environment.get("GIT_CONFIG_PARAMETERS", ""), TEST_GIT_CONFIG) if part),
             "PATH": str(tools) + os.pathsep + environment.get("PATH", os.defpath)}
 
 
