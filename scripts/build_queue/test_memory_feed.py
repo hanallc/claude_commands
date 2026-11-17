@@ -28,12 +28,13 @@ from unittest import mock
 from scripts.buildlog import charts, cost_actions, costs
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, target_availability
+from scripts.build_queue import memory_trace
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
 from scripts.build_targets import build_targets, target_config, targets
 from scripts.build_queue.queue_view import refresh_mac_builds
 from scripts.build_queue.admission_test_support import AdmissionFixture, NOW as ADMISSION_NOW, only_admitted
-from scripts.build_queue.queue_fixture import write_process, write_scope
+from scripts.build_queue.queue_fixture import fixture_reservation, write_process, write_scope
 from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
@@ -208,6 +209,34 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual({row["pid"]: row["tokens"] for row in rows(idle) if "tokens" in row}, {pid: 0})
         self.assertTrue(all("tokens" not in row for row in rows(known) if not local(row)))
 
+    def test_program_memory_main_publishes_a_single_reservation(self) -> None:
+        now = 10 * 86_400
+        started = now - 8
+        policy = memory_trace.MemoryTracePolicy(2, 64, 8_192, 2, 8, 8, 65_536)
+        store = memory_trace.TraceStore(self.root / "buildlog" / "admission" / "memory_traces", policy)
+        writer = store.start(memory_trace.TraceHeader("live-trace", "a" * 64, (now - 6) * 1000, 2000, 10))
+        _ = writer.append(memory_trace.CompileSample(2000, 7, memory_trace.CargoProgress(1, 2), "hana"))
+        reservation: admission_records.Reservation = {
+            **fixture_reservation(101, 10, step="nextest"), "repo": "hana", "reservation_id": "live-trace",
+            "scoped": True, "admitted_at": datetime.fromtimestamp(started, UTC).isoformat(),
+        }
+        memory = admission_records.MeasuredMemory(8, anonymous=admission_records.AnonymousRunUse(8))
+        step = admission_records.RunningStep("", "fixture", "nextest", "/fixture", 10, memory,
+            pid=101, run=LiveBuildRun(101, "live-trace", started), started_at=started)
+        inputs = admission_records.QueueInputs([], (step,), (reservation,),
+            admission_records.HostMemory(30 * admission_records.GIB, 60 * admission_records.GIB),
+            admission_records.NO_PRESSURE_HOLD, admission_records.ReadyToStart(), now)
+        queue = gate.queue_read_from(inputs, admission_policy_fixture())
+        with (mock.patch.object(memory_trace, "read_policy", return_value=policy),
+              mock.patch.object(admission_client, "view", return_value=queue)):
+            self.assertEqual(memory_feed.main(["--once"]), 0)
+        page = cast(memory_feed.MemoryPage, json.loads((self.output / "memory.json").read_text()))
+        row = next(cast(memory_feed.RunRow, row) for row in page["walk"] if row["pid"] == 101)
+        view = row.get("program_memory")
+        assert view is not None
+        self.assertEqual(view["compile_reserve"], {"bytes": 10, "source": "live"})
+        self.assertEqual(view["live"]["compile"]["peak"], [2000, 7])
+
     def test_the_feed_shows_why_token_counts_are_unknown_when_steve_refuses_a_dump(self) -> None:
         reading = reservation_reading()
         with mock.patch.object(admission_client, "view", return_value=reading):
@@ -336,6 +365,7 @@ class MemoryFeedTests(unittest.TestCase):
         })))
         _ = self.enterContext(mock.patch.object(admission_client, "view",
             side_effect=AssertionError("The test must supply a private queue reading")))
+        _ = self.enterContext(mock.patch.object(memory_trace, "read_policy", return_value=memory_trace.TracesOff("fixture")))
         _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={}))
         _ = self.enterContext(mock.patch.object(memory_feed, "host_name", return_value="fixture"))
         _ = self.enterContext(mock.patch.object(memory_feed, "PROC", self.root / "proc"))
@@ -1523,8 +1553,9 @@ process.stdout.write(JSON.stringify({
                     builtins.__import__ = original_import
                     assert changed
                     assert not hasattr(getattr(memory_feed, sys.argv[4]), 'InstalledSchemaRevision')
-                    with mock.patch.object(memory_feed.admission_client, 'view',
-                            side_effect=AssertionError('The old decoder must not read the queue')):
+                    with (mock.patch.object(memory_feed.program_memory_feed, 'configured_feed', return_value=None),
+                          mock.patch.object(memory_feed.admission_client, 'view',
+                            side_effect=AssertionError('The old decoder must not read the queue'))):
                         status = memory_feed.main(['--once', '--code-root', str(root)])
                     print(json.dumps({'status': status, 'changed':
                         memory_feed.LOADED_FEED_CODE_VERSION != memory_feed.installed_feed_code_version(root)}))
@@ -1542,7 +1573,8 @@ process.stdout.write(JSON.stringify({
                     decoded = memory_feed.codec.parse_snapshot_value(
                         {'kind': 'InstalledSchemaRevision', 'revision': 'after'},
                         getattr(memory_feed, sys.argv[2]).InstalledSchemaRevision)
-                    with (mock.patch.object(memory_feed.queue_view, 'refresh_mac_builds'),
+                    with (mock.patch.object(memory_feed.program_memory_feed, 'configured_feed', return_value=None),
+                          mock.patch.object(memory_feed.queue_view, 'refresh_mac_builds'),
                           mock.patch.object(memory_feed, 'report_reading',
                             return_value=memory_feed.charts.IndexUnavailable('private report fixture')),
                           mock.patch.object(memory_feed, 'reading', return_value={

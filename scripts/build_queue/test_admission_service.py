@@ -11,7 +11,7 @@ from scripts.lint.memory_test_support import admission_configuration_fixture, ad
 
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout, suppress
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 import io
 import json
@@ -50,11 +50,14 @@ from scripts.message.roster import UnitLabels
 from scripts.lint.build_shape import build_shape
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service
 from scripts.build_queue import admission_wire as status_wire
-from scripts.build_queue import admission_code, queue_snapshot, queue_view, head_facts, placement
+from scripts.build_queue import admission_code, queue_snapshot, queue_view, head_facts, memory_trace, placement
 from scripts.build_queue import admission_records as records, progress_profile as progress, step_estimator
 from zoneinfo import ZoneInfo
-from scripts.build_queue.queue_fixture import write_memory_config, write_process
+from scripts.build_queue.queue_fixture import write_memory_config, write_process, write_scope
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, caller_admission, only_admitted
+
+
+TRACE_POLICY = memory_trace.MemoryTracePolicy(2, 100, 8192, 7, 10, 16, 1024)
 
 
 def setUpModule() -> None:
@@ -6092,6 +6095,7 @@ class CutoverServiceTests(unittest.TestCase):
             server = mock.MagicMock(replace_in_place=False)
             with mock.patch.object(store, "root", return_value=root), \
                  mock.patch.object(service, "AdmissionServer", return_value=server) as made, \
+                 mock.patch.object(memory_trace, "read_policy", return_value=TRACE_POLICY), \
                  mock.patch.object(sys, "argv", ["admission_service", "serve"]):
                 self.assertEqual(service.main(), 0)
             self.assertEqual(made.call_args.args[0], root / "admission")
@@ -7200,3 +7204,234 @@ class AdmissionConfigurationTests(unittest.TestCase):
                 fixture.allow_next_start()
             self.assertEqual(only_admitted(fixture.server.handle_request(child)), granted)
             self.assertEqual(len([record for record in fixture.server.reservations.values() if record.owner == child.owner]), 1)
+
+
+@dataclass(frozen=True)
+class ScopedMemoryTrace:
+    reader: service.OperatingSystemReader
+    request: wire.AdmitRequest
+    grant: wire.Admitted
+    sidecar: Path
+    scope: Path
+    log: Path
+    store: memory_trace.TraceStore
+
+
+class MemoryTraceCaptureTests(unittest.TestCase):
+    def grant(self, fixture: AdmissionFixture, *, repository: str = "hana",
+              step: str = "nextest", scoped: bool = True) -> ScopedMemoryTrace:
+        server = fixture.server
+        request = fixture.request(step=step, width=records.RequestedTestWidth(8))
+        sidecar = fixture.root / f"sample-{request.owner.pid}.cgroup"
+        request = replace(request, sidecar=str(sidecar) if scoped else "",
+                          argv=("cargo", "nextest", "run", "--test-threads", "8"),
+                          profile=replace(request.profile, repo=repository,
+                              repository=records.RepositoryIdentity(f"git-root:{repository}", repository)))
+        _ = server.run_pass()
+        server.trace_policy = TRACE_POLICY
+        with mock.patch.object(threading.Thread, "start"):
+            server.start_reader()
+        reader = server.system_reader
+        assert isinstance(reader, service.OperatingSystemReader)
+
+        def close_server() -> None:
+            with mock.patch.object(reader.thread, "join"):
+                server.close()
+
+        _ = fixture.callback(close_server)
+        grant = only_admitted(server.handle_request(request))
+        if scoped:
+            _ = fixture.scope(request.owner, current=8 * GIB, anonymous=2 * GIB, swap=3 * GIB)
+            stamp = round(fixture.clock.now() * 1_000_000_000)
+            os.utime(sidecar, ns=(stamp, stamp))
+        scope = fixture.root / f"scope-{request.owner.pid}"
+        log = progress.progress_path(sidecar, "log")
+        return ScopedMemoryTrace(reader, request, grant, sidecar, scope, log,
+                                 memory_trace.TraceStore(fixture.state_dir / "memory_traces", TRACE_POLICY))
+
+    def drive(self, fixture: AdmissionFixture, run: ScopedMemoryTrace, finish_at: float,
+              events: tuple[tuple[float, Callable[[], None]], ...]) -> None:
+        reader = run.reader
+        start = fixture.clock.monotonic()
+        scheduled = iter(events)
+        next_event = next(scheduled, None)
+        waits = 0
+
+        def delay(seconds: float) -> bool:
+            nonlocal next_event, waits
+            waits += 1
+            self.assertLess(waits, 30)
+            if reader.requested.is_set():
+                return True
+            now = fixture.clock.monotonic() - start
+            destination = min(now + seconds, next_event[0] if next_event is not None else finish_at, finish_at)
+            fixture.clock.advance(destination - now)
+            if next_event is not None and destination == next_event[0]:
+                _, action = next_event
+                next_event = next(scheduled, None)
+                action()
+            if destination == finish_at:
+                reader.stopped.set()
+            return reader.requested.is_set()
+
+        with mock.patch.object(reader.requested, "wait", side_effect=delay):
+            reader.thread.run()
+
+    @staticmethod
+    def append(path: Path, content: str) -> None:
+        with path.open("a") as output:
+            _ = output.write(content)
+
+    def sealed(self, run: ScopedMemoryTrace) -> memory_trace.MemoryTrace:
+        path, = (run.store.root / "finished").glob(f"*/*-{run.grant.reservation}.jsonl")
+        trace = memory_trace.read_trace(path, TRACE_POLICY)
+        assert isinstance(trace, memory_trace.MemoryTrace)
+        self.assertIsInstance(trace.state, memory_trace.TraceEnd)
+        return trace
+
+    def test_narrow_ticks_leave_the_full_cadence_and_admission_result_intact(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            server = fixture.server
+            record = server.reservations[run.request.episode]
+            need = records.TestPhaseNeed(2 * GIB, 1, 8, 8, "same_width", 1.5)
+            server.reservations[run.request.episode] = replace(record, test_phase_need=need)
+            run.reader.update(replace(run.reader.plan, config=replace(run.reader.plan.config, running_pass_seconds=4),
+                                      reservations=(server.reservations[run.request.episode],)))
+            initial_result = server.last_result
+            initial_epoch = fixture.clock.now()
+            initial_monotonic = fixture.clock.monotonic()
+            full_times: list[float] = []
+            _ = run.log.write_text("\r\x1b[32m Compiling hana v0.1.0\x1b[0m\rBuilding [=>] 8/9\r")
+            _ = (run.scope / "memory.stat").write_text(
+                f"anon {2 * GIB}\nshmem {GIB}\ninactive_file {4 * GIB}\nfile {5 * GIB}\n")
+
+            def start_tests() -> None:
+                self.assertIs(server.last_result, initial_result)
+                self.append(run.log, "    Nextest run ID edd0\n    Starting 20 tests\n")
+
+            def publish_phase() -> None:
+                phase = Path(record.sidecar).with_suffix(".test-phase.json")
+                _ = phase.write_text(json.dumps({"test_phase_peak_bytes": 3 * GIB,
+                    "test_phase_started_at": initial_epoch + 3.5, "repo_identity": record.repo_identity,
+                    "test_scope": "full", "package": "", "filters": [], "call_id": "", "test_threads": 8}))
+
+            def release() -> None:
+                self.append(run.log, "    Summary [   2.97s] 20 tests run: 19 passed, 1 failed")
+                self.assertEqual(server.handle_request(wire.ReleaseRequest("trace-release", run.grant.reservation, 100)),
+                                 [wire.Ok()])
+                run.log.unlink(missing_ok=True)
+                run.sidecar.unlink(missing_ok=True)
+
+            read_system = service.read_system
+
+            def timed_full_read(plan: service.SystemReadingPlan, readings: service.Readings,
+                                proc: service.Proc, clock: service.Clock) -> service.SystemEvidence:
+                full_times.append(clock.monotonic() - initial_monotonic)
+                return read_system(plan, readings, proc, clock)
+
+            with mock.patch.object(service, "read_system", side_effect=timed_full_read), \
+                 mock.patch.object(gate, "slice_working_set", wraps=gate.slice_working_set) as scope, \
+                 mock.patch.object(gate, "admission_pass", side_effect=AssertionError("trace tick ran admission")):
+                self.drive(fixture, run, 7.5, ((4, start_tests), (6, publish_phase), (7, release)))
+            self.assertEqual(full_times, [0, 4])
+            self.assertEqual(scope.call_args_list.count(mock.call(run.scope)), 4)
+            self.assertEqual(os.eventfd_read(server.reading_events), 2)
+            self.assertIs(server.last_result, initial_result)
+            trace = self.sealed(run)
+            self.assertEqual(trace.compile_samples, tuple(
+                memory_trace.CompileSample(elapsed, 3 * GIB, memory_trace.CargoProgress(8, 9), "hana")
+                for elapsed in (0, 2000)))
+            self.assertEqual(trace.test_start, memory_trace.TestStarted(4000, 9 * GIB // 2))
+            self.assertEqual(trace.test_samples, tuple(memory_trace.TestSample(elapsed, 3 * GIB)
+                                                      for elapsed in (4000, 6000)))
+            self.assertEqual(trace.state, memory_trace.TraceEnd(round((initial_epoch + 7) * 1000),
+                                                               7000, 100, memory_trace.WholeRun()))
+            shape = memory_trace.HanaTraceShape(server.host, record.repo_identity, run.request.argv,
+                                                records.RequestedTestWidth(8))
+            self.assertEqual(trace.header.shape_key, memory_trace.shape_key(shape))
+            self.assertEqual(trace.header.compile_reserve_bytes, run.grant.need)
+
+    def test_replaced_scope_directory_seals_without_sampling_the_new_scope(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+
+            def replace_scope() -> None:
+                _ = run.scope.rename(fixture.root / "old-scope")
+                write_scope(run.scope, members=(run.request.owner.pid,), current=9 * GIB, anonymous=9 * GIB)
+
+            self.drive(fixture, run, 3, ((2, replace_scope),))
+            trace = self.sealed(run)
+            self.assertEqual([sample.program_bytes for sample in trace.compile_samples], [2 * GIB])
+            self.assertEqual(trace.state, memory_trace.TraceEnd(
+                round((fixture.clock.now() - 1) * 1000), 2000, memory_trace.ExitStatusUnavailable(),
+                memory_trace.IncompleteRun(memory_trace.IncompleteReason.SCOPE_LOST)))
+
+    def test_short_tests_that_finish_between_ticks_have_no_test_samples(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            _ = run.log.write_text("Building [=>] 9/10\r")
+
+            def completed() -> None:
+                self.append(run.log, "    Nextest run ID edd0\n    Starting 1 test\n"
+                            + "    Summary [   0.02s] 1 test run: 1 passed\n")
+
+            def release() -> None:
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                    "short-release", run.grant.reservation, 0)), [wire.Ok()])
+
+            self.drive(fixture, run, 3.5, ((2, completed), (3, release)))
+            trace = self.sealed(run)
+            self.assertEqual(trace.test_start, memory_trace.TestStarted(2000, memory_trace.TestReserveUnavailable()))
+            self.assertEqual(trace.test_samples, ())
+            assert isinstance(trace.state, memory_trace.TraceEnd)
+            self.assertEqual(trace.state.coverage, memory_trace.IncompleteRun(memory_trace.IncompleteReason.MISSING_TEST))
+
+    def test_owner_exit_seals_an_incomplete_trace_after_the_scope_drains(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+
+            def owner_exit() -> None:
+                fixture.proc.kill(run.request.owner)
+                _ = (run.scope / "cgroup.procs").write_text("")
+                _ = (run.scope / "cgroup.events").write_text("populated 0\n")
+                run.reader.request_read()
+
+            def finalize_owner() -> None:
+                fixture.server.run_once(0)
+                self.assertNotIn(run.request.episode, fixture.server.reservations)
+
+            self.drive(fixture, run, 4, ((2, owner_exit), (3, finalize_owner)))
+            trace = self.sealed(run)
+            assert isinstance(trace.state, memory_trace.TraceEnd)
+            self.assertEqual(trace.state.exit_status, memory_trace.ExitStatusUnavailable())
+            self.assertEqual(trace.state.coverage, memory_trace.IncompleteRun(memory_trace.IncompleteReason.SCOPE_LOST))
+
+    def test_a_restart_seals_the_readable_prefix_as_incomplete(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            self.drive(fixture, run, 1, ())
+            live = run.store.read_live(run.grant.reservation)
+            assert isinstance(live, memory_trace.MemoryTrace)
+            partial = run.store.root / "live" / f"{run.grant.reservation}.jsonl"
+            self.append(partial, '["t",')
+            with mock.patch.object(threading.Thread, "start"):
+                restarted = service.OperatingSystemReader(run.reader.plan, run.reader.latest,
+                    fixture.readings, fixture.proc, fixture.clock, fixture.server.reading_events,
+                    traces=memory_trace.TraceCapture(run.store, fixture.root, ""))
+            updated = replace(run, reader=restarted)
+            self.drive(fixture, updated, 1, ())
+            trace = self.sealed(run)
+            self.assertEqual(trace.compile_samples, live.compile_samples)
+            self.assertFalse(partial.exists())
+            assert isinstance(trace.state, memory_trace.TraceEnd)
+            self.assertEqual(trace.state.coverage, memory_trace.IncompleteRun(memory_trace.IncompleteReason.RESTART))
+            self.assertIsInstance(run.store.newest_whole_run(trace.header.shape_key), memory_trace.NoMatchingWholeRun)
+
+    def test_non_hana_other_steps_and_unscoped_grants_do_not_record(self) -> None:
+        for repository, step, scoped in (("other", "nextest", True), ("hana", "check", True), ("hana", "nextest", False)):
+            with self.subTest(repository=repository, step=step, scoped=scoped), AdmissionFixture() as fixture:
+                run = self.grant(fixture, repository=repository, step=step, scoped=scoped)
+                self.drive(fixture, run, 3, ())
+                self.assertFalse(list(run.store.root.glob("*/*.jsonl")))
+                self.assertFalse(list(run.store.root.glob("*/*/*.jsonl")))

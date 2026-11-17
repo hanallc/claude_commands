@@ -16,6 +16,7 @@ ADMISSION_CODE_PATHS = (
     "aws_target/hana_execution.py", "build_targets/target_config.py", "build_targets/build_targets.py",
     "build_targets/execution_transport.py",
     "build_queue/scope_activity.py", "build_queue/queue_snapshot.py", "build_queue/progress_profile.py", "build_queue/snapshot_codec.py",
+    "build_queue/memory_trace.py",
     "lib/suite_runners.py", "lib/build_steps.py", "lib/boot_identity.py", "lib/inotify.py", "lib/conf.py", "lib/atomic_file.py", "lib/test_phase.py",
     "lint/build_shape.py", "buildlog/store.py", "buildlog/record.py", "buildlog/repository.py", "buildlog/parse.py",
 )

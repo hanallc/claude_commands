@@ -43,7 +43,7 @@ from scripts.buildlog import charts, cost_actions, mac_idle_alert, parse
 from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
-from scripts.build_queue import cloud_progress, placement
+from scripts.build_queue import cloud_progress, placement, program_memory_feed
 from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, service_activity_text, step_labels
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
 from scripts.build_queue.queue_lines import age, plain, step_text
@@ -521,6 +521,7 @@ class RunRow(RowQueueNotes, SlotPlace):
     ci_cgroup: NotRequired[str]
     need: NotRequired[float]
     need_part: NotRequired[bool]
+    program_memory: NotRequired[program_memory_feed.ProgramMemoryView]
 
 
 # Queue steps whose job shows only in the command's arguments.
@@ -1920,7 +1921,8 @@ def memory_status(explanation: admission_records.QueueExplanation, room: admissi
 
 
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
-            report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET) -> MemoryPage:
+            report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET, *,
+            program_memory: program_memory_feed.ProgramMemoryFeed | None = None) -> MemoryPage:
     started = time.perf_counter()
     if isinstance(configuration, conf.UseConfiguredValue):
         configuration = read_configuration()
@@ -1970,11 +1972,14 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     ci_ram, ci_name = gib(captured.ci_use), "hana CI"
     by_owner: dict[str, admission_records.RunningStep] = {}
     steps_by_owner: dict[str, list[admission_records.RunningStep]] = {}
+    trace_reservations: program_memory_feed.ReservationsByOwner = {}
     reserved_steps = (entry for entry in explanation.running if gate.running_has_reservation(entry.step))
     for reservation, entry in zip(explanation.decided_from.reservations, reserved_steps, strict=True):
         owner = gate.reservation_owner(reservation, entry.step)
         by_owner[owner] = entry.step
         steps_by_owner.setdefault(owner, []).append(entry.step)
+        if program_memory is not None:
+            trace_reservations.setdefault(owner, []).append((reservation, entry))
     run_steps = {admission_records.run_owner(entry.step.run.pid, entry.step.run.start_time): entry.step
                  for entry in explanation.running if isinstance(entry.step.run, LiveBuildRun)}
     walk: list[RunRow] = []
@@ -2006,6 +2011,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      **(target_notes(step.route, routes, step.step, step.folder, step.package)
                         if step is not None and not ci_label else NO_TARGET_NOTES),
                      **job_notes(job, unit, names)})
+    if program_memory is not None:
+        runs = zip((hold.memory.owner for hold in captured.runs), (row["started_at"] for row in walk), strict=True)
+        for index, view in program_memory.views(runs, trace_reservations, explanation.now, host_name()):
+            walk[index]["program_memory"] = view
     groups: dict[str, list[RunRow]] = {}
     remote_groups: set[str] = set()
     for entry in explanation.running:
@@ -2285,6 +2294,7 @@ def main(argv: Sequence[str]) -> int:
     if args.command == "link":
         return page_link()
     configuration = read_configuration()
+    program_memory = program_memory_feed.configured_feed()
     publish_page(configuration)
     target = configuration.output_folder / DATA_NAME
     last_good: MemoryPage | NoGoodReading = NoGoodReading()
@@ -2321,7 +2331,8 @@ def main(argv: Sequence[str]) -> int:
                     holders = TokenHoldersUnknown(refused)
                 # Count from after the request, so slow reads before it never shorten the interval.
                 next_tokens_at = time.monotonic() + configuration.token_dump_seconds
-            payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report_version, holders)
+            payload: MemoryPage | RetainedReading | PageUnavailable = reading(
+                configuration, report_version, holders, program_memory=program_memory)
             last_good = payload
         except (OSError, ValueError, KeyError, RuntimeError) as error:
             if isinstance(last_good, NoGoodReading):
