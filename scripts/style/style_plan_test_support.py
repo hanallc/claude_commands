@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import shutil
 import sqlite3
@@ -49,6 +50,22 @@ CLASS_RULES = (
     "test-module-allow-boilerplate",
     "prefer-type-named-fields-and-bindings",
 )
+
+
+def install_unconfigured_board(folder: Path, repo: Path) -> Path:
+    """Install a board executable that also serves child processes."""
+    folder.mkdir(parents=True, exist_ok=True)
+    envelope: dict[str, object] = {
+        "output_contract_version": 6, "verb": "board", "status": "unconfigured", "exit_code": 4,
+        "reservations": [], "blocked_by": [],
+        "message": f"this repository has no cargo-berth configuration at {repo}/.claude/config/berth.toml; run `cargo-berth init` to create it",
+        "presentation": {"kind": "rendered_blocks", "blocks": []},
+        "payload": {"kind": "no_facts", "alerts": []},
+    }
+    executable = folder / "cargo-berth"
+    _ = executable.write_text(f"#!{sys.executable}\nimport sys\nprint({json.dumps(envelope)!r})\nsys.exit(4)\n")
+    executable.chmod(0o755)
+    return executable
 
 
 @contextmanager

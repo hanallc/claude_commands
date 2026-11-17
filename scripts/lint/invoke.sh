@@ -101,8 +101,13 @@ fi
 # option), and run() runs it plainly.
 # The scope sets oom_score_adj from lint.conf, so earlyoom kills build steps before
 # CI (100) and sessions (200), the largest first.
+# The scope exports BUILDLOG_STEP_SCOPE, its cgroup folder. sccache runs each
+# compiler in sccache.service with the client's environment, so memory_admit
+# charges that compiler to the step that names its scope. sccache hashes CARGO_*
+# variables and the variables that rustc dependency data names. No crate reads
+# BUILDLOG_STEP_SCOPE, so the name keeps cache keys unchanged.
 BUILDLOG_RECORD="$HOME/.claude/scripts/buildlog/record.py"
-BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; printf "%s\n" "$cgroup" > "$0.cgroup"; { echo @BUILD_OOM_SCORE_ADJ@ > /proc/self/oom_score_adj; } 2>/dev/null || true; "$@"; s=$?; cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true; cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
+BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; printf "%s\n" "$cgroup" > "$0.cgroup"; { echo @BUILD_OOM_SCORE_ADJ@ > /proc/self/oom_score_adj; } 2>/dev/null || true; BUILDLOG_STEP_SCOPE="$cgroup"; export BUILDLOG_STEP_SCOPE; "$@"; s=$?; cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true; cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
 BUILDLOG_SCOPE_SH="${BUILDLOG_SCOPE_SH//@BUILD_OOM_SCORE_ADJ@/$BUILD_OOM_SCORE_ADJ}"
 source "$(dirname "${BASH_SOURCE[0]}")/memory_gate.sh" || {
     printf 'invoke.sh: cannot load admission and hold checks; step refused\n' >&2

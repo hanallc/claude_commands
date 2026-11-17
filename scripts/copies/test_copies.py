@@ -190,24 +190,16 @@ class StandingTests(unittest.TestCase):
                 self.assertEqual(removed.returncode, 0, removed.stderr)
                 self.assertTrue(tree.exists())
 
-        for subject, merging, purpose in (
-            ("checkpoint(handler): phase 27 — census --json bound", False,
-             "gate · handler phase 27 · census --json bound"),
-            ("Repair the census output", False, "gate · Repair the census output"),
-            ("Repair src/lib.rs", False, "gate · Repair src/lib.rs"),
-            ("checkpoint(resources): phase 133 — name the gated work", True,
-             "gate · resources phase 133 · name the gated work"),
-        ):
-            with self.subTest(subject=subject, merging=merging):
-                _ = self.git(self.source, "commit", "--allow-empty", "-qm", subject)
+        # The user, 11-16: a test or lint run showed as a gate of the base commit's subject.
+        for step, merging, purpose in (("integrate", False, "integrate"), ("lint", True, "lint"), ("run", False, "run")):
+            with self.subTest(step=step, merging=merging):
                 revision = self.git(self.source, "rev-parse", "HEAD")
                 _ = self.git(self.source, "commit", "--allow-empty", "-qm", "Later source work")
                 merge = copies.MergeRevision(self.git(self.source, "rev-parse", "HEAD")) if merging else copies.NO_MERGE
-                with copies.standing(self.owner_id, self.source, copies.CommittedSource(revision), merge=merge) as tree:
+                with copies.standing(self.owner_id, self.source, copies.CommittedSource(revision), merge=merge, step=step) as tree:
                     lease = self.lease(tree)
                     self.assertEqual(lease["unit"], self.owner_id)
-                    self.assertEqual(lease["work"], "gate")
-                    self.assertEqual(lease["purpose"], purpose)
+                    self.assertEqual((lease["work"], lease["purpose"]), (step, purpose))
 
     def test_a_renamed_unit_reuses_and_removes_its_copy_without_changing_the_folder(self) -> None:
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
