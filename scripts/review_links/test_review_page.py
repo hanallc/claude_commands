@@ -28,7 +28,7 @@ from scripts.production import issues as issue_store
 from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, record_table, review_items, review_page
-from scripts.review_links import list_page, test_change_page
+from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, review_actions, review_later
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.statusline import counts_row
@@ -38,6 +38,19 @@ class ReviewPageTests(unittest.TestCase):
     fixture: test_change_page.ChangePageTests = test_change_page.ChangePageTests("runTest")
     root: Path = Path()
     status: change_page.DeliveryStatus = change_page.DeliveryStatus(Path())
+
+    def test_staff_owners_sources_and_log_names_have_role_colors(self) -> None:
+        _ = self.question()
+        body = review_page.render(self.root).decode()
+        self.assertRegex(body, r'data-color-text="role.showrunner"[^>]*>page-owner</span>')
+        self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>builder-unit</span>')
+        self.assertNotRegex(body, r'class="staff-name"[^>]*>nate</span>')
+        item = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.QUESTION)
+        unknown = replace(item, owner=staff.StaffId('nate'), source_unit=staff.StaffId('unknown-source'))
+        plain = review_page.item_rows(unknown, change_page.ReviewBrowser('private'), staff.snapshot(),
+                                      datetime.now(user_zone()), 0, 100, 3)
+        self.assertIn('<td data-label="Owner">nate<small>· unknown-source</small></td>', plain)
+        self.assertIn('Owner: nate · Source: unknown-source</p>', plain)
 
     @override
     def setUp(self) -> None:
@@ -137,7 +150,7 @@ class ReviewPageTests(unittest.TestCase):
 
     def test_investigation_shows_its_question_title_once_in_details(self) -> None:
         title = 'Why did the gate stop?'
-        filed = investigation.file(self.fixture.unit.id, title, title)
+        filed = investigation.file(self.fixture.unit.id, title, title, waiting_why='The owner must complete the investigation.')
         investigation_record = investigation.answer(filed.owner, filed.id, 'The test failed. The repair is ready.')
         item = next(item for item in review_items.read(self.root)
                     if item.key == f'investigation/{investigation_record.owner}/{investigation_record.id}')
@@ -528,7 +541,7 @@ class ReviewPageTests(unittest.TestCase):
             questions = counts_row.question_counts(owner, user_zone(), identities, None)
             queues = [next_item.read_queue(kind, self.fixture.production)
                       for kind in ('question', 'change', 'investigation', 'proposal', 'efficiency')]
-            return counts, questions, queues, list_page.counts_strip(members)
+            return counts, questions, queues, list_page.counts_strip(members, staff_names.StaffNames(members))
 
         with patch.object(review_items, 'read_kind', side_effect=all_states):
             before = results()
@@ -660,7 +673,7 @@ class ReviewPageTests(unittest.TestCase):
             with self.subTest(kind=opened.type):
                 self.assertEqual(waiting.state, review_items.ReviewState.WAITING)
                 self.assertEqual(waiting.actions, opened.actions)
-                self.assertEqual(review_page.form(waiting, browser), review_page.form(opened, browser))
+                self.assertEqual(review_page.form(waiting, browser, 3), review_page.form(opened, browser, 3))
 
     def waiting_actions(self, kind: review_items.ReviewType, actions: tuple[str, ...], wait: str = 'question') -> None:
         """Use a fresh record for each action and check the displaced answer."""

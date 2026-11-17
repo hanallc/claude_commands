@@ -553,7 +553,7 @@ An explicit number must name an unused path.
 Exact repeated operations change nothing.
 Other updates append a log line and mark the item unread; mark-read clears the unread time without sending a message.
 Update and park refuse Closed items until reopen restores them.
-The table uses `# | Owner | Item | State | Next step | ETA | Update`.
+The table uses `# | Owner | Producer | Item | State | Next step | ETA | Update`; Producer shows the producer's name.
 It sorts Waiting for nate first, unread items second, and next check times third.
 State cells include the check time and identify overdue checks.
 Future parked items and Closed items remain hidden by default.

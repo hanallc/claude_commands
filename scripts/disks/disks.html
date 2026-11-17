@@ -145,7 +145,7 @@ const INFO = icon("M12 2a10 10 0 1 0 0 20a10 10 0 1 0 0-20M12 16v-4M12 8h.01");
 // The Builds page's step tooltip code, as it is (disks_page.shared_step_tip). Its names stay inside this function.
 const stepTip = (() => {
 __STEP_TIP_SCRIPT__
-  return {field, tooltipHtml, tipRowsHtml, hoverTips};
+  return {field, staffField, staffTitle, tooltipHtml, tipRowsHtml, hoverTips, roleName, nameParts};
 })();
 
 function size(bytes) {
@@ -325,9 +325,11 @@ function slotsHtml(report, keepBytes, now, opened, step = () => null) {
   const usedBy = row => {
     if (row.used_by) {
       // The name of the Builds step in the slot, else the lease's work with the Builds names; then the showrunner.
-      const name = step(row)?.name || row.used_by.name;
-      return (name ? `<span class="tag run">${esc(name)}</span>` : "")
-        + (row.used_by.showrunner ? `<span class="dim">${esc(row.used_by.showrunner)}</span>` : "");
+      const current = step(row);
+      const name = current?.name || row.used_by.name;
+      const parts = current?.name ? current.name_parts : row.used_by.name_parts;
+      return (name ? `<span class="tag run">${parts ? stepTip.nameParts(parts) : esc(name)}</span>` : "")
+        + (row.used_by.showrunner ? `<span class="dim">${stepTip.roleName(row.used_by.showrunner)}</span>` : "");
     }
     return row.deleted_tonight ? '<span class="tag go">deleted tonight</span>' : "";
   };
@@ -360,7 +362,7 @@ function sessionRows(report, keepBytes, limit) {
     + (folder.ended ? ' <span class="dim">(unsaved work)</span>' : "")).join(", ") : '<span class="dim">—</span>';
   const state = row => row.state === "ended" ? '<span class="tag go">ended</span>'
     : `<span class="dim">${row.state === "running" ? "running" : "—"}</span>`;
-  const sessionRow = row => `<tr data-tip="session:${esc(row.name)}"><td class="path">${esc(row.name)}</td><td class="n">${folderSize(row.size)}</td>`
+  const sessionRow = row => `<tr data-tip="session:${esc(row.name)}"><td class="path">${stepTip.roleName(row.name)}</td><td class="n">${folderSize(row.size)}</td>`
     + `<td class="share">${row.size && largest ? `<i style="width:${(100 * row.size / largest).toFixed(1)}%"></i>` : ""}</td>`
     + `<td class="held">${held(row)}</td><td>${state(row)}</td></tr>`;
   const {shown, smaller} = sessionsAtLeast(report, limit);
@@ -626,9 +628,9 @@ function slotStep(slot) {
   if (!slot.used_by || !(age <= settings.builds_max_age_seconds)) return null;
   const here = row => row.key && row.slot_folder === slot.name && row.slot_machine === slotReport.machine;
   const run = builds.walk?.find(here);
-  if (run) return {tip: "row:" + run.key, name: run.name};
+  if (run) return {tip: "row:" + run.key, name: run.name, name_parts:run.name_parts};
   const wait = builds.waiters?.find(here);
-  return wait ? {tip: "wait:" + wait.key, name: wait.name} : null;
+  return wait ? {tip: "wait:" + wait.key, name: wait.name, name_parts:wait.name_parts} : null;
 }
 
 // The tooltip of each Disks row and card title. A slot that a Builds page step runs or waits in shows that step's tooltip.
@@ -684,14 +686,15 @@ function slotTip(slot, group, keepBytes, now, unusedDays) {
   const field = stepTip.field;
   const rows = [field(slot.name, slot.used_by ? "in use" : slot.deleted_tonight ? "deleted tonight" : "free", "title"),
     field("Repository", group.repository), field("Size", measuredSize(slot.size, keepBytes)), field("Last used", lastUsedText(slot, now))];
-  if (slot.used_by) rows.push(field("Used by", slot.used_by.name || "—"), field("Showrunner", slot.used_by.showrunner || "—"));
+  if (slot.used_by) rows.push({...field("Used by", slot.used_by.name || "—"), valueParts:slot.used_by.name_parts},
+    stepTip.staffField("Showrunner", [slot.used_by.showrunner || "—"]));
   if (slot.deleted_tonight) rows.push(field("", `No run used it for ${unusedDays} days, so the nightly sweep deletes it.`, "long", true));
   return rows;
 }
 
 function sessionTip(row, keepBytes) {
   const field = stepTip.field;
-  const rows = [field(row.name, row.state === "unknown" ? "state unknown" : row.state, "title"), field("Size", measuredSize(row.size, keepBytes))];
+  const rows = [stepTip.staffTitle(row.name, row.state === "unknown" ? "state unknown" : row.state), field("Size", measuredSize(row.size, keepBytes))];
   if (!row.held.length) return [...rows, field("Held folders", "none")];
   return [...rows, ...row.held.flatMap((folder, index) =>
     [field(folder.name, folder.ended ? "unsaved work" : "held", "field", index === 0), field("", "Task " + folder.task, "long")])];
@@ -716,6 +719,7 @@ async function readBuilds(current) {
   }
   if (!current()) return;
   builds = next;
+  if (builds?.staff_names) globalThis.staffNames?.set(builds.staff_names);
   renderSlots();
 }
 

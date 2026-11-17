@@ -17,6 +17,7 @@ from urllib.parse import parse_qs
 from scripts.lib import conf, file_lock
 from scripts.lib.user_zone import shown_time
 from scripts.production import staff
+from scripts.review_links import staff_names
 from scripts.review_links import change_browser, change_page, console, image_store, page_frame, review_link
 
 PAGE_NAME = "images.html"
@@ -130,17 +131,21 @@ def picture(record: image_store.ImageRecord, label: str, file: str) -> str:
     return f'<figure><figcaption>{label}</figcaption>{linked}</figure>' if label else linked
 
 
-def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapshot, feedback_rows: int) -> str:
+def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapshot, feedback_rows: int,
+         names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
     """Show the caption as the title, then the aligned details, the image or pair, the feedback field and the answer buttons."""
     pair = "before" in record
     pictures = "".join(picture(record, label, file) for label, file in shown_files(record))
     caption = record["caption"]
     added = datetime.fromisoformat(record["registered_at"])
     owner, name = owner_names(members, record["owner"])
+    names = staff_names.for_page(names, members)
+    member = members.by_id(staff.StaffId(record["owner"]))
+    shown_owner = names.html(record["owner"], name) + f" ({member.kind})" if member is not None else html.escape(owner)
     return (f'<article id="image-{record["id"]}"{' class="pair"' if pair else ''} data-image="{record["id"]}" '
             + f'data-owner="{html.escape(record["owner"], quote=True)}" data-owner-name="{html.escape(name, quote=True)}">'
             + f'<h2 class="caption">{html.escape(caption)}</h2><dl class="image-details">'
-            + f'<dt>Owner:</dt><dd>{html.escape(owner)}</dd>'
+            + f'<dt>Owner:</dt><dd>{shown_owner}</dd>'
             + f'<dt>For  :</dt><dd>{html.escape(record["subject"])}</dd>'
             + f'<dt>Added:</dt><dd><time datetime="{html.escape(record["registered_at"], quote=True)}">'
             + f'{shown_time(added)}</time></dd></dl>'
@@ -160,8 +165,9 @@ def render(root: Path) -> bytes:
     started, read_at = time.perf_counter(), time.time()
     token = console_token(root)
     members = staff.snapshot()
+    names = staff_names.StaffNames(members)
     rows = conf.read("review_links").whole("feedback_rows")
-    cards = "".join(card(record, token, members, rows) for record in waiting_records(root))
+    cards = "".join(card(record, token, members, rows, names) for record in waiting_records(root))
     content = (STYLE + page_frame.title("Images", "images")
                + '<div data-image-layout><nav data-image-groups aria-label="Image groups"></nav>'
                + f'<div><div data-images data-script="{SCRIPT_VERSION}">{cards}</div><p hidden data-empty></p></div></div>'
@@ -297,7 +303,10 @@ function showGroups() {
     const name = row.card.dataset.ownerName;
     [name, String(row.count), row.card.querySelector('time').textContent].forEach((text, index) => {
       const cell = document.createElement('span');
-      cell.textContent = text;
+      if (index === 0) {
+        const label = row.card.querySelector('.image-details dd .staff-name');
+        if (label) cell.append(label.cloneNode(true)); else cell.textContent = text;
+      } else cell.textContent = text;
       if (index === 1) cell.className = 'group-count';
       link.append(cell);
     });
