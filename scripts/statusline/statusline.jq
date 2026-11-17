@@ -6,21 +6,29 @@ def trim: gsub("^\\s+|\\s+$"; "");
 
 # Parse once per render. Values remain text until their field validates them.
 def color_config:
-  reduce (split("\n")[] | (split("#")[0] // "") | trim
+  reduce (split("\n")[] | sub("(^|\\s)#.*$"; "") | trim
           | select(. != "") | index("=") as $equals
           | select($equals != null)
           | {key: (.[:$equals] | trim), value: (.[$equals + 1:] | trim)}) as $entry
     ({}; .[$entry.key] = $entry.value);
 
+# Convert the six validated hex digits to three decimal channels.
+def rgb_code:
+  ascii_downcase | .[1:] | explode
+  | map(if . >= 97 then . - 87 else . - 48 end)
+  | "38;2;\(.[0] * 16 + .[1]);\(.[2] * 16 + .[3]);\(.[4] * 16 + .[5])";
+
 def color($config; $key):
   . as $text
-  | ({black: 30, red: 31, green: 32, yellow: 33, blue: 34, magenta: 35,
+  | ($config[$key] // "") as $value
+  | (if ($value | test("^#[0-9a-fA-F]{6}$")) then ($value | rgb_code)
+     else {black: 30, red: 31, green: 32, yellow: 33, blue: 34, magenta: 35,
       cyan: 36, white: 37, "bright-black": 90, "bright-red": 91,
       "bright-green": 92, "bright-yellow": 93, "bright-blue": 94,
       "bright-magenta": 95, "bright-cyan": 96, "bright-white": 97,
       orange: "38;5;208", purple: "38;5;141", pink: "38;5;211",
       teal: "38;5;30", brown: "38;5;137", mauve: "38;5;139"}
-     [($config[$key] // "")]) as $code
+     [$value] end) as $code
   | if $code == null then $text else "\u001b[\($code)m\($text)\u001b[0m" end;
 
 def level_color($config; $family; $value):

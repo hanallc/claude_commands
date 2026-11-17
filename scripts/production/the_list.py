@@ -457,6 +457,39 @@ def _open(item: ListItem) -> None:
         raise ListError(f"{item.id}: reopen the Closed item before changing it")
 
 
+def clean_evidence(keeper: staff.StaffId, *, source: str) -> tuple[int, int]:
+    """Remove the one-off migration copy from each record's Evidence section."""
+    _line(source, "source")
+    store = _store(keeper)
+    changed = unchanged = 0
+    with store.locked():
+        for item in records(keeper, include_closed=True):
+            marker = re.search(r"(?m)^Source checkins\.json item:\r?\n", item.evidence)
+            if marker is None:
+                unchanged += 1
+                continue
+            copied_text = item.evidence[marker.end():].lstrip()
+            try:
+                copied, end = cast(tuple[object, int], json.JSONDecoder().raw_decode(copied_text))
+            except ValueError:
+                unchanged += 1
+                continue
+            if not isinstance(copied, dict) or re.match(r"[ \t]*(?:\r?\n|\Z)", copied_text[end:]) is None:
+                unchanged += 1
+                continue
+            evidence = re.sub(r"(?:\r?\n[ \t]*)+\Z", "", item.evidence[:marker.start()])
+            if not evidence.strip():
+                evidence = ""
+            remaining = re.sub(r"\A(?:[ \t]*\r?\n)+", "", copied_text[end:])
+            if remaining.strip():
+                evidence += ("\n\n" if evidence else "") + remaining
+            moment = now()
+            entry = ItemChange(moment, "Removed the migration copy of checkins.json from Evidence", source)
+            _save(store, replace(item, evidence=evidence, updated=moment, log=(*item.log, entry)))
+            changed += 1
+    return changed, unchanged
+
+
 def update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source: str) -> ListItem:
     def edit(item: ListItem, _: datetime) -> ListItem:
         _open(item)
@@ -659,11 +692,11 @@ def _cli_changes(args: argparse.Namespace) -> ItemChanges:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("add", "update", "park", "close", "reopen", "mark-read", "list"):
+    for name in ("add", "update", "park", "close", "reopen", "mark-read", "clean-evidence", "list"):
         command = commands.add_parser(name)
         if name != "list":
             _ = command.add_argument("--source", required=True)
-        if name not in ("add", "list"):
+        if name not in ("add", "list", "clean-evidence"):
             _ = command.add_argument("--id", required=True)
         if name in ("add", "update"):
             _ = command.add_argument("--title", required=name == "add")
@@ -698,7 +731,10 @@ def main(argv: list[str] | None = None) -> int:
                         include_parked=cast(bool, args.all) or cast(bool, args.include_parked)))
             return 0
         source = cast(str, args.source)
-        if name == "add":
+        if name == "clean-evidence":
+            changed, unchanged = clean_evidence(keeper, source=source)
+            print(f"{changed} changed; {unchanged} unchanged")
+        elif name == "add":
             changes = _cli_changes(args)
             number = cast(dict[str, object], vars(args)).get("number")
             owner = changes.get("owner")

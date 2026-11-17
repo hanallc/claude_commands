@@ -104,6 +104,16 @@ class ShellConfTests(unittest.TestCase):
                 self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "done", ""))
                 self.assertEqual(log.read_text().splitlines(), before + (["raw_reader"] if destination else []))
 
+    def test_comments_preserve_hex_values_and_fragments_without_python(self) -> None:
+        self.write("# color=red\n  # color=blue\n"
+                   + "color=#a0522d # comment\nname=brown\t# comment\nfragment=path#part\n")
+        for key, expected in (("color", "#a0522d"), ("name", "brown"), ("fragment", "path#part")):
+            with self.subTest(key=key):
+                result = self.run_reader(key, trace=True)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, expected + "\n", ""))
+        self.assertFalse((self.root / "python.log").exists())
+        self.assertFalse((self.root / "subshell.log").exists())
+
     def test_normal_integer_enum_and_text_reads_use_no_child_process(self) -> None:
         self.write("# whole: -2..4\ncount=4\n# one of: fast, slow\nmode=fast\npath=a=b\n")
         for key, expected in (("count", "4"), ("mode", "fast"), ("path", "a=b")):

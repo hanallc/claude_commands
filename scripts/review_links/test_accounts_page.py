@@ -46,11 +46,28 @@ class AccountsPageTests(unittest.TestCase):
         self.assertIn(f"<thead><tr>{heads}</tr></thead>", markup)
         self.assertEqual(markup.count('<tr class="account">'), 2)
         self.assertEqual(markup.count("<tr>"), 1)
-        self.assertIn('<td class="left"><span class="default bold">claude1</span></td>', markup)
+        self.assertIn('<td class="left"><span class="default bold" style="color:#af875f">claude1</span></td>', markup)
         self.assertIn('<td class="left"><span class="default bold">total</span></td>', markup)
         self.assertIn('<td class="right"><span class="default">60%</span></td>', markup)
         self.assertIn('<li>units → claude1</li>', markup)
         self.assertIn('<h2>Problems</h2><ul class="problems"><li>&lt;stale&gt;</li></ul>', markup)
+
+    def test_account_labels_use_terminal_colors_and_hex_without_css_injection(self) -> None:
+        reading = accounts.StatusReading((status_row("claude1"),), (), (), timezone.utc, AT)
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "statusline.conf"
+            _ = (config.parent / "accounts.conf").write_bytes(
+                (Path(__file__).resolve().parents[2] / "config/accounts.conf").read_bytes())
+            for value, expected in (("brown", "#af875f"), ("magenta", "#800080"),
+                                    ("#A0522D", "#A0522D"), ("", ""),
+                                    ('red;position:fixed', ""), ('\"><script>alert(1)</script>', "")):
+                with self.subTest(value=value), patch.dict(os.environ, {"CONF_DIR": temporary}):
+                    _ = config.write_text(f"account.claude1={value}\n" if value else "# no account key\n")
+                    markup = accounts_page.board(reading)
+                    style = f' style="color:{expected}"' if expected else ""
+                    self.assertIn(f'<span class="default bold"{style}>claude1</span>', markup)
+                    self.assertNotIn("position:fixed", markup)
+                    self.assertNotIn("<script>", markup)
 
     def test_page_reads_stored_status_and_holds_the_refresh_root(self) -> None:
         reading = accounts.StatusReading((), (), (), timezone.utc, AT)

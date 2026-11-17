@@ -4312,6 +4312,7 @@ class StatusReading:
 
 class StatusAccountDocument(TypedDict):
     label: str
+    color: NotRequired[str]
     tool: Literal["claude", "codex"]
     roles: list[str]
     selected_roles: list[str]
@@ -4336,6 +4337,7 @@ class BoardSpan(TypedDict):
     text: str
     tone: BoardTone
     kind: Literal["fact", "bold"]
+    color: NotRequired[str]
 
 
 class BoardColumn(TypedDict):
@@ -4483,6 +4485,52 @@ def _span(text: str, tone: BoardTone = "default", kind: Literal["fact", "bold"] 
     return BoardSpan(text=text, tone=tone, kind=kind)
 
 
+@dataclass(frozen=True)
+class AccountColor:
+    """The terminal escape and CSS color for one valid account color."""
+    escape: str
+    css: str
+
+
+@dataclass(frozen=True)
+class NoAccountColor:
+    """The account label uses the default text color."""
+
+
+# ANSI names use the standard sixteen colors. Extended names use the xterm color cube.
+ACCOUNT_COLOR_NAMES: dict[str, tuple[str, str]] = {
+    "black": ("30", "#000000"), "red": ("31", "#800000"),
+    "green": ("32", "#008000"), "yellow": ("33", "#808000"),
+    "blue": ("34", "#000080"), "magenta": ("35", "#800080"),
+    "cyan": ("36", "#008080"), "white": ("37", "#c0c0c0"),
+    "bright-black": ("90", "#808080"), "bright-red": ("91", "#ff0000"),
+    "bright-green": ("92", "#00ff00"), "bright-yellow": ("93", "#ffff00"),
+    "bright-blue": ("94", "#0000ff"), "bright-magenta": ("95", "#ff00ff"),
+    "bright-cyan": ("96", "#00ffff"), "bright-white": ("97", "#ffffff"),
+    "orange": ("38;5;208", "#ff8700"), "purple": ("38;5;141", "#af87ff"),
+    "pink": ("38;5;211", "#ff87af"), "teal": ("38;5;30", "#008787"),
+    "brown": ("38;5;137", "#af875f"), "mauve": ("38;5;139", "#af87af"),
+}
+
+
+def account_color(value: str) -> AccountColor | NoAccountColor:
+    """Resolve a configured name or hex value for both board readers."""
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+        channels = (str(int(value[index:index + 2], 16)) for index in (1, 3, 5))
+        return AccountColor("\x1b[38;2;" + ";".join(channels) + "m", value)
+    if value in ACCOUNT_COLOR_NAMES:
+        code, css = ACCOUNT_COLOR_NAMES[value]
+        return AccountColor(f"\x1b[{code}m", css)
+    return NoAccountColor()
+
+
+def _account_label(label: str, colors: dict[str, str]) -> BoardSpan:
+    span = _span(label, kind="bold")
+    if (key := f"account.{label}") in colors:
+        span["color"] = colors[key]
+    return span
+
+
 def _read_ok(row: StatusRow, reading: StatusReading, *, account_config: conf.ConfigRead) -> bool:
     return (isinstance(row.read_at, datetime) and not _reading_is_old(row.read_at, reading.checked_at, account_config=account_config)
             and row.on_credits != "stale"
@@ -4507,7 +4555,8 @@ def _count_cells(count: RoleSessionCounts | NoRoleCount | None) -> dict[str, str
             "exited": str(count.exited), "total": str(count.total)}
 
 
-def _account_board_rows(row: StatusRow, reading: StatusReading, *, account_config: conf.ConfigRead) -> list[BoardRow]:
+def _account_board_rows(row: StatusRow, reading: StatusReading, *, account_config: conf.ConfigRead,
+                        colors: dict[str, str]) -> list[BoardRow]:
     weekly = row.weekly_left_percent
     known = not isinstance(weekly, (StatusUnavailable, WeeklyNotReadSince))
     tone: BoardTone = "default" if not known else "error" if weekly < 10 else "warning" if weekly < 25 else "default"
@@ -4521,7 +4570,7 @@ def _account_board_rows(row: StatusRow, reading: StatusReading, *, account_confi
     for index, role in enumerate(roles):
         first = index == 0
         counts = _count_cells(row.role_counts[index] if index < len(row.role_counts) else None)
-        cells = {"dot": [_span("●", dot)] if first else [], "label": [_span(row.label, kind="bold")] if first else [],
+        cells = {"dot": [_span("●", dot)] if first else [], "label": [_account_label(row.label, colors)] if first else [],
                  "left": [_span(left, tone)] if first else [], "roles": [_span(role)],
                  **{key: [_span(value)] for key, value in counts.items()},
                  "resets": [_span(reset)] if first else [], "credits": [_span(balance)] if first else [],
@@ -4533,13 +4582,17 @@ def _account_board_rows(row: StatusRow, reading: StatusReading, *, account_confi
 def status_board(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> Board:
     """The accounts board: one line per role of each account, then the total line."""
     account_config = read_account_settings(account_config)
+    return _status_board(reading, account_config=account_config, colors=conf.read_or_repository("statusline").values())
+
+
+def _status_board(reading: StatusReading, *, account_config: conf.ConfigRead, colors: dict[str, str]) -> Board:
     rows = sorted(reading.rows, key=lambda row: row.label.casefold())
     # The reset text changes at the next local midnight.
     today = reading.checked_at.astimezone(reading.zone).date()
     stale_at = datetime.combine(today + timedelta(days=1), datetime.min.time(), reading.zone).astimezone(timezone.utc).isoformat()
     if not rows:
         return Board(columns=list(BOARD_COLUMNS), rows=[], stale_at=stale_at)
-    lines = [line for row in rows for line in _account_board_rows(row, reading, account_config=account_config)]
+    lines = [line for row in rows for line in _account_board_rows(row, reading, account_config=account_config, colors=colors)]
     known = [count for row in rows for count in row.role_counts if isinstance(count, RoleSessionCounts)]
     total = {"busy": str(sum(count.busy for count in known)), "idle": str(sum(count.idle for count in known)),
              "paused": str(sum(count.paused for count in known)), "exited": str(sum(count.exited for count in known)),
@@ -4553,6 +4606,7 @@ def status_board(reading: StatusReading, *, account_config: conf.ConfigRead | Re
 
 def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:
     account_config = read_account_settings(account_config)
+    colors = conf.read_or_repository("statusline").values()
     accounts: list[StatusAccountDocument] = []
     for row in reading.rows:
         item = StatusAccountDocument(label=row.label, tool=row.tool, roles=list(row.roles), selected_roles=list(row.selected_roles),
@@ -4570,9 +4624,11 @@ def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRea
             read_at=None if isinstance(row.read_at, StatusUnavailable) else row.read_at.astimezone(timezone.utc).isoformat(),
             read_ok=_read_ok(row, reading, account_config=account_config),
             credits_in_use=row.on_credits == "yes")
+        if (key := f"account.{row.label}") in colors:
+            item["color"] = colors[key]
         accounts.append(item)
     return json.dumps(StatusDocument(upcoming_moves=list(reading.upcoming_moves), session_inputs=list(reading.session_inputs), accounts=accounts,
-                                     board=status_board(reading, account_config=account_config), problems=[note.removeprefix("* ") for note in reading.notes]))
+                                     board=_status_board(reading, account_config=account_config, colors=colors), problems=[note.removeprefix("* ") for note in reading.notes]))
 
 
 ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage", "credits", "legacy", "unnoted", "test login", "access", "identity", "signed out", "wrong login", "unreadable note", "note", "state", "check", "role", "unclassified", "mcp servers"]
@@ -4761,21 +4817,28 @@ def render_status_table(reading: StatusReading, *, account_config: conf.ConfigRe
         cells = _status_row_cells(row, reading.zone, reading.checked_at, account_config=account_config)
         rows.append(cells)
         rows.extend(tuple(_role_count_text(row, role) if index == 2 else "" for index in range(len(cells))) for role in row.roles[1:])
-    return "\n".join([_render_table(rows), "",
+    colors = conf.read_or_repository("statusline").values() if sys.stdout.isatty() else {}
+    return "\n".join([_render_table(rows, colors=colors), "",
         *reading.upcoming_moves, *(("",) if reading.upcoming_moves else ()), *reading.notes, *reading.detail_lines])
 
 
-def _render_table(rows: list[tuple[str, ...]]) -> str:
+def _render_table(rows: list[tuple[str, ...]], *, colors: dict[str, str]) -> str:
     """A Markdown table, padded so it also reads as plain text."""
     widths = [max(len(line[column]) for line in (TABLE_HEADINGS, *rows)) for column in range(len(TABLE_HEADINGS))]
 
-    def rendered(cells: tuple[str, ...]) -> str:
-        return "| " + " | ".join(cell.ljust(width) for cell, width in zip(cells, widths)) + " |"
+    def rendered(cells: tuple[str, ...], *, account: bool = False) -> str:
+        padded = [cell.ljust(width) for cell, width in zip(cells, widths)]
+        if account and cells[1]:
+            span = _account_label(cells[1], colors)
+            color = account_color(span.get("color", ""))
+            if isinstance(color, AccountColor):
+                padded[1] = color.escape + cells[1] + "\x1b[0m" + " " * (widths[1] - len(cells[1]))
+        return "| " + " | ".join(padded) + " |"
 
     return "\n".join([
         rendered(TABLE_HEADINGS),
         rendered(tuple("-" * width for width in widths)),
-        *(rendered(row) for row in rows),
+        *(rendered(row, account=True) for row in rows),
     ])
 
 

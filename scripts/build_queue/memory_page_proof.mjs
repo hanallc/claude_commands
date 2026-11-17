@@ -57,8 +57,8 @@ try {
   const base = readings.good;
   base.waiters = structuredClone(readings.spacing.waiters);
   base.walk.find(row => row.queued).progress = {kind:'RowProgress', phase:'testing', done:8, total:10, percent:80, unit:'modules'};
-  base.walk.find(row => row.queued).unit = 'fixture-unit';
-  base.walk.find(row => row.queued).showrunner = 'fixture-production';
+  base.walk.find(row => row.queued).unit = 'handler';
+  base.walk.find(row => row.queued).showrunner = 'sdlc';
   const swapRow = (name, kind, bytes, pool='outside', extra={}) => ({name, detail:'fixture owner', kind, pool,
     category:'', members:[], owner_count:0, bytes, swap:bytes/1024**3, ...extra});
   const swapOwners = Array.from({length:31}, (_, index) => swapRow('group '+index, 'owner', (31-index)*1024**3/64,
@@ -207,7 +207,7 @@ try {
           const style = document.createElement('style');
           style.textContent = '* { transition: none !important; }';
           document.head.append(style);
-          await tick();
+          await ${path === 'memory_live.html' ? 'pageRefresh.refresh(true)' : 'tick()'};
           window.proofTip = (kind, index) => kind + ':' + (kind === 'row' ? latest.walk : latest.waiters)[index].key;
           window.proofRun = index => latest.walk[index].key;
           window.renderReading = render;
@@ -231,7 +231,7 @@ try {
         await evaluate(`(()=>{
           window.proofRead=window.fetch;
           window.fetch=()=>new Promise((_,reject)=>{window.proofFail=reject;});
-          window.proofPending=tick();
+          window.proofPending=pageRefresh.refresh(true);
           scrollTo(0,0);
         })()`);
         await pressSpace();
@@ -241,34 +241,38 @@ try {
           const read=window.proofRead;
           window.proofFetches=0;
           window.fetch=(...request)=>{window.proofFetches++;return read(...request);};
-          return readingFailure;
+          const line=document.querySelector('[data-page-status]');
+          return {state:line.dataset.state,reason:line.querySelector('[data-status-reason]').textContent};
         })()`);
-        assert.equal(lateFailure,'','A reading that fails after the pause changes the page.');
+        assert.deepEqual(lateFailure,{state:'Paused',reason:'Press space to resume.'},'A reading that fails after the pause changes the page.');
         // A report that arrives after the pause leaves the charts as they were.
         const lateReport = await evaluate(`(async()=>{
           const draw=window.renderReport, version=reportVersion;
           let drawn=0;
           window.renderReport=()=>{drawn++;};
-          await loadReport('proof-late');
+          await loadReport('proof-late',()=>true);
           window.renderReport=draw;
           window.proofFetches=0;
           return {drawn,kept:reportVersion===version};
         })()`);
         assert.deepEqual(lateReport,{drawn:0,kept:true},'A report that arrives after the pause changes the charts.');
         const pausedPage = await evaluate(`(async()=>{
-          const badge=document.querySelector('#paused');
-          const shown=!badge.hidden&&getComputedStyle(badge).display!=='none';
-          await tick();
+          const line=document.querySelector('[data-page-status]');
+          const word=line.querySelector('[data-status-word]');
+          const visibility={checkVisibilityCSS:true,checkOpacity:true};
+          const shown=line.dataset.state==='Paused'&&word.textContent==='Paused'
+            &&line.checkVisibility(visibility)&&word.checkVisibility(visibility);
+          await pageRefresh.refresh();
           await reloadWhenPageChanges();
           const pill=document.querySelector('#pill').getBoundingClientRect();
           return {shown,fetches:window.proofFetches,pill:{x:pill.left+pill.width/2,y:pill.top+pill.height/2}};
         })()`);
-        assert.ok(pausedPage.shown,'Space does not show the paused badge.');
+        assert.ok(pausedPage.shown,'Space does not show the Paused state.');
         assert.equal(pausedPage.fetches,0,'A paused page still reads.');
         await call('Input.dispatchMouseEvent',{type:'mouseMoved',x:pausedPage.pill.x,y:pausedPage.pill.y});
         const pausedTip = await evaluate(`(()=>{
           const tip=document.querySelector('#tip');
-          const boxes=[tip,document.querySelector('#paused'),document.querySelector('.status')].map(item=>item.getBoundingClientRect());
+          const boxes=[tip,document.querySelector('#paused'),document.querySelector('[data-page-status]')].map(item=>item.getBoundingClientRect());
           const left=Math.min(...boxes.map(box=>box.left))-12, top=Math.min(...boxes.map(box=>box.top))-12;
           const right=Math.max(...boxes.map(box=>box.right))+12, bottom=Math.max(...boxes.map(box=>box.bottom))+12;
           return {on:tip.classList.contains('on'),clip:{x:Math.max(0,left),y:Math.max(0,top),width:right-Math.max(0,left),height:bottom-Math.max(0,top),scale:1}};
@@ -278,8 +282,11 @@ try {
         await writeFile(join(folder,'paused-tooltip-dark-desktop.png'),Buffer.from(pausedShot.data,'base64'));
         await call('Input.dispatchMouseEvent',{type:'mouseMoved',x:4,y:4});
         await pressSpace();
-        const resumedPage = await evaluate(`({hidden:document.querySelector('#paused').hidden,fetches:window.proofFetches})`);
-        assert.ok(resumedPage.hidden,'Space does not clear the paused badge.');
+        const resumedPage = await evaluate(`(async()=>{
+          await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+          return {state:document.querySelector('[data-page-status]').dataset.state,fetches:window.proofFetches};
+        })()`);
+        assert.equal(resumedPage.state,'Live','Space does not restore the Live state.');
         assert.ok(resumedPage.fetches>0,'Space does not resume reading.');
 
         const comparisons = [];
@@ -557,7 +564,7 @@ try {
             assert.ok(proof.lower.every(value => value < base.cap), 'The lower axis reaches the cap.');
             assert.ok(Math.abs(proof.rowLeft-proof.headingLeft)<=1, 'The rows miss the card text edge.');
             assert.equal(proof.reservedAmount,proof.dimColor);
-            assert.ok(!proof.owner.includes('fixture-unit'), 'The page repeats the unit beside the name.');
+            assert.ok(!proof.owner.includes('handler'), 'The page repeats the unit beside the name.');
             assert.ok(proof.amountHeader.includes('Used · reserved'), 'The memory amounts have no header.');
             assert.ok(proof.scroll <= proof.client, 'The page overflows. '+JSON.stringify({theme,width,scroll:proof.scroll,client:proof.client}));
             const roomLegend=proof.values.find(row=>row.label==='Free');
@@ -998,13 +1005,13 @@ try {
             proof.overCap=overCap;
             // Build reserves that do not fit under the cap: the Running header names the amount over the cap.
             const shortReading=structuredClone(base);
-            // The running build reserves all of free and 1 GiB more, so its reserve fills the cap.
+            // The running build reserves all of free and 4 GiB more, so its reserve fills the cap.
             const shortRun=shortReading.walk.find(row=>row.kind!=='cloud'&&!row.ci&&typeof row.reserved==='number');
-            shortRun.reserved+=shortReading.room+1;
-            if(typeof shortReading.reserved==='number') shortReading.reserved+=shortReading.room+1;
+            shortRun.reserved+=shortReading.room+4;
+            if(typeof shortReading.reserved==='number') shortReading.reserved+=shortReading.room+4;
             Object.assign(shortReading.ram,{build_covered_bytes:shortReading.ram.build_covered_bytes+shortReading.ram.room_bytes,room_bytes:0});
-            Object.assign(shortReading.ram,{build_target_bytes:shortReading.ram.build_covered_bytes+gib,build_missing_bytes:gib,shortfall_bytes:gib});
-            Object.assign(shortReading,{room:0,taken:shortReading.cap,shortfall:1});
+            Object.assign(shortReading.ram,{build_target_bytes:shortReading.ram.build_covered_bytes+4*gib,build_missing_bytes:4*gib,shortfall_bytes:4*gib});
+            Object.assign(shortReading,{room:0,taken:shortReading.cap,shortfall:4});
             await show(shortReading);
             if(theme==='dark'&&width===1400) {
               const shortClip=await evaluate(`(()=>{
@@ -1015,16 +1022,35 @@ try {
               const shortShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:shortClip});
               await writeFile(join(folder,'over-cap-dark-desktop.png'),Buffer.from(shortShot.data,'base64'));
             }
+            // The bar draws the uncovered reserve past the cap line, with a dashed brace and a tooltip.
+            const overBar=await evaluate(`(() => {
+              const box=id=>{const r=document.getElementById(id).getBoundingClientRect();return {left:r.left,right:r.right,width:r.width};};
+              const tip=Object.fromEntries(tooltipRows('over',latest).map(row=>[row.label,row.value]));
+              return {hidden:document.getElementById('b-overlay').hidden,overlay:box('b-overlay'),cap:box('b-cap'),over:box('b-over'),
+                brace:document.getElementById('b-over').textContent,reserved:document.getElementById('b-reserved').textContent,tip};
+            })()`);
+            assert.equal(overBar.hidden,false,'The bar draws no over-cap box.');
+            // A small hana CI part stays visible, so the builds parts add up on screen.
+            assert.equal(await evaluate(`getComputedStyle(document.getElementById('s-ci')).minWidth`),'3px');
+            assert.ok(Math.abs(overBar.overlay.left-overBar.cap.right)<=3,'The over-cap box does not start at the cap line. '+JSON.stringify(overBar));
+            assert.ok(Math.abs(overBar.overlay.width-overBar.over.width)<=1,'The over-cap box and its brace differ in width. '+JSON.stringify(overBar));
+            assert.equal(overBar.brace,'over cap 4.0');
+            assert.match(overBar.reserved,/^build reserved [0-9.]+ · [0-9.]+ covered$/);
+            assert.equal(overBar.tip['Over cap'],'4.0 GiB');
+            assert.equal(overBar.tip['= Over cap'],'4.0 GiB');
+            assert.ok(Math.abs(parseFloat(overBar.tip['Build reserved (full)'])-parseFloat(overBar.tip['− Free RAM after safety net and swap'])-4)<=0.1+1e-9,
+              'Build reserved (full) − covered is not the amount over the cap. '+JSON.stringify(overBar.tip));
+            proof.overBar=overBar;
             const overHeader=await evaluate(`(() => ({sum:document.querySelector('#walk-sum').textContent,
               sumColor:getComputedStyle(document.querySelector('#walk-sum')).color,hover:tipText('walksum',latest)[1],rows:tooltipRows('walksum',latest),
               cap:getComputedStyle(document.querySelector('#walk .walk-bud .cap-part')||document.querySelector('#walk .walk-bud')).borderLeftColor}))()`);
-            // Taken counts the full reserve, so it reads 1 GiB more than the cap.
-            assert.equal(overHeader.sum,(shortReading.cap+1).toFixed(1)+' of '+shortReading.cap.toFixed(1)+' GiB taken · 1.0 GiB over cap');
+            // Taken counts the full reserve, so it reads 4 GiB more than the cap.
+            assert.equal(overHeader.sum,(shortReading.cap+4).toFixed(1)+' of '+shortReading.cap.toFixed(1)+' GiB taken · 4.0 GiB over cap');
             assert.equal(overHeader.sumColor,overHeader.cap,'The over-cap total is not in the cap color.');
             const fields=Object.fromEntries(overHeader.rows.map(row=>[row.label,row.value]));
-            assert.equal(fields.Taken,(shortReading.cap+1).toFixed(1)+' GiB');
+            assert.equal(fields.Taken,(shortReading.cap+4).toFixed(1)+' GiB');
             assert.equal(fields['Queue cap'],shortReading.cap.toFixed(1)+' GiB');
-            assert.equal(fields['Over cap'],'1.0 GiB');
+            assert.equal(fields['Over cap'],'4.0 GiB');
             assert.ok('+ Build reserved (full)' in fields,overHeader.hover);
             // Taken includes the full reserve. The difference from the cap is the uncovered reserve.
             const number=(text,pattern)=>Number.parseFloat(text.match(pattern)[1]);
@@ -1036,6 +1062,7 @@ try {
             assert.deepEqual([header.taken,header.cap,header.over],[tip.taken,tip.cap,tip.over],'The header and its tooltip differ.');
             const plainHeader=await (async()=>{await show(base);return evaluate(`document.querySelector('#walk-sum').textContent`);})();
             assert.ok(!plainHeader.includes('over cap'),'The header names an over-cap amount when nothing is over the cap.');
+            assert.equal(await evaluate(`document.getElementById('b-overlay').hidden`),true,'The bar draws an over-cap box when nothing is over the cap.');
             proof.overHeader=overHeader;
             // Cloud status text and bar labels are as wide as on the live page; none of it may show on the cap line.
             const cloudReading=structuredClone(base);
@@ -1217,7 +1244,7 @@ try {
             const beforeWait=await positions();
             const waiting=structuredClone(base);
             waiting.waiters=structuredClone(readings.spacing.waiters);
-            waiting.waiters[0].detail='fixture-unit';waiting.waiters[0].pid=51;
+            waiting.waiters[0].detail='handler';waiting.waiters[0].pid=51;
             await show(waiting);
             const afterWait=await positions();
             for(let index=0;index<beforeWait.length;index++) {
@@ -1368,66 +1395,69 @@ try {
           let now=Date.now();
           Date.now=()=>now;
           window.render=window.renderReading;
+          const refresh=createPageRefresh(tick);
+          const line=document.querySelector('[data-page-status]');
+          const part=name=>line.querySelector('[data-status-'+name+']');
+          const ageLimit=JSON.parse(line.dataset.statusOptions).ageLimit;
           const states=[];
-          const snapshot=name=>states.push({name,status:document.querySelector('#status').textContent,
-            stale:document.querySelector('#dot').classList.contains('stale'),
-            unavailable:document.body.classList.contains('queue-unavailable'),
-            screen:document.querySelector('#queue-error').textContent,
+          const snapshot=name=>states.push({name,state:line.dataset.state,
+            reason:part('reason').textContent,age:part('age').textContent,ageHidden:part('age').hidden,
             cards:[...document.querySelectorAll('.card')].map(card=>card.innerHTML).join('')
               .replace(/<div class="last-reading"[^>]*>[^<]*<.div>/,'').replace(/--divider-top: [^;]*;/g,''),
+            cardsVisible:[...document.querySelectorAll('.card')].map(card=>card.checkVisibility({checkVisibilityCSS:true,checkOpacity:true})),
             lastReading:document.querySelector('#last-reading').hidden?'':document.querySelector('#last-reading').textContent,
             rows:document.querySelectorAll('.wrow').length,
-            pill:document.querySelector('#pill-t').textContent,
-            pillClass:document.querySelector('#pill').className,
-            pillDot:getComputedStyle(document.querySelector('.pd')).display,
-            position:getComputedStyle(document.querySelector('.status')).position});
+            word:part('word').textContent,
+            icons:[...line.querySelectorAll('[data-status-icon]')].filter(icon=>!icon.hidden).map(icon=>icon.dataset.statusIcon),
+            timingsHidden:part('trip').hidden&&part('render').hidden,
+            position:getComputedStyle(line).position});
           const good=async()=>{
             reading.read_at=now/1000;
             window.fetch=async()=>({ok:true,json:async()=>reading});
-            await tick(); fitLabels();
+            await refresh.refresh(); fitLabels();
           };
           try {
-            lastRead=0;readingFailure='';
             window.fetch=async()=>({ok:true,json:async()=>({ok:false})});
-            await tick();snapshot('initial');
+            await refresh.refresh();snapshot('initial');
             await good();snapshot('good');
             const goodAt=now;
             window.fetch=async()=>({ok:true,json:async()=>({ok:false})});
-            now+=1000;await tick();snapshot('one_failure');
-            now=goodAt+(STALE+3)*1000;await tick();snapshot('stale');
+            now+=1000;await refresh.refresh();snapshot('one_failure');
+            now=goodAt+(ageLimit+3)*1000;await refresh.refresh();snapshot('stale');
             const retained={...reading,read_error:'private socket timeout',error_at:now/1000};
             window.fetch=async()=>({ok:true,json:async()=>retained});
-            await tick();snapshot('retained');
+            await refresh.refresh();snapshot('retained');
             await good();snapshot('recovered');
             window.fetch=async()=>{throw new Error('proof fetch failure');};
-            now+=(STALE+3)*1000;await tick();snapshot('fetch_failure');
+            now+=(ageLimit+3)*1000;await refresh.refresh();snapshot('fetch_failure');
             await good();snapshot('final');
             return states;
           } finally { window.fetch=originalFetch;Date.now=originalNow;window.render=originalRender; }
         })()`);
         const states=Object.fromEntries(failures.map(state=>[state.name,state]));
-        assert.ok(states.initial.unavailable);
-        assert.equal(states.initial.screen,'The queue did not answer');
+        assert.equal(states.initial.state,'Failed');
+        assert.equal(states.initial.reason,'The queue did not answer.');
         assert.match(states.retained.lastReading,/^Last reading: /);
         assert.equal(states.good.lastReading,'');
         for(const name of ['one_failure','stale','retained']) {
           assert.equal(states[name].cards,states.good.cards, name+' changes the good reading.');
           assert.equal(states[name].rows,states.good.rows);
-          assert.ok(!states[name].unavailable);
+          assert.ok(!states[name].ageHidden);
+          assert.deepEqual(states[name].cardsVisible,states.good.cardsVisible,name+' changes card visibility.');
         }
-        assert.equal(states.one_failure.status,states.good.status);
+        assert.equal(states.one_failure.state,'Failed');
         for(const name of ['stale','retained','fetch_failure']) {
-          assert.ok(states[name].stale);
-          assert.match(states[name].status,/Showing the reading from \d{2}:\d{2}:\d{2}, 18 s old\./);
-          assert.match(states[name].pill,/^as of \d{2}:\d{2}:\d{2}$/);
-          assert.match(states[name].pillClass,/neutral/);
-          assert.equal(states[name].pillDot,'none');
+          assert.equal(states[name].state,'Failed');
+          assert.equal(states[name].age,'18 s ago');
+          assert.equal(states[name].word,'Failed');
+          assert.deepEqual(states[name].icons,['Failed']);
+          assert.ok(states[name].timingsHidden);
           assert.equal(states[name].position,'sticky');
         }
-        assert.match(states.fetch_failure.status,/Cannot load the reading: proof fetch failure/);
+        assert.equal(states.fetch_failure.reason,'proof fetch failure');
         for(const name of ['recovered','final']) {
-          assert.match(states[name].status,/^Live · read at /);
-          assert.ok(!states[name].stale && !states[name].unavailable);
+          assert.equal(states[name].state,'Live');
+          assert.ok(!states[name].ageHidden && states[name].reason==='');
         }
         const capture = async (name, selector) => {
           await evaluate(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({block:'center'})`);
@@ -1622,7 +1652,7 @@ try {
               assert.equal(state.heading,'Build memory on natedev');
             }
             const clip=await evaluate(`(() => {
-              const status=document.querySelector('.status').getBoundingClientRect();
+              const status=document.querySelector(${JSON.stringify(version==='before'?'.status':'[data-page-status]')}).getBoundingClientRect();
               return {x:0,y:0,width:innerWidth,height:Math.ceil(status.bottom+16),scale:1};
             })()`);
             const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
@@ -1974,6 +2004,7 @@ try {
                   machineColors:[...table.querySelectorAll('tr[data-tip^="row:"] .machine')].map(cell=>getComputedStyle(cell).color),
                   ciVisible:!!table.querySelector('tr[data-tip="' + proofTip('row', 3) + '"]'),
                   waiting:table.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .unit').textContent,
+                  waitingOwner:table.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .owner').textContent,
                   pageOverflow:document.documentElement.scrollWidth>document.documentElement.clientWidth};
               })()`);
               if(version==='after') {
@@ -1988,6 +2019,7 @@ try {
                 assert.equal(new Set(comparison.machineColors).size,3);
                 assert.equal(comparison.ciVisible,false);
                 assert.equal(comparison.waiting,'CI');
+                assert.equal(comparison.waitingOwner,'hana CI');
                 assert.equal(comparison.pageOverflow,false);
               } else {
                 assert.equal(comparison.ciVisible,true);
@@ -2359,8 +2391,28 @@ try {
           comparisons.push({swapShare:version,rows});
         }
 
+        // A gate job's tooltip says what the job does and what it changes, below its title (#109).
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
         await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1100,deviceScaleFactor:1,mobile:false});
+        const gateReading=structuredClone(base);
+        const gateIndex=gateReading.walk.findIndex(row=>row.queued);
+        assert.ok(gateIndex>=0,'The base reading has no queued run.');
+        const gateAbout='Merges the handler checkpoint into the sdlc branch, tests every module, then pushes sdlc.';
+        Object.assign(gateReading.walk[gateIndex],{name:'natemerge integrate',unit:'natemerge',about:gateAbout,changes:'sdlc branch',
+          showrunner:'sdlc',machine:'natedev',used:6.2,reserved:2.8,counted:9,started_at:gateReading.read_at-600});
+        // The user, 11-16: "Uses 0.0 GiB? ... has to be a bug". The gate row shows a real use, not memory parts.
+        delete gateReading.walk[gateIndex].parts;
+        await show(gateReading);
+        await evaluate(`showTip(proofTip('row', ${gateIndex}),700,420)`);
+        const gateTip=await evaluate("[...document.querySelectorAll('#tip dt, #tip dd')].map(cell=>cell.textContent)");
+        assert.ok(gateTip[0].startsWith('natemerge · integrate'),'The gate tooltip title: '+gateTip[0]);
+        assert.ok(gateTip.includes(gateAbout),'The gate tooltip omits its description.');
+        assert.equal(gateTip[gateTip.indexOf('Changes')+1],'sdlc branch');
+        assert.equal(gateTip[gateTip.indexOf('Uses')+1],'6.2 GiB');
+        const gateFit=await evaluate(`[...document.querySelectorAll('#tip dt, #tip dd')].every(cell=>cell.scrollWidth<=cell.clientWidth)
+          && document.querySelector('#tip .tip').scrollWidth<=document.querySelector('#tip .tip').clientWidth`);
+        assert.ok(gateFit,'The gate tooltip clips its text.');
+        await capture('gate-tooltip-dark-desktop','#tip');
         await show(base);
         await evaluate('hideTip()');
         const endClip=await evaluate(`(() => {
