@@ -257,6 +257,15 @@ class ReviewTextTests(unittest.TestCase):
                          '<h2>Items</h2><ol class="question-items"><li><div class="code-block">'
                          + '<pre><code>deploy.py up --x &lt;y&gt;</code></pre>' + page_frame.COPY_BUTTON + '</div></li>'
                          + '<li>Run <code>ls</code> now</li><li><code>a</code> and <code>b</code></li></ol>')
+        # A showrunner reply or answer shows a command line as a code block; a span inside a sentence stays inline.
+        for text, expected in (
+            ("Run this:\n`git push origin --delete a <b>`\nThen check.",
+             '<p>Run this:</p><div class="code-block"><pre><code>git push origin --delete a &lt;b&gt;</code></pre>'
+             + page_frame.COPY_BUTTON + '</div><p>Then check.</p>'),
+            ("Run `ls` now.", '<p>Run <code>ls</code> now.</p>'),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(change_browser.answer_html(text), expected)
 
     def test_shared_inline_markdown_renders_bold_headings_and_lists(self) -> None:
         text = '## Heading\n**Field:** <script> & ready\n- **Owner:** morty\n1. **Next:** `run`'
@@ -1677,7 +1686,7 @@ class ChangePageTests(unittest.TestCase):
         return "question/" + owner.id + "/" + filed.path.name
 
     def test_questions_page_renders_the_reviewed_memory_bar_record_without_changing_it(self) -> None:
-        key = self.file_user_question(MEMORY_BAR_RAW, question=MEMORY_BAR_RAW)
+        key = self.file_user_question(MEMORY_BAR_ASK, question=MEMORY_BAR_RAW)
         browser = change_page.ReviewBrowser("private", kind="questions")
         question = next(item for item in change_browser.prepare(browser, change_page.DeliveryStatus(self.root)).questions
                         if item.key == key)

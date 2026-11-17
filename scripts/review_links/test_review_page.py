@@ -111,7 +111,7 @@ class ReviewPageTests(unittest.TestCase):
         title = 'Check the spacing'
         token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
         browser = change_page.ReviewBrowser(token, initial)
-        row = review_page.item_rows(replace(item, title=title), browser, staff.snapshot(), datetime.now(user_zone()), 0, 100)
+        row = review_page.item_rows(replace(item, title=title), browser, staff.snapshot(), datetime.now(user_zone()), 0, 100, 4)
         detail = row.split('data-detail', 1)[1]
         self.assertIn('<h3>Item</h3><p>'+title+'</p>', detail)
         self.assertEqual(detail.count(title), 1)
@@ -142,7 +142,7 @@ class ReviewPageTests(unittest.TestCase):
         self.assertEqual(item.title, investigation_record.question)
         token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
         browser = change_page.ReviewBrowser(token, initial)
-        detail = review_page.details(item, browser, staff.snapshot()).split('data-review-body>', 1)[1]
+        detail = review_page.details(item, browser, staff.snapshot(), 4).split('data-review-body>', 1)[1]
         self.assertIn('<h3>You asked</h3>', detail)
         self.assertEqual(detail.count(html.escape(item.title)), 1)
         self.assertNotIn('<h3>Item</h3>', detail)
@@ -155,7 +155,7 @@ class ReviewPageTests(unittest.TestCase):
         source = replace(item.source, row={**item.source.row, 'What you see': title})
         token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
         browser = change_page.ReviewBrowser(token, initial)
-        detail = review_page.details(replace(item, title=title, source=source), browser, staff.snapshot()).split('data-review-body>', 1)[1]
+        detail = review_page.details(replace(item, title=title, source=source), browser, staff.snapshot(), 4).split('data-review-body>', 1)[1]
         self.assertIn('<h3>Proof</h3><p>'+title+'</p>', detail)
         self.assertEqual(detail.count(title), 1)
         self.assertNotIn('<h3>Item</h3>', detail)
@@ -170,7 +170,7 @@ class ReviewPageTests(unittest.TestCase):
         _ = self.decisions()
         for item in review_items.read(self.root):
             with self.subTest(kind=item.type):
-                row = review_page.item_rows(replace(item, title=title), browser, members, datetime.now(user_zone()), 0, 100)
+                row = review_page.item_rows(replace(item, title=title), browser, members, datetime.now(user_zone()), 0, 100, 4)
                 self.assert_row_title(row, title, title.splitlines()[0][:100]+'…')
                 detail = row.split('data-detail', 1)[1]
                 for line in title.splitlines():
@@ -549,7 +549,7 @@ class ReviewPageTests(unittest.TestCase):
                 continue
             with self.subTest(kind=item.type):
                 self.assertEqual(item.actions,expected[item.key])
-                form = review_page.form(item,change_page.ReviewBrowser(token,initial))
+                form = review_page.form(item,change_page.ReviewBrowser(token,initial),4)
                 self.assertIn('Closes the item',form)
                 self.assertIn('The item returns to you',form)
                 self.assertIn('type="datetime-local"',form)

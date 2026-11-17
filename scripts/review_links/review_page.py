@@ -63,7 +63,11 @@ def short_title(title: str, limit: int) -> str:
     return visible+'…' if visible != title else visible
 
 
-def form(item: ReviewItem, browser: change_page.ReviewBrowser) -> str:
+def answer_section(text: str) -> str:
+    return '<section><h3>Answer</h3>'+change_browser.answer_html(text)+'</section>'
+
+
+def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int) -> str:
     fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key)}
     hidden = ''.join(f'<input type="hidden" name="{key}" value="{html.escape(value, quote=True)}">' for key, value in fields.items())
     closes: list[str] = []
@@ -81,12 +85,12 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser) -> str:
                +'<input type="datetime-local" name="later" aria-label="Later, until">'
                +'<button name="outcome" value="later">Later</button></div></div>')
     return ('<form method="post" data-review-form>'+hidden+f'<label for="words-{html.escape(item.key, quote=True)}">Your words</label>'
-            + f'<textarea id="words-{html.escape(item.key, quote=True)}" name="feedback" rows="2" '
+            + f'<textarea id="words-{html.escape(item.key, quote=True)}" name="feedback" rows="{words_rows}" '
             + 'placeholder="Type your words. They go with the button that you press."></textarea>'
             + '<div class="review-actions">'+groups+'</div><span role="status" data-send-status></span></form>')
 
 
-def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot) -> str:
+def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, words_rows: int) -> str:
     source = item.source
     if isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
         question = source.record.item
@@ -104,14 +108,14 @@ def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff
         row = source.row
         body = section('How to check', row.get('How to check', ''))+section('Proof', row.get('What you see', '') or row.get('Proof', ''))
         if isinstance(source.slots.question, change_page.AnsweredQuestion):
-            body += section('Answer', source.slots.question.answer)
+            body += answer_section(source.slots.question.answer)
         image_id = row.get('Image', '')
         if image_id:
             body = change_page.change_content(row, body)
     elif isinstance(source, review_items.InvestigationSource):
         body = section('You asked', source.record.question)
         if source.record.answer:
-            body += section('Answer', source.record.answer)
+            body += answer_section(source.record.answer)
     elif isinstance(source, review_items.ProposalSource):
         # The issue text loads when the card opens, so the Open view does not carry every proposal body.
         body = ('<section><h3>Proposal</h3><div data-proposal-body>'
@@ -127,7 +131,7 @@ def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff
     owner = owner_name(item, members)
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+'<div data-review-body>'+body
             +'</div></div><section><h3>Log · newest first</h3>'
-            +'<ol class="list-log">'+logs+'</ol></section>'+form(item, browser)
+            +'<ol class="list-log">'+logs+'</ol></section>'+form(item, browser, words_rows)
             +'<p class="review-source">Owner: '+html.escape(owner)+' · Source: '
             +html.escape(review_items.name(item.source_unit, members))+'</p></div>')
 
@@ -142,7 +146,7 @@ def age(filed: datetime, now: datetime) -> str:
 
 
 def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, now: datetime, index: int,
-              title_limit: int) -> str:
+              title_limit: int, words_rows: int) -> str:
     owner = owner_name(item, members)
     source = review_items.name(item.source_unit, members)
     title = ('<strong class="review-title" title="'+html.escape(item.title, quote=True)+'">'
@@ -165,7 +169,7 @@ def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: sta
     row = ''.join(f'<td data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden = ' hidden' if item.state == ReviewState.DONE or item.hidden_until(now) else ''
     return ('<tbody data-list-item'+attributes+hidden+'><tr class="list-row">'+row+'</tr>'
-            +f'<tr data-detail id="{panel}" hidden><td colspan="6">'+details(item, browser, members)+'</td></tr></tbody>')
+            +f'<tr data-detail id="{panel}" hidden><td colspan="6">'+details(item, browser, members, words_rows)+'</td></tr></tbody>')
 
 
 def render(root: Path, *, show: str = 'open') -> bytes:
@@ -185,6 +189,8 @@ def render(root: Path, *, show: str = 'open') -> bytes:
     items.sort(key=lambda item: (item.state != ReviewState.FOR_YOU, item.state == ReviewState.DONE))
     token, initial = change_browser.browser_manifest(change_page.console_folder(root))
     browser = change_page.ReviewBrowser(token, initial)
+    settings = conf.read('review_links')
+    words_rows = settings.whole('review_words_rows')
     visible = items
     options = ''.join(f'<option value="{html.escape(owner, quote=True)}" data-owner-name="{html.escape(name, quote=True)}">{html.escape(name)} '
                      +f'({sum(item.owner == owner or item.type == ReviewType.INVESTIGATION and item.source_unit == owner for item in visible)})</option>'
@@ -196,7 +202,7 @@ def render(root: Path, *, show: str = 'open') -> bytes:
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       +'<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
     content = (record_table.STYLE+STYLE+page_frame.title('Review', 'review')
-        +f'<div data-review data-show="{show}" data-refresh-seconds="{conf.read("review_links").number("page_refresh_seconds")}">'
+        +f'<div data-review data-show="{show}" data-refresh-seconds="{settings.number("page_refresh_seconds")}">'
         +'<div class="review-types">'+chips+'</div><div class="list-filters">'
         +'<label for="list-owner">Owner</label><select id="list-owner"><option value="">All ('+str(len(visible))+')</option>'+options+'</select>'
         +'<label for="list-show">Show</label><select id="list-show">'+shows+'</select>'
@@ -204,7 +210,7 @@ def render(root: Path, *, show: str = 'open') -> bytes:
         +'<span data-list-count role="status"></span></div><div class="list-table"><table aria-label="Review">'
         +'<colgroup><col style="width:13%"><col style="width:13%"><col style="width:14%"><col style="width:41%">'
         +'<col style="width:12%"><col style="width:7%"></colgroup><thead><tr>'+headers+'</tr></thead>'
-        +''.join(item_rows(item,browser,members,now,index,title_limit) for index,item in enumerate(items))
+        +''.join(item_rows(item,browser,members,now,index,title_limit,words_rows) for index,item in enumerate(items))
         +'</table><p data-empty hidden>No items in this view.</p></div></div><script>'+SCRIPT+'</script>')
     return page_frame.rendered(change_page.document(content, 'Review'), started, read_at)
 
