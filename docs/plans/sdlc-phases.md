@@ -551,7 +551,7 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 3. basedpyright reports 0 errors and 0 warnings on the changed Python files.
 4. Live on natedev (director): press the button on the Disks page in a browser. The status line shows `Paused · Measuring…` at once, the button is disabled, and a second press does nothing. About a minute later the sizes update and the button is enabled again. One dark desktop screenshot, clipped to the status line and button, for the Change-Review line with `| after restart`.
 
-### Phase 46 — A question title is one short line, and the Review page never shows a long one  · status: todo
+### Phase 46 — A question title is one short line, and the Review page never shows a long one  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -603,10 +603,15 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
   2. A row whose name has no qualifying prefix is left as it is, with no per-row output. At the end, when one or more rows were left, print one line: `<N> worker names unchanged: no qualified prefix for <owner>`. No hint.
   3. Former names: find where a durable record of the owner's former names exists (the staff row, or the session record `formerNames` that `rename` writes, shutdown.py ~2181). Use a record only if it survives a session restart. If no durable record exists, accept only the owner's current name, and say so in the report.
   4. Qualified rows migrate as now.
+- Live defect (showrunner, 2026-11-17): hana's organon and startup were renamed to `organon-unit` and `startup-unit`. `rename_member` resolves `<name>-unit` to the unit `<name>`, and the rename then treated `<name>-unit` as a new name. For startup it wrote a pending folder and branch move that no command can clear. The STOP on renames lifts only when this defect is gone.
+  5. In `rename_plan` for a unit row, a new name equal to the row's name plus `-unit` is the row's own name: a same-name rename (worker migration and display repair only).
+  6. A new rename replaces an unstarted pending rename: staff path and checkout at the record's `source`, branch at `source_branch`, `destination` absent, move lock free. The test lives in `scripts/production/unit_move.py`; the removal runs under the row lock in `rename_apply_unit`. A started move keeps today's refusal.
+  7. On startup's state, `agents rename 556caf6e-713d-47c0-a8fc-5dd5e8c26ce4 startup` removes the record, renames the row back to `startup`, moves no folder or branch, and restarts no session.
 
 **Files:**
 - `scripts/agents/shutdown.py` — `rename_qualified_workers`
 - `scripts/agents/test_shutdown_cli.py` — tests (the `UNDECIDED` scenarios at ~2234 pin the old kept line and hint; the director approves replacing them with the new behavior)
+- `scripts/production/unit_move.py`, `scripts/production/test_unit_move.py` — the unstarted pending-rename test (items 6–7)
 
 **Workers:** 1 writer.
 
@@ -616,6 +621,7 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 
 **Acceptance gate:**
 1. `scripts.agents.test_shutdown_cli` passes, with tests for: bare rows (`review`, `review2`, `style-ticket-1493`, `held-check-3`) print no per-row line and one summary line; a row with a recorded former-name prefix migrates; a row with an unrecorded foreign prefix stays and prints no hint.
+   `scripts.production.test_unit_move` passes, with tests for items 5–7 and for a started move that still refuses.
 2. basedpyright reports 0 errors and 0 warnings on the changed files.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done

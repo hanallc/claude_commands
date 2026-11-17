@@ -1707,7 +1707,7 @@ class ChangePageTests(unittest.TestCase):
         return "question/" + owner.id + "/" + filed.path.name
 
     def test_questions_page_renders_the_reviewed_memory_bar_record_without_changing_it(self) -> None:
-        key = self.file_user_question(MEMORY_BAR_RAW, question=MEMORY_BAR_RAW)
+        key = self.file_user_question(MEMORY_BAR_ASK, question=MEMORY_BAR_RAW)
         browser = change_page.ReviewBrowser("private", kind="questions")
         question = next(item for item in change_browser.prepare(browser, change_page.DeliveryStatus(self.root)).questions
                         if item.key == key)
