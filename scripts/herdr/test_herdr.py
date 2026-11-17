@@ -2994,6 +2994,7 @@ class HerdrTests(unittest.TestCase):
         for case, births, record, notice in (
                 ("starting", ["birth", "birth"], False, ""),
                 ("exits during the check", ["birth", ValueError("pid 992001: process start is unavailable")], True, ""),
+                ("exits before the read", [herdr.NativeRegistryChanging("pid 992001: process exited")], True, ""),
                 ("steady", ["birth", "birth"], True,
                  f"herdr fixture:w1:p1 tab w1:t1: pane evidence is unknown: {unavailable}; row placement retained\n")):
             with (self.subTest(case=case),
@@ -3010,6 +3011,17 @@ class HerdrTests(unittest.TestCase):
             reason = unavailable if notice else "starting or exiting"
             self.assertEqual(scan, herdr.RowPaneScan({}, [herdr.UnknownPane("w1:p1", "w1:t1", reason)]))
             self.assertEqual(errors.getvalue(), notice)
+
+    def test_process_birth_names_an_exited_process_as_changing(self) -> None:
+        for case, present, expected in (("exited", False, herdr.NativeRegistryChanging),
+                                        ("unreadable", True, ValueError)):
+            with (self.subTest(case=case), patch.dict(os.environ, {"HERDR_PLATFORM": "linux"}),
+                  patch.object(sessions, "process_start", return_value=None),
+                  patch.object(Path, "exists", autospec=True, return_value=present) as exists,
+                  self.assertRaises(ValueError) as raised):
+                _ = herdr._process_birth(992001)  # pyright: ignore[reportPrivateUsage]
+            self.assertIs(type(raised.exception), expected)
+            exists.assert_called_once_with(Path("/proc/992001"))
 
     def test_unreadable_pane_session_reports_one_anomaly_and_keeps_the_pane(self) -> None:
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [{

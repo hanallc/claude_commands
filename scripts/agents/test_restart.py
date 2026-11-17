@@ -751,6 +751,8 @@ class MixedRestartTests(ShutdownTestCase):
                 return world.socket_request(method, **params)
             arguments = cast(list[str], request.get("argv", []))[2:]
             action = arguments[:2]
+            if action in (["pane", "list"], ["pane", "process-info"]):
+                requests.append(" ".join(action))
             if action == ["status", "server"]:
                 return {"running": True}
             if action == ["pane", "list"]:
@@ -868,9 +870,7 @@ class MixedRestartTests(ShutdownTestCase):
         read_bytes, kill = Path.read_bytes, os.kill
         def proc_bytes(path: Path) -> bytes:
             return read_bytes(proc / path.relative_to("/proc")) if str(path).startswith("/proc/991") else read_bytes(path)
-        def signal_process(pid: int, number: int) -> None:
-            if not 990999 <= pid < 991300:
-                return kill(pid, number)
+        def exit_process(pid: int, number: int) -> None:
             if not (proc / str(pid)).exists():
                 raise ProcessLookupError(pid)
             if number:
@@ -883,6 +883,12 @@ class MixedRestartTests(ShutdownTestCase):
                 _ = panes[pane].pop("agent_session", None)
                 write_text_atomic(proc / str(shell_pids[pane]) / "task" / str(shell_pids[pane]) / "children", "")
                 shutil.rmtree(proc / str(pid))
+        def signal_process(pid: int, number: int) -> None:
+            if not 990999 <= pid < 991300:
+                return kill(pid, number)
+            # The fake server answers under this lock; an exit is one change to its world.
+            with lock:
+                exit_process(pid, number)
         _ = self.enterContext(patch.object(Path, "read_bytes", proc_bytes))
         _ = self.enterContext(patch.object(os, "kill", side_effect=signal_process))
         for command in commands:
@@ -935,6 +941,10 @@ class MixedRestartTests(ShutdownTestCase):
             self.assertEqual(len(live), 5 if command == "restart" else 0)
             self.assertGreater(seeds.call_count, 0)
             self.assertIn("pane.process_info", requests)
+            if command == "stop":
+                # Each row stop reads its panes once; five rows took 60 pane lists before the row scope.
+                self.assertLessEqual(requests.count("pane list"), 25, command)
+                self.assertLessEqual(requests.count("pane process-info"), 25, command)
             self.assertEqual(starts.call_count, 2 if command == "restart" else 0)
             self.assertEqual(bool(orders.call_count), command == "restart")
 

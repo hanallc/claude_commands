@@ -3937,6 +3937,9 @@ def _process_birth(pid: int) -> str:
     started = (darwin_process_identity(pid).started if _platform() == "darwin"
                else runtime_sessions.process_start(pid))
     if not started:
+        # The start read failed; a process folder that is gone means the pane's process exited after herdr listed it.
+        if _platform() != "darwin" and not Path(f"/proc/{pid}").exists():
+            raise NativeRegistryChanging(f"pid {pid}: process exited")
         raise ValueError(f"pid {pid}: process start is unavailable")
     return started
 
