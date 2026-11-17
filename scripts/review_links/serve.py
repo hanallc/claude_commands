@@ -35,7 +35,7 @@ STARTED_NS = time.time_ns()
 from scripts.disks import disks_page, sessions, slots
 from scripts.lib import conf
 from scripts.production import change_routing, change_review
-from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, image_store, images
+from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, image_store, images, investigations_page
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
@@ -48,6 +48,7 @@ class AccountsPageCache:
     """Keep the last good page and allow one render at a time."""
 
     page: bytes = b""
+    render_failed: bool = False
     recent_times: deque[float] = field(default_factory=lambda: deque(maxlen=10))
     rendering: bool = False
     first_render: Future[bytes] = field(default_factory=Future[bytes])
@@ -64,7 +65,7 @@ class AccountsPageCache:
                     except RuntimeError:
                         self.rendering = False
                         raise
-                return self.page
+                return self._response()
             if not self.rendering:
                 self.first_render = Future[bytes]()
                 self.rendering = True
@@ -80,10 +81,17 @@ class AccountsPageCache:
             return page
         return attempt.result()
 
+    def _response(self) -> bytes:
+        if self.render_failed:
+            return self.page.replace(b'data-page-facts',
+                                     b'data-page-facts data-read-error="The Accounts render failed."', 1)
+        return self.page
+
     def replace(self) -> bytes:
         try:
             rendered = accounts_page.render_with_facts()
             with self.condition:
+                self.render_failed = False
                 self.recent_times.append(rendered.seconds)
                 self.page = rendered.with_recent_times(tuple(self.recent_times))
                 return self.page
@@ -91,8 +99,9 @@ class AccountsPageCache:
             with self.condition:
                 if not self.page:
                     raise
+                self.render_failed = True
                 print(f"review-links accounts: {error}", file=sys.stderr)
-                return self.page
+                return self._response()
         finally:
             with self.condition:
                 self.rendering = False
@@ -270,6 +279,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 return None
             self.html_response(200, content)
             return None
+        if route.path == investigations_page.PAGE_PATH:
+            try:
+                content = investigations_page.render(root)
+            except (OSError, ValueError) as error:
+                print(f"review-links investigations: {error}", file=sys.stderr)
+                self.html_response(503, change_page.document("<p>The Investigations page is not available.</p>"))
+                return None
+            self.html_response(200, content)
+            return None
         if route.path == images.PAGE_PATH:
             try:
                 content = images.render(root)
@@ -427,6 +445,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == images.PAGE_PATH:
             self.image_post()
             return
+        if urlsplit(self.path).path == investigations_page.PAGE_PATH:
+            self.investigation_post()
+            return
         if urlsplit(self.path).path == f"/{change_page.CONSOLE_FOLDER}/{console.NEWS_NAME}":
             self.news_post()
             return
@@ -558,6 +579,22 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 change_page.deliver(delivery, server.delivery_status)
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
+
+    def investigation_post(self) -> None:
+        """Save Mark read and return an error for the card when the save fails."""
+        root = cast(ReviewLinksServer, self.server).root
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0:
+                raise ValueError("empty investigation request")
+            investigations_page.submit(root, self.rfile.read(length).decode("utf-8"))
+        except ValueError as error:
+            self.browser_failure(400, str(error), error)
+            return
+        except OSError as error:
+            self.browser_failure(503, "The investigation could not be changed. Try again.", error)
+            return
+        self.json_response(200, {"state": "read"})
 
     def image_post(self) -> None:
         """Delete an image or send its feedback; the page shows the reason of a failure on the card."""

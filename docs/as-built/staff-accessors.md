@@ -245,6 +245,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/fake_showrunner.py` | write | native_id, update_current_session |
 | `scripts/production/fake_unit_host.py` | read | by_path |
 | `scripts/production/footer_counts.py` | read | snapshot |
+| `scripts/production/investigation.py` | read | snapshot, by_current_session and by_id find the caller and the owner of an investigation |
 | `scripts/production/live_units.py` | read | snapshot |
 | `scripts/production/log_backup.py` | read | none (StaffRefused, StaffUnreadable exceptions) |
 | `scripts/production/checkpoint_gate.py` | read | snapshot |
@@ -265,6 +266,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/proposals_folder.py` | read | initial_snapshot |
 | `scripts/production/proposals_table.py` | read | none (StaffSnapshot type) |
 | `scripts/production/prune_phase_notes.py` | read | snapshot |
+| `scripts/production/record_store.py` | read | none (StaffId type for the record owner folder) |
 | `scripts/production/rename_test_support.py` | write | find, native_id, operation, set_worktree, update_current_session |
 | `scripts/production/rename_unit_test_support.py` | read | snapshot |
 | `scripts/agents/shutdown.py` | write | by_id, cli_result, initial_snapshot, operation, operation_fds, rename, restore_unit, row_operation, set_doc, set_worktree, snapshot |
@@ -280,6 +282,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/stall_watch.py` | read | snapshot |
 | `scripts/production/store_owner.py` | read | snapshot |
 | `scripts/production/style_units.py` | read | snapshot |
+| `scripts/production/the_list.py` | read | snapshot, by_current_session and by_id find the caller and check the owner of a list item |
 | `scripts/production/tidy_wrapped.py` | read | initial_snapshot |
 | `scripts/production/transfer_unit.py` | write | cli_result, move, operation, snapshot |
 | `scripts/production/unit_command.py` | read | snapshot |
@@ -301,8 +304,9 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/worker_capacity.py` | read | snapshot, local_snapshot, WorkerName.parse, CodexBackend; staff writes go through restart.stop_row and worker_panes.close |
 | `scripts/review_links/branch_page.py` | read | snapshot, worktree_machine, by_id, by_current_session, caller_identity; session_staff.RowResolver reads branches and production docs |
 | `scripts/review_links/change_browser.py` | read | QuestionStaff.read resolves question answer recipients; the shared routing record supplies question owners |
-| `scripts/review_links/change_page.py` | read | snapshot; QuestionStaff.read resolves saved question records during delivery recovery |
+| `scripts/review_links/change_page.py` | read | snapshot; QuestionStaff.read resolves saved question records during delivery recovery; source_name uses by_id and parent_of to name a question or investigation source |
 | `scripts/review_links/images.py` | read | snapshot().by_id checks each image owner at register and names the owner on the Images page |
+| `scripts/review_links/investigations_page.py` | read | snapshot and by_id name each investigation owner on the Investigations page |
 | `scripts/agents/inventory.py` | read | local_snapshot |
 | `scripts/agents/launch_names.py` | read | initial_snapshot |
 | `scripts/agents/member_account.py` | write | StaffRow, SessionHome, set_home; repairs the home from live process evidence |
@@ -323,6 +327,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/style/add_style.py` | read | snapshot, LiveDoc, WrappedDoc |
 | `scripts/style/coverage_report.py` | read | snapshot |
 | `scripts/style/ledger_test_support.py` | write | apply_seed, initial_snapshot, set_doc |
+| `scripts/style/selection_capture.py` | read | record_path copies staff.json into a capture |
 | `scripts/style/style_config.py` | read | StaffRow, StaffSnapshot.find, StaffSnapshot.parent_of, LiveDoc, WrappedDoc |
 | `scripts/style/style_ledger.py` | read | snapshot |
 | `scripts/style/style_plan.py` | read | snapshot |

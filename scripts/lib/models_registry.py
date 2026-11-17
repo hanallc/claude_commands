@@ -12,12 +12,12 @@ import os
 import shlex
 import subprocess
 import sys
-import tempfile
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Literal, NamedTuple, cast, final
 
+from scripts.lib import build_folders
 from scripts.lib import conf_reads, git_index, land_main, main_publish, main_push_lock, registry_rows, waiting_rows
 from scripts.lib.registry_rows import parse_registry as parse_registry
 from scripts.lib.process_failure import failure_detail
@@ -241,7 +241,9 @@ def _git(repo: Path, *arguments: str, input_text: str | None = None,
          environment: dict[str, str] | None = None) -> str:
     try:
         done = subprocess.run(["git", "-C", str(repo), *arguments], input=input_text, text=True,
-                              capture_output=True, env=environment, timeout=60, check=False)
+                              capture_output=True, env=environment, timeout=60, check=False,
+                              pass_fds=((build_folders.build_folder_lock_fd(Path(environment["GIT_INDEX_FILE"]).parent),)
+                                        if environment is not None and "GIT_INDEX_FILE" in environment else ()))
     except subprocess.TimeoutExpired as error:
         raise OSError(f"git {' '.join(arguments)} timed out") from error
     if done.returncode:
@@ -282,11 +284,12 @@ def _preflight_fast_forward(repo: Path, target: str, *, replace_registry: bool,
         raise OSError("the target diverges from the publishing parent; cannot fast-forward")
     waiting = waiting_rows.hold(repo, target, skip=(REGISTRY_PATH,))
     index = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index"))
-    with tempfile.TemporaryDirectory(prefix="models-ff-index-") as directory:
+    with build_folders.tool_folder("models-ff-index") as directory:
         trial_index = Path(directory) / "index"
         git_index.private_copy(index, trial_index)
         environment = {**os.environ, "GIT_INDEX_FILE": str(trial_index)}
-        waiting_rows.give(repo, waiting, environment)
+        if waiting.entries:
+            _ = _git(repo, "update-index", "--index-info", input_text=waiting.entries, environment=environment)
         if replace_registry:
             registry_entry = _git(repo, "ls-tree", target, "--", REGISTRY_PATH) + "\n"
             _ = _git(repo, "update-index", "--index-info", input_text=registry_entry, environment=environment)
@@ -336,7 +339,7 @@ def _reconcile_shared(repo: Path, path: Path, plan: AlreadyContained | FastForwa
 
 def _registry_commit(repo: Path, parent: str, contents: str, description: str) -> str:
     """Commit just the registry through an isolated index; never touch the user's index."""
-    with tempfile.TemporaryDirectory(prefix="models-index-") as directory:
+    with build_folders.tool_folder("models-index") as directory:
         environment = {**os.environ, "GIT_INDEX_FILE": str(Path(directory) / "index")}
         _ = _git(repo, "read-tree", parent, environment=environment)
         blob = _git(repo, "hash-object", "-w", "--stdin", input_text=contents)

@@ -244,8 +244,8 @@ def page_link() -> int:
 def publish_page(configuration: FeedConfiguration) -> None:
     """Publish the repository page with the configured refresh interval."""
     source = console_theme.with_theme(Path(__file__).with_name("memory_live.html").read_text(encoding="utf-8"))
-    page = (source.replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(configuration.interval_seconds))
-            .replace("__PAGE_FRAME_STYLE__", page_frame.STYLE))
+    page = page_frame.template(source, "Builds", "builds").replace(
+        "__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(configuration.interval_seconds))
     write_text_atomic(configuration.output_folder / "memory_live.html", page, new_file_mode=0o644)
 
 
@@ -342,6 +342,9 @@ class HeadRoom(TypedDict):
 
 
 class RowQueueNotes(TypedDict):
+    key: NotRequired[str]
+    # True on the step the queue admits next; only that step shows its room.
+    first_in_line: NotRequired[bool]
     head_room: NotRequired[HeadRoom]
     priority_text: NotRequired[str]
     priority_entries: NotRequired[list[admission_records.PriorityEntry]]
@@ -510,8 +513,17 @@ class RunRow(RowQueueNotes):
     ci: bool
     parts: list[GroupPart]
     ci_runners: NotRequired[list[CIRunner]]
+    ci_cgroup: NotRequired[str]
     need: NotRequired[float]
     need_part: NotRequired[bool]
+
+
+def step_key(row: RunRow | WaitRow | MacBuildRow | MacReadingUnavailableRow | CloudWorkRow) -> str:
+    """Keep a process identity across changes to memory, labels, and queue order."""
+    # An idle or unreadable CI row has no pid or start time; its cgroup tells two CI rows apart.
+    identity = [row.get("machine") or "natedev", row.get("kind", "local"), row["pid"],
+                row.get("started_at", row.get("since", 0)), row.get("group", ""), row.get("ci_cgroup", "")]
+    return hashlib.sha256(json.dumps(codec.snapshot_value(identity)).encode()).hexdigest()[:24]
 
 
 class SwapMember(TypedDict):
@@ -663,7 +675,7 @@ class ReportCost(TypedDict):
 
 @dataclass(frozen=True)
 class ReportSections:
-    charts: dict[str, object]
+    days: int
     top: tuple[ReportCost, ...]
     start: str
     end: str
@@ -699,6 +711,7 @@ class MemoryPage(TypedDict):
     colors: PageColors
     ok: bool
     read_at: float
+    render_seconds: float
     total: float
     available: float
     cap: float | admission_records.CapUnavailable
@@ -874,7 +887,7 @@ def build_ci_row(used: float, now: float,
             "pid": pid, "detail": detail, "used": used,
             "counted": 0.0, "reserved": 0.0, "started_at": busy[0]["started_at"] if busy else 0,
             "queued": False, "keep_text": "\n".join(lines), "group": "", "ci": True, "parts": [],
-            "ci_runners": runners, "admitted": admitted,
+            "ci_runners": runners, "ci_cgroup": str(cgroup), "admitted": admitted,
             "progress": {"kind": "NoProgress", "reason": "no admission counter"}}
 
 
@@ -1016,7 +1029,7 @@ def need_in_next_part(steps: Sequence[admission_records.RunningStep]) -> bool:
                and isinstance(step.measured.window, progress.WindowPeak) for step in steps)
 
 
-WaitCause = Literal["memory", "its turn", "GPU slot", "build slot", "memory pressure", "AWS slot", "build hold", "Mac"]
+WaitCause = Literal["memory", "its turn", "Cargo token", "GPU slot", "build slot", "memory pressure", "AWS slot", "build hold", "Mac"]
 
 
 def wait_why(reason: admission_records.WaitReason) -> WaitCause:
@@ -1027,7 +1040,7 @@ def wait_why(reason: admission_records.WaitReason) -> WaitCause:
         case admission_records.BehindHead():
             return "its turn"
         case admission_records.TokenWaitingWaiter():
-            return "its turn"
+            return "Cargo token"
         case admission_records.StartSpacingWait():
             return "its turn"
         case admission_records.MemoryPressure():
@@ -1240,7 +1253,7 @@ def token_wait_stage(pool: TokenPool | TokenPoolUnavailable) -> str:
 
 
 def report_reading(days: int) -> ReportSections | charts.IndexUnavailable:
-    """Read both report sections from one provider result."""
+    """Read the top costs from one provider result."""
     try:
         recent_days = conf.read("buildlog").whole("TOP_COST_RECENT_DAYS")
         if days < recent_days:
@@ -1261,7 +1274,7 @@ def report_reading(days: int) -> ReportSections | charts.IndexUnavailable:
                              "share": cost_actions.share_text(row.share),
                              "action": cost_actions.action_text(row.action)})
         zone = user_zone()
-        return ReportSections(charts.chart_data(report.charts), tuple(rows), top.start.astimezone(zone).isoformat(),
+        return ReportSections(days, tuple(rows), top.start.astimezone(zone).isoformat(),
                               top.end.astimezone(zone).isoformat(), top.recent_days, str(zone))
     except (OSError, ValueError, RuntimeError) as error:
         return charts.IndexUnavailable(str(error))
@@ -1837,6 +1850,7 @@ def memory_status(explanation: admission_records.QueueExplanation, room: admissi
 
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
             report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET) -> MemoryPage:
+    started = time.perf_counter()
     if isinstance(configuration, conf.UseConfiguredValue):
         configuration = read_configuration()
     names = read_step_names()
@@ -2108,9 +2122,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             head_pid = head.run.pid if isinstance(head.run, LiveBuildRun) else head.pid
         for waiting_row in waiting_rows:
             if waiting_row["pid"] == head_pid:
+                waiting_row["first_in_line"] = True
                 if isinstance(explanation.head, admission_records.HeadExplanation) and explanation.head.decision.state == "hold":
                     waiting_row["head_room"] = head_room(explanation.head.room, explanation.room, ram)
                 break
+    for step_row in (*work_rows, *waiting_rows):
+        step_row["key"] = step_key(step_row)
     pressure = explanation.decided_from.pressure
     policy = explanation.policy.pressure
     # Without the recorded builds and CI swap, the page reads host swap now instead of failing.
@@ -2125,9 +2142,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         pressure_label = admission_records.pressure_text(pressure)
     elif isinstance(pressure, admission_records.PressureUnavailable):
         pressure_label = "unavailable: " + pressure.reason
-    return {
+    page: MemoryPage = {
         "colors": configuration.colors,
-        "ok": True, "read_at": explanation.now, "total": total, "available": gib(captured.available),
+        "ok": True, "read_at": explanation.now, "render_seconds": 0.0, "total": total, "available": gib(captured.available),
         "cap": cap, "floor": safety, "cap_text": room_text(captured),
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,
         "taken": gib(ram["cap_bytes"] - captured.room), "room": gib(captured.room), "room_source": "free",
@@ -2156,6 +2173,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "report_version": report_version,
         "swap_rows": configuration.swap_rows, "leftovers": leftovers,
     }
+    page["render_seconds"] = time.perf_counter() - started
+    return page
 
 
 def page_json(payload: MemoryPage | RetainedReading | PageUnavailable) -> str:

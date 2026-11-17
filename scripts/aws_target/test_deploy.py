@@ -24,7 +24,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 
-from scripts.aws_target import admin_secrets, aws_cli, aws_target, box, config as aws_config, deploy, gate_box, gate_trial, gpu_size_trial, ledger, remote
+from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, ledger, remote
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, text_setting
 from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.aws_target.test_box import SYSTEM, FakeTailnet, write_aws_claim
@@ -698,14 +698,14 @@ sys.exit(7)
         self.assertEqual(output.getvalue().splitlines()[0], 'secrets: saving encrypted credentials')
         self.assertEqual(self.previous_output(output.getvalue(), 'secrets'), '')
 
-    def test_gate_trial_command_prints_progress_around_the_trial(self) -> None:
-        arguments = ['deploy.py', 'gate-trial', '--base', 'base', '--changed', 'changed', '--modules', 'fixture/test_ok.py']
-        with (mock.patch.object(sys, 'argv', arguments), mock.patch.object(gate_trial, 'main', return_value=0) as trial,
+    def test_aws_trial_command_prints_progress_around_the_trial(self) -> None:
+        arguments = ['deploy.py', 'aws-trial', '--base', 'base', '--changed', 'changed', '--modules', 'fixture/test_ok.py']
+        with (mock.patch.object(sys, 'argv', arguments), mock.patch.object(aws_trial, 'main', return_value=0) as trial,
               redirect_stdout(StringIO()) as output):
             self.assertEqual(deploy.main(), 0)
         trial.assert_called_once_with(arguments[2:], conf.path('aws_target'), self.state)
-        self.assertEqual(output.getvalue().splitlines()[0], 'gate-trial: running the trial')
-        self.assertEqual(self.previous_output(output.getvalue(), 'gate-trial'), '')
+        self.assertEqual(output.getvalue().splitlines()[0], 'aws-trial: running the trial')
+        self.assertEqual(self.previous_output(output.getvalue(), 'aws-trial'), '')
 
     def commands(self, operation: str = '') -> list[dict[str, object]]:
         path = self.root / 'commands.jsonl'
@@ -920,7 +920,7 @@ sys.exit(7)
         _ = self.enterContext(mock.patch.object(subject, '_api', return_value=aws_target.AwsCli(
             'build-admin', 'us-east-1', 1, execute=execute)))
         _ = self.enterContext(mock.patch.object(subject, '_stack', return_value=outputs))
-        _ = self.enterContext(mock.patch.object(gate_trial, 'host_nixpkgs_revision', return_value='fixture-revision'))
+        _ = self.enterContext(mock.patch.object(aws_trial, 'host_nixpkgs_revision', return_value='fixture-revision'))
         # A gate deploy reads prices at its end; the fixture keeps that read local.
         _ = self.enterContext(mock.patch.object(deploy, 'read_price_snapshot', return_value=0))
         return subject, commands
@@ -1726,10 +1726,18 @@ sys.exit(7)
                              for name, row in resources.items()))
         self.assertNotIn('GateBucket', resources)
         self.assertNotIn('GateProfile', resources)
-        for name, key in (('GateExpiryRole', 'RoleName'), ('GateExpiryFunction', 'FunctionName')):
+        gate = conf.read_or_repository('cloud_gate')
+        regions = {*gate.words('regions'), *gate.words('spot_candidate_regions')}
+        limits = (('GateSecurityGroup', 'GroupName', 255), ('GateLaunchTemplate', 'LaunchTemplateName', 128),
+                  ('GateExpiryRole', 'RoleName', 64), ('GateExpiryFunction', 'FunctionName', 64),
+                  ('GateExpiryLog', 'LogGroupName', 512), ('GateExpirySchedule', 'Name', 64))
+        for name, key, limit in limits:
             properties = ledger.mapping(ledger.mapping(resources[name])['Properties'])
             value = ledger.text(ledger.mapping(properties[key]), 'Fn::Sub')
-            self.assertLessEqual(len(value.replace('${DeploymentId}', 'f' * 32).replace('${AWS::Region}', 'us-west-2')), 64)
+            for region in regions:
+                with self.subTest(name=name, region=region):
+                    named = value.replace('${DeploymentId}', 'f' * 32).replace('${AWS::Region}', region)
+                    self.assertLessEqual(len(named), limit)
 
     def regional_stack_fixture(self, stack: dict[str, str]) -> tuple[deploy.Deployment, list[list[str]], aws_target.AwsCli]:
         """A regional stack in the state stack['status']; an empty status means the stack does not exist yet.

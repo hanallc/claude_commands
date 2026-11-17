@@ -2,7 +2,7 @@
 
 ## Current model
 
-AWS runs temporary Spot boxes for merge gates, paired gate trials, and the GPU size trial.
+AWS runs temporary Spot boxes for merge gates, paired AWS trials, and the GPU size trial.
 Normal build jobs use `mac` and `natedev`, in that order.
 AWS has no permanent builder or build offload route.
 Cloud gates use `~/.local/state/build-targets/aws` without an `aws` target registration.
@@ -34,6 +34,24 @@ Boxes receive signed URLs and no scaler credential file.
 These files do not provision a machine or add a deployment command.
 Phase D must install and enable the units before the box accepts work.
 `config/hana_aws.conf` keeps placement disabled and supplies all safety timing and resource values.
+
+`scripts/aws_target/hana_render.py` renders both the safety files and the receiver files from this repository's configuration.
+It writes nine files by base name and applies each `GuestFile` mode.
+Without `tool_setup`, `hana_guest.render_files()` omits `hana-tools.service`.
+Phase F2 supplies the tool setup service.
+
+The NixOS build uses the renderer from its pinned `claude-commands` input.
+`scripts/aws_target/hana_render.files` lists the files for the NixOS `lib.fileset` filter.
+The filter excludes unrelated repository changes from the image inputs.
+The NixOS integration replaces the manually copied guest files.
+
+Run this command from the repository root:
+
+```sh
+python3 -E -m scripts.aws_target.hana_render --device /dev/sdf <out_dir>
+```
+
+`-E` ignores `PYTHONPATH`, so the listed files alone supply the imports.
 
 The boot guard waits for a fresh permit within `guard_grace_seconds` from boot.
 It has no ordering or requirement dependency on the data disk, network, or tool setup.
@@ -329,7 +347,7 @@ Teardown still checks retained claims before deletion.
 
 ## Paired speed trials
 
-Run `python3 -m scripts.aws_target.gate_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
+Run `python3 -m scripts.aws_target.aws_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
 Both refs can name local commits in `~/.claude`.
 The trial pushes each commit to a fresh `gate-trial-<expires>-<id>-base|changed` branch with a plain push.
 The expires field records the trial's fixed expiry epoch in seconds.
@@ -339,7 +357,7 @@ The trial installs no signal handler.
 Ctrl-C and terminal command exceptions stop the paired service.
 SIGTERM or SIGHUP to the terminal can skip branch cleanup.
 The separate trial service then runs to its normal end and cleans its boxes.
-The paired unit uses `ExecStopPost` with `gate_trial --paired-cleanup <folder>`.
+The paired unit uses `ExecStopPost` with `aws_trial --paired-cleanup <folder>`.
 After a service stop, systemd runs this cleanup after killing the coordinator and its children.
 Cleanup requests termination for all recorded boxes before searching uncertain launches.
 Cleanup requests termination for each discovered box before the next search.
@@ -435,7 +453,7 @@ The command terminates boxes after results, errors, or cancellation.
 Uncertain launches retain their requests and reservations for reconciliation and expiry cleanup.
 
 The paired trial replaces the size/start trials.
-The twelve `gate_trial_*` settings are removed.
+The old size/start trial settings are removed.
 The paired trial uses the existing `cloud_gate.conf` settings.
 
 ## Cloud gate region fallback
@@ -654,6 +672,7 @@ The user asked for this layout on 2026-11-14 through builds. Each line shows:
    Times come from `cloud-gate-launches.jsonl` over the last `run_cost_days` days.
 3. Runs: the run count of that time.
    A region without its own runs uses the type's runs in other regions, and the cell says `elsewhere`.
+   A type without runs uses the runs of the types with its vCPU count, and the cell says `same vCPUs`.
 4. The estimate: Spot price times that box time, plus the refusal wait cost.
 5. Paid USD/h: the bill's `SpotUsage:<type>` cost for the type and region, over its billed hours.
 6. Paid USD/run: that bill split between the runs of both kinds by box time, for the merge gates only.
@@ -676,7 +695,7 @@ The AWS page shows the same tables, published by `aws_page.publish`.
 The user renamed it from AWS prices to AWS on 2026-11-15, because it holds spend, prices and quotas.
 The published file stays `aws_prices.html`, so older links still open it.
 A Spend card at the top shows today, yesterday and the month to date, with the month forecast below them.
-`spend.read_spend` and `spend.month_spend` give these numbers; `/aws_spend` reads the same functions, so both show the same values.
+`spend.read_spend` and `spend.month_spend` give these numbers; the buildlog report reads the same functions, so both show the same values. Read the spend on the console AWS page; the `/aws_spend` command was removed on 2026-11-16.
 The day is the UTC day. The hourly buildlog run publishes the page, so the spend is current to the last hour.
 After each push to main, `.claude/config/post_push.sh` publishes it again
 when the push changes the page code and the pushing checkout is at the pushed commit, as the promotion step's ~/.claude is.
@@ -808,7 +827,10 @@ After the first run in a region, its own median box time replaces the borrowed t
 It also includes the expected refusals: refused requests per launch for the type and region, times the median wait of one refusal, times `gate_wait_usd_per_minute`.
 Refusals count the zone and quota codes below over the last `run_cost_days` days; `UnauthorizedOperation` does not count.
 Expected box time is the median box time, launch to finish, for the type, region and mode over the last `run_cost_days` days.
-A region without its own runs uses the type's runs in all regions; a type without runs uses all runs of the mode.
+A region without its own runs uses the type's runs in all regions.
+A type without runs uses the runs of the types with its vCPU count, so m7a.8xlarge uses the c7a.8xlarge runs.
+The user, 2026-11-16: "it should be entirley based on who has the lowest price per run".
+Without runs of that vCPU count, it uses all runs of the mode.
 Without any runs, it uses `lifetime_minutes`.
 The AWS page shows the same expected cost and refusals per launch, without the remote transfer and regional delay.
 Its expected cost includes the unmeasured seconds.
@@ -1006,3 +1028,43 @@ Existing configuration values remain unchanged.
 | `aws_timeout_s` | `10` | Bound each provider and receiver request. |
 | `control_url_seconds` | `3600` | Bound signed access for one boot. |
 | `control_poll_seconds` | `1` | Read current permission before the watchdog interval ends. |
+
+
+## Hana source transport
+
+`hana_transport.SourceSender` captures exact source through `copies.capture_source`.
+The copies private index includes staged, unstaged, deleted, and permitted untracked files.
+`apply_changes` uses the same private tree capture.
+The caller's index and refs remain unchanged.
+The existing tree key and a second private capture detect content and executable mode changes.
+Both capture paths refuse new Git links with `NestedRepository`.
+The sender refuses unexpected ignored inputs, credential paths, Git links, and disallowed environment variables.
+It sends no ignored files, HOME, or target output.
+
+A frozen `SourceManifest` carries the repository key, private commit, bundle digest, signed URL, basis commits, command, features, environment, and toolchain digest.
+Its JSON fits the receiver's 65536-byte control limit.
+Each repository retains a bounded list of guest-acknowledged commits.
+Each snapshot commit has no parent, so bundles exclude the caller's Git history and deleted credential blobs.
+Later bundles exclude those commits and their reachable objects.
+A typed `MissingBasis` answer clears that repository's basis before a complete bundle retry.
+`retry_complete` retains the captured commit even when the caller changes working files.
+
+`AwsSourceObjects` implements the typed object boundary through the existing provider.
+It uses conditional `PutObject` and signed `GetObject` access under `source/<deployment>/`.
+The scaler policy grants only `s3:PutObject` and `s3:GetObject` for that deployment's source prefix.
+Each AWS call uses `aws_timeout_s`.
+The guest receives no AWS credentials.
+
+`hana_source.materialize` bounds the download, verifies sha256 and Git prerequisites, checks the advertised commit, and fetches verified objects.
+Curl enforces the total download timeout and maximum file size.
+The data disk retains one bare mirror for each repository under `/var/lib/hana/mirrors`.
+The shared maker allocates mirror metadata and temporary bundle files.
+`build_slots.take_slot` supplies the only working checkout and retains its lease through the caller's context.
+The slot API provides rescue before reset, stable Cargo output, and existing capacity refusal.
+The slot's `rust-toolchain.toml` digest must equal the manifest before execution.
+
+The guest must use host name `aws-hana`.
+Admission requires `roots.slots.aws-hana`, `slots.aws-hana.hana.max`, and `slots.aws-hana.hana.max_bytes`.
+Those values remain unset until the user approves them.
+The guest image needs Git, curl, Python, `hana_source`, and the shared maker, slot, rescue, and configuration modules.
+Phase F2 will deliver manifests and execute commands with inherited slot locks.

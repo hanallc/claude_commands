@@ -388,6 +388,16 @@
               "Resource": {
                 "Fn::Sub": "${ControlBucket.Arn}/control/${DeploymentId}/*"
               }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject",
+                "s3:PutObject"
+              ],
+              "Resource": {
+                "Fn::Sub": "${ControlBucket.Arn}/source/${DeploymentId}/*"
+              }
             }
           ]
         }

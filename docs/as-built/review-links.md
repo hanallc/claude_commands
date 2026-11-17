@@ -94,12 +94,44 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for AWS, Builds, Changes, Images and Questions, in alphabetical order.
+The left navigation has icons and labels for Accounts, AWS, Builds, Changes, Disks, Images, Investigations and Questions, in alphabetical order.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`. The content column is centered in the frame, 32px below its top edge, with at least 32px at each side.
+Each navigation page places `page_frame.title()` directly above its content.
+The shared `.page-status` line follows the title.
+It shows the state, data time, round trip and server render time, in that order.
+Live uses `radio` and `--room`; Reading uses `loader-circle` and `--accent`.
+Late uses `clock-alert` and `--warning`; Failed uses `triangle-alert` and `--error`.
+Paused uses `circle-pause` and `--ink-3`.
+The state order is Paused, Failed, Late, Reading, Live.
+Late, Failed and Paused show a reason after the last data time instead of timings.
+Builds and Disks keep the shown data time when a later read or measure fails.
+A first read shows only Reading until data arrives.
+A slow read retains the last data time and timings.
+The age increases each second without a request.
+After one minute, the age includes the data time and zone.
+Round trip covers request start through the first frame after the data appears.
+Render time comes from the server or the data writer.
+The browser does not estimate render time.
+`config/console.conf` sets timing limits, the Reading delay and each page's age limit.
+Values above the timing limits use `--warning`.
+Late and Failed remain at the top during scrolling.
+The line wraps between its positions on a phone.
+The status speaks only when its state changes.
+Reduced motion stops the loader icon.
+`page_frame.createPageRefresh` owns the refresh timers, visibility handling, failures and status drawing.
+Each loader checks the request identity before it changes content.
+An older response cannot replace a newer response.
+Accounts, Changes, Investigations and Questions read their rendered page at `page_refresh_seconds` intervals.
+Builds reads `memory.json` at its feed interval.
+Disks reads `disks.json` at `page.poll_seconds` intervals and requests a new measure when needed.
+AWS reads its published page when shown; its hourly publisher sets the data time and render time.
+Images reads its rendered page when shown.
+The Changes and Questions pages show Paused while text or an active save holds a replacement.
+
 The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
-AWS, Builds, Changes, Images, Questions and Rebuilds put the title in the same place.
+AWS, Builds, Changes, Images, Investigations, Questions and Rebuilds put the title in the same place.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
@@ -131,7 +163,7 @@ A page that changes its place with `history.replaceState` posts `console-place` 
 A page in a hidden frame can pause its refresh: `window.frameElement?.hidden === true` while the frame is hidden.
 When the console shows a frame that was open before, it posts `console-shown` to that frame, and the page can load an update at once.
 The Changes page follows both rules.
-The Builds page refreshes in a hidden frame until it reads the same signal.
+The shared refresh component stops data requests in hidden frames and hidden browser tabs.
 
 Older links forward to the fixed address with a 303 and keep their query.
 The server forwards `/<snapshot>/console.html` to `/console/`.
@@ -182,6 +214,7 @@ The function takes a `console.NewsRequest` and returns the keys of the items tha
 Changes uses `change_browser.waiting_changes`.
 Questions uses `change_browser.waiting_questions`.
 Images uses `images.waiting_images` for registered images without `feedback_at`.
+Investigations uses `investigations_page.waiting_investigations` for answer-ready records, with the owner, id and answered time in each key.
 The Images page and its items function share the same waiting-record filter.
 Temporary change images stay outside the Images page and its new mark.
 A page without an items function, or an unavailable page, never shows the icon.
@@ -278,10 +311,18 @@ It deletes change images only when no To review row names them and their age exc
 The setting starts at 14 days and is read at each sweep.
 
 Questions read the canonical records through `update_registration.question_records_for_document`.
-A question belongs to the showrunner whose record owns it.
+A question belongs to the showrunner or producer whose fixed staff id owns it.
+A producer's question appears in its current staff name's filter with the same answer form.
+Producer questions use `<SHOWRUNNER_STATE_DIR>/<producer staff id>/questions` without a production document.
 A question without a staff owner appears under **Owner unavailable**.
 The reader also scans question folders under the showrunner state root when their owners leave staff.
-Owned cards show the title before the filed text, choices, and **Asked by <session>**.
+Cards show the title before the filed text and choices.
+Under the buttons, aligned footer lines show `source:`, `date:` and `time:`, in the same form as Changes.
+The source uses the asker's current staff name.
+For a unit, the source is `<parent showrunner name> · <unit name>`.
+The footer reads `since`, which the question record always keeps in the user zone.
+It shows the date as YYYY-MM-DD and the time as HH:MM.
+Cards in **Owner unavailable** show the footer without an answer form.
 They have no separate Question label.
 A question filed with parts (`ask --ask`) shows each part as its own section:
 - the one-line ask in bold, when it differs from the title in more than case and a final `?` or `.`;
@@ -326,6 +367,7 @@ It has no Ask showrunner to check or Ask a question controls.
 The typed `AnswerRelay` gives the same recipient decision as the CLI relay line.
 A unit relay receives the answer directly.
 A transferred unit's showrunner receives the answer with the unit's name.
+A producer receives its answer directly through its current session from the staff record at each send attempt.
 An answer without a relay goes to the question's showrunner.
 Each message starts with `From the user (via the review page): ` and names the question.
 
@@ -357,6 +399,7 @@ The child keeps the status read's stderr capture away from the server's request 
 A failed or late first render gives 503 with **The Accounts page is not available.**
 A failed background render keeps the last good page and writes one line to stderr.
 Failed renders add no render time.
+A cached Accounts response carries its render failure to the status line.
 
 - The table comes from `accounts.status_board()`: the board columns, rows, total row and tones.
 - The upcoming moves and the problems follow the table.
@@ -368,11 +411,60 @@ It also refreshes when the console shows it again and when the tab becomes visib
 Changes, Images and Accounts use the same refresh helper in `page_frame.py`.
 Images has no interval timer.
 
-The line under the Accounts title shows the data age in whole seconds and the browser wait in seconds.
-It then shows the last render time and the median of at most 10 successful renders.
-The browser computes the data age from the render finish time and clamps negative ages to zero.
-The browser measures the first wait from request start to response end in its navigation entry.
-For a refresh, it measures the wait around `fetch` and the response body read.
+The shared status line shows the last server render time.
+The render value's hover text shows the median of at most 10 successful renders.
+
+### Investigations page
+
+`/console/investigations.html` reads every owner's investigation folder, including owners without a current staff row.
+The console places Investigations between Images and Questions with the Lucide `search` icon.
+Each card shows its title, question, answer when present, and the source, date and time as aligned footer lines.
+The source uses the current staff name, or the fixed staff id when the staff row is absent.
+A unit source shows its parent showrunner name and unit name.
+The date and time show the filed time in the user's zone.
+Question and answer text use the Questions page's paragraph and list helper.
+
+The Owner menu lists All and the owners with records, in name order.
+The Show menu lists Not read, Answer ready, Waiting, Read and All.
+Not read is the default.
+The address retains both filters.
+Ready answers appear first, newest answer first.
+Waiting questions follow, oldest filed first.
+Read answers appear last, newest read first.
+
+Only answer-ready cards show Mark read.
+The signed form posts to the server, which calls `investigation.mark_read`.
+A successful save removes the card from the Not read view without a document reload.
+A failed save retains the card and displays the error.
+The page uses `page_frame.createPageRefresh` and `page_refresh_seconds`, with the same visibility rules as Questions.
+Refresh retains the filters and scroll position, skips active saves, and refuses older responses after a newer response or save.
+New ready answers mark the navigation entry as new until the user visits the page.
+
+### Investigations page
+
+`/console/investigations.html` reads every owner's investigation folder, including owners without a current staff row.
+The console places Investigations between Images and Questions with the Lucide `search` icon.
+Each card shows its title, question, answer when present, and the source, date and time as aligned footer lines.
+The source uses the current staff name, or the fixed staff id when the staff row is absent.
+A unit source shows its parent showrunner name and unit name.
+The date and time show the filed time in the user's zone.
+Question and answer text use the Questions page's paragraph and list helper.
+
+The Owner menu lists All and the owners with records, in name order.
+The Show menu lists Not read, Answer ready, Waiting, Read and All.
+Not read is the default.
+The address retains both filters.
+Ready answers appear first, newest answer first.
+Waiting questions follow, oldest filed first.
+Read answers appear last, newest read first.
+
+Only answer-ready cards show Mark read.
+The signed form posts to the server, which calls `investigation.mark_read`.
+A successful save removes the card from the Not read view without a document reload.
+A failed save retains the card and displays the error.
+The page uses `page_frame.createPageRefresh` and `page_refresh_seconds`, with the same visibility rules as Questions.
+Refresh retains the filters and scroll position, skips active saves, and refuses older responses after a newer response or save.
+New ready answers mark the navigation entry as new until the user visits the page.
 
 ### Images page
 
@@ -422,12 +514,11 @@ The modal dialog takes focus and uses the image's alt text as its accessible nam
 
 **Owner** is `<name> (<kind>)`, or `Unknown session: <id>`. **For** is `Change <id>` or `Phase <id>`.
 **Added** is `MMM dd, yyyy, HH:MM` on the 24-hour clock in the user's zone (`config/user_zone.conf`).
-The **Show** menu filters by age: **Last day**, **Last 7 days** (the default) or **All**.
-A period other than the default goes in the URL as `#show=day` or `#show=all`, and the console keeps it.
+The Images page shows every waiting image, oldest first, with no age filter.
 A pair has one caption, one details block, one Feedback field and one set of answer buttons. The owner delete removes both images.
 On a page 1108px or wider, a single card is 680px wide and a pair card is up to 1376px wide; both are centered in the images pane.
 When a pair card is narrower than 600px, its images stack, before on top.
-A page URL with `#image=<id>` opens at that card. When the card is outside the default period, the menu changes to **All**.
+A page URL with `#image=<id>` opens at that card.
 
 A group is a run of shown cards in a row with the same owner.
 A panel at the top left of the images pane lists one row per group, in three columns: owner name, count and the time of its first image.
@@ -436,7 +527,7 @@ The panel has a rounded outline and thin lines between its rows and columns.
 The panel stays in place while the cards scroll.
 Each row shows a hover color, and a click on a row goes to the first image of its group.
 On a narrow screen the panel goes above the cards and scrolls with them, and its owner column takes the spare width.
-An empty period shows **No images in this period. Choose a longer period.**, and no images shows **No images registered.**
+When no images wait for an answer, the page shows **No images registered.**
 The page refreshes its cards when the console shows it again and when the tab becomes visible.
 A hidden frame makes no request.
 The card list carries `data-script`, the page script hash.

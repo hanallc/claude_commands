@@ -23,12 +23,13 @@ from unittest.mock import patch
 
 
 from typing import cast, override
+from urllib.parse import urlencode
 
 
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
-from scripts.production import change_review
-from scripts.review_links import accounts_page, change_browser, change_page, console, serve
+from scripts.production import change_review, investigation, staff
+from scripts.review_links import accounts_page, change_browser, change_page, console, investigations_page, serve
 from scripts.lib import atomic_file, conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -57,6 +58,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-server-test-")))
         self.root = temporary / "root"
         self.root.mkdir()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "SHOWRUNNER_STATE_DIR": str(temporary / "investigations-state")})))
         self.outside = temporary / "outside.txt"
         _ = self.outside.write_text("outside the served root", encoding="utf-8")
         server = serve.ReviewLinksServer(("127.0.0.1", 0), self.root)
@@ -177,6 +180,28 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(self.post("/console/news", body)[0], 400)
         self.assertEqual(self.request("/console/" + console.SEEN_NAME).status, 404)
 
+    def test_investigation_mark_read_saves_and_reports_refused_or_failed_requests(self) -> None:
+        _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())))
+        owner = staff.StaffId("fixture-owner")
+        item = investigation.file(owner, "Find the cause", "Why?")
+        fields = {"owner": owner, "id": item.id,
+                  "token": investigations_page.request_token(self.root, owner, item.id)}
+        self.assertEqual(self.request(investigations_page.PAGE_PATH).status, 200)
+        self.assertEqual(self.post(investigations_page.PAGE_PATH, urlencode(fields))[0], 400)
+        _ = investigation.answer(owner, item.id, "Found it.")
+        for body in (urlencode({**fields, "token": "bad"}), urlencode(fields) + '&owner=other'):
+            with self.subTest(body=body):
+                self.assertEqual(self.post(investigations_page.PAGE_PATH, body)[0], 400)
+                self.assertEqual(investigation.load(owner, item.id).state, investigation.InvestigationState.ANSWER_READY)
+        with patch.object(investigations_page, "submit", side_effect=OSError("fixture write failed")):
+            status, body = self.post(investigations_page.PAGE_PATH, urlencode(fields))
+            self.assertEqual(status, 503)
+            self.assertIn(b'"reason"', body)
+        self.assertEqual(investigation.load(owner, item.id).state, investigation.InvestigationState.ANSWER_READY)
+        self.assertEqual(self.post(investigations_page.PAGE_PATH, urlencode(fields)), (200, b'{"state": "read"}'))
+        self.assertEqual(investigation.load(owner, item.id).state, investigation.InvestigationState.READ)
+
     def test_older_console_browser_and_rebuild_links_forward_to_the_fixed_address(self) -> None:
         for path, location in (
             ("/abc123/console.html?page=questions", "/console/?page=questions"),
@@ -246,7 +271,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_accounts_cache_keeps_the_page_during_one_render_and_after_a_failure(self) -> None:
         cache = serve.AccountsPageCache()
-        first = accounts_page.AccountsRender(b'<p data-load-time>first</p>', 0.25, 100)
+        first = accounts_page.AccountsRender(b'<p data-page-facts>first</p>', 0.25, 100)
         with patch.object(accounts_page, "render_with_facts", return_value=first):
             kept = cache.get()
         for fail in (False, True):
@@ -259,7 +284,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                         raise OSError("the test did not release the render")
                     if fail:
                         raise OSError("no stored data")
-                    return accounts_page.AccountsRender(b'<p data-load-time>second</p>', 0.75, 200)
+                    return accounts_page.AccountsRender(b'<p data-page-facts>second</p>', 0.75, 200)
 
                 before = tuple(cache.recent_times)
                 with patch.object(accounts_page, "render_with_facts", side_effect=render) as child, redirect_stderr(StringIO()) as errors:
@@ -282,6 +307,29 @@ class ReviewLinksServerTests(unittest.TestCase):
                         kept = cache.page
                 if fail:
                     self.assertEqual(errors.getvalue(), "review-links accounts: no stored data\n")
+
+    def test_accounts_cached_http_response_carries_a_render_failure_then_recovers(self) -> None:
+        cache = serve.AccountsPageCache()
+        first = accounts_page.AccountsRender(b'<p data-page-facts>board</p>', .25, 100)
+        with patch.object(accounts_page, "render_with_facts", return_value=first):
+            good = cache.replace()
+        with (patch.object(accounts_page, "render_with_facts", side_effect=OSError("private failure")),
+              redirect_stderr(StringIO())):
+            _ = cache.replace()
+        with patch.object(threading.Thread, "start"):
+            failed = cache.get()
+        self.assertIn(b'data-read-error="The Accounts render failed."', failed)
+        self.assertIn(b'data-read-at="100.000000"', failed)
+        self.assertIn(b'>board</p>', failed)
+        self.assertEqual(cache.page, good)
+        self.assertEqual(tuple(cache.recent_times), (.25,))
+        with patch.object(serve.AccountsPageCache, "get", return_value=failed):
+            response = self.request(accounts_page.PAGE_PATH)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.body, failed)
+        with patch.object(accounts_page, "render_with_facts", return_value=first):
+            recovered = cache.replace()
+        self.assertNotIn(b'data-read-error', recovered)
 
     def test_accounts_first_request_waits_for_its_render(self) -> None:
         cache = serve.AccountsPageCache()
@@ -316,11 +364,11 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_accounts_cache_keeps_only_the_last_ten_successful_render_times(self) -> None:
         cache = serve.AccountsPageCache()
         for seconds in range(1, 13):
-            with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b'<p data-load-time></p>', seconds, seconds+100)):
+            with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b'<p data-page-facts></p>', seconds, seconds+100)):
                 _ = cache.replace()
         self.assertEqual(tuple(cache.recent_times), tuple(range(3, 13)))
         self.assertIn(b'data-render-seconds="12.000000"', cache.page)
-        self.assertIn(b'data-render-finished="112.000000"', cache.page)
+        self.assertIn(b'data-read-at="112.000000"', cache.page)
         self.assertIn(b'data-render-median="7.500000"', cache.page)
         self.assertIn(b'data-render-count="10"', cache.page)
 

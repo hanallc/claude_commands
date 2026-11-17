@@ -487,7 +487,7 @@ Both modes use one launch loop with the same commands, test environments, timeou
 `WholeMachine` prints each completed job's name, exit status, and seconds.
 `WholeMachine.module_seconds` supplies recorded times to `module_order`, which places unknown modules first, then measured modules from slowest to fastest.
 Without recorded times, `WholeMachine` keeps the discovery order. It writes no module times file.
-The gate trial sends the host's module times as a separate S3 object.
+The AWS trial sends the host's module times as a separate S3 object.
 The trial host reads its root `nixpkgs` input revision from `/etc/nixos/flake.lock` before creating resources.
 The guest uses that revision for Python, SQLite, Chromium, and the other Nix packages.
 The guest links `google-chrome` to Chromium before the system profile bind mount for headless chart tests.
@@ -1147,6 +1147,13 @@ The instance profile has no CloudFormation tag property.
 | Bucket, role, profile, security group, launch template | `cloud-claude-gate-${DeploymentId}` |
 | Expiry role, expiry function, schedule | `cloud-claude-gate-${DeploymentId}-expiry` |
 | Log group | `/aws/lambda/cloud-claude-gate-${DeploymentId}-expiry` |
+| Regional security group, launch template | `cloud-gate-${DeploymentId}-${AWS::Region}` |
+| Regional expiry role, expiry function, schedule | `gate-${DeploymentId}-${AWS::Region}-expiry` |
+| Regional log group | `/aws/lambda/gate-${DeploymentId}-${AWS::Region}-expiry` |
+
+IAM role, Lambda function and schedule names allow 64 characters.
+The regional expiry names use the shorter `gate-` prefix, so a region name of up to 19 characters fits.
+The 2026-11-16 deployment failed in `ap-northeast-1`: its 65-character `cloud-gate-` role name passed the limit.
 
 The box sends logs every `log_push_s=5` seconds.
 The route reads module counters from each log download.

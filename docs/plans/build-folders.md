@@ -381,7 +381,10 @@ Do not provision real machines or reset live caches during tests.
 
 1. Route verify and mirror creation through the maker on each execution machine.
 2. Route style base, worker, validation, and standing sources through slots.
-3. Route explicit worktrees, unit worktrees, recovery worktrees, and remaining repository callers through slots.
+3. Route remaining throwaway repository callers through slots.
+   Explicit, unit, production and recovery worktrees are editable work, so they stay outside slots, as `copies.workspace()` does in Phase 4.
+   They use the maker's linked editable worktree request: `create_build_folder()` runs the `git worktree add` at the exact path and branch (sdlc, 2026-11-16).
+   A persistent reference clone uses the remote clone form of the same request.
 4. Classify staging callers by content; repository content requires a slot.
 5. Migrate adjacent fixtures with their runtime owners.
 6. Preserve revision selection, cancellation, result delivery, and recovery behavior.

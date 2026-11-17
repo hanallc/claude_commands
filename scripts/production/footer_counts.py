@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from scripts.production import change_review
 from scripts.lib import conf
-from scripts.production import change_routing, staff
+from scripts.production import change_routing, investigation, staff, unit_lookup
 from scripts.production import proposals_folder
 from scripts.production import proposals_table
 from scripts.production.production_doc import Refusal, production_field
@@ -28,6 +28,7 @@ class FooterCounts(NamedTuple):
     questions: int = 0
     efficiency: int = 0
     unrouted: int = 0
+    investigations: int = 0
 
 
 def total(each: list[FooterCounts]) -> FooterCounts:
@@ -122,14 +123,28 @@ def read_counts(doc: Path, *, questions: int = 0, record: staff.StaffSnapshot | 
     `own` is the doc's `open_proposals` when the caller already read them.
     """
     try:
-        change_count, unrouted_count = change_counts(
-            doc, record if record is not None else staff.snapshot(), source=source, sources=sources)
+        record = record if record is not None else staff.snapshot()
+        investigation_count = investigations(doc, record, source=source, sources=sources)
+        change_count, unrouted_count = change_counts(doc, record, source=source, sources=sources)
         return FooterCounts(change_count, proposals(doc, source=source, sources=sources, own=own), questions,
-                            efficiency(doc, source=source, sources=sources), unrouted_count)
+                            efficiency(doc, source=source, sources=sources), unrouted_count, investigation_count)
     except OSError:
         if sources is not None:
             raise
         return FooterCounts(questions=questions)
+
+
+def investigations(doc: Path, record: staff.StaffSnapshot, *, source: str = "",
+                   sources: list[Path] | None = None) -> int:
+    """Count the owner and the same units used by production proposals."""
+    if source:
+        return len(investigation.records(staff.StaffId(source), sources=sources))
+    try:
+        owner = unit_lookup.doc_owner(doc, record)
+    except staff.StaffUnreadable:
+        return 0
+    owners = (owner, *unit_lookup.doc_units(doc, record))
+    return sum(len(investigation.records(member.id, sources=sources)) for member in owners)
 
 
 def routing_sources(record: staff.StaffSnapshot | None = None, *, sources: list[Path] | None = None) -> list[Path]:
@@ -211,13 +226,14 @@ def plural(count: int, word: str) -> str:
 
 
 def counts_line(counts: FooterCounts) -> str | None:
-    """`For you: 1 question, 2 changes, 130 efficiency, 2 proposals`.
+    """`For you: 1 question, 1 investigation, 2 changes, 130 efficiency, 2 proposals`.
 
     Questions come first because they need the user most (user, 2026-10-20). "efficiency" has
     no plural. Zero counts are left out; None when all are zero.
     """
     parts = [text for count, text in (
         (counts.questions, plural(counts.questions, "question")),
+        (counts.investigations, plural(counts.investigations, "investigation")),
         (counts.changes, plural(counts.changes, "change")),
         (counts.efficiency, f"{counts.efficiency} efficiency"),
         (counts.proposals, plural(counts.proposals, "proposal")),
