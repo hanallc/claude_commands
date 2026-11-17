@@ -557,8 +557,24 @@ Parked items also match the word `Parked`.
 The address retains the owner, producer, view, search, column, and direction.
 
 A row opens to show its latest status, completion condition, item links, and log.
-The open row does not show Evidence; the record keeps it.
+The record keeps Evidence, and the open row has no separate Evidence section.
 The log shows its newest entry first.
+Each log writer saves a typed event.
+The table and log use the same format for staff names, local ETAs, and field values.
+The table, log, and Park response show parking dates in the user's zone.
+The log uses plain field labels, such as Next step and Latest status.
+The reader converts old Added, Updated, Parked, Closed, and feedback entries to the same format.
+An old entry keeps its text if the reader cannot parse it.
+The reader requires the fields for each event.
+The reader applies the same field rules to log values and item values.
+Typed feedback and request receipts require the List page source.
+All entries use the same label column width.
+The log shows feedback words and delivery status.
+Answer and Mark read store explicit events.
+The Answer event includes the question ID.
+Link and Unlink events include the review keys.
+Evidence cleanup events name the copy that was removed.
+Request receipts stay in the record and are hidden from the log display.
 Each expanded row has Remove, Park with a date, and a text box for Ask question and Tell morty.
 The text box shows “Your words for morty about this item” as its placeholder and accessible name.
 Ask question and Tell morty sit below the box at its right edge, beside the send status.
