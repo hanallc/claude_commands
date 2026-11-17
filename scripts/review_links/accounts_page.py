@@ -130,7 +130,7 @@ def _row_open(row: accounts.BoardRow) -> str:
     return f'<tr class="account"{move}>' if row["cells"]["label"] else f"<tr{move}>"
 
 
-def _next_cell(row: accounts.BoardRow, reading: accounts.StatusReading, colors: dict[str, str]) -> str:
+def _next_cell(row: accounts.BoardRow, reading: accounts.StatusReading, labels: dict[str, accounts.BoardSpan]) -> str:
     """Render the selected group's target or the reason this line has no target."""
     if row["cells"]["label"] and row["cells"]["label"][0]["text"] == "total":
         return ""
@@ -146,7 +146,7 @@ def _next_cell(row: accounts.BoardRow, reading: accounts.StatusReading, colors: 
     if isinstance(first, accounts.NextMovesUnavailable):
         content = '<span class="next-muted" title="' + html.escape(first.reason, quote=True) + '">unavailable</span>'
     elif target:
-        content = _spans([accounts.BoardSpan(text=target, tone="default", kind="bold", color=colors.get(target, ""))])
+        content = _spans([labels.get(target, accounts.BoardSpan(text=target, tone="default", kind="bold"))])
     elif editable:
         content = '<span class="next-muted">none</span>'
     else:
@@ -162,7 +162,7 @@ def board(reading: accounts.StatusReading) -> str:
     """The accounts board table, then the upcoming moves and the problems."""
     table = accounts.status_board(reading)
     claude = {row.label for row in reading.rows if row.tool == "claude"}
-    colors = {line["cells"]["label"][0]["text"]: line["cells"]["label"][0].get("color", "")
+    labels = {line["cells"]["label"][0]["text"]: line["cells"]["label"][0]
               for line in table["rows"] if line["cells"]["label"]}
     def target(spans: list[accounts.BoardSpan], left: list[accounts.BoardSpan]) -> list[str]:
         color = accounts.account_color(spans[0].get("color", ""))
@@ -189,7 +189,7 @@ def board(reading: accounts.StatusReading) -> str:
         + "".join(f'<td class="{column["align"]}"{" data-account-name" if column["key"] == "label" else ""}>'
                   + f'{_spans(row["cells"][column["key"]])}</td>'
                   + (f'<td class="left">{swatch(row["cells"][column["key"]])}</td>' if column["key"] in SWATCH_COLUMNS else "")
-                  + (f'<td class="left next-cell">{_next_cell(row, reading, colors)}</td>' if column["key"] == "roles" else "")
+                  + (f'<td class="left next-cell">{_next_cell(row, reading, labels)}</td>' if column["key"] == "roles" else "")
                   for column in table["columns"])
         + "</tr>" for row in table["rows"])
     moves = "".join(f"<li>{html.escape(line)}</li>" for line in reading.upcoming_moves if line)
@@ -277,7 +277,7 @@ background:var(--bg);color:var(--ink);cursor:pointer}.color-actions button:hover
 .color-swatch:focus-visible,.color-picker :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 /* A thin red or amber digit falls under 4.5:1; the heavier stroke keeps it at the token contrast. */
 .error,.warning{font-weight:600}
-.next-cell{white-space:nowrap}.next-muted{color:var(--ink-3)}
+.next-cell{white-space:nowrap}.next-muted{color:var(--ink-2)}
 .next-button{display:inline-flex;vertical-align:middle;margin-left:5px;padding:2px;border:0;border-radius:4px;
 background:transparent;color:var(--ink-2);cursor:pointer}
 .next-button:hover,.next-button:focus-visible{background:var(--hover)}

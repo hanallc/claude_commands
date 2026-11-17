@@ -318,12 +318,57 @@ class AccountsPageTests(unittest.TestCase):
                 else:
                     self.assertIn('>none</span>', cells[1])
                     if first.targets:
-                        self.assertIn('class="default bold" style="color:#b294bb">claude2</span>', cells[0])
+                        self.assertIn('class="default bold" style="color:#b294bb" data-color-text="account.claude2">claude2</span>', cells[0])
                         self.assertIn('class="default bold"', cells[4])
-                        self.assertIn('style="color:#123456">codex2</span>', cells[4])
+                        self.assertIn('style="color:#123456" data-color-text="account.codex2">codex2</span>', cells[4])
                     else:
                         self.assertIn('>none</span>', cells[0])
                         self.assertIn('title="Codex workers move between the Codex accounts by themselves">auto</span>', cells[4])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser contrast")
+    def test_muted_next_cells_meet_the_contrast_floors_in_both_themes(self) -> None:
+        rows = (replace(status_row("claude1"), selected_roles=("units",)), status_row("claude2"),
+                replace(status_row("codex1"), tool="codex", roles=("workers",), selected_roles=("workers",)))
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveTargets())
+        boards = accounts_page.board(reading) + accounts_page.board(replace(
+            reading, first_next_moves=accounts.NextMovesUnavailable("fixture unavailable")))
+        probe = '''<script>
+(async()=>{
+ const failures=[], check=(ok,label)=>{if(!ok) failures.push(label);};
+ const luminance=color=>{
+  const channels=color.match(/[0-9.]+/g).slice(0,3).map(value=>Number(value)/255);
+  const linear=channels.map(value=>value<=0.04045 ? value/12.92 : ((value+0.055)/1.055)**2.4);
+  return linear.reduce((sum,value,index)=>sum+value*[0.2126,0.7152,0.0722][index],0);
+ };
+ const contrast=(first,second)=>{
+  const high=Math.max(first,second),low=Math.min(first,second);
+  return (high+0.05)/(low+0.05);
+ };
+ try{
+  const cells=[...document.querySelectorAll('.next-muted')];
+  check(cells.some(cell=>cell.textContent==='none') && cells.some(cell=>cell.textContent==='auto') &&
+   cells.some(cell=>cell.textContent==='unavailable') && cells.some(cell=>cell.querySelector('svg')),
+   'the contrast rows include every muted cell');
+  for(const theme of ['light','dark']){
+   document.documentElement.dataset.theme=theme;
+   const colors=new Set(cells.map(cell=>getComputedStyle(cell).color));
+   check(colors.size===1,theme+': every muted cell uses one gray');
+   for(const background of ['card','hover']){
+    for(const card of document.querySelectorAll('.card')) card.style.background='var(--'+background+')';
+    for(const cell of cells){
+     const fill=luminance(getComputedStyle(cell.closest('.card')).backgroundColor);
+     const icon=cell.querySelector('svg');
+     const ink=luminance(getComputedStyle(icon || cell).color);
+     check(contrast(ink,fill)>=(icon ? 3 : 4.5),theme+' '+background+': '+(icon ? 'minus' : cell.textContent));
+     if(icon) check(getComputedStyle(icon).stroke===getComputedStyle(cell).color,theme+': the minus uses the muted gray');
+    }
+   }
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        page = ('<!doctype html><html><head>' + accounts_page.STYLE + '</head><body>' + boards + probe + '</body></html>').encode()
+        self.assertEqual(firefox_probe_results(page), [[]])
 
     def test_clear_removes_only_the_first_group_entry_and_refuses_an_empty_group(self) -> None:
         home = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -474,7 +519,8 @@ class AccountsPageTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_refresh_obeys_visibility_and_updates_the_load_time_and_data_age(self) -> None:
-        reading = accounts.StatusReading((status_row("claude1"), status_row("claude2")), (), (), timezone.utc, AT)
+        reading = accounts.StatusReading((status_row("claude1"), replace(status_row("claude2"), selected_roles=("units",))),
+            (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveTargets({"units": "claude1"}))
         with patch.object(accounts, "read_status", return_value=reading):
             content = accounts_page.page()
         initial = accounts_page.AccountsRender(content, 0.75, 200).with_recent_times((0.25, 0.75)).decode()
@@ -513,6 +559,8 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   const key=(control,value,shiftKey=false)=>control.dispatchEvent(new KeyboardEvent('keydown',
    {key:value,shiftKey,bubbles:true,cancelable:true}));
   const label=()=>swatch.closest('tr').querySelector('[data-account-name] span');
+  const nextTarget=()=>document.querySelector('.next-cell [data-color-text="account.claude1"]');
+  const sameAccountColor=()=>nextTarget()?.style.color===label().style.color;
   const action=name=>popup.querySelector('[data-color-'+name+']');
   const original=label().style.color, originalSwatch=swatch.style.background;
   const row=swatch.closest('tr'), cell=swatch.closest('td');
@@ -596,6 +644,7 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   check(popup.open && label().style.color==='rgb(18, 52, 86)' && swatch.style.background==='rgb(18, 52, 86)' && calls===0,
    'Try paints the account name and swatch without a request');
   check(swatch.dataset.savedColor==='#af875f','Try keeps the saved color unchanged');
+  check(sameAccountColor(),'Try paints the next target with the account name color');
   pick('#234567');
   check(label().style.color==='rgb(18, 52, 86)' && preview.style.background==='rgb(35, 69, 103)',
    'a later pick keeps the last tried color on the page');
@@ -603,6 +652,7 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   check(state()==='Paused','the chooser pauses refresh');
   action('cancel').click();
   check(!popup.open && label().style.color===original && swatch.style.background===originalSwatch,'Cancel restores the saved color');
+  check(sameAccountColor(),'Cancel restores the next target and account name to the same color');
   swatch.click();pick('#abcdef');action('try').click();
   popup.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
   check(!popup.open && label().style.color===original && swatch.style.background===originalSwatch,'Escape restores the saved color');
@@ -642,6 +692,7 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   check(label().style.color==='rgb(18, 52, 86)' && swatch.style.background==='rgb(18, 52, 86)',
    'Save retains the new name and swatch colors');
   check(swatch.dataset.savedColor==='#af875f','a pending POST retains the previous saved color');
+  check(sameAccountColor(),'a pending Save keeps the next target and account name the same color');
   check(saves.length===1 && saves[0].path===location.pathname && saves[0].options.method==='POST','Save posts to this page');
   const form=new URLSearchParams(saves[0].options.body);
   check(form.get('key')==='account.claude1' && form.get('value')==='#123456' && [...form.keys()].length===2 &&
