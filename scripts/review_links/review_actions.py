@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from scripts.lib.user_zone import user_zone
-from scripts.production import change_review, investigation, update_registration
+from scripts.production import change_review, change_routing, investigation, update_registration
 from scripts.review_links import change_page, review_items, review_later
 
 
@@ -23,11 +23,14 @@ def record_action(item: review_items.ReviewItem, words: str) -> None:
 
 
 def later(item: review_items.ReviewItem, value: str, words: str) -> str:
+    if isinstance(item.source, review_items.ChangeSource) and isinstance(
+            item.source.assignment.production, change_routing.UnavailableProduction):
+        raise change_page.AnswerRefused("the production document is not available")
     until = datetime.fromisoformat(value)
     if until.tzinfo is None:
         until = until.replace(tzinfo=user_zone())
-    review_later.save(item.key,until)
     record_action(item,'Later until '+until.isoformat()+(': '+words if words else ''))
+    review_later.save(item.key,until)
     return 'later until '+until.strftime('%Y-%m-%d %H:%M %Z')
 
 
