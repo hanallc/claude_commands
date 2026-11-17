@@ -228,12 +228,28 @@ class DisksPageTests(unittest.TestCase):
                       free: text(tipFor("slot:hana-slot2")), group: text(tipFor("group:hana")), slots: text(tipFor("about:slots")),
                       sessions: text(tipFor("about:sessions")), session: text(tipFor("session:fps")),
                       smaller: text(tipFor("smaller:sessions")), gone: tipFor("slot:gone")};
-            // Builds data older than the configured age gives the Disks rows.
+            const usedBy = () => slotsHtml(slotReport, KEEP, input.now, new Set(["hana"]), slotStep).match(/<td class="use wide">(.*?)<[/]td>/)[1];
+            result.runName = usedBy();
+            // A step that waits in a held slot names the slot and gives its tooltip, as the Builds page waiting row does.
+            builds.walk = builds.walk.filter(row => row.key !== "run");
+            builds.waiters = [{...input.wait, key: "wait", slot_folder: "hana-slot1", slot_machine: "natedev"}];
+            result.wait = [tipFor("slot:hana-slot1") === stepTip.tooltipHtml("wait:wait", builds), usedBy()];
+            // Builds data older than the configured age gives the Disks rows and the lease's name.
             builds.read_at = input.now - 31;
             result.stale = text(tipFor("slot:hana-slot1"));
+            result.staleName = usedBy();
+            // Builds data with no read time is not current.
+            delete builds.read_at;
+            result.noTime = usedBy();
         """, extra={"slots": {**SLOTS, "machine": "natedev", "unused_days": 7}, "sessions": SESSIONS, "builds": builds,
-                                                            "now": now}))
+                    "now": now, "wait": {"name": "report test named", "unit": "report", "showrunner": "builds", "pid": 4343,
+                                         "since": now - 60, "need": 3.0, "reason": "its turn", "fits": False, "why": "turn",
+                                         "place": 1}}))
         self.assertEqual(result["run"], result["shared"])
+        # The builds showrunner, 11-16: "map the Disks "Used by" lease words through the same build_steps names that the
+        # Builds page uses, so one step has one name on both pages."
+        self.assertEqual(result["runName"], '<span class="tag run">report integrate</span><span class="dim">builds</span>')
+        self.assertEqual(result["wait"], [True, '<span class="tag run">report test named</span><span class="dim">builds</span>'])
         self.assertIn("report · integrate", result["run"])
         self.assertEqual(result["free"], "|".join(["hana-slot2", "deleted tonight", "Repository", "hana", "Size", "&lt; 256 MiB",
                                                    "Last used", "9 days ago", "No run used it for 7 days, so the nightly sweep deletes it.", ""]))
@@ -244,6 +260,8 @@ class DisksPageTests(unittest.TestCase):
         self.assertEqual(result["smaller"], "3 smaller sessions|1.0 GiB|Each is below 5.0 GiB. Move the size filter to the left to show them.|")
         self.assertEqual(result["gone"], "")
         self.assertTrue(result["stale"].startswith("hana-slot1|in use|Repository|hana|"), result["stale"])
+        self.assertEqual(result["staleName"], result["runName"])
+        self.assertEqual(result["noTime"], result["runName"])
 
     def test_a_measure_starts_only_when_the_sizes_are_old_and_no_measure_runs(self) -> None:
         launches: list[str] = []
