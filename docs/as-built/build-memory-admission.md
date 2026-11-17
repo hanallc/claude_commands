@@ -189,11 +189,13 @@ The adapter uses that grant without a second admission request.
 `PrerequisiteReport` updates that state separately from fixed constraints.
 Restart requires fresh token confirmation for requests that need a token.
 A placement waiter holds no cargo token.
-`verify.sh` sends `--token after-grant` (`TokenAfterGrant`): it takes the token after a local grant.
-`_placement_row` marks a `TokenRequired` row token-waiting for every readiness except `TokenAfterGrant`, so `memory_admit.py` does not admit it.
-The first pass, before the caller reads its token (`TokenReadinessUnchecked`), is marked.
+`_placement_row` marks every `TokenRequired` row token-waiting, so `memory_admit.py` does not admit it.
+`verify.sh` sends `--token after-grant`: it takes the token after a local grant.
+Its first pass sends `TokenRequired(TokenReadinessUnchecked)`.
 That pass starts nothing on natedev, so a free remote target can take the step.
 The client shows no memory wait for that pass, and `verify.sh` sends the next pass at once.
+Later passes send `TokenNotRequired`, because the service needs no token before that grant.
+These are existing wire values, so a new `verify.sh` works with a service that started before this change.
 An older caller sends `--token required` (`TokenUnavailable`) and gets no local grant until it reports `TokenHeld`.
 
 Remote rows carry execution evidence and the assigned host.

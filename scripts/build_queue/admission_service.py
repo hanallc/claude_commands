@@ -2782,12 +2782,8 @@ done
                 row["order_since"] = min(run_place.since, row.get("order_since", row["since"]))
             row["build_run"] = _live_run(request.run)
         row["route"] = request.route
-        # A caller that takes its cargo token after a local grant is never token-waiting.
-        # Any other token-required caller waits for the token before a local grant: the first
-        # pass (readiness unchecked) and a caller that reports the token unavailable.
         prerequisite = self.prerequisites.get(request.episode, placement.TokenRequired())
-        if (isinstance(prerequisite, placement.TokenRequired)
-                and not isinstance(prerequisite.readiness, placement.TokenAfterGrant)):
+        if isinstance(prerequisite, placement.TokenRequired):
             row["token_left_at"] = row.get("token_left_at", request.since)
             _ = row.pop("token_back_at", None)
         else:

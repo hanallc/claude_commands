@@ -602,7 +602,8 @@ class ClientTests(unittest.TestCase):
                                 token_arguments = [*arguments[:arguments.index("--")], "--token", "after-grant",
                                                    *arguments[arguments.index("--"):]]
                                 # After its first pass, a caller without its token can get a local grant;
-                                # it takes the token after the grant.
+                                # it takes the token after the grant. The service marks every TokenRequired
+                                # row token-waiting, as a service from before this client does.
                                 with mock.patch.object(fixture.server, "before_admission", side_effect=release_before_retry):
                                     self.assertEqual(client.main(token_arguments), 0, errors.getvalue())
                             retry_grant = client.read_assignment(assignment_file)

@@ -223,13 +223,15 @@ class KeepPlacementPrerequisite:
 
 
 KEEP_PLACEMENT_PREREQUISITE = KeepPlacementPrerequisite()
-# "after-grant" takes the token after a local grant. "required" is the older caller that
-# holds the token before its grant; the service gives it no local grant until it reports the token held.
+# "after-grant" is the caller that takes its cargo token after a local grant, so the service
+# needs no token before that grant. "required" is the older caller that holds the token
+# before its grant; the service gives it no local grant until it reports the token held.
+# Both forms use the existing wire values, so any running service reads them.
 TOKEN_REQUIRED_CHOICES = ("after-grant", "required")
 
 
-def token_required(choice: str) -> placement.TokenRequired:
-    return placement.TokenRequired(placement.TokenAfterGrant() if choice == "after-grant" else placement.TokenUnavailable())
+def token_prerequisite(choice: str) -> placement.TokenRequired | placement.TokenNotRequired:
+    return placement.TokenNotRequired() if choice == "after-grant" else placement.TokenRequired()
 
 
 def finish_step(path: Path, status: int, reason: str = "", *,
@@ -1267,7 +1269,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             constraints = replace(constraints, selection=placement.MacOnlyHost())
         prerequisite = (placement.TokenRequired(placement.TokenReadinessUnchecked())
                         if args.token in TOKEN_REQUIRED_CHOICES and args.once and not already_queued else
-                        token_required(args.token) if args.token in TOKEN_REQUIRED_CHOICES else
+                        token_prerequisite(args.token) if args.token in TOKEN_REQUIRED_CHOICES else
                         placement.TokenHeld() if args.token == "held" else placement.TokenNotRequired())
         request = wire.PlacementRequest(episode, owner, args.since, local.profile, constraints,
             identity=local.identity, run=local.run,
@@ -1410,14 +1412,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "down-alert":
             return down_alert()
         if args.command == "finish-step":
-            prerequisite = token_required(args.token) if args.token else KEEP_PLACEMENT_PREREQUISITE
+            prerequisite = token_prerequisite(args.token) if args.token else KEEP_PLACEMENT_PREREQUISITE
             print(wire.encode_reply(finish_step(args.assignment_file, args.status, args.reason,
                 prerequisite=prerequisite)), end="")
             return 0
         if args.command == "report-prerequisite":
             reply = read_assignment(args.assignment_file)
             print(wire.encode_reply(report_prerequisite(wire.PrerequisiteReport(
-                uuid.uuid4().hex, reply.assignment.episode, reply.assignment.owner, token_required(args.token)))), end="")
+                uuid.uuid4().hex, reply.assignment.episode, reply.assignment.owner, token_prerequisite(args.token)))), end="")
             return 0
         if args.command == "claim-failed":
             reply = read_assignment(args.assignment_file)
