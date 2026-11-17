@@ -7,7 +7,7 @@ import secrets
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, parse_qsl, urlencode
 
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
@@ -34,8 +34,10 @@ def waiting_items(request: console.NewsRequest) -> frozenset[str]:
 
 
 def legacy_url(path: str, query: str) -> str:
-    kind = 'investigation' if path.endswith('investigations.html') else 'question' if 'type=questions' in query else 'change'
-    return PAGE_PATH + '#' + urlencode({'type': kind})
+    filters = dict(parse_qsl(query, keep_blank_values=True))
+    filters['type'] = ('investigation' if path.endswith('investigations.html') else
+                       'question' if path.endswith('questions.html') or filters.get('type') == 'questions' else 'change')
+    return PAGE_PATH + '?' + urlencode(filters)
 
 
 def icon(kind: ReviewType) -> str:
@@ -69,12 +71,14 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser) -> str:
 
 def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot) -> str:
     source = item.source
-    if isinstance(source, review_items.QuestionSource):
+    if isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
         content, choices = change_browser.question_parts(source.record.item)
         question = source.record.item
         ask = question['parts']['ask'] if 'parts' in question else change_browser.question_text(question)[0]
         lead = change_page.review_text_html(ask, inline=True) if ask != question['text'] else ''
         body = '<section><h3>Question</h3>'+lead+content+choices+'</section>'
+        if isinstance(source, review_items.UnownedQuestionSource):
+            body += '<p>No showrunner owns this question.</p>'
     elif isinstance(source, review_items.ChangeSource):
         row = source.row
         body = section('How to check', row.get('How to check', ''))+section('Proof', row.get('What you see', '') or row.get('Proof', ''))
@@ -92,11 +96,15 @@ def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff
     logs = ''.join('<li><time datetime="'+entry.time.isoformat()+'">'
         +entry.time.astimezone(user_zone()).strftime('%b %d %H:%M')+'</time><span>'+html.escape(entry.words)
         +' <small>— '+html.escape(entry.who)+'</small></span></li>' for entry in reversed(item.log))
-    owner = review_items.name(item.owner, members)
+    owner = owner_name(item, members)
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+body+'</div><section><h3>Log · newest first</h3>'
             +'<ol class="list-log">'+logs+'</ol></section>'+form(item, browser)
             +'<p class="review-source">Owner: '+html.escape(owner)+' · Source: '
             +html.escape(review_items.name(item.source_unit, members))+'</p></div>')
+
+
+def owner_name(item: ReviewItem, members: staff.StaffSnapshot) -> str:
+    return 'Owner unavailable' if isinstance(item.source, review_items.UnownedQuestionSource) else review_items.name(item.owner, members)
 
 
 def age(filed: datetime, now: datetime) -> str:
@@ -105,7 +113,7 @@ def age(filed: datetime, now: datetime) -> str:
 
 
 def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, now: datetime, index: int) -> str:
-    owner = review_items.name(item.owner, members)
+    owner = owner_name(item, members)
     source = review_items.name(item.source_unit, members)
     title = '<strong>'+html.escape(item.title)+'</strong>'
     if item.urgency.level != 'normal':
@@ -137,7 +145,7 @@ def render(root: Path) -> bytes:
     token, initial = change_browser.browser_manifest(change_page.console_folder(root))
     browser = change_page.ReviewBrowser(token, initial)
     visible = [item for item in items if not item.hidden_until(now) and item.state != ReviewState.DONE]
-    owners = {item.owner:review_items.name(item.owner, members) for item in items}
+    owners = {item.owner:owner_name(item, members) for item in items}
     options = ''.join(f'<option value="{html.escape(owner, quote=True)}" data-owner-name="{html.escape(name, quote=True)}">{html.escape(name)} '
                      +f'({sum(item.owner == owner for item in visible)})</option>'
                      for owner, name in sorted(owners.items(), key=lambda pair:pair[1].casefold()))
@@ -216,7 +224,7 @@ const drafts=new Map(),saved=new Map();
 const view=createRecordTable({content:()=>content,single:true,
  resolveOwner:owner=>[...content.querySelectorAll('#list-owner option')].find(option=>option.value===owner || option.dataset.ownerName===owner)?.value ?? owner,
  shows:['open','For you','Waiting','Done','all'],
- visible:(data,{owner,show,query,type})=>(show==='all' || !saved.has(data.key) && data.parked!=='true') &&
+ visible:(data,{owner,show,query,type})=>!saved.has(data.key) && (show==='all' || data.parked!=='true') &&
   !(show==='open' && data.state==='Waiting' && data.checking==='true') &&
   (!owner || data.owner===owner) && (!type || data.type===type) &&
   (!query || data.number.includes(query) || data.title.includes(query)) &&
@@ -264,6 +272,6 @@ async function refresh(_supersede=false,current=()=>true){
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
 }
 view.place();bind();view.apply();
-addEventListener('hashchange',()=>{view.place();view.apply(false);});
+addEventListener('hashchange',()=>{const item=new URLSearchParams(location.hash.slice(1)).get('item');if(item) saved.delete(item);view.place();view.apply(false);});
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
 })();'''

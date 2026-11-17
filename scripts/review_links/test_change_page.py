@@ -653,7 +653,7 @@ class ChangePageTests(unittest.TestCase):
         token = manifest.read_bytes()
         self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
         redirect = self.http_request("/console/changes.html", {})
-        self.assertEqual((redirect.status, redirect.location), (303, "/console/review.html#type=change"))
+        self.assertEqual((redirect.status, redirect.location), (303, "/console/review.html?type=change"))
         changes = self.legacy_browser_reply("/console/changes.html")
         self.assertIn("if(parent!==window) parent.postMessage('console-place',location.origin);", changes.body)
         self.assertIn("const hidden=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;", changes.body)
