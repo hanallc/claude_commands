@@ -22,6 +22,7 @@ from scripts.aws_target.ledger_test_support import CostFixture
 
 TAG: tuple[str, str] = ('HanaDeployment', 'fixture-deployment')
 STACK = 'fixture-hana'
+STACK_ID = 'fixture-hana-id'
 LIVE = ('pending', 'running', 'stopping', 'stopped', 'shutting-down')
 OLD_EVENT = '2020-01-01T00:00:00Z'
 
@@ -59,8 +60,10 @@ class FakeEc2:
     buckets: dict[str, list[str]] = field(default_factory=dict)
     resources: dict[str, tuple[str, str]] = field(default_factory=dict)
     events: list[dict[str, str]] = field(default_factory=list)
+    deleted_events: list[dict[str, str]] | None = None
     operations: list[str] = field(default_factory=list)
     stack: bool = False
+    stack_status: str = 'CREATE_COMPLETE'
     replace: bool = False
     fail_wait: str = ''
     failure: dict[str, str] = field(default_factory=dict)
@@ -68,6 +71,7 @@ class FakeEc2:
     fail: str = ''
     launch_on_cancel: bool = False
     launch_on_execute: bool = False
+    launch_on_delete: bool = False
     count: int = 0
 
     def launch(self, *, tagged: bool, request: str = '') -> str:
@@ -152,7 +156,7 @@ class FakeEc2:
         elif operation == 'describe-stacks':
             if not self.stack:
                 return subprocess.CompletedProcess(list(arguments), 255, '', 'ValidationError: Stack does not exist')
-            value = {'Stacks': [{'StackStatus': 'CREATE_COMPLETE', 'Outputs': []}]}
+            value = {'Stacks': [{'StackId': STACK_ID, 'StackStatus': self.stack_status, 'Outputs': []}]}
         elif operation == 'describe-change-set':
             change = {'ResourceChange': {'LogicalResourceId': 'Instance', 'ResourceType': 'AWS::EC2::Instance',
                                          'Action': 'Modify', 'Replacement': 'True' if self.replace else 'False'}}
@@ -163,21 +167,32 @@ class FakeEc2:
                 self.create_retained()
                 _ = self.launch(tagged=True)
         elif operation == 'delete-stack':
-            self.roll_back()
-            self.stack = False
-            self.events = []
+            if self.stack:
+                if self.launch_on_delete:
+                    _ = self.launch(tagged=True)
+                self.roll_back()
+                self.deleted_events = self.events
+                self.stack = False
+                self.events = []
         elif operation == 'wait' and rest[0] == self.fail_wait:
             if self.failure:
-                self.events.append({**self.failure, 'Timestamp': datetime.now(UTC).isoformat().replace('+00:00', 'Z')})
+                self.events.append({**self.failure, 'Timestamp': datetime.now(UTC).isoformat()})
             self.roll_back()
+            if rest[0] == 'stack-create-complete':
+                self.stack_status = 'ROLLBACK_COMPLETE'
             return subprocess.CompletedProcess(list(arguments), 255, '', 'Waiter failed: fixture rollback')
-        elif operation in ('describe-stack-resources', 'describe-stack-events') and not self.stack:
+        elif operation == 'describe-stack-resources' and not self.stack:
             return subprocess.CompletedProcess(list(arguments), 255, '', 'ValidationError: Stack does not exist')
         elif operation == 'describe-stack-resources':
             value = {'StackResources': [{'LogicalResourceId': logical, 'ResourceType': kind, 'PhysicalResourceId': physical}
                                         for logical, (kind, physical) in self.resources.items()]}
         elif operation == 'describe-stack-events':
-            value = {'StackEvents': self.events}
+            if self.stack:
+                value = {'StackEvents': self.events}
+            elif rest[1] == STACK_ID and self.deleted_events is not None:
+                value = {'StackEvents': self.deleted_events}
+            else:
+                return subprocess.CompletedProcess(list(arguments), 255, '', 'ValidationError: Stack does not exist')
         elif operation == 'delete-volume':
             if self.disks.get(rest[1], Disk('', {})).state != 'available':
                 return subprocess.CompletedProcess(list(arguments), 255, '', 'InvalidVolume.NotFound or in use')
@@ -284,12 +299,14 @@ class SpotEndTests(CostFixture):
             self.change(fake)
         self.assertEqual(fake.leftovers(), ([], [], ['other-disk'], [], False))
         self.assertLess(fake.operations.index('describe-stack-events'), fake.operations.index('delete-stack'))
+        deleted = fake.operations.index('wait stack-delete-complete')
+        self.assertLess(fake.operations.index('describe-stack-events', deleted + 1),
+                        fake.operations.index('delete-volume'))
 
     def test_a_failed_create_names_each_failed_resource_and_its_reason(self) -> None:
         fake = FakeEc2(launch_on_execute=True, fail_wait='stack-create-complete',
                        failure={'LogicalResourceId': 'Instance', 'ResourceType': 'AWS::EC2::Instance',
                                 'ResourceStatus': 'CREATE_FAILED', 'ResourceStatusReason': 'Fixture Spot price too low'})
-        # A failure from an earlier change is not this change's cause.
         fake.events.append({'LogicalResourceId': 'Old', 'ResourceType': 'AWS::S3::Bucket',
                             'ResourceStatus': 'CREATE_FAILED', 'ResourceStatusReason': 'Old reason', 'Timestamp': OLD_EVENT})
         with self.assertRaises(AwsUnavailable) as raised:
@@ -298,7 +315,6 @@ class SpotEndTests(CostFixture):
         self.assertIn('Waiter failed: fixture rollback\nInstance (AWS::EC2::Instance): CREATE_FAILED: Fixture Spot price too low\n'
                       + 'the failed Hana change ended 1 Spot boxes', text)
         self.assertNotIn('Old reason', text)
-        # The failed rows are read before any box end or stack delete changes the events.
         self.assertEqual(fake.operations.index('describe-stack-events'), fake.operations.index('wait stack-create-complete') + 1)
 
     def test_an_unreadable_event_list_keeps_the_error_and_the_cleanup(self) -> None:
@@ -330,8 +346,8 @@ class SpotEndTests(CostFixture):
         self.assertEqual(fake.live_boxes(), [kept])
         self.assertEqual(fake.live_requests(), [fake.boxes[kept].request])
 
-    def test_teardown_ends_every_box_before_the_stack_delete(self) -> None:
-        fake = FakeEc2(stack=True)
+    def test_teardown_ends_boxes_before_and_after_the_stack_delete(self) -> None:
+        fake = FakeEc2(stack=True, launch_on_delete=True)
         fake.create_retained()
         box = fake.launch(tagged=True)
         fake.boxes[box].state = 'stopped'
@@ -343,12 +359,15 @@ class SpotEndTests(CostFixture):
         subject = self.subject(fake)
         with mock.patch.object(subject, '_check_credentials'), mock.patch.object(subject, '_api', return_value=self.api(fake)), \
                 mock.patch.object(subject, '_hana_inputs', return_value=(self.hana_settings(), {}, b'')), \
-                mock.patch('sys.stdout', new_callable=StringIO):
+                mock.patch('sys.stdout', new_callable=StringIO) as output:
             self.assertTrue(subject.hana_down(approve_destroy=True))
         self.assertEqual((fake.live_requests(), fake.live_boxes()), ([], []))
         self.assertLess(fake.operations.index('cancel-spot-instance-requests'), fake.operations.index('terminate-instances'))
         self.assertLess(fake.operations.index('wait instance-terminated'), fake.operations.index('delete-stack'))
-        self.assertLess(fake.operations.index('wait stack-delete-complete'), fake.operations.index('delete-volume'))
+        deleted = fake.operations.index('wait stack-delete-complete')
+        ended_late = fake.operations.index('wait instance-terminated', deleted + 1)
+        self.assertLess(ended_late, fake.operations.index('delete-volume'))
+        self.assertIn('2 Spot boxes ended', output.getvalue())
         self.assertEqual(fake.leftovers(), ([], [], [], [], False))
         self.assertEqual(sorted(path.name for path in hana.iterdir()), [])
 
