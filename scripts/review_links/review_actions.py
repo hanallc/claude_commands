@@ -15,6 +15,7 @@ from scripts.nightly_review import candidates
 from scripts.production import change_review, change_routing, investigation, proposal_issue, record_store, staff, update_registration
 from scripts.production.production_doc import Production
 from scripts.review_links import change_page, decision_store, efficiency_reviews, review_items, review_later
+from scripts.review_links import question_record
 from scripts.review_links import review_events
 from scripts.review_links.review_events import KeepMark, MarkChange, NoMark, ReviewMark
 
@@ -93,7 +94,7 @@ def question_action(item: review_items.ReviewItem, action: change_page.QuestionO
     source = item.source
     assert isinstance(source, review_items.QuestionSource)
     if not words.strip():
-        raise change_page.AnswerRefused('enter an answer')
+        raise question_record.AnswerRefused('enter an answer')
     identities = update_registration.QuestionStaff.read()
     scope = update_registration.question_scope(item.owner, identities.record)
     with update_registration.outstanding_lock(update_registration.outstanding_path(scope)):
@@ -143,7 +144,7 @@ def resume_efficiency(item: review_items.ReviewItem) -> None:
 def later(item: review_items.ReviewItem, value: str, words: str) -> str:
     if isinstance(item.source, review_items.ChangeSource) and isinstance(
             item.source.assignment.production, change_routing.UnavailableProduction):
-        raise change_page.AnswerRefused("the production document is not available")
+        raise question_record.AnswerRefused("the production document is not available")
     until = datetime.fromisoformat(value)
     if until.tzinfo is None:
         until = until.replace(tzinfo=user_zone())
@@ -220,7 +221,7 @@ def decision_action(item: review_items.ReviewItem, action: str, words: str,
     """Apply Approve, Decline, Send feedback or Ask question to a proposal or an efficiency."""
     source = item.source
     if action in ('feedback','question') and not words.strip():
-        raise change_page.AnswerRefused('enter your words')
+        raise question_record.AnswerRefused('enter your words')
     waiting = item.state == review_items.ReviewState.WAITING
     def supersede() -> None:
         if waiting:
@@ -238,7 +239,7 @@ def decision_action(item: review_items.ReviewItem, action: str, words: str,
             try:
                 _ = candidates.record_outcome(identity,'declined','',source.path)
             except candidates.OutcomeRefused as error:
-                raise change_page.AnswerRefused(str(error)) from error
+                raise question_record.AnswerRefused(str(error)) from error
             _ = decision_store.record(item,logged,NoMark())
             clear_wait(item, status)
             return change_page.NoMessageDelivery(),'declined'

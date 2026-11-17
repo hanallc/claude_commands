@@ -24,6 +24,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import change_page, console, image_store, images, page_frame, serve
+from scripts.review_links import question_record
 
 PNG = bytes.fromhex('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c63606060f80f00010401005fe5c34b0000000049454e44ae426082')
 
@@ -505,7 +506,7 @@ class ImagesTests(ImagesFixture):
         self.assertFalse((self.root / image_store.IMAGES_FOLDER / record["id"]).exists())
         self.assertEqual(images.records(self.root), [kept])
         self.assertEqual(self.sent, [])
-        with self.assertRaisesRegex(change_page.AnswerRefused, f"no image {record['id']}"):
+        with self.assertRaisesRegex(question_record.AnswerRefused, f"no image {record['id']}"):
             self.submit(body)
 
     def test_delete_refuses_a_wrong_token_or_unknown_image(self) -> None:
@@ -515,7 +516,7 @@ class ImagesTests(ImagesFixture):
                      urlencode({"image": "000000000000", "token": images.request_token(token, "000000000000")}),
                      urlencode({"image": record["id"]}),
                      urlencode({"image": "../x", "token": "t"})):
-            with self.subTest(body=body), self.assertRaises(change_page.AnswerRefused):
+            with self.subTest(body=body), self.assertRaises(question_record.AnswerRefused):
                 self.submit(body)
         self.assertEqual(images.records(self.root), [record])
 
@@ -587,7 +588,7 @@ class ImagesTests(ImagesFixture):
         token = images.request_token(images.console_token(self.root), record["id"])
         for body, reason in ((self.feedback_body(record, "   "), "enter feedback"),
                              (urlencode({"image": record["id"], "token": token, "action": "move"}), "use the form")):
-            with self.subTest(reason=reason), self.assertRaisesRegex(change_page.AnswerRefused, reason):
+            with self.subTest(reason=reason), self.assertRaisesRegex(question_record.AnswerRefused, reason):
                 self.submit(body)
         self.assertEqual((images.records(self.root), self.sent), ([record], []))
 
@@ -729,7 +730,7 @@ class ImageQuestionTests(ImagesFixture):
 
     def test_empty_questions_and_unknown_or_answered_ids_preserve_the_image(self) -> None:
         record = self.register()
-        with self.assertRaisesRegex(change_page.AnswerRefused, 'Enter a question first'):
+        with self.assertRaisesRegex(question_record.AnswerRefused, 'Enter a question first'):
             self.ask(record, '  ')
         self.assertEqual((images.records(self.root), self.sent), ([record], []))
         self.ask(record)
@@ -738,7 +739,7 @@ class ImageQuestionTests(ImagesFixture):
         self.assertIn('Unknown question id', error.getvalue())
         images.answer_question(self.root, record['id'], 'Q1', 'First answer')
         before = images.records(self.root)
-        with self.assertRaisesRegex(change_page.AnswerRefused, 'already has an answer'):
+        with self.assertRaisesRegex(question_record.AnswerRefused, 'already has an answer'):
             images.answer_question(self.root, record['id'], 'Q1', 'Changed answer')
         self.assertEqual(images.records(self.root), before)
         self.assertTrue((images.images_root(self.root) / record['id'] / record['file']).is_file())

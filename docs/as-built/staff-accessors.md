@@ -308,6 +308,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/change_browser.py` | read | QuestionStaff.read resolves question answer recipients; the shared routing record supplies question owners |
 | `scripts/review_links/change_page.py` | read | snapshot resolves Review owners; QuestionStaff.read resolves saved questions during delivery recovery and owner answers; source_name names each source |
 | `scripts/review_links/images.py` | read | snapshot().by_id checks each image owner at register and names the owner on the Images page |
+| `scripts/review_links/page_question.py` | read | StaffId (type) identifies the question recipient. |
 | `scripts/review_links/review_items.py` | read | snapshot, by_id and parent_of resolve the Review owner and source unit |
 | `scripts/review_links/review_actions.py` | read | snapshot names the owner showrunner in a proposal or efficiency Approve outcome |
 | `scripts/review_links/review_page.py` | read | snapshot resolves the Review owner and source unit for the table and actions |
