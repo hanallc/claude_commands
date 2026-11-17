@@ -97,6 +97,39 @@ def run_shell(program: str, arguments: Sequence[str], environment: Mapping[str, 
 
 
 class OverrideGuardPythonTests(unittest.TestCase):
+    def test_shared_state_requires_the_installed_copy_but_private_state_remains_usable(self) -> None:
+        root = temporary_root(self)
+        installed = installed_script(root, PYTHON_RELATIVE)
+        private = root / "private"
+        private.mkdir()
+        for name in ("buildlog", "build-hold", "build-hold-release", "build-hold-enforcer"):
+            shared = installed.home / ".local/state" / name
+            shared.mkdir(parents=True)
+            marker = shared / "saved"
+            _ = marker.write_bytes(b"unchanged\n")
+            linked = root / (name + "-link")
+            linked.symlink_to(shared, target_is_directory=True)
+            for script, directories, allowed in (
+                (CHECKOUT_SCRIPT, (private,), True),
+                (installed.script, (shared,), True),
+                (CHECKOUT_SCRIPT, (shared,), False),
+                (CHECKOUT_SCRIPT, (private, shared), False),
+                (CHECKOUT_SCRIPT, (linked / "future" / "record",), False),
+            ):
+                with self.subTest(root=name, script=script, directories=directories), \
+                     mock.patch.object(override_guard, "user_home", return_value=installed.home):
+                    result = override_guard.shared_state_access(script, PYTHON_RELATIVE, directories)
+                    if allowed:
+                        self.assertIsInstance(result, override_guard.SharedStateAllowed)
+                        override_guard.require_shared_state_write(script, PYTHON_RELATIVE, *directories)
+                    else:
+                        assert isinstance(result, override_guard.SharedStateRefused)
+                        self.assertIn(str(installed.script), result.line)
+                        with self.assertRaises(override_guard.SharedStateWriteRefused) as raised:
+                            override_guard.require_shared_state_write(script, PYTHON_RELATIVE, *directories)
+                        self.assertEqual(str(raised.exception), result.line)
+                    self.assertEqual(marker.read_bytes(), b"unchanged\n")
+
     def test_wired_modules_keep_their_checkout_import_forms(self) -> None:
         checkout = SCRIPT_DIRECTORY.parent.parent
         environment = child_environment({"XDG_CACHE_HOME": str(temporary_root(self) / "cache")})

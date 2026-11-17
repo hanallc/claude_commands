@@ -192,7 +192,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 
 **Binds later work:** A new script whose owner must show in the table needs an Owns entry in its production doc. Regenerate `working_set_owners.json` from the production docs after an Owns cell changes.
 
-### Phase 8 — Shared build state is written only by the installed copy  · status: todo
+### Phase 8 — Shared build state is written only by the installed copy  · status: done
 **Depends on:** Phases 2, 10, 12 and 19. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8.
 
 **Held (2026-11-05):** the send.py freeze covers `build_hold.py`, so this phase starts after messaging's main hash.
@@ -242,11 +242,11 @@ Own what a build may use and when it starts: memory admission and the memory que
    `memory_gate.sh` and `invoke.sh` use the installed admission client.
    `verify.sh` uses the installed helpers for holds, local release waits, detached runs, Mac idle state and build targets.
    Keep documented script overrides for tests. Test routing under a private `HOME`.
-   `top_level.py` and unit retirement in `scripts/agents/shutdown.py` (its `build_hold.py release --holder` call at line 1438) use the installed hold writer.
+   `top_level.py` and unit retirement in `scripts/agents/shutdown.py` (its `build_hold.py release --holder` call near line 1535) use the installed hold writer.
    `merge_gate.py` already runs from the installed copy. Record that fact without changing its hold reader.
 6. Keep repository and step fields separate in service snapshots and queue queries.
    Reuse `repository_name` on waiters and `repo` on reservations. Add no parallel repository field or prefix parser.
-   Show repository and step separately in the queue overview and cards. Show a missing repository as `—`.
+   builds-queue 3ef82d3ab removed `/build:queue`, `queue_card.py` and the goldens. The Builds page owns the display now; make no page layout change here.
 7. Test refusal and allowed private writes at every mutation entry point, including `export_priority()` and restart recovery.
    Test interrupted cancellation publication, and `WaiterPlace.queue_identity` across restart and owner exit, through the service.
    Test queue queries and service state after admission. Do not require a live `.waiting` file.
@@ -276,8 +276,8 @@ Own what a build may use and when it starts: memory admission and the memory que
 - `scripts/build_hold/hold_enforcer.py` — the hold stop guard; its imported-call refusal test goes in `scripts/build_hold/test_hold_enforcer.py`.
 - `scripts/build_hold/test_override_guard.py`, `scripts/build_hold/test_build_hold.py` — guard and hold recovery tests.
 - `scripts/build_hold/test_hold_enforcer.py`, `scripts/build_targets/test_build_targets.py`, `scripts/direct/test_verify_mac_lifecycle.py`, `scripts/direct/verify_mac_offload_test_support.py`, `scripts/direct/verify_hold_wait_test_support.py` — `read_cycle()` callers that narrow to `HoldCycle`.
-- `scripts/build_queue/queue_view.py`, `scripts/build_queue/queue_card.py` — separate repository and step displays.
-- `scripts/build_queue/test_queue_view.py`, `scripts/build_queue/test_queue_card.py`, `scripts/build_queue/golden/` — display tests and goldens.
+- `scripts/build_queue/queue_view.py` — separate repository and step fields in queue queries.
+- `scripts/build_queue/test_queue_view.py` — queue query tests.
 - `scripts/direct/verify.sh`, `scripts/direct/test_verify_checks_fail_closed.py`, `scripts/direct/test_verify_nix_shell.py` — installed helper routing.
 - `scripts/message/top_level.py`, `scripts/agents/shutdown.py` — installed hold writer routing.
 - `scripts/message/test_top_level.py`, `scripts/agents/test_shutdown_cli.py` — caller tests.
@@ -309,7 +309,7 @@ Own what a build may use and when it starts: memory admission and the memory que
   A checkout mutation attempt refuses before state changes. A private-state attempt still works.
 - Name queue-unit files as `also touches`, tested against `origin/builds-queue`.
   Name verify-unit and hold-caller files with their owners in the notice.
-- Change-Review: `/build:queue` shows repository and step separately. A row shows `hana` and `clippy` in separate cells.
+- Change-Review: none unless a user-visible refusal results; the display item went with `/build:queue`.
 
 ### Phase 9 — The floor sweep counts what a deletion really frees  · status: done
 
