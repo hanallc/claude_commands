@@ -4778,24 +4778,25 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 ### Phase 342 — The Mac run tests use less aws CPU  · status: done
 **Depends on:** none
 
+#### As-built
+
+- `test_mac_run.py` writes a small private production config, so zsh reads fewer settings. The queue fixture calls `mac_test.main()` in its own process with the real claim and release code. Each test uses a private mirror registry. All 20 tests and 144 assertion and signal calls stay.
+- aws pair (3 rounds, c7a.4xlarge): 37.97 -> 26.12 CPU s, a paired median saving of 11.83 s; peak 139.8 -> 139.9 MiB; all passed.
+- Largest cost left: 59 local `copies.py` starts (7.2 CPU s). Main-based commit 0bd91aa39 (branch `natest-macrun342`) is on the merge line as "builds natest342".
+
+### Phase 343 — the gate rename chain merges with main and passes the full suite  · status: todo
+**Depends on:** Phase 340
+
 #### Work Order
 
-**Goal:** `production/test_mac_run.py` uses less aws CPU (48.4 CPU s median, rank 2), with every behavior check kept.
+**Goal:** one chain commit of phases 314-322 and the wire fix 340, merged with builds main 07e10771d, passes the full local suite.
 
 **Spec:**
-1. Profile first: `python3 scripts/test_times/module_cost.py --tree <worktree> production/test_mac_run.py --tests 10 --commands 10`. Name the largest costs by test and by command.
-2. Cut the largest cost that does not carry a check: a repeated setup that a class seed can share, a full `mac_run.sh` run where a function-level call proves the same branch, or a start a test does not check. The slowest test is `test_a_signal_leaves_the_cleanup_to_the_mac_and_the_next_run` (11.4 s).
-3. Keep every assertion and every real signal, exit status and cleanup check. A test that checks a process boundary keeps that boundary.
-4. Measure again with module_cost on the same load. Give before and after CPU, starts and the per-test rows.
-5. No test reads a value /tune can change; a test writes its own fixture config.
+1. Worktree `~/worktrees/claude-natedev-natest-gatechain`, branch `natest-gatechain`, at fc5ff3758 (merge of 0622a8585 with 07e10771d, no conflicts).
+2. `build_queue/first_step.py:137` (from main 44ax/44ay) names the steps 'merge-gate' and 'targeted-test'; the chain renamed the config keys to `program_first_peak_gib.gate` and `.test-affected`. Use the new step names; `copies/test_slot_order.py` uses them too.
+3. `aws_target/test_hana_render.py` fails in its guest checkout: `cannot import name 'program_start' from 'scripts.build_queue'`. Find why the chain's guest file list lacks what main's `slot_wait` now imports, and fix it where the list lives.
+4. Find every other main caller that uses an old gate name.
 
-**Files:** `scripts/production/test_mac_run.py`; test support files only when the profile names them.
+**Files:** as found; the fix goes where each defect lives.
 
-**Workers:** 1 writer. One test module.
-- `impl`: all files.
-- `test`: opens as impl.
-
-**Acceptance gate:**
-- module_cost shows lower CPU for `production/test_mac_run.py`, with the same test count and every test passing.
-- The director runs an aws pair (3 rounds) after review; the paired median CPU is lower.
-- basedpyright reports 0 errors and 0 warnings on the changed files.
+**Acceptance gate:** the full local suite passes on the repaired chain commit; basedpyright clean on changed files.
