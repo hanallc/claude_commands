@@ -1917,7 +1917,8 @@ Slots are not saved. Restart keeps active reservations and run order, but drops 
 The Builds page shows zero room during a shortfall and records the shortfall in the cap explanation.
 The memory page shows `Stage`, `Duration`, `Unit`, `Pid`, `Machine`, and `vCPU` for running rows.
 The first column shows `building` or `testing` from the recorded progress counter.
-A natedev row shows `waiting for jobserver tokens` while its nextest step waits for test tokens; its `Done` cell shows `—`.
+A natedev row shows the stage `waiting` while its nextest step waits for test tokens; its `Done` cell shows `—`.
+The row tooltip gives the full reason, `Waiting for jobserver tokens`.
 `progress_profile.token_wait_line` prints the wait line in `nextest_tokens.py`, and `CounterParser` reads it from the step log as `NoCounter.token_wait`.
 The wait ends at the next line, which reports the tokens taken.
 `NoCounter.token_wait` is an optional field, so the counter wire union does not change for pinned clients.
@@ -1930,12 +1931,14 @@ Idle or unreadable runners have no separate Running row.
 Their memory remains in the taken total, the cap, and the summary tooltip.
 Waiting rows use `#` in the first column for their queue place.
 Both sections use the same column widths.
-The narrow layout adds the `Step` column and shows each cell in full.
-When that table is wider than the card, each step uses two lines: Step, Stage and Done, then Dur, Unit, Pid, Target and vCPU.
-Text wraps only when it does not fit. The chart row names also wrap in the narrow layout.
-`memory_page_proof.mjs` fails when a narrow table cell or chart name is cut, and uses two lines only at 390 px.
-The narrow table leaves out the room row, because the chart above it shows free.
-Beside the chart, the table room row is empty and only keeps the rows aligned.
+The table is always beside the chart, and each step uses one row at every pane width.
+In a narrow pane the table cuts long unit names to 6rem and narrows its column gaps.
+A pane still too narrow for the chart and the table scrolls the Running and Queued card sideways; the page itself does not scroll.
+The label column is as wide as the widest running label.
+A longer queued name wraps at a space, so only its widest word counts.
+The chart, the top bar and the axis start one even gap after the label column.
+The table room row is empty and only keeps the rows aligned.
+`memory_page_proof.mjs` fails when the table leaves the chart's side, a Stage cell is cut, or the label column is wider than its labels.
 The red cap line in the Running chart stops at each line of chart text that it would cross, so no text shows on it.
 `cutCapLine` draws the line as parts after the bar labels are placed; text clipped by an ellipsis does not count.
 `memory_page_proof.mjs` fails when chart text shows on the cap line or the table room row shows text.

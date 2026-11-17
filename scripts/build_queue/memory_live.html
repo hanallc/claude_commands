@@ -56,8 +56,8 @@ __PAGE_FRAME_STYLE__
 .ram-disagree, .ram-missing { margin: 10px 0 0; font-weight: 600; }
 .swap-reserve { margin: 10px 0 0; font-weight: 600; cursor: help; }
 .hatch { background: repeating-linear-gradient(135deg, var(--res-a) 0 3px, var(--res-b) 3px 6px); }
-:root { --amt: 7rem; --gap: 10px; --details: 0px; }
-.bar-wrap { position: relative; padding: 52px 0 26px; margin-top: 10px; margin-left: calc(var(--amt) + var(--gap)); margin-right: var(--details); }
+:root { --amt: 7rem; --gap: 10px; --details: 0px; --bar-details: 0px; }
+.bar-wrap { position: relative; padding: 52px 0 26px; margin-top: 10px; margin-left: calc(var(--amt) + var(--gap)); margin-right: var(--bar-details); }
 .bar { display: flex; gap: 0; height: 44px; }
 .bar > div { height: 100%; border-radius: 2px; min-width: 0; transition: flex-basis 0.6s ease; position: relative; display: flex; align-items: center; justify-content: center; overflow: hidden; }
 .lbl { flex: none; font-size: 0.85rem; font-weight: 700; font-variant-numeric: tabular-nums; padding: 1px 6px; border-radius: 5px; background: color-mix(in srgb, var(--card) 82%, transparent); color: var(--ink); white-space: nowrap; pointer-events: none; transition: opacity 0.2s ease; }
@@ -130,7 +130,7 @@ __PAGE_FRAME_STYLE__
 .machine[data-machine="natedev"] { color: var(--machine-natedev); }
 .machine[data-machine="mac"] { color: var(--machine-mac); }
 .machine[data-machine="aws"] { color: var(--machine-aws); }
-.scale { margin-right: var(--details); margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
+.scale { margin-right: var(--bar-details); margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
 .ticks { position: relative; height: 16px; }
 .ticks span { position: absolute; transform: translateX(-50%); }
 .legend { margin: 10px 0 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 17rem), 1fr)); gap: 14px 28px; align-items: start; }
@@ -237,6 +237,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .row-heading { display: flex; min-width: 0; gap: 4px; align-items: baseline; }
 .row-label .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-label .owner { overflow-wrap: anywhere; color: var(--ink-2); }
+.wrow.wait .row-label .name { white-space: normal; }
 .row-label .owner, .cloud-status .amounts { font-size: 0.75rem; }
 .row-memory { min-width: 0; }
 .cloud-status .cap { color: var(--cap); }
@@ -282,32 +283,16 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
   border-top: 1px solid var(--line); pointer-events: none;
 }
 .walk.beside .wrow.room::before, .walk.beside .wrow.wait-first::before { top: var(--divider-top, 0px); }
-.walk.stacked .step { display: table-cell; }
-/* The stacked chart above the table shows free, so the table leaves out its empty row. */
-.walk.stacked .walk-table tr.room { display: none; }
-.walk.stacked .walk-table tr.queue-head > * { border-top: 1px solid var(--line); }
-.walk.stacked .walk-table { width: 100%; overflow-x: auto; }
-.walk.stacked .walk-table .cell-text, .walk.measuring .walk-table .unit .cell-text { max-width: none; }
-.walk.stacked .row-label .name { white-space: normal; overflow-wrap: anywhere; }
+/* The table never moves under the chart: a pane too narrow for both scrolls the step chart sideways. */
+.walk-scroll { overflow-x: auto; }
+/* The table is measured at its own width, not cut to the walk. */
+.walk.measuring .walk-table, .walk.measuring .walk-table table { max-width: none; }
+.walk.measuring .walk-table .unit .cell-text { max-width: none; }
 .walk.measuring .step { display: none; }
 .walk.measuring .walk-table .cell-text { max-width: 8rem; }
-/* A stacked table wider than the card shows each step on two lines: Step, Stage and Done, then the other columns. */
-.walk.compact .walk-table table { display: grid; grid-template-columns: auto auto auto minmax(auto, 1fr) auto auto auto; column-gap: 12px; width: 100%; }
-.walk.compact .walk-table thead, .walk.compact .walk-table tbody { display: contents; }
-.walk.compact .walk-table tr { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-content: center; row-gap: 2px; height: auto; padding: 4px 0; }
-.walk.compact .walk-table th, .walk.compact .walk-table td { width: auto; padding: 0; white-space: normal; overflow-wrap: break-word; }
-.walk.compact .walk-table .step { grid-area: 1 / 1 / 2 / 3; contain: inline-size; }
-.walk.compact .walk-table .place { grid-area: 1 / 3 / 2 / 7; contain: inline-size; }
-.walk.compact .walk-table .done { grid-area: 1 / 7; }
-.walk.compact .walk-table .duration { grid-area: 2 / 1; min-width: var(--duration); text-align: left; }
-.walk.compact .walk-table .unit { grid-area: 2 / 2; }
-.walk.compact .walk-table .pid { grid-area: 2 / 3; text-align: left; }
-.walk.compact .walk-table .machine { grid-area: 2 / 4; }
-.walk.compact .walk-table .vcpus { grid-area: 2 / 5; }
-.walk.compact .walk-table .slot { grid-area: 2 / 6; }
-.walk.compact .walk-table .tokens { grid-area: 2 / 7; }
-.walk.compact .walk-table tr.wait-first > *, .walk.compact .walk-table tr.queue-head > * { border-top: 0; }
-.walk.compact .walk-table tr.wait-first, .walk.compact .walk-table tr.queue-head { border-top: 1px solid var(--line); }
+/* A narrow pane cuts long unit names and narrows the column gaps, so the chart keeps its room beside the table. */
+.walk.tight .walk-table .unit .cell-text { max-width: 6rem; }
+.walk.tight .walk-table th:not(:last-child), .walk.tight .walk-table td:not(:last-child) { padding-right: 8px; }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
 body.queue-unavailable .queue-error { display: flex; }
 body.queue-unavailable .card { display: none; }
@@ -363,7 +348,7 @@ body.queue-unavailable .card { display: none; }
 </style>
 </head>
 <body>
-<main>
+<main class="page-wide">
   <p class="error" id="mac-idle-alert" role="status" hidden></p>
   __PAGE_TITLE__
   <div class="queue-error" id="queue-error" role="status"></div>
@@ -453,7 +438,7 @@ body.queue-unavailable .card { display: none; }
 
   <section class="card">
     <div class="walk-head"><span class="section-head" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span><div class="walk-tokens num" data-tip="tokens"><span>Tokens</span><dl id="walk-tokens"></dl></div></div>
-    <div class="walk" id="walk"></div>
+    <div class="walk-scroll"><div class="walk" id="walk"></div></div>
     <p class="pressure-reason" id="cap-reason"></p>
     <div class="walk-key">
       <span class="key" data-tip="waiting"><span class="sw waiting"></span>Waiting step, memory it needs</span>
@@ -749,7 +734,7 @@ function ownerText(text) {
 function stageText(row) {
   if (macRow(row)) return ["MacTesting", "MacTestingCounter"].includes(row.stage?.kind) ? "testing" : row.stage?.kind === "MacBuilding" ? "building" : "—";
   return row.progress?.kind === "RowProgress" ? row.progress.phase
-    : row.progress?.kind === "TokenWaitProgress" ? row.progress.stage : "—";
+    : row.progress?.kind === "TokenWaitProgress" ? "waiting" : "—";
 }
 function doneText(row) {
   const progress = row.progress;
@@ -780,6 +765,8 @@ function routeFields(row) {
 }
 function progressRows(row) {
   const progress = row.progress;
+  // The Stage column shows only "waiting"; the tooltip gives the full reason.
+  if (progress?.kind === 'TokenWaitProgress') return [field('Stage', sentence(progress.stage))];
   if (!progress || progress.kind !== 'RowProgress') return [];
   return groupRows([field(sentence(progress.phase), `${progress.done} of ${progress.total} ${progress.unit}`),
     field('Done', formatPercent(progress.percent ?? 100 * progress.done / progress.total, progress.done === progress.total)),
@@ -1378,8 +1365,9 @@ function fitWalkDetails() {
   const track = walk.querySelector(".track");
   if (!latest || !table || !track || document.body.classList.contains("queue-unavailable")) return;
   const root = document.documentElement;
-  // Measure without the last layout: a stacked table is full width, so the chart would stay stacked on a wider page.
-  walk.classList.remove("beside", "stacked", "compact");
+  // Measure the table in the page flow, at the page width.
+  walk.classList.remove("beside", "tight");
+  walk.style.minWidth = "";
   walk.classList.add("measuring");
   const capFraction = capEnd(latest);
   function measure(labelWidth) {
@@ -1423,13 +1411,15 @@ function fitWalkDetails() {
       context.measureText(words.slice(index).join(" ")).width)));
   }));
   const minimumTrackWidth = Math.max(MIN_TRACK_WIDTH, (Math.max(amountWidth + LABEL_GAP, statusWidth) + 1) / (capFraction || 1));
-  const labels = [...walk.querySelectorAll(".row-label .name, .row-label .owner")];
+  // Running rows set the label column. A longer queued name wraps at a space, so only its widest word counts.
+  const labels = [...walk.querySelectorAll(".row-label .name, .row-label .owner")].flatMap(label =>
+    label.closest(".wrow.wait") ? label.textContent.split(/\s+/).map(word => [label, word]) : [[label, label.textContent]]);
   const roomHeading = walk.querySelector(".wrow.room .row-heading");
   context.font = canvasFont(roomHeading);
   const roomWidth = context.measureText(`Free ${memoryAmount(latest.room)}`).width + 8;
-  const textWidth = Math.ceil(Math.max(roomWidth, ...labels.map(label => {
+  const textWidth = Math.ceil(Math.max(roomWidth, ...labels.map(([label, text]) => {
     context.font = canvasFont(label);
-    return context.measureText(label.textContent).width;
+    return context.measureText(text).width;
   }))) + 1;
   const rem = parseFloat(getComputedStyle(root).fontSize);
   let labelWidth = `${Math.min(textWidth, 12 * rem)}px`;
@@ -1438,31 +1428,40 @@ function fitWalkDetails() {
     labelWidth = `${Math.min(textWidth, 9 * rem)}px`;
     fit = measure(labelWidth);
   }
-  const beside = fit.remainingWidth >= minimumTrackWidth;
+  if (fit.remainingWidth < minimumTrackWidth) {
+    walk.classList.add("tight");
+    fit = measure(labelWidth);
+  }
   root.classList.remove("layout-measuring");
   fit = measure(labelWidth);
+  const shortBy = minimumTrackWidth - fit.remainingWidth;
+  if (shortBy > 0) {
+    // Beyond the cap the track runs under the table, so a wider walk gives the chart only the cap share.
+    // With no cap the table width is fixed, so the chart takes all of the added width.
+    const added = fit.reservedWidth > 0 && capFraction > 0 ? shortBy * capFraction : shortBy;
+    walk.style.minWidth = `${Math.ceil(walk.getBoundingClientRect().width + added)}px`;
+    fit = measure(labelWidth);
+  }
   const naturalWidth = table.getBoundingClientRect().width;
-  root.style.setProperty("--details", `${beside ? fit.reservedWidth : 0}px`);
-  walk.classList.toggle("beside", beside);
-  walk.classList.toggle("stacked", !beside);
+  root.style.setProperty("--details", `${fit.reservedWidth}px`);
+  // The top bar shares the chart scale; in a pane where the chart scrolls sideways it uses the card width.
+  root.style.setProperty("--bar-details", `${shortBy > 0 ? 0 : fit.reservedWidth}px`);
+  walk.classList.add("beside");
   walk.classList.remove("measuring");
-  walk.classList.toggle("compact", !beside && table.scrollWidth > table.clientWidth);
   measureColumn("duration");
   measureColumn("machine");
-  if (beside) {
-    // The chart takes its scale from its own track: the memory bar is hidden when RAM readings disagree.
-    const range = track.getBoundingClientRect();
-    const tableLeft = !hasCap(latest)
-      ? walk.getBoundingClientRect().right - naturalWidth
-      : range.left + range.width * capFraction + 0.5 + TABLE_CAP_GAP;
-    walk.style.setProperty("--table-left", `${tableLeft - walk.getBoundingClientRect().left}px`);
-  }
+  // The chart takes its scale from its own track: the memory bar is hidden when RAM readings disagree.
+  const range = track.getBoundingClientRect();
+  const tableLeft = !hasCap(latest)
+    ? walk.getBoundingClientRect().right - naturalWidth
+    : range.left + range.width * capFraction + 0.5 + TABLE_CAP_GAP;
+  walk.style.setProperty("--table-left", `${tableLeft - walk.getBoundingClientRect().left}px`);
   for (const row of walk.querySelectorAll(".wrow[data-tip], .wrow.room")) {
     const metadata = table.querySelector(row.dataset.tip ? `tr[data-tip="${row.dataset.tip}"]` : "tr.room");
     if (!metadata) continue;
     const detail = row.querySelector(".amounts");
-    if (row.classList.contains("cloud-work")) detail.style.maxWidth = beside
-      ? `${Math.max(0, table.getBoundingClientRect().left - detail.getBoundingClientRect().left - TABLE_CAP_GAP)}px` : "";
+    if (row.classList.contains("cloud-work"))
+      detail.style.maxWidth = `${Math.max(0, table.getBoundingClientRect().left - detail.getBoundingClientRect().left - TABLE_CAP_GAP)}px`;
     row.style.minHeight = "44px";
     metadata.style.height = "";
     const height = Math.ceil(Math.max(row.getBoundingClientRect().height, metadata.getBoundingClientRect().height));
