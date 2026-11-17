@@ -637,13 +637,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if not 0 < length <= 4096:
                 raise ValueError("Invalid accounts request size.")
             fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
-            if (set(fields) not in ({"key", "value"}, {"group", "to"})
-                    or any(len(values) != 1 for values in fields.values())):
-                raise ValueError("Use one color key and one color value, or one group and one account.")
+            if (set(fields) not in ({"key", "value"}, {"group", "to"}, {"group", "clear"})
+                    or any(len(values) != 1 for values in fields.values())
+                    or ("clear" in fields and fields["clear"] != ["first"])):
+                raise ValueError("Use one color key and one color value, one group and one account, or one group and clear=first.")
         except (ValueError, UnicodeError) as error:
             self.json_response(400, {"reason": str(error)})
             return
         result = (accounts_page.save_color(fields["key"][0], fields["value"][0]) if "key" in fields
+                  else accounts_page.clear_next_move(fields["group"][0]) if "clear" in fields
                   else accounts_page.save_next_move(fields["group"][0], fields["to"][0]))
         if isinstance(result, accounts_page.Refused):
             self.json_response(400, {"reason": result.reason})
