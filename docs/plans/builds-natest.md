@@ -4695,35 +4695,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 ### Phase 333 — The review launcher tests use less aws CPU  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `direct/test_review_launcher.py` uses less CPU in aws pairs, with the same tests and assertions, or the phase names its floor.
-
-**Decision:** after Phase 331 (a floor) and Phase 332 (the registry Git reads), the aws ranking (`show.py top --host aws`, rows as of 2026-11-17 05:51) puts this module next: median 32.1 CPU s, 18 tests; slowest kept test `ReviewLauncherPassTests.test_broad_lenses_and_retry_keep_the_same_fast_fix_snapshot` 9.5 s. Phase 315 cut the recorder start cost; no phase has cut the test file. builds rejected new shared layers for one module's gain (2026-11-16): the change stays in the test file. Codex has no capacity; the director writes it.
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD direct/test_review_launcher.py --tests 15 --commands 20`, under `systemd-run --user --scope -q -p MemoryMax=2G`. Name the top costs by test, fixture and command.
-2. Remove the largest repeated cost in the test file that a test does not check, with the shared methods of Phases 235-238, 251, 254, 255, 193 and 323: class seeds copied per test, in-process calls where no process boundary is asserted, a forked child with loaded modules where a boundary is asserted but a new interpreter is not, one render where several tests read the same output.
-3. Keep every Git state, lock, race and recovery that a test asserts on, and every exit status. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
-4. If the largest remaining cost is product work (the review launcher, recorder or Git), do not change product code. Report the cost and the floor.
-5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-6. The director runs the aws pairs.
-
-**Files:**
-- `scripts/direct/test_review_launcher.py`
-
-**Workers:** 1 writer; one test module.
-- impl: all files (the director, no worker capacity).
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere. No lazy imports inside functions.
-- Phase 252: every fixture binds private run roots through `bind_private_run_roots`; keep it. Phase 242: in-process calls bind per call the module state that the real process reads at start.
-- Phase 315: the launcher's recorder commands load only what they use; do not measure that again.
-- Phase 330: Git auto maintenance off saves no aws CPU.
-- Phase 323: a forked child with loaded imports keeps a real kill point and exit status; create output files and child cleanup before the fork.
-- sdlc terms: test files only; every test and assertion stays; merge only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain, or the report names the floor; peak memory reported.
+- `test_broad_lenses_and_retry_keep_the_same_fast_fix_snapshot` runs one row: the PATH with no flock and no perl. `file_lock.sh` finds perl past PATH, so the full-PATH row ran the same lock path and checked nothing more. Its 3 `review.sh` launches are gone.
+- The fake reviewer writes its prompt with `cat "$4" > "$FAST_TRACK_REVIEW_PROMPT"`. With `cp`, two concurrent reviews that created the file at once failed with "File exists" (3 in 12 natedev runs, 1 in 3 aws runs).
+- natedev `module_cost.py`: 25.5 to 19.0 CPU s; the test 9.5 to 4.1 CPU s. The module passes 16 of 16 runs.
+- aws pair, 3 rounds: 27.07 to 23.60 CPU s, a saving of 3.47 CPU s; peak memory 149 to 150 MiB; all passed.
+- The largest costs left are `python3 -` helper starts (57, 3.4 CPU s), `fast_track.py` starts (12, 2.0 CPU s) and `pass_record.py` starts (24, 2.6 CPU s), all product starts that the tests check.
