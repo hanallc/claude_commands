@@ -207,7 +207,7 @@ try {
           const style = document.createElement('style');
           style.textContent = '* { transition: none !important; }';
           document.head.append(style);
-          await tick();
+          await ${path === 'memory_live.html' ? 'pageRefresh.refresh(true)' : 'tick()'};
           window.proofTip = (kind, index) => kind + ':' + (kind === 'row' ? latest.walk : latest.waiters)[index].key;
           window.proofRun = index => latest.walk[index].key;
           window.renderReading = render;
@@ -231,7 +231,7 @@ try {
         await evaluate(`(()=>{
           window.proofRead=window.fetch;
           window.fetch=()=>new Promise((_,reject)=>{window.proofFail=reject;});
-          window.proofPending=tick();
+          window.proofPending=pageRefresh.refresh(true);
           scrollTo(0,0);
         })()`);
         await pressSpace();
@@ -241,34 +241,38 @@ try {
           const read=window.proofRead;
           window.proofFetches=0;
           window.fetch=(...request)=>{window.proofFetches++;return read(...request);};
-          return readingFailure;
+          const line=document.querySelector('[data-page-status]');
+          return {state:line.dataset.state,reason:line.querySelector('[data-status-reason]').textContent};
         })()`);
-        assert.equal(lateFailure,'','A reading that fails after the pause changes the page.');
+        assert.deepEqual(lateFailure,{state:'Paused',reason:'Press space to resume.'},'A reading that fails after the pause changes the page.');
         // A report that arrives after the pause leaves the charts as they were.
         const lateReport = await evaluate(`(async()=>{
           const draw=window.renderReport, version=reportVersion;
           let drawn=0;
           window.renderReport=()=>{drawn++;};
-          await loadReport('proof-late');
+          await loadReport('proof-late',()=>true);
           window.renderReport=draw;
           window.proofFetches=0;
           return {drawn,kept:reportVersion===version};
         })()`);
         assert.deepEqual(lateReport,{drawn:0,kept:true},'A report that arrives after the pause changes the charts.');
         const pausedPage = await evaluate(`(async()=>{
-          const badge=document.querySelector('#paused');
-          const shown=!badge.hidden&&getComputedStyle(badge).display!=='none';
-          await tick();
+          const line=document.querySelector('[data-page-status]');
+          const word=line.querySelector('[data-status-word]');
+          const visibility={checkVisibilityCSS:true,checkOpacity:true};
+          const shown=line.dataset.state==='Paused'&&word.textContent==='Paused'
+            &&line.checkVisibility(visibility)&&word.checkVisibility(visibility);
+          await pageRefresh.refresh();
           await reloadWhenPageChanges();
           const pill=document.querySelector('#pill').getBoundingClientRect();
           return {shown,fetches:window.proofFetches,pill:{x:pill.left+pill.width/2,y:pill.top+pill.height/2}};
         })()`);
-        assert.ok(pausedPage.shown,'Space does not show the paused badge.');
+        assert.ok(pausedPage.shown,'Space does not show the Paused state.');
         assert.equal(pausedPage.fetches,0,'A paused page still reads.');
         await call('Input.dispatchMouseEvent',{type:'mouseMoved',x:pausedPage.pill.x,y:pausedPage.pill.y});
         const pausedTip = await evaluate(`(()=>{
           const tip=document.querySelector('#tip');
-          const boxes=[tip,document.querySelector('#paused'),document.querySelector('.status')].map(item=>item.getBoundingClientRect());
+          const boxes=[tip,document.querySelector('#paused'),document.querySelector('[data-page-status]')].map(item=>item.getBoundingClientRect());
           const left=Math.min(...boxes.map(box=>box.left))-12, top=Math.min(...boxes.map(box=>box.top))-12;
           const right=Math.max(...boxes.map(box=>box.right))+12, bottom=Math.max(...boxes.map(box=>box.bottom))+12;
           return {on:tip.classList.contains('on'),clip:{x:Math.max(0,left),y:Math.max(0,top),width:right-Math.max(0,left),height:bottom-Math.max(0,top),scale:1}};
@@ -278,8 +282,11 @@ try {
         await writeFile(join(folder,'paused-tooltip-dark-desktop.png'),Buffer.from(pausedShot.data,'base64'));
         await call('Input.dispatchMouseEvent',{type:'mouseMoved',x:4,y:4});
         await pressSpace();
-        const resumedPage = await evaluate(`({hidden:document.querySelector('#paused').hidden,fetches:window.proofFetches})`);
-        assert.ok(resumedPage.hidden,'Space does not clear the paused badge.');
+        const resumedPage = await evaluate(`(async()=>{
+          await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+          return {state:document.querySelector('[data-page-status]').dataset.state,fetches:window.proofFetches};
+        })()`);
+        assert.equal(resumedPage.state,'Live','Space does not restore the Live state.');
         assert.ok(resumedPage.fetches>0,'Space does not resume reading.');
 
         const comparisons = [];
@@ -1388,66 +1395,69 @@ try {
           let now=Date.now();
           Date.now=()=>now;
           window.render=window.renderReading;
+          const refresh=createPageRefresh(tick);
+          const line=document.querySelector('[data-page-status]');
+          const part=name=>line.querySelector('[data-status-'+name+']');
+          const ageLimit=JSON.parse(line.dataset.statusOptions).ageLimit;
           const states=[];
-          const snapshot=name=>states.push({name,status:document.querySelector('#status').textContent,
-            stale:document.querySelector('#dot').classList.contains('stale'),
-            unavailable:document.body.classList.contains('queue-unavailable'),
-            screen:document.querySelector('#queue-error').textContent,
+          const snapshot=name=>states.push({name,state:line.dataset.state,
+            reason:part('reason').textContent,age:part('age').textContent,ageHidden:part('age').hidden,
             cards:[...document.querySelectorAll('.card')].map(card=>card.innerHTML).join('')
               .replace(/<div class="last-reading"[^>]*>[^<]*<.div>/,'').replace(/--divider-top: [^;]*;/g,''),
+            cardsVisible:[...document.querySelectorAll('.card')].map(card=>card.checkVisibility({checkVisibilityCSS:true,checkOpacity:true})),
             lastReading:document.querySelector('#last-reading').hidden?'':document.querySelector('#last-reading').textContent,
             rows:document.querySelectorAll('.wrow').length,
-            pill:document.querySelector('#pill-t').textContent,
-            pillClass:document.querySelector('#pill').className,
-            pillDot:getComputedStyle(document.querySelector('.pd')).display,
-            position:getComputedStyle(document.querySelector('.status')).position});
+            word:part('word').textContent,
+            icons:[...line.querySelectorAll('[data-status-icon]')].filter(icon=>!icon.hidden).map(icon=>icon.dataset.statusIcon),
+            timingsHidden:part('trip').hidden&&part('render').hidden,
+            position:getComputedStyle(line).position});
           const good=async()=>{
             reading.read_at=now/1000;
             window.fetch=async()=>({ok:true,json:async()=>reading});
-            await tick(); fitLabels();
+            await refresh.refresh(); fitLabels();
           };
           try {
-            lastRead=0;readingFailure='';
             window.fetch=async()=>({ok:true,json:async()=>({ok:false})});
-            await tick();snapshot('initial');
+            await refresh.refresh();snapshot('initial');
             await good();snapshot('good');
             const goodAt=now;
             window.fetch=async()=>({ok:true,json:async()=>({ok:false})});
-            now+=1000;await tick();snapshot('one_failure');
-            now=goodAt+(STALE+3)*1000;await tick();snapshot('stale');
+            now+=1000;await refresh.refresh();snapshot('one_failure');
+            now=goodAt+(ageLimit+3)*1000;await refresh.refresh();snapshot('stale');
             const retained={...reading,read_error:'private socket timeout',error_at:now/1000};
             window.fetch=async()=>({ok:true,json:async()=>retained});
-            await tick();snapshot('retained');
+            await refresh.refresh();snapshot('retained');
             await good();snapshot('recovered');
             window.fetch=async()=>{throw new Error('proof fetch failure');};
-            now+=(STALE+3)*1000;await tick();snapshot('fetch_failure');
+            now+=(ageLimit+3)*1000;await refresh.refresh();snapshot('fetch_failure');
             await good();snapshot('final');
             return states;
           } finally { window.fetch=originalFetch;Date.now=originalNow;window.render=originalRender; }
         })()`);
         const states=Object.fromEntries(failures.map(state=>[state.name,state]));
-        assert.ok(states.initial.unavailable);
-        assert.equal(states.initial.screen,'The queue did not answer');
+        assert.equal(states.initial.state,'Failed');
+        assert.equal(states.initial.reason,'The queue did not answer.');
         assert.match(states.retained.lastReading,/^Last reading: /);
         assert.equal(states.good.lastReading,'');
         for(const name of ['one_failure','stale','retained']) {
           assert.equal(states[name].cards,states.good.cards, name+' changes the good reading.');
           assert.equal(states[name].rows,states.good.rows);
-          assert.ok(!states[name].unavailable);
+          assert.ok(!states[name].ageHidden);
+          assert.deepEqual(states[name].cardsVisible,states.good.cardsVisible,name+' changes card visibility.');
         }
-        assert.equal(states.one_failure.status,states.good.status);
+        assert.equal(states.one_failure.state,'Failed');
         for(const name of ['stale','retained','fetch_failure']) {
-          assert.ok(states[name].stale);
-          assert.match(states[name].status,/Showing the reading from \d{2}:\d{2}:\d{2}, 18 s old\./);
-          assert.match(states[name].pill,/^as of \d{2}:\d{2}:\d{2}$/);
-          assert.match(states[name].pillClass,/neutral/);
-          assert.equal(states[name].pillDot,'none');
+          assert.equal(states[name].state,'Failed');
+          assert.equal(states[name].age,'18 s ago');
+          assert.equal(states[name].word,'Failed');
+          assert.deepEqual(states[name].icons,['Failed']);
+          assert.ok(states[name].timingsHidden);
           assert.equal(states[name].position,'sticky');
         }
-        assert.match(states.fetch_failure.status,/Cannot load the reading: proof fetch failure/);
+        assert.equal(states.fetch_failure.reason,'proof fetch failure');
         for(const name of ['recovered','final']) {
-          assert.match(states[name].status,/^Live · read at /);
-          assert.ok(!states[name].stale && !states[name].unavailable);
+          assert.equal(states[name].state,'Live');
+          assert.ok(!states[name].ageHidden && states[name].reason==='');
         }
         const capture = async (name, selector) => {
           await evaluate(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({block:'center'})`);
@@ -1642,7 +1652,7 @@ try {
               assert.equal(state.heading,'Build memory on natedev');
             }
             const clip=await evaluate(`(() => {
-              const status=document.querySelector('.status').getBoundingClientRect();
+              const status=document.querySelector(${JSON.stringify(version==='before'?'.status':'[data-page-status]')}).getBoundingClientRect();
               return {x:0,y:0,width:innerWidth,height:Math.ceil(status.bottom+16),scale:1};
             })()`);
             const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
