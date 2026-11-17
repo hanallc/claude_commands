@@ -18,7 +18,8 @@ class InvokeProgressFramesTests(unittest.TestCase):
             config = root / "lint_config.sh"
             _ = config.write_text("lint_config_enabled() { return 0; }\nlint_config_skip_notice() { :; }\n")
             environment = {key: value for key, value in os.environ.items() if not key.startswith("BUILDLOG_")}
-            environment.update(HOME=str(root), TMPDIR=str(root), BUILDLOG_OFF="1", LINT_CONFIG_READER=str(config))
+            environment.update(HOME=str(root), TMPDIR=str(root), BUILDLOG_OFF="1", LINT_CONFIG_READER=str(config),
+                               BUILD_HOLD_DIR=str(root / "holders"))
             command = '''source "$1"
 buildlog_step_compiles() { return 1; }
 buildlog_end() { cp -- "$2" "$saved_log"; }
