@@ -595,6 +595,10 @@ class RoleMapTests(unittest.TestCase):
               role_map.stored_role_map()):
             selected = role_map.read_role_map()
             again = role_map.read_role_map()
+            supplied = role_map.RoleMap({"units": "claude3"}, "codex1")
+            with role_map.supplied_role_map(supplied):
+                self.assertEqual(role_map.read_role_map(), supplied)
+            self.assertEqual(role_map.read_role_map(), selected)
         self.assertEqual((selected.groups, selected.workers),
                          ({"units": "claude1", "showrunners": "claude2"}, "codex3"))
         self.assertEqual(again, selected)

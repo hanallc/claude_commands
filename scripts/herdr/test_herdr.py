@@ -3728,8 +3728,8 @@ class HerdrTests(unittest.TestCase):
         self.configure(["--session", "writing", "pane", "list"], json.dumps({"result": {"panes": [{'pane_id': 'w1:p1', 'workspace_id': 'w1'}, {'pane_id': 'w1:p2', 'workspace_id': 'w1'}]}}))
         self.darwin_environment(71, "claude", "HERDR_PANE_ID=w1:p1 TMUX_PANE=%1")
         self.darwin_environment(72, "claude", "HERDR_PANE_ID=w1:p2 TMUX_PANE=")
-        for pid in (71, 72):
-            self.configure(["-a", "-p", str(pid), "-d", "cwd", "-Fn"], f"p{pid}\nfcwd\nn{self.root}\n")
+        self.configure(["-a", "-p", "71,72", "-d", "cwd", "-Fpn"],
+                       "".join(f"p{pid}\nfcwd\nn{self.root}\n" for pid in (71, 72)))
         self.assertEqual(herdr.herdr_place_of(71), herdr.NotInHerdr())
         self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p2"))
         self.assertEqual([row.pid for row in herdr.herdr_processes()], [72])
@@ -3748,15 +3748,18 @@ class HerdrTests(unittest.TestCase):
         self.darwin_environment(74, "claude HERDR_PANE_ID=forged", "")
         self.configure(["-o", "command=", "-p", "75"], code=1, stderr="vanished")
         self.darwin_environment(76, "claude", "HERDR_PANE_ID=w1:p2")
-        self.configure(["-a", "-p", "71", "-d", "cwd", "-Fn"], "p71\nfcwd\nn/work folder\n")
-        self.configure(["-a", "-p", "72", "-d", "cwd", "-Fn"], "p72\nfcwd\nn/work folder\n")
-        self.configure(["-a", "-p", "76", "-d", "cwd", "-Fn"], code=1, stderr="gone")
+        cwd_command = ["-a", "-p", "71,72,74,75,76", "-d", "cwd", "-Fpn"]
+        self.configure(cwd_command, "p72\nfcwd\nn/work folder\np71\nfcwd\nn/work folder\n", code=1, stderr="gone")
         rows = herdr.herdr_processes()
         self.assertCountEqual(rows, [
             herdr.HerdrProcess(71, herdr.HerdrPlace("writing", "w1:p1"), {"CODEX_THREAD_ID": "unit"}, "zsh", "/work folder"),
             herdr.HerdrProcess(72, herdr.HerdrPlace("writing", "w1:p1"), {}, "claude", "/work folder"),
             herdr.HerdrProcess(76, herdr.HerdrPlace("writing", "w1:p2"), {}, "claude",
                                herdr.UnreadableCwd("process 76 cwd: stderr: gone"))])
+        self.assertEqual([command for command in self.commands() if "cwd" in command], [cwd_command])
+        self.configure(cwd_command, "p72\nfcwd\nn/second folder\np71\nfcwd\nn/first folder\np76\nfcwd\nn/third folder\n")
+        self.assertEqual({row.pid: row.working_directory for row in herdr.herdr_processes()},
+                         {71: "/first folder", 72: "/second folder", 76: "/third folder"})
         self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p1"))
         self.assertEqual(herdr.herdr_place_of(74), herdr.NotInHerdr())
         for pid in (73, 77):
@@ -3774,8 +3777,7 @@ class HerdrTests(unittest.TestCase):
         for output, code, error in (("", 1, "permission denied"), ("p72\nfcwd\n", 0, ""),
                                     ("n/one\nn/two\n", 0, "")):
             with self.subTest(output=output, code=code):
-                for pid in (71, 72):
-                    self.configure(["-a", "-p", str(pid), "-d", "cwd", "-Fn"], output, code, error)
+                self.configure(["-a", "-p", "71,72", "-d", "cwd", "-Fpn"], output, code, error)
                 processes = {process.pid: process for process in herdr.herdr_processes()}
                 self.assertCountEqual(processes, [71, 72])
                 self.assertEqual(processes[71].marks, {"CODEX_THREAD_ID": "unit"})
@@ -3878,7 +3880,8 @@ class HerdrTests(unittest.TestCase):
                        json.dumps({"result": {"process_info": {"shell_pid": 71}}}))
         for pid, command in ((71, "zsh"), (72, "claude")):
             self.darwin_environment(pid, command, "HERDR_PANE_ID=w1:p1")
-            self.configure(["-a", "-p", str(pid), "-d", "cwd", "-Fn"], f"p{pid}\nfcwd\nn/work\n")
+        self.configure(["-a", "-p", "71,72", "-d", "cwd", "-Fpn"],
+                       "".join(f"p{pid}\nfcwd\nn/work\n" for pid in (71, 72)))
         self.assertCountEqual([row.pid for row in herdr.herdr_processes()], [71, 72])
         self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p1"))
 
@@ -5193,6 +5196,17 @@ class HerdrTests(unittest.TestCase):
                 self.assertEqual({row.pid: row.place for row in herdr.herdr_processes()}, expected)
                 self.assertEqual(next(row.marks for row in herdr.herdr_processes() if row.pid == 12), {})
 
+        _ = self.process(14, 11, ["codex"], {"HERDR_PANE_ID": "w1:p1"})
+        self.configure_herdr(["pane", "process-info", "--pane", pane],
+                             json.dumps({"result": {"process_info": {"shell_pid": 11,
+                                 "foreground_processes": [{"pid": 14, "argv": ["codex"]}]}}}))
+        self.log.unlink()
+        self.assertEqual({row.pid: row.place for row in herdr.herdr_processes()},
+                         {**expected, 14: herdr.HerdrPlace("fixture", pane)})
+        self.assertEqual(self.commands().count(["--session", "fixture", "pane", "list"]), 1)
+        self.assertEqual(self.commands().count(
+            ["--session", "fixture", "pane", "process-info", "--pane", pane]), 1)
+
     def test_missing_live_pane_never_returns_the_launch_environment_place(self) -> None:
         server = self.process(10, 1, ["herdr", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
@@ -5231,8 +5245,28 @@ class HerdrTests(unittest.TestCase):
                 pane = f"w1:p{pid}"
                 _ = self.process(pid, server_pid, ["claude"], {"HERDR_PANE_ID": pane})
                 expected[pid] = herdr.HerdrPlace(session, pane)
+        unrelated = [self.process(pid, parent, ["unrelated"], {"HERDR_PANE_ID": "w1:p11"})
+                     for pid, parent in ((30, 1), (31, 30))]
+        contents_read: list[Path] = []
+        paths_resolved: list[Path] = []
+        read_bytes = Path.read_bytes
+        resolve = Path.resolve
+
+        def read_contents(path: Path) -> bytes:
+            contents_read.append(path)
+            return read_bytes(path)
+
+        def resolve_path(path: Path, strict: bool = False) -> Path:
+            paths_resolved.append(path)
+            return resolve(path, strict=strict)
+
         self.log.unlink(missing_ok=True)
-        self.assertEqual({row.pid: row.place for row in herdr.herdr_processes()}, expected)
+        with (patch.object(Path, "read_bytes", read_contents),
+              patch.object(Path, "resolve", resolve_path)):
+            self.assertEqual({row.pid: row.place for row in herdr.herdr_processes()}, expected)
+        for process in unrelated:
+            self.assertNotIn(process / "environ", contents_read)
+            self.assertNotIn(process / "cwd", paths_resolved)
         self.assertCountEqual(self.commands(), [
             ["--session", "fixture", "pane", "list"],
             ["--session", "writing", "pane", "list"],
@@ -5285,7 +5319,8 @@ class HerdrTests(unittest.TestCase):
                        json.dumps({"result": {"process_info": {"shell_pid": 71}}}))
         for pid, command in ((71, "zsh"), (72, "claude")):
             self.darwin_environment(pid, command, "HERDR_PANE_ID=w1:p1")
-            self.configure(["-a", "-p", str(pid), "-d", "cwd", "-Fn"], f"p{pid}\nfcwd\nn{self.root}\n")
+        self.configure(["-a", "-p", "71,72", "-d", "cwd", "-Fpn"],
+                       "".join(f"p{pid}\nfcwd\nn{self.root}\n" for pid in (71, 72)))
         expected = {pid: herdr.HerdrPlace("writing", "w2:p9") for pid in (71, 72)}
         self.assertEqual(herdr.herdr_places(), expected)
         self.assertEqual(self.commands().count(["--session", "writing", "pane", "list"]), 1)

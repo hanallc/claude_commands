@@ -178,6 +178,8 @@ It runs beside the local read and merges this machine's entries first.
   The `address` field is empty for `CannotReceiveMessages`.
   Entries omit the `session` field.
 - **`--snapshot`** (hidden from `--help`) prints `RosterSnapshot`: tagged JSON for exchange between machines.
+  The peer receives one stdin document with the caller's encoded staff snapshot and role map for the whole run.
+  Empty stdin keeps normal reads; invalid stdin adds a problem and uses normal reads.
   The `registry_name` field holds `RegistryName` or `NoRegistryName`.
   An older snapshot without this field decodes as `NoRegistryName`.
 - **Problems** go to stderr as `could not read: <source>: <detail>`; the other machine's are prefixed with its host; an unreachable machine, timeout or undecodable snapshot is `<host>: not reached: <why>`. A decodable snapshot is used whatever the remote exit status. Exit 0 clean, 1 with any problem.
