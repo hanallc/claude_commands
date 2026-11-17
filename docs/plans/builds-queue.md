@@ -2768,9 +2768,25 @@ Move the other `copies.standing` callers to the 44ax order with the same code: m
 **Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44bf/work_order.md`.
 
 ### Phase 44bg — The doc verb takes its copy slot only after admission  · status: todo
-**From the 44ax live check, 2026-11-17:** a direct `verify.sh doc` call held a copy slot through `copies.py hold` while it waited for admission. The doc route now uses the 44ax first-step route: freeze the staged files, get admission, then take the slot. No other verb or caller fills a checkout before admission. Hash due 16:15 EST.
+**From the 44ax live check, 2026-11-17:** a direct `verify.sh doc` call held a copy slot through `copies.py hold` while it waited for admission. Three review rounds on a design with a handoff between two processes found new blockers each time (attempts: `phases/44bg/attempts.md`). The design is now the plain order in one verify.sh process: ask admission, then take the slot and check out the staged tree, then run Cargo under the grant it holds. The source key before checkout is sha256 of the staged tree id plus a newline, the key the checkout has. Hash due 18:15 EST.
 
 **Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44bg/work_order.md`.
+
+### Phase 44bh — The Builds page splits "Other build tools"  · status: todo
+**User, 2026-11-17 15:1x ("yes - make that change"):** the "Other build tools" row becomes "Python tests" (worker Python test runs in builds-detached.slice that never enter the queue) and "Waiting runs" (the wrapper processes of queued verify runs). After 44bb merges, because both change memory_feed.py and memory_live.html. Proof: one dark desktop image of the Build tools tooltip. Hash due 19:00 EST.
+
+### Phase 44bi — A waiting verify run uses one Python process  · status: todo
+**From builds, 2026-11-17 15:0x:** a waiting run holds about 45-51 MiB in three Python processes (local_release_wait.py, tree_watch.py, verify_helper.py). One interpreter runs the release wait and the tree watch. The checkpoint gives the PSS of one waiting run before and after. tree_watch.py imports scripts.lib.cargo_output only on the test-build key path (from verify). After 44bg merges. Hash due 21:00 EST.
+
+### Phase 44bj — Replace a waiting step and keep its place  · status: todo
+**User go via builds, 2026-11-17 15:3x ("yes you can assign"):** `verify.sh <verb> <args> --replaces <run>`, a repeatable global flag. The new run takes the earliest place of the runs it replaces only if its fresh estimate is at most the sum of their needs; otherwise the service refuses it, the old runs keep their places, and the message names both sizes. The service ends each old wait with "replaced by <run>". verify's joined test step passes the flag through. After 44bg and the gate folder move. Hash due 22:00 EST.
+
+**Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44bj/work_order.md`.
+
+### Phase 44bk — A lint repair keeps the grant its judgment got  · status: todo
+**From the 15:33 queue stall, 2026-11-17:** the head `praxis mend` got its grant after 101.8 minutes, then verify.sh cancelled the judgment grant and asked again for the repair; another step became head 12 seconds later. The repair now runs under the judgment grant after owner, tree and need checks. Hash due 17:45 EST.
+
+**Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44bk/work_order.md`.
 
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
