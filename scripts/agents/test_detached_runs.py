@@ -29,7 +29,7 @@ from unittest.mock import MagicMock, patch
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.signal_test_support import install_signal_pid_guard
-from scripts.agents import detached_run_process, detached_runs
+from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 from scripts.agents.detached_runs import deliver_in_fresh_process
 from scripts.buildlog import treekey
 from scripts.build_hold import build_hold, hold_enforcer
@@ -179,6 +179,27 @@ class DetachedRunsTests(unittest.TestCase):
             pid = private_supervisor(self, path)
         self.update_record(path, tree_key="key-1", pid=pid)
         return path
+
+    def test_damaged_record_does_not_hide_a_live_run(self) -> None:
+        path = self.live_run(["fixture", "check"])
+        record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        damaged = path.with_name("000-damaged.json")
+        _ = damaged.write_text("{", encoding="utf-8")
+        evidence = detached_runs.live_run_evidence_for_staff(path.parent, frozenset({self.worker_id}))
+        self.assertEqual(evidence.runs, (record,))
+        self.assertEqual(len(evidence.read_errors), 1)
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            unit_runs.report_anomaly.cache_clear()
+            evidence.report_errors()
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn(str(damaged), errors.getvalue())
+        for name in ("live_runs", "live_runs_for_staff"):
+            with self.subTest(name=name), self.assertRaises(worker_lifecycle.WorkerStateUnreadable) as raised:
+                if name == "live_runs":
+                    _ = detached_runs.live_runs(path.parent, WORKER)
+                else:
+                    _ = detached_runs.live_runs_for_staff(path.parent, frozenset({self.worker_id}))
+            self.assertEqual(raised.exception.path, damaged)
 
     def seat_runs(self, count: int) -> list[Path]:
         """Create live supervisors for distinct runs for the fixture worker."""

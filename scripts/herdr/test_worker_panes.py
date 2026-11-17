@@ -2090,6 +2090,18 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertIn(result.pane, errors.getvalue())
                 self.assertIn("launched agent process changed", errors.getvalue())
 
+    def test_damaged_detached_record_prevents_idle_proof(self) -> None:
+        row = self.worker()
+        self.world.add(row, "w1:p1", live=False)
+        stopped = self.observation(row)
+        assert isinstance(stopped, worker_panes.StoppedWorker)
+        run = self.root / "run"
+        path = run / "detached_runs/000-damaged.json"
+        write_text_atomic(path, "{")
+        with self.assertRaises(worker_lifecycle.WorkerStateUnreadable) as raised:
+            _ = worker_panes.can_close(stopped, run=worker_panes.DispatchRun(run))
+        self.assertEqual(raised.exception.path, path)
+
     def test_active_submission_holds_the_worker_after_the_launcher_returns(self) -> None:
         opened = self.start()
         assert isinstance(opened, worker_panes.OpenWorker)
