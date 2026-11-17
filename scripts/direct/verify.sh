@@ -671,7 +671,8 @@ FIX_RETURN_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../mac_test/fix
 # on, in addition to the tree. A change to one of them makes the record stale.
 # fix_return.py places the lint copy, and that place can decide whether lint passes.
 lint_code_files() {
-    LINT_CODE_FILES=("${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" "${FIX_RETURN_SCRIPT:-}"
+    LINT_CODE_FILES=("${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh"
+        "$HOME/.claude/scripts/lint/prebuild.py" "${FIX_RETURN_SCRIPT:-}"
         "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}")
 }
 
@@ -1456,7 +1457,9 @@ if [[ "$CMD" == final && -z "$VERIFY_PACKAGE" && -z "$PINNED_TARGET" && "$MAC_ON
     trap 'final_status=$?; finish_verify_run "$final_status"; exit "$final_status"' EXIT
 fi
 finish_mac_fix || exit 2
-VERIFY_SETUP="$(verify_helper "$VERIFY_START_DIR/dev_features.py" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/Cargo.toml" "$CMD")" || exit 2
+# invoke.sh reads prebuild declarations from the same manifest.
+LINT_WORKSPACE_MANIFEST="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/Cargo.toml"
+VERIFY_SETUP="$(verify_helper "$VERIFY_START_DIR/dev_features.py" "$LINT_WORKSPACE_MANIFEST" "$CMD")" || exit 2
 DEV_FEATURES="${VERIFY_SETUP%%$'\n'*}"
 VERIFY_TEST_ENVIRONMENT=()
 VERIFY_USER_ENVIRONMENT=( ${VERIFY_MAC_ENVIRONMENT[@]+"${VERIFY_MAC_ENVIRONMENT[@]}"} )

@@ -270,7 +270,7 @@ def scratch_test(production: Production, name: str, tests: str, state_dir: Path)
     passed = False
     try:
         with copies.standing(str(production.owner.id), production.checkout, copies.CommittedSource(unit.branch),
-                             merge=copies.MergeRevision(production.merge_branch)) as worktree:
+                             step="test", merge=copies.MergeRevision(production.merge_branch)) as worktree:
             try:
                 with log.open("w", encoding="utf-8") as output:
                     test = subprocess.run(["sh", "-c", tests], cwd=worktree, stdout=output,

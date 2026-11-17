@@ -502,6 +502,12 @@ class RefillRecordingTests(unittest.TestCase):
 from scripts.production.staff_test_support import StaffTestCase
 from scripts.style import unit_files
 
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
+
 
 class BranchFileLocationTests(StaffTestCase):
     def test_file_ownership_uses_the_staff_worktree(self) -> None:

@@ -36,6 +36,8 @@ from scripts.copies.copies_test_support import copies_environment
 from scripts.lib import build_folders, copy_record, scratch
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
+from scripts.style.style_reader_test_support import oracle_reader
+
 
 class Commands:
     def __init__(self) -> None:
@@ -202,6 +204,7 @@ class CrateRunTests(CargoProjectTests):
         _ = shutil.copytree(seed, self.root, symlinks=True)
         self.repo: Path = self.root / "project"
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.fixture_environment)))
+        _ = self.enterContext(oracle_reader())
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.queue: StyleQueueFake = self.enterContext(unqueued_style_children())
         # Each test has fixed copies settings and keeps its own settings dictionary.
@@ -370,7 +373,7 @@ class CrateRunTests(CargoProjectTests):
                         self.assertTrue(idle)
                         with mock.patch.object(scratch, "remove", side_effect=RuntimeError("before deletion")):
                             with self.assertRaisesRegex(RuntimeError, "before deletion"):
-                                scratch.remove_marked(worker, scratch.remove)
+                                scratch.remove_marked(worker)
                 with self.assertRaisesRegex(copies.CopyError, "crate run") as refusal:
                     copies.remove_trees(batch.owner)
                 self.assertIn(str(batch.path), str(refusal.exception))
@@ -421,7 +424,7 @@ class CrateRunTests(CargoProjectTests):
             self.assertTrue(idle)
             with mock.patch.object(scratch, "remove", side_effect=RuntimeError("before deletion")):
                 with self.assertRaisesRegex(RuntimeError, "before deletion"):
-                    scratch.remove_marked(worker, scratch.remove)
+                    scratch.remove_marked(worker)
         shutil.rmtree(worker / ".git")
         with self.assertRaisesRegex(copies.CopyError, "not terminal"):
             copies.remove_trees(self.batch.owner)
@@ -723,10 +726,13 @@ class CrateRunTests(CargoProjectTests):
                 _ = spool.write(b"anonymous git read output")
                 self.assertEqual(os.fstat(spool.fileno()).st_nlink, 0)
             with self.assertRaisesRegex(AssertionError, "dry run attempted a file write"):
-                with tempfile.NamedTemporaryFile():
+                descriptor = os.open(self.root / "named-temporary-file-probe", os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+                try:
                     self.fail("a named temporary file must not be created")
+                finally:
+                    os.close(descriptor)
             with self.assertRaisesRegex(AssertionError, "dry run attempted a filesystem mutation: os.mkdir"):
-                _ = tempfile.mkdtemp()
+                (self.root / "directory-write-probe").mkdir()
             with self.assertRaisesRegex(AssertionError, "dry run attempted a file write"):
                 _ = (self.repo / "named-write-probe").write_bytes(b"must not be written")
         finally:

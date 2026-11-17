@@ -221,9 +221,11 @@ class WaitsOnTests(unittest.TestCase):
         approval = "Sdlc keeps it waiting until the user approves board-reasons; since 13:30"
         cases: tuple[tuple[waits_on.WaitState, frozenset[str], dict[str, land_runs.LandResult], str], ...] = (
             (waits_on.PhaseSent("c" * 40), frozenset(), {}, "After builds phase 589; 10th in the merge line"),
+            (waits_on.PhaseSent("c" * 40), frozenset(), {"c" * 40: failed},
+             "After builds phase 589; 10th in the merge line"),
             (waits_on.PhaseSent("e" * 40), frozenset(), {}, "After builds phase 589; not in the merge line"),
             (waits_on.NotOnMain("c" * 40), frozenset(), {"c" * 40: failed},
-             "After branch builds/589; 10th in the merge line; last attempt failed at red: test_x red; 13:30"),
+             "After branch builds/589; 10th in the merge line"),
             (waits_on.PhaseSent("c" * 40), frozenset({"c" * 9}), {}, "After builds phase 589; merging now"),
             (waits_on.NotOnMain("d" * 40), frozenset(), {}, "After branch builds/589; not on main yet"),
             (waits_on.PhaseOpen(now + 3600), frozenset(), {}, "After builds phase 589; started"),

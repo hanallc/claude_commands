@@ -13,13 +13,13 @@ import re
 import secrets
 import subprocess
 import sys
-import tempfile
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, cast
 from urllib.parse import parse_qs, urlsplit
 
+from scripts.lib import build_folders
 from scripts.direct import plan_history
 from scripts.agents import remote
 from scripts.lib import atomic_file, file_lock, unit_runs
@@ -535,7 +535,7 @@ def publish(repository: Path) -> str:
 def publish_for(repository: Path, publisher: staff.StaffId) -> PublishedBranchPage:
     listing = list_branches(repository, staff.snapshot(), history_roots())
     root = review_link.review_root()
-    with tempfile.TemporaryDirectory(prefix="review-branches-") as temporary:
+    with build_folders.tool_folder("review-branches") as temporary:
         page = BranchPage(repository.resolve(), listing.rows, secrets.token_urlsafe(), publisher,
                           Path(temporary), listing.unowned_total)
         source = Path(temporary) / PAGE_NAME

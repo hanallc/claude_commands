@@ -9,7 +9,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib import waiting_rows
+from scripts.lib import conf, waiting_rows
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SETTINGS = "# whole: 1..\namount=2\n# whole: 1..\nlimit=5\n"
@@ -60,6 +60,24 @@ class WaitingRowsTests(unittest.TestCase):
     def edit(self, path: str, old: str, new: str) -> None:
         file = self.checkout / path
         _ = file.write_text(file.read_text().replace(old, new))
+
+    def test_replace_value_preserves_only_whitespace_comments(self) -> None:
+        for original, expected in (
+            ("account.claude1=brown\n", "account.claude1=#abcdef\n"),
+            ("account.claude1=#123456\n", "account.claude1=#abcdef\n"),
+            ("account.claude1=#123456 # comment\n", "account.claude1=#abcdef # comment\n"),
+            ("account.claude1=#123456\t# comment\r\n", "account.claude1=#abcdef\t# comment\r\n"),
+            (" account.claude1 =#123456  # note#fragment\n",
+             " account.claude1 =#abcdef  # note#fragment\n"),
+            ("account.claude1=  brown  # comment\n", "account.claude1=#abcdef  # comment\n"),
+            ("account.claude1=part#fragment", "account.claude1=#abcdef"),
+            ("account.claude1= # comment\n", "account.claude1=#abcdef # comment\n"),
+        ):
+            with self.subTest(original=original):
+                source = "# heading\n" + original
+                self.assertEqual(waiting_rows.replace_value(source, 1, "#abcdef"),
+                                 "# heading\n" + expected)
+                self.assertEqual(conf.settings(expected)["account.claude1"].value, "#abcdef")
 
     def test_a_waiting_value_stays_live_through_a_main_change_to_the_same_file(self) -> None:
         self.edit("config/example.conf", "amount=2", "amount=3")

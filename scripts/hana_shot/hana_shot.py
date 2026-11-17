@@ -37,6 +37,7 @@ import tomllib
 from types import FrameType
 from typing import IO, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, override
 
+from scripts.lib import build_folders
 from scripts.lib import conf, process_group, scratch
 from scripts.lib.conf import UseConfiguredValue
 
@@ -3108,7 +3109,7 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
     passed: list[str] = []
     with (
         nullcontext(args.out) if args.out is not None
-        else tempfile.TemporaryDirectory(prefix="hana-shot-check-")
+        else build_folders.tool_folder("hana-shot-check")
     ) as out:
         with (
             instance(args.port, args.launch, args.shutdown, args.worktree, args.binary, args.purpose, args.owner, hana_shot_settings=hana_shot_settings) as brp,
@@ -3117,7 +3118,7 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
             _ = session.start()
             sha = git_sha(path.parent, hana_shot_settings=hana_shot_settings)
             today = datetime.now().strftime("%Y-%m-%d")
-            for name, final in zip(names, output_paths(out, names, hana_shot_settings=hana_shot_settings), strict=True):
+            for name, final in zip(names, output_paths(str(out), names, hana_shot_settings=hana_shot_settings), strict=True):
                 shot = with_overrides(shot_from_view(name, views[name], hana_shot_settings=hana_shot_settings), args, hana_shot_settings=hana_shot_settings)
                 invocation.shot = shot
                 invocation.orientation = shot.orientation

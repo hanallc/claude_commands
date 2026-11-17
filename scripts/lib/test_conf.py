@@ -38,6 +38,14 @@ class ConfTests(unittest.TestCase):
     def write(self, value: str) -> None:
         _ = self.path.write_text(value, encoding="utf-8")
 
+    def test_comments_start_only_at_a_line_start_or_after_whitespace(self) -> None:
+        self.write("# comment=value\n  # indented=value\n"
+                   + "color=#a0522d # comment\nname=brown\t# comment\n"
+                   + "fragment=path#part\nmultiple=one#two#three\n")
+        self.assertEqual(conf.read("example").values(), {
+            "color": "#a0522d", "name": "brown", "fragment": "path#part", "multiple": "one#two#three",
+        })
+
     def git(self, *arguments: str) -> str:
         return subprocess.run(
             ["git", *arguments], cwd=self.root, check=True, capture_output=True,

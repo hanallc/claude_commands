@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import pwd
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -16,6 +17,7 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 from scripts.lib import main_push_lock, models_registry
+from scripts.lib.checkout_test_support import write_python_tool
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 
 FIXTURE = Path(__file__).with_name("test_models_registry.conf")
@@ -169,14 +171,45 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
         _ = self.write(self.remote / "hooks/pre-receive",
                        f'#!/bin/sh\nif flock -n "{self.repo}/.git/main-push.lock" true; then exit 93; fi\n')
         (self.remote / "hooks/pre-receive").chmod(0o755)
+        tools = self.root / "lease-git"
+        tools.mkdir()
+        lease_log = self.root / "index-leases"
+        binary = shutil.which("git")
+        assert binary is not None
+        write_python_tool(tools / "git", """import fcntl, os, sys
+from pathlib import Path
+from scripts.lib import build_folders
+index = os.environ.get("GIT_INDEX_FILE", "")
+if index:
+    folder = Path(index).parent
+    if folder.name.startswith(("models-index", "models-ff-index")):
+        lock = folder.with_name(folder.name + ".lock").stat()
+        inherited = []
+        for entry in Path("/dev/fd").iterdir():
+            try:
+                if os.path.samestat(os.fstat(int(entry.name)), lock):
+                    inherited.append(int(entry.name))
+            except OSError:
+                pass
+        assert inherited, "The Git child has no folder lease"
+        fcntl.flock(inherited[0], fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with open(""" + repr(str(lease_log)) + """, "a") as output:
+            output.write(folder.name + " " + build_folders.build_folder_state(folder) + "\\n")
+os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
+""")
         before = path.read_text()
-        with patch.dict(os.environ, {**self.environment, "MODELS_CONFIG_PUBLISH": "1"}, clear=True), \
+        environment = {**self.environment, "MODELS_CONFIG_PUBLISH": "1",
+                       "TMPDIR": str(self.root), "PATH": str(tools) + os.pathsep + self.environment.get("PATH", os.defpath)}
+        with patch.dict(os.environ, environment, clear=True), \
                 patch.object(models_registry, "DEFAULT_PATH", path):
             result = models_registry.store_registry(path, before, before.replace("old", "new"), "fixture")
         landed = self.git("rev-parse", "origin/main").stdout.strip()
         self.assertEqual(result, "[fixture]\nmodel=new\n")
         self.assertEqual(log.read_text(), landed + "\n")
         self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), landed)
+        for tool in ("models-index", "models-ff-index"):
+            with self.subTest(child=tool):
+                self.assertIn(tool + " held", lease_log.read_text().splitlines())
         self.assertTrue((self.repo / ".git" / main_push_lock.RECORD_NAME).is_file())
 
 

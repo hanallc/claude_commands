@@ -47,13 +47,7 @@ SNAPSHOT_DUMP_LINE = re.compile(
 
 def largest_gate_vcpus(instance_types: tuple[str, ...]) -> int:
     """Return the largest known count, or zero when all types have unknown counts."""
-    largest = 0
-    for name in instance_types:
-        size = re.fullmatch(r'[^.]+\.(large|([1-9][0-9]*)?xlarge)', name)
-        if size:
-            count = 2 if size[1] == 'large' else 4 * int(size[2] or '1')
-            largest = max(largest, count)
-    return largest
+    return max((run_cost.gate_vcpus(name) for name in instance_types), default=0)
 
 
 def spot_quota(api: AwsCli, code: str = 'L-34B43A08') -> Decimal:

@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, assert_never
 
@@ -48,9 +48,10 @@ from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
 from scripts.build_queue.queue_lines import age, plain, step_text
 from scripts.build_queue.queue_view import reason_phrase
-from scripts.lib.build_steps import StepNames, read_step_names
+from scripts.lib.build_steps import OtherCommand, StepJob, StepNames, command_job, read_step_names
 from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeProcesses
 from scripts.build_queue import admission_records, target_availability
+from scripts.build_queue.memory_files import DATA_NAME, PAGE_NAME, PAGE_SOURCE, configured_output_folder
 from scripts.build_targets import target_config
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
@@ -175,11 +176,6 @@ class FeedConfiguration:
     stevie_program: Path
 
 
-def configured_output_folder(settings: conf.ConfigRead) -> Path:
-    """Expand the configured page folder."""
-    return Path(os.path.expandvars(settings.text("output_folder"))).expanduser()
-
-
 def read_configuration(settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> FeedConfiguration:
     """Read the page settings from one configuration."""
     if isinstance(settings, conf.UseConfiguredValue):
@@ -223,7 +219,7 @@ def page_arguments(argv: Sequence[str]) -> PageArguments:
 def page_url() -> str:
     """Return the configured page URL without publishing a reading."""
     folder = configured_output_folder(conf.read("memory_feed")).resolve()
-    page = folder / "memory_live.html"
+    page = folder / PAGE_NAME
     url = review_link.snapshot_url(review_link.review_root().resolve(), page)
     if not page.is_file():
         raise FileNotFoundError(f"Builds page is not available: {page}")
@@ -243,10 +239,10 @@ def page_link() -> int:
 
 def publish_page(configuration: FeedConfiguration) -> None:
     """Publish the repository page with the configured refresh interval."""
-    source = console_theme.with_theme(Path(__file__).with_name("memory_live.html").read_text(encoding="utf-8"))
-    page = (source.replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(configuration.interval_seconds))
-            .replace("__PAGE_FRAME_STYLE__", page_frame.STYLE))
-    write_text_atomic(configuration.output_folder / "memory_live.html", page, new_file_mode=0o644)
+    source = console_theme.with_theme(PAGE_SOURCE.read_text(encoding="utf-8"))
+    page = page_frame.template(source, "Builds", "builds").replace(
+        "__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(configuration.interval_seconds))
+    write_text_atomic(configuration.output_folder / PAGE_NAME, page, new_file_mode=0o644)
 
 
 def gib(value: object) -> float:
@@ -342,6 +338,12 @@ class HeadRoom(TypedDict):
 
 
 class RowQueueNotes(TypedDict):
+    key: NotRequired[str]
+    # A gate job's description sentence and what it changes (build_steps about. and changes.).
+    about: NotRequired[str]
+    changes: NotRequired[str]
+    # True on the step the queue admits next; only that step shows its room.
+    first_in_line: NotRequired[bool]
     head_room: NotRequired[HeadRoom]
     priority_text: NotRequired[str]
     priority_entries: NotRequired[list[admission_records.PriorityEntry]]
@@ -485,7 +487,13 @@ def ci_step_label(runner: str, job: str) -> str:
     return " · ".join(" ".join(part.split()) for part in label.split(" · ") if part.strip())
 
 
-class RunRow(RowQueueNotes):
+class SlotPlace(TypedDict):
+    # The slot folder's name and machine; the Disks page finds the step that holds a slot by them.
+    slot_folder: NotRequired[str]
+    slot_machine: NotRequired[str]
+
+
+class RunRow(RowQueueNotes, SlotPlace):
     admitted: NotRequired[bool]
     machine: NotRequired[str]
     vcpus: NotRequired[int | queue_view.UnknownCpuCount]
@@ -510,8 +518,61 @@ class RunRow(RowQueueNotes):
     ci: bool
     parts: list[GroupPart]
     ci_runners: NotRequired[list[CIRunner]]
+    ci_cgroup: NotRequired[str]
     need: NotRequired[float]
     need_part: NotRequired[bool]
+
+
+# Queue steps whose job shows only in the command's arguments.
+GATE_STEPS = frozenset({"merge-gate", "targeted-test"})
+
+
+@dataclass(frozen=True)
+class NotGateStep:
+    """The step is not a merge gate or a targeted test, so its name already says its job."""
+
+
+@dataclass(frozen=True)
+class CommandUnreadable:
+    """The process ended or hid its command line before the feed read it."""
+    error: str
+
+
+StepJobReading = StepJob | NotGateStep | admission_records.PidNotRecorded | CommandUnreadable | OtherCommand
+
+
+def step_job(step: str, pid: int | admission_records.PidNotRecorded, proc: Path = PROC) -> StepJobReading:
+    """The job of a natedev merge gate or targeted test, read from its process arguments."""
+    if step not in GATE_STEPS:
+        return NotGateStep()
+    if not isinstance(pid, int):
+        return pid
+    try:
+        arguments = (proc / str(pid) / "cmdline").read_bytes().split(b"\0")
+    except OSError as error:
+        return CommandUnreadable(str(error))
+    return command_job([part.decode(errors="replace") for part in arguments if part])
+
+
+def job_step(job: StepJobReading, step: str) -> str:
+    """The step key a row shows: the job when the command named one, else the queue's step."""
+    return job.step if isinstance(job, StepJob) else step
+
+
+def job_notes(job: StepJobReading, unit: str, names: StepNames) -> RowQueueNotes:
+    """The description and changes rows of a gate job; empty for any other step."""
+    if not isinstance(job, StepJob):
+        return {}
+    about = names.about(job, unit)
+    return {"about": about, "changes": names.changes(job)} if about else {}
+
+
+def step_key(row: RunRow | WaitRow | MacBuildRow | MacReadingUnavailableRow | CloudWorkRow) -> str:
+    """Keep a process identity across changes to memory, labels, and queue order."""
+    # An idle or unreadable CI row has no pid or start time; its cgroup tells two CI rows apart.
+    identity = [row.get("machine") or "natedev", row.get("kind", "local"), row["pid"],
+                row.get("started_at", row.get("since", 0)), row.get("group", ""), row.get("ci_cgroup", "")]
+    return hashlib.sha256(json.dumps(codec.snapshot_value(identity)).encode()).hexdigest()[:24]
 
 
 class SwapMember(TypedDict):
@@ -555,7 +616,7 @@ class SwapReading:
     files_read: int
 
 
-class WaitRow(RowQueueNotes):
+class WaitRow(RowQueueNotes, SlotPlace):
     kind: NotRequired[Literal["repository-slot"]]
     name: str
     showrunner: str
@@ -576,7 +637,7 @@ class MemoryWaitRow(WaitRow):
     place: int
 
 
-class MacBuildRow(RowQueueNotes):
+class MacBuildRow(RowQueueNotes, SlotPlace):
     kind: Literal["mac-build"]
     name: str
     repository: str
@@ -592,6 +653,8 @@ class MacBuildRow(RowQueueNotes):
     progress: RowProgress | NoProgress
     vcpus: int | queue_view.MacJobsUnavailable
     slot: int | Literal["—"]
+    slot_folder: NotRequired[str]
+    slot_machine: NotRequired[str]
 
 
 class MacReadingUnavailableRow(RowQueueNotes):
@@ -663,7 +726,7 @@ class ReportCost(TypedDict):
 
 @dataclass(frozen=True)
 class ReportSections:
-    charts: dict[str, object]
+    days: int
     top: tuple[ReportCost, ...]
     start: str
     end: str
@@ -699,6 +762,7 @@ class MemoryPage(TypedDict):
     colors: PageColors
     ok: bool
     read_at: float
+    render_seconds: float
     total: float
     available: float
     cap: float | admission_records.CapUnavailable
@@ -757,8 +821,10 @@ class PageUnavailable(TypedDict):
 
 
 def cargo_job(command: tuple[str, ...]) -> str:
-    """Return the job word from a Cargo command."""
+    """Return the job word from a Cargo command or from the CI cargo front's command."""
     for index, argument in enumerate(command):
+        if Path(argument).name == parse.CI_CARGO_FRONT:
+            return cargo_job(("cargo", *parse.cargo_front_call(command[index + 1:]).arguments))
         if Path(argument).name not in ("cargo", "cargo-tile-real", "cargo-nextest"):
             continue
         subcommand = parse.cargo_subcommand(command[index + 1:])
@@ -874,7 +940,7 @@ def build_ci_row(used: float, now: float,
             "pid": pid, "detail": detail, "used": used,
             "counted": 0.0, "reserved": 0.0, "started_at": busy[0]["started_at"] if busy else 0,
             "queued": False, "keep_text": "\n".join(lines), "group": "", "ci": True, "parts": [],
-            "ci_runners": runners, "admitted": admitted,
+            "ci_runners": runners, "ci_cgroup": str(cgroup), "admitted": admitted,
             "progress": {"kind": "NoProgress", "reason": "no admission counter"}}
 
 
@@ -981,6 +1047,21 @@ def build_slot_number(folder: str, machine: str, roots: Mapping[str, str], *, ho
     return int(match[1]) if match and run_folder.parent == configured else "—"
 
 
+class SlotNotes(SlotPlace):
+    slot: int | Literal["—"]
+
+
+def slot_place(number: int | Literal["—"], folder: str, machine: str) -> SlotPlace:
+    """The slot folder and machine of a step in slot number; empty for a step in no slot."""
+    return {} if number == "—" else {"slot_folder": Path(os.path.normpath(folder)).name, "slot_machine": machine}
+
+
+def build_slot(folder: str, machine: str, roots: Mapping[str, str], *, home: str) -> SlotNotes:
+    """A run's slot number, and the slot folder and machine when the run is in a slot."""
+    number = build_slot_number(folder, machine, roots, home=home)
+    return {"slot": number, **slot_place(number, folder, machine)}
+
+
 def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading,
                  identity: unit_labels.UnitLabels, *, names: StepNames,
                  slot_roots: Mapping[str, str], slot_machine: str) -> MacBuildRow:
@@ -995,7 +1076,7 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
             "pid": build.pid, "machine": "mac", "started_at": build.started_at, "read_at": reading.read_at,
             "used": gib(build.resident_bytes) if isinstance(build.resident_bytes, int) else build.resident_bytes,
             "stage": build.stage, "vcpus": queue_view.mac_command_jobs(build.command),
-            "slot": build_slot_number(build.folder, slot_machine, slot_roots, home=reading.home),
+            **build_slot(build.folder, slot_machine, slot_roots, home=reading.home),
             "progress": ({"kind": "RowProgress", "phase": "testing" if build.counter.phase.startswith("test:") else "building",
                           "done": build.counter.done, "total": build.counter.total, "percent": build.counter.percent,
                           "unit": "tests" if build.counter.phase.startswith("test:") else "units"}
@@ -1016,7 +1097,7 @@ def need_in_next_part(steps: Sequence[admission_records.RunningStep]) -> bool:
                and isinstance(step.measured.window, progress.WindowPeak) for step in steps)
 
 
-WaitCause = Literal["memory", "its turn", "GPU slot", "build slot", "memory pressure", "AWS slot", "build hold", "Mac"]
+WaitCause = Literal["memory", "its turn", "Cargo token", "GPU slot", "build slot", "memory pressure", "AWS slot", "build hold", "Mac"]
 
 
 def wait_why(reason: admission_records.WaitReason) -> WaitCause:
@@ -1027,7 +1108,7 @@ def wait_why(reason: admission_records.WaitReason) -> WaitCause:
         case admission_records.BehindHead():
             return "its turn"
         case admission_records.TokenWaitingWaiter():
-            return "its turn"
+            return "Cargo token"
         case admission_records.StartSpacingWait():
             return "its turn"
         case admission_records.MemoryPressure():
@@ -1240,7 +1321,7 @@ def token_wait_stage(pool: TokenPool | TokenPoolUnavailable) -> str:
 
 
 def report_reading(days: int) -> ReportSections | charts.IndexUnavailable:
-    """Read both report sections from one provider result."""
+    """Read the top costs from one provider result."""
     try:
         recent_days = conf.read("buildlog").whole("TOP_COST_RECENT_DAYS")
         if days < recent_days:
@@ -1261,7 +1342,7 @@ def report_reading(days: int) -> ReportSections | charts.IndexUnavailable:
                              "share": cost_actions.share_text(row.share),
                              "action": cost_actions.action_text(row.action)})
         zone = user_zone()
-        return ReportSections(charts.chart_data(report.charts), tuple(rows), top.start.astimezone(zone).isoformat(),
+        return ReportSections(days, tuple(rows), top.start.astimezone(zone).isoformat(),
                               top.end.astimezone(zone).isoformat(), top.recent_days, str(zone))
     except (OSError, ValueError, RuntimeError) as error:
         return charts.IndexUnavailable(str(error))
@@ -1734,6 +1815,9 @@ def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], qu
             continue
         inside = path.is_relative_to(builds)
         if isinstance(memory, admission_records.CompilerServiceMemory):
+            # Each step's compilers count in that step's queued use, not in the compiler cache.
+            jobs = sum(job.use.bytes for job in memory.jobs if isinstance(job.use, admission_records.AnonymousRunUse))
+            amount = max(0, amount - jobs)
             sccache += amount
         elif (not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice)
               or entry.step.step == SWAP_NAMES["between"]):
@@ -1837,6 +1921,7 @@ def memory_status(explanation: admission_records.QueueExplanation, room: admissi
 
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
             report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET) -> MemoryPage:
+    started = time.perf_counter()
     if isinstance(configuration, conf.UseConfiguredValue):
         configuration = read_configuration()
     names = read_step_names()
@@ -1899,8 +1984,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         identity = feed_step_labels(metadata, labels, ci_runners) if metadata is not None else unit_labels.UnitLabels("")
         unit = identity.unit
         ci_label = metadata.session_name if metadata is not None and metadata.unit in ci_runners else ""
-        name = names.for_owner(step.step, unit if unit != "—" else "", identity.role,
-            ci=bool(ci_label), current_name=step_text(step, names, labels=labels)) if step is not None else identity.session or hold.memory.owner
+        job: StepJobReading = step_job(step.step, step.pid) if step is not None and not ci_label else NotGateStep()
+        shown = replace(step, step=job_step(job, step.step)) if step is not None else step
+        name = names.for_owner(shown.step, unit if unit != "—" else "", identity.role,
+            ci=bool(ci_label), current_name=step_text(shown, names, labels=labels)) if shown is not None else identity.session or hold.memory.owner
         detail = unit if step is not None else SWAP_NAMES["between"]
         use = gib(hold.memory.use.bytes) if isinstance(hold.memory.use, admission_records.AnonymousRunUse) else hold.memory.use
         run = hold.memory.run
@@ -1908,16 +1995,17 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             run.pid if isinstance(run, LiveBuildRun) else admission_records.PidNotRecorded())
         walk.append({"name": name, **page_owner_labels(identity, ci_label=ci_label), "between_steps": step is None,
                      "state": "", "pid": pid, "detail": detail, "used": use,
-                     "slot": build_slot_number(metadata.folder, admission_records.execution_host(metadata, host_name()), slot_roots,
+                     **(build_slot(metadata.folder, admission_records.execution_host(metadata, host_name()), slot_roots,
                         home=slot_homes.get(admission_records.execution_host(metadata, host_name()), ""))
-                        if metadata is not None else "—",
+                        if metadata is not None else SlotNotes(slot="—")),
                      "counted": use + gib(hold.bytes) if isinstance(use, float) else use, "reserved": gib(hold.bytes),
                      "started_at": metadata.started_at if metadata is not None else 0,
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ()), token_stage),
                      "queued": True, "keep_text": "", "group": "", "ci": False, "parts": [],
                      "need": gib(hold.memory.need), "need_part": need_in_next_part(steps_by_owner.get(hold.memory.owner, ())),
                      **(target_notes(step.route, routes, step.step, step.folder, step.package)
-                        if step is not None and not ci_label else NO_TARGET_NOTES)})
+                        if step is not None and not ci_label else NO_TARGET_NOTES),
+                     **job_notes(job, unit, names)})
     groups: dict[str, list[RunRow]] = {}
     remote_groups: set[str] = set()
     for entry in explanation.running:
@@ -1938,7 +2026,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 "progress": row_progress((step,), progress.TOKEN_WAIT_REASON),
                 "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
                 "machine": admission_records.execution_host(step, host_name()), "vcpus": queue_view.UnknownCpuCount(),
-                "slot": build_slot_number(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
+                **build_slot(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
                     home=slot_homes.get(admission_records.execution_host(step, host_name()), ""))}
             walk.append(remote_row)
             continue
@@ -2016,8 +2104,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         if isinstance(waiter.reason, admission_records.BehindHead):
             reason += ": the first step in line gets memory first"
         ci_label = waiter.session_name if waiter.unit in ci_runners else ""
-        waiters.append({"name": names.for_owner(waiter.step, identity.unit if identity.unit != "—" else "", identity.role,
-                            ci=bool(ci_label), current_name=step_text(waiter, names, labels=labels)),
+        job = NotGateStep() if ci_label else step_job(waiter.step, waiter.pid)
+        shown_waiter = replace(waiter, step=job_step(job, waiter.step))
+        waiters.append({"name": names.for_owner(shown_waiter.step, identity.unit if identity.unit != "—" else "", identity.role,
+                            ci=bool(ci_label), current_name=step_text(shown_waiter, names, labels=labels)),
                         **page_owner_labels(identity, ci_label=ci_label),
                         "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": "" if ci_label else identity.unit,
                         "need": gib(need), "since": waiter.since,
@@ -2027,7 +2117,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                                 gib(waiter.reason.free) if isinstance(waiter.reason, admission_records.NeedsMemory) else gib(ram["room_bytes"]),
                         "why": wait_why(waiter.reason),
                         **(NO_TARGET_NOTES if ci_label else target_notes(
-                            waiter.route, routes, waiter.step, waiter.folder, waiter.package))})
+                            waiter.route, routes, waiter.step, waiter.folder, waiter.package)),
+                        # A waiting step names its slot, so the Disks page names the slot's work as this row does.
+                        **slot_place(build_slot_number(waiter.folder, host_name(), slot_roots, home=slot_homes[host_name()]),
+                                     waiter.folder, host_name()),
+                        **job_notes(job, identity.unit, names)})
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
     if mac_status:
@@ -2108,9 +2202,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             head_pid = head.run.pid if isinstance(head.run, LiveBuildRun) else head.pid
         for waiting_row in waiting_rows:
             if waiting_row["pid"] == head_pid:
+                waiting_row["first_in_line"] = True
                 if isinstance(explanation.head, admission_records.HeadExplanation) and explanation.head.decision.state == "hold":
                     waiting_row["head_room"] = head_room(explanation.head.room, explanation.room, ram)
                 break
+    for step_row in (*work_rows, *waiting_rows):
+        step_row["key"] = step_key(step_row)
     pressure = explanation.decided_from.pressure
     policy = explanation.policy.pressure
     # Without the recorded builds and CI swap, the page reads host swap now instead of failing.
@@ -2125,9 +2222,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         pressure_label = admission_records.pressure_text(pressure)
     elif isinstance(pressure, admission_records.PressureUnavailable):
         pressure_label = "unavailable: " + pressure.reason
-    return {
+    page: MemoryPage = {
         "colors": configuration.colors,
-        "ok": True, "read_at": explanation.now, "total": total, "available": gib(captured.available),
+        "ok": True, "read_at": explanation.now, "render_seconds": 0.0, "total": total, "available": gib(captured.available),
         "cap": cap, "floor": safety, "cap_text": room_text(captured),
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,
         "taken": gib(ram["cap_bytes"] - captured.room), "room": gib(captured.room), "room_source": "free",
@@ -2156,6 +2253,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "report_version": report_version,
         "swap_rows": configuration.swap_rows, "leftovers": leftovers,
     }
+    page["render_seconds"] = time.perf_counter() - started
+    return page
 
 
 def page_json(payload: MemoryPage | RetainedReading | PageUnavailable) -> str:
@@ -2187,7 +2286,7 @@ def main(argv: Sequence[str]) -> int:
         return page_link()
     configuration = read_configuration()
     publish_page(configuration)
-    target = configuration.output_folder / "memory.json"
+    target = configuration.output_folder / DATA_NAME
     last_good: MemoryPage | NoGoodReading = NoGoodReading()
     report_version = ""
     next_report_at = 0.0

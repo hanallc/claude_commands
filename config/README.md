@@ -798,7 +798,7 @@ The next `up` removes a folder left by a dead run.
 Its `default` development shell uses the host tools.
 
 Paired trials use the installed scaler service and the existing `cloud_gate.conf` settings.
-Run `python3 -m scripts.aws_target.gate_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
+Run `python3 -m scripts.aws_target.aws_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
 Both refs must exist in pushed public history for `~/.claude`.
 Each module uses one box for all rounds.
 All module boxes run concurrently.
@@ -820,20 +820,6 @@ Unconfirmed cleanup uses the reserved lifetime and returns a nonzero status.
 The paired trial adds no settings.
 
 The paired trial replaces the size/start trials.
-The following settings are removed:
-
-1. `gate_trial_size_reserve_usd`.
-1. `gate_trial_start_reserve_usd`.
-1. `gate_trial_lifetime_minutes`.
-1. `gate_trial_url_lifetime_s`.
-1. `gate_trial_target_gate_s`.
-1. `gate_trial_module_limit_s`.
-1. `gate_trial_default_sizes`.
-1. `gate_trial_size_runs`.
-1. `gate_trial_start_runs`.
-1. `gate_trial_poll_pause_s`.
-1. `gate_trial_log_push_s`.
-1. `gate_trial_group_delete_wait_s`.
 
 The setup checks compare plain tool commands on both hosts.
 These stages need no other source repository.

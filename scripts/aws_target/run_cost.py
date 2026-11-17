@@ -6,7 +6,9 @@ from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from enum import Enum
 import json
+import re
 from statistics import median
 from typing import cast
 
@@ -239,6 +241,21 @@ def median_run_time(seconds: list[Decimal]) -> str:
     return f'{minutes}m {remainder}s'
 
 
+def gate_vcpus(instance_type: str) -> int:
+    """Return the vCPU count that the type's size names, or zero for an unknown size."""
+    size = re.fullmatch(r'[^.]+\.(large|([1-9][0-9]*)?xlarge)', instance_type)
+    if not size:
+        return 0
+    return 2 if size[1] == 'large' else 4 * int(size[2] or '1')
+
+
+class BoxTimeSource(Enum):
+    """Where the box times of a type and region come from."""
+    OWN = ''
+    OTHER_REGIONS = ' elsewhere'
+    SAME_VCPUS = ' same vCPUs'
+
+
 @dataclass(frozen=True)
 class RunEvidence:
     """Box times and refusals by type and region, for the expected cost of one run."""
@@ -251,10 +268,18 @@ class RunEvidence:
     # Median seconds from a refused launch request to the next request of the same attempt.
     refusal_wait_s: Decimal
 
-    def box_seconds(self, size: str, region: str, modes: tuple[str, ...]) -> tuple[list[Decimal], bool]:
-        """The region's own box times, else the type's times in all regions (False)."""
+    def box_seconds(self, size: str, region: str, modes: tuple[str, ...]) -> tuple[list[Decimal], BoxTimeSource]:
+        """Own region box times, else the type's times in all regions, else times of types with its vCPU count."""
         own = [time for mode in modes for time in self.by_region.get((size, region, mode), [])]
-        return (own, True) if own else ([time for mode in modes for time in self.by_type.get((size, mode), [])], False)
+        if own:
+            return own, BoxTimeSource.OWN
+        typed = [time for mode in modes for time in self.by_type.get((size, mode), [])]
+        if typed:
+            return typed, BoxTimeSource.OTHER_REGIONS
+        # A type without runs is priced by the runs of a type with the same vCPU count, not by the median of all types.
+        vcpus = gate_vcpus(size)
+        return [time for (other, mode), times in self.by_type.items()
+                if vcpus and mode in modes and gate_vcpus(other) == vcpus for time in times], BoxTimeSource.SAME_VCPUS
 
     def refusals_per_launch(self, size: str, region: str, modes: tuple[str, ...]) -> tuple[Decimal | None, int, int]:
         """Refused requests for each launched box, with the counts it comes from.
@@ -273,9 +298,10 @@ class RunEvidence:
         """Spot price for the median box time, plus the wait cost of the expected refusals first.
 
         A region without its own runs borrows the other regions' box time and adds unmeasured_extra_s for its transfers."""
-        seconds, own = self.box_seconds(size, region, modes)
+        seconds, source = self.box_seconds(size, region, modes)
         seconds = seconds or [time for mode in modes for time in self.by_mode.get(mode, [])]
-        box = (Decimal(median(seconds)) if seconds else default_seconds) + (Decimal(0) if own else unmeasured_extra_s)
+        box = ((Decimal(median(seconds)) if seconds else default_seconds)
+               + (Decimal(0) if source is BoxTimeSource.OWN else unmeasured_extra_s))
         # Capacity refusals do not depend on the run kind, so every request counts.
         refusals = self.refusals_per_launch(size, region, EVERY_KIND)[0] or Decimal(0)
         return price * box / 3600 + refusals * self.refusal_wait_s * wait_usd_per_minute / 60

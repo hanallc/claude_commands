@@ -238,6 +238,9 @@ Both paths compare the current terminal and process with the identities saved af
 A replacement process remains open. Cleanup prints one anomaly with the pane id.
 
 A new slot takes the parent/name lock before the row lock.
+If a sibling split fails with `pane_not_found`, the start retries once from the parent pane.
+If all siblings disappear before the layout read, the start uses the parent pane when the layout confirms it.
+Other errors and a failed parent split keep the current failure path.
 An existing slot takes the row lock.
 `worker_operation` locks the admitted row.
 For a new slot, it first checks membership under the parent/name lock.

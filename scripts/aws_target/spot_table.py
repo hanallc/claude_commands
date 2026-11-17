@@ -237,13 +237,14 @@ def run_costs(directory: Path, now: int, kinds: tuple[tuple[str, ...], tuple[str
                        + f'time (boot included), plus refusal wait at {wait_cost} USD/min '
                        + f'({evidence.refusal_wait_s:.0f} s each). Paid: the AWS bill for the type and region, '
                        + 'split between runs by box time. Runs elsewhere: the type has no runs in the region, '
-                       + 'so the time comes from the other regions.')
+                       + 'so the time comes from the other regions. Runs same vCPUs: the type has no runs, '
+                       + 'so the time comes from the types with its vCPU count.')
         estimates: list[Cheapest] = []
         grid: dict[tuple[str, str], Decimal] = {}
         for size in (*sizes, *gpu):
             for region in regions:
                 price = minimum.get((region, size))
-                seconds, _own = evidence.box_seconds(size, region, scope.modes)
+                seconds, _source = evidence.box_seconds(size, region, scope.modes)
                 if price is not None and seconds:
                     grid[region, size] = evidence.expected_usd(price, size, region, scope.modes, wait_cost, default_seconds,
                                                                unmeasured_extra_s=unmeasured.get(region, Decimal(0)))
@@ -258,7 +259,7 @@ def run_costs(directory: Path, now: int, kinds: tuple[tuple[str, ...], tuple[str
             launched_cells: list[str] = []
             for region in regions:
                 price = minimum.get((region, size))
-                seconds, own = evidence.box_seconds(size, region, scope.modes)
+                seconds, source = evidence.box_seconds(size, region, scope.modes)
                 estimate = grid.get((region, size))
                 # Placement picks only the instance_types, so only they can be the cheapest.
                 if estimate is not None and size in candidates:
@@ -272,7 +273,7 @@ def run_costs(directory: Path, now: int, kinds: tuple[tuple[str, ...], tuple[str
                 refused_cells.append(str(refused))
                 launched_cells.append(str(launched))
                 table.append((region, f'{price:.4f}' if price is not None else 'no price', run_minutes(seconds),
-                              f'{len(seconds)}' + ('' if own or not seconds else ' elsewhere'),
+                              f'{len(seconds)}' + (source.value if seconds else ''),
                               f'{estimate:.4f}' if estimate is not None else '—',
                               f'{paid:.4f}' if paid is not None else unbilled(len(here)),
                               paid_run_cell(billed, len(scoped) - len(billed), allocations), str(len(billed))))

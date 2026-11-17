@@ -19,6 +19,12 @@ from scripts.production import session_staff, staff
 from scripts.agents import remote
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, recorded_showrunner, recorded_unit
 
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
+
 
 class UnitFilesTests(unittest.TestCase):
     def test_callback_helpers_preserve_git_failure_causes(self) -> None:
