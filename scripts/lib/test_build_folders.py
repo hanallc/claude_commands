@@ -996,6 +996,22 @@ print('signals')
         self.assertFalse(path.with_name(path.name + ".lock").exists())
         self.assertFalse(path.with_name(path.name + ".lease.json").exists())
 
+    def test_removal_calls_cleanup_without_creating_an_absent_parent(self) -> None:
+        path = self.root / "absent-parent" / "tree"
+        for result in (True, False, None):
+            with self.subTest(result=result):
+                cleanup = mock.Mock(return_value=result)
+
+                self.assertEqual(folders.remove_build_folder(path, cleanup), result is not False)
+
+                cleanup.assert_called_once_with()
+                self.assertFalse(path.parent.exists())
+        cleanup = mock.Mock(side_effect=FileNotFoundError("cleanup failed"))
+        with self.assertRaisesRegex(FileNotFoundError, "cleanup failed"):
+            _ = folders.remove_build_folder(path, cleanup)
+        cleanup.assert_called_once_with()
+        self.assertFalse(path.parent.exists())
+
     def test_explicit_names_and_attribution_do_not_use_session_names(self) -> None:
         spec = folders.BuildFolderSpec(kind="temporary", parent=self.root, suffix_length=8,
                                        showrunner="builds", unit="queue", work="bf1", purpose="proof")

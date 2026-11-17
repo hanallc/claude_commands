@@ -203,6 +203,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertNotIn(f"refs/heads/{branch}", [line.split()[0] for line in state.origin_branches.splitlines()])
         self.assertNotIn(self.record_path(tree).name, state.records)
         self.assertNotIn(tree.name, state.folders)
+        self.assertFalse(tree.with_name(tree.name + ".lease.json").exists())
+        self.assertFalse(tree.with_name(tree.name + ".lock").exists())
         config = self.command(self.repository, ["git", "config", "--local", "--get", f"branch.{branch}.merge"])
         self.assertEqual(config.returncode, 1, config.stdout + config.stderr)
         self.assertEqual(config.stdout, "")
@@ -418,11 +420,15 @@ class WorktreeLifecycleTests(unittest.TestCase):
 
     def test_partial_removal_resumes_from_the_retained_record(self) -> None:
         for landing in ("merged", "cherry-picked", "plan-shrink", "origin-race",
-                        "legacy-landed", "legacy-unlanded", "local-race", "config-error"):
+                        "legacy-landed", "legacy-unlanded", "local-race", "config-error",
+                        "held-lock", "registered-only", "missing-tree", "missing-parent-registered",
+                        "missing-parent-pruned"):
             with self.subTest(landing=landing):
                 if landing != "merged":
                     self.setUp()
                 tree, branch = self.trees / "partial", "partial"
+                if landing.startswith("missing-parent-"):
+                    tree = self.trees / "absent-parent" / "partial"
                 self.make(tree, branch)
                 checkpoint = self.commit(tree, "code.txt", "landed work\n")
                 self.publish(tree, branch)
@@ -435,6 +441,71 @@ class WorktreeLifecycleTests(unittest.TestCase):
                     checkpoint = self.commit(tree, "docs/plans/phase.md", "# Completed phase\n")
                     self.publish(tree, branch)
                 retained = self.record_path(tree).read_bytes()
+                if landing.startswith("missing-parent-"):
+                    shutil.rmtree(tree.parent)
+                    if landing == "missing-parent-pruned":
+                        _ = self.git(self.repository, "worktree", "prune", "--expire=now")
+                    registered = f"worktree {tree}\n" in self.git(self.repository, "worktree", "list", "--porcelain") + "\n"
+                    self.assertEqual(registered, landing == "missing-parent-registered")
+
+                    results = self.finish_landed()
+
+                    self.assertEqual(results, [{"kind": "Ended", "path": str(tree), "detail": branch}])
+                    self.assert_ended(tree, branch)
+                    self.assertFalse(tree.parent.exists())
+                    continue
+                if landing in ("registered-only", "missing-tree"):
+                    if landing == "registered-only":
+                        shutil.rmtree(tree)
+                    else:
+                        _ = self.git(self.repository, "worktree", "remove", str(tree))
+                    self.assertTrue(tree.with_name(tree.name + ".lease.json").is_file())
+                    self.assertTrue(tree.with_name(tree.name + ".lock").is_file())
+
+                    results = self.finish_landed()
+
+                    self.assertEqual(results, [{"kind": "Ended", "path": str(tree), "detail": branch}])
+                    self.assert_ended(tree, branch)
+                    continue
+                if landing == "held-lock":
+                    lease = tree.with_name(tree.name + ".lease.json")
+                    lock = tree.with_name(tree.name + ".lock")
+                    retained_lease = lease.read_bytes()
+                    holder = subprocess.Popen([str(self.home / ".claude/scripts/lib/py"), "-c",
+                        "import fcntl, sys\n"
+                        + "with open(sys.argv[1], 'r+') as lock:\n"
+                        + "    fcntl.flock(lock, fcntl.LOCK_EX)\n"
+                        + "    print('held', flush=True)\n"
+                        + "    sys.stdin.readline()\n", str(lock)],
+                        env=self.environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True)
+                    try:
+                        assert holder.stdout is not None
+                        self.assertEqual(holder.stdout.readline(), "held\n")
+
+                        results = self.finish_landed()
+
+                        self.assertEqual(results, [{"kind": "Kept", "path": str(tree),
+                            "detail": "the build folder lock is held; the worktree stays"}])
+                        self.assertTrue(tree.is_dir())
+                        self.assertEqual(self.git(self.repository, "rev-parse", f"refs/heads/{branch}"), checkpoint)
+                        self.assertEqual(self.git(self.repository, "config", "--local", "--get",
+                                                  f"branch.{branch}.merge"), f"refs/heads/{branch}")
+                        self.assertEqual(self.record_path(tree).read_bytes(), retained)
+                        self.assertEqual(lease.read_bytes(), retained_lease)
+                        self.assertTrue(lock.is_file())
+                    finally:
+                        if holder.poll() is None:
+                            _ = holder.communicate(input="release\n", timeout=20)
+                        else:
+                            _ = holder.communicate(timeout=20)
+                    self.assertEqual(holder.returncode, 0)
+
+                    results = self.finish_landed()
+
+                    self.assertEqual(results, [{"kind": "Ended", "path": str(tree), "detail": branch}])
+                    self.assert_ended(tree, branch)
+                    continue
                 if landing in ("legacy-landed", "legacy-unlanded"):
                     _ = self.git(self.repository, "worktree", "remove", str(tree))
                     _ = self.git(self.repository, "branch", "-D", branch)
