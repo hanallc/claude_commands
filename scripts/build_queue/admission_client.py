@@ -25,6 +25,8 @@ import uuid
 
 from scripts.build_queue import admission_code, placement, snapshot_codec
 from scripts.build_queue import admission_wire as status_wire
+from scripts.build_queue.admission_wire import read_assignment as read_assignment
+from scripts.build_queue.admission_wire import write_assignment as write_assignment
 from scripts.build_targets import target_config
 from scripts.direct import step_selection
 if TYPE_CHECKING:
@@ -206,23 +208,21 @@ def cancel_placement(request: wire.CancelPlacement) -> wire.Ok:
     raise wire.AdmissionUnavailable("invalid cancellation answer")
 
 
-def read_assignment(path: Path) -> wire.Assignment | wire.LocalPlacementGranted:
-    reply = wire.parse_reply(path.read_text())
-    if isinstance(reply, (wire.Assignment, wire.LocalPlacementGranted)):
-        return reply
-    raise wire.AdmissionUnavailable("file contains no assigned attempt")
-
-
-def write_assignment(path: Path, reply: wire.Assignment | wire.LocalPlacementGranted) -> None:
-    write_text_atomic(path, wire.encode_reply(reply))
-
-
 @dataclass(frozen=True)
 class KeepPlacementPrerequisite:
     pass
 
 
 KEEP_PLACEMENT_PREREQUISITE = KeepPlacementPrerequisite()
+# "after-grant" is the caller that takes its cargo token after a local grant, so the service
+# needs no token before that grant. "required" is the older caller that holds the token
+# before its grant; the service gives it no local grant until it reports the token held.
+# Both forms use the existing wire values, so any running service reads them.
+TOKEN_REQUIRED_CHOICES = ("after-grant", "required")
+
+
+def token_prerequisite(choice: str) -> placement.TokenRequired | placement.TokenNotRequired:
+    return placement.TokenNotRequired() if choice == "after-grant" else placement.TokenRequired()
 
 
 def finish_step(path: Path, status: int, reason: str = "", *,
@@ -406,11 +406,55 @@ def _refused(reason: str, *, checker: bool = False) -> wire.Refused:
     return wire.Refused(reason)
 
 
+def nested_reservation_reason() -> str:
+    """Refuse a child only when the same queue still holds its live parent's reservation.
+
+    The holder must match by pid and start time, so a reused pid never refuses a step.
+    """
+    marker = os.environ.get("BUILDLOG_RESERVED_STEP", "")
+    if not marker:
+        return ""
+    from scripts.build_queue import admission_records as records
+    from scripts.buildlog import store
+
+    try:
+        reservation, raw_pid, directory = marker.split("\t")
+        pid = int(raw_pid)
+        if not reservation or pid <= 0 or Path(directory).resolve() != (store.root() / "admission").resolve():
+            return ""
+        start = records.process_start_time(pid)
+        if start is None:
+            return ""
+        state = cast(object, json.loads((Path(directory) / "state.json").read_text()))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(state, dict):
+        return ""
+    reservations = cast(dict[str, object], state).get("reservations")
+    if not isinstance(reservations, dict):
+        return ""
+    for value in cast(dict[str, object], reservations).values():
+        if not isinstance(value, dict):
+            continue
+        row = cast(dict[str, object], value)
+        owner = row.get("owner")
+        if (row.get("reservation_id") == reservation and isinstance(owner, dict)
+                and cast(dict[str, object], owner).get("pid") == pid
+                and cast(dict[str, object], owner).get("start_time") == start):
+            return (f"verify step cannot run inside reserved step {reservation} (pid {pid}); "
+                    + "run it outside the outer step")
+    return ""
+
+
 def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
           refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None = None,
           *, attempt: Callable[[], None] = _no_attempt_hook, channel: EstimateConnection | None = None,
           configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE
           ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization | wire.RepositorySlotReady | wire.RepositorySlotExpired | status_wire.PlacementStatusReply:
+    if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.PlacementRequest)):
+        reason = nested_reservation_reason()
+        if reason:
+            return _refused(reason)
     acquisition = _is_placement_control(request) or isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest,
         wire.BuildHistoryRequest, wire.PlacementRequest, wire.PrerequisiteReport, wire.RepositorySlotRequest))
     retry = _ACQUISITION_RETRY.get() if acquisition else None
@@ -1259,8 +1303,8 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
         if args.mac_only and not args.writes_tree:
             constraints = replace(constraints, selection=placement.MacOnlyHost())
         prerequisite = (placement.TokenRequired(placement.TokenReadinessUnchecked())
-                        if args.token == "required" and args.once and not already_queued else
-                        placement.TokenRequired() if args.token == "required" else
+                        if args.token in TOKEN_REQUIRED_CHOICES and args.once and not already_queued else
+                        token_prerequisite(args.token) if args.token in TOKEN_REQUIRED_CHOICES else
                         placement.TokenHeld() if args.token == "held" else placement.TokenNotRequired())
         request = wire.PlacementRequest(episode, owner, args.since, local.profile, constraints,
             identity=local.identity, run=local.run,
@@ -1281,7 +1325,10 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                 output.placement_notices(answer, placement_events=args.wait_events)
             if not isinstance(answer, wire.PlacementWait):
                 break
-            if isinstance(answer.wait, wire.Wait) and not isinstance(prerequisite, placement.TokenRequired):
+            # The first pass only lets a free remote target take the step; it is no memory wait.
+            token_check = (isinstance(prerequisite, placement.TokenRequired)
+                           and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
+            if isinstance(answer.wait, wire.Wait) and not token_check:
                 output(answer.wait)
                 notice = PlacementWaitNotice(output.started, output.last_reasons,
                     output.last_position, answer.wait, output.elapsed_memory_seconds, output.last_provider_diagnostics)
@@ -1341,7 +1388,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
-    for name in ("view", "explain", "down-alert", "priority-clear", "code-version"):
+    for name in ("view", "explain", "down-alert", "priority-clear", "code-version", "check-nested"):
         _ = subcommands.add_parser(name)
     status_parser = subcommands.add_parser("placement-status")
     _ = status_parser.add_argument("--episode", required=True)
@@ -1354,7 +1401,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = placement_parser.add_argument("--call-started", type=float, default=0.0)
     _ = placement_parser.add_argument("--assignment-file", type=Path, required=True)
     _ = placement_parser.add_argument("--shell-state", type=Path)
-    _ = placement_parser.add_argument("--token", choices=("required", "held", "none"), default="none")
+    _ = placement_parser.add_argument("--token", choices=(*TOKEN_REQUIRED_CHOICES, "held", "none"), default="none")
     _ = placement_parser.add_argument("--writes-tree", action="store_true")
     _ = placement_parser.add_argument("--local-only", action="store_true")
     _ = placement_parser.add_argument("--local-reason", default=os.environ.get("BUILD_QUEUE_LOCAL_REASON", ""))
@@ -1370,10 +1417,10 @@ def main(argv: list[str] | None = None) -> int:
     _ = finish_parser.add_argument("--assignment-file", type=Path, required=True)
     _ = finish_parser.add_argument("--status", type=int, default=1)
     _ = finish_parser.add_argument("--reason", default="")
-    _ = finish_parser.add_argument("--token", choices=("required",), default="")
+    _ = finish_parser.add_argument("--token", choices=TOKEN_REQUIRED_CHOICES, default="")
     prerequisite_parser = subcommands.add_parser("report-prerequisite")
     _ = prerequisite_parser.add_argument("--assignment-file", type=Path, required=True)
-    _ = prerequisite_parser.add_argument("--token", choices=("required",), required=True)
+    _ = prerequisite_parser.add_argument("--token", choices=TOKEN_REQUIRED_CHOICES, required=True)
     failed_parser = subcommands.add_parser("claim-failed")
     _ = failed_parser.add_argument("--assignment-file", type=Path, required=True)
     _ = failed_parser.add_argument("--reason", required=True)
@@ -1388,6 +1435,13 @@ def main(argv: list[str] | None = None) -> int:
     _ = priority_parser.add_argument("unit")
     _ = priority_parser.add_argument("--why", default="the user's bump")
     args = parser.parse_args(argv, namespace=ClientArguments())
+    if args.command in ("check-nested", "place-step"):
+        reason = nested_reservation_reason()
+        if reason:
+            print(reason, file=sys.stderr)
+            return 2
+        if args.command == "check-nested":
+            return 0
     if args.command == "code-version":
         print(LOADED_ADMISSION_CODE_VERSION)
         return 0
@@ -1400,14 +1454,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "down-alert":
             return down_alert()
         if args.command == "finish-step":
-            prerequisite = placement.TokenRequired() if args.token == "required" else KEEP_PLACEMENT_PREREQUISITE
+            prerequisite = token_prerequisite(args.token) if args.token else KEEP_PLACEMENT_PREREQUISITE
             print(wire.encode_reply(finish_step(args.assignment_file, args.status, args.reason,
                 prerequisite=prerequisite)), end="")
             return 0
         if args.command == "report-prerequisite":
             reply = read_assignment(args.assignment_file)
             print(wire.encode_reply(report_prerequisite(wire.PrerequisiteReport(
-                uuid.uuid4().hex, reply.assignment.episode, reply.assignment.owner, placement.TokenRequired()))), end="")
+                uuid.uuid4().hex, reply.assignment.episode, reply.assignment.owner, token_prerequisite(args.token)))), end="")
             return 0
         if args.command == "claim-failed":
             reply = read_assignment(args.assignment_file)

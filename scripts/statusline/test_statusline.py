@@ -4,10 +4,12 @@ from __future__ import annotations
 from scripts.lib.checkout_test_support import copy_runtime
 
 import json
+import io
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -15,7 +17,8 @@ from contextlib import ExitStack
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast, final, override
+from collections.abc import Callable
+from typing import ClassVar, NotRequired, TextIO, TypedDict, cast, final, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -24,6 +27,7 @@ from scripts.hooks import showrunner_footer
 from scripts.lib import conf
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production import footer_counts, investigation, session_labels, staff
+from scripts.production.issues import ALL_FIELDS, Issue
 from scripts.rebuild import need
 from scripts.agents import remote
 from scripts.statusline import adhoc_items, assignment, counts_row, rebuild_row
@@ -41,19 +45,20 @@ SHELLS = ("/bin/sh", "zsh") if shutil.which("zsh") else ("/bin/sh",)
 ZONE_FILES = {"TZDIR": os.environ["TZDIR"]} if "TZDIR" in os.environ else {}
 
 
-def shipped_account_label(label: str) -> str:
-    """Derive the expected account escape from the shipped configuration."""
-    colors = conf.read(SHIPPED_COLORS).values()
-    key = f"account.{label}"
-    if key not in colors:
-        return label
-    codes = {name: str(30 + index) for index, name in enumerate(
-        ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"))}
-    codes.update({f"bright-{name}": str(90 + index) for index, name in enumerate(
-        ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"))})
-    codes.update({"orange": "38;5;208", "purple": "38;5;141", "pink": "38;5;211",
-                  "teal": "38;5;30", "brown": "38;5;137", "mauve": "38;5;139"})
-    return f"\x1b[{codes[colors[key]]}m{label}\x1b[0m"
+def fixture_colors(root: Path) -> Path:
+    """Write the colors that the test owns."""
+    colors = root / "config/statusline.conf"
+    colors.parent.mkdir()
+    _ = colors.write_text(
+        "role.showrunner=purple\nrole.unit-director=yellow\nrole.worker=#ff04a3\n"
+        + "role.producer=pink\nrole.astra-designer=mauve\nrole.astra-reviewer=bright-green\n"
+        + "account.claude1=#53d5fd\naccount.claude2=#cd54f2\naccount.claude3=#ffc800\n"
+        + "account.claude4=#ff8700\naccount.codex1=#ff1261\naccount.codex2=#4bf331\naccount.claude5=#19d772\n"
+        + "counts.questions=bright-red\ncounts.changes=bright-cyan\ncounts.efficiency=bright-green\n"
+        + "counts.proposals=purple\ncounts.adhoc_items=pink\n# whole: 1..\ncounts.retry_seconds=5\n"
+        + "level.ok=bright-green\nlevel.warn=bright-yellow\nlevel.alarm=bright-red\n"
+        + "tokens.warn=80\ntokens.alarm=90\nleft.warn=10\nleft.alarm=5\n", encoding="utf-8")
+    return colors
 
 
 def status_lines(*inputs: object, labels: Path | None = None, account: str = "claude1",
@@ -119,7 +124,36 @@ class ShowrunnerRecord(TypedDict):
     name: NotRequired[str]
 
 
+class ConfiguredShellTests(unittest.TestCase):
+    """Share one runtime with fixed colors across the tests in each class."""
+    shell_command: ClassVar[str] = ""
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        root = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
+        colors = fixture_colors(root)
+        _ = (colors.parent / "user_zone.conf").write_text("zone=America/New_York\n", encoding="utf-8")
+        scripts = root / "scripts/statusline"
+        scripts.mkdir(parents=True)
+        for folder, source in ((scripts.parent, PROGRAM.parent.parent), (scripts, PROGRAM.parent),
+                               (colors.parent, SHIPPED_COLORS.parent)):
+            for path in source.iterdir():
+                target = folder / path.name
+                if not target.exists():
+                    target.symlink_to(path, target_is_directory=path.is_dir())
+        cls.shell_command = f'statusline="{scripts}"; . "$statusline/statusline.sh"'
+
+
 class ColorTests(unittest.TestCase):
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.colors: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.colors = fixture_colors(Path(self.enterContext(tempfile.TemporaryDirectory())))
+
     def test_direct_jq_without_a_label_shows_only_the_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             colors = Path(directory) / "statusline.conf"
@@ -140,7 +174,7 @@ class ColorTests(unittest.TestCase):
                     self.assertNotIn("\x1b", line)
 
     def test_direct_jq_colors_the_entire_staff_assignment(self) -> None:
-        line = status_lines({"session_id": UNIT.id}, colors=SHIPPED_COLORS, staff_text=staff_text(OWNER, UNIT))[0]
+        line = status_lines({"session_id": UNIT.id}, colors=self.colors, staff_text=staff_text(OWNER, UNIT))[0]
         self.assertEqual(line.split(" | ")[0], "\x1b[33mtrunk unit for show\x1b[0m")
 
     def test_direct_jq_with_invalid_or_non_object_staff_text_keeps_both_lines(self) -> None:
@@ -148,9 +182,9 @@ class ColorTests(unittest.TestCase):
                    "workspace": {"current_dir": "/tmp/project"}, "model": {"display_name": "Opus"}}
         for record in ('{"schema":1,"rows":', "42", "[]"):
             with self.subTest(record=record):
-                self.assertEqual(status_lines(payload, colors=SHIPPED_COLORS, staff_text=record, STAFF_ID=UNIT.id), [
+                self.assertEqual(status_lines(payload, colors=self.colors, staff_text=record, STAFF_ID=UNIT.id), [
                     "unassigned | /tmp/project",
-                    f"{shipped_account_label('claude1')} | Opus | weekly \x1b[92m40% left\x1b[0m",
+                    "\x1b[38;2;83;213;253mclaude1\x1b[0m | Opus | weekly \x1b[92m40% left\x1b[0m",
                 ])
 
     def test_the_user_s_examples_render_the_role_with_its_path_then_the_account_model_tokens_and_weekly(self) -> None:
@@ -175,29 +209,30 @@ class ColorTests(unittest.TestCase):
                                      staff.StaffRow(UNIT.id, "unit", "cables", staff.ReportsTo(OWNER.id), current_session=UNIT.id, unit_type=staff.UnitDetails("direct"))), STAFF_ID=UNIT.id)
             self.assertEqual(lines[0], "cables unit for hana | ~/rust/hana_catalyst_cables | cables")
 
-    def test_shipped_role_colors_and_plain_worker_and_unassigned(self) -> None:
+    def test_fixture_role_colors_and_plain_unassigned(self) -> None:
         cases = (
             ("\x1b[38;5;141mshow showrunner\x1b[0m", OWNER.id),
             ("\x1b[33mtrunk unit for show\x1b[0m", UNIT.id),
-            ("worker", WORKER.id),
+            ("\x1b[38;2;255;4;163mworker\x1b[0m", WORKER.id),
             ("unassigned", ""),
         )
         for expected, identity in cases:
             with self.subTest(role=expected):
-                line = status_lines({"session_id": identity}, colors=SHIPPED_COLORS,
+                line = status_lines({"session_id": identity}, colors=self.colors,
                                     staff_text=staff_text(OWNER, UNIT, WORKER), STAFF_ID=identity)[0]
                 self.assertEqual(line.split(" | ")[0], expected)
 
-    def test_shipped_account_colors_and_unknown_label(self) -> None:
-        colors = conf.read(SHIPPED_COLORS).values()
-        for key in colors:
-            if not key.startswith("account."):
-                continue
-            account = key.removeprefix("account.")
+    def test_fixture_account_colors_and_unknown_label(self) -> None:
+        for account, code in (
+            ("claude1", "38;2;83;213;253"), ("claude2", "38;2;205;84;242"),
+            ("claude3", "38;2;255;200;0"), ("claude4", "38;2;255;135;0"),
+            ("codex1", "38;2;255;18;97"), ("codex2", "38;2;75;243;49"),
+            ("claude5", "38;2;25;215;114"),
+        ):
             with self.subTest(account=account):
-                self.assertEqual(status_lines({}, account=account, colors=SHIPPED_COLORS)[1].split(" | ")[0],
-                                 shipped_account_label(account))
-        self.assertEqual(status_lines({}, account="claude99", colors=SHIPPED_COLORS)[1].split(" | ")[0], "claude99")
+                self.assertEqual(status_lines({}, account=account, colors=self.colors)[1].split(" | ")[0],
+                                 f"\x1b[{code}m{account}\x1b[0m")
+        self.assertEqual(status_lines({}, account="claude99", colors=self.colors)[1].split(" | ")[0], "claude99")
 
     def test_unassigned_stays_uncolored_without_its_role_color(self) -> None:
         line = status_lines({}, colors="role.showrunner=purple\n")[0]
@@ -225,13 +260,16 @@ class ColorTests(unittest.TestCase):
 
     def test_shipped_roles_and_accounts_use_hues_and_accounts_have_distinct_colors(self) -> None:
         accounts: list[str] = []
-        for line in SHIPPED_COLORS.read_text(encoding="utf-8").splitlines():
-            key, separator, value = line.split("#", 1)[0].partition("=")
-            if not separator or not key.strip().startswith(("account.", "role.")):
+        for key, value in conf.read(SHIPPED_COLORS).values().items():
+            if not key.startswith(("account.", "role.")):
                 continue
-            color = value.strip()
+            color = value.lower()
             with self.subTest(key=key):
                 self.assertNotIn(color, ("white", "bright-white", "black", "bright-black"))
+                if color.startswith("#"):
+                    self.assertRegex(color, r"^#[0-9a-f]{6}$")
+                    channels = tuple(int(color[index:index + 2], 16) for index in (1, 3, 5))
+                    self.assertGreater(max(channels), min(channels))
             if key.strip().startswith("account."):
                 accounts.append(color)
         self.assertEqual(len(set(accounts)), len(accounts))
@@ -242,12 +280,20 @@ class ColorTests(unittest.TestCase):
                 field = status_lines({}, colors=f"account.claude1={color}\n")[1].split(" | ")[0]
                 self.assertRegex(field, r"^\x1b\[[0-9;]+mclaude1\x1b\[0m$")
 
+    def test_shipped_color_values_are_renderable(self) -> None:
+        for key, value in conf.read(SHIPPED_COLORS).values().items():
+            if not key.startswith(("role.", "account.", "level.", "counts.")) or key == "counts.retry_seconds":
+                continue
+            with self.subTest(key=key):
+                field = status_lines({}, colors=f"account.claude1={value}\n")[1].split(" | ")[0]
+                self.assertRegex(field, r"^\x1b\[[0-9;]+mclaude1\x1b\[0m$")
+
     def test_token_thresholds_use_the_unrounded_window_percentage(self) -> None:
         for tokens, code in ((79_000, 92), (79_999, 92), (80_000, 93),
                              (89_000, 93), (89_999, 93), (90_000, 91)):
             with self.subTest(tokens=tokens):
                 payload = ContextInput(context_window=ContextWindow(total_input_tokens=tokens, context_window_size=100_000))
-                field = status_lines(payload, colors=SHIPPED_COLORS)[1].split(" | ")[1]
+                field = status_lines(payload, colors=self.colors)[1].split(" | ")[1]
                 self.assertEqual(field, f"\x1b[{code}m{tokens:,}\x1b[0m")
 
     def test_tokens_without_a_positive_window_size_are_uncolored(self) -> None:
@@ -255,7 +301,7 @@ class ColorTests(unittest.TestCase):
                        ContextWindow(total_input_tokens=90_000, context_window_size=0),
                        ContextWindow(total_input_tokens=90_000, context_window_size=-1)):
             with self.subTest(window=window):
-                self.assertEqual(status_lines(ContextInput(context_window=window), colors=SHIPPED_COLORS)[1].split(" | ")[1], "90,000")
+                self.assertEqual(status_lines(ContextInput(context_window=window), colors=self.colors)[1].split(" | ")[1], "90,000")
 
     def test_each_usage_window_colors_the_integer_left_at_both_thresholds(self) -> None:
         for name, index in (("5-hour", 1), ("weekly", -1)):
@@ -265,7 +311,7 @@ class ColorTests(unittest.TestCase):
                     continue
                 with self.subTest(window=name, used=used):
                     payload = limits({"used_percentage": used}, {"used_percentage": used})
-                    field = status_lines(payload, colors=SHIPPED_COLORS)[1].split(" | ")[index]
+                    field = status_lines(payload, colors=self.colors)[1].split(" | ")[index]
                     self.assertEqual(field, f"{name} \x1b[{code}m{left}% left\x1b[0m")
 
     def test_empty_config_unknown_keys_and_invalid_colors_leave_the_piece_uncolored(self) -> None:
@@ -280,9 +326,9 @@ class ColorTests(unittest.TestCase):
         for family in ("tokens", "left"):
             for threshold in ("warn", "alarm"):
                 with self.subTest(family=family, threshold=threshold):
-                    config = SHIPPED_COLORS.read_text(encoding="utf-8") + f"\n{family}.{threshold}=not-a-number\n"
+                    config = self.colors.read_text(encoding="utf-8") + f"\n{family}.{threshold}=not-a-number\n"
                     lines = status_lines({**payload, **usage}, colors=config)
-                    account = shipped_account_label("claude1")
+                    account = "\x1b[38;2;83;213;253mclaude1\x1b[0m"
                     if family == "tokens":
                         self.assertEqual(lines[1], f"{account} | 90,000 | 5-hour \x1b[91m5% left\x1b[0m | weekly \x1b[93m10% left\x1b[0m")
                     else:
@@ -295,16 +341,16 @@ class ColorTests(unittest.TestCase):
                    "model": {"display_name": "Opus"}, "effort": {"level": "high"},
                    "context_window": ContextWindow(total_input_tokens=80_000, context_window_size=100_000)}
         plain = status_lines(payload, staff_text=staff_text(OWNER), STAFF_ID=OWNER.id)
-        colored = status_lines(payload, staff_text=staff_text(OWNER), STAFF_ID=OWNER.id, colors=SHIPPED_COLORS)
+        colored = status_lines(payload, staff_text=staff_text(OWNER), STAFF_ID=OWNER.id, colors=self.colors)
         self.assertEqual([ANSI.sub("", line) for line in colored], plain)
         self.assertEqual(colored, [
             "\x1b[38;5;141mshow showrunner\x1b[0m | /tmp/project",
-            f"{shipped_account_label('claude1')} | Opus high | \x1b[93m80,000\x1b[0m | 5-hour \x1b[93m9% left\x1b[0m until 07:00 EST | weekly \x1b[91m5% left\x1b[0m until Thu 07:00 EST",
+            "\x1b[38;2;83;213;253mclaude1\x1b[0m | Opus high | \x1b[93m80,000\x1b[0m | 5-hour \x1b[93m9% left\x1b[0m until 07:00 EST | weekly \x1b[91m5% left\x1b[0m until Thu 07:00 EST",
         ])
 
     def test_the_counts_row_colors_each_part_by_its_type_and_keeps_the_number_bold(self) -> None:
         row = "sid For you: 1 question, 2 changes, 130 efficiency, 2 proposals"
-        line = status_lines({"session_id": "sid"}, colors=SHIPPED_COLORS, counts=row)[-1]
+        line = status_lines({"session_id": "sid"}, colors=self.colors, counts=row)[-1]
         self.assertEqual(line, "For you: \x1b[91m\x1b[1m1\x1b[22m question\x1b[0m, "
                          + "\x1b[96m\x1b[1m2\x1b[22m changes\x1b[0m, "
                          + "\x1b[92m\x1b[1m130\x1b[22m efficiency\x1b[0m, "
@@ -321,7 +367,7 @@ class ColorTests(unittest.TestCase):
             for text in ("3 adhoc items", "1 adhoc item"):
                 with self.subTest(session=identity, adhoc=text):
                     line = status_lines(
-                        {"session_id": identity}, colors=SHIPPED_COLORS, adhoc=text,
+                        {"session_id": identity}, colors=self.colors, adhoc=text,
                         counts=f"{identity} For you: 1 question, 2 changes, 130 efficiency",
                         staff_text=staff_text(OWNER, UNIT),
                     )[-1]
@@ -483,7 +529,7 @@ class StoredReadingTests(unittest.TestCase):
 
 
 @final
-class RoleTests(unittest.TestCase):
+class RoleTests(ConfiguredShellTests):
     """The first field, as statusline.sh and statusline.jq read it from the session."""
 
     def __init__(self, methodName: str = "runTest") -> None:
@@ -540,13 +586,14 @@ class RoleTests(unittest.TestCase):
     def first_line(self, session_id: str = "aaaa-1111", **marks: str) -> str:
         return ANSI.sub("", self.command_lines({"session_id": session_id}, **marks)[0])
 
-    def command_lines(self, payload: object, *, command: str = COMMAND, shell: str = "/bin/sh", **marks: str) -> list[str]:
+    def command_lines(self, payload: object, *, command: str = "", shell: str = "/bin/sh", **marks: str) -> list[str]:
         """Run the statusLine command as Claude Code does, with only `marks` beside a bare environment."""
         seed_rebuild_cache(self.home)
         self.seed_empty_counts(Path(marks.get("STAFF_FILE", self.home / ".local/state/staff/staff.json")),
                                Path(marks.get("SHOWRUNNER_STATE_DIR", self.home / ".local/state/showrunner")))
         read_log = {"CONF_READ_LOG": os.environ["CONF_READ_LOG"]} if "CONF_READ_LOG" in os.environ else {}
         env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), **read_log, **marks}
+        command = command or self.shell_command
         result = subprocess.run(
             [shell, "-c", command], input=json.dumps(payload), capture_output=True, text=True,
             check=True, env=env, cwd=self.home,
@@ -712,7 +759,7 @@ class RoleTests(unittest.TestCase):
             with self.subTest(shell=shell):
                 line = self.command_lines({"session_id": WORKER.id}, shell=shell, STAFF_ID=OWNER.id,
                                           SHOWRUNNER_UNIT="wrong", UNIT_TEAM_ROLE="director")[0]
-                self.assertEqual(line, "worker | ~")
+                self.assertEqual(ANSI.sub("", line), "worker | ~")
                 self.assertEqual(self.command_lines({"session_id": OWNER.id}, shell=shell, STAFF_ID=WORKER.id,
                                                     SHOWRUNNER_UNIT="wrong")[0].split(" | ")[0],
                                  "\x1b[38;5;141mshow showrunner\x1b[0m")
@@ -846,7 +893,7 @@ class RoleTests(unittest.TestCase):
         ])
         self.assertFalse((self.home / ".local/state/notifier").exists())
 
-    def test_settings_command_finds_shipped_colors_relative_to_the_script_folder(self) -> None:
+    def test_settings_command_finds_fixture_colors_relative_to_the_script_folder(self) -> None:
         config = self.home / "account"
         config.mkdir()
         _ = (config / "account-label").write_text("claude4\n", encoding="utf-8")
@@ -860,7 +907,7 @@ class RoleTests(unittest.TestCase):
         _ = self.write_staff(OWNER, UNIT)
         self.assertEqual(self.command_lines({**payload, "session_id": UNIT.id}, CLAUDE_CONFIG_DIR=str(config)), [
             "\x1b[33mtrunk unit for show\x1b[0m | ~/project | main",
-            f"{shipped_account_label('claude4')} | Opus | \x1b[91m90,000\x1b[0m | 5-hour \x1b[91m5% left\x1b[0m | weekly \x1b[92m11% left\x1b[0m",
+            "\x1b[38;2;255;135;0mclaude4\x1b[0m | Opus | \x1b[91m90,000\x1b[0m | 5-hour \x1b[91m5% left\x1b[0m | weekly \x1b[92m11% left\x1b[0m",
         ])
 
     def test_settings_command_with_a_missing_config_keeps_plain_text(self) -> None:
@@ -907,7 +954,7 @@ class OutstandingItem(TypedDict):
 
 
 @final
-class CountsRowTests(unittest.TestCase):
+class CountsRowTests(ConfiguredShellTests):
     """The third line: the `For you: …` counts row of a session a production targets, kept in a cache."""
 
     def __init__(self, methodName: str = "runTest") -> None:
@@ -936,9 +983,19 @@ class CountsRowTests(unittest.TestCase):
 
 
     def questions(self, *items: OutstandingItem) -> None:
-        path = self.home / ".local/state/showrunner/outstanding" / f"{OWNER.id}.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(json.dumps(list(items)), encoding="utf-8")
+        folder = self.home / ".local/state/showrunner" / OWNER.id / "questions"
+        folder.mkdir(parents=True, exist_ok=True)
+        paths: set[Path] = set()
+        for index, item in enumerate(items):
+            path = folder / f"question-fixture-{index}.md"
+            paths.add(path)
+            fields = item | {"question": item["text"]+"?", "asked_by": OWNER.id}
+            _ = path.write_text("---\nrecord_type: question\nstatus: open\n"
+                + f"production_id: {OWNER.id}\nasked_by: {OWNER.id}\n"
+                + f"registration: {json.dumps(fields)}\n---\n", encoding="utf-8")
+        for path in folder.glob("question-fixture-*.md"):
+            if path not in paths:
+                path.unlink()
 
     def lines(self, session_id: str = OWNER.id, shell: str = "/bin/sh") -> list[str]:
         env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
@@ -976,12 +1033,12 @@ class CountsRowTests(unittest.TestCase):
                             self.assertFalse(any(line.startswith("For you:") for line in self.lines(shell=shell)))
                 _ = record.write_text(saved_record, encoding="utf-8")
 
-    def test_each_count_in_the_row_is_bold_inside_its_shipped_color(self) -> None:
+    def test_each_count_in_the_row_is_bold_inside_its_fixture_color(self) -> None:
         _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
         self.questions(*(OutstandingItem(since="2026-10-16T19:00", text=f"Q{n}") for n in range(12)))
         env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
                "STAFF_FILE": str(self.home / ".local/state/staff/staff.json")}
-        result = subprocess.run(["/bin/sh", "-c", COMMAND], input=json.dumps({"session_id": OWNER.id}),
+        result = subprocess.run(["/bin/sh", "-c", self.shell_command], input=json.dumps({"session_id": OWNER.id}),
                                 capture_output=True, text=True, check=True, env=env, cwd=self.home)
         self.assertEqual(result.stdout.splitlines()[-1],
                          "For you: \x1b[91m\x1b[1m12\x1b[22m questions\x1b[0m, "
@@ -1034,10 +1091,10 @@ class CountsRowTests(unittest.TestCase):
         _ = (self.home / ".local/state/staff/staff.json").write_text(staff_text(
             replace(OWNER, doc=staff.LiveDoc(remote.local_machine(), doc)), UNIT, PRODUCER, child, child_unit, WORKER))
         _ = self.file_investigation(OWNER, answered=True)
-        _ = self.file_investigation(UNIT)
+        _ = self.file_investigation(UNIT, answered=True)
         _ = self.file_investigation(UNIT, read=True)
         for excluded in (PRODUCER, child, child_unit, WORKER):
-            _ = self.file_investigation(excluded)
+            _ = self.file_investigation(excluded, answered=True)
         for shell in SHELLS:
             with self.subTest(shell=shell):
                 self.assertEqual(self.lines(shell=shell)[-1], "For you: 2 investigations")
@@ -1054,12 +1111,12 @@ class CountsRowTests(unittest.TestCase):
             with self.subTest(shell=shell):
                 self.assertFalse(any(line.startswith("For you:") for line in self.lines(shell=shell)))
                 item = self.file_investigation(OWNER)
-                self.assertEqual(self.lines(shell=shell)[-1], "For you: 1 investigation")
+                self.assertFalse(any(line.startswith("For you:") for line in self.lines(shell=shell)))
                 built = self.cache.stat().st_mtime_ns
-                self.assertEqual(self.lines(shell=shell)[-1], "For you: 1 investigation")
+                self.assertFalse(any(line.startswith("For you:") for line in self.lines(shell=shell)))
                 self.assertEqual(self.cache.stat().st_mtime_ns, built)
                 other = self.file_investigation(OWNER, answered=True)
-                self.assertEqual(self.lines(shell=shell)[-1], "For you: 2 investigations")
+                self.assertEqual(self.lines(shell=shell)[-1], "For you: 1 investigation")
                 with patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.home / ".local/state/showrunner")}):
                     _ = investigation.answer(OWNER.id, item.id, "The cause is known.")
                     _ = investigation.mark_read(OWNER.id, item.id)
@@ -1075,11 +1132,11 @@ class CountsRowTests(unittest.TestCase):
 
     def test_a_showrunner_without_a_document_counts_and_watches_its_investigations(self) -> None:
         _ = (self.home / ".local/state/staff/staff.json").write_text(staff_text(OWNER, UNIT))
-        _ = self.file_investigation(UNIT)
+        _ = self.file_investigation(UNIT, answered=True)
         for shell in SHELLS:
             with self.subTest(shell=shell):
                 self.assertFalse(any(line.startswith("For you:") for line in self.lines(shell=shell)))
-                item = self.file_investigation(OWNER)
+                item = self.file_investigation(OWNER, answered=True)
                 self.assertEqual(self.lines(shell=shell)[-1], "For you: 1 investigation")
                 path = self.home / ".local/state/showrunner" / OWNER.id / "investigations"
                 sources = self.cache.read_text().splitlines()[2:]
@@ -1119,7 +1176,9 @@ class CountsRowTests(unittest.TestCase):
                 + f"registration: {json.dumps(fields)}\n---\n")
             _ = (folder / f"proposal-{source.id}.md").write_text(
                 f"---\nstatus: open\ntags: [proposal]\nproposed_by: {source.id}\n---\n")
-        self.questions({"since": "2000-01-01T08:00", "text": "Legacy reminder"})
+        reminder = self.home / ".local/state/showrunner/outstanding" / f"{OWNER.id}.json"
+        reminder.parent.mkdir(parents=True, exist_ok=True)
+        _ = reminder.write_text(json.dumps([{"since": "2000-01-01T08:00", "text": "Legacy reminder"}]))
         own_cache = self.cache.with_name(unit.id)
         other_cache = self.cache.with_name(other.id)
         self.cache.parent.mkdir(parents=True, exist_ok=True)
@@ -1155,7 +1214,7 @@ class CountsRowTests(unittest.TestCase):
                     self.assertEqual(self.lines(session_id, shell=shell)[-1],
                                      "For you: 1 question, 1 change, 2 efficiency, 1 proposal")
                     self.assertEqual(self.lines(shell=shell)[-1],
-                                     "For you: 3 questions, 3 changes, 4 efficiency, 3 proposals")
+                                     "For you: 2 questions, 3 changes, 3 efficiency, 3 proposals")
                     _ = efficiency.write_text(efficiency.read_text().split("- 2026-11-12 config: More")[0])
 
     def test_the_row_counts_efficiency_and_refreshes_when_the_ledger_changes(self) -> None:
@@ -1171,15 +1230,78 @@ class CountsRowTests(unittest.TestCase):
                                       + "- 2026-10-19 messages: Second — deferred\n"
                                       + "- 2026-10-19 rust: Done — accepted, applied\n", encoding="utf-8")
                 self.assertEqual(self.lines(shell=shell)[-1],
-                                 "For you: 1 question, 2 efficiency, 1 proposal")
+                                 "For you: 1 question, 1 efficiency, 1 proposal")
                 _ = ledger.write_text("- 2026-10-19 config: First — accepted, applied\n"
                                       + "- 2026-10-19 messages: Second — deferred\n", encoding="utf-8")
                 self.assertEqual(self.lines(shell=shell)[-1],
-                                 "For you: 1 question, 1 efficiency, 1 proposal")
+                                 "For you: 1 question, 1 proposal")
 
     def test_nothing_counted_shows_no_row(self) -> None:
         self.assertEqual(len(self.lines()), 1)
         self.assertEqual(self.cache.read_text(encoding="utf-8").splitlines()[:2], ["", ""])
+
+    def test_assignment_refreshes_counts_in_its_process_and_reuses_the_cache(self) -> None:
+        from scripts.agents import pane_record
+
+        self.questions({"since": "2026-10-16T19:00", "text": "A"})
+        config = fixture_colors(self.home).parent
+        _ = (config / "change_review.conf").write_text(
+            f"lists_directory={self.home / 'lists'}\nreview_links_directory={self.home / 'links'}\n", encoding="utf-8")
+        environment = {"HOME": str(self.home),
+                       "CONF_DIR": str(config), "XDG_CONFIG_HOME": str(self.home / ".config"),
+                       "USER_ZONE": USER_ZONE.key,
+                       "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
+                       "NOTIFIER_STATE_DIR": str(self.home / ".local/state/notifier"),
+                       "SHOWRUNNER_STATE_DIR": str(self.home / ".local/state/showrunner")}
+        with patch.dict(os.environ, environment), \
+                patch.object(pane_record, "RECORD_DIR", self.home / "pane-records"), \
+                patch.object(counts_row, "write", wraps=counts_row.write) as refresh, \
+                patch.object(os, "execvp") as render, \
+                patch.object(subprocess, "Popen") as child:
+            for reading in ("first", "cached"):
+                with self.subTest(reading=reading), \
+                        patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": OWNER.current_session}))), \
+                        patch.object(sys, "argv", ["assignment.py", "--arg", "pwd", str(self.home)]):
+                    assignment.main()
+                    arguments = cast(list[str], render.call_args.args[1])
+                    position = arguments.index("counts")
+                    self.assertEqual(arguments[position + 1], f"{OWNER.current_session} For you: 1 question\n")
+                    self.assertEqual(refresh.call_count, 1)
+                    child.assert_not_called()
+                    for path in self.cache.read_text(encoding="utf-8").splitlines()[2:]:
+                        self.assertTrue(Path(path).is_relative_to(self.home), path)
+
+            for damage, due in (("text", "damaged"), ("too many digits", "9" * 5000)):
+                _ = self.cache.write_text(f"For you: 99 questions\n{due}\n", encoding="utf-8")
+                before = refresh.call_count
+                with self.subTest(deadline=damage), \
+                        patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": OWNER.current_session}))), \
+                        patch.object(sys, "argv", ["assignment.py", "--arg", "pwd", str(self.home)]):
+                    render.reset_mock()
+                    assignment.main()
+                    render.assert_called_once()
+                    arguments = cast(list[str], render.call_args.args[1])
+                    self.assertEqual(arguments[arguments.index("counts") + 1],
+                                     f"{OWNER.current_session} For you: 1 question\n")
+                    self.assertEqual(refresh.call_count, before + 1)
+                    child.assert_not_called()
+
+            _ = Path(environment["STAFF_FILE"]).write_text(staff_text(OWNER, UNIT), encoding="utf-8")
+            for owner, writer, expected in (
+                    (UNIT, "write_unit", ""),
+                    (OWNER, "write", f"{OWNER.current_session} For you: 99 questions\n")):
+                cache = self.cache.with_name(owner.id)
+                _ = cache.write_text("For you: 99 questions\n0\n", encoding="utf-8")
+                with self.subTest(failed_refresh=owner.kind), \
+                        patch.object(counts_row, writer, side_effect=staff.StaffRefused("fixture refusal")), \
+                        patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": owner.current_session}))), \
+                        patch.object(sys, "argv", ["assignment.py", "--arg", "pwd", str(self.home)]):
+                    render.reset_mock()
+                    assignment.main()
+                    render.assert_called_once()
+                    arguments = cast(list[str], render.call_args.args[1])
+                    self.assertEqual(arguments[arguments.index("counts") + 1], expected)
+                    child.assert_not_called()
 
     def test_failed_reads_retry_and_restore_the_full_row(self) -> None:
         _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
@@ -1233,7 +1355,7 @@ class CountsRowTests(unittest.TestCase):
         fields = {"since": "2000-01-01T08:00", "text": "Choose", "question": "Which?", "asked_by": OWNER.id}
         question = (f"---\nrecord_type: question\nstatus: open\nproduction_id: {OWNER.id}\n"
                     + f"asked_by: {OWNER.id}\nregistration: {json.dumps(fields)}\n---\n# Choose\n")
-        read_text = Path.read_text
+        open_path = Path.open
         for failure in ("unreadable proposal", "invalid proposal encoding", "unreadable question",
                         "invalid question encoding", "malformed question", "invalid registration",
                         # A proposal file is read once for its frontmatter; the late read is its body.
@@ -1261,16 +1383,17 @@ class CountsRowTests(unittest.TestCase):
 
                 reads = 0
 
-                def read(path_to_read: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                def read(path_to_read: Path, mode: str = "r", buffering: int = -1, encoding: str | None = None,
+                         errors: str | None = None, newline: str | None = None) -> TextIO:
                     nonlocal reads
                     if path_to_read == path:
                         reads += 1
                         if failure.startswith("unreadable") or (failure.startswith("late unreadable") and reads > 1):
                             raise PermissionError(f"{path}: unreadable")
-                    return read_text(path_to_read, encoding=encoding, errors=errors)
+                    return cast(TextIO, open_path(path_to_read, mode, buffering, encoding, errors, newline))
 
                 now = int(time.time()) - 100
-                with patch.dict(os.environ, environment), patch.object(Path, "read_text", read), \
+                with patch.dict(os.environ, environment), patch.object(Path, "open", read), \
                         patch.object(time, "time", return_value=now):
                     cache = counts_row.write(instance)
                 line, due, *sources = cache.read_text().splitlines()
@@ -1299,9 +1422,10 @@ class CountsRowTests(unittest.TestCase):
         frontmatter = issues.frontmatter
         reads: list[Path] = []
 
-        def read(path: Path, *, sources: list[Path] | None = None) -> dict[str, list[str]]:
+        def read(path: Path, *, sources: list[Path] | None = None, keys: frozenset[str] = ALL_FIELDS,
+                 select: Callable[[Issue], bool] | None = None) -> dict[str, list[str]]:
             reads.append(path)
-            return frontmatter(path, sources=sources)
+            return frontmatter(path, sources=sources, keys=keys, select=select)
 
         with patch.dict(os.environ, environment), patch.object(issues, "frontmatter", read):
             cache = counts_row.write(instance)
@@ -1319,7 +1443,7 @@ class CountsRowTests(unittest.TestCase):
         instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
         environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
                        "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent)}
-        read_text = Path.read_text
+        open_path = Path.open
         for failure in ("unreadable", "invalid encoding", "malformed table", "invalid urgency", "invalid merge date"):
             with self.subTest(failure=failure):
                 _ = listing.write_text(saved)
@@ -1334,13 +1458,14 @@ class CountsRowTests(unittest.TestCase):
                                            .replace("--- | --- | --- |", "--- | --- | --- | --- |")
                                            .replace("normal |", "normal | invalid |"))
 
-                def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                def read(path: Path, mode: str = "r", buffering: int = -1, encoding: str | None = None,
+                         errors: str | None = None, newline: str | None = None) -> TextIO:
                     if path == listing and failure == "unreadable":
                         raise PermissionError(f"{path}: unreadable")
-                    return read_text(path, encoding=encoding, errors=errors)
+                    return cast(TextIO, open_path(path, mode, buffering, encoding, errors, newline))
 
                 now = int(time.time()) - 100
-                with patch.dict(os.environ, environment), patch.object(Path, "read_text", read), \
+                with patch.dict(os.environ, environment), patch.object(Path, "open", read), \
                         patch.object(time, "time", return_value=now):
                     cache = counts_row.write(instance)
                 line, due, *sources = cache.read_text().splitlines()
@@ -1653,7 +1778,7 @@ class CountsRowTests(unittest.TestCase):
 
     def test_a_deferred_question_joins_the_row_when_its_time_comes(self) -> None:
         later = datetime.now(USER_ZONE) + timedelta(hours=1)
-        outstanding = self.home / ".local/state/showrunner/outstanding" / f"{OWNER.id}.json"
+        outstanding = self.home / ".local/state/showrunner" / OWNER.id / "questions/question-fixture-0.md"
         for shell in SHELLS:
             with self.subTest(shell=shell):
                 self.questions({"since": "2026-10-16T19:00", "text": "A", "after": later.strftime("%Y-%m-%dT%H:%M")})
@@ -1668,6 +1793,26 @@ class CountsRowTests(unittest.TestCase):
                                           encoding="utf-8")
                 os.utime(self.cache, ns=(built, built))
                 self.assertEqual(self.lines(shell=shell)[-1], "For you: 1 question")
+
+    def test_review_later_hides_the_count_and_sets_its_cache_deadline(self) -> None:
+        from scripts.review_links import review_later
+        until = datetime.now(USER_ZONE)+timedelta(hours=1)
+        key = 'question/'+OWNER.id+'/question-fixture-0.md'
+        with patch.dict(os.environ,{'SHOWRUNNER_STATE_DIR':str(self.home/'.local/state/showrunner')}):
+            for shell in SHELLS:
+                with self.subTest(shell=shell):
+                    self.questions({'since':'2026-10-16T19:00','text':'A'})
+                    review_later.save(key,until)
+                    self.assertFalse(any(line.startswith('For you:') for line in self.lines(shell=shell)))
+                    row,due,*sources = self.cache.read_text().splitlines()
+                    self.assertEqual((row,int(due)),('',int(until.timestamp())))
+                    self.assertIn(str(review_later.path()),sources)
+                    began = self.cache.stat().st_mtime_ns
+                    review_later.save(key,datetime.now(USER_ZONE)-timedelta(seconds=2))
+                    os.utime(review_later.path(),ns=(began-10**9,began-10**9))
+                    _ = self.cache.write_text('\n'.join(['',str(int(time.time())-1),*sources])+'\n')
+                    os.utime(self.cache,ns=(began,began))
+                    self.assertEqual(self.lines(shell=shell)[-1],'For you: 1 question')
 
 
 class RebuildRowTests(unittest.TestCase):

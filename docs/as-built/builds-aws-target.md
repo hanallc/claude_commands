@@ -1068,3 +1068,35 @@ Admission requires `roots.slots.aws-hana`, `slots.aws-hana.hana.max`, and `slots
 Those values remain unset until the user approves them.
 The guest image needs Git, curl, Python, `hana_source`, and the shared maker, slot, rescue, and configuration modules.
 Phase F2 will deliver manifests and execute commands with inherited slot locks.
+
+## Hana placement adapter
+
+Hana retains the configured SSH target family and uses signed control instead of an SSH connection.
+`target_config.read_execution_transport()` selects the transport before any connection settings or provider probes.
+`hana_placement.py` exports the shared transport, generation, claim, and waiter types.
+`hana_placement_adapter.py` implements configuration policy, lifecycle evidence, exact claims, and release.
+`hana_generation.py` keeps the canonical boot identity safe for guest imports.
+
+The inactive target registration permits only the normalized Hana repository and check or clippy judgments.
+The command policy rejects repairs, builds, nextest, final steps, path overrides, and unknown wrappers.
+The active target order remains unchanged, and `enabled=off` still prevents placement.
+
+Provider evidence reads lifecycle and execution records through the existing background worker.
+Spending previews use the account ledger lock without saving a reservation or changing the ledger.
+The controller alone owns demand starts, spending reservations, and idle-stop serialization.
+One exact lifecycle claim excludes all other Hana worktrees.
+Boot generations include the deployment, demand-start token, and verified boot identity.
+Permit renewals retain that generation.
+
+F1 receives `HanaClaimPending`, `HanaClaimAdopted`, `HanaClaimRefused`, or `HanaClaimRetained` from `claim_assigned()`.
+Only an adopted claim can request the queue's first launch authorization.
+`release_assigned()` requires F1's durable command settlement before lifecycle and target claim release.
+An ended local holder cannot settle an unresolved Hana dispatch.
+A failed boot needs a terminal `ExecutionReport`; pending settlement retains capacity and the live retry deadline.
+The queue permits fallback only after settlement.
+
+The queue applies worker evidence on its loop thread and invalidates stale read snapshots.
+An exact current assignment and live holder establish the `remote_waiter` hold classification.
+A drain preserves that waiter without granting local memory or a Cargo token.
+Unassigned callers retain the existing drain behavior.
+Phase E adds no stored shape or queue wire field.

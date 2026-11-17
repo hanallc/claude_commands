@@ -130,11 +130,11 @@ class SlotEnvrcTrust(Enum):
 def slot_envrc_trust(envrc: Path) -> SlotEnvrcTrust:
     """Prove a slot's envrc against its checked-out source commit."""
     import subprocess
-    from scripts.lib import build_slots, git_files
+    from scripts.lib import git_files, slot_root
 
     try:
-        root = build_slots.configured_slot_root()
-    except build_slots.SlotsNotConfigured:
+        root = slot_root.configured_slot_root()
+    except slot_root.SlotsNotConfigured:
         return SlotEnvrcTrust.NOT_A_SLOT
     folder = envrc.parent.resolve(strict=True)
     if not folder.is_relative_to(root):

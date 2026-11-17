@@ -25,6 +25,7 @@ from urllib.parse import quote
 from scripts.buildlog import health
 from scripts.buildlog import record
 from scripts.buildlog import store
+from scripts.buildlog.transfer_bytes import TransferBytes as TransferBytes
 
 from pathlib import Path
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -34,13 +35,6 @@ from scripts.lib import conf
 
 REMOTE_ROOT = ".local/state/buildlog/"
 LOCK_NAME = "sync.lock"
-
-
-class TransferBytes(TypedDict):
-    operation: str
-    sent_bytes: int
-    received_bytes: int
-    complete: bool
 
 
 @dataclass

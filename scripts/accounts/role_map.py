@@ -258,6 +258,16 @@ def role_map_command(function: Callable[P, R]) -> Callable[P, R]:
 
 
 @contextmanager
+def supplied_role_map(value: RoleMap) -> Generator[None]:
+    """Use the caller's role map for this command only."""
+    token = _command_map.set(CommandRoleMap(value))
+    try:
+        yield
+    finally:
+        _command_map.reset(token)
+
+
+@contextmanager
 def stored_role_map() -> Generator[None]:
     """Read local authority or saved cache only, within an independent scope."""
     source_token = _role_map_source.set(StoredRoleMap())

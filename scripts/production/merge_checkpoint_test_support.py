@@ -17,6 +17,7 @@ import fcntl
 import json
 import os
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -367,12 +368,17 @@ class MergeCheckpointFixture(unittest.TestCase):
             self.executable(self.bin / name, STUB)
         home = self.root / "home"
         (home / "rust/hanadocs/change-review").mkdir(parents=True)
+        home_stubs = self.root / "home-stubs"
+        home_stubs.mkdir()
         for relative, name in ((".claude/scripts/direct", "verify.sh"),
                                (".claude/scripts/validate_and_push", "validate_and_push.sh"),
                                (".claude/scripts/production", "review_regime.py")):
             directory = home / relative
             directory.mkdir(parents=True)
-            self.executable(directory / name, STUB)
+            # Callers start some of these with bash. A Python stub run by bash ran "import json" (ImageMagick),
+            # which waited for a screen click after the test ended. A shell script starts the Python stub.
+            self.executable(home_stubs / name, STUB)
+            self.executable(directory / name, f'#!/bin/sh\nexec {shlex.quote(str(home_stubs / name))} "$@"\n')
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
             _ = fixture_member("showrunner", name="example")
         self.production_doc()

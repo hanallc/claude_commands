@@ -16,85 +16,27 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
-    def test_a_memory_wait_gives_the_token_to_a_peer_and_takes_it_back_before_its_step(self) -> None:
-        # The memory waiter keeps the token until its step ends.
+    def test_a_memory_waiter_holds_no_token_and_records_its_memory_wait(self) -> None:
         board = self.root / "board"
         self.record_phase(board)
-        lock = board / "locks" / "cargo.d"
+        admission = caller_admission(self, self.root, self.environment)
         meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = meminfo.write_text("MemAvailable: 0 kB\n")
-        environment = {**self.environment, "UNIT_RUN_DIR": str(board),
-                       "UNIT_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1"}
-        phase_16_errors = self.root / "phase-16.err"
-        phase_16 = self.start_memory_waiter({**environment, "TEST_BLOCK": "1"}, phase_16_errors)
-        resume_waiter = self.defer_memory_waiter_for_peer()
-        phase_15: subprocess.Popen[bytes] | None = None
-        try:
-            self.assertEqual((lock / "holder_pid").read_text(), str(phase_16.pid))
-            peer_errors = self.root / "phase-15.err"
-            with peer_errors.open("wb") as stream:
-                phase_15 = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
-                                            cwd=self.root,
-                                            env={**environment, "TEST_BLOCK": "1"},
-                                            stdout=stream, stderr=subprocess.STDOUT,
-                                            start_new_session=True)
-            self.started_groups.add(phase_15.pid)
-            self.wait_for_output(peer_errors, "waiting for the cargo token since", phase_15)
-            self.assertEqual((lock / "holder_pid").read_text(), str(phase_16.pid))
-            launcher_release = subprocess.run(["bash", str(BOARD), "release", str(board), "impl",
-                                               "cargo"], capture_output=True, text=True,
-                                              check=False, timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(launcher_release.returncode, 1, launcher_release.stdout)
-            self.assertIn(f"held by live pid {phase_16.pid}", launcher_release.stderr)
-
-            resume_waiter()
-            self.wait_for_running(self.root / "running", phase_16)
-            self.assertIsNone(phase_16.poll(), phase_16_errors.read_text())
-            self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 1)
-            self.assertEqual((lock / "holder_pid").read_text(), str(phase_16.pid))
-
-            _ = (self.root / "release").touch()
-            self.assertEqual(phase_15.wait(timeout=TEST_HANG_GUARD_SECS), 0)
-            self.assertEqual(phase_16.wait(timeout=TEST_HANG_GUARD_SECS), 0, phase_16_errors.read_text())
-            self.assertNotIn("Traceback", phase_16_errors.read_text())
-            self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
-            self.assertFalse(lock.exists())
-            starts = [row for row in self.phase_waits(board) if row["event_type"] == "wait_started"]
-            ends = [row for row in self.phase_waits(board) if row["event_type"] == "wait_finished"]
-            self.assertIn("memory admission", {row["wait_reason"] for row in starts})
-            self.assertEqual({row["wait_id"] for row in starts}, {row["wait_id"] for row in ends})
-        finally:
-            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
-            _ = (self.root / "release").touch()
-            for process in (phase_16, phase_15):
-                if process is not None:
-                    if process.poll() is None:
-                        self.end_group(process.pid)
-                    _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
-
-    def test_memory_wait_renews_the_token_after_its_original_lease_ends(self) -> None:
-        board = self.root / "board"
-        clock = self.root / "board-clock"
-        _ = clock.write_text("100")
-        shell = self.root / "board-clock.sh"
-        _ = shell.write_text('export UNIT_NOW_EPOCH="$(< "$TEST_BOARD_CLOCK")"\n')
-        admission = caller_admission(self, self.root, self.environment)
-        _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 0 kB\n")
-        errors = self.root / "renew.err"
+        errors = self.root / "memory-wait.err"
         process = self.start_memory_waiter({**self.environment, "UNIT_RUN_DIR": str(board),
-            "UNIT_TEAM_ROLE": "impl", "BASH_ENV": str(shell), "TEST_BOARD_CLOCK": str(clock)}, errors)
+            "UNIT_TEAM_ROLE": "impl"}, errors)
         lock = board / "locks/cargo.d"
-        _ = clock.write_text("3701")
-        wait_until(lambda: int((lock / "expires").read_text() or "0") > 3701,
-                   lock, processes=(process,))
-        peer = subprocess.run(["bash", str(BOARD), "acquire", str(board), "peer", "cargo",
-            "--pid", str(os.getpid()), "--wait", "0"], env={**self.environment, "UNIT_NOW_EPOCH": "3701"},
-            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(peer.returncode, 1, peer.stdout + peer.stderr)
-        self.assertEqual((lock / "holder_pid").read_text(), str(process.pid))
+        self.assertFalse(lock.exists(), "a memory waiter holds no cargo token")
+        _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
         admission.free(48 * 1024 ** 3)
         self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0, errors.read_text())
+        self.assertNotIn("Traceback", errors.read_text())
         self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 1)
+        self.assertFalse(lock.exists())
+        starts = [row for row in self.phase_waits(board) if row["event_type"] == "wait_started"]
+        ends = [row for row in self.phase_waits(board) if row["event_type"] == "wait_finished"]
+        self.assertIn("memory admission", {row["wait_reason"] for row in starts})
+        self.assertEqual({row["wait_id"] for row in starts}, {row["wait_id"] for row in ends})
 
     def test_cancel_during_memory_wait_releases_token_and_waiter(self) -> None:
         board = self.root / "board"
@@ -110,14 +52,10 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
         self.assertEqual(self.live_group_processes(process.pid), [])
         self.assertFalse((self.root / "cargo-calls").exists())
 
-    def test_connection_wait_renews_the_token_before_the_first_reply(self) -> None:
+    def test_connection_wait_holds_no_token_before_the_first_reply(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
         admission.configure(unreachable_limit_seconds=12)
         board = self.root / "board"
-        clock = self.root / "board-clock"
-        _ = clock.write_text("100")
-        shell = self.root / "board-clock.sh"
-        _ = shell.write_text('export UNIT_NOW_EPOCH="$(< "$TEST_BOARD_CLOCK")"\n')
         hidden = admission.socket_path.with_suffix(".unavailable")
         handle_request = admission.server.handle_request
         interrupted = False
@@ -136,9 +74,8 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
         _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=interrupt_first_placement))
         errors = self.root / "connection.err"
         with errors.open("wb") as stream:
-            process = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--local", "connection renewal fixture", "--no-cache"], cwd=self.root,
-                env={**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl",
-                     "BASH_ENV": str(shell), "TEST_BOARD_CLOCK": str(clock)},
+            process = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--local", "connection wait fixture", "--no-cache"], cwd=self.root,
+                env={**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl"},
                 stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
         self.started_groups.add(process.pid)
         try:
@@ -146,19 +83,11 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
             with admission.loop_turn():
                 self.assertEqual(admission.server.waiters, {})
                 self.assertEqual(admission.server.reservations, {})
-            lock = board / "locks/cargo.d"
-            _ = clock.write_text("3701")
-            wait_until(lambda: int((lock / "expires").read_text() or "0") > 3701,
-                       lock, processes=(process,))
-            peer = subprocess.run(["bash", str(BOARD), "acquire", str(board), "peer", "cargo",
-                "--pid", str(os.getpid()), "--wait", "0"],
-                env={**self.environment, "UNIT_NOW_EPOCH": "3701"},
-                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(peer.returncode, 1, peer.stdout + peer.stderr)
-            self.assertEqual((lock / "holder_pid").read_text(), str(process.pid))
+            self.assertFalse((board / "locks/cargo.d").exists(), "a connection wait holds no cargo token")
             _ = hidden.rename(admission.socket_path)
             self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0, errors.read_text())
             self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 1)
+            self.assertFalse((board / "locks/cargo.d").exists())
         finally:
             if hidden.exists():
                 _ = hidden.rename(admission.socket_path)
@@ -234,56 +163,39 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
             if hidden.exists():
                 _ = hidden.rename(admission.socket_path)
 
-    def test_lost_token_refuses_execution_before_retry_after_memory_admission(self) -> None:
+    def test_a_token_lost_after_the_grant_refuses_execution_and_the_retry_takes_it_again(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
         board = self.root / "board"
-        _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 0 kB\n")
         errors = self.root / "lost-token.err"
         attempts = self.root / "attempt-statuses"
+        released = self.root / "token-released"
         shell = self.root / "observe-attempts.sh"
         _ = shell.write_text('''set -T
 observe_attempt_status() {
+    if [[ "${FUNCNAME[1]:-}" == buildlog_exec && ! -e "$TEST_TOKEN_RELEASED" ]]; then
+        : > "$TEST_TOKEN_RELEASED"
+        bash "$TEST_BOARD" release "$UNIT_RUN_DIR" impl cargo --pid $$ >/dev/null 2>&1
+    fi
     if [[ "${FUNCNAME[1]:-}" == run_step_attempt && "$BASH_COMMAND" == 'buildlog_retry_unstarted_step "$@"' ]]; then
-        printf '%s\n' "$status" >> "$TEST_ATTEMPT_STATUSES"
+        printf '%s\\n' "$status" >> "$TEST_ATTEMPT_STATUSES"
     fi
 }
 trap observe_attempt_status DEBUG
 ''')
-        process = self.start_memory_waiter({**self.environment, "UNIT_RUN_DIR": str(board),
-            "UNIT_TEAM_ROLE": "impl", "BASH_ENV": str(shell),
-            "TEST_ATTEMPT_STATUSES": str(attempts)}, errors)
-        lock = board / "locks/cargo.d"
-        released = subprocess.run(["bash", str(BOARD), "release", str(board), "impl", "cargo",
-            "--pid", str(process.pid)], capture_output=True, text=True,
-            check=False, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
-        peer = subprocess.run(["bash", str(BOARD), "acquire", str(board), "peer", "cargo",
-            "--pid", str(os.getpid()), "--wait", "0"], capture_output=True, text=True,
-            check=False, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(peer.returncode, 0, peer.stdout + peer.stderr)
-        admission.free(48 * 1024 ** 3)
-        self.wait_for_output(errors, "waiting for the cargo token since", process)
-        self.assertEqual(attempts.read_text().splitlines(), ["125"])
-        self.assertIn("lost the cargo token before its step started", errors.read_text())
-        self.assertFalse((self.root / "cargo-calls").exists())
-        self.assertEqual((lock / "holder_pid").read_text(), str(os.getpid()))
-        with admission.loop_turn():
-            # Release the fixture host before checking all reservations.
-            for reservation in admission.scenery_reservations:
-                replies = admission.server.handle_request(wire.ReleaseRequest("finish-host", reservation, 0))
-                self.assertEqual(replies, [wire.Ok()])
-            self.assertEqual(admission.caller_reservations(), {})
-            self.assertEqual(admission.server.reservations, {})
-        released = subprocess.run(["bash", str(BOARD), "release", str(board), "peer", "cargo",
-            "--pid", str(os.getpid())], capture_output=True, text=True,
-            check=False, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
+        with errors.open("wb") as stream:
+            process = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
+                env={**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl",
+                     "BASH_ENV": str(shell), "TEST_ATTEMPT_STATUSES": str(attempts),
+                     "TEST_TOKEN_RELEASED": str(released), "TEST_BOARD": str(BOARD)},
+                stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+        self.started_groups.add(process.pid)
         self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0, errors.read_text())
-        self.assertEqual(attempts.read_text().splitlines(), ["125", "0"])
+        self.assertTrue(released.exists())
+        self.assertEqual(attempts.read_text().splitlines()[0], "125")
+        self.assertIn("lost the cargo token before its step started", errors.read_text())
         self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 1)
-        self.assertFalse(lock.exists())
-        with admission.loop_turn():
-            self.assertEqual(admission.server.reservations, {})
+        self.assertFalse((board / "locks/cargo.d").exists())
+        wait_until(admission.callers_released, admission.state_dir)
 
     def test_two_boards_share_memory_without_a_resource_cycle(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
@@ -301,7 +213,7 @@ trap observe_attempt_status DEBUG
         second = self.start_memory_waiter({**self.environment, "UNIT_RUN_DIR": str(second_board),
             "UNIT_TEAM_ROLE": "impl"}, second_errors)
         self.assertEqual((first_board / "locks/cargo.d/holder_pid").read_text(), str(first.pid))
-        self.assertEqual((second_board / "locks/cargo.d/holder_pid").read_text(), str(second.pid))
+        self.assertFalse((second_board / "locks/cargo.d").exists(), "a memory waiter holds no cargo token")
         _ = (self.root / "release").touch()
         self.assertEqual(first.wait(timeout=TEST_HANG_GUARD_SECS), 0, errors.read_text())
         self.assertEqual(second.wait(timeout=TEST_HANG_GUARD_SECS), 0, second_errors.read_text())

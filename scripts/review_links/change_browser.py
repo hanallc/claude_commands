@@ -552,7 +552,7 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
                      + f'data-count="{count}" value="{html.escape(name)}">{html.escape(label)} ({count})</option>')
     cards = (''.join(section(item, feedback_rows) for item in prepared.changes) if kind == "changes"
              else ''.join(question_section(item, browser, feedback_rows) for item in prepared.questions))
-    content = (PAGE_STYLE + page_frame.title(change_page.TITLES[kind], kind) + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}" data-script="{SCRIPT_VERSION}">'
+    content = (PAGE_STYLE + page_frame.title(change_page.TITLES[kind], "review") + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}" data-script="{SCRIPT_VERSION}">'
                + '<div data-showrunner-filter><label for="review-showrunner">Showrunner:</label>'
                + '<select id="review-showrunner" aria-label="Showrunner"><option value="">All</option></select></div>'
                + '<template data-runner-options>' + ''.join(menus) + '</template>'
@@ -586,7 +586,7 @@ section+section{border:0;margin:0;padding:0}
 </style>"""
 
 
-def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
+def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus, *, feedback_closes: bool = False) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) != {"row", "token", "outcome", "feedback"} or any(len(value) != 1 for value in fields.values()):
         raise change_page.AnswerRefused("use the answer form on this page")
@@ -599,7 +599,7 @@ def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus
         if question is None:
             raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page")
         outcome = fields["outcome"][0]
-        if outcome not in ("answer", "followup", "skip"):
+        if outcome not in ("answer", "followup", "skip", "question", "feedback"):
             raise change_page.AnswerRefused("use the answer form on this page")
         if outcome != "skip" and not fields["feedback"][0].strip():
             raise change_page.AnswerRefused("enter an answer")
@@ -629,7 +629,7 @@ def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus
         raise change_page.AnswerRefused("the production document is not available")
     fields["row"] = [found.row["#"]]
     rewritten = urlencode({key: values[0] for key, values in fields.items()})
-    delivery = change_page.submit(found.page, rewritten, status, prepared=prepared.queues[found.tab])
+    delivery = change_page.submit(found.page, rewritten, status, prepared=prepared.queues[found.tab], feedback_closes=feedback_closes)
     answer = ""
     if fields["outcome"] not in (["validate"], ["question"]):
         answer = next(row.get("Verdict", "") for row in change_review.review_rows(found.page.review_list)
@@ -637,14 +637,20 @@ def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus
     return delivery, answer
 
 
-def question_message(outcome: change_page.QuestionOutcome, production: str, text: str, unit: str, words: str) -> str:
+def question_message(outcome: change_page.QuestionOutcome, production: str, text: str, unit: str, words: str,
+                     key: str = "") -> str:
     """The message the asker gets for an answer, a follow-up or a skip."""
     lead = {"answer": "From the user (via the review page): ",
             "followup": "From the user (via the review page), a follow-up on your question: ",
+            "question": "From the user (via Review), Ask question: ",
+            "feedback": "From the user (via Review), feedback sent: ",
             "skip": "From the user (via the review page), skipped for now; it stays open at the end of the list: "}[outcome]
     message = lead + text + (f"\nFor: {unit}" if unit else "")
-    if outcome == "answer":
+    if outcome in ("answer", "feedback"):
         return message + "\n" + words
+    if outcome == "question":
+        return (message + "\n" + words.strip() + "\nAnswer with this command:\n"
+                + change_page.reply_command(key))
     if outcome == "followup":
         return (message + "\n" + words.strip() + "\nReply with this command; the question then returns to the user with your reply:\n"
                 + f"~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py reply --production {shlex.quote(production)} "
@@ -656,9 +662,9 @@ def save_outcome(production: update_registration.QuestionScope, question: Waitin
                  identities: update_registration.QuestionStaff) -> update_registration.AnswerRelay:
     """Answer, send a follow-up or move the question to the end of its queue; return whom the message goes to."""
     text = question.record.item["text"]
-    if outcome == "answer":
+    if outcome in ("answer", "feedback"):
         return update_registration.answer(production, text, identities=identities, only_open=True)
-    if outcome == "followup":
+    if outcome in ("followup", "question"):
         return update_registration.followup(production, text, words, identities=identities)
     urgency.move_to_end(update_registration.question_queue(production), update_registration.item_key(question.owner, text),
                         datetime.now(production.zone).replace(tzinfo=None))
@@ -677,7 +683,9 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
     relay = update_registration.answer_relay(production, production.name,
         update_registration.question_asker(item, update_registration.OpenItemWithoutAsker(), identities), identities)
     recipient = relay.recipient if isinstance(relay.recipient, str) else question.owner
-    message = question_message(outcome, production.name, item["text"], relay.unit, words)
+    if outcome in ('feedback','question'):
+        recipient = question.owner
+    message = question_message(outcome, production.name, item["text"], relay.unit, words, question.key)
     answer = words if outcome == "answer" else ""
     document = production.doc if isinstance(production, Production) else question.record.path.parent
     saved: change_page.StoredUserAnswer = {"saved": False, "source": str(question.record.path), "production": str(document),
@@ -693,7 +701,12 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
         status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page, page.rows[0]), "claimed")
         try:
             relay = save_outcome(production, question, outcome, words, identities)
+            if outcome != "skip":
+                update_registration.record_review_log(question.record.path,
+                    ('feedback sent' if outcome == 'feedback' else outcome)+": "+words)
             recipient = relay.recipient if isinstance(relay.recipient, str) else question.owner
+            if outcome in ('feedback','question'):
+                recipient = question.owner
             intent = replace(intent, recipients=(recipient,))
             page = replace(page, saved={**saved, "saved": True})
             status.write_slots(page, page.rows[0], change_page.DeliverySlots(change_page.NoDelivery(), intent))

@@ -36,10 +36,12 @@ from scripts.buildlog import store
 from scripts.buildlog.cgroup_test_support import CPU, IO_LINES, save_scope_counters, write_cgroup
 
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.build_queue import admission_records, step_estimator
 from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
 from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.buildlog.test_index import point_root_at
 from scripts.lib import test_hang_guard
+from scripts.lint.build_shape import build_shape
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 
 SCRIPT = Path(__file__).with_name("record.py")
@@ -138,6 +140,13 @@ class RecordTests(unittest.TestCase):
             cls.setUpClass()
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(mock.patch.dict(os.environ))
+        self.enterContext(mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(self.base.parent)}))
+        is_file = Path.is_file
+        def fixture_file(path: Path) -> bool:
+            if path.name == "Cargo.toml" and not path.is_relative_to(self.base):
+                return False
+            return is_file(path)
+        _ = self.enterContext(mock.patch.object(Path, "is_file", fixture_file))
         if "BUILDLOG_REPO_IDENTITY" in os.environ:
             del os.environ["BUILDLOG_REPO_IDENTITY"]
         self.enterContext(mock.patch.dict(os.environ, fake_memory_readings(self.base)))
@@ -1110,6 +1119,46 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         record = self.records()[-1]
         self.assertEqual((record["cwd"], record["repo_path"], record["branch"]), (str(elsewhere), str(self.repo), "main"))
 
+    def test_gitless_build_uses_its_recorded_peak_after_the_first_fallback(self) -> None:
+        directory = self.base / "sample"
+        directory.mkdir()
+        manifest = directory / "Cargo.toml"
+        _ = manifest.write_text('[package]\nname = "sample"\nversion = "0.1.0"\n')
+        argv = ["cargo", "build", "--manifest-path", str(manifest)]
+        shape = build_shape(argv)
+        now = datetime.fromtimestamp(START + 60, UTC)
+        config = admission_records.read_memory_config(report=False)
+        fallback = config.program_first_peaks["cargo"]
+        self.assertEqual(fallback, 12 * admission_records.GIB)
+        step_estimator.clear_git_identity_cache()
+        self.addCleanup(step_estimator.clear_git_identity_cache)
+        with mock.patch.dict(os.environ, {"MANIFEST_PATH": ""}):
+            identity, _ = step_estimator.git_identity(argv, str(self.base))
+            first = step_estimator.expected_peak(identity, "build", store.host_name(), now, self.root,
+                                                 shape=shape, first_peak_bytes=fallback)
+            self.assertEqual((first.bytes, first.count, first.basis),
+                             (fallback, 0, admission_records.ShapeFallback()))
+            peak = self.base / "peak"
+            _ = peak.write_text(str(3 * admission_records.GIB) + "\n")
+            row = self.step(0, "1", "", str(peak), argv, cwd=self.base)
+            history = self.root / "admission/anon_peaks.jsonl"
+            history.parent.mkdir(parents=True, exist_ok=True)
+            _ = history.write_text(json.dumps({
+                "host": row["host"], "repo_identity": row["repo_identity"], "step": row["step"],
+                "ended_at": row["ended_at"], "anon_peak_bytes": row["peak_mem_bytes"],
+                "shape": shape.key, "outcome": "completed",
+            }) + "\n")
+            step_estimator.clear_git_identity_cache()
+            identity, _ = step_estimator.git_identity(argv, str(self.base))
+            second = step_estimator.expected_peak(identity, "build", store.host_name(), now, self.root,
+                                                  shape=shape, first_peak_bytes=fallback)
+        self.assertIsInstance(second.basis, admission_records.ShapeLargest)
+        self.assertEqual(second.count, 1)
+        factor = admission_records.DevSizeHeadroom(config.dev_size_factor, config.dev_size_margin_bytes)
+        self.assertEqual(second.bytes, step_estimator.shape_headroom_bytes(3 * admission_records.GIB, factor))
+        self.assertEqual(row["repo_identity"], "manifest-path:" + str(manifest))
+        self.assertEqual(identity, admission_records.RepositoryIdentity("manifest-path:" + str(manifest), "sample"))
+
     def key(self, *argv: str, cwd: Path | None = None) -> str:
         result = self.record("step-context", *argv, cwd=cwd)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1135,18 +1184,21 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
     def test_mirror_steps_record_the_sent_repository_identity_without_derivation(self) -> None:
         mirror = self.base / "mirror"
         mirror.mkdir()
-        _ = self.git("init", "-q", "--template=", cwd=mirror)
+        _ = (mirror / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
         identity = "https://example.org/source"
-        for caller in ("verify-mac", "verify-linux"):
-            with self.subTest(caller=caller), mock.patch.dict(os.environ, {"BUILDLOG_REPO_IDENTITY": identity}):
-                row = self.step(0, "0", "", "", NEXTEST, {"BUILDLOG_CALLER": caller}, cwd=mirror)
-                self.assertEqual(row["repo_identity"], identity)
-                _ = index.update()
-                with closing(index.read_only()) as connection:
-                    indexed = cast(tuple[str, int], connection.execute(
-                        "SELECT repo_identity, identity_derived FROM steps WHERE id = ?", (row["id"],),
-                    ).fetchone())
-                self.assertEqual(indexed, (identity, 0))
+        for git in (False, True):
+            if git:
+                _ = self.git("init", "-q", "--template=", cwd=mirror)
+            for caller in ("verify-mac", "verify-linux"):
+                with self.subTest(caller=caller, git=git), mock.patch.dict(os.environ, {"BUILDLOG_REPO_IDENTITY": identity}):
+                    row = self.step(0, "0", "", "", NEXTEST, {"BUILDLOG_CALLER": caller}, cwd=mirror)
+                    self.assertEqual(row["repo_identity"], identity)
+                    _ = index.update()
+                    with closing(index.read_only()) as connection:
+                        indexed = cast(tuple[str, int], connection.execute(
+                            "SELECT repo_identity, identity_derived FROM steps WHERE id = ?", (row["id"],),
+                        ).fetchone())
+                    self.assertEqual(indexed, (identity, 0))
 
     def test_ordinary_steps_ignore_the_sent_repository_identity(self) -> None:
         directory = self.base / "ordinary"

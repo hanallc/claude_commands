@@ -420,13 +420,21 @@ Hana setup does not change the merge-gates stack.
 The setup command needs no active target or slot capacity.
 `enabled=off` remains unchanged.
 
-1. Obtain the reviewed Hana NixOS image from the Natedev owner.
-2. Set `ami_id`, `ami_owner_id`, `vpc_id`, and `subnet_id` in `config/hana_aws.conf`.
-3. Confirm that the subnet belongs to `availability_zone` and has a public HTTPS route.
+1. Build the reviewed image: `nix build /etc/nixos#nixosConfigurations.aws-hana.config.system.build.images.amazon --out-link RESULT`.
+2. Run `scripts/aws_target/deploy.py hana-image --image RESULT` to read the local image plan.
+3. Run `scripts/aws_target/deploy.py hana-image --image RESULT --approve-resources`.
 4. Run `scripts/aws_target/deploy.py prepare --workload hana`.
 5. Run `scripts/aws_target/deploy.py hana-setup` to read the local resource plan.
 6. Run `scripts/aws_target/deploy.py hana-setup --approve-resources` after resource approval.
 7. Confirm that the command reports a stopped box.
+
+`hana-image` converts the image to a raw disk and uploads it to one EBS snapshot with coldsnap.
+`image_upload_tool` names the coldsnap package, and `image_upload_timeout_s` bounds each long stage.
+The command registers the snapshot as an x86_64 image that requires IMDSv2.
+It selects the public subnet of the gate VPC in `availability_zone`.
+It saves the image, owner, VPC, and subnet in the local `hana/image.json` record.
+An empty `ami_id`, `ami_owner_id`, `vpc_id`, or `subnet_id` in `config/hana_aws.conf` uses that record.
+A rerun with the same image build finds the registered image by name and does not upload again.
 
 The local plan makes no AWS call.
 Approved setup uses the existing encrypted admin session and progress display.

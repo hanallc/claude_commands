@@ -648,8 +648,8 @@ Converted callers request placement before they claim a provider scope.
 `place-step --once` writes an `Assignment` or `LocalPlacementGranted` file.
 A wait retains the episode, original queue time, run place, and priority.
 Token readiness reports remain separate from fixed placement constraints.
-The token renewal wrapper remains active during waits.
-A remote selection releases the unused local token and continuation claim.
+No placement wait holds the cargo token; a local grant takes it.
+A remote selection releases the unused continuation claim.
 
 The adapter claims only the assignment's target, scope, and slot under the existing provider lock.
 Linux repository scopes carry the selected slot.

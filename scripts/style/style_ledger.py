@@ -18,7 +18,6 @@ import re
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import tomllib
 import uuid
 from collections import Counter
@@ -34,6 +33,7 @@ from types import TracebackType
 from typing import Concatenate, Literal, TypedDict, cast
 
 from scripts.production.issues import Issue, frontmatter
+from scripts.lib import build_folders
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.git_blob import git_blob_id
 from scripts.production import staff, session_staff
@@ -9486,8 +9486,8 @@ def refill_lock(repo: Path) -> Generator[None]:
 def preview_ledger(repo: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO_GIT_READ_CACHE) -> Generator[Ledger]:
     """Read and migrate a temporary copy without changing the stored ledger."""
     location = ledger_location(repo)
-    with tempfile.TemporaryDirectory(prefix="style-ledger-preview-") as directory:
-        database = Path(directory) / "ledger.sqlite"
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder("style-ledger-preview-")) as directory:
+        database = directory / "ledger.sqlite"
         if location.database.exists():
             with (closing(sqlite3.connect(location.database.resolve().as_uri() + "?mode=ro", uri=True,
                                           timeout=BUSY_TIMEOUT_SECONDS)) as source,

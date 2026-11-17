@@ -29,7 +29,7 @@ from unittest.mock import MagicMock, patch
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.signal_test_support import install_signal_pid_guard
-from scripts.agents import detached_run_process, detached_runs
+from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 from scripts.agents.detached_runs import deliver_in_fresh_process
 from scripts.buildlog import treekey
 from scripts.build_hold import build_hold, hold_enforcer
@@ -179,6 +179,68 @@ class DetachedRunsTests(unittest.TestCase):
             pid = private_supervisor(self, path)
         self.update_record(path, tree_key="key-1", pid=pid)
         return path
+
+    def test_damaged_record_does_not_hide_a_live_run(self) -> None:
+        path = self.live_run(["fixture", "check"])
+        record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        damaged = path.with_name("000-damaged.json")
+        _ = damaged.write_text("{", encoding="utf-8")
+        evidence = detached_runs.live_run_evidence_for_staff(path.parent, frozenset({self.worker_id}))
+        self.assertEqual(evidence.runs, (record,))
+        self.assertEqual(len(evidence.read_errors), 1)
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            unit_runs.report_anomaly.cache_clear()
+            evidence.report_errors()
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn(str(damaged), errors.getvalue())
+        for name in ("live_runs", "live_runs_for_staff"):
+            with self.subTest(name=name), self.assertRaises(worker_lifecycle.WorkerStateUnreadable) as raised:
+                if name == "live_runs":
+                    _ = detached_runs.live_runs(path.parent, WORKER)
+                else:
+                    _ = detached_runs.live_runs_for_staff(path.parent, frozenset({self.worker_id}))
+            self.assertEqual(raised.exception.path, damaged)
+
+    def test_run_folder_errors_remain_unknown_and_list_readers_raise(self) -> None:
+        runs = self.session / detached_runs.DETACHED_RUNS_DIR
+        identities = frozenset({self.worker_id})
+        absent = detached_runs.live_run_evidence_for_staff(runs, identities)
+        self.assertEqual((absent.runs, absent.read_errors), ((), ()))
+        self.assertEqual(detached_runs.live_runs(runs, WORKER), [])
+        self.assertEqual(detached_runs.live_runs_for_staff(runs, identities), [])
+        runs.mkdir()
+        for error in (PermissionError(13, "Permission denied", str(runs)),
+                      NotADirectoryError(20, "Not a directory", str(runs)),
+                      OSError(5, "Input/output error", str(runs))):
+            with (patch("os.scandir", side_effect=error),
+                  patch.object(detached_run_process, "supervisor_records",
+                               return_value=detached_run_process.ProcessTableUnavailable())):
+                with self.subTest(error=type(error).__name__, reader="evidence"):
+                    evidence = detached_runs.live_run_evidence_for_staff(runs, identities)
+                    self.assertEqual(evidence.runs, ())
+                    self.assertEqual(len(evidence.read_errors), 1)
+                    self.assertEqual(evidence.read_errors[0].path, runs)
+                    self.assertIs(evidence.read_errors[0].error, error)
+                for name, reader in (
+                        ("live_runs", lambda: detached_runs.live_runs(runs, WORKER)),
+                        ("live_runs_for_staff", lambda: detached_runs.live_runs_for_staff(runs, identities)),
+                        ("live_runs_in_folders", lambda: detached_runs.live_runs_in_folders({self.session: identities}))):
+                    with self.subTest(error=type(error).__name__, reader=name):
+                        with self.assertRaises(type(error)) as raised:
+                            _ = reader()
+                        self.assertIs(raised.exception, error)
+
+    def test_twin_and_worker_records_require_a_readable_folder(self) -> None:
+        runs = self.session / detached_runs.DETACHED_RUNS_DIR
+        runs.mkdir()
+        error = PermissionError(13, "Permission denied", str(runs))
+        for name, reader in (
+                ("live_twin", lambda: detached_runs.live_twin(runs, WORKER, ["fixture"], "key-1")),
+                ("worker_runs", lambda: detached_runs.worker_runs(runs, WORKER))):
+            with self.subTest(reader=name), patch("os.scandir", side_effect=error):
+                with self.assertRaises(PermissionError) as raised:
+                    _ = reader()
+                self.assertIs(raised.exception, error)
 
     def seat_runs(self, count: int) -> list[Path]:
         """Create live supervisors for distinct runs for the fixture worker."""
@@ -839,6 +901,8 @@ sys.exit(1)
         with patch("shutil.which", return_value=None):
             self.assertEqual(detached_runs.scope_prefix(marker, on), [])
 
+    # On 2026-11-17 a director sent TERM to a lint run's supervisor group. The supervisor died and its
+    # verify.sh ran on for 3 hours with the cargo token. Each supervisor end now stops the command group.
     def test_stop_ends_the_command_group_and_the_supervisor_delivers_the_result(self) -> None:
         child_source = """import json, os, socket, sys
 with socket.socket(socket.AF_UNIX) as connection:
@@ -853,7 +917,12 @@ from unittest.mock import patch
 from scripts.agents import detached_runs
 from scripts.lib.cancellation import CANCELLATION_SIGNALS
 wait = subprocess.Popen.wait
-address = sys.argv[4]
+start = subprocess.Popen.__init__
+address, watcher = sys.argv[4:6]
+def gate_start(process, arguments, *args, **kwargs):
+    if arguments[3:4] == ['detached-command']:
+        arguments = [*arguments[:4], sys.executable, watcher, *arguments[6:]]
+    start(process, arguments, *args, **kwargs)
 def report(row):
     with socket.socket(socket.AF_UNIX) as connection:
         connection.connect(address)
@@ -867,13 +936,32 @@ def delivery(arguments, *args, **kwargs):
     text = detached_runs.result_text(record, detached_runs.command_result(record))
     report(dict(role='delivery', verb=arguments[-2], text=text))
     return subprocess.CompletedProcess(arguments, 0)
-with patch.object(subprocess.Popen, 'wait', checked_wait), patch.object(subprocess, 'run', delivery):
+with (patch.object(subprocess.Popen, 'wait', checked_wait), patch.object(subprocess.Popen, '__init__', gate_start),
+      patch.object(subprocess, 'run', delivery)):
     sys.argv = sys.argv[1:4]
     runpy.run_path(detached_runs.__file__, run_name='__main__')
 """
         reason = "stopped for timed test; run again after the release"
         with short_socket_directory() as socket_root:
             address = Path(socket_root) / "ready.sock"
+            # The watcher reports the result text over the socket instead of sending it.
+            # It reports after its reap finishes, so the test reads the finished record.
+            watcher = self.root / "watcher.py"
+            _ = watcher.write_text(f"""import json, socket, sys
+sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})
+from unittest.mock import patch
+from scripts.agents import detached_runs
+texts = []
+def deliver(record, result):
+    texts.append(detached_runs.result_text(record, result))
+    return 'fixture delivery'
+with patch.object(detached_runs, 'deliver', deliver), patch.object(detached_runs, '_complete_worker_dispatch', lambda record: None):
+    status = detached_runs.main(sys.argv[1:])
+with socket.socket(socket.AF_UNIX) as connection:
+    connection.connect({str(address)!r})
+    connection.sendall((json.dumps(dict(role='delivery', verb=sys.argv[1], text=chr(10).join(texts))) + chr(10)).encode())
+sys.exit(status)
+""")
             runtime = Path(socket_root) / "runtime"
             (runtime / "systemd").mkdir(parents=True)
             tools = self.root / "tools"
@@ -884,8 +972,10 @@ with patch.object(subprocess.Popen, 'wait', checked_wait), patch.object(subproce
             with socket.socket(socket.AF_UNIX) as manager:
                 manager.bind(str(runtime / "systemd/private"))
                 stopped = 128 + signal.SIGTERM
-                for scoped in (False, True):
-                    with self.subTest(scoped=scoped), socket.socket(socket.AF_UNIX) as ready:
+                cases: tuple[tuple[bool, signal.Signals | None], ...] = (
+                    (False, None), (True, None), (False, signal.SIGTERM), (False, signal.SIGKILL))
+                for scoped, cancel in cases:
+                    with self.subTest(scoped=scoped, cancel=cancel), socket.socket(socket.AF_UNIX) as ready:
                         guard = LauncherHangGuard("detached process group stop")
                         ready.bind(str(address))
                         ready.listen(3)
@@ -894,7 +984,8 @@ with patch.object(subprocess.Popen, 'wait', checked_wait), patch.object(subproce
                                        "XDG_RUNTIME_DIR": str(runtime), "PATH": str(tools) + os.pathsep + os.environ["PATH"]}
                         with (Path(self.root / "supervisor.log").open("ab") as output,
                               subprocess.Popen([sys.executable, "-c", supervisor_source, "detached_runs.py",
-                                                "supervise", str(path), str(address)], env=environment,
+                                                "supervise", str(path), str(address), str(watcher)],
+                                               env=environment,
                                                stdout=output, stderr=subprocess.STDOUT,
                                                start_new_session=True) as supervisor,
                               contextlib.ExitStack() as connections):
@@ -930,23 +1021,36 @@ with patch.object(subprocess.Popen, 'wait', checked_wait), patch.object(subproce
                                                  process_start.Started(saved.get("supervisor_started", "")))
                                 self.assertEqual(saved.get("command_pid"), command_pid)
                                 self.assertEqual(path.with_suffix(".scope").exists(), scoped)
-                                self.assertTrue(detached_runs.stop_command(path, reason))
+                                if cancel is None:
+                                    self.assertTrue(detached_runs.stop_command(path, reason))
+                                else:
+                                    # The signal reaches the supervisor group only; the watcher stops the command.
+                                    process_group.send_process_group(supervisor.pid, cancel)
                                 assert command_connection is not None
                                 self.assertEqual(command_connection.recv(1), b"")
                                 _, delivered = accept()
-                                self.assertEqual(supervisor.wait(timeout=guard.remaining()), 0)
+                                self.assertEqual(supervisor.wait(timeout=guard.remaining()),
+                                                 0 if cancel is None else -cancel)
                             finally:
                                 for group in (supervisor.pid, command_pid):
                                     with contextlib.suppress(ProcessLookupError, ValueError):
                                         process_group.send_process_group(group, signal.SIGKILL)
                                 _ = supervisor.wait(timeout=guard.remaining())
                         address.unlink()
-                        self.assertEqual(delivered["verb"], "deliver")
-                        self.assertIn(f"Result: STOPPED (exit {stopped})", str(delivered["text"]))
-                        self.assertIn(f"Stop reason: {reason}", str(delivered["text"]))
                         record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
-                        self.assertEqual((record["status"], record.get("exit_code"), record.get("ended")),
-                                         ("finished", stopped, None))
+                        if cancel is None:
+                            self.assertEqual(delivered["verb"], "deliver")
+                            self.assertIn(f"Result: STOPPED (exit {stopped})", str(delivered["text"]))
+                            self.assertIn(f"Stop reason: {reason}", str(delivered["text"]))
+                            self.assertEqual((record["status"], record.get("exit_code"), record.get("ended")),
+                                             ("finished", stopped, None))
+                        else:
+                            self.assertEqual(delivered["verb"], "supervisor-gone")
+                            self.assertIn("Result: STOPPED (no exit status)", str(delivered["text"]))
+                            self.assertIn(f"Stop reason: {detached_runs.SUPERVISOR_GONE_REASON}",
+                                          str(delivered["text"]))
+                            self.assertEqual((record["status"], record.get("exit_code"), record.get("ended")),
+                                             ("finished", None, "supervisor gone"))
                         self.assertFalse(path.with_suffix(".scope").exists())
                         self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
 

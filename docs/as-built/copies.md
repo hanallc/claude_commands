@@ -29,6 +29,7 @@ Each slot uses its own Git `info/exclude` to hide `target/` from status.
 `CARGO_BUILD_BUILD_DIR` defaults to the slot's separate Cargo directory.
 Explicit caller output settings remain unchanged.
 Nested slots replace the enclosing slot's default directory with their own default.
+This includes a slot directory inherited from an outer gate or slot command in another process.
 An acquisition above its configured size limit deletes generated output once.
 A failed rescue retains the source and output.
 A damaged index is saved as `.rescue-index-*` with source edits in the rescue commit.

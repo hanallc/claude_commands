@@ -52,6 +52,7 @@ from scripts.message import codex_daemon
 from scripts.message.codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
 from scripts.message import process_table
 from scripts.message import roster
+from scripts.accounts import role_map
 from scripts.message import send
 from scripts.production import unit_lookup
 from scripts.lib import unit_runs
@@ -136,6 +137,7 @@ class RosterTests(unittest.TestCase):
             f"#!{sys.executable}\n"
             + "import json, os, sys\n"
             + "with open(os.environ['SSH_RECORD'], 'a') as log: log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            + "with open(os.environ['SSH_RECORD'] + '.stdin', 'w') as log: log.write(sys.stdin.read())\n"
             + "print(os.environ['SSH_SNAPSHOT'])\n"
             + "raise SystemExit(int(os.environ.get('SSH_STATUS', '0')))\n",
             encoding="utf-8",
@@ -611,7 +613,7 @@ class RosterTests(unittest.TestCase):
                 found = send.matching_recipients(old_name, send.LocalOnly(), observed, membership=staff.snapshot())
                 self.assertIsInstance(found, send.RecipientMatches)
                 assert isinstance(found, send.RecipientMatches)
-                self.assertEqual(found.entries, [])
+                self.assertEqual(found.entries, [unnamed] if unnamed.kind == "claude" else [])
                 addressed = send.matching_recipients(native, send.LocalOnly(), observed, membership=staff.snapshot())
                 self.assertIsInstance(addressed, send.RecipientMatches)
                 assert isinstance(addressed, send.RecipientMatches)
@@ -792,6 +794,7 @@ class RosterTests(unittest.TestCase):
         daemon_result = self._daemon_sessions() if daemon is None else daemon
         with mock.patch.object(codex_daemon, "loaded_sessions", return_value=daemon_result), \
                 mock.patch.object(staff, "runtime_id", return_value=native_identity), \
+                mock.patch.object(sys, "stdin", io.StringIO("")), \
                 redirect_stdout(output), redirect_stderr(errors):
             result = roster.main([*( ["--here"] if here else []), *arguments])
         return result, output.getvalue().splitlines(), errors.getvalue().splitlines()
@@ -928,7 +931,7 @@ class RosterTests(unittest.TestCase):
                 self.assertEqual(entries[name].reach, roster.Messageable(f"worker:unit-one/{name}"))
         self.assertEqual(
             entries["alpha-research"].assignment,
-            roster.WorkerAssignment("review (adversary)", str(self.director_run), "review", "research"),
+            roster.WorkerAssignment("review", str(self.director_run), "review", "research"),
         )
         self.assertEqual(
             entries["alpha-impl"].assignment,
@@ -936,7 +939,7 @@ class RosterTests(unittest.TestCase):
         )
         self.assertEqual(
             entries["review:adversary"].assignment,
-            roster.WorkerAssignment("review (adversary)", str(self.director_run), "review", "adversary"),
+            roster.WorkerAssignment("review", str(self.director_run), "review", "adversary"),
         )
         self.assertEqual(
             entries["review:adversary"].reach,
@@ -1035,7 +1038,7 @@ class RosterTests(unittest.TestCase):
         document = cast(dict[str, object], json.loads("\n".join(lines)))
         rows = cast(list[roster.SerializedRosterEntry], document["entries"])
         by_name = {row["name"] or row["address"]
-                   or "review:" + row["slot_role"].removeprefix("review (").removesuffix(")"): row for row in rows}
+                   or "review:" + row["job"]["qualifier"]: row for row in rows}
         self.assertEqual(by_name["unit-one"]["address"], "")
         for name in ("alpha-test", "alpha-impl", "review:adversary"):
             with self.subTest(serialized_worker=name):
@@ -1173,12 +1176,14 @@ class RosterTests(unittest.TestCase):
             ),
         )
 
-    def test_codex_review_uses_staff_role_and_dispatch_lens(self) -> None:
-        original = self._entries()
+    def test_codex_review_uses_plain_staff_role_despite_dispatch_lens(self) -> None:
+        with mock.patch("scripts.direct.progress_history.last_dispatch",
+                        side_effect=AssertionError("the roster must not read a dispatch lens")):
+            original = self._entries()
         entry = original["alpha-research"]
         self.assertEqual(
             entry.assignment,
-            roster.WorkerAssignment("review (adversary)", str(self.director_run), "review", "research"),
+            roster.WorkerAssignment("review", str(self.director_run), "review", "research"),
         )
         history = self.root / "damaged-dispatch-history.jsonl"
         _ = history.write_bytes(b"\xff\n")
@@ -1187,10 +1192,7 @@ class RosterTests(unittest.TestCase):
         state["history_file"] = str(history)
         write_text_atomic(state_path, json.dumps(state))
         damaged = self._entries()
-        expected = dict(original)
-        expected["alpha-research"] = replace(entry, assignment=roster.WorkerAssignment(
-            "review", str(self.director_run), "review", "research"))
-        self.assertEqual(damaged, expected)
+        self.assertEqual(damaged, original)
         member = staff.local_snapshot().by_current_session("76d3172a-4806-51c4-89b6-e328af9f6367")
         assert member is not None
         _ = staff.set_worker_role(member.id, staff.KnownWorkerRole("fix"))
@@ -1433,6 +1435,23 @@ class RosterTests(unittest.TestCase):
                 row = next(row for row in rows if row["address"] == address)
                 self.assertEqual(row["name"], "")
                 self.assertEqual(row["shown_name"], registry_name or address)
+        member = fixture_member("producer", name="staff-name", runtime_id=fixture_runtime_id("named-freestanding"))
+        address = f"session:{member.current_session}"
+        self._write_session("named-freestanding", "registry-name", member.current_session, self.home, status="idle")
+        status, lines, errors = self._run_main()
+        self.assertEqual((status, errors), (0, []))
+        self.assertIn(f"freestanding registry-name [{address}] — claude, idle, freestanding session, ~",
+                      [line.strip() for line in lines])
+        status, lines, errors = self._run_main("--json")
+        self.assertEqual((status, errors), (0, []))
+        document = cast(dict[str, object], json.loads("\n".join(lines)))
+        rows = cast(list[dict[str, object]], document["entries"])
+        row = next(row for row in rows if row["address"] == address)
+        self.assertEqual(row["shown_name"], "registry-name")
+        self.assertEqual(row["name"], "staff-name")
+        observed = roster.Roster(list(self._entries().values()), [])
+        self.assertEqual(send.resolve_recipient(cast(str, row["shown_name"]), send.LocalOnly(), observed),
+                         send.ClaudeRecipient(address))
 
     def test_unit_rename_and_transfer_change_only_shown_location(self) -> None:
         original = replace(self._entry("fixed-address", "worker", "worker:run/fixed-address", kind="codex"),
@@ -1613,12 +1632,12 @@ class RosterTests(unittest.TestCase):
                 self.assertTrue(entry.director.name)
                 self.assertTrue(entry.director.address)
 
-        result, lines, errors = self._run_main("--json")
+        result, lines, errors = self._run_main("--json", "--all")
         self.assertEqual((result, errors), (0, []))
         document = cast(dict[str, object], json.loads("\n".join(lines)))
         rows = cast(list[dict[str, object]], document["entries"])
         by_name = {cast(str, row["name"] or row["address"]
-                        or "review:" + cast(str, row["slot_role"]).removeprefix("review (").removesuffix(")")): row
+                        or "review:" + cast(str, cast(dict[str, object], row["job"])["qualifier"])): row
                    for row in rows}
         self.assertEqual(by_name["alpha"]["shown_name"], "alpha · showrunner")
         self.assertEqual(by_name["unit-one"]["shown_name"], "alpha · unit-one · unit director")
@@ -1829,7 +1848,7 @@ class RosterTests(unittest.TestCase):
             (reviewer.kind, reviewer.role, reviewer.assignment, reviewer.reach, reviewer.cwd),
             (
                 "codex", "worker",
-                roster.WorkerAssignment("review (adversary)", str(self.director_run), "review", "adversary"),
+                roster.WorkerAssignment("review", str(self.director_run), "review", "adversary"),
                 roster.CannotReceiveMessages("blind reviewer"), "/review/cwd",
             ),
         )
@@ -1888,7 +1907,7 @@ class RosterTests(unittest.TestCase):
         reviewer = entries["review:adversary"]
         self.assertEqual(
             (reviewer.kind, reviewer.assignment),
-            ("codex", roster.WorkerAssignment("review (adversary)", str(self.director_run), "review", "adversary")),
+            ("codex", roster.WorkerAssignment("review", str(self.director_run), "review", "adversary")),
         )
 
     def test_review_markers_without_a_process_add_no_rows_or_unattributed_sessions(self) -> None:
@@ -1949,9 +1968,10 @@ class RosterTests(unittest.TestCase):
         ))
         self.assertTrue(all(isinstance(row["job"], dict) for row in rows))
         by_name = {cast(str, row["name"] or row["address"]
-                        or "review:" + cast(str, row["slot_role"]).removeprefix("review (").removesuffix(")")): row
+                        or "review:" + cast(str, cast(dict[str, object], row["job"])["qualifier"])): row
                    for row in rows}
-        self.assertEqual(next(row for row in rows if row["slot_role"] == "review (adversary)" and not row["thread"])["address"], "")
+        self.assertEqual(next(row for row in rows if row["slot_role"] == "review" and not row["thread"]
+                              and cast(dict[str, object], row["job"])["qualifier"] == "adversary")["address"], "")
         for field in (
             "production", "showrunner", "showrunner_address", "unit", "director",
             "director_address", "slot_role", "session_dir",
@@ -1979,7 +1999,7 @@ class RosterTests(unittest.TestCase):
         document = cast(dict[str, object], json.loads("\n".join(lines)))
         rows = cast(list[dict[str, object]], document["entries"])
         by_name = {cast(str, row["name"] or row["address"]
-                        or "review:" + cast(str, row["slot_role"]).removeprefix("review (").removesuffix(")")): row
+                        or "review:" + cast(str, cast(dict[str, object], row["job"])["qualifier"])): row
                    for row in rows}
         self.assertEqual(by_name["alpha-impl"]["thread"], "7aa082fc-e724-5e46-8846-bd68e7eb3f46")
         self.assertEqual(by_name["codex:eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"]["thread"], "eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539")
@@ -2443,15 +2463,30 @@ class RosterTests(unittest.TestCase):
     def test_closed_pane_worker_keeps_its_backend_account(self) -> None:
         home = self.account_note(2)
         self._publish_workers(self.director_run / unit_runs.STATE_FILE, {
-            "idle-worker": {"thread_id": "idle-thread", "status": "done"}}, codex_home=home)
+            "idle-worker": {"thread_id": "idle-thread", "status": "done", "role": "review", "lens": "adversary"}}, codex_home=home)
         before = self._entries()["idle-worker"]
         self._publish_workers(self.director_run / unit_runs.STATE_FILE, {
-            "idle-worker": {"thread_id": "idle-thread", "status": "ended"}}, codex_home=home)
+            "idle-worker": {"thread_id": "idle-thread", "status": "ended", "role": "review", "lens": "adversary"}}, codex_home=home)
         after = self._entries()["idle-worker"]
         self.assertEqual(before.account, roster.AccountLabel("codex2"))
         self.assertEqual(after.account, before.account)
         self.assertEqual(after.thread, before.thread)
         self.assertEqual(after.reach, roster.CannotReceiveMessages("closed"))
+        self.assertEqual(after.assignment, roster.WorkerAssignment("review", str(self.director_run), roster.AssignmentUnrecorded()))
+        for arguments in ((), ("--all",)):
+            with self.subTest(arguments=arguments):
+                status, lines, errors = self._run_main(*arguments)
+                self.assertEqual((status, errors), (0, []))
+                self.assertEqual(any("[idle-worker]" in line and "closed" in line for line in lines), bool(arguments))
+                status, lines, errors = self._run_main("--json", *arguments)
+                self.assertEqual((status, errors), (0, []))
+                document = cast(dict[str, object], json.loads("\n".join(lines)))
+                rows = cast(list[dict[str, object]], document["entries"])
+                self.assertEqual(any(row["name"] == "idle-worker" for row in rows), bool(arguments))
+        status, lines, errors = self._run_main("--snapshot")
+        self.assertEqual((status, errors), (0, []))
+        snapshot = roster.RosterSnapshot.decode("\n".join(lines)).result
+        self.assertIn(after, snapshot.entries)
 
     def test_worker_slots_keep_full_launch_identity_in_roster_and_titles(self) -> None:
         placements = (("alpha-render-a", "render-a", "impl"), ("alpha-physics-a", "physics-a", "impl"),
@@ -2589,7 +2624,8 @@ class RosterTests(unittest.TestCase):
     def test_default_scope_merges_peer_rows_after_local_rows_with_one_snapshot_call(self) -> None:
         peer = replace(self._entry("Mac Claude", "freestanding", "session:mac-id"), machine="mac")
         self.peer_snapshot(roster.Roster([peer], []))
-        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
+        with (mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()),
+              mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as staff_reads):
             result = roster.roster(os.environ, roster.AllMachines())
         self.assertEqual(result.problems, [])
         self.assertEqual(result.entries[-1], peer)
@@ -2598,6 +2634,11 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(len(commands), 1)
         self.assertEqual(commands[0][:2], ["-o", "BatchMode=yes"])
         self.assertIn("--here --snapshot", commands[0][-1])
+        authority = roster.PeerAuthority.decode(Path(str(self.ssh_log) + ".stdin").read_text())
+        self.assertEqual(authority.membership, staff.initial_snapshot())
+        self.assertEqual(authority.accounts, role_map.read_role_map())
+        self.assertEqual(authority.documents, session_staff.RowResolver(authority.membership).production_document_facts())
+        self.assertEqual(staff_reads.call_count, 1)
         self.assertIn('"$HOME/.claude/scripts/lib/py"', commands[0][-1])
 
     def test_unreachable_peer_is_one_problem_while_local_rows_still_print(self) -> None:
@@ -2662,6 +2703,45 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(director.reach, roster.CannotReceiveMessages("no messaging socket"))
         self.assertEqual(worker.director, roster.UnderDirector("unit-one", "unit-one", "session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b"))
         self.assertEqual(self.ssh_calls(), [])
+
+        record = staff.initial_snapshot()
+        supplied = replace(record, rows=tuple(
+            replace(row, name="supplied-unit") if row.name == "unit-one" else row for row in record.rows))
+        authority = roster.PeerAuthority(supplied, role_map.read_role_map(),
+                                         session_staff.RowResolver(supplied).production_document_facts())
+        valid_document = authority.encode()
+        with (role_map.supplied_role_map(authority.accounts),
+              mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions())):
+            expected = roster.roster(os.environ, roster.ThisMachine(), membership=supplied)
+        invalid_facts = cast(dict[str, object], json.loads(valid_document))
+        invalid_facts["production_documents"] = []
+        for document in (valid_document, "not JSON", '{"staff": {}, "role_map": {}}', json.dumps(invalid_facts)):
+            output = io.StringIO()
+            with (self.subTest(document=document),
+                  mock.patch.object(sys, "stdin", io.StringIO(document)),
+                  mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()),
+                  redirect_stdout(output)):
+                if document == valid_document:
+                    with (mock.patch.object(staff, "is_owner", return_value=False),
+                          mock.patch.object(staff, "_remote", side_effect=AssertionError("staff ssh")),
+                          mock.patch.object(session_staff, "_read_facts", side_effect=AssertionError("document fact read")),
+                          mock.patch.object(role_map, "is_role_map_host", return_value=False),
+                          mock.patch.object(role_map, "ssh_role_map", side_effect=AssertionError("role-map ssh"))):
+                        status = roster.main(["--here", "--snapshot"])
+                else:
+                    status = roster.main(["--here", "--snapshot"])
+                received = roster.RosterSnapshot.decode(output.getvalue()).result
+                if document == valid_document:
+                    self.assertEqual(status, 0)
+                    self.assertEqual(received, expected)
+                    supplied_director = next(row for row in received.entries if row.name == "supplied-unit")
+                    self.assertEqual(supplied_director.session, director.session)
+                    self.assertNotIn("unit-one", [row.name for row in received.entries])
+                else:
+                    self.assertEqual(status, 1)
+                    self.assertIn("peer authority stdin", received.problems[0])
+                    self.assertIn(director, received.entries)
+        self.assertEqual(staff.initial_snapshot(), record)
 
     def test_snapshot_is_hidden_from_help_and_public_json_has_no_session_field(self) -> None:
         output = io.StringIO()
