@@ -10,6 +10,7 @@ from scripts.buildlog import store
 from scripts.lib import git_files
 
 GIT_TIMEOUT_S = 5
+MANIFEST_IDENTITY_PREFIX = "manifest-path:"
 
 def output(args: list[str], cwd: str, timeout: float) -> str | None:
     try:
@@ -45,7 +46,19 @@ def remote_identity(remote: str, directory: str) -> str:
 
 
 def repository_key(directory: str) -> str:
-    """Read the remote identity or the first root commit of a directory."""
+    """Keep Git identities or use the nearest real manifest without Git."""
+    folder = Path(directory).resolve()
+    ceilings = {Path(value).resolve() for value in os.environ.get("GIT_CEILING_DIRECTORIES", "").split(os.pathsep) if value}
+    git_parents: list[Path] = []
+    for parent in (folder, *folder.parents):
+        if parent != folder and parent in ceilings:
+            break
+        git_parents.append(parent)
+    if folder.is_dir() and not any((parent / ".git").exists() for parent in git_parents):
+        for parent in (folder, *folder.parents):
+            manifest = parent / "Cargo.toml"
+            if manifest.is_file():
+                return MANIFEST_IDENTITY_PREFIX + str(manifest.resolve())
     remote = output(["git", "-C", directory, "remote", "get-url", "origin"], directory, GIT_TIMEOUT_S)
     if remote and remote.strip():
         return remote_identity(remote.strip(), directory)
