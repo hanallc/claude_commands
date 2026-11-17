@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from scripts.lib import atomic_file
 from scripts.production import investigation, record_store, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
+from scripts.review_links import review_items
 
 MORTY = staff.StaffRow(staff.StaffId("536997b5-4415-4cb1-b683-d777e02e9a22"), "producer", "morty", staff.StaffRoot(),
                        current_session=staff.StaffId("20fa30c6-3cad-493a-b74a-0e408a93f865"))
@@ -237,6 +238,137 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(the_list.load(MORTY.id, item.id).evidence, proof)
         self.assertEqual(self.command("clean-evidence", "--source", "morty"), (0, "0 changed; 1 unchanged\n", ""))
 
+    def test_review_links_keep_order_history_and_repeat_without_writes(self) -> None:
+        first = investigation.file(OWNER.id, "First review", "Read the first result.")
+        second = investigation.file(OWNER.id, "Second review", "Read the second result.")
+        identities = (f"{OWNER.name}/{first.id}", f"{OWNER.name}/{second.id}")
+        keys = tuple(f"investigation/{OWNER.id}/{review.id}" for review in (first, second))
+        item = self.add()
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        with patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.root / "reviews")}), patch.object(
+                review_items, "read", wraps=review_items.read) as read:
+            self.assertEqual(self.command("link", item.id, "--review", identities[1], "--review", identities[0],
+                                          "--review", identities[1], "--source", "morty"), (0, "", ""))
+        read.assert_called_once()
+        linked = the_list.load(MORTY.id, item.id)
+        self.assertEqual(linked.reviews, keys[::-1])
+        self.assertEqual(linked.log[:-1], item.log)
+        self.assertEqual(linked.log[-1], the_list.ItemChange(START, "Linked reviews: " + ", ".join(keys[::-1]), "morty"))
+        self.assertEqual(replace(linked, reviews=item.reviews, log=item.log), item)
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        with patch.object(review_items, "read", return_value=[]) as read:
+            self.assertEqual(self.command("link", item.id, "--review-key", keys[0], "--source", "morty"), (0, "", ""))
+            read.assert_not_called()
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(self.command("unlink", item.id, "--review-key", keys[1], "--review-key", keys[1],
+                                     "--source", "morty"), (0, "", ""))
+        unlinked = the_list.load(MORTY.id, item.id)
+        self.assertEqual(unlinked.reviews, (keys[0],))
+        self.assertEqual(unlinked.log[:-1], linked.log)
+        self.assertEqual(unlinked.log[-1].what, "Unlinked reviews: " + keys[1])
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        with patch.object(review_items, "read", return_value=[]):
+            self.assertEqual(self.command("unlink", item.id, "--review", "missing/C9", "--source", "morty"), (0, "", ""))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        with patch.object(review_items, "read", return_value=[]):
+            self.assertEqual(self.command("link", item.id, "--review-key", keys[0], "--review", "missing/C9",
+                                          "--source", "morty"), (1, "", "the_list: unknown review id: missing/C9\n"))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        _ = the_list.close(MORTY.id, item.id, "Stop tracking", source="nate")
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        for command in ("link", "unlink"):
+            with self.subTest(command=command):
+                self.assertEqual(self.command(command, item.id, "--review", identities[0], "--source", "morty"),
+                    (1, "", f"the_list: {item.id}: reopen the Closed item before changing it\n"))
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_old_records_without_reviews_load_without_writes(self) -> None:
+        item = self.add()
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        _ = path.write_text(path.read_text().replace('reviews: "[]"\n', ""))
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        self.assertEqual(the_list.load(MORTY.id, item.id), item)
+        self.assertEqual(item.reviews, ())
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_review_commands_resolve_keys_and_refuse_ambiguous_shown_ids(self) -> None:
+        _ = investigation.file(OWNER.id, "First review", "Read the result.")
+        first = review_items.investigation_items(staff.snapshot())[0]
+        second = replace(first, key="proposal/other/I1", type=review_items.ReviewType.PROPOSAL,
+                         source=review_items.ProposalLedgerSource(self.root / "proposals.md"))
+        ambiguous = (1, "", f"the_list: ambiguous review id: {first.id}; "
+                     + f"{first.key} (investigation), {second.key} (proposal)\n")
+        for option, identity, expected in (
+                ("--review", first.id, ambiguous),
+                ("--review", first.key, (1, "", "the_list: unknown review id: " + first.key + "\n")),
+                ("--review-key", first.id, (1, "", "the_list: unknown review key: " + first.id + "\n")),
+                ("--review-key", first.key, (0, "", ""))):
+            with self.subTest(option=option, identity=identity):
+                item = self.add()
+                path = the_list.folder(MORTY.id) / f"{item.id}.md"
+                before = path.read_bytes(), path.stat().st_mtime_ns
+                with patch.object(review_items, "read", return_value=[first, second]):
+                    self.assertEqual(self.command("link", item.id, option, identity, "--source", "morty"), expected)
+                if expected[0]:
+                    self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+                else:
+                    self.assertEqual(the_list.load(MORTY.id, item.id).reviews, (first.key,))
+                    with patch.object(review_items, "read", return_value=[first, second]):
+                        self.assertEqual(self.command("unlink", item.id, "--review", first.id, "--source", "morty"),
+                                         ambiguous)
+                    with patch.object(review_items, "read", return_value=[first]):
+                        self.assertEqual(self.command("unlink", item.id, "--review", first.id, "--source", "morty"),
+                                         (0, "", ""))
+                    self.assertEqual(the_list.load(MORTY.id, item.id).reviews, ())
+
+        third = replace(first, id="other/I2", key="investigation/other/I2")
+        fourth = replace(first, id="other/I3", key="investigation/other/I3")
+        item = self.add()
+        with patch.object(review_items, "read", return_value=[first, second, third, fourth]) as read:
+            self.assertEqual(self.command("link", item.id, "--review-key", second.key, "--review", third.id,
+                "--review-key", first.key, "--review", fourth.id, "--review-key", second.key,
+                "--source", "morty"), (0, "", ""))
+        read.assert_called_once()
+        linked_item = the_list.load(MORTY.id, item.id)
+        self.assertEqual(linked_item.reviews, (second.key, third.key, first.key, fourth.key))
+        self.assertEqual(linked_item.log[-1].what, "Linked reviews: " + ", ".join(linked_item.reviews))
+        with patch.object(review_items, "read", return_value=[first, second, third, fourth]) as read:
+            self.assertEqual(self.command("unlink", item.id, "--review", third.id, "--review-key", second.key,
+                "--review", third.id, "--review-key", first.key, "--source", "morty"), (0, "", ""))
+        read.assert_called_once()
+        unlinked_item = the_list.load(MORTY.id, item.id)
+        self.assertEqual(unlinked_item.reviews, (fourth.key,))
+        self.assertEqual(unlinked_item.log[-1].what, "Unlinked reviews: " + ", ".join((third.key, second.key, first.key)))
+
+    def test_review_options_keep_shown_ids_separate_from_exact_keys(self) -> None:
+        _ = investigation.file(OWNER.id, "Review the result", "Read the result.")
+        base = review_items.investigation_items(staff.snapshot())[0]
+        first = replace(base, id="natedev/C1", key="natedev/C1")
+        second = replace(base, id=first.id, key="hanadocs/C1", type=review_items.ReviewType.PROPOSAL,
+                         source=review_items.ProposalLedgerSource(self.root / "proposals.md"))
+        ambiguous = (1, "", "the_list: ambiguous review id: natedev/C1; "
+                     + "natedev/C1 (investigation), hanadocs/C1 (proposal)\n")
+        cases = (
+            ("link", "--review", first.id, (), ambiguous, ()),
+            ("link", "--review", first.id, (first.key,), ambiguous, (first.key,)),
+            ("link", "--review-key", first.key, (), (0, "", ""), (first.key,)),
+            ("link", "--review-key", second.key, (), (0, "", ""), (second.key,)),
+            ("unlink", "--review-key", second.key, (first.key, second.key), (0, "", ""), (first.key,)),
+            ("unlink", "--review", first.id, (first.key, second.key), ambiguous, (first.key, second.key)),
+        )
+        for command, option, value, linked, expected, keys in cases:
+            with self.subTest(command=command, option=option, linked=linked):
+                item = self.add()
+                if linked:
+                    item = the_list.link(MORTY.id, item.id, linked, source="morty")
+                path = the_list.folder(MORTY.id) / f"{item.id}.md"
+                before = path.read_bytes(), path.stat().st_mtime_ns
+                with patch.object(review_items, "read", return_value=[first, second]):
+                    self.assertEqual(self.command(command, item.id, option, value, "--source", "morty"), expected)
+                self.assertEqual(the_list.load(MORTY.id, item.id).reviews, keys)
+                if expected[0]:
+                    self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
     def test_page_events_only_mark_read_or_append_feedback(self) -> None:
         item = self.add(number=106)
         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": OWNER.current_session}):
@@ -395,7 +527,8 @@ class TheListTests(unittest.TestCase):
         before = path.read_text()
         for field, old, new in (("state", "New", "Parked"), ("number", "1", "2"),
                                 ("opened", START.isoformat(), "bad"), ("eta", "Not asked", "Tomorrow\nInvalid"),
-                                ("closed", "", START.isoformat()), ("blocked_by", "[]", "[true]")):
+                                ("closed", "", START.isoformat()), ("blocked_by", "[]", "[true]"),
+                                ("reviews", "[]", "[true]"), ("reviews", "[]", '["C1", "C1"]')):
             with self.subTest(field=field):
                 _ = path.write_text(before.replace(f"{field}: {json.dumps(old)}", f"{field}: {json.dumps(new)}"))
                 with self.assertRaises(the_list.ListError):

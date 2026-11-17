@@ -9,6 +9,7 @@ import re
 import secrets
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
@@ -20,6 +21,7 @@ from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, record_store, session_staff, staff, the_list
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_link
+from scripts.review_links import review_items, review_page
 from scripts.statusline import counts_row, rebuild_row
 
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/list.html"
@@ -111,7 +113,36 @@ def feedback_form(entry: ListRecord, secret: str) -> str:
             + '<button name="action" value="tell" disabled>Tell morty</button></div></form>')
 
 
-def details(entry: ListRecord, today: datetime, secret: str) -> str:
+def review_summary(item: the_list.ListItem, reviews: Mapping[str, review_items.ReviewItem], today: datetime) -> str:
+    """Describe the current turn for the linked reviews without storing their states."""
+    if not item.reviews:
+        return ""
+    linked = [reviews[identity] for identity in item.reviews if identity in reviews]
+    ready = [review for review in linked if review.for_you(today)]
+    waiting = [review for review in linked if review.state != review_items.ReviewState.DONE and not review.for_you(today)]
+    if ready:
+        kind = "changes" if all(review.type == review_items.ReviewType.CHANGE for review in ready) else "reviews"
+        text = f"{len(ready)} {kind} for you"
+    elif waiting:
+        text = f"{len(waiting)} reviews waiting on others"
+    else:
+        text = "Reviews done — decide: close, keep or park"
+    return f'<a href="{review_page.PAGE_PATH}" target="_top">{text}</a>'
+
+
+def review_card(identity: str, reviews: Mapping[str, review_items.ReviewItem]) -> str:
+    """Link the shown ID only when the Review page contains its card type."""
+    if identity not in reviews:
+        return html.escape(identity)
+    review = reviews[identity]
+    label = html.escape(review.id)
+    if review.type not in review_page.TYPES:
+        return label
+    href = review_page.PAGE_PATH + '#' + urlencode({"item": review.key})
+    return f'<a href="{html.escape(href, quote=True)}" target="_top">{label}</a>'
+
+
+def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[str, review_items.ReviewItem]) -> str:
     item = entry.item
     sections = ''.join('<section><h3>' + heading + '</h3>'
                        + change_browser.question_paragraphs(text or "Not recorded") + '</section>'
@@ -124,6 +155,9 @@ def details(entry: ListRecord, today: datetime, secret: str) -> str:
         sections += '<section><h3>Links</h3><ul>' + ''.join(links) + '</ul></section>'
     if item.state == the_list.ItemState.CLOSED:
         sections += '<section><h3>Closing words</h3>' + change_browser.question_paragraphs(item.closing_words) + '</section>'
+    if item.reviews:
+        cards = (review_card(identity, reviews) for identity in item.reviews)
+        sections += '<p>' + review_summary(item, reviews, today) + '</p><p>' + ' · '.join(cards) + '</p>'
     log = ''.join('<li><time datetime="' + change.time.isoformat() + '">' + html.escape(local_time(change.time, today))
                   + '</time><span>' + html.escape(change.what) + ' <small>— ' + html.escape(change.source)
                   + '</small></span></li>' for change in reversed(item.log))
@@ -131,7 +165,8 @@ def details(entry: ListRecord, today: datetime, secret: str) -> str:
             + '</div><section><h3>Log · newest first</h3><ol class="list-log">' + log + '</ol></section></div>')
 
 
-def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, index: int, secret: str) -> str:
+def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, index: int, secret: str,
+              reviews: Mapping[str, review_items.ReviewItem]) -> str:
     item = entry.item
     owner = owner_name(members, item.owner)
     unread = isinstance(item.unread_since, datetime)
@@ -162,6 +197,8 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
             state += '<small>Check: ' + html.escape(item.next_check.text) + '</small>'
     if parked and isinstance(item.parked_until, datetime):
         state += '<small>Parked until ' + html.escape(local_time(item.parked_until, today)) + '</small>'
+    if item.reviews:
+        state += '<small>' + review_summary(item, reviews, today) + '</small>'
     update = '<span class="list-dot" role="img" aria-label="Unread update"></span>' if unread else '<span aria-label="No unread update">—</span>'
     sent = the_list.sent_to_morty(item)
     if isinstance(sent, datetime):
@@ -175,7 +212,7 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
     row = ''.join(f'<td data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden = ' hidden' if parked or item.state in (the_list.ItemState.DONE, the_list.ItemState.CLOSED) else ''
     return (f'<tbody data-list-item{attrs}{hidden}><tr class="list-row">' + row
-            + f'</tr><tr data-detail id="{panel}" hidden><td colspan="7">' + details(entry, today, secret) + '</td></tr></tbody>')
+            + f'</tr><tr data-detail id="{panel}" hidden><td colspan="7">' + details(entry, today, secret, reviews) + '</td></tr></tbody>')
 
 
 @dataclass(frozen=True)
@@ -329,6 +366,8 @@ def render(root: Path) -> bytes:
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
     items = records()
+    reviews = ({review.key: review for review in review_items.read(root, members=members)}
+               if any(entry.item.reviews for entry in items) else {})
     today = datetime.fromtimestamp(read_at, user_zone())
     secret = change_browser.browser_manifest(change_page.console_folder(root))[0]
     owners = {str(entry.item.owner): owner_name(members, entry.item.owner) for entry in items}
@@ -348,7 +387,7 @@ def render(root: Path) -> bytes:
                + '<div class="list-table"><table aria-label="The List"><colgroup><col style="width:5%"><col style="width:8%">'
                + '<col style="width:22%"><col style="width:15%"><col style="width:25%"><col style="width:17%"><col style="width:8%">'
                + '</colgroup><thead><tr>' + headers + '</tr></thead>'
-               + ''.join(item_rows(entry, members, today, index, secret) for index, entry in enumerate(items)) + '</table>'
+               + ''.join(item_rows(entry, members, today, index, secret, reviews) for index, entry in enumerate(items)) + '</table>'
                + '<p data-empty hidden>No items in this view.</p></div>' + counts_strip(members) + '</div><script>' + SCRIPT + '</script>')
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
 
