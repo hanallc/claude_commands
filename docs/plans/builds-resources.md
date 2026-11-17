@@ -193,123 +193,21 @@ Own what a build may use and when it starts: memory admission and the memory que
 **Binds later work:** A new script whose owner must show in the table needs an Owns entry in its production doc. Regenerate `working_set_owners.json` from the production docs after an Owns cell changes.
 
 ### Phase 8 — Shared build state is written only by the installed copy  · status: done
-**Depends on:** Phases 2, 10, 12 and 19. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8.
 
-**Held (2026-11-05):** the send.py freeze covers `build_hold.py`, so this phase starts after messaging's main hash.
+#### As-built
 
-**User decision (2026-11-05, via the builds showrunner):** "A. Build Phase 8 with the refusals." The question was whether to add the installed-copy write guards; the user's 2026-11-05 rule sends a new check to the user first.
+- Only the installed scripts under `~/.claude/scripts` write the shared build state: the hold, release and enforcer directories under `~/.local/state`, `/proc` signals from the hold stop, the admission socket directory and the queue store root. `override_guard.shared_state_access(script, relative, directories)` returns `SharedStateAllowed` or `SharedStateRefused(line)`; it resolves each real path, links included. `require_shared_state_write()` raises `SharedStateWriteRefused` with `"<script>: shared build state at <path> requires <installed path>"`. Each CLI (`build_hold.py`, `hold_enforcer.py`, `build_targets.py`, `admission_service.py`, `memory_admit.py`) prints it and exits 2. Private test directories pass from any copy. The installed scripts keep their environment-override refusal.
+- `shared_state_defaults.py` is a stdlib-only leaf that defines the five shared roots once; owners import it, and the guard caches the resolved roots per home.
+- `build_hold.release_lock(*directories)` checks both hold directories before it makes the lock and yields `ReleaseLockHeld`; the recovery helpers (`recorded_releases`, `complete_release_record`, `set_aside_damaged_record`, and the others) take it. `cycle_path()` and `read_cycle()` return `NoCycle` when no cycle exists. Temporary files are inside the guard call before each write. A damaged `cycle.json` link is checked at its own location, not its target.
+- `AdmissionServer` checks its state directory at construction, saved paths at restore and each new path at `ServiceStateWrites.register()`. `_end()` passes `RegisteredServiceWrites`, so finalization checks only the current episode; direct `StateIntents` construction and `export_priority()` keep the full check.
+- `memory_gate.sh`, `invoke.sh`, `verify.sh`, `top_level.py` and `shutdown.py` call the installed helpers; the documented test overrides stay.
+- Queue queries keep `repository_name` and `step` (waiters) and `repo` and `step` (reservations) as separate fields. The Builds page owns the display.
 
-#### Work Order
+**Files:** `scripts/build_hold/override_guard.py`, `scripts/build_hold/shared_state_defaults.py`, `scripts/build_hold/build_hold.py`, `scripts/build_hold/hold_enforcer.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/admission_wire.py`, `scripts/build_queue/queue_view.py`, `scripts/lint/memory_admit.py`, `scripts/lint/memory_gate.sh`, `scripts/lint/invoke.sh`, `scripts/direct/verify.sh`, `scripts/build_targets/build_targets.py`, `scripts/message/top_level.py`, `scripts/agents/shutdown.py`, their tests and support fixtures, `docs/as-built/build-memory-admission.md`.
 
-**Goal:** only the installed copy under `~/.claude/scripts` writes shared build state. Tests use private state.
+**Gotchas:** a test that runs a checkout copy against a real shared path gets exit 2; fixtures use private directories and set `BUILD_TARGETS_SCRIPT` to the checkout script.
 
-**Measured:**
-1. `AdmissionServer` owns admission transitions. `persist()` saves the service state and drains the lifecycle outbox.
-2. `StateIntents` saves finalization intent. `export_priority()` mutates state without constructing `AdmissionServer`.
-3. `admission_client.step_request()` calls `step_estimator.step_estimate()` before it connects to the service.
-4. Hold recovery can change release records during an imported call. A CLI guard alone does not cover that call.
-
-**Spec:**
-1. Extend `scripts/build_hold/override_guard.py` with one shared installed-copy guard.
-   Reuse `user_home()` and `is_installed_file()`. Add no second home lookup or installed-path check.
-   Check the actual directory before a write. Return a named refusal that identifies the installed entry point.
-   Use a named allowed state and a named refusal state. Keep private test directories usable.
-   Raise a typed refusal for imported mutation attempts. The CLI reports the reason and exits with status 2.
-   Keep the installed copy's existing environment-override refusal.
-2. Guard `AdmissionServer` before construction can restore or change shared state.
-   Guard `StateIntents` and the lifecycle outbox through the same validated service boundary.
-   Cover state replacement, reservation finalization, cancellation, priority changes, token returns and restart recovery.
-   Guard `export_priority()` separately because it does not construct `AdmissionServer`.
-   Validate each actual mutation path against the guarded directory. A private root does not authorize a real-state reservation path.
-   Test direct imported calls to each mutation entry point. Refuse before any file changes.
-3. Keep initial estimation in `admission_client` through `step_estimate()`. Phase 68 removes the estimate cache (`admission/build_marks.json`) and its writer; add no guard for it.
-4. Guard hold and release mutations through `build_hold.release_lock()`.
-   Validate both the holder directory and the release directory.
-   Introduce a named `ReleaseLockHeld` capability for helpers that change release state.
-   Bind the capability to the validated directories. Require it for receipt migration and damaged-intent recovery.
-   Cover `release_records_for_change()`, `complete_release_record()` and `set_aside_damaged_record()` through that capability.
-   Do not take the same flock again inside a helper. Keep hold status read-only.
-   Refuse mixed private and real directories before either real directory changes.
-   Guard the hold stop: `hold_enforcer.stop_waiting_run()` (`scripts/build_hold/hold_enforcer.py:358`) stops live runs and writes their run record through `detached_runs.stop_with_reason()` (`scripts/agents/detached_runs.py:198`) outside `release_lock()`.
-   Refuse an imported call from a non-installed copy before any signal or record write. Keep the command-group stop and the supervisor's result delivery (Phase 129).
-   `read_cycle()` (`build_hold.py:1016`) returns `HoldCycle | None`, and `cycle_path()` (`build_hold.py:1005`) returns `Path | None`, for the same no-current-cycle state.
-   Return the existing `NoCycle` (`build_hold.py:73`) from both in place of `None`. Add no second type for this state.
-   Update `read_cycle_for_change()` and its test callers.
-   Dailies callers were retired on 2026-11-11.
-   Update the test callers too. Six test files narrow the result with `assert cycle is not None`, a check that `NoCycle` passes.
-   Replace each one with `assert not isinstance(cycle, build_hold.NoCycle)`. `HoldCycle` is a `TypedDict`, so `isinstance` against it raises `TypeError`. This change keeps the assertion's intent.
-5. Route callers through the installed copy.
-   `memory_gate.sh` and `invoke.sh` use the installed admission client.
-   `verify.sh` uses the installed helpers for holds, local release waits, detached runs, Mac idle state and build targets.
-   Keep documented script overrides for tests. Test routing under a private `HOME`.
-   `top_level.py` and unit retirement in `scripts/agents/shutdown.py` (its `build_hold.py release --holder` call near line 1535) use the installed hold writer.
-   `merge_gate.py` already runs from the installed copy. Record that fact without changing its hold reader.
-6. Keep repository and step fields separate in service snapshots and queue queries.
-   Reuse `repository_name` on waiters and `repo` on reservations. Add no parallel repository field or prefix parser.
-   builds-queue 3ef82d3ab removed `/build:queue`, `queue_card.py` and the goldens. The Builds page owns the display now; make no page layout change here.
-7. Test refusal and allowed private writes at every mutation entry point, including `export_priority()` and restart recovery.
-   Test interrupted cancellation publication, and `WaiterPlace.queue_identity` across restart and owner exit, through the service.
-   Test queue queries and service state after admission. Do not require a live `.waiting` file.
-   Fake both memory readings. Never change real coordination state in a test.
-
-**Constraints from prior phases:**
-- builds-queue Phase 10z replaced the Phase 20 active and inactive windows. One pass (`memory_admit.admission_walk`) uses the captured room.
-  It protects room for the head, lets a `ContinuationSlot` reuse its run's slot, and lets an oversized head start alone.
-  Displays, the client and the wait text use that pass's frozen result. Add no separate admission rule in a reader.
-- Phase 20: `PendingLeft` saves durable cancellation facts. Restart publishes one cancellation with its original time.
-  Keep the one lifecycle outbox and the saved finalization intent. Add no second lifecycle writer.
-- Phase 20: `WaiterPlace.queue_identity` carries the logical identity. Preserve it through restart and owner exit.
-  builds-queue Phase 10x (89ba4f087) removed the legacy place import and its test. Add no migration for old places.
-  Add no user control or display for pending cancellation.
-- Phase 41: token waiters keep their arrival and priority times. They hold neither the head position nor head room.
-  Preserve the saved offset and transition identity for priority publication retries.
-- Phases 22 and 23: hold recovery can migrate receipts and recover damaged release records.
-  Guard those writes without changing the read-only status path.
-- Phase 68 removes Phase 18's estimate-cache writer and `admission/build_marks.json`. Nothing remains to guard there.
-
-**Files:**
-- `scripts/build_queue/admission_service.py`, `scripts/build_queue/admission_client.py` — service boundaries and installed routing.
-- `scripts/build_queue/test_admission_service.py`, `scripts/build_queue/test_admission_client.py` — refusal, recovery and routing tests.
-- `scripts/lint/memory_admit.py`, `scripts/lint/memory_gate.sh`, `scripts/lint/invoke.sh` — caller routing.
-- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_invoke_scope.py` — caller tests.
-- `scripts/build_hold/override_guard.py`, `scripts/build_hold/build_hold.py` — shared guard and hold mutation boundary.
-- `scripts/build_hold/hold_enforcer.py` — the hold stop guard; its imported-call refusal test goes in `scripts/build_hold/test_hold_enforcer.py`.
-- `scripts/build_hold/test_override_guard.py`, `scripts/build_hold/test_build_hold.py` — guard and hold recovery tests.
-- `scripts/build_hold/test_hold_enforcer.py`, `scripts/build_targets/test_build_targets.py`, `scripts/direct/test_verify_mac_lifecycle.py`, `scripts/direct/verify_mac_offload_test_support.py`, `scripts/direct/verify_hold_wait_test_support.py` — `read_cycle()` callers that narrow to `HoldCycle`.
-- `scripts/build_queue/queue_view.py` — separate repository and step fields in queue queries.
-- `scripts/build_queue/test_queue_view.py` — queue query tests.
-- `scripts/direct/verify.sh`, `scripts/direct/test_verify_checks_fail_closed.py`, `scripts/direct/test_verify_nix_shell.py` — installed helper routing.
-- `scripts/message/top_level.py`, `scripts/agents/shutdown.py` — installed hold writer routing.
-- `scripts/message/test_top_level.py`, `scripts/agents/test_shutdown_cli.py` — caller tests.
-- `docs/as-built/build-memory-admission.md` — installed-copy rule and separate row fields.
-
-**Workers:** `1 writer + 1 tester`
-- `impl` owns the implementation files and documentation listed above.
-- `test` owns the listed test files, routing fixtures and display goldens.
-
-**Acceptance gate:**
-- Preserve these existing tests unchanged. builds-queue 3ef82d3ab (`/build:bump`) removed the two earlier `test_queue_view.py` tests this list named; do not restore them.
-  1. `test_priority_and_frozen_release_keep_the_resolved_head` in `scripts/build_queue/test_admission_service.py`.
-  2. `test_each_pass_matches_the_shared_rule_and_view_uses_its_frozen_limits` in `scripts/build_queue/test_admission_service.py`.
-  3. `test_view_release_and_admit_pass_capture_the_same_continuation_slot` in `scripts/build_queue/test_admission_service.py`.
-  4. `test_a_younger_run_cannot_take_the_room_protected_for_the_head` in `scripts/build_queue/test_admission_service.py`.
-  5. `test_an_oversized_head_starts_alone_but_unreadable_host_or_pressure_holds_it` in `scripts/build_queue/test_admission_service.py`.
-- Preserve `test_restart_retries_an_interrupted_cancellation_with_its_original_time` unchanged in `scripts/build_queue/test_admission_service.py`.
-- Preserve `test_full_queue_holds_gate_until_the_running_charge_is_released` and `test_admission_error_refuses_before_any_module_starts` unchanged.
-  Both tests are in `scripts/production/test_merge_gate_suites_admission.py`.
-- Preserve these hold tests unchanged in `scripts/build_hold/test_build_hold.py`:
-  1. `test_status_reports_recovery_without_changing_damaged_record`.
-  2. `test_status_names_unsent_release_after_last_holder_is_gone`.
-  3. `test_release_sets_aside_malformed_current_intent_with_no_holder`.
-  4. `test_release_recovers_recipient_notices_from_a_damaged_referenced_cycle`.
-  5. `test_status_names_unreadable_pending_records_and_cycles_without_hiding_them`.
-- Every changed module and caller passes its tests. Basedpyright reports `0 errors, 0 warnings, 0 notes` for those modules.
-- No `read_cycle()` caller checks its result with `is not None` or `is None`, in source or in tests.
-- After installation, query the service and inspect its saved state. Repository and step fields remain separate.
-  A checkout mutation attempt refuses before state changes. A private-state attempt still works.
-- Name queue-unit files as `also touches`, tested against `origin/builds-queue`.
-  Name verify-unit and hold-caller files with their owners in the notice.
-- Change-Review: none unless a user-visible refusal results; the display item went with `/build:queue`.
+**Ruled out:** the run-record root as a shared root; owner lookups by module-name strings (`shared_state_defaults.py` breaks the import cycle instead).
 
 ### Phase 9 — The floor sweep counts what a deletion really frees  · status: done
 
@@ -2672,9 +2570,14 @@ The cutover removal commit deletes the script after the run.
 **Spec:**
 1. Change `scripts/lint/tmp_sweep.py` and the floor callers in `scripts/lint/sweep.py` to measurement and alarms. They delete nothing.
 2. Send each eligible one-off to the maker's lock and rescue path (`build_folders`). Keep explicit maker cleanup.
-   `tmp_sweep.py --apply` (`apply_cleanup_plan()`, which deletes through `remove_entry()` at `scripts/lint/tmp_sweep.py:1456`) is explicit cleanup of a saved plan: route each entry through the same maker path. Keep no direct delete in it.
+   `tmp_sweep.py --apply` (`apply_cleanup_plan()` at `scripts/lint/tmp_sweep.py:1456`, which deletes through `remove_entry()` at line 1162 and `remove_idle_entry()` at line 1185) is explicit cleanup of a saved plan: route each entry through the same maker path. Keep no direct delete in it.
 3. Retire each competing managed-folder delete path after its legacy users drain.
 4. Keep `~/.cache` out of every root. Add no cleanup tool.
+5. Unfinished trim records: `_hold_floor_pass()` runs `recover_pending_trims()` before it reads free space (`scripts/lint/sweep.py:4481`), and `TrimTake.recover()` deletes the remaining paired output (`sweep.py:2051`). At the cutover, a saved `deleting` or `publishing` intent deletes nothing more: keep the remaining files and keep the record of each completed deletion.
+
+**Constraints from prior phases:**
+- Phase 8: only the installed copy writes the shared hold, release, enforcer and admission state. A checkout or test copy that tries gets exit 2. Tests use private directories.
+- `docs/as-built/build-memory-admission.md` has an "Installed writers and private test state" section. Put the alarm-only lines beside the `tmp_sweep` lines, not in that section.
 
 **Files:**
 - `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py` — alarm-only floor callers and the explicit cleanup route.
@@ -2685,7 +2588,7 @@ The cutover removal commit deletes the script after the run.
 - `impl` owns `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py` and the documentation.
 - `test` owns both test modules and the alarm, cleanup and saved-plan fixtures.
 
-**Acceptance gate:** a low-disk check keeps every fixture folder; the floor alarm still sends once per crossing; explicit maker cleanup still rescues and removes an unlocked one-off; `tmp_sweep.py --apply` on a saved plan removes through the maker path and keeps a locked one. Run the sweep, tmp sweep, folder audit and source enforcement tests. The full gate runs after the final migration.
+**Acceptance gate:** a low-disk check keeps every fixture folder; the floor alarm still sends once per crossing; explicit maker cleanup still rescues and removes an unlocked one-off; `tmp_sweep.py --apply` on a saved plan removes through the maker path and keeps a locked one; a saved `deleting` trim intent keeps its remaining files and the record of its completed deletions. Run the sweep, tmp sweep, folder audit and source enforcement tests. The full gate runs after the final migration.
 
 ### Phase 132 — hana_shot launch refuses a new app at the local app cap  · status: done
 **Source:** builds showrunner 2026-11-15 23:1x, natedev decision after the 11-15 swap peak: 8 research `hana_shot.py launch` apps on ports 15820-15827 pushed swap to 36.6 GiB at 16:15 EST. An interim step; queue's memory gate for app launches (queue phase A) replaces it.
