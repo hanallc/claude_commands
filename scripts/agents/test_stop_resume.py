@@ -47,7 +47,7 @@ from scripts.agents import pane_record, shutdown
 from scripts.message import codex_daemon, session_records, sessions
 from scripts.message import sessions as runtime_sessions
 from scripts.production import unit_lookup, test_worker
-from scripts.direct import progress_history
+from scripts.direct import progress_history, step_record
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.agents.test_pane_restore import FakeClient, fixture_launch_transcript
 
@@ -4506,9 +4506,15 @@ class BuildWaitTests(unittest.TestCase):
     """An automatic move waits for the build steps a session owns; a move by hand does not."""
     moved: list[list[str]] = []
     up: dict[str, stop_resume.ClaudeUp] = {}
+    root: Path = Path()
 
     @override
     def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(patch.object(sys, "platform", "linux"))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "VERIFY_STEPS_DIR": str(self.root / "records"), "VERIFY_PROC_ROOT": str(self.root / "proc"),
+        })))
         self.moved = []
         self.up = {name: stop_resume.ClaudeUp(name, "w1:p1", "claude3") for name in ("alpha", "beta")}
 
@@ -4546,16 +4552,16 @@ class BuildWaitTests(unittest.TestCase):
         self.assertEqual(self.moved, [["beta"], ["alpha"]])
         self.assertEqual(shown.getvalue(), "build wait: alpha owns nextest in /w; the move waits for its steps to end\n")
 
-    def test_the_batch_moves_an_owner_at_the_limit_and_names_the_steps_it_ends(self) -> None:
+    def test_memory_wait_defers_at_the_move_deadline(self) -> None:
         self.batch()
         held = {"alpha": ("nextest in /w", "check in /w")}
         with patch.object(stop_resume, "_build_holders", return_value=held), \
                 patch.object(stop_resume, "monotonic", side_effect=[0.0, 0.0, 30 * 60.0]), \
                 redirect_stdout(io.StringIO()) as shown:
             results = stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto")
-        self.assertEqual(results, [self.up["alpha"]])
-        self.assertEqual(self.moved, [["alpha"]])
-        self.assertIn("build wait limit: alpha: the move ends nextest in /w; check in /w\n", shown.getvalue())
+        self.assertIsInstance(results[0], stop_resume.StopFailed)
+        self.assertEqual(self.moved, [])
+        self.assertIn("move deferred", shown.getvalue())
 
     def test_an_unread_queue_holds_the_owner_until_a_read_proves_its_steps_ended(self) -> None:
         self.batch()
@@ -4566,12 +4572,149 @@ class BuildWaitTests(unittest.TestCase):
             _ = stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto")
         self.assertEqual(self.moved, [["alpha"]])
 
-    def test_an_unread_queue_at_the_start_moves_at_once(self) -> None:
+    def test_an_unread_queue_at_the_start_defers_without_a_stop(self) -> None:
         with patch.object(stop_resume, "_build_holders", return_value=stop_resume.BuildQueueUnreadable("no socket")), \
                 redirect_stdout(io.StringIO()) as shown:
             results = stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto")
-        self.assertEqual(results, [self.up["alpha"]])
-        self.assertEqual(shown.getvalue(), "build wait: the build queue is unreadable (no socket); the move does not wait\n")
+        self.assertIsInstance(results[0], stop_resume.StopFailed)
+        self.assertEqual(self.moved, [])
+        self.assertIn("move deferred", shown.getvalue())
+
+    def verify_call(self, session: str = "alpha", *, pid: int = 4242, start: str = "123") -> None:
+        record = step_record.StepRecord("v20261116T225500-4242-1", pid, start, Path("/w"), "build",
+            step_record.NamedPackage("hana"), step_record.NatedevOnly("local"),
+            step_record.StepState.ON_NATEDEV, "2026-11-16T22:55:00+00:00")
+        step_record.write(record)
+        process = self.root / "proc" / str(pid)
+        process.mkdir(parents=True, exist_ok=True)
+        _ = (process / "stat").write_text(f"{pid} (bash) S 1 " + "0 " * 17 + start + "\n")
+        _ = (process / "environ").write_bytes(f"CLAUDE_CODE_SESSION_ID={session}\0".encode())
+
+    def empty_view(self) -> object:
+        from types import SimpleNamespace
+        return SimpleNamespace(view=SimpleNamespace(running=(), waiting=()))
+
+    def test_live_verify_outside_the_snapshot_holds_its_owner(self) -> None:
+        from scripts.build_queue import admission_client
+        self.verify_call()
+        with patch.object(admission_client, "view", return_value=self.empty_view()):
+            self.assertEqual(REAL_BUILD_HOLDERS(["alpha", "beta"]), {"alpha": ("verify.sh build in /w",)})
+
+    def test_token_wait_defers_at_the_move_deadline(self) -> None:
+        from scripts.build_queue import admission_client
+        self.batch()
+        self.verify_call()
+        with patch.object(admission_client, "view", return_value=self.empty_view()), \
+                patch.object(stop_resume, "_build_holders", new=REAL_BUILD_HOLDERS), \
+                patch.object(stop_resume, "monotonic", side_effect=[0.0, 0.0, 1800.0]), \
+                redirect_stdout(io.StringIO()):
+            results = stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto")
+        self.assertIsInstance(results[0], stop_resume.StopFailed)
+        self.assertEqual(self.moved, [])
+
+    def test_a_workers_waiting_verify_call_holds_its_director(self) -> None:
+        from scripts.build_queue import admission_client
+
+        self.batch()
+        run = self.root / "run"
+        director = staff.StaffRow(staff.StaffId("director"), "unit", "alpha", staff.STAFF_ROOT,
+            current_session=staff.StaffId("alpha"), run=staff.OpenRun(run))
+        for identity in ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"):
+            with self.subTest(identity=identity):
+                self.verify_call("worker")
+                _ = (self.root / "proc/4242/environ").write_bytes(
+                    f"{identity}=worker\0UNIT_RUN_DIR={run}\0".encode())
+                with patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((director,))), \
+                        patch.object(admission_client, "view", return_value=self.empty_view()), \
+                        patch.object(stop_resume, "_build_holders", new=REAL_BUILD_HOLDERS), \
+                        patch.object(stop_resume, "monotonic", side_effect=[0.0, 0.0, 1800.0]), \
+                        redirect_stdout(io.StringIO()):
+                    results = stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto")
+                self.assertIsInstance(results[0], stop_resume.BuildMoveDeferred)
+                self.assertEqual(self.moved, [])
+
+    def test_unreadable_staff_with_a_workers_live_verify_call_defers_the_move(self) -> None:
+        from scripts.build_queue import admission_client
+
+        self.verify_call("worker")
+        run = self.root / "run"
+        _ = (self.root / "proc/4242/environ").write_bytes(
+            f"CLAUDE_CODE_SESSION_ID=worker\0UNIT_RUN_DIR={run}\0".encode())
+        record = self.root / "staff.json"
+        _ = record.write_text("unreadable staff record")
+        with patch.dict(os.environ, {"STAFF_FILE": str(record)}), \
+                patch.object(admission_client, "view", return_value=self.empty_view()), \
+                patch.object(stop_resume, "_build_holders", new=REAL_BUILD_HOLDERS), \
+                redirect_stdout(io.StringIO()) as shown:
+            results = stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto")
+        self.assertIsInstance(results[0], stop_resume.BuildMoveDeferred)
+        self.assertEqual(self.moved, [])
+        self.assertIn("ownership is unreadable", shown.getvalue())
+
+    def test_unread_verify_identity_cannot_prove_the_build_ended(self) -> None:
+        from scripts.build_queue import admission_client
+        self.verify_call()
+        _ = (self.root / "proc/4242/stat").write_text("unreadable identity")
+        with patch.object(admission_client, "view", return_value=self.empty_view()):
+            self.assertIsInstance(REAL_BUILD_HOLDERS(["alpha"]), stop_resume.BuildQueueUnreadable)
+
+    def test_verify_identity_rechecks_and_preserves_unreadable_evidence(self) -> None:
+        from scripts.build_queue import admission_client
+        from scripts.lib import process_start
+
+        for state in (process_start.Gone(), process_start.Started("999"),
+                      process_start.Zombie("123"), process_start.Unreadable("denied")):
+            with self.subTest(state=type(state).__name__):
+                self.verify_call()
+                with patch.object(admission_client, "view", return_value=self.empty_view()), \
+                        patch.object(process_start, "process_start", side_effect=[process_start.Started("123"), state]):
+                    result = REAL_BUILD_HOLDERS(["alpha"])
+                if isinstance(state, process_start.Unreadable):
+                    self.assertIsInstance(result, stop_resume.BuildQueueUnreadable)
+                else:
+                    self.assertEqual(result, {})
+
+    def test_verify_records_keep_unknown_ownership_and_ignore_other_sessions(self) -> None:
+        from scripts.build_queue import admission_client
+
+        for owner in ("beta", ""):
+            with self.subTest(owner=owner):
+                self.verify_call(owner)
+                with patch.object(admission_client, "view", return_value=self.empty_view()):
+                    result = REAL_BUILD_HOLDERS(["alpha"])
+                if owner:
+                    self.assertEqual(result, {})
+                else:
+                    self.assertIsInstance(result, stop_resume.BuildQueueUnreadable)
+        self.verify_call()
+        (self.root / "proc/4242/environ").unlink()
+        with patch.object(admission_client, "view", return_value=self.empty_view()):
+            self.assertIsInstance(REAL_BUILD_HOLDERS(["alpha"]), stop_resume.BuildQueueUnreadable)
+
+    def test_dead_and_reused_verify_records_do_not_hold_the_director(self) -> None:
+        from scripts.build_queue import admission_client
+
+        self.verify_call()
+        process = self.root / "proc/4242/stat"
+        for stat in ("4242 (bash) S 1 " + "0 " * 17 + "999\n", ""):
+            with self.subTest(stat=stat):
+                if stat:
+                    _ = process.write_text(stat)
+                else:
+                    process.unlink()
+                with patch.object(admission_client, "view", return_value=self.empty_view()):
+                    self.assertEqual(REAL_BUILD_HOLDERS(["alpha"]), {})
+
+    def test_mixed_batch_moves_only_the_free_director_at_the_deadline(self) -> None:
+        self.batch()
+        held = {"alpha": ("build in /w",)}
+        with patch.object(stop_resume, "_build_holders", return_value=held), \
+                patch.object(stop_resume, "monotonic", side_effect=[0.0, 0.0, 1800.0]), \
+                redirect_stdout(io.StringIO()):
+            results = stop_resume.move_sessions(["alpha", "beta"], "claude3", why="auto: head", cause="auto")
+        self.assertIsInstance(results[0], stop_resume.StopFailed)
+        self.assertEqual(results[1], self.up["beta"])
+        self.assertEqual(self.moved, [["beta"]])
 
     def test_the_reader_names_running_and_waiting_steps_of_the_selected_sessions(self) -> None:
         from types import SimpleNamespace

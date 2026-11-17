@@ -207,7 +207,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/hooks/session-start-direct-resume.py` | read | local_by_current_session, unit_command |
 | `scripts/hooks/showrunner_footer.py` | read | snapshot |
 | `scripts/hooks/staff_session_identity.py` | write | initial_snapshot, native_id, runtime_id, update_current_session |
-| `scripts/hooks/stop-direct-continue.py` | read | local_by_current_session, unit_command |
+| `scripts/hooks/stop-direct-continue.py` | read | local_by_current_session, unit_command, local_snapshot; active_dispatch reads the worker's fixed staff ID |
 | `scripts/hooks/user-prompt-submit-conversation-pause.py` | read | StaffSnapshot (type); conversation_pause.session_staff reads the row |
 | `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
 | `scripts/lib/resume_message.py` | read | StaffId |
