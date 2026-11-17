@@ -190,6 +190,18 @@ class ReviewPageTests(unittest.TestCase):
         self.assertEqual(deferred.state,review_items.ReviewState.WAITING)
         self.assertEqual(review_items.proposals(doc),1)
         self.assertEqual(review_items.ready_investigations(self.fixture.unit.id),1)
+        news = review_page.waiting_items(console.NewsRequest(self.root))
+        with self.subTest(finding='F017'):
+            self.assertFalse(any(key.startswith(('proposal/', 'efficiency/')) for key in news),
+                             'F017: only visible types mark Review as new')
+        for fields in ('unit: implementer', 'stage: active', 'style_answer: declined'):
+            with self.subTest(finding='F016', fields=fields):
+                _ = (proposals / 'approved.md').write_text('---\nstatus: open\ntags: [proposal]\n'
+                    +f'proposed_by: {self.fixture.unit.id}\nproposal_id: P2\ndate_created: 2026-11-01\n{fields}\n---\n')
+                approved = next(item for item in review_items.read(self.root) if item.id == 'P2')
+                self.assertEqual(approved.state, review_items.ReviewState.DONE, 'F016: approval finishes the Review item')
+                self.assertEqual(review_items.proposals(doc), 1)
+                self.assertEqual(len(review_items.next_queue('proposal', doc, False, staff.snapshot())[1]), 1)
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_filters_single_card_refresh_drafts_and_saved_row_removal(self) -> None:
@@ -237,9 +249,14 @@ window.fetch=async(_url,options={})=>options.method==='POST' ?
   await new Promise(resolve=>nativeTimeout(resolve,1000));
   check(allTarget.hidden,'F010: the saved row leaves All');
   location.hash=new URLSearchParams({item:target.dataset.key});await flush();
-  check(!target.hidden && !target.querySelector('[data-detail]').hidden,'a Review item link shows the saved row');
-  check(document.getElementById('list-show').value==='all' && document.getElementById('list-owner').value==='' &&
-    document.getElementById('list-search').value==='','a Review item link clears filters');
+  check(target.hidden,'F010: a fragment change keeps the saved row hidden');
+  const reloaded=document.createElement('iframe');reloaded.src='/console/review.html#'+new URLSearchParams({item:target.dataset.key});
+  const reloadComplete=new Promise(resolve=>reloaded.addEventListener('load',resolve,{once:true}));document.body.append(reloaded);await reloadComplete;
+  const linkedTarget=reloaded.contentDocument.querySelector('[data-key="'+target.dataset.key+'"]');
+  check(!linkedTarget.hidden && !linkedTarget.querySelector('[data-detail]').hidden,'a Review item link shows the saved row');
+  check(reloaded.contentDocument.getElementById('list-show').value==='all' && reloaded.contentDocument.getElementById('list-owner').value==='' &&
+    reloaded.contentDocument.getElementById('list-search').value==='','a Review item link clears filters');
+  reloaded.remove();
   const retained={item:fresh.dataset.key,type:'question',owner:fresh.dataset.owner,show:'For you',q:'Q1',sort:'Age',dir:'desc'};
   location.hash=new URLSearchParams(retained);await flush();
   check(document.getElementById('list-owner').value===retained.owner && document.getElementById('list-show').value==='For you' &&

@@ -249,6 +249,10 @@ The console inlines the icons and makes no CDN, font, script, or stylesheet requ
 `/console/review.html` replaces the Changes, Questions and Investigations navigation pages.
 The old addresses redirect to Review with the corresponding type filter.
 The redirect retains the owner, filters, sort and open item.
+Legacy `row` fields become `item` fields.
+The former Investigations Show values select the same records on Review.
+`not-read` selects Open; `answer ready` selects For you; `open` selects Waiting; `read` selects Done; `all` selects All.
+Legacy investigation owner filters retain the exact record owner.
 The Review navigation entry uses the Lucide `inbox` icon.
 Selected-row snapshots retain their signed legacy forms.
 
@@ -289,10 +293,13 @@ Send feedback closes a change.
 Ask showrunner to check transfers the next action to the showrunner.
 A successful check closes the item; only a problem returns it to For you.
 After a save, the row shows its result and leaves every Show view.
+Refresh keeps a completed row hidden until the page reloads.
 The page does not open another card automatically.
 The shared status component refreshes the page every `page_refresh_seconds`, initially 15 seconds.
 Refresh retains the open row, scroll position and typed text.
 The Review navigation entry marks new For you items.
+Only Questions, Changes and Investigations can set this mark in this phase.
+Approved and declined proposals become Done in the shared reader.
 Cross-type feedback, questions, Later, and owner reply commands belong to the next phase.
 
 ### Accounts page

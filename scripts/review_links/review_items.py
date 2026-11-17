@@ -21,6 +21,7 @@ from scripts.nightly_review import candidates
 from scripts.production import change_review, change_routing, delivery_state, investigation, staff, update_registration
 from scripts.production import proposals_folder, proposals_table
 from scripts.production.issues import Issue
+from scripts.production.proposal_issue import DeclinedDecision, InProgress, decision_answer, proposal_progress
 from scripts.production.production_doc import production_field, Refusal
 from scripts.review_links import review_events
 from scripts.review_links.review_events import ReviewLog as ReviewLog
@@ -328,6 +329,14 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
     return found
 
 
+def proposal_state(issue: Issue) -> ReviewState:
+    """Finish the user's review when a proposal is approved, declined or closed."""
+    if (issue.value('status') != 'open' or isinstance(proposal_progress(issue), InProgress)
+            or isinstance(decision_answer(issue), DeclinedDecision)):
+        return ReviewState.DONE
+    return ReviewState.FOR_YOU
+
+
 def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                    sources: list[Path] | None = None, own: list[Issue] | None = None) -> list[ReviewItem]:
     found: dict[str, ReviewItem] = {}
@@ -344,8 +353,9 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
             who = staff.StaffId(issue.value('proposed_by')) if issue is not None else owner
             filed = entry.since.replace(tzinfo=user_zone()) if entry.since is not None else moment('1970-01-01')
             key = 'proposal/'+entry.key
+            state = proposal_state(issue) if issue is not None else ReviewState.FOR_YOU
             found[key] = ReviewItem(key, issue.value('proposal_id') or path.stem if issue is not None else entry.item.proposal,
-                ReviewType.PROPOSAL, owner, who, entry.item.proposal, ReviewState.FOR_YOU, ReviewTimes(filed,filed),
+                ReviewType.PROPOSAL, owner, who, entry.item.proposal, state, ReviewTimes(filed,filed),
                 (ReviewLog(filed,name(who,members),'Proposed'),), (), source, entry.urgency,
                 'proposal/'+entry.after if entry.after else '', queue,entry.key,entry.after,entry.value,
                 proposals_table.proposal_text(entry))
@@ -357,7 +367,7 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
             key = 'proposal/'+str(issue.path)
             who = staff.StaffId(issue.value('proposed_by') or owner)
             found[key] = ReviewItem(key,issue.value('proposal_id') or issue.path.stem,ReviewType.PROPOSAL,
-                owner,who,issue.path.stem,ReviewState.WAITING,ReviewTimes(filed,filed),(),(),ProposalSource(issue))
+                owner,who,issue.path.stem,proposal_state(issue),ReviewTimes(filed,filed),(),(),ProposalSource(issue))
     return list(found.values())
 
 
