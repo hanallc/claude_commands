@@ -515,6 +515,109 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 - A du fan-out over subfolders: each du process counts a hard link again, so the Nix store and cargo `deps/` count twice.
 - A threaded Python walker: the GIL holds it near 130k entries/s (/ 58–68 s).
 
+### Phase 45 — A refresh button on the Disks page measures the drives at once  · status: done
+**Depends on:** Phase 44
+
+#### Work Order
+
+**Goal:** the user (change review C1825, 2026-11-17): "a refresh icon (lucide) that when pressed, would cause it to remeasure". The Disks page has a Lucide `refresh-cw` button. A press starts a measure at once, also when the sizes are current, and the status line shows Measuring. A press while a measure runs starts no second measure (showrunner, 2026-11-17).
+
+**Spec:**
+- `scripts/disks/disks_page.py` — `start_measure(now, launch=launch_measure, *, force=False)`: with `force`, skip the `cache_seconds` check. The lock rule stays: a running measure gives `MeasureStart.RUNNING` and no launch.
+- `scripts/review_links/serve.py` — `disks_measure_post` reads the posted form. `force=1` passes `force=True`; an empty body keeps today's behavior. The answer keeps its form (`state`, `slots`, `sessions`).
+- `scripts/disks/disks.html`:
+  - A `<button type="button">` with the vendored Lucide `refresh-cw` icon (`scripts/review_links/lucide/refresh-cw.svg`, put in by `disks_page.publish` through `page_frame.icon_svg`; no hand-copied path), `aria-label="Measure now"` and a tooltip "Measure now". It sits at the end of the page status line, in the same row.
+  - A press posts `force=1` to the measure name, sets the page's `measuring` state as `askMeasure` does, and runs a page refresh, so the status line shows `Paused · Measuring…` at once (the existing busy path).
+  - While `measuring` is set, the button is disabled. It is enabled again when new data arrives or the wait ends (`settings.wait_seconds`).
+  - A failed press shows its reason through the existing `failure` path; the button is enabled again.
+  - Style: the icon is 16 px, `currentColor`, with the page's muted text color and the accent color on hover and focus; a visible focus ring. Use console theme tokens only; no new color.
+
+**Files:**
+- `scripts/disks/disks_page.py` — `start_measure` force
+- `scripts/disks/disks.html` — the button and its press
+- `scripts/review_links/serve.py` — `force=1` in `disks_measure_post`
+- `scripts/disks/test_disks_page.py` — tests
+- `scripts/review_links/test_serve.py` — tests
+
+**Workers:** 1 writer — `impl` writes all five files.
+
+**State:** none
+
+**Constraints from prior phases:** a measure takes about 55–60 s on natedev (dust, both drives at once). `start_measure` never waits for the measure. `disks_page.publish` writes the page only when it changes. Tests write a fixture config; no test reads a tunable value. Every tunable goes in a config file.
+
+**Acceptance gate:**
+1. `scripts.disks.test_disks_page` passes, with tests for: `start_measure(force=True)` launches when the data is current; `force=True` with the lock held gives `RUNNING` and no launch; the published page holds the `refresh-cw` button with its label.
+2. `scripts.review_links.test_serve` passes, with a test that `force=1` reaches `start_measure` and an empty body does not force.
+3. basedpyright reports 0 errors and 0 warnings on the changed Python files.
+4. Live on natedev (director): press the button on the Disks page in a browser. The status line shows `Paused · Measuring…` at once, the button is disabled, and a second press does nothing. About a minute later the sizes update and the button is enabled again. One dark desktop screenshot, clipped to the status line and button, for the Change-Review line with `| after restart`.
+
+### Phase 46 — A question title is one short line, and the Review page never shows a long one  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the user (2026-11-17, via builds and the showrunner): "the item description is ridiculously long and unreadable - we need to have that be an impossible thing to happen". spacetime/Q461 and Q462 filed the whole question (context, values, choices, recommendation) as the item title, and the Review page shows 15+ lines in the Item column. The writer refuses a long title, and the Review page cuts an old long title to one short line.
+
+**Spec:**
+- `config/production.conf` — new key `question_title_max_chars=100` with a comment and a `# whole: 20..` line, as the other keys carry.
+- `scripts/production/update_registration.py`:
+  - `ask` refuses `--text` and `--ask` when either is longer than `question_title_max_chars` characters (the existing one-line check stays). The refusal names the limit and the length, and says to put the rest in `--context` and `--item`. It runs before the question review, so a refused question costs no review.
+  - The `questions --state` path (the replacement table from a showrunner's `open_for_user`) refuses a new or changed item whose text is longer than the limit or longer than one line. This is the path that filed spacetime/Q461 and Q462. A stored item that is already longer is only named, as `plumbing` problems are (`report("questions", "reword", …)`).
+  - Every other path that writes a question title: search for writers of `OutstandingItem` `text` and `parts["ask"]`, and apply the same rule through one helper, so the limit lives in one place.
+  - The `--text` and `--ask` help text names the limit.
+- `scripts/review_links/review_page.py`: the row title of every review item shows only its first line, cut at `question_title_max_chars` characters with "…" when longer. The search attribute keeps the full text. When the title is cut, the details show the full text (a question whose `ask` equals its `text` shows the full `ask` as its lead). Keep this change small: admin-console also changes this file now.
+- `commands/showrunner/produce.md`, **Open-questions list**: today it says "Keep each item complete enough to stand alone when the user asks for the list: what is asked, where, why and the choices". That text made spacetime put the whole question in the item. Replace it: an `open_for_user` item is the short one-line title (at most `question_title_max_chars`); file a new question with `update_registration.py ask` and its parts (`--ask`, `--context`, `--item`, `--choice`, `--recommend`), so the page and `/next` show the rest.
+- `docs/question_template.md` — the `--ask` line (line 12) names the title limit and says the rest goes in `--context` and `--item`. Both question commands import this file, so the rule lives in one place; `commands/showrunner/question.md`, `commands/unit/question.md` and the producer docs need no change.
+
+**Files:**
+- `config/production.conf` — the limit
+- `scripts/production/update_registration.py` — the refusal
+- `scripts/production/test_update_registration_questions.py` — tests
+- `scripts/review_links/review_page.py` — the cut title
+- `scripts/review_links/test_review_page.py` — tests
+- `docs/question_template.md` — the limit line
+- `commands/showrunner/produce.md` — the filing rule
+
+**Workers:** 1 writer — `impl` writes all files.
+
+**State:** none
+
+**Constraints from prior phases:** tests write a fixture config; no test reads a tunable value. A changed config key needs the showrunner's go; this key is new. `review_page.py` is shared with admin-console: keep the hunk small and touch no other part of the file.
+
+**Acceptance gate:**
+1. `scripts.production.test_update_registration_questions` passes, with tests for: `ask` refuses a `--text` and an `--ask` one character over the limit and names the limit; a title at the limit files; the `questions --state` path refuses a new long or multi-line item and only names a stored one.
+2. `scripts.review_links.test_review_page` passes, with a test that a long title shows one line cut with "…", the search attribute keeps the full text, and the details show the full text.
+3. basedpyright reports 0 errors and 0 warnings on the changed Python files.
+4. Live on natedev (director): the Review page shows spacetime/Q461 and Q462 (or a fixture copy when they are closed) as one line each. One dark desktop screenshot of those rows for the Change-Review line with `| after restart`.
+
+### Phase 47 — A rename of a unit to its own name keeps bare worker names quiet  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the showrunner (2026-11-17, renamequiet). `agents rename OWNER OWNER` migrates old qualified worker names. For cargo-liner-style, whose worker rows already have bare names (`review`, `review2`, `style-ticket-1493`, `held-check-N`), it printed about 110 lines `kept; prefix does not end with cargo-liner-style`, each with a wrong hint such as `rename <id> 1493`. A row with no qualified prefix for this owner is already correct. The command prints no per-row line for it and never prints a hint that cuts a name. Second case (hana's widget): 14 rows carry the unit's former name as prefix (`widget-enhancements-impl`). Accept a prefix that equals or ends with a recorded former name of the owner; use only recorded former names, never a former name inferred from the shape of a worker name.
+
+**Spec:**
+- `scripts/agents/shutdown.py` `rename_qualified_workers(owner)`:
+  1. The owner's qualified prefixes are its name and each recorded former name. A prefix qualifies when it equals one of them or ends with `-<one of them>`.
+  2. A row whose name has no qualifying prefix is left as it is, with no per-row output. At the end, when one or more rows were left, print one line: `<N> worker names unchanged: no qualified prefix for <owner>`. No hint.
+  3. Former names: find where a durable record of the owner's former names exists (the staff row, or the session record `formerNames` that `rename` writes, shutdown.py ~2181). Use a record only if it survives a session restart. If no durable record exists, accept only the owner's current name, and say so in the report.
+  4. Qualified rows migrate as now.
+
+**Files:**
+- `scripts/agents/shutdown.py` — `rename_qualified_workers`
+- `scripts/agents/test_shutdown_cli.py` — tests (the `UNDECIDED` scenarios at ~2234 pin the old kept line and hint; the director approves replacing them with the new behavior)
+
+**Workers:** 1 writer.
+
+**State:** none
+
+**Constraints from prior phases:** test with fixture staff rows only; no run on live units. No new check or gate (showrunner).
+
+**Acceptance gate:**
+1. `scripts.agents.test_shutdown_cli` passes, with tests for: bare rows (`review`, `review2`, `style-ticket-1493`, `held-check-3`) print no per-row line and one summary line; a row with a recorded former-name prefix migrates; a row with an unrecorded foreign prefix stays and prints no hint.
+2. basedpyright reports 0 errors and 0 warnings on the changed files.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 

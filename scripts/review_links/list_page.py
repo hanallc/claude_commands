@@ -22,6 +22,7 @@ from scripts.production import change_review, footer_counts, record_store, sessi
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_link
 from scripts.review_links import review_items, review_page
+from scripts.review_links import staff_names
 from scripts.statusline import counts_row, rebuild_row
 
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/list.html"
@@ -142,7 +143,8 @@ def review_card(identity: str, reviews: Mapping[str, review_items.ReviewItem]) -
     return f'<a href="{html.escape(href, quote=True)}" target="_top">{label}</a>'
 
 
-def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[str, review_items.ReviewItem]) -> str:
+def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[str, review_items.ReviewItem],
+            names: staff_names.StaffNames) -> str:
     item = entry.item
     sections = ''.join('<section><h3>' + heading + '</h3>'
                        + change_browser.question_paragraphs(text or "Not recorded") + '</section>'
@@ -159,14 +161,16 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[st
         cards = (review_card(identity, reviews) for identity in item.reviews)
         sections += '<p>' + review_summary(item, reviews, today) + '</p><p>' + ' · '.join(cards) + '</p>'
     log = ''.join('<li><time datetime="' + change.time.isoformat() + '">' + html.escape(local_time(change.time, today))
-                  + '</time><span>' + html.escape(change.what) + ' <small>— ' + html.escape(change.source)
+                  + '</time><span>' + html.escape(change.what) + ' <small>— ' + names.html(change.source)
                   + '</small></span></li>' for change in reversed(item.log))
     return ('<div class="list-panel"><div>' + sections + feedback_form(entry, secret)
             + '</div><section><h3>Log · newest first</h3><ol class="list-log">' + log + '</ol></section></div>')
 
 
 def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, index: int, secret: str,
-              reviews: Mapping[str, review_items.ReviewItem]) -> str:
+              reviews: Mapping[str, review_items.ReviewItem],
+              names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
+    names = staff_names.for_page(names, members)
     item = entry.item
     owner = owner_name(members, item.owner)
     producer = owner_name(members, item.producer)
@@ -186,7 +190,7 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
               + f'aria-label="Show item {item.number}"><span class="list-chevron" aria-hidden="true">›</span>{item.number}</button>')
     title = '<strong>' + html.escape(item.title) + '</strong>'
     if item.unit:
-        title += '<small>' + html.escape(item.unit) + '</small>'
+        title += '<small>' + names.html(item.unit) + '</small>'
     tone = {the_list.ItemState.WAITING_FOR_NATE: "warning", the_list.ItemState.BLOCKED: "error",
             the_list.ItemState.WORKING: "accent", the_list.ItemState.DELIVERED: "room",
             the_list.ItemState.DONE: "room"}.get(item.state, "muted")
@@ -205,16 +209,17 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
     sent = the_list.sent_to_morty(item)
     if isinstance(sent, datetime):
         feedback = tuple(the_list.feedback_requests(item).values())[-1]
-        notice = "sent to morty"
+        notice = "sent to " + names.html("morty")
         if feedback.state == "alerted":
-            notice = "not sent; " + feedback.alerted_to + " told" if feedback.alerted_to else "not sent; no showrunner for alert"
-        update += '<small>' + html.escape(notice + ", " + local_time(sent, today)) + '</small>'
-    cells = (number, html.escape(owner), html.escape(producer), title, state, change_browser.question_paragraphs(item.next_step or "Not recorded"),
+            notice = ("not sent; " + names.html(feedback.alerted_to) + " told" if feedback.alerted_to
+                      else "not sent; no showrunner for alert")
+        update += '<small>' + notice + ", " + html.escape(local_time(sent, today)) + '</small>'
+    cells = (number, names.html(item.owner, owner), names.html(item.producer, producer), title, state, change_browser.question_paragraphs(item.next_step or "Not recorded"),
              html.escape(eta_text(item.eta, today)), update)
     row = ''.join(f'<td data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden = ' hidden' if parked or item.state in (the_list.ItemState.DONE, the_list.ItemState.CLOSED) else ''
     return (f'<tbody data-list-item{attrs}{hidden}><tr class="list-row">' + row
-            + f'</tr><tr data-detail id="{panel}" hidden><td colspan="{len(HEADERS)}">' + details(entry, today, secret, reviews) + '</td></tr></tbody>')
+            + f'</tr><tr data-detail id="{panel}" hidden><td colspan="{len(HEADERS)}">' + details(entry, today, secret, reviews, names) + '</td></tr></tbody>')
 
 
 @dataclass(frozen=True)
@@ -335,7 +340,7 @@ def count_link(page: str, place: str, text: str) -> str:
     return f'<a href="{html.escape(path, quote=True)}" target="_top">{text}</a>'
 
 
-def counts_strip(members: staff.StaffSnapshot) -> str:
+def counts_strip(members: staff.StaffSnapshot, names: staff_names.StaffNames) -> str:
     """Use the status line readers for the counts beside their existing pages."""
     identities = QuestionStaff(members, session_staff.MemberSources(()))
     chips: list[str] = []
@@ -362,7 +367,7 @@ def counts_strip(members: staff.StaffSnapshot) -> str:
             path += '#' + urlencode({"showrunner": owner.name})
             parts.append(count_link("questions" if label == "question" else "changes", path, text))
         if parts:
-            chips.append('<span class="list-count-chip">' + html.escape(owner.name) + ' · ' + ' · '.join(parts) + '</span>')
+            chips.append('<span class="list-count-chip">' + names.html(owner.id, owner.name) + ' · ' + ' · '.join(parts) + '</span>')
     try:
         machines = rebuild_row.read(conf.path("statusline")).machines
     except errors:
@@ -376,22 +381,23 @@ def counts_strip(members: staff.StaffSnapshot) -> str:
             + ''.join(chips) + '</aside>') if chips else ''
 
 
-def filter_options(names: Mapping[str, str]) -> str:
+def filter_options(names: Mapping[str, str], colors: staff_names.StaffNames) -> str:
     """Write one menu option for each staff ID, sorted by its shown name."""
-    return ''.join(f'<option value="{html.escape(value, quote=True)}">{html.escape(name)}</option>'
+    return ''.join(f'<option value="{html.escape(value, quote=True)}"{colors.style(value)}>{html.escape(name)}</option>'
                    for value, name in sorted(names.items(), key=lambda pair: (pair[1].casefold(), pair[0])))
 
 
 def render(root: Path) -> bytes:
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
+    names = staff_names.StaffNames(members)
     items = records()
     reviews = ({review.key: review for review in review_items.read(root, members=members)}
                if any(entry.item.reviews for entry in items) else {})
     today = datetime.fromtimestamp(read_at, user_zone())
     secret = change_browser.browser_manifest(change_page.console_folder(root))[0]
-    owners = filter_options({str(entry.item.owner): owner_name(members, entry.item.owner) for entry in items})
-    producers = filter_options({str(entry.item.producer): owner_name(members, entry.item.producer) for entry in items})
+    owners = filter_options({str(entry.item.owner): owner_name(members, entry.item.owner) for entry in items}, names)
+    producers = filter_options({str(entry.item.producer): owner_name(members, entry.item.producer) for entry in items}, names)
     shows = ''.join(f'<option value="{value}">{label}</option>' for value, label in SHOWS)
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
@@ -408,8 +414,8 @@ def render(root: Path) -> bytes:
                + '<div class="list-table"><table aria-label="The List"><colgroup><col style="width:5%"><col style="width:8%">'
                + '<col style="width:10%"><col style="width:18%"><col style="width:14%"><col style="width:23%"><col style="width:14%">'
                + '<col style="width:8%"></colgroup><thead><tr>' + headers + '</tr></thead>'
-               + ''.join(item_rows(entry, members, today, index, secret, reviews) for index, entry in enumerate(items)) + '</table>'
-               + '<p data-empty hidden>No items in this view.</p></div>' + counts_strip(members) + '</div><script>' + SCRIPT + '</script>')
+               + ''.join(item_rows(entry, members, today, index, secret, reviews, names) for index, entry in enumerate(items)) + '</table>'
+               + '<p data-empty hidden>No items in this view.</p></div>' + counts_strip(members, names) + '</div><script>' + SCRIPT + '</script>')
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
 
 

@@ -4555,6 +4555,27 @@ ROLE_COLOR_KEYS = {"units": "role.unit-director", "showrunners": "role.showrunne
                    "producers": "role.producer"}
 
 
+@dataclass(frozen=True)
+class StaffRoleColor:
+    """The configured key and valid CSS color for a staff role."""
+
+    key: str
+    css: str
+
+
+def role_colors() -> dict[str, str]:
+    """Read the same current color settings as the Accounts board."""
+    return conf.read_or_repository("statusline").values()
+
+
+def staff_role_color(member: staff.StaffRow, colors: Mapping[str, str]) -> StaffRoleColor | NoAccountColor:
+    """Resolve the staff kind through the Accounts role keys and color parser."""
+    group = "units" if member.kind == "unit" else member.kind + "s"
+    key = ROLE_COLOR_KEYS[group]
+    color = account_color(colors.get(key, ""))
+    return StaffRoleColor(key, color.css) if isinstance(color, AccountColor) else NoAccountColor()
+
+
 def _colored_span(text: str, key: str, colors: dict[str, str], kind: Literal["fact", "bold"] = "fact") -> BoardSpan:
     span = _span(text, kind=kind)
     if key in colors:
@@ -4643,7 +4664,7 @@ def account_details_in_row_order(rows: list[BoardRow]) -> list[BoardRow]:
 def status_board(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> Board:
     """The accounts board: one line per role of each account, then the total line."""
     account_config = read_account_settings(account_config)
-    return _status_board(reading, account_config=account_config, colors=conf.read_or_repository("statusline").values())
+    return _status_board(reading, account_config=account_config, colors=role_colors())
 
 
 def _status_board(reading: StatusReading, *, account_config: conf.ConfigRead, colors: dict[str, str]) -> Board:
@@ -4668,7 +4689,7 @@ def _status_board(reading: StatusReading, *, account_config: conf.ConfigRead, co
 
 def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:
     account_config = read_account_settings(account_config)
-    colors = conf.read_or_repository("statusline").values()
+    colors = role_colors()
     accounts: list[StatusAccountDocument] = []
     for row in reading.rows:
         item = StatusAccountDocument(label=row.label, tool=row.tool, roles=list(row.roles), selected_roles=list(row.selected_roles),
