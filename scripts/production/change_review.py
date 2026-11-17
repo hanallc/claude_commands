@@ -46,7 +46,7 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 
 from scripts.production import issues  # noqa: E402
 from scripts.production.proposals_folder import owner_docs, scope_docs  # noqa: E402
-from scripts.production import change_routing, session_staff, showrunner_tree, showrunners, staff, unit_config, unit_lookup
+from scripts.production import change_routing, delivery_state, session_staff, showrunner_tree, showrunners, staff, unit_config, unit_lookup
 from scripts.production.production_doc import Refusal, production_field
 from scripts.review_links import image_store
 from scripts.agents import remote
@@ -1826,26 +1826,44 @@ class VerdictRefused:
     warnings: list[str] = field(default_factory=list)
 
 
-def save_verdict(path: Path, row: str, verdict: str, production: Path) -> VerdictSaved | VerdictRefused:
-    """Save a verdict and remove its scratch folders without printing output."""
+def _require_verdict_exchange(slots: delivery_state.DeliverySlots, verdict: str, validation_id: str) -> None:
+    """Apply the same exchange checks to a single verdict and a batch verdict."""
+    try:
+        if isinstance(slots.question, delivery_state.OpenQuestion):
+            _ = delivery_state.question_exchange_for_reply(slots.question, '', verdict)
+        if validation_id or slots.validation_requested:
+            delivery_state.require_exchange_id(
+                slots.validation if isinstance(slots.validation, delivery_state.NoDelivery) else slots.validation.attempt,
+                validation_id)
+    except delivery_state.StaleQuestionExchange as error:
+        raise ChangeReviewError(str(error)) from error
+
+
+def save_verdict(path: Path, row: str, verdict: str, production: Path, *, validation_id: str = '') -> VerdictSaved | VerdictRefused:
+    """Check the exchange and save the verdict under the same delivery lock."""
     verdict = _words("verdict", verdict)
     local_row = _row_id("row", row.rpartition("/")[2])
     shown = row_display_id(path, local_row)
     warnings: list[str] = []
     root = change_routing.review_root()
+    root.mkdir(parents=True, exist_ok=True)
     delivery = change_routing.delivery_path(root, path, local_row)
-    slots = change_routing.delivery_slots(delivery)
-    empty_row: dict[str, str] = {}
-    pending_row = next((item for item in pending(path) if item["#"] == local_row), empty_row)
-    if slots.validation_requested and not lands(verdict) and pending_row.get("Review log"):
-        with file_lock.exclusive(root / ".review-link-delivery.lock"):
+    with file_lock.exclusive(root / '.review-link-delivery.lock'):
+        slots = change_routing.delivery_slots(delivery)
+        try:
+            _require_verdict_exchange(slots, verdict, validation_id)
+        except ChangeReviewError as error:
+            return VerdictRefused([], str(error))
+        empty_row: dict[str, str] = {}
+        pending_row = next((item for item in pending(path) if item["#"] == local_row), empty_row)
+        if slots.validation_requested and not lands(verdict) and pending_row.get("Review log"):
             fields = cast(dict[str, object], json.loads(delivery.read_text()))
             record_review_log(path, local_row, "Check found a problem: "+verdict, production,
                               unit_lookup.doc_owner(production, staff.snapshot()).name)
             _ = fields.pop("validation", None)
             write_text_atomic(delivery, json.dumps(fields)+"\n")
-        return VerdictSaved([f"{shown}: the check found a problem; returned to For you"])
-    result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append)
+            return VerdictSaved([f"{shown}: the check found a problem; returned to For you"])
+        result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append)
     return _verdict_output(path, local_row, shown, verdict, result, warnings)
 
 
@@ -2117,6 +2135,7 @@ class CommandLine(argparse.Namespace):
     see: str = ""
     row: str = ""
     verdict: str = ""
+    validation: str = ""
     kind: str = ""
     production: str = ""
     urgency: str = ""
@@ -2247,7 +2266,7 @@ class BatchWrite:
     write: Callable[[list[str]], Callable[[], list[str]]]
 
 
-def _batch_item(value: object, index: int, day: date) -> BatchWrite:
+def _batch_item(value: object, index: int, day: date, review_root: Path) -> BatchWrite:
     if not isinstance(value, dict):
         raise ChangeReviewError("expected an object")
     fields = cast(dict[str, object], value)
@@ -2290,10 +2309,13 @@ def _batch_item(value: object, index: int, day: date) -> BatchWrite:
         if text("image") or text("output"):
             raise ChangeReviewError("verdict does not accept image or output")
         verdict = _words("verdict", text("verdict", required=True))
+        validation_id = text('validation')
         change_verdict = _verdict_write(path, target.row, verdict, day)
         shown = row_display_id(path, target.row)
 
         def record(lines: list[str]) -> Callable[[], list[str]]:
+            delivery = change_routing.delivery_path(review_root, path, target.row)
+            _require_verdict_exchange(change_routing.delivery_slots(delivery), verdict, validation_id)
             result = change_verdict.write(lines)
             if isinstance(result, VerdictConflict):
                 raise ChangeReviewError(f'{target.row} has the verdict "{result.recorded}" from {result.day}')
@@ -2317,11 +2339,12 @@ def batch(file: Path) -> list[str]:
     if not isinstance(values, list):
         raise ChangeReviewError("batch: expected a JSON array")
     day = today()
+    root = change_routing.review_root()
     items: list[BatchWrite] = []
     rows: dict[tuple[Path, str], int] = {}
     for index, value in enumerate(cast(list[object], values)):
         try:
-            item = _batch_item(value, index, day)
+            item = _batch_item(value, index, day, root)
             key = (item.path, item.row)
             if key in rows:
                 raise ChangeReviewError(f"row {item.row} is already item {rows[key]}")
@@ -2334,8 +2357,9 @@ def batch(file: Path) -> list[str]:
     if len({item.path.parent for item in items}) != 1:
         raise ChangeReviewError("batch: all lists must be in one folder")
     items[0].path.parent.mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
     after: list[Callable[[], list[str]]] = []
-    with _list_lock(items[0].path):
+    with file_lock.exclusive(root / '.review-link-delivery.lock'), _list_lock(items[0].path):
         original: dict[Path, str] = {}
         lines_by_path: dict[Path, list[str]] = {}
         for item in items:
@@ -2371,7 +2395,7 @@ ACTION_OPTIONS: dict[str, tuple[str, ...]] = {
     "show": ("list", "production", "row"),
     "mark-important": ("list", "production", "row"),
     "set-kind": ("list", "production", "row", "kind"),
-    "verdict": ("list", "production", "row", "verdict"),
+    "verdict": ("list", "production", "row", "verdict", "validation"),
     "list-path": ("production",),
     "showrunner": ("production",),
     "backfill-production": ("list", "write"),
@@ -2446,7 +2470,8 @@ def _run(options: CommandLine) -> int:
             print(set_row_kind(target.path, target.row, options.kind, production_doc(options.production)))
         case "verdict":
             target = _row_option(options)
-            result = save_verdict(target.path, target.row, options.verdict, production_doc(options.production))
+            result = save_verdict(target.path, target.row, options.verdict, production_doc(options.production),
+                                  validation_id=options.validation)
             for warning in result.warnings:
                 print(warning, file=sys.stderr)
             if isinstance(result, VerdictRefused):
@@ -2497,7 +2522,7 @@ def main(argv: list[str]) -> int:
                                                    "backfill-production", "image", "batch"))
     _ = parser.add_argument("--repo", default=".")
     for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "step", "change", "check", "see",
-                 "row", "verdict", "production", "urgency", "due", "after", "kind", "image", "output", "file"):
+                 "row", "verdict", "validation", "production", "urgency", "due", "after", "kind", "image", "output", "file"):
         _ = parser.add_argument(f"--{name}", default="")
     _ = parser.add_argument("--write", action="store_true")
     _ = parser.add_argument("--hold", action="append")

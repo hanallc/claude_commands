@@ -11,12 +11,12 @@ Each action refuses an option it does not read.
 For `/change_review` with no action:
 
 The command prints the Hana console link.
-Review combines questions, changes and investigations.
+Review combines questions, changes, investigations, proposals and efficiencies.
 Each card has Your words, closing actions, Ask question and Later with a date and time.
 Send feedback closes the item with the result **feedback sent**.
 Ask question sends the words to the owner and returns the item after the owner answers.
-Owners use `change_page.py answer-question --item <Review key> --text "<answer>"` for all three types.
-For changes, include `--question <id>` from the message.
+Owners use `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"` for all five types.
+Use the question ID from the request message.
 Later keeps the state and hides the item from Review, the For you count and `/next` until its time.
 The canonical question log retains the user's answer words without a time limit.
 
@@ -202,11 +202,13 @@ The file contains an array of items:
 [
   {"op": "edit", "production": "hana", "row": "hana/C1", "change": "New text", "check": "Open the page", "see": "The result"},
   {"op": "edit", "production": "hana", "row": "hana/C2", "image": "/path/shot.png"},
-  {"op": "verdict", "production": "hana", "row": "hana/C3", "verdict": "works"}
+  {"op": "verdict", "production": "hana", "row": "hana/C3", "verdict": "works", "validation": "<validation id>"}
 ]
 ```
 
 Each item can set `list` to the path accepted by `--list`.
+For a showrunner check, copy `validation` from the validation message's ID.
+Omit `validation` for an ordinary user verdict.
 All lists must be in one folder.
 Each row can appear only once per list in a batch.
 A repeated row reports `batch item <j>: row <id> is already item <i>` before any list write.
@@ -381,13 +383,14 @@ The review page sends one failure alert per list, row, and error text.
 Then:
 
 ```sh
-… verdict [--production <name>] --row <id> --verdict "<the user's words>"
+… verdict [--production <name>] --row <id> --verdict "<the user's words>" [--validation <id>]
 ```
 
 Pass the displayed ID, such as `sdlc/C9`, or its existing list-based ID.
-It moves the row to `## Reviewed` with the verdict, today's date and its Merged cell, and prints
-`<showrunner>/C<n> landed` or `<showrunner>/C<n> returns to its unit (merged …)`. Either way it removes
-the row's scratch folders and prints `removed <path>` for each.
+For a showrunner check, include `--validation <id>` from the validation message.
+An ordinary verdict moves the row to `## Reviewed` with the verdict, today's date and its Merged cell.
+It prints `<showrunner>/C<n> landed` or `<showrunner>/C<n> returns to its unit (merged …)`.
+It removes the row's scratch folders and prints `removed <path>` for each.
 The Producer cell stays with the row in Reviewed.
 Send a returning row and the user's words to its Producer staff id.
 Read its current session from the staff record at send time.
@@ -400,28 +403,28 @@ refused; it still ends the row's scratch folders.
 
 ## Validate
 
-A message `Change review C<n>: the user asks you to validate this` asks the
-showrunner of the row's tab to check the change in place of the user:
+The validation message asks the row's showrunner to check the change for the user.
 
-1. Check the change with evidence: run it, read its output, or look at the screen.
-2. If it works, save the verdict
-   `works (validated by the showrunner: <evidence>; not seen live: <what>)`.
-3. If it does not work, save a verdict that names the fault. The row returns to
-   its unit, and the fix comes back as a new row for the user.
+1. Read the validation ID from the message.
+2. Check the change with evidence from a run, its output or the screen.
+3. Save `works (validated by the showrunner: <evidence>; not seen live: <what>)` if the check passes.
+4. Save a verdict that names the fault if the check fails.
 
-Use the `verdict` command above for both. The row stays out of the user's count until the verdict saves.
+Use `verdict --production <name> --row <id> --validation <validation id> --verdict "<result>"` for either result.
+A fault returns the row to For you with the evidence in its log.
+The command refuses a missing or old validation ID.
 
 ## Ask question
 
-1. Read the Review item key and the user's words in the message.
+1. Read the Review item key, question ID and user's words in the message.
 2. Check the item or ask its source unit.
 3. Save the answer with this command:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --item <Review-key> --text "<answer>"
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --item <Review-key> --question <id> --text "<answer>"
 ```
 
-For a change, include `--question <id>` from the request message.
+Use the question ID from the request message for all five Review types.
 The item returns to For you with the answer in its log.
 The answer and cells can hold several lines; lines that start with `- ` or `1. ` show as lists.
 The user can give a verdict or ask another question.
