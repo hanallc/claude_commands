@@ -49,6 +49,7 @@ CONSOLE_FOLDER = "console"
 SEND_ERRORS = (OSError, RuntimeError, subprocess.SubprocessError)
 SENDER = Path(__file__).stem
 DELIVERY_PREFIX = ".review-link-delivery-"
+IMAGE_QUESTION_ROW_PREFIX = "Images "
 
 
 class BrowserManifest(TypedDict):
@@ -136,6 +137,16 @@ class StoredDeliverySlots(TypedDict, total=False):
     review_message: StoredReviewMessage
 
 
+class ImageQuestionDispatch(TypedDict):
+    attempt: str
+    state: Literal["started", "accepted"]
+
+
+@dataclass(frozen=True)
+class NoImageQuestionDispatch:
+    """The record has no send mark for this image question."""
+
+
 class StoredReviewMessage(TypedDict):
     saved: bool
     source: str
@@ -143,6 +154,7 @@ class StoredReviewMessage(TypedDict):
     message: str
     # A record saved before efficiencies has no row; its row is the source's stem.
     row: NotRequired[str]
+    image_question_dispatch: NotRequired[ImageQuestionDispatch]
 
 
 class SentCloseoutAlerts(TypedDict):
@@ -301,6 +313,7 @@ class DeliveryStatus:
     def __init__(self, root: Path) -> None:
         self.root: Path = root
         self.request_attempts: dict[str, AttemptOwnership] = {}
+        self.startup_recovery_pending: threading.Event = threading.Event()
 
     def read_view(self) -> DeliveryReadView:
         return DeliveryReadView(self, frozenset(self.root.glob(DELIVERY_PREFIX + "*")))
@@ -316,8 +329,27 @@ class DeliveryStatus:
 
     def owns_live_attempt(self, page: ReviewPage, row: str, intent: DeliveryIntent) -> bool:
         """Check the sender while the caller holds the delivery lock."""
-        owner = self.request_attempts.get(intent.attempt)
+        return self.owns_live_claim(page, row, intent.attempt)
+
+    def owns_live_claim(self, page: ReviewPage, row: str, attempt: str) -> bool:
+        owner = self.request_attempts.get(attempt)
         return owner is not None and owner.row_file == self.path(page, row) and owner.request_thread.is_alive()
+
+    def image_question_dispatch(self, page: ReviewPage, row: str) -> ImageQuestionDispatch | NoImageQuestionDispatch:
+        try:
+            value = cast(object, json.loads(self.path(page, row).read_text(encoding="utf-8")))
+        except (FileNotFoundError, ValueError):
+            return NoImageQuestionDispatch()
+        if isinstance(value, dict):
+            saved = cast(dict[str, object], value).get("review_message")
+            if isinstance(saved, dict):
+                dispatch = cast(dict[str, object], saved).get("image_question_dispatch")
+                if isinstance(dispatch, dict):
+                    fields = cast(dict[str, object], dispatch)
+                    attempt, state = fields.get("attempt"), fields.get("state")
+                    if isinstance(attempt, str) and (state == "started" or state == "accepted"):
+                        return {"attempt": attempt, "state": cast(Literal["started", "accepted"], state)}
+        return NoImageQuestionDispatch()
 
     def closeout_path(self, page: ReviewPage, row: str) -> Path:
         name = self.path(page, row).name.removeprefix(DELIVERY_PREFIX)
@@ -331,6 +363,10 @@ class DeliveryStatus:
             return NoFailedDelivery()
         failed = fields.get("failed_delivery")
         if failed is None:
+            return NoFailedDelivery()
+        dispatch = self.image_question_dispatch(page, row)
+        if not isinstance(dispatch, NoImageQuestionDispatch) and (
+                dispatch["state"] == "accepted" or dispatch["attempt"] != failed["attempt"]):
             return NoFailedDelivery()
         return FailedDelivery(failed["attempt"], Path(failed["review_list"]), failed["row"], failed["last_error"])
 
@@ -467,7 +503,18 @@ class DeliveryStatus:
     def record(self, delivery: MessageDelivery, result: FailedDelivery | NoFailedDelivery = NO_FAILED_DELIVERY) -> None:
         with self.locked():
             _ = self.request_attempts.pop(delivery.attempt, None)
-            slots = self.slots(delivery.page, delivery.row)
+            page, row = delivery.page, delivery.row
+            slots = self.slots(page, row)
+            if isinstance(page, ReviewMessagePage) and row.startswith(IMAGE_QUESTION_ROW_PREFIX):
+                dispatch = self.image_question_dispatch(page, row)
+                if (not isinstance(dispatch, NoImageQuestionDispatch) and dispatch["state"] == "started"
+                        and dispatch["attempt"] == delivery.attempt):
+                    if isinstance(result, NoFailedDelivery):
+                        accepted = replace(page, saved={**page.saved, "image_question_dispatch": {
+                            "attempt": delivery.attempt, "state": "accepted"}})
+                        self.write_slots(accepted, row, slots)
+                    self.record_result_locked(delivery, result)
+                    return
             for current in slots.intents():
                 if current.attempt == delivery.attempt:
                     self.record_result_locked(delivery, result)
@@ -1222,6 +1269,12 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
         if not any(intent.attempt == delivery.attempt for intent in slots.intents()):
             _ = status.request_attempts.pop(delivery.attempt, None)
             return
+        page = delivery.page
+        if isinstance(page, ReviewMessagePage) and delivery.row.startswith(IMAGE_QUESTION_ROW_PREFIX):
+            started = replace(page, saved={**page.saved, "image_question_dispatch": {
+                "attempt": delivery.attempt, "state": "started"}})
+            # Save the send mark before the sender can accept the message.
+            status.write_slots(started, delivery.row, slots.updated("verdict", NoDelivery()))
         status.request_attempts[delivery.attempt] = AttemptOwnership(status.path(delivery.page, delivery.row), "sending")
     failures = (send_with_retries(SENDER, delivery.recipients, delivery.message, tries, pause) if delivery.recipients
                 else [DeliveryFailure(MissingRecipient(), "no showrunner to send to")])

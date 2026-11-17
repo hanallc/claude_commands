@@ -6,11 +6,15 @@ import hashlib
 import hmac
 import html
 import secrets
-import time
 import shutil
 import sys
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import cast
 from urllib.parse import parse_qs
 
@@ -30,7 +34,22 @@ ANSWERS = {"approved": "your image is approved.", "not approved": "your image is
            "feedback": "feedback on your image."}
 # A page loaded before the answer buttons existed can still post delete.
 ACTIONS = frozenset(("delete", "question", *ANSWERS))
-NO_QUESTIONS: frozenset[str] = frozenset()
+
+
+class QuestionDeliveryNotice(StrEnum):
+    NONE = "No delivery notice"
+    SENDING = "Question saved. Sending to the owner."
+    RETRY = "Not sent. Press Ask question again with the same words."
+    UNCONFIRMED = "The send result is unknown. Enter the same words and press Ask question to send it again."
+
+
+@dataclass(frozen=True)
+class QuestionDeliveryView:
+    notice: QuestionDeliveryNotice
+    poll: bool = False
+
+
+NO_QUESTION_NOTICES: Mapping[str, QuestionDeliveryNotice] = MappingProxyType({})
 
 
 class AnswerNotSent(Exception):
@@ -141,25 +160,19 @@ def picture(record: image_store.ImageRecord, label: str, file: str) -> str:
     return f'<figure><figcaption>{label}</figcaption>{linked}</figure>' if label else linked
 
 
-def question_html(question: question_record.Question, failed_questions: frozenset[str],
-                  pending_questions: frozenset[str]) -> str:
+def question_html(question: question_record.Question, notice: QuestionDeliveryNotice) -> str:
     """Show the answer, a delivery failure, or a pending delivery for this question."""
     if question.answer is not None:
         return page_question.answered_question_html(question)
     content = page_question.open_question_html(question)
-    if question.question_id in failed_questions:
-        notice = 'Not sent. Press Ask question again with the same words.'
-    elif question.question_id in pending_questions:
-        notice = 'Question saved. Sending to the owner.'
-    else:
+    if notice is QuestionDeliveryNotice.NONE:
         return content
     return content.removesuffix('</section>') + f'<p role="status">{notice}</p></section>'
 
 
 def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapshot, feedback_rows: int,
-         failed_questions: frozenset[str] = NO_QUESTIONS,
          names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT, *,
-         pending_questions: frozenset[str] = NO_QUESTIONS) -> str:
+         question_notices: Mapping[str, QuestionDeliveryNotice] = NO_QUESTION_NOTICES) -> str:
     """Show the caption as the title, then the aligned details, the image or pair, the feedback field and the answer buttons."""
     pair = "before" in record
     pictures = "".join(picture(record, label, file) for label, file in shown_files(record))
@@ -179,7 +192,8 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
             + f'<dt>Added:</dt><dd><time datetime="{html.escape(record["registered_at"], quote=True)}">'
             + f'{shown_time(added)}</time></dd></dl>'
             + (f'<div class="image-pair">{pictures}</div>' if pair else pictures)
-            + ''.join(question_html(question, failed_questions, pending_questions) for question in questions)
+            + ''.join(question_html(question, question_notices.get(question.question_id, QuestionDeliveryNotice.NONE))
+                      for question in questions)
             + '<form method="post" data-image-form>'
             + f'<input type="hidden" name="image" value="{record["id"]}">'
             + f'<input type="hidden" name="token" value="{request_token(token, record["id"])}">'
@@ -190,6 +204,29 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
             + '<button type="submit" name="action" value="feedback">Send Feedback</button>'
             + '<button type="submit" name="action" value="question">Ask question</button>'
             + '<span role="status" data-image-status></span></div></form></article>')
+
+
+def question_delivery_view(status: change_page.DeliveryStatus, page: change_page.ReviewPage,
+                           row: str) -> QuestionDeliveryView:
+    """Read the notice and polling state under the delivery lock."""
+    intent = status.slots(page, row).verdict
+    if isinstance(intent, change_page.DeliveryIntent) and status.startup_recovery_pending.is_set():
+        return QuestionDeliveryView(QuestionDeliveryNotice.SENDING, poll=True)
+    live_intent = isinstance(intent, change_page.DeliveryIntent) and status.owns_live_attempt(page, row, intent)
+    if isinstance(status.failed_delivery(page, row), change_page.FailedDelivery):
+        return QuestionDeliveryView(QuestionDeliveryNotice.RETRY, poll=live_intent)
+    if live_intent:
+        return QuestionDeliveryView(QuestionDeliveryNotice.SENDING, poll=True)
+    dispatch = status.image_question_dispatch(page, row)
+    if not isinstance(dispatch, change_page.NoImageQuestionDispatch):
+        if dispatch["state"] == "accepted":
+            return QuestionDeliveryView(QuestionDeliveryNotice.NONE)
+        if status.owns_live_claim(page, row, dispatch["attempt"]):
+            return QuestionDeliveryView(QuestionDeliveryNotice.SENDING, poll=True)
+        return QuestionDeliveryView(QuestionDeliveryNotice.UNCONFIRMED)
+    if isinstance(intent, change_page.DeliveryIntent):
+        return QuestionDeliveryView(QuestionDeliveryNotice.RETRY)
+    return QuestionDeliveryView(QuestionDeliveryNotice.NONE)
 
 
 def render(status: change_page.DeliveryStatus) -> bytes:
@@ -207,23 +244,16 @@ def render(status: change_page.DeliveryStatus) -> bytes:
             continue
         source = images_root(root) / record['id'] / image_store.RECORD
         page = change_page.ReviewPage(source, source.parent, (), '')
-        open_rows = {saved['question_id']: f"Images {record['id']}/{saved['question_id']}"
+        open_rows = {saved['question_id']: f"{change_page.IMAGE_QUESTION_ROW_PREFIX}{record['id']}/{saved['question_id']}"
                      for saved in record.get('questions', []) if saved['answer'] is None}
-        pending: set[str] = set()
-        failed: set[str] = set()
+        notices: dict[str, QuestionDeliveryNotice] = {}
         if open_rows:
             with status.locked():
                 for identity, row in open_rows.items():
-                    intent = status.slots(page, row).verdict
-                    if isinstance(intent, change_page.DeliveryIntent):
-                        if status.owns_live_attempt(page, row, intent):
-                            pending.add(identity)
-                        else:
-                            failed.add(identity)
-                    if isinstance(status.failed_delivery(page, row), change_page.FailedDelivery):
-                        failed.add(identity)
-        has_pending_delivery = has_pending_delivery or bool(pending)
-        cards += card(record, token, members, rows, frozenset(failed), names, pending_questions=frozenset(pending))
+                    delivery = question_delivery_view(status, page, row)
+                    notices[identity] = delivery.notice
+                    has_pending_delivery = has_pending_delivery or delivery.poll
+        cards += card(record, token, members, rows, names, question_notices=notices)
     delivery_refresh_seconds = settings.number("page_refresh_seconds")
     refresh_seconds = delivery_refresh_seconds if has_pending_delivery else 0
     content = (STYLE + page_frame.title("Images", "images")
@@ -274,7 +304,7 @@ def ask_question(root: Path, identity: str, words: str, status: change_page.Deli
     command = ('~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py answer '
                + '--id {item} --question {question_id} --text "<answer>"')
     return page_question.ask(store, identity, staff.StaffId(record['owner']), folder / image_store.RECORD,
-        'Images '+identity, record['caption'], words, command, status)
+        change_page.IMAGE_QUESTION_ROW_PREFIX+identity, record['caption'], words, command, status)
 
 
 def answer_question(root: Path, identity: str, question_id: str, text: str) -> None:
