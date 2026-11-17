@@ -3,7 +3,7 @@
 Usage: counts_row.py <notifier instance dir>
        counts_row.py --unit <staff id>
 
-statusline.sh runs this when a source file changes or a cached deadline passes.
+assignment.py calls this module when a source changes or a deadline passes.
 The cache is `<showrunner state>/counts/<staff id>`:
 
   line 1  the counts line, empty when nothing is counted;

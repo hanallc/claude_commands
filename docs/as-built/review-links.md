@@ -313,17 +313,34 @@ An efficiency card shows its ledger line.
 
 Questions offer Answer and Send feedback in the closing group.
 Changes offer Works, Does not work, Ask showrunner to check and Send feedback in that group.
-Investigations with an answer offer Mark read and Send feedback in that group.
+Investigations offer Mark read and Send feedback in that group.
 Proposals and efficiencies offer Approve, Decline and Send feedback in that group.
 A plan backlog proposal has no issue to hold an answer, so it offers only Later; the user answers it in chat.
 Each card has Ask question in a separate return group and Later with a date and time.
+Waiting cards retain the actions of their For you cards, in the same groups and order.
+Unowned questions retain only Later.
+Waiting cards keep their state and counts until the user acts.
+An action supersedes the open question, showrunner check, investigation or decision wait.
+The record and the owner's production log retain the superseded wait.
+Questions archive the old followup before the new action saves.
+Changes remove the old question and validation slots before the new action saves.
+Investigations close or replace their open request.
+Proposals replace their review mark; efficiencies also clear a deferred ledger state.
 The primary button comes first.
 The shared sender handles all five types, including retries, owner alerts and startup recovery.
 Send feedback sends the words to the owner and finishes the item with the result **feedback sent**.
 Ask question sends the words to the owner and moves the item to Waiting.
 The owner's answer returns it to For you and stays in its log.
-Owners use `change_page.py answer-question --item <Review key> --text "<answer>"` for all five types.
-Change messages also supply `--question <id>` to identify the pending exchange.
+Owners use `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"` for all five types.
+Each new request supplies a question ID to identify the pending exchange.
+The existing question ID rule refuses a reply to a superseded exchange.
+`update_registration.py reply` and `investigation.py answer` apply this rule before they save a native answer.
+A native answer without the current question ID cannot replace a newer Review question.
+`change_review.py verdict` applies the same rule when a Review question replaces a showrunner check.
+These commands retain the existing refusal text and exit 1.
+Each showrunner check uses its delivery attempt as the validation ID.
+Initial and recovered messages include `change_review.py verdict --validation <id>` with the complete answer command.
+The native verdict command refuses a missing, old or completed validation ID under the same rule.
 Every request message includes the complete answer command.
 Later keeps the state and hides the item from every page view, the For you count and `/next` until its time.
 `<SHOWRUNNER_STATE_DIR>/review-later.json` stores one ISO timestamp for each stable Review key across all five types.
@@ -424,7 +441,8 @@ The render value's hover text shows the median of at most 10 successful renders.
 `/console/list.html` reads the producer's numbered List records on each request.
 The navigation label is List, and the page title is The List.
 The page uses the shared status line in `page_frame.py`.
-The columns are #, Owner, Item, State, Next step, ETA, and Update.
+The columns are #, Owner, Producer, Item, State, Next step, ETA, and Update.
+The Producer cell shows the name of the record's producer.
 The default order uses `the_list.order`, which the CLI also uses.
 User decisions come first, then unread updates, then the earliest next check.
 A column button sorts its values; a second click reverses that order.
@@ -445,6 +463,12 @@ Repeated links and absent links cause no write or log entry.
 Each changed record gets one log entry with the resolved keys.
 Old records without the reviews field load with no links.
 
+Each List record stores a `producer`: the fixed staff ID of a staff row with the producer role.
+`the_list.py add` and `update` take `--producer <name or staff id>`.
+The option refuses a name or ID that does not resolve to exactly one current producer row.
+A new item without the option, and an old record without the field, belong to the record keeper, morty.
+The terminal list shows a Producer column after Owner.
+
 When List records have review links, the page reads review items once per render and indexes them by key.
 It stores no review states on the List record.
 The State cell shows “N changes for you” when every review that needs nate is a change.
@@ -459,10 +483,12 @@ Only types in `review_page.TYPES` link to Review cards.
 Other types and missing reviews show plain text.
 
 The Owner menu includes record owners without a current staff row.
+The Producer menu beside it lists each producer that a record names.
+An address with a producer that no record names shows all producers.
 The Show menu contains Open, Needs me, Unread, Done, Parked, Closed, and All.
 Open excludes Done, Closed, and items with a future parking time.
 The search field matches an item number or title.
-The address retains the owner, view, search, column, and direction.
+The address retains the owner, producer, view, search, column, and direction.
 
 A row opens to show its latest status, completion condition, item links, and log.
 The open row does not show Evidence; the record keeps it.
@@ -805,7 +831,8 @@ The user can ask another question or save a verdict.
 
 Send feedback sends the words through the existing sender and closes the change.
 Legacy forms from pages already open retain their prior feedback delivery record.
-Those forms store `kind: feedback` and accept `change_page.py answer-question` replies.
+Those forms store `kind: feedback` and accept `change_page.py answer-question --question <Feedback id>` replies.
+The feedback message supplies the ID.
 
 Each answer uses a background `fetch` POST.
 The row shows **Saving…** during the save and **Saved: <result>** after success.
@@ -865,8 +892,13 @@ The server does not repeat the feature-log operation for a saved answer.
 
 The server then calls `change_review.save_verdict` with paths from the configured list and production records.
 It returns `VerdictSaved` with the output lines, or `VerdictRefused` with the refusal text.
-`save_verdict` is the only answer writer, for the page and for the `change_review.py verdict` command.
-It retains its lock, conflict checks, scratch cleanup, and list commit behavior.
+`save_verdict` serves the page and the `change_review.py verdict` command.
+Single and batch verdicts share the same stale-ID check.
+Both paths take the delivery lock before the list lock.
+They check the current exchange and save while the delivery lock remains held.
+Batch verdicts use the validation message's ID in the `validation` field.
+A refused batch exchange leaves every list unchanged.
+Both paths retain their conflict checks, scratch cleanup and list commit behavior.
 Classified rows retain Kind, How to check, and Production in Reviewed.
 Older rows without Kind retain their existing Reviewed table behavior.
 An identical saved answer changes nothing and sends nothing; a different saved answer is refused.

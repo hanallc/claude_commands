@@ -14,17 +14,20 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from enum import StrEnum
 from hashlib import sha256
 import json
+import math
 import os
 from pathlib import Path
 import re
 import stat
+from statistics import median
 import subprocess
 import sys
 import threading
 import time
-from typing import cast, final
+from typing import ClassVar, cast, final
 from uuid import uuid4
 
 
@@ -61,17 +64,84 @@ def step(command: str, text: str, settings: Path, *, hint: str = '') -> Generato
 
     worker = threading.Thread(target=heartbeat, name='deployment-progress', daemon=True)
     worker.start()
+    completed = False
     try:
         yield
+        completed = True
     finally:
         stopped.set()
         worker.join()
         elapsed = time.monotonic() - started
-        print(f'{command}: {text} done in {elapsed:.0f} s', file=stream, flush=True)
+        outcome = 'done in' if completed else 'failed after'
+        print(f'{command}: {text} {outcome} {elapsed:.0f} s', file=stream, flush=True)
 
 
 class DeploymentRefused(ValueError):
     """Current evidence does not permit a resource request."""
+
+
+class GateRegionOperation(StrEnum):
+    NETWORK = 'network'
+    STACK = 'stack'
+
+
+@dataclass
+class GateRegionTimings:
+    """Keep successful regional durations for the next deployment estimate."""
+
+    _LABELS: ClassVar[dict[GateRegionOperation, str]] = {
+        GateRegionOperation.NETWORK: 'preparing the network and image',
+        GateRegionOperation.STACK: 'updating the gate stack',
+    }
+    _path: Path
+    _seconds: dict[GateRegionOperation, dict[str, float]]
+
+    @classmethod
+    def read(cls, directory: Path) -> GateRegionTimings:
+        path = directory / 'gate-region-times.json'
+        try:
+            saved = remote.read_record(path)
+            if saved.get('version') != 1:
+                raise ValueError('Unsupported regional timing version')
+            operations = ledger.mapping(saved['seconds'])
+            seconds: dict[GateRegionOperation, dict[str, float]] = {}
+            for operation in GateRegionOperation:
+                if operation not in operations:
+                    continue
+                seconds[operation] = {}
+                for region, value in ledger.mapping(operations[operation]).items():
+                    if (isinstance(value, bool) or not isinstance(value, (int, float))
+                            or not math.isfinite(value) or value < 0):
+                        raise ValueError('Invalid regional duration')
+                    seconds[operation][region] = float(value)
+            return cls(path, seconds)
+        except (OSError, ValueError, KeyError, OverflowError):
+            return cls(path, {})
+
+    def announce(self, operation: GateRegionOperation, regions: Sequence[str]) -> None:
+        if not regions:
+            return
+        saved = self._seconds.get(operation, {})
+        if saved:
+            typical = median(saved.values())
+            total = sum(saved.get(region, typical) for region in regions)
+            estimate = f'expected total {total:.0f} s from saved regional times'
+        else:
+            estimate = 'expected total is not yet measured'
+        print(f'cloud-gate: {self._LABELS[operation]} in {len(regions)} regions: {estimate}', flush=True)
+
+    @contextmanager
+    def measure(self, operation: GateRegionOperation, region: str, position: int, total: int,
+                settings: Path) -> Generator[None]:
+        started = time.monotonic()
+        with step(f'cloud-gate: {region}', self._LABELS[operation], settings, hint=f'{position} of {total}'):
+            yield
+        self._seconds.setdefault(operation, {})[region] = time.monotonic() - started
+        record = json.dumps({'version': 1, 'seconds': self._seconds}, sort_keys=True) + '\n'
+        try:
+            write_text_atomic(self._path, record)
+        except OSError:
+            print(f'cloud-gate: warning: could not write {self._path.name}', flush=True)
 
 
 def quota_targets(home: str) -> tuple[tuple[tuple[str, ...], str, int, str], ...]:
@@ -438,6 +508,10 @@ class Deployment:
                            timeout_s=workload.whole('aws_timeout_s'))
         zone = workload.text('availability_zone')
         upload_timeout = workload.whole('image_upload_timeout_s')
+        wait_interval = max(workload.whole('image_wait_interval_s'),
+                            (upload_timeout + hana_image.COLDSNAP_MAX_WAIT_ATTEMPTS - 1)
+                            // hana_image.COLDSNAP_MAX_WAIT_ATTEMPTS)
+        wait_attempts = upload_timeout // wait_interval
         api = self._api(settings)
         with control_lock(self.directory):
             _ = self._guard()
@@ -448,27 +522,53 @@ class Deployment:
                                           '--filters', 'Name=name,Values=' + built.name), 'Images')
             if not images:
                 tag = conf.read(self.settings_path)
-                tags = '{Key=%s,Value=%s}' % (tag.text('cost_explorer_tag_key'), tag.text('cost_explorer_tag_value'))
+                cost_tag = 'Key=%s,Value=%s' % (tag.text('cost_explorer_tag_key'), tag.text('cost_explorer_tag_value'))
+                pending = hana_image.saved(self.directory)
+                resume = isinstance(pending, hana_image.PendingImageRegistration) and pending.name == built.name
+                if not resume:
+                    snapshots = ledger.rows(api.call('describe-snapshots', '--owner-ids', 'self', '--filters',
+                                                     'Name=description,Values=' + built.name), 'Snapshots')
+                    if snapshots:
+                        states = ', '.join(ledger.text(row, 'State') for row in snapshots)
+                        if len(snapshots) != 1 or snapshots[0].get('State') not in ('completed', 'pending'):
+                            raise DeploymentRefused(
+                                f'Hana snapshot adoption refused: {len(snapshots)} matching snapshots; states: {states}')
+                        pending = hana_image.PendingImageRegistration(built.name, ledger.text(snapshots[0], 'SnapshotId'))
+                        _ = hana_image.save(self.directory, pending)
+                        resume = True
                 raw = self.output / 'hana' / 'image.raw'
-                raw.parent.mkdir(parents=True, exist_ok=True)
                 try:
-                    with step('hana-image', 'converting the image to a raw disk', self.settings_path):
-                        _ = self.execute(['qemu-img', 'convert', '-f', built.source_format, '-O', 'raw',
-                                          str(built.file), str(raw)], capture_output=True, text=True,
-                                         timeout=upload_timeout, check=True)
+                    if not resume:
+                        raw.parent.mkdir(parents=True, exist_ok=True)
+                        with step('hana-image', 'converting the image to a raw disk', self.settings_path):
+                            _ = self.execute(['qemu-img', 'convert', '-f', built.source_format, '-O', 'raw',
+                                              str(built.file), str(raw)], capture_output=True, text=True,
+                                             timeout=upload_timeout, check=True)
                     tool = self.execute(['nix', 'build', '--no-link', '--print-out-paths',
                                          workload.text('image_upload_tool')], capture_output=True, text=True,
                                         timeout=upload_timeout, check=True).stdout.strip().splitlines()[-1]
-                    with step('hana-image', 'uploading the snapshot', self.settings_path, hint='can take several minutes'):
-                        upload = self.admin.executor(self.execute)(
-                            [tool + '/bin/coldsnap', '--region', settings.region, 'upload', '--wait', '--no-progress',
-                             '--omit-zero-blocks', '--description', built.name, str(raw)],
-                            capture_output=True, text=True, timeout=upload_timeout, check=False)
-                    if upload.returncode or not upload.stdout.strip():
-                        raise DeploymentRefused('the Hana snapshot upload failed: ' + upload.stderr.strip())
+                    if resume and isinstance(pending, hana_image.PendingImageRegistration):
+                        snapshot = pending.snapshot
+                    else:
+                        with step('hana-image', 'uploading the snapshot', self.settings_path, hint='can take several minutes'):
+                            upload = self.admin.executor(self.execute)(
+                                [tool + '/bin/coldsnap', '--region', settings.region, 'upload', '--no-progress',
+                                 '--omit-zero-blocks', '--description', built.name, '--tag', cost_tag, str(raw)],
+                                capture_output=True, text=True, timeout=upload_timeout, check=False)
+                        if upload.returncode or not upload.stdout.strip():
+                            raise DeploymentRefused('the Hana snapshot upload failed: ' + upload.stderr.strip())
+                        snapshot = upload.stdout.strip().splitlines()[-1]
+                        _ = hana_image.save(self.directory, hana_image.PendingImageRegistration(built.name, snapshot))
                 finally:
                     raw.unlink(missing_ok=True)
-                snapshot = upload.stdout.strip().splitlines()[-1]
+                with step('hana-image', 'waiting for the snapshot', self.settings_path):
+                    waited = self.admin.executor(self.execute)(
+                        [tool + '/bin/coldsnap', '--region', settings.region, 'wait',
+                         '--seconds-between-attempts', str(wait_interval),
+                         '--max-attempts', str(wait_attempts), snapshot],
+                        capture_output=True, text=True, timeout=upload_timeout, check=False)
+                    if waited.returncode:
+                        raise DeploymentRefused('the Hana snapshot wait failed: ' + waited.stderr.strip())
                 with step('hana-image', 'registering the image', self.settings_path):
                     image = ledger.text(api.call(
                         'register-image', '--name', built.name, '--architecture', 'x86_64',
@@ -476,8 +576,7 @@ class Deployment:
                         '--boot-mode', built.boot_mode, '--imds-support', 'v2.0',
                         '--root-device-name', settings.root_device_name, '--block-device-mappings',
                         f'DeviceName={settings.root_device_name},Ebs={{SnapshotId={snapshot},VolumeType=gp3,DeleteOnTermination=true}}',
-                        '--tag-specifications', f'ResourceType=image,Tags=[{tags}]',
-                        f'ResourceType=snapshot,Tags=[{tags}]'), 'ImageId')
+                        '--tag-specifications', f'ResourceType=image,Tags=[{{{cost_tag}}}]'), 'ImageId')
                     _ = api.call('wait', 'image-available', '--image-ids', image, timeout_s=upload_timeout)
                 images = ledger.rows(api.call('describe-images', '--image-ids', image), 'Images')
             if len(images) != 1 or images[0].get('State') != 'available':
@@ -1319,7 +1418,13 @@ class Deployment:
             prefix = f'arn:{partition}:ec2:{settings.region}:{account}:'
             values = cloud_gate.settings()
             # The home scaler policies cover every gate region, so the scaler user's policy count stays fixed.
-            networks = [self.regional_network(api, settings, region) for region in regions[1:]]
+            timings = GateRegionTimings.read(self.directory)
+            additional = regions[1:]
+            timings.announce(GateRegionOperation.NETWORK, additional)
+            networks: list[RegionalNetwork] = []
+            for position, region in enumerate(additional, 1):
+                with timings.measure(GateRegionOperation.NETWORK, region, position, len(additional), self.settings_path):
+                    networks.append(self.regional_network(api, settings, region))
             parameters = {
                 'EnableGates': 'true', 'GateImage': settings.ami_id,
                 'GateVpcs': ','.join([prefix + 'vpc/' + settings.vpc_id,
@@ -1363,10 +1468,12 @@ class Deployment:
             }
             cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             regional = list(ledger.rows(manifest, 'regions'))
-            for network in networks:
-                regional.append(self.regional_gate_stack(api, settings, outputs, parameters, network))
-                manifest['regions'] = regional
-                cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
+            timings.announce(GateRegionOperation.STACK, additional)
+            for position, network in enumerate(networks, 1):
+                with timings.measure(GateRegionOperation.STACK, network.region, position, len(networks), self.settings_path):
+                    regional.append(self.regional_gate_stack(api, settings, outputs, parameters, network))
+                    manifest['regions'] = regional
+                    cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             print('cloud-gate: deployed')
         self._fill_prices()
         return True

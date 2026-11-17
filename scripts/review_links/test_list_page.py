@@ -41,6 +41,8 @@ OWNER = staff.StaffRow(staff.StaffId("a0882376-677b-4da5-adbb-f11db9146021"), "s
                         current_session=staff.StaffId("a0882376-677b-4da5-adbb-f11db9146021"))
 OTHER = staff.StaffRow(staff.StaffId("f5636030-6745-4ff4-aeda-4c2773d18da8"), "showrunner", "builds", staff.StaffRoot(),
                         current_session=staff.StaffId("f5636030-6745-4ff4-aeda-4c2773d18da8"))
+DWIGHT = staff.StaffRow(staff.StaffId("920b0a64-6eee-479e-8c07-e03e4dcd4ef6"), "producer", "dwight", staff.StaffRoot(),
+                        current_session=staff.StaffId("920b0a64-6eee-479e-8c07-e03e4dcd4ef6"))
 NOW = datetime(2026, 11, 16, 18, tzinfo=UTC)
 
 
@@ -61,7 +63,7 @@ class ListPageTests(unittest.TestCase):
             "SHOWRUNNER_STATE_DIR": str(self.root / "state"), "STAFF_FILE": str(self.root / "staff.json"),
             "USER_ZONE": "America/New_York", "REVIEW_LINKS_ROOT": str(self.root / "reviews")})))
         _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [
-            row.to_json() for row in (MORTY, OWNER, OTHER)]}))
+            row.to_json() for row in (MORTY, DWIGHT, OWNER, OTHER)]}))
         _ = self.enterContext(patch.object(the_list, "now", return_value=NOW))
         _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
         _ = self.enterContext(patch.object(rebuild_row, "read", return_value=rebuild_row.RebuildAnswer((), False)))
@@ -83,6 +85,7 @@ class ListPageTests(unittest.TestCase):
                  self.add("Read the delivered page", the_list.ItemState.DONE, number=63),
                  self.add("Removed task", number=54)]
         _ = the_list.mark_read(MORTY.id, items[0].id, source="nate")
+        _ = the_list.update(MORTY.id, items[1].id, {"producer": DWIGHT.id}, source="morty")
         _ = the_list.park(MORTY.id, items[3].id, NOW + timedelta(days=2), source="nate")
         _ = the_list.close(MORTY.id, items[5].id, "The user removed this task.", source="nate")
         return items
@@ -99,6 +102,12 @@ class ListPageTests(unittest.TestCase):
             self.assertIn(f'<option value="{value}">{label}</option>', body)
         self.assertIn('<option value="' + OWNER.id + '">sdlc</option>', body)
         self.assertIn('<option value="' + OTHER.id + '">builds</option>', body)
+        producers = body.split('<select id="list-producer">', 1)[1].split('</select>', 1)[0]
+        self.assertEqual(producers, '<option value="">All</option><option value="' + DWIGHT.id + '">dwight</option>'
+                         + '<option value="' + MORTY.id + '">morty</option>')
+        self.assertEqual(body.count('<td data-label="Producer">dwight</td>'), 1)
+        self.assertEqual(body.count('<td data-label="Producer">morty</td>'), 5)
+        self.assertIn(f'data-producer="{DWIGHT.id}"', body)
         for text in ('Latest status', 'Done when', 'Log · newest first', 'Links', 'Closing words',
                      'Check overdue', '14:00 EST', '15:00 EST'):
             self.assertIn(text, body)
@@ -607,7 +616,7 @@ try{
  check(visible().map(row=>row.dataset.number).join(',')==='58,105,106','the number sort is numeric');
  document.querySelector('[data-sort="0"]').click();
  check(visible().map(row=>row.dataset.number).join(',')==='106,105,58','a second click reverses the sort');
- for(let column=1;column<7;column++){
+ for(let column=1;column<8;column++){
   document.querySelector('[data-sort="'+column+'"]').click();
   check(document.querySelector('[data-sort="'+column+'"]').parentElement.getAttribute('aria-sort')==='ascending','sort column '+column);
  }
@@ -618,7 +627,12 @@ try{
  change('list-show','closed');check(visible().length===1 && visible()[0].dataset.number==='54','Closed');
  change('list-show','all');check(visible().length===6,'All');
  change('list-owner',OWNER);check(visible().length===5,'Owner');
- change('list-owner','');change('list-search','#106','input');
+ change('list-owner','');
+ change('list-producer',DWIGHT);check(visible().map(row=>row.dataset.number).join(',')==='105','Producer');
+ check(new URLSearchParams(location.hash.slice(1)).get('producer')===DWIGHT,'the address keeps the producer');
+ change('list-producer','');
+ check(visible().length===6 && !new URLSearchParams(location.hash.slice(1)).has('producer'),'All producers');
+ change('list-search','#106','input');
  check(visible().length===1 && visible()[0].dataset.number==='106','number search');
  change('list-search','console','input');check(visible().length===2,'title search');
  check(new URLSearchParams(location.hash.slice(1)).get('q')==='console','the address keeps the query');
@@ -696,12 +710,17 @@ try{
  check(new Set(requestIds).size===4,'each new action uses a fresh request');
  location.hash=new URLSearchParams({show:'closed',sort:'#',dir:'desc'});await flush();
  check(visible().length===1 && visible()[0].dataset.number==='54','hash navigation restores the filters');
+ location.hash=new URLSearchParams({show:'all',producer:DWIGHT});await flush();
+ check(document.getElementById('list-producer').value===DWIGHT && visible().map(row=>row.dataset.number).join(',')==='105',
+   'an address restores the producer filter');
+ location.hash=new URLSearchParams({show:'all',producer:'missing'});await flush();
+ check(document.getElementById('list-producer').value==='' && visible().length===6,'an unknown producer shows all items');
 
  for(const target of rows().filter(row=>['Done','Closed'].includes(row.dataset.state) || row.dataset.parked==='true')){
   location.hash=new URLSearchParams({item:target.dataset.key});await flush();
   check(!target.hidden && !target.querySelector('[data-detail]').hidden,'an item link shows '+target.dataset.state);
   check(document.getElementById('list-show').value==='all' && document.getElementById('list-owner').value==='' &&
-    document.getElementById('list-search').value==='','an item link clears filters');
+    document.getElementById('list-producer').value==='' && document.getElementById('list-search').value==='','an item link clears filters');
  }
  const retained=rows().find(row=>row.dataset.number==='106');
  location.hash=new URLSearchParams({item:retained.dataset.key,owner:retained.dataset.owner,show:'open',q:'106',sort:'#',dir:'desc'});await flush();
@@ -710,10 +729,17 @@ try{
  check(!retained.hidden && !retained.querySelector('[data-detail]').hidden,'an address restores its open item');
  check(document.querySelectorAll('[data-feedback-form]').length===6,'each row has feedback controls');
  check(document.documentElement.scrollWidth<=innerWidth,'the page has no horizontal overflow');
- if(innerWidth<960){check(getComputedStyle(visible()[0]).display==='block','a phone row is a card');}
+ if(innerWidth<960){
+  check(getComputedStyle(visible()[0]).display==='block','a phone row is a card');
+  const card=number=>rows().find(row=>row.dataset.number===number);
+  const cell=(number,label,part=null)=>getComputedStyle(card(number).querySelector('td[data-label="'+label+'"]'),part);
+  check(cell('105','Item').fontSize==='17px' && cell('105','Producer').fontSize!=='17px','a phone card shows the title largest');
+  check(cell('105','Producer','::before').content.includes('Producer'),'a phone card labels another producer');
+  check(cell('106','Producer').display==='none','a phone card leaves out the keeper as producer');
+ }
 }catch(error){failed.push(String(error));}
 await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...errors])});
-})();</script>'''.replace('OWNER', json.dumps(OWNER.id))
+})();</script>'''.replace('OWNER', json.dumps(OWNER.id)).replace('DWIGHT', json.dumps(DWIGHT.id))
         for width in (1440, 390):
             with self.subTest(width=width):
                 markup = list_page.render(self.root / "reviews").decode()
