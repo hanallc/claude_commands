@@ -15,6 +15,7 @@ from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, proposal_issue, staff
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_link
+from scripts.review_links import question_record
 from scripts.review_links import review_legacy
 from scripts.review_links import review_actions
 from scripts.review_links import staff_names
@@ -234,21 +235,21 @@ def proposal_body(root: Path, key: str) -> bytes:
 def submit(root: Path, body: str, status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) not in ({'row','token','outcome','feedback'},{'row','token','outcome','feedback','later'}) or any(len(values)!=1 for values in fields.values()):
-        raise change_page.AnswerRefused('use the answer form on this page')
+        raise question_record.AnswerRefused('use the answer form on this page')
     token, initial = change_browser.browser_manifest(change_page.console_folder(root))
     browser = change_page.ReviewBrowser(token,initial)
     key = fields['row'][0]
     if not secrets.compare_digest(fields['token'][0],change_browser.row_token(browser,key)):
-        raise change_page.AnswerRefused('row or page token does not match this page')
+        raise question_record.AnswerRefused('row or page token does not match this page')
     outcome, words = fields['outcome'][0], fields['feedback'][0]
     if outcome == 'later' or key.startswith(('investigation/', 'proposal/', 'efficiency/')):
         item = next((item for item in review_items.read(root) if item.key == key),None)
         if item is None:
-            raise change_page.AnswerRefused('this item is not on the page')
+            raise question_record.AnswerRefused('this item is not on the page')
         if outcome == 'later':
             return change_page.NoMessageDelivery(),review_actions.later(item,fields.get('later',[''])[0],words)
         if outcome not in item.actions:
-            raise change_page.AnswerRefused('choose an action on this card')
+            raise question_record.AnswerRefused('choose an action on this card')
         delivery, answer = (review_actions.investigation_action(item,outcome,words,status)
                             if item.type == ReviewType.INVESTIGATION else
                             review_actions.decision_action(item,outcome,words,status))
@@ -259,7 +260,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus) -> tuple[c
     item = next((item for item in review_items.read(root, kinds=(ReviewType.QUESTION,)) if item.key == key), None) if key.startswith('question/') else None
     if item is not None and item.state == ReviewState.WAITING:
         if outcome not in item.actions:
-            raise change_page.AnswerRefused('choose an action on this card')
+            raise question_record.AnswerRefused('choose an action on this card')
         delivery, answer = review_actions.question_action(item, cast(change_page.QuestionOutcome, outcome), words, status)
     else:
         delivery, answer = change_browser.submit(browser, urlencode({key:values[0] for key,values in fields.items()}), status,

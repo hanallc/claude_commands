@@ -11,25 +11,26 @@ from unittest.mock import patch
 
 from scripts.production import staff
 from scripts.review_links import change_page, page_question
+from scripts.review_links import question_record
 
 
 class FixtureStore:
     def __init__(self) -> None:
-        self.items: dict[str, tuple[page_question.Question, ...]] = {}
+        self.items: dict[str, tuple[question_record.Question, ...]] = {}
 
-    def questions(self, item: str) -> tuple[page_question.Question, ...]:
+    def questions(self, item: str) -> tuple[question_record.Question, ...]:
         return self.items.get(item, ())
 
-    def add(self, item: str, question: page_question.Question) -> None:
+    def add(self, item: str, question: question_record.Question) -> None:
         if any(saved.question_id == question.question_id for saved in self.questions(item)):
-            raise change_page.AnswerRefused('duplicate id')
+            raise question_record.AnswerRefused('duplicate id')
         self.items[item] = (*self.questions(item), question)
 
-    def set_answer(self, item: str, question_id: str, answer: page_question.Answer) -> None:
+    def set_answer(self, item: str, question_id: str, answer: question_record.Answer) -> None:
         questions = self.questions(item)
         current = next((question for question in questions if question.question_id == question_id), None)
         if current is None or current.answer is not None:
-            raise change_page.AnswerRefused('not an open question')
+            raise question_record.AnswerRefused('not an open question')
         self.items[item] = tuple(replace(question, answer=answer) if question.question_id == question_id else question
                                  for question in questions)
 
@@ -123,7 +124,7 @@ class PageQuestionTests(unittest.TestCase):
     def test_a_retry_finishes_a_save_that_stops_after_the_question_write(self) -> None:
         original = self.store.add
 
-        def interrupted_add(item: str, question: page_question.Question) -> None:
+        def interrupted_add(item: str, question: question_record.Question) -> None:
             original(item, question)
             raise OSError('interrupted after write')
 
@@ -138,7 +139,7 @@ class PageQuestionTests(unittest.TestCase):
         self.assertEqual(len(self.store.questions('image-1')), 1)
 
     def test_an_empty_question_does_not_write_or_claim(self) -> None:
-        with self.assertRaisesRegex(change_page.AnswerRefused, 'Enter a question first'):
+        with self.assertRaisesRegex(question_record.AnswerRefused, 'Enter a question first'):
             _ = self.ask(words='  ')
         self.assertEqual(self.store.questions('image-1'), ())
         self.assertEqual(self.sent, [])
@@ -176,8 +177,8 @@ class PageQuestionTests(unittest.TestCase):
         _ = self.ask()
         original = self.store.set_answer
 
-        def answer_first(item: str, identity: str, answer: page_question.Answer) -> None:
-            original(item, identity, page_question.Answer('First answer', answer.answered_at))
+        def answer_first(item: str, identity: str, answer: question_record.Answer) -> None:
+            original(item, identity, question_record.Answer('First answer', answer.answered_at))
             original(item, identity, answer)
 
         with patch.object(self.store, 'set_answer', side_effect=answer_first):
@@ -198,10 +199,10 @@ class PageQuestionTests(unittest.TestCase):
         self.assertIn('Use &lt;wide&gt; &amp; tall?', rendered)
         self.assertIn('&lt;Yes&gt; &amp; checked', rendered)
         self.assertNotIn('waiting for an answer', rendered)
-        self.assertEqual(page_question.read(page_question.stored(result.question)), result.question)
+        self.assertEqual(question_record.read(question_record.stored(result.question)), result.question)
 
     def test_invalid_stored_question_data_is_refused(self) -> None:
         for value in ({}, {'question_id': 'Q0', 'asked_at': 'today', 'words': 'Ask', 'answer': None},
                       {'question_id': 'Q1', 'asked_at': '2026-11-17T12:00:00+00:00', 'words': 'Ask', 'answer': 5}):
             with self.subTest(value=value), self.assertRaises(ValueError):
-                _ = page_question.read(value)
+                _ = question_record.read(value)

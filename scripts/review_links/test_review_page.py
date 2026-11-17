@@ -28,6 +28,7 @@ from scripts.production import issues as issue_store
 from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, record_table, review_items, review_page
+from scripts.review_links import question_record
 from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, review_actions, review_later
 from scripts.review_links.test_page_frame import assert_status_states
@@ -830,7 +831,7 @@ class ReviewPageTests(unittest.TestCase):
             body = self.body(key, 'later', 'Keep these words.')+'&'+urlencode({'later':until.isoformat()})
             with patch.object(review_items, 'read', return_value=[unavailable]), \
                     patch.object(change_review, 'record_review_log') as log:
-                with self.assertRaisesRegex(change_page.AnswerRefused, '^the production document is not available$'):
+                with self.assertRaisesRegex(question_record.AnswerRefused, '^the production document is not available$'):
                     _ = review_page.submit(self.root, body, self.status)
                 log.assert_not_called()
             self.assertNotIn(key, review_later.times())
@@ -893,7 +894,7 @@ class ReviewPageTests(unittest.TestCase):
                 approved = next(item for item in review_items.read(self.root) if item.key == key)
                 self.assertEqual(approved.state, review_items.ReviewState.DONE, 'Approve makes the item Done at once.')
                 self.assertEqual(approved.log[-1].words, 'Approve: Use it.')
-                with self.assertRaisesRegex(change_page.AnswerRefused, 'choose an action'):
+                with self.assertRaisesRegex(question_record.AnswerRefused, 'choose an action'):
                     _ = review_page.submit(self.root, self.body(key, 'decline'), self.status)
         with self.subTest(action='decline', kind='proposal'):
             delivery, result = review_page.submit(self.root, self.body(items['page-owner/P2'].key, 'decline', 'Not now.'),

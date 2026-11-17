@@ -21,6 +21,7 @@ from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, footer_counts, record_store, session_staff, staff, the_list
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_link
+from scripts.review_links import question_record
 from scripts.review_links import review_items, review_page
 from scripts.review_links import staff_names
 from scripts.statusline import counts_row, rebuild_row
@@ -238,16 +239,16 @@ def submit(root: Path, body: str) -> ListFeedbackDelivery | change_page.NoMessag
     """Accept nate's signed words and leave item changes to morty."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) != {"keeper", "id", "request", "token", "action", "words", "until"} or any(len(values) != 1 for values in fields.values()):
-        raise change_page.AnswerRefused("use the form on this page")
+        raise question_record.AnswerRefused("use the form on this page")
     keeper, identity, request = fields["keeper"][0], fields["id"][0], fields["request"][0]
     if re.fullmatch(r"[a-f0-9]{32}", request) is None or re.fullmatch(r"L[1-9]\d*", identity) is None:
-        raise change_page.AnswerRefused("the List request does not match this page")
+        raise question_record.AnswerRefused("the List request does not match this page")
     expected = request_token(root, keeper, identity, request)
     if not secrets.compare_digest(fields["token"][0].encode(), expected.encode()):
-        raise change_page.AnswerRefused("the List token does not match this page")
+        raise question_record.AnswerRefused("the List token does not match this page")
     morty = staff.snapshot().by_id(staff.StaffId(keeper))
     if morty is None or morty.kind != "producer" or morty.name != "morty":
-        raise change_page.AnswerRefused("the item has no morty producer")
+        raise question_record.AnswerRefused("the item has no morty producer")
     item = the_list.load(morty.id, identity)
     action, words, until = fields["action"][0], fields["words"][0].strip(), fields["until"][0]
     if action == "read":
@@ -257,11 +258,11 @@ def submit(root: Path, body: str) -> ListFeedbackDelivery | change_page.NoMessag
         words = f"Remove {item.number}"
     elif action == "park":
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", until) is None:
-            raise change_page.AnswerRefused("enter a parking date")
+            raise question_record.AnswerRefused("enter a parking date")
         _ = date.fromisoformat(until)
         words = f"Park {item.number} until {until}"
     elif action != "tell" or not words or len(words) > 10000:
-        raise change_page.AnswerRefused("enter words for morty")
+        raise question_record.AnswerRefused("enter words for morty")
     saved = the_list.save_feedback(morty.id, identity, the_list.PageFeedback(request, words))
     if saved.state != "pending":
         return change_page.NoMessageDelivery()
