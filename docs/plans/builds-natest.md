@@ -4774,3 +4774,28 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `test_statusline` (branch only) runs the renderer from a runtime copy with a fixture `statusline.conf`: colors, thresholds, routing paths and time zone. builds-report fixed the same color failures on main first (8e952ffbb); the next main merge takes main's file.
 - Both modules pass plain and with a Codex TMPDIR, SESSION_TEMP_ROOT=/tmp, SESSION_TEMP_ROOT=/var/tmp and a caller GIT_DIR.
 - Main-based commit 04c45e3cc (branch `natest-envtests341`, copy test only) went to builds.
+
+### Phase 342 — The Mac run tests use less aws CPU  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `production/test_mac_run.py` uses less aws CPU (48.4 CPU s median, rank 2), with every behavior check kept.
+
+**Spec:**
+1. Profile first: `python3 scripts/test_times/module_cost.py --tree <worktree> production/test_mac_run.py --tests 10 --commands 10`. Name the largest costs by test and by command.
+2. Cut the largest cost that does not carry a check: a repeated setup that a class seed can share, a full `mac_run.sh` run where a function-level call proves the same branch, or a start a test does not check. The slowest test is `test_a_signal_leaves_the_cleanup_to_the_mac_and_the_next_run` (11.4 s).
+3. Keep every assertion and every real signal, exit status and cleanup check. A test that checks a process boundary keeps that boundary.
+4. Measure again with module_cost on the same load. Give before and after CPU, starts and the per-test rows.
+5. No test reads a value /tune can change; a test writes its own fixture config.
+
+**Files:** `scripts/production/test_mac_run.py`; test support files only when the profile names them.
+
+**Workers:** 1 writer. One test module.
+- `impl`: all files.
+- `test`: opens as impl.
+
+**Acceptance gate:**
+- module_cost shows lower CPU for `production/test_mac_run.py`, with the same test count and every test passing.
+- The director runs an aws pair (3 rounds) after review; the paired median CPU is lower.
+- basedpyright reports 0 errors and 0 warnings on the changed files.
