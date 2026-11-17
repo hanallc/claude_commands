@@ -59,6 +59,12 @@ def section(heading: str, text: str) -> str:
     return '<section><h3>'+heading+'</h3>'+change_browser.question_paragraphs(text)+'</section>'
 
 
+def short_title(title: str, limit: int) -> str:
+    first = title.splitlines()[0] if title else ''
+    visible = first[:limit]
+    return visible+'…' if visible != title else visible
+
+
 def answer_section(text: str) -> str:
     return '<section><h3>Answer</h3>'+change_browser.answer_html(text)+'</section>'
 
@@ -91,10 +97,14 @@ def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff
     names = staff_names.for_page(names, members)
     source = item.source
     if isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
-        content, choices = change_browser.question_parts(source.record.item)
         question = source.record.item
         ask = question['parts']['ask'] if 'parts' in question else change_browser.question_text(question)[0]
-        lead = change_page.review_text_html(ask, inline=True) if ask != question['text'] else ''
+        # The lead shows the ask. Keep the shared body renderer from repeating it.
+        body_question = question.copy()
+        if 'parts' in question:
+            body_question['text'] = ask
+        content, choices = change_browser.question_parts(body_question)
+        lead = change_page.review_text_html(ask, inline=True)
         body = '<section><h3>Question</h3>'+lead+content+choices+'</section>'
         if isinstance(source, review_items.UnownedQuestionSource):
             body += '<p>No showrunner owns this question.</p>'
@@ -113,16 +123,18 @@ def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff
     elif isinstance(source, review_items.ProposalSource):
         # The issue text loads when the card opens, so the Open view does not carry every proposal body.
         body = ('<section><h3>Proposal</h3><div data-proposal-body>'
-                +'<p>'+html.escape(source.record.path.name)+'</p></div></section>')
+                +'<p data-title-ignore>Loading proposal…</p></div></section>')
     elif isinstance(source, review_items.EfficiencySource):
         body = section('Proposal', item.title)
     else:
         body = ''
+    fallback = '<section data-title-fallback hidden><h3>Item</h3><p>'+html.escape(item.title)+'</p></section>'
     logs = ''.join('<li><time datetime="'+entry.time.isoformat()+'">'
         +entry.time.astimezone(user_zone()).strftime('%b %d %H:%M')+'</time><span>'+html.escape(entry.words)
         +' <small>— '+names.html(entry.who)+'</small></span></li>' for entry in reversed(item.log))
     owner = owner_name(item, members)
-    return ('<div class="list-panel review-panel '+item.type+'"><div>'+body+'</div><section><h3>Log · newest first</h3>'
+    return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+'<div data-review-body>'+body
+            +'</div></div><section><h3>Log · newest first</h3>'
             +'<ol class="list-log">'+logs+'</ol></section>'+form(item, browser, words_rows)
             +'<p class="review-source">Owner: '+names.html(item.owner, owner)+' · Source: '
             +names.html(item.source_unit, review_items.name(item.source_unit, members))+'</p></div>')
@@ -138,11 +150,13 @@ def age(filed: datetime, now: datetime) -> str:
 
 
 def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, now: datetime, index: int,
-              words_rows: int, names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
+              title_limit: int, words_rows: int,
+              names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
     names = staff_names.for_page(names, members)
     owner = owner_name(item, members)
     source = review_items.name(item.source_unit, members)
-    title = '<strong>'+html.escape(item.title)+'</strong>'
+    title = ('<strong class="review-title" title="'+html.escape(item.title, quote=True)+'">'
+             +html.escape(short_title(item.title, title_limit))+'</strong>')
     if item.urgency.level != 'normal':
         title += '<small>'+html.escape({'user': 'Important', 'blocks': 'Blocks work', 'soon': 'Due soon', 'later': 'Later'}[item.urgency.level])+'</small>'
     values = (item.id, item.type.value, owner, item.title, item.state.value, item.times.filed.timestamp())
@@ -166,6 +180,7 @@ def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: sta
 
 def render(root: Path, *, show: str = 'open') -> bytes:
     started, read_at = time.perf_counter(), time.time()
+    title_limit = conf.read_or_repository('production').whole('question_title_max_chars')
     members = staff.snapshot()
     names = staff_names.StaffNames(members)
     now = datetime.fromtimestamp(read_at, user_zone())
@@ -202,7 +217,7 @@ def render(root: Path, *, show: str = 'open') -> bytes:
         +'<span data-list-count role="status"></span></div><div class="list-table"><table aria-label="Review">'
         +'<colgroup><col style="width:13%"><col style="width:13%"><col style="width:14%"><col style="width:41%">'
         +'<col style="width:12%"><col style="width:7%"></colgroup><thead><tr>'+headers+'</tr></thead>'
-        +''.join(item_rows(item,browser,members,now,index,words_rows,names) for index,item in enumerate(items))
+        +''.join(item_rows(item,browser,members,now,index,title_limit,words_rows,names) for index,item in enumerate(items))
         +'</table><p data-empty hidden>No items in this view.</p></div></div><script>'+SCRIPT+'</script>')
     return page_frame.rendered(change_page.document(content, 'Review'), started, read_at)
 
@@ -260,6 +275,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus) -> tuple[c
 
 
 STYLE = '''<style>
+.review-title{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .review-types{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 12px}
 .review-types button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
 background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--ink-2);padding:5px 14px;margin:0}
@@ -326,19 +342,38 @@ const view=createRecordTable({content:()=>content,single:true,
   if(show!==requestedShow){requestedShow=show;queueMicrotask(()=>pageRefresh.refresh(true));}
  }
 });
+function updateTitleFallback(panel){
+ const fallback=panel.querySelector('[data-title-fallback]');
+ const body=panel.querySelector('[data-review-body]').cloneNode(true);
+ body.querySelectorAll('[data-title-fallback],[data-title-ignore],.list-log,form,button,input,select,textarea,label,script,style')
+  .forEach(node=>node.remove());
+ const blocks=new Set('ADDRESS ARTICLE ASIDE BLOCKQUOTE BR DD DETAILS DIALOG DIV DL DT FIELDSET FIGCAPTION FIGURE FOOTER H1 H2 H3 H4 H5 H6 HEADER HGROUP HR LI MAIN MENU NAV OL P PRE SECTION SUMMARY TABLE TBODY TD TFOOT TH THEAD TR UL'.split(' '));
+ const bodyText=node=>{
+  if(node.nodeType===Node.TEXT_NODE) return node.textContent;
+  const text=[...node.childNodes].map(bodyText).join('');
+  return blocks.has(node.nodeName) ? ' '+text+' ' : text;
+ };
+ const plain=text=>text.replace(/\s+/g,' ').trim();
+ fallback.hidden=plain(bodyText(body)).includes(plain(fallback.querySelector('p').textContent));
+}
 function loadBodies(){
  view.opened.forEach(key=>{
   const target=content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"] [data-proposal-body]');
   if(!target || target.dataset.loaded) return;
   target.dataset.loaded='true';
-  if(bodies.has(key)){target.innerHTML=bodies.get(key);return;}
+  const panel=target.closest('.review-panel');
+  if(bodies.has(key)){target.innerHTML=bodies.get(key);updateTitleFallback(panel);return;}
   fetch(location.pathname+'?'+new URLSearchParams({body:key}),{cache:'no-store'})
    .then(response=>response.ok ? response.text() : Promise.reject(new Error('HTTP '+response.status)))
-   .then(text=>{bodies.set(key,text);if(target.isConnected) target.innerHTML=text;})
-   .catch(error=>{target.textContent='The proposal text is not available: '+error.message;});
+   .then(text=>{bodies.set(key,text);if(target.isConnected){target.innerHTML=text;updateTitleFallback(panel);}})
+   .catch(error=>{
+    target.textContent='The proposal text is not available: '+error.message;
+    target.dataset.titleIgnore='';updateTitleFallback(panel);
+   });
  });
 }
 function bind(){
+ content.querySelectorAll('.review-panel').forEach(updateTitleFallback);
  view.replace();
  content.querySelectorAll('[data-review-form]').forEach(form=>{
   const row=form.closest('[data-list-item]'),key=row.dataset.key,words=form.elements.feedback,later=form.elements.later;
@@ -385,7 +420,7 @@ async function refresh(_supersede=false,current=()=>true){
  const page=new DOMParser().parseFromString(await response.text(),'text/html'),fresh=page.querySelector('[data-review]');
  if(!fresh) throw new Error('The page has no review table.');
  if(saving || !current() || show!==selectedShow) return;
- const top=scrollY,focus=document.activeElement?.id,start=document.activeElement?.selectionStart,end=document.activeElement?.selectionEnd;
+ const top=scrollY,restoreFocus=restoreFocusAfterRefresh();
  content.replaceWith(fresh);content=fresh;
  for(const [key,result] of saved){
   if(result.later){if(Date.now()>=result.later) saved.delete(key);continue;}
@@ -398,8 +433,7 @@ async function refresh(_supersede=false,current=()=>true){
   if(!row || row.dataset.state!=='For you' || row.dataset.updated!==result.updated) saved.delete(key);
  }
  bind();view.apply(false);
- if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
-  if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number') field.setSelectionRange(start,end);}
+ restoreFocus();
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
 }
 view.place();bind();view.apply();

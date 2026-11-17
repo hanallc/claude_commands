@@ -1,4 +1,4 @@
-"""Store console images and temporary change images without page dependencies."""
+"""Store console images, image questions and temporary change images."""
 from __future__ import annotations
 
 import html
@@ -9,11 +9,13 @@ import shutil
 import subprocess
 import tempfile
 from datetime import UTC, datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, file_lock
 from scripts.production import change_routing
+from scripts.review_links import change_page, page_question
 
 CHANGE_FOLDER = "change-images"
 IMAGES_FOLDER = "images"
@@ -21,6 +23,7 @@ RECORD = ".review-link-image.json"
 DRAFT_PREFIX = ".review-link-draft-"
 SUFFIXES = frozenset((".png", ".jpg", ".jpeg", ".gif", ".webp"))
 IDENTITY = re.compile(r"[0-9a-f]{12}")
+LOCK = ".review-link-images.lock"
 # Chrome clips a headless screenshot below about 150 pixels.
 MIN_OUTPUT_IMAGE_HEIGHT = 160
 
@@ -36,6 +39,7 @@ class ImageRecord(TypedDict):
     before: NotRequired[str]
     # Set when the owner received the user's answer; the page hides the image until the owner deletes it.
     feedback_at: NotRequired[str]
+    questions: NotRequired[list[page_question.StoredQuestion]]
 
 
 def read_record(folder: Path) -> ImageRecord:
@@ -59,11 +63,62 @@ def read_record(folder: Path) -> ImageRecord:
         record["before"] = before
     if isinstance(feedback_at := fields.get("feedback_at"), str):
         record["feedback_at"] = feedback_at
+    if "questions" in fields:
+        questions = fields["questions"]
+        if not isinstance(questions, list):
+            raise ValueError(f"{folder.name}: invalid image questions")
+        checked = [page_question.read(question) for question in cast(list[object], questions)]
+        if len({question.question_id for question in checked}) != len(checked):
+            raise ValueError(f"{folder.name}: duplicate question id")
+        record["questions"] = [page_question.stored(question) for question in checked]
     return record
 
 
 def write_record(folder: Path, record: ImageRecord) -> None:
     atomic_file.write_bytes_atomic(folder / RECORD, json.dumps(record).encode("utf-8"), mode=0o600)
+
+
+@dataclass(frozen=True)
+class ImageQuestionStore:
+    """Keep question changes and the answer's return mark in one image write."""
+
+    root: Path
+
+    def folder(self, item: str) -> Path:
+        if not IDENTITY.fullmatch(item):
+            raise change_page.AnswerRefused('not an image id')
+        folder = self.root / item
+        if folder.is_symlink() or not folder.is_dir():
+            raise change_page.AnswerRefused(f'no image {item}')
+        return folder
+
+    def questions(self, item: str) -> tuple[page_question.Question, ...]:
+        record = read_record(self.folder(item))
+        return tuple(page_question.read(question) for question in record.get('questions', []))
+
+    def add(self, item: str, question: page_question.Question) -> None:
+        with file_lock.exclusive(self.root / LOCK):
+            folder = self.folder(item)
+            record = read_record(folder)
+            questions = [page_question.read(saved) for saved in record.get('questions', [])]
+            if any(saved.question_id == question.question_id for saved in questions):
+                raise change_page.AnswerRefused('This image already has that question id.')
+            record['questions'] = [page_question.stored(saved) for saved in (*questions, question)]
+            write_record(folder, record)
+
+    def set_answer(self, item: str, question_id: str, answer: page_question.Answer) -> None:
+        with file_lock.exclusive(self.root / LOCK):
+            folder = self.folder(item)
+            record = read_record(folder)
+            questions = [page_question.read(saved) for saved in record.get('questions', [])]
+            current = next((question for question in questions if question.question_id == question_id), None)
+            if current is None or current.answer is not None:
+                raise change_page.AnswerRefused('This image has no open question with that id.')
+            record['questions'] = [page_question.stored(page_question.Question(
+                question.question_id, question.asked_at, question.words, answer)
+                if question.question_id == question_id else question) for question in questions]
+            _ = record.pop('feedback_at', None)
+            write_record(folder, record)
 
 
 def register_file(image: Path, folder: Path, caption: str = "", owner: str = "", subject: str = "",
