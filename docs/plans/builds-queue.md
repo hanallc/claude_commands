@@ -2709,11 +2709,13 @@ Goal: no queue fixture calls bare `mkdtemp`, `git clone` or `git worktree add`. 
 **Proof:** tests for each item; one dark desktop shot of the Disks page where a waiting run holds no slot.
 **Restart:** none expected: the change is in the client (`copies.py`, `verify.sh`).
 **Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44ax/work_order.md`. Clone `/session/queue/slotorder`, branch `builds-queue-slotorder`.
-**Built:** checkpoint 654dcfcf0 on origin branch `builds-queue-slotorder-cp`, sent to builds 2026-11-17. A private source copy keeps the repository identity and writes no objects into the source. Three review passes closed five findings. Proof image c1b4e8f2ddc5.
+**Built:** checkpoint 2e49fd46c on origin branch `builds-queue-slotorder-cp2`, sent to builds 2026-11-17. It replaces 654dcfcf0, which was red at merge: the Hana render list lacked `first_step.py`, and `first_step` asked for its place outside `queue_place`. A private source copy keeps the repository identity and writes no objects into the source. Three review passes closed five findings. Proof image c1b4e8f2ddc5.
 
 ### Phase 44ay — The other slot users take their slot after admission too  · status: todo
 **Depends on:** 44ax. builds asked for it at once after 44ax, so two orders do not stay in place.
 Move the other `copies.standing` callers to the 44ax order with the same code: merge_gate nightly, ci_points, fast_track, waiting.py, style crate_run, bump_gate, simplify_daily and rust_release. A caller whose work is not one queue step keeps the old order and says why in a comment.
+
+**Built:** checkpoint 338d18d93 on origin branch `builds-queue-otherslots-cp`, one commit on 2e49fd46c, sent to builds 2026-11-17. All eight callers share the `copies` command_tree entry point; `phases/44ay/callers.md` lists each one. Two review passes closed three findings: the bump gate reads its command from the recorded tip, scratch tests ask the queue first only when the shell keeps the words, and style fixtures use a private `ADMISSION_SOCKET`. During the build, an old nightly fixture reached the live queue for a short time; every fixture now sets a private socket.
 
 ### Phase 44az — A waiting step says why it stays off the Mac, and a dead holder's claim no longer looks busy  · status: todo
 **Depends on:** nothing; urgent. builds gave the go on 2026-11-17 11:15 EST. ETA 2026-11-17 13:45 EST.
@@ -2742,6 +2744,14 @@ Move the other `copies.standing` callers to the 44ax order with the same code: m
 
 **Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44bb/work_order.md`. Clone `/session/queue/macidle`, branch `builds-queue-verifyverb`.
 **Held user items, not approved for work:** style crate integration, `validate_and_push` and the buildlog tools run their Cargo work through `verify.sh`, so every Rust row has a verb.
+
+### Phase 44bc — Two more callers take their slot after admission  · status: todo
+**Depends on:** 44ay (branch `builds-queue-otherslots` after 06768708e). Two minor findings of the second 44ay review. Hash due 2026-11-17 15:30 EST.
+
+1. A scratch command with literal words that contain `=` or quoted brackets asks the queue first. A word the shell changes still keeps the old order.
+2. A bump gate that starts with `verify.sh` checks out its tip once before admission, not twice.
+
+**Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44bc/work_order.md`. Clone `/session/queue/otherslots`.
 
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
