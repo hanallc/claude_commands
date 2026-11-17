@@ -299,7 +299,8 @@ It does not write live tickets, plans, or proposals.
 
 Identify a build with its Rust sources, dependency lockfile, protocol version, and ported Python contract digest.
 Include relevant workspace settings in that identity.
-The current stamp covers only `HEAD:rust/style_reader`; that is insufficient for the expanded selector.
+The Python client checks the installed `cargo-style` crate version and protocol.
+It does not build the reader during a refill.
 Reject incompatible binaries before selection.
 
 Build and install the binary before enabling the selector.
@@ -713,7 +714,7 @@ Phase 9 must compare those behaviors before the native selector replaces them.
 | Identity | Captured fields |
 | --- | --- |
 | Implementation | Git commit, tracked selection diff hash, and hashes of all Python selection files, including new files |
-| Reader | Committed reader source tree ID and installed binary stamp bytes |
+| Reader | Checked `cargo-style --version` line with its crate version and protocol |
 | Tools | Python version, Git version, and complete ripgrep version output |
 | Locale | `LC_ALL`, `LC_CTYPE`, `LANG`; unset values remain unset |
 | Rule interpreter | Captured rule bytes, rule blob IDs in the copied source rows, and implementation identity |
@@ -943,7 +944,7 @@ Director decisions at phase start (2026-11-16):
 
 **Spec:**
 
-1. Capture. A new command makes a capture folder from a repository, a ledger and a unit. It copies the ledger through a `mode=ro` backup. It records the schema, the `refill_tables` version vector and the resolved revision ids (synced, unit tip, main tip, pushed tip, checkpoints, branch presence). It copies each external input that selection reads: rule files, style configuration, ignore files, proposal files, plans, staff values and board values. It records locale, the ripgrep version, the Python version and the reader binary stamp. A `manifest.json` gives a SHA-256 for each copied file.
+1. Capture. A new command makes a capture folder from a repository, a ledger and a unit. It copies the ledger through a `mode=ro` backup. It records the schema and the `refill_tables` version vector. It records the synced, unit, main, pushed and checkpoint revisions. It records branch presence. It copies each external input that selection reads. These inputs include rules, configuration, ignore files, proposals, plans, staff values and board values. It records locale and the ripgrep and Python versions. It records the checked `cargo-style --version` line in `tools.cargo_style`. A `manifest.json` gives a SHA-256 for each copied file.
 2. Replay. A replay runs the current Python `COUNT` refill on a fresh copy of the captured ledger, with `--reader python|rust`. It reads the captured external inputs where an existing setting can point there. For each read that has no setting, the replay compares the live file hash with the manifest and reports each difference. It adds no refusal. Two replays of one capture give the same digest.
 3. Benchmark reset. `refill_measure.clear_derived` deletes an explicit list of derived tables. It keeps `refill_tables`, `refill_rows` and `refill_results`.
 4. Stage measurement. A measure option times these stages separately: Python start, ledger reads, external file reads, Git subprocess calls, reader child calls, derived-result encoding and writes. It counts unique revision pairs, declaration searches, rule scans, Git subprocesses and reader requests. It reports candidate and finding counts beside the times. It wraps functions only inside the measure worker. Default selection does not change.
