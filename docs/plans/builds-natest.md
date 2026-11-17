@@ -4578,6 +4578,7 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `production/test_fast_track.py`: the interruption tests start each fast-track child as a fork of the test process with its modules loaded (`command`); the former in-process body moves unchanged to `invoke_command`. The real Git wrapper still sends SIGKILL at the tested boundary, and each test reads the real exit status. The complete command case and the concurrent second process keep fresh interpreters. Output files and child cleanup exist before the process starts.
 - Profile before the change: 42.8 natedev CPU s; Git 12.1 s over 6,749 starts; 22 fast-track children 11.6 s. The class seed already existed. Remaining cost: Git starts, which tests check.
 - aws pairs (3 rounds, c7a.4xlarge): 55.37 -> 45.36 CPU s (paired median saving 10.07 s, lower in every round); peak 200.7 -> 205.5 MiB. 50 tests and 312 assertions unchanged; both reviews approve. Checkpoint a0463a3b9.
+- Main-based commit 759acb7a7 (branch `natest-fasttrack323`) went to builds.
 
 ### Phase 324 — The verify wait-holder tests use less aws CPU  · status: done
 **Depends on:** none
@@ -4681,6 +4682,7 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - natedev `module_cost.py`: 25.5 to 19.0 CPU s; the test 9.5 to 4.1 CPU s. The module passes 16 of 16 runs.
 - aws pair, 3 rounds: 27.07 to 23.60 CPU s, a saving of 3.47 CPU s; peak memory 149 to 150 MiB; all passed.
 - The largest costs left are `python3 -` helper starts (57, 3.4 CPU s), `fast_track.py` starts (12, 2.0 CPU s) and `pass_record.py` starts (24, 2.6 CPU s), all product starts that the tests check.
+- Main-based commit 4c66a1966 (branch `natest-reviewlauncher333b`) went to builds as "builds natest333".
 
 ### Phase 334 — The deploy command stops waiting gates and never leaves a half state  · status: done
 **Depends on:** Phase 322
@@ -4740,7 +4742,7 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The lock was in `/tmp` because the caller set `TMPDIR=/tmp`; `build_folders.tool_folder` uses the caller's temporary parent.
 - module_cost own CPU on fast track: 7.3 to 3.7 s. Main-based commit f2850a915 (branch `natest-modulecost338`) went to builds. F009 (cleanup can reach an in-process caller's own children) went to phase 339.
 
-### Phase 339 — module_cost measures in its own process and counts starts with one tracer
+### Phase 339 — module_cost measures in its own process and counts starts with one tracer  · status: done
 **Depends on:** Phase 338
 
 #### Work Order
@@ -4763,3 +4765,33 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - A caller child started before `module_cost.main` lives on after a measurement timeout and keeps its exit status.
 - `module_cost.py production/test_fast_track.py` reports the same start counts with no strace stage, and its own CPU is lower.
 - The test_times tests pass; basedpyright reports 0 errors and 0 warnings on the changed files.
+
+### Phase 340 — box requests keep the old step names and SuiteMode reads both  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `SuiteMode.wire` gives the old names "merge-gate" and "targeted-test" for box requests and the request identity. `SuiteMode._missing_` reads the old names; `SuiteMode.step` maps a recorded step to the new name and keeps other steps, such as "gpu-size-trial".
+- `cloud_gate`: the launch ledger, `rank_variants`, the timeout record and `import_record` store the new names. `accepts_suite_mode` accepts a tested commit whose member values or `_missing_` hold the wire value; an unknown commit runs the local gate.
+- Accepted limit: a candidate `_missing_` that names the old values only to raise passes admission, then the guest rejects it.
+- 382 tests pass; basedpyright clean. Main-based commit 0622a8585 (branch `natest-gatewire2`) went to builds as "builds gatewire".
+
+### Phase 341 — two tests set their own environment  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts.copies.test_live_roots_guard` and `scripts.statusline.test_statusline` pass in any caller environment, a Codex worker included.
+
+**Spec:**
+1. `test_live_roots_guard` sets its own TMPDIR. A caller TMPDIR under /session/verify/test-runs must not make the copy guard see a live root.
+2. `test_statusline` sets its own color environment. COLORTERM=truecolor does not cause the failure. First find, in a Codex worker run, the variable that gives RGB colors. Then the test sets that variable itself, so the 9 color assertions pass.
+3. Every behavior check stays.
+
+**Files:** `scripts/copies/test_live_roots_guard.py`, `scripts/statusline/test_statusline.py`.
+
+**Workers:** 1 writer. Two small test files; one pass.
+- `impl`: both files.
+- `test`: opens as impl.
+
+**Acceptance gate:** both modules pass in a Codex worker run, with TMPDIR under /session/verify/test-runs, and in a plain run.
