@@ -8,6 +8,7 @@ from typing import cast
 
 from scripts.lib import file_lock
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.user_zone import user_zone
 from scripts.production.record_store import state_root
 
 
@@ -36,6 +37,6 @@ def save(key: str, until: datetime) -> None:
 
 
 def deadline() -> str:
-    now = datetime.now().astimezone()
+    now = datetime.now().astimezone(user_zone())
     future = [value for value in times().values() if value > now]
     return str(int(min(future).timestamp())) if future else ''
