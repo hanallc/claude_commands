@@ -53,7 +53,6 @@ A workspace can declare an artifact that its tests need, in its root `Cargo.toml
 target = "wasm32-unknown-unknown"
 env = "HANA_AGORA_SERVER_WASM"
 for = ["hana_agora", "hana"]
-platforms = ["linux"]
 ```
 
 `platforms` is optional. It lists the platforms that build the artifact, `linux` and `macos`; the default is both.
@@ -68,6 +67,17 @@ platforms = ["linux"]
 - Cargo's fingerprints make an unchanged build a no-op. There is no second cache.
 - A failed build exits with cargo's status and prints `the tests did not run`. An invalid declaration exits 2 with one line. A `workspace`, `metadata` or `dev` value that is not a table declares nothing, and the tests run unchanged.
 - The profile is always `release`. The entry has no profile key.
+
+### Dev shell programs (`scripts/lib/dev_shell.py`)
+
+A test can need a program that the workspace's flake development shell declares, for example SpacetimeDB for hana_catalyst. `verify.sh` on natedev runs inside that shell (`nix_env.py exec`), and the Linux SSH runner sources the whole shell. The Mac route and a bare `lint` call do not.
+
+1. `run_step_attempt` makes `PATH` local, and for a `cargo nextest run` step it calls `lint_dev_shell_path` before admission.
+2. When `IN_NIX_SHELL` is not set and the workspace root has `flake.nix`, `dev_shell.py path --root R` prints the shell's `/nix/store` program folders. The step adds them to the END of `PATH`. Every tool the host has stays first: the Mac cargo gate, rustup's cargo and the system compiler. No other variable changes, so the step builds as before.
+3. The evaluation (`nix print-dev-env path:<inputs>#<selector>`) is cached per flake input change under `config/dev_shell.conf` `cache`. A failed evaluation fails the step with `lint: the flake development shell did not load; the tests did not run`, after nix's last error line.
+4. A workspace without `flake.nix`, or a step inside a nix shell, starts no process. The next step starts from the caller's `PATH`.
+
+A program that the shell has and the host lacks is visible to build scripts too. Adding the folders last limits this to tools that the host does not have.
 
 ### Width in the reservation (`scripts/lint/memory_admit.py`)
 
@@ -119,6 +129,7 @@ Order: `require_taplo`, mend `--fix`, nightly fmt of the package and changed mem
 ## Invariants
 
 - `invoke.sh` is the only place nextest policy flags are composed; callers own scope.
+- The dev shell folders go at the end of `PATH`, never the start: the Mac cargo gate and the host's tools stay first.
 - The prebuild prefix goes before the token holder: `nextest_tokens.py` reads `cargo nextest run --test-threads W` at the start of its command.
 - The caller's width wins: a width flag before `--`, or `NEXTEST_TEST_THREADS`, means `invoke.sh` adds nothing. Such a run takes no test tokens.
 - No counter: a run's tokens are the bytes it holds, and steve takes back the tokens of a dead process.
