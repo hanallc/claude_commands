@@ -14,17 +14,20 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from enum import StrEnum
 from hashlib import sha256
 import json
+import math
 import os
 from pathlib import Path
 import re
 import stat
+from statistics import median
 import subprocess
 import sys
 import threading
 import time
-from typing import cast, final
+from typing import ClassVar, cast, final
 from uuid import uuid4
 
 
@@ -61,17 +64,84 @@ def step(command: str, text: str, settings: Path, *, hint: str = '') -> Generato
 
     worker = threading.Thread(target=heartbeat, name='deployment-progress', daemon=True)
     worker.start()
+    completed = False
     try:
         yield
+        completed = True
     finally:
         stopped.set()
         worker.join()
         elapsed = time.monotonic() - started
-        print(f'{command}: {text} done in {elapsed:.0f} s', file=stream, flush=True)
+        outcome = 'done in' if completed else 'failed after'
+        print(f'{command}: {text} {outcome} {elapsed:.0f} s', file=stream, flush=True)
 
 
 class DeploymentRefused(ValueError):
     """Current evidence does not permit a resource request."""
+
+
+class GateRegionOperation(StrEnum):
+    NETWORK = 'network'
+    STACK = 'stack'
+
+
+@dataclass
+class GateRegionTimings:
+    """Keep successful regional durations for the next deployment estimate."""
+
+    _LABELS: ClassVar[dict[GateRegionOperation, str]] = {
+        GateRegionOperation.NETWORK: 'preparing the network and image',
+        GateRegionOperation.STACK: 'updating the gate stack',
+    }
+    _path: Path
+    _seconds: dict[GateRegionOperation, dict[str, float]]
+
+    @classmethod
+    def read(cls, directory: Path) -> GateRegionTimings:
+        path = directory / 'gate-region-times.json'
+        try:
+            saved = remote.read_record(path)
+            if saved.get('version') != 1:
+                raise ValueError('Unsupported regional timing version')
+            operations = ledger.mapping(saved['seconds'])
+            seconds: dict[GateRegionOperation, dict[str, float]] = {}
+            for operation in GateRegionOperation:
+                if operation not in operations:
+                    continue
+                seconds[operation] = {}
+                for region, value in ledger.mapping(operations[operation]).items():
+                    if (isinstance(value, bool) or not isinstance(value, (int, float))
+                            or not math.isfinite(value) or value < 0):
+                        raise ValueError('Invalid regional duration')
+                    seconds[operation][region] = float(value)
+            return cls(path, seconds)
+        except (OSError, ValueError, KeyError, OverflowError):
+            return cls(path, {})
+
+    def announce(self, operation: GateRegionOperation, regions: Sequence[str]) -> None:
+        if not regions:
+            return
+        saved = self._seconds.get(operation, {})
+        if saved:
+            typical = median(saved.values())
+            total = sum(saved.get(region, typical) for region in regions)
+            estimate = f'expected total {total:.0f} s from saved regional times'
+        else:
+            estimate = 'expected total is not yet measured'
+        print(f'cloud-gate: {self._LABELS[operation]} in {len(regions)} regions: {estimate}', flush=True)
+
+    @contextmanager
+    def measure(self, operation: GateRegionOperation, region: str, position: int, total: int,
+                settings: Path) -> Generator[None]:
+        started = time.monotonic()
+        with step(f'cloud-gate: {region}', self._LABELS[operation], settings, hint=f'{position} of {total}'):
+            yield
+        self._seconds.setdefault(operation, {})[region] = time.monotonic() - started
+        record = json.dumps({'version': 1, 'seconds': self._seconds}, sort_keys=True) + '\n'
+        try:
+            write_text_atomic(self._path, record)
+        except OSError:
+            print(f'cloud-gate: warning: could not write {self._path.name}', flush=True)
 
 
 def quota_targets(home: str) -> tuple[tuple[tuple[str, ...], str, int, str], ...]:
@@ -1348,7 +1418,13 @@ class Deployment:
             prefix = f'arn:{partition}:ec2:{settings.region}:{account}:'
             values = cloud_gate.settings()
             # The home scaler policies cover every gate region, so the scaler user's policy count stays fixed.
-            networks = [self.regional_network(api, settings, region) for region in regions[1:]]
+            timings = GateRegionTimings.read(self.directory)
+            additional = regions[1:]
+            timings.announce(GateRegionOperation.NETWORK, additional)
+            networks: list[RegionalNetwork] = []
+            for position, region in enumerate(additional, 1):
+                with timings.measure(GateRegionOperation.NETWORK, region, position, len(additional), self.settings_path):
+                    networks.append(self.regional_network(api, settings, region))
             parameters = {
                 'EnableGates': 'true', 'GateImage': settings.ami_id,
                 'GateVpcs': ','.join([prefix + 'vpc/' + settings.vpc_id,
@@ -1392,10 +1468,12 @@ class Deployment:
             }
             cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             regional = list(ledger.rows(manifest, 'regions'))
-            for network in networks:
-                regional.append(self.regional_gate_stack(api, settings, outputs, parameters, network))
-                manifest['regions'] = regional
-                cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
+            timings.announce(GateRegionOperation.STACK, additional)
+            for position, network in enumerate(networks, 1):
+                with timings.measure(GateRegionOperation.STACK, network.region, position, len(networks), self.settings_path):
+                    regional.append(self.regional_gate_stack(api, settings, outputs, parameters, network))
+                    manifest['regions'] = regional
+                    cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             print('cloud-gate: deployed')
         self._fill_prices()
         return True
