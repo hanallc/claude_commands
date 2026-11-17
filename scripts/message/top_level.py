@@ -15,10 +15,10 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
-from pathlib import Path
 
 from scripts.message import roster
 from scripts.message import sessions
+from scripts.build_hold.override_guard import user_home
 
 USAGE = "usage: top_level.py"
 
@@ -81,7 +81,7 @@ def main(argv: list[str]) -> int:
     for session in forwarded:
         if isinstance(session, UnaddressableSession):
             print(f"not reachable: {session.name} [{session.session_id}] has no messaging socket", file=sys.stderr)
-    hold_script = Path(__file__).resolve().parent.parent / "build_hold" / "build_hold.py"
+    hold_script = user_home() / ".claude/scripts/build_hold/build_hold.py"
     for session in recipients:
         result = subprocess.run([sys.executable, str(hold_script), "record-recipient", "--session-id", session.session_id, "--name", session.name], capture_output=True)
         if result.returncode != 0:

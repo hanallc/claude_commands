@@ -1388,55 +1388,59 @@ def command_eligibility(args: CliArguments) -> int:
 
 def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "build_targets/build_targets.py")
-    from scripts.build_targets import target_config
-
-    args = parser().parse_args(namespace=CliArguments())
-    if args.command == "recover-probe":
-        return command_recover_probe(args)
-    if args.command == "probe-backoff":
-        return command_probe_backoff(args.target, probe=not args.no_probe)
-    if args.command == "source-key":
-        from scripts.buildlog import treekey
-
-        print(treekey.tree_key(args.repo_root) or "")
-        return 0
-    if args.command == "submitting-session":
-        print(claim_state.session_id(claim_state.submitting_session(args.session)))
-        return 0
-    if args.command == "assigned-info":
-        from scripts.build_queue import admission_protocol as wire
-
-        saved = wire.parse_reply(Path(args.assignment_file).read_text())
-        if not isinstance(saved, (wire.Assignment, wire.LocalPlacementGranted)):
-            raise wire.AdmissionUnavailable("file contains no assigned attempt")
-        destination = saved.assignment.destination
-        if destination.provider == "local":
-            print("-\tlinux\t" + claim_state.session_id(saved.assignment.session))
-        else:
-            target = target_config.configured_ssh_target(destination.target)
-            print(f"{target.settings}\t{target.platform}\t{claim_state.session_id(saved.assignment.session)}")
-        return 0
-    if args.command in ("reserve", "recover-reservation"):
-        if args.command == "recover-reservation":
-            args.recover_only = True
-        return command_reserve(args)
-    if args.command in ("release-wait", "eligible", "constraints"):
+    try:
         from scripts.build_targets import target_config
 
-        with target_config.command_configuration():
-            if args.command == "release-wait":
-                return command_release_wait(args.pid, identity=claim_state.ClaimIdentity(
-                    args.claim_id, args.episode, args.attempt), session=args.session)
-            return command_constraints(args) if args.command == "constraints" else command_eligibility(args)
-    if args.command == "register-local":
-        return command_register_local(args.call_id, pid=args.pid, session=args.session)
-    if args.command == "wait-local":
-        return command_wait_local(args.call_id, pid=args.pid, leave_hook=args.leave_hook, caller=args.caller, session=args.session)
-    if args.command == "check-local":
-        return command_check_local(args.caller, session=args.session)
-    if args.command == "interrupt-local":
-        return command_interrupt_local(args.call_id, args.signal_name)
-    return command_status(args.probe)
+        args = parser().parse_args(namespace=CliArguments())
+        if args.command == "recover-probe":
+            return command_recover_probe(args)
+        if args.command == "probe-backoff":
+            return command_probe_backoff(args.target, probe=not args.no_probe)
+        if args.command == "source-key":
+            from scripts.buildlog import treekey
+
+            print(treekey.tree_key(args.repo_root) or "")
+            return 0
+        if args.command == "submitting-session":
+            print(claim_state.session_id(claim_state.submitting_session(args.session)))
+            return 0
+        if args.command == "assigned-info":
+            from scripts.build_queue import admission_protocol as wire
+
+            saved = wire.parse_reply(Path(args.assignment_file).read_text())
+            if not isinstance(saved, (wire.Assignment, wire.LocalPlacementGranted)):
+                raise wire.AdmissionUnavailable("file contains no assigned attempt")
+            destination = saved.assignment.destination
+            if destination.provider == "local":
+                print("-\tlinux\t" + claim_state.session_id(saved.assignment.session))
+            else:
+                target = target_config.configured_ssh_target(destination.target)
+                print(f"{target.settings}\t{target.platform}\t{claim_state.session_id(saved.assignment.session)}")
+            return 0
+        if args.command in ("reserve", "recover-reservation"):
+            if args.command == "recover-reservation":
+                args.recover_only = True
+            return command_reserve(args)
+        if args.command in ("release-wait", "eligible", "constraints"):
+            from scripts.build_targets import target_config
+
+            with target_config.command_configuration():
+                if args.command == "release-wait":
+                    return command_release_wait(args.pid, identity=claim_state.ClaimIdentity(
+                        args.claim_id, args.episode, args.attempt), session=args.session)
+                return command_constraints(args) if args.command == "constraints" else command_eligibility(args)
+        if args.command == "register-local":
+            return command_register_local(args.call_id, pid=args.pid, session=args.session)
+        if args.command == "wait-local":
+            return command_wait_local(args.call_id, pid=args.pid, leave_hook=args.leave_hook, caller=args.caller, session=args.session)
+        if args.command == "check-local":
+            return command_check_local(args.caller, session=args.session)
+        if args.command == "interrupt-local":
+            return command_interrupt_local(args.call_id, args.signal_name)
+        return command_status(args.probe)
+    except override_guard.SharedStateWriteRefused as error:
+        print(str(error), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
