@@ -51,7 +51,9 @@ When no local source remains, removal exports the rescue into a sibling bare rep
 Removal verifies the exported rescue before it deletes the workspace.
 Python callers pass slot lease descriptors to their build and test children.
 `clone()` keeps its task-owned return-a-path API and uses the maker outside the gate root.
-Its callers retain their existing task cleanup.
+Task cleanup removes the clone and clears the removal marks before it tries to remove the lease file and lock file.
+Cleanup holds the lock and checks the identities of those two files before it removes either file.
+Recovery leaves the files if the clone is already absent when recovery starts.
 
 `copies.py list` reads slot leases and remote mirror rows.
 `copies.py remove` removes owned editable and remote copies; it never removes a shared slot.

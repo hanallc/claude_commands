@@ -7,7 +7,7 @@ except FileNotFoundError:
     pass
 
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import fcntl
@@ -664,18 +664,88 @@ def _unlink_metadata(path: Path, directory: int) -> None:
             pass
 
 
-def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool = True) -> bool:
-    """Hold path's lease lock when it is free. A missing lock file means no lease."""
+@dataclass(frozen=True)
+class RefusedRemovalLease:
+    """A busy or unreadable lock prevents removal."""
+
+
+@dataclass(frozen=True)
+class UnreservedRemovalFolder:
+    """The folder has no lock file to hold."""
+
+
+SidecarIdentity = tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class HeldFolderRemovalLease:
+    """The descriptor reserves the folder name until lock removal."""
+
+    folder: Path
+    directory: int
+    descriptor: int
+
+    def _sidecar_identity(self, name: str) -> SidecarIdentity | None:
+        try:
+            inode = os.stat(name, dir_fd=self.directory, follow_symlinks=False)
+        except OSError:
+            return None
+        if stat.S_ISREG(inode.st_mode) and inode.st_nlink == 1:
+            return inode.st_dev, inode.st_ino, inode.st_ctime_ns
+        return None
+
+    def sidecar_identities(self) -> dict[str, SidecarIdentity]:
+        """Read the identities for this removal while the lock is held."""
+        try:
+            lock = os.fstat(self.descriptor)
+        except OSError:
+            return {}
+        lock_name = self.folder.name + ".lock"
+        lock_identity = (lock.st_dev, lock.st_ino, lock.st_ctime_ns)
+        if self._sidecar_identity(lock_name) != lock_identity:
+            return {}
+        lease_name = self.folder.name + ".lease.json"
+        lease_identity = self._sidecar_identity(lease_name)
+        identities = {lease_name: lease_identity} if lease_identity is not None else {}
+        identities[lock_name] = lock_identity
+        return identities
+
+    def _source_removed(self) -> bool:
+        try:
+            return (os.path.samestat(os.fstat(self.directory), self.folder.parent.stat())
+                    and not _folder_exists(self.folder, self.directory))
+        except OSError:
+            return False
+
+    def unlink_sidecars(self, expected: dict[str, SidecarIdentity]) -> None:
+        """Remove the original sidecars after the source and marks are gone."""
+        lock_name = self.folder.name + ".lock"
+        lock_identity = expected.get(lock_name)
+        if lock_identity is None:
+            return
+        for name in (self.folder.name + ".lease.json", lock_name):
+            identity = expected.get(name)
+            if (identity is not None and self._source_removed() and self._sidecar_identity(name) == identity
+                    and (name == lock_name or self._sidecar_identity(lock_name) == lock_identity)):
+                with suppress(OSError):
+                    os.unlink(name, dir_fd=self.directory)
+
+
+FolderRemovalLease = RefusedRemovalLease | UnreservedRemovalFolder | HeldFolderRemovalLease
+
+
+def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool = True) -> FolderRemovalLease:
+    """Hold the lock if it is free. The stack owns the descriptor."""
     try:
         descriptor = _open_lock(path, directory, create=False)
     except FileNotFoundError:
-        return True
+        return UnreservedRemovalFolder()
     _ = stack.callback(os.close, descriptor)
-    held = _take_lock(descriptor, fcntl.LOCK_EX, wait=wait) and _lock_current(path, directory, descriptor)
-    if held:
-        _ = stack.callback(_locks.pop, descriptor, None)
-        _locks[descriptor] = path
-    return held
+    if not _take_lock(descriptor, fcntl.LOCK_EX, wait=wait) or not _lock_current(path, directory, descriptor):
+        return RefusedRemovalLease()
+    _ = stack.callback(_locks.pop, descriptor, None)
+    _locks[descriptor] = path
+    return HeldFolderRemovalLease(path, directory, descriptor)
 
 
 def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True) -> bool:
@@ -688,9 +758,32 @@ def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True) -> bo
         for name in files:
             stem = name.removesuffix(".lock")
             if stem != name and (stem in folders or stem + ".lease.json" in files):
-                if not _hold_free_lease(Path(top) / stem, directory, stack, wait=wait):
+                if isinstance(_hold_free_lease(Path(top) / stem, directory, stack, wait=wait), RefusedRemovalLease):
                     return False
     return True
+
+
+@contextmanager
+def folder_removal_lease(path: Path, *, children: bool = False, wait: bool = True) -> Generator[FolderRemovalLease]:
+    """Hold the collector's locks and return the reservation for a folder."""
+    metadata = _METADATA.fullmatch(path.name)
+    folder = path.with_name(metadata[1]) if metadata else path
+    with ExitStack() as stack:
+        try:
+            directory = stack.enter_context(_folder_parent(folder, folder.parent, create=False))
+            lease = _hold_free_lease(folder, directory, stack, wait=wait)
+            if not isinstance(lease, RefusedRemovalLease):
+                if metadata is not None:
+                    lease = UnreservedRemovalFolder()
+                elif children:
+                    with suppress(FileNotFoundError):
+                        if not _hold_child_leases(folder, stack):
+                            lease = RefusedRemovalLease()
+        except FileNotFoundError:
+            lease = UnreservedRemovalFolder()
+        except (OSError, ValueError):
+            lease = RefusedRemovalLease()
+        yield lease
 
 
 @contextmanager
@@ -702,18 +795,8 @@ def collector_lease(path: Path, *, children: bool = False, wait: bool = True) ->
     A lock file or lease record is judged by its folder's lease. With children, also hold every lease below the folder; a held one, or an unreadable
     folder, is busy.
     """
-    metadata = _METADATA.fullmatch(path.name)
-    folder = path.with_name(metadata[1]) if metadata else path
-    with ExitStack() as stack:
-        try:
-            directory = stack.enter_context(_folder_parent(folder, folder.parent, create=False))
-            free = (_hold_free_lease(folder, directory, stack, wait=wait)
-                    and (metadata is not None or not children or _hold_child_leases(folder, stack)))
-        except FileNotFoundError:
-            free = True
-        except (OSError, ValueError):
-            free = False
-        yield free
+    with folder_removal_lease(path, children=children, wait=wait) as lease:
+        yield not isinstance(lease, RefusedRemovalLease)
 
 
 @contextmanager
