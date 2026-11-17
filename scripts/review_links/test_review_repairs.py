@@ -137,7 +137,7 @@ class ReviewRepairsTests(unittest.TestCase):
                 if self.path == '/complete':
                     _ = complete.wait(25)
                 elif self.path.startswith('/fresh') or self.path.startswith('/console/review.html'):
-                    _ = self.wfile.write(review_page.render(case.root))
+                    _ = self.wfile.write(review_page.render(case.root, show=parse_qs(route.query).get('show', ['open'])[0]))
                 else:
                     _ = self.wfile.write(document)
 
@@ -180,19 +180,23 @@ class ReviewRepairsTests(unittest.TestCase):
         question = self.case.question()
         ready = self.case.investigation()
         markup = review_page.render(self.case.root).decode()
-        setup = '''<script>const nativeFetch=fetch;window.setInterval=()=>0;window.reviewRead=Promise.resolve();
+        setup = '''<script>const nativeFetch=fetch;window.setInterval=()=>0;
 window.fetch=(url,options={})=>{
- const response=nativeFetch(options.method==='POST'?'/action':'/fresh',options);
- if(options.method!=='POST') window.reviewRead=response.then(reply=>reply.clone().text());
- return response;
+ return nativeFetch(options.method==='POST'?'/action':'/fresh'+new URL(url,location.href).search,options);
 };</script>'''
         markup = markup.replace('<head>','<head>'+setup,1)
         probe = r'''
 (async()=>{
  const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
- const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+ const nextView=()=>new Promise(resolve=>{
+  const previous=document.querySelector('[data-review]');
+  const observer=new MutationObserver(()=>{
+   if(document.querySelector('[data-review]')!==previous){observer.disconnect();resolve();}
+  });
+  observer.observe(document.body,{childList:true,subtree:true});
+ });
  const row=id=>document.querySelector('[data-key="page-owner/'+id+'"]');
- const refresh=async()=>{dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await window.reviewRead;await pause(120);};
+ const refresh=async()=>{const loaded=nextView();dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await loaded;};
  const save=async(form,value)=>{
   const complete=new Promise(resolve=>{
    const observer=new MutationObserver(()=>{if(!form.dataset.sending){observer.disconnect();resolve();}});
@@ -200,45 +204,59 @@ window.fetch=(url,options={})=>{
   });
   form.requestSubmit(form.querySelector('[value="'+value+'"]'));await complete;
  };
- const show=value=>{const field=document.getElementById('list-show');field.value=value;field.dispatchEvent(new Event('change'));};
+ const show=async value=>{const field=document.getElementById('list-show');if(field.value===value) return;const loaded=nextView();field.value=value;field.dispatchEvent(new Event('change'));await loaded;};
  try{
   row('C1').querySelector('.list-toggle').click();
   const form=row('C1').querySelector('form');await save(form,'validate');
   check(row('C1').hidden,'the saved check leaves Open');
-  await refresh();check(row('C1').hidden,'a refresh keeps the waiting check out of Open');
-  show('Waiting');check(!row('C1').hidden,'Waiting can show the active check');show('open');
+  await refresh();check(!row('C1') || row('C1').hidden,'a refresh keeps the waiting check out of Open');
+  await show('Waiting');check(!row('C1').hidden,'Waiting can show the active check');await show('open');
   await nativeFetch('/problem');await refresh();check(!row('C1').hidden,'a problem returns to For you');
   row('C2').querySelector('.list-toggle').click();
   const second=row('C2').querySelector('form');await save(second,'validate');
-  await nativeFetch('/passed');await refresh();check(row('C2').hidden,'a passed check stays out of Open');
-  show('Done');check(!row('C2').hidden && row('C2').dataset.state==='Done','a passed check records Done');
-  show('all');row('C3').querySelector('.list-toggle').click();
+  await nativeFetch('/passed');await refresh();check(!row('C2') || row('C2').hidden,'a passed check stays out of Open');
+  await show('Done');check(!row('C2').hidden && row('C2').dataset.state==='Done','a passed check records Done');
+  await show('all');row('C3').querySelector('.list-toggle').click();
   const third=row('C3').querySelector('form');await save(third,'works');
   check(row('C3').hidden,'F010: Works leaves All');
   for(let pass=0;pass<2;pass++){
    await refresh();
    for(const choice of ['open','For you','Waiting','Done','all']){
-    show(choice);check(row('C3').hidden,'F010: refresh keeps Works hidden in '+choice);
+    await show(choice);check(!row('C3') || row('C3').hidden,'F010: refresh keeps Works hidden in '+choice);
    }
   }
   const keys=QUESTION_KEYS;
   for(const key of keys){
-   show('open');
+   await show('open');
    const asked=()=>document.querySelector('[data-key="'+key+'"]');
    asked().querySelector('.list-toggle').click();
    const asking=asked().querySelector('form');asking.elements.feedback.value='Check the next case.';
    await save(asking,'question');
    check(asked().hidden,'F021: Ask question leaves Open for '+key);
    for(let pass=0;pass<2;pass++){
-    await refresh();check(asked().hidden,'F021: Waiting stays hidden after refresh for '+key);
+    await refresh();check(!asked() || asked().hidden,'F021: Waiting stays hidden after refresh for '+key);
    }
    await nativeFetch('/owner-answer?item='+encodeURIComponent(key));await refresh();
    check(!asked().hidden && asked().dataset.state==='For you','F021: the owner answer returns '+key);
   }
+  location.hash=new URLSearchParams({owner:UNIT_OWNER,show:'open',type:'investigation'});
+  await new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  const investigation=document.querySelector('[data-key="'+keys.at(-1)+'"]');
+  investigation.querySelector('.list-toggle').click();await save(investigation.querySelector('form'),'read');
+  await refresh();
+  const owner=document.getElementById('list-owner');
+  check(owner.value===UNIT_OWNER && owner.selectedOptions[0]?.textContent===UNIT_NAME+' (0)',
+   'F002: the selected unit Owner remains with a zero count after its last Open row disappears');
+  check(!document.querySelector('[data-list-item]:not([hidden])'),'F002: the empty unit filter stays active');
+  await show('Done');
+  check(document.getElementById('list-owner').value===UNIT_OWNER,
+   'F002: the unit Owner remains selected when Done returns its record');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();'''
         probe = probe.replace('QUESTION_KEYS',json.dumps([question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}']))
+        probe = probe.replace('UNIT_OWNER', json.dumps(str(ready.owner))).replace(
+            'UNIT_NAME', json.dumps(review_items.name(ready.owner, staff.snapshot())))
         self.assertEqual(self.browser(markup,probe),[])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
@@ -255,6 +273,13 @@ window.fetch=(url,options={})=>{
         probe = r'''
 (async()=>{
  const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
+ const loadedView=(page,show)=>new Promise(resolve=>{
+  if(page.querySelector('[data-review]')?.dataset.show===show){resolve();return;}
+  const observer=new MutationObserver(()=>{
+   if(page.querySelector('[data-review]')?.dataset.show===show){observer.disconnect();resolve();}
+  });
+  observer.observe(page.body,{childList:true,subtree:true});
+ });
  try{
   const frame=[...document.querySelectorAll('iframe')].find(frame=>!frame.hidden);
   if(!frame.contentDocument.querySelector('[data-review]')) await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
@@ -268,7 +293,7 @@ window.fetch=(url,options={})=>{
   for(const entry of cases){
    const legacy=document.createElement('iframe');legacy.src=entry.url;
    const loaded=new Promise(resolve=>legacy.addEventListener('load',resolve,{once:true}));document.body.append(legacy);await loaded;
-   const page=legacy.contentDocument;
+   const page=legacy.contentDocument;await loadedView(page,entry.show);
    check(page.getElementById('list-show').value===entry.show,'F012: legacy Show '+entry.url);
    const visible=[...page.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
    check(visible.length===entry.count && visible.every(row=>row.dataset.type===entry.type),'F012: legacy records '+entry.url);
@@ -303,7 +328,14 @@ window.fetch=(url,options={})=>{
  try{
   const frame=[...document.querySelectorAll('iframe')].find(frame=>!frame.hidden);
   if(!frame.contentDocument.querySelector('[data-review]')) await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
-  const page=frame.contentDocument,rows=[...page.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
+  const page=frame.contentDocument;
+  if(page.querySelector('[data-review]').dataset.show!=='Done') await new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{
+    if(page.querySelector('[data-review]').dataset.show==='Done'){observer.disconnect();resolve();}
+   });
+   observer.observe(page.body,{childList:true,subtree:true});
+  });
+  const rows=[...page.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
   if(page.getElementById('list-show').value!=='Done' || rows.length!==1 || rows[0].dataset.state!=='Done')
    failures.push('F012: the console alias retains Read and its exact owner');
  }catch(error){failures.push(String(error));}

@@ -24,6 +24,7 @@ try:
 except FileNotFoundError:
     pass
 
+from collections.abc import Callable
 import json
 import math
 import os
@@ -38,7 +39,7 @@ from typing import NamedTuple, cast
 from scripts.lib import conf
 from scripts.production import showrunners, staff
 from scripts.production.production_doc import Refusal
-from scripts.production.issues import Issue
+from scripts.production.issues import ALL_FIELDS, Issue
 from scripts.production.proposal_issue import AwaitingApproval, InProgress, ProposalProgress, proposal_progress, staff_name
 from scripts.production.proposals_folder import ledger, owners, proposal_issues, proposer, scope_docs
 
@@ -335,11 +336,12 @@ def queue(doc: Path, *, record: staff.StaffSnapshot | None = None) -> str:
     return f"proposal-{document_id(doc, record=record)}"
 
 
-def scope_issues(doc: Path, below: bool = False, *, sources: list[Path] | None = None) -> list[Issue]:
+def scope_issues(doc: Path, below: bool = False, *, sources: list[Path] | None = None,
+                 select: Callable[[Issue], bool] | None = None, keys: frozenset[str] = ALL_FIELDS) -> list[Issue]:
     """The open proposal issues of the production, and with `below` of each one below it, from each one's folder."""
     found: dict[Path, Issue] = {}
     for each in scope_docs(doc, below):
-        for issue in proposal_issues(each, sources=sources):
+        for issue in proposal_issues(each, sources=sources, select=select, keys=keys):
             _ = found.setdefault(issue.path, issue)
     names = owners(doc, below) if found else frozenset[str]()
     return [issue for issue in found.values() if proposer(issue) in names]

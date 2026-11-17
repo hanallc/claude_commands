@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import shutil
 import json
+import os
 import subprocess
 import tempfile
 import threading
 from datetime import datetime, timedelta, tzinfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Self, cast
+from typing import Callable, Self, TextIO, cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
 import unittest
@@ -20,12 +21,15 @@ from urllib.parse import urlencode
 
 from scripts.agents.remote import local_machine
 from scripts.production.production_doc import read_production
+from scripts.production.issues import Issue
+from scripts.production import issues as issue_store
 from scripts.production.staff_test_support import fixture_member
-from scripts.production import change_review, change_routing, investigation, staff, update_registration
+from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, record_table, review_items, review_page
-from scripts.review_links import test_change_page
+from scripts.review_links import list_page, test_change_page
 from scripts.review_links import review_later
 from scripts.review_links.test_page_frame import assert_status_states
+from scripts.statusline import counts_row
 
 
 class ReviewPageTests(unittest.TestCase):
@@ -161,6 +165,197 @@ class ReviewPageTests(unittest.TestCase):
         self.assertIn('createPageRefresh(refresh,()=>content.dataset.refreshSeconds)',source)
         self.assertIn('class="lucide lucide-microscope"',source)
         self.assertIn('data-refresh-seconds="15.0"',source)
+
+    def test_server_renders_only_the_selected_show_view(self) -> None:
+        ready = self.investigation()
+        waiting = self.investigation(False)
+        _ = investigation.mark_read(ready.owner, ready.id)
+        done_key = f'investigation/{ready.owner}/{ready.id}'
+        waiting_key = f'investigation/{waiting.owner}/{waiting.id}'
+        opened = review_page.render(self.root).decode()
+        self.assertNotIn(f'data-key="{done_key}"', opened)
+        self.assertIn(f'data-key="{waiting_key}"', opened)
+        self.assertNotIn('data-state="Done"', opened)
+        done = review_page.render(self.root, show='Done').decode()
+        self.assertIn(f'data-key="{done_key}"', done)
+        self.assertNotIn(f'data-key="{waiting_key}"', done)
+        self.assertNotIn('data-state="For you"', done)
+        self.assertNotIn('data-state="Waiting"', done)
+        all_items = review_page.render(self.root, show='all').decode()
+        self.assertIn(f'data-key="{done_key}"', all_items)
+        self.assertIn(f'data-key="{waiting_key}"', all_items)
+        for show in ('For you', 'Waiting'):
+            with self.subTest(show=show):
+                source = review_page.render(self.root, show=show).decode()
+                self.assertIn(f'data-show="{show}"', source)
+                self.assertNotIn('data-state="Done"', source)
+                owner_menu = source.partition('<select id="list-owner">')[2].partition('</select>')[0]
+                self.assertIn(f'value="{waiting.owner}"', owner_menu,
+                              'F002: the unit Owner option remains when its Show view has no rows')
+
+    def test_open_read_skips_done_payloads_and_retains_full_selected_records(self) -> None:
+        question_key = self.question()
+        ready = self.investigation()
+        _ = self.investigation(False)
+        _ = investigation.mark_read(ready.owner, ready.id)
+        delivery, _ = review_page.submit(self.root, self.body(question_key, 'answer', 'Use the first layout.'), self.status)
+        change_page.deliver(delivery, self.status)
+        _ = change_review.save_verdict(self.fixture.review_list, 'C1', 'works', self.fixture.production)
+        all_items = review_items.read(self.root)
+        members = staff.snapshot()
+        expected_owners = {item.owner:review_page.owner_name(item, members) for item in all_items}
+        expected_owners.update({item.source_unit:review_items.name(item.source_unit, members)
+                                for item in all_items if item.type == review_items.ReviewType.INVESTIGATION})
+        owners: dict[staff.StaffId, str] = {}
+        with patch.object(review_items, 'change_item', wraps=review_items.change_item) as project_change, patch.object(
+                review_items, 'question_item', wraps=review_items.question_item) as project_question, patch.object(
+                investigation, 'load', wraps=investigation.load) as load_investigation:
+            opened = review_items.read(self.root, show='open', owner_options=owners)
+        self.assertEqual(opened, [item for item in all_items if item.state != review_items.ReviewState.DONE])
+        self.assertEqual(owners, expected_owners, 'The owner menu includes owners of omitted Done records.')
+        self.assertTrue(project_change.called)
+        self.assertFalse(any(cast(dict[str, str], call.args[1]).get('Verdict') for call in project_change.call_args_list),
+                         'An Open read does not project a Done change.')
+        self.assertFalse(project_question.called, 'An Open read does not project a closed question.')
+        self.assertNotIn(ready.id, [call.args[1] for call in load_investigation.call_args_list],
+                         'An Open read does not load a read investigation.')
+        for show in ('For you', 'Waiting', 'Done', 'all'):
+            with self.subTest(show=show):
+                expected = all_items if show == 'all' else [item for item in all_items if item.state == show]
+                self.assertEqual(review_items.read(self.root, show=show), expected)
+
+    def test_open_allocates_question_id_without_decoding_malformed_closed_registration(self) -> None:
+        key = self.question()
+        identities = update_registration.QuestionStaff.for_record(staff.snapshot())
+        record = update_registration.question_records_for_document(self.fixture.production, identities)[0]
+        _ = record.item.pop('review_id', None)
+        lines = record.path.read_text().splitlines()
+        _ = record.path.write_text('\n'.join('registration: '+json.dumps(record.item)
+            if line.startswith('registration: ') else line for line in lines)+'\n')
+        closed = record.path.with_name('question-closed.md')
+        _ = closed.write_text('---\nrecord_type: question\nstatus: closed\n'
+            +f'production_id: {record.owner}\nasked_by: {record.asker}\n'
+            +'registration: {"review_id": "Q8", invalid}\n---\n')
+        opened = review_items.read(self.root, show='open')
+        self.assertEqual(next(item.id for item in opened if item.key == key), 'page-owner/Q9',
+                         'F003: allocate after existing IDs without decoding a malformed closed registration.')
+
+    def test_open_retains_reviewed_change_without_verdict(self) -> None:
+        _ = change_review.save_verdict(self.fixture.review_list, 'C1', 'works', self.fixture.production)
+        text = self.fixture.review_list.read_text()
+        _ = self.fixture.review_list.write_text(text.replace('| works |', '|  |'))
+        all_items = review_items.read(self.root)
+        expected = next(item for item in all_items if item.key == 'page-owner/C1')
+        self.assertEqual(expected.state, review_items.ReviewState.FOR_YOU)
+        opened = review_items.read(self.root, show='open')
+        self.assertEqual(next((item for item in opened if item.key == expected.key), None), expected,
+                         'F005: the Verdict decides the state in both Reviewed and Open.')
+
+    def test_open_skips_investigation_that_disappears_after_enumeration(self) -> None:
+        record = self.investigation()
+        missing = investigation.folder(record.owner) / (record.id+'.md')
+        original = Path.open
+
+        def open_record(path: Path, *args: object, **kwargs: object) -> TextIO:
+            if path == missing:
+                raise FileNotFoundError(str(path))
+            return cast(Callable[..., TextIO], original)(path, *args, **kwargs)
+
+        with patch.object(Path, 'open', open_record):
+            opened = review_items.read(self.root, show='open')
+        self.assertNotIn('investigation/'+record.owner+'/'+record.id, [item.key for item in opened],
+                         'F004: skip a record that disappears before state selection.')
+
+    def test_proposal_read_scans_each_shared_folder_once(self) -> None:
+        folder = self.fixture.temporary / 'shared-proposals'
+        folder.mkdir()
+        other_doc = self.fixture.temporary / 'other.md'
+        _ = other_doc.write_text(f'# Other\n- **Proposals:** {folder}\n')
+        other = fixture_member('showrunner', name='other', doc=staff.LiveDoc(local_machine(), other_doc))
+        _ = self.fixture.production.write_text(self.fixture.production.read_text()+f'- **Proposals:** {folder}\n')
+        paths: list[Path] = []
+        for identity, owner, extra in (('P1', self.fixture.unit.id, ''), ('P2', other.id, ''),
+                                       ('P3', other.id, 'unit: implementer\n')):
+            path = folder / (identity+'.md')
+            paths.append(path)
+            _ = path.write_text('---\nstatus: open\ntags: [proposal]\nstage: backlog\n'
+                +f'proposed_by: {owner}\nproposal_id: {identity}\ndate_created: 2026-11-01\n{extra}---\n')
+        with patch.object(issue_store, 'frontmatter', wraps=issue_store.frontmatter) as read_header:
+            opened = review_items.proposal_items(staff.snapshot(), (self.fixture.production, other_doc),
+                                                states=review_items.selected_states('open'))
+        self.assertEqual({item.id for item in opened}, {'P1', 'P2'})
+        calls = [call.args[0] for call in read_header.call_args_list]
+        self.assertEqual({path:calls.count(path) for path in paths}, dict.fromkeys(paths, 1),
+                         'Read each proposal header once when productions share a folder.')
+        (self.fixture.temporary / 'extra').mkdir()
+        variants = {
+            'relative':Path(os.path.relpath(self.fixture.production)),
+            'equivalent':self.fixture.temporary / 'extra' / '..' / self.fixture.production.name,
+        }
+        members = staff.snapshot()
+        expected_queue = next_item.read_queue('proposal', self.fixture.production, record=members)
+        for spelling, document in variants.items():
+            with self.subTest(path=spelling):
+                self.assertEqual(review_items.proposals(document, record=members), 1,
+                                 'F006: an equivalent production path retains the proposal count.')
+                self.assertEqual(next_item.read_queue('proposal', document, record=members), expected_queue,
+                                 'F006: an equivalent production path retains the /next entry.')
+                with patch.object(issue_store, 'frontmatter', wraps=issue_store.frontmatter) as read_header:
+                    opened = review_items.proposal_items(members, (document, other_doc),
+                                                        states=review_items.selected_states('open'))
+                self.assertEqual({item.id for item in opened}, {'P1', 'P2'})
+                calls = [call.args[0] for call in read_header.call_args_list]
+                self.assertEqual({path:calls.count(path) for path in paths}, dict.fromkeys(paths, 1),
+                                 'F006: equivalent production paths keep one scan per shared folder.')
+
+    def test_fast_reads_keep_count_queue_news_and_list_results(self) -> None:
+        _ = self.question()
+        ready = self.investigation()
+        _ = self.investigation(False)
+        _ = investigation.mark_read(ready.owner, ready.id)
+        _ = change_review.save_verdict(self.fixture.review_list, 'C1', 'works', self.fixture.production)
+        proposals = self.fixture.temporary / 'shared-proposals'
+        proposals.mkdir()
+        for name, fields in (('first', 'depends_on: [approved]'), ('approved', 'unit: implementer')):
+            _ = (proposals / (name+'.md')).write_text('---\nstatus: open\ntags: [proposal]\nstage: backlog\n'
+                +f'proposed_by: {self.fixture.unit.id}\nproposal_id: {name}\ndate_created: 2026-11-01\n{fields}\n---\n')
+        ledger = self.fixture.temporary / 'shared-efficiency.md'
+        _ = ledger.write_text('- 2026-11-01 tests: Open — proposed\n- 2026-11-02 tests: Done — accepted\n')
+        _ = self.fixture.production.write_text(self.fixture.production.read_text()
+            +f'- **Proposals:** {proposals}\n- **Efficiency ledger:** {ledger}\n')
+        members = staff.snapshot()
+        owner = next(row for row in members.rows if row.name == 'page-owner')
+        identities = update_registration.QuestionStaff.for_record(members)
+        original = review_items.read_kind
+
+        def all_states(kind: review_items.ReviewType, scope: Path | staff.StaffRow,
+                       record: staff.StaffSnapshot, *, below: bool = False, sources: list[Path] | None = None,
+                       own: list[Issue] | None = None, show: str = 'all') -> list[review_items.ReviewItem]:
+            _ = show
+            return original(kind, scope, record, below=below, sources=sources, own=own)
+
+        def results() -> tuple[footer_counts.FooterCounts, tuple[int, str], list[next_item.Queue], str]:
+            counts = footer_counts.read_counts(self.fixture.production, record=members)
+            questions = counts_row.question_counts(owner, user_zone(), identities, None)
+            queues = [next_item.read_queue(kind, self.fixture.production)
+                      for kind in ('question', 'change', 'investigation', 'proposal', 'efficiency')]
+            return counts, questions, queues, list_page.counts_strip(members)
+
+        with patch.object(review_items, 'read_kind', side_effect=all_states):
+            before = results()
+        self.assertEqual(results(), before, 'Counts, /next and The List keep the same results.')
+        now = datetime.now(user_zone())
+        expected_news = frozenset(item.key+'/'+item.times.updated.isoformat() for item in review_items.read(self.root)
+                                  if item.type in review_page.TYPES and item.for_you(now))
+        self.assertEqual(review_page.waiting_items(console.NewsRequest(self.root)), expected_news,
+                         'Console news and the nav new mark keep the same records and revisions.')
+
+    def test_review_reads_only_the_stores_that_the_page_shows(self) -> None:
+        with patch.object(review_items, 'proposal_items') as proposals, patch.object(
+                review_items, 'efficiency_items') as efficiency:
+            _ = review_page.render(self.root)
+        proposals.assert_not_called()
+        efficiency.assert_not_called()
 
     def test_review_nav_replaces_the_three_pages_and_marks_only_for_you(self) -> None:
         _ = self.question()
@@ -421,17 +616,25 @@ class ReviewPageTests(unittest.TestCase):
         update_registration.write_question_record(question_item.source.record)
         _ = self.investigation()
         _ = self.investigation(False)
+        for _ in range(3):
+            done = self.investigation()
+            _ = investigation.mark_read(done.owner, done.id)
         source = review_page.render(self.root).decode()
+        done_source = review_page.render(self.root, show='Done').decode()
         setup = r"""<script>
 const nativeFetch=fetch, nativeTimeout=setTimeout, original=MARKUP;
+window.doneMarkup=DONE_MARKUP;
 window.setInterval=()=>0;window.clearInterval=()=>{};
 const refreshed=new DOMParser().parseFromString(original,'text/html');
 const refreshedForm=refreshed.querySelector('[data-type="question"] form');
 refreshedForm.elements.token.value+='-refreshed';refreshedForm.elements.row.value+='-refreshed';
 window.refreshMarkup=refreshed.documentElement.outerHTML;
-window.fetch=async(_url,options={})=>options.method==='POST' ?
- {ok:true,json:async()=>({answer:'works'})} : {ok:true,text:async()=>window.refreshMarkup};
-</script>""".replace('MARKUP',json.dumps(source).replace('</','<\\/'))
+window.refreshRequests=[];
+window.fetch=async(_url,options={})=>{
+ if(options.method==='POST') return {ok:true,json:async()=>({answer:'works'})};
+ window.refreshRequests.push(_url);return {ok:true,text:async()=>window.refreshMarkup};
+};
+</script>""".replace('DONE_MARKUP',json.dumps(done_source).replace('</','<\\/')).replace('MARKUP',json.dumps(source).replace('</','<\\/'))
         probe = r"""<script>
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
@@ -442,6 +645,8 @@ window.fetch=async(_url,options={})=>options.method==='POST' ?
  try{
   await flush();
   check(shown().length===6,'Open includes For you and Waiting');
+  check(document.querySelector('[data-list-count]').textContent==='5 for you · 1 waiting',
+    'F007: Open counts only For you and Waiting when Done records exist');
   document.querySelector('[data-type-chip="question"]').click();
   choose('list-search','Q1','input');check(shown().length===1,'type and ID filters');
   choose('list-search','','input');document.querySelector('[data-type-chip=""]').click();
@@ -455,7 +660,7 @@ window.fetch=async(_url,options={})=>options.method==='POST' ?
   const picked=question.querySelector('input[name=choice]');picked.click();
   question.querySelector('textarea').value='Keep this draft';question.querySelector('textarea').dispatchEvent(new Event('input'));
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
-  const fresh=rows().find(row=>row.dataset.type==='question');
+  let fresh=rows().find(row=>row.dataset.type==='question');
   check(!fresh.querySelector('[data-detail]').hidden && fresh.querySelector('textarea').value==='Keep this draft','refresh keeps the card and draft');
   check(fresh.querySelector('[name="later"]').value==='2098-12-31T16:30','F018: refresh keeps the picked Later date and time');
   check(fresh.querySelector('input[name=choice]:checked')?.value===picked.value,'F018: refresh keeps the selected choice');
@@ -484,6 +689,7 @@ window.fetch=async(_url,options={})=>options.method==='POST' ?
   reloaded.remove();
   const retained={item:fresh.dataset.key,type:'question',owner:fresh.dataset.owner,show:'For you',q:'Q1',sort:'Age',dir:'desc'};
   location.hash=new URLSearchParams(retained);await flush();
+  fresh=rows().find(row=>row.dataset.type==='question');
   check(document.getElementById('list-owner').value===retained.owner && document.getElementById('list-show').value==='For you' &&
     document.getElementById('list-search').value==='Q1' && document.querySelector('[data-type-chip="question"]').getAttribute('aria-pressed')==='true',
     'F014: restore the filters with an open row');
@@ -541,6 +747,15 @@ window.fetch=async(_url,options={})=>options.method==='POST' ?
    check(Number(document.querySelector('[data-list-count]').textContent.split(' ')[0])===initialCount-(revealed?0:1),
      'F021: only the new For you response restores the count');
   }
+  window.refreshMarkup=window.doneMarkup;
+  choose('list-show','Done');await flush();await flush();
+  check(document.querySelector('[data-list-count]').textContent==='3 done',
+    'F007: Done counts only Done records');
+  check(new URL(window.refreshRequests.at(-1),location.href).searchParams.get('show')==='Done',
+    'the Show menu requests the selected rows');
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+  check(new URL(window.refreshRequests.at(-1),location.href).searchParams.get('show')==='Done' &&
+    document.getElementById('list-show').value==='Done','the refresh keeps the selected Show view');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
