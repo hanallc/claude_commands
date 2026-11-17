@@ -345,7 +345,7 @@ def render(root: Path) -> bytes:
                + '<input type="search" id="list-search" placeholder="Filter by number or title">'
                + '<span data-list-count role="status" aria-live="polite"></span></div>'
                + '<div class="list-table"><table aria-label="The List"><colgroup><col style="width:5%"><col style="width:8%">'
-               + '<col style="width:22%"><col style="width:15%"><col style="width:27%"><col style="width:17%"><col style="width:6%">'
+               + '<col style="width:22%"><col style="width:15%"><col style="width:25%"><col style="width:17%"><col style="width:8%">'
                + '</colgroup><thead><tr>' + headers + '</tr></thead>'
                + ''.join(item_rows(entry, members, today, index, secret) for index, entry in enumerate(items)) + '</table>'
                + '<p data-empty hidden>No items in this view.</p></div>' + counts_strip(members) + '</div><script>' + SCRIPT + '</script>')
@@ -354,7 +354,7 @@ def render(root: Path) -> bytes:
 
 STYLE = '''<style>
 [hidden]{display:none!important}body{background:var(--bg);color:var(--ink)}
-main{max-width:1440px;font-size:15px;line-height:1.5}
+main{font-size:15px;line-height:1.5}
 .list-filters{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
 .list-filters label{display:inline;color:var(--ink-2)}
 .list-filters select,.list-filters input{font:inherit;min-height:44px;padding:7px 10px;border:1px solid var(--line);

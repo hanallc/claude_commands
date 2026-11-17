@@ -439,6 +439,13 @@ const visible=()=>rows().filter(row=>!row.hidden);
 const change=(id,value,event='change')=>{const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event(event,{bubbles:true}));};
 try{
  await flush();
+ if(innerWidth>=960){
+  check(document.querySelector('main').getBoundingClientRect().width===1124,'the desktop uses the shared column width');
+  for(const header of document.querySelectorAll('[data-sort]')){
+   const label=document.createRange();label.selectNodeContents(header.firstChild);
+   check(label.getClientRects().length===1,'the desktop header fits on one line: '+header.textContent);
+  }
+ }
  check(visible().map(row=>row.dataset.number).join(',')==='58,105,106','the default order and Open filter');
  document.querySelector('[data-sort="0"]').click();
  check(visible().map(row=>row.dataset.number).join(',')==='58,105,106','the number sort is numeric');
