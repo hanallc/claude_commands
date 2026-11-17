@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, NamedTuple, NotRequired, cast
 
 from scripts.accounts import accounts
+from scripts.build_hold import override_guard
 from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
 from scripts.copies import copies
@@ -831,7 +832,7 @@ SCRIPTS = Path(__file__).resolve().parent.parent
 
 DETACHED_RUNS = "detached_runs"
 
-BUILD_HOLD = SCRIPTS / "build_hold" / "build_hold.py"
+BUILD_HOLD = override_guard.user_home() / ".claude/scripts/build_hold/build_hold.py"
 
 MAC_CLAIMS = Path.home() / ".local/state/mac-test/claims"
 

@@ -115,7 +115,7 @@ def change_cycle(path: Path, change: Callable[[build_hold.HoldCycle], None]) -> 
         "STAFF_FILE": str(release.parent / "staff.json"),
     }), build_hold.release_lock():
         cycle = build_hold.read_cycle()
-        assert cycle is not None
+        assert not isinstance(cycle, build_hold.NoCycle)
         change(cycle)
         build_hold.save_cycle(cycle)
 
