@@ -239,7 +239,7 @@ When no machine needs a rebuild, the link hides, and an open Rebuilds page shows
 A navigation entry shows the Lucide `sparkle` icon when its page holds an item added after the user last opened that page.
 An optional `page.<id>.items` key names the page's items function, in the form `python:<module>:<function>`.
 The function takes a `console.NewsRequest` and returns the keys of the items that wait on the page.
-Review uses `review_page.waiting_items` for For you records.
+Review uses `review_page.waiting_items` for Open records.
 Images uses `images.waiting_images` for registered images without `feedback_at`.
 The Images page and its items function share the same waiting-record filter.
 Temporary change images stay outside the Images page and its new mark.
@@ -272,7 +272,7 @@ The old addresses redirect to Review with the corresponding type filter.
 The redirect retains the owner, filters, sort and open item.
 Legacy `row` fields become `item` fields.
 The former Investigations Show values select the same records on Review.
-`not-read` selects Open; `answer ready` selects For you; `open` selects Waiting; `read` selects Done; `all` selects All.
+`not-read` and `answer ready` select Open; `open` selects Waiting; `read` selects Done; `all` selects All.
 Legacy investigation owner filters retain the exact record owner.
 The Review navigation entry uses the Lucide `inbox` icon.
 Selected-row snapshots retain their signed legacy forms.
@@ -280,16 +280,16 @@ Selected-row snapshots retain their signed legacy forms.
 `review_items.py` reads the existing question, change, investigation, proposal and efficiency stores.
 It projects each record into one `ReviewItem`; it stores no second record.
 Each item has an ID, type, owner, source unit, title, state, times, log and permitted actions.
-The states are **For you**, **Waiting** and **Done**.
+The states are **Open**, **Waiting** and **Done**.
 A future time hides an item without changing its state.
 The count readers and `/next` use this shared reader.
-Only For you items count in the status line.
+Open items count in the status line.
 An open investigation and a deferred efficiency item do not count.
 Questions receive a stable owner-local `Q<n>` ID in their existing registration record.
 The first read shows the allocated ID.
 Ordinary reminders serve the owner's session; Review excludes them from items and counts.
 Questions without an owner remain visible under Owner unavailable.
-These questions count as For you, as on the former Questions page.
+These questions have the state Open and retain their previous count totals.
 They have no answer control until an owner becomes available.
 
 The page shows Questions, Changes, Investigations, Proposals and Efficiencies.
@@ -299,8 +299,42 @@ One row can open its card in place.
 `record_table.py` supplies the table styles, filters, sorting and open-row controls for Review and The List.
 Each row becomes a card at phone width.
 Type chips and the Owner menu show counts.
-Show offers Open, For you, Waiting, Done and All.
-Open puts For you records before Waiting records.
+The Owner menu counts items for the selected type, Show and words.
+The menu lists owners with the selected type and words in any Show state.
+An owner without that type and words returns to All.
+An owner with matching rows in another Show stays selected with a zero count.
+All stays first and shows the total without an owner constraint.
+An unknown owner returns to All and clears both owner and source-owner constraints.
+Owner names resolve against all known owners before the type and Show filters apply.
+The address uses the resulting selection.
+Type and Show changes restore owners when their rows match again.
+A second chip row offers Open, Waiting, Done and All below the type chips.
+Exactly one Show chip stays selected. Pressing that chip changes nothing.
+Each type count uses the selected owner, Show and words.
+Each Show count uses the selected type, owner and words.
+One typed `ReviewIndexEntry` record defines the index for counts, filters and column sorting.
+Each page and refresh carries the complete index, including states outside the rendered view.
+The index contains the key, ID, type, owner, source owner, owner name, title, state, filed time and revision time.
+It contains no bodies or HTML.
+The browser uses the index for every count and filter.
+The Show chips replace the right count text.
+Each chip selects its state. All selects every state.
+Waiting includes active showrunner checks.
+A save changes its index entry to Waiting, Done or a Later time.
+The next refresh replaces the index.
+The fresh index supplies each item's state and revision, including items outside the rendered Show.
+The browser removes a saved marker when the index moves beyond its submitted revision and saved state.
+An owner answer returns to Open after a refresh from Waiting or Done.
+Stable chip IDs retain keyboard focus after a Show load or refresh.
+The shared table owns the Show state for both chip groups and selects.
+The List keeps its Show select.
+The address and refresh retain the selected Show view.
+Both chip rows wrap at phone width.
+All types that wait on the user have the state Open.
+The Open view shows only Open records.
+Legacy For you Show values select Open.
+The records keep their actions and their totals in /next, footer counts and the status line.
+`ReviewItem.for_you` keeps its name for automation callers and selects Open records outside Later times.
 The text filter matches the ID and title.
 The address retains the filters, sort and open item.
 An address with only `item` selects All and clears the filters.
@@ -317,7 +351,7 @@ Investigations offer Mark read and Send feedback in that group.
 Proposals and efficiencies offer Approve, Decline and Send feedback in that group.
 A plan backlog proposal has no issue to hold an answer, so it offers only Later; the user answers it in chat.
 Each card has Ask question in a separate return group and Later with a date and time.
-Waiting cards retain the actions of their For you cards, in the same groups and order.
+Waiting cards retain the actions of their Open cards, in the same groups and order.
 Unowned questions retain only Later.
 Waiting cards keep their state and counts until the user acts.
 An action supersedes the open question, showrunner check, investigation or decision wait.
@@ -330,7 +364,8 @@ The primary button comes first.
 The shared sender handles all five types, including retries, owner alerts and startup recovery.
 Send feedback sends the words to the owner and finishes the item with the result **feedback sent**.
 Ask question sends the words to the owner and moves the item to Waiting.
-The owner's answer returns it to For you and stays in its log.
+The owner's answer returns every type to Open.
+The answer stays in the item log.
 Owners use `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"` for all five types.
 Each new request supplies a question ID to identify the pending exchange.
 The existing question ID rule refuses a reply to a superseded exchange.
@@ -342,7 +377,7 @@ Each showrunner check uses its delivery attempt as the validation ID.
 Initial and recovered messages include `change_review.py verdict --validation <id>` with the complete answer command.
 The native verdict command refuses a missing, old or completed validation ID under the same rule.
 Every request message includes the complete answer command.
-Later keeps the state and hides the item from every page view, the For you count and `/next` until its time.
+Later keeps the state and hides the item from every page view, the count totals and `/next` until its time.
 `<SHOWRUNNER_STATE_DIR>/review-later.json` stores one ISO timestamp for each stable Review key across all five types.
 The shared reader applies that timestamp without copying the item or its state.
 The status cache watches that file and expires at the first pending Later time.
@@ -350,13 +385,13 @@ The item returns after that time without a new action.
 Every action keeps its time, actor and words in the existing record log.
 Closed question records retain the user's words without the answer replay archive's 48-hour limit.
 Ask showrunner to check transfers the next action to the showrunner.
-A successful check closes the item; only a problem returns it to For you.
+A successful check closes the item; only a problem returns it to Open.
 After a save, the row shows its result and leaves every Show view.
 Refresh keeps a completed row hidden until the page reloads.
 The page does not open another card automatically.
 The shared status component refreshes the page every `page_refresh_seconds`, initially 15 seconds.
 Refresh retains the open row, scroll position and typed text.
-The Review navigation entry marks new For you items.
+The Review navigation entry marks new Open items.
 Every type can set this mark.
 Approved and declined proposals become Done in the shared reader.
 
@@ -755,7 +790,7 @@ An account move changes the next recipient address without changing the stored s
 The status line counts the same staff groups and shows a separate `unrouted` item.
 The `unrouted` count covers all page lists across independent production roots.
 The page and status line use the same waiting rule.
-Saved verdicts, validation requests and open questions leave the For you count and queue as soon as they save.
+Saved verdicts, validation requests and open questions leave the user count and queue as soon as they save.
 The page, footer, and `/next` use this rule regardless of delivery results.
 Review shows one row per record and keeps one card open.
 The type, owner and state controls select the visible rows.
@@ -813,7 +848,7 @@ The command refuses a row without an open question.
 The command refuses an old or unknown question ID.
 The same ID and answer text change nothing and exit 0 on a rerun.
 The same ID with different answer text is refused.
-The row returns to For you after the answer saves.
+The row returns to Open after the answer saves.
 The page shows the question and answer below the change, with the usual answer buttons.
 Question and Answer show text lines in paragraphs and use the same list forms as How to check.
 The answer keeps its internal line breaks and strips only whitespace at its two ends.

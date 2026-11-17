@@ -14,7 +14,7 @@ import unittest
 from urllib.parse import parse_qs, urlencode, urlsplit
 from unittest.mock import patch
 
-from scripts.lib import urgency
+from scripts.lib import conf, urgency
 from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, footer_counts, investigation, next_item, staff, update_registration
 from scripts.production.production_doc import read_production
@@ -37,12 +37,12 @@ class ReviewRepairsTests(unittest.TestCase):
         _ = ledger.write_text(proposed+'\n- 2026-11-02 tests: Shipped — accepted; related item — proposed\n')
         _ = fixture.production.write_text(fixture.production.read_text()+f'- **Efficiency ledger:** `{ledger}`\n')
         items = [item for item in review_items.read(self.case.root) if item.type == review_items.ReviewType.EFFICIENCY]
-        self.assertEqual([item.state for item in items],[review_items.ReviewState.FOR_YOU,review_items.ReviewState.DONE])
+        self.assertEqual([item.state for item in items],[review_items.ReviewState.OPEN,review_items.ReviewState.DONE])
         self.assertEqual(footer_counts.efficiency(fixture.production),1)
         queue = next_item.read_queue('efficiency',fixture.production)
         self.assertEqual([entry.item for entry in queue.entries],[proposed])
         selected = review_items.read_kind(review_items.ReviewType.EFFICIENCY,fixture.production,staff.snapshot())
-        self.assertEqual([item.state for item in selected],[review_items.ReviewState.FOR_YOU,review_items.ReviewState.DONE])
+        self.assertEqual([item.state for item in selected],[review_items.ReviewState.OPEN,review_items.ReviewState.DONE])
 
     def test_review_retains_the_change_queue_pin_and_move(self) -> None:
         fixture = self.case.fixture
@@ -117,7 +117,8 @@ class ReviewRepairsTests(unittest.TestCase):
             assert isinstance(waiting.source, review_items.UnownedQuestionSource)
             before = waiting.source.record.path.read_bytes()
             self.assertEqual(waiting.actions, ())
-            form = review_page.form(waiting, change_page.ReviewBrowser('fixture-token'))
+            form = review_page.form(waiting, change_page.ReviewBrowser('fixture-token'),
+                                    conf.read('review_links').whole('review_words_rows'))
             self.assertIn('value="later">Later', form)
             for action in ('answer', 'feedback', 'question'):
                 with self.subTest(action=action):
@@ -252,7 +253,7 @@ class ReviewRepairsTests(unittest.TestCase):
         self.assertNotIn('Questions page',source)
         self.assertNotIn('Investigations page',source)
 
-    def browser(self, markup: str, probe: str, place: str = '/') -> list[str]:
+    def browser(self, markup: str, probe: str, place: str = '/', width: int = 1440) -> list[str]:
         results: list[list[str]] = []
         complete = threading.Event()
         case = self.case
@@ -318,7 +319,7 @@ class ReviewRepairsTests(unittest.TestCase):
             try:
                 with tempfile.TemporaryDirectory(dir=self.case.fixture.temporary) as profile:
                     done = subprocess.run(['firefox','--headless','--no-remote','--profile',profile,
-                        '--window-size','1440,1100','--screenshot',str(self.case.fixture.temporary/'repair.png'),
+                        '--window-size',f'{width},1100','--screenshot',str(self.case.fixture.temporary/'repair.png'),
                         f'http://127.0.0.1:{server.server_port}'+place],capture_output=True,text=True,timeout=35)
                 self.assertEqual(done.returncode,0,done.stderr)
             finally:
@@ -328,7 +329,87 @@ class ReviewRepairsTests(unittest.TestCase):
         return results[0]
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_index_refresh_and_owner_constraints(self) -> None:
+        _ = self.case.question()
+        ready = self.case.investigation()
+        setup = '''<script>const nativeFetch=fetch;window.setInterval=()=>0;
+window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/fresh'+new URL(url,location.href).search,options);
+</script>'''
+        probe = r'''
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const nextView=()=>new Promise(resolve=>{
+  const previous=document.querySelector('[data-review]');
+  const observer=new MutationObserver(()=>{
+   if(document.querySelector('[data-review]')!==previous){observer.disconnect();resolve();}
+  });observer.observe(document.body,{childList:true,subtree:true});
+ });
+ const refresh=async()=>{const loaded=nextView();dispatchEvent(new MessageEvent('message',{
+  source:parent,origin:location.origin,data:'console-shown'}));await loaded;};
+ const show=async value=>{
+  const chip=document.querySelector('[data-show-chip="'+value+'"]');
+  if(chip.getAttribute('aria-pressed')==='true') return;
+  const loaded=nextView();chip.click();await loaded;
+ };
+ const count=value=>Number(document.querySelector('[data-show-chip="'+value+'"] b').textContent);
+ const owner=()=>document.querySelector('#list-owner');
+ const chooseOwner=value=>{owner().value=value;owner().dispatchEvent(new Event('change'));};
+ const type=value=>document.querySelector('[data-type-chip="'+value+'"]').click();
+ const search=value=>{const field=document.querySelector('#list-search');field.value=value;field.dispatchEvent(new Event('input'));};
+ const save=async form=>{
+  const complete=new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{if(!form.dataset.sending){observer.disconnect();resolve();}});
+   observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+  });form.elements.feedback.value='Check the next case.';
+  form.requestSubmit(form.querySelector('[value="question"]'));await complete;
+ };
+ try{
+  for(const [id,selected] of [['C1','Waiting'],['C2','Done']]){
+   await show('open');const before=count('open');
+   const key='page-owner/'+id,row=document.querySelector('[data-key="'+key+'"]');
+   row.querySelector('.list-toggle').click();await save(row.querySelector('form'));
+   await show(selected);await nativeFetch('/owner-answer?item='+encodeURIComponent(key));await refresh();
+   check(count('open')===before && count('Waiting')===0,
+    'F005: the fresh index keeps the owner answer Open while '+selected+' omits its row');
+   await show('open');
+   check(!document.querySelector('[data-key="'+key+'"]').hidden,
+    'F005: Open shows the owner answer after refresh from '+selected);
+  }
+  const navigated=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  location.hash=new URLSearchParams({legacy:'investigation',owner:'unknown',type:'investigation',show:'not-read'});
+  await navigated;
+  const address=new URLSearchParams(location.hash.slice(1));
+  check(owner().value==='' && owner().options[0].textContent==='All (1)' && count('open')===1 &&
+   !address.get('owner') && !address.has('source-owner') &&
+   document.querySelectorAll('[data-list-item]:not([hidden])').length===1,
+   'F006: hash navigation clears every owner constraint before it counts');
+  chooseOwner(UNIT_OWNER);await show('Done');
+  check(owner().value===UNIT_OWNER && owner().selectedOptions[0].textContent===UNIT_NAME+' (0)' &&
+   count('open')===1 && count('Done')===0,
+   'F007: an owner with rows in another Show stays selected with zero');
+  check([...owner().options].some(option=>option.value===UNIT_OWNER),
+   'F007: Owner lists matching type and words across every Show');
+  type('question');
+  check(owner().value==='' && owner().options.length===2 &&
+   owner().options[1].dataset.ownerName==='page-owner' &&
+   !new URLSearchParams(location.hash.slice(1)).get('owner'),
+   'F007: an owner without the selected type resets to All and leaves the menu');
+  await show('open');type('investigation');chooseOwner(UNIT_OWNER);search('no matching title');
+  check(owner().value==='' && owner().options.length===1 && owner().options[0].textContent==='All (0)',
+   'F007: words remove owners without matching rows and reset the selection');
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();'''
+        probe = probe.replace('UNIT_OWNER', json.dumps(str(ready.owner))).replace(
+            'UNIT_NAME', json.dumps(review_items.name(ready.owner, staff.snapshot())))
+        for width in (1440, 390):
+            with self.subTest(width=width):
+                markup = review_page.render(self.case.root).decode().replace('<head>', '<head>'+setup, 1)
+                self.assertEqual(self.browser(markup, probe, width=width), [])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_showrunner_check_stays_out_of_open_after_refresh_and_returns_only_for_a_problem(self) -> None:
+        decisions = self.case.decisions()
         question = self.case.question()
         ready = self.case.investigation()
         markup = review_page.render(self.case.root).decode()
@@ -356,14 +437,25 @@ window.fetch=(url,options={})=>{
   });
   form.requestSubmit(form.querySelector('[value="'+value+'"]'));await complete;
  };
- const show=async value=>{const field=document.getElementById('list-show');if(field.value===value) return;const loaded=nextView();field.value=value;field.dispatchEvent(new Event('change'));await loaded;};
+ const show=async value=>{
+  const chip=document.querySelector('[data-show-chip="'+value+'"]');
+  if(chip.getAttribute('aria-pressed')==='true') return;
+  const loaded=nextView();chip.click();await loaded;
+ };
  try{
   row('C1').querySelector('.list-toggle').click();
+  const counts=()=>['open','Waiting','Done','all'].map(value=>
+   Number(document.querySelector('[data-show-chip="'+value+'"] b').textContent));
+  const before=counts();
   const form=row('C1').querySelector('form');await save(form,'validate');
+  check(JSON.stringify(counts())===JSON.stringify([before[0]-1,before[1]+1,before[2],before[3]]),
+   'A save moves the entry from Open to Waiting without changing All.');
   check(row('C1').hidden,'the saved check leaves Open');
   await refresh();check(!row('C1') || row('C1').hidden,'a refresh keeps the waiting check out of Open');
+  check(counts()[1]===before[1]+1 && counts()[3]===before[3],
+   'F001: refresh replaces the counts with the saved state');
   await show('Waiting');check(!row('C1').hidden,'Waiting can show the active check');await show('open');
-  await nativeFetch('/problem');await refresh();check(!row('C1').hidden,'a problem returns to For you');
+  await nativeFetch('/problem');await refresh();check(!row('C1').hidden,'a problem returns to Open');
   row('C2').querySelector('.list-toggle').click();
   const second=row('C2').querySelector('form');await save(second,'validate');
   await nativeFetch('/passed');await refresh();check(!row('C2') || row('C2').hidden,'a passed check stays out of Open');
@@ -373,7 +465,7 @@ window.fetch=(url,options={})=>{
   check(row('C3').hidden,'F010: Works leaves All');
   for(let pass=0;pass<2;pass++){
    await refresh();
-   for(const choice of ['open','For you','Waiting','Done','all']){
+   for(const choice of ['open','Waiting','Done','all']){
     await show(choice);check(!row('C3') || row('C3').hidden,'F010: refresh keeps Works hidden in '+choice);
    }
   }
@@ -389,7 +481,8 @@ window.fetch=(url,options={})=>{
     await refresh();check(!asked() || asked().hidden,'F021: Waiting stays hidden after refresh for '+key);
    }
    await nativeFetch('/owner-answer?item='+encodeURIComponent(key));await refresh();
-   check(!asked().hidden && asked().dataset.state==='For you','F021: the owner answer returns '+key);
+   const returnedState='Open';
+   check(!asked().hidden && asked().dataset.state===returnedState,'F021: the owner answer returns '+key);
   }
   location.hash=new URLSearchParams({owner:UNIT_OWNER,show:'open',type:'investigation'});
   await new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
@@ -397,16 +490,19 @@ window.fetch=(url,options={})=>{
   investigation.querySelector('.list-toggle').click();await save(investigation.querySelector('form'),'read');
   await refresh();
   const owner=document.getElementById('list-owner');
-  check(owner.value===UNIT_OWNER && owner.selectedOptions[0]?.textContent===UNIT_NAME+' (0)',
-   'F002: the selected unit Owner remains with a zero count after its last Open row disappears');
-  check(!document.querySelector('[data-list-item]:not([hidden])'),'F002: the empty unit filter stays active');
+  check(owner.value===UNIT_OWNER && owner.selectedOptions[0]?.textContent===UNIT_NAME+' (0)' &&
+    owner.options[0].textContent==='All (0)',
+   'The selected owner remains with zero after its last Open row disappears.');
+  check(!document.querySelector('[data-list-item]:not([hidden])'),'the selected type and Show still have no rows');
   await show('Done');
-  check(document.getElementById('list-owner').value===UNIT_OWNER,
-   'F002: the unit Owner remains selected when Done returns its record');
+  check(document.getElementById('list-owner').value===UNIT_OWNER &&
+    document.getElementById('list-owner').options[0]?.textContent==='All (1)' &&
+    [...document.getElementById('list-owner').options].some(option=>option.value===UNIT_OWNER),
+   'Done counts the saved record for the selected owner.');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();'''
-        probe = probe.replace('QUESTION_KEYS',json.dumps([question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}']))
+        probe = probe.replace('QUESTION_KEYS',json.dumps([question,'page-owner/C1',*decisions,f'investigation/{ready.owner}/{ready.id}']))
         probe = probe.replace('UNIT_OWNER', json.dumps(str(ready.owner))).replace(
             'UNIT_NAME', json.dumps(review_items.name(ready.owner, staff.snapshot())))
         self.assertEqual(self.browser(markup,probe),[])
@@ -446,7 +542,7 @@ window.fetch=(url,options={})=>{
    const legacy=document.createElement('iframe');legacy.src=entry.url;
    const loaded=new Promise(resolve=>legacy.addEventListener('load',resolve,{once:true}));document.body.append(legacy);await loaded;
    const page=legacy.contentDocument;await loadedView(page,entry.show);
-   check(page.getElementById('list-show').value===entry.show,'F012: legacy Show '+entry.url);
+   check(page.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip===entry.show,'F012: legacy Show '+entry.url);
    const visible=[...page.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
    check(visible.length===entry.count && visible.every(row=>row.dataset.type===entry.type),'F012: legacy records '+entry.url);
    if(entry.item) check(!page.querySelector('[data-key="'+entry.item+'"] [data-detail]').hidden,'F012: legacy row opens its card');
@@ -461,12 +557,12 @@ window.fetch=(url,options={})=>{
                   'show':'open','count':1,'type':'question','item':question_key}]
         cases.extend({'url':'/console/investigations.html#'+urlencode({'owner':ready.owner,'show':old}),
                       'show':new,'count':count,'type':'investigation','item':''}
-                     for old,new,count in (('not-read','open',2),('answer ready','For you',1),
+                     for old,new,count in (('not-read','open',1),('answer ready','open',1),
                                            ('open','Waiting',1),('read','Done',1),('all','all',3)))
         cases.extend(({'url':'/console/investigations.html#'+urlencode({'owner':owner.id,'show':'all'}),
                        'show':'all','count':1,'type':'investigation','item':''},
                       {'url':'/console/investigations.html#'+urlencode({'owner':ready.owner}),
-                       'show':'open','count':2,'type':'investigation','item':''},
+                       'show':'open','count':1,'type':'investigation','item':''},
                       {'url':'/console/changes.html?'+urlencode({'type':'changes','showrunner':'page-owner','row':'page-owner/C2'}),
                        'show':'open','count':3,'type':'change','item':'page-owner/C2'},
                       {'url':'/console/questions.html#'+urlencode({'showrunner':'page-owner','row':question_key}),
@@ -488,7 +584,7 @@ window.fetch=(url,options={})=>{
    observer.observe(page.body,{childList:true,subtree:true});
   });
   const rows=[...page.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
-  if(page.getElementById('list-show').value!=='Done' || rows.length!==1 || rows[0].dataset.state!=='Done')
+  if(page.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip!=='Done' || rows.length!==1 || rows[0].dataset.state!=='Done')
    failures.push('F012: the console alias retains Read and its exact owner');
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});

@@ -78,7 +78,7 @@ class RegistrationTests(RegistrationFixture):
             self.assertEqual(result, 0, output.getvalue())
             current = next(item for item in review_items.read(case.root) if item.key == key)
             assert isinstance(current.source, review_items.QuestionSource)
-            self.assertEqual(current.state, review_items.ReviewState.FOR_YOU)
+            self.assertEqual(current.state, review_items.ReviewState.OPEN)
             self.assertNotIn('followup', current.source.record.item)
             self.assertEqual(current.source.record.item.get('followups', [])[-1],
                              {'followup': 'Check the new native case.', 'reply': 'The new native case passes.'})
@@ -123,7 +123,7 @@ class RegistrationTests(RegistrationFixture):
             self.assertTrue(change_page.answer_item(key, 'The new case passes.', new_request.question_id, case.status))
             self.assertIsInstance(case.status.slots(new.page, new.row).question, change_page.AnsweredQuestion)
             current = next(item for item in review_items.read(case.root) if item.key == key)
-            self.assertEqual(current.state, review_items.ReviewState.FOR_YOU)
+            self.assertEqual(current.state, review_items.ReviewState.OPEN)
             self.assertNotIn('The old case passes.', path.read_text())
             self.assertIn('The new case passes.', path.read_text())
         finally:
