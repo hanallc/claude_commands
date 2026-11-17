@@ -2983,6 +2983,23 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertEqual(self.git("branch", "--show-current", cwd=folder), branch)
         self.assertEqual(staff.by_id(row.id), row)
 
+    def test_rename_replaces_the_old_suffix_when_it_also_matches_the_new_name(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        row = staff.rename(row.id, "demo-alpha")
+        folder = self.rust / "claude-demo-alpha"
+        destination = self.rust / "claude-alpha"
+        _ = self.git("branch", "-m", "topic-demo-alpha", cwd=folder)
+
+        with FolderSessionFixture(row, live=False).installed(), RenameDisplays(row).installed():
+            result = self.invoke(["rename", str(row.id), "alpha"])
+
+        self.assert_ok(result)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(folder.exists())
+        self.assertEqual(self.git("branch", "--show-current", cwd=destination), "topic-alpha")
+        self.assertEqual(staff.by_id(row.id), replace(row, name="alpha",
+            worktree=staff.PresentWorktree("natedev", destination)))
+
     def test_review_push_uses_an_explicit_refspec_for_the_move_and_retry(self) -> None:
         from scripts.production import unit_move
 
@@ -3773,6 +3790,46 @@ class FolderRenameTests(FolderRenameFixture):
         self.assertFalse(self.destination.exists())
         self.assertEqual(self.git("branch", "--show-current", cwd=self.source), "cargo-liner-x")
         self.assertEqual(staff.by_id(self.owner.id), replace(self.owner, name="x"))
+
+
+@final
+class StartupRenameTests(FolderRenameFixture):
+    old_name: str = "startup"
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(mock.patch.object(shutdown, "rename_send_notice"))
+        _ = self.enterContext(mock.patch.object(shutdown, "rename_repair_displays", return_value=False))
+        _ = staff.rename(self.owner.id, "startup-unit")
+
+    def restore_startup_name(self) -> subprocess.CompletedProcess[str]:
+        arguments = ["rename", str(self.owner.id), "startup"]
+        return invoke_cli(shutdown, lambda: shutdown.main(arguments), arguments, dict(os.environ), self.checkout)
+
+    def test_restore_startup_name_keeps_the_matching_folder_and_branch_quiet(self) -> None:
+        result = self.restore_startup_name()
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "done\n", ""))
+        self.assertEqual(staff.by_id(self.owner.id), self.owner)
+        self.assertTrue(self.source.is_dir())
+        self.assertEqual(self.git("branch", "--show-current", cwd=self.source), "cargo-liner-startup")
+        self.assertIsNone(unit_move.pending_rename(self.owner.id))
+
+    def test_restore_startup_name_reports_only_the_unmatched_folder(self) -> None:
+        folder = self.source.with_name("unmatched")
+        _ = self.git("worktree", "move", str(self.source), str(folder))
+        location = staff.PresentWorktree(remote.local_machine(), folder)
+        _ = staff.set_worktree(self.owner.id, location, expected=self.owner.worktree)
+
+        result = self.restore_startup_name()
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (0, "done\n", f"anomaly: folder {folder} does not end with -startup-unit\n"))
+        self.assertEqual(staff.by_id(self.owner.id), replace(self.owner, worktree=location))
+        self.assertTrue(folder.is_dir())
+        self.assertEqual(self.git("branch", "--show-current", cwd=folder), "cargo-liner-startup")
+        self.assertIsNone(unit_move.pending_rename(self.owner.id))
 
 
 class UnitRenameSessionsTests(UnitRenameFixture):
