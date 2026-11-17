@@ -3233,7 +3233,11 @@ def submit_direct_placement(request: OffloadRequest, since: float,
                            placement=AssignedOffloadRequest(reply.assignment))
         if not isinstance(reply, wire.PlacementWait):
             raise wire.AdmissionUnavailable("the fixed remote assignment did not permit execution")
-        time.sleep(records.read_memory_config().waiting_pass_seconds)
+        timing = records.read_memory_config()
+        delay = timing.waiting_pass_seconds
+        if reply.position == 0 and timing.min_pass_gap_seconds > 0:
+            delay = timing.min_pass_gap_seconds
+        time.sleep(delay)
 
 
 def report_placement_result(controller: ProcessController, request: OffloadRequest, result: MacOffloadResult) -> None:

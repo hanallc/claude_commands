@@ -22,7 +22,14 @@ def read_execution_transport(target: SshTarget) -> ExecutionTransport:
     """Select the configured transport before reading SSH settings."""
     from scripts.lib import conf
 
-    values = conf.read(target.settings).values()
+    return execution_transport(target, conf.read(target.settings))
+
+
+def execution_transport(target: SshTarget, configuration: conf.ConfigRead) -> ExecutionTransport:
+    """Select the transport from the parsed provider settings."""
+    from scripts.lib import conf
+
+    values = configuration.values()
     transport = values.get('execution_transport', 'ssh')
     if transport == 'ssh':
         return SshCommandTransport(target.settings)

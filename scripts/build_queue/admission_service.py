@@ -46,6 +46,8 @@ from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHol
 from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
 
+from scripts.build_targets.execution_transport import ExecutionTransport, HanaControlTransport
+from scripts.build_targets.target_config import SshTarget
 from scripts.buildlog import store
 from scripts.lib import test_phase
 
@@ -996,13 +998,6 @@ class DeferredOwnerRequest:
     arrived_monotonic: float
 
 
-@dataclass(frozen=True)
-class ParkedPlacement:
-    """A placement request whose reply waits for the next pass."""
-    request: wire.PlacementRequest
-    connection: Connection
-
-
 QueueChange = wire.PrioritySetRequest | wire.PriorityClearRequest
 
 
@@ -1056,6 +1051,42 @@ class WaitingRepositorySlot:
 @dataclass(frozen=True)
 class NoPass:
     pass
+
+
+@dataclass
+class PassHostConfiguration:
+    """Share host configuration reads until the placement pass ends."""
+
+    files: dict[Path, bytes] = field(default_factory=dict)
+    generations: dict[frozenset[Path], str] = field(default_factory=dict)
+    settings: dict[str | Path, conf.ConfigRead] = field(default_factory=dict)
+    transports: dict[SshTarget, ExecutionTransport] = field(default_factory=dict)
+
+    def read_settings(self, file: str | Path) -> conf.ConfigRead:
+        if file not in self.settings:
+            self.settings[file] = conf.read(file)
+        return self.settings[file]
+
+    def transport(self, target: SshTarget) -> ExecutionTransport:
+        from scripts.aws_target.hana_placement_adapter import execution_transport
+
+        if target not in self.transports:
+            self.transports[target] = execution_transport(target, self.read_settings(target.settings))
+        return self.transports[target]
+
+    def generation(self, paths: frozenset[Path]) -> str:
+        if paths not in self.generations:
+            digest = hashlib.sha256()
+            for path in sorted(paths):
+                if path not in self.files:
+                    try:
+                        self.files[path] = path.read_bytes()
+                    except FileNotFoundError:
+                        self.files[path] = b"missing"
+                digest.update(str(path).encode())
+                digest.update(self.files[path])
+            self.generations[paths] = digest.hexdigest()
+        return self.generations[paths]
 
 
 def _no_fault(_stage: str) -> None:
@@ -1212,6 +1243,7 @@ class AdmissionServer:
         self.host_observations: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
         self.host_requests: dict[placement.HostEvidenceKey, wire.PlacementRequest] = {}
         self.placement_host_keys: dict[tuple[str, placement.PlacementDestination], placement.HostEvidenceKey] = {}
+        self.pass_host_configuration: PassHostConfiguration | NoPass = NoPass()
         # Start time of each hold that keeps a remote destination for an older waiting request.
         self.placement_holds: dict[tuple[str, placement.PlacementDestination], float] = {}
         # The reading that answered each ended hold. That reading never starts another hold.
@@ -1250,7 +1282,6 @@ class AdmissionServer:
         self.system_evidence: SystemEvidence | NoPass = NoPass()
         self.reader_requested: bool = False
         self.deferred_requests: list[DeferredOwnerRequest] = []
-        self.parked_placements: list[ParkedPlacement] = []
         self.last_pass_started: float = float("-inf")
         self.receiving_requests: bool = False
         self.connections: dict[int, Connection] = {}
@@ -1961,18 +1992,13 @@ class AdmissionServer:
                   ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
         from scripts.build_targets import target_config
 
-        # One pass reads the target list once; each placement check in the pass uses that read.
-        with target_config.command_configuration():
-            result = self._pass(configuration)
-        self._answer_parked_placements()
-        return result
-
-    def _answer_parked_placements(self) -> None:
-        parked, self.parked_placements = self.parked_placements, []
-        for item in parked:
-            if not item.connection.finished and item.connection.socket.fileno() >= 0:
-                self._send(item.connection, self._placement_reply(item.request,
-                    self.local_hold_holders.get(item.request.episode, placement.ResourceHolderUnknown())))
+        previous = self.pass_host_configuration
+        self.pass_host_configuration = PassHostConfiguration()
+        try:
+            with target_config.command_configuration():
+                return self._pass(configuration)
+        finally:
+            self.pass_host_configuration = previous
 
     def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
               ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
@@ -2434,10 +2460,15 @@ class AdmissionServer:
             self.ledger[ending.request_id] = ReplayEntry(wire.Ok(), self.clock.now())
         self.persist()
 
+    def _host_configuration(self) -> PassHostConfiguration:
+        configuration = self.pass_host_configuration
+        return PassHostConfiguration() if isinstance(configuration, NoPass) else configuration
+
     def host_evidence_key(self, request: wire.PlacementRequest,
                           destination: placement.PlacementDestination) -> placement.HostEvidenceKey:
         from scripts.build_targets import target_config
 
+        configuration = self._host_configuration()
         paths = {conf.path("build_targets"), conf.path("build_admission"), conf.path("mac_test")}
         settings = next((candidate.settings for candidate in request.constraints.candidates
                          if candidate.destination == destination), placement.ConfiguredProviderSettings())
@@ -2446,37 +2477,29 @@ class AdmissionServer:
         for target in target_config.read_targets():
             if isinstance(target, target_config.SshTarget) and target.name == destination.target:
                 paths.add(target.settings)
-                from scripts.aws_target import hana_placement
-                if isinstance(target_config.read_execution_transport(target), hana_placement.HanaControlTransport):
+                if isinstance(configuration.transport(target), HanaControlTransport):
                     paths.add(conf.path('aws_target'))
-        digest = hashlib.sha256()
-        for path in sorted(paths):
-            digest.update(str(path).encode())
-            try:
-                digest.update(path.read_bytes())
-            except FileNotFoundError:
-                digest.update(b"missing")
         return placement.HostEvidenceKey(destination, request.constraints.session,
-            request.constraints.command, digest.hexdigest(), request.constraints.repository,
+            request.constraints.command, configuration.generation(frozenset(paths)), request.constraints.repository,
             request.constraints.package, request.profile.step, settings,
             request.owner if destination.provider == "local" else placement.NoLocalHoldOwner(),
             request.constraints.command_kind)
 
     def _host_probe_timeout(self, key: placement.HostEvidenceKey) -> float:
         from scripts.build_targets import target_config
-        from scripts.aws_target import hana_placement
 
         if isinstance(key.settings, placement.ExplicitProviderSettings):
-            target = target_config.SshTarget(key.destination.target, 'linux', key.settings.path)
-            if isinstance(target_config.read_execution_transport(target), hana_placement.HanaControlTransport):
-                return float(conf.read(target.settings).whole('aws_timeout_s'))
-            return conf.read(key.settings.path).number("probe_timeout_s")
-        for target in target_config.read_targets():
-            if isinstance(target, target_config.SshTarget) and target.name == key.destination.target:
-                if isinstance(target_config.read_execution_transport(target), hana_placement.HanaControlTransport):
-                    return float(conf.read(target.settings).whole('aws_timeout_s'))
-                return conf.read(target.settings).number("probe_timeout_s")
-        return conf.read("mac_test").number("probe_timeout_s")
+            target = SshTarget(key.destination.target, 'linux', key.settings.path)
+        else:
+            target = next((target for target in target_config.read_targets()
+                           if isinstance(target, SshTarget) and target.name == key.destination.target), None)
+        configuration = self._host_configuration()
+        if target is None:
+            return configuration.read_settings("mac_test").number("probe_timeout_s")
+        settings = configuration.read_settings(target.settings)
+        if isinstance(configuration.transport(target), HanaControlTransport):
+            return float(settings.whole('aws_timeout_s'))
+        return settings.number("probe_timeout_s")
 
     def publish_host_evidence(self, evidence: placement.HostEvidence) -> None:
         self.host_observations[evidence.key] = evidence
@@ -2519,17 +2542,18 @@ class AdmissionServer:
         key = self.host_evidence_key(request, destination)
         self.placement_host_keys[(request.episode, destination)] = key
         if destination.provider == 'ssh':
-            from scripts.aws_target import hana_placement
             from scripts.build_targets import target_config
 
+            configuration = self._host_configuration()
             for target in target_config.read_targets():
                 if not isinstance(target, target_config.SshTarget) or target.name != destination.target:
                     continue
                 if isinstance(key.settings, placement.ExplicitProviderSettings):
                     target = replace(target, settings=key.settings.path)
-                transport = target_config.read_execution_transport(target)
-                if (isinstance(transport, hana_placement.HanaControlTransport)
-                        and request.profile.peak.bytes > conf.read(transport.settings).whole('step_memory_gib') * 1024 ** 3):
+                transport = configuration.transport(target)
+                if (isinstance(transport, HanaControlTransport)
+                        and request.profile.peak.bytes
+                        > configuration.read_settings(transport.settings).whole('step_memory_gib') * 1024 ** 3):
                     # Memory belongs to this request, not the shared host evidence.
                     return placement.FreshHostEvidence(key, self.clock.now(), '', placement.TemporaryExclusion('memory'))
                 break
@@ -2701,15 +2725,25 @@ done
             result = subprocess.run(["ssh", *offload.ssh_options(config.connection), host, "sh -c " + shlex.quote(script)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 check=False, timeout=config.probe_timeout_s)
-            if result.returncode == 0:
-                for line in result.stdout.splitlines():
-                    pid, separator, start = line.partition("\t")
-                    if separator and pid.isdecimal() and int(pid) > 0 and start.strip():
-                        return placement.ObservedExecution(placement.ProcessExecution(host, generation, int(pid), start.strip()))
-            else:
-                offload.write_backoff(time.time() + config.unreachable_backoff_s, destination.target)
-        except (OSError, ValueError, subprocess.TimeoutExpired):
+        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+            reason = "remote execution reach failure: " + str(error).partition("\n")[0]
+            print(f"memory admission: {destination.target}: {reason}", file=sys.stderr, flush=True)
             offload.write_backoff(time.time() + config.unreachable_backoff_s, destination.target)
+            return placement.ExecutionEvidenceUnavailable(reason, self.clock.now())
+        if result.returncode != 0:
+            failure = "reach" if result.returncode == 255 else "script"
+            detail = result.stderr.splitlines()
+            reason = f"remote execution {failure} failure: ssh exit {result.returncode}"
+            if detail:
+                reason += f": {detail[0]}"
+            print(f"memory admission: {destination.target}: {reason}", file=sys.stderr, flush=True)
+            if result.returncode == 255:
+                offload.write_backoff(time.time() + config.unreachable_backoff_s, destination.target)
+            return placement.ExecutionEvidenceUnavailable(reason, self.clock.now())
+        for line in result.stdout.splitlines():
+            pid, separator, start = line.partition("\t")
+            if separator and pid.isdecimal() and int(pid) > 0 and start.strip():
+                return placement.ObservedExecution(placement.ProcessExecution(host, generation, int(pid), start.strip()))
         return placement.ExecutionEvidenceUnavailable("remote execution remains unresolved", self.clock.now())
 
     def _prune_ended_placements(self, cutoff: float) -> None:
@@ -2835,8 +2869,8 @@ done
             try:
                 destination = saved.assignment.destination
                 target = target_config.configured_ssh_target(destination.target)
-                transport = target_config.read_execution_transport(target)
-                if isinstance(transport, hana_placement.HanaControlTransport):
+                transport = self._host_configuration().transport(target)
+                if isinstance(transport, HanaControlTransport):
                     from scripts.aws_target.hana_execution import claim_dispatch_pending
                     reference = placement.ProviderClaimReference('ssh', destination.target, destination.scope,
                         placement.assigned_claim_id(saved.assignment.episode, saved.assignment.attempt),
@@ -2990,12 +3024,15 @@ done
         self._refresh_host_observations()
         # Keep the current holder label without retaining local process evidence.
         self.local_hold_holders.clear()
+        refreshed: set[tuple[str, placement.PlacementDestination]] = set()
         for saved in self.assignments.values():
-            if saved.assignment.destination.provider == "local":
+            identity = (saved.assignment.episode, saved.assignment.destination)
+            if saved.assignment.destination.provider == "local" or identity in refreshed:
                 continue
             submitted = self.placement_requests.get(saved.assignment.episode)
             if submitted is not None and (submitted.episode in self.current_assignments
                     or self._placement_waiting(submitted)):
+                refreshed.add(identity)
                 _ = self._request_host_evidence(submitted, saved.assignment.destination)
         for request in tuple(self.placement_requests.values()):
             if self.placement_requests.get(request.episode) is not request:
@@ -3485,9 +3522,8 @@ done
             self._watch_owner(request.owner)
             self.persist()
             if isinstance(connection, Connection) and not self._pass_gap_open():
-                self.parked_placements.append(ParkedPlacement(request, connection))
                 self.next_pass = min(self.next_pass, self.clock.monotonic())
-                return []
+                return [wire.PlacementWait(request.episode, request.since, 0, ())]
             _ = self.run_pass()
             return [self._placement_reply(request,
                 self.local_hold_holders.get(request.episode, placement.ResourceHolderUnknown()))]
@@ -3927,7 +3963,6 @@ done
     def _drop_deferred_requests(self, connection: Connection) -> None:
         self.deferred_requests = [pending for pending in self.deferred_requests
                                   if pending.connection is not connection]
-        self.parked_placements = [item for item in self.parked_placements if item.connection is not connection]
 
     def _disconnect(self, connection: Connection) -> None:
         self._drop_deferred_requests(connection)
@@ -4277,7 +4312,6 @@ done
             connection.socket.close()
         self.connections.clear()
         self.deferred_requests.clear()
-        self.parked_placements.clear()
         for descriptor in self.watchers:
             os.close(descriptor)
         self.watchers.clear()

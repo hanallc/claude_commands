@@ -1,6 +1,7 @@
 """Seeded tools and real Bash step-routing fixtures."""
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 from pathlib import Path
 import subprocess
@@ -124,25 +125,28 @@ class VerifyStepRouteTools(VerifyMacOffloadFixture):
                     (placement.PrelaunchRefused, placement.AttemptDeclined)):
                 caller_provider_controls(self, admission).set_host(request.assignment.destination.target,
                     placement.TemporaryExclusion(request.outcome.reason))
-            replies = previous(request, connection)
-            if (isinstance(request, wire.PlacementRequest)
+            return previous(request, connection)
+
+        send = cast(Callable[[service.Connection, wire.Reply], None], getattr(admission.server, "_send"))
+
+        def observe_reply(connection: service.Connection, reply: wire.Reply) -> None:
+            request = connection.request
+            if (isinstance(reply, wire.PlacementWait) and isinstance(request, wire.PlacementRequest)
                     and ("--fix" in request.constraints.command or self.environment.get("TEST_MAC_ALLOWED") == "0")):
-                for reply in replies:
-                    if not isinstance(reply, wire.PlacementWait):
-                        continue
-                    for candidate in reply.eligibility:
-                        if (candidate.destination.provider == "local"
-                                and isinstance(candidate.eligibility, placement.TemporaryExclusion)
-                                and candidate.eligibility.reason == "blocked"):
-                            self.local_waits.append(admission.server.host_evidence_key(request, candidate.destination))
-                            if self.environment.get("TEST_ASSERT_LOCAL_HELD") == "1":
-                                self.assertEqual(self.local_runs(), [])
-                            for holder in Path(self.environment["BUILD_HOLD_DIR"]).iterdir():
-                                holder.unlink()
-                            return replies
-            return replies
+                for candidate in reply.eligibility:
+                    if (candidate.destination.provider == "local"
+                            and isinstance(candidate.eligibility, placement.TemporaryExclusion)
+                            and candidate.eligibility.reason == "blocked"):
+                        self.local_waits.append(admission.server.host_evidence_key(request, candidate.destination))
+                        if self.environment.get("TEST_ASSERT_LOCAL_HELD") == "1":
+                            self.assertEqual(self.local_runs(), [])
+                        for holder in Path(self.environment["BUILD_HOLD_DIR"]).iterdir():
+                            holder.unlink()
+                        break
+            send(connection, reply)
 
         _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=handle))
+        _ = self.enterContext(mock.patch.object(admission.server, "_send", side_effect=observe_reply))
 
     @override
     def build_fixture(self) -> None:

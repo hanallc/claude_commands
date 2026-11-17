@@ -15,20 +15,22 @@ import sys
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 from typing import TextIO, cast, override
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
-from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service, placement
+from scripts.build_queue import admission_client, admission_protocol as wire, admission_records as records, admission_service as service, placement
 from scripts.build_queue.admission_test_support import AdmissionFixture, ObservedAdmissionServer, only_admitted, GIB
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
-from scripts.mac_test import claim_state, mac_test, offload
+from scripts.mac_test import claim_state, eligibility, mac_test, offload
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.build_queue.queue_fixture import write_process
 from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
+from scripts.build_targets import build_targets
 from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLER, PinnedTarget
 
 
@@ -1284,46 +1286,11 @@ class MacOrderTests(unittest.TestCase):
 
 
 class PassGapTests(unittest.TestCase):
-    """Socket requests in one pass gap share the next pass and get their replies from it."""
+    """Placement and memory requests share a pass when they arrive in its gap."""
 
     def gap_fixture(self, fixture: AdmissionFixture) -> None:
         fixture.configure(min_pass_gap_seconds=0.25)
         _ = fixture.run_pass()
-
-    def test_placement_requests_in_one_gap_share_the_next_pass(self) -> None:
-        with PlacementFixture() as fixture:
-            self.gap_fixture(fixture)
-            requests = [placement_request(fixture) for _ in range(2)]
-            for request in requests:
-                _ = publish_candidate(fixture, request)
-            peers = [fixture.connect(request) for request in requests]
-            with mock.patch.object(fixture.server, "run_pass", wraps=fixture.server.run_pass) as passes:
-                self.assertEqual(peers[0].replies(), [])
-                self.assertEqual([item.request.episode for item in fixture.server.parked_placements],
-                                 [request.episode for request in requests])
-                self.assertEqual(passes.call_count, 0)
-                fixture.clock.advance(0.25)
-                replies = [peer.replies() for peer in peers]
-                self.assertEqual(passes.call_count, 1)
-            for reply in replies:
-                self.assertEqual(len(reply), 1, reply)
-                self.assertIsInstance(reply[0], wire.Assignment | wire.PlacementWait)
-            self.assertFalse(fixture.server.parked_placements)
-
-    def test_a_closed_connection_drops_its_parked_placement(self) -> None:
-        with PlacementFixture() as fixture:
-            self.gap_fixture(fixture)
-            request = placement_request(fixture)
-            _ = publish_candidate(fixture, request)
-            peer = fixture.connect(request)
-            self.assertEqual(peer.replies(), [])
-            self.assertEqual(len(fixture.server.parked_placements), 1)
-            peer.close()
-            fixture.server.run_once(0)
-            self.assertFalse(fixture.server.parked_placements)
-            fixture.clock.advance(0.25)
-            fixture.server.run_once(0)
-            self.assertFalse(fixture.server.connections)
 
     def test_an_admission_in_the_gap_gets_its_grant_at_the_next_pass(self) -> None:
         with AdmissionFixture() as fixture:
@@ -1333,10 +1300,83 @@ class PassGapTests(unittest.TestCase):
             fixture.clock.advance(0.25)
             _ = only_admitted(peer.replies())
 
-    def test_a_request_without_a_connection_gets_its_reply_at_once(self) -> None:
+
+    def test_placement_requests_in_one_gap_share_the_next_pass(self) -> None:
+        with PlacementFixture() as fixture:
+            self.gap_fixture(fixture)
+            requests = (placement_request(fixture, since=fixture.clock.now() - 1),
+                        placement_request(fixture))
+            readings = fixture.readings.counts["host"]
+            for request in requests:
+                _ = publish_candidate(fixture, request)
+                reply, = fixture.connect(request).replies()
+                self.assertEqual(reply, wire.PlacementWait(request.episode, request.since, 0, ()))
+            self.assertEqual(fixture.readings.counts["host"], readings)
+            self.assertFalse(fixture.server.current_assignments)
+
+            fixture.clock.advance(0.25)
+            fixture.server.run_once(0)
+
+            self.assertEqual(fixture.readings.counts["host"], readings + 1)
+            self.assertEqual(set(fixture.server.placement_eligibility), {request.episode for request in requests})
+            self.assertEqual(set(fixture.server.current_assignments), {requests[0].episode})
+
+    def test_a_request_without_a_socket_can_get_an_assignment_in_the_gap(self) -> None:
         with PlacementFixture() as fixture:
             self.gap_fixture(fixture)
             request = placement_request(fixture)
             _ = publish_candidate(fixture, request)
-            _ = assignment_for(fixture, request)
-            self.assertFalse(fixture.server.parked_placements)
+            started = fixture.clock.monotonic()
+            assignment = assignment_for(fixture, request)
+            self.assertEqual(assignment.episode, request.episode)
+            self.assertEqual(assignment.destination, request.constraints.candidates[0].destination)
+            self.assertEqual(fixture.clock.monotonic(), started)
+
+    def test_direct_offload_retries_a_gap_wait_at_the_next_pass(self) -> None:
+        self.assert_direct_offload_retry_delay(0.25, 0.25)
+
+    def test_direct_offload_waits_for_coordinator_evidence_at_zero_gap(self) -> None:
+        self.assert_direct_offload_retry_delay(0, 1.5)
+
+    def assert_direct_offload_retry_delay(self, pass_gap: float, expected_delay: float) -> None:
+        from scripts.build_queue.test_admission_service import FixedSystemReader
+
+        with PlacementFixture() as fixture:
+            fixture.configure(min_pass_gap_seconds=pass_gap, waiting_pass_seconds=1.5)
+            _ = fixture.run_pass()
+            initial = fixture.server.system_evidence
+            assert isinstance(initial, service.SystemEvidence)
+            reader = FixedSystemReader(initial)
+            if pass_gap == 0:
+                fixture.server.system_reader = reader
+            template = placement_request(fixture)
+            config = eligibility.read_config(fixture.root / "mac_test.conf")
+            request = offload.OffloadRequest(fixture.root, "hana", "call", offload.NO_RESULT_FILE, (), "", "")
+            delays: list[float] = []
+
+            def advance(seconds: float) -> None:
+                delays.append(seconds)
+                fixture.clock.advance(seconds)
+                if pass_gap == 0:
+                    self.assertEqual(reader.requests, 1)
+                    policy = fixture.server.last_usable_configuration
+                    assert isinstance(policy, records.MemoryConfig)
+                    reader.latest = service.read_system(service.SystemReadingPlan(policy, (), (), False),
+                        fixture.readings, fixture.proc, fixture.clock)
+
+            def submit(submitted: wire.PlacementRequest) -> wire.Assignment | wire.PlacementWait:
+                self.assertLessEqual(len(delays), 1)
+                if not delays:
+                    _ = publish_candidate(fixture, submitted)
+                reply, = fixture.connect(submitted).replies()
+                assert isinstance(reply, (wire.Assignment, wire.PlacementWait))
+                return reply
+
+            with (mock.patch.object(build_targets, "fixed_placement_constraints", return_value=template.constraints),
+                  mock.patch.object(admission_client, "request_placement", side_effect=submit),
+                  mock.patch.object(offload, "time", SimpleNamespace(sleep=advance))):
+                assigned = offload.submit_direct_placement(request, fixture.clock.now(), config)
+
+            assert isinstance(assigned.placement, offload.AssignedOffloadRequest)
+            self.assertEqual(assigned.placement.assignment.destination, template.constraints.candidates[0].destination)
+            self.assertEqual(delays, [expected_delay])
