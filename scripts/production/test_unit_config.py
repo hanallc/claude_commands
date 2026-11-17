@@ -5,25 +5,82 @@ from dataclasses import replace
 import os
 from pathlib import Path
 import select
+import socket
 import subprocess
 import sys
 import tomllib
-import unittest
+from types import SimpleNamespace
 from typing import cast
 from unittest import mock
 from unittest.mock import patch
 
-from scripts.lib import atomic_file, git_exclude
+from scripts.lib import atomic_file, conf, git_exclude
+from scripts.lib.checkout_test_support import write_python_tool
 from scripts.lib.git_exclude import ExcludeRefused
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, unit_config as config
+from scripts.production.staff_test_support import StaffTestCase, fixture_member
+from scripts.agents import remote
 from scripts.production.unit_config_test_support import UnitConfigFixture
 from scripts.production.unit_config_format_test_support import (
     check_format, count_taplo, remove_assignment_spacing, require_taplo, write_aligning_config,
 )
 
 
-class UnitPortCellTests(unittest.TestCase):
+class UnitPortSelectionTests(StaffTestCase):
+    def test_port_range_excludes_recorded_reserved_and_bound_ports(self) -> None:
+        atomic_file.write_text_atomic(self.root / "Cargo.toml", '[package]\nname = "hana"\n')
+        peer = self.root / "peer"
+        peer.mkdir()
+        owner = fixture_member("showrunner", name="port-owner")
+        row = fixture_member("unit", name="port-peer", parent=owner.id,
+                             worktree=staff.PresentWorktree(remote.local_machine(), peer))
+        for cause in ("recorded", "bound", "mac", "smoke", "full", "available"):
+            with self.subTest(cause=cause), socket.socket() as held:
+                held.bind(("127.0.0.1", 0))
+                number = cast(tuple[str, int], held.getsockname())[1]
+                settings = self.root / "production.conf"
+                atomic_file.write_text_atomic(settings, f"# whole: 1..\nunit_port_first={number}\n# whole: 1..\nunit_port_last={number}\n"
+                    + f"# whole: 1..\nmac_run_port={number if cause == 'mac' else 1}\n"
+                    + f"# whole: 1..\nsmoke_port={number if cause == 'smoke' else 2}\n")
+                atomic_file.write_text_atomic(peer / ".unit.toml", 'plan = "plan.md"\nresponsibilities = []\n'
+                    + (f"port = {number}\n" if cause == "recorded" else ""))
+                if cause not in ("bound", "full"):
+                    held.close()
+                settings_read = conf.read(settings)
+                with patch.object(conf, "read", return_value=settings_read):
+                    if cause == "available":
+                        self.assertEqual(config.default_port(self.root, config.NoAppPort()), config.AppPort(number))
+                    else:
+                        with self.assertRaises(config.ConfigRefused) as refused:
+                            _ = config.default_port(self.root, config.NoAppPort())
+                        self.assertEqual(len(str(refused.exception).splitlines()), 1)
+                        self.assertIn(f"{number}..{number}", str(refused.exception))
+        self.assertIsNotNone(staff.snapshot().by_id(row.id))
+
+
+class UnitPortCellTests(StaffTestCase):
+    def test_app_port_defaults_skip_a_bound_port_and_keep_explicit_values(self) -> None:
+        import tempfile
+        _ = fixture_member("showrunner", name="port-defaults")
+        with tempfile.TemporaryDirectory() as directory, socket.socket() as held:
+            root = Path(directory)
+            atomic_file.write_text_atomic(root / "Cargo.toml", '[package]\nname = "hana"\n')
+            held.bind(("127.0.0.1", 0))
+            held.listen()
+            occupied = cast(tuple[str, int], held.getsockname())[1]
+            for selected in (config.NoAppPort(), config.AppPort(8123)):
+                with self.subTest(selected=selected):
+                    port = config.default_port(root, selected)
+                    self.assertIsInstance(port, config.AppPort)
+                    assert isinstance(port, config.AppPort)
+                    self.assertNotEqual(port.number, occupied)
+                    if isinstance(selected, config.AppPort):
+                        self.assertEqual(port, selected)
+                    else:
+                        with socket.socket() as available:
+                            available.bind(("127.0.0.1", port.number))
+
     def test_raw_port_cells_accept_absence_numbers_and_history_notes(self) -> None:
         for raw in ("—", "-", "none", "", " `—` "):
             with self.subTest(raw=raw):
@@ -155,7 +212,7 @@ class UnitPortRepairTests(UnitConfigFixture):
                             raise OSError("stopped at port publication")
                         real_replace(temporary, destination)
 
-                    with patch.object(os, "replace", side_effect=interrupt):
+                    with patch.object(atomic_file, "os", SimpleNamespace(**vars(os))) as file_os, patch.object(file_os, "replace", side_effect=interrupt):
                         with self.assertRaisesRegex(OSError, "stopped at port publication"):
                             _ = config.repair_port(target, original.port, settled)
                     actual = config.read_parked(self.unit) if parked else config.read(self.worktree)
@@ -362,8 +419,7 @@ class UnitConfigTests(UnitConfigFixture):
         fields: dict[str, object] = {
             "plan": "docs/plans/worker.md", "port": 8123,
             "responsibilities": ["nightly-review", "build-check"],
-            "retired": {"date": "2026-10-31", "session": "session-before-retire",
-                        "folder": str(self.worktree), "branch": "feature/worker"},
+            "retired": {"date": "2026-10-31", "session": "session-before-retire"},
         }
         self.assertEqual(config.decode(fields), replace(self.config(), retired=self.retirement()))
         for key, invalid in (("port", True), ("responsibilities", "nightly-review"),
@@ -518,8 +574,31 @@ class UnitConfigTests(UnitConfigFixture):
         row = staff.snapshot().by_id(self.unit)
         assert row is not None
         _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", removed), expected=row.worktree)
+        tools = self.root / "lease-taplo"
+        tools.mkdir()
+        log = self.root / "taplo-lease"
+        write_python_tool(tools / "taplo", """import fcntl, os, sys
+from pathlib import Path
+from scripts.lib import build_folders
+folder = Path.cwd()
+lock = folder.with_name(folder.name + ".lock").stat()
+inherited = []
+for entry in Path("/dev/fd").iterdir():
+    try:
+        if os.path.samestat(os.fstat(int(entry.name)), lock):
+            inherited.append(int(entry.name))
+    except OSError:
+        pass
+assert inherited, "The Taplo child has no folder lease"
+fcntl.flock(inherited[0], fcntl.LOCK_EX | fcntl.LOCK_NB)
+Path(""" + repr(str(log)) + """).write_text(build_folders.build_folder_state(folder))
+os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
+""")
         value = replace(self.config(), retired=self.retirement())
-        _ = config.write_parked(self.unit, value)
+        with patch.dict(os.environ, {"PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""),
+                                     "TMPDIR": str(self.root)}):
+            _ = config.write_parked(self.unit, value)
+        self.assertEqual(log.read_text(), "held")
         result = check_format(binary, self.parked, self.worktree, defaults=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(config.read_parked(self.unit), value)
@@ -575,6 +654,12 @@ class UnitConfigTests(UnitConfigFixture):
             _ = config.read(self.worktree)
 
     def test_park_restore_and_discard_keep_retirement_facts_until_the_last_step(self) -> None:
+        for staff_file, directory in (("", self.home / ".local/state/staff/units"),
+                                      (str(self.root / "private/staff.json"), self.root / "private/units")):
+            with self.subTest(staff_file=staff_file), patch.dict(os.environ, {"STAFF_FILE": staff_file}):
+                self.assertEqual(config.parked_path(self.unit), directory / f"{self.unit}.toml")
+                self.assertEqual(config.parked_path(self.unit, home=self.home),
+                                 self.home / ".local/state/staff/units" / f"{self.unit}.toml")
         self.assertIsInstance(config.place(self.unit, self.worktree), config.Nowhere)
         _ = config.write(self.worktree, self.config())
         source = self.source.read_bytes()
@@ -582,8 +667,7 @@ class UnitConfigTests(UnitConfigFixture):
         _ = config.park(self.unit, self.worktree, self.retirement())
         self.assertEqual(self.source.read_bytes(), source)
         facts = cast(dict[str, object], tomllib.loads(self.parked.read_text())["retired"])
-        self.assertEqual(facts, {"date": "2026-10-31", "session": "session-before-retire",
-                                 "branch": "feature/worker"})
+        self.assertEqual(facts, {"date": "2026-10-31", "session": "session-before-retire"})
         self.assertEqual(config.place(self.unit, self.worktree), config.Both(self.source, self.parked, True))
         self.source.unlink()
         self.assertEqual(config.place(self.unit, self.worktree), config.Parked(self.parked))
@@ -600,18 +684,16 @@ class UnitConfigTests(UnitConfigFixture):
         self.assertEqual(self.file_versions(), before)
 
     def test_legacy_retirement_folder_is_ignored_and_not_written(self) -> None:
-        _ = config.write(self.worktree, self.config())
-        _ = config.park(self.unit, self.worktree, self.retirement())
-        legacy = self.parked.read_text().replace('[retired]', '[retired]\nfolder = "/old/unit"')
-        _ = self.parked.write_text(legacy)
-        saved = config.read_parked(self.unit)
-        self.assertEqual(saved, replace(self.config(), retired=self.retirement()))
-        assert isinstance(saved, config.UnitConfig)
-        _ = config.write_parked(self.unit, saved)
-        self.assertNotIn("folder =", self.parked.read_text())
-        before = self.file_versions()
-        _ = config.write_parked(self.unit, saved)
-        self.assertEqual(self.file_versions(), before)
+        self.park_config()
+        original = self.parked.read_text()
+        for field in ('folder = "/old/unit"', 'branch = "old-branch"'):
+            with self.subTest(field=field):
+                legacy = original.replace('[retired]', '[retired]\n' + field)
+                _ = self.parked.write_text(legacy)
+                before = self.file_versions()
+                with self.assertRaises(config.ConfigRefused):
+                    _ = config.read_parked(self.unit)
+                self.assertEqual(self.file_versions(), before)
 
     def test_park_after_worktree_removal_uses_verified_retirement_and_changes_nothing(self) -> None:
         self.park_config()
@@ -657,7 +739,7 @@ class UnitConfigTests(UnitConfigFixture):
                         _ = temporary.write_text(temporary.read_text().replace("8123", "8126"))
                     real_replace(temporary, path)
 
-                with patch.object(os, "replace", side_effect=corrupt_publication):
+                with patch.object(atomic_file, "os", SimpleNamespace(**vars(os))) as file_os, patch.object(file_os, "replace", side_effect=corrupt_publication):
                     with self.assertRaises(config.ConfigRefused) as caught:
                         if destination == self.parked:
                             _ = config.park(self.unit, self.worktree, self.retirement())
@@ -692,7 +774,7 @@ class UnitConfigTests(UnitConfigFixture):
         self.park_config()
         before = self.file_versions()
         with self.assertRaisesRegex(config.ConfigRefused, "retired"):
-            _ = config.park(self.unit, self.worktree, replace(self.retirement(), branch=config.Branch("other")))
+            _ = config.park(self.unit, self.worktree, replace(self.retirement(), session_id="other-session"))
         self.assertEqual(self.file_versions(), before)
 
     def test_matching_copies_make_park_and_restore_reruns_noops(self) -> None:
@@ -717,7 +799,7 @@ class UnitConfigTests(UnitConfigFixture):
                         raise OSError("stopped at parked publication")
                     real_replace(temporary, destination)
 
-                with patch.object(os, "replace", side_effect=interrupt):
+                with patch.object(atomic_file, "os", SimpleNamespace(**vars(os))) as file_os, patch.object(file_os, "replace", side_effect=interrupt):
                     with self.assertRaisesRegex(OSError, "stopped at parked publication"):
                         _ = config.park(self.unit, self.worktree, self.retirement())
                 self.assertEqual(self.source.read_bytes(), source)
@@ -746,7 +828,7 @@ class UnitConfigTests(UnitConfigFixture):
                         raise OSError("stopped at worktree publication")
                     real_replace(temporary, destination)
 
-                with patch.object(os, "replace", side_effect=interrupt):
+                with patch.object(atomic_file, "os", SimpleNamespace(**vars(os))) as file_os, patch.object(file_os, "replace", side_effect=interrupt):
                     with self.assertRaisesRegex(OSError, "stopped at worktree publication"):
                         config.restore(self.unit, self.worktree)
                 self.assertEqual((self.parked.read_bytes(), self.parked.stat().st_mtime_ns), saved)
@@ -794,7 +876,7 @@ class UnitConfigTests(UnitConfigFixture):
         _ = config.write(self.worktree, self.config())
         before = self.file_versions()
         updated = replace(self.config(), port=config.AppPort(8125))
-        with patch.object(os, "replace", side_effect=OSError("stopped before replace")):
+        with patch.object(atomic_file, "os", SimpleNamespace(**vars(os))) as file_os, patch.object(file_os, "replace", side_effect=OSError("stopped before replace")):
             with self.assertRaisesRegex(OSError, "stopped before replace"):
                 _ = config.write(self.worktree, updated)
         self.assertEqual(self.file_versions(), before)

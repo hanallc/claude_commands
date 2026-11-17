@@ -105,7 +105,12 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Binds later work:** `read_usage` in `phase_process.py` sums input and all cache classes into one number and drops the model, so weighted tokens need a different read. `phase_boundaries` selects phases by finish time, and `measure_director_tokens` stops at phase end. Phase boundaries and fix time come from `scripts/history/rounds.py`: an open phase is a named state; fix time is worker time, apart from wall-time shares; a mixed phase is reported apart. `direct.md` costs about 41k tokens as a Read. `phase_process.py` has director tokens per phase, but no compactions per phase and no context size after reload.
 
-**Gotchas:** closure reviews are not in rounds.py, so the closure pass row stays a review pass. A ledger-only round has zero fix time and adds to the round count only. A repair round with `cause == "merge"` counts under fix, not under the merge row. Inserted phases are about 2% of gaps.
+**Gotchas:** closure reviews remain review passes.
+A dispatch without an eligible fix pass adds no repair round.
+Started passes with one ledger batch count once across relaunches.
+Legacy passes without a ledger number group by overlap.
+A repair with `cause == "merge"` counts under fix, not under the merge row.
+The saved baseline reports inserted phases as about 2% of gaps.
 
 **Ruled out:** a retrospective before sample for cheap A — a phase's start time does not prove which contract it read; the full A targets (10% tokens, 10 s) — the measured cut does not reach them.
 
@@ -154,37 +159,349 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Ruled out:** mode recording (showrunner, 2026-11-08); `--before-at` for this sample (`--route-revision` reads the before hashes from the route's parent).
 
-### Phase 5 — Measure the first step and propose the next  · status: todo
+### Phase 5 — Measure the first step and propose the next  · status: done
 **Depends on:** Phase 4
 
-**Waits for:** at least twenty eligible `AfterChange` phases from the same units as the before sample, after the route's main time (2026-11-07 23:32:53Z).
+#### As-built
 
-#### Work Order
-
-**Goal:** the design doc says whether Step 1 moved its measure, and the next step goes to the user.
-
-**Spec:**
-- Fix both bounds before the run: `--since` is the time the route reached main, and `--until` is the collection time, written as UTC stamps in the Step log. Never use the script's moving fourteen-day default. Run one invocation per unit, because `render_trial` pools the primary measures across all selected units: `phase_process.py baseline --exposure after --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units <one unit of the before sample> --since <the route main time> --until <the collection time>`, at the Step log's measurement version. Record the after phase instances and their matching metadata the same way Phase 4's freeze did (`--detail trial` per unit, then each row's phase start event). Add the after numbers to the Step log with n for each: weighted director tokens over the phase plus its following gap (the primary measure), compactions per phase and context size after each reload (reported, no target). Show each unit's results apart, and each excluded state (`ExposureNotRecorded`, `NoFollowingPhase`, `SharedDirector`, mixed) with n.
-- Matching: the same units in both windows, with matched scope class, worker model and gates. If they do not match, the result is `inconclusive`, with what did not match; it is never read as a pass or a failure. Two `NotRecorded` values never match: a control that is `NotRecorded` in either window makes the result `inconclusive`.
-- Mode is not a matching control: no record holds the director's mode. The result names Mode as a `NotRecorded` limit in both windows (showrunner, 2026-11-08). Add no mode recording.
-- Counts: the n a step names counts usable primary observations (weighted tokens known). `Unweighted`, `NotRecorded`, `NoCompaction` and `NoReload` are reported with n; they are never 0 and never a failed saving.
-- Quality held: median and p90 phase time per unit, over the trial's eligible phases (the trial section's phase-time line), do not rise against the Step log's before sample. A rise is reported with the step's result.
-- If the window holds no eligible observation (n 0, or below the n the step names), the result is `not yet measurable`: the Step log names the missing evidence and the condition for the next collection, and the phase waits on it; this is never read as a failed step.
-- Compute the saving from the exact per-phase weighted tokens the Step log holds (the `--detail trial` rows), never from the short-form table cells (`2.7M`), which hide differences near 1.5%.
-- If the primary measure did not fall by at least 1.5% (half the low end of the 3–7% target), the Step log says so, names the likely reason, and proposes undoing it or changing it; that proposal is the question.
-- Otherwise update Steps with what the measure taught, and pick the next step.
-- At phase end, the unit director sends the showrunner the result and the next step as one question for the user. The next approved step becomes a new phase after this one. Write that step's own implementation Work Order: its Spec, its Files, its Workers, and its measurement requirements (the measure it must move, the target, the n it names and the excluded states it reports). Keep the frozen comparison protocol: fixed `--since` and `--until` bounds, one invocation per unit, recorded phase instances and matching metadata, and the before sample frozen in the Step log before any contract edit.
+- The Step log's "After sample (Phase 5)" section holds the cheap A after measure: window `[2026-11-07T23:32:53Z, 2026-11-15T14:00:00Z)`, run at the before sample's measurement version (archived from `96c882a1e`), one summary and one `--detail trial` run per unit. A second run matched line for line.
+- 25 eligible after phases, 24 with known weighted tokens, from five units present in both windows. The pooled median rose 3.06% (n=9 before, n=24 after). Phase time rose in four of five units.
+- Result: `inconclusive`. Every after worker pass records model `unknown`: `progress_history.begin_dispatch` writes `unknown` for each pane dispatch (since `a453a2ca4`, 2026-11-05). No-worker mode from 2026-11-13 moved implementation into director tokens.
+- The Step log lists each main change to the recorder, launchers, hooks, wait publishers and `phase_process.py` inside the after window (95), and to `docs/direct/*.md` and `phase_reservation.py` inside either window (40).
+- Steps item 1 notes the result. sdlc decided (2026-11-15): keep cheap A, fix the worker-model recording now (Phase 29), and measure again after the workers-back notice (Phase 30).
 
 **Files:**
 - `docs/plans/sdlc-phases-design.md` — Step log, Steps
 
-**Workers:** `1 writer + 1 tester` — one doc. `impl` runs the measure and writes the Step log.
-- `impl` — `docs/plans/sdlc-phases-design.md`
-- `test` — opens as test — independently re-runs the frozen measure, recomputes the percentage from the exact observations (values near 1.5% included), and checks the Step log; it writes no doc text
+### Phase 29 — Each worker pass records its model  · status: done
+**Depends on:** Phase 5
 
-**Constraints from prior phases:** Deployed revisions: Phase 4's **Constraints from prior phases** lists the main commit and time for Phases 3, 6 to 16, 18 and 19, the staff-lifecycle cut and postmaster-unit's records. The route is on main at 7733bee4c (2026-11-07 23:32:53Z). The Step log before measure (version, filter, units, n, fixed window, phase instances with matching metadata), the route revision and its main time, and the change Phase 3 shipped. Step 1's target: weighted director tokens 3–7% lower per phase plus gap; gap 0–3 s. Exposure comes from the `direct.md` hash the recorder records at each phase start and finish (Phase 3), never from a deploy time; Phase 4 froze the before sample from recorded hashes after the route shipped. The next step is chosen from B, full A, G and I (design doc, Recommendation); C waits until dispatch time comes first. The after window ends at the collection time. A change to the recorder, a launcher, a hook (the Stop and prompt hooks included), a wait publisher or `phase_process.py` does not end it: these files change on main almost daily (the first, `d6ed85d3e` at 2026-11-08T00:50:40Z, changed `codex_mesh.py` and `mesh_runs.py` 78 minutes after the route), so a cutoff would leave no sample. Exposure already guards the measure: a phase counts as `AfterChange` only when it starts and finishes with the route's recorded `direct.md` hash. The Step log lists each such change inside the after window with hash and main time, and the result names them. hierarchies Phase 30, which deletes `codex_mesh.py`, is one. Run the measure at the Step log's measurement version of `phase_process.py`. The Step log also lists each main change to `docs/direct/*.md` and to `scripts/direct/phase_reservation.py` inside either window, with hash and time; Phase 21 is one. `trial_exposure` reads only the `direct.md` hash, so the result names these changes. `test_phase_process.py` holds three tests that read the design doc's Recommendation, Comparison and Steps; every Step log or Recommendation edit keeps them green. The before sample (Phase 4, checkpoint 271be2de5) holds 31 instances from 9 units: cargo-liner-handler, claude-natedev-builds-natest, claude-natedev-builds-resources, claude-natedev-efficiency, claude-natedev-unit-board, devtools, hana_catalyst-build-speed-tests, remove-running-section-handler and sdlc-devtools. `--units` matches the run-start unit, worktree, branch and working-directory name, so the `remove-running-section-handler` selector also picks `cargo-liner-handler` phases and `sdlc-devtools` also picks `devtools` phases. Compute each unit's after numbers from its own `--detail trial` rows, as the Step log does; never add selector totals. The detail rows omit the phase instance id: keep the Step log's `Ambiguous` mark on a display id with several starts in a window. Scope class and gates use the Step log's sources: for builds-resources, the Work Order at the phase's checkpoint commit; a field with no retained source stays `NotRecorded`. The two devtools selectors have unavailable compaction counts (invalid JSON in their transcript).
+#### As-built
 
-**Acceptance gate:** the Step log has before and after numbers with n and window, the matching result and the phase-time check; `python3 -m unittest discover -s scripts/direct -p 'test_phase_process.py'` passes, its design-doc tests included; the question is sent.
+- `progress_history.begin_dispatch` takes `called: CalledAgent` (family, model, effort). The default `CALLED_AGENT_NOT_RECORDED` is `unknown / unknown / unset`, so test calls in other modules keep their form.
+- `worker.launched_agent(row)` reads the worker's newest pane launch record (`pane_record.launch_for_session`). The family is the launch kind; the model and effort come from `worker_panes.kept_settings` over `pane_record.resume_arguments`. A Claude launch keeps no effort and records `unset`. No record or no kept model records `unknown / unknown / unset`. The herdr dispatch passes `called=launched_agent(started.row)`.
+- Tests: `test_dispatch_records_the_called_worker_model` (test_progress_history.py) and `test_launched_agent_reads_the_kept_launch_settings` (test_worker.py).
+- A live read of 607 worker rows resolves the 30 that have launch records. A live dispatch proof waits for the workers-back notice.
+- The Step log's "Worker model and NoReload cause (Phase 29)" section gives the NoReload cause. In 86 cargo-liner-handler boundaries of the after window, 27 reload with `Read`, 21 reload with Bash only, and 38 do not reload. 71 of 86 show the skill text that Claude Code restores after compaction. The measure counts only `Read`.
+
+**Files:**
+- `scripts/direct/progress_history.py` — `CalledAgent`, `begin_dispatch`
+- `scripts/production/worker.py` — `launched_agent`, the `begin_dispatch` call
+- `scripts/direct/test_progress_history.py`, `scripts/production/test_worker.py`
+- `docs/plans/sdlc-phases-design.md` — Step log
+
+**Gotchas:** `pane_launch.CurrentLaunch["kind"]` is not a required key; read it through `pane_launch.saved_kind`.
+
+### Phase 30 — Measure cheap A again on worker-mode phases  · status: todo
+**Depends on:** Phase 29
+
+**Waits for:** (the workers-back notice is met: 2026-11-15 13:36 EST) at least 20 eligible `AfterChange` phases with a recorded worker model from at least two before-sample units, after Phase 29 reaches main.
+
+#### Work Order
+
+**Goal:** the design doc says whether cheap A moved director tokens on worker-mode phases, and the next step goes to the showrunner.
+
+**Spec:**
+- Run the frozen protocol of Phase 5. Fixed `--since` (Phase 29's main time) and `--until` (the collection time) as UTC stamps; one invocation per unit, summary and `--detail trial`; the measurement version is blob `98bef1370ee83586a43f1b0e12cd16b92b30876e` from `git archive 96c882a1e`; `--exposure after --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3`. Record each after instance and its matching metadata (scope class, worker model, gates) as Phase 5 did.
+- Measure: weighted director tokens over the phase plus its following gap. Target: the pooled median and the median of each matched unit 3–7% lower than the Step log's before sample; a fall below 1.5% is a proposal to undo or change cheap A. n counts phases with known weighted tokens. Report compactions per phase and context size after reload with no target, and median and p90 phase time per unit.
+- Report each excluded state with n: `ExposureNotRecorded`, `NoFollowingPhase`, `SharedDirector`, mixed, open unmixed, `Unweighted`, `NotRecorded`, `NoCompaction` and `NoReload`.
+- Matching: a phase with no worker pass, or with a worker model `NotRecorded`, does not match a before row with a recorded worker model. A control `NotRecorded` in either window makes the result `inconclusive`. Mode stays a named `NotRecorded` limit.
+- Start no new step (B, full A, G or I) before this result (showrunner, 2026-11-15). Send the showrunner the result and the next step.
+
+**Files:**
+- `docs/plans/sdlc-phases-design.md` — Step log, Steps
+
+**Workers:** director only — the director runs the measure and writes the Step log.
+
+**Acceptance gate:** the Step log has the after numbers with n and window, the matching result and the phase-time check; `test_phase_process.py` passes; the result is sent.
+
+### Phase 31 — Every read-only Claude run has no file-edit tools  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/agents/agent_exec.sh` readonly Claude mode passes `--permission-mode plan --disallowedTools Edit,Write,NotebookEdit`. Write mode keeps every tool.
+- The `direct.simplify`-only tool branch and its readonly-only guard are deleted. The one caller, `simplify_daily.py`, runs readonly.
+- `test_agent_exec.sh` checks the exact readonly argv for a plain task and a tier task, and the removed tools for simplify.
+
+**Files:**
+- `scripts/agents/agent_exec.sh`
+- `scripts/agents/test_agent_exec.sh`
+
+**Gotchas:** the dry run prints each argument with `%q`, so the expected argv has `Edit\,Write\,NotebookEdit`.
+
+### Phase 32 — One place decides a Claude run failed, and one helper reads the review minutes  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/direct/simplify_result.py` `validate` reads only `stats` from `claude_result`. A failed Claude run reaches it as the `ERROR: <reason>` report that `agent_exec.sh` writes through `claude_result.py`; that is the one failure check.
+- `scripts/production/review_regime.py` `optional_float` reads `review_minutes`, `ux_check_minutes` and `ux_repair_minutes`. Values and missing values are the same as before.
+- Tests: `test_a_failed_run_records_the_error_from_the_launcher_report` (test_simplify_result.py) and `test_each_review_minute_field_reads_numbers_and_skips_other_values` (test_review_regime.py).
+
+**Files:**
+- `scripts/direct/simplify_result.py`, `scripts/direct/test_simplify_result.py`
+- `scripts/production/review_regime.py`, `scripts/production/test_review_regime.py`
+
+### Phase 33 — A repair and a checkpoint of the same phase never lose the release record  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `phase_reservation.phase_lock(phase_dir)` holds `phase_baseline.lock`, the lock file the baseline writer already used. `committed`, the repair record (`_repair_record`), `record_active`, `enroll`, `clear`, `reset_for_start` and `_record_baselines` hold it across their read and write.
+- `release_held` takes no lock itself; its final `clear` takes the lock and checks the pending record again.
+- The repair holds the lock during its board check, so a checkpoint can wait up to that check's timeout.
+- Test: `test_a_checkpoint_during_a_repair_keeps_its_pending_release_record` fails with the lock removed and passes with it.
+
+**Files:**
+- `scripts/direct/phase_reservation.py`
+- `scripts/direct/test_phase_reservation.py`
+
+**Gotchas:** flock locks an open file description, so a nested `phase_lock` on the same phase in one process blocks itself. `clear` returns before the lock when no state file exists, so it creates no directory.
+
+### Phase 34 — `remaining` and `ahead` live in note_file.py  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `note_file.ahead(resets, *, now)` and `note_file.remaining(note)` hold the two note helpers. `remaining` takes `note_file.FieldReader`.
+- `quota_alert` calls `note_file.ahead` and `note_file.remaining`. It keeps no copy and no re-export, so a caller of the helpers does not load `quota_alert`.
+- `test_agent_notes.py` reads `note_file.ahead`; no other caller was found.
+
+**Files:**
+- `scripts/whoami/note_file.py` — `ahead`, `remaining`
+- `scripts/whoami/quota_alert.py` — the call sites
+- `scripts/whoami/test_agent_notes.py` — the `ahead` tests
+
+### Phase 35 — The launch account for a Claude task lives in models.conf  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `agents_resolve` sets `AGENT_CLAUDE_ACCOUNT` for a claude task from `[<function>.options]`: `claude_account.<subtask>`, then `claude_account`. The value is `workers` (the default) or `caller`; another value stops with `ERROR:` and the allowed values. A codex task gets an empty value.
+- `agent_exec.sh` runs a `caller` task on the caller's own account and every other Claude task on the workers pool. No task-name test is left.
+- `config/models.conf` has `[direct.options] claude_account.simplify=caller`.
+
+**Files:**
+- `scripts/agents/models_config.sh` — `_agents_resolve_claude_account`
+- `scripts/agents/agent_exec.sh` — the account branch
+- `config/models.conf`, `docs/as-built/agent-registry.md` — the key and its description
+- `scripts/agents/test_models_config.sh`, `scripts/agents/test_agent_exec.sh` — each value, and `account_case` on the caller account
+- `scripts/lib/test_nix_env_launches.py` — the `agents_resolve` stub sets `AGENT_CLAUDE_ACCOUNT`
+
+**Gotchas:** `agent_exec.sh` runs under `set -u`, so an `agents_resolve` stub must set every variable the launcher reads.
+
+### Phase 36 — The simplify-follow items still in the tree  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `agent_exec.sh` calls `claude_result.py` at its one call site. The wrapper function is gone; its comment sits above the Claude command line.
+- `simplify_result.py` lists `SIMPLIFY_AGENTS` with `", "`.
+- `account_for_launch` in `add_unit.py` calls `accounts.prepare_claude_launch`; its `try` turns `AccountsError` into `Refusal`.
+- `account_test_support.store_usage(tool, login, usage)` writes one login's readings under the store lock. `stored_room` and `test_accounts.py` `reading` call it.
+- `test_agent_exec.py`, `test_review.py` (two sites) and `add_showrunner_test_support.py` call `create_claude_account`.
+- `agent-registry.md` says every readonly Claude run disables the editing tools.
+
+**Files:**
+- `scripts/agents/agent_exec.sh`, `scripts/direct/simplify_result.py`, `scripts/production/add_unit.py`
+- `scripts/whoami/account_test_support.py` — `store_usage`
+- `scripts/agents/test_agent_exec.py`, `scripts/notify/test_review.py`, `scripts/production/add_showrunner_test_support.py`, `scripts/accounts/test_accounts.py`, `scripts/direct/test_simplify_result.py`
+- `docs/as-built/agent-registry.md`
+
+**Gotchas:** A long `TMPDIR` makes socket tests fail with `AF_UNIX path too long`; run them with a short `TMPDIR`.
+
+### Phase 37 — An Images card can show a before and after pair  · status: done
+**Depends on:** none
+
+#### As-built
+
+User request 11-15 10:24: before and after shots side by side, with one metadata block and one Delete. The user accepted the mockup.
+
+- `images.py register (--image PATH | --before PATH --after PATH)`: a pair is one folder with `before<suffix>` and `after<suffix>`, one record, one id and one image link. The record keeps the after image in `file` and the before image in `before`.
+- A pair card (`article.pair`) shows Before and After side by side in `.image-pair`, each linked to its full size. It has one caption, one details block, one Feedback field, one Send feedback and one Delete, which removes the folder.
+- The feedback message has a `Before:` and an `After:` link for a pair.
+- On a page 1104px or wider, a single card is 680px and a pair card is up to 1376px, both centered. A pair card under 600px stacks its images, before on top (container query).
+- `/show_image`, `docs/as-built/review-links.md` and the proof rule in `docs/production_format.md` say: file before and after shots as one pair.
+
+**Files:**
+- `scripts/review_links/images.py` — `register(before=)`, `shown_files`, `picture`, the pair card, the CSS and the `register` options
+- `scripts/review_links/test_images.py` — `ImagePairTests` and the pair server test
+- `commands/show_image.md`, `docs/as-built/review-links.md`, `docs/production_format.md`
+
+**Gotchas:** The branch carries sdlc-fix-rounds at 304c80d16 (merge 6dbb94f81), so it lands after the admin-console batch.
+
+### Phase 38 — A change-review write holds the lock under 1 s, and one batch writes many rows  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `_commit(paths, what)` in `change_review.py` commits one or more lists of one repository by plumbing only. It runs from the repository top level: `hash-object -w --path` for each list, then `read-tree` of HEAD (or `--empty`), `update-index --cacheinfo` and `write-tree` in a temporary `GIT_INDEX_FILE`. It sets each list's entry in the real index, then runs `commit-tree` and `update-ref HEAD <new> <old HEAD>`. A moved HEAD retries up to 5 times. A tree equal to HEAD's makes no commit. No command refreshes the index, so clean filters on other modified files never run. A write in a repository shaped like hanadocs takes 0.01-0.06 s, down from about 3.1 s.
+- A failure warns "written but not committed: <reason>; the next write commits it" and moves no ref.
+- `change_review.py batch --file <json>` takes an array of `edit` and `verdict` items (`op`, `production`, `row`, optional `list`; `change`, `check`, `see`, `image`, `output` for `edit`; `verdict` for `verdict`). It checks every item and registers images before the lock. All lists must be in one folder, and a row named twice is refused. Under one lock it writes every list, then makes one commit over every target list, changed or not: subject `change-review: batch <N> writes (<owner> <count>, ...)`. Any error exits 1 and names the item index. A rerun after a stopped batch finishes the remaining writes and commits every list.
+- `edit_row` and `record_verdict` share `_edit_write` and `_verdict_write` (a `RowWrite` with `write` and `after`) with `batch`.
+- `add`, `edit` and batch `edit` items accept `--output` like the `image` action; `--image` with `--output` is refused.
+- `show --row <id>` prints that row with `describe`; a row not on the list exits 1.
+- `ACTION_OPTIONS` maps each action to the options it reads. Any other option given a value exits 1 and names the option.
+
+**Files:**
+- `scripts/production/change_review.py` — `_commit`, `_edit_write`, `_verdict_write`, `_register_image`, `batch`, `ACTION_OPTIONS`, `show --row`
+- `scripts/production/test_change_review.py` — plumbing commit, race, unborn HEAD, filter, batch and option tests
+- `commands/change_review.md` — `batch`, the plumbing commit, the option rules
+
+**Gotchas:**
+- `hash-object --path` takes a path relative to the top level, so it must run from the top level, or list attributes do not match.
+- Images a failed batch registered stay unclaimed until `sweep_change_images` removes them.
+
+### Phase 39 — The ten C51 suites pass on the Mac  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/lib/py` writes every array expansion as `${name[@]+"${name[@]}"}` (`shim_parts`, `python_options`, `file_separator`). macOS `/bin/bash` 3.2 runs it under `set -u` with no Python options. Other behavior does not change.
+- `scripts.lib.test_py_shim` refuses a bare `"${name[@]}"` expansion in the file (a text check), and runs the shim under `bash -u` with no options (stdin) and with `-c`.
+- `NativePaneSessionTests` pins `herdr._PLATFORM` to `"linux"` in the three tests that fake `/proc`: `test_bare_codex_launch_uses_its_process_instead_of_the_tabs_old_thread`, `test_codex_native_process_uses_its_resume_argument_or_own_pane_report` and `test_cached_starting_pane_reports_once_in_each_run`. Product code does not change.
+- The account_move preview test sets `CLAUDE_PYTHON=sys.executable`, so `scripts/lib/py` writes no interpreter cache under the test HOME on darwin.
+- Proof: a `mac_queue_run.py` run of the ten C51 suites plus `test_py_shim` at 7d40bfcc5 with this diff ran 826 tests OK; natedev ran 844 tests OK.
+
+**Files:**
+- `scripts/lib/py` — the Python launcher shim
+- `scripts/lib/test_py_shim.py` — shim tests and the bare-expansion check
+- `scripts/herdr/test_herdr.py` — `NativePaneSessionTests` platform pin
+- `scripts/agents/test_account_move.py` — the preview test sets `CLAUDE_PYTHON`
+
+**Gotchas:**
+- Under `set -u`, bash 3.2 treats `"${arr[@]}"` of an empty array as unbound. Bash 4.4 and later do not, so natedev cannot show the failure; the text check stands in for it.
+- On darwin, `scripts/lib/py` writes `$HOME/Library/Caches/claude/python3-x.y` unless `CLAUDE_PYTHON` is set. A test that compares HOME disk state sets `CLAUDE_PYTHON`.
+- A test that fakes Linux `/proc` pins `herdr._PLATFORM` to `"linux"`; on darwin, herdr reads `ps` instead.
+
+**Ruled out:** a class-wide platform pin in `setUp` (most `NativePaneSessionTests` tests do not fake `/proc`).
+
+### Phase 40 — Every main push lands through one function, and the post-push hook runs after each one  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/lib/land_main.py` holds `land(checkout, commit, branch="main", *, time_limit=UNLIMITED_GIT) -> Landed(commit, branch, push, hook)` and a CLI (`--checkout`, `--commit`, `--branch`). Under `main_push_lock.main_push_lock(checkout)` it fetches the branch, then:
+  1. Origin at the commit: `AlreadyLanded`; the hook runs unless the record names the commit.
+  2. The commit is a strict ancestor of origin: `AlreadyLanded` with `HookSkipped`. The newer landing owns the hook.
+  3. Origin is an ancestor of the commit: a plain fast-forward push (`Pushed`).
+  4. Otherwise: `NotFastForward(LandError)`, and no hook runs.
+- On the default branch (`refs/remotes/origin/HEAD`, else `main`), it runs `<checkout root>/.claude/config/post_push.sh` with bash, with `LANDED_SHA` and `LANDED_BRANCH`, inside the lock. After exit 0 it writes the commit to `post-push-completed` in the git common dir. An unreadable record counts as no record.
+- Hook outcomes are `HookAbsent`, `HookDone`, `HookSkipped` and `HookFailed(exit_code, rerun_command)`; `hook_report(hook)` gives one line. A failed hook never fails the landing: the CLI prints the rerun command and exits 0. It exits 1 on `LandError`.
+- Every default-branch push calls it: `push_direct.sh`, `push_pr_branch_and_merge.sh`, `restore_unreleased.sh`, `main_publish.push`, `fast_track`, `merge_checkpoint.promote_local_checkout`, `merge_gate.promote`, `production_lifecycle.promote_main`, `models_registry._publish` and `vault_pull.publish_mac` (120 s time limit). `post_push_hook.sh` no longer exists.
+- `main_push_lock.py`'s CLI passes `held_environment(checkout)` to its child, so a nested `land_main.py` reuses the hold.
+- Callers report the hook: `main_publish` only when it ran or failed; `merge_checkpoint` as a `post-push` line, `warning` on failure. `commands/showrunner/produce.md` states that each promotion syncs hana's mirror through the hook.
+- Hook interface (agreed with hana-merges): cwd is the landing checkout root, which can be a merge-branch worktree; exit 0 means the sync is done; the hook can run under the main push lock, must not push the default branch, and must be safe to rerun for one `LANDED_SHA`.
+
+**Files:**
+- `scripts/lib/land_main.py`, `scripts/lib/test_land_main.py` — the landing path and its tests
+- `scripts/lib/main_push_lock.py`, `scripts/lib/main_publish.py`, `scripts/lib/models_registry.py`, `scripts/buildlog/vault_pull.py` — callers
+- `scripts/production/production_lifecycle.py`, `scripts/production/merge_checkpoint.py`, `scripts/production/merge_gate.py`, `scripts/production/fast_track.py` — promotion callers
+- `scripts/validate_and_push/push_direct.sh`, `scripts/validate_and_push/push_pr_branch_and_merge.sh`, `scripts/release/restore_unreleased.sh` — shell callers of the CLI
+- `docs/as-built/validate-and-push-cancel-prior.md`, `commands/showrunner/produce.md` — docs
+
+**Binds later work:** the release's main push (`restore_unreleased.sh`) runs `post_push.sh`; `test_release.py` installs a hook file and checks `post-push hook: done`.
+
+**Gotchas:**
+- `land` fetches inside the lock even when the caller fetched before; tests that count fetches see two.
+- A test that injects a push failure patches `land_main.land` where the caller looks it up, not `git push`.
+- `systemd-run` expands `${...}` in its arguments; run a gate loop from a script file.
+
+**Ruled out:** a nonzero exit on a hook failure (the landing is done; the rerun line is the remedy).
+
+### Phase 41 — Each release step skips work that is done, and the GitHub release goes to the configured repository  · status: done
+**Depends on:** none
+
+#### As-built
+
+- A `/release` rerun after a partial failure finishes the release. STEP 0 reads the version at `HEAD` from the `Cargo.toml` of `${PACKAGE}`, else of the primary crate. When it equals `${VERSION}`, the run resumes: `${RESUME_FLAG}` is `--resume`, STEPs 2–4 are skipped and STEP 5 checks out the release branch. A resume starts from `${BASE_BRANCH}`, or from the hotfix branch in hotfix mode.
+- `validate_version.sh <version> [--resume] <crate>...`: with `--resume`, a published crate prints `<crate>: <version> already published (resume)` and the next crate is checked.
+- `create_release_branch.sh`: a release branch at `HEAD` is checked out (`reusing release branch <branch>`); one at another commit is refused with both commits named.
+- `publish_crate.sh`: reads the package version with `cargo metadata`; when `verify_published.sh` passes it prints `already published: <crate> <version>` and skips the dry-run and the publish.
+- `create_github_release.sh`: `gh release view <tag> --repo <repo>` exit 0 prints `already released: <tag> on <repo>` and exits 0. Before a create it checks `gh api repos/<repo>/git/ref/tags/<tag>`: HTTP 404 prints `ERROR: tag <tag> is not on <repo>; push it there first`; another failure prints gh's error and `ERROR: could not check tag <tag> on <repo>`. Creates use `--verify-tag`; a failed create prints `ERROR: gh release create failed for <tag> on <repo>`.
+- STEP 1 takes the GitHub release repository from `github_release_repo` (`owner/name`) in `.claude/config/release.toml`. With no key, origin is used only when `gh repo view --json isPrivate` is false; else STEP 1 stops and names the key. STEP 8 passes that repository and needs the tag there first.
+
+**Files:**
+- `commands/release.md` — STEP 0 resume, STEP 1 repository choice, STEP 8 tag rule, `github_release_repo` in Configuration
+- `scripts/release/validate_version.sh`, `create_release_branch.sh`, `publish_crate.sh`, `create_github_release.sh` — the skips and refusals
+- `scripts/release/test_release.py` — stub `gh`, `cargo` and `curl` on `PATH`; no test publishes or makes a release
+
+**Binds later work:** Phase 42's per-crate pipeline uses these skips; a crate is done when `verify_published.sh` and `gh release view` both pass.
+
+**Gotchas:** `push_release.sh` and `restore_unreleased.sh` were already safe to rerun.
+
+### Phase 42 — One `/release` run releases a list of crates and runs the post-publish hook for each  · status: done
+**Depends on:** Phase 40, Phase 41
+
+#### As-built
+
+- `/release <bump|version> <crate>[@<version>] ...` with more than one package runs Multi-Package Mode in `commands/release.md`. One package keeps single-package mode. Multi-package mode runs only in normal and isolated mode, from `${BASE_BRANCH}`: on a `release-` branch STEP 1 stops, and hotfix mode stops.
+- STEP 1 orders the crates by `publish_order` (an array of crate names) in `.claude/config/release.toml`; a named crate absent from it stops the run. Without the key, the order is the order given. Each crate's version is resolved once.
+- After `git fetch origin ${BASE_BRANCH}`, each crate gets one state: `done` (on crates.io, GitHub release present, and neither `HEAD` nor `origin/${BASE_BRANCH}` holds the release version), `push` (the STEP 11 commit is local only), `resume` (Phase 41 rule) or `new`. A `done` crate is reported and skipped.
+- The plan block lists each crate, its state, version, next dev version and public pushes; one yes covers it and replaces the STEP 6 and STEP 11 confirmations. Dry-run lists and asks nothing. A nonzero patch part counts as a patch release for the next dev version; a resume reads the version from the parent of the version commit.
+- After the yes, a `push` crate runs `git push origin ${BASE_BRANCH}` (dry-run prints `[DRY-RUN] Would push ${BASE_BRANCH}`); other crates run the single-package pipeline. On a failure the run checks out `${BASE_BRANCH}` when the tree is clean and prints `rerun: /release <crate>@<version> ...` with every crate. The final report lists each crate's version, tag and release URL.
+- STEP 7 ends with `scripts/release/post_publish_hook.sh <crate> <version> <sha> [--dry-run]`; `<sha>` is `git merge-base ${BASE_BRANCH} HEAD` (the version commit in hotfix mode, `HEAD` in dry-run). It runs `<repo root>/.claude/config/post_publish.sh` with bash from the repo root, with `CRATE`, `VERSION` and `SHA` exported. It prints `post-publish hook: absent`, `done`, or `failed (exit N)` plus a `rerun:` line on stderr and exits 1; a failure stops before STEP 8. It refuses a version with a leading `v` and a SHA that is not a 40-hex commit.
+
+**Files:**
+- `commands/release.md` — Multi-Package Mode, `publish_order` in Configuration, the STEP 1 stop, the STEP 7 hook
+- `scripts/release/post_publish_hook.sh` — the hook runner
+- `scripts/release/test_release.py` — hook runner tests: absent hook, env names, nonzero exit, bad version, bad SHA
+
+**Gotchas:** hana main has no `publish_order` or `github_release_repo` yet; hana-merges owns those keys and `post_publish.sh`.
+
+### Phase 43 — `hana_shot locate` prints where to click a named target  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `hana_shot.py locate --port N --target <selector> [--json]` reads the current camera (it waits with `Session.settle` while the camera moves) and prints `<selector> <x> <y> <width> <height> <cx> <cy> scale <s>`, then `clipped` and `occluded` when set. Values are window logical pixels (physical / the camera's `scale_factor`), the space brp_extras `move_mouse`, `click_mouse` and `drag_mouse` take; the scale prints unrounded. `--json` prints `selector`, `entity`, `rect`, `click`, `scale_factor`, `window`, `clipped`, `occluded`. It never moves the camera, takes no shot and writes no timing line.
+- One shared projection (`project_bounds`) serves locate and `--crop entity`; the crop output is unchanged. A corner behind the camera is dropped and a rectangle past a window edge is cut; both mark `clipped`. A camera with a viewport is refused.
+- Click point: rays from the camera (`inverse_projection`, `window_ray`) through a `locate_grid` x `locate_grid` grid hit each visible `Aabb` in its `GlobalTransform` with a slab test (`box_hit_distance`); `ray_owner` gives each ray to the nearest hit. The click point is the target-owned point nearest the rectangle centre; `occluded` marks a centre owned by another entity.
+- Rays follow bevy_picking: a mesh whose `Pickable` has `should_block_lower: false` never covers unless it is a target member, and a box that holds the ray origin is not hit unless it carries `RayCastBackfaces`.
+- Exit 1 prints one stderr line: `off screen`, `behind the camera`, `covered by <name or entity:id>`, `no clear click point on <selector>` (no ray hits a box), or the no-visible-mesh-bounds failure with its parent hint. Exit 2 is a refused request.
+- Selectors: `<outer>/<inner>` keeps inner matches under the one outer match; a missing outer prints `<scoped>: outer X found nothing`. A Show scope also reaches the entities whose `DrawnByShow` names it, plus their descendants; a Hana that does not reflect `DrawnByShow` reaches only the Show's children, and the failure text says so. `tool:<Kind>#-n` counts from the newest tool of that kind.
+
+**Files:**
+- `scripts/hana_shot/hana_shot.py` — `locate`, `project_bounds`, the ray and box hit test, scoped and `#-n` selectors
+- `scripts/hana_shot/test_hana_shot.py` — locate tests on the `Fake` BRP
+- `config/hana_shot.conf` — `locate_grid=9`
+- `commands/hana_shot.md` — the selector list and the locate item
+
+**Gotchas:**
+- The hit test uses each mesh's box, not its triangles, so a point near a round edge can miss.
+- `covered by` means a click hits the cover. A cable drag can still land on a covered jack, because Hana's drop rule picks the nearest jack under the hit's root; locate does not model that rule. The Show's rear jack reads `covered by Tool Visual Root` for this reason.
+- The default scene holds its own Shapes and Shows, so a new tool is `#-1`, not `#1`.
+- A beamed part is not a child of its Show; it carries `DrawnByShow` (`hana_mimesis_tools::show::DrawnByShow`), reflected from Hana 5593161498.
+
+**Ruled out:** a triangle hit test; moving the camera to make a target clear.
+
+### Phase 44 — The Disks measure walks each drive in parallel, both drives at once  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/disks/measure.py` walks each drive with dust, both drives at the same time (one `ThreadPoolExecutor` thread for each drive). `disks.json` keeps the config order of `drives`; `render_seconds` is the time of the whole measure. Live on natedev under build load: 52.0 s and 59.2 s (148 s with one du for each drive, one drive after the other); root totals match du within 0.1 %.
+- `dust_command(mount, settings)`: `systemd-run --user --scope --quiet -p MemoryMax=<measure.memory_max> -- nice -n 19 dust -x -D -j -P -o b -z <keep_bytes - 1> -d <measure.max_depth> -n <measure.max_lines> --config <scripts/disks/dust.toml> <mount>`.
+- `parse_dust(output)` reads dust's nested JSON (`size` such as `"2327020666880B"`, `name` a full path) into the `dict[str, int]` that `folder_tree` takes; the tree, `other` and the collapse rule are unchanged.
+- Errors: a timeout; `the measure did not start: dust is not on PATH` when `shutil.which("dust")` finds nothing; `dust exited N: <last stderr line>` for a nonzero exit or no output. A folder dust cannot read leaves out its size, and the walk still counts as a measure.
+- dust comes from nixos `modules/common/development.nix` (550a77b) on natedev and the Mac.
+
+**Files:**
+- `scripts/disks/measure.py` — `dust_command`, `parse_dust`, the concurrent `measure`
+- `scripts/disks/dust.toml` — empty dust config; dust never reads a personal config
+- `scripts/disks/test_measure.py` — the dust command, the JSON parse, both drives at once, the error forms
+- `config/disks.conf` — `measure.max_depth` and `measure.max_lines` (1000000 each)
+
+**Gotchas:**
+- dust keeps a folder only when its size is above `-z`, so the measure passes `keep_bytes - 1` to keep a folder of exactly `keep_bytes`.
+- dust reads a personal config unless `--config` names a `.toml` file; it rejects `/dev/null` as a config.
+- dust gives partial JSON and exit 0 for unreadable folders; a missing path gives exit 1 and no output.
+- natedev's NVMe drives use IO scheduler `none`, so `ionice` has no effect. The walk's inode and dentry cache is larger than the 2 GiB cap, so repeat walks are not faster.
+
+**Ruled out:**
+- A du fan-out over subfolders: each du process counts a hard link again, so the Nix store and cargo `deps/` count twice.
+- A threaded Python walker: the GIL holds it near 130k entries/s (/ 58–68 s).
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
@@ -192,7 +509,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 #### As-built
 
 - `progress_history.py start-wait --kind <kind> [--reason <text>]` prints a wait id, and `finish-wait --wait-id <id>` closes that one wait. Events (`wait_started`, `wait_finished`, `unclosed`) carry the phase instance id, the display phase id, unit, owner session and UTC times. Kinds: `WaitingForQuotaRefusal` (a provider refusal only, never a quota reading), `WaitingForMemoryOrSlot`, `WaitingForMergeGate`, `WaitingForUser`, `WaitingForSupplier`, `ReadyWithoutCapacity`. A probe session writes no wait. An open wait at `finish-phase` closes as `unclosed` with its start and no end.
-- Emit points: `verify.sh` (memory admission, cargo token, build hold); `codex_mesh.py` (provider refusal, ready dispatch held for room); `merge_checkpoint.py` (merge gate); the Stop hook starts a user wait on a `decision:`/`gate:` turn and a supplier wait on a `blocked:` turn, and the UserPromptSubmit hook closes it through `turn_wait.json`.
+- Emit points: `verify.sh` (memory admission, cargo token, build hold); `merge_checkpoint.py` (merge gate); the Stop hook starts a user wait on a `decision:`/`gate:` turn and a supplier wait on a `blocked:` turn, and the UserPromptSubmit hook closes it through `turn_wait.json`.
 - The `waits` verb returns waits for `[since, until)` with `covered_n` and `missing_n`. `start-phase` marks the instance as covered; a covered phase with no wait reads as covered zero, and a phase from a run with no wait history reads `HistoryNotRecorded`, never 0.
 - Each pushed merge on both paths (checkpoint and child handoff) appends one receipt to `merge_receipts.jsonl` under the history root: project (from `Repository`), issue or plan phase, merge commit, source checkpoint, target branch, UTC time. A retry writes no second receipt; a rolled-back merge writes none. The `receipts` verb names a merge commit with no receipt `ReceiptMissing`.
 - `phase_process.py baseline`'s trial section reports median and p90 phase time per unit, with n, over the same eligible trial phases as its three measures. `history.py` and `rounds.py` still read old run files.
@@ -201,13 +518,12 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Files:**
 - `scripts/direct/progress_history.py` — the recorder, the `waits` and `receipts` verbs; every emit point calls it
 - `scripts/direct/phase_process.py` — trial phase time
-- `scripts/direct/verify.sh`, `scripts/agents/codex_mesh.py`, `scripts/production/merge_checkpoint.py`, `scripts/hooks/stop-direct-continue.py`, `scripts/hooks/user-prompt-submit-conversation-pause.py` — emit points and receipts
+- `scripts/direct/verify.sh`, `scripts/production/merge_checkpoint.py`, `scripts/hooks/stop-direct-continue.py`, `scripts/hooks/user-prompt-submit-conversation-pause.py` — emit points and receipts
 - `scripts/hooks/test_direct_turn_wait_hooks.py`, `scripts/production/test_merge_checkpoint.py` — hook wait and receipt tests
 
 **Binds later work:** the wait event shape, the six kinds, `HistoryNotRecorded` versus covered zero, and the receipt fields go to hierarchies-unit as a schema handoff; no script in this tree reads wait events yet. The baseline freeze records trial phase time from `phase_process.py baseline`.
 
 **Gotchas:**
-- `codex_mesh` runs one app-server per run, so a launcher's exported variables (`UNIT_PHASE_ID`, `UNIT_TEAM_ROLE`) are fixed at server start. Only `CODEX_THREAD_ID` is per thread.
 - A unit finishes its phase before the showrunner merges it, so a merge-time record resolves a finished phase instance.
 - A new import in a shared script breaks the fixture copy lists in `test_review_launcher.py` and `test_update_registration.py`.
 - `phase_reservation.py` committed does not run in a repository that is not enrolled.
@@ -219,7 +535,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 #### As-built
 
-- Worker waits: `verify.sh` gives `CODEX_THREAD_ID` to the recorder, and `codex_mesh.py`'s controller passes the worker name, run directory and thread id explicitly (it reads no environment identity). Both call one resolver, `resolve_worker_pass`, which maps the thread to exactly one `mesh_roster.json` worker and that worker to exactly one active pass. It returns `ResolvedWorkerPass` or `UnresolvedWaitAttribution` with its reason and candidates. Start and finish events carry `pass_instance_id` and `worker_name`. A director-run `verify.sh` wait is owned by the director (`--director` plus `CLAUDE_CODE_SESSION_ID`).
+- Historical worker waits (2026-10-29): `verify.sh` supplied `CODEX_THREAD_ID`. The mesh controller supplied the worker name, run directory and thread id. `resolve_worker_pass` mapped the thread through `mesh_roster.json` to one active pass. Commit `ce529466f` removed the mesh controller on 2026-11-08. The deployment record in Phase 4 identifies the earlier revisions.
 - Merge-gate waits: `<CheckpointCommit/>` runs `progress_history.py checkpoint --session-dir <S> --phase <id> --commit <hash>` after each commit, in every repository. `merge_checkpoint.py` turns the notice's hash into the full id (`git rev-parse --verify <commit>^{commit}`) and finds that event across the run files under the history root, this worktree's phases included. One match attributes the wait. Zero or several matches read as uncertain coverage for each candidate, never covered zero. A child handoff records a production-level handoff wait with no phase.
 - User and supplier waits: the UserPromptSubmit hook ends `WaitingForUser` on typed input, or on a `From the user (via the showrunner):` relay from the expected showrunner address. It ends `WaitingForSupplier` only on a message from the supplier's current address. The production comes from the plan header through `resolve_production_unit`, which reads metadata only and accepts both header forms. Timers, task notices and other peers leave both open. The duplicate check compares the supplier too. Waits a phase leaves open close as `Unclosed` at phase completion, external waits included, under a shared lock.
 - `waits` JSON reports `covered_n`, `attribution_miss_n`, `uncertain_phase_n`, `missing_n`, `production_handoff_n` and the handoffs, each miss with its reason and candidates.
@@ -231,7 +547,6 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `scripts/direct/progress_history.py` — resolver, attribution types, checkpoint verb, supplier identity, uncertain coverage, `waits` JSON
 - `scripts/hooks/user-prompt-submit-conversation-pause.py` — sender-matched completion and the showrunner relay
 - `scripts/direct/verify.sh`, `scripts/lint/memory_gate.sh` — thread attribution and the shared memory line
-- `scripts/agents/codex_mesh.py` — explicit controller context
 - `scripts/production/merge_checkpoint.py` — full-hash checkpoint lookup and the child handoff wait
 - `commands/unit/checkpoint.md` — the checkpoint verb line
 - `scripts/direct/workers.py`, `scripts/direct/phase_process.py`
@@ -270,9 +585,9 @@ For active process redesigns, as we are currently undergoing with promotions and
 #### As-built
 
 - `<WorkerRuns/>` in `commands/unit/direct.md` holds the run-cancel rule: when a decision makes a running or queued test, lint or build run useless (the phase is parked, the round failed, a newer tree replaces the run's tree, or a result in hand answers the question), cancel it in the same turn to free its memory and its place in the queue. No run finishes only to complete a report.
-- Cancel steps by run kind. A `mesh_runs.py` run: read `pid` from its record in `${SESSION_DIR}/mesh_runs/` (the `.json` beside its log); signal only while `status` is `running` and `ps -p <pid> -o args=` shows `mesh_runs.py supervise` with that record's path, so a reused pid is never signalled; then `kill -TERM -- -<pid>`. A detached `verify.sh` run: the same record and command, because `verify.sh` detaches through `mesh_runs.py` and handles TERM. A run in the memory queue: cancel its owning run; the queue drops dead callers on its next read. The queue has no cancel command of its own (`memory_admit.py release` only releases a reservation); the rule says so and points to `docs/plans/sdlc-run-cancel-design.md`.
+- Cancel steps by run kind. A detached run: run `detached_runs.py stop --reason "<why>" <record>` on its record in `${SESSION_DIR}/detached_runs/` (the `.json` beside its log). The verb checks the supervisor and the command leader, then sends TERM to the command group only; the supervisor delivers the stopped result. A detached `verify.sh` run: the same verb, because `verify.sh` detaches through `detached_runs.py` and handles TERM. A run in the memory queue: cancel its owning run; the queue drops dead callers on its next read. The queue has no cancel command of its own (`memory_admit.py release` only releases a reservation); the rule says so and points to `docs/plans/sdlc-run-cancel-design.md`.
 - The park path and the repair-round path in `direct.md` point to `<WorkerRuns/>`. In `/showrunner:produce`, a ruling that parks, stops or replaces work names the runs to cancel.
-- `docs/direct/write_prompt_contract.md` item 3 (`## Builds and tests`) holds the worker form: cancel a run of your own that a later edit or result makes useless, with the same pid check and `kill -TERM -- -<pid>`.
+- `docs/direct/write_prompt_contract.md` item 3 (`## Builds and tests`) holds the worker form: cancel a run of your own that a later edit or result makes useless, with `detached_runs.py stop --reason "<why>" <record>`.
 
 **Files:**
 - `commands/unit/direct.md` — the `<WorkerRuns/>` rule and its park and repair pointers
@@ -299,7 +614,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 #### As-built
 
-- `docs/plans/sdlc-run-cancel-design.md` holds each owner's answer to builds' part. The design defines no copy path. It points to the user's rule of 2026-10-29 (`/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, the folder name from `roster.UnitLabels.folder_name()` on labels from `roster.unit_labels_for`, owned by verify-unit's `docs/plans/verify-copies.md`), and the run-stop provenance goes in a file inside that folder. `board.sh` is natedev's file.
+- `docs/plans/sdlc-run-cancel-design.md` holds each owner's answer to builds' part. The design defines no copy path. It points to the user's rule of 2026-10-29 (`/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, the folder name from `roster.UnitLabels.folder_name()` on labels from `roster.unit_labels_for`, owned by verify-unit's `docs/as-built/gate-checkouts.md`), and the run-stop provenance goes in a file inside that folder. `board.sh` is natedev's file.
 - verify-unit agreed items 1, 3, 4 and 6: the launchers export the owner link before `verify.sh` refuses calls without it; one command id passes down in the environment; the TERM order builds on verify-unit's token fix (no reclaim from a live holder, token renewed with `--pid`); the Mac claim stays until the remote side is empty; one 15 s attempt deadline; only verify's own cancel path sets exit 77.
 - resources-unit agreed item 2: charges bind to the step's systemd scope cgroup; a dead wrapper's kept charge counts measured memory; a step with no scope keeps today's rule; hold waits cancel through `interrupt-local`; a stopped command leaves a tombstone.
 - Items still open stay under the doc's Open questions. No code changed.
@@ -325,7 +640,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `scripts/direct/progress_history.py` — holder types and flags, `wait-holder`, the `holders` output, the wait-without-id count, phase source metadata
 - `scripts/direct/test_progress_history.py` — CLI tests for each case
 
-**Binds later work:** the producers are other units' files and have hand-offs: `verify.sh`'s `phase_wait_start` (builds) passes the board token owner for a slot wait, the memory reservation owner for a memory wait and the build hold's holder for a hold wait, and calls `wait-holder` when the holder changes; `codex_mesh.py`'s `_mesh_phase_wait` (models-unit) passes the account label for quota and capacity waits. hierarchies-unit reads the holder field shape.
+**Binds later work:** `verify.sh` passes the resource holder to the wait recorder and calls `wait-holder` when the holder changes. The holder identifies the slot owner, memory reservation owner or build hold owner. hierarchies-unit reads the holder field shape. The deleted mesh producer requires no further change.
 
 **Gotchas:** most plan headers name the production with no unit part, so the production reader accepts both header forms.
 
@@ -432,7 +747,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `scripts/lib/process_start.py` — the shared reader and `OwnerCheck`; `scripts/lib/test_process_start.py`.
 - `scripts/lib/process_start_test_support.py` — the one fake stat helper for tests (`write_stat`, `process_start_probe`, `stored_start_probe`).
 - `scripts/direct/assign.py`, `findings.py`, `verify.sh`, `end_session.sh` — the five rerun fixes; tests in `test_assign_launcher.py`, `test_findings.py`, `test_verify_hold_lint.py`, `test_verify_hold_wait.py`, `test_end_session.py`.
-- Callers of the shared reader (own copy deleted): `scripts/direct/` (`step_record.py`, `tree_watch.py`, `board.sh`, `implement.sh`), `scripts/agents/codex_mesh.py`, `scripts/production/` (`retire_unit.py`, `merge_gate.py`, `fake_unit_host.py`, `rename_unit.py`), `scripts/herdr/herdr.py`, `scripts/message/sessions.py`, `scripts/shutdown/` (`remote_control.py`, `stop.py`, `inventory.py`, `pane_record.py`), `scripts/nix_env/heal.py`, `scripts/mac_test/` (`mac_test.py`, `copy_watch.py`), `scripts/build_targets/build_targets.py`, `scripts/build_hold/` (`build_hold.py`, `hold_enforcer.py`), `scripts/lint/` (`memory_admit.py`, `tmp_sweep.py`), `scripts/buildlog/mac_idle.py`. Their tests and test support modules use the shared fake stat helper.
+- Callers of the shared reader (own copy deleted): `scripts/direct/` (`step_record.py`, `tree_watch.py`, `board.sh`, `implement.sh`), `scripts/production/` (`retire_unit.py`, `merge_gate.py`, `fake_unit_host.py`, `rename_unit.py`), `scripts/herdr/herdr.py`, `scripts/message/sessions.py`, `scripts/agents/` (`remote_control.py`, `stop.py`, `inventory.py`, `pane_record.py`), `scripts/nix_env/heal.py`, `scripts/mac_test/` (`mac_test.py`, `copy_watch.py`), `scripts/build_targets/build_targets.py`, `scripts/build_hold/` (`build_hold.py`, `hold_enforcer.py`), `scripts/lint/` (`memory_admit.py`, `tmp_sweep.py`), `scripts/buildlog/mac_idle.py`. Their tests and test support modules use the shared fake stat helper.
 
 **Binds later work:**
 - Any code that reads a process start or decides a process is stale calls `scripts.lib.process_start` (`check_owner`, `check_group_leader`). Only GONE and REPLACED reclaim. Only ALIVE signals. UNKNOWN keeps the record.
@@ -443,7 +758,6 @@ For active process redesigns, as we are currently undergoing with promotions and
 - A Mac start time is `ps -o lstart=` text, read with `LC_ALL=C` and `TZ=UTC`. A host without /proc gives UNKNOWN on a date mismatch, never REPLACED.
 - A test that patches a per-script start reader breaks, because those readers are gone. Patch `scripts.lib.process_start`.
 - A stop inside `phase_wait_start` still leaves an open wait with no wait file. "A stopped verify.sh wait is found and closed on a rerun" closes it.
-- A mesh inbox race in `codex_mesh.py` stays open; models-unit owns that file.
 
 ### Phase 18 — The Stop hook lets a full-context stop through only when something live will wake the session  · status: done
 **Depends on:** none (showrunner fix, 2026-10-29: ahead of other work)
@@ -492,12 +806,11 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `scripts/mac_test/copy_watch.py` — result publication needs the pre-created hold folder and never recreates it
 - `scripts/direct/verify_hold_wait_test_support.py`, `test_verify_hold_wait.py`, `test_progress_history.py` — stop-and-resume interleaving regressions on the shared fixture
 
-**Binds later work:** every wait publisher calls `publish_wait`; there is no second wait-file writer or id format. Work that freezes the recorder, launchers and wait records between a before and an after sample depends on models-unit's move of `codex_mesh.py` `_mesh_phase_wait` onto `publish_wait`: if that move lands after the before sample, a new before sample is frozen after it.
+**Binds later work:** every wait publisher calls `publish_wait`. There is no second wait-file writer or id format. Freeze the recorder, launchers and wait records before each comparison sample. The deleted mesh producer creates no remaining dependency.
 
 **Gotchas:**
 - Deleting a folder by its original path is never safe while a publisher knows that path; only a rename under the lock makes a late publisher fail.
 - A shared writer that creates a missing parent reopens the late-publication race; publishers into a hold folder pass `create_parent=False`.
-- `codex_mesh.py` `_mesh_phase_wait` still appends its event before its marker, so a killed codex_mesh can leave an open wait with no file; models-unit owns its move to `publish_wait`.
 
 ### Phase 21 — repair frees a phase record whose reservation a sibling's checkpoint released  · status: done
 
@@ -519,3 +832,112 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Gotchas:** `repair` and `committed` take no shared lock, so a checkpoint during a repair of the same phase can lose its pending-release record. The cargo-berth side of the shared release belongs to tile.
 
 **Ruled out:** a repair/checkpoint lock in this phase (a new guard; a next item).
+
+### Phase 22 — Checkpoint notices carry no Parallel line  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint notices carry no `Parallel:` line. `merge_checkpoint.py` takes no `--parallel` argument and has no `check_parallel`.
+- `phase_table.py` has no `parallel` subcommand, no `"parallel"` JSON key and no `CouldStart`, `NothingToStart`, `DependenciesUnknown` or `ParallelCheck` types.
+- `plan_history.plan_phases(plan_path)` reads no `**Depends on:**` line; each `PlanPhase` has `id`, `title` and `done`. `plan_member` stays for `phase_table.py` and `progress_history.py`.
+- `dailies_input.py` prints no `parallel check:` line.
+- The docs keep the `**Depends on:**` rule and the rule that a director starts independent phases itself, with no report line.
+
+**Files:**
+- `scripts/production/merge_checkpoint.py` — checkpoint merge request checks, without the Parallel line
+- `scripts/direct/phase_table.py` — phase table build and render
+- `scripts/direct/plan_history.py` — plan phase reader
+- `scripts/production/dailies_input.py`, `scripts/production/unit_phases.py` — callers without the parallel data
+- `docs/production_format.md`, `commands/showrunner/produce.md`, `commands/unit/checkpoint.md`, `docs/direct/phase_end.md`, `commands/plan/to_phased_plan.md`, `docs/as-built/phase-tables.md`, `docs/as-built/showrunner-automation.md` — notice format and phase-start rules
+
+**Ruled out:** a replacement check for independent phases (user order).
+
+### Phase 23 — Transcript lookups do not resolve each file  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- `transcript_paths(root, pattern)` calls no `resolve()` on each file. It keys each match by `uncompressed_path(path)`, so a plain file and its `.zst` copy give one entry, with the plain file preferred.
+- `distinct_files(paths)` in `scripts/lib/transcripts.py` merges symlink aliases in a small list of matches. A caller that counts or picks among the matches of one session uses it: `read_director_transcripts` in `phase_process.py`.
+- `showrunner_transcripts` in `nightly_review.py` resolves each path as it enters its result set, so a recorded path and a discovered path give one entry.
+- `_found_backends` in `staff.py` lists each real session folder once and reuses the list for each home that links to it. A row gets `CodexBackend(home)` only for its recorded home.
+- Paired CPU per call on natedev, 662 rows: `_found_backends` 0.08–0.10 s against 0.45–0.52 s before; `transcript_paths` over three homes 0.16 s against 0.42 s.
+
+**Files:**
+- `scripts/lib/transcripts.py` — transcript discovery and `distinct_files`
+- `scripts/production/staff.py` — Codex backend lookup, one scan for each real folder
+- `scripts/direct/phase_process.py`, `scripts/nightly_review/nightly_review.py` — callers that merge aliases
+- `scripts/lib/test_transcripts.py`, `scripts/production/test_staff.py`, `scripts/direct/test_phase_process.py` — alias, shared-folder and plain-preferred rows
+
+### Phase 24 — Phase start names an unclosed phase  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- When `start-phase` sets aside the current phase and no open pass belongs to it, `_report_unclosed_phase` prints one line to stderr: `anomaly: start-phase: <unit>: phase <id> set aside unclosed, started <YYYY-MM-DD HH:MM zone>`. It stops nothing.
+- A set-aside phase with an open pass prints no line. A run with no unit row names the unit as `unit not recorded (<reason>)`.
+
+**Files:**
+- `scripts/direct/progress_history.py` — `_report_unclosed_phase` and its call in `_start_phase`
+- `scripts/direct/test_progress_history.py` — rows in `test_a_phase_started_while_another_is_open_leaves_the_older_one_open`
+
+### Phase 25 — A reservation released without a checkpoint clears  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- `phase_reservation.clear` deletes an `Active` record when berth's board in `repo` shows its reservation `released_without_checkpoint` (`RELEASED_WITHOUT_CHECKPOINT`). That clear writes no release marker.
+- Every other `Active` lifecycle (`active`, `outstanding`, unreadable) stays refused, as before.
+
+**Files:**
+- `scripts/direct/phase_reservation.py` — `clear`
+- `scripts/direct/test_phase_reservation.py` — rows in `test_a_held_reservation_is_never_replaced_or_cleared_by_hand`, board answer patched
+
+### Phase 26 — Record-active ignores paths a merge brought  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- `phase_reservation.changed_since_baseline` lists the paths of the branch's first-parent commits from the baseline to `HEAD`, the uncommitted changes against `HEAD`, and the untracked files.
+- With `--diff-merges=dense-combined`, a merge commit adds only a path its result changes from every parent, as a conflict resolved by hand. A plain merge adds nothing, at phase start or later.
+- A path the phase changed and later changed back still counts.
+
+**Files:**
+- `scripts/direct/phase_reservation.py` — `changed_since_baseline` and the module docstring
+- `scripts/direct/test_phase_reservation.py` — `test_record_active_claims_only_the_paths_a_merge_resolved_by_hand`
+
+### Phase 27 — Stall-watch sees a permission prompt on the screen  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- `stall_watch.prompt_on_screen` finds a `PROMPT_QUESTION` line with a `PROMPT_OPTION` answer (`❯ 1. Yes`) under it in the pane's bottom `PROMPT_LINES` lines.
+- `watch_pass` treats a pane that shows one as blocked, whatever herdr's state is. The pass sends no bump and alerts on the usual prompt timing from the pending call's time.
+- rca 261114-1 cause: herdr reads the dialog as idle when an input box shows under it (`live_prompt_box`), so stall-watch saw the prompt only when herdr first reported it blocked.
+
+**Files:**
+- `scripts/production/stall_watch.py` — `prompt_on_screen`, `PROMPT_OPTION` and the blocked decision in `watch_pass`
+- `scripts/production/test_stall_watch.py` — `test_a_prompt_herdr_reports_idle_is_blocked_on_the_first_pass`; four tests that end a prompt clear it from the screen
+
+### Phase 28 — An accepted finding takes the user's decision after close  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- `_decision` takes a held, decided or accepted finding, also after the phase ledger closes. Other states keep the refusal.
+- An accepted finding keeps its `accepted` state, because a reviewer already accepted its repair.
+- A ruling is the saved `decision`, whatever the state. `--withdraw` and the repeat rule use that test.
+- Case: tile phase 62 F003 (accepted, ledger closed) refused the user's "Approved". tile records it with `decision --phase 62` after the fix reaches main.
+
+**Files:**
+- `scripts/direct/findings.py` — `_decision`
+- `scripts/direct/test_findings.py` — `test_an_accepted_finding_in_a_closed_phase_takes_the_users_decision`, `test_a_decided_finding_a_verdict_accepted_changes_its_ruling_with_withdraw`
+- `docs/as-built/simplify-lens.md` — the decision paragraph

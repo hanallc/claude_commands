@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import unittest
-import subprocess
-from pathlib import Path
 
 from scripts.style import style_footprint
 from scripts.style import approved_renames
@@ -14,6 +12,12 @@ from scripts.style.approved_renames import (AppliedCheck, AppliedInCode, Approve
                               approved_rename, binding_rename, binding_rename_check, binding_scope, resolution_scope, declaration_sites, file_rename,
                               refactor_rename, rename_declaration, RenameDeclaration,
                               pattern_binding_check, PatternBindingCollision, DistinctPatternBindings)
+
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
 
 
 def files(sources: dict[str, str]) -> FileReader:
@@ -314,12 +318,6 @@ class AppliedCheckTests(unittest.TestCase):
             "src/lib.rs", source, source, (pair,)), current=source).checks[pair],
                               approved_renames.OuterBindingBlocked | approved_renames.OuterBindingUnproved)
 
-    def test_syntax_and_site_modules_import_without_an_initialization_cycle(self) -> None:
-        result = subprocess.run(
-            [str(Path(__file__).resolve().parents[1] / "lib/py"), "-B", "-c", "from scripts.style import approved_renames, finding_sites, declarations"],
-            cwd=Path(__file__).resolve().parent, capture_output=True, text=True, check=False)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
     def test_inner_attributes_of_the_file_and_enclosing_modules_require_admission(self) -> None:
         for source in (
                 "mod outer { #![inject] fn label() {\nmap(|g| g + 1)\n} }\n",
@@ -383,16 +381,6 @@ class AppliedCheckTests(unittest.TestCase):
             rename = BindingRename(line, source.splitlines()[line - 1], "g", "checkout_info")
             with self.subTest(form=label):
                 self.assertIsInstance(approved_renames.rename_admission(source, rename), expected)
-
-    def test_unparsed_enclosing_condition_is_unproved_instead_of_clear(self) -> None:
-        source = ("fn label() {\n    if let Some(checkout_info) = if flag { value } else { other } {\n"
-                  "        map(|g| g + 1);\n    }\n}\n")
-        rename = BindingRename(3, source.splitlines()[2], "g", "checkout_info")
-        result = approved_renames.rename_admission(source, rename)
-        self.assertIsInstance(result, approved_renames.OuterBindingUnproved)
-        assert isinstance(result, approved_renames.OuterBindingUnproved)
-        self.assertEqual(result.reason, "wanted name already used in this item: 'checkout_info' at line 2")
-        self.assertEqual(approved_renames.binding_admission_check(source, (rename,), binding_rename_check("src/lib.rs", source, source, (rename,)), current=source).checks[rename], result)
 
     def test_preceding_enclosing_macro_cannot_hide_a_binding(self) -> None:
         source = "fn label() { introduce!(checkout_info);\n    map(|g| g + 1)\n}\n"

@@ -39,6 +39,7 @@ from scripts.whoami.agent_accounts import (ClaudeDirectorySource, CodexHomeSourc
                             codex_credits, reset_credits)
 from scripts.whoami.agent_notes import local_reset
 from scripts.whoami.note_file import Note, read_note
+from scripts.whoami.notes_state_test_support import private_notes_state
 from scripts.accounts import accounts, refusal_watch, refusals, role_map
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.production import showrunners
@@ -109,7 +110,7 @@ class AgentNotesTests(unittest.TestCase):
         _ = os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
         _ = os.environ.pop("CODEX_HOME", None)
         _ = self.enterContext(patch.object(note_file, "AGENTS_DIR", self.root))
-        _ = self.enterContext(patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl", create=True))
+        _ = self.enterContext(private_notes_state(self.root))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         self.rows = cast(MagicMock, self.enterContext(patch.object(session_table, "live_sessions", return_value=session_table.ReadSessions({}, frozenset()))))
         _ = self.enterContext(patch("scripts.message.sessions.live_sessions", return_value=[]))
@@ -1119,7 +1120,7 @@ class AgentNotesTests(unittest.TestCase):
             events.append("refusal")
             return ["fixture refusal decision", *unit_watchdog.run(self.now, dry_run=False)]
         with (patch.object(sys, "argv", ["agent_notes.py"]),
-              patch.object(herdr, "_proc_root", return_value=proc),
+              patch.object(herdr, "proc_root", return_value=proc),
               patch.object(herdr, "_process_sessions", wraps=herdr._process_sessions) as scans,  # pyright: ignore[reportPrivateUsage]
               patch.object(agent_notes, "live_reports", return_value=[report]) as reports,
               patch.object(agent_notes, "resolve_workers_home", return_value=home),
@@ -1349,22 +1350,21 @@ class AgentNotesTests(unittest.TestCase):
               patch.object(note_file, "read_notes", return_value=[])):
             agent_notes.main()
         self.assertEqual(blocked.call_args.kwargs["refused_at"], quota_alert.RefusalTimeUnknown())
-        self.assertEqual(blocked.call_args.kwargs["stopped"], quota_alert.StoppedCommandUnknown())
+        self.assertEqual(blocked.call_args.kwargs["stopped"], quota_alert.StoppedWorkerUnknown())
 
-    def test_blocked_cli_converts_stopped_worker_command_at_the_argument_boundary(self) -> None:
-        command = "worker.py assign impl 'finish the patch'"
+    def test_blocked_cli_converts_stopped_worker_at_the_argument_boundary(self) -> None:
         with (patch.object(sys, "argv", ["agent_notes.py", "blocked", str(self.root / ".codex"),
-                  "workers@example.invalid", "codex1", "--stopped", "own-director", "impl", command]),
+                  "workers@example.invalid", "codex1", "--stopped", "own-director", "impl"]),
               patch.object(agent_notes, "blocked", return_value=[]) as blocked,
               patch.object(note_file, "read_notes", return_value=[])):
             agent_notes.main()
         blocked.assert_called_once()
         self.assertEqual(blocked.call_args.kwargs["stopped"],
-                         quota_alert.StoppedWorkerCommand("own-director", "impl", command))
+                         quota_alert.StoppedWorker("own-director", "impl"))
 
     def test_blocked_cli_rejects_incomplete_stopped_context_before_reporting(self) -> None:
         with (patch.object(sys, "argv", ["agent_notes.py", "blocked", str(self.root / ".codex"),
-                  "workers@example.invalid", "codex1", "--stopped", "own-director", "impl"]),
+                  "workers@example.invalid", "codex1", "--stopped", "own-director"]),
               patch.object(agent_notes, "blocked") as blocked,
               redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exited):
             agent_notes.main()
@@ -2206,15 +2206,15 @@ class ResetTimeTests(unittest.TestCase):
                          note_file.KnownReset(datetime(2026, 10, 13, 10, tzinfo=timezone.utc)))
         self.assertTrue(agent_notes.still_ahead("2099-01-01T00:00:00-07:00"))
         self.assertFalse(agent_notes.still_ahead("2000-01-01T00:00:00-07:00"))
-        self.assertTrue(quota_alert.ahead("2099-01-01T00:00:00+09:00", now=self.now))
-        self.assertFalse(quota_alert.ahead("2000-01-01T00:00:00+09:00", now=self.now))
+        self.assertTrue(note_file.ahead("2099-01-01T00:00:00+09:00", now=self.now))
+        self.assertFalse(note_file.ahead("2000-01-01T00:00:00+09:00", now=self.now))
         self.assertEqual(codex_pacer.parse_local("2026-10-13T03:00:00-07:00"),
                          note_file.KnownReset(datetime(2026, 10, 13, 10, tzinfo=timezone.utc).astimezone().replace(tzinfo=None)))
 
     def test_a_reset_written_before_the_offset_is_read_in_the_machines_zone(self) -> None:
         self.assertEqual(note_file.reset_time("2026-10-13T03:00:00"), note_file.KnownReset(datetime(2026, 10, 13, 3).astimezone()))
         self.assertTrue(agent_notes.still_ahead("2099-01-01T00:00:00"))
-        self.assertFalse(quota_alert.ahead("2000-01-01T00:00:00", now=self.now))
+        self.assertFalse(note_file.ahead("2000-01-01T00:00:00", now=self.now))
         self.assertEqual(codex_pacer.parse_local("2026-10-13T03:00:00"), note_file.KnownReset(datetime(2026, 10, 13, 3)))
 
     def test_an_absent_or_unreadable_reset_names_the_reason(self) -> None:
@@ -2223,7 +2223,7 @@ class ResetTimeTests(unittest.TestCase):
                 self.assertIsInstance(note_file.reset_time(value),
                                       note_file.InvalidReset if value == "soon" else note_file.NoResetKnown)
                 self.assertFalse(agent_notes.still_ahead(value))
-                self.assertFalse(quota_alert.ahead(value, now=self.now))
+                self.assertFalse(note_file.ahead(value, now=self.now))
 
 
 if __name__ == "__main__":

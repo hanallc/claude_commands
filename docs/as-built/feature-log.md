@@ -151,6 +151,7 @@ Every write holds `locked()`, an exclusive `flock` on `state_dir()/"lock"`. A no
 | `add` | new-note flags, or `--review ROW` alone | one live note | `added: <path>` or `unchanged: <path>` |
 | `supersede` | new-note flags and `--old TITLE` (repeatable, at least one), optional `--split`, or `--review ROW` alone | the replacement; each old note becomes `superseded` and gains the replacement in `replaced_by` | `added:` or `unchanged:`, then `superseded: <old> → <new>` per old note it changes |
 | `propose` | `--review ROW`, new-note flags, optional `--old TITLE` | every `add`/`supersede` check runs; no note; the proposal is saved | `proposed: <ROW> (<verb> <title>)` |
+| `land` | `--review ROW`, optional `--if-proposed` | the proposal lands with the verb it records, `add` or `supersede` | the `add`/`supersede --review` lines |
 | `drop` | `--review ROW --verdict TEXT` | an open proposal closes without a note | `dropped: <ROW>` or `unchanged: <ROW>` |
 | `amend` | `--project --title`, any of `--summary --behavior --see --area --kind --crate --evidence`; with `--backfill` also `--link` with `--completed`, `--release crate@version` or `crate@Unreleased`, `--separate-result` | the note corrected in place | `amended: <path> (<fields>)` or `unchanged: <path>` |
 | `live` | `--project`, optional `--crate --area --kind --grep` | live notes, newest `completed_date` first | `<completed> <kind> <title> — <summary> [<crates>] (<area>) <link>` |
@@ -174,7 +175,8 @@ New-note rules:
 Repeats and the link rule:
 
 - `_same_repeat` compares a repeat with the stored note apart from `date_created` and `date_modified`, and apart from `completed_date` when `--completed` is omitted. Equal prints `unchanged`. Different fields fail with `use amend`. The same title under another link fails with `make the title more specific`.
-- `_reject_duplicate_link` allows one live note per link in a project. Another title on that link needs `--separate-result`. `supersede` may reuse the link of its own `--old` notes.
+- Direct note writes require `--separate-result` when another live title holds the link in that project. `supersede` may reuse its `--old` notes' link.
+- Landing a review proposal treats its row as a separate result. It accepts a shared link even when the saved `separate_result` is false.
 - A repeated `supersede` finishes any `--old` note still live. An `--old` note superseded by something else is refused with `old note <title> is not live`.
 - `supersede --split` lifts that refusal: an `--old` note that is already superseded gains the new note in `replaced_by` and stays superseded, and the call prints `superseded: <old> → <new>`. On a live `--old` note the flag changes nothing. A repeat prints `unchanged:` for the new note and adds no event. Replacements of one note that share a link pass `--separate-result`, because the link rule exempts only the `--old` notes. `--split` with `--review` is refused (`--split cannot be combined with --review`), and `propose` does not take the flag. argparse turns it into `ReplacementPolicy = ReplaceLiveNotes | ExtendReplacementSet`.
 - `amend --evidence` skips items already stored. `amend --crate` drops `release` values of crates that left the list.
@@ -220,9 +222,20 @@ Release refusals, each checked before any write:
 | `add`/`supersede --review ROW` | lands with the saved arguments, the saved `completed` included; prints the write lines, then `[[<title>]]` | `unchanged: [[<note>]]` | refused | `no proposal for <ROW>; run propose first` |
 | `drop --review ROW --verdict TEXT` | becomes dropped | refused | `unchanged: <ROW>` | refused |
 
-A row is `A<n>` or `C<n>`, bare for a row of hana's list `~/rust/hanadocs/change-review/change-review - hana.md`, else qualified by its list: `<list>/C<n>`, where `<list>` is the showrunner `~/rust/hanadocs/change-review/change-review - <list>.md` is named for (`natedev/C3`). Every list numbers its rows from 1, so only the qualifier keeps two lists' rows apart; a qualified row is stored at `proposals/<list>/<ROW>.json`. `propose` refuses a bare row for any project but hana: `feature_log: a claude review row names its list: <list>/C3`. `add`, `supersede` and `drop` take the row as `propose` saved it.
+A feature-log review ID uses `A<n>` or `C<n>` on hana's list.
+Other lists use `<list>/C<n>`, where `<list>` comes from `change-review - <list>.md`, such as `natedev/C3`.
+Each list numbers its rows from 1.
+The qualifier separates equal row numbers in different lists.
+The proposal path is `proposals/<list>/<ROW>.json`.
+`propose` refuses a bare row for projects other than hana.
+`add`, `supersede`, and `drop` use the ID that `propose` saved.
+These stored IDs remain valid when the review page or `/next` displays the responsible showrunner, such as `sdlc/C3`.
 
 A verb that differs from the proposal's fails and names the right verb. `propose` also requires every `--old` note to exist and be live.
+
+Different review rows can land notes on the same merge link in order.
+Landing keeps the saved proposal arguments unchanged.
+Repeating a landed row creates no note or event.
 
 ### Digest
 
@@ -275,6 +288,16 @@ A call is off host when the verb is not `project-of`, the short host name is not
 | `changelog` | arguments checked locally; one forwarded read, `changelog --crate X --version V --selection`, through `forwarded_reader`, returning `ChangelogSelection(section, titles)` or `ForwardFailed(exit, stderr)`; render, compare and save happen locally |
 | `release` | contents read and checked locally; `release --crate X --version V --contents-stdin` forwarded through `release_forwarder` with the contents JSON on stdin |
 | every other verb | `ssh natedev "~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_log.py " + shlex.join(argv)` through `ssh_runner` |
+
+`_off_host` is the one off-host rule. `main` and the review library functions call it.
+
+The change page calls three library functions in its own process. They print nothing.
+
+- `project_of(path: str) -> str | None` is the `project-of` lookup. It always runs locally.
+- `land_review(row, if_proposed=False, *, verb="recorded") -> list[str]` lands a proposal. `verb="recorded"` uses the proposal's verb; the `land` command uses it.
+- `drop_review(row, verdict, if_proposed=False) -> list[str]` drops a proposal.
+
+Both review functions return the output lines and raise `FeatureLogError` on a refusal. With `if_proposed`, an absent proposal returns `skipped: no proposal for <row>`. Off host, they forward the matching command by ssh, capture its output, and raise `FeatureLogError` with the remote stderr on a nonzero exit. `FeatureLogError.diagnostic` gives the text with one `feature_log: ` prefix, local or remote.
 
 ### Close-out paths
 
@@ -363,7 +386,8 @@ Rules the backfill followed, which bind any correction:
 - Project repositories are evidence: read at a recorded ref, never edited. `inventory.py` runs git with `GIT_OPTIONAL_LOCKS=0`.
 - `PROJECTS`, `vault_dir()`, `state_dir()` and `locked()` are the import surface. No other script reads a path constant. Every write to notes, events, proposals, the cursor and ledgers holds `locked()`.
 - A refusal writes nothing. Repeating a writing call adds no second note and no second event.
-- One live note per link per project unless `--separate-result`. A live note has `replaced_by: []`; a superseded note names at least one replacement, and every note it names exists.
+- Shared live links require `--separate-result` or a review proposal for each result. A live note has `replaced_by: []`.
+- A superseded note names at least one replacement. Each replacement note exists.
 - A split loses nothing: every sentence of the old note is in a replacement or in a remainder that holds no release.
 - `--link`, `--completed` and `--release` on `amend` require `--backfill`; link and date travel together.
 - A new note's `completed_date` is the given `--completed` or the linked commit's committer date. It never falls back to the logging date: a commit no checkout holds is refused.
@@ -397,7 +421,7 @@ The script:
 - A test that omits `--completed` needs a link to a real commit in a temp checkout; a made-up sha is refused.
 - A note is dated from natedev's checkouts. A commit not yet fetched into any of them is refused until it is fetched or `--completed` is given.
 - A kill between a note and its event leaves a note with no event; the next identical call appends it. For link, date and release amendments the order is reversed: the event exists and the note lags until a retry.
-- `propose` checks a link against notes already written. Two open proposals for one merge cannot see each other, so the second is refused at landing unless every row carries `--separate-result`.
+- `propose` checks links against existing notes. Landing accepts separate review rows on one link, including old proposals without `--separate-result`.
 - `--backfill` only omits the `@Unreleased` default; `add`, `supersede` and `amend` each accept `--backfill --release X@Unreleased`.
 - `amend` takes no `--production` or `--unit`; they belong to `add` and `supersede`.
 - A `live` read can fail once with `missing opening frontmatter delimiter` when it catches a note mid-rewrite while Obsidian runs on natedev. The script's own writes are atomic, and `.<name>.tmp` files are never globbed.

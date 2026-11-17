@@ -1,6 +1,10 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Read live configuration, complete missing default values, and recover invalid values from Git."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
@@ -15,6 +19,8 @@ import socket
 import subprocess
 import sys
 from typing import TYPE_CHECKING, TypeVar
+
+from scripts.lib import conf_reads
 
 
 if TYPE_CHECKING:
@@ -59,6 +65,7 @@ class Unusable(ValueError):
 
 @dataclass(frozen=True)
 class Setting:
+    """The setting holds its stored value, limit, and source line."""
     value: str
     limit: str
     line: int
@@ -69,17 +76,20 @@ Result = TypeVar("Result")
 
 @dataclass(frozen=True)
 class UsableLiveValue[Value]:
+    """The live configuration supplies this usable value."""
     value: Value
 
 
 @dataclass(frozen=True)
 class RecoveredValue[Value]:
+    """The recovered configuration value includes the reason for recovery."""
     value: Value
     reason: str
 
 
 @dataclass(frozen=True)
 class UnavailableValue:
+    """The reason explains why no usable configuration value is available."""
     reason: str
 
 
@@ -89,6 +99,7 @@ class _MissingKey(ValueError):
 
 @dataclass(frozen=True)
 class _UnreadableFile:
+    """The file read failure holds its reason and whether the file is missing."""
     reason: str
     missing: bool
 
@@ -221,6 +232,7 @@ def directory() -> Path:
 
 
 def path(file: str | Path) -> Path:
+    conf_reads.record(file if isinstance(file, str) else file.stem)
     if isinstance(file, Path):
         return file.expanduser()
     if not file or Path(file).name != file or file.endswith(".conf"):
@@ -230,6 +242,7 @@ def path(file: str | Path) -> Path:
 
 def _repository_path(stem: str) -> Path:
     """Return the repository configuration file for a validated stem."""
+    conf_reads.record(stem)
     return Path(__file__).resolve().parents[2] / "config" / f"{stem}.conf"
 
 
@@ -237,13 +250,18 @@ def _parse(source: str) -> dict[str, Setting]:
     settings: dict[str, Setting] = {}
     previous = ""
     for index, raw in enumerate(source.splitlines()):
-        line = raw.split("#", 1)[0].strip()
+        line = re.split(r"(?:^|\s)#", raw, maxsplit=1)[0].strip()
         if line and not line.startswith("["):
             key, separator, value = line.partition("=")
             if separator:
                 _ = settings.setdefault(key.strip(), Setting(value.strip(), previous, index))
         previous = raw.strip()
     return settings
+
+
+def settings(source: str) -> dict[str, Setting]:
+    """Return each stored key of a config text, with its first value and line."""
+    return _parse(source)
 
 
 def _setting(settings: dict[str, Setting], key: str) -> Setting:

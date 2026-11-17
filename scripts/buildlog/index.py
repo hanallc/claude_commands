@@ -30,13 +30,19 @@ from urllib.parse import quote
 from scripts.buildlog import store, parse
 
 from scripts.lib import conf
-from scripts.test_times.gate_record import TYPE_CHECK_JOB
+from scripts.test_times.gate_record import (
+    TYPE_CHECK_JOB, RecordedConfigReads, RecordedContentReads, RecordedFolderScans,
+    folder_scan_strings, module_read_record,
+)
 
-SCHEMA_VERSION = 36
+SCHEMA_VERSION = 42
 
 
 # These indexes support repeated queries over the current schema.
 COST_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS steps_linked_started ON steps (started_at, host) WHERE step_link IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS steps_linked_result ON steps"
+    + " (step_link, is_final_result, ended_at DESC, id DESC) WHERE step_link IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS steps_session_previous ON steps (session, started_at_us DESC, id DESC) WHERE step = 'nextest'",
     "CREATE INDEX IF NOT EXISTS steps_execution_end ON steps ((unixepoch(started_at,'subsec') + duration_s)) WHERE duration_s > 0",
     "CREATE INDEX IF NOT EXISTS steps_wait_started ON steps ((unixepoch(started_at,'subsec'))) WHERE mem_wait_s > 0",
@@ -89,6 +95,19 @@ class JobRunState(StrEnum):
     CARRIED_OVER = "carried_over"
 
 
+PLACEMENT_COLUMNS: list[Column] = [
+    ("step_link", "TEXT", "call and placement episode; NULL for older rows"),
+    ("placement_episode", "TEXT", "queue placement episode"),
+    ("placement_attempt", "TEXT", "queue execution attempt"),
+    ("execution_generation", "TEXT", "verified deployment, start, and boot identity"),
+    ("source_key", "TEXT", "source key bound to the captured commit"),
+    ("source_commit", "TEXT", "full captured commit; distinct from the verify source key"),
+    ("toolchain_identity", "TEXT", "source toolchain fingerprint; distinct from rustc -V"),
+    ("attempt_role", "TEXT", "remote or fallback; NULL for older rows"),
+    ("is_final_result", "INTEGER", "1 for the selected result, 0 for a lost attempt; NULL for older rows"),
+]
+
+
 STEP_COLUMNS: list[Column] = [
     ("id", "TEXT PRIMARY KEY", "host-UTC time-random"),
     ("src", "TEXT", "the JSON lines file the row came from, relative to the root"),
@@ -127,7 +146,7 @@ STEP_COLUMNS: list[Column] = [
     ("tty", "INTEGER", "1 when a terminal watched it; then no log facts are recorded"),
     ("status", "INTEGER", "exit status; 128+n for signal n"),
     ("rustc", "TEXT", "rustc -V for the step's toolchain"),
-    ("peak_mem_bytes", "INTEGER", "cgroup memory.peak of the step (page cache included); natedev only"),
+    ("peak_mem_bytes", "INTEGER", "cgroup memory.peak on the execution host, including page cache"),
     ("test_phase_charge_bytes", "INTEGER", "charge admission used for the test phase; NULL when no charge was recorded"),
     ("mem_stall_some_s", "REAL", "seconds at least one task waited on memory; natedev only"),
     ("mem_stall_full_s", "REAL", "seconds every task waited on memory; natedev only"),
@@ -155,6 +174,7 @@ STEP_COLUMNS: list[Column] = [
     ("build_directory", "TEXT NOT NULL", "resolved Cargo intermediate root; unknown when the record has no output pair"),
     ("build_history_group", "TEXT", "real folder or legacy checkout group; NULL for none or unresolved"),
     ("identity_derived", "INTEGER NOT NULL DEFAULT 0", "1 when the index derives the repository key from the call"),
+    *PLACEMENT_COLUMNS,
 ]
 
 TEST_COLUMNS: list[Column] = [
@@ -173,6 +193,7 @@ TEST_COLUMNS: list[Column] = [
 ]
 
 GATE_RUN_COLUMNS: list[Column] = [
+    ("vcpus", "INTEGER", "vCPU count; absent for old records"),
     ("step", "TEXT", "targeted-test or merge-gate; empty for old records"),
     ("id", "TEXT PRIMARY KEY", "gate run identity"),
     ("src", "TEXT", "source file"),
@@ -214,6 +235,8 @@ GATE_MODULE_COLUMNS: list[Column] = [
     ("src", "TEXT", "source file"),
     ("host", "TEXT", "host"),
     ("started_at", "TEXT", "the run's start"),
+    ("module_started_at", "TEXT", "the module attempt's start, UTC ISO; NULL when not recorded"),
+    ("module_ended_at", "TEXT", "the module attempt's end, UTC ISO; NULL when not recorded"),
     ("suite", "TEXT", "suite name"),
     ("module", "TEXT", "test module; basedpyright for the types suite"),
     ("attempt", "INTEGER", "execution number from 1; includes hold restarts and reruns"),
@@ -229,6 +252,9 @@ GATE_MODULE_COLUMNS: list[Column] = [
     ("errors", "INTEGER", "test errors"),
     ("skipped", "INTEGER", "skipped tests"),
     ("tests_s", "REAL", "sum of all test times"),
+    ("config_reads", "TEXT", "sorted JSON config stems; [] records no reads, NULL means no record"),
+    ("folder_scans", "TEXT", "sorted JSON repository folders; [] records no scans, NULL means no record"),
+    ("content_reads", "TEXT", "sorted JSON repository file reads; [] records no reads, NULL means no record"),
 ]
 
 GATE_TEST_COLUMNS: list[Column] = [
@@ -434,12 +460,12 @@ MAC_IDLE_COLUMNS: list[Column] = [
     ("call_id", "TEXT", "verify call; joins calls.id after the call ends"),
     ("pid", "INTEGER", "verify process id"),
     ("proc_start", "TEXT", "process start ticks; guards pid reuse"),
-    ("session", "TEXT", "live call session"),
+    ("session", "TEXT", "live call session; rows before 2026-11-15 only"),
     ("repo", "TEXT", "call repository path"),
     ("package", "TEXT", "test package"),
-    ("wait", "TEXT", "memory, build_hold, cargo_token or routing; backed by live wait evidence"),
-    ("cause", "TEXT", "missing_temp_root, missing_leave_hook, retry_delayed, call_has_no_marker_hook or idle_with_waiter"),
-    ("action", "TEXT", "created_session_temp_root, retry_marker, message_showrunner or message_pending (send retried; row stays once)"),
+    ("wait", "TEXT", "memory, build_hold or routing; backed by live wait evidence; older rows also cargo_token"),
+    ("cause", "TEXT", "missing_leave_hook or idle_with_waiter; older rows also missing_temp_root, retry_delayed or call_has_no_marker_hook"),
+    ("action", "TEXT", "recorded, message_showrunner or message_pending (send retried; row stays once); older rows also created_session_temp_root or retry_marker"),
 ]
 
 QUEUE_BUMP_COLUMNS: list[Column] = [
@@ -470,6 +496,7 @@ SSH_ATTEMPT_COLUMNS: list[Column] = [
     ("cleanup", "TEXT", "confirmed or unconfirmed cleanup evidence"),
     ("unresolved_count", "INTEGER", "remaining processes; NULL when unavailable"),
     ("evidence_at", "REAL", "ownership evidence timestamp"),
+    *PLACEMENT_COLUMNS,
 ]
 
 TABLES: dict[str, tuple[list[Column], str, str]] = {
@@ -511,6 +538,13 @@ TABLES: dict[str, tuple[list[Column], str, str]] = {
 GATE_TABLES = tuple(table for table in TABLES if table.startswith("gate_"))
 
 VIEWS: dict[str, tuple[str, str]] = {
+    "logical_step_results": (
+        "one final result per linked call and episode; older unlinked steps retain their identities",
+        """SELECT * FROM steps WHERE coalesce(is_final_result, 1) = 1
+AND (step_link IS NULL OR id = (
+    SELECT final.id FROM steps AS final WHERE final.step_link = steps.step_link AND final.is_final_result = 1
+    ORDER BY final.ended_at DESC, final.id DESC LIMIT 1))""",
+    ),
     "holds": (
         "one interval per began row; ends when the next row of its key is ended; a next began or no later row leaves ended_at NULL; an ended row without a preceding began has began_at NULL; previous_at and next_at bound missing events; later_row is 1 when a later row exists; no row proves a hold is in force now",
         """WITH ordered AS (
@@ -951,7 +985,15 @@ def add_gate_run(connection: sqlite3.Connection, record: dict[str, object], src:
     for suite_row in entries(record, "suites"):
         insert(connection, "gate_suites", pick({**suite_row, **parent}, GATE_SUITE_COLUMNS))
     for module in module_rows:
-        insert(connection, "gate_modules", pick({**module, **parent}, GATE_MODULE_COLUMNS))
+        reads = module_read_record(module.get("config_reads"), module.get("folder_scans"), module.get("content_reads"))
+        config_reads = json.dumps(sorted(reads.config_reads.stems)) if isinstance(reads.config_reads, RecordedConfigReads) else None
+        folder_scans = json.dumps(folder_scan_strings(reads.folder_scans)) if isinstance(reads.folder_scans, RecordedFolderScans) else None
+        content_reads = json.dumps(sorted(reads.content_reads.paths)) if isinstance(reads.content_reads, RecordedContentReads) else None
+        insert(connection, "gate_modules", pick({**module, **parent,
+                                                "module_started_at": module.get("started_at"),
+                                                "module_ended_at": module.get("ended_at"),
+                                                "config_reads": config_reads,
+                                                "folder_scans": folder_scans, "content_reads": content_reads}, GATE_MODULE_COLUMNS))
         owner: GateTestOwner = {
             **parent,
             "suite": module.get("suite"),
@@ -1149,7 +1191,7 @@ def cleanup_unused_indexes(root: Path, current: Path, settings: conf.ConfigRead)
         except FileNotFoundError:
             remove_index(path)
         else:
-            if path.name == LEGACY_INDEX_NAME or max(changed.st_atime, changed.st_mtime) < cutoff:
+            if path.name == LEGACY_INDEX_NAME or changed.st_mtime < cutoff:
                 remove_index(path)
 
 

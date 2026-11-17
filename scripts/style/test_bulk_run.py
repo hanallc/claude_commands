@@ -1,10 +1,12 @@
 """Workspace bulk runs use temporary Git repos and a fake command runner; never build Rust."""
 from __future__ import annotations
 
-from scripts.production.staff_test_support import foreign_hostname
+from scripts.production.staff_test_support import foreign_hostname, isolated_staff_file
 
 import json
+import fcntl
 import os
+import shutil
 import signal
 import tempfile
 import sqlite3
@@ -17,7 +19,7 @@ from collections.abc import Callable, Iterable, Sequence
 from contextlib import closing, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-from typing import TypedDict, cast, final, override
+from typing import ClassVar, TypedDict, cast, final, override
 from types import SimpleNamespace
 
 
@@ -26,9 +28,12 @@ from scripts.style import style_sync
 from scripts.style import bulk_rename as bulk
 from scripts.style import fake_fmt
 from scripts.style.style_child_test_support import StyleQueueFake, install_refusal_tools, unqueued_style_children
+from scripts.style.style_reader_test_support import oracle_reader
 from scripts.build_queue import queue_place
 from scripts.style.style_plan_test_support import unit_staff_id
-from scripts.lib import berth_board
+from scripts.lib import berth_board, build_folders
+from scripts.copies import copies
+from scripts.copies.copies_test_support import copies_environment
 from scripts.style import rules
 from scripts.style.ledger_test_support import machine_rename_fixture, MACHINE_RENAME_AFTER, ticket_owner_id
 from scripts.style import style_ledger as ledger_api
@@ -37,6 +42,7 @@ from scripts.style.test_bulk_rename import CargoProjectTests, ScriptedServer, wo
 
 
 def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
     unittest.enterModuleContext(foreign_hostname())
 
 
@@ -83,11 +89,69 @@ class FakeRunner:
         return run.CommandResult(0)
 
 
-class WorkspaceRunTests(CargoProjectTests):
+class BulkRunFixture(CargoProjectTests):
+    fixture_root: ClassVar[Path]
+    fixture_seed: ClassVar[Path]
+    fixture_environment: ClassVar[dict[str, str]]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.prepare_project_seed()
+        cls.fixture_seed = cls.project_seed.parent / "fixture"
+        fixture = cls(methodName="runTest")
+        environment = os.environ.copy()
+        try:
+            CargoProjectTests.setUp(fixture)
+            fixture.enterContext(mock.patch.dict(os.environ, copies_environment(fixture.root)))
+            cls.fixture_root = fixture.root
+            cls.fixture_environment = {key: value for key, value in os.environ.items()
+                                       if environment.get(key) != value}
+            _ = shutil.copytree(fixture.root, cls.fixture_seed, symlinks=True)
+        finally:
+            fixture.doCleanups()
+
+    @classmethod
+    def prepare_project_seed(cls) -> None:
+        pass
+
+    @override
+    def setUp(self) -> None:
+        if self.fixture_root.exists():
+            super().setUp()
+            return
+        self.root: Path = self.fixture_root
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
+        self.repo: Path = self.root / "project"
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.fixture_environment)))
+        _ = self.enterContext(oracle_reader())
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        self.queue: StyleQueueFake = self.enterContext(unqueued_style_children())
+
+
+class WorkspaceRunTests(BulkRunFixture):
     base: str = ""
     tree: str = ""
     runner: FakeRunner = FakeRunner()
     server: ScriptedServer = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
+
+    @classmethod
+    @override
+    def prepare_project_seed(cls) -> None:
+        fixture = cls(methodName="runTest")
+        fixture.repo = cls.project_seed
+        _ = (fixture.repo / "Cargo.toml").write_text(
+            (fixture.repo / "Cargo.toml").read_text() + '\n[workspace]\nmembers=[".", "beta"]\n')
+        (fixture.repo / "beta/src").mkdir(parents=True)
+        _ = (fixture.repo / "beta/Cargo.toml").write_text(
+            '[package]\nname="beta"\nversion="0.1.0"\nedition="2021"\n')
+        _ = (fixture.repo / "beta/src/lib.rs").write_bytes((fixture.repo / "src/lib.rs").read_bytes())
+        _ = fixture.git("add", ".")
+        _ = fixture.git("commit", "-qm", "workspace fixture")
+        cls.base = fixture.git("rev-parse", "HEAD")
+        cls.tree = fixture.git("rev-parse", "HEAD^{tree}")
 
     def assert_refused_writer_releases_its_finding(self, *, shared_proposal: bool) -> None:
         ledger, definition, findings = self.setup_findings(shared_proposal=shared_proposal)
@@ -350,19 +414,13 @@ class WorkspaceRunTests(CargoProjectTests):
     def setUp(self) -> None:
         super().setUp()
         self.enterContext(mock.patch.dict(os.environ, {
+            **copies_environment(self.root),
             "HOME": str(self.root / "gate-home"),
             "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
         }))
         _ = self.enterContext(mock.patch.object(style_sync, "gate_owner", return_value="sample-style"))
 
-        _ = (self.repo / "Cargo.toml").write_text((self.repo / "Cargo.toml").read_text() + '\n[workspace]\nmembers=[".", "beta"]\n')
-        (self.repo / "beta/src").mkdir(parents=True)
-        _ = (self.repo / "beta/Cargo.toml").write_text('[package]\nname="beta"\nversion="0.1.0"\nedition="2021"\n')
-        _ = (self.repo / "beta/src/lib.rs").write_bytes((self.repo / "src/lib.rs").read_bytes())
-        _ = self.git("add", ".")
-        _ = self.git("commit", "-qm", "workspace fixture")
-        self.base = self.git("rev-parse", "HEAD")
-        self.tree = self.git("rev-parse", "HEAD^{tree}")
+        _ = self.git("update-index", "--refresh")
         self.runner = FakeRunner()
         self.server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
 
@@ -384,20 +442,41 @@ class WorkspaceRunTests(CargoProjectTests):
         self.addCleanup(ledger.close)
         destination = "refs/heads/cli-destination"
         _ = self.git("update-ref", destination, self.base)
+        batch = crate_run.CrateRun(ledger, "cli")
+        end_workspaces = copies.end_workspaces
+
+        def remove_under_run_lock(task: str, paths: list[Path], *,
+                                  run_lock: copies.CrateRunRemovalLock = copies.ACQUIRE_CRATE_RUN_LOCK) -> None:
+            with (batch.folder / "run.lock").open("a") as second:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(second, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                end_workspaces(task, paths, run_lock=run_lock)
+
         with mock.patch.object(run, "execute_plan", wraps=run.execute_plan) as execute:
-            self.assertEqual(self.crate_cli(ledger, ["--crate", "bulk_sample", "--run", "cli",
-                             "--rule", definition.rule_id, "--base-tree", self.tree,
-                             "--destination", destination]), 0)
+            with mock.patch.object(copies, "end_workspaces", side_effect=remove_under_run_lock):
+                self.assertEqual(self.crate_cli(ledger, ["--crate", "bulk_sample", "--run", "cli",
+                                 "--rule", definition.rule_id, "--base-tree", self.tree,
+                                 "--destination", destination]), 0)
             batch = crate_run.CrateRun(ledger, "cli")
             first = batch.read()["crates"]["bulk_sample"]
             self.assertEqual(first["stage"], crate_run.CrateStage.INTEGRATED)
+            self.assertFalse(Path(first["checkout"]).exists())
             self.assertEqual(batch.read()["crates"]["beta"]["stage"], crate_run.CrateStage.SELECTED)
+            with self.subTest("terminal resume removes a remaining copy"):
+                with copies.workspace(batch.owner, self.repo, self.base, name=Path(first["checkout"]).name,
+                                      branch=first["branch"], task=batch.task, run_manifest=batch.path) as remaining:
+                    self.assertEqual(str(remaining), first["checkout"])
+                self.assertTrue(remaining.exists())
+                with mock.patch.object(batch, "frozen_checkout", side_effect=AssertionError("terminal crate reopened")):
+                    self.assertEqual(batch.advance("bulk_sample"), batch.read())
+                self.assertFalse(remaining.exists())
             with mock.patch.object(run, "select", side_effect=AssertionError("no reselection")):
                 self.assertEqual(self.crate_cli(ledger, ["--crate", "beta", "--run", "cli"]), 0)
             self.assertEqual(execute.call_count, 2)
         result = batch.read()
         for record in result["crates"].values():
             self.assertEqual(record["stage"], crate_run.CrateStage.INTEGRATED)
+            self.assertFalse(Path(record["checkout"]).exists())
             checkpoint = batch.result(record)["commit"]
             self.assertEqual(self.git("merge-base", checkpoint, destination), checkpoint)
             self.assertEqual(self.git("rev-parse", record["branch"]), checkpoint)
@@ -421,6 +500,44 @@ class WorkspaceRunTests(CargoProjectTests):
         result = crate_run.CrateRun(ledger, "sequence").read()
         self.assertTrue(all(record["stage"] == crate_run.CrateStage.INTEGRATED
                             for record in result["crates"].values()))
+        self.assertTrue(all(not Path(record["checkout"]).exists() for record in result["crates"].values()))
+        self.doCleanups()
+        with self.subTest(failed_crate_copy="adopted"):
+            case = WorkspaceRunTests(methodName="runTest")
+            case.setUp()
+            try:
+                failed_ledger, failed_definition, _ = case.setup_findings()
+                case.addCleanup(failed_ledger.close)
+                _ = case.git("update-ref", destination, case.base)
+                batch = crate_run.CrateRun(failed_ledger, "failed")
+                batch.create(failed_definition, case.tree, destination)
+                manifest = batch.read()
+                record = manifest["crates"]["bulk_sample"]
+                adopted = case.root / "adopted" / "worker"
+                adopted.mkdir(parents=True)
+                copies.initialize_git(adopted, case.repo)
+                _ = run.git(adopted, "checkout", "-q", "-B", record["branch"].removeprefix("refs/heads/"), case.base)
+                record["checkout"] = str(adopted)
+                record["intent"] = str(adopted / ".git/style-batch-intent.json")
+                batch.save(manifest)
+                case.runner.red_tests = True
+                self.assertEqual(case.crate_cli(failed_ledger, ["--crate", "bulk_sample", "--run", "failed",
+                                 "--rule", failed_definition.rule_id, "--base-tree", case.tree,
+                                 "--destination", destination]), 1)
+                batch = crate_run.CrateRun(failed_ledger, "failed")
+                failed = batch.read()["crates"]["bulk_sample"]
+                self.assertEqual(failed["stage"], crate_run.CrateStage.ABANDONED)
+                self.assertFalse(Path(failed["checkout"]).exists())
+                self.assertEqual(batch.read()["crates"]["beta"]["stage"], crate_run.CrateStage.SELECTED)
+                with mock.patch.object(batch, "frozen_checkout", side_effect=AssertionError("terminal crate reopened")):
+                    self.assertEqual(batch.advance("bulk_sample"), batch.read())
+                self.assertFalse(Path(failed["checkout"]).exists())
+                case.runner.red_tests = False
+                self.assertEqual(case.crate_cli(failed_ledger, ["--crate", "beta", "--run", "failed"]), 0)
+                self.assertEqual(batch.read()["crates"]["beta"]["stage"], crate_run.CrateStage.INTEGRATED)
+                self.assertTrue(all(not Path(record["checkout"]).exists() for record in batch.read()["crates"].values()))
+            finally:
+                case.doCleanups()
 
     def test_cli_without_crate_uses_unchanged_workspace_run(self) -> None:
         ledger, definition, _ = self.setup_findings()
@@ -700,11 +817,21 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertFalse(intent.path.exists())
 
     def test_admission_window_preserves_only_admission_interrupts(self) -> None:
+        seed = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="admission-window-seed-"))) / "case"
+        # Keep recorded paths valid when each case restores the private staff and repository.
+        _ = shutil.copytree(self.root, seed, symlinks=True)
         for case in ("cleanup_interrupt", "recovery_interrupt", "startup_interrupt", "tested_interrupt"):
             with self.subTest(case=case):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(seed, self.root, symlinks=True)
                 fixture = WorkspaceRunTests(methodName="runTest")
+                fixture.root = self.root
+                fixture.repo = self.repo
+                fixture.runner = FakeRunner()
+                fixture.server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
                 try:
-                    fixture.setUp()
+                    fixture.queue = fixture.enterContext(unqueued_style_children())
+                    _ = fixture.git("update-index", "--refresh")
                     fixture.check_admission_window(case)
                 finally:
                     _ = fixture.doCleanups()
@@ -1520,7 +1647,8 @@ class WorkspaceRunTests(CargoProjectTests):
                                        ("bash", verify, "final", "--saved", "--tree", str(report["tested_tree"]))])
         self.assertTrue(all(folder == self.runner.test_checkout for folder, args in self.runner.calls if args[0] == "bash"))
         self.assertNotEqual(self.runner.test_checkout, self.repo)
-        self.assertTrue((self.runner.test_checkout / ".git").is_dir())
+        self.assertTrue(self.runner.test_checkout.exists())
+        self.assertEqual(build_folders.build_folder_state(self.runner.test_checkout), "free")
         self.assertEqual(self.runner.test_tree, report["tested_tree"])
         self.assertEqual(self.git("rev-list", "--count", f"{self.base}..HEAD"), "1")
         self.assertIn(f"Tested-Tree: {report['tested_tree']}", self.git("log", "-1", "--format=%B"))
@@ -2094,7 +2222,8 @@ class WorkspaceRunTests(CargoProjectTests):
                 self.runner.mutate_stage = stage
                 with self.assertRaisesRegex(bulk.BulkRenameError, "clean checkout"):
                     _ = run.test_tree(self.repo, self.base, self.tree, self.runner, {})
-                self.assertTrue((self.runner.test_checkout / ".git").is_dir())
+                self.assertTrue(self.runner.test_checkout.exists())
+                self.assertEqual(build_folders.build_folder_state(self.runner.test_checkout), "free")
                 self.assertEqual("final --saved" if self.runner.calls[-1][1][2:4] == ("final", "--saved") else self.runner.calls[-1][1][2], stage)
 
     def test_hidden_untracked_test_output_never_publishes_or_keeps_the_batch_commit(self) -> None:
@@ -2118,7 +2247,8 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git("status", "--porcelain=v1", "--untracked-files=all"), "")
         self.assertEqual([("final --saved" if args[2:4] == ("final", "--saved") else args[2]) for _, args in self.runner.calls if args[0] == "bash"], ["final"])
-        self.assertTrue((self.runner.test_checkout / ".git").is_dir())
+        self.assertTrue(self.runner.test_checkout.exists())
+        self.assertEqual(build_folders.build_folder_state(self.runner.test_checkout), "free")
         self.assertFalse(tuple(ticket for ticket in ledger.proposal_tickets()
                                if ticket["state"] not in ledger_api.FINAL_TICKET_STATES))
         self.assertTrue(all(isinstance(f.build_ticket, ledger_api.NoBuildTicket)
@@ -2142,7 +2272,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertTrue(all("let number" in file.edited for file in planned.files))
 
 
-class FreshMachineJudgmentTests(CargoProjectTests):
+class FreshMachineJudgmentTests(BulkRunFixture):
     def fresh_case(self, current: str = MACHINE_RENAME_AFTER
                    ) -> tuple[ledger_api.Ledger, ledger_api.HeldFinding, str]:
         ledger = self.ledger()

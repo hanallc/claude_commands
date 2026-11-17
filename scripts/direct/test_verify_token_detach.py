@@ -1,7 +1,12 @@
 """Real verify.sh token detach behavior."""
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import tempfile
+from typing import ClassVar, override
 import unittest
+from unittest import mock
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY
 
 
@@ -42,6 +47,28 @@ class VerifyTokenDetachTests(VerifyTokenWaitFixture):
         self.assertEqual(self.detached_runs_calls(), [])
         self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
 
+
+class VerifyTokenDetachInsideDetachedRunTests(VerifyTokenDetachTests):
+    """The same calls from a suite that a detached run started, as a merge gate does."""
+
+    outer_record: ClassVar[Path]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        outer = tempfile.TemporaryDirectory(prefix="outer-run-")
+        cls.addClassCleanup(outer.cleanup)
+        cls.outer_record = Path(outer.name) / "outer-run.json"
+        with mock.patch.dict(os.environ, {"UNIT_DETACHED_RUN": "1", "UNIT_DETACHED_RECORD": str(cls.outer_record)}):
+            super().setUpClass()
+
+    @override
+    def tearDown(self) -> None:
+        try:
+            # verify.sh under test never saves its exit into the outer run's record.
+            self.assertNotIn("record-exit", [call[0] for call in self.detached_runs_calls()])
+        finally:
+            super().tearDown()
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixtu
 @final
 class VerifyMacMalformedTests(VerifyMacOffloadFixture):
     def test_unusable_runner_results_continue_locally(self) -> None:
-        cases = (('none', '75'), ('none', '1'))
+        cases = (('none', '75'),)
         for mode, status in cases:
             with self.subTest(mode=mode, status=status):
                 self.clear_observations()

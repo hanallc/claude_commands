@@ -10,6 +10,7 @@ except FileNotFoundError:
 import argparse
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -20,13 +21,14 @@ from typing import cast
 SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.production import showrunners, staff
+from scripts.lib import build_folders
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.production import showrunner_tree
 from scripts.production.add_showrunner import NoEndingTab, herdr_tab_open
 from scripts.herdr import herdr
 from scripts.production.production_doc import Production, Refusal, production_field, read_production, read_new_production, optional_field, FieldPresent
 
-from scripts.style import rules
+from scripts.style import rules, style_config
 from scripts.style import style_ledger
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -132,7 +134,16 @@ def _git(repo: Path, *arguments: str) -> str:
 
 
 def standing_style_production(repo_dir: Path) -> StandingStyleProduction | NoStyleProduction:
-    """Locate the repository's standing production without changing any state."""
+    """Locate the repository's standing style production."""
+    return _style_production(repo_dir, include_direct=False)
+
+
+def configured_style_production(repo_dir: Path) -> StandingStyleProduction | NoStyleProduction:
+    """Locate the production that controls the repository's configured style units."""
+    return _style_production(repo_dir, include_direct=True)
+
+
+def _style_production(repo_dir: Path, *, include_direct: bool) -> StandingStyleProduction | NoStyleProduction:
     repository = Path(_git(repo_dir, "rev-parse", "--path-format=absolute", "--git-common-dir")).parent
     trees = tuple(Path(line.removeprefix("worktree ")) for line in
                   _git(repository, "worktree", "list", "--porcelain").splitlines() if line.startswith("worktree "))
@@ -147,6 +158,9 @@ def standing_style_production(repo_dir: Path) -> StandingStyleProduction | NoSty
         if optional_field(lines, "Kind") == FieldPresent("style"):
             branch_point = production_field(lines, "Branch point").removeprefix("refs/heads/")
             return StandingStyleProduction(repository, row.name, checkout, doc, branch_point)
+        if include_direct and style_config.has_style_units(lines):
+            config = style_config.read_config(doc)
+            return StandingStyleProduction(repository, row.name, checkout, doc, config.route.branch_point)
     return NoStyleProduction(repository, f"{repository.name}-style")
 
 
@@ -205,16 +219,25 @@ def _production_text(style: StyleProduction) -> str:
         f"- **Log:** {style.log}",
         f"- **Proposals:** {style.proposals}",
         "- **Updates:** on demand", "- **Push:** git", *style.merge_tests, "",
+        "## Style units", "", "| Unit | Families | Open tickets |", "| --- | --- | --- |",
+        *(f"| {style.name}-{family} | {family} | 1 |" for family in FAMILIES), "",
+        "## Unit launch", "",
+        "Launch each configured unit through `production/add_unit.py --unit-type style`.",
+        "The selected command is `/unit:style`; read `docs/direct/style_unit.md` for ticket contracts.", "",
     ])
 
 
-def _plan_text(style: StyleProduction, family: rules.Family, catalog: tuple[rules.Rule, ...]) -> str:
-    family_rules = [f"  - `{rule.rule_id}` — tier {rule.tier}" for rule in catalog if rule.family == family]
+def _plan_text(style: StyleProduction, assignment: style_config.StyleUnitAssignment, catalog: tuple[rules.Rule, ...]) -> str:
+    family = ", ".join(assignment.families)
+    family_rules = [f"  - `{rule.rule_id}` — tier {rule.tier}" for rule in catalog if rule.family in assignment.families]
     return "\n".join([
-        f"# {style.name} — {family}", "",
+        f"# {assignment.unit} — {family}", "",
         "> **Standing:** style_plan.py", "", "## Delegation Context", "",
         f"- **Project:** {style.repository.name} — standing {family} style coverage",
         f"- **Repository:** {style.repository}",
+        (f"- **Launch:** `~/.claude/scripts/lib/py ~/.claude/scripts/production/add_unit.py "
+         + f"--production {style.name} {assignment.unit} --unit-type style "
+         + f"--plan {PLAN_DIRECTORY / (assignment.unit + '-unit.md')}`"),
         "- **Stack:** Rust; Python style ledger and ticket planner",
         "- **Layout:** Ticket files are selected at refill; this unit owns no files.",
         "- **Key files:** `~/.claude/docs/style_production.md` — standing procedure, yielding and mechanical criteria",
@@ -350,7 +373,7 @@ def _steps(style: StyleProduction, existing: bool) -> tuple[str, ...]:
         f"ensure {style.merge_branch} from {style.branch_tip} and worktree {style.checkout}",
         (f"set Proposals in existing production doc {style.doc}"
          if style.doc.exists() else f"write missing production doc {style.doc}"),
-        f"write four missing standing plans under {style.checkout / PLAN_DIRECTORY}",
+        f"write missing standing plans for the configured units under {style.checkout / PLAN_DIRECTORY}",
         f"exclude docs/style-production/, {style.doc.relative_to(style.checkout)} and {style.log} in shared info/exclude",
         f"initialize ledger at {style.branch_tip} with {style.merge_branch}; launch via add_showrunner.py",
     )
@@ -389,15 +412,25 @@ def main(argv: list[str]) -> int:
                 ["git", "-C", str(style.repository), "show-ref", "--verify", "--quiet", f"refs/heads/{style.merge_branch}"],
                 check=False, capture_output=True, text=True,
             )
+            branch: build_folders.NewWorktreeBranch | build_folders.ExistingWorktreeBranch
             if present.returncode == 1:
-                _ = _git(style.repository, "branch", style.merge_branch, style.branch_tip)
+                branch = build_folders.NewWorktreeBranch(style.merge_branch, style.branch_tip)
             elif present.returncode:
                 raise Refusal(present.stderr.strip())
-            _ = _git(style.repository, "worktree", "add", str(style.checkout), style.merge_branch)
+            else:
+                branch = build_folders.ExistingWorktreeBranch(style.merge_branch)
+            checkout_mode = stat.S_IMODE(style.checkout.stat().st_mode) if style.checkout.exists() else None
+            if checkout_mode is not None:
+                style.checkout.rmdir()
+            _ = build_folders.create_build_folder(build_folders.LinkedEditableRepository(
+                style.checkout, style.repository, branch))
+            if checkout_mode is not None:
+                style.checkout.chmod(checkout_mode)
         _write_missing(style.doc, _production_text(style))
         _update_destination(style)
-        for family in FAMILIES:
-            _write_missing(style.checkout / PLAN_DIRECTORY / f"{style.name}-{family}-unit.md", _plan_text(style, family, catalog))
+        config = style_config.read_config(style.doc)
+        for assignment in config.assignments:
+            _write_missing(style.checkout / PLAN_DIRECTORY / f"{assignment.unit}-unit.md", _plan_text(style, assignment, catalog))
         if isinstance(pilot, PilotUnits):
             _configure_pilot(style, pilot)
         _exclude(style)

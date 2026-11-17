@@ -5,20 +5,26 @@ from __future__ import annotations
 from scripts.lib.test_models_registry import write_registry
 
 import json
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
-from collections.abc import Generator
-from contextlib import contextmanager
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
+from typing import cast
+from unittest import mock
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 HOOK = Path(__file__).with_name("stop-direct-continue.py")
-SESSION = "fixture-director"
+SESSION = fixture_runtime_id("fixture-director")
 # A 200k window reserves 33k for compaction and 25k for the handoff.
 THRESHOLD = 142_000
 
@@ -27,7 +33,7 @@ THRESHOLD = 142_000
 class DirectorStopFixture:
     root: Path
     run: Path
-    marker: Path
+    staff_file: Path
     transcript: Path
     environment: dict[str, str]
 
@@ -37,6 +43,38 @@ class DirectorStopFixture:
                 "model": "claude-sonnet-4", "usage": {"input_tokens": tokens},
             },
         }) + "\n", encoding="utf-8")
+
+    def set_unit_type(self, unit_type: staff.UnitType) -> None:
+        document = cast(dict[str, object], json.loads(self.staff_file.read_text()))
+        rows = cast(list[dict[str, object]], document["rows"])
+        parent_id = staff.StaffId(fixture_runtime_id("fixture-parent"))
+        parent = staff.StaffRow(parent_id, "showrunner", "TEST-parent", staff.StaffRoot(),
+                                current_session=parent_id)
+        rows[0].update(kind="unit", unit_type=unit_type, parent=str(parent.id))
+        rows.append(parent.to_json())
+        _ = self.staff_file.write_text(json.dumps(document))
+
+    def queue_order(self, key: str) -> Path:
+        from scripts.message import send
+
+        path = self.root / "state/message/queue" / send.queue_path(key).name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({
+            "time": "2026-11-16T22:15:00-05:00", "from": "TEST-showrunner",
+            "to": f"staff:{SESSION}", "summary": "Merge order",
+            "text": "Merge the authorized checkpoint.", "reason": "queued",
+            "stable_recipient": f"staff:{SESSION}",
+        }) + "\n")
+        return path
+
+    def add_merge_worker(self) -> staff.StaffId:
+        worker_id = staff.StaffId(fixture_runtime_id("fixture-merge-worker"))
+        worker = staff.StaffRow(worker_id, "worker", "TEST-merge-worker", staff.ReportsTo(staff.StaffId(SESSION)),
+                                current_session=worker_id, role=staff.KnownWorkerRole("test"))
+        document = cast(dict[str, object], json.loads(self.staff_file.read_text()))
+        cast(list[dict[str, object]], document["rows"]).append(worker.to_json())
+        _ = self.staff_file.write_text(json.dumps(document))
+        return worker_id
 
     def call(self, **fields: object) -> subprocess.CompletedProcess[str]:
         payload: dict[str, object] = {
@@ -49,46 +87,299 @@ class DirectorStopFixture:
             env=self.environment, cwd=self.root,
         )
 
+    def call_with_mocked_reads(self) -> subprocess.CompletedProcess[str]:
+        from scripts.message import send
+
+        hook = import_module("scripts.hooks.stop-direct-continue")
+        payload: dict[str, object] = {
+            "session_id": SESSION, "transcript_path": str(self.transcript), "background_tasks": [],
+        }
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = 0
+        with (mock.patch.dict(os.environ, self.environment, clear=True),
+              mock.patch.object(send, "STATE", self.root / "state/message"),
+              mock.patch("sys.stdin", io.StringIO(json.dumps(payload))),
+              redirect_stdout(stdout), redirect_stderr(stderr)):
+            try:
+                cast(Callable[[], None], hook.main)()
+            except SystemExit as error:
+                code = int(str(error.code))
+            except Exception:
+                # Match the script's outer handler for hook errors.
+                pass
+        return subprocess.CompletedProcess([str(HOOK)], code, stdout.getvalue(), stderr.getvalue())
+
 
 @contextmanager
 def director_stop_fixture() -> Generator[DirectorStopFixture]:
     with tempfile.TemporaryDirectory(prefix="stop-hook-") as temporary:
         root = Path(temporary)
-        run = root / "run"
-        run.mkdir()
+        run = root / "unit" / "run"
+        run.mkdir(parents=True)
         history = root / "history" / "run.jsonl"
         history.parent.mkdir()
         _ = history.write_text("", encoding="utf-8")
         _ = (run / "progress_history_state.json").write_text(json.dumps({
             "run_id": "fixture-run", "history_file": str(history),
-            "working_dir": str(root), "status": "active",
+            "owner_staff_id": SESSION,
+            "working_dir": str(root),
             "main_agent": {"session_id": SESSION},
             "phase": {"id": "1", "instance_id": "fixture-phase", "status": "active"},
             "pass": {}, "open_phases": [],
         }), encoding="utf-8")
-        active = root / "active"
-        active.mkdir()
-        marker = active / SESSION
-        _ = marker.write_text(str(run), encoding="utf-8")
         config = root / "models.conf"
         _ = write_registry(config, {'claude.context': {'default': '200k'}}, replace_sections=('claude.context',))
         from scripts.lib.atomic_file import write_text_atomic
 
-        write_text_atomic(root / "staff.json", json.dumps({"schema": 1, "rows": []}))
+        row = staff.StaffRow(staff.StaffId(SESSION), "showrunner", "director", staff.StaffRoot(),
+                             current_session=staff.StaffId(SESSION), run=staff.OpenRun(run))
+        write_text_atomic(root / "staff.json", json.dumps({"schema": 2, "rows": [row.to_json()]}))
         environment = {
             "PATH": os.environ.get("PATH", ""), "HOME": str(root),
             "PYTHONDONTWRITEBYTECODE": "1", "HERDR_BIN": "/nonexistent/herdr",
-            "XDG_STATE_HOME": str(root / "state"), "UNIT_ACTIVE_DIR": str(active),
+            "XDG_STATE_HOME": str(root / "state"), 
             "UNIT_HISTORY_DIR": str(history.parent), "UNIT_SYNC_WRITES": "0",
+            "SCRATCH_ROOT": str(root / "scratch"),
             "CLAUDE_PROBE_SESSION": "0", "MODELS_CONFIG_FILE": str(config),
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200k", "STAFF_FILE": str(root / "staff.json"),
         }
-        fixture = DirectorStopFixture(root, run, marker, root / "transcript.jsonl", environment)
+        fixture = DirectorStopFixture(root, run, root / "staff.json", root / "transcript.jsonl", environment)
         fixture.write_usage(160_000)
         yield fixture
 
 
 class DirectorStopTests(unittest.TestCase):
+    def test_unreadable_queue_does_not_hide_a_readable_pending_order(self) -> None:
+        from scripts.message import send
+
+        with director_stop_fixture() as fixture:
+            fixture.set_unit_type("merge")
+            queued = fixture.queue_order(f"staff:{SESSION}")
+            messages = send.read_queue(queued)
+            unreadable = queued.with_name("unreadable.jsonl")
+            with mock.patch.object(send, "read_queue", side_effect=[
+                    PermissionError(13, "Permission denied", str(unreadable)), messages]):
+                result = fixture.call_with_mocked_reads()
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("/unit:merge run active", result.stderr)
+
+    def test_unreadable_queue_without_work_allows_stop_with_one_anomaly(self) -> None:
+        with director_stop_fixture() as fixture:
+            fixture.set_unit_type("merge")
+            unreadable = fixture.root / "state/message/queue/unreadable.jsonl"
+            unreadable.parent.mkdir(parents=True)
+            _ = unreadable.write_bytes(b"\xff\n")
+            result = fixture.call()
+            self.assertEqual((result.returncode, result.stdout), (0, ""))
+            self.assertEqual(len(result.stderr.splitlines()), 1)
+            self.assertIn("anomaly:", result.stderr)
+            self.assertIn(str(unreadable), result.stderr)
+            self.assertFalse((fixture.run / "compaction_wake_line").exists())
+
+    def test_unknown_dispatch_without_work_allows_stop_and_reports_its_reason(self) -> None:
+        from scripts.direct import progress_history
+
+        with director_stop_fixture() as fixture:
+            fixture.set_unit_type("merge")
+            _ = fixture.add_merge_worker()
+            reason = f"{fixture.run}/progress_history_state.json: Permission denied"
+            with mock.patch.object(progress_history, "active_dispatch",
+                                   return_value=progress_history.ActiveDispatchUnavailable(reason)):
+                result = fixture.call_with_mocked_reads()
+            self.assertEqual((result.returncode, result.stdout), (0, ""))
+            self.assertEqual(len(result.stderr.splitlines()), 1)
+            self.assertIn("anomaly:", result.stderr)
+            self.assertIn(reason, result.stderr)
+            self.assertFalse((fixture.run / "compaction_wake_line").exists())
+
+    def test_unknown_dispatch_does_not_hide_a_pending_order(self) -> None:
+        from scripts.direct import progress_history
+
+        with director_stop_fixture() as fixture:
+            fixture.set_unit_type("merge")
+            _ = fixture.add_merge_worker()
+            _ = fixture.queue_order(f"staff:{SESSION}")
+            with mock.patch.object(progress_history, "active_dispatch",
+                                   return_value=progress_history.ActiveDispatchUnavailable("Cannot read the dispatch.")):
+                result = fixture.call_with_mocked_reads()
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("/unit:merge run active", result.stderr)
+
+    def test_stop_names_the_recorded_unit_command(self) -> None:
+        for unit_type in staff.UNIT_TYPES:
+            with self.subTest(unit_type=unit_type), director_stop_fixture() as fixture:
+                fixture.set_unit_type(unit_type)
+                if unit_type == "merge":
+                    _ = fixture.queue_order(f"staff:{SESSION}")
+                result = fixture.call()
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(f"/unit:{unit_type} run active", result.stderr)
+                self.assertIn(f"commands/unit/{unit_type}.md", result.stderr)
+
+    def test_waiting_merge_unit_with_an_open_phase_stops_without_a_wake(self) -> None:
+        with director_stop_fixture() as fixture:
+            fixture.set_unit_type("merge")
+            worker_id = fixture.add_merge_worker()
+            state_path = fixture.run / "progress_history_state.json"
+            state = cast(dict[str, object], json.loads(state_path.read_text()))
+            state["pass"] = {"test": {"status": "canceled", "worker_id": worker_id}}
+            _ = state_path.write_text(json.dumps(state))
+            stale = fixture.run / "phases/old-order/test_status"
+            stale.parent.mkdir(parents=True)
+            _ = stale.write_text("running\n")
+            self.assert_allowed(fixture.call(last_assistant_message="The merge unit waits for an order."))
+            self.assertFalse((fixture.run / "compaction_wake_line").exists())
+
+    def test_merge_unit_with_a_runner_still_gets_a_wake(self) -> None:
+        with director_stop_fixture() as fixture:
+            fixture.set_unit_type("merge")
+            state_path = fixture.run / "progress_history_state.json"
+            state = cast(dict[str, object], json.loads(state_path.read_text()))
+            state["phase"] = {"status": "completed"}
+            _ = state_path.write_text(json.dumps(state))
+            record = fixture.run / "detached_runs/land.json"
+            record.parent.mkdir()
+            supervisor = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
+                                           "detached_runs.py", "supervise", str(record.resolve())], stdin=subprocess.PIPE)
+            _ = record.write_text(json.dumps({"run_id": "land", "status": "running", "staff_id": SESSION,
+                                              "worker": "fixture-director", "pid": supervisor.pid}))
+            try:
+                result = fixture.call()
+            finally:
+                _ = supervisor.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("/unit:merge run active", result.stderr)
+            self.assert_allowed(fixture.call(last_assistant_message="The merge runner stopped."))
+
+    def test_damaged_record_does_not_hide_a_live_merge_runner(self) -> None:
+        with director_stop_fixture() as fixture:
+            fixture.set_unit_type("merge")
+            runs = fixture.run / "detached_runs"
+            runs.mkdir()
+            damaged = runs / "000-damaged.json"
+            _ = damaged.write_text("{", encoding="utf-8")
+            record = runs / "land.json"
+            supervisor = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
+                                           "detached_runs.py", "supervise", str(record.resolve())], stdin=subprocess.PIPE)
+            _ = record.write_text(json.dumps({"run_id": "land", "status": "running", "staff_id": SESSION,
+                                              "worker": "fixture-director", "pid": supervisor.pid}))
+            try:
+                result = fixture.call()
+            finally:
+                _ = supervisor.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("/unit:merge run active", result.stderr)
+            self.assertEqual(sum(line.startswith("anomaly:") for line in result.stderr.splitlines()), 1)
+            self.assertIn(str(damaged), result.stderr)
+
+    def test_damaged_record_without_work_reports_one_anomaly_and_allows_stop(self) -> None:
+        with director_stop_fixture() as fixture:
+            fixture.set_unit_type("merge")
+            damaged = fixture.run / "detached_runs/000-damaged.json"
+            damaged.parent.mkdir()
+            _ = damaged.write_text("{", encoding="utf-8")
+            result = fixture.call()
+            self.assertEqual((result.returncode, result.stdout), (0, ""))
+            self.assertEqual(len(result.stderr.splitlines()), 1)
+            self.assertIn("anomaly:", result.stderr)
+            self.assertIn(str(damaged), result.stderr)
+            self.assertFalse((fixture.run / "compaction_wake_line").exists())
+
+    def test_unreadable_run_folder_reports_one_anomaly_and_allows_stop(self) -> None:
+        with director_stop_fixture() as fixture:
+            fixture.set_unit_type("merge")
+            runs = fixture.run / "detached_runs"
+            runs.mkdir()
+            scandir = os.scandir
+
+            def read_folder(path: str | os.PathLike[str]) -> object:
+                if Path(path) == runs:
+                    raise PermissionError(13, "Permission denied", str(runs))
+                return scandir(path)
+
+            with mock.patch("os.scandir", side_effect=read_folder):
+                result = fixture.call_with_mocked_reads()
+            self.assertEqual((result.returncode, result.stdout), (0, ""))
+            self.assertEqual(len(result.stderr.splitlines()), 1)
+            self.assertIn("anomaly:", result.stderr)
+            self.assertIn(str(runs), result.stderr)
+            self.assertFalse((fixture.run / "compaction_wake_line").exists())
+
+    def test_merge_unit_with_an_active_dispatch_still_gets_a_wake(self) -> None:
+        with director_stop_fixture() as fixture:
+            fixture.set_unit_type("merge")
+            worker_id = fixture.add_merge_worker()
+            state_path = fixture.run / "progress_history_state.json"
+            state = cast(dict[str, object], json.loads(state_path.read_text()))
+            state["phase"] = {"status": "completed"}
+            state["pass"] = {"test": {"status": "active", "worker_id": worker_id,
+                                       "instance_id": "fixture-dispatch", "launcher_command": ["assign.sh"]}}
+            _ = state_path.write_text(json.dumps(state))
+            result = fixture.call()
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("/unit:merge run active", result.stderr)
+
+    def test_merge_unit_with_a_background_runner_still_gets_a_wake(self) -> None:
+        with director_stop_fixture() as fixture:
+            fixture.set_unit_type("merge")
+            result = fixture.call(background_tasks=[{"id": "land", "status": "running"}])
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("/unit:merge run active", result.stderr)
+
+    def test_merge_unit_with_a_pending_message_still_gets_a_wake(self) -> None:
+        for key in (f"staff:{SESSION}", f"session-{SESSION}", "legacy-recipient"):
+            with self.subTest(key=key), director_stop_fixture() as fixture:
+                fixture.set_unit_type("merge")
+                state_path = fixture.run / "progress_history_state.json"
+                state = cast(dict[str, object], json.loads(state_path.read_text()))
+                state["phase"] = {"status": "completed"}
+                _ = state_path.write_text(json.dumps(state))
+                queued = fixture.queue_order(key)
+                before = queued.read_bytes()
+                result = fixture.call()
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("/unit:merge run active", result.stderr)
+                self.assertEqual(queued.read_bytes(), before)
+
+    def test_another_units_queued_message_does_not_wake_a_waiting_merge_unit(self) -> None:
+        for recipient in (f"staff:{fixture_runtime_id('another-unit')}", ""):
+            with self.subTest(recipient=recipient), director_stop_fixture() as fixture:
+                fixture.set_unit_type("merge")
+                queued = fixture.queue_order("another-unit")
+                message = cast(dict[str, object], json.loads(queued.read_text()))
+                if recipient:
+                    message["stable_recipient"] = recipient
+                else:
+                    _ = message.pop("stable_recipient")
+                _ = queued.write_text(json.dumps(message) + "\n")
+                before = queued.read_bytes()
+                self.assert_allowed(fixture.call())
+                self.assertEqual(queued.read_bytes(), before)
+
+    def test_merge_gate_with_no_open_order_phase_stops_without_a_wake(self) -> None:
+        with director_stop_fixture() as fixture:
+            fixture.set_unit_type("merge")
+            state_path = fixture.run / "progress_history_state.json"
+            state = cast(dict[str, object], json.loads(state_path.read_text()))
+            state["phase"] = {"id": "1", "instance_id": "fixture-phase", "status": "completed"}
+            _ = state_path.write_text(json.dumps(state))
+            self.assert_allowed(fixture.call(last_assistant_message="— holding: queue empty"))
+            self.assertFalse((fixture.run / "compaction_wake_line").exists())
+
+    def test_live_detached_run_of_the_director_stops_without_a_wake(self) -> None:
+        with director_stop_fixture() as fixture:
+            record = fixture.run / "detached_runs" / "land.json"
+            record.parent.mkdir()
+            supervisor = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
+                                           "detached_runs.py", "supervise", str(record.resolve())], stdin=subprocess.PIPE)
+            _ = record.write_text(json.dumps({"run_id": "land", "status": "running", "staff_id": SESSION,
+                                              "worker": "fixture-director", "pid": supervisor.pid}))
+            try:
+                self.assert_allowed(fixture.call(last_assistant_message="— holding: waiting on the land run"))
+            finally:
+                _ = supervisor.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assert_blocked(fixture.call(last_assistant_message="— holding: waiting on the land run"))
+
     def assert_blocked(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual((result.returncode, result.stdout), (2, ""))
         self.assertIn(
@@ -153,14 +444,14 @@ class DirectorStopTests(unittest.TestCase):
         with director_stop_fixture() as fixture:
             self.assert_allowed(fixture.call(session_id=""))
 
-    def test_exception_allows_stop_without_output(self) -> None:
-        with director_stop_fixture() as fixture:
-            _ = fixture.marker.write_bytes(b"\xff")
-            self.assert_allowed(fixture.call())
-
     def test_no_active_run_allows_stop(self) -> None:
         with director_stop_fixture() as fixture:
-            fixture.marker.unlink()
+            _ = fixture.staff_file.write_text(json.dumps({"schema": 2, "rows": []}))
+            self.assert_allowed(fixture.call())
+
+    def test_unreadable_staff_allows_stop_without_output(self) -> None:
+        with director_stop_fixture() as fixture:
+            fixture.environment["STAFF_FILE"] = str(fixture.root)
             self.assert_allowed(fixture.call())
 
     def test_declared_user_wait_is_recorded_and_allows_stop(self) -> None:
@@ -204,7 +495,8 @@ class DirectorStopTests(unittest.TestCase):
             self.assert_allowed(fixture.call(last_assistant_message=(
                 "blocked: pause order from the user through the showrunner; only the showrunner restarts this work"
             )))
-            self.assertFalse((fixture.run / "turn_wait.json").exists())
+            # A pause opens a wait, so the paused time leaves active phase time.
+            self.assertTrue((fixture.run / "turn_wait.json").exists())
 
     def test_paused_status_without_a_prefix_above_the_threshold_allows_stop(self) -> None:
         with director_stop_fixture() as fixture:

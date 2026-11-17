@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from typing import cast
 
+from scripts.lib import git_files
 from scripts.production import staff
 from scripts.statusline import adhoc_items, rebuild_row
 
@@ -25,6 +26,8 @@ def assignment(record: staff.StaffSnapshot, session_id: str) -> tuple[str, str]:
         return f"{row.name} showrunner", "showrunner"
     if row.kind == "worker":
         return "worker", "worker"
+    if row.kind == "producer":
+        return f"{row.name} producer", "producer"
     parent = record.parent_of(row)
     label = f"{row.name} unit"
     if parent is not None:
@@ -44,6 +47,21 @@ def staff_record(text: str) -> staff.StaffSnapshot:
         return staff.StaffSnapshot(())
 
 
+def current_branch(payload: dict[str, object], pwd: str) -> str:
+    """Read the branch from the repository that contains the displayed folder."""
+    workspace = cast(dict[str, object], payload.get("workspace") or {})
+    folder = workspace.get("current_dir")
+    if folder is None or folder is False:
+        folder = payload.get("cwd")
+    try:
+        head = git_files.head(git_files.locate(Path(str(folder or pwd))))
+    except (OSError, ValueError):
+        return ""
+    if isinstance(head, git_files.OnBranch):
+        return head.name
+    return f"detached {head.commit[:7]}" if head.commit else ""
+
+
 def main() -> None:
     payload = cast(dict[str, object], json.load(sys.stdin))
     try:
@@ -52,6 +70,9 @@ def main() -> None:
         record = staff.StaffSnapshot(())
     session_id = str(payload.get("session_id", ""))
     label, role = assignment(record, session_id)
+    pwd = next((value for option, name, value in zip(sys.argv, sys.argv[1:], sys.argv[2:])
+                if option == "--arg" and name == "pwd"), os.getcwd())
+    branch = current_branch(payload, pwd) if role == "unit-director" else ""
     rebuild_config = Path(__file__).resolve().parents[2] / "config/statusline.conf"
     rebuild = rebuild_row.read(rebuild_config)
     if rebuild.refresh_due:
@@ -65,6 +86,7 @@ def main() -> None:
             pass
     os.execvp("jq", ["jq", "-n", "--argjson", "payload", json.dumps(payload),
                      "--arg", "assignment", label, "--arg", "role", role,
+                     "--arg", "branch", branch,
                      "--arg", "adhoc", adhoc_items.row(session_id),
                      "--arg", "rebuild", rebuild.row(), *sys.argv[1:]])
 

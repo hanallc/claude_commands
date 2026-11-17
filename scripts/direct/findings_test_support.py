@@ -70,8 +70,8 @@ class FindingsLedgerFixture(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
-        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
+        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.root = self.fixture_root
         self.session_dir = self.root / "session"
         self.history_file = self.root / "history" / "run.jsonl"
@@ -118,10 +118,6 @@ class FindingsLedgerFixture(unittest.TestCase):
                  for line in STANDARD_CONFIG.splitlines()]
         _ = self.config_file.write_text("\n".join(lines) + "\n" + "\n".join(
             key + "=" + value for key, value in changes.items()), encoding="utf-8")
-
-    def write_partial_config(self, text: str) -> None:
-        """Write `text` as the whole file, standard limits omitted."""
-        _ = self.config_file.write_text(text, encoding="utf-8")
 
     @staticmethod
     def dispatch_arguments(arguments: tuple[str, ...]) -> tuple[str, ...]:

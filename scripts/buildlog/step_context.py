@@ -21,6 +21,7 @@ from scripts.buildlog import parse
 
 @dataclass(frozen=True)
 class CargoTargetFolder:
+    """The path identifies the Cargo target folder."""
     path: Path
 
     def __post_init__(self) -> None:
@@ -30,12 +31,12 @@ class CargoTargetFolder:
 
 @dataclass(frozen=True)
 class NoTargetFolder:
-    pass
+    """The step has no Cargo target folder."""
 
 
 @dataclass(frozen=True)
 class UnresolvedTargetFolder:
-    pass
+    """The Cargo target folder has not been resolved."""
 
 
 StepTargetFolder = CargoTargetFolder | NoTargetFolder | UnresolvedTargetFolder

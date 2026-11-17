@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from scripts.accounts.home_test_support import clear_notes_directory_cache, scratch_account_home, scratch_accounts_config
 from scripts.accounts import accounts, new_account
+from scripts.lib import conf_reads
 from scripts.whoami import agent_accounts
 from scripts.whoami import note_file
 
@@ -220,7 +221,7 @@ class NewAccountTests(unittest.TestCase):
         self.assertTrue(note.startswith('---\ndate_created: "[['))
         self.assertIn("done: ~/.claude4 is logged in", stdout)
         self.assertIn("done: claude4 alias: comes from the account note", stdout)
-        self.assertTrue(stdout.endswith("claude4 is ready; /showrunner:accounts shows its row.\n"))
+        self.assertTrue(stdout.endswith("claude4 is ready; Hana console, Accounts shows its row.\n"))
         self.assertIsInstance(accounts.account_directory_readiness("claude4"), accounts.AccountDirectoryReady)
 
     def test_new_claude_account_inserts_the_first_free_color_after_the_last_account_without_changing_other_bytes(self) -> None:
@@ -238,9 +239,12 @@ class NewAccountTests(unittest.TestCase):
 
     def test_next_claude_account_gets_the_second_free_color_after_the_first_is_taken(self) -> None:
         before = self.colors.read_bytes()
-        first = new_account.statusline_color_step(new_account.parse_account("claude", "claude5"))
-
-        second = new_account.statusline_color_step(new_account.parse_account("claude", "claude6"))
+        reads = self.home / "config-reads"
+        _ = reads.write_text("")
+        with conf_reads.record_reads(reads):
+            first = new_account.statusline_color_step(new_account.parse_account("claude", "claude5"))
+            second = new_account.statusline_color_step(new_account.parse_account("claude", "claude6"))
+        self.assertEqual(reads.read_text().splitlines(), [self.colors.stem] * 2)
 
         self.assertTrue(first.done, first.text)
         self.assertTrue(second.done, second.text)
@@ -283,6 +287,41 @@ class NewAccountTests(unittest.TestCase):
         self.assertEqual((self.colors.stat().st_ino, self.colors.stat().st_mtime_ns),
                          (before_stat.st_ino, before_stat.st_mtime_ns))
         replace.assert_not_called()
+
+    def test_existing_hex_color_is_reported_as_written_without_rewriting_the_file(self) -> None:
+        account = new_account.parse_account("claude", "claude5")
+        for value in ("#a0522d", "#A0522D"):
+            with self.subTest(value=value):
+                before = f"# account.claude5=blue\naccount.claude5={value}\t# keep this comment\n".encode()
+                _ = self.colors.write_bytes(before)
+                before_stat = self.colors.stat()
+                step = new_account.statusline_color_step(account)
+                self.assertEqual(step, new_account.Step(True, f"status line color {value} for claude5"))
+                self.assertEqual(self.colors.read_bytes(), before)
+                self.assertEqual((self.colors.stat().st_ino, self.colors.stat().st_mtime_ns),
+                                 (before_stat.st_ino, before_stat.st_mtime_ns))
+
+    def test_new_account_avoids_hex_colors_that_match_palette_names(self) -> None:
+        palette = [name for name in new_account.STATUSLINE_PALETTE
+                   if name not in new_account.STATUSLINE_EXCLUDED_COLORS]
+        for prefix in ("account", "role"):
+            for index, name in enumerate(palette):
+                with self.subTest(prefix=prefix, name=name):
+                    occupied = [accounts.account_color(color) for color in palette[:index + 1]]
+                    self.assertTrue(all(isinstance(color, accounts.AccountColor) for color in occupied))
+                    text = "".join(f"{prefix}.fixture{number}={color.css.upper()} # occupied\n"
+                                   for number, color in enumerate(occupied) if isinstance(color, accounts.AccountColor))
+                    _ = self.colors.write_text(text)
+                    step = new_account.statusline_color_step(new_account.parse_account("claude", "claude5"))
+                    expected = (palette[index + 1] if index + 1 < len(palette)
+                                else palette[0] if prefix == "role" else "")
+                    self.assertTrue(step.done, step.text)
+                    if expected:
+                        self.assertEqual(step.text, f"status line color {expected} for claude5")
+                        self.assertEqual(self.colors.read_text(), text + f"account.claude5={expected}\n")
+                    else:
+                        self.assertIn("claude5 stays uncolored", step.text)
+                        self.assertEqual(self.colors.read_text(), text)
 
     def test_exhausted_distinct_colors_fall_back_to_role_colors_then_leave_the_account_uncolored(self) -> None:
         _ = self.colors.write_text(

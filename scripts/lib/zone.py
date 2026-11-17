@@ -4,13 +4,14 @@
   zone.py                   the zone, its label and offset, and the time now; sends a queued Mac change
   zone.py set NAME          change it. NAME is an IANA zone (America/Curacao), the city of one
                             (Curacao, "New York"), or a label (AST) that only one zone uses
-  zone.py drain [--pulled]  send a change queued while the Mac was offline
+  zone.py drain [--pulled PATH]  send a change queued while the Mac was offline
 
-`set` writes config/user_zone.conf, commits it on main and pushes it, pulls the Mac's ~/.claude,
-and tells every session on both machines with broadcast.py --all. It runs on natedev, whose
-~/.claude main the Mac pulls from. When the Mac cannot be reached, its pull and its sessions'
-message wait in the queue (<state>/zone/mac.json); a bare `zone.py` and each promotion's Mac pull
-(merge_checkpoint.promote) send them. A name that is not a zone, or that names more than one,
+`set` writes config/user_zone.conf live at once on natedev and on the Mac, as /tune does, and
+tells every session on both machines with broadcast.py --all. The commit on main, the push and
+the Mac pull follow through live_settings; none of them comes before the write. It runs on
+natedev, whose ~/.claude main the Mac pulls from. When the Mac cannot be reached, its sessions'
+message waits in the queue (<state>/zone/mac.json); a bare `zone.py` and each promotion's Mac
+pull (merge_checkpoint.promote) send it. A name that is not a zone, or that names more than one,
 is refused with exit 2 and the zones it could mean.
 
 ZONE_SSH, ZONE_BROADCAST and ZONE_STATE replace ssh, broadcast.py and the state folder in tests.
@@ -29,18 +30,18 @@ import subprocess
 import sys
 import unicodedata
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from zoneinfo import ZoneInfo, available_timezones
 
-from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import main_publish, user_zone  # noqa: E402
+from scripts.lib import conf as config, live_settings, mac_wake, main_publish, user_zone  # noqa: E402
 from scripts.lib.main_publish import Refusal as Refusal
-from scripts.lib.main_publish import checkout_of, first_line as _first_line, git, queue, queue_path, read_queue
-from scripts.lib.main_publish import ready as _ready
+from scripts.lib.main_publish import checkout_of, first_line as _first_line, queue, read_queue
 
 MAC = "mac"
 SENDER = "zone"
 SUBJECT = "zone("
+STEM = "user_zone"
+KEY = "zone"
 SHOWN_CANDIDATES = 3
 
 
@@ -104,22 +105,6 @@ def stored(conf: Path) -> str:
     return user_zone.stored_zone(str(conf)) or user_zone.DEFAULT_ZONE
 
 
-def write_zone(conf: Path, zone: str) -> None:
-    """Set the zone= line of `conf`, keeping its comments; add the line when it has none."""
-    lines = conf.read_text(encoding="utf-8").splitlines() if conf.exists() else []
-    written = [f"zone={zone}" if line.startswith("zone=") else line for line in lines]
-    if written == lines and not any(line.startswith("zone=") for line in lines):
-        written.append(f"zone={zone}")
-    write_text_atomic(conf, "\n".join(written) + "\n")
-
-
-def _commit(checkout: Path, conf: Path, zone: str, before_text: str | None) -> str:
-    label = datetime.now(ZoneInfo(zone)).tzname() or zone
-    before = main_publish.MissingFile() if before_text is None else main_publish.ExistingFile(before_text)
-    return main_publish.commit(checkout, conf, f"{SUBJECT}{zone}): set with /zone ({label})", before,
-                               subject_prefix=SUBJECT, unchanged="the zone is unchanged")
-
-
 def _ssh(remote: str) -> subprocess.CompletedProcess[str] | str:
     return main_publish.ssh(remote, ssh_program=os.environ.get("ZONE_SSH") or "ssh", host=MAC)
 
@@ -156,80 +141,83 @@ def broadcast_on_mac(text: str) -> tuple[bool, str]:
     return delivered and done.returncode == 0, summary
 
 
-def notice(zone: str, before: str, commit: str) -> str:
+def notice(zone: str, before: str) -> str:
     now = datetime.now(ZoneInfo(zone))
     label = now.tzname() or zone
     return (f"From /zone ({now:%H:%M} {label}): the user's time zone is now {zone} ({label}, {_offset(now)}); "
-            + f"it was {before}. config/user_zone.conf says so ({commit}). Write every time you give the user "
+            + f"it was {before}. config/user_zone.conf says so on both machines. Write every time you give the user "
             + f"in {label}, with its label. Read the clock with TZ=$(python3 ~/.claude/scripts/lib/user_zone.py) "
             + "date '+%H:%M %Z', never with bare date, because each machine's clock keeps its own zone. "
             + "Scripts that read user_zone.py change by themselves. Change any note of yours that names the old zone.")
 
 
-def drain(checkout: Path | None, *, pulled: bool) -> list[str]:
-    """Send the queued Mac change: pull (unless `pulled`), then tell the Mac's sessions."""
+def drain(checkout: Path | None, *, pulled: PurePosixPath | None) -> list[str]:
+    """Pull each pending checkout, then send its queued zone notice."""
     change = read_queue()
     if isinstance(change, main_publish.NoPendingMacPull):
         return []
-    if not pulled:
-        if checkout is None:
-            return [f"mac: the {change.label} change waits since {change.since}; run /zone on natedev"]
-        outcome = pull_mac(checkout)
-        if isinstance(outcome, main_publish.MacPullFailed):
-            return [f"mac: the {change.label} change still waits since {change.since}: {outcome.reason}"]
+    for pull in change.pulls:
+        if pull.mac != pulled:
+            source = pull.source if isinstance(pull.source, Path) else checkout
+            if source is None:
+                return [f"mac: the {change.label} change waits since {change.since}; run /zone on natedev"]
+            outcome = main_publish.pull_mac(source, mac=pull.mac, ssh_program=os.environ.get("ZONE_SSH") or "ssh")
+            if isinstance(outcome, main_publish.MacPullFailed):
+                return [f"mac: the {change.label} change still waits since {change.since}: {outcome.reason}"]
+        main_publish.clear_pull_only(pull.mac)
     delivered, summary = broadcast_on_mac(change.text) if change.text else (True, "no message")
     if not delivered:
         return [f"mac: pulled the {change.label} change; its message still waits: {summary}"]
-    queue_path().unlink(missing_ok=True)
+    main_publish.clear_pull_only(notice_delivered=True)
     return [f"mac: took the {change.label} change queued at {change.since}; message {summary}"]
 
 
 def set_zone(name: str) -> int:
+    """Write the zone live on both machines and tell every session; the commit, push and Mac pull follow."""
     if platform.system() == "Darwin":
         raise Refusal("run /zone on natedev: the Mac pulls ~/.claude main from there")
     zone = resolve(name)
     conf = Path(user_zone.CONF)
+    if conf.resolve() != config.path(STEM).resolve():
+        raise Refusal(f"{conf} is not the live settings file {config.path(STEM)}")
     checkout = checkout_of(conf)
-    _ready(checkout)
     before = stored(conf)
     print(f"zone: {describe(zone)}")
-    before_text = conf.read_text(encoding="utf-8") if conf.exists() else None
-    if before != zone:
+    delivered = True
+    if before == zone:
+        print("was: the same; nothing to change")
+    else:
         print(f"was: {before}")
-        write_zone(conf, zone)
-    changed = git(checkout, "diff", "HEAD", "--", str(conf))
-    if changed.returncode:
-        raise Refusal(f"git diff: {_first_line(changed)}")
-    if changed.stdout:
-        commit = _commit(checkout, conf, zone, before_text)
-    else:
-        print("was: the same; nothing to commit")
-        commit = git(checkout, "rev-parse", "--short", "HEAD").stdout.strip()
-    pushed, push_line = main_publish.push(checkout)
-    print(f"main: {commit}, {push_line}")
-    text = notice(zone, before, commit)
-    if not pushed:
-        print("mac: not pulled because main is not on origin")
-        print(f"broadcast: {broadcast(text, here=True)[1]}")
-        return 1
-    outcome = pull_mac(checkout)
-    if isinstance(outcome, main_publish.MacPulled):
-        print("mac: pulled")
-        queue_path().unlink(missing_ok=True)
-        delivered, summary = broadcast(text, here=False)
-    else:
-        since = datetime.now(ZoneInfo(zone)).strftime("%Y-%m-%d %H:%M %Z")
-        queue(main_publish.PendingMacPull(label=zone, text=text, since=since, reason=outcome.reason))
-        print(f"mac: queued ({outcome.reason}); a bare /zone or the next promotion sends it")
-        delivered, summary = broadcast(text, here=True)
-    print(f"broadcast: {summary}")
+        label = datetime.now(ZoneInfo(zone)).tzname() or zone
+        message = f"{SUBJECT}{zone}): set with /zone ({label})"
+        _ = live_settings.stage(live_settings.WaitingChange(STEM, KEY, zone, message))
+        print(f"live now: {KEY}={zone}")
+        mac = live_settings.write_mac(STEM, KEY, zone)
+        print(mac)
+        text = notice(zone, before)
+        if mac.startswith("mac: live now"):
+            delivered, summary = broadcast(text, here=False)
+        else:
+            since = datetime.now(ZoneInfo(zone)).strftime("%Y-%m-%d %H:%M %Z")
+            queue(main_publish.PendingMacPull(label=zone, text=text, since=since, reason=mac))
+            _ = mac_wake.start()
+            delivered, summary = broadcast(text, here=True)
+        print(f"broadcast: {summary}")
+    try:
+        lines = live_settings.publish(checkout, wait=True) or []
+    except (Refusal, OSError) as error:
+        print(f"zone: {' '.join(str(error).split())}", file=sys.stderr)
+        print(f"zone: {zone} stays live; main does not have it; the notes timer tries again", file=sys.stderr)
+        return 2
+    for line in [*lines, *drain(checkout, pulled=None)]:
+        print(line)
     return 0 if delivered else 1
 
 
 def show() -> int:
     print(f"zone: {describe(user_zone.user_zone_name())}")
     checkout = None if platform.system() == "Darwin" else checkout_of(Path(user_zone.CONF))
-    for line in drain(checkout, pulled=False):
+    for line in drain(checkout, pulled=None):
         print(line)
     return 0
 
@@ -241,13 +229,14 @@ def main(arguments: list[str]) -> int:
                 return show()
             case ["set", name]:
                 return set_zone(name)
-            case ["drain", *pulled] if pulled in ([], ["--pulled"]):
-                checkout = None if pulled or platform.system() == "Darwin" else checkout_of(Path(user_zone.CONF))
-                for line in drain(checkout, pulled=bool(pulled)):
+            case ["drain"] | ["drain", "--pulled", _]:
+                checkout = None if platform.system() == "Darwin" else checkout_of(Path(user_zone.CONF))
+                pulled = PurePosixPath(arguments[2]) if len(arguments) == 3 else None
+                for line in drain(checkout, pulled=pulled):
                     print(line)
                 return 0
             case _:
-                print("usage: zone.py [set NAME | drain [--pulled]]", file=sys.stderr)
+                print("usage: zone.py [set NAME | drain [--pulled PATH]]", file=sys.stderr)
                 return 2
     except (Refusal, ValueError) as error:
         print(f"zone: {error}", file=sys.stderr)

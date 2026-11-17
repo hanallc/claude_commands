@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import json
 import os
@@ -22,6 +22,17 @@ from scripts.production.update_registration_test_support import setUpModule as s
 
 
 class RegistrationTests(RegistrationFixture):
+    def test_closed_review_questions_keep_answer_words_after_replay_history_expires(self) -> None:
+        _ = self.run_ask('Choose the layout','Which layout should we use?')
+        path = self.question_record_path('Choose the layout')
+        registration.record_review_log(path,'answer: Keep the plain layout.')
+        done = self.run_command('answer','--item','Choose the layout')
+        self.assertEqual(done.returncode,0,done.stdout+done.stderr)
+        self.assertEqual(registration.answered_items(self.outstanding(),datetime.now(timezone.utc)+timedelta(days=3)),[])
+        saved = frontmatter(path)
+        self.assertEqual(saved['status'],['closed'])
+        self.assertIn('Keep the plain layout.',saved['registration'][0])
+
     def test_shared_proposals_and_questions_follow_staff_rename_and_transfer_without_rewrites(self) -> None:
         owner_id = self.owner_id
         unit_id = self.fixture_staff_id("alpha")
@@ -37,7 +48,7 @@ class RegistrationTests(RegistrationFixture):
         ]))
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
             for title, asker in (("Choose the layout", str(unit_id)), ("Choose the colors", "")):
-                filed = self.run_command("ask", "--text", title, "--question", "Keep this layout?",
+                filed = self.run_command("ask", "--text", title, "--ask", "Keep this layout?",
                                          "--unit", asker)
                 self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
         questions = list((self.root / "issues").glob("question-*.md"))
@@ -116,7 +127,7 @@ class RegistrationTests(RegistrationFixture):
         self.checkout = unit
         self.doc = unit / relative
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
-            filed = self.run_command("ask", "--text", "Choose the shared layout", "--question", "Keep this layout?",
+            filed = self.run_command("ask", "--text", "Choose the shared layout", "--ask", "Keep this layout?",
                                      "--unit", str(asker_id))
         self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
         records = list((owner / "questions").glob("question-*.md"))
@@ -148,7 +159,7 @@ class RegistrationTests(RegistrationFixture):
         self.checkout = document.parents[2]
         self.doc = document
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
-            result = self.run_command("ask", "--text", "Choose the layout", "--question", "Keep this layout?",
+            result = self.run_command("ask", "--text", "Choose the layout", "--ask", "Keep this layout?",
                                       "--unit", str(asker_id))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         question, = (self.root / "issues").glob("question-*.md")
@@ -186,25 +197,69 @@ class RegistrationTests(RegistrationFixture):
         _ = self.git("worktree", "add", "-b", "owner-copy", str(owner))
         _ = self.git("worktree", "add", "-b", "unit-copy", str(unit))
         _ = staff.set_doc(owner_id, staff.LiveDoc(remote.local_machine(), owner / relative))
+        asker = staff.by_id(asker_id)
+        assert asker is not None
+        _ = staff.set_worktree(asker_id, staff.PresentWorktree(remote.local_machine(), unit), expected=asker.worktree)
         staff_file = self.state / "staff/staff.json"
         before = staff_file.read_bytes()
-        for checkout, title in ((unit, "Unit checkout question"), (main, "Main checkout question")):
-            with self.subTest(checkout=checkout):
+        cases = ((unit, "Unit checkout question", True),
+                 (main, "Main checkout question", True),
+                 (unit, "Parent document question", False))
+        for checkout, title, select_production in cases:
+            with self.subTest(checkout=checkout, select_production=select_production):
                 self.checkout: Path = checkout
                 self.doc: Path = relative
                 with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
-                    filed = self.run_command("ask", "--text", title, "--question", "Keep this layout?",
-                                             "--unit", str(asker_id))
+                    arguments = ["ask", "--text", title, "--ask", "Keep this layout?", "--unit", str(asker_id)]
+                    if select_production:
+                        filed = self.run_command(*arguments)
+                    else:
+                        filed = invoke_cli(registration, registration.main, arguments,
+                                           self.env, self.checkout, production_state=True)
                 self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
                 listed = self.run_command("questions-table")
                 self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
                 self.assertIn(title, listed.stdout)
         records = list((self.root / "issues").glob("question-*.md"))
-        self.assertEqual(len(records), 2)
+        self.assertEqual(len(records), len(cases))
         for record in records:
             self.assertIn(f"asked_by: {asker_id}", record.read_text().splitlines())
             self.assertIn(f"production_id: {owner_id}", record.read_text().splitlines())
         self.assertEqual(staff_file.read_bytes(), before)
+
+    def test_ask_with_parts_stores_them_beside_the_joined_text_and_a_later_list_keeps_them(self) -> None:
+        arguments = ("ask", "--ask", "Approve both page changes to land?", "--context", "Two changes wait on your look.",
+                     "--item", "AWS region filter\nAfter: http://127.0.0.1:8765/console/?page=images",
+                     "--item", "Memory bar", "--recommend", "go for both; the checks pass",
+                     "--choice", "go for both", "--choice", "no")
+        joined = ("Approve both page changes to land?\n\nTwo changes wait on your look.\n\n"
+                  + "1. AWS region filter\nAfter: http://127.0.0.1:8765/console/?page=images\n2. Memory bar\n\n"
+                  + "Recommended: go for both; the checks pass\n\nChoices:\n- go for both\n- no")
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("reviewed text")) as reviewer:
+            filed = self.run_command(*arguments)
+        self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
+        self.assertEqual(reviewer.call_args.args[1], joined)
+        row, = cast(list[dict[str, object]], cast(object, self.open_rows()))
+        self.assertEqual((row["text"], row["question"]), ("Approve both page changes to land?", joined))
+        self.assertEqual(row["parts"], {
+            "ask": "Approve both page changes to land?", "context": "Two changes wait on your look.",
+            "items": ["AWS region filter\nAfter: http://127.0.0.1:8765/console/?page=images", "Memory bar"],
+            "recommend": "go for both; the checks pass", "choices": ["go for both", "no"]})
+        state = self.question_state([{"text": "Approve both page changes to land?"}])
+        listed = self.run_command("questions", "--state", str(state))
+        self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+        self.assertEqual(cast(list[dict[str, object]], cast(object, self.open_rows()))[0]["parts"], row["parts"])
+        for refused, reason in (
+                (("--choice", "yes", "--recommend", "yes"), "at least two --choice and one --recommend"),
+                (("--choice", "yes", "--choice", "no"), "at least two --choice and one --recommend")):
+            with self.subTest(refused=refused):
+                result = self.run_command("ask", "--text", "Other", "--ask", "Keep it?", *refused)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(reason, result.stdout)
+        old_form = self.run_command("ask", "--text", "Other", "--question", "Keep it?")
+        self.assertEqual(old_form.returncode, 2, old_form.stdout + old_form.stderr)
+        self.assertIn("--ask", old_form.stderr)
+        self.assertEqual(len(self.open_rows()), 1)
 
     def test_question_without_a_proposals_line_can_be_filed_listed_and_answered(self) -> None:
         _ = self.doc.write_text("\n".join(line for line in self.doc.read_text().splitlines()
@@ -251,7 +306,7 @@ class RegistrationTests(RegistrationFixture):
         records = list(folder.glob("question-*.md"))
         self.assertEqual(len(records), 1)
         self.assertEqual(json.loads(legacy.read_text()), [reminder])
-        self.assertEqual(next(row for row in self.open_rows() if "question" in row), question)
+        self.assertEqual(next(row for row in self.open_rows() if "question" in row), question | {"review_id": "Q1"})
         self.assertEqual(list((self.root / "issues").iterdir()), [])
         paths = [legacy, *records]
         before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
@@ -269,7 +324,7 @@ class RegistrationTests(RegistrationFixture):
                 path = self.outstanding()
                 history = path.with_suffix(".history.jsonl")
                 before = path.read_bytes()
-                command = (("ask", "--text", "new question?", "--question", "Try the new layout?", "--unit", "alpha")
+                command = (("ask", "--text", "new question?", "--ask", "Try the new layout?", "--unit", "alpha")
                            if action == "ask" else ("mark-important", "--item", "Reminder")
                            if action == "mark-important" else
                            ("questions", "--state", str(self.question_state(["Reminder", "New reminder"]))))

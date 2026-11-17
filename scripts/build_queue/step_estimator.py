@@ -17,6 +17,7 @@ from pathlib import Path
 
 
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
+from scripts.build_queue import progress_profile as progress
 from scripts.build_queue.admission_records import (
     AdmissionPolicy,
     BuildHistoryGeneration,
@@ -41,7 +42,7 @@ from scripts.build_queue.admission_records import (
     ShapeFallback,
     ShapeLargest,
     ShapeNeedBasis,
-    ShapeP90,
+    ShapeRankedPeak,
     StepProfile,
     TestScope,
     UnknownRepository,
@@ -64,6 +65,9 @@ FILTERED_FLOOR = GIB
 ANON_SHARE = 0.65
 
 HISTORY_DAYS = 14
+
+# Rows append when steps end. On 2026-11-15, 7 of 55,899 rows came late, by 19 minutes at most.
+LATE_ROW_MARGIN = timedelta(days=1)
 
 VERIFY_PACKAGE_PREDICATE = r"package\(([A-Za-z0-9_-]+)\)"
 
@@ -149,6 +153,10 @@ def _test_scope(argv: list[str], step: str) -> TestScope:
                           word.split("=", 1)[1] if "=" in word else next(arguments, ""))
             if TEST_PREDICATE.search(expression):
                 return "filtered"
+        elif option == "--run-ignored":
+            value = word.split("=", 1)[1] if "=" in word else next(arguments, "")
+            if value == "only":
+                return "filtered"
         elif word in TEST_OPTION_VALUES:
             _ = next(arguments, "")
         elif not word.startswith("-"):
@@ -233,17 +241,56 @@ NO_BUILD_SHAPE = NoBuildShape()
 NO_STEP_EVIDENCE = StepEvidence(NO_BUILD_SHAPE, CompileCountUnknown())
 
 
-def anonymous_history_rows(path: Path) -> Iterator[dict[str, object]]:
-    """Read complete anonymous-history rows under a shared lock."""
-    return store.locked_rows(path)
+@dataclass(frozen=True)
+class HistoryWindow:
+    """Rows of one host and one of these names that ended at or after `start`."""
+    host: str
+    names: tuple[str, ...]
+    start: datetime
+
+
+@dataclass(frozen=True)
+class AllHistoryRows:
+    pass
+
+
+ALL_HISTORY_ROWS = AllHistoryRows()
+
+
+def anonymous_history_rows(path: Path, window: HistoryWindow | AllHistoryRows = ALL_HISTORY_ROWS
+                           ) -> Iterator[dict[str, object]]:
+    """Read complete anonymous-history rows under a shared lock; a window decodes only rows that can be in it."""
+    if isinstance(window, AllHistoryRows):
+        return store.locked_rows(path)
+    earliest = window.start - LATE_ROW_MARGIN
+
+    def reached(row: dict[str, object]) -> bool:
+        ended = row.get("ended_at")
+        try:
+            return not isinstance(ended, str) or datetime.fromisoformat(ended) >= earliest
+        except (ValueError, TypeError):
+            return True
+
+    # An ASCII name has one JSON spelling, so a row without it cannot match.
+    host = json.dumps(window.host).encode()
+    names = tuple(json.dumps(name).encode() for name in window.names)
+    exact = window.host.isascii() and all(name.isascii() for name in window.names)
+
+    def may_match(line: bytearray) -> bool:
+        return not exact or (host in line and any(name in line for name in names))
+
+    return store.locked_rows_in_order(path, reached, may_match)
 
 
 def program_peak_estimate(program: str, host: str, now: datetime, root: Path,
-                          first_peak_bytes: int) -> MeasuredProgramPeak | FirstProgramPeak:
+                          first_peak_bytes: int, *,
+                          share_percent: int | progress.ConfiguredPeakShare = progress.CONFIGURED_PEAK_SHARE
+                          ) -> MeasuredProgramPeak | FirstProgramPeak:
     """Read one program's peak history, without using cargo estimates."""
     cutoff = now - timedelta(days=HISTORY_DAYS)
     peaks: list[int] = []
-    for row in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
+    for row in anonymous_history_rows(root / "admission/anon_peaks.jsonl",
+                                      window=HistoryWindow(host, (program,), cutoff)):
         try:
             if row.get("host") != host or row.get("step") != program:
                 continue
@@ -254,16 +301,16 @@ def program_peak_estimate(program: str, host: str, now: datetime, root: Path,
                 peaks.append(peak)
         except (ValueError, TypeError, AttributeError):
             continue
-    return MeasuredProgramPeak(percentile(peaks), len(peaks)) if peaks else FirstProgramPeak(first_peak_bytes)
+    return MeasuredProgramPeak(percentile(peaks, share_percent=share_percent), len(peaks)) if peaks else FirstProgramPeak(first_peak_bytes)
 
 
 def memory_config() -> MemoryConfig:
     return read_memory_config()
 
 
-def percentile(values: list[int]) -> int:
-    values.sort()
-    return values[(90 * len(values) + 99) // 100 - 1]
+def percentile(values: list[int], *,
+               share_percent: int | progress.ConfiguredPeakShare = progress.CONFIGURED_PEAK_SHARE) -> int:
+    return progress.ranked_peak(values, 1, share_percent=share_percent)
 
 
 def expected_peak(repository: Repository, step: str, host: str, now: datetime, root: Path,
@@ -271,10 +318,11 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
                   filters: tuple[str, ...] = (), package: str = "",
                   fresh: bool = False,
                   shape: BuildShape | NoBuildShape = NO_BUILD_SHAPE,
-                  first_peak_bytes: int) -> ExpectedPeak:
+                  first_peak_bytes: int,
+                  share_percent: int | progress.ConfiguredPeakShare = progress.CONFIGURED_PEAK_SHARE) -> ExpectedPeak:
     """Read the history once and select a fresh or compile promise."""
     if step == "build":
-        return build_expected_peak(repository, shape, host, now, root, first_peak_bytes)
+        return build_expected_peak(repository, shape, host, now, root, first_peak_bytes, share_percent=share_percent)
     if isinstance(repository, UnknownRepository):
         return ExpectedPeak(first_peak_bytes, "fallback", 0)
     filters = filter_set(filters)
@@ -283,19 +331,20 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
     history = read_estimate_history(root, host, steps, now)
     if fresh and step == "nextest" and package:
         fresh_peak = fresh_test_peak(repository, step, host, now, root, test_threads,
-                                     scope, filters, package, history)
+                                     scope, filters, package, history, share_percent=share_percent)
         if isinstance(fresh_peak, ExpectedPeak):
             return fresh_peak
     if filtered:
         return filtered_history_peak(repository, step, host, now, root, test_threads,
-                                     filters, package, history)
+                                     filters, package, history, share_percent=share_percent)
     return full_history_peak(repository, step, host, now, root, test_threads,
-                             scope, package, first_peak_bytes, history)
+                             scope, package, first_peak_bytes, history, share_percent=share_percent)
 
 
 def full_history_peak(repository: RepositoryIdentity, step: str, host: str, now: datetime,
                       root: Path, test_threads: int | None, scope: TestScope,
-                      package: str, first_peak_bytes: int, history: EstimateHistory) -> ExpectedPeak:
+                      package: str, first_peak_bytes: int, history: EstimateHistory, *,
+                      share_percent: int | progress.ConfiguredPeakShare = progress.CONFIGURED_PEAK_SHARE) -> ExpectedPeak:
     """Use repository peaks, indexed peaks, then pooled peaks for full runs.
 
     Full test requests with a package recover missing selection fields from
@@ -319,7 +368,7 @@ def full_history_peak(repository: RepositoryIdentity, step: str, host: str, now:
                 for item in repository_history(rows, repository)]
     pooled = [int(cast(int, item["anon_peak_bytes"])) for item in rows]
     if len(measured) >= 5:
-        return ExpectedPeak(percentile(measured), "measured", len(measured))
+        return ExpectedPeak(percentile(measured, share_percent=share_percent), "measured", len(measured))
     peaks: list[int] = []
     if repository.legacy_name:
         try:
@@ -340,19 +389,19 @@ def full_history_peak(repository: RepositoryIdentity, step: str, host: str, now:
         except (OSError, sqlite3.Error):
             pass
     if len(peaks) >= 5:
-        return ExpectedPeak(int(percentile(peaks) * ANON_SHARE), "buildlog", len(peaks))
+        return ExpectedPeak(int(percentile(peaks, share_percent=share_percent) * ANON_SHARE), "buildlog", len(peaks))
     if measured:
         peak = max(measured)
         if len(pooled) >= 5:
-            peak = min(peak, percentile(pooled))
+            peak = min(peak, percentile(pooled, share_percent=share_percent))
         return ExpectedPeak(peak, "measured", len(measured))
     if peaks:
         peak = int(max(peaks) * ANON_SHARE)
         if len(pooled) >= 5:
-            peak = min(peak, percentile(pooled))
+            peak = min(peak, percentile(pooled, share_percent=share_percent))
         return ExpectedPeak(peak, "buildlog", len(peaks))
     if len(pooled) >= 5:
-        return ExpectedPeak(percentile(pooled), "pooled", len(pooled))
+        return ExpectedPeak(percentile(pooled, share_percent=share_percent), "pooled", len(pooled))
     return ExpectedPeak(first_peak_bytes, "fallback", 0)
 
 
@@ -403,7 +452,8 @@ def read_estimate_history(root: Path, host: str, steps: tuple[str, ...], now: da
     cutoff = now - timedelta(days=HISTORY_DAYS)
     rows: dict[str, list[dict[str, object]]] = {step: [] for step in steps}
     try:
-        for item in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
+        for item in anonymous_history_rows(root / "admission/anon_peaks.jsonl",
+                                           window=HistoryWindow(host, steps, cutoff)):
             step = item.get("step")
             if item.get("host") != host or not isinstance(step, str) or step not in rows:
                 continue
@@ -495,7 +545,8 @@ def shape_headroom_bytes(base: int, rule: HeadroomRule) -> int:
 
 
 def build_expected_peak(repository: Repository, shape: BuildShape | NoBuildShape,
-                        host: str, now: datetime, root: Path, first_peak_bytes: int) -> ExpectedPeak:
+                        host: str, now: datetime, root: Path, first_peak_bytes: int, *,
+                        share_percent: int | progress.ConfiguredPeakShare = progress.CONFIGURED_PEAK_SHARE) -> ExpectedPeak:
     rows = build_peaks(repository, host, now, root) if isinstance(repository, RepositoryIdentity) else []
     same = [row for row in rows if row.shape == shape]
     floor: FailedPeakFloor | NoFloor = NoFloor()
@@ -506,8 +557,9 @@ def build_expected_peak(repository: Repository, shape: BuildShape | NoBuildShape
         floor = FailedPeakFloor(newest.peak, store.utc_iso(newest.ended_at.timestamp()))
     count = len(same)
     if count >= 10:
-        base = percentile([row.peak for row in same])
-        basis: ShapeNeedBasis = ShapeP90(count)
+        selected_share = progress.peak_share_percent(share_percent)
+        base = percentile([row.peak for row in same], share_percent=selected_share)
+        basis: ShapeNeedBasis = ShapeRankedPeak(count, selected_share)
     elif same:
         base = max(row.peak for row in same)
         basis = ShapeLargest(count)
@@ -515,7 +567,7 @@ def build_expected_peak(repository: Repository, shape: BuildShape | NoBuildShape
         base = max([first_peak_bytes, *(row.peak for row in rows
                                if isinstance(shape, BuildShape) and row.shape.profile == shape.profile)])
         basis = ShapeFallback()
-    if isinstance(basis, (ShapeP90, ShapeLargest)):
+    if isinstance(basis, (ShapeRankedPeak, ShapeLargest)):
         if isinstance(floor, FailedPeakFloor):
             base = max(base, floor.peak)
         factor: HeadroomRule = NoHeadroom()
@@ -554,8 +606,9 @@ def filtered_steps(step: str) -> tuple[str, ...]:
 
 def filtered_history_peak(repository: RepositoryIdentity, step: str, host: str, now: datetime,
                           root: Path, width: int | None, filters: tuple[str, ...],
-                          package: str, history: EstimateHistory) -> ExpectedPeak:
-    """Use the larger exact-filter and package anonymous p90.
+                          package: str, history: EstimateHistory, *,
+                          share_percent: int | progress.ConfiguredPeakShare = progress.CONFIGURED_PEAK_SHARE) -> ExpectedPeak:
+    """Use the larger exact-filter and package ranked anonymous peak.
 
     Recorded selection fields take priority. The shared resolver reads indexed
     test arguments only when a field is missing. Indexed test peaks, then
@@ -590,8 +643,8 @@ def filtered_history_peak(repository: RepositoryIdentity, step: str, host: str, 
             if filters and selection.filters == filters:
                 exact.append(peak)
     if measured:
-        package_peak = percentile(measured)
-        if exact and (exact_peak := percentile(exact)) >= package_peak:
+        package_peak = percentile(measured, share_percent=share_percent)
+        if exact and (exact_peak := percentile(exact, share_percent=share_percent)) >= package_peak:
             return ExpectedPeak(exact_peak, "measured", len(exact))
         return ExpectedPeak(package_peak, "measured", len(measured))
     indexed: list[int] = []
@@ -624,11 +677,11 @@ def filtered_history_peak(repository: RepositoryIdentity, step: str, host: str, 
             pass
     for values in (indexed_exact, indexed):
         if values:
-            return ExpectedPeak(int(percentile(values) * ANON_SHARE), "buildlog", len(values))
+            return ExpectedPeak(int(percentile(values, share_percent=share_percent) * ANON_SHARE), "buildlog", len(values))
     if compile_peaks:
-        return ExpectedPeak(percentile(compile_peaks), "measured", len(compile_peaks))
+        return ExpectedPeak(percentile(compile_peaks, share_percent=share_percent), "measured", len(compile_peaks))
     if compile_index:
-        return ExpectedPeak(int(percentile(compile_index) * ANON_SHARE),
+        return ExpectedPeak(int(percentile(compile_index, share_percent=share_percent) * ANON_SHARE),
                             "buildlog", len(compile_index))
     return ExpectedPeak(FILTERED_FLOOR, "fallback", 0)
 
@@ -760,7 +813,8 @@ class NoFreshHistory:
 def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: datetime,
                     root: Path, width: int | None, scope: TestScope,
                     filters: tuple[str, ...], package: str,
-                    history: EstimateHistory) -> ExpectedPeak | NoFreshHistory:
+                    history: EstimateHistory, *,
+                    share_percent: int | progress.ConfiguredPeakShare = progress.CONFIGURED_PEAK_SHARE) -> ExpectedPeak | NoFreshHistory:
     """Use only completed zero-compile measurements of this package and scope."""
     cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
     before = store.utc_iso(now.timestamp())
@@ -807,7 +861,7 @@ def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: d
     for values, source in ((measured_exact, "measured"), (indexed_exact, "buildlog"),
                            (measured, "measured"), (indexed, "buildlog")):
         if values:
-            peak = percentile(values)
+            peak = percentile(values, share_percent=share_percent)
             if source == "buildlog":
                 peak = int(peak * ANON_SHARE)
             return ExpectedPeak(max(FILTERED_FLOOR, peak),
@@ -815,17 +869,33 @@ def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: d
     return NoFreshHistory()
 
 GENERIC_REPO_NAMES = frozenset({"", "repo", "c", "clone", "scratch", "tmp", "repository"})
+_GIT_IDENTITIES: dict[tuple[str, str], tuple[Repository, str]] = {}
+
+
+def clear_git_identity_cache() -> None:
+    """Clear identities after a test changes an origin or replaces a repository."""
+    _GIT_IDENTITIES.clear()
 
 
 def git_identity(argv: list[str], cwd: str) -> tuple[Repository, str]:
     if not argv:
         return UnknownRepository(), ""
-    directory = record.git_directory(argv, cwd)
+    directory = os.path.abspath(record.git_directory(argv, cwd))
+    key = (directory, cwd)
+    if key not in _GIT_IDENTITIES:
+        _GIT_IDENTITIES[key] = _read_git_identity(directory, cwd)
+    return _GIT_IDENTITIES[key]
+
+
+def _read_git_identity(directory: str, cwd: str) -> tuple[Repository, str]:
     facts = record.git_facts(directory)
     worktree = Path(facts["worktree"] or cwd).name
     key = repository.repository_key(directory)
     if key == store.UNKNOWN_IDENTITY:
         return UnknownRepository(), worktree
+    if key.startswith(repository.MANIFEST_IDENTITY_PREFIX):
+        manifest = Path(key.removeprefix(repository.MANIFEST_IDENTITY_PREFIX))
+        return RepositoryIdentity(key, manifest.parent.name), Path(directory).resolve().name
     checkout_name = Path(facts["repo_path"] or cwd).name
     if key.startswith("git-root:"):
         return RepositoryIdentity(key, checkout_name), worktree
@@ -866,6 +936,7 @@ READ_REPOSITORY_AT_USE = ReadRepositoryAtUse()
 def step_estimate(argv: list[str], cwd: str, profile: InferFromArgv | StepProfile | ProgramProfile,
                   now: datetime | Callable[[], datetime], root: Path, policy: AdmissionPolicy, *,
                   first_peak_bytes: int,
+                  share_percent: int | progress.ConfiguredPeakShare = progress.CONFIGURED_PEAK_SHARE,
                   build_history_generation: Callable[[], BuildHistoryGeneration | NoBuildHistoryGeneration] = no_build_history_generation,
                   location: RepositoryLocation | ReadRepositoryAtUse = READ_REPOSITORY_AT_USE
                   ) -> StepEstimate:
@@ -878,7 +949,7 @@ def step_estimate(argv: list[str], cwd: str, profile: InferFromArgv | StepProfil
         if not sizing.estimated_at or estimate_time.timestamp() - sizing.estimated_at >= policy.timing.estimate_refresh_seconds:
             profile = replace(profile, sizing=replace(sizing,
                 estimate=program_peak_estimate(profile.program, store.host_name(), estimate_time, root,
-                                               sizing.first_peak_bytes),
+                                               sizing.first_peak_bytes, share_percent=share_percent),
                 estimated_at=estimate_time.timestamp()))
     elif isinstance(profile, StepProfile) and profile.estimated_at and estimate_time.timestamp() - profile.estimated_at >= policy.timing.estimate_refresh_seconds:
         profile = InferFromArgv()
@@ -908,7 +979,7 @@ def step_estimate(argv: list[str], cwd: str, profile: InferFromArgv | StepProfil
         peak = expected_peak(repository, step, host, estimate_time, root, scope=scope,
                              package=package, filters=filters, fresh=fresh,
                              shape=build_shape(argv) if step == "build" else NO_BUILD_SHAPE,
-                             first_peak_bytes=first_peak_bytes)
+                             first_peak_bytes=first_peak_bytes, share_percent=share_percent)
         profile = StepProfile(repo, step, worktree, peak, repository, scope, estimate_time.timestamp(),
                               generation)
     elif isinstance(profile, StepProfile) and not profile.estimated_at:

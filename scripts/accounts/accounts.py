@@ -18,13 +18,14 @@ import math
 import os
 import re
 import shlex
+import shutil
 import socket
 import stat
 import subprocess
 import sys
 import tomllib
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextvars import ContextVar
+from contextvars import Context, ContextVar
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext, redirect_stderr
 from dataclasses import dataclass, field, replace
@@ -40,10 +41,12 @@ SCRIPTS = REPOSITORY_ROOT / "scripts"
 _ = sys.modules.setdefault("scripts.accounts.accounts", sys.modules[__name__])
 
 from scripts.whoami import account  # noqa: E402
+from scripts.herdr import herdr_types  # noqa: E402
 from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
 from scripts.lib import atomic_file, conf, file_lock, models_registry  # noqa: E402
 from scripts.lib.agent_program import resolve_program as resolve_program
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
+from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.whoami import note_file  # noqa: E402
 from scripts.whoami import usage_store  # noqa: E402
@@ -56,7 +59,7 @@ from scripts.accounts.refusals import (  # noqa: E402
 )
 
 from scripts.accounts import next_moves
-from scripts.shutdown import remote, stop_results
+from scripts.agents import remote, stop_results
 from scripts.accounts.role_map import (  # noqa: E402
     RoleMap as RoleMap, RoleMapChange as RoleMapChange,
     StoredGroupSelection as StoredGroupSelection, StoredGroupSelections as StoredGroupSelections,
@@ -65,7 +68,7 @@ from scripts.accounts.role_map import (  # noqa: E402
 )
 
 if TYPE_CHECKING:
-    from scripts.shutdown.inventory import ListedSession, Session
+    from scripts.agents.inventory import ListedSession, Session
     from scripts.production import staff
 
 
@@ -141,6 +144,9 @@ ALWAYS_LINKED = frozenset({
     "paste-cache", "uploads",
 })
 CODEX_ALWAYS_LINKED = frozenset({"skills", "rules", "plugins", "sessions", "archived_sessions"})
+# Keep these links before the first append creates their shared targets.
+CODEX_WRITE_THROUGH = frozenset({"session_index.jsonl", "history.jsonl"})
+NO_WRITE_THROUGH_FILES = frozenset[str]()
 AT_FDCWD = -100  # Linux: resolve relative paths from the current directory.
 RENAME_NOREPLACE = 1  # Linux renameat2: refuse an existing destination.
 RENAME_EXCL = 4  # macOS renamex_np: refuse an existing destination.
@@ -188,7 +194,7 @@ CODEX_ROLE = "workers"
 NO_VALUE = "—"
 TABLE_HEADINGS = (
     "Folder", "Label", "Role", "Weekly left", "Weekly resets",
-    "On credits", "Credits left", "Read",
+    "On credits", "Credits left", "Read", "Login ends",
 )
 
 
@@ -425,6 +431,10 @@ class AccountsError(ValueError):
         self.source: ObservedStateCause | NoObservedStateCause = source
 
 
+class WorkerMovesStartFailed(AccountsError):
+    """The detached worker runner did not start; its request remains pending."""
+
+
 @dataclass(frozen=True)
 class AccountStatus:
     """The user-visible state of one default or named account directory."""
@@ -483,6 +493,7 @@ class CommandLine(argparse.Namespace):
     since: str = ""
     until: str = ""
     dry_run: bool = False
+    follow_role: bool = False
     alerts: MoveAlerts = "user"
     claude_args: list[str] = []
     probe: bool = False
@@ -768,12 +779,13 @@ def _repair_link(path: Path, target: Path, shared_home: str = "~/.claude") -> li
 
 def _shared_repair_problems(
     destination: Path, source_dir: Path, shared: tuple[str, ...], folders: frozenset[str],
+    *, write_through: frozenset[str] = NO_WRITE_THROUGH_FILES,
 ) -> list[str]:
     """Judge shared entries without performing any of their possible repairs."""
     if destination == source_dir:
         return []
     if not source_dir.is_dir():
-        return _shared_link_problems(destination, source_dir, shared, folders)
+        return _shared_link_problems(destination, source_dir, shared, folders, write_through=write_through)
     problems: list[str] = []
     for name in shared:
         path, target = destination / name, source_dir / name
@@ -801,6 +813,7 @@ def _shared_repair_problems(
 
 def _repair_shared_links(
     destination: Path, source_dir: Path, shared: tuple[str, ...], folders: frozenset[str],
+    *, write_through: frozenset[str] = NO_WRITE_THROUGH_FILES,
 ) -> list[str]:
     """Repair entries inside an existing shared home; never create an empty shared file."""
     if (destination == source_dir or destination.is_symlink() or not destination.is_dir()
@@ -818,7 +831,7 @@ def _repair_shared_links(
                 if name in folders:
                     target.mkdir(mode=0o700, exist_ok=True)
                     target.chmod(0o700)
-                else:
+                elif name not in write_through:
                     if _is_expected_link(path, target):
                         try:
                             path.unlink()
@@ -995,15 +1008,31 @@ def source_has_claude_trust(source: Path) -> bool:
     return False
 
 
-def set_claude_folder_trust(folder: Path, *, trusted: bool) -> None:
-    """Trust a folder or remove its project entry in every existing account file. Report each failed home independently."""
+@dataclass(frozen=True)
+class FolderTrustComplete:
+    """Every existing account file has the requested folder trust state."""
+
+
+@dataclass(frozen=True)
+class FolderTrustFailed:
+    """One or more account files could not receive the requested folder trust state."""
+
+    reasons: tuple[str, ...]
+
+    def report(self) -> None:
+        for reason in self.reasons:
+            print(reason, file=sys.stderr)
+
+
+def set_claude_folder_trust(folder: Path, *, trusted: bool) -> FolderTrustComplete | FolderTrustFailed:
+    """Set folder trust in each existing account file and return all failures."""
     try:
         key = str(folder.resolve())
         files = _account_trust_files()
     except (OSError, ValueError) as error:
-        print(f"accounts: anomaly: cannot prepare folder trust ({type(error).__name__})", file=sys.stderr)
-        return
+        return FolderTrustFailed((f"accounts: anomaly: cannot prepare folder trust ({type(error).__name__}): {error}",))
     change = with_trusted_folders if trusted else without_project_entries
+    failures: list[str] = []
     for account_file in files:
         try:
             _ = account_file.path.stat()
@@ -1011,7 +1040,8 @@ def set_claude_folder_trust(folder: Path, *, trusted: bool) -> None:
         except FileNotFoundError:
             continue
         except (OSError, ValueError) as error:
-            print(f"accounts: anomaly: {account_file.path}: cannot change trust ({type(error).__name__})", file=sys.stderr)
+            failures.append(f"accounts: anomaly: {account_file.path}: cannot change trust ({type(error).__name__}): {error}")
+    return FolderTrustFailed(tuple(failures)) if failures else FolderTrustComplete()
 
 
 def trust_accounts() -> int:
@@ -1098,6 +1128,7 @@ def _link_problems(destination: Path) -> list[str]:
 
 def _shared_link_problems(
     destination: Path, source_dir: Path, shared: tuple[str, ...], required: frozenset[str],
+    *, write_through: frozenset[str] = NO_WRITE_THROUGH_FILES,
 ) -> list[str]:
     problems: list[str] = []
     for name in shared:
@@ -1117,7 +1148,7 @@ def _shared_link_problems(
                 problems.append(
                     f"accounts: {path} points to {actual}, not {target}"
                 )
-            elif not path.exists():
+            elif not path.exists() and not (name in write_through and not os.path.lexists(target)):
                 problems.append(f"accounts: {path} is broken")
         elif path.exists():
             problems.append(_real_entry_problem(path, f"~/{source_dir.name}"))
@@ -1327,6 +1358,7 @@ def _link_codex_home(label: str) -> list[str]:
         return [f"accounts: could not create {destination}: {error}"]
     problems = _repair_shared_links(
         destination, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED,
+        write_through=CODEX_WRITE_THROUGH,
     )
     return problems
 
@@ -1388,10 +1420,11 @@ def _inspect_codex_home(label: str, destination: Path, workers_home: Path, *, al
         return CodexHomeInspection((diagnostic,), ObservedStateCause(diagnostic,
             ProblemCauseKey("access", CauseAccount(label), CauseFile(str(destination)))))
     problems = (_check_default_codex_home(workers_home) if destination == accounts_home() / ".codex"
-                else _shared_repair_problems(destination, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED)
+                else _shared_repair_problems(destination, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED,
+                                            write_through=CODEX_WRITE_THROUGH)
                 if allow_shared_repair
                 else _shared_link_problems(destination, (accounts_home() / ".codex").absolute(),
-                                           CODEX_SHARED, CODEX_ALWAYS_LINKED))
+                                           CODEX_SHARED, CODEX_ALWAYS_LINKED, write_through=CODEX_WRITE_THROUGH))
     problems.extend(_codex_private_link_problems(destination))
     if destination != accounts_home() / ".codex":
         try:
@@ -1547,7 +1580,7 @@ def _update_codex(arguments: list[str], *, account_config: conf.ConfigRead | Rea
     machine = remote.other_machine()
     command = 'CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" update >&2 && "$HOME/.local/bin/codex" --version'
     try:
-        updated = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={account_config.whole("codex_update_connect_timeout_seconds")}", machine, command],
+        updated = subprocess.run(["ssh", "-o", "BatchMode=yes", machine, command],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=account_config.whole("codex_update_timeout_seconds"), check=False)
     except (subprocess.TimeoutExpired, OSError):
         print(f"{machine}: unreachable; run codex update there")
@@ -1682,7 +1715,7 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False, accou
         if name.startswith("SHOWRUNNER_"):
             _ = environment.pop(name, None)
     if probe:
-        from scripts.herdr.herdr import NATIVE_ID_MARKS
+        from scripts.herdr.herdr_types import NATIVE_ID_MARKS
 
         environment[PROBE_ENV] = "1"
         for name in NATIVE_ID_MARKS:
@@ -1693,6 +1726,7 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False, accou
             os.execvpe(str(SCRIPTS / "lib" / "py"), [str(SCRIPTS / "lib" / "py"), str(SCRIPTS / "lib" / "relaunch.py"),
                                       "run", "--", program, *arguments], models_registry.agent_environment(environment))
         else:
+            arguments = models_registry.claude_arguments(arguments, environment)
             os.execvpe(program, [program, *arguments], models_registry.agent_environment(environment))
     except OSError as error:
         raise AccountsError(f"accounts: could not start claude: {error}") from error
@@ -2116,7 +2150,7 @@ def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[
         if refusal_problem:
             reason = refusal_problem
         elif refusal is not None and not refusals.resolved(refusal, reading, now):
-            reason = "refused at " + refusal.at.astimezone(agent_accounts.user_zone()).strftime("%Y-%m-%d %H:%M %Z")
+            reason = "refused at " + refusal.at.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M %Z")
         elif tool == "claude" and isinstance(reading, FreshReading) and any(
             isinstance(window, ReadingWindow) and window.left <= 0 for window in (weekly, five)
         ):
@@ -2331,6 +2365,93 @@ def live_group_members() -> dict[ClaudeGroup, list[LiveGroupMember]]:
     return _read_local_role_sessions(GroupAccounts(), include_workers=False).members
 
 
+@dataclass(frozen=True)
+class InvalidProducerSettings:
+    """The producer has no usable launch settings for this operation."""
+
+
+_scoped_producer_settings: ContextVar[dict[staff.StaffId, models_registry.LaunchSettings | InvalidProducerSettings]] = (
+    ContextVar("scoped_producer_settings"))
+
+
+@contextmanager
+def settings_report_scope() -> Generator[None]:
+    """Resolve and report each producer's settings once within an operation."""
+    try:
+        _ = _scoped_producer_settings.get()
+    except LookupError:
+        token = _scoped_producer_settings.set({})
+        try:
+            yield
+        finally:
+            _scoped_producer_settings.reset(token)
+    else:
+        yield
+
+
+def producer_settings(member: staff.StaffRow) -> models_registry.LaunchSettings | InvalidProducerSettings:
+    """Read one producer's settings and exclude it when its settings are invalid."""
+    resolved = _scoped_producer_settings.get({})
+    if member.id in resolved:
+        return resolved[member.id]
+    try:
+        settings: models_registry.LaunchSettings | InvalidProducerSettings = (
+            models_registry.launch_settings("producers", member.name))
+    except ValueError as error:
+        account_anomaly(f"{member.name}: {error}")
+        settings = InvalidProducerSettings()
+    resolved[member.id] = settings
+    return settings
+
+
+def eligible_producers(membership: staff.StaffSnapshot, family: str) -> tuple[staff.StaffRow, ...]:
+    """Select active, unpaused, local producers of the requested family."""
+    from scripts.production import staff
+
+    machine = _session_counts_machine()
+    return tuple(row for row in staff.active(membership, "producer")
+                 if not isinstance(row.paused, staff.Paused)
+                 and (not isinstance(row.doc, staff.LiveDoc) or row.doc.machine == machine)
+                 and (not isinstance(row.worktree, staff.PresentWorktree) or row.worktree.machine == machine)
+                 and isinstance(settings := producer_settings(row), models_registry.LaunchSettings)
+                 and settings.kind == family)
+
+
+def producer_upkeep_members() -> tuple[staff.StaffRow, ...]:
+    """Select admitted local producers without a pause or an exit request."""
+    from scripts.production import staff
+
+    try:
+        membership = staff.local_snapshot()
+    except staff.StaffAbsent:
+        return ()
+    members = eligible_producers(membership, "claude") + eligible_producers(membership, "codex")
+    return tuple(row for row in members if not isinstance(row.exited, staff.Exited))
+
+
+@settings_report_scope()
+def group_move_members(group: ClaudeGroup) -> tuple[list[LiveGroupMember], tuple[staff.StaffRow, ...]]:
+    """Keep verified accounts and retain eligible members without account proof."""
+    from scripts.production import staff
+    from scripts.message import sessions
+
+    live = live_group_members()[group]
+    try:
+        membership = staff.local_snapshot()
+    except staff.StaffUnreadable:
+        return live, ()
+    running = {session["sessionId"] for session in sessions.running_sessions()}
+    running.update(member.session_id for member in live)
+    kind = "unit" if group == "units" else "showrunner"
+    candidates = {row.id: row for row in membership.find(kind=kind) if row.current_session in running}
+    if group == "showrunners":
+        candidates.update((row.id, row) for row in eligible_producers(membership, "claude"))
+    live = [member for member in live if (owner := membership.by_current_session(member.session_id)) is None
+            or owner.kind != "producer" or owner.id in candidates]
+    verified = {member.session_id for member in live}
+    return live, tuple(row for row in candidates.values() if row.current_session not in verified)
+
+
 def session_account_label(session: ListedSession | LiveGroupMember) -> str:
     return claude_config_label(session.config_dir)
 
@@ -2495,13 +2616,13 @@ def placement_report(now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW, 
 
 def no_room_line(tool: str, outcome: NoAccountWithRoom) -> str:
     reset = outcome.earliest_reset
-    time = reset.at.astimezone(agent_accounts.user_zone()).strftime("%a %Y-%m-%d %H:%M %Z") if isinstance(reset, EarliestReset) else "unknown"
+    time = reset.at.astimezone(user_zone()).strftime("%a %Y-%m-%d %H:%M %Z") if isinstance(reset, EarliestReset) else "unknown"
     return f"no {tool} account has room; the earliest reset is {time}"
 
 
 def _pick_explanation(reason: PickReason) -> str:
     weekly = f"{reason.weekly.left:g}%" if isinstance(reason.weekly, ReadingWindow) else "unavailable"
-    reset = (reason.weekly.reset.at.astimezone(agent_accounts.user_zone()).strftime("%a %Y-%m-%d %H:%M %Z")
+    reset = (reason.weekly.reset.at.astimezone(user_zone()).strftime("%a %Y-%m-%d %H:%M %Z")
              if isinstance(reason.weekly, ReadingWindow) and isinstance(reason.weekly.reset, KnownReset) else "unknown")
     five = f"{reason.five_hour.left:g}%" if isinstance(reason.five_hour, ReadingWindow) else "no window"
     return f"{reason.label}: weekly {weekly}, resets {reset}, 5-hour {five}; {reason.status}"
@@ -2519,8 +2640,6 @@ def _iso_time(text: str, place: str) -> datetime:
         raise AccountsError(f"accounts: {place} must be an ISO timestamp") from error
     if at.tzinfo is None:
         # Command-line and historical wall times use the user's zone.
-        from scripts.lib.user_zone import user_zone
-
         at = at.replace(tzinfo=user_zone())
     return at.astimezone(timezone.utc)
 
@@ -2742,7 +2861,30 @@ class SessionMoveRefused:
     returncode: int = 1
 
 
-SessionMoveOutcome = stop_results.ClaudeUp | stop_results.MoveHandedOff | stop_results.ResumePending | SessionMoveRefused
+@dataclass(frozen=True)
+class IdleWorkerPaneClose:
+    """An idle worker can keep its conversation without a pane."""
+
+
+@dataclass(frozen=True)
+class SessionIdlePaneClosed:
+    session_id: str
+
+
+SessionMoveOutcome = stop_results.ClaudeUp | stop_results.MoveHandedOff | stop_results.ResumePending | SessionMoveRefused | SessionIdlePaneClosed
+
+
+class WorkerResumePreview(Protocol):
+    """The source account and pane reason for a worker that can resume."""
+
+    @property
+    def source(self) -> str: ...
+
+    @property
+    def kept_open_reason(self) -> str: ...
+
+    @property
+    def detached_context(self) -> str: ...
 
 
 class PaneMoves(Protocol):
@@ -2751,14 +2893,22 @@ class PaneMoves(Protocol):
 
     def run_for_worker(self, row: staff.StaffRow, record: staff.StaffSnapshot) -> Path: ...
 
+    def preview_worker(self, row: staff.StaffRow, record: staff.StaffSnapshot, target: str,
+                       why: str, run: Path) -> WorkerResumePreview | IdleWorkerPaneClose | SessionMoveRefused | stop_results.ClaudeUp: ...
+
 
 class AccountWorkerActivity(Protocol):
     @property
     def row(self) -> staff.StaffRow: ...
 
 
+class AccountOpenWorkerActivity(AccountWorkerActivity, Protocol):
+    @property
+    def status(self) -> str: ...
+
+
 class AccountPaneReader(Protocol):
-    OpenWorker: type[AccountWorkerActivity]
+    OpenWorker: type[AccountOpenWorkerActivity]
 
     def observe_parents(self, parents: Sequence[staff.StaffRow], record: staff.StaffSnapshot
                         ) -> dict[staff.StaffId, list[AccountWorkerActivity]]: ...
@@ -2776,9 +2926,9 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.M
 
     account_config = read_account_settings(account_config)
     if TYPE_CHECKING:
-        from scripts.shutdown import inventory
+        from scripts.agents import inventory
     else:
-        inventory = import_module("scripts.shutdown.inventory")
+        inventory = import_module("scripts.agents.inventory")
 
     checked = check_move_target(target, datetime.now(timezone.utc), account_config=account_config)
     if isinstance(checked, MoveRefused):
@@ -2794,7 +2944,7 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.M
         else:
             eligible.append(identity)
     outcomes: dict[str, SessionMoveOutcome] = dict(refused)
-    batch = cast(SessionBatchMove, import_module("scripts.shutdown.stop_resume").move_sessions)
+    batch = cast(SessionBatchMove, import_module("scripts.agents.stop_resume").move_sessions)
     sources = {item.session_id: claude_config_label(item.config_dir) for item in live if item.session_id in eligible}
     results = batch(eligible, checked.destination.label, why=why, cause=cause, source_accounts=sources)
     for identity, result in zip(eligible, results):
@@ -2808,6 +2958,8 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.M
 
 
 def move_result_line(result: SessionMoveOutcome) -> str:
+    if isinstance(result, SessionIdlePaneClosed):
+        return f"{result.session_id}: idle pane closed; the next assign resumes its conversation"
     if isinstance(result, SessionMoveRefused):
         return f"{result.session_id}: not moved: {result.reason}"
     if isinstance(result, stop_results.ResumePending):
@@ -2861,52 +3013,186 @@ class GroupMoveStarted:
     outcomes: tuple[SessionMoveOutcome, ...] = field(default=(), kw_only=True)
 
 
+@dataclass(frozen=True)
+class FollowWorkersRole:
+    """Move Codex workers to the current workers role."""
+
+
+@dataclass(frozen=True)
+class FixedClaudeWorkersTarget:
+    """Move Claude workers to this account without reading the workers role."""
+
+    label: str
+
+
 def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
+                 follow_role: bool = False,
                  account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS
                  ) -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
-    """Resume workers on the destination in their existing conversations."""
-    from scripts.production import staff, session_staff
-    pane_moves = cast(PaneMoves, cast(object, import_module("scripts.accounts.pane_moves")))
-    from scripts.herdr import herdr
-
+    """Follow the Codex workers role or move Claude workers to the requested account."""
     target = note_file.canonical_label(target)
-    if _label_is(target, "codex"):
-        _ = _codex_move_target(target)
-    else:
-        checked = check_move_target(target, datetime.now(timezone.utc), repair=False, account_config=account_config)
-        if isinstance(checked, MoveRefused):
-            return checked
+    if not follow_role or dry_run:
+        if _label_is(target, "codex"):
+            selected = _current_workers_target()
+            if target != selected:
+                return MoveRefused(f"workers role is {selected}; run accounts.py swap workers {target} to select it")
+            _ = _codex_move_target(target)
+        else:
+            checked = check_move_target(target, datetime.now(timezone.utc), repair=False, account_config=account_config)
+            if isinstance(checked, MoveRefused):
+                return checked
+    if not dry_run:
+        destination = FollowWorkersRole() if _label_is(target, "codex") else FixedClaudeWorkersTarget(target)
+        return _run_worker_moves(destination, why)
+    return _preview_worker_moves(target, why)
+
+
+def _workers_move_rows(record: staff.StaffSnapshot, family: str) -> tuple[staff.StaffRow, ...]:
+    """Include Codex producers in the workers account selection."""
+    from scripts.production import session_staff
+
+    producers: set[staff.StaffId] = {row.id for row in eligible_producers(record, family)} if family == "codex" else set()
+    return tuple(row for row in record.rows
+                 if (row.kind == "worker" and (not row.current_session or
+                     session_staff.worker_family(record, row.id) == family)) or
+                    row.id in producers)
+
+
+@settings_report_scope()
+def _preview_worker_moves(target: str, why: str) -> GroupMoveDryRun:
+    """Preview workers after the caller checks the destination."""
+    from scripts.production import staff
+    pane_moves = cast(PaneMoves, cast(object, import_module("scripts.accounts.pane_moves")))
     record = staff.local_snapshot()
-    rows = record.find(kind="worker")
+    family = "codex" if _label_is(target, "codex") else "claude"
+    rows = _workers_move_rows(record, family)
     identities = tuple(str(row.id) for row in rows)
 
-    def restart_refusal(identity: staff.StaffId) -> str:
-        if session_staff.worker_family(record, identity) != ("codex" if _label_is(target, "codex") else "claude"):
-            return f"cannot restart on {target} through assign.sh"
-        return ""
-
-    if dry_run:
-        lines: list[str] = []
-        for row in rows:
-            reason = restart_refusal(row.id)
-            preview = f"would stop and resume the same conversation on {target} in its worker pane"
-            if reason:
-                preview = f"not moved: {reason}"
-            lines.append(f"{row.name} ({row.id}): {preview}")
-        return GroupMoveDryRun(identities, tuple(lines))
-    results: list[SessionMoveOutcome] = []
+    lines: list[str] = []
+    nothing = 0
     for row in rows:
+        if row.kind == "producer":
+            lines.append(f"{row.name} ({row.id}): would stop and resume the same conversation on {target}")
+            continue
         try:
             run = pane_moves.run_for_worker(row, record)
-            reason = restart_refusal(row.id) if row.current_session else ""
-            results.append(SessionMoveRefused(row.id, reason) if reason else
-                           pane_moves.move_worker(row, record, target, why, run))
-        except (OSError, ValueError, AccountsError, staff.StaffRefused, herdr.HerdrFailure) as error:
-            results.append(SessionMoveRefused(row.id, str(error).replace("\n", " ")))
-    outcomes = tuple(results)
+            decision = pane_moves.preview_worker(row, record, target, why, run)
+        except (OSError, ValueError, AccountsError, staff.StaffRefused, herdr_types.HerdrFailure) as error:
+            decision = SessionMoveRefused(row.id, str(error).replace("\n", " "))
+        if isinstance(decision, stop_results.ClaudeUp) or isinstance(decision, SessionMoveRefused) and decision.returncode == 0:
+            nothing += 1
+            continue
+        if isinstance(decision, IdleWorkerPaneClose):
+            preview = f"would close its idle pane; the next assign resumes it on {target}"
+        else:
+            preview = (f"not moved: {decision.reason}" if isinstance(decision, SessionMoveRefused) else
+                       f"would stop and resume the same conversation on {target} in its worker pane")
+            if not isinstance(decision, SessionMoveRefused) and decision.detached_context:
+                preview += "; " + decision.detached_context.replace("\n", " ")
+            if not isinstance(decision, SessionMoveRefused) and decision.kept_open_reason:
+                preview = f"kept open: {decision.kept_open_reason}; {preview}"
+        lines.append(f"{row.name} ({row.id}): {preview}")
+    if nothing:
+        lines.append(f"{nothing} workers: nothing to move")
+    return GroupMoveDryRun(identities, tuple(lines))
+
+
+def _move_worker_row(pane_moves: PaneMoves, row: staff.StaffRow, record: staff.StaffSnapshot,
+                     target: str, why: str) -> SessionMoveOutcome:
+    from scripts.production import staff
+
+    try:
+        if row.kind == "producer":
+            batch = cast(SessionBatchMove, import_module("scripts.agents.stop_resume").move_sessions)
+            result = batch([str(row.current_session)], target, why=why, cause="by hand", source_accounts={})[0]
+            if isinstance(result, stop_results.SessionNotFound):
+                return SessionMoveRefused(row.current_session, "no saved session was found")
+            if isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff, stop_results.ResumePending)):
+                return result
+            return SessionMoveRefused(row.current_session, result.reason)
+        run = pane_moves.run_for_worker(row, record)
+        return pane_moves.move_worker(row, record, target, why, run)
+    except (OSError, ValueError, AccountsError, staff.StaffRefused, herdr_types.HerdrFailure) as error:
+        return SessionMoveRefused(row.id, str(error).replace("\n", " "))
+
+
+def _current_workers_target() -> str:
+    """Read the authority without reusing the command's earlier observation."""
+    return Context().run(read_role_map).workers
+
+
+def _resolve_worker_move_target(destination: FollowWorkersRole | FixedClaudeWorkersTarget) -> str:
+    return _current_workers_target() if isinstance(destination, FollowWorkersRole) else destination.label
+
+
+@dataclass(frozen=True)
+class TargetCanWork:
+    """The target account can take workers."""
+
+
+@dataclass(frozen=True)
+class CreditsOffTarget:
+    """The target may not spend credits and has no included usage left."""
+
+    reason: str
+
+
+def _codex_target_credit_block(label: str, now: datetime) -> TargetCanWork | CreditsOffTarget:
+    """A worker move never sends work to an account that may not spend credits and has no included usage."""
+    if not isinstance(agent_accounts.codex_credits_setting(label), agent_accounts.CreditsOff):
+        return TargetCanWork()
+    try:
+        login = _codex_home_login(_codex_account_home(label))
+    except AccountsError:
+        return TargetCanWork()
+    reading = refusals.stored_reading("codex", login, now) if login else NoReading()
+    if not isinstance(reading, (FreshReading, StaleReading)) or not isinstance(reading.weekly, ReadingWindow):
+        return TargetCanWork()
+    if _codex_reading_can_work(FreshReading(reading.weekly, reading.five_hour, "0"), now, agent_accounts.CreditsOff()):
+        return TargetCanWork()
+    return CreditsOffTarget(f"{label}: it may not spend credits and its included usage is gone; the worker stays")
+
+
+@settings_report_scope()
+def _run_worker_moves(destination: FollowWorkersRole | FixedClaudeWorkersTarget,
+                      why: str) -> GroupMoveStarted | GroupMoveStartFailed:
+    from scripts.production import staff
+
+    pane_moves = cast(PaneMoves, cast(object, import_module("scripts.accounts.pane_moves")))
+    results: dict[staff.StaffId, SessionMoveOutcome] = {}
+    attempted: dict[staff.StaffId, str] = {}
+    family = "codex" if isinstance(destination, FollowWorkersRole) else "claude"
+    with _workers_move_lock("run"):
+        if isinstance(destination, FollowWorkersRole):
+            with _workers_move_lock("schedule"):
+                if isinstance(_read_pending_worker_moves(), NoPendingWorkerMoves):
+                    _queue_worker_moves(_resolve_worker_move_target(destination))
+        while True:
+            record = staff.local_snapshot()
+            for row in _workers_move_rows(record, family):
+                target = _resolve_worker_move_target(destination)
+                if attempted.get(row.id) == target:
+                    continue
+                block = _codex_target_credit_block(target, datetime.now(timezone.utc)) if family == "codex" else TargetCanWork()
+                results[row.id] = (SessionMoveRefused(row.id, block.reason) if isinstance(block, CreditsOffTarget)
+                                   else _move_worker_row(pane_moves, row, record, target, why))
+                attempted[row.id] = target
+            with _workers_move_lock("schedule") if isinstance(destination, FollowWorkersRole) else nullcontext():
+                target = _resolve_worker_move_target(destination)
+                latest = staff.local_snapshot()
+                if any(attempted.get(row.id) != target for row in _workers_move_rows(latest, family)):
+                    continue
+                if isinstance(destination, FollowWorkersRole):
+                    pending = _read_pending_worker_moves()
+                    if isinstance(pending, PendingWorkerMoves):
+                        _complete_worker_move_requests(pending.requests, target,
+                                                       _codex_target_credit_block(target, datetime.now(timezone.utc)))
+                        _workers_move_file().unlink()
+                break
+    outcomes = tuple(results.values())
     stdout, stderr, code = _move_output(outcomes, ())
     outcome = GroupMoveStartFailed if code else GroupMoveStarted
-    return outcome(identities, target, stdout, stderr, code, outcomes=outcomes)
+    return outcome(tuple(str(identity) for identity in results), target, stdout, stderr, code, outcomes=outcomes)
 
 
 
@@ -2951,7 +3237,7 @@ def check_move_target(target: str, now: datetime, *, repair: bool = True, accoun
         if reading.credits != "unlimited" and (not math.isfinite(credits) or credits <= 0):
             for name, window in (("weekly", reading.weekly), ("5-hour", reading.five_hour)):
                 if isinstance(window, ReadingWindow) and window.left <= 0:
-                    reset = (window.reset.at.astimezone(agent_accounts.user_zone()).strftime("%a %-I:%M %p")
+                    reset = (window.reset.at.astimezone(user_zone()).strftime("%a %-I:%M %p")
                              if isinstance(window.reset, KnownReset) else "unknown")
                     chosen = pick("claude", now, exclude=frozenset({destination.label}), keep=NoKeep(), account_config=account_config)
                     room = f"{chosen.label} has room" if isinstance(chosen, PickedAccount) else no_room_line("claude", chosen)
@@ -2963,8 +3249,33 @@ def check_move_target(target: str, now: datetime, *, repair: bool = True, accoun
     return MoveTargetReady(destination, (f"no fresh usage reading for {destination.label} ({age})",))
 
 
+def detached_move_context(identity: str) -> str:
+    """Find a worker's live runs by staff id, session id, or name."""
+    from scripts.production import staff
+
+    try:
+        record = staff.local_snapshot()
+    except staff.StaffAbsent:
+        return ""
+    row = record.by_member_reference(identity)
+    if row is None:
+        matches = [member for member in record.find() if member.name == identity]
+        if len(matches) != 1:
+            return ""
+        row = matches[0]
+    if row.kind != "worker":
+        return ""
+    pane_moves = cast(PaneMoves, cast(object, import_module("scripts.accounts.pane_moves")))
+    context = cast(Callable[[Path, str], str], import_module("scripts.agents.detached_runs").resume_context)
+    run = pane_moves.run_for_worker(row, record)
+    return context(run / "detached_runs", row.name)
+
+
 def move_preview_line(member: ListedSession | LiveGroupMember, target: str) -> str:
-    return f"{member.name}: {member.session_id} · stop, then resume on {target} (from {session_account_label(member)})"
+    line = f"{member.name}: {member.session_id} · stop, then resume on {target} (from {session_account_label(member)})"
+    context = (detached_move_context(member.session_id)
+               if not isinstance(member, LiveGroupMember) and member.kind == "worker" else "")
+    return line + ("; " + context.replace("\n", " ") if context else "")
 
 
 def _move_output(results: tuple[SessionMoveOutcome, ...],
@@ -2984,6 +3295,8 @@ def _move_output(results: tuple[SessionMoveOutcome, ...],
 @role_map.role_map_command
 def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: str = "", alerts: MoveAlerts = "user", account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
     """Select the group after target checks, then stop and resume each owner."""
+    from scripts.production import staff
+
     account_config = read_account_settings(account_config)
     del alerts
     target = note_file.canonical_label(target)
@@ -2991,16 +3304,18 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     checked = check_move_target(target, now, repair=not dry_run, account_config=account_config)
     if isinstance(checked, MoveRefused):
         return checked
-    members = live_group_members()[group]
+    members, stopped = group_move_members(group)
     selected = [session for session in members if not session_on_account(session, target)]
-    ids = tuple(session.session_id for session in selected)
+    ids = (*tuple(session.session_id for session in selected), *(row.current_session for row in stopped))
     reason = why or f"{group} moved by hand"
     notices = (f"{group}: no live session moves",) if not ids else ()
+    notices += tuple(f"{row.name}: saved account is unknown; resume on {target}"
+                     for row in stopped if not isinstance(row.home, staff.SessionHome))
     if group == "showrunners":
         if TYPE_CHECKING:
-            from scripts.shutdown import inventory
+            from scripts.agents import inventory
         else:
-            inventory = import_module("scripts.shutdown.inventory")
+            inventory = import_module("scripts.agents.inventory")
         live_ids = {member.session_id for member in members}
         notices += tuple(
             f"{runner.name}: no session runs under the id its update timer names; "
@@ -3008,7 +3323,9 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
             for runner in inventory.showrunner_registrations().entries if runner.session_id not in live_ids)
     if dry_run:
         return GroupMoveDryRun(ids, (*checked.notices, f"{group}: would select {target}",
-            *(move_preview_line(item, target) for item in selected), *notices))
+            *(move_preview_line(item, target) for item in selected),
+            *(f"{row.name}: {row.current_session} · resume on {target} (from {claude_config_label(row.home.path)})"
+              for row in stopped if isinstance(row.home, staff.SessionHome)), *notices))
     _ = set_group_account(group, target, why=reason)
     results = move_sessions(ids, target, why=reason, account_config=account_config) if ids else ()
     stdout, stderr, code = _move_output(results, (*checked.notices, *notices))
@@ -3035,26 +3352,38 @@ def move(session: str, target: str, *, dry_run: bool, why: str = "", alerts: Mov
 
 
 def move(session: str, target: str, *, dry_run: bool = False, why: str = "", alerts: MoveAlerts = "user", account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> MoveStarted | MoveStartFailed | MoveDryRun | MoveRefused:
-    """Move one local owner after the quota check."""
+    """Skip an owner on the target; check quota before moving another owner."""
     account_config = read_account_settings(account_config)
     del alerts
     target = note_file.canonical_label(target)
     if TYPE_CHECKING:
-        from scripts.shutdown import inventory
+        from scripts.agents import inventory
     else:
-        inventory = import_module("scripts.shutdown.inventory")
+        inventory = import_module("scripts.agents.inventory")
     try:
-        now = datetime.now(timezone.utc)
-        checked = check_move_target(target, now, repair=not dry_run, account_config=account_config)
-        if isinstance(checked, MoveRefused):
-            return checked
-        live = inventory.listing()
+        refuse_default(target)
+        try:
+            live = inventory.listing()
+        except (inventory.InvalidInventory, OSError, ValueError):
+            checked = check_move_target(target, datetime.now(timezone.utc), repair=not dry_run, account_config=account_config)
+            if isinstance(checked, MoveRefused):
+                return checked
+            raise
         matches = [item for item in live if item.session_id == session]
         if not matches:
             matches = [item for item in live if item.name == session]
+        if len(matches) == 1 and session_account_label(matches[0]) == target:
+            owner = matches[0]
+            line = f"{owner.name}: already on {target}"
+            return MoveDryRun(owner.session_id, (line,)) if dry_run else MoveStarted(owner.session_id, target, line + "\n", "", 0)
+        checked = check_move_target(target, datetime.now(timezone.utc), repair=not dry_run, account_config=account_config)
+        if isinstance(checked, MoveRefused):
+            return checked
         if not matches:
             if dry_run:
-                return MoveDryRun(session, (f"{session}: would resume on {target} if its saved tab is local",))
+                context = detached_move_context(session)
+                line = f"{session}: would resume on {target} if its saved tab is local"
+                return MoveDryRun(session, (line + ("; " + context.replace("\n", " ") if context else ""),))
             results = move_sessions((session,), target, why=why or "finish account move", live=live, account_config=account_config)
             stdout, stderr, code = _move_output(results, ())
             outcome = MoveStartFailed if code else MoveStarted
@@ -3097,6 +3426,7 @@ def check_codex_target(label: str, workers_home: Path, *, repair: bool = True) -
     target = _codex_move_target(label)
     problems = (_repair_shared_links if repair else _shared_repair_problems)(
         target.home, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED,
+        write_through=CODEX_WRITE_THROUGH,
     )
     for problem in problems:
         account_anomaly(problem)
@@ -3108,9 +3438,161 @@ def codex_home_label(home: Path) -> str:
     return agent_accounts.codex_home_role_label(home)
 
 
+WorkerMoves = Literal["wait", "detach"]
+
+
+@dataclass(frozen=True)
+class PendingWorkerMoves:
+    """Accepted group requests await the end of a detached workers move."""
+
+    requests: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class NoPendingWorkerMoves:
+    """No detached workers move needs a retry."""
+
+
+@dataclass(frozen=True)
+class KeepWorkersRole:
+    """Restart pending moves without changing the selected account."""
+
+
+KEEP_WORKERS_ROLE = KeepWorkersRole()
+
+
+class WorkerMovesDocument(TypedDict):
+    requests: list[str]
+
+
+def _workers_move_file() -> Path:
+    return moves.store_file().with_name("workers_move.json")
+
+
+@contextmanager
+def _workers_move_lock(purpose: Literal["run", "schedule"]) -> Generator[None]:
+    path = _workers_move_file().with_suffix(f".{purpose}.lock")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with file_lock.exclusive(path):
+        yield
+
+
+def _pending_workers_requests(
+    journal: Sequence[moves.MoveEntry] | moves.ReadCurrentMoveJournal = moves.READ_CURRENT_MOVE_JOURNAL,
+) -> dict[str, moves.RequestedMove]:
+    pending: dict[str, moves.RequestedMove] = {}
+    entries = moves.read_moves() if isinstance(journal, moves.ReadCurrentMoveJournal) else journal
+    for entry in entries:
+        if entry["subject"] != "workers":
+            continue
+        if entry["kind"] == "requested":
+            pending[entry["move_id"]] = entry
+        elif entry["move_id"] in pending:
+            del pending[entry["move_id"]]
+    return pending
+
+
+def _read_pending_worker_moves() -> PendingWorkerMoves | NoPendingWorkerMoves:
+    try:
+        raw = cast(object, json.loads(_workers_move_file().read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return NoPendingWorkerMoves()
+    if not isinstance(raw, dict):
+        raise AccountsError("accounts: invalid pending workers move")
+    requests = cast(dict[str, object], raw).get("requests")
+    if not isinstance(requests, list) or not all(isinstance(value, str) for value in cast(list[object], requests)):
+        raise AccountsError("accounts: invalid pending workers move requests")
+    return PendingWorkerMoves(tuple(cast(list[str], requests)))
+
+
+def _queue_worker_moves(
+    label: str, journal: Sequence[moves.MoveEntry] | moves.ReadCurrentMoveJournal = moves.READ_CURRENT_MOVE_JOURNAL,
+) -> None:
+    requests = tuple(_pending_workers_requests(journal).values())
+    saved = _read_pending_worker_moves()
+    # Keep saved requests even when this pass has an older journal snapshot.
+    accepted = list(saved.requests) if isinstance(saved, PendingWorkerMoves) else []
+    boundary = next((index + 1 for index in range(len(requests) - 1, -1, -1)
+                     if requests[index]["to"] == label), len(requests))
+    accepted.extend(request["move_id"] for request in requests[:boundary] if request["move_id"] not in accepted)
+    document = WorkerMovesDocument(requests=accepted)
+    atomic_file.write_text_atomic(_workers_move_file(), json.dumps(document) + "\n", new_file_mode=0o600)
+
+
+def _complete_worker_move_requests(requests: tuple[str, ...], target: str,
+                                   block: TargetCanWork | CreditsOffTarget) -> None:
+    pending = _pending_workers_requests()
+    home = str(_codex_account_home(target) if _label_is(target, "codex") else claude_account_dir(target))
+    for identity in requests:
+        request = pending.get(identity)
+        if request is None:
+            continue
+        common = moves.MoveCommon(at=datetime.now(timezone.utc).isoformat(), tool=request["tool"],
+                                  subject="workers", move_id=identity)
+        if isinstance(block, CreditsOffTarget):
+            moves.append_move(moves.FailedMove(**common, kind="failed", reason=block.reason))
+        elif request["to"] == target:
+            moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=home))
+        else:
+            moves.append_move(moves.FailedMove(**common, kind="failed", reason=f"superseded by {target}"))
+
+
+def _launch_worker_moves(label: str, why: str) -> None:
+    command = [str(SCRIPTS / "lib/py"), str(SCRIPTS / "accounts/accounts.py"), "move", "workers", label,
+               "--follow-role", "--why", why]
+    try:
+        if shutil.which("systemd-run") is None:
+            _ = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+            return
+        unit = "accounts-workers-move"
+        if subprocess.run(["systemctl", "--user", "is-active", "--quiet", unit], check=False).returncode == 0:
+            return
+        started = subprocess.run(["systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}", *command],
+                                 capture_output=True, text=True, check=False)
+    except OSError as error:
+        raise WorkerMovesStartFailed(f"accounts: could not start the workers move: {error}") from error
+    if started.returncode:
+        raise WorkerMovesStartFailed(f"accounts: could not start the workers move: {started.stderr.strip()}")
+
+
+def _start_worker_moves(
+    label: str, why: str, *, change: RoleMapChange | KeepWorkersRole = KEEP_WORKERS_ROLE,
+    journal: Sequence[moves.MoveEntry] | moves.ReadCurrentMoveJournal = moves.READ_CURRENT_MOVE_JOURNAL,
+) -> None:
+    """Write the role and pending work under the final-check lock, then start one detached move."""
+    with _workers_move_lock("schedule"):
+        if isinstance(change, RoleMapChange):
+            write_role_map(change)
+        _queue_worker_moves(label, journal)
+        _launch_worker_moves(label, why)
+
+
+def resume_worker_moves(
+    journal: Sequence[moves.MoveEntry] | moves.ReadCurrentMoveJournal = moves.READ_CURRENT_MOVE_JOURNAL,
+) -> None:
+    """Restart an unfinished handoff without replacing its role selection."""
+    with _workers_move_lock("schedule"):
+        pending = _read_pending_worker_moves()
+        entries = moves.read_moves() if isinstance(journal, moves.ReadCurrentMoveJournal) else journal
+        requests = _pending_workers_requests(entries)
+        if isinstance(pending, NoPendingWorkerMoves) and not requests:
+            return
+        target = _current_workers_target()
+        if isinstance(pending, NoPendingWorkerMoves):
+            if not any(request["to"] == target for request in requests.values()):
+                return
+            _queue_worker_moves(target, entries)
+        why = next((request["why"] for request in reversed(tuple(requests.values())) if request["to"] == target),
+                   "retry workers move")
+        _launch_worker_moves(target, why)
+
+
 def _swap_workers(label: str, *, dry_run: bool, why: str = "by hand",
                   cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand",
-                  included_only: bool = False) -> WorkersSwapOutcome:
+                  included_only: bool = False, worker_moves: WorkerMoves = "wait",
+                  worker_move_journal: Sequence[moves.MoveEntry] | moves.ReadCurrentMoveJournal = moves.READ_CURRENT_MOVE_JOURNAL,
+                  ) -> WorkersSwapOutcome:
     """Check the live allowance before changing the workers account."""
     refuse_default(label)
     try:
@@ -3136,16 +3618,17 @@ def _swap_workers(label: str, *, dry_run: bool, why: str = "by hand",
         if not report.problem:
             account_anomaly(f"{account_label} ({_codex_folder(target_home)}): {readiness.problem}")
     if dry_run:
-        preview = move_workers(account_label, dry_run=True, why=why)
-        if isinstance(preview, MoveRefused):
-            raise AccountsError(preview.reason)
-        assert isinstance(preview, GroupMoveDryRun)
+        preview = _preview_worker_moves(account_label, why)
         return WorkersSwapDryRun(preview.lines)
     try:
+        if worker_moves == "detach":
+            change = RoleMapChange("workers", account_label, why, datetime.now(timezone.utc).isoformat(), cause=cause)
+            _start_worker_moves(account_label, why, change=change, journal=worker_move_journal)
+            return WorkersSwapStarted(())
         _ = _write_role("workers", account_label if _label_is(account_label, "codex") else label, why=why, cause=cause)
     except OSError as error:
         raise AccountsError(f"accounts: could not move the workers role: {error}") from error
-    moved = move_workers(account_label, why=why)
+    moved = move_workers(account_label, why=why, follow_role=True)
     if isinstance(moved, MoveRefused):
         raise AccountsError(moved.reason)
     assert not isinstance(moved, GroupMoveDryRun)
@@ -3154,11 +3637,17 @@ def _swap_workers(label: str, *, dry_run: bool, why: str = "by hand",
 
 def swap(role: str, label: str, *, dry_run: bool = False, why: str = "by hand",
          cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand",
-         included_only: bool = False) -> SwapOutcome | WorkersSwapOutcome:
-    """Move workers; included_only requires room without paid credits at the live check."""
+         included_only: bool = False, worker_moves: WorkerMoves = "wait",
+         worker_move_journal: Sequence[moves.MoveEntry] | moves.ReadCurrentMoveJournal = moves.READ_CURRENT_MOVE_JOURNAL,
+         ) -> SwapOutcome | WorkersSwapOutcome:
+    """Move workers; included_only requires room without paid credits at the live check.
+
+    "detach" writes the role, then moves the workers in their own process and returns at once.
+    """
     _validate_role(role)
     if role == "workers":
-        return _swap_workers(label, dry_run=dry_run, why=why, cause=cause, included_only=included_only)
+        return _swap_workers(label, dry_run=dry_run, why=why, cause=cause, included_only=included_only,
+                             worker_moves=worker_moves, worker_move_journal=worker_move_journal)
     raise AccountsError(UNIT_ROLE_GONE)
 
 
@@ -3742,7 +4231,7 @@ def _usage_store_problem(report: agent_accounts.Report, warning: agent_accounts.
     return StatusProblem(subject,
         "usage store read continued without a hold" if claim_failed else "usage store reading not saved",
         ProblemCause("usage claim" if claim_failed else "usage save",
-            f"{warning.reason}; read at {at.astimezone(agent_accounts.user_zone()):%Y-%m-%d %H:%M %Z}",
+            f"{warning.reason}; read at {at.astimezone(user_zone()):%Y-%m-%d %H:%M %Z}",
             CauseFile(str(directory.directory if isinstance(directory, agent_accounts.ClaudeDirectorySource)
                           else directory.home if isinstance(directory, agent_accounts.CodexHomeSource)
                           else usage_store.store_file()))),
@@ -3798,6 +4287,11 @@ class RoleSessionCountsDocument(TypedDict):
     total: int
 
 
+class AccountSessionDocument(TypedDict):
+    session: str
+    state: session_state.SessionState
+
+
 @dataclass(frozen=True)
 class StatusRow:
     """One account's values, shared by the table and JSON renderers."""
@@ -3817,6 +4311,8 @@ class StatusRow:
     role_counts: tuple[RoleSessionCounts | NoRoleCount, ...] = ()
     role_counts_by_machine: dict[str, dict[str, RoleSessionCountsDocument]] = field(default_factory=dict)
     selected_roles: tuple[str, ...] = ()
+    sessions: tuple[AccountSessionDocument, ...] = ()
+    login_ends_at: agent_accounts.LoginEndKnown | agent_accounts.LoginEndUnknown = field(default_factory=agent_accounts.LoginEndUnknown)
 
 
 @dataclass(frozen=True)
@@ -3833,13 +4329,16 @@ class StatusReading:
 
 class StatusAccountDocument(TypedDict):
     label: str
+    color: NotRequired[str]
     tool: Literal["claude", "codex"]
     roles: list[str]
     selected_roles: list[str]
     role_counts: list[RoleSessionCountsDocument | None]
+    sessions: list[AccountSessionDocument]
     role_counts_by_machine: dict[str, dict[str, RoleSessionCountsDocument]]
     weekly_left_percent: float | None
     resets_at: str | None
+    login_ends_at: str | None
     credits: float | Literal["unlimited"] | None
     use_credits: bool
     read_at: str | None
@@ -3847,10 +4346,49 @@ class StatusAccountDocument(TypedDict):
     credits_in_use: bool
 
 
+BoardTone = Literal["default", "success", "error", "warning", "inactive"]
+
+
+class BoardSpan(TypedDict):
+    """One styled piece of a board cell; the console Accounts page draws it as it is."""
+    text: str
+    tone: BoardTone
+    kind: Literal["fact", "bold"]
+    color: NotRequired[str]
+    # The statusline.conf key of a valid color; the console Accounts page offers a swatch for it.
+    color_key: NotRequired[str]
+
+
+class BoardColumn(TypedDict):
+    key: str
+    heading: str
+    align: Literal["left", "right"]
+
+
+class BoardGroup(TypedDict):
+    """A Claude group that this account line serves; the console Accounts page sets its next move."""
+    account: str
+    group: Literal["units", "showrunners"]
+
+
+class BoardRow(TypedDict):
+    """The cells of one table line."""
+    cells: dict[str, list[BoardSpan]]
+    group: NotRequired[BoardGroup]
+
+
+class Board(TypedDict):
+    """The rows hold the reset text for one local day; a reader draws them again from stale_at, an ISO UTC time."""
+    columns: list[BoardColumn]
+    rows: list[BoardRow]
+    stale_at: str
+
+
 class StatusDocument(TypedDict):
     upcoming_moves: list[str]
     session_inputs: list[str]
     accounts: list[StatusAccountDocument]
+    board: Board
     problems: list[str]
 
 
@@ -3922,7 +4460,9 @@ def _status_row(
         tool == "codex" and isinstance(agent_accounts.codex_credits_setting(status.label), agent_accounts.CreditsOn),
         read_at, usage_store.latest_read_outcome(usage or usage_store.StoredUsage()) if login
         else agent_accounts.UsageReadOutcome.OK,
-        _stored_time((usage or {}).get("attempted_at", "")) or StatusUnavailable())
+        _stored_time((usage or {}).get("attempted_at", "")) or StatusUnavailable(),
+        login_ends_at=agent_accounts.login_end_from_iso((usage or {}).get("login_ends_at"))
+        if login and tool == "claude" else agent_accounts.LoginEndUnknown())
 
 
 def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> tuple[str, ...]:
@@ -3952,11 +4492,167 @@ def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime, *, acc
         reset.cell if isinstance(reset, StatusUnavailable) else reset.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
         row.on_credits,
         credits.cell if isinstance(credits, StatusUnavailable) else credits if isinstance(credits, str) else f"{credits:,.0f}",
-        read_cell)
+        read_cell,
+        row.login_ends_at.at.astimezone(zone).strftime("%a %m-%d %H:%M %Z")
+        if row.tool == "claude" and isinstance(row.login_ends_at, agent_accounts.LoginEndKnown) else NO_VALUE)
+
+
+COUNT_COLUMNS = ("busy", "idle", "paused", "exited", "total")
+BOARD_COLUMNS: tuple[BoardColumn, ...] = (
+    BoardColumn(key="dot", heading="", align="left"), BoardColumn(key="label", heading="account", align="left"),
+    BoardColumn(key="left", heading="left", align="right"), BoardColumn(key="roles", heading="role", align="left"),
+    *(BoardColumn(key=key, heading=key, align="right") for key in COUNT_COLUMNS),
+    BoardColumn(key="resets", heading="resets", align="right"), BoardColumn(key="credits", heading="credits", align="right"),
+    BoardColumn(key="enabled", heading="enabled", align="left"),
+)
+
+
+def _span(text: str, tone: BoardTone = "default", kind: Literal["fact", "bold"] = "fact") -> BoardSpan:
+    return BoardSpan(text=text, tone=tone, kind=kind)
+
+
+@dataclass(frozen=True)
+class AccountColor:
+    """The terminal escape and CSS color for one valid account color."""
+    escape: str
+    css: str
+
+
+@dataclass(frozen=True)
+class NoAccountColor:
+    """The account label uses the default text color."""
+
+
+# ANSI names use the standard sixteen colors. Extended names use the xterm color cube.
+ACCOUNT_COLOR_NAMES: dict[str, tuple[str, str]] = {
+    "black": ("30", "#000000"), "red": ("31", "#800000"),
+    "green": ("32", "#008000"), "yellow": ("33", "#808000"),
+    "blue": ("34", "#000080"), "magenta": ("35", "#800080"),
+    "cyan": ("36", "#008080"), "white": ("37", "#c0c0c0"),
+    "bright-black": ("90", "#808080"), "bright-red": ("91", "#ff0000"),
+    "bright-green": ("92", "#00ff00"), "bright-yellow": ("93", "#ffff00"),
+    "bright-blue": ("94", "#0000ff"), "bright-magenta": ("95", "#ff00ff"),
+    "bright-cyan": ("96", "#00ffff"), "bright-white": ("97", "#ffffff"),
+    "orange": ("38;5;208", "#ff8700"), "purple": ("38;5;141", "#af87ff"),
+    "pink": ("38;5;211", "#ff87af"), "teal": ("38;5;30", "#008787"),
+    "brown": ("38;5;137", "#af875f"), "mauve": ("38;5;139", "#af87af"),
+}
+
+
+def account_color(value: str) -> AccountColor | NoAccountColor:
+    """Resolve a configured name or hex value for both board readers."""
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+        channels = (str(int(value[index:index + 2], 16)) for index in (1, 3, 5))
+        return AccountColor("\x1b[38;2;" + ";".join(channels) + "m", value)
+    if value in ACCOUNT_COLOR_NAMES:
+        code, css = ACCOUNT_COLOR_NAMES[value]
+        return AccountColor(f"\x1b[{code}m", css)
+    return NoAccountColor()
+
+
+# The statusline.conf key that colors each account role group's labels.
+ROLE_COLOR_KEYS = {"units": "role.unit-director", "showrunners": "role.showrunner", "workers": "role.worker"}
+
+
+def _colored_span(text: str, key: str, colors: dict[str, str], kind: Literal["fact", "bold"] = "fact") -> BoardSpan:
+    span = _span(text, kind=kind)
+    if key in colors:
+        span["color"] = colors[key]
+        if isinstance(account_color(colors[key]), AccountColor):
+            span["color_key"] = key
+    return span
+
+
+def _account_label(label: str, colors: dict[str, str]) -> BoardSpan:
+    return _colored_span(label, f"account.{label}", colors, kind="bold")
+
+
+def _role_spans(role: str, selected: bool, colors: dict[str, str]) -> list[BoardSpan]:
+    if not role:
+        return [_span("")]
+    key = ROLE_COLOR_KEYS.get(role)
+    return [_colored_span(role, key, colors) if key else _span(role), *([_span(" ✓")] if selected else [])]
+
+
+def _read_ok(row: StatusRow, reading: StatusReading, *, account_config: conf.ConfigRead) -> bool:
+    return (isinstance(row.read_at, datetime) and not _reading_is_old(row.read_at, reading.checked_at, account_config=account_config)
+            and row.on_credits != "stale"
+            and row.read_outcome in (agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD))
+
+
+def _reset_text(at: datetime | StatusUnavailable, zone: tzinfo, now: datetime) -> str:
+    """The clock today, the weekday and clock within six days, or the day and month."""
+    if isinstance(at, StatusUnavailable):
+        return ""
+    local = at.astimezone(zone)
+    days = abs((local.date() - now.astimezone(zone).date()).days)
+    if days > 6:
+        return f"{local.day} {local:%b}"
+    return f"{local:%H:%M}" if days == 0 else f"{local:%a %H:%M}"
+
+
+def _count_cells(count: RoleSessionCounts | NoRoleCount | None) -> dict[str, str]:
+    if not isinstance(count, RoleSessionCounts):
+        return {key: "" for key in COUNT_COLUMNS}
+    return {"busy": str(count.busy), "idle": str(count.idle), "paused": str(count.paused),
+            "exited": str(count.exited), "total": str(count.total)}
+
+
+def _account_board_rows(row: StatusRow, reading: StatusReading, *, account_config: conf.ConfigRead,
+                        colors: dict[str, str]) -> list[BoardRow]:
+    weekly = row.weekly_left_percent
+    known = not isinstance(weekly, (StatusUnavailable, WeeklyNotReadSince))
+    tone: BoardTone = "default" if not known else "error" if weekly < 10 else "warning" if weekly < 25 else "default"
+    left = f"{round(weekly)}%" if known else "—"
+    reset = _reset_text(row.resets_at, reading.zone, reading.checked_at)
+    balance = ("" if isinstance(row.credits, StatusUnavailable) else "unlimited" if row.credits == "unlimited"
+               else f"{row.credits:,.0f}")
+    dot: BoardTone = "success" if _read_ok(row, reading, account_config=account_config) else "error"
+    roles = list(row.roles) or [""]
+    lines: list[BoardRow] = []
+    for index, role in enumerate(roles):
+        first = index == 0
+        counts = _count_cells(row.role_counts[index] if index < len(row.role_counts) else None)
+        cells = {"dot": [_span("●", dot)] if first else [], "label": [_account_label(row.label, colors)] if first else [],
+                 "left": [_span(left, tone)] if first else [], "roles": _role_spans(role, role in row.selected_roles, colors),
+                 **{key: [_span(value)] for key, value in counts.items()},
+                 "resets": [_span(reset)] if first else [], "credits": [_span(balance)] if first else [],
+                 "enabled": [_span("yes" if row.use_credits else "")] if first else []}
+        line = BoardRow(cells=cells)
+        if row.tool == "claude" and role in row.selected_roles and (role == "units" or role == "showrunners"):
+            line["group"] = BoardGroup(account=row.label, group=role)
+        lines.append(line)
+    return lines
+
+
+def status_board(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> Board:
+    """The accounts board: one line per role of each account, then the total line."""
+    account_config = read_account_settings(account_config)
+    return _status_board(reading, account_config=account_config, colors=conf.read_or_repository("statusline").values())
+
+
+def _status_board(reading: StatusReading, *, account_config: conf.ConfigRead, colors: dict[str, str]) -> Board:
+    rows = sorted(reading.rows, key=lambda row: row.label.casefold())
+    # The reset text changes at the next local midnight.
+    today = reading.checked_at.astimezone(reading.zone).date()
+    stale_at = datetime.combine(today + timedelta(days=1), datetime.min.time(), reading.zone).astimezone(timezone.utc).isoformat()
+    if not rows:
+        return Board(columns=list(BOARD_COLUMNS), rows=[], stale_at=stale_at)
+    lines = [line for row in rows for line in _account_board_rows(row, reading, account_config=account_config, colors=colors)]
+    known = [count for row in rows for count in row.role_counts if isinstance(count, RoleSessionCounts)]
+    total = {"busy": str(sum(count.busy for count in known)), "idle": str(sum(count.idle for count in known)),
+             "paused": str(sum(count.paused for count in known)), "exited": str(sum(count.exited for count in known)),
+             "total": str(sum(count.total for count in known))}
+    empty: list[BoardSpan] = []
+    lines.append(BoardRow(cells={"dot": empty, "label": [_span("total", kind="bold")], "left": empty, "roles": empty,
+                                 **{key: [_span(value)] for key, value in total.items()},
+                                 "resets": empty, "credits": empty, "enabled": empty}))
+    return Board(columns=list(BOARD_COLUMNS), rows=lines, stale_at=stale_at)
 
 
 def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:
     account_config = read_account_settings(account_config)
+    colors = conf.read_or_repository("statusline").values()
     accounts: list[StatusAccountDocument] = []
     for row in reading.rows:
         item = StatusAccountDocument(label=row.label, tool=row.tool, roles=list(row.roles), selected_roles=list(row.selected_roles),
@@ -3964,18 +4660,21 @@ def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRea
                 idle=count.idle, paused=count.paused, exited=count.exited, total=count.total)
                 if isinstance(count, RoleSessionCounts) else None for count in
                 (row.role_counts or tuple(NoRoleCount() for _role in row.roles))],
+            sessions=list(row.sessions),
             role_counts_by_machine=row.role_counts_by_machine,
             weekly_left_percent=None if isinstance(row.weekly_left_percent, (StatusUnavailable, WeeklyNotReadSince)) else row.weekly_left_percent,
             resets_at=None if isinstance(row.resets_at, StatusUnavailable) else row.resets_at.astimezone(timezone.utc).isoformat(),
+            login_ends_at=agent_accounts.login_end_iso(row.login_ends_at) if row.tool == "claude" else None,
             credits=None if isinstance(row.credits, StatusUnavailable) else row.credits,
             use_credits=row.use_credits,
             read_at=None if isinstance(row.read_at, StatusUnavailable) else row.read_at.astimezone(timezone.utc).isoformat(),
-            read_ok=isinstance(row.read_at, datetime) and not _reading_is_old(row.read_at, reading.checked_at, account_config=account_config)
-            and row.on_credits != "stale" and row.read_outcome in (
-                agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD),
+            read_ok=_read_ok(row, reading, account_config=account_config),
             credits_in_use=row.on_credits == "yes")
+        if (key := f"account.{row.label}") in colors:
+            item["color"] = colors[key]
         accounts.append(item)
-    return json.dumps(StatusDocument(upcoming_moves=list(reading.upcoming_moves), session_inputs=list(reading.session_inputs), accounts=accounts, problems=[note.removeprefix("* ") for note in reading.notes]))
+    return json.dumps(StatusDocument(upcoming_moves=list(reading.upcoming_moves), session_inputs=list(reading.session_inputs), accounts=accounts,
+                                     board=_status_board(reading, account_config=account_config, colors=colors), problems=[note.removeprefix("* ") for note in reading.notes]))
 
 
 ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage", "credits", "legacy", "unnoted", "test login", "access", "identity", "signed out", "wrong login", "unreadable note", "note", "state", "check", "role", "unclassified", "mcp servers"]
@@ -4164,21 +4863,28 @@ def render_status_table(reading: StatusReading, *, account_config: conf.ConfigRe
         cells = _status_row_cells(row, reading.zone, reading.checked_at, account_config=account_config)
         rows.append(cells)
         rows.extend(tuple(_role_count_text(row, role) if index == 2 else "" for index in range(len(cells))) for role in row.roles[1:])
-    return "\n".join([_render_table(rows), "",
+    colors = conf.read_or_repository("statusline").values() if sys.stdout.isatty() else {}
+    return "\n".join([_render_table(rows, colors=colors), "",
         *reading.upcoming_moves, *(("",) if reading.upcoming_moves else ()), *reading.notes, *reading.detail_lines])
 
 
-def _render_table(rows: list[tuple[str, ...]]) -> str:
+def _render_table(rows: list[tuple[str, ...]], *, colors: dict[str, str]) -> str:
     """A Markdown table, padded so it also reads as plain text."""
     widths = [max(len(line[column]) for line in (TABLE_HEADINGS, *rows)) for column in range(len(TABLE_HEADINGS))]
 
-    def rendered(cells: tuple[str, ...]) -> str:
-        return "| " + " | ".join(cell.ljust(width) for cell, width in zip(cells, widths)) + " |"
+    def rendered(cells: tuple[str, ...], *, account: bool = False) -> str:
+        padded = [cell.ljust(width) for cell, width in zip(cells, widths)]
+        if account and cells[1]:
+            span = _account_label(cells[1], colors)
+            color = account_color(span.get("color", ""))
+            if isinstance(color, AccountColor):
+                padded[1] = color.escape + cells[1] + "\x1b[0m" + " " * (widths[1] - len(cells[1]))
+        return "| " + " | ".join(padded) + " |"
 
     return "\n".join([
         rendered(TABLE_HEADINGS),
         rendered(tuple("-" * width for width in widths)),
-        *(rendered(row) for row in rows),
+        *(rendered(row, account=True) for row in rows),
     ])
 
 
@@ -4487,7 +5193,7 @@ def _read_status(source: UsageSource, *, detail: bool, account_config: conf.Conf
     With `detail`, also unknown entries, each live session, the Codex workers and recent moves.
     """
     account_config = read_account_settings(account_config)
-    zone = agent_accounts.user_zone()
+    zone = user_zone()
     statuses = account_statuses()
     for status in statuses:
         for problem in _status_problems(status, detail=detail, zone=zone):
@@ -4679,7 +5385,7 @@ def _observe_status_problem(problem: StatusProblem, raw: tuple[str, ...] = (), *
 def _map_provenance_problem(provenance: role_map.RoleMapProvenance) -> list[StatusProblem]:
     if not isinstance(provenance, role_map.CachedAfterFetchFailure):
         return []
-    stamp = provenance.at.astimezone(agent_accounts.user_zone()).strftime("%Y-%m-%d %H:%M %Z")
+    stamp = provenance.at.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M %Z")
     cause = f"natedev fetch failed: {provenance.failure}"
     return [StatusProblem("role map", "using saved assignments",
         ProblemCause("role", f"map saved at {stamp}; {cause}", CauseFile(str(role_map.role_map_cache_file()))),
@@ -4737,14 +5443,21 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     represented.update(raw for raw_lines in diagnostics.counterparts.values() for raw in raw_lines)
     represented.update(raw for raw_lines in diagnostics.included_raw.values() for raw in raw_lines)
     notes = list(reading.notes)
+    warning_groups: dict[tuple[str, str], list[str]] = {}
     for line in dict.fromkeys(held.getvalue().splitlines()):
         if not line.strip() or line in represented or line in diagnostics.delivered:
             continue
         mcp = re.fullmatch(r"~/(\.claude[0-9]+): mcpServers: .*", line)
         if mcp and any(note.startswith(mcp[1][1:] + " turns ") and " where ~/.claude does not: " in note for note in notes):
             continue
-        notes.append(render_status_problem(StatusProblem("accounts", "read warning",
-            ProblemCause("warning", line), NoUserStep())))
+        session_warning = re.fullmatch(r"anomaly: [A-Za-z0-9_.-]+: (.+)", line)
+        key = ("session", session_warning[1]) if session_warning else ("line", line)
+        warning_groups.setdefault(key, []).append(line)
+    for (kind, cause), lines in warning_groups.items():
+        warning = f"{cause} ({len(lines)} sessions)" if kind == "session" and len(lines) > 1 else lines[0]
+        rendered = render_status_problem(StatusProblem("accounts", "read warning",
+            ProblemCause("warning", warning), NoUserStep()))
+        notes.append(rendered)
     return replace(reading, notes=tuple(dict.fromkeys(notes)))
 
 
@@ -4779,7 +5492,7 @@ def status_report(*, detail: bool = False, source: UsageSource = REFRESH_STALE_U
 class LocalRoleSessions:
     """One local observation supplies counts and detail output."""
 
-    counts: dict[tuple[Path, str], dict[str, str]]
+    counts: dict[tuple[Path, str], dict[str, session_state.SessionState]]
     members: dict[ClaudeGroup, list[LiveGroupMember]]
     inputs: tuple[str, ...]
     session_lines: tuple[str, ...]
@@ -4789,7 +5502,7 @@ class LocalRoleSessions:
 @dataclass(frozen=True)
 class CodexRoleProcess:
     pid: int
-    activity: Literal["busy", "idle"]
+    activity: Literal["busy", "idle", "starting"]
 
 
 def _local_codex_processes() -> dict[str, CodexRoleProcess]:
@@ -4798,10 +5511,11 @@ def _local_codex_processes() -> dict[str, CodexRoleProcess]:
 
     try:
         agents = herdr.Herdr(herdr.shared_session()).agents()
-    except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+    except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
         agents = []
-    activities: dict[str, Literal["busy", "idle"]] = {
-        agent["agent_session"].session_id: "busy" if agent["agent_status"] == herdr.AgentStatus.WORKING else "idle"
+    activities: dict[str, Literal["busy", "idle", "starting"]] = {
+        agent["agent_session"].session_id: ("busy" if agent["agent_status"] == herdr.AgentStatus.WORKING
+            else "starting" if agent["agent_status"] == herdr.AgentStatus.STARTING else "idle")
         for agent in agents if agent.get("agent") == "codex"
         and isinstance(agent["agent_session"], herdr.ReportedAgentSession)
     }
@@ -4822,7 +5536,7 @@ def _session_config_dir(pid: int) -> account.ConfiguredClaudeFolder | account.No
     return account.ConfiguredClaudeFolder(Path(directory)) if directory else account.NoAccountSetting()
 
 
-def _local_session_counts() -> tuple[dict[tuple[Path, str], dict[str, str]], tuple[str, ...]]:
+def _local_session_counts() -> tuple[dict[tuple[Path, str], dict[str, session_state.SessionState]], tuple[str, ...]]:
     with role_map.stored_role_map():
         observed = _read_local_role_sessions(group_accounts())
     return observed.counts, observed.inputs
@@ -4836,31 +5550,42 @@ def _moving_role_suffix(role: str, label: str, groups: GroupAccounts) -> str:
     return ""
 
 
+@settings_report_scope()
 def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = True) -> LocalRoleSessions:
     """Read local membership, processes, and activity for counts and moves."""
+    from scripts.herdr import herdr
+
+    # One pane and process read serves every member in this read.
+    with herdr.observation_snapshot():
+        return _observed_role_sessions(groups, include_workers=include_workers)
+
+
+def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool) -> LocalRoleSessions:
     from scripts.message import sessions
     from scripts.herdr import pane_launch
     from scripts.production import session_staff, staff
 
     inputs = {sessions.sessions_dir(), pane_launch.record_directory()}
-    counts: dict[tuple[Path, str], dict[str, str]] = {}
+    counts: dict[tuple[Path, str], dict[str, session_state.SessionState]] = {}
     launches: dict[str, pane_launch.PaneLaunch] = {}
-    for path in pane_launch.record_directory().glob("*.json"):
-        inputs.add(path)
-        try:
-            entries = pane_launch.read_valid_entries(path)
-        except (OSError, ValueError):
-            continue
-        for launch in entries.values():
-            previous = launches.get(launch["session_id"])
-            if previous is None or previous["written_at"] < launch["written_at"]:
-                launches[launch["session_id"]] = launch
     try:
         membership = staff.local_snapshot()
     except staff.StaffUnreadable as error:
         if not isinstance(error.__cause__, FileNotFoundError):
             print(f"accounts: unit counts are incomplete: {error}", file=sys.stderr)
         membership = staff.StaffSnapshot(())
+    detached = session_state.running_detached_work(membership)
+    inputs.update(detached.inputs)
+    for path in pane_launch.record_directory().glob("*.json"):
+        inputs.add(path)
+        try:
+            entries = pane_launch.read_valid_entries(path, record=membership)
+        except (OSError, ValueError):
+            continue
+        for launch in entries.values():
+            previous = launches.get(pane_launch.reference_id(launch))
+            if previous is None or previous["written_at"] < launch["written_at"]:
+                launches[pane_launch.reference_id(launch)] = launch
     inputs.update(Path(path) for path in membership.inputs)
     machine = _session_counts_machine()
 
@@ -4887,7 +5612,7 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                                              session_staff.LiveSession(identity))
             if isinstance(member, session_staff.NoSuchMember) and launch is not None:
                 member = session_staff.unit_match(session_staff.ObservedUnit(""), membership,
-                                                 session_staff.StoredReference(launch["session_id"]))
+                                                 session_staff.StoredReference(pane_launch.reference_id(launch)))
         except (staff.StaffUnreadable, ValueError) as error:
             print(f"accounts: unit {identity}: {error}", file=sys.stderr)
             continue
@@ -4895,6 +5620,10 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
             role = "units"
         if owner is not None and owner.kind in ("showrunner", "worker"):
             role = "showrunners" if owner.kind == "showrunner" else "workers"
+        if owner is not None and owner.kind == "producer":
+            settings = producer_settings(owner)
+            role = ("showrunners" if isinstance(settings, models_registry.LaunchSettings) and settings.kind == "claude"
+                    else "")
         setting = _session_config_dir(session["pid"])
         directory = setting.path if isinstance(setting, account.ConfiguredClaudeFolder) else None
         label = claude_config_label(directory) if directory is not None else "account unreadable"
@@ -4905,15 +5634,19 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
             members[group].append(LiveGroupMember(identity, session["name"], group, directory))
         if role and directory is not None:
             if role == "workers":
-                state = "busy" if session.get("status") == "busy" else "idle"
+                state = session_state.classify(owner if owner is not None else session_state.UnrecordedStaff(),
+                    session_state.LiveActivity(session.get("status", "")), detached=detached)
             else:
                 member_row = member.row if isinstance(member, session_staff.MemberFound) else owner
                 state = session_state.classify(
                     member_row if member_row is not None else session_state.UnrecordedStaff(),
-                    session_state.LiveActivity(session.get("status", "")))
+                    session_state.LiveActivity(session.get("status", "")), detached=detached)
             counts.setdefault((directory, role), {})[identity] = state
     # A member without a live session belongs to its selected role account.
-    for member in (*staff.active(membership, "unit"), *staff.active(membership, "showrunner")):
+    for member in (*staff.active(membership, "unit"), *staff.active(membership, "showrunner"),
+                   *(row for row in staff.active(membership, "producer")
+                     if isinstance(settings := producer_settings(row), models_registry.LaunchSettings)
+                     and settings.kind == "claude")):
         if member.current_session in live or not local_member(member):
             continue
         role = "units" if member.kind == "unit" else "showrunners"
@@ -4921,8 +5654,8 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
         if not isinstance(selected, str):
             continue
         directory = account_dir(selected)
-        state = session_state.classify(member, session_state.NoLiveSession())
-        counts.setdefault((directory, role), {})[str(member.id)] = state
+        state = session_state.classify(member, session_state.NoLiveSession(), detached=detached)
+        counts.setdefault((directory, role), {})[member.current_session] = state
         session_lines.append(f"session {member.current_session} ({member.name}): {selected}; {state}")
     observed_workers = set(live)
     if include_workers and (parents := session_staff.pane_parents(membership)):
@@ -4934,14 +5667,16 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                 if not isinstance(evidence, session_staff.RecordedWorker):
                     session_lines.append(f"worker {state.row.name}: {evidence.reason}")
                     continue
-                status = worker_panes.worker_state(state)
+                status = ("starting" if isinstance(state, worker_panes.OpenWorker) and state.status == "starting"
+                          else worker_panes.worker_state(state))
                 if status == "unknown":
                     reason = cast(object, getattr(state, "reason", "pane status is unknown"))
                     session_lines.append(f"worker {state.row.name}: {reason}")
                     continue
                 if isinstance(state, worker_panes.OpenWorker) and isinstance(evidence.backend, staff.CodexBackend):
                     directory = evidence.backend.codex_home
-                    counts.setdefault((directory, "workers"), {})[state.row.current_session] = status
+                    counts.setdefault((directory, "workers"), {})[state.row.current_session] = session_state.classify(
+                        state.row, session_state.LiveActivity(status), detached=detached)
                     observed_workers.add(state.row.current_session)
     unobserved_workers = [member for member in staff.active(membership, "worker")
         if include_workers and member.id not in observed_workers and member.current_session not in observed_workers
@@ -4954,7 +5689,8 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                 if isinstance(setting, account.ProcessEnvironmentUnread):
                     continue
                 directory = setting.home if isinstance(setting, account.ProcessCodexHome) else accounts_home() / ".codex"
-                counts.setdefault((directory, "workers"), {})[member.current_session] = process.activity
+                counts.setdefault((directory, "workers"), {})[member.current_session] = session_state.classify(
+                    member, session_state.LiveActivity(process.activity), detached=detached)
     return LocalRoleSessions(counts, members, tuple(str(path) for path in sorted(inputs)),
                              tuple(session_lines), ())
 
@@ -4967,7 +5703,11 @@ def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSession
         roles = tuple(dict.fromkeys((*row.roles, *(role for folder, role in observed.counts if folder == directory))))
         if any(role != "spare" for role in roles):
             roles = tuple(role for role in roles if role != "spare")
-        counted.append(replace(row, roles=roles, selected_roles=tuple(role for role in row.roles if role != "spare"),
+        members: dict[str, session_state.SessionState] = {identity: state for role in roles
+                   for identity, state in observed.counts.get((directory, role), {}).items()}
+        counted.append(replace(row, roles=roles,
+            sessions=tuple(AccountSessionDocument(session=identity, state=state) for identity, state in sorted(members.items())),
+            selected_roles=tuple(role for role in row.roles if role != "spare"),
             role_counts=tuple(NoRoleCount() if role == "spare" else _role_session_counts(
                 tuple(observed.counts.get((directory, role), {}).values()), row.tool) for role in roles)))
     return tuple(counted), observed.inputs
@@ -4988,8 +5728,9 @@ def _session_counts_machine() -> str:
     return "mac" if remote.other_machine() == "natedev" else "natedev"
 
 
-def _session_counts_document(counts: dict[tuple[Path, str], dict[str, str]]) -> MachineSessionCounts:
-    mapped: dict[tuple[str, str], dict[str, str]] = {}
+def _session_counts_document(counts: dict[tuple[Path, str], dict[str, session_state.SessionState]]) -> MachineSessionCounts:
+    """Publish the four session states for each account and role."""
+    mapped: dict[tuple[str, str], dict[str, session_state.SessionState]] = {}
     for (directory, role), members in counts.items():
         label = directory.name.removeprefix(".")
         if re.fullmatch(r"codex(?:[1-9][0-9]*)?", label):
@@ -5001,14 +5742,15 @@ def _session_counts_document(counts: dict[tuple[Path, str], dict[str, str]]) -> 
     for (label, role), members in mapped.items():
         tool = "codex" if label.startswith("codex") else "claude"
         count = _role_session_counts(tuple(members.values()), tool)
-        values.setdefault(label, {})[role] = RoleSessionCountsDocument(busy=count.busy,
-            idle=count.idle, paused=count.paused, exited=count.exited, total=count.total)
+        values.setdefault(label, {})[role] = RoleSessionCountsDocument(busy=count.busy, idle=count.idle,
+            paused=count.paused, exited=count.exited, total=count.total)
     document = MachineSessionCounts(machine=_session_counts_machine(),
         at=datetime.now(timezone.utc).isoformat(), accounts=values)
     return document
 
 
 def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
+    """Count an older peer's starting sessions as busy; its busy count already holds waiting."""
     value = cast(object, json.loads(text))
     if not isinstance(value, dict):
         raise ValueError("invalid session counts")
@@ -5025,24 +5767,32 @@ def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
             if role not in ("units", "showrunners", "workers") or not isinstance(raw, dict):
                 raise ValueError("invalid role counts")
             count = cast(dict[str, object], raw)
+            starting = count.get("starting", 0)
             busy, idle, paused, exited, total = (count.get(key) for key in ("busy", "idle", "paused", "exited", "total"))
-            if any(type(value) is not int for value in (busy, idle, paused, exited, total)):
+            if any(type(value) is not int for value in (busy, starting, idle, paused, exited, total)):
                 raise ValueError("invalid activity counts")
+            starting = cast(int, starting)
             busy, idle, paused, exited, total = (cast(int, value) for value in (busy, idle, paused, exited, total))
-            if min(busy, idle, paused, exited, total) < 0 or busy + idle + paused + exited != total:
+            if min(busy, starting, idle - starting, paused, exited, total) < 0 or busy + idle + paused + exited != total:
                 raise ValueError("invalid count total")
-            checked[label][role] = RoleSessionCountsDocument(busy=busy, idle=idle, paused=paused, exited=exited, total=total)
+            checked[label][role] = RoleSessionCountsDocument(busy=busy + starting, idle=idle - starting, paused=paused, exited=exited, total=total)
     return MachineSessionCounts(machine=machine, at=stamp, accounts=checked)
 
 
+def _session_counts_failure() -> Path:
+    return _session_counts_cache().with_name("peer_session_counts_failed.json")
+
+
 def _fetch_session_counts() -> int:
-    """Fetch only the other machine's local counts through the shared transport."""
+    """Fetch the other machine's counts; a failed read keeps the last good copy for its age limit."""
     try:
         machine = remote.other_machine()
-        document = _decode_session_counts(role_map.ssh_role_map(("session-counts-read",), machine=machine), machine)
-        atomic_file.write_text_atomic(_session_counts_cache(), json.dumps(document))
-    except (OSError, ValueError, subprocess.SubprocessError):
-        atomic_file.write_text_atomic(_session_counts_cache(), json.dumps({"unavailable": True}))
+        text = role_map.ssh_role_map(("session-counts-read",), machine=machine)
+        _ = _decode_session_counts(text, machine)
+        atomic_file.write_text_atomic(_session_counts_cache(), text)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        atomic_file.write_text_atomic(_session_counts_failure(), json.dumps({
+            "at": datetime.now(timezone.utc).isoformat(), "reason": f"{type(error).__name__}: {error}"}))
         return 1
     return 0
 
@@ -5081,10 +5831,7 @@ def _machine_role_counts(
     except (OSError, ValueError):
         peer_accounts = {}
         available = False
-    started = _start_session_counts_fetch()
-    available = available and started
-    if not available:
-        peer_accounts = {}
+    _ = _start_session_counts_fetch()
     counted: list[StatusRow] = []
     for row in rows:
         local_counts = {role: RoleSessionCountsDocument(busy=count.busy,
@@ -5275,6 +6022,7 @@ def _parser() -> argparse.ArgumentParser:
     _ = move_command.add_argument("--from", dest="source", default="")
     _ = move_command.add_argument("--to", dest="target", default="")
     _ = move_command.add_argument("--dry-run", action="store_true")
+    _ = move_command.add_argument("--follow-role", action="store_true", help=argparse.SUPPRESS)
     _ = move_command.add_argument("--no-alert", dest="alerts", action="store_const", const="none", default="user")
     _ = move_command.add_argument("--why", default="")
     for action in ("role", "env"):
@@ -5406,7 +6154,8 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
             if options.session == "workers":
                 if not options.label or options.source or options.target:
                     raise AccountsError("move workers requires <claudeN|codexN>")
-                moved = move_workers(options.label, dry_run=options.dry_run, why=options.why, account_config=account_config)
+                moved = move_workers(options.label, dry_run=options.dry_run, why=options.why,
+                                     follow_role=options.follow_role, account_config=account_config)
             elif options.session in CLAUDE_GROUPS:
                 if not options.label or options.source or options.target:
                     raise AccountsError("move units|showrunners requires <claudeN>")

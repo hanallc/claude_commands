@@ -1,0 +1,7 @@
+# Format only the Rust crate manifests; the other TOML files keep their own layout.
+include = ["Cargo.toml", "rust/**/*.toml"]
+
+[formatting]
+align_entries  = true
+reorder_arrays = true
+reorder_keys   = true

@@ -1,15 +1,17 @@
-"""Run a Claude implementation pass inside assign."""
+"""Run a Claude implementation pass inside assign.
+
+Stop the launcher's process group to stop its child commands.
+Status readers recover claims after a launcher dies.
+"""
 from __future__ import annotations
 
 import json
 import os
 import re
-import signal
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from types import FrameType
 from typing import NoReturn, TypedDict, cast
 
 from scripts.agents import worker_lifecycle
@@ -25,6 +27,11 @@ PYTHON = str(SCRIPTS / "../lib/py")
 @dataclass(frozen=True)
 class NewClaudeWorker:
     """Start a worker through the admission coordinator."""
+
+
+@dataclass(frozen=True)
+class ClaudeDeliveryRetry:
+    """Retry assignment delivery to the published Claude session."""
 
 
 @dataclass(frozen=True)
@@ -89,18 +96,19 @@ def _record(launch: ClaudeLaunch, name: str) -> bool:
             if not session:
                 return False
             with worker_lifecycle.locked_state(path) as state:
-                state.publish(json.dumps({**state.read_object(), **identity}))
+                state.publish(json.dumps({**{key: value for key, value in state.read_object().items()
+                                             if key not in ("name", "family")}, **identity}))
             return True
     except Exception:
         return False
 
 
 def _claim(launch: ClaudeLaunch, name: str, env: dict[str, str]) -> None:
+    status = worker_state.worker_status_path(launch.run, launch.slot)
     with worker_state.worker_claim_lock(launch.run):
         path, expected, session = _identity(launch, name)
         if not _read(path) and expected["staff_id"]:
             _ = path.write_text(json.dumps(expected))
-        status = worker_state.worker_status_path(launch.run, launch.slot)
         claim = launch.run / f"impl_claim_{launch.slot}.json"
         owner = worker_state.read_worker_claim(claim)
         if isinstance(owner, worker_state.HeldWorkerClaim):
@@ -129,31 +137,26 @@ def _release(launch: ClaudeLaunch) -> None:
             claim.unlink(missing_ok=True)
 
 
-def _switch(launch: ClaudeLaunch, name: str) -> bool:
+def _switch(launch: ClaudeLaunch, name: str) -> NewClaudeWorker | ClaudeDeliveryRetry | ClaudeFollowUp:
     with worker_state.worker_claim_lock(launch.run):
         record = staff.local_snapshot()
         member = worker_admission.member(launch.run, name, record)
-        return member is not None and (session_staff.worker_family(record, member.id) != "claude"
-            or worker_admission.dispatch_pending(launch.run, name, launch.prompt))
-
-
-def _interrupted(signum: int, frame: FrameType | None) -> NoReturn:
-    del frame
-    raise SystemExit(128 + signum)
+        if member is not None:
+            if session_staff.worker_family(record, member.id) != "claude":
+                return NewClaudeWorker()
+            if worker_admission.dispatch_pending(launch.run, name, launch.prompt):
+                return ClaudeDeliveryRetry()
+        return ClaudeFollowUp(name)
 
 
 def run(launch: ClaudeLaunch) -> int:
-    """Keep the shell launch order and release the claim on exit."""
-    handlers = {sig: signal.signal(sig, _interrupted) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    """Release the claim on return; status readers recover a killed launcher."""
     try:
-        return _run(launch)
+        code = _run(launch)
     except subprocess.CalledProcessError as error:
         return error.returncode
-    finally:
-        if isinstance(launch.worker, ClaudeFollowUp):
-            _release(launch)
-        for sig, handler in handlers.items():
-            _ = signal.signal(sig, handler)
+    _release(launch)
+    return code
 
 
 def claim_phase(run: Path, phase: str, cwd: Path, log: Path, status: Path,
@@ -202,7 +205,7 @@ def _run(launch: ClaudeLaunch) -> int:
     log = directory / f"impl_agent_{launch.slot}.log"
     task = f"direct.{launch.role}"
     tag = f"{launch.role}:{launch.slot}"
-    worker = launch.worker
+    worker: NewClaudeWorker | ClaudeDeliveryRetry | ClaudeFollowUp = launch.worker
     if isinstance(worker, ClaudeFollowUp):
         name = worker.name
     else:
@@ -214,31 +217,67 @@ def _run(launch: ClaudeLaunch) -> int:
         name = child(["bash", str(SCRIPTS / "worker_name.sh"), str(launch.cwd), launch.slot, launch.role, prefix],
                      capture=True).stdout.strip()
     try:
-        _ = worker_admission.admit(name, launch.run)
+        allowed = worker_admission.admit(name, launch.run)
     except worker_admission.AdmissionRefused as error:
         _fail(str(error))
     _ = child([PYTHON, str(SCRIPTS / "worker_state.py"), str(launch.run)])
     directory.mkdir(parents=True, exist_ok=True)
-    if isinstance(worker, ClaudeFollowUp) and _switch(launch, name):
-        worker = NewClaudeWorker()
+    slot = allowed.slot
+    if isinstance(worker, ClaudeFollowUp):
+        worker = _switch(launch, name)
+        if not isinstance(worker, ClaudeFollowUp):
+            slot = worker_admission.NewWorkerSlot()
     if isinstance(worker, ClaudeFollowUp):
         _claim(launch, name, env)
+    else:
+        with worker_state.worker_claim_lock(launch.run):
+            claim = launch.run / f"impl_claim_{launch.slot}.json"
+            owner = worker_state.read_worker_claim(claim)
+            if isinstance(owner, worker_state.HeldWorkerClaim):
+                _fail(f"{name} is claimed by launcher {owner.pid}")
+            worker_state.publish_worker_claim(claim, name)
     if not claim_phase(launch.run, launch.phase, launch.cwd, log, status, launch.slot, env):
         return 1
+    env["UNIT_RUN_DIR"] = str(launch.run)
+    env["UNIT_PASS_OWNER"] = "launcher"
+    build_folders = str(SCRIPTS / "../lib/build_folders.py")
+    env["TMPDIR"] = child([PYTHON, build_folders, "run-temp-path", str(launch.run)], capture=True).stdout.strip()
+    if not Path(env["TMPDIR"]).is_dir():
+        _ = child([PYTHON, build_folders, "stable", "--run-temp", str(launch.run)], capture=True)
+    message = directory / f"impl_follow_message_{launch.slot}.{os.getpid()}.txt"
+    if isinstance(worker, ClaudeFollowUp):
+        _ = message.write_bytes(launch.prompt.read_bytes() +
+            f"\n\nAs your last act, write impl_summary_{launch.slot}.txt, then post done on the board.\n".encode())
+    if isinstance(worker, (ClaudeFollowUp, ClaudeDeliveryRetry)):
+        record_path = _identity(launch, name)[0]
+        launch = replace(launch, model=str(_read(record_path)["model"]))
+    turn = claude_worker.ClaudeTurn(name, launch.run, launch.cwd,
+        message if isinstance(worker, ClaudeFollowUp) else launch.prompt, summary, log,
+        launch.model, launch.effort, launch.role, env.get("WORKER_STAFF_ID", ""), True, env)
+    prepared: claude_worker.PreparedClaudeLaunch | claude_worker.NotDelivered | claude_worker.ClaudeLaunchPreparation
+    prepared = claude_worker.ClaudeLaunchPreparation.AT_START
+    if isinstance(worker, NewClaudeWorker):
+        prepared = claude_worker.prepare_launch(turn)
+        if isinstance(prepared, claude_worker.PreparedClaudeLaunch):
+            launch = replace(launch, model=prepared.model)
+            env.clear()
+            env.update(prepared.environment)
+            turn = replace(turn, model=prepared.model)
     _ = summary.write_text("")
     _ = status.write_text("implementing\n")
     _ = (directory / f"impl_agent_{launch.slot}").write_text(
         f"task={task}\nfamily=claude\nagent={launch.model}\neffort={launch.effort}\n")
     progress = launch.run / "progress_history_state.json"
     phase_options = ["--phase-id", launch.phase] if launch.phase else []
-    env["UNIT_PASS_OWNER"] = "launcher"
+    worker_options = ["--worker-id", slot.row.id] if isinstance(slot, worker_admission.ExistingWorkerSlot) else []
     if progress.is_file():
         started = child([PYTHON, str(SCRIPTS / "progress_history.py"), "start-pass", "--session-dir", str(launch.run),
             "--pass-kind", launch.role, "--prompt-file", str(launch.prompt), "--fix-cause", launch.fix_cause,
             "--fix-pass", str(launch.fix_pass), "--activity", launch.role, "--called-task", task,
             "--worker-name", name, "--called-family", "claude", "--called-model", launch.model,
             "--called-effort", launch.effort or "unset", "--launcher-command", json.dumps(launch.command),
-            *phase_options], check=False)
+            "--launcher-pid", str(os.getpid()),
+            *phase_options, *worker_options], check=False)
         if started.returncode:
             print(f"ERROR: unable to record the {launch.role} pass start.", file=sys.stderr)
             _ = status.write_text("error\n")
@@ -248,25 +287,15 @@ def _run(launch: ClaudeLaunch) -> int:
     note = f"follow-up to {name}" if isinstance(worker, ClaudeFollowUp) else "launcher up"
     board("register", f"{launch.role} {note} (claude/{launch.model}:{launch.effort or 'unset'}); "
           + f"worker={name}; reach=SendMessage; role={launch.role}; status in impl_status_{launch.slot}")
-    env["UNIT_RUN_DIR"] = str(launch.run)
-    build_folders = str(SCRIPTS / "../lib/build_folders.py")
-    env["TMPDIR"] = child([PYTHON, build_folders, "run-temp-path", str(launch.run)], capture=True).stdout.strip()
-    if not Path(env["TMPDIR"]).is_dir():
-        _ = child([PYTHON, build_folders, "stable", "--run-temp", str(launch.run)], capture=True)
-    message = directory / f"impl_follow_message_{launch.slot}.{os.getpid()}.txt"
-    if isinstance(worker, ClaudeFollowUp):
-        _ = message.write_bytes(launch.prompt.read_bytes() +
-            f"\n\nAs your last act, write impl_summary_{launch.slot}.txt, then post done on the board.\n".encode())
-    turn = claude_worker.ClaudeTurn(name, launch.run, launch.cwd,
-        message if isinstance(worker, ClaudeFollowUp) else launch.prompt, summary, log,
-        launch.model, launch.effort, launch.role, env.get("WORKER_STAFF_ID", ""), True, env)
     try:
         try:
             if isinstance(worker, ClaudeFollowUp):
                 member = worker_admission.member(launch.run, name, staff.local_snapshot())
                 delivered = claude_worker.follow_up(turn, member.current_session if member else "")
+            elif isinstance(prepared, claude_worker.NotDelivered):
+                delivered = prepared
             else:
-                delivered = claude_worker.open_worker(turn)
+                delivered = claude_worker.open_worker(turn, launch=prepared)
         finally:
             _ = _record(launch, name)
         if isinstance(delivered, claude_worker.Delivered):

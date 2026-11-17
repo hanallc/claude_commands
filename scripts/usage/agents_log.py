@@ -197,45 +197,40 @@ def _review_lens(run: Path, name: str) -> Lens | None:
 
 
 def _run_assignments(run: Path, membership: staff.StaffSnapshot) -> Iterator[tuple[str, Assignment]]:
-    from scripts.production import session_staff
+    from scripts.agents import worker_lifecycle
+    from scripts.lib import unit_runs
+    from scripts.production import session_staff, staff
 
-    roster_path = run / "mesh_roster.json"
+    state_path = run / unit_runs.STATE_FILE
     try:
-        if roster_path.is_file():
-            stamp = datetime.fromtimestamp(roster_path.stat().st_mtime, timezone.utc)
-            value = cast(object, json.loads(roster_path.read_text(encoding="utf-8")))
-            if not isinstance(value, dict):
-                raise ValueError("roster must be an object")
-            records = cast(dict[str, object], value)
-            for name, value in records.items():
-                if not isinstance(value, dict):
-                    continue
-                worker = cast(dict[str, object], value)
-                agent_id = session_staff.worker_session(worker, membership)
-                if not agent_id.strip():
-                    continue
-                role = session_staff.worker_name(worker, membership)
-                if role in ROLES:
-                    current = _role(role)
-                    lens = _review_lens(run, name) if current == "review" else None
-                    yield agent_id, Assignment(stamp, current, lens, True)
+        state = worker_lifecycle.read_json_object(state_path)
+        participants = {worker_lifecycle.read_worker_state(path).get("staff_id")
+                        for path in run.glob("impl_worker_*.json")}
+        workers = [worker for worker in session_staff.run_workers(state, membership) if worker.id in participants]
+        if workers:
+            stamp = datetime.fromtimestamp(state_path.stat().st_mtime, timezone.utc)
+            for worker in workers:
+                if isinstance(worker.role, staff.KnownWorkerRole) and worker.role.value in ROLES:
+                    current = _role(worker.role.value)
+                    lens = _review_lens(run, worker.name) if current == "review" else None
+                    yield worker.current_session, Assignment(stamp, current, lens, True)
     except (OSError, ValueError, RecursionError) as exc:
-        _report_problem(f"{roster_path}: {exc}")
+        _report_problem(f"{state_path}: {exc}")
 
 
-def _recover_directors(live: Path, recovered: list[tuple[str, Assignment]]) -> None:
-    """Add a director assignment for each marker that names a run folder under `live`."""
-    active = live / "active"
-    if not active.is_dir():
-        return
-    for marker in sorted(active.iterdir()):
-        if not marker.is_file():
+def _recover_directors(live: Path, membership: staff.StaffSnapshot,
+                       recovered: list[tuple[str, Assignment]]) -> None:
+    """Add a director assignment for each staff run under the live root."""
+    from scripts.production import staff
+
+    for row in membership.rows:
+        if not isinstance(row.run, staff.OpenRun) or not row.current_session:
             continue
+        run = row.run.path
         try:
-            run_text = marker.read_text(encoding="utf-8").strip()
-            if run_text and Path(run_text).is_dir() and Path(run_text).resolve().parent == live.resolve():
-                stamp = datetime.fromtimestamp(marker.stat().st_mtime, timezone.utc)
-                recovered.append((marker.name, Assignment(stamp, "director", None, True)))
+            if run.is_dir() and run.resolve().parent == live.resolve():
+                stamp = datetime.fromtimestamp(run.stat().st_mtime, timezone.utc)
+                recovered.append((row.current_session, Assignment(stamp, "director", None, True)))
         except (OSError, ValueError) as exc:
             _report_problem(exc)
 
@@ -251,15 +246,15 @@ def backfill(archive: Path, *live: Path) -> int:
             if not root.exists():
                 continue
             for run in sorted(root.iterdir()):
-                if run.is_dir() and run.name != "active":
+                if run.is_dir():
                     try:
                         recovered.extend(_run_assignments(run, membership))
                     except (OSError, ValueError) as exc:
                         _report_problem(exc)
+        for root in live:
+            _recover_directors(root, membership, recovered)
     except (OSError, ValueError) as exc:
         _report_problem(f"{staff.record_path()}: {exc}")
-    for root in live:
-        _recover_directors(root, recovered)
     path = state_dir() / "agents.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     added = 0

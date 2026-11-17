@@ -4,6 +4,7 @@ from __future__ import annotations
 from scripts.lib import test_phase
 
 from scripts.build_queue import snapshot_codec as codec
+from scripts.build_queue.admission_protocol_v1_fixture import parse_request as decode_legacy
 
 from scripts.lint.memory_test_support import admission_policy_fixture
 
@@ -15,20 +16,115 @@ import os
 import socket
 from pathlib import Path
 import subprocess
+import sys
 import unittest
 from typing import Literal, cast
 from unittest import mock
-from zoneinfo import ZoneInfo
 
-from scripts.lib.build_steps import read_step_names
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint import memory_admit as gate
-from scripts.build_queue import admission_client as client, admission_protocol as wire, queue_evidence
+from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import admission_code, admission_records as records
-from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
+from scripts.build_queue import placement
+from scripts.build_queue.admission_test_support import admitted_reply, wait_reply, only_admitted
 from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, ScriptedTransport, GIB, NOW
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_placement_status_round_trips_without_launch_permission(self) -> None:
+        from scripts.build_queue import admission_wire as status_wire
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            destination = request.constraints.candidates[0].destination
+            assignment = placement.PlacementAssignment(request.episode, "attempt-a", destination,
+                request.constraints.source_key, request.owner, request.constraints.session, request.since)
+            claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
+                "claim-a", assignment.episode, assignment.attempt)
+            status_request = status_wire.PlacementStatusRequest(assignment.episode, assignment.attempt)
+            self.assertEqual(wire.parse_request(wire.encode_request(status_request)), status_request)
+            statuses = (status_wire.KnownPlacementStatus(assignment, placement.CurrentAssignment(), claim),
+                status_wire.KnownPlacementStatus(assignment, placement.ClosedAssignment("cancelled"), claim),
+                status_wire.KnownPlacementStatus(assignment, placement.CurrentAssignment(), placement.NoProviderClaim()),
+                status_wire.UnknownPlacementStatus("unseen-episode", "unseen-attempt"))
+            for status in statuses:
+                with self.subTest(status=status):
+                    reply = status_wire.PlacementStatusReply(status)
+                    encoded = wire.encode_reply(reply)
+                    self.assertEqual(wire.parse_reply(encoded, status_request), reply)
+                    self.assertNotIn("permission", encoded)
+                    with self.assertRaisesRegex(ValueError, "placement requires version 3"):
+                        _ = wire.encode_reply(reply, version=2)
+
+    def test_older_placement_messages_keep_absence_and_authority_as_named_states(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            current = placement_request(fixture)
+            envelope = cast(dict[str, object], json.loads(wire.encode_request(current)))
+            data = cast(dict[str, object], envelope["data"])
+            for field in ("identity", "run", "local", "prerequisite", "purpose"):
+                del data[field]
+            constraints = cast(dict[str, object], data["constraints"])
+            for old_source in ("source-a", ""):
+                with self.subTest(source=old_source):
+                    constraints["source_key"] = old_source
+                    parsed = wire.parse_request(json.dumps(envelope))
+                    assert isinstance(parsed, wire.PlacementRequest)
+                    self.assertIsInstance(parsed.local, wire.LocalAdmissionUnavailable)
+                    self.assertIsInstance(parsed.run, wire.NoRun)
+                    self.assertIsInstance(parsed.prerequisite, placement.TokenNotRequired)
+                    self.assertIsInstance(parsed.purpose, placement.NormalStep)
+                    self.assertEqual(parsed.constraints.source_key, placement.SourceKeyKnown(old_source) if old_source
+                        else placement.SourceKeyUnavailable("older request has no source key"))
+            assignment = placement.PlacementAssignment(current.episode, "older-attempt",
+                current.constraints.candidates[0].destination, current.constraints.source_key,
+                current.owner, current.constraints.session, current.since)
+            claim = placement.ProviderClaimReference(assignment.destination.provider, assignment.destination.target,
+                assignment.destination.scope, "older-claim", assignment.episode, assignment.attempt)
+            consume = cast(dict[str, object], json.loads(wire.encode_request(wire.ConsumePermission("older-consume", assignment, claim))))
+            del cast(dict[str, object], consume["data"])["holder"]
+            parsed_consume = wire.parse_request(json.dumps(consume))
+            assert isinstance(parsed_consume, wire.ConsumePermission)
+            self.assertIsInstance(parsed_consume.holder, placement.ClaimHolderUnconfirmed)
+            report = cast(dict[str, object], json.loads(wire.encode_request(wire.ExecutionReport(
+                "older-report", assignment, claim, placement.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now())))))
+            report_data = cast(dict[str, object], report["data"])
+            report_data["outcome"] = ""
+            del report_data["path"]
+            parsed_report = wire.parse_request(json.dumps(report))
+            assert isinstance(parsed_report, wire.ExecutionReport)
+            self.assertIsInstance(parsed_report.evidence, placement.ExecutionEvidenceUnavailable)
+            self.assertIsInstance(parsed_report.outcome, placement.AttemptOutcomeUnavailable)
+            self.assertIsInstance(parsed_report.path, placement.DispatchPathPending)
+
+
+    def test_client_startup_imports_only_the_wire_without_record_readers(self) -> None:
+        for operation in ("import", "release reply"):
+            with self.subTest(operation=operation):
+                source = "import json, sys; from scripts.build_queue import admission_client; "
+                if operation == "release reply":
+                    source += (
+                        "wire = admission_client.wire; "
+                        "reply = wire.parse_reply(wire.encode_reply(wire.Ok()), wire.ReleaseRequest('request', 'reservation', 0)); "
+                        "assert isinstance(reply, wire.Ok); ")
+                source += "print(json.dumps(sorted(sys.modules)))"
+                result = subprocess.run([sys.executable, "-c", source],
+                    cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True,
+                    timeout=TEST_HANG_GUARD_SECS, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                loaded = cast(list[str], json.loads(result.stdout))
+                self.assertIn("scripts.build_queue.admission_wire", loaded)
+                for module in (
+                    "scripts.build_queue.admission_protocol", "scripts.build_queue.admission_records",
+                    "scripts.build_queue.queue_lines", "scripts.build_queue.progress_profile",
+                    "scripts.build_queue.scope_activity", "scripts.build_queue.cloud_progress",
+                    "scripts.buildlog.store", "scripts.lib.build_steps", "scripts.lib.user_zone",
+                    "scripts.message.send_budget", "scripts.message.send_result", "scripts.message.session_send",
+                ):
+                    with self.subTest(module=module):
+                        self.assertNotIn(module, loaded)
 
     def test_local_and_cloud_places_survive_the_request_wire(self) -> None:
         with AdmissionFixture() as fixture:
@@ -39,6 +135,69 @@ class ProtocolTests(unittest.TestCase):
                     self.assertEqual(parsed, request)
                     assert isinstance(parsed, wire.AdmitRequest)
                     self.assertEqual(parsed.place, place)
+                    for version in (1, 2):
+                        envelope = cast(dict[str, object], json.loads(wire.encode_request(request)))
+                        envelope["v"] = version
+                        self.assertEqual(wire.parse_request_envelope(json.dumps(envelope)), (version, request))
+
+    def test_placement_exchanges_preserve_identity_without_replaying_authority(self) -> None:
+        from scripts.build_queue.test_placement import placement_request, coordinator_holder
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            destination = request.constraints.candidates[0].destination
+            assignment = placement.PlacementAssignment(request.episode, "attempt-a", destination,
+                request.constraints.source_key, request.owner, request.constraints.session, request.since)
+            claim = placement.ProviderClaimReference("mac", destination.target, destination.scope,
+                                                     "claim-a", assignment.episode, assignment.attempt)
+            requests: list[wire.Request] = [
+                request, wire.ClaimFailure("failed", assignment, "busy"),
+                wire.ClaimFailure("foreign-claim", assignment, "busy",
+                    replace(claim, episode="previous-episode", attempt="previous-attempt")),
+                wire.ConsumePermission("consume", assignment, claim),
+                wire.ExecutionReport("report", assignment, claim, placement.ExecutionNotStarted()),
+                wire.ExecutionReport("report-observed", assignment, claim, placement.ObservedExecution(
+                    placement.ProcessExecution("fixture-mac", "generation-a", 42, "remote-start"))),
+                wire.ExecutionReport("report-unavailable", assignment, claim,
+                    placement.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now())),
+                wire.ConsumePermission("consume-child", assignment, claim, holder=coordinator_holder(assignment)),
+                wire.PrerequisiteReport("token-held", request.episode, request.owner, placement.TokenHeld()),
+                wire.CancelPlacement("cancel", request.episode, request.owner, "caller ended"),
+            ]
+            for prerequisite in (placement.TokenRequired(), placement.TokenHeld(), placement.TokenNotRequired()):
+                requests.append(replace(request, prerequisite=prerequisite))
+            requests.append(replace(request, local=wire.LocalAdmissionUnavailable("old caller")))
+            requests.append(replace(request, purpose=placement.SpeculativeCopy("local-parent", fixture.clock.now())))
+            for outcome, evidence, path in (
+                (placement.AttemptRunning(), placement.ObservedExecution(
+                    placement.ProcessExecution("fixture-mac", "generation-a", 42, "remote-start")),
+                    placement.DispatchPathPending("start child runs")),
+                (placement.AttemptCompleted(17), placement.ExecutionNotStarted(), placement.DispatchPathSettled()),
+                (placement.PrelaunchRefused("disk"), placement.ExecutionNotStarted(), placement.DispatchPathSettled()),
+                (placement.AttemptCancelled("caller ended"), placement.ExecutionNotStarted(), placement.DispatchPathSettled()),
+                (placement.AttemptOutcomeUnavailable("unreachable"),
+                    placement.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now()),
+                    placement.DispatchPathPending("start child has no result")),
+            ):
+                requests.append(wire.ExecutionReport("typed-outcome", assignment, claim, evidence, outcome, path))
+            for message in requests:
+                with self.subTest(message=message):
+                    self.assertEqual(wire.parse_request(wire.encode_request(message)), message)
+            local = only_admitted(fixture.server.handle_request(fixture.request()))
+            replies: tuple[wire.Reply, ...] = (
+                wire.PlacementWait(request.episode, request.since, 1,
+                    (placement.CandidateEligibility(destination, placement.TemporaryExclusion("busy")),)),
+                wire.Assignment(assignment), wire.FirstAuthorization(assignment, claim),
+                wire.LocalPlacementGranted(assignment, local),
+                wire.DispatchStatus(assignment, placement.CurrentAssignment(), placement.PermissionAvailable()),
+                wire.DispatchStatus(assignment, placement.CurrentAssignment(), placement.PermissionConsumed(fixture.clock.now())),
+                wire.DispatchStatus(assignment, placement.ClosedAssignment("obsolete"), placement.NoLaunchPermission("closed")),
+                wire.DispatchStatus(placement.UnknownAssignment(assignment.episode, "old-attempt"),
+                    placement.ClosedAssignment("unknown"), placement.NoLaunchPermission("unknown")),
+            )
+            for reply in replies:
+                with self.subTest(reply=reply):
+                    self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
 
     def test_cloud_rows_survive_view_and_mine_reply_wires(self) -> None:
         from scripts.build_queue import cloud_progress, progress_profile
@@ -199,10 +358,9 @@ class ProtocolTests(unittest.TestCase):
                 parsed = wire.parse_reply(wire.encode_reply(reply))
                 self.assertEqual(parsed, reply)
                 assert isinstance(parsed, wire.ViewReply)
-                shown = queue_evidence.running_text(parsed.reading.explanation.running[0],
-                    parsed.reading.explanation, {}, ZoneInfo("UTC"), names=read_step_names())
-                self.assertIn("0.1 GiB RAM; 2.0 GiB swapped", shown)
-                self.assertIn("running job, 2 min" if isinstance(state, RunningServiceJob) else "idle", shown)
+                current = parsed.reading.view.running[0].measured
+                self.assertEqual(current, memory)
+
 
     def test_main_display_fields_and_diagnostics_remain_readable(self) -> None:
         from scripts.build_queue.scope_activity import LiveBuildRun
@@ -268,15 +426,25 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
             self.assertEqual(cast(dict[str, object], run_encoded["data"])["run"], codec.snapshot_value(run))
 
     def test_pressure_condition_variants_keep_their_meaning_through_the_codec(self) -> None:
-        conditions: tuple[records.PressureConditionNotRecorded | Literal["full", "swap"], ...] = (
-            "full", "swap", records.PressureConditionNotRecorded())
-        for condition in conditions:
-            with self.subTest(condition=condition):
+        conditions: tuple[tuple[str, records.PressureConditionNotRecorded | Literal["full", "some"]], ...] = (
+            ("full", "full"), ("some", "some"), ("swap", "some"), ("", records.PressureConditionNotRecorded()))
+        for saved, condition in conditions:
+            with self.subTest(condition=condition, saved=saved):
                 pressure = records.MemoryPressure(8, 15, 80, condition=condition)
                 reply = wait_reply(pressure)
                 reply = replace(reply, snapshot=replace(reply.snapshot,
-                    decision=replace(reply.snapshot.decision, pressure=pressure)))
-                self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
+                    decision=replace(reply.snapshot.decision, pressure=pressure), head_reason=pressure))
+                encoded = wire.encode_reply(reply)
+                if saved == "swap":
+                    encoded = encoded.replace('"condition":"some"', '"condition":"swap"')
+                restored = wire.parse_reply(encoded)
+                self.assertEqual(restored, reply)
+                if saved == "swap":
+                    assert isinstance(restored, wire.Wait)
+                    self.assertEqual(client.wait_reasons(restored.snapshot), ("some memory pressure",))
+                    restored_pressure = restored.snapshot.decision.pressure
+                    assert isinstance(restored_pressure, records.MemoryPressure)
+                    self.assertEqual(records.pressure_text(restored_pressure), "memory pressure: some avg10 15.0")
 
 
     def test_every_request_round_trips_with_profiles_width_and_call_states(self) -> None:
@@ -291,7 +459,6 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                 wire.ReleaseRequest("release", "/tmp/stem", 137),
                 wire.WidthRequest("width", "/tmp/stem", 4), wire.ViewRequest(),
                 wire.ExplainRequest(), wire.MineRequest("session"),
-                wire.AdmitHeadRequest("head", "urgent", "actor"),
                 wire.PrioritySetRequest("priority", "queue-unit", "urgent", "actor"),
                 wire.PriorityClearRequest("clear", "actor"), wire.TokenWaitRequest("token", "stem")]
             for width in (records.RequestedTestWidth(3), records.UnspecifiedTestWidth(), records.NoTestWidth()):
@@ -304,6 +471,31 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                     self.assertEqual(len(encoded.splitlines()), 1)
                     self.assertEqual(wire.parse_request(encoded), value)
                     self.assertEqual(wire.parse_record(wire.encode_record(value), type(value)), value)
+            build = fixture.request(step="build")
+            assert isinstance(build.profile, records.StepProfile)
+            self.assertEqual(wire.VERSION, 3)
+            for share in (0, 10, 50):
+                shaped = replace(build, profile=replace(build.profile,
+                    peak=records.ExpectedPeak(10 * GIB, "shape", 14, records.ShapeRankedPeak(14, share))))
+                self.assertEqual(wire.parse_record(wire.encode_record(shaped), wire.AdmitRequest), shaped)
+                for version in (1, 2):
+                    with self.subTest(share=share, shape_version=version):
+                        envelope = cast(dict[str, object], json.loads(wire.encode_request(shaped)))
+                        envelope["v"] = version
+                        data = cast(dict[str, object], envelope["data"])
+                        profile = cast(dict[str, object], data["profile"])
+                        peak = cast(dict[str, object], profile["peak"])
+                        basis = cast(dict[str, object], peak["basis"])
+                        if share == 10:
+                            self.assertEqual(basis["kind"], "ShapeP90")
+                            self.assertNotIn("share_percent", basis)
+                            self.assertEqual(codec.snapshot_value(decode_legacy(json.dumps(envelope))), data)
+                        else:
+                            self.assertEqual((basis["kind"], basis["share_percent"]), ("ShapeRankedPeak", share))
+                            with self.assertRaises(ValueError):
+                                _ = decode_legacy(json.dumps(envelope))
+                        self.assertEqual(wire.parse_request_envelope(json.dumps(envelope)), (version, shaped))
+                        self.assertEqual(wire.parse_record(json.dumps(data), wire.AdmitRequest), shaped)
 
     def test_every_reply_round_trips_and_domain_payloads_use_the_shared_codec(self) -> None:
         with AdmissionFixture() as fixture:
@@ -325,6 +517,24 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                     with mock.patch.object(codec, "parse_snapshot_value", wraps=codec.parse_snapshot_value) as parse:
                         self.assertEqual(wire.parse_reply(line), reply)
                     self.assertGreater(parse.call_count, 0)
+            held = wait_reply(records.ReadyForAdmission())
+            for share in (0, 10, 50):
+                shaped = replace(held, snapshot=replace(held.snapshot,
+                    peak=records.ExpectedPeak(10 * GIB, "shape", 14, records.ShapeRankedPeak(14, share))))
+                self.assertEqual(wire.parse_reply(wire.encode_reply(shaped)), shaped)
+                for version in (1, 2):
+                    with self.subTest(share=share, reply_version=version):
+                        line = wire.encode_reply(shaped, version=version)
+                        envelope = cast(dict[str, object], json.loads(line))
+                        self.assertEqual(envelope["v"], version)
+                        self.assertEqual(wire.parse_reply(line), shaped)
+                        if share == 10:
+                            self.assertEqual(envelope["v"], version)
+                            self.assertIn('"ShapeP90"', line)
+                            self.assertNotIn('"share_percent"', line)
+                        else:
+                            self.assertIn('"ShapeRankedPeak"', line)
+                            self.assertIn(f'"share_percent":{share}', line)
 
     def test_admit_and_launch_have_distinct_outcomes(self) -> None:
         with AdmissionFixture() as fixture:
@@ -346,8 +556,8 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
 
     def test_unknown_versions_and_malformed_envelopes_are_rejected(self) -> None:
         message = cast(dict[str, object], json.loads(wire.encode_request(wire.ViewRequest())))
-        message["v"] = 3
-        with self.assertRaisesRegex(ValueError, "client version 3, service supports 1..2"):
+        message["v"] = 4
+        with self.assertRaisesRegex(ValueError, "client version 4, service supports 1..3"):
             _ = wire.parse_request(json.dumps(message))
         for line in ("", "not json", "[]", '{}', '{"v":true}', '{"v":1,"type":"bump","data":{}}'):
             with self.subTest(line=line), self.assertRaises(ValueError):
@@ -374,15 +584,8 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
             self.assertEqual(parsed.explanation, local)
             self.assertEqual(parsed.explanation.decided_from, inputs)
             self.assertIsInstance(gate.smallest_head_release(parsed.explanation), records.EstimateExpired)
-            zone = ZoneInfo("UTC")
-            names = read_step_names()
-            shown = queue_evidence.release_text(gate.smallest_head_release(parsed.explanation), parsed.explanation, {}, zone, names=names)
-            self.assertEqual(shown,
-                             queue_evidence.release_text(gate.smallest_head_release(local), local, {}, zone, names=names))
-            self.assertTrue(shown.startswith("the estimate expired at"))
             assert isinstance(local.head, records.HeadExplanation)
             assert isinstance(local.head.cause, records.EstimateExpired)
             assert isinstance(parsed.explanation.head, records.HeadExplanation)
             assert isinstance(parsed.explanation.head.cause, records.EstimateExpired)
-            self.assertEqual(queue_evidence.estimate_refresh_text(parsed.explanation.head.cause, zone),
-                             queue_evidence.estimate_refresh_text(local.head.cause, zone))
+            self.assertEqual(parsed.explanation.head.cause, local.head.cause)

@@ -21,9 +21,11 @@ from scripts.direct.memory_kill_test_support import (
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
-# A Codex worker running this suite must not make verify.sh detach its call.
+# A Codex worker running this suite must not make verify.sh detach its call,
+# and an outer detached run must not take its exit status.
 WORKER_FREE_ENVIRONMENT = {name: value for name, value in os.environ.items()
-                           if name not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID", "UNIT_DETACHED_RUN"}}
+                           if name not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID"}
+                           and not name.startswith("UNIT_DETACHED_")}
 
 WORKER_FREE_ENVIRONMENT.update({"VERIFY_START_DIR": str(VERIFY.parent), "PY": sys.executable})
 
@@ -39,7 +41,7 @@ def classifier_functions() -> str:
     for path, name in (
         (VERIFY.parent.parent / "lint" / "invoke.sh", "buildlog_step_compiles"),
         *((VERIFY, name) for name in (
-            "memory_kill_in_journal", "step_was_killed_for_memory", "lint_failure_is_the_tree",
+            "verify_helper", "memory_kill_in_journal", "step_was_killed_for_memory", "lint_failure_is_the_tree",
             "release_wait_claim", "step_writes_tree", "finish_step_token", "run", "run_step", "note_event")),
     ):
         functions.append(shell_function(path.read_text(), name))

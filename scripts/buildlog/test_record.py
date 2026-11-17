@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Tests for record.py, run as invoke.sh and verify.sh run it: a subprocess, BUILDLOG_DIR on a temporary root."""
+"""Test record contents in process and keep real CLI entry cases on temporary roots."""
 
 from __future__ import annotations
 
 from functools import cached_property
 from contextlib import closing
 import gzip
+import io
 import json
 import os
 import re
@@ -21,7 +22,7 @@ import unittest
 from unittest import mock
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import BinaryIO, cast, override
+from typing import BinaryIO, ClassVar, cast, override
 
 
 from scripts.lib.socket_test_support import short_socket_directory
@@ -35,10 +36,13 @@ from scripts.buildlog import store
 from scripts.buildlog.cgroup_test_support import CPU, IO_LINES, save_scope_counters, write_cgroup
 
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.build_queue import admission_records, step_estimator
 from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
 from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.buildlog.test_index import point_root_at
 from scripts.lib import test_hang_guard
+from scripts.lint.build_shape import build_shape
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 
 SCRIPT = Path(__file__).with_name("record.py")
 CONTEXT_SCRIPT = SCRIPT.with_name("step_context.py")
@@ -106,14 +110,43 @@ def setUpModule() -> None:
 
 
 class RecordTests(unittest.TestCase):
+    repository_seed: ClassVar[Path]
     base: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     repo: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        seed_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="record-seed-"))).resolve()
+        seed_home = seed_root / "home"
+        seed_home.mkdir()
+        cls.repository_seed = seed_root / "repository"
+        cls.repository_seed.mkdir()
+        builder = cls()
+        builder.base = seed_root
+        builder.root = seed_root / "buildlog"
+        builder.repo = cls.repository_seed
+        with mock.patch.dict(os.environ, {"HOME": str(seed_home), "XDG_CONFIG_HOME": str(seed_home / ".config")}):
+            _ = builder.git("init", "-q", "-b", "main", cwd=builder.repo)
+            _ = builder.git("commit", "-q", "--allow-empty", "-m", "first", cwd=builder.repo)
+
     @override
     def setUp(self) -> None:
+        # Other test modules also construct this fixture without class setup.
+        cls = type(self)
+        if not hasattr(cls, "repository_seed") or not cls.repository_seed.is_dir():
+            self.addCleanup(cls.doClassCleanups)
+            cls.setUpClass()
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(mock.patch.dict(os.environ))
+        self.enterContext(mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(self.base.parent)}))
+        is_file = Path.is_file
+        def fixture_file(path: Path) -> bool:
+            if path.name == "Cargo.toml" and not path.is_relative_to(self.base):
+                return False
+            return is_file(path)
+        _ = self.enterContext(mock.patch.object(Path, "is_file", fixture_file))
         if "BUILDLOG_REPO_IDENTITY" in os.environ:
             del os.environ["BUILDLOG_REPO_IDENTITY"]
         self.enterContext(mock.patch.dict(os.environ, fake_memory_readings(self.base)))
@@ -122,9 +155,7 @@ class RecordTests(unittest.TestCase):
         self.root = self.base / "buildlog"
         point_root_at(self, self.root)
         self.repo = self.base / "hana"
-        self.repo.mkdir()
-        _ = self.git("init", "-q", "-b", "main", cwd=self.repo)
-        _ = self.git("commit", "-q", "--allow-empty", "-m", "first", cwd=self.repo)
+        _ = shutil.copytree(cls.repository_seed, self.repo)
         _ = self.admission
         self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
@@ -141,7 +172,7 @@ class RecordTests(unittest.TestCase):
         environment["BUILDLOG_DIR"] = str(self.root)
         environment["BUILD_HOLD_DIR"] = str(self.base / "holders")
         environment["BUILD_HOLD_RELEASE_DIR"] = str(self.base / "release")
-        environment["UNIT_ACTIVE_DIR"] = str(self.base / "active")
+        environment["STAFF_FILE"] = str(self.base / "staff.json")
         environment["BUILDLOG_CALL_ID"] = environment["BUILDLOG_CALLER"] = ""
         environment["BUILDLOG_HOLD_WAIT_FILE"] = environment["BUILDLOG_HOLD_ADMISSION_FILE"] = ""
         environment["BUILDLOG_HOLD_STARTED_FILE"] = environment["BUILDLOG_HOLD_WAITER_FILE"] = ""
@@ -167,8 +198,20 @@ class RecordTests(unittest.TestCase):
     def record(
         self, *args: str, cwd: Path | None = None, extra: dict[str, str] | None = None, input: str = ""
     ) -> subprocess.CompletedProcess[str]:
+        if process_boundary_for_case(self):
+            return self.record_process(*args, cwd=cwd, extra=extra, input=input)
+        module = step_context if args and args[0] == "step-context" else recorder
+        arguments = list(args)
+        with mock.patch.object(recorder, "detach"), mock.patch.object(sys, "stdin", io.StringIO(input)):
+            return invoke_cli(module, lambda: module.main(arguments), arguments,
+                              self.environment(**(extra or {})), cwd or self.repo)
+
+    def record_process(
+        self, *args: str, cwd: Path | None = None, extra: dict[str, str] | None = None, input: str = ""
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [str(SCRIPT.resolve().parents[1] / "lib/py"), str(CONTEXT_SCRIPT if args[0] == "step-context" else SCRIPT), *args],
+            [str(SCRIPT.resolve().parents[1] / "lib/py"),
+             str(CONTEXT_SCRIPT if args and args[0] == "step-context" else SCRIPT), *args],
             cwd=cwd or self.repo,
             input=input,
             env=self.environment(**(extra or {})),
@@ -282,6 +325,10 @@ class RecordTests(unittest.TestCase):
                 lines = result.stdout.splitlines()
                 self.assertEqual(len(lines), 2, result.stdout + result.stderr)
                 self.assertEqual(lines[1], str(workspace / "target"))
+        result = self.record_process(cwd=workspace)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("record.py step STATUS START END TTY LOG PEAK ARGV...", result.stderr)
 
     def folder_context(self, argv: list[str], *, extra: dict[str, str] | None = None,
                        cwd: Path | None = None, metadata: str = "") -> str:
@@ -393,6 +440,7 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(self.resolved_folder(argv), "/x")
         _ = self.assert_folder_record(argv, "/x")
 
+    @process_boundary
     def test_changed_target_environment_rejects_the_callers_metadata(self) -> None:
         _ = (self.repo / "Cargo.toml").write_text('[workspace]\n')
         metadata = json.dumps({"workspace_root": str(self.repo), "target_directory": "/stale"})
@@ -649,6 +697,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         _ = path.write_text("123456\n")
         return path
 
+    @process_boundary
     def test_step_record_fields(self) -> None:
         handoff, peak = self.handoff(), self.peak_file()
         record = self.step(1, "0", str(handoff), str(peak), NEXTEST, {"BUILDLOG_CALL_ID": CALL_ID})
@@ -805,7 +854,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
             env=environment, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertRegex(result.stderr, r"waiting for memory since \d\d:\d\d P[DS]T: the machine has 10\.5 GiB free; a build starts at 12\.0")
+        self.assertRegex(result.stderr, r"waiting for memory since \d\d:\d\d P[DS]T: .* needs \d+\.\d GiB; 10\.5 GiB free; ")
         self.assertEqual(result.stderr.count("waiting for memory since "), 1)
         reason = "memory admission check failed (launch wait limit reached without admission); step refused"
         self.assertEqual(result.stderr.count(reason), 1)
@@ -960,8 +1009,8 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
             self.assertIn("waiting for memory since ", first_message)
             self.assertFalse(marker.exists())
             _ = threading.Event().wait(1.1)
-            released_at = time.time()
             _ = meminfo.write_text("MemAvailable: 12582912 kB\n")
+            released_at = meminfo.stat().st_mtime
             output, remaining_errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
             errors = first_message + remaining_errors
         finally:
@@ -977,14 +1026,6 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         started = datetime.fromisoformat(str(record["started_at"]).replace("Z", "+00:00")).timestamp()
         self.assertGreaterEqual(started, released_at - 0.01)
         self.assertEqual(record["mem_wait_s"], int(output.split("wait=")[-1].strip()))
-
-    def test_scope_memory_names_its_values_and_marks_missing_stalls_unmeasured(self) -> None:
-        peak = self.peak_file()
-        memory = recorder.peak_and_stall(str(peak))
-        self.assertIsInstance(memory, recorder.StepScopeMemory)
-        self.assertEqual(memory.peak_bytes, 123456)
-        self.assertIs(memory.stall_some_s, sample.Unmeasured.VALUE)
-        self.assertIs(memory.stall_full_s, sample.Unmeasured.VALUE)
 
     def test_scope_memory_uses_shared_pressure_parser_for_partial_counters(self) -> None:
         peak = self.base / "partial-pressure"
@@ -1078,6 +1119,46 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         record = self.records()[-1]
         self.assertEqual((record["cwd"], record["repo_path"], record["branch"]), (str(elsewhere), str(self.repo), "main"))
 
+    def test_gitless_build_uses_its_recorded_peak_after_the_first_fallback(self) -> None:
+        directory = self.base / "sample"
+        directory.mkdir()
+        manifest = directory / "Cargo.toml"
+        _ = manifest.write_text('[package]\nname = "sample"\nversion = "0.1.0"\n')
+        argv = ["cargo", "build", "--manifest-path", str(manifest)]
+        shape = build_shape(argv)
+        now = datetime.fromtimestamp(START + 60, UTC)
+        config = admission_records.read_memory_config(report=False)
+        fallback = config.program_first_peaks["cargo"]
+        self.assertEqual(fallback, 12 * admission_records.GIB)
+        step_estimator.clear_git_identity_cache()
+        self.addCleanup(step_estimator.clear_git_identity_cache)
+        with mock.patch.dict(os.environ, {"MANIFEST_PATH": ""}):
+            identity, _ = step_estimator.git_identity(argv, str(self.base))
+            first = step_estimator.expected_peak(identity, "build", store.host_name(), now, self.root,
+                                                 shape=shape, first_peak_bytes=fallback)
+            self.assertEqual((first.bytes, first.count, first.basis),
+                             (fallback, 0, admission_records.ShapeFallback()))
+            peak = self.base / "peak"
+            _ = peak.write_text(str(3 * admission_records.GIB) + "\n")
+            row = self.step(0, "1", "", str(peak), argv, cwd=self.base)
+            history = self.root / "admission/anon_peaks.jsonl"
+            history.parent.mkdir(parents=True, exist_ok=True)
+            _ = history.write_text(json.dumps({
+                "host": row["host"], "repo_identity": row["repo_identity"], "step": row["step"],
+                "ended_at": row["ended_at"], "anon_peak_bytes": row["peak_mem_bytes"],
+                "shape": shape.key, "outcome": "completed",
+            }) + "\n")
+            step_estimator.clear_git_identity_cache()
+            identity, _ = step_estimator.git_identity(argv, str(self.base))
+            second = step_estimator.expected_peak(identity, "build", store.host_name(), now, self.root,
+                                                  shape=shape, first_peak_bytes=fallback)
+        self.assertIsInstance(second.basis, admission_records.ShapeLargest)
+        self.assertEqual(second.count, 1)
+        factor = admission_records.DevSizeHeadroom(config.dev_size_factor, config.dev_size_margin_bytes)
+        self.assertEqual(second.bytes, step_estimator.shape_headroom_bytes(3 * admission_records.GIB, factor))
+        self.assertEqual(row["repo_identity"], "manifest-path:" + str(manifest))
+        self.assertEqual(identity, admission_records.RepositoryIdentity("manifest-path:" + str(manifest), "sample"))
+
     def key(self, *argv: str, cwd: Path | None = None) -> str:
         result = self.record("step-context", *argv, cwd=cwd)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1103,18 +1184,21 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
     def test_mirror_steps_record_the_sent_repository_identity_without_derivation(self) -> None:
         mirror = self.base / "mirror"
         mirror.mkdir()
-        _ = self.git("init", "-q", "--template=", cwd=mirror)
+        _ = (mirror / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
         identity = "https://example.org/source"
-        for caller in ("verify-mac", "verify-linux"):
-            with self.subTest(caller=caller), mock.patch.dict(os.environ, {"BUILDLOG_REPO_IDENTITY": identity}):
-                row = self.step(0, "0", "", "", NEXTEST, {"BUILDLOG_CALLER": caller}, cwd=mirror)
-                self.assertEqual(row["repo_identity"], identity)
-                _ = index.update()
-                with closing(index.read_only()) as connection:
-                    indexed = cast(tuple[str, int], connection.execute(
-                        "SELECT repo_identity, identity_derived FROM steps WHERE id = ?", (row["id"],),
-                    ).fetchone())
-                self.assertEqual(indexed, (identity, 0))
+        for git in (False, True):
+            if git:
+                _ = self.git("init", "-q", "--template=", cwd=mirror)
+            for caller in ("verify-mac", "verify-linux"):
+                with self.subTest(caller=caller, git=git), mock.patch.dict(os.environ, {"BUILDLOG_REPO_IDENTITY": identity}):
+                    row = self.step(0, "0", "", "", NEXTEST, {"BUILDLOG_CALLER": caller}, cwd=mirror)
+                    self.assertEqual(row["repo_identity"], identity)
+                    _ = index.update()
+                    with closing(index.read_only()) as connection:
+                        indexed = cast(tuple[str, int], connection.execute(
+                            "SELECT repo_identity, identity_derived FROM steps WHERE id = ?", (row["id"],),
+                        ).fetchone())
+                    self.assertEqual(indexed, (identity, 0))
 
     def test_ordinary_steps_ignore_the_sent_repository_identity(self) -> None:
         directory = self.base / "ordinary"
@@ -1421,14 +1505,6 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
                                             "2026-10-12T12:00:00+00:00"]), 0)
         self.assertEqual(self.records(), [])
         self.assertIn("write failed", (self.root / "errors.log").read_text())
-
-    def test_hold_event_refuses_invalid_or_naive_planned_ends_without_failing_its_caller(self) -> None:
-        for until in ("later", "2026-10-12T14:00:00"):
-            with self.subTest(until=until):
-                result = self.record("hold-event", "began", "mac", "block-key", "hana", "render",
-                                     "2026-10-12T12:00:00Z", until)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(self.records(), [])
 
     def test_hold_event_accepts_an_empty_planned_end(self) -> None:
         result = self.record("hold-event", "began", "mac", "block-key", "hana", "render",

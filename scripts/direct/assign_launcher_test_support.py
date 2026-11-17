@@ -6,20 +6,23 @@ import os
 import subprocess
 import sys
 import unittest
+from contextlib import contextmanager
+from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, TextIO, cast, override
 from unittest.mock import patch
 
-from scripts.direct import assign
+from scripts.direct import assign, phase_table
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
 from scripts.lib.git_test_support import commit_repository
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff, unit_config, test_worker, worker
 from scripts.production.cli_fixture import invoke_cli
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 ROOT = Path(__file__).resolve().parents[2]
 ASSIGN = ROOT / "scripts/direct/assign.sh"
@@ -41,8 +44,8 @@ def backend_fixture_command(directory: Path, command: list[str],
         f"if sys.argv[0] == {str(ASSIGN.with_suffix('.py'))!r}: sys.setprofile(enter)",
     )) + "\n")
     child_environment = dict(environment)
-    child_environment["FIXTURE_ASSIGN_PYTHONPATH"] = environment.get("PYTHONPATH", str(ROOT))
-    child_environment["PYTHONPATH"] = os.pathsep.join((str(directory), str(ROOT)))
+    child_environment["FIXTURE_ASSIGN_PYTHONPATH"] = environment.get("PYTHONPATH", str(ROOT / "scripts/lib/python_startup"))
+    child_environment["PYTHONPATH"] = os.pathsep.join((str(ROOT / "scripts/lib/python_startup"), str(directory)))
     return ["bash", str(ASSIGN)], child_environment
 
 
@@ -63,6 +66,38 @@ DEFAULT_ASSIGNMENT_EXECUTION = InProcessAssignment()
 def invoke_assignment(arguments: list[str], environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
     with patch.object(assign, "require_live_director"):
         return invoke_cli(assign, assign.main, arguments, environment, ROOT)
+
+
+@contextmanager
+def assignment_helpers() -> Generator[None]:
+    """Keep helper parsers and handlers in the fixture process."""
+    from scripts.direct.assign_claude_test_support import direct_launcher_helpers
+    from scripts.direct.findings_test_support import invoke_findings
+
+    cache = Path.home() / ".cache"
+    seed_interpreter_cache(cache)
+    with patch.dict(os.environ, {"CLAUDE_PYTHON": "", "XDG_CACHE_HOME": str(cache)}), direct_launcher_helpers():
+        run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+        def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            path = Path(command[1]).resolve() if len(command) > 1 else Path()
+            if path not in (ROOT / "scripts/direct/phase_table.py", ROOT / "scripts/direct/findings.py"):
+                return run_process(command, **options)
+            environment = cast(dict[str, str], options.get("env", os.environ.copy()))
+            directory = Path(cast(str | Path, options.get("cwd") or Path.cwd()))
+            result = (invoke_findings(command[2:], environment, directory) if path.name == "findings.py" else
+                      invoke_cli(phase_table, phase_table.main, command[2:], environment, directory))
+            if not options.get("capture_output"):
+                if options.get("stdout") is None:
+                    print(result.stdout, end="")
+                if options.get("stderr") is None:
+                    print(result.stderr, end="", file=sys.stderr)
+            if options.get("check"):
+                result.check_returncode()
+            return result
+
+        with patch.object(subprocess, "run", side_effect=run):
+            yield
 
 
 def read_object(path: Path) -> dict[str, object]:
@@ -91,6 +126,7 @@ class AssignLauncherFixture(unittest.TestCase):
         _ = config.write_text((ROOT / "config/direct.conf").read_text())
         _ = config.with_name("shutdown.conf").write_text((ROOT / "config/shutdown.conf").read_text())
         self.addCleanup(self.native.doCleanups)
+        _ = self.enterContext(assignment_helpers())
         self.home = Path.home()
         self.session_dir = self.native.run_dir
         self.project = self.session_dir.parent / "project"
@@ -115,12 +151,12 @@ class AssignLauncherFixture(unittest.TestCase):
         self.registry = self.native.fixture.root / "conf/models.conf"
         _ = write_registry(self.registry, {'codex.agents': {'gpt-kept-sol': 'low,medium,high,xhigh,max', 'gpt-other-sol': 'low,medium,high,xhigh,max'}, 'assignments': {'direct': 'codex'}, 'direct.codex': {'impl': 'gpt-kept-sol:high', 'test': 'gpt-kept-sol:high', 'fix': 'gpt-kept-sol:high', 'review': 'gpt-kept-sol:high'}})
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "UNIT_HISTORY_DIR": str(self.history), "UNIT_ACTIVE_DIR": str(self.session_dir.parent / "active"),
+            "UNIT_HISTORY_DIR": str(self.history), 
             "UNIT_RUN_ROOT": str(self.session_dir.parent), "ROSTER_RUN_ROOT": str(self.session_dir.parent),
             "MODELS_CONFIG_FILE": str(self.registry), "UNIT_SYNC_WRITES": "0", "UNIT_RUN_DIR": str(self.session_dir),
-            "PYTHONPATH": str(ROOT), "ASTRA_ROLES_STATE": str(self.session_dir.parent / "roles"),
+            "PYTHONPATH": str(ROOT / "scripts/lib/python_startup"), "ASTRA_ROLES_STATE": str(self.session_dir.parent / "roles"),
         })))
-        for key in ("MODELS_LAUNCH_CONFIGURATION", "MODELS_REGISTRY_EDIT_BASE", "AGENTS_CALLER_FAMILY", "AGENTS_CALLER_ASSIGNMENT"):
+        for key in ("MODELS_LAUNCH_CONFIGURATION", "MODELS_REGISTRY_EDIT_BASE"):
             _ = os.environ.pop(key, None)
         original = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
         def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
@@ -231,7 +267,7 @@ class AssignLauncherFixture(unittest.TestCase):
             f"        runpy.run_path({str(injection)!r})",
             f"if sys.argv[0] == {str(ASSIGN.with_suffix('.py'))!r}: sys.setprofile(enter)",
         )))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"PYTHONPATH": f"{directory}{os.pathsep}{ROOT}"})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"PYTHONPATH": f"{ROOT / 'scripts/lib/python_startup'}{os.pathsep}{directory}"})))
         self.injections.append(code)
         saved = vars(assign).copy()
         exec(code, {})
@@ -254,26 +290,19 @@ class AssignLauncherFixture(unittest.TestCase):
         return prepared
 
 
-class FirstDispatchFixture(AssignLauncherFixture):
+class HookAssignmentFixture(AssignLauncherFixture):
+    """Deliver native completion events after the launcher returns."""
+
+    @override
+    def launch(self, role: str = "implement", *options: str, paths: bool = True, session: bool = True,
+               execution: AssignmentExecution = DEFAULT_ASSIGNMENT_EXECUTION) -> subprocess.CompletedProcess[str]:
+        result = super().launch(role, *options, paths=paths, session=session, execution=execution)
+        if result.returncode == 0 and self.native.agent.submitted:
+            row = self.native.agent.row(self.native.agent.submitted[-1][0])
+            _ = self.native.finish(row.name)
+        return result
+
+
+class FirstDispatchFixture(HookAssignmentFixture):
     def first_assignment(self, role: str = "implement", *options: str) -> None:
         _ = self.successful(role, *options)
-
-
-@dataclass(frozen=True)
-class FirstDispatchArtifact:
-    """A completed first dispatch publishes this file."""
-
-    relative: Path
-    content: bytes
-    mode: int
-
-def snapshot_files(root: Path) -> dict[Path, bytes]:
-    """Read regular files before a dispatch."""
-    return {path.relative_to(root): path.read_bytes() for path in root.rglob("*")
-            if path.is_file() and not path.is_symlink()}
-
-def changed_files(root: Path, before: dict[Path, bytes]) -> tuple[FirstDispatchArtifact, ...]:
-    """Keep files that the dispatch changed."""
-    return tuple(FirstDispatchArtifact(relative, content, (root / relative).stat().st_mode)
-                 for relative, content in snapshot_files(root).items()
-                 if before.get(relative) != content)

@@ -68,23 +68,52 @@ class ConversationPauseRegistrationTests(unittest.TestCase):
         self.assertEqual(allow.count(f"Bash({resume_prefix} *)"), 1)
 
 
-
 class ConversationPauseTests(ConversationPauseFixture):
     def test_unreadable_staff_reports_the_error_and_keeps_the_native_timer_pause(self) -> None:
-        instance = self.create_instance("unit-native")
         other = self.create_instance("showrunner-other", session_id="another-owner")
-        _ = (self.root / "staff.json").write_text("invalid staff JSON\n")
-        result = self.run_prompt("hello")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(
-            f"conversation-pause: timer lookup: cannot read staff record {self.root / 'staff.json'}: invalid staff JSON:",
-            result.stderr,
-        )
-        reply = cast(dict[str, object], json.loads(result.stdout))
-        self.assertEqual(reply["systemMessage"],
-                         f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}")
-        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
-        self.assertTrue((other / "state").read_text().startswith("ENABLED=1\n"))
+        for failure in ("invalid JSON", "directory"):
+            with self.subTest(failure=failure):
+                session_id = fixture_runtime_id(f"unreadable-{failure}")
+                instance = self.create_instance(f"unit-{session_id}", session_id=session_id)
+                path = self.root / "staff.json" if failure == "invalid JSON" else self.root
+                if failure == "invalid JSON":
+                    _ = path.write_text("invalid staff JSON\n")
+                self.environment["STAFF_FILE"] = str(path)
+                with patch.dict(os.environ, self.environment), self.assertRaises(staff.StaffUnreadable):
+                    _ = conversation_pause.director_turn(session_id)
+                result = self.run_prompt("hello", extra={"session_id": session_id})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                detail = "invalid staff JSON:" if failure == "invalid JSON" else "[Errno 21] Is a directory:"
+                self.assertIn(
+                    f"conversation-pause: timer lookup: cannot read staff record {path}: {detail}",
+                    result.stderr,
+                )
+                reply = cast(dict[str, object], json.loads(result.stdout))
+                self.assertEqual(reply["systemMessage"],
+                                 f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}")
+                self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+                self.assertTrue((other / "state").read_text().startswith("ENABLED=1\n"))
+
+    def test_prompt_reuses_one_staff_read_for_activity_hold_and_timer_pause(self) -> None:
+        for state in ("active", "paused"):
+            with self.subTest(state=state):
+                owner = fixture_member("showrunner", name=f"one-read-{state}")
+                _ = staff.set_run(owner.id, staff.OpenRun(self.root / f"run-{state}"))
+                if state == "paused":
+                    _ = staff.set_hold(owner.id, staff.Paused("now", "reviewer", "review"))
+                timer = self.create_instance(f"showrunner-{owner.id}", session_id=owner.id)
+                with patch.object(staff, "_local_fields", wraps=staff._local_fields) as reads:  # pyright: ignore[reportPrivateUsage]
+                    result = self.run_prompt("hello", extra={"session_id": owner.current_session})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(reads.call_count, 1)
+                reply = cast(dict[str, object], json.loads(result.stdout))
+                if state == "paused":
+                    self.assertIn("This unit is paused", str(reply))
+                    self.assertTrue((timer / "state").read_text().startswith("ENABLED=1\n"))
+                else:
+                    self.assertIn("Automatic updates paused", str(reply))
+                    self.assertTrue((timer / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_staff_timer_is_found_after_the_showrunner_session_changes(self) -> None:
         owner = fixture_member("showrunner", name="timer-owner")
@@ -244,8 +273,10 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertEqual(self.activity_calls(1), expected)
         self.activity_log.unlink()
         _ = (self.notifier_root / self.showrunner_timer("demo") / "conf").write_text("TARGET=session:other\nEVERY=5\nCOMMAND=report\n")
-        _ = (self.unit_active_root / SESSION).write_text("/tmp/claude/unit/run-1\n")
-        self.assertEqual(self.run_prompt("hello").returncode, 0)
+        owner = fixture_member("showrunner", name="unit-director")
+        _ = staff.set_run(owner.id, staff.OpenRun(self.root / "run-1"))
+        self.assertEqual(self.run_prompt("hello", extra={"session_id": owner.current_session}).returncode, 0)
+        expected[0][4] = owner.current_session
         self.assertEqual(self.activity_calls(1), expected)
 
     def test_other_sessions_and_prompts_record_no_activity(self) -> None:
@@ -283,7 +314,8 @@ class ConversationPauseTests(ConversationPauseFixture):
                     "foreground_processes": [{"pid": 998042, "argv": ["claude"]}]}}), \
                 patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(herdr.EnvironmentThread(SESSION), "fixture-start", {})), \
                 patch.object(herdr.Herdr, "composer", return_value=herdr.ComposerInput("")):
-            conversation_pause.record_scheduled_prompts(SESSION, (resume,))
+            conversation_pause.record_scheduled_prompts(
+                SESSION, (conversation_pause.ScheduledTaskPrompt("resume", resume, False),))
             with patch.object(herdr.Herdr, "prompt") as transmitted:
                 session_pane.type_place(Place("demo", pane), relay, target=SESSION)
             transmitted.assert_called_once_with(pane, script_prompt(relay), target=SESSION)
@@ -383,12 +415,12 @@ class ConversationPauseTests(ConversationPauseFixture):
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
-    def test_typed_showrunner_prompt_pauses_dailies_once(self) -> None:
+    def test_typed_showrunner_prompt_pauses_reports_once(self) -> None:
         instance = self.create_instance(self.showrunner_timer("demo"))
         first = self.parsed_reply(self.run_prompt("hello", now=100))
         self.assertEqual(first, {
             "systemMessage": (
-                f"Automatic updates paused while we talk: dailies. {RETURN_SCHEDULE}"
+                f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}"
             ),
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
@@ -665,7 +697,8 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertFalse((self.escalate_root / "typed").exists())
 
     def test_recorded_scheduled_prompt_does_not_pause_but_different_prompt_does(self) -> None:
-        instance = self.create_instance("unit-abc")
+        self.record_activity()
+        instance = self.create_instance(self.showrunner_timer("demo"))
         recorded = self.run_stop(
             extra={"session_crons": [scheduled_wakeup("  recurring status  ")]}
         )
@@ -673,11 +706,61 @@ class ConversationPauseTests(ConversationPauseFixture):
             (recorded.returncode, recorded.stdout, recorded.stderr), (0, "", "")
         )
 
-        scheduled = self.run_prompt("recurring status")
+        for arrival in (1, 2):
+            with self.subTest(recurring_arrival=arrival):
+                scheduled = self.run_prompt("recurring status")
+                self.assertEqual(
+                    (scheduled.returncode, scheduled.stdout, scheduled.stderr), (0, "", "")
+                )
+                self.assertEqual(self.scheduled_prompts(), ["  recurring status  "])
 
-        self.assertEqual(
-            (scheduled.returncode, scheduled.stdout, scheduled.stderr), (0, "", "")
+        prompt = (
+            "P7 ETA 07:00 EST is due. If the Phase 7 landing notice is not sent, "
+            "send hana a new ETA with what slowed it."
         )
+        tasks = [scheduled_wakeup(prompt, task_id=task_id, recurring=False)
+                 for task_id in ("first-eta", "3aabfc24")]
+        recorded = self.run_stop(extra={"session_crons": tasks})
+        self.assertEqual((recorded.returncode, recorded.stdout, recorded.stderr), (0, "", ""))
+        for arrival in (1, 2):
+            with self.subTest(one_shot_arrival=arrival):
+                scheduled = self.run_prompt(prompt)
+                self.assertEqual(
+                    (scheduled.returncode, scheduled.stdout, scheduled.stderr), (0, "", "")
+                )
+                if arrival == 1:
+                    self.assertEqual(json.loads(self.scheduled_prompts_path().read_text()), [
+                        {"id": "3aabfc24", "prompt": prompt, "recurring": False}])
+                    stopped = self.run_stop(extra={"session_crons": [
+                        scheduled_wakeup("a new task", task_id="new-task")]})
+                    self.assertEqual((stopped.returncode, stopped.stdout, stopped.stderr), (0, "", ""))
+                    self.assertEqual(self.scheduled_prompts(), ["a new task", prompt])
+                else:
+                    self.assertEqual(self.scheduled_prompts(), ["a new task"])
+        self.assertEqual([call[2] for call in self.activity_calls(4)], ["ScriptPrompt"] * 4)
+
+        rows = (
+            (False, ("check build B", "check build A"), ["check build… [+40 chars]"], 6),
+            (True, ("check build B", "check build A", "check build B"),
+             ["check build… [+40 chars]", "check build B"], 9),
+        )
+        for recurring_b, arrivals, remaining_after_b, activity_count in rows:
+            with self.subTest(recurring_b=recurring_b):
+                recorded = self.run_stop(extra={"session_crons": [
+                    scheduled_wakeup("check build… [+40 chars]", task_id="build-a", recurring=False),
+                    scheduled_wakeup("check build B", task_id="build-b", recurring=recurring_b),
+                ]})
+                self.assertEqual((recorded.returncode, recorded.stdout, recorded.stderr), (0, "", ""))
+                for arrival, prompt in enumerate(arrivals):
+                    with self.subTest(overlapping_prompt=prompt, arrival=arrival):
+                        scheduled = self.run_prompt(prompt)
+                        self.assertEqual(
+                            (scheduled.returncode, scheduled.stdout, scheduled.stderr), (0, "", "")
+                        )
+                        if arrival == 0:
+                            self.assertEqual(self.scheduled_prompts(), remaining_after_b)
+                self.assertEqual([call[2] for call in self.activity_calls(activity_count)],
+                                 ["ScriptPrompt"] * activity_count)
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
         self.assertFalse((self.escalate_root / "typed").exists())
         self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
@@ -765,28 +848,28 @@ class ConversationPauseTests(ConversationPauseFixture):
         )
         result = self.run_cli("resume")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "automatic updates on: dailies\n")
+        self.assertEqual(result.stdout, "automatic updates on: status reports\n")
         self.assertEqual(self.calls(self.notifier_log), [["unpause", self.showrunner_timer("demo")]])
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
         self.assertFalse(record_path.exists())
 
     def test_a_timer_stopped_during_the_pause_stay_stopped_at_resume(self) -> None:
-        dailies = self.create_instance(self.showrunner_timer("demo"))
+        reports = self.create_instance(self.showrunner_timer("demo"))
         unit_report = self.create_instance("unit-abc")
         _ = self.run_prompt("hello", now=100)
-        # The showrunner stops its dailies on purpose while the user talks.
-        self.set_enabled(dailies, False)
+        # The showrunner stops its reports on purpose while the user talks.
+        self.set_enabled(reports, False)
 
         result = self.run_cli("resume")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "automatic updates on: status reports\n")
         self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertTrue((dailies / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue((reports / "state").read_text().startswith("ENABLED=0\n"))
         self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
 
     def test_a_timer_stopped_before_the_pause_stay_stopped_at_resume(self) -> None:
-        dailies = self.create_instance(self.showrunner_timer("demo"), enabled=False)
+        reports = self.create_instance(self.showrunner_timer("demo"), enabled=False)
         unit_report = self.create_instance("unit-abc")
         _ = self.run_prompt("hello", now=100)
         self.assertEqual(self.record()["instances"], ["unit-abc"])
@@ -796,10 +879,10 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "automatic updates on: status reports\n")
         self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertTrue((dailies / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue((reports / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_the_timeout_return_leaves_what_was_stopped_during_the_pause(self) -> None:
-        dailies = self.create_instance(self.showrunner_timer("demo"), enabled=False)
+        reports = self.create_instance(self.showrunner_timer("demo"), enabled=False)
         unit_report = self.create_instance("unit-abc", enabled=False, paused=True)
         _ = self.create_instance("conversation-pause", run="tick")
         _ = self.write_record(
@@ -811,14 +894,14 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertEqual(tick.returncode, 0, tick.stderr)
         self.assertEqual(self.record()["phase"], {"kind": "returned", "returned_at": 400})
         self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertTrue((dailies / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue((reports / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_a_tick_drops_what_was_stopped_by_hand_from_the_pause_record(self) -> None:
-        dailies = self.create_instance(self.showrunner_timer("demo"))
+        reports = self.create_instance(self.showrunner_timer("demo"))
         _ = self.create_instance("unit-abc")
         _ = self.create_instance("conversation-pause", run="tick")
         _ = self.run_prompt("hello", now=100)
-        self.set_enabled(dailies, False)
+        self.set_enabled(reports, False)
 
         tick = self.run_cli("tick", now=150)
 
@@ -876,7 +959,7 @@ class ConversationPauseTests(ConversationPauseFixture):
         )
         self.assertEqual(
             self.run_cli("status").stdout,
-            "paused: dailies, status reports (replying)\n",
+            "paused: status reports (replying)\n",
         )
         kept = self.run_cli("keep")
         self.assertEqual(kept.returncode, 0, kept.stderr)
@@ -927,10 +1010,13 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertEqual(self.record(), before)
 
     def test_stop_hook_records_scheduled_prompts_without_pause_record(self) -> None:
+        path = self.scheduled_prompts_path()
+        path.parent.mkdir(parents=True)
+        _ = path.write_text(json.dumps(["an old scheduled prompt"]))
         result = self.run_stop(extra={
             "session_crons": [
                 scheduled_wakeup("first scheduled prompt"),
-                scheduled_wakeup("second scheduled prompt"),
+                scheduled_wakeup("second scheduled prompt", task_id="scheduled-2"),
             ]
         })
 
@@ -1782,84 +1868,6 @@ print("SENT: delivered")
             self.record("kept-session")["phase"], {"kind": "kept_off"}
         )
 
-    def test_open_reviews_leave_all_phases_byte_identical(self) -> None:
-        asked_instance = self.create_instance(
-            self.showrunner_timer("asked"), session_id="asked-session", enabled=False, paused=True
-        )
-        quiet_instance = self.create_instance(
-            self.showrunner_timer("quiet"), session_id="quiet-session", enabled=False, paused=True
-        )
-        returned_instance = self.create_instance(
-            self.showrunner_timer("returned"), session_id="returned-session", enabled=False, paused=True
-        )
-        _ = self.create_instance("conversation-pause", run="tick")
-        paths = {
-            "asked": self.write_record(
-                asked_read(100, 1),
-                instances=(asked_instance.name,),
-                session_id="asked-session",
-            ),
-            "quiet": self.write_record(
-                {"kind": "quiet", "user_wrote_at": 10, "reply_ended_at": 100},
-                instances=(quiet_instance.name,),
-                session_id="quiet-session",
-            ),
-            "returned": self.write_record(
-                {"kind": "returned", "returned_at": 100},
-                instances=(returned_instance.name,),
-                session_id="returned-session",
-            ),
-        }
-        review_root = self.showrunner_root / "review-paused"
-        review_root.mkdir(parents=True)
-        review_paths = [review_root / f"{name}.json" for name in paths]
-        for review_path in review_paths:
-            _ = review_path.write_text("{}\n")
-        before = {name: path.read_bytes() for name, path in paths.items()}
-
-        held = self.run_cli("tick", now=1_000)
-        self.assertEqual(held.returncode, 0, held.stderr)
-        self.assertEqual(
-            {name: path.read_bytes() for name, path in paths.items()}, before
-        )
-        self.assertEqual(self.calls(self.send_log), [])
-        self.assertEqual(
-            [call for call in self.calls(self.notifier_log) if call[0] == "unpause"],
-            [],
-        )
-
-        for review_path in review_paths:
-            review_path.unlink()
-        advanced = self.run_cli("tick", now=1_000)
-        self.assertEqual(advanced.returncode, 0, advanced.stderr)
-        self.assertEqual(
-            self.record("asked-session")["phase"],
-            {"kind": "returned", "returned_at": 1_000},
-        )
-        self.assertEqual(
-            self.record("quiet-session")["phase"],
-            asked_not_read(1_000),
-        )
-        self.assertFalse(paths["returned"].exists())
-        self.assertEqual(len(self.calls(self.send_log)), 1)
-
-    def test_review_file_is_ignored_without_a_showrunner_item(self) -> None:
-        instance = self.create_instance("unit-abc", enabled=False, paused=True)
-        _ = self.create_instance("conversation-pause", run="tick")
-        _ = self.write_record(
-            asked_read(100, 1),
-            instances=("unit-abc",),
-        )
-        review_path = self.showrunner_root / "review-paused/demo.json"
-        review_path.parent.mkdir(parents=True)
-        _ = review_path.write_text("{}\n")
-
-        result = self.run_cli("tick", now=400)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            self.record()["phase"], {"kind": "returned", "returned_at": 400}
-        )
-        self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
 
     def test_unreadable_record_does_not_block_another_session(self) -> None:
         instance = self.create_instance("unit-abc", enabled=False, paused=True)

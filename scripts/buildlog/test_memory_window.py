@@ -44,7 +44,8 @@ def configured_host_cli(script: Path, *arguments: str) -> list[str]:
     return [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c",
             "import runpy, sys; "
             + "script = sys.argv.pop(1); sys.argv[0] = script; "
-            + "from scripts.buildlog import record, store; store.host_name = lambda: record.local_step_identity().hosts[0]; "
+            + "from scripts.buildlog import store; "
+            + f"store.host_name = lambda: {configured_local_host()!r}; "
             + "runpy.run_path(script, run_name='__main__')", str(script), *arguments]
 
 def write_lint_config(root: Path, adjustment: int | str, *, include_adjustment: bool = True) -> Path:
@@ -137,7 +138,7 @@ class MemoryWindowTests(unittest.TestCase):
         start, end = datetime.fromisoformat(START_UTC), datetime.fromisoformat(END_UTC)
         configuration = admission_records.read_memory_config()
         inputs = admission_records.QueueInputs([], (), (), admission_records.HostMemory(30 * GIB, 60 * GIB),
-            admission_records.NoPressureHold(), admission_records.ReadyToStart(), admission_records.NoHeadAdmissionOverride(), start.timestamp())
+            admission_records.NoPressureHold(), admission_records.ReadyToStart(), start.timestamp())
         directory = self.root / "admission"
         directory.mkdir(parents=True)
         queue_snapshot.write_queue_snapshot(directory, inputs, configuration.policy)

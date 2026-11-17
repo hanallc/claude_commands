@@ -176,8 +176,8 @@ esac
         self.environment = {
             **{
                 name: value for name, value in os.environ.items()
-                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
-                                "CODEX_SESSION_ID", "UNIT_DETACHED_RUN"}
+                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID", "CODEX_SESSION_ID"}
+                and not name.startswith("UNIT_DETACHED_")
             },
             "PATH": tool_path,
             "HOME": str(self.root),
@@ -188,6 +188,8 @@ esac
             "FAKE_CHECK_EXIT": "0",
             "CARGO_TARGET_DIR": str(self.root / "target"),
             "CARGO_HOME": str(self.root / "cargo-home"),
+            # No jobserver pool: a test step takes no live /dev/steve token.
+            "CARGO_MAKEFLAGS": f"--jobserver-auth=fifo:{self.root / 'no-pool'}",
             "TMPDIR": str(self.root / "tmp"),
             "XDG_RUNTIME_DIR": str(self.root / "runtime"),
             "XDG_STATE_HOME": str(self.root / "state"),
@@ -203,7 +205,7 @@ esac
             "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_RUN_DIR": "",
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "BUILD_TARGETS_SCRIPT": str(VERIFY.parent.parent / "build_targets" / "build_targets.py"),
@@ -304,8 +306,8 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
     @override
     def setUpClass(cls) -> None:
         builder = ExampleWorkspaceFixture()
-        builder.setUp()
         cls.addClassCleanup(builder.doCleanups)
+        builder.setUp()
         cls.fixture_root = builder.root
         seed = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="example-workspace-seed-"))
         cls.fixture_seed = Path(seed) / "seed"
@@ -327,8 +329,8 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
             super().setUp()
             return
         self.root = self.fixture_root
-        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.calls = self.root / "cargo-calls"
         self.metadata_calls = self.root / "metadata-calls"
         self.environment = self.fixture_environment.copy()

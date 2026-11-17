@@ -3,24 +3,39 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 import shutil
 import subprocess
-import sys
+import tempfile
 import unittest
-from typing import cast, override
+from typing import ClassVar, cast, override
 from unittest.mock import patch
 
+from scripts.direct import simplify_daily
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.git_test_support import commit_repository
+from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib import build_folders
+from scripts.lib.checkout_test_support import copy_runtime
 from scripts.lib.nix_env_test_support import NixFixture, ROOT
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.whoami.account_test_support import write_claude_account
 
 
+class ReviewTime(datetime):
+    @classmethod
+    @override
+    def now(cls, tz: tzinfo | None = None) -> ReviewTime:
+        moment = cls.fromisoformat(os.environ["SIMPLIFY_TEST_NOW"])
+        return moment.astimezone(tz) if tz is not None else moment.replace(tzinfo=None)
+
+
 class DailySimplifyTests(NixFixture):
+    agent_exec: ClassVar[Path]
     origin: Path = Path()
     session: Path = Path()
     calls: Path = Path()
@@ -29,6 +44,25 @@ class DailySimplifyTests(NixFixture):
     first: str = ""
     real_git: str = ""
     day: str = "2026-11-05"
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        launcher = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
+        for folder, names in (
+            ("agents", ("agent_exec.sh", "models_config.sh", "claude_account.sh", "claude_result.py")),
+            ("lib", ("py", "package_root.py", "models_registry.py", "nix_env.py")),
+        ):
+            destination = launcher / "scripts" / folder
+            destination.mkdir(parents=True)
+            for name in names:
+                _ = shutil.copy2(ROOT / "scripts" / folder / name, destination / name)
+        direct = launcher / "scripts/direct"
+        direct.mkdir()
+        _ = (direct / "assign_gate.py").write_text("# Admission succeeds in this private fixture.\n")
+        copy_runtime(launcher, configuration=False)
+        cls.agent_exec = launcher / "scripts/agents/agent_exec.sh"
 
     @override
     def setUp(self) -> None:
@@ -40,10 +74,10 @@ class DailySimplifyTests(NixFixture):
         self.calls = self.root / "claude_calls.jsonl"
         self.env.update({
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
-            "CLAUDE_PYTHON": sys.executable, "CLAUDE_CONFIG_DIR": str(self.home / ".claude1"),
+            **interpreter_cache_environment(self.root / "cache"), "CLAUDE_CONFIG_DIR": str(self.home / ".claude1"),
             "USAGE_STATE_DIR": str(self.root / "usage"), "USER_ZONE": "America/New_York",
             "AGENT_NOTES_DIR": str(self.root / "notes"),
-            "UNIT_HISTORY_DIR": str(self.root / "history"), "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "UNIT_HISTORY_DIR": str(self.root / "history"), 
             "SIMPLIFY_TEST_CALLS": str(self.calls), "SIMPLIFY_TEST_NOW": "2026-11-06T03:30:00+00:00",
             "TMPDIR": str(self.root / "tmp"),
         })
@@ -60,9 +94,10 @@ class DailySimplifyTests(NixFixture):
         registry = write_registry(self.root / "models.conf", base_text=(ROOT / "config/models.conf").read_text())
         self.env.update({"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
                          "CODEX_CATALOG_SYNC_STATE_FILE": str(registry)})
+        self.env.update(private_slot_config(self.root, repository="origin").environment)
         settings = Path(self.env["CONF_DIR"])
+        _ = shutil.copytree(ROOT / "config/review", settings / "review", dirs_exist_ok=True)
         _ = write_config_fixture(settings / "direct.conf", "SIMPLIFY_LENS=on\nSIMPLIFY_FIRST_RUN_BEFORE=2026-11-05T22:50:00-05:00\n")
-        _ = write_config_fixture(settings / "build_folders.conf", f"roots.copies={self.root / 'copies'}\n")
         startup = self.root / "startup"
         startup.mkdir()
         _ = (startup / "sitecustomize.py").write_text('''import datetime, os, sys
@@ -88,11 +123,19 @@ if sys.argv[0].endswith(("assign.py", "simplify_daily.py")):
                 simplify_daily.write_text_atomic = publish_status
     sys.setprofile(enter)
 ''')
-        self.env["PYTHONPATH"] = os.pathsep.join((str(startup), str(ROOT)))
+        self.env["PYTHONPATH"] = os.pathsep.join((str(ROOT / "scripts/lib/python_startup"), str(startup)))
         self.script(self.bin / "claude", '''import json, os, subprocess, sys, uuid
 from pathlib import Path
 session = sys.argv[sys.argv.index("--session-id") + 1] if "--session-id" in sys.argv else str(uuid.uuid4())
+lock = os.stat(os.getcwd() + ".lock")
+inherited_lease = False
+for descriptor in range(3, 256):
+    try:
+        inherited_lease = inherited_lease or os.path.samestat(lock, os.fstat(descriptor))
+    except OSError:
+        pass
 record = {"argv": sys.argv[1:], "prompt": sys.stdin.read(), "cwd": os.getcwd(),
+          "inherited_lease": inherited_lease,
           "config_dir": os.environ.get("CLAUDE_CONFIG_DIR"), "session_id": session,
           "head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
           "branch": subprocess.check_output(["git", "branch", "--show-current"], text=True).strip(),
@@ -123,10 +166,15 @@ raise SystemExit(1 if failed else 0)
         return commit_repository(self.work, content, env={**self.env, "GIT_AUTHOR_DATE": at, "GIT_COMMITTER_DATE": at})
 
     def launch(self, *, session: Path | None = None) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(["bash", str(ROOT / "scripts/direct/assign.sh"), "--role", "simplify",
-                               "--session-dir", str(session or self.session), "--cwd", str(self.work)],
-                              env=self.env, capture_output=True, text=True, check=False,
-                              timeout=TEST_HANG_GUARD_SECS)
+        arguments = ["--session-dir", str(session or self.session), "--cwd", str(self.work)]
+        if process_boundary_for_case(self):
+            return subprocess.run(["bash", str(ROOT / "scripts/direct/assign.sh"), "--role", "simplify", *arguments],
+                                  env=self.env, capture_output=True, text=True, check=False,
+                                  timeout=TEST_HANG_GUARD_SECS)
+        with (patch.object(simplify_daily, "datetime", ReviewTime),
+              patch.object(simplify_daily, "AGENT_EXEC", self.agent_exec)):
+            return invoke_cli(simplify_daily, lambda: simplify_daily.main(arguments), arguments,
+                              {**self.env, "MODELS_CONFIG_TIER_ONLY": "1"}, Path.cwd())
 
     def reviews(self) -> list[dict[str, object]]:
         return ([cast(dict[str, object], json.loads(line)) for line in self.calls.read_text().splitlines()]
@@ -147,6 +195,7 @@ raise SystemExit(1 if failed else 0)
         self.assertEqual(self.reviews(), [])
         self.assertEqual(self.refs(), {})
 
+    @process_boundary
     def test_first_run_reviews_the_diff_from_the_commit_before_the_cutoff(self) -> None:
         result = self.launch()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -178,6 +227,11 @@ raise SystemExit(1 if failed else 0)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.artifacts() / "diff").read_text().strip(), self.git("diff", self.first, self.tip))
         self.assertEqual(self.reviews()[0]["head"], self.tip)
+        review = self.reviews()[0]
+        slot = Path(cast(str, review["cwd"]))
+        self.assertTrue(slot.is_relative_to(self.root / "slots"))
+        self.assertTrue(review["inherited_lease"])
+        self.assertEqual(build_folders.build_folder_state(slot), "free")
         self.assertEqual(self.git("rev-parse", "HEAD"), local_tip)
         self.assertEqual(self.refs()["refs/simplify/last"], self.tip)
 
@@ -240,7 +294,7 @@ raise SystemExit(1 if failed else 0)
         self.assertEqual((call["head"], call["branch"], call["content"]), (self.tip, "", "origin tip\n"))
         clone = Path(cast(str, call["cwd"]))
         self.assertNotEqual(clone, self.work)
-        self.assertFalse(clone.exists(), "The launcher must remove only its own clone")
+        self.assertEqual(build_folders.build_folder_state(clone), "free", "The launcher must release its slot")
         self.assertEqual((self.work / "payload.txt").read_text(), "uncommitted unit work\n")
         rows = [cast(dict[str, object], json.loads(line)) for line in
                 (Path(self.env["USAGE_STATE_DIR"]) / "agents.jsonl").read_text().splitlines()]
@@ -283,6 +337,7 @@ raise SystemExit(1 if failed else 0)
         self.assertEqual(self.reviews(), [])
         self.assertEqual(self.refs()["refs/simplify/last"], self.before)
 
+    @process_boundary
     def test_a_failed_reviewed_status_write_keeps_the_last_ref(self) -> None:
         self.env["SIMPLIFY_TEST_STATUS_FAILURE"] = "1"
         _ = self.git("update-ref", "refs/simplify/last", self.before, repository=self.origin)

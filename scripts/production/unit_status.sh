@@ -22,12 +22,8 @@ REPO=${0:A:h:h:h}
 # One line per unit: its id, its place now, whether Claude runs there, its session name now.
 unit_lines=$("$REPO/scripts/lib/py" "$REPO/scripts/production/live_units.py" --status "${production[@]}") || exit 1
 [[ -n $unit_lines ]] && units=("${(@f)unit_lines}") || units=()
-# What a gate line may call a peer: its unit id, or its session name now.
+# Staff supplies peer names, fixed identities and current session ids.
 names=()
-for line in $units; do
-  fields=("${(@ps:\t:)line}")
-  names+=($fields[1] $fields[4])
-done
 PY=$REPO/scripts/lib/py
 staff_lines=$("$PY" - "$REPO" "${production[@]}" <<'PYTHON'
 import sys
@@ -37,22 +33,19 @@ arguments = sys.argv[2:]
 record = staff.snapshot()
 owner = owner_for(arguments[1] if arguments[0] == "--production" else arguments[0], record=record)
 for row in record.find(parent=owner.id, kind="unit"):
-    print(f"{row.name}\t{row.id}")
+    run = str(row.run.path) if isinstance(row.run, staff.OpenRun) else ""
+    print(f"{row.name}\t{row.id}\t{run}\t{row.current_session}")
 PYTHON
 ) || exit 1
 staff_rows=("${(@f)staff_lines}")
-typeset -A state_keys
+typeset -A state_keys open_runs
 for line in $staff_rows; do
   fields=("${(@ps:\t:)line}")
   state_keys[$fields[1]]=$fields[2]
+  open_runs[$fields[1]]=$fields[3]
+  names+=($fields[1] $fields[2] $fields[4])
 done
 NOTIFIER=$REPO/scripts/message/notifier.sh
-# Run markers sit under unit/, or delegate/ for a run started before the rename.
-if [[ -n ${UNIT_ACTIVE_DIR:-${PLAN_DELEGATE_ACTIVE_DIR:-}} ]]; then
-  ACTIVE_DIRS=(${UNIT_ACTIVE_DIR:-$PLAN_DELEGATE_ACTIVE_DIR})
-else
-  ACTIVE_DIRS=(/tmp/claude/unit/active /tmp/claude/delegate/active)
-fi
 mkdir -p "$DIR"
 SEEN=$DIR/decisions_seen
 BLOCKS=$DIR/blocks_open
@@ -156,19 +149,13 @@ for line in $units; do
     unknown) echo 'CLAUDE STATE UNKNOWN' ;;
     stopped) echo 'CLAUDE NOT RUNNING' ;;
   esac
-  marker=
-  for active in $ACTIVE_DIRS; do
-    if [[ -n $session_id && -f $active/$session_id ]]; then marker=$active/$session_id; break; fi
-  done
-  if [[ -n $marker ]]; then
-    session_dir=$(< "$marker")
-    if [[ -n $session_dir ]]; then
-      instance=unit-${session_dir:t}
-      [[ ${${session_dir:h}:t} == delegate ]] && instance=delegate-${session_dir:t}
-      health=$(zsh "$NOTIFIER" health "$instance" 2>&1)
-      if (( $? == 1 )); then
-        print -r -- "TICKS FAILING (${health#failing: })"
-      fi
+  session_dir=${open_runs[$u]}
+  if [[ -n $session_id && -n $session_dir ]]; then
+    instance=unit-${session_dir:t}
+    [[ ${${session_dir:h}:t} == delegate ]] && instance=delegate-${session_dir:t}
+    health=$(zsh "$NOTIFIER" health "$instance" 2>&1)
+    if (( $? == 1 )); then
+      print -r -- "TICKS FAILING (${health#failing: })"
     fi
   fi
   [[ $claude_state == unknown || $claude_state == stopped ]] && continue
@@ -179,7 +166,7 @@ for line in $units; do
   print -r -- "$pane" | grep -E '^\s*▸ ' | tail -1 | sed 's/^ *//' | cut -c1-160
   print -r -- "$pane" | grep -E '^\s*[✢✻✽✶·*] [A-Z][a-z]+( [a-z]+)?…' | tail -1 | sed 's/^ *//' | cut -c1-80
   print -r -- "$pane" | grep -nE -- '^\s*(— )?(decision|blocked|gate):' | tail -1 | cut -c1-200
-  # The last three distinct ETA lines, in pane order. The dailies builder, which remembers when
+  # The last three distinct ETA lines, in pane order. The caller, which remembers when
   # it first saw each, picks the newest: the lowest line may be an old one pinned under later text.
   print -r -- "$pane" | grep -wE 'ETA' | grep -v 'From the user' | sed 's/^ *//' | cut -c1-160 \
     | awk '{ line[NR] = $0; last[$0] = NR }

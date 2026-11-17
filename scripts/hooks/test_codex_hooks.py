@@ -19,6 +19,7 @@ from scripts.copies.test_copy_guard import argv_policy_cases, repair_policy_case
 
 from scripts.hooks import codex_hooks
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 
 
 INSTALLER = Path(__file__).with_name("codex_hooks.py")
@@ -51,9 +52,12 @@ CLEAR_TURN_GROUP: dict[str, object] = {"matcher": "*",
     "hooks": [{"type": "command", "command": CLEAR_TURN_COMMAND, "timeout": 10}]}
 CLEAR_END_GROUP: dict[str, object] = {"matcher": "*",
     "hooks": [{"type": "command", "command": CLEAR_END_COMMAND, "timeout": 10}]}
+TURN_END_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/../herdr/turn_end.py"'
+TURN_END_GROUP: dict[str, object] = {"matcher": "*",
+    "hooks": [{"type": "command", "command": TURN_END_COMMAND, "timeout": 10}]}
 LIFECYCLE_GROUPS = {"SessionStart": [STE_GROUP, QUEUE_GROUP], "SubagentStart": [STE_GROUP],
                     "PreCompact": [COMPACTION_GROUP], "UserPromptSubmit": [CLEAR_TURN_GROUP],
-                    "PostCompact": [CLEAR_END_GROUP]}
+                    "PostCompact": [CLEAR_END_GROUP], "Stop": [TURN_END_GROUP]}
 
 STUB = r'''#!__PYTHON__
 import hashlib
@@ -100,7 +104,7 @@ def hooks_list(state):
                           "trusted" if recorded_hash == current_hash else "modified")
                 entries.append({
                     "key": key, "eventName": event[:1].lower() + event[1:],
-                    "matcher": None if event == "UserPromptSubmit" else matcher,
+                    "matcher": None if event in ("UserPromptSubmit", "Stop") else matcher,
                     "handlerType": handler.get("type"),
                     "command": handler.get("command"),
                     "timeoutSec": handler.get("timeout"),
@@ -192,11 +196,14 @@ class CodexHookInstallerTests(unittest.TestCase):
         _ = self.environment.pop("STUB_REFUSE", None)
 
     def run_installer(self, action: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [sys.executable, str(INSTALLER), action],
-            capture_output=True, text=True, check=False,
-            env=self.environment, cwd=cwd, timeout=TEST_HANG_GUARD_SECS,
-        )
+        if process_boundary_for_case(self):
+            return subprocess.run(
+                [sys.executable, str(INSTALLER), action],
+                capture_output=True, text=True, check=False,
+                env=self.environment, cwd=cwd, timeout=TEST_HANG_GUARD_SECS,
+            )
+        return invoke_cli(codex_hooks, codex_hooks.main, [action], self.environment,
+                          cwd if cwd is not None else Path.cwd())
 
     def run_bash_policy(self, command: str | list[str]) -> subprocess.CompletedProcess[str]:
         hook = next(hook for hook in codex_hooks.HOOKS if hook.name == "scratch-guard")
@@ -293,6 +300,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         ]})
         _ = self.hooks_file.write_text(json.dumps(config))
 
+    @process_boundary
     def test_fresh_install_creates_group_and_records_trust(self) -> None:
         result = self.run_installer("install")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -309,7 +317,8 @@ class CodexHookInstallerTests(unittest.TestCase):
                           "config/batchWrite", "hooks/list", "config/batchWrite", "hooks/list",
                           "config/batchWrite", "hooks/list", "config/batchWrite", "hooks/list",
                           "config/batchWrite", "hooks/list", "config/batchWrite", "hooks/list",
-                          "config/batchWrite", "hooks/list", "config/batchWrite", "hooks/list"])
+                          "config/batchWrite", "hooks/list", "config/batchWrite", "hooks/list",
+                          "config/batchWrite", "hooks/list"])
         initialize = cast(dict[str, object], calls[0]["params"])
         client = cast(dict[str, object], initialize["clientInfo"])
         capabilities = cast(dict[str, object], initialize["capabilities"])
@@ -324,7 +333,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(edits[0]["mergeStrategy"], "upsert")
         self.assertEqual(self.groups("PreToolUse"), PRE_GROUPS)
         trust = self.trust()
-        self.assertEqual(len(trust), 11)
+        self.assertEqual(len(trust), 12)
         self.assertIn("fn-length codex hook: trusted " + next(iter(trust)), result.stdout)
         self.assertIn(f"berth codex hook: trusted {self.hooks_file}:pre_tool_use:0:0", result.stdout)
         self.assertIn(f"scratch-guard codex hook: trusted {self.hooks_file}:pre_tool_use:1:0", result.stdout)
@@ -336,6 +345,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         for event, listed_event, group, name, key, matcher in (
             ("UserPromptSubmit", "userPromptSubmit", CLEAR_TURN_GROUP, "compaction-clear-turn", "user_prompt_submit", None),
             ("PostCompact", "postCompact", CLEAR_END_GROUP, "compaction-clear-end", "post_compact", "*"),
+            ("Stop", "stop", TURN_END_GROUP, "turn-end", "stop", None),
         ):
             self.assertEqual(self.groups(event), [group])
             self.assertIn(f"{name} codex hook: trusted {self.hooks_file}:{key}:0:0", result.stdout)
@@ -379,7 +389,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(self.hooks_file.resolve(), target)
         self.assertEqual(self.groups(), [existing, QUEUE_GROUP])
         self.assertEqual(target.read_bytes(), self.hooks_file.read_bytes())
-        self.assertEqual(len(self.trust()), 11)
+        self.assertEqual(len(self.trust()), 12)
         self.assertEqual({entry.name for entry in shared.iterdir()}, {"hooks.json"})
 
     def test_install_creates_the_temporary_hooks_file_beside_the_link_target(self) -> None:
@@ -425,9 +435,9 @@ class CodexHookInstallerTests(unittest.TestCase):
             f"{self.hooks_file}:session_start:0:0", f"{self.hooks_file}:subagent_start:0:0",
             f"{self.hooks_file}:session_start:1:0", f"{self.hooks_file}:post_tool_use:{len(original)}:0",
             f"{self.hooks_file}:pre_compact:0:0", f"{self.hooks_file}:user_prompt_submit:0:0",
-            f"{self.hooks_file}:post_compact:0:0",
+            f"{self.hooks_file}:post_compact:0:0", f"{self.hooks_file}:stop:0:0",
         ])
-        self.assertEqual(len(self.trust()), 11)
+        self.assertEqual(len(self.trust()), 12)
 
     def test_existing_natedev_fn_group_keeps_trust(self) -> None:
         self._assert_existing_fn_group_keeps_trust([])
@@ -603,7 +613,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(installed.stderr.splitlines(), [
             f"{self.hooks_file}: remove the remaining retired script handler by hand",
         ])
-        self.assertEqual(len(self.trust()), 11)
+        self.assertEqual(len(self.trust()), 12)
         self.assertIn(f"{self.hooks_file}:post_tool_use:1:0", self.trust())
         before = self.hooks_file.read_bytes()
         modified = self.hooks_file.stat().st_mtime_ns
@@ -639,7 +649,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         state = self.state()
         trust = cast(dict[str, str], state["trust"])
-        self.assertEqual(len(trust), 11)
+        self.assertEqual(len(trust), 12)
         first_key = next(key for key in trust if key.endswith(":post_tool_use:0:0"))
         second_key = first_key.replace(":0:0", ":1:0")
         trust[second_key] = trust.pop(first_key)
@@ -842,7 +852,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         start_lines = ["ste codex hook: trusted", "ste-subagent codex hook: trusted",
                        "queue-start codex hook: trusted", "queue-tools codex hook: trusted",
                        "compaction-marker codex hook: trusted", "compaction-clear-turn codex hook: trusted",
-                       "compaction-clear-end codex hook: trusted"]
+                       "compaction-clear-end codex hook: trusted", "turn-end codex hook: trusted"]
 
         trust = self.trust()
         berth_key = next(key for key in trust if key.endswith(":pre_tool_use:0:0"))
@@ -882,7 +892,8 @@ class CodexHookInstallerTests(unittest.TestCase):
                           "build-hold-guard codex hook: absent", "ste codex hook: absent",
                           "ste-subagent codex hook: absent", "queue-start codex hook: absent",
                           "queue-tools codex hook: absent", "compaction-marker codex hook: absent",
-                          "compaction-clear-turn codex hook: absent", "compaction-clear-end codex hook: absent"])
+                          "compaction-clear-turn codex hook: absent", "compaction-clear-end codex hook: absent",
+                          "turn-end codex hook: absent"])
 
     def test_check_reports_absent_untrusted_modified_and_disabled(self) -> None:
         absent = self.run_installer("check")
@@ -910,6 +921,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(disabled.returncode, 1)
         self.assertIn("fn-length codex hook: disabled", disabled.stdout + disabled.stderr)
 
+    @process_boundary
     def test_dead_app_server_is_reported(self) -> None:
         executable = Path(self.environment["PATH"]) / "codex"
         _ = executable.write_text("#!/bin/sh\nexit 7\n")

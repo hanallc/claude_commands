@@ -229,6 +229,26 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
   - A pair across local midnight that is close enough counts, with `TZ=UTC` pinned.
   - An empty day keeps the heading, `memory waits: none` and `60 s samples: none; machine stall: unavailable.`
 
+## Build cost definitions
+
+Phase time is `phase_active_seconds`: the finish time minus `phase_started_at`, less the waits for the user or a supplier.
+A finish without `phase_active_seconds` has no phase time. Its day reads `phases ended before waits were recorded`.
+The phase finish time selects the window. Cost categories can overlap.
+
+Memory wait is the recorded wait time. A cold rebuild compiles at least 50 crates.
+A failed run has a counted nonzero step status, a nonzero gate run status or a failed CI result.
+A failed gate run costs its wall time on the machine that holds its file.
+A gate run also counts as a recorded event of that machine. AWS records only gate runs, under `aws`.
+
+A rerun after a pass repeats nextest within 60 minutes for the same worker.
+The recorded tree, worktree, and build input must match.
+
+CI cost sums job wall times. When job records are absent, CI cost uses the run wall time.
+Cancelled CI counts cancelled workflow attempts.
+
+Mac idle time starts with candidate wait intervals. It excludes Mac execution and recorded holds.
+Missing records remain unknown.
+
 ## Invariants
 
 - **The sampler never opens the SQLite index.** `buildlog sample` appends one JSON line and exits; the index ingests that line on the next query. A test checks that no file appears at `index_path()`.

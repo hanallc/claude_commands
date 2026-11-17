@@ -1,4 +1,4 @@
-"""Read context events and tracked settings without writing state."""
+"""Read cached context events and tracked settings without changing transcripts."""
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -17,9 +17,12 @@ import subprocess
 from typing import Literal, cast
 
 from scripts.lib import conf
-from scripts.usage import collect
-from scripts.usage.rollouts import parse_timestamp
-from scripts.usage.usage_report import open_read_store
+from scripts.lib.transcripts import open_transcript
+from scripts.usage.context_economy_cache import (
+    FileProgress, ParseCheckpoint, SummaryUnavailable, TranscriptCache,
+    TranscriptReadSettings, TranscriptSettingsSource, read_settings,
+)
+from scripts.usage.rollouts import complete_lines as complete_lines, decode_rollout, is_compaction, parse_timestamp, timestamp_of, token_usage
 
 
 _CLI_VERSION = re.compile(rb'"version"\s*:\s*"([^"\\]*)"')
@@ -42,11 +45,16 @@ class Request:
 
 
 @dataclass(frozen=True)
+class SizeNotReported:
+    """The transcript does not report this compaction size."""
+
+
+@dataclass(frozen=True)
 class CompactionEvent:
     at: datetime
     trigger: str | None
-    pre_tokens: int | None
-    post_tokens: int | None
+    pre_tokens: int | SizeNotReported
+    post_tokens: int | SizeNotReported
     kind: Literal["precomputed", "normal", "unknown"]
 
 
@@ -85,6 +93,14 @@ class SettingsSet:
 @dataclass(frozen=True)
 class SettingsUnknown:
     """The timeline has no settings set at or before this start."""
+
+
+class ReportSettingsTimeline(list[SettingsSet]):
+    """Keep resolved start settings for one report's timeline."""
+
+    def __init__(self, entries: Sequence[SettingsSet]) -> None:
+        super().__init__(entries)
+        self.by_start: dict[datetime, SettingsSet | SettingsUnknown] = {}
 
 
 @dataclass
@@ -131,21 +147,42 @@ def _request(record: dict[str, object], at: datetime) -> Request:
 def _compaction(record: dict[str, object], at: datetime) -> CompactionEvent:
     metadata = record.get("compactMetadata")
     if not isinstance(metadata, dict):
-        return CompactionEvent(at, None, None, None, "unknown")
+        return CompactionEvent(at, None, SizeNotReported(), SizeNotReported(), "unknown")
     values = cast(dict[str, object], metadata)
     trigger, pre, post = values.get("trigger"), values.get("preTokens"), values.get("postTokens")
     return CompactionEvent(at, trigger if isinstance(trigger, str) else None,
-        pre if type(pre) is int else None, post if type(post) is int else None,
+        pre if type(pre) is int else SizeNotReported(), post if type(post) is int else SizeNotReported(),
         "precomputed" if values.get("precomputed") is True else "normal")
 
 
-def _read_transcript(path: Path, since: datetime, until: datetime, history: _SessionRecords) -> None:
-    previous_version = b""
-    with path.open("rb") as source:
-        for number, line in enumerate(source):
-            version_match = _CLI_VERSION.search(line)
+def _cached_session(checkpoint: ParseCheckpoint) -> tuple[dict[str, object], Session]:
+    state = _object(cast(object, json.loads(checkpoint.payload)))
+    empty = Session("", "claude", "", "", [], [], [])
+    session = _wire_session(_wire_object(state["session"])) if state else empty
+    return state, session
+
+
+def _read_transcript(path: Path, checkpoint: ParseCheckpoint) -> ParseCheckpoint:
+    state, session = _cached_session(checkpoint)
+    previous_version = _text(state.get("previous_version")).encode()
+    number = _count(state.get("lines"))
+    keys = [_wire_text(value) for value in _wire_list(state.get("start_keys", []))]
+    starts = dict(zip(keys, session.starts))
+    request_keys = _wire_list(state.get("request_keys", []))
+    completed = checkpoint.offset
+    first = session.first_record_at
+    with open_transcript(path) as source:
+        completed = source.seek(checkpoint.offset)
+        for offset, line in complete_lines(source):
+            position = number
+            number += 1
+            completed = offset + len(line)
+            version_position = line.find(b'"version"')
+            version_match = _CLI_VERSION.match(line, version_position) if version_position >= 0 else None
+            if version_position >= 0 and version_match is None:
+                version_match = _CLI_VERSION.search(line, version_position)
             version_changed = version_match is not None and version_match[1] != previous_version
-            first_timestamp = isinstance(history.first_record_at, SessionBeginningUnknown) and b'"timestamp"' in line
+            first_timestamp = isinstance(first, SessionBeginningUnknown) and b'"timestamp"' in line
             if not (first_timestamp or version_changed
                     or b'"usage"' in line and b'"assistant"' in line
                     or b'"compact_boundary"' in line
@@ -158,8 +195,8 @@ def _read_transcript(path: Path, since: datetime, until: datetime, history: _Ses
             at = parse_timestamp(record.get("timestamp"))
             if at is None:
                 continue
-            if isinstance(history.first_record_at, SessionBeginningUnknown):
-                history.first_record_at = at
+            if isinstance(first, SessionBeginningUnknown):
+                first = at
             version = _version(record)
             restart = bool(version and previous_version and version.encode() != previous_version)
             if version:
@@ -172,35 +209,53 @@ def _read_transcript(path: Path, since: datetime, until: datetime, history: _Ses
                 if (attachment.get("type") == "hook_success" and attachment.get("hookEvent") == "SessionStart"
                         and name in ("SessionStart:startup", "SessionStart:resume")):
                     source_name = "startup" if name == "SessionStart:startup" else "resume"
-                    hook = str(attachment.get("toolUseID", record.get("toolUseID", (path, number))))
-                    if hook not in history.starts:
-                        history.starts[hook] = Start(at, source_name, version)
+                    hook = str(attachment.get("toolUseID", record.get("toolUseID", (path, position))))
+                    if hook not in starts:
+                        starts[hook] = Start(at, source_name, version)
                         explicit_start = True
             if restart and not explicit_start:
-                history.starts[f"version:{path}:{number}"] = Start(at, "resume", version)
-            if not since <= at < until:
-                continue
+                starts[f"version:{path}:{position}"] = Start(at, "resume", version)
             message = _object(record.get("message"))
             if (kind == "assistant" and message.get("model") != "<synthetic>"
                     and isinstance(message.get("usage"), dict)):
-                key = (_text(message.get("id")), _text(record.get("requestId")))
-                history.requests[key] = _request(record, at)
+                request_keys.append([_text(message.get("id")), _text(record.get("requestId"))])
+                session.requests.append(_request(record, at))
             elif kind == "system" and record.get("subtype") == "compact_boundary":
-                history.compactions.append(_compaction(record, at))
+                session.compactions.append(_compaction(record, at))
+    saved = Session("", "claude", "", "", session.requests, session.compactions, list(starts.values()), first)
+    return ParseCheckpoint(completed, json.dumps({"session": _session_data(saved), "request_keys": request_keys,
+        "start_keys": list(starts), "previous_version": previous_version.decode(), "lines": number}, separators=(",", ":")))
 
 
-def read_claude(projects_root: Path, since: datetime, until: datetime, machine: str) -> list[Session]:
-    """Read main sessions and subagents whose files can contain events in the window."""
+def read_claude(projects_root: Path, since: datetime, until: datetime, machine: str, *,
+                settings: TranscriptReadSettings | TranscriptSettingsSource = TranscriptSettingsSource.LOCAL_CONFIG,
+                ) -> list[Session]:
+    """Read cached main sessions and subagents; apply the window after loading each summary."""
     since, until = _utc(since), _utc(until)
     histories: dict[tuple[str, str], _SessionRecords] = {}
-    paths = sorted({*projects_root.glob("*/*.jsonl"), *projects_root.glob("*/*/subagents/*.jsonl")})
-    for path in paths:
-        if path.stat().st_mtime < since.timestamp():
-            continue
-        session_id = path.parent.parent.name if path.parent.name == "subagents" else path.stem
-        agent_id = path.stem.removeprefix("agent-") if path.parent.name == "subagents" else session_id
-        history = histories.setdefault((session_id, agent_id), _SessionRecords())
-        _read_transcript(path, since, until, history)
+    found = sorted({*projects_root.glob("*/*.jsonl"), *projects_root.glob("*/*/subagents/*.jsonl"),
+                    *projects_root.glob("*/*.jsonl.zst"), *projects_root.glob("*/*/subagents/*.jsonl.zst")})
+    settings = read_settings(settings)
+    with closing(TranscriptCache(settings)) as cache:
+        paths = cache.paths("claude", [projects_root], found, since.timestamp())
+        progress = FileProgress(machine, "claude", len(paths), settings)
+        for path in paths:
+            checkpoint = cache.read(path, "claude", _read_transcript)
+            progress.advance(skipped=isinstance(checkpoint, SummaryUnavailable))
+            if isinstance(checkpoint, SummaryUnavailable):
+                continue
+            state, parsed = _cached_session(checkpoint)
+            session_id = path.parent.parent.name if path.parent.name == "subagents" else path.stem
+            agent_id = path.stem.removeprefix("agent-") if path.parent.name == "subagents" else session_id
+            history = histories.setdefault((session_id, agent_id), _SessionRecords())
+            if isinstance(history.first_record_at, SessionBeginningUnknown):
+                history.first_record_at = parsed.first_record_at
+            for key, request in zip(_wire_list(state["request_keys"]), parsed.requests):
+                pair = _wire_list(key)
+                if since <= request.at < until:
+                    history.requests[(_wire_text(pair[0]), _wire_text(pair[1]))] = request
+            history.compactions.extend(event for event in parsed.compactions if since <= event.at < until)
+            history.starts.update(zip((_wire_text(key) for key in _wire_list(state["start_keys"])), parsed.starts))
     sessions: list[Session] = []
     for (session_id, agent_id), history in histories.items():
         starts = sorted((start for start in history.starts.values() if start.at < until), key=lambda start: start.at)
@@ -210,6 +265,87 @@ def read_claude(projects_root: Path, since: datetime, until: datetime, machine: 
             sessions.append(Session(machine, "claude", session_id, agent_id,
                 sorted(history.requests.values(), key=lambda request: request.at),
                 sorted(history.compactions, key=lambda event: event.at), [*earlier[-1:], *in_window], history.first_record_at))
+    return sessions
+
+
+def _read_codex_file(path: Path, checkpoint: ParseCheckpoint) -> ParseCheckpoint:
+    state, session = _cached_session(checkpoint)
+    identity, model = session.session_id, _text(state.get("model"))
+    version = _version(state)
+    first = session.first_record_at
+    requests, compactions = session.requests, session.compactions
+    starts = {start.at: start for start in session.starts}
+    previous_total = _object(state.get("previous_total"))
+    completed = checkpoint.offset
+    with open_transcript(path) as stream:
+        completed = stream.seek(checkpoint.offset)
+        for offset, line in complete_lines(stream):
+            completed = offset + len(line)
+            if not isinstance(first, SessionBeginningUnknown) and not any(marker in line for marker in (
+                    b'"session_meta"', b'"turn_context"', b'"token_count"',
+                    b'"compacted"', b'"contextCompaction"', b'\\u')):
+                continue
+            record = decode_rollout(line.decode("utf-8"))
+            if record is None:
+                continue
+            payload = _object(cast(object, record.get("payload")))
+            at = timestamp_of(record)
+            if at is not None and isinstance(first, SessionBeginningUnknown):
+                first = at
+            if record.get("type") == "session_meta":
+                identity = _text(payload.get("id")) or identity
+                value = payload.get("cli_version")
+                version = value if isinstance(value, str) else None
+                opening = parse_timestamp(payload.get("timestamp")) or at
+                if opening is not None and opening not in starts:
+                    starts[opening] = Start(opening, "resume" if starts else "startup", version)
+            elif record.get("type") == "turn_context":
+                model = _text(payload.get("model"))
+            usage = token_usage(record)
+            repeated = False
+            if usage is not None:
+                total = _object(_object(payload.get("info")).get("total_token_usage"))
+                repeated = bool(total) and total == previous_total
+                if total:
+                    previous_total = total
+            if at is None:
+                continue
+            if usage is not None and not repeated:
+                requests.append(Request(at, model, version, usage.uncached_input, usage.cached_input,
+                                        0, 0, usage.output))
+            if is_compaction(record):
+                compactions.append(CompactionEvent(at, None, SizeNotReported(), SizeNotReported(), "unknown"))
+    saved = Session("", "codex", identity, identity, requests, compactions, list(starts.values()), first)
+    return ParseCheckpoint(completed, json.dumps({"session": _session_data(saved), "model": model,
+        "version": version, "previous_total": previous_total}, separators=(",", ":")))
+
+
+def read_codex(sessions_roots: Sequence[Path], since: datetime, until: datetime, machine: str, *,
+               settings: TranscriptReadSettings | TranscriptSettingsSource = TranscriptSettingsSource.LOCAL_CONFIG,
+               ) -> list[Session]:
+    """Read each logical rollout once, including retained summaries without a source file."""
+    since, until = _utc(since), _utc(until)
+    found = sorted({path.resolve() for root in sessions_roots
+                    for pattern in ("*.jsonl", "*.jsonl.zst") for path in root.rglob(pattern)})
+    sessions: list[Session] = []
+    settings = read_settings(settings)
+    with closing(TranscriptCache(settings)) as cache:
+        paths = cache.paths("codex", sessions_roots, found, since.timestamp())
+        progress = FileProgress(machine, "codex", len(paths), settings)
+        for path in paths:
+            checkpoint = cache.read(path, "codex", _read_codex_file)
+            progress.advance(skipped=isinstance(checkpoint, SummaryUnavailable))
+            if isinstance(checkpoint, SummaryUnavailable):
+                continue
+            parsed = _cached_session(checkpoint)[1]
+            requests = [request for request in parsed.requests if since <= request.at < until]
+            compactions = [event for event in parsed.compactions if since <= event.at < until]
+            earlier = [start for start in parsed.starts if start.at < since]
+            in_window = [start for start in parsed.starts if since <= start.at < until]
+            retained = [*sorted(earlier, key=lambda start: start.at)[-1:], *sorted(in_window, key=lambda start: start.at)]
+            if parsed.session_id and (requests or compactions or in_window):
+                sessions.append(Session(machine, "codex", parsed.session_id, parsed.agent_id,
+                                        requests, compactions, retained, parsed.first_record_at))
     return sessions
 
 
@@ -245,7 +381,7 @@ def _settings_values(commit: str, blobs: dict[tuple[str, str], bytes],
                      keys: tuple[str, ...], files: tuple[str, ...]) -> dict[str, object]:
     content = blobs.get((commit, "settings.json"), b"{}")
     settings = _object(cast(object, json.loads(content)))
-    values: dict[str, object] = {key: settings.get(key) for key in keys}
+    values: dict[str, object] = {key: settings[key] for key in keys if key in settings}
     for path in files:
         content = blobs.get((commit, path), b"")
         values[path] = ({"bytes": len(content), "sha": hashlib.sha256(content).hexdigest()[:12]}
@@ -282,19 +418,30 @@ def settings_timeline(checkout: Path, since: datetime, until: datetime) -> list[
 
 def settings_for(session_start: datetime, timeline: Sequence[SettingsSet]) -> SettingsSet | SettingsUnknown:
     """Select the latest settings; later timeline entries win equal times."""
-    eligible = [entry for entry in timeline if entry.at <= _utc(session_start)]
-    return max(reversed(eligible), key=lambda entry: entry.at) if eligible else SettingsUnknown()
+    session_start = _utc(session_start)
+    if isinstance(timeline, ReportSettingsTimeline) and session_start in timeline.by_start:
+        return timeline.by_start[session_start]
+    eligible = [entry for entry in timeline if entry.at <= session_start]
+    resolved = max(reversed(eligible), key=lambda entry: entry.at) if eligible else SettingsUnknown()
+    if isinstance(timeline, ReportSettingsTimeline):
+        timeline.by_start[session_start] = resolved
+    return resolved
 
 
 def label(current: SettingsSet, previous: SettingsSet | SettingsUnknown) -> str:
     """Name each tracked value that changed from the preceding settings set."""
     before = previous.values if isinstance(previous, SettingsSet) else {}
-    return ", ".join(f"{key}={json.dumps(value, ensure_ascii=False, separators=(',', ':'))}"
-                     for key, value in current.values.items() if key not in before or before[key] != value)
+    changes = [f"{key}={json.dumps(value, ensure_ascii=False, separators=(',', ':'))}"
+               for key, value in current.values.items() if key not in before or before[key] != value]
+    changes.extend(f"{key}=<absent>" for key in before if key not in current.values)
+    return ", ".join(changes)
 
 
 def role_of(store: Path, machine: str, family: str, session_id: str, agent_id: str) -> str:
     """Read the latest matching ledger role without creating or changing the store."""
+    from scripts.usage import collect
+    from scripts.usage.usage_report import open_read_store
+
     if not store.is_file():
         return "unknown"
     if family == "claude":
@@ -311,3 +458,108 @@ def role_of(store: Path, machine: str, family: str, session_id: str, agent_id: s
             return "unknown"
         value = cast(object, row["role"])
         return value if isinstance(value, str) and value else "unknown"
+
+
+def _session_data(session: Session) -> dict[str, object]:
+    return {
+        "type": "session", "machine": session.machine, "family": session.family,
+        "session_id": session.session_id, "agent_id": session.agent_id,
+        "first_record_at": session.first_record_at.isoformat() if isinstance(session.first_record_at, datetime) else None,
+        "requests": [{"at": request.at.isoformat(), "model": request.model, "cli_version": request.cli_version,
+                      "input": request.input, "cache_read": request.cache_read,
+                      "cache_write_5m": request.cache_write_5m, "cache_write_1h": request.cache_write_1h,
+                      "output": request.output} for request in session.requests],
+        "starts": [{"at": start.at.isoformat(), "source": start.source, "cli_version": start.cli_version}
+                   for start in session.starts],
+        "compactions": [{"at": event.at.isoformat(), "trigger": event.trigger, "kind": event.kind,
+                         "pre_tokens": event.pre_tokens if isinstance(event.pre_tokens, int) else None,
+                         "post_tokens": event.post_tokens if isinstance(event.post_tokens, int) else None}
+                        for event in session.compactions],
+    }
+
+
+def _wire_object(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("Cached transcript data must contain an object")
+    return cast(dict[str, object], value)
+
+
+def _wire_list(value: object) -> list[object]:
+    if not isinstance(value, list):
+        raise ValueError("Cached transcript data must contain a list")
+    return cast(list[object], value)
+
+
+def _wire_text(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Cached transcript data must contain text")
+    return value
+
+
+def _wire_optional_text(value: object) -> str | None:
+    return None if value is None else _wire_text(value)
+
+
+def _wire_count(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError("Cached transcript data must contain a whole number")
+    return value
+
+
+def _wire_time(value: object) -> datetime:
+    at = parse_timestamp(_wire_text(value))
+    if at is None:
+        raise ValueError("Cached transcript data has an invalid timestamp")
+    return at
+
+
+def _wire_request(value: object) -> Request:
+    row = _wire_object(value)
+    return Request(_wire_time(row["at"]), _wire_text(row["model"]), _wire_optional_text(row["cli_version"]),
+                   *(_wire_count(row[name]) for name in
+                     ("input", "cache_read", "cache_write_5m", "cache_write_1h", "output")))
+
+
+def _wire_compaction(value: object) -> CompactionEvent:
+    row = _wire_object(value)
+    kind = row["kind"]
+    if kind not in ("precomputed", "normal", "unknown"):
+        raise ValueError("Cached transcript data has an invalid compaction kind")
+    pre, post = row["pre_tokens"], row["post_tokens"]
+    return CompactionEvent(_wire_time(row["at"]), _wire_optional_text(row["trigger"]),
+        SizeNotReported() if pre is None else _wire_count(pre),
+        SizeNotReported() if post is None else _wire_count(post), kind)
+
+
+def _wire_start(value: object) -> Start:
+    row = _wire_object(value)
+    source = row["source"]
+    if source not in ("startup", "resume"):
+        raise ValueError("Cached transcript data has an invalid start source")
+    return Start(_wire_time(row["at"]), source,
+                 _wire_optional_text(row["cli_version"]))
+
+
+def _wire_session(row: dict[str, object]) -> Session:
+    family = row["family"]
+    if family not in ("claude", "codex"):
+        raise ValueError("Cached transcript data has an invalid session family")
+    first = row["first_record_at"]
+    return Session(_wire_text(row["machine"]), family,
+        _wire_text(row["session_id"]), _wire_text(row["agent_id"]),
+        [_wire_request(value) for value in _wire_list(row["requests"])],
+        [_wire_compaction(value) for value in _wire_list(row["compactions"])],
+        [_wire_start(value) for value in _wire_list(row["starts"])],
+        SessionBeginningUnknown.UNRECORDED if first is None else _wire_time(first))
+
+
+def timeline_start(sessions: Sequence[Session], since: datetime) -> datetime:
+    """Include the settings anchor that each session needs before the report window."""
+    anchors = [since]
+    for session in sessions:
+        earlier = [start.at for start in session.starts if start.at < since]
+        if earlier:
+            anchors.append(max(earlier))
+        elif isinstance(session.first_record_at, datetime):
+            anchors.append(session.first_record_at)
+    return min(anchors)

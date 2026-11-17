@@ -17,6 +17,8 @@ from zoneinfo import ZoneInfo
 
 from scripts.nightly_review import candidates
 from scripts.nightly_review.candidates import Candidate, TimeGain, TokenGain, Unmeasured
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 
 # Importable once candidates has put scripts/lib on the path.
 from scripts.lib import urgency
@@ -70,6 +72,9 @@ class CandidatesTests(unittest.TestCase):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = fixture_member("showrunner", name="review")
+        _ = self.enterContext(mock.patch.object(staff, "caller_identity", return_value=""))
         configuration = self.root / "config"
         configuration.mkdir()
         _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/nightly_review.conf", configuration / "nightly_review.conf")
@@ -198,6 +203,39 @@ class CandidatesTests(unittest.TestCase):
         code, out, _ = self.run_main([])
         self.assertEqual((code, out.splitlines()[2].split(" | ")[0]), (0, "| recommended"))
 
+    def test_outcome_writes_each_state_on_its_own_line_and_a_rerun_changes_nothing(self) -> None:
+        ledger = self.root / "ledger.md"
+        head = "- 2026-10-12 rust/hana: Run the GPU tests 8 at a time [gain/week: 38 min waiting] [by: unit-1]"
+        other = "- 2026-10-05 config: Other [gain/week: 2 min waiting] — proposed"
+        moment = datetime(2026, 10, 13, 9, 0, tzinfo=ZoneInfo("America/New_York"))
+        cases: tuple[tuple[str, list[str], str], ...] = (("accepted", ["--applied", "claude abc123"], "accepted 2026-10-13, applied (claude abc123)"),
+                 ("declined", [], "declined"), ("deferred", [], "deferred"),
+                 ("done", [], "done 2026-10-13"), ("relayed", [], "relayed 2026-10-13"))
+        with mock.patch.object(candidates, "now", return_value=moment):
+            for state, options, words in cases:
+                with self.subTest(state=state):
+                    _ = ledger.write_text(f"{other}\n{head} — proposed\n")
+                    code, out, err = self.run_main(["outcome", "sdlc/E2", state, *options])
+                    self.assertEqual((code, err), (0, ""))
+                    self.assertEqual(ledger.read_text(), f"{other}\n{head} — {words}\n")
+                    self.assertEqual(out, f"E2: {head} — {words}\n")
+                    self.assertEqual(self.run_main(["outcome", "E2", state, *options]),
+                                     (0, f"E2 unchanged: {head} — {words}\n", ""))
+            self.assertIn("Other", self.note.read_text())
+            self.note.unlink()
+            elsewhere = self.root / "elsewhere.md"
+            _ = elsewhere.write_text(f"{head} — proposed\n")
+            self.assertEqual(self.run_main(["outcome", "E1", "declined", "--ledger", str(elsewhere)])[0], 0)
+            self.assertEqual((elsewhere.read_text(), self.note.exists()), (f"{head} — declined\n", False))
+            _ = ledger.write_text(f"{other}\n{head} — declined\n")
+            code, _, err = self.run_main(["outcome", "E2", "done"])
+            self.assertEqual((code, err.split(":")[0]), (1, "candidates"))
+            self.assertEqual(ledger.read_text(), f"{other}\n{head} — declined\n")
+            for arguments in (["outcome", "E2", "accepted"], ["outcome", "E2", "declined", "--applied", "x"],
+                              ["outcome", "P2", "declined"], ["outcome", "E0", "declined"], ["outcome", "E2", "kept"]):
+                with self.subTest(arguments=arguments):
+                    self.assertEqual(self.run_main(arguments)[0], 2)
+
     def test_a_line_gives_its_night_area_gain_and_state(self) -> None:
         self.assertEqual(
             candidates.open_candidate("- 2026-10-11 config, also found: Duplicate CLAUDE.md [gain/week: 0.4% of tokens] — proposed"),
@@ -206,6 +244,16 @@ class CandidatesTests(unittest.TestCase):
         evening = candidates.open_candidate("- 2026-09-29-evening rust/hana: One feature set — deferred")
         self.assertEqual(evening, Candidate("2026-09-29-evening", "rust/hana", "", "One feature set", "", "deferred"))
         self.assertIsNone(candidates.open_candidate("One line per night."))
+        source = "4b2b7c73-5bed-4df0-a688-f72da64b598c"
+        for gain in ("", "38 min waiting"):
+            for by in ("", source):
+                with self.subTest(gain=gain, by=by):
+                    gain_tag = f" [gain/week: {gain}]" if gain else ""
+                    source_tag = f" [by: {by}]" if by else ""
+                    line = f"- 2026-10-12 rust/hana: Faster tests{gain_tag}{source_tag} — proposed"
+                    candidate = Candidate("2026-10-12", "rust/hana", "", "Faster tests", gain, "proposed", by=by)
+                    self.assertEqual(candidate.line, line)
+                    self.assertEqual(candidates.open_candidate(line), candidate)
 
     def test_the_table_marks_the_first_measured_row_recommended(self) -> None:
         _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
@@ -503,21 +551,34 @@ class CandidatesTests(unittest.TestCase):
         night.mkdir()
         report = night / "rust.md"
         _ = report.write_text(REPORT, encoding="utf-8")
-        _ = (self.root / "ledger.md").write_text("- 2026-10-11 config: Earlier — proposed\n", encoding="utf-8")
-        expected = [
+        untagged = [
             "- 2026-10-12 rust/hana: Run the GPU tests 8 at a time [gain/week: 38 min waiting] — proposed",
             "- 2026-10-12 rust/hana, also found: The reload tests share one port [gain/week: 12 min red CI] — proposed",
             "- 2026-10-12 rust/hana, also found: Stale style rule — proposed",
             "- 2026-10-12 rust/hana, also found: A plain item — proposed",
             "- 2026-10-12 rust/hana, noted: Target choice was close — proposed",
         ]
-        code, out, err = self.run_main(["record", str(report)])
-        self.assertEqual((code, err, out.splitlines()), (0, "", expected))
-        ledger = (self.root / "ledger.md").read_text(encoding="utf-8").splitlines()
-        self.assertEqual(ledger, ["- 2026-10-11 config: Earlier — proposed", *expected])
-        self.assertEqual([each.title for each in candidates.ranked(ledger)][:2],
-                         ["Run the GPU tests 8 at a time", "The reload tests share one port"])
-        self.assertEqual(self.run_main(["record", str(report)]), (0, "nothing new to record\n", ""))
+        owner = fixture_member("showrunner", name="review")
+        unit = fixture_member("unit", name="tests", parent=owner.id)
+        unit = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("review-restarted")))
+        worker = fixture_member("worker", name="writer", parent=unit.id)
+        for caller, source, has_staff in (("", "", True), (owner.current_session, "", True),
+                                          (unit.current_session, unit.id, True), (worker.current_session, "", True),
+                                          ("", "", False)):
+            with (self.subTest(caller=caller, has_staff=has_staff),
+                  mock.patch.object(staff, "caller_identity", return_value=caller)):
+                if not has_staff:
+                    (self.root / "staff.json").unlink()
+                _ = (self.root / "ledger.md").write_text("- 2026-10-11 config: Earlier — proposed\n", encoding="utf-8")
+                expected = [line.replace(" — proposed", f" [by: {source}] — proposed")
+                            if source else line for line in untagged]
+                code, out, err = self.run_main(["record", str(report)])
+                self.assertEqual((code, err, out.splitlines()), (0, "", expected))
+                ledger = (self.root / "ledger.md").read_text(encoding="utf-8").splitlines()
+                self.assertEqual(ledger, ["- 2026-10-11 config: Earlier — proposed", *expected])
+                self.assertEqual([each.title for each in candidates.ranked(ledger)][:2],
+                                 ["Run the GPU tests 8 at a time", "The reload tests share one port"])
+                self.assertEqual(self.run_main(["record", str(report)]), (0, "nothing new to record\n", ""))
 
     def test_record_keeps_a_line_whose_outcome_was_already_written(self) -> None:
         night = self.root / "2026-10-12"

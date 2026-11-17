@@ -17,10 +17,13 @@ from uuid import uuid4
 
 from scripts.copies import copies
 from scripts.direct import simplify_result
-from scripts.lib import conf, scratch, user_zone
+from scripts.lib import conf, user_zone
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.usage import agents_log
+
+
+AGENT_EXEC = Path(__file__).resolve().parents[1] / "agents/agent_exec.sh"
 
 
 def git(cwd: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -80,9 +83,7 @@ def review(run: Path, cwd: Path, settings: conf.ConfigRead) -> int:
             'The user said: "the scope of the simplify needs to be for everything that has changed '
             'since the last simplify run on codebase that the unit is working on".\n'
         ))
-        clone = copies.clone(cwd)
-        try:
-            _ = git(clone, "checkout", "--detach", tip)
+        with copies.standing(copies.source_owner(cwd), cwd, copies.CommittedSource(tip)) as clone:
             simplify_result.prepare(directory / "diff", directory / "source_prompt.md", prompt, report_path, settings)
             session = str(uuid4())
             try:
@@ -93,22 +94,19 @@ def review(run: Path, cwd: Path, settings: conf.ConfigRead) -> int:
             env["AGENT_EXEC_EXTRA_ARGS"] = (env.get("AGENT_EXEC_EXTRA_ARGS", "") + f" --session-id {session}").strip()
             write_text_atomic(status, "reviewing\n")
             launched = subprocess.run([
-                "bash", str(Path(__file__).resolve().parents[1] / "agents/agent_exec.sh"),
+                "bash", str(AGENT_EXEC),
                 "direct.simplify", "readonly", str(clone), str(prompt), str(report_path), str(log_path),
-            ], env=env, check=False)
+            ], env=env, check=False, pass_fds=copies.COMMAND_LOCKS.get())
             report = report_path.read_text()
             log = log_path.read_text(errors="replace") if log_path.exists() else ""
             reason = simplify_result.validate(report, log, len(settings.words("SIMPLIFY_AGENTS")))
             if launched.returncode and not reason:
                 reason = simplify_result.failure_reason(log, launched.returncode)
-        finally:
-            with scratch.removal_lock(clone.parent):
-                scratch.remove_marked(clone.parent, scratch.remove)
         if not reason:
             write_text_atomic(status, "reviewed\n")
             _ = git(cwd, "push", "origin", f"--force-with-lease=refs/simplify/last:{last}", f"{tip}:refs/simplify/last")
             state = "reviewed"
-    except (OSError, KeyError, ValueError, RuntimeError, copies.CopyError, scratch.ScratchError) as error:
+    except (OSError, KeyError, ValueError, RuntimeError, copies.CopyError) as error:
         reason = str(error)
     if state == "error":
         write_text_atomic(status, "error\n")

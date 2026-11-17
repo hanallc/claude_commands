@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -20,48 +21,52 @@ from scripts.production import fake_unit_host
 from scripts.production import production_lifecycle
 from scripts.production import showrunners, staff, unit_config
 from scripts.production import unit_lookup
+from scripts.production import session_records_test_support
 from scripts.production import tidy_wrapped
 from scripts.production.cli_fixture import invoke_cli
 
 
 SCRIPT = Path(__file__).with_name("production_lifecycle.py")
-STUB = '''#!__PYTHON__
-import os
-import shutil
-from pathlib import Path
+# Only an interpreter can run the showrunners.py stub, so it stays Python and records any call.
+INTERPRETER_STUB = '''import os
 import sys
+from pathlib import Path
 
-state = Path(os.environ["LIFECYCLE_TEST_STATE"])
-name = Path(sys.argv[0]).name
-with (state / "calls").open("a") as output:
-    output.write(name + " " + " ".join(sys.argv[1:])
-                 + (" cwd=" + os.getcwd() if name == "cargo-berth" else "") + "\\n")
-if name == "ssh":
-    print("rc=" + (state / "mac-rc").read_text().strip() if (state / "mac-rc").exists() else "rc=0")
-    raise SystemExit(0)
-if name == "cargo-berth" and sys.argv[1:2] == ["board"]:
-    print((state / "reservations.json").read_text() if (state / "reservations.json").exists() else
-          '{"output_contract_version": 1, "verb": "board", "status": "unconfigured", "payload": {"kind": "no_facts"}}')
-    raise SystemExit(int((state / "board-exit").read_text()) if (state / "board-exit").exists() else 4)
-if name == "notifier.sh" and sys.argv[1:2] == ["remove"]:
-    timer = state / "notifier" / sys.argv[2]
-    if timer.exists():
-        shutil.rmtree(timer)
-    raise SystemExit(0)
-if name in ("notifier.sh", "showrunners.py", "cargo-berth", "py"):
-    raise SystemExit(0)
-raise SystemExit(99)
+with (Path(os.environ["LIFECYCLE_TEST_STATE"]) / "calls").open("a") as output:
+    output.write(Path(sys.argv[0]).name + " " + " ".join(sys.argv[1:]) + "\\n")
 '''
-# The session records and the message sender showrunners.py reads: nothing real is looked up or sent.
-SESSIONS = '''import json, os, pathlib, sys
-command, target = sys.argv[1:]
-for path in pathlib.Path(os.environ["NOTIFIER_SESSIONS_DIR"]).glob("*.json"):
-    record = json.loads(path.read_text())
-    if command == "socket" and target == "session:" + record["sessionId"]:
-        print(record["messagingSocketPath"])
-        raise SystemExit(0)
-raise SystemExit(1)
+# The executable stubs record the same calls without a Python start for each call.
+SHELL_STUB = '''#!/bin/sh
+state=$LIFECYCLE_TEST_STATE
+name=${0##*/}
+if [ "$name" = cargo-berth ]; then
+    printf '%s %s cwd=%s\\n' "$name" "$*" "$(pwd -P)" >> "$state/calls"
+else
+    printf '%s %s\\n' "$name" "$*" >> "$state/calls"
+fi
+case $name in
+ssh)
+    if [ -e "$state/mac-rc" ]; then printf 'rc=%s\\n' "$(cat "$state/mac-rc")"; else echo rc=0; fi
+    exit 0 ;;
+cargo-berth)
+    if [ "$1" = board ]; then
+        if [ -e "$state/reservations.json" ]; then
+            cat "$state/reservations.json"; echo
+        else
+            echo '{"output_contract_version": 1, "verb": "board", "status": "unconfigured", "payload": {"kind": "no_facts"}}'
+        fi
+        if [ -e "$state/board-exit" ]; then exit "$(cat "$state/board-exit")"; fi
+        exit 4
+    fi
+    exit 0 ;;
+notifier.sh)
+    if [ "$1" = remove ]; then rm -rf "$state/notifier/$2"; fi
+    exit 0 ;;
+py) exit 0 ;;
+esac
+exit 99
 '''
+# The message sender showrunners.py reads: nothing real is sent.
 SEND = '''import json, os, sys
 with open(os.environ["TEST_SENT"], "a") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\\n")
@@ -70,6 +75,7 @@ with open(os.environ["TEST_SENT"], "a") as handle:
 
 from scripts.production.staff_test_support import fixture_member, StaffTestCase
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lint.memory_test_support import config_environment
 
 class LifecycleFixture(unittest.TestCase):
@@ -90,6 +96,7 @@ class LifecycleFixture(unittest.TestCase):
 
     fixture_root: ClassVar[Path]
     fixture_snapshot: ClassVar[Path]
+    running_snapshot: ClassVar[Path]
     fixture_env: ClassVar[dict[str, str]]
 
     @classmethod
@@ -100,24 +107,26 @@ class LifecycleFixture(unittest.TestCase):
         cls.fixture_root = Path(folder.name).resolve() / "case"
         cls.fixture_root.mkdir()
         cls.fixture_snapshot = cls.fixture_root.with_name("snapshot")
+        cls.running_snapshot = cls.fixture_root.with_name("running")
         builder = cls()
         builder.root = cls.fixture_root
         builder.build_fixture()
         cls.fixture_env = builder.env.copy()
         _ = shutil.copytree(cls.fixture_root, cls.fixture_snapshot)
+        builder.build_running_repository()
+        _ = shutil.copytree(cls.fixture_root, cls.running_snapshot)
         shutil.rmtree(cls.fixture_root)
 
     @override
     def setUp(self) -> None:
-        socket_for = showrunners.socket_for
         labeled_sessions = unit_lookup.labeled_sessions
         self.staff = StaffTestCase()
-        self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
-        _ = self.enterContext(mock.patch.object(showrunners, "socket_for", socket_for))
+        self.staff.setUp()
+        _ = self.enterContext(mock.patch.object(showrunners, "socket_for", self.socket_for))
         _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_sessions", labeled_sessions))
-        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(self.remove_fixture)
+        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.root = self.fixture_root
         self.bind_fixture()
         self.env = self.fixture_env.copy()
@@ -131,11 +140,15 @@ class LifecycleFixture(unittest.TestCase):
             _ = fixture_member("unit", name=name, parent=owner.id,
                                worktree=staff.PresentWorktree(remote.local_machine(), folder))
 
+    def socket_for(self, target: str, *, deadline: float = math.inf) -> str | None:
+        """Read the fixture session records as the sessions script does, without a process for each lookup."""
+        del deadline  # Fixture records answer at once.
+        return session_records_test_support.socket_path(self.state / "sessions", target)
+
     def remove_fixture(self) -> None:
         """Release the next fixture path before removal can fail."""
-        finished = Path(tempfile.mkdtemp(prefix="finished-", dir=self.fixture_root.parent))
-        _ = self.fixture_root.rename(finished)
-        shutil.rmtree(finished)
+        with tempfile.TemporaryDirectory(prefix="finished-", dir=self.fixture_root.parent) as finished:
+            _ = self.fixture_root.rename(finished)
 
     def bind_fixture(self) -> None:
         self.origin = self.root / "origin.git"
@@ -162,6 +175,7 @@ class LifecycleFixture(unittest.TestCase):
                          ".claude/scripts/lib/py"):
             self.stub(self.home / relative)
         self.env = {**os.environ, "HOME": str(self.home), "LIFECYCLE_TEST_STATE": str(self.state),
+                    "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.root.parent)), "GIT_CONFIG_NOSYSTEM": "1",
                     "PATH": str(bin_path) + os.pathsep + os.environ.get("PATH", ""),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
                     "SHOWRUNNER_SESSION": "environment-showrunner",
@@ -169,11 +183,10 @@ class LifecycleFixture(unittest.TestCase):
                     "NOTIFIER_SESSIONS_DIR": str(self.state / "sessions"),
                     "PHASE_TABLE_VAULT": str(self.phase_table_vault),
                     "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
-                    "SHOWRUNNERS_SESSIONS": str(self.root / "sessions.py"),
+                    "SHOWRUNNERS_SESSIONS": session_records_test_support.__file__,
                     "SHOWRUNNERS_SEND": str(self.root / "send.py"), "TEST_SENT": str(self.state / "sent.jsonl")}
         self.env.update(fake_unit_host.environment(self.root))
         self.env.update(config_environment(self.root / "config"))
-        self.write(self.root / "sessions.py", SESSIONS)
         self.write(self.root / "send.py", SEND)
         self.checkout.mkdir()
         _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
@@ -191,8 +204,12 @@ class LifecycleFixture(unittest.TestCase):
 
     def stub(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.write(path, STUB.replace("__PYTHON__", sys.executable))
-        path.chmod(0o644 if path.name == "showrunners.py" else 0o755)
+        if path.name == "showrunners.py":
+            self.write(path, INTERPRETER_STUB)
+            path.chmod(0o644)
+        else:
+            self.write(path, SHELL_STUB)
+            path.chmod(0o755)
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -224,7 +241,7 @@ class LifecycleFixture(unittest.TestCase):
         lines.extend(["", "## Production rules", "", "- No CI, smoke launch, Mac run, or validate_and_push.sh."])
         self.write(self.doc, "\n".join(lines) + "\n")
 
-    def running(self) -> None:
+    def build_running_repository(self) -> None:
         _ = self.git("switch", "-c", "production")
         self.production_doc("running")
         _ = self.git("add", str(self.doc))
@@ -233,13 +250,22 @@ class LifecycleFixture(unittest.TestCase):
         _ = self.git("worktree", "add", "-b", "alpha-branch", str(self.alpha), "production")
         _ = self.git("worktree", "add", "-b", "beta-branch", str(self.beta), "production")
         _ = self.git("push", "origin", "alpha-branch", "beta-branch")
+        with mock.patch.dict(os.environ, self.env):
+            for name, worktree in (("alpha", self.alpha), ("beta", self.beta)):
+                _ = unit_config.write(worktree, unit_config.UnitConfig(
+                    unit_config.PlanFile(Path(f"docs/plans/{name}.md")), unit_config.NoAppPort(), ()))
+
+    def running(self) -> None:
+        # Keep the per-test state and the fixed paths in Git worktree links.
+        for directory in (self.origin, self.checkout, self.alpha, self.beta):
+            if directory.exists():
+                shutil.rmtree(directory)
+            _ = shutil.copytree(self.running_snapshot / directory.name, directory)
         runner = fixture_member("showrunner", name="example",
                               doc=staff.LiveDoc(remote.local_machine(), self.doc))
         for name, worktree in (("alpha", self.alpha), ("beta", self.beta)):
             row = fixture_member("unit", name=name, parent=runner.id,
                                worktree=staff.PresentWorktree(remote.local_machine(), worktree))
-            _ = unit_config.write(worktree, unit_config.UnitConfig(
-                unit_config.PlanFile(Path(f"docs/plans/{name}.md")), unit_config.NoAppPort(), ()))
             self.staff.pane(f"fixture:{name}", session_id=row.id, environment={
                 "SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": name,
             })
@@ -252,7 +278,9 @@ class LifecycleFixture(unittest.TestCase):
     def park_fixture_unit(self, name: str, worktree: Path, branch: str) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == name)
         with mock.patch.dict(os.environ, self.env):
-            _ = unit_config.park(row.id, worktree, unit_config.RetiredSession("2026-10-31", row.id, unit_config.Branch(branch)))
+            _ = unit_config.park(row.id, worktree, unit_config.RetiredSession("2026-10-31", row.id))
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), worktree, staff.ParkedBranch(branch)),
+                                   expected=row.worktree)
 
     def run_lifecycle(self, action: str, *extra: str) -> subprocess.CompletedProcess[str]:
         # Restore import-time state just as a fresh CLI would compute it.

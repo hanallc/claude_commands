@@ -9,6 +9,8 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
 BUILDLOG_MEM_ADMIT_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_queue" && pwd)/admission_client.py"
+# The build queue is the one way in: steps admit, launch and release through queue_place.py.
+BUILDLOG_QUEUE_PLACE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_queue" && pwd)/queue_place.py"
 BUILDLOG_MEM_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/py"
 
 # Each new wait uses its own identity. Rejoining callers restore it after sourcing.
@@ -17,6 +19,11 @@ export -n BUILDLOG_MEM_WAIT_SINCE BUILDLOG_MEM_WAIT_FIRST_FILE
 
 buildlog_memory_python() {
     "$BUILDLOG_MEM_PY" "$@"
+}
+
+buildlog_check_nested_step() {
+    [[ -n "${BUILDLOG_RESERVED_STEP:-}" ]] || return 0
+    buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" check-nested
 }
 
 # Status 0 when the holder directory is missing or readable with no entry.
@@ -101,10 +108,11 @@ build_hold_wait_local() {
     build_hold_call
     local waiter_pid status=0 diagnostics output_fd output_pid output_status=0
     local arguments=(wait-local --call-id "$BUILDLOG_HOLD_CALL_ID" --pid "${BUILDLOG_HOLD_PID:-$$}")
+    if [[ -n "${BUILDLOG_PLACEMENT_EPISODE:-}" ]]; then arguments+=(--session "${PLACEMENT_SESSION:-}"); fi
     if [[ -n "$BUILDLOG_HOLD_CALLER" ]]; then arguments+=(--caller "$BUILDLOG_HOLD_CALLER"); fi
     # A held natedev cannot start the step, so the leave hook also runs here:
     # status 75 (LINT_LEFT_QUEUE_STATUS) means another machine is free.
-    if [[ -n "${LINT_QUEUE_LEAVE_HOOK:-${BUILDLOG_MAC_IDLE_HOOK:-}}" ]]; then
+    if [[ -z "${BUILDLOG_PLACEMENT_EPISODE:-}" && -n "${LINT_QUEUE_LEAVE_HOOK:-${BUILDLOG_MAC_IDLE_HOOK:-}}" ]]; then
         arguments+=(--leave-hook "${LINT_QUEUE_LEAVE_HOOK:-$BUILDLOG_MAC_IDLE_HOOK}")
     fi
     diagnostics=$(mktemp "${TMPDIR:-/tmp}/hold-check.XXXXXX") || {
@@ -142,7 +150,9 @@ build_hold_check_local() {
     if build_hold_nothing_held; then return 0; fi
     build_hold_call
     local status=0
-    buildlog_memory_python "$BUILD_TARGETS_SCRIPT" check-local --caller "${BUILDLOG_HOLD_CALLER:-verify}" || status=$?
+    local session_args=()
+    if [[ -n "${BUILDLOG_PLACEMENT_EPISODE:-}" ]]; then session_args=(--session "${PLACEMENT_SESSION:-}"); fi
+    buildlog_memory_python "$BUILD_TARGETS_SCRIPT" check-local --caller "${BUILDLOG_HOLD_CALLER:-verify}" ${session_args[@]+"${session_args[@]}"} || status=$?
     build_hold_check_result "$status" check-local
 }
 
@@ -154,7 +164,12 @@ buildlog_memory_refuse() {
 buildlog_memory_event() { :; }
 
 buildlog_wait_for_memory() {
+    buildlog_check_nested_step || return $?
     BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=MeminfoUnavailable BUILDLOG_MEM_RESERVATION=""
+    if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
+        source "$BUILDLOG_SELECTED_LOCAL_GRANT" || return $?
+        return 0
+    fi
     if buildlog_target_admitted || [[ "${OSTYPE:-}" == darwin* && -z "${BUILDLOG_MEMINFO+x}" ]]; then
         BUILDLOG_MEM_OUTCOME=Granted
         return 0
@@ -170,7 +185,7 @@ buildlog_wait_for_memory() {
         set -o pipefail
         LINT_QUEUE_LEAVE_HOOK="${LINT_QUEUE_LEAVE_HOOK:-}" \
         BUILDLOG_MAC_IDLE_HOOK="${BUILDLOG_MAC_IDLE_HOOK:-}" \
-        buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" "$action" --pid "$owner" \
+        buildlog_memory_python "$BUILDLOG_QUEUE_PLACE_SCRIPT" "$action" --pid "$owner" \
             --since "$BUILDLOG_MEM_WAIT_FROM" --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" \
             --shell-state "$grant" --wait-events -- "$@" |
             while IFS= read -r event; do buildlog_memory_event "$event"; done
@@ -196,5 +211,21 @@ buildlog_release_memory() {
     BUILDLOG_MEM_RESERVATION=""
     export BUILDLOG_MEM_CLEANUP_TIMING
     [[ -n "$reservation" ]] || return 0
-    buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" release "$reservation" "${1:-0}" >/dev/null 2>&1 || true
+    if [[ -n "${BUILDLOG_PLACEMENT_FILE:-}" ]]; then
+        local finish_args=(finish-step --assignment-file "$BUILDLOG_PLACEMENT_FILE" --status "${1:-0}")
+        if [[ -n "${BUILDLOG_MEM_PRELAUNCH_REASON:-}" ]]; then
+            finish_args+=(--reason "$BUILDLOG_MEM_PRELAUNCH_REASON")
+        elif [[ -s "${HOLD_WAIT_DIR:-/nonexistent}/token-lost" ]]; then
+            finish_args+=(--reason "execution token ownership changed")
+        fi
+        if [[ -s "${HOLD_WAIT_DIR:-/nonexistent}/token-lost" ]]; then
+            finish_args+=(--token after-grant)
+        fi
+        buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" "${finish_args[@]}" >/dev/null 2>&1 || true
+        BUILDLOG_MEM_PRELAUNCH_REASON=""
+        rm -f "${BUILDLOG_SELECTED_LOCAL_GRANT:-/nonexistent}"
+        BUILDLOG_SELECTED_LOCAL_GRANT="" BUILDLOG_PLACEMENT_FILE=""
+    else
+        buildlog_memory_python "$BUILDLOG_QUEUE_PLACE_SCRIPT" release "$reservation" "${1:-0}" >/dev/null 2>&1 || true
+    fi
 }

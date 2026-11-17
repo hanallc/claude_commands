@@ -192,13 +192,7 @@ name = "change"
 kind = "record"
 defined_in = "commands/change_review.md#add"
 other_names = ["change-review row"]
-other_meaning_files = ["commands/changelog.md", "commands/commit_prep.md"]
-
-[[terms]]
-name = "dailies"
-kind = "document"
-defined_in = "commands/showrunner/dailies.md#Dailies"
-other_names = ["scheduled update"]
+other_meaning_files = ["commands/changelog.md"]
 
 [[terms]]
 name = "checkpoint"

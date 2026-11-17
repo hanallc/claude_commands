@@ -19,6 +19,8 @@ from functools import partial
 from pathlib import Path
 from typing import Literal, cast, override
 
+from scripts.lib.transcripts import open_transcript, transcript_paths, uncompressed_path
+
 Agent = Literal["Claude", "Codex"]
 CallKind = Literal["shot", "other"]
 ProjectAttribution = Literal["repository", "scratchpad", "last_path", "removed_worktree", "scratchpad_target_missing"]
@@ -648,7 +650,7 @@ def _timing_invocations(path: Path, source_host: str = "local", start: int = 0) 
     if not path.exists():
         return [], start, 0
     records: list[InvocationRecord] = []
-    with path.open("rb") as source:
+    with open_transcript(path) as source:
         _ = source.seek(start)
         while line := source.readline():
             if not line.endswith(b"\n"):
@@ -720,7 +722,8 @@ def _candidate_files(root: Path) -> list[Path]:
     result = subprocess.run([*args, str(root)], capture_output=True, check=False)
     if result.returncode not in (0, 1):
         raise RuntimeError(result.stderr.decode(errors="replace"))
-    return [Path(name.decode(errors="replace")) for name in result.stdout.split(b"\0") if name]
+    return [Path(name.decode(errors="replace")) for name in result.stdout.split(b"\0") if name] + [
+        path for path in transcript_paths(root) if path.suffix == ".zst" and _whole_file_candidate(path, "Claude")]
 
 
 def _codex_candidate_files(root: Path) -> list[Path]:
@@ -738,7 +741,8 @@ def _codex_candidate_files(root: Path) -> list[Path]:
         if result.returncode not in (0, 1):
             raise RuntimeError(result.stderr.decode(errors="replace"))
     names = set(direct.stdout.split(b"\0")) | set(related.stdout.split(b"\0"))
-    return [Path(name.decode(errors="replace")) for name in names if name]
+    return [Path(name.decode(errors="replace")) for name in names if name] + [
+        path for path in transcript_paths(root) if path.suffix == ".zst" and _whole_file_candidate(path, "Codex")]
 
 
 def _claude_encoded(path: Path) -> str:
@@ -1692,26 +1696,21 @@ def _message_text(value: object) -> str:
 def _outgoing_tool_message(name: str, value: object, command: str) -> str:
     if name == "SendMessage" or name.endswith(".SendMessage"):
         return _message_text(value)
-    if "send.py" not in command and "codex_mesh.py" not in command:
+    if "send.py" not in command:
         return ""
     messages: list[str] = []
     for tokens in _shell_segments(command):
         program, arguments = _program(tokens)
-        if program in ("send.py", "codex_mesh.py"):
+        if program == "send.py":
             options = arguments[1:]
-        elif program.startswith("python") and len(arguments) > 1 and Path(arguments[1]).name in ("send.py", "codex_mesh.py"):
-            program = Path(arguments[1]).name
+        elif program.startswith("python") and len(arguments) > 1 and Path(arguments[1]).name == "send.py":
             options = arguments[2:]
         else:
             continue
-        if program == "codex_mesh.py":
-            message_option = "--message"
-        else:
-            message_option = "--text"
         for index, option in enumerate(options):
-            if option == message_option and index + 1 < len(options):
+            if option == "--text" and index + 1 < len(options):
                 messages.append(options[index + 1])
-            elif option.startswith(message_option + "="):
+            elif option.startswith("--text="):
                 messages.append(option.partition("=")[2])
     return " ".join(messages)
 
@@ -1814,17 +1813,10 @@ def _read_json(line: str) -> dict[str, object]:
 
 
 def _matching_lines(path: Path, markers: tuple[bytes, ...]) -> Iterator[bytes]:
-    args = ["rg", "--no-heading", "--no-line-number", "--text", "-F"]
-    for marker in markers:
-        args.extend(("-e", marker.decode()))
-    with subprocess.Popen([*args, str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
-        if process.stdout is None:
-            raise RuntimeError(f"No output stream for {path}")
-        for line in cast(Iterable[bytes], process.stdout):
-            yield line.rstrip(b"\n")
-        if process.wait() not in (0, 1):
-            error = cast(bytes, process.stderr.read()).decode(errors="replace") if process.stderr is not None else ""
-            raise RuntimeError(error)
+    with open_transcript(path) as source:
+        for line in source:
+            if any(marker in line for marker in markers):
+                yield line.rstrip(b"\n")
 
 
 def _claude_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]],
@@ -2082,8 +2074,10 @@ def _codex_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]]
 def _scan_file(file: tuple[Agent, Path], scratchpad_roots: tuple[Path, ...]) -> TranscriptEvidence:
     agent, path = file
     projects: dict[str, tuple[str, ProjectAttribution]] = {}
-    return (_claude_calls(path, projects, scratchpad_roots=scratchpad_roots) if agent == "Claude"
-            else _codex_calls(path, projects, scratchpad_roots=scratchpad_roots))
+    lines = _matching_lines(path, _markers(agent))
+    logical = uncompressed_path(path)
+    return (_claude_calls(logical, projects, lines, scratchpad_roots=scratchpad_roots) if agent == "Claude"
+            else _codex_calls(logical, projects, lines, scratchpad_roots=scratchpad_roots))
 
 
 def _markers(agent: Agent) -> tuple[bytes, ...]:
@@ -2097,11 +2091,12 @@ def _has_candidate_hint(agent: Agent, line: bytes) -> bool:
 
 
 def _whole_file_candidate(path: Path, agent: Agent) -> bool:
-    with path.open("rb") as source:
+    with open_transcript(path) as source:
         return any(_has_candidate_hint(agent, line) for line in source)
 
 
 def _new_progress(agent: Agent, path: Path) -> TranscriptProgress:
+    path = uncompressed_path(path)
     if agent == "Claude":
         return ClaudeTranscriptProgress()
     thread_suffix = CODEX_THREAD_SUFFIX.search(path.stem)
@@ -2111,6 +2106,7 @@ def _new_progress(agent: Agent, path: Path) -> TranscriptProgress:
 
 def _parse_lines(path: Path, agent: Agent, lines: Iterable[bytes],
                  progress: TranscriptProgress, scratchpad_roots: tuple[Path, ...]) -> TranscriptEvidence:
+    path = uncompressed_path(path)
     projects: dict[str, tuple[str, ProjectAttribution]] = {}
     if agent == "Claude" and isinstance(progress, ClaudeTranscriptProgress):
         return _claude_calls(path, projects, lines, progress, scratchpad_roots=scratchpad_roots)
@@ -2128,7 +2124,7 @@ class TranscriptContentRead:
 
 def _appended_lines(path: Path, agent: Agent, read: TranscriptContentRead) -> Iterator[bytes]:
     markers = _markers(agent)
-    with path.open("rb") as source:
+    with open_transcript(path) as source:
         _ = source.seek(read.cursor)
         while line := source.readline():
             read.content_bytes += len(line)
@@ -2141,7 +2137,7 @@ def _appended_lines(path: Path, agent: Agent, read: TranscriptContentRead) -> It
 
 
 def _appended_candidate(path: Path, agent: Agent, read: TranscriptContentRead) -> bool:
-    with path.open("rb") as source:
+    with open_transcript(path) as source:
         _ = source.seek(read.cursor)
         while line := source.readline():
             read.content_bytes += len(line)
@@ -2155,7 +2151,7 @@ def _appended_candidate(path: Path, agent: Agent, read: TranscriptContentRead) -
 def _complete_cursor(path: Path, size: int) -> int:
     if size == 0:
         return 0
-    with path.open("rb") as source:
+    with open_transcript(path) as source:
         _ = source.seek(size - 1)
         if source.read(1) == b"\n":
             return size
@@ -2176,7 +2172,7 @@ def _new_file_evidence(file: tuple[Agent, Path, str], scratchpad_roots: tuple[Pa
                                         _complete_cursor(path, stat.st_size), stat.st_size, stat.st_mtime_ns,
                                         TranscriptEvidence([], []), progress, False)
     complete = _complete_cursor(path, stat.st_size)
-    if complete == stat.st_size:
+    if complete == stat.st_size and path.suffix != ".zst":
         lines = _matching_lines(path, _markers(agent))
         evidence = _parse_lines(path, agent, lines, progress, scratchpad_roots)
         cursor = stat.st_size
@@ -2213,15 +2209,28 @@ def _file_inventory(claude_root: Path, codex_root: Path) -> dict[str, tuple[Agen
     for agent, root in (("Claude", claude_root), ("Codex", codex_root)):
         for directory, _, names in os.walk(root):
             for name in names:
-                if not name.endswith(".jsonl"):
+                if not name.endswith((".jsonl", ".jsonl.zst")):
                     continue
                 path = Path(directory) / name
+                if path.suffix == ".zst" and uncompressed_path(path).exists():
+                    continue
                 try:
                     stat = path.stat()
                 except OSError:
                     continue
                 inventory[str(path)] = (cast(Agent, agent), path, stat)
     return inventory
+
+
+def _archive_content_size_matches(path: Path, expected: int) -> bool:
+    """Read frame sizes without decompression, including concatenated frames."""
+    try:
+        result = subprocess.run(["zstd", "--list", "-v", "--", str(path)],
+                                capture_output=True, text=True, check=False)
+    except OSError:
+        return False
+    size = re.search(r"^Decompressed Size: .* \((\d+) B\)$", result.stdout, re.MULTILINE)
+    return result.returncode == 0 and size is not None and int(size[1]) == expected
 
 
 def _joined_calls(evidence: Iterable[TranscriptEvidence], records: list[InvocationRecord]) -> list[ToolCall]:
@@ -2246,7 +2255,8 @@ def _joined_calls(evidence: Iterable[TranscriptEvidence], records: list[Invocati
             if matches:
                 call = replace(call, project=max(matches, key=len), project_attribution="removed_worktree")
         folded.append(call)
-    return folded
+    return sorted(folded, key=lambda call: (call.start, call.end, call.transcript_path,
+                                            call.session_id, call.tool_use_id))
 
 
 def _joined_tool_events(evidence: Iterable[TranscriptEvidence]) -> list[TranscriptToolEvent]:
@@ -2275,7 +2285,21 @@ def _cached_scan(claude_root: Path, codex_root: Path, timing_source: TimingSourc
                 initial_results = dict(zip((str(path) for _, path, _ in tasks), workers.map(parse_file, tasks)))
         else:
             initial_results = {str(task[1]): _new_file_evidence(task, scratchpad_roots) for task in tasks}
-    changed = False
+    renamed: dict[str, str] = {}
+    for name, (_, path, stat) in inventory.items():
+        if path.suffix != ".zst" or name in saved.files:
+            continue
+        logical = str(uncompressed_path(path))
+        prior = saved.files.get(logical)
+        if (prior is not None and prior.modified_ns == stat.st_mtime_ns
+                and prior.cursor == prior.observed_size
+                and _archive_content_size_matches(path, prior.observed_size)):
+            prior.device, prior.inode = stat.st_dev, stat.st_ino
+            prior.observed_size, prior.modified_ns = stat.st_size, stat.st_mtime_ns
+            renamed[logical] = name
+    if renamed:
+        saved.files = {renamed.get(name, name): prior for name, prior in saved.files.items()}
+    changed = bool(renamed)
     # Count unique source byte offsets inspected in this run. Cold prefilter and parser
     # passes over the same file contribute its size once, even if both touch it.
     bytes_read = sum(stat.st_size for _, _, stat in inventory.values()) if initial else 0
@@ -2288,7 +2312,8 @@ def _cached_scan(claude_root: Path, codex_root: Path, timing_source: TimingSourc
             stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
         ):
             continue
-        if (prior is not None and prior.device == stat.st_dev and prior.inode == stat.st_ino
+        if (prior is not None and path.suffix != ".zst"
+                and prior.device == stat.st_dev and prior.inode == stat.st_ino
                 and stat.st_size > prior.observed_size):
             if prior.candidate:
                 bytes_read += _append_file_evidence(prior, path, stat, scratchpad_roots)

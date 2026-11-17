@@ -19,9 +19,7 @@ OVERRIDE_VARIABLES: tuple[str, ...] = (
     "BUILD_TARGETS_SCRIPT",
     "BUILD_TARGETS_CONFIG",
     "BUILD_TARGETS_NOW",
-    "UNIT_ACTIVE_DIR",
     # The same folder under its name before the rename, which unit_runs.environ still reads.
-    "PLAN_DELEGATE_ACTIVE_DIR",
 )
 REFUSED_STATUS = 2
 
@@ -33,11 +31,12 @@ def user_home() -> Path:
 
 @dataclass(frozen=True)
 class OverridesAllowed:
-    pass
+    """The caller can use configuration overrides."""
 
 
 @dataclass(frozen=True)
 class OverridesRefused:
+    """The refusal line explains why the caller cannot use configuration overrides."""
     line: str
 
 

@@ -21,7 +21,7 @@ from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import StaffTestCase, production_membership, recorded_showrunner, fixture_member
 from scripts.production import showrunner_tree
 from scripts.production.proposals_table import ADD_ON_STATE, IN_PROGRESS_STATE, REVIEW_STATE, Row
-from scripts.lib import conf
+from scripts.lib import conf, unit_runs
 
 # Importable once proposals_table has put scripts/direct on the path.
 from scripts.direct import phase_table
@@ -247,7 +247,7 @@ class ProposalsTableTests(StaffTestCase):
         plan = self.root / "unit/docs/as-built/footers.md"
         earlier = self.root / "unit/docs/plans/footers.md"
         _ = self.write("sessions/run-1/next_items_pending.md", "- add: Keep the old footer for one release\n")
-        with mock.patch.object(proposals_table, "SESSION_ROOTS", (self.root / "sessions",)), \
+        with mock.patch.object(unit_runs, "run_roots", return_value=(self.root / "sessions",)), \
                 self.runs_of({earlier: [Path("/history/runs/run-1.jsonl")]}):
             rows = proposals_table.unit_add_on_rows("footer", plan)
         self.assertEqual([row.proposal for row in rows], ["Keep the old footer for one release"])
@@ -256,7 +256,7 @@ class ProposalsTableTests(StaffTestCase):
         plan = self.root / "unit/docs/plans/footers.md"
         _ = self.write("unit-runs/run-new/next_items_pending.md", "- add: New-folder add-on\n")
         _ = self.write("former-runs/run-old/next_items_pending.md", "- add: Former-folder add-on\n")
-        with mock.patch.object(proposals_table, "SESSION_ROOTS", (self.root / "unit-runs", self.root / "former-runs")), \
+        with mock.patch.object(unit_runs, "run_roots", return_value=(self.root / "unit-runs", self.root / "former-runs")), \
                 self.runs_of({plan: [Path("/history/runs/run-new.jsonl"), Path("/history/runs/run-old.jsonl")]}):
             rows = proposals_table.unit_add_on_rows("footer", plan)
         self.assertEqual(sorted(row.proposal for row in rows), ["Former-folder add-on", "New-folder add-on"])
@@ -305,7 +305,7 @@ class ProposalsTableTests(StaffTestCase):
         _ = self.write("backlog/ledger.md", "- 2026-10-11 Codex dots — proposed\n")
         _ = self.write("sessions/run-1/next_items_pending.md", "- add: Keep the old footer\n")
         records = '{"footer": {"plan": "%s"}, "idle": {"unavailable": "no plan"}}' % plan
-        with mock.patch.object(proposals_table, "SESSION_ROOTS", (self.root / "sessions",)), \
+        with mock.patch.object(unit_runs, "run_roots", return_value=(self.root / "sessions",)), \
                 mock.patch.object(phase_table, "show_production", return_value=records), \
                 self.runs_of({plan: [Path("run-1.jsonl")]}):
             code, out, err = self.run_main(["--production", "footers"])

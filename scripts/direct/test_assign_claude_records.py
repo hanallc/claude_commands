@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import unittest
+from scripts.accounts import accounts
+from scripts.production.cli_fixture import process_boundary
 from scripts.direct import assign_claude_test_support as support
 from scripts.direct.assign_claude_test_support import DIRECT_DIR as DIRECT_DIR
+from scripts.lib.test_models_registry import claude_catalog_environment
 from typing import cast
 import json
+import os
 import subprocess
 import sys
+from unittest.mock import patch
 
 
-class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
+class AssignClaudeLauncherWorkerTests(support.InProcessAssignClaudeLauncherFixture):
     def test_a_companion_fix_starts_after_the_resolver_lands_its_round(self) -> None:
         session = self.start_phase("landed-companion")
         self.open_repair_round(session)
@@ -94,6 +99,27 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
         for line, expected in zip(register, ("role=impl", "role=impl")):
             self.assertIn(expected, line)
 
+        with self.subTest(model="catalog target"):
+            session = self.start_phase("catalog-records")
+            environment = self.launch_environment(session)
+            with patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(accounts.setup("claude2"), [])
+                _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({
+                    "oauthAccount": {"emailAddress": "worker@example.invalid"}}))
+            expected_model = "claude-opus-assign-fixture"
+            environment.update(claude_catalog_environment(self.root / ".claude2", {"opus": expected_model}))
+            result = self.run_assignment(self.assign_command(session), environment)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            arguments = cast(list[str], json.loads((self.root / "launch_args.json").read_text()))
+            self.assertEqual(arguments[arguments.index("--model") + 1], expected_model)
+            self.assertIn("agent=" + expected_model, (session / "impl_agent_impl").read_text())
+            started, = self.launch_records(session, "pass_started")
+            self.assertEqual(cast(dict[str, object], started["called_agent"])["model"], expected_model)
+            self.assertIn("claude/" + expected_model + ":high", (session / "board.log").read_text())
+            self.assertIn("claude/" + expected_model + ":high", (session / "heartbeat.log").read_text())
+            worker = cast(dict[str, object], json.loads((session / "impl_worker_impl.json").read_text()))
+            self.assertEqual(worker["model"], expected_model)
+
     def test_failed_follow_up_abandons_round_and_posts_blocked(self) -> None:
         session_dir, first = self.first_worker_launch(repair=True)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -114,6 +140,7 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertIn("blocked:", board)
 
+    @process_boundary
     def test_failed_landed_record_leaves_error_status(self) -> None:
         session_dir, first = self.first_worker_launch(repair=True)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -132,6 +159,7 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
         )
         self.assertIn("blocked:", (session_dir / "board.log").read_text(encoding="utf-8"))
 
+    @process_boundary
     def test_failed_pass_write_posts_blocked_and_does_not_send(self) -> None:
         session_dir, first = self.first_worker_launch()
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -170,7 +198,9 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
         self.assertEqual(self.repair_outcome(session_dir), "landed")
         self.assertEqual(self.open_passes(session_dir)[name]["kind"], "fix")
         self.assertEqual(self.open_passes(session_dir)[name]["status"], "completed")
-        self.assertEqual(self.open_passes(session_dir)[name]["worker_name"], name)
+        passed = self.open_passes(session_dir)[name]
+        self.assertEqual(passed["worker_id"], self.recorded_worker(session_dir).id)
+        self.assertNotIn("worker_name", passed)
         # A renamed unit's seat works in the worktree the launcher names, not the one its thread began in.
         self.assertEqual((self.root / "follow_cwd.txt").read_text(encoding="utf-8"), str(self.working_dir))
         message = (self.root / "delivered_message.txt").read_text(encoding="utf-8")
@@ -191,6 +221,7 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
         check = cast(dict[str, object], started["launch_check"])
         self.assertEqual(check["fix_cause"], "retry tests fail after integration")
 
+    @process_boundary
     def test_success_status_follows_pass_and_landed_records(self) -> None:
         session_dir, first = self.first_worker_launch(repair=True)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -209,6 +240,7 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
             "implemented\n",
         )
 
+    @process_boundary
     def test_worker_error_status_follows_pass_and_abandon_records(self) -> None:
         session_dir, first = self.first_worker_launch(repair=True)
         self.assertEqual(first.returncode, 0, first.stderr)

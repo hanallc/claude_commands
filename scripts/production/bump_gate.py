@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.copies import copies
 
-from scripts.production.merge_checkpoint import (
+from scripts.production.checkpoint_gate import (
     Stop, complete_gate, read_record, record_lock,
     run_checkpoint_test_steps, save_record,
 )
@@ -39,7 +39,8 @@ def run_gate(path: Path) -> int:
         record["proc_start"] = proc_start
         save_record(path, record)
     try:
-        with copies.standing(record["owner_id"], Path(record["checkout"]), copies.CommittedSource(record["tip"])) as clone:
+        with copies.standing(record["owner_id"], Path(record["checkout"]), copies.CommittedSource(record["tip"]),
+                             step="integrate") as clone:
             production = ProductionDocument(Path(record["production_doc"]), record["name"], record["merge_branch"],
                                     clone, Path(record["checkout"]) / record["production_log"], ZoneInfo(record["zone"]))
             os.environ["BUILDLOG_UNIT"] = record["unit"]

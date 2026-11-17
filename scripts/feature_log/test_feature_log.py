@@ -2958,7 +2958,7 @@ class FeatureLogTests(unittest.TestCase):
                 self.assert_rejected(arguments, "cannot read proposal")
 
     def test_optional_review_flag_reaches_the_writer_host_and_keeps_ssh_failures(self) -> None:
-        for verb in ("add", "supersede", "drop"):
+        for verb in ("add", "supersede", "land", "drop"):
             arguments = [verb, "--review", "natedev/C908", "--if-proposed"]
             if verb == "drop":
                 arguments.extend(("--verdict", "not works"))
@@ -2971,6 +2971,40 @@ class FeatureLogTests(unittest.TestCase):
                           + shlex.join(arguments))
                 self.assertEqual(runner.commands, [["ssh", "natedev", remote]])
                 self.assertEqual(result, CliResult(7, "", "ssh failed\n"))
+
+        transport = self.root / "bin"
+        transport.mkdir()
+        ssh = transport / "ssh"
+        _ = ssh.write_text(
+            "\n".join([
+                f"#!{sys.executable}",
+                "import os, shlex, sys",
+                "if os.environ['FEATURE_LOG_TEST_SSH_FAILURE'] == '1':",
+                "    sys.stderr.write('ssh failed\\n')",
+                "    sys.exit(7)",
+                f"os.environ['FEATURE_LOG_VAULT'] = {str(self.vault)!r}",
+                f"os.execv(sys.executable, [sys.executable, {feature_log.__file__!r}, *shlex.split(sys.argv[2])[2:]])",
+                "",
+            ]),
+            encoding="utf-8",
+        )
+        ssh.chmod(0o700)
+        actions: tuple[Callable[[], list[str]], ...] = (
+            lambda: feature_log.land_review("natedev/C908", if_proposed=True),
+            lambda: feature_log.drop_review("natedev/C908", "not works", if_proposed=True),
+        )
+        for action in actions:
+            for failure in (False, True):
+                with (self.subTest(action=action, failure=failure),
+                      patch.dict(os.environ, {"PATH": f"{transport}{os.pathsep}{os.environ['PATH']}",
+                                              "FEATURE_LOG_TEST_SSH_FAILURE": str(int(failure))}),
+                      patch.object(socket, "gethostname", return_value="macbook.local")):
+                    _ = os.environ.pop("FEATURE_LOG_VAULT")
+                    if failure:
+                        with self.assertRaisesRegex(feature_log.FeatureLogError, "^ssh failed$"):
+                            _ = action()
+                    else:
+                        self.assertEqual(action(), ["skipped: no proposal for natedev/C908"])
 
     def test_review_requires_a_proposal_and_the_matching_verb(self) -> None:
         missing = self.cli(["add", "--review", "A999"])
@@ -3011,7 +3045,7 @@ class FeatureLogTests(unittest.TestCase):
         self.assertEqual(self.cli(add_proposal).status, 0)
         self.assert_rejected(["supersede", "--review", "C903"], "add")
 
-    def test_same_merge_results_require_separate_result_to_land_together(self) -> None:
+    def test_same_merge_review_results_land_together_without_separate_result(self) -> None:
         first = self.proposal_arguments(
             "C906",
             self.add_arguments(title="Shared Merge First", link=sha_one),
@@ -3033,23 +3067,29 @@ class FeatureLogTests(unittest.TestCase):
         self.assertTrue(self.note("hana", "shared merge first").is_file())
         self.assertTrue(self.note("hana", "shared merge second").is_file())
 
-        unmarked_first = self.proposal_arguments(
-            "C908",
-            self.add_arguments(title="Unmarked Merge First", link=sha_two),
-        )
-        unmarked_second = self.proposal_arguments(
-            "C909",
-            self.add_arguments(title="Unmarked Merge Second", link=sha_two),
-        )
-        self.assertEqual(self.cli(unmarked_first).status, 0)
-        self.assertEqual(self.cli(unmarked_second).status, 0)
-        self.assertEqual(self.cli(["add", "--review", "C908"]).status, 0)
-
-        refused = self.cli(["add", "--review", "C909"])
-
-        self.assertEqual(refused.status, 2)
-        self.assertIn("--separate-result", refused.stderr)
-        self.assertFalse(self.note("hana", "unmarked merge second").exists())
+        for project in ("hana", "claude"):
+            rows = tuple((f"C{number}" if project == "hana" else f"natedev/C{number}", title)
+                         for number, title in ((908, "Unmarked Merge First"), (909, "Unmarked Merge Second"),
+                                               (910, "Unmarked Merge Third")))
+            for row, title in rows:
+                arguments = self.proposal_arguments(row, self.add_arguments(
+                    project=project, title=title, link=sha_two, crates=("hana",) if project == "hana" else ()))
+                self.assertEqual(self.cli(arguments).status, 0)
+                self.assertFalse(self.proposal(row)["args"]["separate_result"])
+            for row, title in rows:
+                with self.subTest(project=project, row=row):
+                    landed = self.cli(["land", "--review", row])
+                    self.assertEqual(landed.status, 0, landed.stderr)
+                    self.assertEqual(self.proposal(row)["status"], "landed")
+                    self.assertFalse(self.proposal(row)["args"]["separate_result"])
+                    note = feature_log.parse_note(self.note(project, title.lower()))
+                    self.assertEqual((note["link"], note["state"]), (self.proposal(row)["args"]["link"], "live"))
+                    self.assertTrue(note["link"].endswith("/commit/" + sha_two))
+                    before = self.vault_snapshot(), self.events()
+                    self.assertEqual(self.cli(["land", "--review", row]).status, 0)
+                    self.assertEqual((self.vault_snapshot(), self.events()), before)
+            self.assert_rejected(self.add_arguments(project=project, title="Unreviewed shared result", link=sha_two,
+                crates=("hana",) if project == "hana" else ()), "--separate-result")
 
     def test_drop_closes_an_open_proposal_without_a_note(self) -> None:
         arguments = self.proposal_arguments(

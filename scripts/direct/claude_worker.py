@@ -13,17 +13,18 @@ from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from enum import Enum
+from io import TextIOWrapper
 from pathlib import Path
 from typing import cast
 
 from scripts.accounts import accounts
 from scripts.agents import worker_lifecycle
 from scripts.lib import conf, models_registry, nix_env
-from scripts.message import sessions
+from scripts.lib.transcripts import open_transcript
+from scripts.message import session_send, sessions
 from scripts.production import staff, worker_admission
 from scripts.usage import agents_log
-
-SCRIPTS = Path(__file__).resolve().parents[1]
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,18 @@ class ClaudeTurn:
     staff_id: str
     workers: bool
     env: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class PreparedClaudeLaunch:
+    """One model and account environment for the records and the command."""
+    model: str
+    environment: dict[str, str]
+    loaded: nix_env.Loaded | nix_env.NoEnvrc
+
+
+class ClaudeLaunchPreparation(Enum):
+    AT_START = "prepare the launch at start"
 
 
 @dataclass(frozen=True)
@@ -122,7 +135,7 @@ def _banner_identity(banner: str) -> str:
                  if (match := re.search(r"\b[0-9a-f]{8}\b", line))), "")
 
 
-def _start(turn: ClaudeTurn, binary: str, environment: dict[str, str]) -> str:
+def _prepare_launch(turn: ClaudeTurn, environment: dict[str, str]) -> PreparedClaudeLaunch:
     try:
         selected = accounts.account_for_unscoped_launch(environment, workers=turn.workers)
     except accounts.AccountsError as error:
@@ -143,6 +156,24 @@ def _start(turn: ClaudeTurn, binary: str, environment: dict[str, str]) -> str:
     if isinstance(loaded, nix_env.Refused):
         print(loaded.reason, file=sys.stderr)
         raise _LaunchFailed(1)
+    model = models_registry.claude_model(turn.model, loaded.env) if turn.model else ""
+    return PreparedClaudeLaunch(model, environment, loaded)
+
+
+def prepare_launch(turn: ClaudeTurn) -> PreparedClaudeLaunch | NotDelivered:
+    """Prepare the account and model before assign writes the launch records."""
+    with _environment(turn) as environment:
+        try:
+            return _prepare_launch(turn, environment)
+        except _LaunchFailed as error:
+            return NotDelivered(error.code)
+
+
+def _start(turn: ClaudeTurn, binary: str, environment: dict[str, str],
+           launch: PreparedClaudeLaunch | ClaudeLaunchPreparation) -> str:
+    prepared = _prepare_launch(turn, environment) if isinstance(launch, ClaudeLaunchPreparation) else launch
+    environment.update(prepared.environment)
+    loaded = prepared.loaded
     settings = {name: value for name, value in loaded.env.items()
                 if not name.startswith(("HERDR_", "CODEX_", "CLAUDE_CODE_MESSAGING_"))
                 and name not in {"CLAUDE_CODE_BRIDGE_SESSION_ID", "TMUX", "TMUX_PANE"}}
@@ -153,8 +184,8 @@ def _start(turn: ClaudeTurn, binary: str, environment: dict[str, str]) -> str:
     _ = settings.pop("CLAUDE_CODE_CHILD_SESSION", None)
     arguments = [binary, "--bg", "--name", turn.name, "--dangerously-skip-permissions", "--settings",
                  json.dumps({"sandbox": {"enabled": False}, "env": models_registry.agent_environment(settings)})]
-    if turn.model:
-        arguments += ["--model", turn.model]
+    if prepared.model:
+        arguments += ["--model", prepared.model]
     if turn.effort:
         arguments += ["--effort", turn.effort]
     start_env = models_registry.agent_environment(loaded.env)
@@ -213,7 +244,9 @@ def _transcript_count(native_id: str) -> int:
     count = 0
     if paths:
         try:
-            for line in paths[0].read_text().splitlines():
+            with open_transcript(paths[0]) as stream, TextIOWrapper(stream) as text:
+                lines = text.read().splitlines()
+            for line in lines:
                 try:
                     row = cast(object, json.loads(line))
                 except ValueError:
@@ -236,9 +269,10 @@ def _deliver(turn: ClaudeTurn, native_id: str, environment: Mapping[str, str]) -
             agents_log.append(native_id, cast(agents_log.Role, turn.role), None, datetime.now(timezone.utc))
         except Exception as error:
             print("agents_log: " + " ".join(str(error).splitlines()), file=sys.stderr)
-    script = environment.get("CLAUDE_WORKER_SEND_SCRIPT") or str(SCRIPTS / "message/send.py")
-    result = subprocess.run([str(SCRIPTS / "lib/py"), script, "--to", f"session:{native_id}", "--from", "launcher",
-                             "--file", str(turn.prompt)], env=environment, text=True, stdout=subprocess.PIPE, check=False)
+    script = environment.get("CLAUDE_WORKER_SEND_SCRIPT") or str(session_send.SEND_SCRIPT)
+    result = subprocess.run(session_send.send_argv("--to", f"session:{native_id}", "--from", "launcher",
+                             "--file", str(turn.prompt), send_script=Path(script), python_interpreter=session_send.PYTHON_LAUNCHER),
+                            env=environment, text=True, stdout=subprocess.PIPE, check=False)
     if result.returncode:
         raise _LaunchFailed(2)
     if not result.stdout.startswith(("SENT:", "SKIPPED:")):
@@ -246,7 +280,8 @@ def _deliver(turn: ClaudeTurn, native_id: str, environment: Mapping[str, str]) -
         raise _LaunchFailed(2)
 
 
-def open_worker(turn: ClaudeTurn) -> Delivered | Unchanged | NotDelivered:
+def open_worker(turn: ClaudeTurn, *,
+                launch: PreparedClaudeLaunch | ClaudeLaunchPreparation = ClaudeLaunchPreparation.AT_START) -> Delivered | Unchanged | NotDelivered:
     """Publish a worker before delivering its assignment."""
     with _environment(turn) as environment:
         binary = ""
@@ -266,7 +301,7 @@ def open_worker(turn: ClaudeTurn) -> Delivered | Unchanged | NotDelivered:
                     opening = turn.run / f"{allowed.lock_reference}.opening.md"
                     _ = opening.write_text(handoff.opening(turn.prompt.read_text()))
                     prepared = replace(turn, prompt=opening)
-                created = _start(prepared, binary, environment)
+                created = _start(prepared, binary, environment, launch)
                 return _registered(created, register_seconds)
 
             def dispatch(worker: worker_admission.PublishedWorker) -> worker_admission.SwitchState:
@@ -291,6 +326,11 @@ def open_worker(turn: ClaudeTurn) -> Delivered | Unchanged | NotDelivered:
                 before = TurnsNotCounted() if created else _transcript_count(worker.row.current_session)
                 worker_admission.record_dispatch(allowed, request, worker_admission.SwitchState.DISPATCH_IN_FLIGHT,
                                                  expected_request=request)
+                if turn.role in staff.WORKER_ROLES and worker.row.role != staff.KnownWorkerRole(turn.role):
+                    try:
+                        _ = staff.set_worker_role(worker.row.id, staff.KnownWorkerRole(turn.role))
+                    except (OSError, staff.StaffNotFound, staff.StaffRefused) as error:
+                        print(f"anomaly: {worker.row.id}: {' '.join(str(error).splitlines())}", file=sys.stderr)
                 _deliver(prepared, worker.row.current_session, environment)
                 delivered = Delivered(worker.row.current_session, before, dict(environment))
                 return worker_admission.SwitchState.ASSIGNMENT_ACCEPTED

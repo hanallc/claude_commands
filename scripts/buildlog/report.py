@@ -25,7 +25,6 @@ from scripts.buildlog.moments import COLD_BUILD_MIN_CRATES
 from scripts.buildlog import store
 from scripts.buildlog import record
 from scripts.buildlog import sync, rust_release, aws_report
-from scripts.mac_test import mac_test
 from scripts.buildlog.mac_outcome import (
     DECLINE_REASONS,
     CacheReuse,
@@ -52,8 +51,8 @@ from scripts.buildlog.mac_outcome import (
 
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone  # noqa: E402
-from scripts.aws_target import measurement
-from scripts.build_targets.target_config import SshTarget, is_aws_target, read_targets
+from scripts.aws_target import config as aws_config, ledger, measurement, spend as aws_spend
+from scripts.build_targets.target_config import ssh_target_state_directory
 
 
 KIND_ORDER = ["fmt", "check", "clippy", "mend", "doc", "nextest", "sweep"]
@@ -2272,13 +2271,20 @@ def disk_section() -> list[str]:
         rows.append([free_label, gib(snapshot["free"])])
     rows.extend([f"Cargo outputs unavailable: {reason}", "unavailable"]
                 for reason in snapshot.get("output_unavailable", []))
-    measured = sync.sync_time(snapshot["measured_at"], datetime.now())
+    now = datetime.now()
+    measured = sync.sync_time(snapshot["measured_at"], now)
+    capacity_measured_at = snapshot.get("capacity_measured_at", snapshot["measured_at"])
+    if capacity_measured_at != snapshot["measured_at"]:
+        capacity = sync.sync_time(capacity_measured_at, now)
+        measurement = f"Folder sizes measured by the buildlog disk job at {measured}; free and used space at {capacity}"
+    else:
+        measurement = f"Measured by the buildlog disk job at {measured}"
     return [
         f"### Disk: {snapshot['host']}",
         "",
         *table(["Where", "Size"], rows),
         "",
-        f"Measured by the buildlog disk job at {measured}: allocated blocks, each hard-linked file once.",
+        f"{measurement}: allocated blocks, each hard-linked file once.",
         "",
     ]
 
@@ -2309,70 +2315,80 @@ def peer_sync_lines() -> list[str]:
     return lines
 
 
+def spend_analysis(spends: Sequence[ledger.DailySpend], monthly_limit: Decimal, today: date, pace_days: int) -> list[str]:
+    """Month to date, the month forecast from recent billed days, and the gate compute share."""
+    month = aws_spend.month_spend(spends, today, pace_days)
+    if month is None:
+        return []
+    return [f'**Month to date (UTC {today:%Y-%m}): ${month.to_date:.2f} of the ${monthly_limit:.2f} monthly limit. '
+            + f'Month forecast: ${month.forecast:.2f} at ${month.pace:.2f} a day, the average of the last {month.billed_days} billed days.**',
+            '', f'32-CPU gate compute is {month.gate_share:.0%} of the spend on those days.', '']
+
+
 def aws_section(connection: sqlite3.Connection, day: str) -> list[str]:
     """Render local costs and comparison estimates without contacting AWS or a peer."""
-    configured = tuple(item for item in read_targets() if isinstance(item, SshTarget) and is_aws_target(item))
-    return [line for target in configured for line in aws_target_section(connection, day, target, len(configured) > 1)]
-
-
-def aws_target_section(connection: sqlite3.Connection, day: str, configured: SshTarget, multiple: bool) -> list[str]:
-    target = configured.name
-    directory = mac_test.state_paths(target).directory
+    settings = conf.path('aws_target')
+    directory = ssh_target_state_directory('aws')
     instant = int(time.time())
+    today = datetime.fromtimestamp(instant, UTC).date().isoformat()
+    current_report = day == datetime.fromtimestamp(instant, user_zone()).date().isoformat()
+    last_estimate_day = today if current_report else day
+    spend: aws_spend.Spend | measurement.MeasurementUnavailable = aws_spend.NO_SPEND
     try:
-        inputs = measurement.read_inputs(configured.settings, directory)
-        snapshot = measurement.read_measurement(configured.settings, directory, instant, inputs=inputs)
-        usage = measurement.daily_usage(configured.settings, directory, day, instant, inputs=inputs)
+        inputs = measurement.read_inputs(aws_config.account_settings_path(), directory)
+        snapshot = measurement.read_measurement(settings, directory, instant, inputs=inputs)
+        usage = measurement.daily_usage(settings, directory, day, instant, inputs=inputs)
+        spend = aws_spend.spend_from(inputs, snapshot, directory, instant, last_estimate_day)
     except (OSError, ValueError, ArithmeticError) as error:
         snapshot = measurement.MeasurementUnavailable(str(error))
         usage = measurement.MeasurementUnavailable(str(error))
-    saving = aws_report.estimate_wait_saved(connection, day, target, bounds=day_range(day))
-    lines = [f'### AWS: {target}' if multiple else '### AWS', '']
-    dollars = uptime = 'unavailable'
-    ratio = 'cost per saved hour unavailable'
-    if isinstance(usage, measurement.DailyUsage):
-        dollars = f'{usage.usd:.2f}'
-        uptime = f'{usage.uptime_s / 3600:.2f}'
-    saved = 'queue wait saved unavailable'
-    if isinstance(saving.queue_saved_s, Decimal):
-        hours = saving.queue_saved_s / Decimal(3600)
-        saved = f'about {hours:.2f} h of queue wait saved'
-        ratio = 'unavailable per saved hour'
-        if isinstance(usage, measurement.DailyUsage) and hours > 0:
-            ratio = f'${usage.usd / hours:.2f} per saved hour'
-    lines.append(f'AWS: up {uptime} h, {saving.steps} steps, {saved} for ${dollars} ({ratio}, estimated).')
-    if isinstance(saving.run_saved_s, Decimal):
-        lines.append(f'Estimated run time saved: {saving.run_saved_s / Decimal(3600):.2f} h. Negative differences remain included.')
-    else:
-        lines.append('Estimated run time saved: unavailable; matching command comparisons are missing.')
-    if isinstance(snapshot, measurement.MeasurementUnavailable):
-        lines.append(f'AWS measurement unavailable: {snapshot.reason}.')
-    else:
-        for reading in snapshot.charge_reads:
-            if reading.day == day:
-                lines.append(f'Actual charges: ${reading.actual_usd:.2f}; reconciliation difference '
-                             + f'${reading.difference_usd:.2f}; query cost ${reading.query_usd:.2f}.')
-        if isinstance(snapshot.go_live_at, int):
-            boundary = store.utc_iso(snapshot.go_live_at)
-            periods: list[list[object]] = []
-            for relation in ('<', '>='):
-                rows = fetch(connection, "SELECT sum(coalesce(mem_wait_s,0)) FROM steps WHERE "
-                             + natedev_step_predicate() + f' AND started_at {relation} ?'
-                             + " GROUP BY date(started_at,'localtime') ORDER BY date(started_at,'localtime')", boundary)
-                periods.append([row[0] for row in rows])
-            before, after = periods
-            lines.append('Natedev daily summed queue wait before go-live: '
-                         + (', '.join(seconds(value) for value in before) if before else 'unavailable')
-                         + '; after go-live: ' + (', '.join(seconds(value) for value in after) if after else 'unavailable')
-                         + '; unmatched for load.')
+    if isinstance(spend, measurement.MeasurementUnavailable):
+        spend = aws_spend.NO_SPEND
+    shown = list(spend.days)
+    saving = aws_report.estimate_wait_saved(connection, day, 'aws', bounds=day_range(day))
+    lines = ['### AWS', '', *aws_report.daily_spend_lines(shown, spend.daily_limit, today)]
+    try:
+        pace_days = conf.read(settings).whole('spend_pace_days')
+        lines.extend(spend_analysis(shown, spend.monthly_limit, date.fromisoformat(today), pace_days))
+    except (OSError, ValueError, KeyError) as error:
+        lines.extend((f'Month forecast unavailable: {error}.', ''))
+    notes: list[str] = []
+    if saving.steps > 0:
+        dollars = uptime = 'unavailable'
+        ratio = 'cost per saved hour unavailable'
+        if isinstance(usage, measurement.DailyUsage):
+            dollars = f'{usage.usd:.2f}'
+            uptime = f'{usage.uptime_s / 3600:.2f}'
+        saved = 'queue wait saved unavailable'
+        if isinstance(saving.queue_saved_s, Decimal):
+            hours = saving.queue_saved_s / Decimal(3600)
+            saved = f'about {hours:.2f} h of queue wait saved'
+            ratio = 'unavailable per saved hour'
+            if isinstance(usage, measurement.DailyUsage) and hours > 0:
+                ratio = f'${usage.usd / hours:.2f} per saved hour'
+        notes.append(f'AWS: up {uptime} h, {saving.steps} steps, {saved} for ${dollars} ({ratio}, estimated).')
+        if isinstance(saving.run_saved_s, Decimal):
+            notes.append(f'Estimated run time saved: {saving.run_saved_s / Decimal(3600):.2f} h. Negative differences remain included.')
         else:
-            lines.append('Natedev daily queue wait before and after go-live: unavailable; unmatched for load.')
-    status = sync.read_status(target)
-    if isinstance(status, sync.SyncStatus) and isinstance(status.last_good, sync.LastSynced):
-        lines.append(f'AWS report data synchronized at {sync.sync_time(status.last_good.at, datetime.fromtimestamp(instant))}.')
+            notes.append('Estimated run time saved: unavailable; matching command comparisons are missing.')
+    if isinstance(snapshot, measurement.MeasurementUnavailable):
+        notes.append(f'AWS measurement unavailable: {snapshot.reason}.')
     else:
-        lines.append('AWS report data never synchronized; run buildlog sync.')
-    return [*lines, '']
+        fees = sum((spend.query_usd for spend in shown), Decimal(0))
+        bill_read = ''
+        if snapshot.charge_reads:
+            at = max(reading.at for reading in snapshot.charge_reads)
+            bill_read = datetime.fromtimestamp(at, user_zone()).strftime('Bill read %Y-%m-%d %H:%M %Z. ')
+        notes.append(f'{bill_read}Ledger query fees for these days: ${fees:.2f}.')
+    notes.append('Spot compute can include the older Spot builder.')
+    try:
+        days = conf.read(settings).whole('gate_type_window_days')
+        comparison = aws_report.gate_type_report(directory, day, days)
+        lines.extend(comparison.tables)
+        notes.append(comparison.source)
+    except (OSError, ValueError, ArithmeticError, KeyError) as error:
+        notes.append(f'Gate type comparison unavailable: {error}.')
+    return [*lines, *(f'- {note}' for note in notes), '']
 
 
 def lead_block(
@@ -2476,6 +2492,26 @@ def recorder_health_lines(day: str) -> list[str]:
     return lines
 
 
+def linked_steps_section(connection: sqlite3.Connection, day: str) -> list[str]:
+    """Count selected logical results while retaining every execution host."""
+    start, end = day_range(day)
+    rows = fetch(connection,
+        'SELECT host, count(*), count(DISTINCT CASE WHEN is_final_result=1 THEN step_link END),'
+        + ' sum(CASE WHEN is_final_result=0 THEN duration_s ELSE 0 END), sum(duration_s), max(peak_mem_bytes)'
+        + ' FROM steps WHERE step_link IS NOT NULL AND started_at>=? AND started_at<? GROUP BY host ORDER BY host',
+        start, end)
+    if not rows:
+        return []
+    total = fetch(connection,
+        'SELECT count(DISTINCT step_link) FROM steps WHERE step_link IS NOT NULL'
+        + ' AND is_final_result=1 AND started_at>=? AND started_at<?',
+        start, end)[0][0]
+    body = [[str(host), count(attempts), count(finals), seconds(lost), seconds(elapsed), gib(peak)]
+            for host, attempts, finals, lost, elapsed, peak in rows]
+    return ['### Linked placement steps', '', f'{total} logical results. Lost attempts retain their execution time.', '',
+            *table(['Execution host', 'Attempts', 'Final results', 'Lost time', 'Execution time', 'Peak GiB'], body), '']
+
+
 @target_predicate_scope()
 def report(connection: sqlite3.Connection, day: str, *, usage_day: str | None = None) -> str:
     found = kinds(connection, day)
@@ -2496,6 +2532,7 @@ def report(connection: sqlite3.Connection, day: str, *, usage_day: str | None = 
     lines += lead_block(connection, day, test_calls, waits, copies)
     lines += waiting_lines(waits)
     lines += rebuilds_section(connection, day)
+    lines += linked_steps_section(connection, day)
     lines += launches_section(connection, day)
     for kind in found:
         lines += kind_section(connection, day, kind, hosts)
@@ -2524,7 +2561,7 @@ def report(connection: sqlite3.Connection, day: str, *, usage_day: str | None = 
     lines += [calls_line, *port_lint_line, ci_line, *rust_release.report_line()]
     notes = [
         *peer_sync_lines(),
-        "Peak memory is measured on natedev only. It counts files the step read or wrote that stayed in RAM, so it runs above what the step's processes used.",
+        "Peak memory belongs to the execution host. It includes files that remain in RAM after the step reads or writes them.",
     ]
     lines += ["", *(f"- {note}" for note in notes)]
     return "\n".join(lines)

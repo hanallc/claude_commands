@@ -1,18 +1,30 @@
 """Test Claude launcher validation and artifact placement."""
 from __future__ import annotations
 
+from collections.abc import Callable, Generator
 import json
 import os
+import select
+import shutil
+import shlex
+import signal
+import socket
+from contextlib import ExitStack, contextmanager, suppress
 import subprocess
+import sys
 from pathlib import Path
+from unittest.mock import patch
 from scripts.whoami.account_test_support import write_codex_auth
-from typing import cast
+from typing import ClassVar, cast
 
 from scripts.direct import assign_claude_test_support as support
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import RegistryReadProbe
-from scripts.lib import models_registry
+from scripts.lib import models_registry, process_group, process_start, unit_runs
+from scripts.lib.socket_test_support import short_socket_directory
+from scripts.direct import worker_state
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
+from scripts.production.cli_fixture import process_boundary
 
 
 def configure_pane_account(home: Path, notes: Path) -> None:
@@ -28,25 +40,135 @@ def configure_pane_account(home: Path, notes: Path) -> None:
 
 
 
+GROUP_STOP_READY = """import json, os, socket
+with socket.socket(socket.AF_UNIX) as connection:
+    connection.connect(os.environ['TEST_STOP_SOCKET'])
+    connection.sendall((json.dumps([os.getpid(), os.getpgrp(), 'stop']) + '\\n').encode())
+    connection.recv(1)
+"""
+
+
+@contextmanager
+def exit_watch(pid: int) -> Generator[Callable[[], None]]:
+    """Watch pid from before the stop; the wait returns after the kernel ends the process.
+
+    The peer socket closes before the process is a zombie, so its end of file does not prove the exit.
+    """
+    if sys.platform == "darwin":
+        queue = select.kqueue()
+        try:
+            try:
+                _ = queue.control([select.kevent(pid, select.KQ_FILTER_PROC,
+                    select.KQ_EV_ADD | select.KQ_EV_ONESHOT, select.KQ_NOTE_EXIT)], 0)
+            except ProcessLookupError:
+                yield lambda: None
+                return
+
+            def wait_mac() -> None:
+                assert queue.control(None, 1, TEST_HANG_GUARD_SECS), f"process {pid} did not exit"
+
+            yield wait_mac
+        finally:
+            queue.close()
+        return
+    try:
+        descriptor = os.pidfd_open(pid)
+    except ProcessLookupError:
+        yield lambda: None
+        return
+    try:
+        def wait_linux() -> None:
+            assert select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0], f"process {pid} did not exit"
+
+        yield wait_linux
+    finally:
+        os.close(descriptor)
+
+
+def stop_assignment(command: list[str], environment: dict[str, str], number: int, *, private_worker: bool = False) -> tuple[subprocess.CompletedProcess[str], int]:
+    """Stop a private assignment group from the external test controller."""
+    with short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener:
+        address = str(Path(directory) / "ready")
+        listener.bind(address)
+        listener.listen()
+        listener.settimeout(TEST_HANG_GUARD_SECS)
+        with subprocess.Popen(command[3:], env={**environment, "TEST_STOP_SOCKET": address},
+                start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as launcher:
+            try:
+                with ExitStack() as connections:
+                    peers: list[socket.socket] = []
+                    exits: list[Callable[[], None]] = []
+                    child = 0
+                    for _ in range(2 if private_worker else 1):
+                        connection = connections.enter_context(listener.accept()[0])
+                        connection.settimeout(TEST_HANG_GUARD_SECS)
+                        with connection.makefile() as incoming:
+                            pid, group, kind = cast(tuple[int, int, str], json.loads(incoming.readline()))
+                        assert group == launcher.pid, (group, launcher.pid)
+                        exits.append(connections.enter_context(exit_watch(pid)))
+                        if kind == "stop":
+                            child = pid
+                        peers.append(connection)
+                    assert child > 0
+                    process_group.send_process_group(launcher.pid, number)
+                    for connection in peers:
+                        assert connection.recv(1) == b""
+                    output, errors = launcher.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    for wait in exits:
+                        wait()
+                    assert isinstance(process_start.process_start(child), (process_start.Gone, process_start.Zombie))
+                    if private_worker:
+                        pid = int((Path(environment["STUB_CLAUDE_ROOT"]) / "private-worker-pid").read_text())
+                        assert isinstance(process_start.process_start(pid), (process_start.Gone, process_start.Zombie))
+                return subprocess.CompletedProcess(command, launcher.returncode, output, errors), child
+            finally:
+                with suppress(ProcessLookupError):
+                    process_group.send_process_group(launcher.pid, signal.SIGKILL)
+                _ = launcher.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+
+def private_worker_backend(root: Path, source: str) -> str:
+    """Register a private worker that inherits the launcher's process group."""
+    _ = (root / "private-worker.py").write_text(GROUP_STOP_READY.replace("'stop'", "'worker'"))
+    return source.replace("if sys.argv[1] == '--bg':", """if sys.argv[1] == '--bg':
+    import subprocess
+    from scripts.message import sessions
+    worker = subprocess.Popen([sys.executable, str(root / 'private-worker.py')],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    (root / 'private-worker-pid').write_text(str(worker.pid))
+    os.environ['FIXTURE_BACKEND_PID'] = str(worker.pid)
+    os.environ['FIXTURE_BACKEND_START'] = sessions.process_start(worker.pid) or ''""")
+
+
 class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
-    def test_term_after_the_start_banner_stops_the_unpublished_session(self) -> None:
-        session = self.start_phase("term-after-banner")
-        backend = self.root / "claude-bin"
-        text = backend.read_text().replace(
-            "    print(f'backgrounded · abc12345 · {name}')",
-            "    print(f'backgrounded · abc12345 · {name}', flush=True)\n"
-            + "    import signal\n"
-            + "    os.kill(os.getppid(), signal.SIGTERM)")
-        text = text.replace(
-            "elif sys.argv[1:3] == ['agents', '--json']:",
-            "elif sys.argv[1] == 'stop':\n"
-            + "    with (root / 'backend-stops').open('a') as output:\n"
-            + "        output.write('stop ' + sys.argv[2] + '\\n')\n"
-            + "elif sys.argv[1:3] == ['agents', '--json']:")
-        _ = backend.write_text(text)
-        result = self.worker_launch(session)
-        self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
-        self.assertEqual((self.root / "backend-stops").read_text().splitlines(), ["stop abc12345"])
+    direct_cli_calls: ClassVar[bool] = True
+
+    @process_boundary
+    def test_group_stop_after_the_start_banner_ends_the_private_worker(self) -> None:
+        for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(number=number):
+                session = self.start_phase(f"banner-{number}")
+                backend = self.root / "claude-bin"
+                original = backend.read_text()
+                text = private_worker_backend(self.root, original).replace(
+                    "    print(f'backgrounded · abc12345 · {name}')",
+                    "    print(f'backgrounded · abc12345 · {name}', flush=True)\n"
+                    + "\n".join("    " + line for line in GROUP_STOP_READY.splitlines()))
+                _ = backend.write_text(text)
+                try:
+                    result, pid = stop_assignment(self.assign_command(session), self.launch_environment(session), number, private_worker=True)
+                finally:
+                    _ = backend.write_text(original)
+                self.assertEqual(result.returncode, -number,
+                    result.stdout + result.stderr)
+                self.assertIsInstance(process_start.process_start(pid), (process_start.Gone, process_start.Zombie))
+                worker_pid = int((self.root / "private-worker-pid").read_text())
+                self.assertIsInstance(process_start.process_start(worker_pid), (process_start.Gone, process_start.Zombie))
+                _ = worker_state.worker_status_paths(session)
+                self.assertEqual((session / "impl_status_impl").read_text(), "error\n")
+                self.assertIn("this worker is down", (session / "board.log").read_text())
+                for record in (self.root / "sessions").glob("*.json"):
+                    record.unlink()
 
     def test_an_invalid_registry_wait_records_a_failed_pass_and_status(self) -> None:
         session = self.start_phase("invalid-registry-wait")
@@ -58,28 +180,30 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
         self.assertEqual(finished["status"], "error")
         self.assertEqual((session / "impl_status_impl").read_text(), "error\n")
 
-    def test_term_during_the_worker_wait_ends_the_agent_and_records_failure(self) -> None:
+    @process_boundary
+    def test_group_term_during_the_worker_wait_records_a_dead_launcher(self) -> None:
         session = self.start_phase("term-during-wait")
         stub = self.root / "claude-bin"
-        _ = stub.write_text(stub.read_text().replace(
+        _ = stub.write_text(private_worker_backend(self.root, stub.read_text()).replace(
             "(root / 'worker_state').write_text('idle')",
             "(root / 'worker-wait-ready').touch()"))
         watcher = self.root / "scripts/agents/heartbeat_watch.sh"
         _ = watcher.write_text('''#!/usr/bin/env bash
 printf '%s\\n' "$3" > "$STUB_CLAUDE_ROOT/agent-pid"
 python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/worker-wait-ready"
-kill -TERM "$PPID"
-exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
-''')
-        result = self.worker_launch(session)
+exec python3 -c ''' + shlex.quote(GROUP_STOP_READY) + "\n")
+        result, watcher_pid = stop_assignment(self.assign_command(session), self.launch_environment(session), signal.SIGTERM, private_worker=True)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         agent_pid = int((self.root / "agent-pid").read_text())
         with self.assertRaises(ProcessLookupError):
             os.kill(agent_pid, 0)
+        self.assertIsInstance(process_start.process_start(watcher_pid), (process_start.Gone, process_start.Zombie))
+        worker_pid = int((self.root / "private-worker-pid").read_text())
+        self.assertIsInstance(process_start.process_start(worker_pid), (process_start.Gone, process_start.Zombie))
+        _ = worker_state.worker_status_paths(session)
         self.assertEqual((session / "impl_status_impl").read_text(), "error\n")
-        self.assertEqual(self.open_passes(session)["impl"]["status"], "error")
-        finished, = self.launch_records(session, "pass_finished")
-        self.assertEqual(finished["status"], "error")
+        self.assertEqual(self.open_passes(session)["impl"]["status"], "active")
+        self.assertEqual(self.launch_records(session, "pass_finished"), [])
         board = (session / "board.log").read_text()
         self.assertIn("blocked:", board)
         self.assertIn("this worker is down", board)
@@ -98,17 +222,29 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
             "    baseline = session / 'phases/3/phase_baseline'",
             "    (root / 'worker-models-path').write_text(settings['MODELS_CONFIG_FILE'])\n"
             + "    baseline = session / 'phases/3/phase_baseline'"))
-        result = subprocess.run(self.assign_command(session), env=configuration.environment(environment),
-                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        result = self.run_assignment(self.assign_command(session), configuration.environment(environment))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.root / "worker-models-path").read_text(), str(custom.resolve()))
 
     def test_a_failed_claude_launch_ends_its_run_and_keeps_its_worker_row(self) -> None:
         session = self.start_phase("failed-worker")
         environment = self.launch_environment(session)
-        marker = Path(environment["UNIT_ACTIVE_DIR"]) / environment["CODEX_THREAD_ID"]
-        marker.parent.mkdir(parents=True)
-        _ = marker.write_text(str(session) + "\n")
+        environment.update({
+            "SCRATCH_ROOT": str(self.root / "scratch"),
+            "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
+            "SCRATCH_HOLDS": str(self.root / "scratch-holds.json"),
+            "DESIGN_ROLES_STATE": str(self.root / "designs"),
+        })
+        # This backend has no native worker panes to remove.
+        _ = (self.assign_script.parent / "remove_workers.py").write_text("")
+        copies = self.root / "scripts/copies"
+        copies.mkdir(exist_ok=True)
+        _ = shutil.copy2(support.DIRECT_DIR.parent / "copies/copies.py", copies / "copies.py")
+        environment["COPIES_CONFIG"] = str(support.DIRECT_DIR.parents[1] / "config/copies.conf")
+        with patch.dict(os.environ, environment):
+            row = staff.local_snapshot().by_current_session(environment["CODEX_THREAD_ID"])
+            assert row is not None
+            _ = staff.set_run(row.id, staff.OpenRun(session))
         registry = Path(environment["NOTIFIER_SESSIONS_DIR"])
         registry.mkdir(parents=True)
         from scripts.message import sessions
@@ -119,10 +255,10 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         }))
         sender = self.root / "opening-send.py"
         _ = sender.write_text(sender.read_text().replace("print('SENT: fixture')", "raise SystemExit(2)"))
-        result = subprocess.run(self.assign_command(session), env=environment,
-                                text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        result = self.run_assignment(self.assign_command(session), environment)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertFalse(marker.exists(), result.stdout + result.stderr)
+        with patch.dict(os.environ, environment):
+            self.assertIsNone(unit_runs.open_run(environment["CODEX_THREAD_ID"]), result.stdout + result.stderr)
         state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
         self.assertEqual(state["status"], "error")
         self.assertEqual([event["status"] for event in self.launch_records(session, "run_finished")], ["error"])
@@ -131,6 +267,7 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         self.assertEqual(worker.parent, staff.ReportsTo(staff.native_id(self.staff_parent)))
         self.assertTrue(worker.current_session)
 
+    @process_boundary
     def test_delivery_has_assign_as_its_only_launcher_parent(self) -> None:
         session = self.start_phase("one-launcher")
         sender = self.root / "opening-send.py"
@@ -153,13 +290,12 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         self.assertNotEqual(sender_pid, launcher_pid)
         self.assertNotIn("agent_bg.sh", processes[parent_pid][1])
 
+    @process_boundary
     def test_implementation_reads_one_registry_snapshot_across_its_child_processes(self) -> None:
         session = self.start_phase("registry-snapshot")
         environment = self.environment()
         probe = RegistryReadProbe(self.root, Path(environment["MODELS_CONFIG_FILE"]))
-        result = subprocess.run(
-            self.assign_command(session),
-            env=probe.environment(environment), capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        result = self.run_assignment(self.assign_command(session), probe.environment(environment))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(probe.reads()), 1, probe.reads())
 
@@ -168,10 +304,7 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         session_dir = self.start_phase("director")
         environment = self.environment()
         environment["CLAUDE_CODE_SESSION_ID"] = "sid-director"
-        result = subprocess.run(
-            self.assign_command(session_dir),
-            check=False, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
-        )
+        result = self.run_assignment(self.assign_command(session_dir), environment)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.recorded_worker(session_dir).parent, staff.ReportsTo(staff.native_id(self.staff_parent)))
 
@@ -187,6 +320,7 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((session / "wait-context").read_text(), f"{session}|impl")
 
+    @process_boundary
     def test_new_launch_keeps_heartbeat_watcher_output(self) -> None:
         watcher = self.root / "scripts/agents/heartbeat_watch.sh"
         _ = watcher.write_text(
@@ -203,13 +337,9 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         self.assertIn("heartbeat watcher output", result.stdout)
 
     def test_a_launch_naming_its_phase_writes_in_that_phase_directory(self) -> None:
-        # Two phases running the same role each name their own, so neither overwrites the
-        # other's status, summary or log, and the name stays off the worker's address.
+        # Each phase keeps its own artifacts and the same worker address.
         session_dir = self.start_phase("phase-directory")
-        result = subprocess.run(
-            self.assign_command(session_dir, "--phase", "3"),
-            check=False, capture_output=True, text=True, env=self.environment(), timeout=TEST_HANG_GUARD_SECS,
-        )
+        result = self.run_assignment(self.assign_command(session_dir, "--phase", "3"), self.environment())
         self.assertEqual(result.returncode, 0, result.stderr)
         phase_dir = session_dir / "phases" / "3"
         self.assertEqual((phase_dir / "impl_status_impl").read_text(encoding="utf-8").strip(), "implemented")
@@ -257,9 +387,7 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
     def test_phase_claim_precedes_the_claude_worker_open(self) -> None:
         session = self.start_phase("claim-before-open")
         environment, calls = self.claim_fixture(session, "clear")
-        result = subprocess.run(self.assign_command(session, "--phase", "3"),
-                                capture_output=True, text=True, check=False, env=environment,
-                                timeout=TEST_HANG_GUARD_SECS)
+        result = self.run_assignment(self.assign_command(session, "--phase", "3"), environment)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls.read_text().splitlines(), ["sid-director.phase-3 check reviewed.txt --json"])
         state = (session / "phases/3/delegated_phase_reservation_state.json").read_text()
@@ -269,9 +397,7 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
     def test_refused_phase_claim_prevents_the_claude_worker_open(self) -> None:
         session = self.start_phase("claim-refused")
         environment, calls = self.claim_fixture(session, "blocked")
-        result = subprocess.run(self.assign_command(session, "--phase", "3"),
-                                capture_output=True, text=True, check=False, env=environment,
-                                timeout=TEST_HANG_GUARD_SECS)
+        result = self.run_assignment(self.assign_command(session, "--phase", "3"), environment)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("phase 3 could not claim its files", result.stderr)
         self.assertEqual(len(calls.read_text().splitlines()), 1)
@@ -281,15 +407,14 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
     def test_unreadable_ledger_allows_the_worker_with_the_claim_pending(self) -> None:
         session = self.start_phase("claim-unreadable")
         environment, calls = self.claim_fixture(session, "ledger_unreadable")
-        result = subprocess.run(self.assign_command(session, "--phase", "3"),
-                                capture_output=True, text=True, check=False, env=environment,
-                                timeout=TEST_HANG_GUARD_SECS)
+        result = self.run_assignment(self.assign_command(session, "--phase", "3"), environment)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(calls.read_text().splitlines()), 1)
         state = (session / "phases/3/delegated_phase_reservation_state.json").read_text()
         self.assertIn("enrolled_awaiting_first_touch", state)
         self.assertEqual((session / "dispatch_events.txt").read_text().splitlines(), ["claim", "open"])
 
+    @process_boundary
     def test_new_worker_identity_precedes_the_heartbeat_watcher(self) -> None:
         session = self.start_phase("identity-before-heartbeat")
         watcher = self.root / "scripts/agents/heartbeat_watch.sh"

@@ -2,12 +2,14 @@
 """The one item /next shows from the four lists the user works through, and moving an item to the end.
 
     next_item.py show [--production NAME] [--kind change|proposal|efficiency|question] [--order urgent|oldest|newest] [--all-below]
+    next_item.py show --id C1535|sdlc/C1535 [--production NAME]
     next_item.py move-to-end --kind change|proposal|efficiency|question [--production NAME] [--all-below]
 
 `show` prints the item's kind on the first line, then the item as its list prints it, and pins it
 (urgency.py). With a kind it takes that list's first item; with none, the first across the four
 lists (`urgency.top_across`). The order is urgency.py's: `urgent` (the default) or `oldest` or
-`newest`. It prints one item and never the one after it.
+`newest`. It prints one item and never the one after it. With `--id` it prints that change row
+and pins nothing; a row with a verdict, or an ID on no list, prints one line that says so.
 
 `move-to-end` moves the item /next last showed from that list to the end of the list, so the next
 `show` takes another item. It shows nothing after it.
@@ -37,25 +39,22 @@ from pathlib import Path
 from typing import NamedTuple, TypeVar, cast
 
 from scripts.production import change_review
-from scripts.production import proposals_folder
-from scripts.production import proposals_table
-from scripts.production.footer_counts import efficiency_ledger
 from scripts.production.store_owner import document_id
 from scripts.production import staff
-from scripts.production.production_doc import Refusal, read_production
-from scripts.production.update_registration import QuestionStaff, RegistrationFailure, open_lists, question_queue
+from scripts.production.production_doc import Refusal
+from scripts.production.update_registration import RegistrationFailure
 
 from scripts.lib import urgency  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
-from scripts.nightly_review import candidates
 
 CHANGE = "change"
 PROPOSAL = "proposal"
 EFFICIENCY = "efficiency"
 QUESTION = "question"
 # The order a tie across lists keeps.
-KINDS = (CHANGE, PROPOSAL, EFFICIENCY, QUESTION)
+INVESTIGATION = "investigation"
+KINDS = (CHANGE, PROPOSAL, EFFICIENCY, QUESTION, INVESTIGATION)
 Item = TypeVar("Item")
 
 
@@ -90,68 +89,80 @@ READ_CHANGE_LISTS = ReadChangeLists()
 
 
 def change_queue(doc: Path, below: bool = False, *,
-                 prepared: change_review.ChangeQueue | ReadChangeLists = READ_CHANGE_LISTS) -> Queue:
+                 prepared: change_review.ChangeQueue | change_review.PreparedChangeLists | ReadChangeLists = READ_CHANGE_LISTS) -> Queue:
     """The production's current and earlier change rows, and with `below` each lower one's."""
-    queue = (change_review.change_queue(change_review.scope_list(doc), doc, below)
-             if isinstance(prepared, ReadChangeLists) else prepared)
+    if isinstance(prepared, change_review.PreparedChangeLists):
+        queue = change_review.change_queue(change_review.scope_list(doc, prepared=prepared), doc, below, prepared=prepared)
+    else:
+        queue = (change_review.change_queue(change_review.scope_list(doc), doc, below)
+                 if isinstance(prepared, ReadChangeLists) else prepared)
     return Queue(queue.name, _as_text(queue.entries, lambda entry: change_review.describe(entry.item)))
 
 
 def efficiency_queue(doc: Path, below: bool = False) -> Queue:
     """The open candidates of the production's Efficiency ledger, and with `below` of each one below it."""
-    ledgers = dict.fromkeys(ledger for each in proposals_folder.scope_docs(doc, below)
-                            if (ledger := efficiency_ledger(each)) is not None)
-    lines = [line for ledger in ledgers for line in candidates.read_lines(ledger)]
-    return Queue(urgency.scope_queue(candidates.QUEUE, below), _as_text(candidates.entries(lines), lambda entry: entry.item.line))
+    return read_queue(EFFICIENCY, doc, below)
+
+
+def review_scope(production: Path | None, record: staff.StaffSnapshot) -> Path | staff.StaffRow:
+    """Use the caller's producer scope unless a production is selected."""
+    caller = record.by_current_session(staff.caller_identity()) if production is None else None
+    return caller if caller is not None and caller.kind == "producer" else _doc(production)
 
 
 def read_queue(kind: str, production: Path | None, below: bool = False, *,
                record: staff.StaffSnapshot | None = None) -> Queue:
     """The waiting items of one list."""
+    from scripts.review_links import review_items
     try:
-        match kind:
-            case "change":
-                return change_queue(_doc(production), below)
-            case "proposal":
-                doc = _doc(production)
-                waiting, _ = proposals_table.waiting_entries(doc, below)
-                return Queue(urgency.scope_queue(proposals_table.queue(doc, record=record), below), _as_text(waiting, proposals_table.proposal_text))
-            case "question":
-                doc = _doc(production)
-                identities = QuestionStaff.read() if record is None else QuestionStaff.for_record(record)
-                owner = identities.owner(doc)
-                found = read_production(owner)
-                due = open_lists(found, below, identities=identities).due
-                return Queue(question_queue(found, below), _as_text(due, lambda entry: entry.item.line()))
-            case _:
-                return efficiency_queue(_doc(production), below)
+        record = staff.snapshot() if record is None else record
+        scope = review_scope(production, record)
+        name, entries = review_items.next_queue(kind, scope, below, record)
+        return Queue(name, entries)
     except (change_review.ChangeReviewError, RegistrationFailure, Refusal, OSError, ValueError) as error:
         raise NextError(f"{kind}: {error}") from None
 
 
 def show(kind: str, order: str, production: Path | None, below: bool = False) -> str:
     """The one item /next shows, led by its kind; it is pinned."""
-    record = None if kind == EFFICIENCY else staff.snapshot()
+    record = staff.snapshot()
     if kind:
         queue = read_queue(kind, production, below, record=record)
         shown = urgency.top(queue.entries, queue.name, order)
         return f"{kind}\n{shown.item}" if shown is not None else f"no {kind} is waiting for you"
-    doc = _doc(production)
+    scope = review_scope(production, record)
     queues: dict[str, list[urgency.Entry[str]]] = {}
     kinds: dict[str, str] = {}
     for each in KINDS:
         try:
-            queue = read_queue(each, doc, below, record=record)
+            queue = read_queue(each, scope if isinstance(scope, Path) else None, below, record=record)
         except NextError as error:
             print(f"next_item: {error}", file=sys.stderr)
             continue
         queues[queue.name] = queue.entries
         kinds[queue.name] = each
-    found = urgency.top_across(queues, urgency.scope_queue(f"next-{document_id(doc, record=record)}", below), order)
+    owner = scope.id if isinstance(scope, staff.StaffRow) else document_id(scope, record=record)
+    found = urgency.top_across(queues, urgency.scope_queue(f"next-{owner}", below), order)
     if found is None:
         return "nothing is waiting for you"
     name, shown = found
     return f"{kinds[name]}\n{shown.item}"
+
+
+def show_change(value: str, production: str) -> str:
+    """The change row with this ID, as /next shows a change; a row with a verdict, or on no list, is one line."""
+    try:
+        target = change_review.resolve_row(value, production=production)
+        row = next((row for row in change_review.review_rows(target.path) if row["#"] == target.row), None)
+        if row is None:
+            return f"{value} is on no review list"
+        if row.get("Verdict"):
+            return f"{value} has its verdict: {row['Verdict']}"
+        return f"{CHANGE}\n{change_review.describe(row | {'#': change_review.row_display_id(target.path, target.row)})}"
+    except change_review.RowNotListed:
+        return f"{value} is on no review list"
+    except (change_review.ChangeReviewError, OSError) as error:
+        raise NextError(f"{CHANGE}: {error}") from None
 
 
 def move_to_end(kind: str, production: Path | None, below: bool = False, *, key: str = "",
@@ -176,6 +187,7 @@ def main(arguments: list[str]) -> int:
     shown = actions.add_parser("show")
     _ = shown.add_argument("--kind", choices=KINDS, default="")
     _ = shown.add_argument("--order", choices=urgency.ORDERS, default=urgency.URGENT)
+    _ = shown.add_argument("--id", default="", dest="row")
     moved = actions.add_parser("move-to-end")
     _ = moved.add_argument("--kind", choices=KINDS, required=True)
     for action in (shown, moved):
@@ -185,6 +197,9 @@ def main(arguments: list[str]) -> int:
     production_name = cast(str, args.production)
     below = cast(bool, args.below)
     try:
+        if cast(str, args.action) == "show" and cast(str, args.row):
+            print(show_change(cast(str, args.row), production_name))
+            return 0
         production = change_review.production_doc(production_name) if production_name else None
         if cast(str, args.action) == "show":
             print(show(cast(str, args.kind), cast(str, args.order), production, below))

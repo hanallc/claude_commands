@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.direct import workers
-from scripts.lib import scratch
+from scripts.lib import git_files, scratch
 
 VERIFY_CACHE = "verify_cache"
 # A folder holding any of these is a checkout or a cargo target.
@@ -65,14 +65,17 @@ def scratch_folders(run: Path) -> list[Path]:
         current = frontier.pop()
         try:
             with os.scandir(current) as entries:
-                folders = [entry.path for entry in entries if entry.is_dir(follow_symlinks=False)]
+                listed = list(entries)
+                folders = {entry.path for entry in listed if entry.is_dir(follow_symlinks=False)}
+                folders.update(str(path) for path in scratch.marked_folders(Path(entry.path) for entry in listed))
         except OSError:
             continue
         for folder in sorted(folders):
             candidate = Path(folder).resolve()
             if candidate in protected:
                 continue
-            if (current == str(run) and os.path.basename(folder) == VERIFY_CACHE) or is_copy(folder):
+            if ((current == str(run) and os.path.basename(folder) == VERIFY_CACHE)
+                    or is_copy(folder) or scratch.removal_mark(Path(folder)).exists()):
                 if not any(candidate in cwd.parents for cwd in protected):
                     found.append(Path(folder))
             else:
@@ -82,25 +85,13 @@ def scratch_folders(run: Path) -> list[Path]:
 
 def worktree_source(folder: Path) -> Path | None:
     """The common git folder of the repo folder is a linked worktree of, or None when folder is no
-    linked worktree. .git holds "gitdir: <common>/worktrees/<name>"; that folder names the common
-    one in its commondir file, which is read when present."""
-    dot_git = folder / ".git"
-    if dot_git.is_symlink() or not dot_git.is_file():
+    linked worktree: its .git is a file, not a link."""
+    if (folder / ".git").is_symlink() or not (folder / ".git").is_file():
         return None
     try:
-        line = dot_git.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeDecodeError):
+        return git_files.at(folder).common_dir
+    except git_files.GitFilesError:
         return None
-    if not line.startswith("gitdir:"):
-        return None
-    gitdir = Path(line.removeprefix("gitdir:").strip())
-    if not gitdir.is_absolute():
-        gitdir = folder / gitdir
-    try:
-        common = (gitdir / (gitdir / "commondir").read_text(encoding="utf-8").strip()).resolve()
-    except (OSError, UnicodeDecodeError):
-        common = gitdir.parent.parent
-    return common if common.is_dir() else None
 
 
 def git(common: Path, *arguments: str) -> bool:
@@ -113,7 +104,7 @@ def git(common: Path, *arguments: str) -> bool:
 
 
 def remove(folder: Path) -> None:
-    scratch.remove_with_cargo_output(folder, remove_tree)
+    scratch.remove_marked(folder, source_deletion=scratch.SourceDeletion.RUN)
 
 
 def remove_tree(folder: Path) -> None:
@@ -136,7 +127,10 @@ def end_tracked_scratch(run: Path) -> int:
         resolved = path.resolve()
         return any(cwd == resolved or resolved in cwd.parents for cwd in protected)
 
-    return len(scratch.end(task, keep=retained))
+    result = scratch.end(task, keep=retained)
+    for folder in result.kept:
+        print(f"remove_run_scratch: kept {folder.path}: {folder.reason}", file=sys.stderr)
+    return len(result)
 
 
 def main() -> int:
@@ -151,7 +145,7 @@ def main() -> int:
         for folder in scratch_folders(run):
             try:
                 remove(folder)
-            except OSError as error:
+            except (OSError, scratch.ScratchError) as error:
                 failed += 1
                 print(f"remove_run_scratch: could not remove {folder}: {error}", file=sys.stderr)
                 continue

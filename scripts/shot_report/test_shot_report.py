@@ -22,9 +22,12 @@ from scripts.shot_report import shot_report as report_module
 from scripts.shot_report.changes import MeasurementChange, ProductChange, append_change, read_changes, write_changes
 from scripts.shot_report.episodes import (
     GAP_CATEGORIES, EpisodeTimeline, LegacyEvidenceUnavailable, NoObservablePath, NoneCited,
-    OneCitedShot, SeveralCitedShots, TimelineUnavailable, read_episodes, write_episodes,
+    OneCitedShot, SeveralCitedShots, TimelineUnavailable, read_episodes, split_episodes, write_episodes,
 )
-from scripts.shot_report.transcripts import AvailableTimingSource, ExactAttemptCountFromOrderedCaptures
+from scripts.lib.transcript_test_support import compressed_copy
+from scripts.shot_report.transcripts import (
+    AvailableTimingSource, ExactAttemptCountFromOrderedCaptures, PersistentScanCache, scan_calls,
+)
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -824,23 +827,27 @@ class ShotReportTest(unittest.TestCase):
 
     def test_mac_reader_chunks_round_trip_and_count_source_bytes(self) -> None:
         content = b'{"cmd":"hana_shot.py shot"}\n' + b'x' * (2 * 65536 + 17)
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / ".codex/sessions/capture.jsonl"
-            source.parent.mkdir(parents=True)
-            _ = source.write_bytes(content)
-            clock = "import time\ntime.monotonic = lambda: 0\n"
-            result = subprocess.run([sys.executable, "-c", clock + report_module._mac_reader_source()],  # pyright: ignore[reportPrivateUsage]
-                                    input="{}", capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False,
-                                    env={**os.environ, "HOME": directory})
-        self.assertEqual(result.returncode, 0, result.stderr)
-        rows = [cast(dict[str, object], json.loads(line)) for line in result.stdout.splitlines()]
-        chunks = [row for row in rows if row.get("kind") == "chunk"]
-        self.assertTrue(chunks)
-        self.assertTrue(all(row.get("encoding") == "zlib+base64" for row in chunks))
-        source_chunks = [_chunk_bytes(row) for row in chunks]
-        self.assertTrue(all(chunk for chunk in source_chunks))
-        self.assertEqual(sum(map(len, source_chunks)), len(content))
-        self.assertEqual(b"".join(source_chunks), content)
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed), tempfile.TemporaryDirectory() as directory:
+                source = Path(directory) / ".codex/sessions/capture.jsonl"
+                source.parent.mkdir(parents=True)
+                _ = source.write_bytes(content)
+                if compressed:
+                    _ = compressed_copy(source)
+                clock = "import time\ntime.monotonic = lambda: 0\n"
+                result = subprocess.run([sys.executable, "-c", clock + report_module._mac_reader_source()],  # pyright: ignore[reportPrivateUsage]
+                                        input="{}", capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False,
+                                        env={**os.environ, "HOME": directory})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = [cast(dict[str, object], json.loads(line)) for line in result.stdout.splitlines()]
+            chunks = [row for row in rows if row.get("kind") == "chunk"]
+            self.assertTrue(chunks)
+            self.assertTrue(all(row.get("encoding") == "zlib+base64" for row in chunks))
+            source_chunks = [_chunk_bytes(row) for row in chunks]
+            self.assertTrue(all(chunk for chunk in source_chunks))
+            self.assertEqual(sum(map(len, source_chunks)), len(content))
+            self.assertEqual(b"".join(source_chunks), content)
+
 
     def test_mac_reader_resumes_legacy_manifest_then_restarts_same_size_rewrite(self) -> None:
         first_content = b'{"cmd":"hana_shot.py shot"}\n' + b'a' * (65536 + 23)
@@ -901,6 +908,82 @@ class ShotReportTest(unittest.TestCase):
             self.assertEqual(mirror.read_bytes(), rewritten)
             manifest = report_module._read_object(state_dir / "mac_manifest.json")  # pyright: ignore[reportPrivateUsage]
             self.assertEqual(cast(dict[str, object], manifest[key])["cursor"], len(rewritten))
+
+    def test_mac_compression_keeps_mirror_and_cached_citations_without_parsing(self) -> None:
+        real_run = subprocess.run
+        transfers: list[list[dict[str, object]]] = []
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "remote"
+            source = home / ".claude/projects/studio/session.jsonl"
+            source.parent.mkdir(parents=True)
+            start = datetime.fromisoformat("2026-10-01T12:00:00+00:00")
+            rows = [
+                _timeline_part(start, "session", "assistant", {
+                    "type": "tool_use", "id": "shot", "name": "Bash",
+                    "input": {"command": "python3 hana_shot.py shot"},
+                }),
+                _timeline_part(start + timedelta(seconds=5), "session", "user", {
+                    "type": "tool_result", "tool_use_id": "shot", "content": "saved /tmp/front.png",
+                }),
+                _timeline_part(start + timedelta(seconds=30), "session", "assistant", {
+                    "type": "tool_use", "id": "send", "name": "Bash",
+                    "input": {"command": "python3 send.py --text 'Use /tmp/front.png'"},
+                }),
+            ]
+            content = ("\n".join(json.dumps(row) for row in rows) + "\n").encode()
+            _ = source.write_bytes(content)
+            state_dir = Path(directory) / "state"
+
+            def local_ssh(args: list[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+                self.assertEqual(args[0], "ssh")
+                command = shlex.shlex(args[-1], posix=True, punctuation_chars=";")
+                command.whitespace_split = True
+                reader = list(command)[2]
+                result = real_run([sys.executable, "-c", reader],
+                                  input=cast(bytes, options["input"]), capture_output=True,
+                                  timeout=TEST_HANG_GUARD_SECS, check=False,
+                                  env={**os.environ, "HOME": str(home)})
+                transfers.append([cast(dict[str, object], json.loads(line))
+                                  for line in result.stdout.splitlines()])
+                _ = cast(BinaryIO, options["stdout"]).write(result.stdout)
+                return subprocess.CompletedProcess(args, result.returncode,
+                                                   stderr=f"rc={result.returncode}\n".encode() + result.stderr)
+
+            with mock.patch.object(subprocess, "run", side_effect=local_ssh):
+                first = report_module._mac_evidence(state_dir)  # pyright: ignore[reportPrivateUsage]
+            assert isinstance(first, report_module.MacEvidenceAvailable)
+            self.assertEqual(first.bytes_read, len(content))
+            cache = PersistentScanCache(state_dir / "scan-cache-mac.pickle")
+            before = scan_calls(first.claude_root, first.codex_root, cache=cache, source_host="mac")
+            self.assertEqual([call.cited_image_paths for call in before], [("/tmp/front.png",)])
+            mirror = first.claude_root / "studio/session.jsonl"
+            mirror_stat = mirror.stat()
+            source_stat = source.stat()
+            archive = compressed_copy(source)
+            self.assertNotEqual(archive.stat().st_ino, source_stat.st_ino)
+            self.assertEqual(archive.stat().st_mtime_ns, source_stat.st_mtime_ns)
+
+            with mock.patch.object(subprocess, "run", side_effect=local_ssh):
+                second = report_module._mac_evidence(state_dir)  # pyright: ignore[reportPrivateUsage]
+            assert isinstance(second, report_module.MacEvidenceAvailable)
+            self.assertFalse(any(row["kind"] == "chunk" for row in transfers[1]))
+            file_row = next(row for row in transfers[1] if row["kind"] == "file")
+            self.assertEqual(file_row["start"], len(content))
+            self.assertEqual(file_row["inode"], archive.stat().st_ino)
+            self.assertEqual(second.bytes_read, 0)
+            self.assertEqual(mirror.read_bytes(), content)
+            after_stat = mirror.stat()
+            self.assertEqual((after_stat.st_ino, after_stat.st_size, after_stat.st_mtime_ns),
+                             (mirror_stat.st_ino, mirror_stat.st_size, mirror_stat.st_mtime_ns))
+            with (mock.patch("scripts.shot_report.transcripts._parse_lines", side_effect=AssertionError("parsed")),
+                  mock.patch("scripts.shot_report.transcripts.open_transcript", side_effect=AssertionError("read"))):
+                after = scan_calls(second.claude_root, second.codex_root, cache=cache, source_host="mac")
+            self.assertEqual(after.bytes_read, 0)
+            self.assertEqual(list(after), list(before))
+            self.assertEqual(after.tool_events, before.tool_events)
+            self.assertEqual([call.cited_image_paths for call in after], [("/tmp/front.png",)])
+            self.assertEqual([episode.kept_shot for episode in split_episodes(after, 300)],
+                             [OneCitedShot(0)])
 
     def test_previous_reader_manifest_resumes_without_duplicate_calls(self) -> None:
         content = (FIXTURES / "codex/sessions/2026/10/01/rollout-control.jsonl").read_bytes()

@@ -1,6 +1,7 @@
 """Move a pane worker through its shared conversation and terminal APIs."""
 from __future__ import annotations
 
+import subprocess
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -13,10 +14,9 @@ from scripts.accounts.accounts import SessionMoveOutcome
 from scripts.herdr import herdr, worker_panes
 from scripts.direct import progress_history
 from scripts.lib import conf
-from scripts.lib.resume_message import AccountMove, BusyPass, resume_message
+from scripts.lib.resume_message import AccountMove, BusyPass, NO_OWN_PASS, resume_message
 from scripts.production import session_staff, staff
-from scripts.shutdown import restart, stop_resume, stop_results
-from scripts.whoami import agent_accounts
+from scripts.agents import detached_runs, restart, stop_resume, stop_results
 
 WorkerStartFailure = (worker_panes.IncompleteStart | worker_panes.AdmissionRefused | worker_panes.UnpublishedWorker
                       | worker_panes.ProcessUnknownWorker | worker_panes.UncertainWorker | worker_panes.StartRefused)
@@ -31,6 +31,21 @@ class WorkerMove:
     why: str
     run: Path
     client: herdr.Herdr
+
+
+@dataclass(frozen=True)
+class WorkerResume:
+    """A worker can resume its conversation on the destination account."""
+
+    state: worker_panes.OpenWorker | worker_panes.StoppedWorker | worker_panes.ClosedWorker
+    role: staff.WorkerRole
+    source: str
+    close_check: worker_panes.CloseAllowed | worker_panes.Kept = worker_panes.CloseAllowed()
+    detached_context: str = ""
+
+    @property
+    def kept_open_reason(self) -> str:
+        return self.close_check.blocker if isinstance(self.close_check, worker_panes.Kept) else ""
 
 
 def _observe(move: WorkerMove) -> worker_panes.WorkerPane:
@@ -50,10 +65,6 @@ def _failed(row: staff.StaffRow, result: WorkerStartFailure) -> accounts.Session
 
 def _confirm(move: WorkerMove, common: moves.MoveCommon) -> None:
     confirmed = moves.ConfirmedMove(**common, kind="confirmed", worker=move.row.name, run=str(move.run))
-    if move.family == "codex":
-        confirmed["home"] = str(agent_accounts.codex_account_home(move.target).home)
-    else:
-        confirmed["config_dir"] = str(accounts.claude_account_dir(move.target))
     moves.append_move(confirmed)
 
 
@@ -73,6 +84,17 @@ def _source_account(row: staff.StaffRow) -> str:
     return accounts.claude_config_label(Path(environment.get("CLAUDE_CONFIG_DIR", str(accounts.main_config_dir()))))
 
 
+def _own_policy(move: WorkerMove, role: staff.WorkerRole) -> worker_panes.LaunchPolicy:
+    """Keep the worker's own family and model; a move changes only the account."""
+    family = "codex" if move.family == "codex" else "claude" if move.family == "claude" else "assigned"
+    policy = worker_panes.launch_policy(role, family)
+    try:
+        kind, _, arguments = restart.session_launch(str(move.row.current_session), move.row.name)
+    except OSError:
+        return policy
+    return replace(policy, settings=worker_panes.kept_settings(policy.settings, arguments)) if kind == policy.settings.kind else policy
+
+
 def _request(move: WorkerMove, source: str, terminal: str) -> moves.MoveCommon:
     common = moves.MoveCommon(at=datetime.now(timezone.utc).isoformat(), tool="codex" if move.family == "codex" else "claude",
                               subject=move.row.id, move_id=uuid4().hex)
@@ -85,20 +107,24 @@ def _request(move: WorkerMove, source: str, terminal: str) -> moves.MoveCommon:
     return common
 
 
-def _continue_pass(move: WorkerMove, opened: worker_panes.OpenWorker, source: str, target: str) -> None:
+def _continue_pass(move: WorkerMove, opened: worker_panes.OpenWorker, source: str, target: str,
+                   detached: str = "") -> None:
     passed = worker_panes.worker_pass(move.row, move.run)
-    if passed.get("status") in ("active", "refused"):
+    detached = detached or detached_runs.resume_context(move.run / detached_runs.DETACHED_RUNS_DIR, move.row.name)
+    if passed.get("status") in ("active", "refused") or detached:
+        own = BusyPass(str(passed["instance_id"])) if passed.get("status") in ("active", "refused") else NO_OWN_PASS
         move.client.prompt(opened.pane, resume_message(move.why, move=AccountMove(source, target),
-                           own_pass=BusyPass(str(passed["instance_id"]))),
+                           own_pass=own, detached=detached),
                            target=str(move.row.current_session))
 
 
-def _recover_source(move: WorkerMove, source: str, role: staff.WorkerRole, hold: worker_panes.WorkerLockHold) -> str:
+def _recover_source(move: WorkerMove, source: str, role: staff.WorkerRole, policy: worker_panes.LaunchPolicy,
+                    hold: worker_panes.WorkerLockHold) -> str:
     fresh = _observe(move)
     if not isinstance(fresh, (worker_panes.StoppedWorker, worker_panes.ClosedWorker)):
         return "source not started; no fresh proof that the target process is absent"
     rollback = worker_panes.start_or_resume(move.parent, staff.WorkerName.parse(move.row.name), role,
-                account=worker_panes.DestinationWorkerAccount(source), lock=hold)
+                account=worker_panes.DestinationWorkerAccount(source), lock=hold, policy=policy)
     if isinstance(rollback, worker_panes.OpenWorker):
         _continue_pass(move, rollback, move.target, source)
         return f"source resumed on {source}"
@@ -106,7 +132,12 @@ def _recover_source(move: WorkerMove, source: str, role: staff.WorkerRole, hold:
 
 
 def _resume_destination(move: WorkerMove, source: str, state: worker_panes.OpenWorker | worker_panes.StoppedWorker | worker_panes.ClosedWorker,
-                        role: staff.WorkerRole, hold: worker_panes.WorkerLockHold) -> SessionMoveOutcome:
+                        role: staff.WorkerRole, hold: worker_panes.WorkerLockHold,
+                        detached: str = "") -> SessionMoveOutcome:
+    try:
+        policy = _own_policy(move, role)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return accounts.SessionMoveRefused(move.row.id, f"anomaly: worker launch settings are unreadable: {error}")
     terminal = state.terminal if isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker)) else ""
     common = _request(move, source, terminal)
     began = time.monotonic()
@@ -120,37 +151,34 @@ def _resume_destination(move: WorkerMove, source: str, state: worker_panes.OpenW
             moves.append_move(moves.FailedMove(**common, kind="failed", reason=reason))
             return accounts.SessionMoveRefused(move.row.id, reason)
     result = worker_panes.start_or_resume(move.parent, staff.WorkerName.parse(move.row.name), role,
-                account=worker_panes.DestinationWorkerAccount(move.target), lock=hold)
+                account=worker_panes.DestinationWorkerAccount(move.target), lock=hold, policy=policy)
     if isinstance(result, worker_panes.OpenWorker):
         elapsed_seconds = time.monotonic() - began
         _confirm(move, common)
-        _continue_pass(move, result, source, move.target)
+        _continue_pass(move, result, source, move.target, detached)
         return stop_results.ClaudeUp(move.row.id, result.pane, move.target, elapsed_seconds=elapsed_seconds)
     failure = _failed(move.row, result)
-    reason = f"{failure.reason}; {_recover_source(move, source, role, hold)}"
+    reason = f"{failure.reason}; {_recover_source(move, source, role, policy, hold)}"
     moves.append_move(moves.FailedMove(**common, kind="failed", reason=reason))
     return replace(failure, reason=reason)
 
 
-def _move_locked(move: WorkerMove, hold: worker_panes.WorkerLockHold) -> SessionMoveOutcome:
+def _move_decision(move: WorkerMove, *, lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse =
+                   worker_panes.WorkerLockAtUse.ACQUIRE
+                   ) -> WorkerResume | accounts.IdleWorkerPaneClose | accounts.SessionMoveRefused | stop_results.ClaudeUp:
+    """Use the same evidence for a preview and a locked move."""
+    locked = worker_panes.check_worker_lock(move.row, lock)
+    if isinstance(locked, worker_panes.Kept):
+        return accounts.SessionMoveRefused(move.row.id, locked.blocker)
     state = _observe(move)
     if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
         return accounts.SessionMoveRefused(move.row.id, f"anomaly: {state.reason}")
     active = progress_history.active_dispatch(move.row.id, move.run)
     if isinstance(active, progress_history.ActiveDispatchUnavailable):
         return accounts.SessionMoveRefused(move.row.id, f"anomaly: {' '.join(active.reason.splitlines())}")
-    if isinstance(active, progress_history.NoActiveDispatch):
-        if isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker)):
-            closed = worker_panes.close(move.parent, staff.WorkerName.parse(move.row.name),
-                                        run=worker_panes.DispatchRun(move.run), lock=hold)
-            if isinstance(closed, worker_panes.Kept):
-                return accounts.SessionMoveRefused(move.row.id, closed.blocker)
-            if isinstance(closed, worker_panes.UncertainWorker):
-                return accounts.SessionMoveRefused(move.row.id, f"anomaly: {closed.reason}")
+    detached = detached_runs.resume_context(move.run / detached_runs.DETACHED_RUNS_DIR, move.row.name)
+    if not detached and isinstance(active, progress_history.NoActiveDispatch) and isinstance(state, worker_panes.ClosedWorker):
         return accounts.SessionMoveRefused(move.row.id, "nothing to move", 0)
-    role = worker_panes.dispatch_role(move.row)
-    if isinstance(role, worker_panes.WorkerRoleUnavailable):
-        return accounts.SessionMoveRefused(move.row.id, role.reason)
     if isinstance(state, worker_panes.OpenWorker):
         running = stop_resume.running_on_account(str(move.row.current_session), state.pane, kind=move.family)
         if not isinstance(running, stop_results.ClaudeUp):
@@ -158,14 +186,42 @@ def _move_locked(move: WorkerMove, hold: worker_panes.WorkerLockHold) -> Session
             return accounts.SessionMoveRefused(move.row.id, f"anomaly: {reason}")
         source = running.account
         if source == move.target:
-            _confirm_pending(move)
             return replace(running, session_id=move.row.id)
     else:
         source = _source_account(move.row)
-    return _resume_destination(move, source, state, role, hold)
+        if source == move.target:
+            return accounts.SessionMoveRefused(move.row.id, f"already on {move.target}", 0)
+    close_check: worker_panes.CloseAllowed | worker_panes.Kept = worker_panes.CloseAllowed()
+    # A live run needs an immediate resume to receive its result.
+    if (not detached and isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker))
+            and worker_panes.worker_state(state) == "idle"):
+        close_check = worker_panes.can_close(state, run=worker_panes.DispatchRun(move.run), lock=lock)
+        if isinstance(close_check, worker_panes.CloseAllowed):
+            return accounts.IdleWorkerPaneClose()
+    role = worker_panes.dispatch_role(move.row)
+    if isinstance(role, worker_panes.WorkerRoleUnavailable):
+        return accounts.SessionMoveRefused(move.row.id, role.reason)
+    return WorkerResume(state, role, source, close_check, detached)
+
+
+def _move_locked(move: WorkerMove, hold: worker_panes.WorkerLockHold) -> SessionMoveOutcome:
+    decision = _move_decision(move, lock=hold)
+    if isinstance(decision, accounts.IdleWorkerPaneClose):
+        closed = worker_panes.close(move.parent, staff.WorkerName.parse(move.row.name), lock=hold)
+        if isinstance(closed, worker_panes.Closed):
+            return accounts.SessionIdlePaneClosed(move.row.id)
+        reason = closed.blocker if isinstance(closed, worker_panes.Kept) else closed.reason
+        return accounts.SessionMoveRefused(move.row.id, reason)
+    if isinstance(decision, WorkerResume):
+        return _resume_destination(move, decision.source, decision.state, decision.role, hold, decision.detached_context)
+    if isinstance(decision, stop_results.ClaudeUp):
+        _confirm_pending(move)
+    return decision
 
 
 def run_for_worker(row: staff.StaffRow, record: staff.StaffSnapshot) -> Path:
+    if not row.current_session:
+        return Path()
     parent = record.parent_of(row)
     try:
         return worker_panes.worker_run(row, record=record) if parent is not None else Path()
@@ -173,15 +229,29 @@ def run_for_worker(row: staff.StaffRow, record: staff.StaffSnapshot) -> Path:
         raise ValueError(f"anomaly: {error}") from error
 
 
-def move_worker(row: staff.StaffRow, record: staff.StaffSnapshot, target: str, why: str, run: Path) -> SessionMoveOutcome:
+def _worker_move(row: staff.StaffRow, record: staff.StaffSnapshot, target: str,
+                 why: str, run: Path) -> WorkerMove | accounts.SessionMoveRefused:
     if not row.current_session:
         return accounts.SessionMoveRefused(row.id, "nothing to move", 0)
     parent = record.parent_of(row)
     if parent is None:
         return accounts.SessionMoveRefused(row.id, "worker parent is unavailable")
-    move = WorkerMove(row, parent.id, session_staff.worker_family(record, row.id), target, why, run,
+    return WorkerMove(row, parent.id, session_staff.worker_family(record, row.id), target, why, run,
                       herdr.Herdr(herdr.shared_session()))
-    with worker_panes.worker_lock(parent.id, staff.WorkerName.parse(row.name)) as hold:
+
+
+def preview_worker(row: staff.StaffRow, record: staff.StaffSnapshot, target: str,
+                   why: str, run: Path) -> WorkerResume | accounts.IdleWorkerPaneClose | accounts.SessionMoveRefused | stop_results.ClaudeUp:
+    """Read a worker's move decision without stopping or resuming it."""
+    move = _worker_move(row, record, target, why, run)
+    return move if isinstance(move, accounts.SessionMoveRefused) else _move_decision(move)
+
+
+def move_worker(row: staff.StaffRow, record: staff.StaffSnapshot, target: str, why: str, run: Path) -> SessionMoveOutcome:
+    move = _worker_move(row, record, target, why, run)
+    if isinstance(move, accounts.SessionMoveRefused):
+        return move
+    with worker_panes.worker_lock(move.parent, staff.WorkerName.parse(row.name)) as hold:
         if isinstance(hold, worker_panes.Kept):
             return accounts.SessionMoveRefused(row.id, hold.blocker)
         return _move_locked(move, hold)

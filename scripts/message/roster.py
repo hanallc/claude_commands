@@ -7,38 +7,35 @@ try:
 except FileNotFoundError:
     pass
 
-import argparse
 import json
 import os
 import shlex
-import socket
 import subprocess
 import sys
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, fields, replace
-from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
-from scripts.production import showrunners  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
-from scripts.herdr import herdr  # noqa: E402
+from scripts.herdr import herdr_types  # noqa: E402
+from scripts.herdr.place import HerdrPlace  # noqa: E402
 from scripts.message import codex_daemon  # noqa: E402
 from scripts.message import process_table  # noqa: E402
 from scripts.message import sessions  # noqa: E402
-from scripts.astra import design_roles  # noqa: E402
-from scripts.production import staff, session_staff, worker_admission
+from scripts.production import staff, session_staff
 from scripts.production.production_doc import Refusal as ProductionDocumentRefused
-from scripts.usage import agents_log
-from scripts.lib import names  # noqa: E402
-from scripts.lib.names import JobKey  # noqa: E402
+from scripts.accounts import role_map
 if TYPE_CHECKING:
     from scripts.accounts.role_map import role_map_command
     from scripts.whoami import account, agent_accounts, note_file
+    from scripts.production import showrunners
+    from scripts.lib.names import JobKey
 else:
     import importlib.util
     from scripts.accounts.role_map import role_map_command
@@ -60,14 +57,29 @@ else:
     account = _lazy_module("scripts.whoami.account")
     agent_accounts = _lazy_module("scripts.whoami.agent_accounts")
     note_file = _lazy_module("scripts.whoami.note_file")
-from scripts.shutdown import remote as remote  # noqa: E402
+from scripts.agents import remote as remote  # noqa: E402
 from scripts.message.sessions import RegistryRead, SessionRecord, messaging_socket_exists  # noqa: E402
 
 Kind = Literal["claude", "codex"]
 Role = Literal["showrunner", "unit director", "worker", "freestanding", "astra-designer", "astra-reviewer"]
-WorkerRole = Literal["impl", "test", "fix", "review"]
-KNOWN_SLOT_ROLES = frozenset(("impl", "test", "fix", "review"))
+WorkerRole = staff.WorkerRole
+KNOWN_SLOT_ROLES = frozenset(staff.WORKER_ROLES)
 MESSAGEABLE_WORKER_STATUSES = frozenset(("running", "waiting_capacity"))
+
+
+@dataclass(frozen=True)
+class AllRosterSessions:
+    """Read every session for discovery."""
+
+
+@dataclass(frozen=True)
+class MessageParticipants:
+    """Read worker details for a proved recipient and its sender."""
+
+    native_ids: frozenset[str]
+
+
+ALL_ROSTER_SESSIONS = AllRosterSessions()
 
 
 from scripts.message.unit_labels import (
@@ -249,6 +261,16 @@ class NoHerdrPane:
 
 
 @dataclass(frozen=True)
+class RegistryName:
+    value: str
+
+
+@dataclass(frozen=True)
+class NoRegistryName:
+    """The session registry has no name for this row."""
+
+
+@dataclass(frozen=True)
 class RosterEntry:
     machine: str
     kind: str
@@ -264,7 +286,8 @@ class RosterEntry:
     session: ClaudeSession | NoClaudeSession = NoClaudeSession()
     account: AccountAttribution = AccountUnread("not read")
     daemon: codex_daemon.CodexDaemon | NotDaemonSession = NotDaemonSession()
-    pane: herdr.HerdrPlace | NoHerdrPane = NoHerdrPane()
+    pane: HerdrPlace | NoHerdrPane = NoHerdrPane()
+    registry_name: RegistryName | NoRegistryName = NoRegistryName()
 
 
 @dataclass(frozen=True)
@@ -322,8 +345,11 @@ class ShownName:
     unit: UnitPart | NoUnit
     job: ShownJob | JobUnassigned
     address: str
+    registry_name: RegistryName | NoRegistryName = NoRegistryName()
 
     def render(self) -> str:
+        from scripts.lib import names
+
         parts: list[str] = []
         if isinstance(self.production, ProductionPart) and self.production.name:
             parts.append(self.production.name)
@@ -340,7 +366,8 @@ class ShownName:
             elif isinstance(qualifier, JobSlot) and qualifier.slot:
                 label += f" {qualifier.slot}"
             parts.append(label)
-        return " · ".join(parts) or self.address
+        return " · ".join(parts) or (self.registry_name.value
+                                    if isinstance(self.registry_name, RegistryName) else self.address)
 
 
 def shown_name(entry: RosterEntry) -> ShownName:
@@ -366,7 +393,9 @@ def shown_name(entry: RosterEntry) -> ShownName:
                            JobSlot(slot) if slot else Unqualified())
     address = _address(entry) or _session_address(entry)
     return ShownName(ProductionPart(production) if production else NoProduction(),
-                     UnitPart(unit) if unit else NoUnit(), job, address or entry.name)
+                     UnitPart(unit) if unit else NoUnit(), job, address or entry.name,
+                     entry.registry_name if entry.kind == "claude" and entry.role == "freestanding"
+                     else NoRegistryName())
 
 
 @dataclass(frozen=True)
@@ -393,13 +422,15 @@ def unit_labels(entries: Iterable[RosterEntry]) -> dict[str, UnitLabels]:
 
 
 TaggedSnapshotState = (MessageReach | ShowrunnerRelationship | DirectorRelationship | NotAWorker
-                       | CodexThread | NoCodexThread | ClaudeSession | NoClaudeSession | AccountAttribution)
+                       | CodexThread | NoCodexThread | ClaudeSession | NoClaudeSession | AccountAttribution
+                       | RegistryName | NoRegistryName)
 SnapshotState = TaggedSnapshotState | WorkerAssignment | HeldDesignRole
 _SNAPSHOT_STATES: tuple[type[TaggedSnapshotState], ...] = (
     Messageable, CannotReceiveMessages, UnderShowrunner, RunsProduction,
     ProductionWithoutRunningShowrunner, NoShowrunner, UnderDirector, DirectsUnit,
     UnitWithoutRunningDirector, NoDirector, NotAWorker, CodexThread, NoCodexThread,
     ClaudeSession, NoClaudeSession, AccountLabel, AccountUnread, AccountAttributionUnavailable,
+    RegistryName, NoRegistryName,
 )
 
 
@@ -419,6 +450,7 @@ class SnapshotEntry(TypedDict):
     account: NotRequired[dict[str, str]]
     daemon: NotRequired[dict[str, str]]
     pane: NotRequired[dict[str, str]]
+    registry_name: NotRequired[dict[str, str]]
 
 
 def _tagged_state(state: TaggedSnapshotState) -> dict[str, str]:
@@ -449,7 +481,8 @@ def _snapshot_entry(entry: RosterEntry) -> SnapshotEntry:
         daemon=({"home": str(entry.daemon.home), "socket": str(entry.daemon.socket)}
                 if isinstance(entry.daemon, codex_daemon.CodexDaemon) else {}),
         pane=({"session": entry.pane.session, "pane": entry.pane.pane}
-              if isinstance(entry.pane, herdr.HerdrPlace) else {}),
+              if isinstance(entry.pane, HerdrPlace) else {}),
+        registry_name=_tagged_state(entry.registry_name),
     )
 
 
@@ -512,8 +545,9 @@ def _decode_state(value: object) -> SnapshotState:
 
 def _decode_entry(value: object) -> RosterEntry:
     values = _snapshot_object(value)
-    required = set(SnapshotEntry.__annotations__) - {"account", "daemon", "pane"}
-    if not required <= set(values) or set(values) - required - {"account", "daemon", "pane"}:
+    optional = {"account", "daemon", "pane", "registry_name"}
+    required = set(SnapshotEntry.__annotations__) - optional
+    if not required <= set(values) or set(values) - required - optional:
         raise ValueError("invalid snapshot entry fields")
     reach = _decode_state(values.get("reach"))
     showrunner = _decode_state(values.get("showrunner"))
@@ -521,14 +555,15 @@ def _decode_entry(value: object) -> RosterEntry:
     assignment = _decode_state(values.get("assignment"))
     thread = _decode_state(values.get("thread"))
     session = _decode_state(values.get("session"))
+    registry_name = _decode_state(values["registry_name"]) if "registry_name" in values else NoRegistryName()
     attributed = (_decode_state(values["account"]) if "account" in values
                   else AccountAttributionUnavailable("peer sent no account"))
     daemon: codex_daemon.CodexDaemon | NotDaemonSession = NotDaemonSession()
-    pane: herdr.HerdrPlace | NoHerdrPane = NoHerdrPane()
+    pane: HerdrPlace | NoHerdrPane = NoHerdrPane()
     if "pane" in values:
         place = _snapshot_object(values["pane"])
         if place:
-            pane = herdr.HerdrPlace(_snapshot_string(place, "session"), _snapshot_string(place, "pane"))
+            pane = HerdrPlace(_snapshot_string(place, "session"), _snapshot_string(place, "pane"))
     if "daemon" in values:
         owner = _snapshot_object(values["daemon"])
         if owner:
@@ -542,7 +577,8 @@ def _decode_entry(value: object) -> RosterEntry:
             and isinstance(assignment, Assignment)
             and isinstance(thread, CodexThread | NoCodexThread)
             and isinstance(session, ClaudeSession | NoClaudeSession)
-            and isinstance(attributed, AccountAttribution)):
+            and isinstance(attributed, AccountAttribution)
+            and isinstance(registry_name, RegistryName | NoRegistryName)):
         raise ValueError("snapshot state is in the wrong field")
     if isinstance(attributed, AccountLabel):
         attributed = AccountLabel(note_file.canonical_label(attributed.label))
@@ -554,7 +590,7 @@ def _decode_entry(value: object) -> RosterEntry:
         role=role, name=_snapshot_string(values, "name"),
         status=_snapshot_string(values, "status"), cwd=_snapshot_string(values, "cwd"),
         reach=reach, showrunner=showrunner, director=director, assignment=assignment,
-        thread=thread, session=session, account=attributed, daemon=daemon, pane=pane,
+        thread=thread, session=session, account=attributed, daemon=daemon, pane=pane, registry_name=registry_name,
     )
 
 
@@ -685,6 +721,8 @@ class SerializedRosterEntry(TypedDict):
 
 
 def serialized_job(job: ShownJob | JobUnassigned) -> dict[str, str]:
+    from scripts.lib import names
+
     if isinstance(job, JobUnassigned):
         return {"state": "unassigned", "reason": job.reason}
     loaded = names.runtime_names()
@@ -754,6 +792,8 @@ def _session_details(records: list[SessionRecord]) -> dict[str, _ClaudeDetails]:
 
 
 def _worker_ledger(run: _LiveRun, problems: list[str], membership: staff.StaffSnapshot) -> list[staff.StaffRow]:
+    from scripts.production import worker_admission
+
     try:
         owner = (membership.by_current_session(run.director.session_id)
                  if isinstance(run.director, _DirectorSession)
@@ -789,20 +829,12 @@ def _worker_slot(run: Path, name: str, record: Mapping[str, object], problems: l
     return fallback
 
 
-def _role_log() -> agents_log.RoleLog:
-    return agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
-
-
 def _worker_assignment(run: Path | str, slot: str, record: Mapping[str, object],
-                       membership: staff.StaffSnapshot, role_log: agents_log.RoleLog) -> WorkerAssignment:
-    assignment = agents_log.role_at(role_log, session_staff.worker_session(record, membership),
-                                    datetime.now(timezone.utc))
-    if isinstance(assignment, agents_log.Unassigned):
+                       membership: staff.StaffSnapshot) -> WorkerAssignment:
+    member = session_staff.worker_row(record, membership)
+    if member is None or not isinstance(member.role, staff.KnownWorkerRole):
         return WorkerAssignment("no role", str(run), AssignmentUnrecorded(), slot)
-    role = worker_role({"role": assignment.role})
-    label = (f"review ({assignment.lens})" if assignment.role == "review" and assignment.lens
-             else assignment.role)
-    return WorkerAssignment(label, str(run), role, slot)
+    return WorkerAssignment(member.role.value, str(run), member.role.value, slot)
 
 
 def _held_location(parent: staff.StaffRow, membership: staff.StaffSnapshot,
@@ -841,6 +873,8 @@ def worker_shown_name(session_dir: str, name: str, record: Mapping[str, object])
     """Build a thread title with the same production and unit lookup as the roster."""
     run = Path(session_dir)
     if design_id := _as_string(record.get("held_design_id")):
+        from scripts.astra import design_roles
+
         held_role = record.get("held_role")
         try:
             design = design_roles.read_design(design_id)
@@ -860,9 +894,11 @@ def worker_shown_name(session_dir: str, name: str, record: Mapping[str, object])
             showrunner, director = _held_location(parent, membership, {})
         except (OSError, ValueError):
             return ShownName(NoProduction(), NoUnit(), JobUnassigned("design worker parent unavailable"), name)
+        instance = next(instance for instance in design.roles if instance.role == held_role)
+        name = design_roles.instance_name(instance, membership)
         return shown_name(RosterEntry(
             machine="", kind="codex", role="astra-designer" if held_role == "designer" else "astra-reviewer",
-            name=name, status="", reach=Messageable(name), cwd=design.repository,
+            name=name, status="", reach=Messageable(name), cwd=design_roles.design_repository(design, membership),
             showrunner=showrunner, director=director, assignment=HeldDesignRole(held_role, session_dir)))
     showrunner: ShowrunnerRelationship = NoShowrunner()
     director: DirectorRelationship = NoDirector()
@@ -876,7 +912,7 @@ def worker_shown_name(session_dir: str, name: str, record: Mapping[str, object])
     place = places.get(unit_runs.director(run, record=membership))
     if place is not None:
         showrunner, director = place.showrunner, UnderDirector(place.director.unit, "", "")
-    assignment = _worker_assignment(run, _worker_slot(run, name, record, []), record, membership, _role_log())
+    assignment = _worker_assignment(run, _worker_slot(run, name, record, []), record, membership)
     entry = RosterEntry(machine="", kind="codex", role="worker", name=name, status="",
                         reach=Messageable(name), cwd="", showrunner=showrunner,
                         director=director, assignment=assignment)
@@ -887,20 +923,13 @@ def worker_shown_name(session_dir: str, name: str, record: Mapping[str, object])
 
 
 def claude_assignment(run: Path, member: staff.StaffRow, problems: list[str]) -> WorkerAssignment:
-    """The launch names the slot; the board records its current assignment."""
+    """Read the slot from launch evidence and the current role from staff."""
     slot = _slot_role(member.name)
     legacy_label = slot if slot in KNOWN_SLOT_ROLES else "role unknown"
     slot = _worker_slot(run, member.name, {"staff_id": member.id}, problems)
-    try:
-        result = subprocess.run(["bash", str(SCRIPTS / "direct/board.sh"), "roles", str(run)],
-                                capture_output=True, text=True, timeout=5, check=True,
-                                stdin=subprocess.DEVNULL)
-        roles = dict(line.split("\t", 1) for line in result.stdout.splitlines() if "\t" in line)
-    except (OSError, subprocess.SubprocessError) as error:
-        _problem(problems, f"worker assignments {run}", error)
-        return WorkerAssignment(legacy_label, str(run), AssignmentUnreadable(str(error)), slot)
-    assignment = worker_role({"role": roles[slot]} if slot in roles else {})
-    return WorkerAssignment(legacy_label, str(run), assignment, slot)
+    if isinstance(member.role, staff.KnownWorkerRole):
+        return WorkerAssignment(member.role.value, str(run), member.role.value, slot)
+    return WorkerAssignment(legacy_label, str(run), AssignmentUnrecorded(), slot)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -979,14 +1008,17 @@ def _ledger_workers(
     workers: dict[str, _WorkerPlace] = {}
     records_list = list(records)
     owner_runs: dict[staff.StaffId, list[str]] = {}
+    scanned: dict[str, list[str]] = {}
     for run in sorted(runs, key=lambda run: (isinstance(run.director, _NoRunningDirector),
                                              not (run.path / unit_runs.STATE_FILE).exists())):
         for member in _worker_ledger(run, problems, membership):
             owner = membership.parent_of(member)
             if owner is not None:
                 if owner.id not in owner_runs:
+                    if not owner_runs:
+                        scanned = unit_runs.held_by_session(os.environ.get("ROSTER_RUN_ROOT"), record=membership)
                     owner_runs[owner.id] = unit_runs.held(owner.current_session, os.environ.get("ROSTER_RUN_ROOT"),
-                                                        record=membership)
+                                                        record=membership, scanned=scanned)
                 preferred = owner_runs[owner.id]
                 if preferred and run.path.resolve() != Path(preferred[0]).resolve():
                     continue
@@ -1049,7 +1081,7 @@ def _claude_entries(
                     unit = ""
                 director = UnderDirector(
                     unit,
-                    director_entry["name"],
+                    owner.name if (owner := membership.by_current_session(run_director.session_id)) is not None else "",
                     f"session:{run_director.session_id}",
                 )
         else:
@@ -1059,7 +1091,7 @@ def _claude_entries(
             machine=machine,
             kind="claude",
             role=role,
-            name=record["name"],
+            name=member.name if (member := membership.by_current_session(session_id)) is not None else "",
             status=detail.status,
             reach=(
                 Messageable(f"session:{session_id}")
@@ -1071,6 +1103,7 @@ def _claude_entries(
             director=director,
             assignment=assignment,
             session=ClaudeSession(session_id),
+            registry_name=RegistryName(record["name"]) if record["name"] else NoRegistryName(),
             account=_process_account(record["pid"], "claude", home_state=home_state),
         )
     return entries
@@ -1127,6 +1160,7 @@ def _review_workers(
     machine: str, run: _LiveRun, place: _RunPlace,
     table: Mapping[int, process_table.Process], problems: list[str], *,
     home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
+    names_by_pid: Mapping[int, str],
 ) -> list[RosterEntry]:
     entries: list[RosterEntry] = []
     try:
@@ -1158,19 +1192,17 @@ def _review_workers(
         process = _reviewer_process(launcher_pid, table)
         if isinstance(process, _ReviewerProcessNotFound):
             continue
-        name = f"{lens} reviewer" if lens else "blind reviewer"
-        slot_role = f"review ({lens})" if lens else "review"
         entries.append(RosterEntry(
             machine=machine,
             kind=process.kind,
             role="worker",
-            name=name,
+            name=names_by_pid.get(process.pid, ""),
             status="running",
             reach=CannotReceiveMessages("blind reviewer"),
             cwd=_reviewer_cwd(process, place.cwd),
             showrunner=place.showrunner,
             director=place.director,
-            assignment=WorkerAssignment(slot_role, str(run.path), "review", lens or "review"),
+            assignment=WorkerAssignment("review", str(run.path), "review", lens or "review"),
             account=_process_account(process.pid, process.kind, home_state=home_state),
         ))
     return entries
@@ -1181,23 +1213,34 @@ def _unit_workers(
     production_places: Mapping[str, _ProductionPlace],
     problems: list[str], *, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
     membership: staff.StaffSnapshot,
+    records: list[SessionRecord],
+    participants: AllRosterSessions | MessageParticipants = ALL_ROSTER_SESSIONS,
 ) -> tuple[list[RosterEntry], set[str]]:
-    try:
-        table = process_table.snapshot()
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
-        _problem(problems, "process table", error)
-        table = {}
+    table: dict[int, process_table.Process] = {}
+    if isinstance(participants, AllRosterSessions):
+        try:
+            table = process_table.snapshot()
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            _problem(problems, "process table", error)
     entries: list[RosterEntry] = []
     worker_threads: set[str] = set()
-    role_log = _role_log()
     try:
         parents = session_staff.pane_parents(membership)
+        selected_workers = membership.find(kind="worker")
+        if isinstance(participants, MessageParticipants):
+            selected_workers = [row for row in selected_workers if row.current_session in participants.native_ids]
+            parent_ids = {row.parent.id for row in selected_workers if isinstance(row.parent, staff.ReportsTo)}
+            parents = [parent for parent in parents if parent.id in parent_ids]
         if parents:
             from scripts.herdr import worker_panes
 
-            observations = worker_panes.observe_parents(parents, membership)
+            observations = (worker_panes.observe_parents(parents, membership,
+                                selection=worker_panes.SelectedWorkerRows(frozenset(row.id for row in selected_workers)))
+                            if isinstance(participants, MessageParticipants)
+                            else worker_panes.observe_parents(parents, membership))
+            scanned = worker_panes.parent_run_index(membership)
             for parent in parents:
-                run = worker_panes.worker_run(parent, record=membership)
+                run = worker_panes.worker_run(parent, record=membership, scanned=scanned)
                 for state in observations[parent.id]:
                     row = state.row
                     backend = membership.backends.get(row.id)
@@ -1218,31 +1261,43 @@ def _unit_workers(
                                   f"unknown; pane {state.pane}: {state.reason}" if isinstance(state, worker_panes.ProcessUnknownWorker) else
                                   f"incomplete: {state.reason}")
                         reach = CannotReceiveMessages(status)
+                    assignment = (WorkerAssignment(row.role.value if isinstance(row.role, staff.KnownWorkerRole) else "no role",
+                                                   str(run), AssignmentUnrecorded())
+                                  if isinstance(state, worker_panes.ClosedWorker)
+                                  else _worker_assignment(run, _worker_slot(run, row.name, {"staff_id": row.id}, problems),
+                                                          {"staff_id": row.id}, membership))
                     entries.append(RosterEntry(
                         machine=machine, kind="codex" if isinstance(backend, staff.CodexBackend) else "claude",
                         role="worker", name=row.name, status=status, reach=reach,
                         cwd=str(session_staff.worker_directory(membership, row.id)),
                         showrunner=showrunner, director=director,
-                        assignment=_worker_assignment(run, _worker_slot(run, row.name, {"staff_id": row.id}, problems),
-                                                      {"staff_id": row.id}, membership, role_log),
+                        assignment=assignment,
                         thread=CodexThread(row.current_session) if isinstance(backend, staff.CodexBackend) else NoCodexThread(),
                         session=ClaudeSession(row.current_session) if isinstance(backend, staff.ClaudeBackend) else NoClaudeSession(),
                         account=_codex_home_account(backend.codex_home) if isinstance(backend, staff.CodexBackend)
                         else AccountUnread("worker account not read")))
-    except (OSError, ValueError, herdr.HerdrFailure, ProductionDocumentRefused) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure, ProductionDocumentRefused) as error:
         _problem(problems, "pane workers", error)
+    # Blind review rows have no native address and cannot identify either participant.
+    if isinstance(participants, MessageParticipants):
+        return entries, worker_threads
+    names_by_pid = {record["pid"]: member.name for record in records
+                    if (member := membership.by_current_session(record["sessionId"])) is not None}
     for run in runs:
         try:
             place = _run_place(run, claude_entries, production_places, membership)
         except staff.StaffUnreadable as error:
             _problem(problems, str(run.path), error)
             continue
-        entries.extend(_review_workers(machine, run, place, table, problems, home_state=home_state))
+        entries.extend(_review_workers(machine, run, place, table, problems,
+                                       home_state=home_state, names_by_pid=names_by_pid))
     return entries, worker_threads
 
 
 def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: list[str], *,
                    membership: staff.StaffSnapshot) -> tuple[list[RosterEntry], set[str]]:
+    from scripts.astra import design_roles
+
     entries: list[RosterEntry] = []
     threads: set[str] = set()
     for path in sorted(design_roles.state_root().glob('*/design.json')):
@@ -1258,7 +1313,7 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
                 thread = (member.current_session if member is not None and isinstance(evidence, session_staff.RecordedWorker)
                           and isinstance(evidence.backend, staff.CodexBackend) else "")
                 if not thread:
-                    print(f"anomaly: {instance.name}: held role has no Codex backend", file=sys.stderr)
+                    print(f"anomaly: {design_roles.instance_name(instance, membership)}: held role has no Codex backend", file=sys.stderr)
                     continue
                 if thread in threads:
                     continue
@@ -1266,9 +1321,9 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
                 status = type(instance.lifecycle).__name__
                 entries.append(RosterEntry(machine=machine, kind='codex',
                     role='astra-designer' if instance.role == 'designer' else 'astra-reviewer',
-                    name=instance.name, status=status, reach=CannotReceiveMessages(
+                    name=design_roles.instance_name(instance, membership), status=status, reach=CannotReceiveMessages(
                         'held role; add pending messages through design_roles.py'),
-                    cwd=design.repository, showrunner=showrunner, director=director,
+                    cwd=design_roles.design_repository(design, membership), showrunner=showrunner, director=director,
                     assignment=HeldDesignRole(instance.role, str(path.parent)), thread=CodexThread(thread),
                     account=AccountUnread('serving home not read')))
         except (OSError, ValueError, TypeError) as error:
@@ -1277,17 +1332,21 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
 
 
 def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
-                       worker_threads: Iterable[str] = ()) -> Roster:
+                       worker_threads: Iterable[str] = (), membership: staff.StaffSnapshot | None = None,
+                       participants: AllRosterSessions | MessageParticipants = ALL_ROSTER_SESSIONS) -> Roster:
     """Use the reported session or the pane process to address Codex."""
+    from scripts.herdr import herdr
+
+    membership = staff.initial_snapshot() if membership is None else membership
     entries: list[RosterEntry] = []
     problems: list[str] = []
     try:
         sessions = herdr.live_sessions()
-    except herdr.HerdrMissing as error:
+    except herdr_types.HerdrMissing as error:
         for production in productions:
             _problem(problems, f"unit hosts for {production} were not read", error)
         return Roster(entries, problems)
-    except herdr.HerdrFailure as error:
+    except herdr_types.HerdrFailure as error:
         _problem(problems, "herdr sessions", error)
         for production in productions:
             _problem(problems, f"unit hosts for {production} were not read", error)
@@ -1301,7 +1360,7 @@ def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
         name = session["name"]
         try:
             agents = worker_panes.agent_inventory(herdr.Herdr(name))
-        except herdr.HerdrFailure as error:
+        except herdr_types.HerdrFailure as error:
             _problem(problems, f"herdr session {name}", error)
             continue
         for agent in agents:
@@ -1316,18 +1375,23 @@ def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
                 try:
                     thread = CodexThread(herdr.Herdr(name).native_pane_process(
                         pane, "codex", herdr.PROGRAM_TIMEOUT_SECONDS).current_identity)
-                except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+                except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
                     pass
-            process = codex_processes.get(herdr.HerdrPlace(name, pane))
+            if isinstance(participants, MessageParticipants) and (
+                    not isinstance(thread, CodexThread) or thread.thread_id not in participants.native_ids):
+                continue
+            process = codex_processes.get(HerdrPlace(name, pane))
             if process is not None and process.marks.get("CODEX_THREAD_ID", "") in worker_threads:
                 continue
             entries.append(RosterEntry(
                 machine=machine, kind="codex", role="freestanding",
-                name=f"herdr {name}:{pane}", status=str(agent["agent_status"]),
+                name=(member.name if isinstance(thread, CodexThread)
+                      and (member := membership.by_current_session(thread.thread_id)) is not None else ""),
+                status=str(agent["agent_status"]),
                 reach=(Messageable(f"codex:{thread.thread_id}") if isinstance(thread, CodexThread)
                        else CannotReceiveMessages("interactive Codex in a herdr pane")),
-                thread=thread, pane=herdr.HerdrPlace(name, pane),
-                cwd=cwds.get(herdr.HerdrPlace(name, pane), ""),
+                thread=thread, pane=HerdrPlace(name, pane),
+                cwd=cwds.get(HerdrPlace(name, pane), ""),
                 showrunner=NoShowrunner(), director=NoDirector(), assignment=NotAWorker(),
                 account=_process_account(process.pid, "codex") if process else AccountUnread("pane process not found"),
             ))
@@ -1335,11 +1399,21 @@ def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
 
 
 def machine_name() -> str:
-    return socket.gethostname().split(".", 1)[0]
+    return remote.this_machine()
 
 
 def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnapshot,
-                  registry: RegistryRead) -> Roster:
+                  registry: RegistryRead,
+                  participants: AllRosterSessions | MessageParticipants = ALL_ROSTER_SESSIONS) -> Roster:
+    from scripts.herdr import herdr
+
+    with herdr.observation_snapshot(), herdr.pane_snapshot():
+        return _read_local_roster(environment, membership=membership, registry=registry, participants=participants)
+
+
+def _read_local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnapshot,
+                       registry: RegistryRead,
+                       participants: AllRosterSessions | MessageParticipants = ALL_ROSTER_SESSIONS) -> Roster:
     home_state = account.home_account_state()
     problems: list[str] = []
     warnings: list[str] = []
@@ -1360,8 +1434,13 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
     )
     runner_ids = _showrunner_ids(records, registered, membership=membership)
     roots = unit_runs.run_roots(environment.get("ROSTER_RUN_ROOT"))
-    runs = _live_runs(roots, {record["sessionId"] for record in records}, problems)
-    workers = _ledger_workers(runs, records, problems, membership)
+    runs = _live_runs(roots, {record["sessionId"] for record in records}, problems, record=membership)
+    ledger_records = ([record for record in records if record["sessionId"] in participants.native_ids]
+                      if isinstance(participants, MessageParticipants) else records)
+    ledger_workers = {row.current_session for row in membership.find(kind="worker")}
+    workers = (_ledger_workers(runs, ledger_records, problems, membership)
+               if isinstance(participants, AllRosterSessions)
+               or any(record["sessionId"] in ledger_workers for record in ledger_records) else {})
     production_places: dict[str, _ProductionPlace] = {}
     try:
         production_places = _production_places(
@@ -1375,7 +1454,8 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
         home_state=home_state, problems=problems, membership=membership,
     )
     unit_workers, worker_threads = _unit_workers(
-        machine, runs, claude, production_places, problems, home_state=home_state, membership=membership
+        machine, runs, claude, production_places, problems,
+        home_state=home_state, membership=membership, records=records, participants=participants
     )
     durable_roles, durable_threads = _durable_roles(machine, claude, warnings, membership=membership)
     unit_workers = [entry for entry in unit_workers
@@ -1393,7 +1473,7 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
                 machine=machine,
                 kind="codex",
                 role="freestanding",
-                name=session.name,
+                name=member.name if (member := membership.by_current_session(session.thread_id)) is not None else "",
                 status=session.status,
                 reach=Messageable(f"codex:{session.thread_id}"),
                 cwd=session.cwd,
@@ -1406,8 +1486,10 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
             )
             for session in daemon
             if session.thread_id not in worker_threads
+            and (isinstance(participants, AllRosterSessions) or session.thread_id in participants.native_ids)
         )
-    interactive = _herdr_codex_panes(machine, (runner["name"] for runner in registered), worker_threads=worker_threads)
+    interactive = _herdr_codex_panes(machine, (runner["name"] for runner in registered),
+                                    worker_threads=worker_threads, membership=membership, participants=participants)
     problems.extend(interactive.problems)
     excluded = diagnostics.excluded_sessions
     claude = {key: entry for key, entry in claude.items() if key not in worker_threads}
@@ -1423,16 +1505,52 @@ class PeerNotReached:
     reason: str
 
 
-def peer_snapshot(environment: Mapping[str, str]) -> Roster | PeerNotReached:
+@dataclass(frozen=True)
+class PeerAuthority:
+    """The caller's staff snapshot and role map for one peer read."""
+
+    membership: staff.StaffSnapshot
+    accounts: role_map.RoleMap
+    documents: session_staff.ProductionDocumentFacts | session_staff.ReadProductionDocuments = session_staff.READ_PRODUCTION_DOCUMENTS
+
+    def encode(self) -> str:
+        document = {"staff": cast(object, json.loads(self.membership.encode())),
+                    "role_map": cast(object, json.loads(role_map.encode_role_map(self.accounts)))}
+        if isinstance(self.documents, session_staff.ProductionDocumentFacts):
+            document["production_documents"] = self.documents.to_json()
+        return json.dumps(document)
+
+    @classmethod
+    def decode(cls, text: str) -> PeerAuthority:
+        document = cast(object, json.loads(text))
+        if not isinstance(document, dict):
+            raise ValueError("peer authority must be an object")
+        fields = cast(dict[str, object], document)
+        return cls(staff.StaffSnapshot.decode(json.dumps(fields["staff"])),
+                   role_map.decode_role_map(json.dumps(fields["role_map"])),
+                   session_staff.ProductionDocumentFacts.from_json(fields["production_documents"])
+                   if "production_documents" in fields else session_staff.READ_PRODUCTION_DOCUMENTS)
+
+
+@dataclass(frozen=True)
+class ReadPeerAuthority:
+    """The peer reads staff and accounts from their authorities."""
+
+
+READ_PEER_AUTHORITY = ReadPeerAuthority()
+
+
+def peer_snapshot(environment: Mapping[str, str],
+                  authority: PeerAuthority | ReadPeerAuthority = READ_PEER_AUTHORITY) -> Roster | PeerNotReached:
     """Read only the peer, decoding states immediately at the ssh boundary."""
     host = remote.other_machine()
-    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
+    command = ["ssh", "-o", "BatchMode=yes", host,
                '\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/message/roster.py\" --here --snapshot']
     try:
-        # ssh forwards its input to the peer. It gets none, so it never waits on the caller's
-        # input or takes text the caller was meant to read.
+        # Send only the supplied document. Never consume the caller's stdin.
         done = subprocess.run(command, capture_output=True, text=True, timeout=20, check=False,
-                              stdin=subprocess.DEVNULL,
+                              input=authority.encode() if isinstance(authority, PeerAuthority) else None,
+                              stdin=None if isinstance(authority, PeerAuthority) else subprocess.DEVNULL,
                               env={key: value for key, value in environment.items()
                                    if key not in {"CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"}})
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -1448,8 +1566,9 @@ def peer_snapshot(environment: Mapping[str, str]) -> Roster | PeerNotReached:
                   [f"{host}: {warning}" for warning in result.warnings])
 
 
-def peer_roster(environment: Mapping[str, str]) -> Roster:
-    result = peer_snapshot(environment)
+def peer_roster(environment: Mapping[str, str],
+                authority: PeerAuthority | ReadPeerAuthority = READ_PEER_AUTHORITY) -> Roster:
+    result = peer_snapshot(environment, authority)
     if isinstance(result, PeerNotReached):
         return Roster([], [f"{result.host}: not reached: {result.reason}"])
     return result
@@ -1457,7 +1576,8 @@ def peer_roster(environment: Mapping[str, str]) -> Roster:
 
 @role_map_command
 def roster(environment: Mapping[str, str], scope: RosterScope, *,
-           membership: staff.StaffSnapshot | None = None, registry: RegistryRead | None = None) -> Roster:
+           membership: staff.StaffSnapshot | None = None, registry: RegistryRead | None = None,
+           participants: AllRosterSessions | MessageParticipants = ALL_ROSTER_SESSIONS) -> Roster:
     problems: list[str] = []
     try:
         membership = staff.initial_snapshot() if membership is None else membership
@@ -1468,13 +1588,20 @@ def roster(environment: Mapping[str, str], scope: RosterScope, *,
     registry = sessions.read_registry() if registry is None else registry
     match scope:
         case ThisMachine():
-            local = _local_roster(environment, membership=membership, registry=registry)
+            local = _local_roster(environment, membership=membership, registry=registry, participants=participants)
             local.problems[:0] = problems
             return local
         case AllMachines():
+            try:
+                authority = PeerAuthority(membership, role_map.read_role_map(),
+                                          session_staff.RowResolver(membership).production_document_facts())
+            except role_map.RoleMapUnavailable:
+                authority = ReadPeerAuthority()
             with ThreadPoolExecutor(max_workers=2) as pool:
-                peer = pool.submit(peer_roster, environment)
-                local = _local_roster(environment, membership=membership, registry=registry)
+                peer = pool.submit(peer_roster, environment, authority)
+                with session_staff.supplied_production_facts(
+                        authority.documents if isinstance(authority, PeerAuthority) else session_staff.READ_PRODUCTION_DOCUMENTS):
+                    local = _local_roster(environment, membership=membership, registry=registry, participants=participants)
                 local.problems[:0] = problems
                 other = peer.result()
             return Roster([*local.entries, *other.entries], [*local.problems, *other.problems],
@@ -1632,19 +1759,37 @@ def _print_text(
 
 
 def main(argv: list[str]) -> int:
+    import argparse
+
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--json", action="store_true", dest="as_json")
     _ = parser.add_argument("--kind", choices=("claude", "codex"))
     _ = parser.add_argument("--here", action="store_true", help="read this machine only")
+    _ = parser.add_argument("--all", action="store_true", help="include closed workers; hide them by default")
     _ = parser.add_argument("--snapshot", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args(argv)
-    result = roster(os.environ, ThisMachine() if getattr(arguments, "here", False) is True else AllMachines())
+    input_problems: list[str] = []
+    with ExitStack() as reads:
+        if getattr(arguments, "snapshot", False) is True and not sys.stdin.isatty():
+            try:
+                document = sys.stdin.read()
+                if document.strip():
+                    authority = PeerAuthority.decode(document)
+                    _ = reads.enter_context(staff.supplied_snapshot(authority.membership))
+                    _ = reads.enter_context(role_map.supplied_role_map(authority.accounts))
+                    _ = reads.enter_context(session_staff.supplied_production_facts(authority.documents))
+            except (OSError, ValueError, TypeError, KeyError, staff.StaffUnreadable) as error:
+                _problem(input_problems, "peer authority stdin", error)
+        result = roster(os.environ, ThisMachine() if getattr(arguments, "here", False) is True else AllMachines())
+    result.problems[:0] = input_problems
     if getattr(arguments, "snapshot", False) is True:
         print(RosterSnapshot(result).encode())
         return 1 if result.problems else 0
     raw_kind = getattr(arguments, "kind", None)
     kind = raw_kind if raw_kind in ("claude", "codex") else None
-    entries, contexts = _chosen_entries(result.entries, kind)
+    visible = (result.entries if getattr(arguments, "all", False) is True else
+               [entry for entry in result.entries if not (entry.role == "worker" and entry.status == "closed")])
+    entries, contexts = _chosen_entries(visible, kind)
     if getattr(arguments, "as_json", False) is True:
         print(json.dumps({
             "entries": [_serialized_entry(entry) for entry in entries],

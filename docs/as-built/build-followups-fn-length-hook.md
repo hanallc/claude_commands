@@ -6,7 +6,9 @@ A set of agent-session tools in `~/.claude`, all Python (standard library) or zs
 
 - A PostToolUse hook that blocks an editing agent the moment an edit leaves a Rust function over clippy's `too_many_lines` limit.
 
-- An adhoc-review pause of the dailies. The showrunner question Stop hook is retired (user, 2026-10-19: "i have already asked you to get rid of the stop hook that does this"), and the reply footer it once checked is gone (user, 2026-10-18).
+- The showrunner question Stop hook was retired on 2026-10-19.
+  The user retired its reply footer on 2026-10-18.
+  Dailies and their adhoc-review pause were retired on 2026-11-11.
 
 - Cargo-token hygiene: each verify step runs in its own process group that a release or reclaim stops.
 
@@ -33,7 +35,7 @@ Claude's `Edit|MultiEdit|Write` PostToolUse group runs basedpyright and fn-lengt
 
 ### Codex registration and trust
 
-`scripts/hooks/codex_hooks.py install|check` manages eleven handlers.
+`scripts/hooks/codex_hooks.py install|check` manages twelve handlers.
 The `queue-start` and `queue-tools` handlers run `codex-queue-drain.py` at `SessionStart` and `PostToolUse`.
 Both use matcher `*` and 10-second timeouts.
 `docs/as-built/session-roster.md` describes these handlers.
@@ -52,8 +54,16 @@ The shell command starts no Python process when the marker folder has no `*.json
 The `compaction-clear-end` handler runs `compaction-marker-clear.py` at `PostCompact`.
 Both handlers delete only the input session's marker through the shared clear function.
 Codex 0.167.0 lists these events as `userPromptSubmit` and `postCompact`.
-It reports no matcher for `UserPromptSubmit`, so listing checks use `null` for that field.
+It reports no matcher for `UserPromptSubmit` or `Stop`, so listing checks use `null` for those events.
 See [compaction markers](hook-dispatch.md#compaction-start-markers) for the marker format and retention setting.
+
+The `turn-end` handler runs `../herdr/turn_end.py` through the shared Python launcher at `Stop`, with a 10-second timeout.
+Codex supplies the event as JSON on stdin.
+The handler sends the payload to a separate child through stdin and returns without stdout text.
+The child applies the worker completion rule.
+The handler never exits 2, which would request another Codex turn.
+The installer lists this event as `stop`, with a null matcher.
+See [worker completion](long-lived-workers.md#pane-submission-and-completion) for the completion rule and deployment steps.
 
 The `ste` and `ste-subagent` handlers run `session-start-ste.py` through the shared Python launcher, with 10-second timeouts. They use `SessionStart` and `SubagentStart`, respectively. Both use `matcher: "*"`. For `SessionStart`, the matcher filters the session source, including startup, resume, clear and compact. For `SubagentStart`, it filters the subagent type. The wildcard covers every source and type. See the [Codex hook reference](https://learn.chatgpt.com/docs/hooks).
 
@@ -68,7 +78,7 @@ Claude registration in `settings.json` and Codex installation are separate deplo
 Claude's `SessionStart` registration runs `session-start-ste.py` with matcher `startup|resume|clear|compact`.
 Its `SubagentStart` registration runs the same script.
 On natedev and the Mac, `~/.codex`, `~/.codex1`, and `~/.codex2` share one `hooks.json`.
-Each home must trust its eleven handlers separately.
+Each home must trust its twelve handlers separately.
 
 Codex 0.167.0 requires integer `timeout` values in `hooks.json`. A floating value such as `10.0` rejects the whole file, including fn-length, STE, and queue handlers. The installer rounds configured timeouts up to whole seconds. It also rounds existing floating timeouts up to integers in every handler, including user handlers. It keeps every other field of a user handler unchanged. This preserves their groups and indexes. The listed `timeoutSec` is then an integer. No older-version matching rule is used.
 
@@ -92,11 +102,16 @@ An install that removes nothing makes no extra app-server calls for cleanup. A s
 
 ### Showrunner question hook
 
-The reply footer, its `Waiting on:` block, the footers-off switch and `/showrunner:footer` are gone (user, 2026-10-18: "i want footers gone for good"). The user reads the counts in the status line. The question check is retired too (user, 2026-10-19: "i have already asked you to get rid of the stop hook that does this"): what is left reads productions for the status line's counts row and the review pause.
+The user retired the reply footer, its `Waiting on:` block, and `/showrunner:footer` on 2026-10-18.
+The user retired the question Stop hook on 2026-10-19.
+The user reads counts in the status line.
+The remaining readers supply production questions for that line.
 
 Files: `scripts/hooks/showrunner_footer.py`, `scripts/production/footer_counts.py`, the Open-questions list and The hook bullets of `commands/showrunner/produce.md`. The Stop hook that checked a showrunner's reply is gone (2026-10-19).
 
-- **Production.** `read_production(instance_dir) -> Production | None` takes the doc from the last token of the instance's `CHECK`, requires `Status: PRODUCTION — running`, takes the zone from the user's zone setting (`scripts/lib/user_zone.py`; the doc's `- **User zone:**` line is not read), and builds `schedule` from state: `ScheduledDailies(next_due)` when `ENABLED=1`, else `NoDailiesSchedule.PAUSED_OR_UNSCHEDULED`. Anything unreadable gives `None` (the production is skipped).
+- **Production.** Production identity and question paths come from the staff record.
+  The user's zone setting supplies the zone.
+  Dailies schedules no longer supply production status.
 - **Open questions.** `open_questions(productions) -> int | None` counts the items now due in every production's needs-user file: an item with no `after`, or whose `after` is at or before now in the production's zone. It is `None` when a file cannot be read.
 - **Counts line.** `scripts/production/footer_counts.py` reads each count at render time and stores none. `changes` uses the staff routing function in `scripts/production/change_routing.py`, which also supplies the change page tabs.
 The router reads the fixed staff id in each row's Producer cell.
@@ -109,8 +124,19 @@ The page, footer, and `/next` use the same typed waiting rule.
 The status count watches staff, lists, and delivery records.
 The merge writer and `change_review add` store Producer ids.
 
-`proposals` counts `proposals_table.waiting_entries(doc)`, the same own-production rows as `/next proposal`: open proposal issues waiting for approval and proposed lines in the ledger the Improvement queue field names. Accepted and deferred plan-backlog lines do not count. Shared issue folders are filtered by the showrunner staff name and units (`proposals_folder.owners` and `proposer`); showrunners above and below count their own. `sources()` includes the Improvement queue ledger so the status line cache refreshes when it changes. A source that cannot be read counts 0. `counts_line` writes `For you: 1 question, 2 changes, 130 efficiency, 1 proposal`, zero counts left out, None when all are zero. Every kind is available through `/next`. The status line adds the open questions of the production's own list (`showrunner_footer.counts_line`, questions from `open_questions`). The dailies report's own footer (`dailies_render.py --footer`) shows the line too; no reply carries it.
-- **Old state.** Switch files left in `~/.local/state/showrunner/footers-off/` are not read; `tidy_wrapped.py` deletes a production's file at wrap. Pause and review-pause records still load. Their footer keys have no effect. Shutdown restart keeps only staff row IDs.
+`proposals` counts `proposals_table.waiting_entries(doc)`, the same production rows as `/next proposal`.
+These include open proposal issues awaiting approval and proposed lines in the Improvement queue ledger.
+Accepted and deferred plan items do not count.
+`proposals_folder.owners` and `proposer` filter shared issue folders by the showrunner and its units.
+Each showrunner counts its own proposals.
+`sources()` includes the Improvement queue ledger, so a change refreshes the status line cache.
+An unreadable source contributes zero.
+`counts_line` prints `For you: 1 question, 2 changes, 130 efficiency, 1 proposal` and omits zero counts.
+It returns `None` when all counts are zero.
+Every kind is available through `/next`.
+The status line includes open questions from `open_questions` through `showrunner_footer.counts_line`.
+Replies carry no count line.
+- **Old state.** Switch files left in `~/.local/state/showrunner/footers-off/` are not read; `tidy_wrapped.py` deletes a production's file at wrap. Pause records still load. Their footer keys have no effect. Shutdown restart keeps only staff row IDs.
 
 ### Tool-output read guard
 
@@ -121,15 +147,9 @@ Files: `scripts/hooks/pre-tool-use-tool-output-read.py`, `scripts/hooks/test_too
 - **Changes and copies.** `changes_output` refuses a simple command whose program is `rm`, `cp`, `mv` or `tee` with an argument matching the same pattern, and a redirect operator (`>`, `>>`, `&>`, `>|`) whose target matches it. These also prompt, and units waited hours on an `rm` of the saved `cargo-berth board --json` output (2026-10-21). The `deny` says to leave saved output alone and names `cat <file> > /tmp/claude/<name>` to keep a copy. `commands/unit/direct.md` now reads only `.status` from the board through `jq`, so that output is not saved.
 - **Not an allow rule.** A `Bash(sed -n …)` or `Bash(awk …)` allow rule would also allow `sed -n 'w <file>'` and `awk 'BEGIN{system(…)}'`, so the guard sends the session to the forms that already run with no prompt.
 
-### Production status: run-out and pane lookup
+### Account usage rate
 
 - `scripts/whoami/run_out.py`: `Reading(at, used_percent)`, `read_readings`, and `weighted_rate(readings, end) -> float | None`: percent used per second by `end`, each rise between consecutive readings weighted by 0.5^(age / `HALF_LIFE`, 12 h). A drop (a weekly refill or a redeemed reset), time at 100% and a gap over `MAX_GAP` (15 min: the account sat logged out) are skipped, so rises before a refill still count. None until the counted time, weighted, reaches `MIN_SPAN` (1 h).
-
-- `dailies_render.agent_line` extends `weighted_rate` at the latest reading to 100%, rounded to the minute. When it is None, the fallback divides used percent by the time since the later of the weekly refill and now minus `run_out.WINDOW` (24 h).
-
-- Agents line forms (then the unchanged resets part, `N reset(s) available until <Mon D>` / `no resets available` / `resets unknown`): `claude1: 25%; runs out about Tue 22:02 PDT, before its Sun 23:00 refill; …` (`22:02 PDT today` when today); `…; runs out about Mon 04:00 PDT, so it hits its Sun 23:00 refill first; …`; `…: 1%; does not run out at this pace, so it hits its Sun 23:00 refill first; …` (rate at or below 0); `…: 100%; ran out, back at its Sun 23:00 refill; …`. Unknown usage reads `week's usage unknown; refills …`.
-
-- `agent_section(now, zone, *, at=None)`: with `--at`, when a note's `weekly_usage_checked_at` is later than the stamped minute, each line uses the account's latest reading before the end of that minute (computed in absolute time), and only readings up to it feed the pace; with none the note stands. Notes are the accounts in use (`role` or `sessions`) in `~/rust/hanadocs/agents/*.md`, read by their stable account labels; readings live in `~/.local/state/agent-notes/readings.jsonl`.
 
 ### Showrunner settings and stall watcher
 
@@ -142,16 +162,61 @@ Files: `scripts/hooks/pre-tool-use-tool-output-read.py`, `scripts/hooks/test_too
   - **Permission prompt (2026-10-18).** Before the turn-end check, `session_pane.agent_status(place)` reads herdr's `agent list` state for the unit's pane. `blocked` means a trust, permission or question prompt waits on the user, so no bump can move it: the idle stretch starts again, nothing goes to the unit or the showrunner, and `<stretch>.prompt.json` keeps `{since, alerted}`. After `PROMPT_ALERT_SECONDS` (60) the user gets one phone alert, the registered text `stall_watch.permission_prompt` (`push_texts.user_send_argv`, need `blocked`), with the unit, the machine, the time and `prompt_request(pane)`. Its body is "{unit} asks to {request}. It has waited since {since}." and then the lines "Yes: it does that and goes on." and "No: it does not, and asks you what to do instead." (2026-10-23). Read from the screen, the request is "edit panes.py" from "Do you want to make this edit to panes.py?", "run a shell command to <description>" from a Bash prompt, else the question's own words. A failed send is sent again on the next tick. A prompt that shows Claude Code's auto-mode banner (`AUTO_DENY_BANNER`, a line that starts "⚠ Claude Code will automatically deny this request in M:SS") gets no alert and drops its `<stretch>.prompt.json`, since Claude Code denies it by itself when the countdown ends; `prompt_request` skips that line, so the description stays the real one (2026-10-19). With one-minute ticks the alert arrives one to two minutes after the prompt shows. An unreadable herdr state counts as not blocked, ends no prompt, and is reported on stderr.
   - **Retire the alert when its prompt is gone (2026-10-23).** The alert is an emergency push: Pushover repeats it every 300 s for 3 h until the user taps Acknowledge, so on 2026-10-23 an alert sent at 09:04 AST went on after the user answered the prompt at 09:22. It is sent with the per-unit key `stall-watch:prompt:<showrunner name>:<unit>` (`prompt_key`), which pushover.py tags it with. When the prompt is gone after its alert went out (`alerted` true), `end_prompt` marks `<stretch>.prompt.json` `retiring` and queues `send.py retire --to user --from stall-watch --key <key>` (`push_texts.user_retire_argv`) in the `send_all` batch, kind `retire`, under the same 90 s deadline. The prompt is gone when the unit is no longer blocked, when its prompt shows the auto-deny banner, when its run is no longer running (`forget`), and when its Claude is not running. A different pending call while the unit stays blocked also retires the old alert first, since both alerts have the one key; the new prompt can alert after the retire, independently of case creation. Exit 0 ("cancelled" or "nothing to cancel") removes the prompt state or, if its case is still pending, atomically moves the saved snapshot to `<report hash>.case.json` in the same state directory for case retries. Exit 3, a timeout or a failure to start keeps it with `retiring` true and prints to stderr: the next tick sends the retire again and no new alert, also when the unit is blocked again. A prompt that never alerted sends no retire; its state is removed. The alert's rca.py case keeps the wait's start, the sender `stall-watch` and this key (`prompt_report`), so `rca.py fixed` retires the alert too.
   - **Request and wait start from the transcript (2026-10-21).** `pending_tool(session_id)` reads the newest tool call with no `tool_result` yet, from the end of the session's transcript and of each helper (subagent) transcript, `projects/*/<session id>/subagents/agent-*.jsonl`, since a helper's prompt shows in the session's pane (2026-10-23). `prompt_request(pane, pending)` words it: a Bash call is "run <command>", with whitespace collapsed to single spaces and each path with a folder shown as its file name, cut at `COMMAND_LENGTH` (90: 89 characters and "…"), as send.py cuts a refused command (2026-10-23). The description is never used, since the user decides on the command that runs. Edit, MultiEdit, NotebookEdit and Write are "edit <file>" or "write <file>". Without a pending call the screen is read: the Bash prompt's description is its sentence line plus its wrapped lowercase lines, and the warning paragraph is never the description. When that prompt shows Claude Code's warning "<path>, which is outside the allowed working directories", the request names what the command does to that file instead ("delete its saved tool output b1e4yc8b9.txt, which is outside its allowed folders"; `rm`, `cp`, `mv` give delete, copy, move, any other program "use"; a file in the `tool-results` folder is "its saved tool output"). `<stretch>.prompt.json` also keeps the call's id as `tool`: the wait starts at the call's transcript time, not at herdr's first `blocked` reading, and a different call is a new prompt with its own alert. On 2026-10-21 herdr reported cargo-liner-style-types idle from its 10:54 prompt until 16:21 (herdr owns that), so the alert said "since 16:21" and cut the request at 200 characters.
-  - A unit whose last turn-end line (`holding|gate|decision|blocked|done:`) is `done:`, `blocked:`, `gate:` or `decision:` is waiting: no bump, no report, a fresh stretch below the compaction wake point; a one-line reply's `●` or `⏺` bullet is allowed before the turn end. A `holding:` status prevents a bump only when it names an outside party. Party occurrences inside complete own names, pane labels or session addresses do not count. Separate occurrences and longer peer names still count. Hyphens join words; sentence periods end names. The watcher logs `inspected <showrunner name>/<name>: holding` and sends no delivery to the unit or showrunner. A hold naming only the unit's own work receives the normal idle bump when nothing runs. Pauses, external-owner deferrals and future stated hold ends keep their existing rules. A unit whose run state (`RunStates.state` of its Worktree cell, from one `unit_lookup.read_run_states()` snapshot per tick) is `run-finished` or `standing-by`, and a unit whose Units row is retired, is skipped and its stretch file deleted. The stall watch does not use `run done` text in the Plan cell. A shell or launcher descendant of Claude (`zsh bash sh assign.sh review.sh verify.sh`, defunct ones skipped) means work is running and resets the stretch, as does any process carrying the unit's marks other than the Claude, its pane and the helpers it starts itself; the staff row selects the production for that work. After a report the stretch holds until work runs or the turn-end line changes.
-  - **Context near compaction (2026-10-29).** At the shared context-hook handoff threshold (`context_usage.handoff_threshold(window)`) or above, a waiting turn end or a future stated hold no longer resets the stretch. The normal idle path sends one bump and one showrunner tell per stretch, with the same `Last status:` text, except that a `holding:` unit naming an outside party gets only its per-unit log line, even near compaction. The bump starts the request that lets Claude Code compact. `context_near_compaction(session_id)` uses `sessions.latest_transcript` and the context hook's existing `context_usage.latest_reading`, `estimate_tokens`, `auto_compact_window` and `handoff_threshold`: bounded tail reads, the configured window clamped to the transcript's model, and the same handoff margin and held-back tokens, with no separate percentage or copied threshold formula. Missing usage, unreadable transcripts and usage discarded by compaction keep the waiting rule. Permission prompts, running work and run-state skips keep their existing handling.
+  - Staff supplies the unit's identity, parent, current session, and retirement state.
+    The watcher inspects the director's held unfinished run.
+    The [stall-watch contract](showrunner-automation.md#invariants) defines waiting statuses, outside parties, and compaction wakes.
+    The watcher leaves an outside wait quiet and resets the idle stretch when work resumes.
+  - `context_near_compaction` uses the shared context hook's bounded transcript read and model-specific threshold.
+    Missing usage retains the waiting rule.
+    Permission prompts and running work retain their separate handling.
   - Idle for `stall_minutes` with no work and a `holding:` status naming an outside party: only a per-unit log line, with no bump or showrunner tell. The hold leaves `tell_sent` false. A later idle unit can receive its bump and tell in the same stretch. Other idle units, including holds naming only their own work and units with no turn-end status, keep one bump to the unit's own socket (`stall-watch: you have been idle since HH:MM <zone> with nothing running. Continue your run; …`, key `stall-watch:<unit>:<since>:bump`) and one report to its showrunner (`<unit> idle since …, nothing running; bumped. Last status: <line>`, key `…:tell`) per idle stretch.
   - `send_all` starts every `send.py --to uds:<socket> --from stall-watch --key <key> --text …` together and waits at most 90 s for the batch; a failed recipient is retried next tick with the same key; the stretch flag is set only after a successful send. A successful prompt alert immediately saves `alerted` and its report as `case_pending`. `retry_cases` opens pending cases after the batch and on later ticks, clearing each report only when its case opens or joins; case retries send no second alert. A cleared prompt retires its alert even while the case is pending. Successful retirement moves a pending case to its own `.case.json` snapshot, freeing the active prompt state for new alerts. `retry_cases` reads both prompt and case files and removes each case file only after its case opens or joins.
 
-- `notifier.sh new <instance> --every <min> --run <cmd> [--timeout <s>]` makes a run-only instance (`RUN=` in `conf`; not combinable with `--to`, `--from`, `--check`, `--command`, `--prompt-file`, `--hold` or `--aligned`; timeout defaults to 120 s). `cmd_tick` starts each due `RUN=` job outside the tick through `launch_run`: a transient `systemd-run --user --collect --quiet --no-block --unit session-notifier-<name>-<pid>-<random>` on Linux; on macOS a `launchctl submit` job that runs `run-due-and-remove <name> <label>` and removes its own label; with neither launcher it logs `run launcher unavailable: <name>; waiting after tick` to `notifier.log` and runs the job after the tick lock is released. The job claims its slot, runs the command with output to `<instance>/run.log` (replaced each run), has a `zselect` watchdog that sends TERM at the timeout, and appends `run timeout` or `run exit <rc>` to `fire.log`. Non-run jobs still run inside the tick.
+- `notifier.sh new <instance> --every <min> --run <cmd> [--timeout <s>]` creates a run-only instance with `RUN=` in `conf`.
+  It cannot combine `--run` with `--to`, `--from`, `--check`, `--command`, `--prompt`, `--hold` or `--aligned`.
+  The timeout defaults to 120 seconds.
+  `cmd_tick` starts each due job through `launch_run` outside the tick.
+  Linux uses a transient `systemd-run --user --collect --quiet --no-block` service named `session-notifier-<name>-<pid>-<random>`.
+  macOS uses a `launchctl submit` job that runs `run-due-and-remove <name> <label>` and removes its own label.
+  Without either launcher, the notifier logs `run launcher unavailable: <name>; waiting after tick` and runs the job after it releases the tick lock.
+  The job claims its slot and replaces `<instance>/run.log` with its command output.
+  A `zselect` watchdog sends TERM at the timeout.
+  The job appends `run timeout` or `run exit <rc>` to `fire.log`.
+  Other jobs run inside the tick.
 
-### Adhoc review pause
+### Production launch and wrap records
 
-`scripts/production/review_pause.py pause | status | resume dailies|none` acts on each production targeting `$CLAUDE_CODE_SESSION_ID`. The record is `~/.local/state/showrunner/review-paused/<showrunner name>.json`, `ReviewPauseRecord{dailies}` with the action an `ActionState`: `untouched`, `attempted`, `done` or `skipped` (legacy booleans read as `done`/`skipped`; a `footers` key from before 2026-10-18 is ignored), written atomically before and after the action. `pause` stops dailies (`notifier.sh stop showrunner-<showrunner name>`, 10 s timeout) when enabled; `reconcile_attempted(instance, path, record)` (shared by `pause`, `status`, `resume`) turns an `attempted` action into `done` when its effect is observable. A failed stop leaves `attempted`, so a re-run redoes only what did not happen. `resume dailies` turns dailies back on only when the record says `done`; `resume none` leaves them off; both delete the record. `/adhoc_review` Step 2 runs `pause`; Step 5 runs `status` and, when the review paused dailies, asks `Turn dailies back on? (yes / leave off)`, then `resume dailies` or `resume none`.
+`scripts/production/add_showrunner.py` writes `~/.local/state/showrunner/<owner staff id>/add_showrunner.json`.
+The receipt stores `owner`, `caller`, `resume` and `started_at`.
+It stores no `session_id`.
+A pending receipt also stores `doc` and `config_dir` as creation claims.
+
+`finish_publication` completes an unknown home through `staff.set_home(..., only_unknown=True)`.
+The setter checks the current home inside the staff transaction.
+A stale receipt cannot overwrite a home that another writer records first.
+Publication then removes `session_id`, `doc`, and `config_dir` from the receipt.
+The first launch and a repeated owned launch with creation claims both call `finish_publication`.
+This order lets a repeated launch complete an interrupted home write.
+
+`completion_receipt.read_launch_receipt` resolves `owner` through staff and returns `OwnedReceipt`, `UnpublishedReceipt` or `NoReceipt`.
+An owned receipt uses the owner's current session, document and home from staff.
+An unpublished receipt has no staff row and uses `owner` as its native session identity.
+Its creation claims supply the document and account directory until publication completes.
+`ShowrunnerLaunch.from_receipt` accepts the receipt variant and reads `started_at` from its fields.
+
+`scripts/production/production_lifecycle.py` saves `wrap_release.json` under the same owner directory.
+`former_parent` stores a recipient staff id or `null`.
+`former_children` and `told` store lists of recipient staff ids.
+`showrunner_tree.edges_to_release` captures these ids from staff relationships.
+`release_edges` reads each recipient's current staff name immediately before its delivery.
+After a successful delivery, it saves that recipient's id in `told`.
+It reads current names again for the final parent and children report.
+This per-delivery lookup preserves correct routing when a recipient changes name during an earlier delivery.
+
+### Adhoc review
+
+Dailies and their pause/resume steps were retired on 2026-11-11.
+`/adhoc_review` no longer manages a dailies schedule.
 
 ### Cargo token and step groups
 
@@ -176,7 +241,7 @@ Run files keep staff references instead of copied native identities.
   An empty registry effort prevents the caller's environment from supplying another effort.
   A continued worker keeps its effort.
   The module records the dispatch role before delivery.
-- The [Claude coordinator](long-lived-workers.md#claude-coordinator-and-friends) proves the running session before publication and delivery.
+- The [Claude coordinator](long-lived-workers.md#claude-coordinator) proves the running session before publication and delivery.
 
 - When a worker leaves its summary file empty, `scripts/direct/claude_worker.py` writes a summary from the pane log in the assign process.
   It decodes UTF-8 with replacement.
@@ -186,7 +251,10 @@ Run files keep staff references instead of copied native identities.
   It retains newlines, tabs, and the last 4000 characters.
   With no readable text, the summary is `The background agent <name> produced no summary.`
   It preserves the log and any summary that the worker writes.
-- `scripts/direct/unit_notifier.sh <claude_session_id> [on|off]` reads the marker `<session id>` from `UNIT_ACTIVE_DIR`, else from `/tmp/claude/unit/active` or `/tmp/claude/delegate/active` (it names the session directory; its basename is the run id). No mode creates the `unit-<run id>` instance (`worker-<run id>` for a run started before the folder rename; old name read until no live marker remains) (`--every` from `UNIT_PROGRESS_INTERVAL_SECONDS` rounded up to minutes, `--hold`, check `direct_run.py check`); `off` runs `notifier.sh stop unit-<run id>` and prints `progress updates off: unit-<run id>`; `on` runs `notifier.sh start` and prints `progress updates on: unit-<run id> <next_due line>` (`worker-<run id>` for a run started before the folder rename; old name read until no live marker remains). A missing or empty marker exits 1 and changes nothing; a `notifier.sh` failure passes its message and status through; a bad mode word or more than two arguments prints the usage and exits 2.
+- The director's staff row records its open run folder in `run`.
+  `unit_runs.open_run(session_id)` reads that pointer.
+  `direct_run.py check` uses the pointer to identify the current run.
+  The notifier instance uses `unit-<run id>` or the former `delegate-<run id>` prefix.
 - `/unit:report [tables|on|off]` (`commands/unit/report.md`): `on` or `off` runs `zsh ~/.claude/scripts/direct/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID" on|off`, relays its line and composes no report; a failure is relayed as printed. A Codex unit has no notifier, so the command says the switch is unavailable there.
 
 ## Invariants
@@ -233,7 +301,7 @@ Run files keep staff references instead of copied native identities.
 
 - **Effort.** A Claude worker launched without `--effort` inherits `~/.claude/settings.json` (`modelSettings` → model → `effortLevel`, `xhigh` for Sonnet 5.5), so a pane line reading `thinking with xhigh effort` on a `sonnet:low` worker means the launch dropped the effort, not that the pane misleads.
 
-- **`/unit:report off`.** `unit_notifier.sh` exit 1 covers both no active run and a missing notifier instance; only the message says which, so the command relays it as printed. `off` persists in the notifier instance until `on` or `end_session.sh`. `<ProgressContract/>` in `commands/unit/direct.md` names `/unit:report off` and `/unit:report on` for a Claude unit.
+- **`/unit:report`.** Reports run on request and create no notifier instance. The command accepts only the optional `tables` argument.
 
 - **Live checks need a person.** The permission classifier refuses an automated bare `claude --bg` probe. A person must check the worker effort. Register a Claude worker as `sonnet:low`. Start it through `assign.sh --role implement`. Check that its pane shows `low effort`, not `xhigh`.
 
@@ -249,7 +317,6 @@ Run files keep staff references instead of copied native identities.
 
 - **No Stop hook for asked questions** (user, 2026-10-19: "i have already asked you to get rid of the stop hook that does this"). The reply footer it once checked is gone (user, 2026-10-18).
 
-- **The switch is a file keyed by showrunner staff name** so it survives compaction, resume and a retargeted notifier instance; the review pause records what it changed so `resume` restores only that, and per-action states make a failed pause retryable.
 
 - **Run jobs get their own service.** A background child stays in the tick's cgroup or launchd job and dies with it; a separate service keeps the run, its watchdog and its final log write alive.
 

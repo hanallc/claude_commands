@@ -8,13 +8,14 @@ import os
 import select
 import signal
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from dataclasses import dataclass
 from typing import cast
+from unittest.mock import patch
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.lib import test_hang_guard
 
@@ -29,9 +30,10 @@ OOM_SCORE_ADJ = "/proc/self/oom_score_adj"
 
 class VerifyTemporaryParentTests(NixFixture):
     def test_verify_creates_missing_tmpdir_before_environment_loading(self) -> None:
+        _ = (self.work / "Cargo.toml").write_text("[workspace]\n")
         missing = self.root / "session with spaces" / "tmp"
         _ = self.envrc(self.work)
-        self.env.update({"TMPDIR": str(missing), "CLAUDE_PYTHON": sys.executable})
+        self.env.update({"TMPDIR": str(missing), **interpreter_cache_environment(self.root / "cache")})
         self.script(self.bin / "direnv", '''import os, sys
 from pathlib import Path
 if sys.argv[1] == "allow":
@@ -106,6 +108,12 @@ def require_score_below_500(test: unittest.TestCase) -> None:
         test.skipTest("this process already runs at oom_score_adj 500 or more, so a 500 in the step proves nothing")
 
 
+def setUpModule() -> None:
+    cache_home = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory(prefix="invoke-cache-")))
+    _ = cast(object, unittest.enterModuleContext(patch.dict(
+        os.environ, interpreter_cache_environment(cache_home))))
+
+
 class BuildOomScoreAdjReaderTests(unittest.TestCase):
     python_reader: list[str] = [
         str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", "from scripts.lib import conf; "
@@ -116,7 +124,7 @@ class BuildOomScoreAdjReaderTests(unittest.TestCase):
         return subprocess.run(
             command, capture_output=True, text=True, check=False,
             env={**os.environ, "HOME": str(config.parent), "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent),
-                 "PYTHONPATH": str(INVOKE.resolve().parents[2])},
+                 "PYTHONPATH": str(INVOKE.resolve().parents[1] / "lib/python_startup")},
             timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
@@ -148,7 +156,12 @@ class BuildOomScoreAdjReaderTests(unittest.TestCase):
     def test_absent_key_uses_default_silently(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = write_lint_config(Path(directory), 650, include_adjustment=False)
-            self.assert_readers(config, 500, warns=False)
+            override = config.rename(config.with_name("override.conf"))
+            reads = Path(directory) / "config-reads"
+            _ = reads.write_text("")
+            with patch.dict(os.environ, {"CONF_READ_LOG": str(reads)}):
+                self.assert_readers(override, 500, warns=False)
+            self.assertEqual(reads.read_text().splitlines(), [override.stem])
 
     def test_python_reader_recovers_committed_values_and_refuses_without_history(self) -> None:
         from scripts.lint.memory_test_support import commit_config_fixture
@@ -287,11 +300,12 @@ class BuildScopeTests(unittest.TestCase):
             result = subprocess.run(
                 ["/bin/sh", "-c", 'exec 3>&2; exec /bin/sh -c "$@"',
                  "scope-test", command, str(marker), "sh", "-c",
-                 'test -f "$1.cgroup" && cat "$1.cgroup"', "step", str(marker)],
+                 'test -f "$1.cgroup" && cat "$1.cgroup" && printf "%s\\n" "$BUILDLOG_STEP_SCOPE"', "step", str(marker)],
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(result.stdout.strip(), str(scope))
+            # The step names its scope, so a compiler that sccache runs is charged to it.
+            self.assertEqual(result.stdout.splitlines(), [str(scope), str(scope)])
             self.assertEqual((root / "peak.cgroup").read_text().strip(), str(scope))
 
     def test_failed_score_write_is_silent_and_step_runs_under_exported_errexit(self) -> None:
@@ -396,7 +410,7 @@ buildlog_sample_anon "$1" "$2" "$$"
                 env={**os.environ,
                      "BUILD_HOLD_DIR": str(root / "holders"),
                      "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                     "UNIT_ACTIVE_DIR": str(root / "active"),
+                     "STAFF_FILE": str(root / "staff.json"),
                      "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                      "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                      "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": directory, "LINT_CONFIG_READER": str(root / "missing-config")},
@@ -459,7 +473,7 @@ buildlog_sample_anon "$1" "$2" "$$"
                 env={**os.environ,
                      "BUILD_HOLD_DIR": str(root / "holders"),
                      "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                     "UNIT_ACTIVE_DIR": str(root / "active"),
+                     "STAFF_FILE": str(root / "staff.json"),
                      "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                      "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                      "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": directory, "TMPDIR": directory,
@@ -469,27 +483,69 @@ buildlog_sample_anon "$1" "$2" "$$"
             self.assertEqual(list(root.glob("*.peak.cgroup")), [])
 
 
+@dataclass(frozen=True)
+class SweepRun:
+    events: str
+    journal: str
+
+
+JOURNAL_WRITER = """#!/bin/sh
+printf '%s\\n' "$*" > "$SWEEP_TEST_JOURNAL.part"
+cat >> "$SWEEP_TEST_JOURNAL.part"
+mv "$SWEEP_TEST_JOURNAL.part" "$SWEEP_TEST_JOURNAL"
+"""
+# A systemd-cat that cannot reach the journal: it closes its input and fails.
+JOURNAL_REFUSED = """#!/bin/sh
+exec 0<&-
+: > "$SWEEP_TEST_JOURNAL.closed"
+exit 1
+"""
+SWEEP_STAND_IN = ('invoke_sweep() { printf "started\\n" >&"$SWEEP_TEST_FD"; read -r _ < "$SWEEP_TEST_RELEASE"; '
+                  'printf "lint sweep: the floor took 1.0 GiB from /t/target\\n"; '
+                  'printf "finished\\n" >&"$SWEEP_TEST_FD"; }')
+
+
 class SweepStartupTests(unittest.TestCase):
-    def sweep_events(self, switch: str) -> str:
+    def sweep_run(self, switch: str, systemd_cat: str = JOURNAL_WRITER) -> SweepRun:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            tools = root / "bin"
+            tools.mkdir()
+            journal = root / "journal.txt"
+            tool = tools / "systemd-cat"
+            _ = tool.write_text(systemd_cat)
+            tool.chmod(0o755)
+            release = root / "release"
+            os.mkfifo(release)
             reader, writer = os.pipe()
             process = subprocess.Popen(
-                ["bash", "-c", 'source "$1"; invoke_sweep() { printf "started\\n" >&"$SWEEP_TEST_FD"; }; sweep_after_step test-step',
-                 "sweep-test", str(INVOKE)],
+                ["bash", "-c", f'source "$1"; {SWEEP_STAND_IN}; sweep_after_step test-step', "sweep-test", str(INVOKE)],
                 cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 pass_fds=(writer,),
                 env={**os.environ, "HOME": directory, "TMPDIR": directory,
+                     "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
                      "XDG_RUNTIME_DIR": str(root / "runtime"), "LINT_INVOKE_SOURCED": "",
                      "LINT_CONFIG_READER": str(root / "missing-config"), "LINT_SKIP_SWEEP": switch,
-                     "SWEEP_TEST_FD": str(writer)},
+                     "SWEEP_TEST_FD": str(writer), "SWEEP_TEST_RELEASE": str(release),
+                     "SWEEP_TEST_JOURNAL": str(journal)},
             )
             os.close(writer)
+            release_writer: int | None = None
             try:
+                # The step returns and its output closes while the sweep still waits.
                 output, errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.returncode, 0, output + errors)
-                events = b""
+                self.assertFalse(journal.exists(), "the sweep ended before its release")
                 deadline = time.monotonic() + test_hang_guard.TEST_HANG_GUARD_SECS
+                if systemd_cat == JOURNAL_REFUSED and switch != "1":
+                    closed = Path(f"{journal}.closed")
+                    while not closed.exists():
+                        self.assertLess(time.monotonic(), deadline, "systemd-cat stand-in did not start")
+                        time.sleep(0.01)
+                # A read-write open does not wait for the reader; the line waits in the FIFO.
+                release_writer = os.open(release, os.O_RDWR)
+                _ = os.write(release_writer, b"go\n")
+                events = b""
                 while True:
                     ready, _, _ = select.select([reader], [], [], max(0, deadline - time.monotonic()))
                     self.assertTrue(ready, "sweep stand-in still holds its pipe")
@@ -499,21 +555,31 @@ class SweepStartupTests(unittest.TestCase):
                     events += chunk
                 if switch == "1":
                     self.assertFalse((root / "runtime" / "lint-sweep").exists())
-                return events.decode()
+                # systemd-cat inherits the events pipe, so it has ended with the pipe.
+                return SweepRun(events.decode(), journal.read_text() if journal.exists() else "")
             finally:
+                if release_writer is not None:
+                    os.close(release_writer)
                 if process.poll() is None:
                     process.kill()
                     _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 os.close(reader)
 
     def test_offload_switch_starts_no_detached_sweep(self) -> None:
-        self.assertEqual(self.sweep_events("1"), "")
+        self.assertEqual(self.sweep_run("1"), SweepRun("", ""))
 
     def test_without_offload_switch_the_detached_sweep_still_starts(self) -> None:
-        self.assertEqual(self.sweep_events(""), "started\n")
+        self.assertEqual(self.sweep_run("").events, "started\nfinished\n")
 
     def test_switch_set_to_zero_keeps_detached_sweep_enabled(self) -> None:
-        self.assertEqual(self.sweep_events("0"), "started\n")
+        self.assertEqual(self.sweep_run("0").events, "started\nfinished\n")
+
+    def test_detached_sweep_lines_reach_the_journal(self) -> None:
+        self.assertEqual(self.sweep_run("").journal,
+                         "-t lint-sweep\nlint sweep: the floor took 1.0 GiB from /t/target\n")
+
+    def test_sweep_finishes_when_the_journal_refuses_its_lines(self) -> None:
+        self.assertEqual(self.sweep_run("", JOURNAL_REFUSED), SweepRun("started\nfinished\n", ""))
 
 
 class BuildAdmissionTests(unittest.TestCase):
@@ -600,7 +666,7 @@ sweep_after_step() { :; }
                  "BUILDLOG_DIR": str(root / "buildlog"),
                  "BUILD_HOLD_DIR": str(root / "holders"),
                  "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                 "UNIT_ACTIVE_DIR": str(root / "active"),
+                 "STAFF_FILE": str(root / "staff.json"),
                  "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                  "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                  "MAC_TEST_STATE_DIR": str(root / "mac-state"),
@@ -652,7 +718,6 @@ buildlog_release_memory() {
     echo release >> "$events"
     rm -rf "$TMPDIR/scope"
 }
-nextest_share_end() { :; }
 buildlog_end() { echo "record $1" >> "$events"; }
 sweep_after_step() { :; }
 run_once fixture-step

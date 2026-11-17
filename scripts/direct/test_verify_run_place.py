@@ -1,13 +1,14 @@
 """Verify startup gives nested and detached steps one live run identity."""
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import copy_runtime, fixture_shim_source, python_tool_source
+
 import json
 import os
 from pathlib import Path
 import select
 import signal
 import subprocess
-import sys
 from typing import TypedDict, cast
 import unittest
 
@@ -31,13 +32,16 @@ class VerifyRunPlaceTests(unittest.TestCase):
         scripts = fixture.root / "scripts"
         direct = scripts / "direct"
         direct.mkdir(parents=True)
+        (direct / "file_lock.sh").symlink_to(VERIFY.with_name("file_lock.sh"))
         (direct / "step_record.py").symlink_to(VERIFY.with_name("step_record.py"))
         for directory in ("agents", "build_targets", "build_hold"):
             (scripts / directory).symlink_to(VERIFY.parent.parent / directory, target_is_directory=True)
         library = scripts / "lib"
         library.mkdir()
-        (library / "py").symlink_to(sys.executable)
+        _ = (library / "py").write_text(fixture_shim_source())
+        (library / "py").chmod(0o755)
         (library / "package_root.py").symlink_to(VERIFY.parent.parent / "lib/package_root.py")
+        (library / "conf_record.sh").symlink_to(VERIFY.parent.parent / "lib/conf_record.sh")
         (library / "build_folders.py").symlink_to(VERIFY.parent.parent / "lib/build_folders.py")
         lint = scripts / "lint"
         lint.mkdir()
@@ -65,15 +69,21 @@ if [[ "$1" == outer ]]; then
 fi
 :
 ''')
+        copy_runtime(fixture.root)
         return script
 
-    def start(self, script: Path, name: str,
+    def start(self, script: Path, name: str, *words: str,
               **changes: str) -> subprocess.Popen[str]:
+        repository = script.parents[2] / "repository"
+        repository.mkdir()
+        _ = (repository / "Cargo.toml").write_text("[workspace]\n")
+        _ = subprocess.run(["git", "init", "--quiet"], cwd=repository, check=True,
+                           capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
         environment = {**os.environ, "IN_NIX_SHELL": "fixture", "CODEX_THREAD_ID": "",
                        "UNIT_DETACHED_RUN": "", **changes}
         _ = environment.pop("PYTHONPATH", None)
         _ = environment.pop("BUILDLOG_RUN", None)
-        process = subprocess.Popen(["bash", str(script), name], env=environment,
+        process = subprocess.Popen(["bash", str(script), name, *words], cwd=repository, env=environment,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, start_new_session=True)
         self.addCleanup(self.stop, process)
@@ -174,6 +184,21 @@ with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
             self.assertEqual(fixture.queue_pids(), [second.owner.pid, peer.owner.pid])
             _ = os.write(input_fd, b"continue\n")
 
+    def test_attached_build_stays_in_the_foreground_under_a_codex_worker(self) -> None:
+        with AdmissionFixture() as fixture:
+            script = self.script(fixture)
+            launcher = script.with_name("detach.py")
+            started = fixture.root / "detach-started"
+            _ = launcher.write_text(f"from pathlib import Path\n_ = Path({str(started)!r}).write_text('started')\n")
+            process = self.start(script, "build", "style_reader", "--release", "--attached",
+                                 CODEX_THREAD_ID="fixture", VERIFY_DETACHED_RUNS_SCRIPT=str(launcher))
+            probe = self.probe(process)
+            self.assertEqual(probe["pid"], process.pid)
+            self.proceed(process)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 0, output + errors)
+            self.assertFalse(started.exists(), "an --attached build started the detach launcher")
+
     def end_detached(self, pid: int) -> None:
         try:
             send_process_group(pid, signal.SIGKILL)
@@ -185,12 +210,11 @@ with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
             script = self.script(fixture)
             shim = fixture.root / "scripts/lib/py"
             shim.unlink()
-            _ = shim.write_text(f'''#!{sys.executable}
-import os, sys
+            _ = shim.write_text(python_tool_source('''import os, sys
 if sys.argv[2:3] == ["start"]:
     raise SystemExit("Mac startup requested a process start time")
 os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
-''')
+'''))
             shim.chmod(0o755)
             process = self.start(script, "mac", OSTYPE="darwin23")
             probe = self.probe(process)

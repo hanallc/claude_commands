@@ -15,16 +15,19 @@ import shlex
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import cached_property
 import sys
 from pathlib import Path
 from typing import cast
 
 from scripts.production import showrunners  # noqa: E402
+from scripts.herdr import herdr_types  # noqa: E402
 from scripts.production.production_doc import ProductionDocument  # noqa: E402
 from scripts.production import staff, unit_config, session_staff  # noqa: E402
+from scripts.herdr import pane_launch  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
-from scripts.message import sessions  # noqa: E402
-from scripts.shutdown import remote  # noqa: E402
+from scripts.message import morty_identity, sessions  # noqa: E402
+from scripts.agents import remote  # noqa: E402
 
 
 # Matchers live in unit_lookup, so lower readers use the same join without an import cycle.
@@ -50,12 +53,12 @@ def ensure_staff_showrunner(child: ProductionDocument, caller: str = "", *, runt
         if runtime_id and found.row.current_session != staff.native_id(runtime_id):
             raise staff.StaffRefused(f"{child.name}: native session conflicts with retained staff identity")
         if found.row.doc == location:
-            return found.row
-        return staff.ensure("showrunner", name=found.row.name, parent=found.row.parent, doc=location)
+            return pane_launch.staff_admitted(found.row)
+        return pane_launch.staff_admitted(staff.ensure("showrunner", name=found.row.name, parent=found.row.parent, doc=location))
     if caller:
         _ = showrunners.owner_for(caller, record)
     # Admission records the document. Parent attachment records the edge and notices later.
-    return staff.ensure("showrunner", name=child.name, doc=location, runtime_id=runtime_id)
+    return pane_launch.staff_admitted(staff.ensure("showrunner", name=child.name, doc=location, runtime_id=runtime_id))
 
 
 def showrunner_members(record: staff.StaffSnapshot) -> dict[str, staff.StaffRow]:
@@ -138,22 +141,25 @@ def pane_holds_staff_member(record: staff.StaffSnapshot, sources: _MemberSources
     for launch in sources.launches:
         if launch.get("pane_id") != pane or launch.get("ended"):
             continue
-        if record.by_member_reference(launch["session_id"]) is not None:
+        if record.by_member_reference(pane_launch.reference_id(launch)) is not None:
             return True
     return False
 
 
 class CodexProcessThreads:
-    """Read a thread from its process or terminal metadata."""
+    """Read a thread from its process or native pane record."""
 
     def __init__(self) -> None:
         self.panes: dict[tuple[str, str], dict[str, object]] = {}
         self.foreground_pids: dict[tuple[str, str], int] = {}
-        self.threads: dict[Path, dict[str, str]] = {}
+
+    @cached_property
+    def morty(self) -> morty_identity.MortyHolder | morty_identity.NoMortyHolder:
+        """One staff read serves every process of a report."""
+        return morty_identity.holder()
 
     def thread(self, pid: int, environment: Mapping[str, str]) -> str:
         from scripts.herdr import herdr
-        from scripts.message import codex_daemon
 
         try:
             try:
@@ -177,23 +183,8 @@ class CodexProcessThreads:
                 return identity
             if identity := environment.get("CODEX_THREAD_ID", ""):
                 return identity
-            title = pane.get("terminal_title_stripped")
-            if not isinstance(title, str):
-                return ""
-            name = title.partition(" | ")[0]
-            home = Path(environment.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
-            if home not in self.threads:
-                observed = codex_daemon.loaded_sessions(home / "app-server-control/app-server-control.sock")
-                self.threads[home] = {}
-                if not isinstance(observed, codex_daemon.DaemonUnreadable):
-                    for entry in observed:
-                        # A repeated name cannot identify one terminal's thread.
-                        if entry.name in self.threads[home]:
-                            self.threads[home][entry.name] = ""
-                        else:
-                            self.threads[home][entry.name] = entry.thread_id
-            return self.threads[home].get(name, "")
-        except (OSError, ValueError, herdr.HerdrFailure):
+            return ""
+        except (OSError, ValueError, herdr_types.HerdrFailure):
             return environment.get("CODEX_THREAD_ID", "")
 
 
@@ -202,9 +193,10 @@ class CodexProcessThreads:
 
         try:
             native = identity or (self.thread(pid, herdr.process_environment(pid)) if pid else "")
-        except (OSError, ValueError, herdr.HerdrFailure):
+        except (OSError, ValueError, herdr_types.HerdrFailure):
             native = identity
-        return session_staff.ReportProcessIdentity(native, session_staff.morty_thread(native))
+        return session_staff.ReportProcessIdentity(
+            native, self.morty == morty_identity.MortyHolder(staff.StaffId(native)))
 
 
 @dataclass(frozen=True)
@@ -294,7 +286,7 @@ class _WorkerSources:
                     continue
                 try:
                     environment = herdr.process_environment(process.pid)
-                except (OSError, herdr.HerdrFailure):
+                except (OSError, herdr_types.HerdrFailure):
                     if process.pid in process_table.snapshot():
                         raise
                     continue
@@ -419,14 +411,14 @@ def live() -> dict[str, object]:
                     unregistered.append(pending.identity)
                     incomplete = True
                     _problem(pending.identity, "backend publication is unfinished")
-    active_ids = {row.id for kind in ("unit", "showrunner", "agent") for row in staff.active(record, kind)}
+    active_ids = {row.id for kind in ("unit", "showrunner", "producer") for row in staff.active(record, kind)}
     resolver = session_staff.RowResolver(record, dependencies=dependencies)
     for row in record.rows:
         identity = scan.identities.get(row.id) if row.id in active_ids else None
         if row.kind != "worker" and identity is not None and row.current_session in identity.values():
             problems: list[str] = []
             document = resolver.production_doc(row)
-            if row.kind != "agent" and not isinstance(document, session_staff.ProductionDoc):
+            if row.kind != "producer" and not isinstance(document, session_staff.ProductionDoc):
                 problems.append(f"production doc could not be read: {document.reason}")
             if row.kind == "unit":
                 branch = resolver.unit_branch(row)

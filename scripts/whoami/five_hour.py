@@ -1,7 +1,6 @@
 """Log Codex five-hour warnings and relay Claude warnings once per low spell."""
 from __future__ import annotations
 
-import sys
 import os
 import subprocess
 import fcntl
@@ -20,11 +19,12 @@ from zoneinfo import ZoneInfo
 from scripts.whoami.agent_accounts import KnownCodexAccount
 from scripts.whoami.agent_accounts import Report, observe_workers_home
 from scripts.whoami import account
+from scripts.production import staff
 from scripts.whoami.quota_alert import (PROTOCOL, load_config, recipients, relay, showrunners_now,
                          CodexAlertPassReadings, ReadCurrentCodexReadings, READ_CURRENT_CODEX_READINGS,
                          codex_alert_pass, selected_codex_report, codex_swap_line)
 
-from scripts.message import escalate  # noqa: E402
+from scripts.message import escalate, session_send  # noqa: E402
 # Percent of the five-hour window left at which the alert list is told.
 THRESHOLD = 20
 STATE = Path(os.environ.get("FIVE_HOUR_STATE_DIR")
@@ -174,8 +174,8 @@ def cancel_outgoing_notices(key: str, names: list[str]) -> None:
         name = path.read_text(encoding="utf-8")
         retired = True
         for recipient in names:
-            result = subprocess.run([sys.executable, str(escalate.SEND), "retire", "--to", recipient,
-                                "--from", "quota_alert", "--key", f"5-hour {name}"],
+            result = subprocess.run(session_send.send_argv("retire", "--to", recipient,
+                                "--from", "quota_alert", "--key", f"5-hour {name}", send_script=escalate.SEND),
                                capture_output=True, text=True, check=False)
             if result.returncode != 0:
                 retired = False
@@ -265,7 +265,9 @@ def watch(reports: list[Report], *,
 
                 with ThreadPoolExecutor() as pool:
                     problems = list(pool.map(send_notice, owed))
-                lines += [f"5-hour limit: {name} {left:.0f}% left -> {recipient}"
+                membership = staff.snapshot()
+                lines += [f"5-hour limit: {name} {left:.0f}% left -> "
+                          + (owner.name if (owner := membership.by_id(staff.StaffId(recipient))) is not None else recipient)
                           + (f": NOT sent: {problem}" if problem else "") for recipient, problem in zip(owed, problems)]
             else:
                 for recipient in names:

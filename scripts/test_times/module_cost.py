@@ -16,11 +16,12 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from typing import Literal, TypedDict, cast
 
+from scripts.lib import build_folders
 from scripts.lib.terminal_cells import print_table, seconds
+from scripts.production.merge_gate import test_module_environment
 
 
 @dataclass(frozen=True)
@@ -87,18 +88,23 @@ class ModuleCost:
                 seconds(self.wall_s), status]
 
 
-def measure(tree: Path, module: str, strace: str) -> ModuleCost:
+def runner_command(tree: Path, module: str) -> list[str]:
     folder, filename = module.rsplit("/", 1)
-    command = [sys.executable, str(Path(__file__).with_name("module_run.py")), f"scripts/{folder}", filename]
-    environment = dict(os.environ, HERDR_BIN="/nonexistent/herdr", PYTHONDONTWRITEBYTECODE="1")
-    with tempfile.TemporaryDirectory(prefix="module-cost-") as temporary:
+    return [sys.executable, str(tree / "scripts/test_times/module_run.py"), f"scripts/{folder}", filename]
+
+
+def measure(tree: Path, module: str, strace: str) -> ModuleCost:
+    command = runner_command(tree, module)
+    with build_folders.tool_folder("module-cost") as temporary:
         root = Path(temporary)
+        environment = test_module_environment(root, dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
         report = root / "times.json"
         environment["TEST_TIMES_OUT"] = str(report)
         with (root / "time.log").open("w+") as output:
             started = time.perf_counter()
             with subprocess.Popen(command, cwd=tree, env=environment,
-                                  stdout=output, stderr=subprocess.STDOUT) as child:
+                                  stdout=output, stderr=subprocess.STDOUT,
+                                  pass_fds=(build_folders.build_folder_lock_fd(root),)) as child:
                 _, status, usage = os.wait4(child.pid, 0)
                 child.returncode = test_status = os.waitstatus_to_exitcode(status)
             wall_s = time.perf_counter() - started
@@ -116,6 +122,7 @@ def measure(tree: Path, module: str, strace: str) -> ModuleCost:
             traced = subprocess.run(
                 [strace, "-f", "-e", "trace=fork,vfork,clone,clone3,execve", "-o", str(trace), *command],
                 cwd=tree, env=environment, stdout=output, stderr=subprocess.STDOUT, check=False,
+                pass_fds=(build_folders.build_folder_lock_fd(root),),
             )
             if traced.returncode:
                 _ = output.seek(0)
@@ -160,13 +167,13 @@ def main(argv: list[str] | None = None) -> int:
     if request.commands:
         from scripts.test_times import task_cpu
 
-        environment = dict(os.environ, HERDR_BIN="/nonexistent/herdr", PYTHONDONTWRITEBYTECODE="1")
-        _ = environment.pop("TEST_TIMES_OUT", None)
         for cost in costs:
-            folder, filename = cost.module.rsplit("/", 1)
-            command = [sys.executable, str(Path(__file__).with_name("module_run.py")),
-                       f"scripts/{folder}", filename]
-            tasks = task_cpu.measure(command, cwd=request.tree.resolve(), environment=environment)
+            command = runner_command(request.tree.resolve(), cost.module)
+            with build_folders.tool_folder("module-cost-commands") as temporary:
+                environment = test_module_environment(Path(temporary), dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+                _ = environment.pop("TEST_TIMES_OUT", None)
+                tasks = task_cpu.measure(command, cwd=request.tree.resolve(), environment=environment,
+                                         pass_fds=(build_folders.build_folder_lock_fd(temporary),))
             print_table([cost.module + " command", "starts", "CPU s"],
                         [[row.command, str(row.starts), seconds(row.cpu_s)]
                          for row in tasks.commands[:request.commands]])

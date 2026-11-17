@@ -8,7 +8,7 @@ Pool maintenance paths do not dispatch new reviews.
 
 Agent launchers resolve their family, model, effort, and service tier from `config/models.conf`.
 Python uses `scripts/lib/models_registry.py`. Bash uses `scripts/agents/models_config.sh`.
-Consumers include unit workers, production unit directors, CLI aliases, and `/ask_a_friend`.
+Consumers include unit workers, production unit directors and CLI aliases.
 The registry gives each task one source for its launch settings.
 `/default_models` changes a function's family or a task's model and effort.
 
@@ -21,7 +21,7 @@ Its INI-style sections hold assignments, task rows, catalogs, family aliases, an
 `#` starts a comment, including a trailing row comment.
 
 ```ini
-[assignments]                 # <function>=<family>, plus optional <function>.<subtask>=<family>; `caller` = the family of the agent running it
+[assignments]                 # <function>=<family>; optional <function>.<subtask>=<family>
 direct=codex
 
 [direct.codex]              # [<function>.<family>] — <subtask>=<agent>[:<effort>]
@@ -37,6 +37,7 @@ codex_service_tier=fast
 
 Options sections hold launch flags instead of agent rows.
 `[<function>.options]` can set `codex_service_tier` and `codex_service_tier.<subtask>`.
+It can also set `claude_account` and `claude_account.<subtask>`: the Claude launch account, `workers` (the default) or `caller`. `agent_exec.sh` runs a `caller` task on the caller's own account; `[direct.options] claude_account.simplify=caller` keeps the /simplify review there.
 The editor excludes options sections from family enumeration.
 
 A family is `codex` or `claude`.
@@ -51,24 +52,25 @@ A direct change to an unsupported family refuses without writing.
 | Function | Sub-tasks |
 | --- | --- |
 | `direct` | `impl`, `test`, `fix`, `review`, plus the Claude `simplify` task |
-| `cli` | `commit_prep`, `merge_branch`, `interactive` |
-| `ask_a_friend` | `consultation` |
+| `cli` | `merge_branch`, `interactive` |
 | `production` | `director` |
 | `design_roles` | `designer`, `reviewer` |
 
 `[codex.agents]` and `[codex.families]` come from catalog synchronization.
 Family aliases such as `sol` resolve to a concrete model from `[codex.families]`.
-The Claude catalog and family aliases are hand-maintained.
+The Claude catalog and family aliases are hand-maintained. Each `[claude.families]` value is the family word itself (`fable=fable`).
+A Claude launch turns that word into the newest model of the family; see [Claude family resolution](#claude-family-resolution).
 `production` has only a Claude set. `design_roles` has only a Codex set.
-`ask_a_friend` selects the caller's family.
 
 ### Registry publication
 
 `store_registry(registry, before, after, description, *, additive_catalog=False)` owns every registry publication.
-It replays the changed rows against the latest text under an exclusive writer lock.
+It first writes the changed rows live: it replays them against the latest text under an exclusive writer lock.
 It preserves unrelated edits, file mode, comments, and spacing.
-It returns the published text while it still holds the lock.
-The `store` command builds `configuration_shell` from that text without a second read.
+The live write never waits for the main push lock, so the new value is in effect at once.
+Publication follows the write. A failed publication keeps the rows live and fails with `the rows are live; main does not have them yet`, as `/tune` exits 2 after its live write.
+The notes timer then publishes them through `publish_pending`.
+It returns the live text after publication. The `store` command builds `configuration_shell` from that text without a second read.
 
 Publication applies only to the real registry under the Git root of `~/.claude`.
 `MODELS_CONFIG_PUBLISH=0` disables publication.
@@ -77,14 +79,26 @@ The shared writer fetches origin and checks fast-forward safety with a temporary
 `models_registry._fetch(repo, branch)` fetches `+refs/heads/<branch>:refs/remotes/origin/<branch>` and reads that ref, never `FETCH_HEAD`.
 Every fetch in the checkout writes `FETCH_HEAD`, so another fetch between the fetch and the read cannot change the target.
 With `fetch.prune=true`, this one-ref refspec prunes no other `origin/*` ref.
+Main publication takes the [shared main push lock](repair-rounds.md#shared-main-push-lock), after the live write, before the registry writer lock.
+The hold covers fetch, row replay, commit, push retries, and local reconciliation.
+Other target branches retain only the registry writer lock.
 An isolated index and `commit-tree` make a commit containing only `config/models.conf`.
 Its subject is `config(models): <description>`.
 Temporary index folders use the `models-index-` and `models-ff-index-` prefixes.
-The commit uses local HEAD as its parent, so a push can include pre-existing local commits.
+The commit goes only onto origin/main. A checkout with local commits that origin does not have refuses publication, so a push never carries another commit.
 The writer stages, commits, stashes, resets, or rebases no other path.
 
 A rejected push fetches and replays the same row changes, for at most three attempts.
 Repeating an interrupted edit publishes all pending local rows, even when the requested value already matches. Recovery recognizes an accepted push without another commit.
+Pending rows replay onto the fetched registry, so a registry commit from another writer does not block them.
+
+`MODELS_CONFIG_PUBLISH=later` writes the shared registry live and skips the publication.
+It never waits for main, so a landing that holds main never delays the caller.
+The quota alert's `edit_registry` uses this mode for its role routing.
+`sync_codex_catalog.sh` uses it on Linux; the Mac runs no notes timer and publishes its catalog rows in place.
+`publish_pending(registry)` commits and pushes the rows that HEAD does not have.
+It returns `False` at once when another process holds the main push lock.
+Each quota part of the notes timer calls it through `live_settings.publish_waiting()`.
 Exhaustion reports that the file is edited but not shared.
 Local integration uses fast-forward only.
 A successful push with failed local reconciliation reports both facts.
@@ -121,6 +135,38 @@ Model, effort, and service tier for one submission come from the same configurat
 Explicit dispatch overrides retain their precedence.
 The [progress recorder](unit-progress-history.md#configuration-digest) uses the inherited exact text for telemetry.
 
+### Python launch settings
+
+`models_registry.launch_settings(section, key, family="assigned", *, configuration=None) -> LaunchSettings` gives Python callers the shell resolver's result.
+A `claude` or `codex` family reads that family's row through `_agents_resolve_in_family`, whatever the assignment is.
+Without `configuration`, it builds a `LaunchModelConfiguration` in Python from `_snapshot`, so an inherited `MODELS_LAUNCH_CONFIGURATION` decides the result. A writer passes its candidate text as `configuration`.
+It starts one `bash`, which sources `models_config.sh` and reads `configuration_shell` output from stdin.
+Bash loads that table with `_models_table_load` and runs the real `agents_resolve`. No Python registry process starts.
+The child environment sets `MODELS_CONFIG_TIER_ONLY=1`, so this path never synchronizes the Codex catalog.
+The result is four lines: family, model, effort, and service tier.
+A resolver failure or bad output raises `ValueError`. A missing registry raises `OSError` before bash starts.
+
+### Claude family resolution
+
+`_agents_model_slug claude <word>` is the one Claude model resolver.
+It reads the `*-cc.json` file with the largest `.fetchedAt` under `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/cache/model-catalog/`.
+It prints `.catalog.config.provider_alias_targets.<word>.default` when the installed `claude --version` meets that model's `min_claude_code_version`.
+In every other case it prints the `[claude.families]` value. A full model id passes unchanged.
+
+`agents_resolve` and `launch_settings` keep the family word in `AGENT_MODEL`. `AGENT_WORD` keys `[claude.agents]` effort lookups.
+Each account has its own catalog, so a launch resolves only after it chooses the account, with that account's environment.
+`models_registry.claude_model(model, environment)` and `claude_arguments(arguments, environment)` run the resolver for Python launchers. A failed call returns the input model.
+The launch paths are `herdr.launch_prepared_agent`, `stop_resume`, `accounts.exec_account`, `relaunch.child_launch`, `claude_worker`, `agent_exec.sh`, `cli_agent.sh`, the `send.py` relay and `review.py`.
+`worker_panes._live_policy` compares an unchanged explicit Claude policy with its resolved model, so a live pane stays reusable.
+
+Run records name the model that ran, not the family word:
+
+- `review.sh` runs `claude_launch_environment workers` and resolves `AGENT_MODEL` before it writes the agent file, board `register` line, `--called-model` and heartbeat header. It passes `AGENT_EXEC_CLAUDE_MODEL`, so `agent_exec.sh` skips its own account choice and resolve.
+- `claude_worker.prepare_launch(turn)` returns `PreparedClaudeLaunch(model, environment, loaded)`. `assign_claude.py` writes every record from that model and passes the same launch to `open_worker`.
+- `_switch` in `assign_claude.py` returns `NewClaudeWorker`, `ClaudeDeliveryRetry` or `ClaudeFollowUp`. Only `NewClaudeWorker` prepares a launch. A delivery retry reuses the published session, so it and a follow-up take the model from the saved worker record.
+
+Tests set a temporary `HOME` and `MODELS_CONFIG_PUBLISH=0`, and build a fixture catalog in a temporary `CLAUDE_CONFIG_DIR`. No test writes the live registry.
+
 ### Agent environment boundary
 
 Operation snapshots reach helpers, but they never reach an agent or an app-server.
@@ -146,14 +192,11 @@ The resolver applies these rules:
 
 1. Split the task into two nonempty segments.
 2. Select the exact-task assignment before the function assignment.
-3. Resolve `caller` through `AGENTS_CALLER_FAMILY`, then `CODEX_THREAD_ID`, then `CLAUDE_CODE_SESSION_ID`.
-4. Read the task row from `<function>.<family>`.
-5. Resolve a model alias through the family catalog.
-6. Validate the model and effort against `<family>.agents`.
-7. Select the task-specific service tier before the function tier.
+3. Read the task row from `<function>.<family>`.
+4. Resolve a model alias through the family catalog.
+5. Validate the model and effort against `<family>.agents`.
+6. Select the task-specific service tier before the function tier.
 
-`AGENTS_CALLER_ASSIGNMENT` names the `caller` assignment value.
-No detectable caller family produces an error.
 A trailing colon with no effort is invalid.
 A model with an empty effort catalog accepts only a bare model name.
 A row edit leaves the active family unchanged.
@@ -169,7 +212,9 @@ Sourcing the file defines functions without reading or synchronizing the registr
 `models_launch_configuration` obtains and exports the launch snapshot.
 `models_registry_edit` gives an editor one scoped base.
 `_models_registry_scope --launch|--edit` holds the parsed arrays for that scope.
-`models_registry_store` evaluates the configuration returned by the publication writer.
+`_models_table_load <assignments>` is the one table loader. It evaluates the assignments and marks the table as loaded for `MODELS_CONFIG_FILE`.
+`_models_registry_parse`, `models_registry_store` and the Python launch-settings reader call it.
+`models_registry_store` loads the configuration returned by the publication writer.
 
 | Function | Result or change |
 |---|---|
@@ -179,7 +224,7 @@ Sourcing the file defines functions without reading or synchronizing the registr
 | `agents_list_assignments [filter]` | Lists each active task once and reports invalid rows. |
 | `agents_list_function <function>` | Lists both family sets and marks active rows. |
 | `agents_set_assignment <function> <family>` | Validates the target set and changes its assignment. |
-| `agents_set_all_assignments <family>` | Changes supported assignments and keeps caller-based or pinned functions. |
+| `agents_set_all_assignments <family>` | Changes supported assignments and keeps pinned functions. |
 | `agents_set_model <agent> [function]` | Changes supported sets to the model while preserving valid efforts. |
 | `agents_set_row <task> <agent>[:<effort>]` | Changes the row in the model's family, without changing its assignment. |
 | `agents_set_service_tier <tier> [function or task]` | Changes tier options; `inherit` removes the selected override. |
@@ -189,7 +234,6 @@ Sourcing the file defines functions without reading or synchronizing the registr
 The editor validates the complete requested change before publication.
 Ambiguous model names and missing task sets produce errors.
 A function-wide tier change removes narrower task-tier overrides.
-`caller` functions keep their family assignment during global edits.
 `AGENT_KEPT_FUNCTIONS` reports pinned functions that a global edit preserved.
 
 The argument emitters produce one space-separated line for `read -r -a`.
@@ -217,8 +261,7 @@ It sends prompt contents through stdin, avoiding the command-line argument size 
 | Claude | Uses print mode with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and retains stream-json events in the log. |
 
 Write mode uses unrestricted write permissions.
-Readonly mode selects the read-only Codex sandbox or Claude plan permissions.
-`direct.simplify` also disables Claude editing tools.
+Readonly mode selects the read-only Codex sandbox, or Claude plan permissions with the editing tools disabled.
 `claude_result.py` writes the final answer to the output file.
 An `is_error` result or nonempty errors array produces `ERROR: <reason>` and exit 1.
 Otherwise the launcher preserves the agent's exit status.
@@ -239,9 +282,9 @@ The plain `codex exec` worker fallback is absent.
 `design_roles.py` uses `worker.py add`, `assign`, and `end` for held Astra roles.
 These roles keep their staff row and current session in a pane.
 Held roles receive messages through `send.py`.
-An ad hoc Astra review outside the staff hierarchy uses the one-turn `codex exec` path in `astra_review.py`.
-`side_pane.py` serves ask-a-friend consultations without a staff row.
-The friend launches with the worker policy through `worker_panes.worker_policy`, so it replies with `send.py` and stops at no permission prompt.
+An ad hoc Astra review starts through `assign.sh --target consultation-pane --operation astra-review`.
+`side_pane.py` supplies pane functions for Astra consultations without a staff row.
+Its command interface retains `send` and `close`.
 A managed Astra review starts through `assign.sh --role review --operation astra-review`.
 `worker.py` adds, assigns, and ends the reviewer.
 The pane transport keeps the hold while `assign.sh` runs; after a failed end, the staff row is the record of the reviewer.
@@ -312,7 +355,7 @@ Invalid argument counts print usage and return 1.
 | `unit_effort.py` | Shares one editor base through its command. |
 | `progress_history.py` | Reads the [configuration digest](unit-progress-history.md#configuration-digest) without publication. |
 | `add_unit.py` | Resolves `production.director` and requires Claude. |
-| `side_pane.py` | Resolves `ask_a_friend.consultation` in the caller's family. |
+| `worker_panes.launch_policy`, `assign.pane_policy` | Call `launch_settings`. Each catches `OSError` and `ValueError` and refuses the invalid role configuration. |
 
 [Long-lived workers](long-lived-workers.md) owns worker launch, handoff, and recovery behavior.
 [Unit progress history](unit-progress-history.md) owns recorder events and progress reports.
@@ -335,6 +378,9 @@ Invalid argument counts print usage and return 1.
 ## Gotchas
 
 - An unexported `MODELS_CONFIG_FILE` still selects the Bash reader's registry.
+- `launch_settings` passes the table on stdin, never as an argument. The table holds the registry text about twice, and Linux limits one argument to 128 KiB.
+- `read -r -d ""` returns 1 at end of input, so it is not chained with `&&`. Bash 3.2 on macOS cannot use `source /dev/stdin`.
+- Table text is plain assignments, never `declare`. So `_models_table_load` sets the caller's locals in `_models_registry_scope` through dynamic scope.
 - An inherited launch or edit snapshot suppresses catalog synchronization for that operation.
 - A telemetry read never synchronizes or publishes the registry.
 - A failed synchronization warns and uses the current registry. It does not stop the launch.

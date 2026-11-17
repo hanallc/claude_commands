@@ -87,6 +87,11 @@ class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
             "--filter", "render", "--filter", "audio", "--features", "a")
         self.assertNotEqual(verdict, other_verdict)
         self.assertEqual(build, other_build)
+        for selection in (("--run-ignored", "only"),):
+            with self.subTest(selection=selection):
+                ignored_verdict = self.calculate_build_keys(
+                    "--filter", "native_rate", "--features", "a", *selection)[0]
+                self.assertNotEqual(verdict, ignored_verdict)
         for name, value in (("NEXTEST_TEST_THREADS", "1"), ("NEXTEST_RETRIES", "3"),
                             ("NEXTEST_STATUS_LEVEL", "all")):
             with self.subTest(input=name):
@@ -155,7 +160,7 @@ class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
         # ordering relative to invoke.sh's run_once and buildlog_begin.
         hold_wrapper = "# A build hold stops every natedev build," + source.split(
             "# A build hold stops every natedev build,", 1)[1].split(
-                "# Again with the token held:", 1)[0]
+                "# Again before the first step:", 1)[0]
         key_setup = source.split('TOKEN_WAIT_FILE="$(mktemp)"\n', 1)[1].split(
             'if [[ -n "${CACHE_DIR}" ]]', 1)[0]
         metadata = cast(dict[str, object], json.loads(self.environment["TEST_METADATA"]))
@@ -213,7 +218,6 @@ buildlog_wait_for_memory() {
 }
 build_hold_check_local() { return 0; }
 buildlog_exec() { :; }
-nextest_share_end() { :; }
 buildlog_release_memory() { :; }
 sweep_after_step() { :; }
 run_once cargo nextest run -E "package(sample) & test(native_rate)"

@@ -86,6 +86,11 @@ def optional_int(record: dict[str, object], key: str) -> int | None:
     return value if isinstance(value, int) else None
 
 
+def optional_float(record: dict[str, object], key: str) -> float | None:
+    value = record.get(key)
+    return float(value) if isinstance(value, int | float) else None
+
+
 def read_rows() -> list[Row]:
     if not LEDGER.exists():
         return []
@@ -94,9 +99,6 @@ def read_rows() -> list[Row]:
         if not line.strip():
             continue
         record = cast(dict[str, object], json.loads(line))
-        minutes = record.get("review_minutes")
-        check_minutes = record.get("ux_check_minutes")
-        repair_minutes = record.get("ux_repair_minutes")
         note = record.get("note")
         excluded = record.get("excluded")
         plan = record.get("plan")
@@ -112,9 +114,9 @@ def read_rows() -> list[Row]:
                 merge_defects=int(cast(int, record["merge_defects"])),
                 ux_findings=optional_int(record, "ux_findings"),
                 code_findings=optional_int(record, "code_findings"),
-                review_minutes=float(minutes) if isinstance(minutes, int | float) else None,
-                ux_check_minutes=float(check_minutes) if isinstance(check_minutes, int | float) else None,
-                ux_repair_minutes=float(repair_minutes) if isinstance(repair_minutes, int | float) else None,
+                review_minutes=optional_float(record, "review_minutes"),
+                ux_check_minutes=optional_float(record, "ux_check_minutes"),
+                ux_repair_minutes=optional_float(record, "ux_repair_minutes"),
                 note=note if isinstance(note, str) else None,
                 excluded=excluded if isinstance(excluded, str) else None,
             )

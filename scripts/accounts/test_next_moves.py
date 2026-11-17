@@ -210,6 +210,38 @@ class NextMovesTests(unittest.TestCase):
         next_moves.remove_next_move("showrunners", next_moves.GroupPosition(1))
         self.assertEqual(next_moves.read_next_moves(), ())
 
+    def test_set_first_replaces_only_the_groups_first_entry_or_appends_one(self) -> None:
+        runner = next_moves.add_next_move("showrunners", 2, "claude2")
+        added = next_moves.set_first_next_move("units", 1, "claude3")
+        self.assertEqual(next_moves.read_next_moves(), (runner, added))
+        self.assertEqual((added.group, added.at_percent, next_moves.target_label(added)), ("units", 1, "claude3"))
+        later = next_moves.add_next_move("units", 5, "claude4", next_moves.HalfPointHold())
+        replaced = next_moves.set_first_next_move("units", 1, "claude2")
+        self.assertEqual(next_moves.read_next_moves(), (runner, replaced, later))
+        self.assertIsInstance(replaced, next_moves.ClaudeGroupMove)
+        self.assertEqual(cast(next_moves.ClaudeGroupMove, replaced).hold_mode, next_moves.FixedHold(0))
+        with self.assertRaises(next_moves.NextMoveError):
+            _ = next_moves.set_first_next_move("units", 1, "codex2")
+        self.assertEqual(next_moves.read_next_moves(), (runner, replaced, later))
+
+    def test_remote_set_first_removes_the_hosts_first_entry_then_inserts_at_one(self) -> None:
+        for queued, expected in (("[]", [("next-read",), ("next-write", "--at", "1")]),
+                                 (json.dumps([{"id": "old", "group": "units", "at_percent": 1, "hold_minutes": 0,
+                                               "to": "claude2", "added_at": NOW.isoformat()}]),
+                                  [("next-read",), ("next", "remove", "units", "1"), ("next-write", "--at", "1")])):
+            calls: list[tuple[str, ...]] = []
+
+            def remote(arguments: tuple[str, ...], queued: str = queued) -> str:
+                calls.append(arguments[:1] + arguments[2:] if arguments[0] == "next-write" else arguments)
+                return queued if arguments == ("next-read",) else arguments[1] if arguments[0] == "next-write" else ""
+
+            with (self.subTest(queued=queued), patch.object(role_map, "is_role_map_host", return_value=False),
+                  patch.object(role_map, "ssh_role_map", side_effect=remote)):
+                entry = next_moves.set_first_next_move("units", 1, "claude3")
+            self.assertEqual(calls, expected)
+            self.assertEqual(next_moves.target_label(entry), "claude3")
+        self.assertFalse(next_moves.next_moves_file().exists())
+
     def test_group_positions_are_one_based_and_out_of_range_edits_preserve_the_log(self) -> None:
         for value in (0, -1, True):
             with self.subTest(value=value), self.assertRaises(next_moves.NextMoveError):

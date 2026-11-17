@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: validate_version.sh <version> <crate_name> [<crate_name>...]
-# Validates version format, checks not already published, and verifies no gaps.
+# Usage: validate_version.sh <version> [--resume] <crate_name> [<crate_name>...]
+# Check the version format and gaps. With --resume, skip published versions.
 # Exit 0 = valid, Exit 1 = invalid (prints reason to stderr)
 
 VERSION="$1"
 shift
+RESUME=""
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --resume) RESUME="--resume"; shift ;;
+    *) echo "ERROR: unknown flag: $1" >&2; exit 1 ;;
+  esac
+done
 CRATES=("$@")
 
 # crates.io's /api/v1 enforces a data-access policy that rejects requests
@@ -46,6 +53,10 @@ for CRATE in "${CRATES[@]}"; do
 
   # Check exact match — already published?
   if echo "$VERSIONS" | grep -qx "$VERSION"; then
+    if [[ -n "$RESUME" ]]; then
+      echo "  $CRATE: $VERSION already published (resume)"
+      continue
+    fi
     echo "ERROR: $CRATE version $VERSION is already published on crates.io" >&2
     exit 1
   fi
