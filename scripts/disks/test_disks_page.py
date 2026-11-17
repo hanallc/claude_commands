@@ -134,7 +134,7 @@ class DisksPageTests(unittest.TestCase):
             page = disks_page.publish(Path(directory), SETTINGS).read_text()
         self.assertIn('</h1><p class="page-status"', page)
         self.assertIn(page_frame.REFRESH_SCRIPT, page)
-        self.assertIn("createPageRefresh(loadDisks,()=>settings.poll_seconds,()=>measuring ? 'Measuring…' : '')", page)
+        self.assertIn("createPageRefresh(loadDisks,()=>settings.poll_seconds,()=>measuring && !readFailed ? 'Measuring…' : '')", page)
         self.assertIn('readAt:data.measured_at,renderSeconds:data.render_seconds', page)
         self.assertIn('throw new Error("The measure did not finish.")', page)
         match = re.search(r'data-status-options="([^"]+)"', page)
@@ -149,12 +149,13 @@ const localStorage={getItem:()=>null};
         assert start is not None
         scenario = r"""
 const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
-let fileAt=now/1000-4200,measureState='current',stalled=false,release;
+let fileAt=now/1000-4200,measureState='current',stalled=false,failedReads=false,release;
 function render(){}
 function renderCards(){}
 const payload=()=>({measured_at:fileAt,render_seconds:.03,drives:[]});
 const fetch=async(url)=>{
  if(url==='measure') return {ok:true,json:async()=>({state:measureState})};
+ if(failedReads) return {ok:false,status:502};
  if(stalled) return new Promise(resolve=>release=()=>resolve({ok:true,json:async()=>payload()}));
  return {ok:true,json:async()=>payload()};
 };
@@ -181,6 +182,19 @@ START
   'A measure timeout must keep its failure after the age clock runs.');
  measureState='current';await pageRefresh.refresh();
  check(line.dataset.state==='Live','A server answer must recover with the old sizes.');
+ measureState='started';await pageRefresh.refresh();
+ failedReads=true;await pageRefresh.refresh();pageRefresh.changed();
+ await Promise.resolve();await Promise.resolve();
+ check(line.dataset.state==='Failed' && parts.reason.textContent==='HTTP 502',
+  'A failed read during a measure must show Failed and HTTP 502.');
+ check(measuring!==null,'A failed read before the wait limit must retain the measure start.');
+ now+=(settings.wait_seconds+1)*1000;await pageRefresh.refresh();pageRefresh.changed();
+ await Promise.resolve();await Promise.resolve();
+ check(measuring===null,'Failed reads after the wait limit must clear measuring.');
+ check(line.dataset.state==='Failed' && parts.reason.textContent==='HTTP 502',
+  'Failed reads after the wait limit must show Failed and HTTP 502.');
+ failedReads=false;measureState='current';await pageRefresh.refresh();
+ check(line.dataset.state==='Live','A good read after failed reads must return to Live.');
  stalled=true;const pendingRead=pageRefresh.refresh();
  now+=(JSON.parse(line.dataset.statusOptions).ageLimit+1)*1000;pageRefresh.changed();
  check(line.dataset.state==='Late','A missing server answer must become Late.');

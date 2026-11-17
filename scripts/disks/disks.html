@@ -388,6 +388,7 @@ let sessionReport = null;
 let sessionLimit = 0;
 let builds = null;
 let measuring = null;
+let readFailed = false;
 
 // A walk bar: the parent's span as a band, and this row's part of it at its running offset, on one scale for the drive.
 function walk(row, scale) {
@@ -714,8 +715,17 @@ async function askMeasure(current) {
     measuring={since:Date.now()/1000,before:data ? data.measured_at : null};
 }
 async function loadDisks(supersede=false,current=()=>true){
- const next=await readData();
+ let next;
+ try{next=await readData();}
+ catch(error){
+  if(current()){
+   readFailed=true;
+   if(measuring && Date.now()/1000-measuring.since>settings.wait_seconds) measuring=null;
+  }
+  throw error;
+ }
  if(!current()) return;
+ readFailed=false;
  if(next && (!data || next.measured_at!==data.measured_at)){measuring=null;show(next);}
  let failure='';
  try{if(!measuring) await askMeasure(current);}
@@ -736,7 +746,7 @@ onToggle(document.getElementById("slots"), "tr[data-group]", row => {
   renderSlots();
 });
 __PAGE_REFRESH_SCRIPT__
-const pageRefresh=createPageRefresh(loadDisks,()=>settings.poll_seconds,()=>measuring ? 'Measuring…' : '');
+const pageRefresh=createPageRefresh(loadDisks,()=>settings.poll_seconds,()=>measuring && !readFailed ? 'Measuring…' : '');
 void pageRefresh.refresh();
 </script>
 </body>
