@@ -829,6 +829,15 @@ run() {
 }
 
 run_step() {
+    if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
+        if buildlog_step_compiles "$@"; then
+            local STEP_WRITES_TREE=0
+            if step_writes_tree "$@"; then STEP_WRITES_TREE=1; fi
+            route_compiling_step "$@"
+            exit $?
+        fi
+        return 0
+    fi
     # A reservation for this call must not cover the next step's local waits.
     if [[ -n "${HOLD_WAIT_DIR:-}" && -s "$HOLD_WAIT_DIR/ssh-reservation" ]]; then
         release_wait_claim
@@ -1933,6 +1942,7 @@ cancel_tree_run() {
 }
 
 start_tree_watch() {
+    [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || return 0
     [[ -z "$TREE_WATCH_PID" ]] || return 0
     TREE_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" tool --tool verify-tree --owner-pid "$$")"
     set_verdict_keys --watch-start "$TREE_WATCH_DIR/start"
@@ -1965,6 +1975,16 @@ PYDOC
 
 # The copy owner holds the lease until this shell closes descriptor 8.
 doc_checkout() {
+    if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
+        DOC_CHECKOUT="$DOC_REPO_TOP"
+        DOC_TREE=""
+        return 0
+    fi
+    if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$DOC_REPO_TOP" ]]; then
+        DOC_CHECKOUT="$DOC_REPO_TOP"
+        DOC_TREE=$(doc_tree) || return $?
+        return 0
+    fi
     local copy_script
     copy_script="$(dirname "$BUILD_FOLDERS_SCRIPT")/../copies/copies.py"
     coproc DOC_COPY { "$PY" "$copy_script" hold --repo "$DOC_REPO_TOP"; }
@@ -2028,6 +2048,7 @@ PYDOC
 # record.py adds the repo, worktree, branch and commit. A record that cannot be
 # written is lost, never the result.
 note_event() {
+    [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || return 0
     [[ "${CALL_NOTED}" -eq 0 ]] || return 0
     CALL_NOTED=1
     collect_hold_wait
@@ -2459,6 +2480,7 @@ route_compiling_step() {
     if [[ "${PLACEMENT_RETRY:-0}" != 1 ]]; then
         PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
         PLACEMENT_EPISODE="$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER"
+        PLACEMENT_OWNER_PID=$$
         PLACEMENT_SINCE="${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHREALTIME:-$(date +%s)}}"
         PLACEMENT_SOURCE_KEY=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "${MAC_SOURCE_ROOT:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}") || return $?
     fi
@@ -2473,6 +2495,14 @@ route_compiling_step() {
     fi
     PLACEMENT_SESSION=$(verify_helper "$BUILD_TARGETS_SCRIPT" submitting-session) || return $?
     export PLACEMENT_SESSION
+    if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
+        PLACEMENT_EPISODE="$BUILDLOG_FIRST_STEP_EPISODE"
+        PLACEMENT_SINCE="$BUILDLOG_FIRST_STEP_SINCE"
+        local request_status=0
+        placement_once || request_status=$?
+        PLACEMENT_EPISODE=""
+        exit "$request_status"
+    fi
     buildlog_begin "$@" || true
     BUILDLOG_PLACEMENT_PREPARED=1
     if [[ "${STEP_WRITES_TREE:-0}" == 0 ]]; then
@@ -2607,6 +2637,7 @@ mac_only_refuse() {
 
 PLACEMENT_STEP_NUMBER=0
 PLACEMENT_EPISODE=""
+PLACEMENT_OWNER_PID=$$
 PLACEMENT_EVIDENCE_EPISODE=""
 PLACEMENT_COMMAND=()
 PLACEMENT_ASSIGNMENT_FILE=""
@@ -2633,7 +2664,7 @@ placement_once() {
     if [[ "${TOKEN_USED:-0}" == 1 ]]; then token=after-grant; fi
     export LINT_QUEUE_LEAVE_HOOK BUILDLOG_MAC_IDLE_HOOK
     local placement_args=(place-step --once --wait-events --episode "$PLACEMENT_EPISODE" --since "$PLACEMENT_SINCE"
-        --pid $$ --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
+        --pid "${BUILDLOG_FIRST_STEP_PID:-${PLACEMENT_OWNER_PID:-$$}}" --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
         --kind "$CMD" --source-key "$PLACEMENT_SOURCE_KEY" --session-id "$PLACEMENT_SESSION"
         --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" --token "$token"
         --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" --shell-state "$PLACEMENT_GRANT_FILE")
@@ -2646,6 +2677,24 @@ placement_once() {
     [[ "${LOCAL_ONLY:-0}" == 0 ]] || placement_args+=(--local-only --local-reason "$LOCAL_REASON")
     [[ "${STEP_WRITES_TREE:-0}" == 0 ]] || placement_args+=(--writes-tree)
     [[ "${MAC_ONLY:-0}" == 0 ]] || placement_args+=(--mac-only)
+    if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
+        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" "${placement_args[@]}" \
+            --token none --request-file "$BUILDLOG_FIRST_STEP_REQUEST" -- "${PLACEMENT_COMMAND[@]}"
+        return $?
+    fi
+    if [[ -n "${BUILDLOG_FIRST_STEP_ASSIGNMENT:-}" ]]; then
+        PLACEMENT_ASSIGNMENT_FILE="$BUILDLOG_FIRST_STEP_ASSIGNMENT"
+        IFS=$'\t' read -r PLACEMENT_PROVIDER STEP_ASSIGNED_TARGET STEP_ASSIGNED_HOST STEP_ASSIGNED_SLOT \
+            PLACEMENT_EPISODE PLACEMENT_ATTEMPT <<< "$BUILDLOG_FIRST_STEP_ROUTE"
+        PLACEMENT_OWNER_PID="${BUILDLOG_RUN%%:*}"
+        PLACEMENT_SINCE="$BUILDLOG_FIRST_STEP_SINCE"
+        export BUILDLOG_PLACEMENT_EPISODE="$PLACEMENT_EPISODE"
+        unset BUILDLOG_FIRST_STEP_ASSIGNMENT BUILDLOG_FIRST_STEP_ROUTE BUILDLOG_FIRST_STEP_SINCE
+        local metadata
+        metadata=$(verify_helper "$BUILD_TARGETS_SCRIPT" assigned-info --assignment-file "$PLACEMENT_ASSIGNMENT_FILE") || return $?
+        IFS=$'\t' read -r STEP_ASSIGNED_SETTINGS STEP_ASSIGNED_PLATFORM PLACEMENT_SESSION <<< "$metadata"
+        return 0
+    fi
     # A builtin wait lets the parent handle TERM during a service outage.
     PLACEMENT_CLIENT_ACTIVE=1
     [[ $- != *m* ]] || monitor=1
@@ -2763,7 +2812,7 @@ route_test() {
                     && "$PLACEMENT_WAIT_MEMORY" == 1 && -n "$MAC_LEAVE_SETTINGS" ]] \
                     && STEP_WRITES_TREE=0 step_can_retry; then
                 verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                    --pid $$ --reason "judge lint before local repair" >/dev/null || return $?
+                    --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "judge lint before local repair" >/dev/null || return $?
                 LINT_MEMORY_WAIT_FILE="$PLACEMENT_ASSIGNMENT_FILE.wait"
                 LINT_MEMORY_JUDGMENT=1
                 BUILDLOG_PLACEMENT_PREPARED=0
@@ -2795,12 +2844,12 @@ route_test() {
         if [[ "$PLACEMENT_PROVIDER" == local ]]; then
             if [[ "${LINT_MAC_FIX:-0}" == 1 ]]; then
                 verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                    --pid $$ --reason "the Mac fix pass runs only on the Mac" >/dev/null || return $?
+                    --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "the Mac fix pass runs only on the Mac" >/dev/null || return $?
                 return "$LINT_LEFT_QUEUE_STATUS"
             fi
             if [[ "${LINT_MEMORY_JUDGMENT:-0}" == 1 ]]; then
                 verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                    --pid $$ --reason "local memory permits lint repair" >/dev/null || return $?
+                    --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "local memory permits lint repair" >/dev/null || return $?
                 return "$LINT_LEFT_QUEUE_STATUS"
             fi
             # The grant keeps its reservation while the call takes its unit's cargo token.
@@ -2821,7 +2870,7 @@ route_test() {
             fi
             if (( token_status != 0 )); then
                 verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                    --pid $$ --reason "the cargo token wait ended" >/dev/null || true
+                    --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "the cargo token wait ended" >/dev/null || true
                 return "$token_status"
             fi
             record_token_wait
@@ -2872,7 +2921,7 @@ route_test() {
         [[ "$MAC_PASSED" != 1 ]] || return 0
         if [[ "${LINT_MAC_FIX:-0}" == 1 && "${LAST_TARGET_REASON:-}" != busy && "${LAST_TARGET_REASON:-}" != blocked ]]; then
             verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                --pid $$ --reason "the Mac fix pass did not run" >/dev/null 2>&1 || true
+                --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "the Mac fix pass did not run" >/dev/null 2>&1 || true
             return "$LINT_LEFT_QUEUE_STATUS"
         fi
         last_decline=${LAST_TARGET_REASON:-}
@@ -2890,9 +2939,10 @@ route_test() {
         fi
         if [[ "${LAST_TARGET_REASON:-}" == source_changed ]]; then
             verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                --pid $$ --reason "source changed before dispatch" >/dev/null || return $?
+                --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "source changed before dispatch" >/dev/null || return $?
             PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
             PLACEMENT_EPISODE="$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER"
+            PLACEMENT_OWNER_PID=$$
             export BUILDLOG_PLACEMENT_EPISODE="$PLACEMENT_EPISODE"
             PLACEMENT_SOURCE_KEY=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key \
                 --repo-root "${MAC_SOURCE_ROOT:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}") || return $?
@@ -3006,6 +3056,7 @@ run_local_test() {
 # tree, or (lint) already failed on it; LOOKUP_STATUS is the status to exit
 # with. Sets LOOKUP_KEY either way, --no-cache included.
 cache_lookup() {
+    [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || return 1
     local record outcome="" word
     [[ -n "${CACHE_DIR}" ]] || return 1
     LOOKUP_KEY="$(tree_key)"
@@ -3926,7 +3977,7 @@ verify_cleanup() {
     [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "$TOKEN_WAIT_FILE" "${TOKEN_WAIT_FILE}.given_back"
     release_wait_claim
     if [[ -n "${PLACEMENT_EPISODE:-}" ]]; then
-        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" --pid $$ \
+        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" --pid "${PLACEMENT_OWNER_PID:-$$}" \
             --reason "verify ended" >/dev/null 2>&1 || true
     fi
     remove_step_record

@@ -644,6 +644,16 @@ sys.exit(7)
             'up: updating the stack (can take several minutes)',
             'up: updating the stack done in 2 s'])
 
+    def test_deployment_step_reports_failure_and_reraises(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output), mock.patch.object(time, 'monotonic', side_effect=[10.0, 12.0]):
+            with self.assertRaises(KeyboardInterrupt):
+                with deploy.step('up', 'updating the stack', self.settings):
+                    raise KeyboardInterrupt
+        self.assertEqual(output.getvalue().splitlines(), [
+            'up: updating the stack',
+            'up: updating the stack failed after 2 s'])
+
     def test_deployment_step_prints_heartbeat_until_completion(self) -> None:
         self.replace('deploy_progress_interval_s', '0.001')
         heartbeat = threading.Event()
@@ -987,6 +997,123 @@ sys.exit(7)
         self.assertEqual([row['region'] for row in ledger.rows(saved, 'regions')], ['us-east-2', 'us-west-2'])
         self.assertEqual(ledger.rows(saved, 'regions')[1], west)
         self.assertEqual(saved['instance_types'], ['m7a.8xlarge', 'm7a.4xlarge'])
+
+    def test_gate_up_prints_regional_progress_and_uses_saved_times(self) -> None:
+        subject, _commands = self.gate_fixture()
+        regions = ('us-west-2', 'eu-north-1')
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 ' + ' '.join(regions))
+        clock = [0.0]
+        path = self.state / 'gate-region-times.json'
+        network_action = 'preparing the network and image'
+        stack_action = 'updating the gate stack'
+        network_seconds = (2, 4)
+        stack_seconds = (160, 170)
+        output = StringIO()
+
+        def completed(key: str, action: str, region: str, durations: tuple[int, int]) -> None:
+            index = regions.index(region)
+            self.assertIn(f'cloud-gate: {region}: {action} ({index + 1} of 2)', output.getvalue())
+            if index:
+                saved = ledger.mapping(remote.read_record(path)['seconds'])
+                self.assertEqual(ledger.mapping(saved[key])[regions[0]], durations[0])
+            clock[0] += durations[index]
+
+        def network(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, region: str) -> deploy.RegionalNetwork:
+            completed('network', network_action, region, network_seconds)
+            return deploy.RegionalNetwork(region, 'fixture-vpc', [], 'fixture-image')
+
+        def stack(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, _home: dict[str, str],
+                  _parameters: dict[str, str], given: deploy.RegionalNetwork) -> dict[str, object]:
+            completed('stack', stack_action, given.region, stack_seconds)
+            return {'region': given.region}
+
+        for run in range(2):
+            output = StringIO()
+            with (mock.patch.object(subject, 'regional_network', side_effect=network),
+                    mock.patch.object(subject, 'regional_gate_stack', side_effect=stack),
+                    mock.patch.object(time, 'monotonic', side_effect=lambda: clock[0]), redirect_stdout(output)):
+                self.assertTrue(subject.gate_up(approve_resources=True))
+            lines = output.getvalue().splitlines()
+            previous = -1
+            for action, durations, total in ((network_action, network_seconds, 6), (stack_action, stack_seconds, 330)):
+                estimate = f'expected total {total} s from saved regional times' if run else 'expected total is not yet measured'
+                expected = [f'cloud-gate: {action} in 2 regions: {estimate}']
+                for index, region in enumerate(regions):
+                    expected.extend((f'cloud-gate: {region}: {action} ({index + 1} of 2)',
+                                     f'cloud-gate: {region}: {action} done in {durations[index]} s'))
+                for line in expected:
+                    position = lines.index(line)
+                    self.assertGreater(position, previous)
+                    previous = position
+            self.assertEqual(remote.read_record(path), {'version': 1, 'seconds': {
+                'network': dict(zip(regions, network_seconds)), 'stack': dict(zip(regions, stack_seconds))}})
+            network_seconds = (3, 5)
+            stack_seconds = (150, 180)
+
+    def test_regional_time_estimate_uses_the_median_for_an_unmeasured_region(self) -> None:
+        path = self.state / 'gate-region-times.json'
+        _ = path.write_text('{"version": 1, "seconds": {"stack": {"us-west-2": 120, "eu-north-1": 180}}}')
+        timings = deploy.GateRegionTimings.read(self.state)
+        output = StringIO()
+        with redirect_stdout(output):
+            timings.announce(deploy.GateRegionOperation.STACK, ('us-west-2', 'eu-north-1', 'us-east-1'))
+        self.assertEqual(output.getvalue(),
+                         'cloud-gate: updating the gate stack in 3 regions: expected total 450 s from saved regional times\n')
+
+    def test_invalid_regional_times_do_not_supply_an_estimate(self) -> None:
+        path = self.state / 'gate-region-times.json'
+        for contents in ('{', '{}', '{"version": 2}',
+                         '{"version": 1, "seconds": {"stack": {"us-west-2": -1}}}',
+                         '{"version": 1, "seconds": {"stack": {"us-west-2": true}}}',
+                         '{"version": 1, "seconds": {"stack": {"us-west-2": NaN}}}'):
+            with self.subTest(contents=contents):
+                _ = path.write_text(contents)
+                with redirect_stdout(StringIO()) as output:
+                    deploy.GateRegionTimings.read(self.state).announce(deploy.GateRegionOperation.STACK, ('us-west-2',))
+                self.assertEqual(output.getvalue(),
+                    'cloud-gate: updating the gate stack in 1 regions: expected total is not yet measured\n')
+
+    def test_regional_time_overflow_does_not_supply_an_estimate(self) -> None:
+        path = self.state / 'gate-region-times.json'
+        _ = path.write_text(json.dumps({'version': 1, 'seconds': {'stack': {'us-west-2': 10**400}}}))
+        with redirect_stdout(StringIO()) as output:
+            deploy.GateRegionTimings.read(self.state).announce(deploy.GateRegionOperation.STACK, ('us-west-2',))
+        self.assertEqual(output.getvalue(),
+            'cloud-gate: updating the gate stack in 1 regions: expected total is not yet measured\n')
+
+    def test_gate_up_warns_and_continues_when_it_cannot_write_regional_times(self) -> None:
+        subject, _commands = self.gate_fixture()
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 us-west-2')
+        (self.state / 'gate-region-times.json').mkdir()
+        network = deploy.RegionalNetwork('us-west-2', 'fixture-vpc', [], 'fixture-image')
+        with (mock.patch.object(subject, 'regional_network', return_value=network),
+                mock.patch.object(subject, 'regional_gate_stack', return_value={'region': network.region}),
+                redirect_stdout(StringIO()) as output):
+            self.assertTrue(subject.gate_up(approve_resources=True))
+        warnings = [line for line in output.getvalue().splitlines() if 'warning:' in line]
+        self.assertEqual(warnings, ['cloud-gate: warning: could not write gate-region-times.json'] * 2)
+        manifest = remote.read_record(self.state / 'gate-deployment.json')
+        self.assertEqual([row['region'] for row in ledger.rows(manifest, 'regions')], ['us-east-2', 'us-west-2'])
+
+    def test_gate_up_saves_each_successful_region_before_a_later_region_fails(self) -> None:
+        subject, _commands = self.gate_fixture()
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 us-west-2 eu-north-1')
+        def network(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, region: str) -> deploy.RegionalNetwork:
+            return deploy.RegionalNetwork(region, 'fixture-vpc', [], 'fixture-image')
+        def stack(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, _home: dict[str, str],
+                  _parameters: dict[str, str], given: deploy.RegionalNetwork) -> dict[str, object]:
+            if given.region == 'eu-north-1':
+                raise aws_target.AwsUnavailable('fixture regional failure')
+            return {'region': given.region}
+        with (mock.patch.object(subject, 'regional_network', side_effect=network),
+                mock.patch.object(subject, 'regional_gate_stack', side_effect=stack), redirect_stdout(StringIO())):
+            with self.assertRaisesRegex(aws_target.AwsUnavailable, 'fixture regional failure'):
+                _ = subject.gate_up(approve_resources=True)
+        saved = ledger.mapping(remote.read_record(self.state / 'gate-region-times.json')['seconds'])
+        self.assertEqual(set(ledger.mapping(saved['network'])), {'us-west-2', 'eu-north-1'})
+        self.assertEqual(set(ledger.mapping(saved['stack'])), {'us-west-2'})
+        manifest = remote.read_record(self.state / 'gate-deployment.json')
+        self.assertEqual([row['region'] for row in ledger.rows(manifest, 'regions')], ['us-east-2', 'us-west-2'])
 
     def test_prices_lists_all_region_type_zone_combinations_without_ids(self) -> None:
         subject = self.deployment()

@@ -60,6 +60,22 @@ SlotSelection = ExactSlotRequest | LowestFreeSlot
 LOWEST_FREE_SLOT = LowestFreeSlot()
 
 
+@dataclass(frozen=True)
+class SlotQueuePosition:
+    """Retain the admitted run's place when another run takes the last slot."""
+
+    episode: str
+    since: float
+
+
+@dataclass(frozen=True)
+class NewSlotQueuePosition:
+    """The caller has no earlier admission position."""
+
+
+NEW_SLOT_QUEUE_POSITION = NewSlotQueuePosition()
+
+
 class SlotsFull(RuntimeError):
     """Every slot in the pool has a holder."""
 
@@ -368,14 +384,16 @@ def _wait_mac_slot(root: Path, repository: str, maximum: int, deadline: float) -
 def take_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: str,
               purpose: str, wait_policy: SlotWaitPolicy = SlotWaitPolicy.QUEUE,
               report: Callable[[str], None] = print,
-              selection: SlotSelection = LOWEST_FREE_SLOT) -> Generator[Slot]:
+              selection: SlotSelection = LOWEST_FREE_SLOT,
+              queue_position: SlotQueuePosition | NewSlotQueuePosition = NEW_SLOT_QUEUE_POSITION) -> Generator[Slot]:
     """Take the lowest free slot and wait through the queue at capacity."""
     from scripts.build_queue import slot_wait
 
-    episode = str(uuid4())
-    since = time.time()
+    episode = queue_position.episode if isinstance(queue_position, SlotQueuePosition) else str(uuid4())
+    since = queue_position.since if isinstance(queue_position, SlotQueuePosition) else time.time()
     seconds = conf.read_or_repository("build_folders").number("slots.wait_seconds")
     deadline = time.monotonic() + seconds
+    expires_at = time.time() + seconds
     while True:
         with ExitStack() as held:
             try:
@@ -389,7 +407,8 @@ def take_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                     _wait_mac_slot(configured_slot_root(), error.repository, error.maximum, deadline)
                 else:
                     slot_wait.wait_for_slot(error.repository, error.machine, configured_slot_root(), error.maximum,
-                        episode=episode, since=since, showrunner=showrunner, unit=unit, work=work, purpose=purpose)
+                        episode=episode, since=since, showrunner=showrunner, unit=unit, work=work, purpose=purpose,
+                        expires_at=expires_at)
                 continue
             yield slot
             return
