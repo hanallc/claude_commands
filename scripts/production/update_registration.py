@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.checkpoint_gate import report
 
-from scripts.production import showrunners, session_staff, showrunner_tree, staff, unit_lookup
+from scripts.production import change_routing, delivery_state, showrunners, session_staff, showrunner_tree, staff, unit_lookup
 from scripts.production.proposals_folder import issues_folder
 from scripts.production.store_owner import showrunner_id
 from scripts.production.record_store import state_root
@@ -979,7 +979,8 @@ def question_records(production: QuestionScope, identities: QuestionStaff) -> li
 
 def question_records_for_document(doc: Path | staff.StaffRow, identities: QuestionStaff, *, include_unrouted: bool = False,
                                   lines: list[str] | None = None,
-                                  sources: list[Path] | None = None) -> list[QuestionRecord]:
+                                  sources: list[Path] | None = None, statuses: tuple[str, ...] = (),
+                                  owner_ids: set[staff.StaffId] | None = None) -> list[QuestionRecord]:
     """Read canonical question records without requiring unrelated checkpoint fields."""
     folder = question_folder(doc, identities, lines=lines)
     if isinstance(folder, QuestionOwnerUnavailable):
@@ -990,18 +991,36 @@ def question_records_for_document(doc: Path | staff.StaffRow, identities: Questi
         source = folder.path
     from scripts.production.issues import source_paths
 
-    issues = [Issue(path, frontmatter(path, sources=sources))
-              for path in sorted(source_paths(source, "question-*.md", sources=sources))]
-    if isinstance(folder, QuestionFolder):
-        issues = [issue for issue in issues if issue.value("production_id") == folder.owner]
+    paths = sorted(source_paths(source, "question-*.md", sources=sources))
+    return selected_question_records(paths, statuses, owner_ids, sources,
+                                    folder.owner if isinstance(folder, QuestionFolder) else "")
+
+
+def selected_question_records(paths: list[Path], statuses: tuple[str, ...], owner_ids: set[staff.StaffId] | None,
+                              sources: list[Path] | None = None, owner: str = "") -> list[QuestionRecord]:
+    """Select by status and owner before decoding the question registration."""
+    def wanted(issue: Issue) -> bool:
+        if issue.value("record_type") != "question" or owner and issue.value("production_id") != owner:
+            return False
+        if owner_ids is not None:
+            owner_ids.add(staff.StaffId(issue.value("production_id")))
+        return not statuses or issue.value("status") in statuses or issue.value("status") not in ("open", "closed")
+
+    issues: list[Issue] = []
+    for path in paths:
+        fields = frontmatter(path, sources=sources, keys=frozenset(("record_type", "status", "production_id")), select=wanted)
+        if fields:
+            issues.append(Issue(path, fields))
     return _question_records(issues)
 
 
-def unowned_question_records(identities: QuestionStaff) -> list[QuestionRecord]:
+def unowned_question_records(identities: QuestionStaff, *, statuses: tuple[str, ...] = (),
+                             owner_ids: set[staff.StaffId] | None = None) -> list[QuestionRecord]:
     """Read state questions, including producers without production documents."""
     owners = {row.id for row in identities.record.rows if row.kind == "showrunner"}
-    paths = sorted(state_root().glob("*/questions/question-*.md"))
-    return _question_records([Issue(path, frontmatter(path)) for path in paths if path.parent.parent.name not in owners])
+    paths = sorted(path for path in state_root().glob("*/questions/question-*.md")
+                   if path.parent.parent.name not in owners)
+    return selected_question_records(paths, statuses, owner_ids)
 
 
 def _question_records(issues: list[Issue]) -> list[QuestionRecord]:
@@ -1042,6 +1061,8 @@ def close_questions(document: Path, identities: QuestionStaff) -> None:
 
 def question_review_id(record: QuestionRecord) -> str:
     """Allocate the question's stable owner-local number in its existing record."""
+    if identity := record.item.get("review_id", ""):
+        return identity
     with outstanding_lock(record.path.parent / ".review-ids"):
         fields = frontmatter(record.path) if record.path.exists() else {}
         if fields:
@@ -1052,10 +1073,13 @@ def question_review_id(record: QuestionRecord) -> str:
             return identity
         highest = 0
         for path in record.path.parent.glob("question-*.md"):
-            for other in _question_records([Issue(path, frontmatter(path))]):
-                number = other.item.get("review_id", "")
-                if number.startswith("Q") and number[1:].isdigit():
-                    highest = max(highest, int(number[1:]))
+            fields = frontmatter(path, keys=frozenset(("record_type", "registration")))
+            if fields.get("record_type") != ["question"]:
+                continue
+            registration = next(iter(fields.get("registration", [])), "")
+            number = re.search(r'(?:^|[,{])\s*"review_id"\s*:\s*"Q([1-9][0-9]*)"', registration)
+            if number is not None:
+                highest = max(highest, int(number[1]))
         identity = f"Q{highest+1}"
         record.item["review_id"] = identity
         write_question_record(record)
@@ -1238,7 +1262,7 @@ def read_open_fields(path: Path | None, *, production: QuestionScope | None = No
                 return entries
         if sources is not None and isinstance(document, Path):
             sources.append(document)
-        entries.extend(record.item.copy() for record in question_records_for_document(document, identities, sources=sources)
+        entries.extend(record.item.copy() for record in question_records_for_document(document, identities, sources=sources, statuses=("open",))
                        if record.status == "open")
         return entries
     except (RegistrationFailure, InputError) as error:
@@ -1608,7 +1632,7 @@ def answer_followup(entry: OutstandingItem, text: str) -> None:
     entry["followups"] = [*entry.get("followups", []), FollowupExchange(followup=pending["text"], reply=text.strip())]
 
 
-def reply_record(record: QuestionRecord, text: str, who: str, *, identities: QuestionStaff) -> None:
+def reply_record(record: QuestionRecord, text: str, who: str, *, identities: QuestionStaff, question_id: str = '') -> None:
     """Answer the exact record under its owner's lock and keep the answer in its log."""
     from scripts.review_links import review_events
     if not text.strip():
@@ -1616,6 +1640,10 @@ def reply_record(record: QuestionRecord, text: str, who: str, *, identities: Que
     scope = question_scope(record.owner, identities.record)
     with outstanding_lock(outstanding_path(scope)):
         current = _question_records([Issue(record.path, frontmatter(record.path))])[0]
+        delivery = change_routing.delivery_path(change_routing.review_root(), current.path, current.path.stem)
+        exchange = change_routing.delivery_slots(delivery).question
+        if question_id or isinstance(exchange, delivery_state.OpenQuestion):
+            _ = delivery_state.question_exchange_for_reply(exchange, question_id, text.strip())
         if current.status != "open" or "followup" not in current.item:
             raise RegistrationFailure("reply", f"{current.item['text']}: no open follow-up waits for a reply")
         answer_followup(current.item, text)
@@ -1639,8 +1667,11 @@ def reply(production: QuestionScope, words: str, text: str, *, identities: Quest
     if len(found) != 1:
         raise RegistrationFailure("reply", f"{len(found)} questions with a follow-up match {wanted!r}; name one by its exact text")
 
-    _ = change_open_question(production, found[0], wanted, identities, "reply", lambda entry: answer_followup(entry, text))
-    report("reply", "ok", f"{found[0]}: {wanted}: back on the open-questions list with the reply")
+    scope = production if found[0] == production.name else question_scope(found[0], identities.record)
+    record = next(record for record in question_records(scope, identities)
+                  if record.status == 'open' and 'followup' in record.item and record.item['text'] == wanted)
+    owner = identities.record.by_id(record.owner)
+    reply_record(record, text, owner.name if owner is not None else str(record.owner), identities=identities)
 
 
 def state_block(production: Production, state: ShowrunnerState, timestamp: str) -> str:
@@ -1990,6 +2021,9 @@ def main() -> int:
         else:
             questions(production, cast(Path | None, args.state))
         return 0
+    except delivery_state.StaleQuestionExchange as error:
+        report(action, "failed", str(error))
+        return 1
     except (staff.StaffRefused, RegistrationFailure, InputError, Refusal, OSError, ValueError, json.JSONDecodeError) as error:
         step = error.step if isinstance(error, RegistrationFailure) else action
         report(step, "failed", str(error).replace("\n", "; "))

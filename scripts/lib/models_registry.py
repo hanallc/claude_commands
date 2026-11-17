@@ -20,12 +20,13 @@ from typing import Literal, NamedTuple, cast, final
 from scripts.lib import build_folders
 from scripts.lib import conf_reads, git_index, land_main, main_publish, main_push_lock, registry_rows, waiting_rows
 from scripts.lib.registry_rows import parse_registry as parse_registry
+from scripts.lib.operation_environment import OPERATION_ENVIRONMENT as OPERATION_ENVIRONMENT
+from scripts.lib.operation_environment import agent_environment as agent_environment
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import write_text_atomic
 
 DEFAULT_PATH = Path("~/.claude/config/models.conf").expanduser()
 REGISTRY_PATH = "config/models.conf"
-OPERATION_ENVIRONMENT = ("MODELS_LAUNCH_CONFIGURATION", "MODELS_REGISTRY_EDIT_BASE")
 
 
 class LaunchModelConfiguration(NamedTuple):
@@ -103,12 +104,6 @@ def _sync_catalog(path: Path, environment: Mapping[str, str]) -> None:
     except OSError:
         pass
     print("WARNING: Codex catalog sync failed; using the current model registry.", file=sys.stderr)
-
-
-def agent_environment(environment: Mapping[str, str]) -> dict[str, str]:
-    """Remove operation state before an agent or server starts."""
-    return {key: value for key, value in environment.items()
-            if key not in (*OPERATION_ENVIRONMENT, "STAFF_OPERATION_FD")}
 
 
 def _decoded(encoded: str) -> tuple[Path, str]:

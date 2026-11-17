@@ -16,7 +16,7 @@ from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_targets import target_config
 
 if TYPE_CHECKING:
-    from scripts.buildlog import sync as buildlog_sync
+    from scripts.buildlog.transfer_bytes import TransferBytes
 
 
 SubmittingSession = OwningSession | NoOwningSession
@@ -238,7 +238,7 @@ class ClaimOwnerRecord(TypedDict):
     repo_key: NotRequired[str]
     repo_name: NotRequired[str]
     slot: NotRequired[int]
-    transfers: NotRequired[list[buildlog_sync.TransferBytes]]
+    transfers: NotRequired[list[TransferBytes]]
 
 
 class ProcessBoundClaim(ClaimOwnerRecord):
@@ -378,7 +378,7 @@ def read_run(path: Path) -> RunState:
         "since": since,
     }
     if "transfers" in values:
-        record["transfers"] = cast("list[buildlog_sync.TransferBytes]", values["transfers"])
+        record["transfers"] = cast("list[TransferBytes]", values["transfers"])
     if "holder_session" in values:
         holder_session = required_string(values, "holder_session", path)
         if not holder_session.strip():

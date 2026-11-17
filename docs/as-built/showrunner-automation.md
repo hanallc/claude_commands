@@ -442,6 +442,9 @@ Each local Promote checkout must exist before the command pushes.
   `show` displays the next row only when the user asks.
   `verdict` moves a row to Reviewed; `works` or `fine` accepts it.
   Other verdicts return the change to its unit.
+  A showrunner check requires `verdict --validation <id>` with the validation ID from its request message.
+  The single verdict command returns a check problem to For you.
+  A batch verdict uses the same ID in its `validation` field.
   `list-path` and `showrunner` resolve the list and its root owner.
   `backfill-production [--list L] [--write]` retains its older owner-cell repair.
   It traces an empty cell through the merge's checkpoint, production ownership, then first-parent history.
@@ -550,7 +553,7 @@ An explicit number must name an unused path.
 Exact repeated operations change nothing.
 Other updates append a log line and mark the item unread; mark-read clears the unread time without sending a message.
 Update and park refuse Closed items until reopen restores them.
-The table uses `# | Owner | Item | State | Next step | ETA | Update`.
+The table uses `# | Owner | Producer | Item | State | Next step | ETA | Update`; Producer shows the producer's name.
 It sorts Waiting for nate first, unread items second, and next check times third.
 State cells include the check time and identify overdue checks.
 Future parked items and Closed items remain hidden by default.
@@ -589,7 +592,8 @@ The states are `open`, `answer ready` and `read`.
 Review maps them to Waiting, For you and Done.
 Ask question returns an answered investigation to Waiting and preserves its previous answer in the log.
 Send feedback finishes it with the result **feedback sent**.
-The owner answers a Review question with `change_page.py answer-question --item investigation/<staff id>/I<n> --text "<answer>"`.
+The owner answers a Review question with `change_page.py answer-question --item investigation/<staff id>/I<n> --question <id> --text "<answer>"`.
+The request message supplies the question ID.
 The answer returns the record to For you.
 An exact repeat of an answer-ready or read operation changes nothing.
 Other state changes receive one refusal line.
@@ -601,6 +605,8 @@ Other state changes receive one refusal line.
 5. Include read investigations with `investigation.py list --all`.
 
 Answer and read commands accept `--owner <staff id>` to select another owner's record.
+The native answer command accepts an initial investigation answer without a Review exchange.
+An open Review exchange requires the shared answer command and its current question ID.
 `records`, `load`, and `mark_read` provide the same store operations for console callers.
 `records` skips invalid records, reports each path and cause on stderr, and watches those paths for cache refresh.
 Invalid UTF-8 receives the same refusal as invalid record fields.
@@ -653,7 +659,8 @@ A missing folder uses its nearest existing parent until the folder appears.
   Its status count, `/next question`, and Review page filter read those records.
   Answers, Send feedback and Ask question use the existing retry, alert and recovery paths.
   Send feedback closes the question; Ask question waits for the owner's answer.
-  The owner runs `change_page.py answer-question --item <Review key> --text "<answer>"` to return it to For you.
+  The owner runs `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"` to return it to For you.
+  The request message supplies the question ID.
   The canonical question log keeps the user's words after the 48-hour replay archive expires.
   A missing showrunner owner gives `QuestionOwnerUnavailable`.
   A unit rename rewrites no question record.
@@ -665,7 +672,8 @@ A missing folder uses its nearest existing parent until the folder appears.
   More or fewer than one match exits 2.
   It prints `relay: to <unit>`, `relay: to the showrunner of <showrunner name>, for <unit>`, or `relay: none; …`.
   It then prints `answer: ok — <showrunner name>: <text>`.
-- `reply --item <text> --text <reply>` remains the compatibility API behind the shared Review answer command.
+- `reply --item <text> --text <reply>` answers a native followup without a tracked Review exchange.
+  An open Review exchange requires the shared answer command and its question ID from the request message.
   A question with a follow-up that waits for its reply is not due: `open` lists it as `waiting for the asker's reply since <time>`, and `/next` and the page leave it out.
   `reply` finds the one question with exactly that text and a waiting follow-up, in this production or a production below it.
   It keeps the follow-up and the reply in `followups`, and the question is due again with both shown.
@@ -1051,6 +1059,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
   - **Settings.** `config/nightly_review.conf` holds the nightly review's tunables: the state folders, the session and unit names, the review modes, the message sample size and history window, the table cell width, the note path and the command path. Each value is read when it is used. `XDG_STATE_HOME` and `NIGHTLY_REVIEW_NOTE` still override the state base and the note path.
   - **Vault note.** `write_note(body)` rewrites `~/rust/hanadocs/nightly improvement list.md` after the table prints and after every `record` that exits 0; `NIGHTLY_REVIEW_NOTE`, read at each write, replaces the path. The note is the line `Read <YYYY-MM-DD HH:MM> <zone label> from the nightly review's ledger on <short host>. The nightly review rewrites this note; edits made here are lost.`, a blank line, then the table as printed or `no open candidates`. The read time is in the user's zone, and the host is `socket.gethostname()` up to its first dot. The write is a dot-named temp file in the note's folder, mode `0o644`, then `os.replace`. The ledger stays the one record and the note is a copy: nothing is written when the note's folder is missing or this machine holds no `ledger.md`, so a machine without the ledger never replaces natedev's note. Every step after the path is chosen sits in one `OSError` handler, the two existence checks included, because `Path.is_dir` and `Path.is_file` can raise: a failure prints `candidates: cannot write <path>: <error>` to stderr and leaves stdout and the exit status as they were. The note sits at the vault root, outside the excluded `showrunners/` folder, so the vault's Git sees every rewrite. A test keeps `NIGHTLY_REVIEW_NOTE` on a temp path, because the default is the live vault.
   - **`record <report>`.** The watcher runs it on `Nightly proposal ready: <path>`; the night is the report's folder name. It appends the proposal (`# <title>`, `**Target:**`, `**Gain per week:**`) and each item under `**Also found:**` or `**Noted:**`: a `- ` or numbered line, whose bold lead is its title and whose closing tag is its gain. A paragraph closes the item list, so a list of what was denied that night is no candidate. A line whose start (`- <night> <area>: <title>`) the ledger already holds is not written again: a second run adds nothing, and a decided line keeps its outcome. A report with no title or target exits 1 and writes nothing.
+  - **`outcome E<n> <state>`.** Writes one outcome on ledger line n, the `E<n>` id that the Review page and `/next efficiency` show; an `<owner>/` prefix is allowed. The states are `accepted --applied '<repo> <sha>'` (`accepted <date>, applied (<repo> <sha>)`), `declined`, `deferred`, `done` (`done <date>`) and `relayed` (`relayed <date>`). Only an open line takes an outcome; the same outcome again prints `unchanged`. `--ledger <path>` selects another production's ledger; only the nightly review's own ledger rewrites the vault note. No session edits the ledger by hand.
   - **Earlier lines.** Before 2026-10-12 a smaller item's outcome was written on its night's line as `; from Also found: <title> — <outcome>`. Those stay as written; every item still open then got a line of its own.
 
 - **Queued messages.** `sessions.addressed` resolves a staff name through its fixed staff ID and `current_session`. Explicit `session:` and `uds:` addresses select native records. Registry names and former names do not select recipients. A named recipient uses `STATE/queue/staff_<staff id>.jsonl`. An explicit session address uses `session-<session id>.jsonl`. A session drains its native keys, its socket key, and its fixed staff key. Queue entries retain their stable owner across session changes. A delivered keyed message removes its queued copy. `send.py retire` removes the selected queued messages. The one-off `convert_queue_keys.py` program moves current staff-name queue files into their staff ID files. Its default mode only prints the moves.

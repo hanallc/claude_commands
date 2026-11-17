@@ -14,7 +14,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import cast
 
-from scripts.production import record_store, staff
+from scripts.production import change_routing, delivery_state, record_store, staff
 from scripts.review_links import review_events
 from scripts.review_links.review_events import ReviewLog
 from scripts.production.record_store import state_root as state_root
@@ -86,9 +86,11 @@ def load(owner: staff.StaffId, identity: str, *, sources: list[Path] | None = No
 
 
 def records(owner: staff.StaffId, *, include_read: bool = False,
-            sources: list[Path] | None = None) -> list[Investigation]:
+            sources: list[Path] | None = None,
+            states: tuple[InvestigationState, ...] = ()) -> list[Investigation]:
     """Read investigations in numeric order and watch the folder and each record."""
-    items = _store(owner).records(lambda identity: load(owner, identity), sources=sources)
+    selected = states or (() if include_read else (InvestigationState.OPEN, InvestigationState.ANSWER_READY))
+    items = _store(owner).records(lambda identity: load(owner, identity), sources=sources, states=selected)
     return sorted((item for item in items if include_read or item.state != InvestigationState.READ),
                   key=lambda item: int(item.id[1:]))
 
@@ -117,13 +119,20 @@ def file(owner: staff.StaffId, title: str, question: str) -> Investigation:
         return item
 
 
-def answer(owner: staff.StaffId, identity: str, text: str) -> Investigation:
-    """Save an answer once; accept an exact repeat without writing."""
+def answer(owner: staff.StaffId, identity: str, text: str, *, question_id: str = '') -> Investigation:
+    """Save an answer and refuse a stale Review exchange ID."""
     if not text.strip():
         raise InvestigationError("answer must not be empty")
-    _ = _path(owner, identity)
+    path = _path(owner, identity)
     with _store(owner).locked():
         item = load(owner, identity)
+        delivery = change_routing.delivery_path(change_routing.review_root(), path, identity)
+        question = change_routing.delivery_slots(delivery).question
+        if question_id or isinstance(question, delivery_state.OpenQuestion):
+            try:
+                _ = delivery_state.question_exchange_for_reply(question, question_id, text.strip())
+            except delivery_state.StaleQuestionExchange as error:
+                raise InvestigationError(str(error)) from None
         if item.state == InvestigationState.ANSWER_READY and item.answer == text:
             return item
         if item.state != InvestigationState.OPEN:

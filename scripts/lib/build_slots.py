@@ -27,6 +27,8 @@ from uuid import uuid4
 
 from scripts.buildlog.store import host_name
 from scripts.lib import build_folders, conf, copy_record, git_files, git_rescue
+from scripts.lib.slot_root import SlotsNotConfigured as SlotsNotConfigured, configured_slot_root as configured_slot_root
+from scripts.lib.slot_root import slot_root as slot_root
 
 
 SLOT_NAME = re.compile(r"(.+)-slot([1-9][0-9]*)")
@@ -58,6 +60,22 @@ SlotSelection = ExactSlotRequest | LowestFreeSlot
 LOWEST_FREE_SLOT = LowestFreeSlot()
 
 
+@dataclass(frozen=True)
+class SlotQueuePosition:
+    """Retain the admitted run's place when another run takes the last slot."""
+
+    episode: str
+    since: float
+
+
+@dataclass(frozen=True)
+class NewSlotQueuePosition:
+    """The caller has no earlier admission position."""
+
+
+NEW_SLOT_QUEUE_POSITION = NewSlotQueuePosition()
+
+
 class SlotsFull(RuntimeError):
     """Every slot in the pool has a holder."""
 
@@ -75,13 +93,6 @@ class SlotRepositoryMismatch(ValueError):
         self.path: Path = path
         self.source: Path = source
         super().__init__(f"slots: {path} belongs to a different repository than {source}")
-
-
-class SlotsNotConfigured(ValueError):
-    """The user has not activated repository slots on this machine."""
-
-    def __init__(self, machine: str) -> None:
-        super().__init__(f"slots: roots.slots.{machine} is not configured; slots are not active")
 
 
 class SlotGitFailure(RuntimeError):
@@ -130,21 +141,6 @@ def source_checkout(source: Path) -> Path:
 
 def _root(settings: conf.ConfigRead, key: str) -> Path:
     return Path(os.path.expandvars(settings.text(key))).expanduser().resolve()
-
-
-def slot_root(values: Mapping[str, str], machine: str) -> str:
-    """Select the machine's slot root, with the common root as the default."""
-    return values.get(f"roots.slots.{machine}", values.get("roots.slots", ""))
-
-
-def configured_slot_root() -> Path:
-    """Read the machine's slot root without creating a folder."""
-    settings = conf.read_or_repository("build_folders")
-    machine = host_name()
-    root = slot_root(settings.values(), machine)
-    if not root:
-        raise SlotsNotConfigured(machine)
-    return Path(os.path.expandvars(root)).expanduser().resolve()
 
 
 def slot_cargo_root(settings: conf.ConfigRead) -> Path:
@@ -388,14 +384,16 @@ def _wait_mac_slot(root: Path, repository: str, maximum: int, deadline: float) -
 def take_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: str,
               purpose: str, wait_policy: SlotWaitPolicy = SlotWaitPolicy.QUEUE,
               report: Callable[[str], None] = print,
-              selection: SlotSelection = LOWEST_FREE_SLOT) -> Generator[Slot]:
+              selection: SlotSelection = LOWEST_FREE_SLOT,
+              queue_position: SlotQueuePosition | NewSlotQueuePosition = NEW_SLOT_QUEUE_POSITION) -> Generator[Slot]:
     """Take the lowest free slot and wait through the queue at capacity."""
     from scripts.build_queue import slot_wait
 
-    episode = str(uuid4())
-    since = time.time()
+    episode = queue_position.episode if isinstance(queue_position, SlotQueuePosition) else str(uuid4())
+    since = queue_position.since if isinstance(queue_position, SlotQueuePosition) else time.time()
     seconds = conf.read_or_repository("build_folders").number("slots.wait_seconds")
     deadline = time.monotonic() + seconds
+    expires_at = time.time() + seconds
     while True:
         with ExitStack() as held:
             try:
@@ -409,7 +407,8 @@ def take_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                     _wait_mac_slot(configured_slot_root(), error.repository, error.maximum, deadline)
                 else:
                     slot_wait.wait_for_slot(error.repository, error.machine, configured_slot_root(), error.maximum,
-                        episode=episode, since=since, showrunner=showrunner, unit=unit, work=work, purpose=purpose)
+                        episode=episode, since=since, showrunner=showrunner, unit=unit, work=work, purpose=purpose,
+                        expires_at=expires_at)
                 continue
             yield slot
             return

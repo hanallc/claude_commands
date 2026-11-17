@@ -25,11 +25,12 @@ from typing import Protocol, cast
 from uuid import uuid4
 
 from scripts.aws_target.gate_box import (
-    GUEST as GUEST, SigningKey as SigningKey, presign as presign, user_data as user_data,
+    GUEST as GUEST, user_data as user_data,
     boot_trap as boot_trap, log_push_loop as log_push_loop,
     RUN_FIELDS as RUN_FIELDS, validate_paired_result as validate_paired_result,
 )
 from scripts.aws_target import ledger, cloud_gate
+from scripts.aws_target.s3_presign import SigningKey as SigningKey, presign as presign
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings, account_settings_path, gate_deployment, gate_regions
 from scripts.lib import conf

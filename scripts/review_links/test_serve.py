@@ -96,6 +96,15 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(reply.content_type, content_type)
                 self.assertEqual(reply.body.decode("utf-8"), text)
 
+    def test_review_request_passes_the_selected_show_view(self) -> None:
+        for query, show in (('', 'open'), ('?show=Done', 'Done'), ('?show=all', 'all'),
+                            ('?show=For+you', 'For you'), ('?show=Waiting', 'Waiting')):
+            with self.subTest(show=show), patch.object(review_page, 'render', return_value=b'Review') as render:
+                reply = self.request('/console/review.html'+query)
+                self.assertEqual(reply.status, 200)
+                self.assertEqual(reply.body, b'Review')
+                render.assert_called_once_with(self.root, show=show)
+
     def test_other_text_files_are_readable_as_utf8(self) -> None:
         text = "a report with no standard text extension — café\n"
         _ = (self.root / "report.log").write_text(text, encoding="utf-8")
@@ -346,19 +355,27 @@ class ReviewLinksServerTests(unittest.TestCase):
         render.assert_called_once_with()
         with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
             for result, expected, body in (
-                (accounts_page.ColorSaved(), 200, {"state": "saved"}),
-                (accounts_page.ColorRefused("Unknown account."), 400, {"reason": "Unknown account."}),
-                (accounts_page.ColorSaveFailed("tune: refused"), 503, {"reason": "tune: refused"}),
+                (accounts_page.Saved(), 200, {"state": "saved"}),
+                (accounts_page.Refused("Unknown key."), 400, {"reason": "Unknown key."}),
+                (accounts_page.SaveFailed("tune: refused"), 503, {"reason": "tune: refused"}),
             ):
                 with self.subTest(result=result), patch.object(accounts_page, "save_color", return_value=result) as save:
-                    status, content = self.post(accounts_page.PAGE_PATH, "label=claude1&value=%23af875f")
+                    status, content = self.post(accounts_page.PAGE_PATH, "key=role.worker&value=%23af875f")
                     self.assertEqual((status, json.loads(content)), (expected, body))
-                    save.assert_called_once_with("claude1", "#af875f")
-            for form in ("", "label=claude1", "label=claude1&value=x&value=y", "label=claude1&value=x&extra=y"):
-                with self.subTest(form=form), patch.object(accounts_page, "save_color") as save:
+                    save.assert_called_once_with("role.worker", "#af875f")
+                with self.subTest(move=result), patch.object(accounts_page, "save_next_move", return_value=result) as move:
+                    status, content = self.post(accounts_page.PAGE_PATH, "group=units&to=claude2")
+                    self.assertEqual((status, json.loads(content)), (expected, body))
+                    move.assert_called_once_with("units", "claude2")
+            for form in ("", "key=account.claude1", "label=claude1&value=x", "key=account.claude1&value=x&value=y",
+                         "key=account.claude1&value=x&extra=y", "group=units", "group=units&to=claude2&value=x",
+                         "key=account.claude1&to=claude2"):
+                with (self.subTest(form=form), patch.object(accounts_page, "save_color") as save,
+                      patch.object(accounts_page, "save_next_move") as move):
                     status, _ = self.post(accounts_page.PAGE_PATH, form)
                     self.assertEqual(status, 400)
                     save.assert_not_called()
+                    move.assert_not_called()
         with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b"new color", .5, 101)):
             self.assertEqual(self.request(accounts_page.PAGE_PATH).body, b"new color")
 

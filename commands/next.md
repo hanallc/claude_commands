@@ -140,10 +140,12 @@ End with one choice line, based on that check:
 `approve (recommended — reason) / decline / defer / elaborate`.
 For a fix that belongs to another session, offer `relay` in place of `approve`.
 
-Record the outcome on the candidate's own ledger line as soon as it is decided:
-its `— proposed` becomes `— accepted <date>, applied (<repo> <sha>)`,
-`— declined`, `— deferred`, `— done <date>` or `— relayed <date>`. Apply an
-approved change; commit and push only when the user says so.
+Record the outcome as soon as it is decided. Never edit the ledger by hand. Run:
+`~/.claude/scripts/lib/py ~/.claude/scripts/nightly_review/candidates.py outcome E<n> <state> [--ledger <path>]`.
+`E<n>` is the item's id. `<state>` is `accepted --applied '<repo> <sha>'`,
+`declined`, `deferred`, `done` or `relayed`. Pass `--ledger` with the ledger
+that the `Efficiency ledger` line names, when it is not the nightly review's own.
+Apply an approved change; commit and push only when the user says so.
 
 ## question
 
@@ -179,10 +181,15 @@ Open investigations wait for the owner and do not appear in `/next`.
 
 ## Review actions
 
-Questions, changes and investigations share Send feedback, Ask question and Later on the Review page.
+All five kinds share Send feedback, Ask question and Later on the Review page.
+Proposals and efficiencies also have Approve and Decline.
+Approve and Decline make the item Done at once.
+Approve sends the user's words and the record command to the owner showrunner.
+Run that command when the message arrives.
+Decline records the answer at once: a proposal's declined answer, or an efficiency's `declined` outcome.
 Send feedback sends the words to the owner and closes the item.
 Ask question moves it to Waiting.
-Answer it with `change_page.py answer-question --item <Review key> --text "<answer>"`.
-For a change, include the `--question <id>` from its request message.
+Answer it with `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"`.
+Use the question ID from the request message for all five Review types.
 The item returns to For you with the answer in its log.
 Later takes a date and time and hides the item from Review, the count and `/next` until then.

@@ -361,12 +361,15 @@ class DiskTests(unittest.TestCase):
             events.append("usage")
             return filesystem.FilesystemUsage(used=500, free=600)
 
+        # Folders under "/" share its device whatever the cwd is; the run's own sccache and Cargo outputs stay out.
+        environment = {key: value for key, value in os.environ.items() if key != "SCCACHE_DIR"}
         for label, previous, hour in (("none", None, 15), ("old shape", old, 15), ("old full", full, 3)):
             clock = mock.Mock(return_value=datetime(2026, 10, 4, hour, tzinfo=user_zone()))
             with (
                 self.subTest(previous=label),
-                mock.patch.object(disk, "FOLDERS", [("first", "first"), ("second", "second")]),
-                mock.patch.dict(os.environ, {copy_record.ROOT_ENV: "first/scratch"}),
+                mock.patch.object(disk, "FOLDERS", [("first", "/first"), ("second", "/second")]),
+                mock.patch.dict(os.environ, {**environment, copy_record.ROOT_ENV: "/first/scratch"}, clear=True),
+                mock.patch.object(disk, "mapped_output_paths", return_value=([], [])),
                 mock.patch.object(disk, "read_floor", return_value=None),
                 mock.patch.object(disk, "read_snapshot", return_value=previous),
                 mock.patch.object(disk, "datetime", wraps=datetime, now=clock),
@@ -375,11 +378,10 @@ class DiskTests(unittest.TestCase):
             ):
                 events.clear()
                 result = disk.snapshot()
-
-            self.assertEqual(events, ["first", "second", "usage"])
-            self.assertEqual(result["used"], 500)
-            self.assertEqual(result["free"], 600)
-            self.assertEqual(result["capacity_measured_at"], result["measured_at"])
+                self.assertEqual(events, ["/first", "/second", "usage"])
+                self.assertEqual(result["used"], 500)
+                self.assertEqual(result["free"], 600)
+                self.assertEqual(result["capacity_measured_at"], result["measured_at"])
 
     def test_malformed_floor_read_reports_its_config_key(self) -> None:
         config = self.base() / "lint.conf"

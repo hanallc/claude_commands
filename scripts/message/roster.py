@@ -7,7 +7,6 @@ try:
 except FileNotFoundError:
     pass
 
-import argparse
 import json
 import os
 import shlex
@@ -15,6 +14,7 @@ import subprocess
 import sys
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from types import ModuleType
@@ -22,21 +22,20 @@ from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
-from scripts.production import showrunners  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
-from scripts.herdr import herdr, herdr_types  # noqa: E402
+from scripts.herdr import herdr_types  # noqa: E402
 from scripts.herdr.place import HerdrPlace  # noqa: E402
 from scripts.message import codex_daemon  # noqa: E402
 from scripts.message import process_table  # noqa: E402
 from scripts.message import sessions  # noqa: E402
-from scripts.astra import design_roles  # noqa: E402
-from scripts.production import staff, session_staff, worker_admission
+from scripts.production import staff, session_staff
 from scripts.production.production_doc import Refusal as ProductionDocumentRefused
-from scripts.lib import names  # noqa: E402
-from scripts.lib.names import JobKey  # noqa: E402
+from scripts.accounts import role_map
 if TYPE_CHECKING:
     from scripts.accounts.role_map import role_map_command
     from scripts.whoami import account, agent_accounts, note_file
+    from scripts.production import showrunners
+    from scripts.lib.names import JobKey
 else:
     import importlib.util
     from scripts.accounts.role_map import role_map_command
@@ -349,6 +348,8 @@ class ShownName:
     registry_name: RegistryName | NoRegistryName = NoRegistryName()
 
     def render(self) -> str:
+        from scripts.lib import names
+
         parts: list[str] = []
         if isinstance(self.production, ProductionPart) and self.production.name:
             parts.append(self.production.name)
@@ -720,6 +721,8 @@ class SerializedRosterEntry(TypedDict):
 
 
 def serialized_job(job: ShownJob | JobUnassigned) -> dict[str, str]:
+    from scripts.lib import names
+
     if isinstance(job, JobUnassigned):
         return {"state": "unassigned", "reason": job.reason}
     loaded = names.runtime_names()
@@ -789,6 +792,8 @@ def _session_details(records: list[SessionRecord]) -> dict[str, _ClaudeDetails]:
 
 
 def _worker_ledger(run: _LiveRun, problems: list[str], membership: staff.StaffSnapshot) -> list[staff.StaffRow]:
+    from scripts.production import worker_admission
+
     try:
         owner = (membership.by_current_session(run.director.session_id)
                  if isinstance(run.director, _DirectorSession)
@@ -868,6 +873,8 @@ def worker_shown_name(session_dir: str, name: str, record: Mapping[str, object])
     """Build a thread title with the same production and unit lookup as the roster."""
     run = Path(session_dir)
     if design_id := _as_string(record.get("held_design_id")):
+        from scripts.astra import design_roles
+
         held_role = record.get("held_role")
         try:
             design = design_roles.read_design(design_id)
@@ -1289,6 +1296,8 @@ def _unit_workers(
 
 def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: list[str], *,
                    membership: staff.StaffSnapshot) -> tuple[list[RosterEntry], set[str]]:
+    from scripts.astra import design_roles
+
     entries: list[RosterEntry] = []
     threads: set[str] = set()
     for path in sorted(design_roles.state_root().glob('*/design.json')):
@@ -1326,6 +1335,8 @@ def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
                        worker_threads: Iterable[str] = (), membership: staff.StaffSnapshot | None = None,
                        participants: AllRosterSessions | MessageParticipants = ALL_ROSTER_SESSIONS) -> Roster:
     """Use the reported session or the pane process to address Codex."""
+    from scripts.herdr import herdr
+
     membership = staff.initial_snapshot() if membership is None else membership
     entries: list[RosterEntry] = []
     problems: list[str] = []
@@ -1391,11 +1402,18 @@ def machine_name() -> str:
     return remote.this_machine()
 
 
-@herdr.observation_snapshot()
-@herdr.pane_snapshot()
 def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnapshot,
                   registry: RegistryRead,
                   participants: AllRosterSessions | MessageParticipants = ALL_ROSTER_SESSIONS) -> Roster:
+    from scripts.herdr import herdr
+
+    with herdr.observation_snapshot(), herdr.pane_snapshot():
+        return _read_local_roster(environment, membership=membership, registry=registry, participants=participants)
+
+
+def _read_local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnapshot,
+                       registry: RegistryRead,
+                       participants: AllRosterSessions | MessageParticipants = ALL_ROSTER_SESSIONS) -> Roster:
     home_state = account.home_account_state()
     problems: list[str] = []
     warnings: list[str] = []
@@ -1487,16 +1505,52 @@ class PeerNotReached:
     reason: str
 
 
-def peer_snapshot(environment: Mapping[str, str]) -> Roster | PeerNotReached:
+@dataclass(frozen=True)
+class PeerAuthority:
+    """The caller's staff snapshot and role map for one peer read."""
+
+    membership: staff.StaffSnapshot
+    accounts: role_map.RoleMap
+    documents: session_staff.ProductionDocumentFacts | session_staff.ReadProductionDocuments = session_staff.READ_PRODUCTION_DOCUMENTS
+
+    def encode(self) -> str:
+        document = {"staff": cast(object, json.loads(self.membership.encode())),
+                    "role_map": cast(object, json.loads(role_map.encode_role_map(self.accounts)))}
+        if isinstance(self.documents, session_staff.ProductionDocumentFacts):
+            document["production_documents"] = self.documents.to_json()
+        return json.dumps(document)
+
+    @classmethod
+    def decode(cls, text: str) -> PeerAuthority:
+        document = cast(object, json.loads(text))
+        if not isinstance(document, dict):
+            raise ValueError("peer authority must be an object")
+        fields = cast(dict[str, object], document)
+        return cls(staff.StaffSnapshot.decode(json.dumps(fields["staff"])),
+                   role_map.decode_role_map(json.dumps(fields["role_map"])),
+                   session_staff.ProductionDocumentFacts.from_json(fields["production_documents"])
+                   if "production_documents" in fields else session_staff.READ_PRODUCTION_DOCUMENTS)
+
+
+@dataclass(frozen=True)
+class ReadPeerAuthority:
+    """The peer reads staff and accounts from their authorities."""
+
+
+READ_PEER_AUTHORITY = ReadPeerAuthority()
+
+
+def peer_snapshot(environment: Mapping[str, str],
+                  authority: PeerAuthority | ReadPeerAuthority = READ_PEER_AUTHORITY) -> Roster | PeerNotReached:
     """Read only the peer, decoding states immediately at the ssh boundary."""
     host = remote.other_machine()
     command = ["ssh", "-o", "BatchMode=yes", host,
                '\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/message/roster.py\" --here --snapshot']
     try:
-        # ssh forwards its input to the peer. It gets none, so it never waits on the caller's
-        # input or takes text the caller was meant to read.
+        # Send only the supplied document. Never consume the caller's stdin.
         done = subprocess.run(command, capture_output=True, text=True, timeout=20, check=False,
-                              stdin=subprocess.DEVNULL,
+                              input=authority.encode() if isinstance(authority, PeerAuthority) else None,
+                              stdin=None if isinstance(authority, PeerAuthority) else subprocess.DEVNULL,
                               env={key: value for key, value in environment.items()
                                    if key not in {"CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"}})
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -1512,8 +1566,9 @@ def peer_snapshot(environment: Mapping[str, str]) -> Roster | PeerNotReached:
                   [f"{host}: {warning}" for warning in result.warnings])
 
 
-def peer_roster(environment: Mapping[str, str]) -> Roster:
-    result = peer_snapshot(environment)
+def peer_roster(environment: Mapping[str, str],
+                authority: PeerAuthority | ReadPeerAuthority = READ_PEER_AUTHORITY) -> Roster:
+    result = peer_snapshot(environment, authority)
     if isinstance(result, PeerNotReached):
         return Roster([], [f"{result.host}: not reached: {result.reason}"])
     return result
@@ -1537,9 +1592,16 @@ def roster(environment: Mapping[str, str], scope: RosterScope, *,
             local.problems[:0] = problems
             return local
         case AllMachines():
+            try:
+                authority = PeerAuthority(membership, role_map.read_role_map(),
+                                          session_staff.RowResolver(membership).production_document_facts())
+            except role_map.RoleMapUnavailable:
+                authority = ReadPeerAuthority()
             with ThreadPoolExecutor(max_workers=2) as pool:
-                peer = pool.submit(peer_roster, environment)
-                local = _local_roster(environment, membership=membership, registry=registry, participants=participants)
+                peer = pool.submit(peer_roster, environment, authority)
+                with session_staff.supplied_production_facts(
+                        authority.documents if isinstance(authority, PeerAuthority) else session_staff.READ_PRODUCTION_DOCUMENTS):
+                    local = _local_roster(environment, membership=membership, registry=registry, participants=participants)
                 local.problems[:0] = problems
                 other = peer.result()
             return Roster([*local.entries, *other.entries], [*local.problems, *other.problems],
@@ -1697,6 +1759,8 @@ def _print_text(
 
 
 def main(argv: list[str]) -> int:
+    import argparse
+
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--json", action="store_true", dest="as_json")
     _ = parser.add_argument("--kind", choices=("claude", "codex"))
@@ -1704,7 +1768,20 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--all", action="store_true", help="include closed workers; hide them by default")
     _ = parser.add_argument("--snapshot", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args(argv)
-    result = roster(os.environ, ThisMachine() if getattr(arguments, "here", False) is True else AllMachines())
+    input_problems: list[str] = []
+    with ExitStack() as reads:
+        if getattr(arguments, "snapshot", False) is True and not sys.stdin.isatty():
+            try:
+                document = sys.stdin.read()
+                if document.strip():
+                    authority = PeerAuthority.decode(document)
+                    _ = reads.enter_context(staff.supplied_snapshot(authority.membership))
+                    _ = reads.enter_context(role_map.supplied_role_map(authority.accounts))
+                    _ = reads.enter_context(session_staff.supplied_production_facts(authority.documents))
+            except (OSError, ValueError, TypeError, KeyError, staff.StaffUnreadable) as error:
+                _problem(input_problems, "peer authority stdin", error)
+        result = roster(os.environ, ThisMachine() if getattr(arguments, "here", False) is True else AllMachines())
+    result.problems[:0] = input_problems
     if getattr(arguments, "snapshot", False) is True:
         print(RosterSnapshot(result).encode())
         return 1 if result.problems else 0

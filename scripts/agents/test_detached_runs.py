@@ -901,6 +901,8 @@ sys.exit(1)
         with patch("shutil.which", return_value=None):
             self.assertEqual(detached_runs.scope_prefix(marker, on), [])
 
+    # On 2026-11-17 a director sent TERM to a lint run's supervisor group. The supervisor died and its
+    # verify.sh ran on for 3 hours with the cargo token. Each supervisor end now stops the command group.
     def test_stop_ends_the_command_group_and_the_supervisor_delivers_the_result(self) -> None:
         child_source = """import json, os, socket, sys
 with socket.socket(socket.AF_UNIX) as connection:
@@ -915,7 +917,12 @@ from unittest.mock import patch
 from scripts.agents import detached_runs
 from scripts.lib.cancellation import CANCELLATION_SIGNALS
 wait = subprocess.Popen.wait
-address = sys.argv[4]
+start = subprocess.Popen.__init__
+address, watcher = sys.argv[4:6]
+def gate_start(process, arguments, *args, **kwargs):
+    if arguments[3:4] == ['detached-command']:
+        arguments = [*arguments[:4], sys.executable, watcher, *arguments[6:]]
+    start(process, arguments, *args, **kwargs)
 def report(row):
     with socket.socket(socket.AF_UNIX) as connection:
         connection.connect(address)
@@ -929,13 +936,32 @@ def delivery(arguments, *args, **kwargs):
     text = detached_runs.result_text(record, detached_runs.command_result(record))
     report(dict(role='delivery', verb=arguments[-2], text=text))
     return subprocess.CompletedProcess(arguments, 0)
-with patch.object(subprocess.Popen, 'wait', checked_wait), patch.object(subprocess, 'run', delivery):
+with (patch.object(subprocess.Popen, 'wait', checked_wait), patch.object(subprocess.Popen, '__init__', gate_start),
+      patch.object(subprocess, 'run', delivery)):
     sys.argv = sys.argv[1:4]
     runpy.run_path(detached_runs.__file__, run_name='__main__')
 """
         reason = "stopped for timed test; run again after the release"
         with short_socket_directory() as socket_root:
             address = Path(socket_root) / "ready.sock"
+            # The watcher reports the result text over the socket instead of sending it.
+            # It reports after its reap finishes, so the test reads the finished record.
+            watcher = self.root / "watcher.py"
+            _ = watcher.write_text(f"""import json, socket, sys
+sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})
+from unittest.mock import patch
+from scripts.agents import detached_runs
+texts = []
+def deliver(record, result):
+    texts.append(detached_runs.result_text(record, result))
+    return 'fixture delivery'
+with patch.object(detached_runs, 'deliver', deliver), patch.object(detached_runs, '_complete_worker_dispatch', lambda record: None):
+    status = detached_runs.main(sys.argv[1:])
+with socket.socket(socket.AF_UNIX) as connection:
+    connection.connect({str(address)!r})
+    connection.sendall((json.dumps(dict(role='delivery', verb=sys.argv[1], text=chr(10).join(texts))) + chr(10)).encode())
+sys.exit(status)
+""")
             runtime = Path(socket_root) / "runtime"
             (runtime / "systemd").mkdir(parents=True)
             tools = self.root / "tools"
@@ -946,8 +972,10 @@ with patch.object(subprocess.Popen, 'wait', checked_wait), patch.object(subproce
             with socket.socket(socket.AF_UNIX) as manager:
                 manager.bind(str(runtime / "systemd/private"))
                 stopped = 128 + signal.SIGTERM
-                for scoped in (False, True):
-                    with self.subTest(scoped=scoped), socket.socket(socket.AF_UNIX) as ready:
+                cases: tuple[tuple[bool, signal.Signals | None], ...] = (
+                    (False, None), (True, None), (False, signal.SIGTERM), (False, signal.SIGKILL))
+                for scoped, cancel in cases:
+                    with self.subTest(scoped=scoped, cancel=cancel), socket.socket(socket.AF_UNIX) as ready:
                         guard = LauncherHangGuard("detached process group stop")
                         ready.bind(str(address))
                         ready.listen(3)
@@ -956,7 +984,8 @@ with patch.object(subprocess.Popen, 'wait', checked_wait), patch.object(subproce
                                        "XDG_RUNTIME_DIR": str(runtime), "PATH": str(tools) + os.pathsep + os.environ["PATH"]}
                         with (Path(self.root / "supervisor.log").open("ab") as output,
                               subprocess.Popen([sys.executable, "-c", supervisor_source, "detached_runs.py",
-                                                "supervise", str(path), str(address)], env=environment,
+                                                "supervise", str(path), str(address), str(watcher)],
+                                               env=environment,
                                                stdout=output, stderr=subprocess.STDOUT,
                                                start_new_session=True) as supervisor,
                               contextlib.ExitStack() as connections):
@@ -992,23 +1021,36 @@ with patch.object(subprocess.Popen, 'wait', checked_wait), patch.object(subproce
                                                  process_start.Started(saved.get("supervisor_started", "")))
                                 self.assertEqual(saved.get("command_pid"), command_pid)
                                 self.assertEqual(path.with_suffix(".scope").exists(), scoped)
-                                self.assertTrue(detached_runs.stop_command(path, reason))
+                                if cancel is None:
+                                    self.assertTrue(detached_runs.stop_command(path, reason))
+                                else:
+                                    # The signal reaches the supervisor group only; the watcher stops the command.
+                                    process_group.send_process_group(supervisor.pid, cancel)
                                 assert command_connection is not None
                                 self.assertEqual(command_connection.recv(1), b"")
                                 _, delivered = accept()
-                                self.assertEqual(supervisor.wait(timeout=guard.remaining()), 0)
+                                self.assertEqual(supervisor.wait(timeout=guard.remaining()),
+                                                 0 if cancel is None else -cancel)
                             finally:
                                 for group in (supervisor.pid, command_pid):
                                     with contextlib.suppress(ProcessLookupError, ValueError):
                                         process_group.send_process_group(group, signal.SIGKILL)
                                 _ = supervisor.wait(timeout=guard.remaining())
                         address.unlink()
-                        self.assertEqual(delivered["verb"], "deliver")
-                        self.assertIn(f"Result: STOPPED (exit {stopped})", str(delivered["text"]))
-                        self.assertIn(f"Stop reason: {reason}", str(delivered["text"]))
                         record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
-                        self.assertEqual((record["status"], record.get("exit_code"), record.get("ended")),
-                                         ("finished", stopped, None))
+                        if cancel is None:
+                            self.assertEqual(delivered["verb"], "deliver")
+                            self.assertIn(f"Result: STOPPED (exit {stopped})", str(delivered["text"]))
+                            self.assertIn(f"Stop reason: {reason}", str(delivered["text"]))
+                            self.assertEqual((record["status"], record.get("exit_code"), record.get("ended")),
+                                             ("finished", stopped, None))
+                        else:
+                            self.assertEqual(delivered["verb"], "supervisor-gone")
+                            self.assertIn("Result: STOPPED (no exit status)", str(delivered["text"]))
+                            self.assertIn(f"Stop reason: {detached_runs.SUPERVISOR_GONE_REASON}",
+                                          str(delivered["text"]))
+                            self.assertEqual((record["status"], record.get("exit_code"), record.get("ended")),
+                                             ("finished", None, "supervisor gone"))
                         self.assertFalse(path.with_suffix(".scope").exists())
                         self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
 

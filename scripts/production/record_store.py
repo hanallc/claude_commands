@@ -102,17 +102,39 @@ class NumberedRecords:
         except (ValueError, KeyError) as error:
             raise self.invalid(identity, error) from None
 
+    def field(self, identity: str, name: str) -> str:
+        """Read one header field before loading the record body or log."""
+        try:
+            with self.path(identity).open(encoding="utf-8") as stream:
+                if stream.readline() != "---\n":
+                    raise ValueError("missing frontmatter")
+                for line in stream:
+                    if line.rstrip("\n") == "---":
+                        break
+                    if line.startswith(name+": "):
+                        value = cast(object, json.loads(line[len(name)+2:]))
+                        if isinstance(value, str):
+                            return value
+                        raise ValueError("invalid field")
+            raise ValueError("missing "+name)
+        except FileNotFoundError:
+            raise self.error_type(f"{identity}: no {self.noun} for owner {self.owner}") from None
+        except (ValueError, UnicodeError) as error:
+            raise self.invalid(identity, error) from None
+
     def write(self, identity: str, fields: Mapping[str, str], body: str) -> None:
         header = "\n".join(f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in fields.items())
         write_text_atomic(self.path(identity), f"---\n{header}\n---\n\n{body}")
 
-    def records[T](self, load: Callable[[str], T], *, sources: list[Path] | None = None) -> list[T]:
+    def records[T](self, load: Callable[[str], T], *, sources: list[Path] | None = None,
+                   states: tuple[str, ...] = ()) -> list[T]:
         items: list[T] = []
         for path in source_paths(self.folder(), f"{self.prefix}*.md", sources=sources):
             if sources is not None:
                 sources.append(path)
             try:
-                items.append(load(path.stem))
+                if not states or self.field(path.stem, "state") in states:
+                    items.append(load(path.stem))
             except self.error_type as error:
                 print(f"{self.noun}: {path}: {str(error).replace(chr(10), ' ')}", file=sys.stderr)
         return items

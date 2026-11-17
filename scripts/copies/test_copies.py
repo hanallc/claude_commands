@@ -135,8 +135,9 @@ class StandingTests(unittest.TestCase):
                          "wait_seconds": "0.01", "git_timeout_seconds": "10",
                          "guard_timeout_seconds": "10"}
         self.write_config(self.settings)
+        # A run inside a build slot carries that slot's Cargo cache; the test's gates lease their own.
         environment = {key: value for key, value in os.environ.items()
-                       if not key.startswith("GIT_") and key != "UNIT_RUN_DIR"}
+                       if not key.startswith("GIT_") and key not in ("UNIT_RUN_DIR", "CARGO_BUILD_BUILD_DIR")}
         environment.update({
             **slot_configuration.environment,
             "HOME": str(home), "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
@@ -403,6 +404,12 @@ class StandingTests(unittest.TestCase):
         self.assertEqual(os.environ.get('CARGO_BUILD_BUILD_DIR'), previous)
         self.assertEqual(build_folders.build_folder_state(first), 'free')
         self.assertEqual(build_folders.build_folder_state(second), 'free')
+        # A command inside a build slot inherits that slot's cache; a gate it opens builds in its own slot's cache.
+        outer = str(self.base / "cargo" / "outer-slot1")
+        with mock.patch.dict(os.environ, {"CARGO_BUILD_BUILD_DIR": outer}):
+            with copies.standing(self.owner_id, self.source, copies.CommittedSource('HEAD')) as first:
+                self.assertEqual(os.environ['CARGO_BUILD_BUILD_DIR'], str(self.base / 'cargo' / first.name))
+            self.assertEqual(os.environ['CARGO_BUILD_BUILD_DIR'], outer)
         for output in (str(self.base / "explicit-output"), "relative-output"):
             with self.subTest(output=output), mock.patch.dict(os.environ, {"CARGO_BUILD_BUILD_DIR": output}):
                 with copies.standing(self.owner_id, self.source, copies.CommittedSource('HEAD')) as first:

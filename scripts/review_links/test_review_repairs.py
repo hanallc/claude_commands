@@ -16,8 +16,9 @@ from unittest.mock import patch
 
 from scripts.lib import urgency
 from scripts.lib.user_zone import user_zone
-from scripts.production import change_review, footer_counts, investigation, next_item, staff
-from scripts.review_links import change_page, console, review_items, review_page, test_review_page
+from scripts.production import change_review, footer_counts, investigation, next_item, staff, update_registration
+from scripts.production.production_doc import read_production
+from scripts.review_links import change_page, console, review_actions, review_items, review_page, test_review_page
 
 
 class ReviewRepairsTests(unittest.TestCase):
@@ -100,6 +101,150 @@ class ReviewRepairsTests(unittest.TestCase):
         self.assertIn('Last error: fixture send failed',calls[-1])
         self.assertEqual(next(item.state for item in review_items.read(self.case.root) if item.key == key),review_items.ReviewState.DONE)
 
+    def test_waiting_unowned_question_keeps_only_later(self) -> None:
+        key = self.case.question()
+        members = staff.snapshot()
+        owner = next(row for row in members.rows if row.name == 'page-owner')
+        scope = read_production(owner, members)
+        identities = update_registration.QuestionStaff.for_record(members)
+        question = next(item for item in review_items.read(self.case.root) if item.key == key)
+        _ = update_registration.followup(scope, question.title, 'Check the old case.', identities=identities)
+        without_owner = staff.StaffSnapshot(tuple(row for row in members.rows if row.id != owner.id))
+        with patch.object(staff, 'snapshot', return_value=without_owner):
+            waiting = next(item for item in review_items.read(self.case.root) if item.key == key)
+            self.assertEqual(waiting.state, review_items.ReviewState.WAITING)
+            self.assertIsInstance(waiting.source, review_items.UnownedQuestionSource)
+            assert isinstance(waiting.source, review_items.UnownedQuestionSource)
+            before = waiting.source.record.path.read_bytes()
+            self.assertEqual(waiting.actions, ())
+            form = review_page.form(waiting, change_page.ReviewBrowser('fixture-token'))
+            self.assertIn('value="later">Later', form)
+            for action in ('answer', 'feedback', 'question'):
+                with self.subTest(action=action):
+                    self.assertNotIn(f'value="{action}"', form)
+                    with self.assertRaises(change_page.AnswerRefused):
+                        _ = review_page.submit(self.case.root, self.case.body(key, action, 'Use the new case.'), self.case.status)
+                    self.assertEqual(waiting.source.record.path.read_bytes(), before)
+
+    def test_empty_actions_keep_each_wait_and_its_question_id(self) -> None:
+        proposal, efficiency = self.case.decisions()
+        question = self.case.question()
+        report = self.case.investigation()
+        keys = (question, 'page-owner/C1', f'investigation/{report.owner}/{report.id}', proposal, efficiency)
+        for key in keys:
+            delivery, _ = review_page.submit(self.case.root, self.case.body(key, 'question', 'Check the old case.'), self.case.status)
+            assert isinstance(delivery, change_page.MessageDelivery)
+            change_page.deliver(delivery, self.case.status)
+            waiting = next(item for item in review_items.read(self.case.root) if item.key == key)
+            slots = self.case.status.slots(delivery.page, delivery.row)
+            actions = ('answer', 'feedback', 'question') if waiting.type == review_items.ReviewType.QUESTION else ('feedback', 'question')
+            for action in actions:
+                with self.subTest(kind=waiting.type, action=action):
+                    with self.assertRaises((ValueError, update_registration.RegistrationFailure)):
+                        _ = review_page.submit(self.case.root, self.case.body(key, action, ' \n '), self.case.status)
+                    self.assertEqual(next(item for item in review_items.read(self.case.root) if item.key == key), waiting)
+                    self.assertEqual(self.case.status.slots(delivery.page, delivery.row), slots)
+
+    def test_native_question_followup_accepts_each_action(self) -> None:
+        for action in ('answer', 'feedback', 'question'):
+            with self.subTest(action=action):
+                case = test_review_page.ReviewPageTests('runTest')
+                case.setUp()
+                try:
+                    key = case.question()
+                    members = staff.snapshot()
+                    owner = next(row for row in members.rows if row.name == 'page-owner')
+                    scope = read_production(owner, members)
+                    identities = update_registration.QuestionStaff.for_record(members)
+                    question = next(item for item in review_items.read(case.root) if item.key == key)
+                    _ = update_registration.followup(scope, question.title, 'Check the old case.', identities=identities)
+                    waiting = next(item for item in review_items.read(case.root) if item.key == key)
+                    self.assertEqual(waiting.state, review_items.ReviewState.WAITING)
+                    delivery, _ = review_page.submit(case.root, case.body(key, action, 'Use the new case.'), case.status)
+                    change_page.deliver(delivery, case.status)
+                    updated = next(item for item in review_items.read(case.root) if item.key == key)
+                    expected = review_items.ReviewState.WAITING if action == 'question' else review_items.ReviewState.DONE
+                    self.assertEqual(updated.state, expected)
+                    assert isinstance(updated.source, review_items.QuestionSource)
+                    self.assertEqual('followup' in updated.source.record.item, action == 'question')
+                    self.assertEqual(updated.source.record.item.get('followups', []), [])
+                    self.assertTrue(any('superseded' in entry.words.casefold() for entry in updated.log))
+                    self.assertTrue(any('Check the old case.' in entry.words for entry in updated.log))
+                    self.assertIn('superseded', scope.log.read_text().casefold())
+                    before = updated.source.record.path.read_bytes()
+                    with self.assertRaises((ValueError, update_registration.RegistrationFailure)):
+                        _ = change_page.answer_item(key, 'The old case passes.', '', case.status)
+                    self.assertEqual(updated.source.record.path.read_bytes(), before)
+                finally:
+                    case.doCleanups()
+
+    def test_recovery_sends_only_the_action_that_replaced_the_pending_request(self) -> None:
+        for kind in review_items.REVIEW_TYPES:
+            with self.subTest(kind=kind):
+                case = test_review_page.ReviewPageTests('runTest')
+                case.setUp()
+                try:
+                    if kind == review_items.ReviewType.QUESTION:
+                        key = case.question()
+                    elif kind == review_items.ReviewType.CHANGE:
+                        key = 'page-owner/C1'
+                    elif kind == review_items.ReviewType.INVESTIGATION:
+                        report = case.investigation()
+                        key = f'investigation/{report.owner}/{report.id}'
+                    else:
+                        proposal, efficiency = case.decisions()
+                        key = proposal if kind == review_items.ReviewType.PROPOSAL else efficiency
+                    old, _ = review_page.submit(case.root, case.body(key, 'question', 'OBSOLETE_REQUEST'), case.status)
+                    _, _ = review_page.submit(case.root, case.body(key, 'feedback', 'CURRENT_ACTION'), case.status)
+                    restarted = change_page.DeliveryStatus(case.root)
+                    change_page.recover_pending(restarted)
+                    messages = tuple(case.fixture.messages)
+                    self.assertEqual(len(messages), 2 if kind == review_items.ReviewType.CHANGE else 1)
+                    self.assertTrue(all('CURRENT_ACTION' in text and 'OBSOLETE_REQUEST' not in text for _, _, text in messages))
+                    change_page.deliver(old, case.status)
+                    change_page.recover_pending(restarted)
+                    self.assertEqual(tuple(case.fixture.messages), messages)
+                    updated = next(item for item in review_items.read(case.root) if item.key == key)
+                    self.assertEqual(updated.state, review_items.ReviewState.DONE)
+                finally:
+                    case.doCleanups()
+
+    def test_question_recovery_keeps_the_id_before_tracking_finishes(self) -> None:
+        for kind in (review_items.ReviewType.QUESTION, review_items.ReviewType.INVESTIGATION,
+                     review_items.ReviewType.PROPOSAL, review_items.ReviewType.EFFICIENCY):
+            with self.subTest(kind=kind):
+                case = test_review_page.ReviewPageTests('runTest')
+                case.setUp()
+                try:
+                    if kind == review_items.ReviewType.QUESTION:
+                        key = case.question()
+                    elif kind == review_items.ReviewType.INVESTIGATION:
+                        report = case.investigation()
+                        key = f'investigation/{report.owner}/{report.id}'
+                    else:
+                        proposal, efficiency = case.decisions()
+                        key = proposal if kind == review_items.ReviewType.PROPOSAL else efficiency
+                    with patch.object(review_actions, 'track_question', side_effect=RuntimeError('fixture crash')):
+                        with self.assertRaisesRegex(RuntimeError, 'fixture crash'):
+                            _ = review_page.submit(case.root, case.body(key, 'question', 'Check this request.'), case.status)
+                    waiting = next(item for item in review_items.read(case.root) if item.key == key)
+                    page = review_actions.delivery_page(waiting, case.status)
+                    slots = case.status.slots(page, page.rows[0])
+                    self.assertIsInstance(slots.question, change_page.OpenQuestion)
+                    assert isinstance(slots.question, change_page.OpenQuestion)
+                    identity = slots.question.question_id
+                    fields = cast(change_page.StoredDeliverySlots, json.loads(case.status.path(page, page.rows[0]).read_text()))
+                    saved = fields.get('user_answer') or fields.get('review_message')
+                    assert saved is not None
+                    self.assertIn('--question '+identity, saved['message'])
+                    restarted = change_page.DeliveryStatus(case.root)
+                    change_page.recover_pending(restarted)
+                    self.assertEqual(len(case.fixture.messages), 1)
+                    self.assertIn('--question '+identity, case.fixture.messages[0][2])
+                    self.assertEqual(case.status.slots(page, page.rows[0]).question, slots.question)
+                finally:
+                    case.doCleanups()
+
     def test_automation_docs_name_review_and_only_answer_ready_counts(self) -> None:
         source = (Path(__file__).parents[2]/'docs/as-built/showrunner-automation.md').read_text()
         self.assertIn('The status line counts only answer-ready investigations after questions.',source)
@@ -124,20 +269,27 @@ class ReviewRepairsTests(unittest.TestCase):
                 if route.path == '/owner-answer':
                     key = parse_qs(route.query)['item'][0]
                     item = next(item for item in review_items.read(case.root) if item.key == key)
-                    question = item.source.slots.question if isinstance(item.source, review_items.ChangeSource) else change_page.NoQuestion()
+                    if isinstance(item.source, review_items.ChangeSource):
+                        question = item.source.slots.question
+                    else:
+                        page = review_actions.delivery_page(item, case.status)
+                        question = case.status.slots(page, page.rows[0]).question
                     identity = question.question_id if isinstance(question, change_page.OpenQuestion) else ''
                     _ = change_page.answer_item(key,'The owner checked the next case.',identity,case.status)
-                if self.path == '/problem':
-                    _ = change_review.save_verdict(case.fixture.review_list,'C1','not works: The spacing differs.',case.fixture.production)
-                if self.path == '/passed':
-                    _ = change_review.save_verdict(case.fixture.review_list,'C2','works',case.fixture.production)
+                if self.path in ('/problem', '/passed'):
+                    row, verdict = ('C1', 'not works: The spacing differs.') if self.path == '/problem' else ('C2', 'works')
+                    page = change_page.ReviewPage(case.fixture.review_list, case.fixture.production, (row,), '')
+                    validation = case.status.slots(page, row).validation
+                    assert isinstance(validation, (change_page.DeliveryIntent, change_page.ValidationRequested))
+                    _ = change_review.save_verdict(case.fixture.review_list, row, verdict, case.fixture.production,
+                                                   validation_id=validation.attempt)
                 self.send_response(200)
                 self.send_header('Content-Type','text/html; charset=utf-8')
                 self.end_headers()
                 if self.path == '/complete':
                     _ = complete.wait(25)
                 elif self.path.startswith('/fresh') or self.path.startswith('/console/review.html'):
-                    _ = self.wfile.write(review_page.render(case.root))
+                    _ = self.wfile.write(review_page.render(case.root, show=parse_qs(route.query).get('show', ['open'])[0]))
                 else:
                     _ = self.wfile.write(document)
 
@@ -180,19 +332,23 @@ class ReviewRepairsTests(unittest.TestCase):
         question = self.case.question()
         ready = self.case.investigation()
         markup = review_page.render(self.case.root).decode()
-        setup = '''<script>const nativeFetch=fetch;window.setInterval=()=>0;window.reviewRead=Promise.resolve();
+        setup = '''<script>const nativeFetch=fetch;window.setInterval=()=>0;
 window.fetch=(url,options={})=>{
- const response=nativeFetch(options.method==='POST'?'/action':'/fresh',options);
- if(options.method!=='POST') window.reviewRead=response.then(reply=>reply.clone().text());
- return response;
+ return nativeFetch(options.method==='POST'?'/action':'/fresh'+new URL(url,location.href).search,options);
 };</script>'''
         markup = markup.replace('<head>','<head>'+setup,1)
         probe = r'''
 (async()=>{
  const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
- const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+ const nextView=()=>new Promise(resolve=>{
+  const previous=document.querySelector('[data-review]');
+  const observer=new MutationObserver(()=>{
+   if(document.querySelector('[data-review]')!==previous){observer.disconnect();resolve();}
+  });
+  observer.observe(document.body,{childList:true,subtree:true});
+ });
  const row=id=>document.querySelector('[data-key="page-owner/'+id+'"]');
- const refresh=async()=>{dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await window.reviewRead;await pause(120);};
+ const refresh=async()=>{const loaded=nextView();dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await loaded;};
  const save=async(form,value)=>{
   const complete=new Promise(resolve=>{
    const observer=new MutationObserver(()=>{if(!form.dataset.sending){observer.disconnect();resolve();}});
@@ -200,45 +356,59 @@ window.fetch=(url,options={})=>{
   });
   form.requestSubmit(form.querySelector('[value="'+value+'"]'));await complete;
  };
- const show=value=>{const field=document.getElementById('list-show');field.value=value;field.dispatchEvent(new Event('change'));};
+ const show=async value=>{const field=document.getElementById('list-show');if(field.value===value) return;const loaded=nextView();field.value=value;field.dispatchEvent(new Event('change'));await loaded;};
  try{
   row('C1').querySelector('.list-toggle').click();
   const form=row('C1').querySelector('form');await save(form,'validate');
   check(row('C1').hidden,'the saved check leaves Open');
-  await refresh();check(row('C1').hidden,'a refresh keeps the waiting check out of Open');
-  show('Waiting');check(!row('C1').hidden,'Waiting can show the active check');show('open');
+  await refresh();check(!row('C1') || row('C1').hidden,'a refresh keeps the waiting check out of Open');
+  await show('Waiting');check(!row('C1').hidden,'Waiting can show the active check');await show('open');
   await nativeFetch('/problem');await refresh();check(!row('C1').hidden,'a problem returns to For you');
   row('C2').querySelector('.list-toggle').click();
   const second=row('C2').querySelector('form');await save(second,'validate');
-  await nativeFetch('/passed');await refresh();check(row('C2').hidden,'a passed check stays out of Open');
-  show('Done');check(!row('C2').hidden && row('C2').dataset.state==='Done','a passed check records Done');
-  show('all');row('C3').querySelector('.list-toggle').click();
+  await nativeFetch('/passed');await refresh();check(!row('C2') || row('C2').hidden,'a passed check stays out of Open');
+  await show('Done');check(!row('C2').hidden && row('C2').dataset.state==='Done','a passed check records Done');
+  await show('all');row('C3').querySelector('.list-toggle').click();
   const third=row('C3').querySelector('form');await save(third,'works');
   check(row('C3').hidden,'F010: Works leaves All');
   for(let pass=0;pass<2;pass++){
    await refresh();
    for(const choice of ['open','For you','Waiting','Done','all']){
-    show(choice);check(row('C3').hidden,'F010: refresh keeps Works hidden in '+choice);
+    await show(choice);check(!row('C3') || row('C3').hidden,'F010: refresh keeps Works hidden in '+choice);
    }
   }
   const keys=QUESTION_KEYS;
   for(const key of keys){
-   show('open');
+   await show('open');
    const asked=()=>document.querySelector('[data-key="'+key+'"]');
    asked().querySelector('.list-toggle').click();
    const asking=asked().querySelector('form');asking.elements.feedback.value='Check the next case.';
    await save(asking,'question');
    check(asked().hidden,'F021: Ask question leaves Open for '+key);
    for(let pass=0;pass<2;pass++){
-    await refresh();check(asked().hidden,'F021: Waiting stays hidden after refresh for '+key);
+    await refresh();check(!asked() || asked().hidden,'F021: Waiting stays hidden after refresh for '+key);
    }
    await nativeFetch('/owner-answer?item='+encodeURIComponent(key));await refresh();
    check(!asked().hidden && asked().dataset.state==='For you','F021: the owner answer returns '+key);
   }
+  location.hash=new URLSearchParams({owner:UNIT_OWNER,show:'open',type:'investigation'});
+  await new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  const investigation=document.querySelector('[data-key="'+keys.at(-1)+'"]');
+  investigation.querySelector('.list-toggle').click();await save(investigation.querySelector('form'),'read');
+  await refresh();
+  const owner=document.getElementById('list-owner');
+  check(owner.value===UNIT_OWNER && owner.selectedOptions[0]?.textContent===UNIT_NAME+' (0)',
+   'F002: the selected unit Owner remains with a zero count after its last Open row disappears');
+  check(!document.querySelector('[data-list-item]:not([hidden])'),'F002: the empty unit filter stays active');
+  await show('Done');
+  check(document.getElementById('list-owner').value===UNIT_OWNER,
+   'F002: the unit Owner remains selected when Done returns its record');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();'''
         probe = probe.replace('QUESTION_KEYS',json.dumps([question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}']))
+        probe = probe.replace('UNIT_OWNER', json.dumps(str(ready.owner))).replace(
+            'UNIT_NAME', json.dumps(review_items.name(ready.owner, staff.snapshot())))
         self.assertEqual(self.browser(markup,probe),[])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
@@ -255,6 +425,13 @@ window.fetch=(url,options={})=>{
         probe = r'''
 (async()=>{
  const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
+ const loadedView=(page,show)=>new Promise(resolve=>{
+  if(page.querySelector('[data-review]')?.dataset.show===show){resolve();return;}
+  const observer=new MutationObserver(()=>{
+   if(page.querySelector('[data-review]')?.dataset.show===show){observer.disconnect();resolve();}
+  });
+  observer.observe(page.body,{childList:true,subtree:true});
+ });
  try{
   const frame=[...document.querySelectorAll('iframe')].find(frame=>!frame.hidden);
   if(!frame.contentDocument.querySelector('[data-review]')) await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
@@ -268,7 +445,7 @@ window.fetch=(url,options={})=>{
   for(const entry of cases){
    const legacy=document.createElement('iframe');legacy.src=entry.url;
    const loaded=new Promise(resolve=>legacy.addEventListener('load',resolve,{once:true}));document.body.append(legacy);await loaded;
-   const page=legacy.contentDocument;
+   const page=legacy.contentDocument;await loadedView(page,entry.show);
    check(page.getElementById('list-show').value===entry.show,'F012: legacy Show '+entry.url);
    const visible=[...page.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
    check(visible.length===entry.count && visible.every(row=>row.dataset.type===entry.type),'F012: legacy records '+entry.url);
@@ -303,7 +480,14 @@ window.fetch=(url,options={})=>{
  try{
   const frame=[...document.querySelectorAll('iframe')].find(frame=>!frame.hidden);
   if(!frame.contentDocument.querySelector('[data-review]')) await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
-  const page=frame.contentDocument,rows=[...page.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
+  const page=frame.contentDocument;
+  if(page.querySelector('[data-review]').dataset.show!=='Done') await new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{
+    if(page.querySelector('[data-review]').dataset.show==='Done'){observer.disconnect();resolve();}
+   });
+   observer.observe(page.body,{childList:true,subtree:true});
+  });
+  const rows=[...page.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
   if(page.getElementById('list-show').value!=='Done' || rows.length!==1 || rows[0].dataset.state!=='Done')
    failures.push('F012: the console alias retains Read and its exact owner');
  }catch(error){failures.push(String(error));}

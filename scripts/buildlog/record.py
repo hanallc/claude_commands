@@ -83,6 +83,7 @@ from scripts.lib.test_phase import (
 from scripts.buildlog import cgroup_capture, store, step_context
 from scripts.buildlog.repository import (
     GIT_TIMEOUT_S as GIT_TIMEOUT_S,
+    MANIFEST_IDENTITY_PREFIX,
     output as output,
     remote_identity as remote_identity,
     repository_key as repository_key,
@@ -972,7 +973,7 @@ def fallback_step_fields(assignment_path: Path) -> dict[str, object]:
     except FileNotFoundError:
         return {}
     from scripts.aws_target import hana_result
-    from scripts.build_queue import admission_client, admission_protocol as wire, placement
+    from scripts.build_queue import admission_protocol as wire, admission_wire, placement
 
     row = hana_result.object_fields(cast(object, json.loads(content)))
     if type(row.get('version')) is not int or row['version'] != 1:
@@ -980,7 +981,7 @@ def fallback_step_fields(assignment_path: Path) -> dict[str, object]:
     remote_key = hana_result.decode_attempt_key(row['key'])
     fields = hana_result.object_fields(row['link'])
     link = hana_result.LogicalStepLink(hana_result.string_field(fields, 'call_id'), hana_result.string_field(fields, 'episode'))
-    reply = admission_client.read_assignment(assignment_path)
+    reply = admission_wire.read_assignment(assignment_path)
     if (not isinstance(reply, wire.LocalPlacementGranted) or reply.assignment.episode != link.episode
             or remote_key.episode != link.episode
             or link.call_id != os.environ.get('BUILDLOG_CALL_ID')):
@@ -1111,7 +1112,8 @@ def step(args: list[str]) -> None:
         tree = tree_facts(os.environ.get("BUILDLOG_TREE_START"), treekey.tree_key(directory))
         step_caller = caller(tty)
         sent_identity = sent_repository_identity()
-        if (repo_identity == store.UNKNOWN_IDENTITY and step_caller in ("verify-mac", "verify-linux")
+        if ((repo_identity == store.UNKNOWN_IDENTITY or repo_identity.startswith(MANIFEST_IDENTITY_PREFIX))
+                and step_caller in ("verify-mac", "verify-linux")
                 and isinstance(sent_identity, SentRepositoryIdentity)):
             repo_identity = sent_identity.value
         sent_key = sent_tree_key()

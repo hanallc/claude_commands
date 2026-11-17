@@ -282,9 +282,21 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path in (investigations_page.PAGE_PATH, "/console/questions.html", "/console/changes.html"):
             self.redirect(review_page.legacy_url(route.path, route.query))
             return None
+        if route.path == review_page.PAGE_PATH and 'body' in parse_qs(route.query):
+            try:
+                content = review_page.proposal_body(root, parse_qs(route.query)['body'][0])
+            except LookupError as error:
+                self.html_response(404, html.escape(str(error)).encode())
+                return None
+            except (OSError, ValueError) as error:
+                print(f"review-links proposal body: {error}", file=sys.stderr)
+                self.html_response(503, b"The proposal text is not available.")
+                return None
+            self.html_response(200, content)
+            return None
         if route.path == review_page.PAGE_PATH:
             try:
-                content = review_page.render(root)
+                content = review_page.render(root, show=parse_qs(route.query).get('show', ['open'])[0])
             except (OSError, ValueError) as error:
                 print(f"review-links review: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Review page is not available.</p>"))
@@ -458,7 +470,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.review_post()
             return
         if urlsplit(self.path).path == accounts_page.PAGE_PATH:
-            self.account_color_post()
+            self.accounts_post()
             return
         if urlsplit(self.path).path == images.PAGE_PATH:
             self.image_post()
@@ -618,22 +630,24 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         finally:
             change_page.deliver(delivery, server.delivery_status)
 
-    def account_color_post(self) -> None:
-        """Validate and publish one color from the Accounts page."""
+    def accounts_post(self) -> None:
+        """Validate and save one account color or one next move from the Accounts page."""
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 4096:
-                raise ValueError("Invalid color request size.")
+                raise ValueError("Invalid accounts request size.")
             fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
-            if set(fields) != {"label", "value"} or any(len(values) != 1 for values in fields.values()):
-                raise ValueError("Use one label and one color value.")
+            if (set(fields) not in ({"key", "value"}, {"group", "to"})
+                    or any(len(values) != 1 for values in fields.values())):
+                raise ValueError("Use one color key and one color value, or one group and one account.")
         except (ValueError, UnicodeError) as error:
             self.json_response(400, {"reason": str(error)})
             return
-        result = accounts_page.save_color(fields["label"][0], fields["value"][0])
-        if isinstance(result, accounts_page.ColorRefused):
+        result = (accounts_page.save_color(fields["key"][0], fields["value"][0]) if "key" in fields
+                  else accounts_page.save_next_move(fields["group"][0], fields["to"][0]))
+        if isinstance(result, accounts_page.Refused):
             self.json_response(400, {"reason": result.reason})
-        elif isinstance(result, accounts_page.ColorSaveFailed):
+        elif isinstance(result, accounts_page.SaveFailed):
             self.json_response(503, {"reason": result.reason})
         else:
             cast(ReviewLinksServer, self.server).accounts_cache = AccountsPageCache()
