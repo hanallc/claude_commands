@@ -4588,3 +4588,38 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Floor: 34.3 to 35.7 natedev CPU s over two module_cost runs. Class setups cost 0.53 s (1.6%); they already use class seeds and direct recorder calls.
 - Remaining cost is real recorder and helper work: progress_history.py 3.6 to 5.3 s over 25 starts, verify_helper.py 3.9 to 5.1 s over 11, recorder-python 4.0 to 4.4 s over 31.
 - Proposal sent to builds: a shared fixture preloader that starts before the admission threads. It loads the recorder and holder modules once, takes requests on a private socket and forks one child per request. Each child binds env, cwd, argv, staff and config paths and private run roots, then runs the real parser and handler. The real shell, recorder writes, failure injection and exit status stay. Checkpoint 470134deb.
+
+### Phase 325 — The status line tests use less aws CPU  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `statusline/test_statusline.py` uses less CPU in aws pairs, with the same tests and assertions, or the phase names its floor.
+
+**Decision:** after Phase 324, the aws ranking (`show.py top --host aws`, rows as of 2026-11-16 20:50) puts this module next after the two modules of Phases 323 and 324: median 45.3 CPU s for 98 tests; slowest kept test `CountsRowTests.test_a_unit_session_shows_its_source_counts_and_refreshes_only_its_cache` 6.1 s. Phases 263, 274 and 278 cut it before; this phase measures what is left. builds rejected new shared layers for one module's gain (2026-11-16): the change stays in the test file.
+
+**Spec:**
+1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD statusline/test_statusline.py --tests 15 --commands 15`, under `systemd-run --user --scope -q -p MemoryMax=2G`. Name the top costs by test, fixture and command.
+2. Remove the largest repeated cost in the test file that a test does not check, with the shared methods of Phases 235-238, 251, 254, 255, 263 and 323: class seeds copied per test, in-process calls where no process boundary is asserted, a forked child with loaded modules where a boundary is asserted but a new interpreter is not, one render where several tests read the same output.
+3. Keep every `statusline.sh` start that a test asserts on, and every exit status and output line. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
+4. If the largest remaining cost is product work (`statusline.sh`, jq, `counts_row.py` startup), do not change product code. Report the cost and the floor.
+5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
+6. The director runs the aws pairs.
+
+**Files:**
+- `scripts/statusline/test_statusline.py`
+
+**Workers:** 1 writer; one test module.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 232: no signal handlers anywhere. No lazy imports inside functions.
+- Phase 252: every fixture binds private run roots through `bind_private_run_roots`; keep it. Phase 242: in-process calls bind per call the module state that the real process reads at start.
+- Phase 263: `RoleTests.command_lines` seeds an empty counts cache so the shell starts no `counts_row.py`; CountsRowTests checks the counts row.
+- Phase 323: a forked child with loaded imports keeps a real kill point and exit status; create output files and child cleanup before the fork.
+- sdlc terms: test files only; every test and assertion stays; merge only on a measured aws gain; report paired peak memory.
+
+**Acceptance gate:**
+- The same test count and assertions; the module passes three times.
+- `module_cost.py` CPU before and after, with the top costs named.
+- aws pairs (3 rounds) show a gain, or the report names the floor; peak memory reported.
