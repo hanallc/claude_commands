@@ -941,6 +941,17 @@ The sender releases the claim only when both sends return `failed`, `refused`, o
 Every other outcome preserves the delivered claim.
 The sender prints each send outcome header to the journal.
 
+`build_queue/head_stall.py` watches for a stalled queue head. `buildlog sample` runs it each minute on natedev.
+It reads `queue.json` and the tail of `queue_times.jsonl`. It does not ask the service.
+A stall needs three facts: the head waited `head_stall_alert_minutes` (`build_admission.conf`), a step with a promise above zero runs, and no step with need above zero started in that time.
+Merge gates and targeted tests start with zero need, so they do not hide a stall.
+A snapshot older than `silence_seconds` is not a stall; `down-alert` covers a silent service.
+The watch sends one message to `builds` with the head and each holder's promise and use.
+It also sends one `alert.blocked` phone push with the key `head-stall-<pid>:<start time>:<last start>`.
+The push clears when `head_stall.py cleared --head <key>` exits 0: the head started, left, or no longer stalls.
+`~/.local/state/buildlog/head_stall.json` records the alerted key, so each stall alerts once. A step start ends a stall; a later stall alerts again. A failed send retries the next minute.
+The 2026-11-17 stall held the head from 00:36 to 03:46 EST; no alert reached anyone.
+
 The builds showrunner owns cut-over. Workers do not change live units or admission state.
 
 1. Stop and disable the socket and service before the prerequisite rebuild.
