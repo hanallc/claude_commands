@@ -2694,6 +2694,26 @@ Goal: no queue fixture calls bare `mkdtemp`, `git clone` or `git worktree add`. 
 **Restart:** the admission service and the memory feed read the new key at use. A service restart needs builds' go and the user's go.
 **Built:** checkpoint 5ff3631f2 on origin branch `builds-queue-reserveshare-cp`, sent to builds 2026-11-17 09:46 EST. The review found one minor defect: a small shortage rounded to 0.0 GiB and hid the alert. A short reserve now shows at least 0.1 GiB missing. Proof image 57bbedb2a910.
 
+### Phase 44ax — A run takes its build slot only when the queue lets its first step start  · status: todo
+**Depends on:** nothing; urgent. builds gave the go on 2026-11-17 10:50 EST. ETA 2026-11-17 14:30 EST.
+**User words (C1816, via builds):** "this is a waste of resources - and if we have many items in line even worse - this has to be an urgent fix as only running builds should take slots - of course if they are multi-step they should hold their slot so they go faster!"
+**Cause:** `copies.py run` takes a slot (`standing` → `build_slots.take_slot`) and prepares the tree before its command asks the memory queue. A run holds its slot for all of its memory wait.
+
+1. `copies.py run` with a step command asks the queue to admit the command's first step before it takes a slot. It is the run (BUILDLOG_RUN).
+2. When admitted, it takes the slot. A lost slot race keeps its place in the line.
+3. It prepares the tree, then ends its admitted step. The command's first step claims the between-steps hold as a continuation and does not wait again.
+4. A multi-step run keeps its slot for all of its steps.
+5. A run that leaves the line before admission leaves no slot, lease or folder.
+6. Other `copies.standing` callers keep the old order until 44ay.
+
+**Proof:** tests for each item; one dark desktop shot of the Disks page where a waiting run holds no slot.
+**Restart:** none expected: the change is in the client (`copies.py`, `verify.sh`).
+**Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44ax/work_order.md`. Clone `/session/queue/slotorder`, branch `builds-queue-slotorder`.
+
+### Phase 44ay — The other slot users take their slot after admission too  · status: todo
+**Depends on:** 44ax. builds asked for it at once after 44ax, so two orders do not stay in place.
+Move the other `copies.standing` callers to the 44ax order with the same code: merge_gate nightly, ci_points, fast_track, waiting.py, style crate_run, bump_gate, simplify_daily and rust_release. A caller whose work is not one queue step keeps the old order and says why in a comment.
+
 ### Phase 45 — Merge gates take their route from the queue  · status: todo
 **Depends on:** 44 and aws-unit's repair of the uncertain cloud launch. Checkpoint 3 of section 8 in `docs/plans/builds-queue-placement.md`. `merge_gate --tests-only` takes the same queue route as a full gate and keeps its exit codes. Tell the sdlc showrunner before this phase edits `merge_gate.py`, because natest phase 119 changed `run_gate_suites`. Phase 119 is at 14581684f on builds-natest: merge builds first, keep its selection lines before the `cloud.route` call, and keep its empty-selection result. Tell the sdlc showrunner when this phase is on main. The Work Order follows at phase start.
 
