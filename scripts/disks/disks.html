@@ -746,7 +746,7 @@ onToggle(document.getElementById("slots"), "tr[data-group]", row => {
   renderSlots();
 });
 __PAGE_REFRESH_SCRIPT__
-const pageRefresh=createPageRefresh(loadDisks,()=>settings.poll_seconds,()=>measuring && !readFailed ? 'Measuring…' : '');
+const pageRefresh=createPageRefresh(loadDisks,()=>settings.poll_seconds,()=>measuring && !readFailed && Date.now()/1000-measuring.since<=settings.wait_seconds ? 'Measuring…' : '');
 void pageRefresh.refresh();
 </script>
 </body>

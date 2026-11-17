@@ -134,7 +134,7 @@ class DisksPageTests(unittest.TestCase):
             page = disks_page.publish(Path(directory), SETTINGS).read_text()
         self.assertIn('</h1><p class="page-status"', page)
         self.assertIn(page_frame.REFRESH_SCRIPT, page)
-        self.assertIn("createPageRefresh(loadDisks,()=>settings.poll_seconds,()=>measuring && !readFailed ? 'Measuring…' : '')", page)
+        self.assertIn("createPageRefresh(loadDisks,()=>settings.poll_seconds,()=>measuring && !readFailed && Date.now()/1000-measuring.since<=settings.wait_seconds ? 'Measuring…' : '')", page)
         self.assertIn('readAt:data.measured_at,renderSeconds:data.render_seconds', page)
         self.assertIn('throw new Error("The measure did not finish.")', page)
         match = re.search(r'data-status-options="([^"]+)"', page)
@@ -200,6 +200,16 @@ START
  check(line.dataset.state==='Late','A missing server answer must become Late.');
  release();await pendingRead;
  check(line.dataset.state==='Live','A later server answer must clear Late with the same sizes.');
+ stalled=false;measureState='started';await pageRefresh.refresh();
+ check(line.dataset.state==='Paused' && parts.reason.textContent==='Measuring…',
+  'The next measure must start before its reads stop answering.');
+ stalled=true;void pageRefresh.refresh();
+ now+=settings.wait_seconds*1000;pageRefresh.changed();
+ check(line.dataset.state==='Paused','The measure hold must last through the wait limit.');
+ now+=1000;pageRefresh.changed();
+ check(line.dataset.state!=='Paused' && parts.reason.textContent!=='Measuring…',
+  'A pending read must not retain Paused or Measuring after 3601 seconds.');
+ check(line.dataset.state==='Late','A pending read past the wait limit must show Late.');
  if(failures.length) throw new Error(failures.join('\n'));
  console.log('PASS');
 })().catch(error=>{console.error(error);process.exitCode=1;});
