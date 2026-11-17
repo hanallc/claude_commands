@@ -7,6 +7,9 @@
 // Add --cloud-owner as the fourth argument for cloud worker owner images.
 // Add --blocks as the fourth argument for the target block and hold images.
 // Add --identity as the fourth argument for the row hover identity block images.
+// Add --wait-tip as the fourth argument for the waiting step hover images.
+// Add --macroute as the fourth argument for the Mac route and width images.
+// Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
 import {createServer} from 'node:http';
@@ -23,11 +26,13 @@ const folder = callerFolder ? resolve(callerFolder) : await mkdtemp(join(tmpdir(
 try {
   await mkdir(folder, {recursive:true});
   const systemTemporaryRoot = execFileSync(process.env.PYTHON || 'python3', ['-c',
-    'from pathlib import Path; import sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())', folder],
+    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE)); from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())', folder],
     {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
   const page = await readFile(join(folder, 'memory_live.html'));
   const beforePage = process.argv[3] ? (await readFile(process.argv[3], 'utf8'))
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
+  const swapBeforePage = process.env.SWAP_BEFORE_PAGE
+    ? (await readFile(process.env.SWAP_BEFORE_PAGE, 'utf8')).replace('__MEMORY_FEED_INTERVAL_SECONDS__','0.125') : null;
   const queuedComparison = process.argv[4] === '--queued';
   const consoleComparison = process.argv[4] === '--console';
   const stepNamesComparison = process.argv[4] === '--step-names';
@@ -35,6 +40,8 @@ try {
   const cloudOwnerComparison = process.argv[4] === '--cloud-owner';
   const blocksComparison = process.argv[4] === '--blocks';
   const identityComparison = process.argv[4] === '--identity';
+  const waitTipComparison = process.argv[4] === '--wait-tip';
+  const macrouteComparison = process.argv[4] === '--macroute';
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
@@ -42,6 +49,7 @@ try {
     for (const row of reading.walk) {
       if (row.started_at) row.started_at += shift;
       if (row.read_at) row.read_at += shift;
+      for(const part of row.parts || []) if(part.started_at) part.started_at += shift;
     }
     for (const waiter of reading.waiters) waiter.since += shift;
     reading.read_at = now;
@@ -49,8 +57,8 @@ try {
   const base = readings.good;
   base.waiters = structuredClone(readings.spacing.waiters);
   base.walk.find(row => row.queued).progress = {kind:'RowProgress', phase:'testing', done:8, total:10, percent:80, unit:'modules'};
-  base.walk.find(row => row.queued).unit = 'fixture-unit';
-  base.walk.find(row => row.queued).showrunner = 'fixture-production';
+  base.walk.find(row => row.queued).unit = 'handler';
+  base.walk.find(row => row.queued).showrunner = 'sdlc';
   const swapRow = (name, kind, bytes, pool='outside', extra={}) => ({name, detail:'fixture owner', kind, pool,
     category:'', members:[], owner_count:0, bytes, swap:bytes/1024**3, ...extra});
   const swapOwners = Array.from({length:31}, (_, index) => swapRow('group '+index, 'owner', (31-index)*1024**3/64,
@@ -68,7 +76,7 @@ try {
     swapRow('All swap used', 'total', swapUsed, 'all')];
   readings.shrink = structuredClone(base);
   const extra = structuredClone(base.walk.find(row => row.queued));
-  extra.name = 'second nextest'; extra.pid = 222;
+  extra.name = 'second nextest'; extra.pid = 222; extra.key += '-second';
   readings.shrink.walk.unshift(extra);
   readings.shrink.waiters = [];
   function pngPixels(buffer) {
@@ -106,10 +114,13 @@ try {
     return (x,y)=>[...pixels.subarray(y*stride+x*channels,y*stride+x*channels+3)];
   }
 
+  let servedReading = base;
+  let currentFixture = base;
   const server = createServer((req, res) => {
-    const isData = req.url.startsWith('/memory.json');
-    res.writeHead(200, {'Content-Type':isData ? 'application/json' : 'text/html; charset=utf-8'});
-    res.end(isData ? JSON.stringify({...base,read_at:Date.now()/1000}) : req.url === '/before.html' ? beforePage : page);
+    const isData = req.url.startsWith('/memory.json'), isReport = req.url.startsWith('/report.json');
+    res.writeHead(200, {'Content-Type':isData || isReport ? 'application/json' : 'text/html; charset=utf-8'});
+    res.end(isData ? JSON.stringify({...servedReading,read_at:Date.now()/1000}) : isReport ? JSON.stringify(base.report)
+      : req.url === '/before.html' ? beforePage : req.url === '/swap-before.html' ? swapBeforePage : page);
   });
   try {
     server.listen(0, '127.0.0.1');
@@ -189,40 +200,214 @@ try {
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
         await call('Emulation.setDeviceMetricsOverride', {width:1600,height:1200,deviceScaleFactor:1,mobile:false});
         const navigate = async path => {
+          currentFixture = servedReading;
           const loaded = new Promise((resolve, reject) => events.set(`${sessionId}:Page.loadEventFired`, {resolve,reject}));
           await Promise.all([loaded, call('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/${path}`})]);
           await evaluate(`(async () => {
           const style = document.createElement('style');
           style.textContent = '* { transition: none !important; }';
           document.head.append(style);
-          await tick();
+          await ${path === 'memory_live.html' ? 'pageRefresh.refresh(true)' : 'tick()'};
+          window.proofTip = (kind, index) => kind + ':' + (kind === 'row' ? latest.walk : latest.waiters)[index].key;
+          window.proofRun = index => latest.walk[index].key;
           window.renderReading = render;
           window.proofData = structuredClone(latest);
           window.render = () => {};
           await document.fonts.ready;
+          const legend = document.querySelector('.legend-box');
+          if (${JSON.stringify(path)} === 'memory_live.html' && legend.open) throw new Error('The legend starts open.');
+          // The proof measures the legend, so it opens it as a click does.
+          if (legend) legend.open = true;
           fitLabels();
           })()`);
         };
         await navigate('memory_live.html');
+        // The user, 11-16: space pauses every update, a tooltip still opens, and space again resumes.
+        const pressSpace = async () => {
+          for (const type of ['keyDown','keyUp'])
+            await call('Input.dispatchKeyEvent',{type,code:'Space',key:' ',windowsVirtualKeyCode:32,nativeVirtualKeyCode:32});
+        };
+        // A reading that fails after the pause leaves the page as it was.
+        await evaluate(`(()=>{
+          window.proofRead=window.fetch;
+          window.fetch=()=>new Promise((_,reject)=>{window.proofFail=reject;});
+          window.proofPending=pageRefresh.refresh(true);
+          scrollTo(0,0);
+        })()`);
+        await pressSpace();
+        const lateFailure = await evaluate(`(async()=>{
+          window.proofFail(new Error('proof'));
+          await window.proofPending;
+          const read=window.proofRead;
+          window.proofFetches=0;
+          window.fetch=(...request)=>{window.proofFetches++;return read(...request);};
+          const line=document.querySelector('[data-page-status]');
+          return {state:line.dataset.state,reason:line.querySelector('[data-status-reason]').textContent};
+        })()`);
+        assert.deepEqual(lateFailure,{state:'Paused',reason:'Press space to resume.'},'A reading that fails after the pause changes the page.');
+        // A report that arrives after the pause leaves the charts as they were.
+        const lateReport = await evaluate(`(async()=>{
+          const draw=window.renderReport, version=reportVersion;
+          let drawn=0;
+          window.renderReport=()=>{drawn++;};
+          await loadReport('proof-late',()=>true);
+          window.renderReport=draw;
+          window.proofFetches=0;
+          return {drawn,kept:reportVersion===version};
+        })()`);
+        assert.deepEqual(lateReport,{drawn:0,kept:true},'A report that arrives after the pause changes the charts.');
+        const pausedPage = await evaluate(`(async()=>{
+          const line=document.querySelector('[data-page-status]');
+          const word=line.querySelector('[data-status-word]');
+          const visibility={checkVisibilityCSS:true,checkOpacity:true};
+          const shown=line.dataset.state==='Paused'&&word.textContent==='Paused'
+            &&line.checkVisibility(visibility)&&word.checkVisibility(visibility);
+          await pageRefresh.refresh();
+          await reloadWhenPageChanges();
+          const pill=document.querySelector('#pill').getBoundingClientRect();
+          return {shown,fetches:window.proofFetches,pill:{x:pill.left+pill.width/2,y:pill.top+pill.height/2}};
+        })()`);
+        assert.ok(pausedPage.shown,'Space does not show the Paused state.');
+        assert.equal(pausedPage.fetches,0,'A paused page still reads.');
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved',x:pausedPage.pill.x,y:pausedPage.pill.y});
+        const pausedTip = await evaluate(`(()=>{
+          const tip=document.querySelector('#tip');
+          const boxes=[tip,document.querySelector('#paused'),document.querySelector('[data-page-status]')].map(item=>item.getBoundingClientRect());
+          const left=Math.min(...boxes.map(box=>box.left))-12, top=Math.min(...boxes.map(box=>box.top))-12;
+          const right=Math.max(...boxes.map(box=>box.right))+12, bottom=Math.max(...boxes.map(box=>box.bottom))+12;
+          return {on:tip.classList.contains('on'),clip:{x:Math.max(0,left),y:Math.max(0,top),width:right-Math.max(0,left),height:bottom-Math.max(0,top),scale:1}};
+        })()`);
+        assert.ok(pausedTip.on,'A paused page opens no tooltip.');
+        const pausedShot=await call('Page.captureScreenshot',{format:'png',clip:pausedTip.clip});
+        await writeFile(join(folder,'paused-tooltip-dark-desktop.png'),Buffer.from(pausedShot.data,'base64'));
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved',x:4,y:4});
+        await pressSpace();
+        const resumedPage = await evaluate(`(async()=>{
+          await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+          return {state:document.querySelector('[data-page-status]').dataset.state,fetches:window.proofFetches};
+        })()`);
+        assert.equal(resumedPage.state,'Live','Space does not restore the Live state.');
+        assert.ok(resumedPage.fetches>0,'Space does not resume reading.');
 
+        const comparisons = [];
         const proofs = [];
-        const show = async (reading, clearTip=true) => evaluate(`(async () => {
+        // An over-cap reading takes more than the cap total, so its legend rows exceed that total.
+        const proofTip = (kind, index, reading = currentFixture) => kind + ':' + (kind === 'row' ? reading.walk : reading.waiters)[index].key;
+        const show = async (reading, clearTip=true, legendSums=true) => {
+          for (const [kind, rows] of [['run', reading.walk], ['wait', reading.waiters]]) {
+            const seen = new Set();
+            for (const row of rows) {
+              row.key ??= `proof-${kind}-${row.pid ?? row.name}`;
+              if (seen.has(row.key)) row.key += '-process-' + row.pid;
+              seen.add(row.key);
+            }
+          }
+          currentFixture = reading;
+          const totals=await evaluate(`(async () => {
           ${clearTip ? "hideTip();" : ""}
           document.body.classList.remove('queue-unavailable');
           const data = ${JSON.stringify(reading)};
           data.read_at = Date.now()/1000;
           latest = data;
           window.renderReading(data);
+          renderReport(data.report);
           fitLabels();
           await document.fonts.ready;
           await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+          return [...document.querySelectorAll('.legend-group')].map(group=>({
+            name:group.querySelector('.group-head .name').textContent,
+            total:group.querySelector(':scope > .group-head .v,:scope > .row.total .v').textContent,
+            rows:[...group.querySelectorAll(':scope > .row:not(.in):not(.total)')]
+              .filter(row=>!row.hidden&&row.dataset.tip!=='shortfall')
+              .map(row=>row.querySelector('.v').textContent)}));
+          })()`);
+          for(const group of legendSums?totals:[]) {
+            if(group.total==='unavailable') continue;
+            const amount=text=>text==='unavailable'?0:Number.parseFloat(text.replace('<',''));
+            const sum=group.rows.reduce((total,text)=>total+amount(text),0);
+            // Every displayed total is the sum of its displayed leaves.
+            assert.ok(Math.abs(amount(group.total)-sum)<=1e-9,
+              'A legend total differs from its rows: '+JSON.stringify(group));
+          }
           return true;
+        };
+        // The same step keeps its screen position and hover after work above it changes.
+        const steady = structuredClone(base);
+        steady.waiters = Array.from({length: 12}, (_, index) => ({...steady.waiters[0],
+          key: 'steady-wait-' + index, pid: 8000 + index, name: 'steady waiting ' + index}));
+        servedReading = steady;
+        await call('Emulation.setDeviceMetricsOverride', {width:1400,height:700,deviceScaleFactor:1,mobile:false});
+        await navigate(process.env.STEADY_BASELINE ? 'before.html' : 'memory_live.html');
+        const beforeSteady = await evaluate(`(() => {
+          const row = [...document.querySelectorAll('.wrow.wait')].find(row => row.querySelector('.name').textContent === 'steady waiting 3');
+          window.scrollBy(0, row.getBoundingClientRect().top - 200);
+          const key = row.dataset.tip;
+          const table = document.querySelector('tr[data-tip="'+key+'"]');
+          table.focus({preventScroll:true});
+          document.querySelector('#swaprows .smaller details').open = true;
+          showTip(key, 700, 500);
+          window.render = window.renderReading;
+          return {top:row.getBoundingClientRect().top, key, tip:document.querySelector('#tip').innerText,
+            tipTop:document.querySelector('#tip').style.top,tipLeft:document.querySelector('#tip').style.left};
         })()`);
+        const changedSteady = structuredClone(steady);
+        changedSteady.walk.unshift(...[1,2].map(index => ({...changedSteady.walk.find(row=>row.queued),
+          key:'steady-new-'+index, pid:9000+index, name:'new running '+index})));
+        changedSteady.waiters = [...changedSteady.waiters.slice(6), ...changedSteady.waiters.slice(0,6)];
+        servedReading = changedSteady;
+        const afterSteady = await evaluate(`(async () => {
+          await tick();
+          await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+          const row=[...document.querySelectorAll('.wrow.wait')].find(row=>row.querySelector('.name').textContent==='steady waiting 3');
+          return {top:row.getBoundingClientRect().top,key:row.dataset.tip,tip:document.querySelector('#tip').innerText,
+            tipTop:document.querySelector('#tip').style.top,tipLeft:document.querySelector('#tip').style.left,
+            focus:document.activeElement.dataset.tip,details:document.querySelector('#swaprows .smaller details').open};
+        })()`);
+        const steadyResult = {before:beforeSteady,after:afterSteady,delta:afterSteady.top-beforeSteady.top};
+        await writeFile(join(folder,'steady-refresh.json'),JSON.stringify(steadyResult,null,2)+'\n');
+        assert.ok(Math.abs(steadyResult.delta)<1,'The viewed waiting step moves during refresh: '+JSON.stringify(steadyResult));
+        assert.equal(afterSteady.key,beforeSteady.key);
+        assert.equal(afterSteady.tip,beforeSteady.tip,'The open hover changes to another step.');
+        assert.equal(afterSteady.tipTop,beforeSteady.tipTop);
+        assert.equal(afterSteady.tipLeft,beforeSteady.tipLeft);
+        assert.equal(afterSteady.focus,beforeSteady.key);
+        assert.ok(afterSteady.details,'The open details closes during refresh.');
+        // Removing that step clears its hover without borrowing the next step.
+        servedReading = {...changedSteady,waiters:changedSteady.waiters.filter(row=>row.key!=='steady-wait-3')};
+        assert.equal(await evaluate("(async()=>{await tick();return document.querySelector('#tip').classList.contains('on')})()"), false);
+        // A focused row out of view does not anchor the page: the first row in view keeps its place.
+        servedReading = steady;
+        const outOfView = await evaluate(`(async () => {
+          await tick();
+          hideTip();
+          // The reorder moves step 6 up six places and step 0 down six places.
+          const viewed=[...document.querySelectorAll('.wrow.wait')].find(row=>row.querySelector('.name').textContent==='steady waiting 6');
+          window.scrollBy(0, viewed.getBoundingClientRect().top - 10);
+          const far=document.querySelector('tr[data-tip="wait:steady-wait-0"]');
+          far.focus({preventScroll:true});
+          const bounds=far.getBoundingClientRect();
+          const first=[...document.querySelectorAll('.wrow[data-tip]')].find(row=>{const r=row.getBoundingClientRect();return r.top>=0&&r.bottom>0&&r.top<innerHeight;});
+          return {farInView:bounds.bottom>0&&bounds.top<innerHeight, key:first.dataset.tip, top:first.getBoundingClientRect().top};
+        })()`);
+        assert.ok(!outOfView.farInView && outOfView.key==='wait:steady-wait-6', 'The setup is wrong: '+JSON.stringify(outOfView));
+        servedReading = changedSteady;
+        const outOfViewTop = await evaluate(`(async () => {
+          await tick();
+          await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+          return document.querySelector('.wrow[data-tip="${outOfView.key}"]').getBoundingClientRect().top;
+        })()`);
+        assert.ok(Math.abs(outOfViewTop-outOfView.top)<1, 'A focused row out of view moves the rows in view: '+JSON.stringify({outOfView,outOfViewTop}));
+        servedReading = base;
+        await navigate('memory_live.html');
+        // A reload of the same page keeps its scroll; the pixel checks below read the page from its top.
+        await evaluate('scrollTo(0,0)');
         for (const theme of ['light','dark']) {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
           for (const width of [1400,900,390]) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
             await show(base);
+            // A render keeps the viewed row in place, so the scroll of the last width stays; the pixel checks read from the top.
+            await evaluate('scrollTo(0,0)');
             const timeCells = await evaluate(`({
               short:ago(latest.read_at-15,latest.read_at),
               waiting:[...document.querySelectorAll('tr[data-tip^="wait:"] .duration')].map(cell=>cell.textContent)
@@ -263,6 +448,8 @@ try {
               const contrast = (a,b) => (Math.max(luminance(a),luminance(b))+0.05)/(Math.min(luminance(a),luminance(b))+0.05);
               const swap = [...document.querySelectorAll('#swaprows .row')];
               const small = swap.find(row => row.classList.contains('owner'))?.querySelector('small');
+              // A long detail wraps at phone width, so compare the first text lines, not the boxes.
+              const firstLine = element => { const range=document.createRange(); range.selectNodeContents(element); return range.getClientRects()[0]; };
               const gauges = ['some','full'].map(key => {
                 const value=document.querySelector('#gv-'+key), limit=document.querySelector('#limit-'+key);
                 return {value:rect(value), limit:rect(limit), text:value.textContent, nowrap:getComputedStyle(value).whiteSpace};
@@ -272,6 +459,8 @@ try {
               const card = document.querySelector('#walk').closest('.card');
               const metrics = {
                 headings:[...table.querySelectorAll('thead th')].map(e=>e.textContent),
+                runningSlots:[...table.querySelectorAll('tr[data-tip^="row:"] .slot')].map(cell=>cell.textContent),
+                queuedSlots:table.querySelectorAll('tr[data-tip^="wait:"] .slot,tr.queue-head .slot').length,
                 answer:text('#answer'),
                 queueHeaders:[...table.querySelectorAll('tbody tr.queue-head th')].map(e=>e.textContent),
                 queueHeaderHeight:table.querySelector('tr.queue-head')?.getBoundingClientRect().height,
@@ -302,14 +491,12 @@ try {
                 machine:table.querySelector('td.machine')?.textContent,
                 capText:text('#cap-value'), room:text('#v-room'),
                 roomBar:rect(document.querySelector('#s-room')), roomColor:color('--room'),
-                reportPoints:[...document.querySelectorAll('#history-charts svg circle')].map(point=>({
-                  box:rect(point),color:getComputedStyle(point).fill})),
                 rowLeft:rect(row.querySelector('.row-label')).left,
                 headingLeft:rect(card.querySelector('.section-head')).left,
                 reservedAmount:getComputedStyle(row.querySelector('.reserved-amount')).color,
                 dimColor:color('--ink-2'),
                 leftover:text('#leftover-rows'), history:text('#report-charts'), top:text('#report-top'),
-                historyWindow:text('#history-window'), costWindow:text('#cost-window'), pressureReason:text('#pressure-reason'),
+                costWindow:text('#cost-window'), pressureReason:text('#pressure-reason'),
                 charts:document.querySelectorAll('#history-charts svg').length,
                 progress:progress?rect(progress):null, capLine:rect(cap),
                 progressColor:progress?getComputedStyle(progress).backgroundColor:null,
@@ -318,7 +505,7 @@ try {
                 swapRows:swap.length, swapText:swap.map(e=>e.textContent),
                 swapBytes:swap.filter(e=>e.dataset.bytes).map(e=>Number(e.dataset.bytes)),
                 swapContrast:small?contrast(getComputedStyle(small).color,color('--card')):null,
-                swapBaseline:small?rect(small).bottom-rect(small.parentElement.querySelector('.name')).bottom:0,
+                swapBaseline:small?firstLine(small).bottom-firstLine(small.parentElement.querySelector('.name')).bottom:0,
                 gauges, lower, values,
                 name:row.querySelector('.name').textContent, owner:owner?.textContent||'',
                 walk:rect(document.querySelector('#walk')), card:rect(card),
@@ -329,8 +516,10 @@ try {
               };
               return metrics;
             })()`);
-            assert.deepEqual(proof.headings, ['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU']);
-            assert.equal(proof.answer,'Next step room');
+            assert.deepEqual(proof.headings, ['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot','Tokens']);
+            assert.ok(proof.runningSlots.length>0 && proof.runningSlots.every(slot=>slot==='—'));
+            assert.equal(proof.queuedSlots,0);
+            assert.equal(proof.answer,'Free for the next step');
             assert.deepEqual(proof.queueHeaders,['#','Done','Step','Waiting','Unit','Pid','Target','vCPU']);
             assert.equal(proof.queueHeaderHeight,proof.queueSpacerHeight);
             assert.ok(proof.stages.includes('testing'));
@@ -346,12 +535,14 @@ try {
             for (const age of ['45 min','19 h','2 d']) assert.ok(proof.leftover.includes(age), age);
             assert.match(proof.leftover,/pid 46/);
             assert.ok(!/pid (70|80)\b/.test(proof.leftover), 'The leftover list includes a live build or compiler service.');
-            assert.equal(proof.historyWindow,'Oct 31, 2026 – Nov 7, 2026 · America/New_York');
-            assert.match(proof.costWindow,/^Nov 4, 2026 – Nov 7, 2026 · America\/New_York/);
+            assert.ok(!proof.history.includes('Build history'));
+            assert.match(proof.costWindow,/^Last 3 days: Nov 4, 2026 – Nov 7, 2026 · America\/New_York/);
             assert.equal(proof.pressureReason,'Pressure is unreadable: /private/proc/pressure/memory');
-            assert.ok(proof.charts > 0, 'The history section has no chart.');
+            assert.equal(proof.charts, 0, 'The removed history chart remains.');
             assert.match(proof.top, /Memory wait/);
-            assert.match(proof.top, /fixture-owner/);
+            assert.match(proof.top, /Memory wait on fixture: /);
+            assert.match(proof.top, /fixture nextest paid 75% of it\./);
+            assert.match(proof.top, /Action: lower the memory peak of fixture nextest\./);
             assert.ok(proof.progress && proof.progress.width > 0, 'The progress line is absent.');
             assert.ok(proof.progress.height <= 3, 'The progress line is too thick.');
             assert.ok(proof.progress.right <= proof.capLine.left + 1, 'The progress line crosses the cap.');
@@ -359,7 +550,7 @@ try {
             assert.match(proof.swapText[0], /Outside builds and CI/);
             assert.match(proof.swapText[base.swap_rows+1], /25 smaller groups/);
             assert.match(proof.swapText[base.swap_rows+1], /5\.1 GiB/);
-            assert.match(proof.swapText.at(-3), /Not attributed7 B/);
+            assert.match(proof.swapText.at(-3), /Not attributed7\.0 B/);
             assert.match(proof.swapText.at(-2), /Builds and CI/);
             assert.match(proof.swapText.at(-1), /All swap used7\.8 GiB/);
             assert.equal(proof.swapBytes.slice(0,-1).reduce((sum,bytes)=>sum+bytes,0),proof.swapBytes.at(-1));
@@ -373,10 +564,10 @@ try {
             assert.ok(proof.lower.every(value => value < base.cap), 'The lower axis reaches the cap.');
             assert.ok(Math.abs(proof.rowLeft-proof.headingLeft)<=1, 'The rows miss the card text edge.');
             assert.equal(proof.reservedAmount,proof.dimColor);
-            assert.ok(!proof.owner.includes('fixture-unit'), 'The page repeats the unit beside the name.');
+            assert.ok(!proof.owner.includes('handler'), 'The page repeats the unit beside the name.');
             assert.ok(proof.amountHeader.includes('Used · reserved'), 'The memory amounts have no header.');
             assert.ok(proof.scroll <= proof.client, 'The page overflows. '+JSON.stringify({theme,width,scroll:proof.scroll,client:proof.client}));
-            const roomLegend=proof.values.find(row=>row.label==='Next step room');
+            const roomLegend=proof.values.find(row=>row.label==='Free');
             assert.ok(Math.abs(roomLegend.labelBox.top-roomLegend.value.top)<2, 'The room value uses a second line.');
             assert.ok(roomLegend.value.left-roomLegend.labelBox.right<80, 'The legend value is too far from its label.');
             for (const gauge of proof.gauges) assert.equal(gauge.nowrap, 'nowrap');
@@ -404,10 +595,83 @@ try {
               assert.ok(matches,label+' '+JSON.stringify({x,y,actual,expected}));
             };
             checkPixel(proof.roomBar.left+5,(proof.roomBar.top+proof.roomBar.bottom)/2,proof.roomColor,'The room pixels differ.');
-            assert.ok(proof.reportPoints.length>0,'The report has no measured points.');
-            const point=proof.reportPoints.at(-1);
-            checkPixel((point.box.left+point.box.right)/2,(point.box.top+point.box.bottom)/2,point.color,'The report pixels differ.',true);
             proofs.push({theme,width,metrics:proof});
+            const slotReview=structuredClone(base);
+            const running=slotReview.walk.find(row=>row.queued&&!row.ci);
+            slotReview.walk=[
+              {...running,name:'hana nextest',unit:'queue',machine:'natedev',slot:2,tokens:6},
+              {...running,name:'tools nextest',unit:'tests',machine:'natedev',pid:51,slot:'—'},
+            ];
+            slotReview.tokens={kind:'TokenPool',total:31,free:4,memory_floor_bytes:12*2**30,paused:false};
+            slotReview.token_counts='';
+            slotReview.waiters=[];
+            slotReview.ram.build_tools_bytes=0;
+            await show(slotReview);
+            const slotColumn=await evaluate(`(()=>{
+              const table=document.querySelector('.walk-table');
+              const rows=[...table.querySelectorAll('tr[data-tip^="row:"]')];
+              const box=table.getBoundingClientRect();
+              const bottom=rows.at(-1).getBoundingClientRect().bottom;
+              return {slots:rows.map(row=>row.querySelector('.slot').textContent),
+                tokens:rows.map(row=>row.querySelector('.tokens').textContent),
+                pool:[...document.querySelectorAll('#walk-tokens dt')].map(label=>[label.textContent,label.nextElementSibling.textContent]),
+                poolAlignment:[...document.querySelectorAll('#walk-tokens dd')].map(value=>getComputedStyle(value).textAlign),
+                lastColumns:rows.map(row=>[...row.children].slice(-3).map(cell=>cell.className)),
+                overflow:document.documentElement.scrollWidth>document.documentElement.clientWidth,
+                clip:{x:Math.floor(box.left)-4,y:Math.floor(box.top+scrollY)-4,
+                  width:Math.ceil(box.width)+8,height:Math.ceil(bottom-box.top)+8,scale:1}};
+            })()`);
+            assert.deepEqual(slotColumn.slots,['2','—']);
+            assert.deepEqual(slotColumn.tokens,['6','—']);
+            assert.deepEqual(slotColumn.pool,[['Total','31'],['Available','4']]);
+            assert.deepEqual(slotColumn.poolAlignment,['right','right']);
+            assert.deepEqual(slotColumn.lastColumns,[['vcpus','slot','tokens'],['vcpus','slot','tokens']]);
+            assert.equal(slotColumn.overflow,false);
+            if(theme==='dark'&&width===1400) {
+              const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:slotColumn.clip});
+              await writeFile(join(folder,'slot-column-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+            }
+            for(const state of ['active','paused','unavailable']) {
+              const tokenReading=structuredClone(slotReview);
+              if(state==='paused') {
+                tokenReading.tokens.free=0;
+                tokenReading.tokens.paused=true;
+                tokenReading.token_counts='steve cannot be asked.';
+              }
+              if(state==='unavailable') tokenReading.tokens={kind:'TokenPoolUnavailable',reason:'steve exited 1.'};
+              await show(tokenReading);
+              await evaluate("showTip('tokens',200,200)");
+              const tokenView=await evaluate(`(() => {
+                const tip=document.querySelector('#tip');
+                const box=tip.getBoundingClientRect();
+                return {rows:tooltipRows('tokens',latest),grids:tip.querySelectorAll('dl.tip').length,
+                  values:[...tip.querySelectorAll('dt + dd')].map(value=>getComputedStyle(value).textAlign),
+                  clipped:box.left<0||box.right>innerWidth||box.top<0||box.bottom>innerHeight};
+              })()`);
+              const fields=Object.fromEntries(tokenView.rows.map(row=>[row.label,row.value]));
+              assert.equal(fields.Tokens,'');
+              assert.equal(tokenView.grids,1);
+              assert.ok(tokenView.values.every(value=>value==='right'));
+              assert.equal(tokenView.clipped,false);
+              if(state==='unavailable') {
+                assert.equal(fields.Status,'unavailable');
+                assert.equal(fields.Because,'steve exited 1');
+              } else {
+                assert.equal(fields.Total,'31');
+                assert.equal(fields.Available,state==='paused'?'0':'4');
+                assert.equal(fields['Pause below free RAM'],'12.0 GiB');
+                assert.equal(fields.Pool,state);
+                assert.equal(fields['Per-build counts'],state==='paused'?'unavailable':'known');
+                if(state==='paused') assert.equal(fields.Because,'steve cannot be asked');
+              }
+              comparisons.push({tokenTooltip:true,theme,width,state,...tokenView});
+              if(theme==='dark'&&width===1400) {
+                const box=await evaluate("(() => {const r=document.querySelector('#tip').getBoundingClientRect();return {x:Math.floor(r.left)-2,y:Math.floor(r.top+scrollY)-2,width:Math.ceil(r.width)+4,height:Math.ceil(r.height)+4,scale:1};})()");
+                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:box});
+                await writeFile(join(folder,`tokens-${state}-dark-desktop.png`),Buffer.from(shot.data,'base64'));
+              }
+            }
+            await show(base);
 
             proof.swapRefresh=await evaluate(`(async () => {
               const originalFetch=window.fetch, originalRender=window.render;
@@ -436,37 +700,14 @@ try {
             assert.deepEqual(proof.swapRefresh,{states:[true,true],closed:true},
               'The smaller-owner list loses its state across two refreshes or a row move.');
 
-            await evaluate(`(() => {
-              document.querySelector('#history-machine').value='fixture';
-              document.querySelector('#history-cause').value='Cold rebuilds';
-              const unit=document.querySelector('#history-unit');
-              unit.value='perPhase';unit.dispatchEvent(new Event('change'));
-              for(const table of document.querySelectorAll('#history-plots details')) table.open=true;
-              window.proofControl=unit;
-              window.proofTable=document.querySelector('#history-plots details');
-            })()`);
+            const topBefore = await evaluate("document.querySelector('#top-costs').textContent");
             await show(base);
-            const sameReport=await evaluate(`({sameControl:window.proofControl===document.querySelector('#history-unit'),
-              sameTable:window.proofTable===document.querySelector('#history-plots details'),
-              open:[...document.querySelectorAll('#history-plots details')].every(table=>table.open)})`);
-            assert.ok(sameReport.sameControl && sameReport.sameTable && sameReport.open,
-              'A queue refresh replaces report controls or closes a table.');
-            const updatedReport=structuredClone(base);
-            updatedReport.report.charts.end+=60000;
+            assert.equal(await evaluate("document.querySelector('#top-costs').textContent"), topBefore);
+            const updatedReport = structuredClone(base);
+            updatedReport.report.top[0].action = 'Updated cost action.';
             await show(updatedReport);
-            const changedReport=await evaluate(`({machine:document.querySelector('#history-machine').value,
-              cause:document.querySelector('#history-cause').value,unit:document.querySelector('#history-unit').value,
-              open:[...document.querySelectorAll('#history-plots details')].every(table=>table.open)})`);
-            assert.deepEqual(changedReport,{machine:'fixture',cause:'Cold rebuilds',unit:'perPhase',open:true},
-              'New report data loses the report choices or open tables.');
-            proof.reportRefresh={sameReport,changedReport};
-            await evaluate(`(() => {
-              for(const table of document.querySelectorAll('#history-plots details')) table.open=false;
-              document.querySelector('#history-machine').value='';
-              document.querySelector('#history-cause').selectedIndex=0;
-              const unit=document.querySelector('#history-unit');unit.value='daily';
-              unit.dispatchEvent(new Event('change'));
-            })()`);
+            assert.match(await evaluate("document.querySelector('#top-costs').textContent"), /Updated cost action/);
+            await show(base);
 
             // A disagree reading hides the memory bar; the Running chart keeps the layout of the agree reading.
             const disagreeReading=structuredClone(readings.cloud_region);
@@ -544,6 +785,12 @@ try {
                 machine:running?.querySelector('.machine')?.textContent,
                 place:waiting?.querySelector('.place')?.textContent,
                 waitingMachine:waiting?.querySelector('.machine')?.textContent,
+                localWaiting:(() => {const index=latest.waiters.findIndex(row=>row.kind!=='cloud');
+                  return index<0?null:{shown:table.querySelector('tr[data-tip="'+proofTip('wait',index)+'"] .machine')?.textContent,
+                    targets:(latest.waiters[index].targets||[]).join(' or ')};})(),
+                beside:document.querySelector('#walk').classList.contains('beside'),
+                statusHeight:runningDetails?.querySelector('.amounts')?.getBoundingClientRect().height,
+                statusLine:parseFloat(getComputedStyle(runningDetails?.querySelector('.amounts')||document.body).lineHeight),
                 waitingVcpus:waiting?.querySelector('.vcpus')?.textContent,
                 vcpus:running?.querySelector('.vcpus')?.textContent,
                 cloudCard:!!document.querySelector('#cloud'),
@@ -563,10 +810,10 @@ try {
                 staleColor:stale?getComputedStyle(stale).color:null,
                 errorColor:(() => {const span=document.createElement('span');span.style.color='var(--cap)';
                   document.body.append(span);const color=getComputedStyle(span).color;span.remove();return color;})(),
-                slots:tipText('wait:'+latest.waiters.findIndex(row=>row.head_text),latest).join(' '),
+                slots:tipText(proofTip('wait',latest.waiters.findIndex(row=>row.kind==='cloud')),latest).join(' '),
                 scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
             })()`);
-            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU']);
+            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot','Tokens']);
             assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
             assert.equal(cloudProof.machine,'aws');
             assert.equal(cloudProof.vcpus,'32');
@@ -582,10 +829,16 @@ try {
             assert.ok(Math.abs(cloudProof.height-cloudProof.tableHeight)<1,'The cloud row heights differ.');
             assert.ok(cloudProof.tipsMatch,'The cloud hover keys differ from the local row keys.');
             assert.equal(cloudProof.place,'cloud');
-            assert.equal(cloudProof.waitingMachine,'');
+            assert.equal(cloudProof.waitingMachine,'aws');
+            // The user, 11-15: a queued row names the machines that can take it in the Target column.
+            assert.ok(cloudProof.localWaiting && cloudProof.localWaiting.targets,'The fixture has no local waiting row with targets.');
+            assert.equal(cloudProof.localWaiting.shown,cloudProof.localWaiting.targets);
+            // The user, 11-15: a cloud status wraps one letter to a line when its room before the cap is narrow.
+            // A stacked chart gives the status the full card width.
+            if(cloudProof.beside) assert.ok(cloudProof.statusHeight<=2*cloudProof.statusLine+1,'The cloud status takes more than two lines: '+cloudProof.statusHeight+' at '+width+' px.');
             assert.equal(cloudProof.waitingVcpus,'');
             assert.match(cloudProof.waiting,/waits for a cloud slot: 1 of 1 in use/);
-            assert.match(cloudProof.slots,/cloud 1 of 1 slots/);
+            assert.match(cloudProof.slots,/Runs on  AWS.*Because  natedev when AWS cannot start/s);
             assert.ok(!cloudProof.cloudCard,'The page retains a separate Cloud card.');
             assert.ok(!cloudProof.cloudMemory,'Cloud work has a memory reservation.');
             assert.ok(cloudProof.localMemory,'The local memory bar is absent.');
@@ -625,6 +878,26 @@ try {
               } else assert.equal(alert.height,0,'The clear alert keeps an empty line.');
               proof[name+'Alert']=alert;
             }
+            const signedLegend=structuredClone(base), legendGib=1024**3;
+            Object.assign(signedLegend.ram,{desktop_bytes:2*legendGib,agents_bytes:3*legendGib,
+              other_programs_bytes:legendGib,programs:[],smaller_programs_bytes:legendGib,
+              kernel_bytes:2*legendGib,compressed_swap_bytes:0,kernel_structures_bytes:2*legendGib,
+              kernel_counters_bytes:0,kernel_no_counter_bytes:0,cache_bytes:2*legendGib,unattributed_bytes:0});
+            await show(signedLegend);
+            const unsignedWidths=await evaluate(`RAM_BLOCKS.map(([key])=>document.querySelector('#s-'+key).style.width)`);
+            signedLegend.ram.unattributed_bytes=-legendGib;
+            await show(signedLegend);
+            const signedProof=await evaluate(`({
+              total:document.querySelector('#v-g-else').textContent,
+              unattributed:document.querySelector('#v-unattributed').textContent,
+              tip:tipText('g-else',latest)[0],
+              widths:RAM_BLOCKS.map(([key])=>document.querySelector('#s-'+key).style.width)
+            })`);
+            assert.equal(signedProof.total,'9.0 GiB','The legend total omits the negative reading.');
+            assert.equal(signedProof.unattributed,'-1.0 GiB');
+            assert.equal(signedProof.tip,'Everything else  9.0 GiB');
+            assert.deepEqual(signedProof.widths,unsignedWidths,'The negative reading changes bar widths.');
+            proof.signedLegend=signedProof;
             await show({...base, ram:{...base.ram, agreement:'disagree'}});
             const disagree=await evaluate(`(() => {
               const note=document.querySelector('#ram-disagree');
@@ -635,16 +908,23 @@ try {
             assert.ok(disagree.bar>0,'A disagreement hides the memory bar.');
             assert.equal(disagree.scale,false,'A disagreement hides the scale.');
             proof.disagree=disagree;
-            // Build tools sit outside the cap; the cap terms (queued builds, CI, reservations, room) add to the cap.
-            const gib=1024**3, capReading=structuredClone(base);
-            Object.assign(capReading.ram,{build_tools_bytes:2*gib,sccache_bytes:2*gib,
-              ci_bytes:3*gib/2,room_bytes:capReading.ram.room_bytes-3*gib/2});
+            // Build tools and hana CI sit inside the queue cap: more of them leaves less free, and the cap stays.
+            const gib=1024**3, capReading=structuredClone(base), known=value=>typeof value==='number'?value:0;
+            Object.assign(capReading.ram,{build_tools_bytes:capReading.ram.build_tools_bytes+gib,
+              sccache_bytes:capReading.ram.sccache_bytes+gib,ci_bytes:known(capReading.ram.ci_bytes)+gib/2,
+              available_bytes:capReading.ram.available_bytes-3*gib/2,
+              room_bytes:capReading.ram.room_bytes-3*gib/2});
             capReading.room-=1.5;
+            capReading.taken=capReading.cap-capReading.room;
             await show(capReading);
             const capLine=await evaluate(`(() => {
               const line=document.querySelector('#walk .walk-bud');
               const track=document.querySelector('#walk .wrow[data-run] .track').getBoundingClientRect();
               const room=document.querySelector('#walk .wrow.room .roomb')?.getBoundingClientRect();
+              const tools=document.querySelector('#walk .wrow.tools .seg-tools').getBoundingClientRect();
+              const memoryTools=document.querySelector('#s-tools').getBoundingClientRect();
+              const memoryBar=document.querySelector('#barwrap .bar').getBoundingClientRect();
+              const memoryCap=document.querySelector('#b-cap').getBoundingClientRect();
               const box=line?.getBoundingClientRect(), card=document.querySelector('#walk').closest('.card').getBoundingClientRect();
               // The line stops at chart text, so the pixel check reads the longest part of it.
               const drawn=[...(line?.querySelectorAll('.cap-part')||[])];
@@ -652,10 +932,18 @@ try {
                 .sort((a,b)=>b.box.height-a.box.height)[0];
               return {layout:document.querySelector('#walk').classList.contains('beside')?'beside':'stacked',present:!!line&&getComputedStyle(line).display!=='none'&&box.width>0&&box.height>0,
                 left:box?box.left+1:null,top:part?.box.top,bottom:part?.box.bottom,roomRight:room?room.right:null,
+                tools:{left:tools.left,right:tools.right,width:tools.width,trackLeft:track.left},
+                memoryTools:{left:memoryTools.left,right:memoryTools.right,width:memoryTools.width,
+                  barLeft:memoryBar.left,capRight:memoryCap.right},
                 expected:track.left+track.width*latest.cap*${gib}/latest.ram.total_bytes,color:part?getComputedStyle(part.element).borderLeftColor:'',
                 scrollY,card:{x:Math.floor(card.left),y:Math.floor(card.top+scrollY),width:Math.ceil(card.width)+1,height:Math.ceil(card.height)+1}};
             })()`);
             assert.ok(capLine.present,'The Running chart has no cap line.');
+            assert.ok(capLine.tools.width>0 && capLine.memoryTools.width>0);
+            assert.ok(Math.abs(capLine.tools.left-capLine.tools.trackLeft)<=1,'Build tools do not start at the chart left edge.');
+            assert.ok(capLine.tools.right<capLine.left,'Build tools extend beyond the chart cap mark.');
+            assert.ok(Math.abs(capLine.memoryTools.left-capLine.memoryTools.barLeft)<=1,'Build tools do not start at the memory bar left edge.');
+            assert.ok(capLine.memoryTools.right<capLine.memoryTools.capRight,'Build tools extend beyond the memory bar cap mark.');
             if(width===1400) assert.equal(capLine.layout,'beside','The Running chart stays stacked after a narrow page.');
             assert.ok(Math.abs(capLine.left-capLine.expected)<=1.5,'The cap line is off the cap value. '+JSON.stringify(capLine));
             assert.ok(Math.abs(capLine.roomRight-capLine.expected)<=1.5,'The room bar does not end at the cap. '+JSON.stringify(capLine));
@@ -666,7 +954,116 @@ try {
             assert.ok(capPixel.every((value,index)=>Math.abs(value-capColor[index])<=1),
               'The cap line pixels differ. '+JSON.stringify({capPixel,capColor}));
             if(width===1400) await writeFile(join(folder,`${theme}-${width}-cap-line.png`),capShot);
+            if(theme==='dark'&&width===1400) {
+              const clip=await evaluate(`(()=>{
+                const memory=document.querySelector('#barwrap').getBoundingClientRect();
+                const running=document.querySelector('#walk').closest('.card').getBoundingClientRect();
+                return {x:running.left,y:memory.top+scrollY,width:running.width,height:running.bottom-memory.top,scale:1};
+              })()`);
+              const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+              await writeFile(join(folder,'build-tools-inside-cap-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+              const legendClip=await evaluate(`(()=>{
+                const box=document.querySelector('.legend-box .legend').getBoundingClientRect();
+                return {x:Math.floor(box.left)-4,y:Math.floor(box.top+scrollY)-4,
+                  width:Math.ceil(box.width)+8,height:Math.ceil(box.height)+8,scale:1};
+              })()`);
+              const legendShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:legendClip});
+              await writeFile(join(folder,'legend-totals-dark-desktop.png'),Buffer.from(legendShot.data,'base64'));
+              // The user, 11-16: the legend starts collapsed under the memory bar.
+              const closedClip=await evaluate(`(()=>{
+                const legend=document.querySelector('.legend-box');
+                legend.open=false;
+                const card=legend.closest('.card').getBoundingClientRect();
+                return {x:card.left,y:card.top+scrollY,width:card.width,height:card.height,scale:1};
+              })()`);
+              const closedShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:closedClip});
+              await writeFile(join(folder,'legend-closed-dark-desktop.png'),Buffer.from(closedShot.data,'base64'));
+              await evaluate(`document.querySelector('.legend-box').open=true`);
+            }
             proof.capLine=capLine;
+            // Bars that add to more than the cap stop at the cap line; a cut bar ends in the cap color.
+            const overReading=structuredClone(base), over=overReading.room+1;
+            Object.assign(overReading.ram,{build_tools_bytes:overReading.ram.build_tools_bytes+over*gib,
+              available_bytes:overReading.ram.available_bytes-over*gib,room_bytes:0});
+            overReading.room=0;
+            overReading.taken=overReading.cap+1;
+            // A waiting step that needs more than the cap also stops at the cap line.
+            overReading.waiters.find(row=>row.kind!=='cloud').need=overReading.cap+10;
+            await show(overReading,true,false);
+            const overCap=await evaluate(`(() => {
+              const edge=document.querySelector('#walk .walk-bud').getBoundingClientRect().left+1;
+              const bars=[...document.querySelectorAll('#walk .wrow .track .b:not(.row-progress):not(.seg-remote)')]
+                .map(bar=>({cls:bar.className,right:bar.getBoundingClientRect().right}));
+              const cut=document.querySelector('#walk .track .b.over-cap');
+              return {edge,bars,cut:cut?getComputedStyle(cut).boxShadow:'',
+                cap:getComputedStyle(document.querySelector('#walk .walk-bud .cap-part')||document.querySelector('#walk .walk-bud')).borderLeftColor};
+            })()`);
+            assert.ok(overCap.bars.length>0,'The over-cap chart draws no bars.');
+            assert.ok(overCap.bars.some(bar=>bar.cls.includes('waitb')),'The over-cap chart draws no wait bar.');
+            for(const bar of overCap.bars) assert.ok(bar.right<=overCap.edge+0.5,'A bar runs past the cap line. '+JSON.stringify({bar,edge:overCap.edge}));
+            assert.ok(overCap.cut.includes(overCap.cap),'A bar cut at the cap has no cap-colored end. '+JSON.stringify(overCap));
+            proof.overCap=overCap;
+            // Build reserves that do not fit under the cap: the Running header names the amount over the cap.
+            const shortReading=structuredClone(base);
+            // The running build reserves all of free and 4 GiB more, so its reserve fills the cap.
+            const shortRun=shortReading.walk.find(row=>row.kind!=='cloud'&&!row.ci&&typeof row.reserved==='number');
+            shortRun.reserved+=shortReading.room+4;
+            if(typeof shortReading.reserved==='number') shortReading.reserved+=shortReading.room+4;
+            Object.assign(shortReading.ram,{build_covered_bytes:shortReading.ram.build_covered_bytes+shortReading.ram.room_bytes,room_bytes:0});
+            Object.assign(shortReading.ram,{build_target_bytes:shortReading.ram.build_covered_bytes+4*gib,build_missing_bytes:4*gib,shortfall_bytes:4*gib});
+            Object.assign(shortReading,{room:0,taken:shortReading.cap,shortfall:4});
+            await show(shortReading);
+            if(theme==='dark'&&width===1400) {
+              const shortClip=await evaluate(`(()=>{
+                const memory=document.querySelector('#barwrap').getBoundingClientRect();
+                const running=document.querySelector('#walk').closest('.card').getBoundingClientRect();
+                return {x:running.left,y:memory.top+scrollY,width:running.width,height:running.bottom-memory.top,scale:1};
+              })()`);
+              const shortShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:shortClip});
+              await writeFile(join(folder,'over-cap-dark-desktop.png'),Buffer.from(shortShot.data,'base64'));
+            }
+            // The bar draws the uncovered reserve past the cap line, with a dashed brace and a tooltip.
+            const overBar=await evaluate(`(() => {
+              const box=id=>{const r=document.getElementById(id).getBoundingClientRect();return {left:r.left,right:r.right,width:r.width};};
+              const tip=Object.fromEntries(tooltipRows('over',latest).map(row=>[row.label,row.value]));
+              return {hidden:document.getElementById('b-overlay').hidden,overlay:box('b-overlay'),cap:box('b-cap'),over:box('b-over'),
+                brace:document.getElementById('b-over').textContent,reserved:document.getElementById('b-reserved').textContent,tip};
+            })()`);
+            assert.equal(overBar.hidden,false,'The bar draws no over-cap box.');
+            // A small hana CI part stays visible, so the builds parts add up on screen.
+            assert.equal(await evaluate(`getComputedStyle(document.getElementById('s-ci')).minWidth`),'3px');
+            assert.ok(Math.abs(overBar.overlay.left-overBar.cap.right)<=3,'The over-cap box does not start at the cap line. '+JSON.stringify(overBar));
+            assert.ok(Math.abs(overBar.overlay.width-overBar.over.width)<=1,'The over-cap box and its brace differ in width. '+JSON.stringify(overBar));
+            assert.equal(overBar.brace,'over cap 4.0');
+            assert.match(overBar.reserved,/^build reserved [0-9.]+ · [0-9.]+ covered$/);
+            assert.equal(overBar.tip['Over cap'],'4.0 GiB');
+            assert.equal(overBar.tip['= Over cap'],'4.0 GiB');
+            assert.ok(Math.abs(parseFloat(overBar.tip['Build reserved (full)'])-parseFloat(overBar.tip['− Free RAM after safety net and swap'])-4)<=0.1+1e-9,
+              'Build reserved (full) − covered is not the amount over the cap. '+JSON.stringify(overBar.tip));
+            proof.overBar=overBar;
+            const overHeader=await evaluate(`(() => ({sum:document.querySelector('#walk-sum').textContent,
+              sumColor:getComputedStyle(document.querySelector('#walk-sum')).color,hover:tipText('walksum',latest)[1],rows:tooltipRows('walksum',latest),
+              cap:getComputedStyle(document.querySelector('#walk .walk-bud .cap-part')||document.querySelector('#walk .walk-bud')).borderLeftColor}))()`);
+            // Taken counts the full reserve, so it reads 4 GiB more than the cap.
+            assert.equal(overHeader.sum,(shortReading.cap+4).toFixed(1)+' of '+shortReading.cap.toFixed(1)+' GiB taken · 4.0 GiB over cap');
+            assert.equal(overHeader.sumColor,overHeader.cap,'The over-cap total is not in the cap color.');
+            const fields=Object.fromEntries(overHeader.rows.map(row=>[row.label,row.value]));
+            assert.equal(fields.Taken,(shortReading.cap+4).toFixed(1)+' GiB');
+            assert.equal(fields['Queue cap'],shortReading.cap.toFixed(1)+' GiB');
+            assert.equal(fields['Over cap'],'4.0 GiB');
+            assert.ok('+ Build reserved (full)' in fields,overHeader.hover);
+            // Taken includes the full reserve. The difference from the cap is the uncovered reserve.
+            const number=(text,pattern)=>Number.parseFloat(text.match(pattern)[1]);
+            const header={taken:number(overHeader.sum,/^([0-9.]+) of/),cap:number(overHeader.sum,/of ([0-9.]+) GiB/),over:number(overHeader.sum,/· ([0-9.]+) GiB over cap/)};
+            const tip={builds:parseFloat(fields.Builds),reserved:parseFloat(fields['+ Build reserved (full)']),
+              taken:parseFloat(fields.Taken),over:parseFloat(fields['Over cap']),cap:parseFloat(fields['Queue cap'])};
+            assert.ok(Math.abs(tip.builds+tip.reserved-tip.taken)<=0.1+1e-9,'Builds + Build reserved is not Taken. '+JSON.stringify(tip));
+            assert.ok(Math.abs(tip.taken-tip.cap-tip.over)<=0.1+1e-9,'Taken - Queue cap is not the amount over the cap. '+JSON.stringify(tip));
+            assert.deepEqual([header.taken,header.cap,header.over],[tip.taken,tip.cap,tip.over],'The header and its tooltip differ.');
+            const plainHeader=await (async()=>{await show(base);return evaluate(`document.querySelector('#walk-sum').textContent`);})();
+            assert.ok(!plainHeader.includes('over cap'),'The header names an over-cap amount when nothing is over the cap.');
+            assert.equal(await evaluate(`document.getElementById('b-overlay').hidden`),true,'The bar draws an over-cap box when nothing is over the cap.');
+            proof.overHeader=overHeader;
             // Cloud status text and bar labels are as wide as on the live page; none of it may show on the cap line.
             const cloudReading=structuredClone(base);
             cloudReading.walk.push({kind:'cloud',name:'cloud merge',showrunner:'fixture-owner',unit:'cloud',pid:31,detail:'cloud',
@@ -700,72 +1097,47 @@ try {
             assert.ok(capCrossings.parts>0,'The cap line shows.');
             assert.deepEqual(capCrossings.crossings,[],'Text shows on the cap line at '+width+' px, '+theme+'.');
             proof.capCrossings=capCrossings;
-            // The memory bar draws its cap marker and label at the cap value.
+            await show(capReading);
+            // The user, 11-15: the queue cap brace runs from 0 to the end of free, under the bar.
             const barMark=await evaluate(`(() => {
-              const mark=document.querySelector('#barwrap #mark'), label=document.querySelector('#barwrap #marklabel');
-              const bar=document.querySelector('#barwrap .bar').getBoundingClientRect(), box=mark?.getBoundingClientRect();
+              const cap=document.querySelector('#barwrap #b-cap'), free=document.querySelector('#barwrap #b-room');
+              const bar=document.querySelector('#barwrap .bar').getBoundingClientRect(), box=cap?.getBoundingClientRect();
               const card=document.querySelector('#barwrap').closest('.card').getBoundingClientRect();
-              return {present:!!mark&&!mark.hidden&&getComputedStyle(mark).display!=='none'&&box.height>0,
-                label:label&&!label.hidden?label.textContent:'',left:box?box.left+7:null,middle:(bar.top+bar.bottom)/2,
-                expected:bar.left+bar.width*latest.cap*${gib}/latest.ram.total_bytes,
-                color:mark?getComputedStyle(mark,'::before').borderLeftColor:'',scrollY,
+              return {present:!!cap&&!cap.hidden&&getComputedStyle(cap).display!=='none'&&box.height>0,
+                label:cap?cap.querySelector('.brace-label').textContent:'',left:box?.left,right:box?.right,
+                freeRight:free?.getBoundingClientRect().right,barLeft:bar.left,below:box?box.top>=bar.bottom-1:false,
+                expected:bar.left+bar.width*latest.cap*${gib}/latest.ram.total_bytes,bottom:box?.bottom,
+                color:cap?getComputedStyle(cap).borderBottomColor:'',scrollY,
                 card:{x:Math.floor(card.left),y:Math.floor(card.top+scrollY),width:Math.ceil(card.width)+1,height:Math.ceil(card.height)+1}};
             })()`);
-            assert.ok(barMark.present,'The memory bar has no cap marker.');
-            assert.equal(barMark.label,'cap '+capReading.cap.toFixed(1));
-            assert.ok(Math.abs(barMark.left-barMark.expected)<=1.5,'The memory bar cap marker is off the cap value. '+JSON.stringify(barMark));
+            assert.ok(barMark.present,'The memory bar has no queue cap brace.');
+            assert.match(barMark.label,new RegExp(capReading.cap.toFixed(1).replace('.','\\.')+'$'));
+            assert.ok(barMark.below,'The queue cap brace is not under the bar.');
+            assert.ok(Math.abs(barMark.left-barMark.barLeft)<=1.5,'The queue cap does not start at 0. '+JSON.stringify(barMark));
+            assert.ok(Math.abs(barMark.right-barMark.expected)<=1.5,'The queue cap brace is off the cap value. '+JSON.stringify(barMark));
+            assert.ok(Math.abs(barMark.freeRight-barMark.expected)<=1.5,'Free does not end at the queue cap. '+JSON.stringify(barMark));
             const barShot=Buffer.from((await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,
               clip:{...barMark.card,scale:1}})).data,'base64');
-            const barPixel=pngPixels(barShot)(Math.floor(barMark.left-barMark.card.x),Math.floor(barMark.middle+barMark.scrollY-barMark.card.y));
+            const barPixel=pngPixels(barShot)(Math.floor((barMark.left+barMark.right)/2-barMark.card.x),
+              Math.floor(barMark.bottom-1+barMark.scrollY-barMark.card.y));
             const barColor=barMark.color.match(/[0-9.]+/g).slice(0,3).map(Number);
             assert.ok(barPixel.every((value,index)=>Math.abs(value-barColor[index])<=1),
-              'The memory bar cap marker pixels differ. '+JSON.stringify({barPixel,barColor}));
+              'The queue cap brace pixels differ. '+JSON.stringify({barPixel,barColor}));
             if(width===1400) await writeFile(join(folder,`${theme}-${width}-bar-cap.png`),barShot);
             proof.barMark=barMark;
-            // The cap terms end at the mark and the build tools start there: the mark splits no block.
-            const blockEdges=`(() => {
-              const edge=id=>{const b=document.getElementById(id);if(!b||b.hidden)return null;
-                const r=b.getBoundingClientRect();return {left:r.left,right:r.right,width:r.width};};
-              const bar=document.querySelector('#barwrap .bar').getBoundingClientRect();
-              const mark=document.querySelector('#barwrap #mark').getBoundingClientRect().left+7;
-              const terms=['s-queued','s-ci','s-reserved','s-room'].map(edge).filter(Boolean);
-              const blocks=[...document.querySelectorAll('#barwrap .bar > div')].filter(b=>!b.hidden).map(b=>b.getBoundingClientRect());
-              return {mark,termsRight:terms.length?terms[terms.length-1].right:bar.left,over:edge('s-over'),tools:edge('s-tools'),
-                unit:bar.width*${gib}/latest.ram.total_bytes,split:blocks.filter(b=>b.left<mark-1.5&&b.right>mark+1.5).length};
-            })()`;
-            const terms=await evaluate(blockEdges);
-            assert.ok(Math.abs(terms.termsRight-terms.mark)<=1.5,'The cap terms do not end at the cap mark. '+JSON.stringify(terms));
-            assert.ok(terms.tools&&Math.abs(terms.tools.left-terms.mark)<=1.5,'The build tools do not start at the cap mark. '+JSON.stringify(terms));
-            assert.equal(terms.over,null,'An over-cap block shows when use is under the cap.');
-            assert.equal(terms.split,0,'The cap mark splits a block. '+JSON.stringify(terms));
-            // Available RAM below the safety and swap reserves puts the cap below queued and CI use.
-            const overReading=structuredClone(capReading);
-            const overUse=overReading.ram.queued_builds_bytes+overReading.ram.ci_bytes;
-            Object.assign(overReading.ram,{build_covered_bytes:0,room_bytes:0});
-            overReading.cap=(overUse-2*gib)/gib;
-            overReading.room=0;
-            await show(overReading);
-            const over=await evaluate(blockEdges);
-            assert.ok(Math.abs(over.termsRight-over.mark)<=1.5,'Queued and CI use do not stop at the cap mark. '+JSON.stringify(over));
-            assert.ok(over.over&&Math.abs(over.over.left-over.mark)<=1.5&&Math.abs(over.over.width-2*over.unit)<=1.5,
-              'The use above the cap is not its own block at the mark. '+JSON.stringify(over));
-            assert.ok(over.tools&&Math.abs(over.tools.left-over.over.right)<=1.5,'The build tools do not follow the over-cap block. '+JSON.stringify(over));
-            assert.equal(over.split,0,'The cap mark splits a block. '+JSON.stringify(over));
-            assert.match(await evaluate("tipText('shortfall',latest).join(' ')"),/Queued and CI use above the cap: 2\.0 GiB\./);
-            proof.overCap=over;
             for(const [name,expected] of [['priority',"queue priority: research (the user's bump)"],
               ['priority_unmatched',''],['good','']]) {
               await show(readings[name]);
               const priority=await evaluate(`(() => {
                 const index=latest.walk.findIndex(row=>row.queued);
-                return tipText('row:'+index,latest).join(' ');
+                return tipText(proofTip('row',index),latest).join(' ');
               })()`);
-              assert.equal(priority.includes("queue priority:"),!!expected);
-              if(expected) assert.ok(priority.includes(expected));
+              assert.equal(priority.includes("Priority  "),!!expected);
+              if(expected) assert.ok(priority.includes("Priority  research"));
               const heading=await evaluate("tipText('walkhead',latest).join(' ')");
               const unmatched=name==='priority_unmatched';
-              assert.equal(heading.includes("queue priority:"),unmatched);
-              if(unmatched) assert.equal(heading.split("queue priority: research (the user's bump)").length-1,1);
+              assert.equal(heading.includes("Priority  "),unmatched);
+              if(unmatched) assert.equal(heading.split("Priority  research").length-1,1);
               if(unmatched && theme==='dark' && width===1400) {
                 const clip=await evaluate(`(() => {
                   const heading=document.querySelector('[data-tip="walkhead"]');
@@ -773,7 +1145,7 @@ try {
                   const h=heading.getBoundingClientRect();
                   heading.dispatchEvent(new MouseEvent('click',{bubbles:true,clientX:h.left+10,clientY:h.bottom}));
                   const tip=document.querySelector('#tip');
-                  if(!tip.classList.contains('on') || !tip.textContent.includes(latest.unmatched_priority_text))
+                  if(!tip.classList.contains('on') || !tip.textContent.includes('research'))
                     throw new Error('The heading click loses the unmatched priority.');
                   const r=heading.closest('.card').getBoundingClientRect();
                   return {x:0,y:r.top+scrollY,width:document.documentElement.clientWidth,height:r.height,scale:1};
@@ -791,20 +1163,27 @@ try {
                 counted:0,started_at:now-60,unit:'hana-ci.slice',machine:'fixture',pid:701,vcpus:4,
                 progress:{kind:'NoProgress',reason:'no admission counter'},ci_runners:[{state:state==='waiting'||state==='unmatched'?'busy':state}]});
               ciReading.ci_ram=0.125;
-              ciReading.taken=ciReading.used+ciReading.ci_ram+ciReading.reserved;
+              ciReading.ram.ci_bytes=known(ciReading.ram.ci_bytes)+gib/8;
+              ciReading.ram.available_bytes-=gib/8;
+              ciReading.ram.room_bytes-=gib/8;
+              ciReading.room-=0.125;
+              ciReading.taken=ciReading.cap-ciReading.room;
               await show(ciReading);
               const ciProof=await evaluate(`(() => {
-                const key='row:'+(latest.walk.length-1);
+                const key=proofTip('row',latest.walk.length-1);
                 const table=document.querySelector('.walk-table tr[data-tip="'+key+'"]');
                 const chart=document.querySelector('.wrow[data-tip="'+key+'"]');
                 return {table:!!table,chart:!!chart,stage:table?.querySelector('.place').textContent,
-                  taken:document.querySelector('#walk-sum').textContent,ci:latest.ci_ram};
+                  taken:document.querySelector('#walk-sum').textContent,ci:latest.ci_ram,
+                  builds:document.querySelector('#v-g-builds').textContent,
+                  reserved:document.querySelector('#v-reserved').textContent,cap:document.querySelector('#v-cap').textContent};
               })()`);
               assert.equal(ciProof.table,state==='busy');
               assert.equal(ciProof.chart,state==='busy');
               if(state==='busy') assert.equal(ciProof.stage,'—');
               assert.equal(ciProof.ci,0.125);
-              assert.equal(ciProof.taken,ciReading.taken.toFixed(1)+' of '+ciReading.cap.toFixed(1)+' GiB taken');
+              const takenTenths=Math.round(parseFloat(ciProof.builds)*10)+Math.round(parseFloat(ciProof.reserved)*10);
+              assert.equal(ciProof.taken,(takenTenths/10).toFixed(1)+' of '+ciProof.cap.replace(' GiB','')+' GiB taken');
             }
             await show(base);
 
@@ -813,15 +1192,15 @@ try {
               const rows=latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build');
               const unit=document.querySelector('#barwrap').getBoundingClientRect().width/latest.total;
               return rows.map(({row,index})=>{
-                const chart=document.querySelector('.wrow[data-run="'+index+'"]');
-                const table=document.querySelector('.walk-table tr[data-tip="row:'+index+'"]');
+                const chart=document.querySelector('.wrow[data-run="'+proofRun(index)+'"]');
+                const table=document.querySelector('.walk-table tr[data-tip="'+proofTip('row',index)+'"]');
                 return {name:row.name,stage:table.querySelector('.place').textContent,
                   unit:table.querySelector('.unit').textContent,percent:table.querySelector('.done').textContent,
                   underBar:!!chart.querySelector('.progress-amount'),
                   used:chart.querySelector('.seg-remote').getBoundingClientRect().width,
                   color:getComputedStyle(chart.querySelector('.seg-remote')).backgroundColor,
                   expected:row.used*unit,hatched:!!chart.querySelector('.hatch'),
-                  tip:tooltipHtml('row:'+index,latest),
+                  tip:tooltipHtml(proofTip('row',index),latest),
                   chartTop:chart.getBoundingClientRect().top-document.querySelector('.walk-chart-head').getBoundingClientRect().bottom,
                   tableTop:table.getBoundingClientRect().top-document.querySelector('.walk-table thead tr').getBoundingClientRect().bottom};
               });
@@ -831,8 +1210,8 @@ try {
             assert.deepEqual(macProof.map(row=>row.percent),['60.4%','64.7%','98.3%']);
             assert.deepEqual(macProof.map(row=>row.unit),['—','trunk','—']);
             const macLabels=await evaluate(`latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build').map(({index})=>({
-              repository:document.querySelector('.wrow[data-run="'+index+'"] .owner').textContent,
-              jobs:document.querySelector('tr[data-tip="row:'+index+'"] .vcpus').textContent}))`);
+              repository:document.querySelector('.wrow[data-run="'+proofRun(index)+'"] .owner').textContent,
+              jobs:document.querySelector('tr[data-tip="'+proofTip('row',index)+'"] .vcpus').textContent}))`);
             assert.deepEqual(macLabels.map(row=>row.repository),['','hana','']);
             assert.deepEqual(macLabels.map(row=>row.jobs),['—','12','6']);
             for(const row of macProof) {
@@ -841,12 +1220,12 @@ try {
               assert.equal(row.hatched,false);
               assert.equal(row.underBar,false);
               assert.ok(Math.abs(row.chartTop-row.tableTop)<1);
-              assert.ok(row.tip.includes('Mac memory does not count against natedev.'));
+              assert.ok(/<dt>In queue cap<\/dt><dd>no<\/dd>/.test(row.tip));
             }
             await show(readings.mac_failed);
             const failedMac=await evaluate(`({rows:document.querySelectorAll('.wrow[data-run]').length,
               text:document.querySelector('#walk').textContent,
-              unknown:document.querySelector('.walk-table tr[data-tip="row:'+latest.walk.findIndex(row=>row.kind==='mac-unavailable')+'"] .place').textContent})`);
+              unknown:document.querySelector('.walk-table tr[data-tip="'+proofTip('row',latest.walk.findIndex(row=>row.kind==='mac-unavailable'))+'"] .place').textContent})`);
             assert.ok(failedMac.text.includes('Mac reading is old'));
             assert.ok(!failedMac.text.includes('private raw error'));
             assert.ok(!failedMac.text.includes('Progress unavailable: Mac process'));
@@ -865,7 +1244,7 @@ try {
             const beforeWait=await positions();
             const waiting=structuredClone(base);
             waiting.waiters=structuredClone(readings.spacing.waiters);
-            waiting.waiters[0].detail='fixture-unit';waiting.waiters[0].pid=51;
+            waiting.waiters[0].detail='handler';waiting.waiters[0].pid=51;
             await show(waiting);
             const afterWait=await positions();
             for(let index=0;index<beforeWait.length;index++) {
@@ -882,14 +1261,93 @@ try {
               machine:document.querySelector('.walk-table td.machine').textContent})`);
             assert.equal(absentCells.unit,'');assert.equal(absentCells.owner,'');assert.equal(absentCells.machine,'—');
 
-            for (const [name, expected] of [['pressure','/private/proc/pressure/memory'],['spacing','start spacing'],['head','behind']]) {
+            for (const [name, expected] of [['pressure','memory'],['spacing','its turn'],['head','its turn']]) {
               await show(readings[name]);
               const state=await evaluate(`({list:document.querySelector('#priority-line,#head-line,#wait-reasons'),
-                hover:tipText('wait:0',latest)[1], rows:document.querySelectorAll('.wrow[data-run]').length})`);
+                hover:tipText(proofTip('wait', 0),latest)[1], rows:document.querySelectorAll('.wrow[data-run]').length})`);
               assert.equal(state.list,null,'The removed list remains.');
               assert.ok(state.hover.includes(expected), name+' has no hover reason.');
               assert.ok(state.rows > 0);
+              if(name==='spacing'&&theme==='dark'&&width===1400) {
+                const clip=await evaluate(`(() => {
+                  const row=document.querySelector('.walk-table tr[data-tip="' + proofTip('wait', 0) + '"]');
+                  row.scrollIntoView({block:'center'});
+                  const box=row.getBoundingClientRect();
+                  showTip(proofTip('wait', 0),(box.left+box.right)/2,box.top);
+                  const tooltip=document.querySelector('#tip');
+                  const tipBox=tooltip.getBoundingClientRect();
+                  const left=Math.min(box.left,tipBox.left)-4,top=Math.min(box.top,tipBox.top)-4;
+                  return {text:tooltip.textContent,clip:{x:left+scrollX,y:top+scrollY,
+                    width:Math.max(box.right,tipBox.right)-left+4,
+                    height:Math.max(box.bottom,tipBox.bottom)-top+4,scale:1}};
+                })()`);
+                assert.ok(clip.text.includes(expected),'The waiting tooltip omits the explanation.');
+                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:clip.clip});
+                await writeFile(join(folder,'start-spacing-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+                await evaluate("hideTip();window.scrollTo(0,0)");
+              }
             }
+            for(const name of ['head_memory','head_shortfall','head_swap_shortfall']) {
+              await show(readings[name]);
+              const headProof=await evaluate(`(() => {
+                const rows=latest.waiters[0].head_room.rows;
+                const group=document.querySelector('.cap-group');
+                const legend=Object.fromEntries([...group.querySelectorAll('.row')].map(row=>[
+                  row.querySelector('.name').textContent,{value:row.querySelector('.v').textContent}]));
+                return {removed:document.querySelector('#head-line,#admission-terms,#admission-check-rows')===null,
+                  values:Object.fromEntries(tooltipRows(proofTip('wait', 0),latest).filter(row=>rows.some(term=>term.label===row.label))
+                    .map(row=>[row.label.replace(/^[−=] /,''),row.value])),
+                  all:latest.waiters[0].head_room.rows.map(row=>row.gib),
+                  hover:tipText(proofTip('wait', 0),latest)[1],capHover:tipText('cap',latest)[1],legend,reservedNote:document.querySelector('#reserved-note').textContent,
+                  covered:document.querySelector('#v-reserved').textContent,
+                  scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
+              })()`);
+              assert.ok(headProof.removed,'The removed Head line returns.');
+              assert.deepEqual(Object.keys(headProof.values),['Queue cap','Builds','Build reserved','Free']);
+              for(const [label,value] of Object.entries(headProof.values)) {
+                assert.ok(headProof.hover.includes(label+'  '+value),'The head tooltip omits the term: '+label);
+              }
+              const tenths=text=>Math.round(parseFloat(text)*10);
+              assert.equal(tenths(headProof.values['Queue cap'])-tenths(headProof.values.Builds)
+                -tenths(headProof.values['Build reserved']),tenths(headProof.values.Free));
+              for(const [label,value] of Object.entries(headProof.values))
+                assert.equal(value,headProof.legend[label].value,'The head changes a legend amount: '+label);
+              assert.ok(!headProof.hover.includes('Safety net') && !headProof.hover.includes('Swap coming back'));
+              assert.ok(!headProof.capHover.includes('Safety net') && !headProof.capHover.includes('Swap coming back'));
+              const ram=readings[name].ram;
+              assert.ok(!headProof.hover.includes('outside the cap'),'The head tooltip explains the queue cap: '+headProof.hover);
+              assert.ok(headProof.capHover.includes('What builds may use'),'The queue cap tooltip omits its caption');
+              assert.equal(headProof.values['Build reserved'],(ram.build_covered_bytes/gib).toFixed(1)+' GiB');
+              assert.ok(ram.build_target_bytes>ram.build_covered_bytes,'The fixture has no uncovered build reserve.');
+              if(name==='head_swap_shortfall') assert.ok(ram.swap_target_bytes>ram.swap_covered_bytes);
+              assert.ok(headProof.scroll<=headProof.client,'The admission requirements overflow the page.');
+              if(name==='head_memory'&&theme==='dark'&&width===1400) {
+                const clip=await evaluate(`(() => {
+                  const card=document.querySelector('#barwrap').closest('.card').getBoundingClientRect();
+                  const legend=document.querySelector('.legend-box').getBoundingClientRect();
+                  const row=document.querySelector('.walk-table tr[data-tip="' + proofTip('wait', 0) + '"]').getBoundingClientRect();
+                  const groups=[...document.querySelectorAll('.legend-group')].map(group=>group.getBoundingClientRect());
+                  showTip(proofTip('wait', 0),card.right-140,row.top);
+                  const popup=document.querySelector('#tip');
+                  const legendRight=Math.max(...groups.map(group=>group.right));
+                  const beside=card.right-legendRight>=popup.offsetWidth+24;
+                  const top=beside?legend.top+36:Math.max(...groups.map(group=>group.bottom))+18;
+                  placeTip(card.right-popup.offsetWidth/2-8,top+popup.offsetHeight+14);
+                  const tip=popup.getBoundingClientRect();
+                  if(groups.some(group=>group.left<tip.right&&group.right>tip.left&&group.top<tip.bottom&&group.bottom>tip.top)) {
+                    throw new Error('The head tooltip covers a legend group.');
+                  }
+                  return {x:card.left,y:card.top+scrollY,width:Math.max(card.right,tip.right+8)-card.left,
+                    height:Math.max(row.bottom,tip.bottom)-card.top+8,scale:1};
+                })()`);
+                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+                await writeFile(join(folder,'head-tooltip-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+              }
+              proof[name]=headProof;
+            }
+            await show(base);
+            const reserveNotes=await evaluate(`['reserved-note','safety-note','swap-note'].map(id=>document.getElementById(id).textContent)`);
+            assert.deepEqual(reserveNotes,['Running builds grow into it.','A fixed setting.','RAM held for swap that comes back.']);
             for (const name of ['old_cap','missing_cap','missing_use']) {
               await show(readings[name]);
               const state=await evaluate(`({rows:document.querySelectorAll('.wrow[data-run]').length,
@@ -916,7 +1374,8 @@ try {
             }
             await show(readings.shrink);
             assert.equal(await evaluate("document.querySelectorAll('.queue-head').length"),0);
-            await evaluate(`showTip('row:${readings.shrink.walk.length-1}',200,200)`);
+            // The tooltip shows 'second nextest', a step that the smaller reading no longer has.
+            await evaluate(`showTip('${proofTip('row',0,readings.shrink)}',200,200)`);
             const smaller=structuredClone(base);
             smaller.walk=smaller.walk.filter(row=>!row.queued);
             smaller.waiters=[];
@@ -936,66 +1395,69 @@ try {
           let now=Date.now();
           Date.now=()=>now;
           window.render=window.renderReading;
+          const refresh=createPageRefresh(tick);
+          const line=document.querySelector('[data-page-status]');
+          const part=name=>line.querySelector('[data-status-'+name+']');
+          const ageLimit=JSON.parse(line.dataset.statusOptions).ageLimit;
           const states=[];
-          const snapshot=name=>states.push({name,status:document.querySelector('#status').textContent,
-            stale:document.querySelector('#dot').classList.contains('stale'),
-            unavailable:document.body.classList.contains('queue-unavailable'),
-            screen:document.querySelector('#queue-error').textContent,
+          const snapshot=name=>states.push({name,state:line.dataset.state,
+            reason:part('reason').textContent,age:part('age').textContent,ageHidden:part('age').hidden,
             cards:[...document.querySelectorAll('.card')].map(card=>card.innerHTML).join('')
               .replace(/<div class="last-reading"[^>]*>[^<]*<.div>/,'').replace(/--divider-top: [^;]*;/g,''),
+            cardsVisible:[...document.querySelectorAll('.card')].map(card=>card.checkVisibility({checkVisibilityCSS:true,checkOpacity:true})),
             lastReading:document.querySelector('#last-reading').hidden?'':document.querySelector('#last-reading').textContent,
             rows:document.querySelectorAll('.wrow').length,
-            pill:document.querySelector('#pill-t').textContent,
-            pillClass:document.querySelector('#pill').className,
-            pillDot:getComputedStyle(document.querySelector('.pd')).display,
-            position:getComputedStyle(document.querySelector('.status')).position});
+            word:part('word').textContent,
+            icons:[...line.querySelectorAll('[data-status-icon]')].filter(icon=>!icon.hidden).map(icon=>icon.dataset.statusIcon),
+            timingsHidden:part('trip').hidden&&part('render').hidden,
+            position:getComputedStyle(line).position});
           const good=async()=>{
             reading.read_at=now/1000;
             window.fetch=async()=>({ok:true,json:async()=>reading});
-            await tick(); fitLabels();
+            await refresh.refresh(); fitLabels();
           };
           try {
-            lastRead=0;readingFailure='';
             window.fetch=async()=>({ok:true,json:async()=>({ok:false})});
-            await tick();snapshot('initial');
+            await refresh.refresh();snapshot('initial');
             await good();snapshot('good');
             const goodAt=now;
             window.fetch=async()=>({ok:true,json:async()=>({ok:false})});
-            now+=1000;await tick();snapshot('one_failure');
-            now=goodAt+(STALE+3)*1000;await tick();snapshot('stale');
+            now+=1000;await refresh.refresh();snapshot('one_failure');
+            now=goodAt+(ageLimit+3)*1000;await refresh.refresh();snapshot('stale');
             const retained={...reading,read_error:'private socket timeout',error_at:now/1000};
             window.fetch=async()=>({ok:true,json:async()=>retained});
-            await tick();snapshot('retained');
+            await refresh.refresh();snapshot('retained');
             await good();snapshot('recovered');
             window.fetch=async()=>{throw new Error('proof fetch failure');};
-            now+=(STALE+3)*1000;await tick();snapshot('fetch_failure');
+            now+=(ageLimit+3)*1000;await refresh.refresh();snapshot('fetch_failure');
             await good();snapshot('final');
             return states;
           } finally { window.fetch=originalFetch;Date.now=originalNow;window.render=originalRender; }
         })()`);
         const states=Object.fromEntries(failures.map(state=>[state.name,state]));
-        assert.ok(states.initial.unavailable);
-        assert.equal(states.initial.screen,'The queue did not answer');
+        assert.equal(states.initial.state,'Failed');
+        assert.equal(states.initial.reason,'The queue did not answer.');
         assert.match(states.retained.lastReading,/^Last reading: /);
         assert.equal(states.good.lastReading,'');
         for(const name of ['one_failure','stale','retained']) {
           assert.equal(states[name].cards,states.good.cards, name+' changes the good reading.');
           assert.equal(states[name].rows,states.good.rows);
-          assert.ok(!states[name].unavailable);
+          assert.ok(!states[name].ageHidden);
+          assert.deepEqual(states[name].cardsVisible,states.good.cardsVisible,name+' changes card visibility.');
         }
-        assert.equal(states.one_failure.status,states.good.status);
+        assert.equal(states.one_failure.state,'Failed');
         for(const name of ['stale','retained','fetch_failure']) {
-          assert.ok(states[name].stale);
-          assert.match(states[name].status,/Showing the reading from \d{2}:\d{2}:\d{2}, 18 s old\./);
-          assert.match(states[name].pill,/^as of \d{2}:\d{2}:\d{2}$/);
-          assert.match(states[name].pillClass,/neutral/);
-          assert.equal(states[name].pillDot,'none');
+          assert.equal(states[name].state,'Failed');
+          assert.equal(states[name].age,'18 s ago');
+          assert.equal(states[name].word,'Failed');
+          assert.deepEqual(states[name].icons,['Failed']);
+          assert.ok(states[name].timingsHidden);
           assert.equal(states[name].position,'sticky');
         }
-        assert.match(states.fetch_failure.status,/Cannot load the reading: proof fetch failure/);
+        assert.equal(states.fetch_failure.reason,'proof fetch failure');
         for(const name of ['recovered','final']) {
-          assert.match(states[name].status,/^Live · read at /);
-          assert.ok(!states[name].stale && !states[name].unavailable);
+          assert.equal(states[name].state,'Live');
+          assert.ok(!states[name].ageHidden && states[name].reason==='');
         }
         const capture = async (name, selector) => {
           await evaluate(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({block:'center'})`);
@@ -1006,7 +1468,6 @@ try {
           const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
           await writeFile(join(folder,`${name}.png`),Buffer.from(shot.data,'base64'));
         };
-        const comparisons = [];
         if (cloudOwnerComparison) {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
           await call('Emulation.setDeviceMetricsOverride', {width:1600,height:1200,deviceScaleFactor:1,mobile:false});
@@ -1021,8 +1482,8 @@ try {
             }
             await show(reading);
             const row=await evaluate(`(() => {
-              const chart=document.querySelector('.wrow[data-run="0"]');
-              const table=document.querySelector('tr[data-tip="row:0"]');
+              const chart=document.querySelector('.wrow[data-run="' + proofRun(0) + '"]');
+              const table=document.querySelector('tr[data-tip="' + proofTip('row', 0) + '"]');
               return {name:chart.querySelector('.name').textContent,
                 small:chart.querySelector('.owner').textContent,
                 unit:table.querySelector('.unit').textContent,
@@ -1033,7 +1494,7 @@ try {
             assert.equal(row.unit,version==='before'?'owner not recorded':'research');
             if(version==='after') assert.equal(row.small,'hana');
             await capture(version+'-aws-row','#walk');
-            await evaluate(`showTip('row:0',180,160)`);
+            await evaluate(`showTip(proofTip('row', 0),180,160)`);
             const tooltip=await evaluate(`document.querySelector('#tip').innerText`);
             if(version==='after') {
               assert.match(tooltip,/showrunner\s*:?\s*hana/);
@@ -1058,25 +1519,25 @@ try {
             await show(reading);
             const state=await evaluate(`(() => {
               const index=latest.walk.findIndex(row=>row.kind==='mac-build');
-              const chart=document.querySelector('.wrow[data-run="'+index+'"]');
+              const chart=document.querySelector('.wrow[data-run="'+proofRun(index)+'"]');
               const headers=[...document.querySelectorAll('.walk-table thead th')].map(cell=>cell.textContent);
               const waiting=[...document.querySelectorAll('.walk-table tr.queue-head th')].map(cell=>cell.textContent);
               const spacings=[...document.querySelectorAll('.walk-table thead th,.walk-table tr.queue-head th')]
                 .filter(cell=>getComputedStyle(cell).display!=='none' && cell.nextElementSibling)
                 .map(cell=>parseFloat(getComputedStyle(cell).paddingRight));
-              const table=document.querySelector('tr[data-tip="row:'+index+'"]');
+              const table=document.querySelector('tr[data-tip="'+proofTip('row',index)+'"]');
               return {index,name:chart.querySelector('.name').textContent,small:chart.querySelector('.owner').textContent,
                 unit:table.querySelector('.unit').textContent,
-                waitingUnit:document.querySelector('tr[data-tip="wait:0"] .unit').textContent,
+                waitingUnit:document.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .unit').textContent,
                 headers,waiting,spacings,scroll:document.documentElement.scrollWidth,client:innerWidth,
-                tip:tooltipHtml('row:'+index,latest)};
+                tip:tooltipHtml(proofTip('row',index),latest)};
             })()`);
             if(version==='after') {
               assert.equal(state.name,'CI nextest');
               assert.equal(state.unit,'CI');
               assert.equal(state.waitingUnit,'CI');
               assert.match(state.small,/hana CI.*hana-mac-1.*test-hana/);
-              assert.deepEqual(state.headers,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU']);
+              assert.deepEqual(state.headers,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot','Tokens']);
               assert.deepEqual(state.waiting,['#','Done','Step','Waiting','Unit','Pid','Target','vCPU']);
               assert.ok(state.spacings.every(gap=>gap===12), JSON.stringify(state.spacings));
               assert.ok(state.tip.includes('CI') && state.tip.includes('hana-mac-1'));
@@ -1084,8 +1545,8 @@ try {
             }
             await capture(version+'-running-queued','#walk');
             await capture(version+'-table-columns','.walk-table');
-            await capture(version+'-mac-ci','.wrow[data-run="'+state.index+'"]');
-            await evaluate(`showTip('row:'+${state.index},700,420)`);
+            await capture(version+'-mac-ci','.wrow[data-tip="'+proofTip('row',state.index)+'"]');
+            await evaluate(`showTip(proofTip('row',${state.index}),700,420)`);
             if(version==='after') {
               const ciTip=await evaluate(`document.querySelector('#tip').textContent`);
               assert.match(ciTip,/hana CI/);
@@ -1094,10 +1555,10 @@ try {
             const owners=structuredClone(readings.step_owners);
             if(version==='before') owners.walk.find(row=>row.kind==='mac-build').name='hana nextest';
             await show(owners);
-            const key=await evaluate(`'row:'+latest.walk.findIndex(row=>row.kind==='mac-build')`);
+            const key=await evaluate(`proofTip('row',latest.walk.findIndex(row=>row.kind==='mac-build'))`);
             await evaluate(`showTip(${JSON.stringify(key)},700,420)`);
             if(version==='after') {
-              const tips=await evaluate(`[...latest.walk.map((row,index)=>'row:'+index),...latest.waiters.map((row,index)=>'wait:'+index)].map(key=>tooltipHtml(key,latest))`);
+              const tips=await evaluate(`[...latest.walk.map((row,index)=>proofTip('row',index)),...latest.waiters.map((row,index)=>proofTip('wait',index))].map(key=>tooltipHtml(key,latest))`);
               for(const tip of tips) {
                 assert.match(tip,/<dl class="identity"><dt>showrunner<\/dt><dd class="colon" aria-hidden="true">:<\/dd><dd>hana<\/dd><dt>unit<\/dt><dd class="colon" aria-hidden="true">:<\/dd><dd>research<\/dd>/);
               }
@@ -1138,15 +1599,15 @@ try {
             await call('Emulation.setDeviceMetricsOverride',{width:1600,height:1200,deviceScaleFactor:1,mobile:false});
             await show(reading);
             const displayed=await evaluate(`({pid:latest.walk[0].pid,
-              name:document.querySelector('.wrow[data-run="0"] .name').textContent,
-              small:document.querySelector('.wrow[data-run="0"] .owner').textContent,
-              unit:document.querySelector('tr[data-tip="row:0"] .unit').textContent,
-              tooltip:tooltipHtml('row:0',latest)})`);
+              name:document.querySelector('.wrow[data-run="' + proofRun(0) + '"] .name').textContent,
+              small:document.querySelector('.wrow[data-run="' + proofRun(0) + '"] .owner').textContent,
+              unit:document.querySelector('tr[data-tip="' + proofTip('row', 0) + '"] .unit').textContent,
+              tooltip:tooltipHtml(proofTip('row', 0),latest)})`);
             assert.match(displayed.name,/^CI /);assert.match(displayed.small,/hana CI/);
             assert.equal(displayed.unit,'CI');assert.match(displayed.tooltip,/hana CI/);
             await writeFile(join(folder,'live-mac-ci-page.json'),JSON.stringify(displayed,null,2));
             await capture('live-mac-ci','#walk');
-            await evaluate(`showTip('row:0',700,420)`);
+            await evaluate(`showTip(proofTip('row', 0),700,420)`);
             await capture('live-mac-ci-tooltip','#tip');
             console.log('LIVE_MAC_CI:',JSON.stringify(displayed));
           }
@@ -1191,7 +1652,7 @@ try {
               assert.equal(state.heading,'Build memory on natedev');
             }
             const clip=await evaluate(`(() => {
-              const status=document.querySelector('.status').getBoundingClientRect();
+              const status=document.querySelector(${JSON.stringify(version==='before'?'.status':'[data-page-status]')}).getBoundingClientRect();
               return {x:0,y:0,width:innerWidth,height:Math.ceil(status.bottom+16),scale:1};
             })()`);
             const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
@@ -1304,7 +1765,7 @@ try {
         if (blocksComparison) {
           assert.ok(beforePage, 'The block comparison needs the previous page.');
           const blockReason='research P16 Hana palette Command-shortcut shots (kept binary, no cargo)';
-          const blockLine='Mac: blocked by research (hana) awaiting unblock; requested expiry was 16:30 EST';
+          const blockLine='natedev or Mac';
           const blocked=structuredClone(readings.spacing);
           Object.assign(blocked,{room:1.0,pressure:'some stall above its limit',psi:{some:31.0,full:6.2},
             mac_idle_alert:'MAC IDLE 8 min: 1 steps wait for the Mac. Blocked by research since 15:32 ('+blockReason
@@ -1316,7 +1777,7 @@ try {
                since:'since 15:20 EST',until:'expected release 16:00 EST'},
               {target:'natedev',state:'Held',reason:'cargo sweep of the shared target folder',holder:'cables',unit:'cables',
                showrunner:'builds',since:'start not recorded',until:'until released'}]});
-          blocked.waiters[0].mac_text=blockLine;
+          blocked.waiters[0].runs_on='natedev or Mac';
           const after=structuredClone(blocked);
           after.mac_idle_alert='';
           const contrast=`(() => {
@@ -1360,7 +1821,7 @@ try {
               const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,
                 clip:{x:0,y:0,width:1400,height:Math.ceil(state.bottom)+16,scale:1}});
               await writeFile(join(folder,`${version}-${theme}-blocks.png`),Buffer.from(shot.data,'base64'));
-              await evaluate(`showTip('wait:0',700,420)`);
+              await evaluate(`showTip(proofTip('wait', 0),700,420)`);
               const tooltip=await evaluate(`document.querySelector('#tip').innerText`);
               if(version==='after') assert.ok(tooltip.includes(blockLine),tooltip);
               else assert.ok(!tooltip.includes('Mac:'),tooltip);
@@ -1386,19 +1847,60 @@ try {
           }
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
           await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1200,deviceScaleFactor:1,mobile:false});
-          const lines=[blockLine,'Mac: busy with nextest hana','Mac: natedev only, makes natedev artifacts',
-            'Mac: kind not offloaded','Mac: excluded, linux_only; package not recorded','Mac: unreachable, retry backoff',
-            'Mac: state unreadable, retry backoff: backoff time is not finite',
-            'Mac: no recorded block or claim; availability not checked'];
+          const lines=['natedev or Mac','natedev only','natedev only (Mac state unknown)'];
           for (const [index,line] of lines.entries()) {
             const reading=structuredClone(after);
-            reading.waiters[0].mac_text=line;
+            reading.waiters[0].runs_on=line;
             await show(reading);
-            await evaluate(`showTip('wait:0',700,420)`);
+            await evaluate(`showTip(proofTip('wait', 0),700,420)`);
             const tooltip=await evaluate(`document.querySelector('#tip').innerText`);
             assert.ok(tooltip.includes(line),tooltip);
             await capture(`after-mac-line-${index+1}`,'#tip');
             comparisons.push({line,tooltip});
+          }
+        }
+        if (waitTipComparison) {
+          assert.ok(beforePage, 'The wait hover comparison needs the previous page.');
+          await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+          const owner={name:'hana nextest',showrunner:'hana',unit:'research',runner:'unit director',worker:'',detail:'research',
+            pid:4242,need:16.3,since:now-16*60,reason:'free memory',fits:false};
+          const priority="queue priority: research (the user's bump)";
+          const note='Other programs have 9.8 GiB of memory in swap. It comes back into RAM when they run, so the queue holds RAM for it.';
+          const oldRoom={rows:[{label:'free RAM',gib:28.4},{label:'− safety net',gib:3.0},
+            {label:'− swap coming back',gib:9.8},{label:'− build reserved',gib:8.5},
+            {label:'= free',gib:7.1},{label:'needs',gib:16.3}],note};
+          const room={unavailable:'',
+            rows:[{label:'Queue cap',gib:17.1},{label:'− Builds',gib:1.5},{label:'− Build reserved',gib:8.5},
+            {label:'= Free for builds',gib:7.1}]};
+          const behind={...owner,name:'trunk nextest',unit:'trunk',detail:'trunk',pid:4243,need:2.0,
+            reason:'behind #1: the first step in line gets memory first',runs_on:'natedev or Mac'};
+          const head={...owner,place:1,first_in_line:true,why:'only 7.1 GiB is free for builds. It starts when 16.3 GiB is free.'};
+          const second={...behind,place:2,why:'it is behind the first build in line, which gets memory first.'};
+          const cloud=structuredClone(readings.cloud.waiters.find(row=>row.kind==='cloud')||readings.step_owners.waiters.find(row=>row.kind==='cloud'));
+          Object.assign(cloud,{since:now-3*60,name:'claude gate',unit:'builds',reason:'waits for a cloud slot: 9 of 9 in use',
+            runs_on:'AWS (natedev only when AWS cannot start the gate)'});
+          const cases=[['before','before.html',[{...owner,priority_text:priority,priority_entries:[{unit:'research'}],runs_on:'natedev only',head_room:oldRoom},behind,cloud]],
+            ['after','memory_live.html',[{...head,priority_text:priority,priority_entries:[{unit:'research'}],runs_on:'natedev only',head_room:room},second,cloud]]];
+          for (const theme of ['light','dark']) {
+            await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
+            for (const [version,path,waiters] of cases) {
+              await navigate(path);
+              await show({...structuredClone(readings.spacing),waiters});
+              for (const index of waiters.keys()) {
+                await evaluate(`showTip(proofTip('wait',${index}),700,420)`);
+                const tooltip=await evaluate(`document.querySelector('#tip').innerText`);
+                if (version==='after') {
+                  assert.ok(!tooltip.includes('Head'),tooltip);
+                  assert.ok(index<2 ? tooltip.includes('Why it waits: ') : /\nreason\s/.test(tooltip),tooltip);
+                  assert.ok(tooltip.includes('can run on'),tooltip);
+                  assert.equal(tooltip.includes('= Free for builds'),index===0,tooltip);
+                  assert.ok(!tooltip.includes('outside the cap'),tooltip);
+                  assert.ok(!/needs\s/.test(tooltip),tooltip);
+                }
+                await capture(`${version}-${theme}-wait-${index+1}`,'#tip');
+                comparisons.push({version,theme,index,tooltip});
+              }
+            }
           }
         }
         if (identityComparison) {
@@ -1438,8 +1940,8 @@ try {
           })()`);
           const lefts=state=>[...new Set(state.fields.map(([, , left])=>left.toFixed(2)))];
           for (const [key,name,expected] of [
-            ['row:'+mac,'mac-row',[['showrunner','hana'],['unit','research'],['worker','impl2']]],
-            ['wait:0','queued-row',[['showrunner','builds'],['unit','report'],['worker','this run is from the unit director']]]]) {
+            [proofTip('row',mac,reading),'mac-row',[['showrunner','hana'],['unit','research'],['worker','impl2']]],
+            [proofTip('wait',0,reading),'queued-row',[['showrunner','builds'],['unit','report'],['worker','this run is from the unit director']]]]) {
             for (const version of ['before','after']) {
               await navigate(version==='before'?'before.html':'memory_live.html');
               await show(reading);
@@ -1453,12 +1955,12 @@ try {
           }
           await navigate('memory_live.html');
           await show(reading);
-          const showrunnerState=await identity('row:'+local);
+          const showrunnerState=await identity(proofTip('row',local,reading));
           assert.deepEqual(showrunnerState.fields.map(([field,value])=>[field,value]),
             [['showrunner','builds'],['unit','this run is from the showrunner']]);
           assert.equal(lefts(showrunnerState).length,1);
         }
-        if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison) {
+        if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison && !waitTipComparison && !macrouteComparison) {
           const review = structuredClone(readings.spacing);
           review.priority_text = "queue priority: port (the user's bump)";
           review.head_text = 'Head: need 1.9 GiB > room 0.0 GiB (free 8.5 GiB − safety 3.0 GiB − 6.0 GiB swapped outside builds) · cloud 2 of 9 slots';
@@ -1474,10 +1976,14 @@ try {
             progress:{kind:'NoProgress',reason:'no counter'},ci_runners:[{state:'busy',job:'doctests'}]};
           review.walk = [local, mac, aws, ci];
           review.waiters = [{...review.waiters[0],name:'CI doctests',unit:'',showrunner:'',
-            ci_label:'hana CI · fixture-runner · doctests',detail:'',reason:'free memory',
-            head_text:review.head_text,priority_text:review.priority_text}];
+            ci_label:'hana CI · fixture-runner · doctests',detail:'',reason:'free memory',place:1,
+            why:'only 0.0 GiB is free for builds. It starts when 1.9 GiB is free.',
+            head_text:review.head_text,priority_text:review.priority_text,first_in_line:true,
+            head_room:{unavailable:'',
+              rows:[{label:'Queue cap',gib:0.0},{label:'− Builds',gib:0.0},{label:'− Build reserved',gib:0.0},
+              {label:'= Free for builds',gib:0.0}],note:''}}];
           review.ci_ram = 0.125;
-          review.taken = review.used + review.ci_ram + review.reserved;
+          review.taken = review.cap - review.room;
           for (const theme of ['light','dark']) {
             await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
             for (const version of ['before','after']) {
@@ -1486,18 +1992,19 @@ try {
               await show(review);
               const comparison = await evaluate(`(() => {
                 const table=document.querySelector('.walk-table');
-                const mac=document.querySelector('.wrow[data-run="1"]');
+                const mac=document.querySelector('.wrow[data-run="' + proofRun(1) + '"]');
                 const macBar=mac.querySelector('.seg-remote,.seg-used');
-                const awsBar=document.querySelector('.wrow[data-run="2"] .seg-remote');
+                const awsBar=document.querySelector('.wrow[data-run="' + proofRun(2) + '"] .seg-remote');
                 return {headers:[...table.querySelectorAll('thead th')].map(cell=>cell.textContent),
-                  done:table.querySelector('tr[data-tip="row:1"] .done')?.textContent,
+                  done:table.querySelector('tr[data-tip="' + proofTip('row', 1) + '"] .done')?.textContent,
                   underBar:!!mac.querySelector('.progress-amount'),
                   remoteColor:getComputedStyle(macBar).backgroundColor,
                   awsColor:awsBar?getComputedStyle(awsBar).backgroundColor:null,
-                  localColor:getComputedStyle(document.querySelector('.wrow[data-run="0"] .seg-used')).backgroundColor,
+                  localColor:getComputedStyle(document.querySelector('.wrow[data-run="' + proofRun(0) + '"] .seg-used')).backgroundColor,
                   machineColors:[...table.querySelectorAll('tr[data-tip^="row:"] .machine')].map(cell=>getComputedStyle(cell).color),
-                  ciVisible:!!table.querySelector('tr[data-tip="row:3"]'),
-                  waiting:table.querySelector('tr[data-tip="wait:0"] .unit').textContent,
+                  ciVisible:!!table.querySelector('tr[data-tip="' + proofTip('row', 3) + '"]'),
+                  waiting:table.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .unit').textContent,
+                  waitingOwner:table.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .owner').textContent,
                   pageOverflow:document.documentElement.scrollWidth>document.documentElement.clientWidth};
               })()`);
               if(version==='after') {
@@ -1512,6 +2019,7 @@ try {
                 assert.equal(new Set(comparison.machineColors).size,3);
                 assert.equal(comparison.ciVisible,false);
                 assert.equal(comparison.waiting,'CI');
+                assert.equal(comparison.waitingOwner,'hana CI');
                 assert.equal(comparison.pageOverflow,false);
               } else {
                 assert.equal(comparison.ciVisible,true);
@@ -1520,7 +2028,7 @@ try {
               }
               await capture(`${version}-${theme}-c1507-b`,'#walk');
               await capture(`${version}-${theme}-hanaci-row`,'#walk');
-              await evaluate(`showTip('row:1',180,160)`);
+              await evaluate(`showTip(proofTip('row', 1),180,160)`);
               const note = await evaluate(`(() => {
                 const tip=document.querySelector('#tip');
                 const note=tip.querySelector('span');
@@ -1544,12 +2052,12 @@ try {
                     return {tables:walk.querySelectorAll('table').length,
                       lists:card.querySelectorAll('#priority-line,#head-line,#wait-reasons').length,
                       layout:walk.classList.contains('beside')?'beside':'stacked',
-                      head:tipText('wait:0',latest).join(' ')};
+                      head:tipText(proofTip('wait', 0),latest).join(' ')};
                   })()`);
                   assert.equal(layout.tables,1);
                   assert.equal(layout.lists,0);
                   assert.equal(layout.layout,width===1400?'beside':'stacked');
-                  for(const value of [review.head_text,review.priority_text,'free memory'])
+                  for(const value of ['= Free for builds',review.priority_text,'Why it waits: '])
                     assert.equal(layout.head.split(value).length-1,1);
                   responsive.push({width,...layout});
                 }
@@ -1559,6 +2067,361 @@ try {
           }
         }
 
+        await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+        await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1100,deviceScaleFactor:1,mobile:false});
+        for(const version of beforePage ? ['before','after'] : ['after']) {
+          await navigate(version==='before' ? 'before.html' : 'memory_live.html');
+          const reading=structuredClone(readings.macroute_running);
+          const row=reading.walk.find(row=>row.kind==='mac-build');
+          if(version==='before') row.name += ' · '+row.gate_label;
+          await show(reading);
+          const index=reading.walk.findIndex(row=>row.kind==='mac-build');
+          await evaluate(`showTip(proofTip('row',${index}),700,420)`);
+          const state=await evaluate(`(() => {
+            const tip=document.querySelector('#tip');
+            const head=tip.querySelector('dt.title');
+            return {title:head.textContent,
+              duration:head.nextElementSibling.textContent,width:tip.getBoundingClientRect().width,
+              scroll:tip.scrollWidth,client:tip.clientWidth};
+          })()`);
+          if(version==='after') {
+            assert.equal(state.title,'fps nextest');
+            assert.equal(state.duration,'running 10 min');
+            assert.ok(state.width<=24*16+22,JSON.stringify(state));
+            assert.ok(state.scroll<=state.client,JSON.stringify(state));
+          }
+          const desktop=await call('Page.captureScreenshot',{format:'png'});
+          await writeFile(join(folder,`macroute-${version}-running-desktop.png`),Buffer.from(desktop.data,'base64'));
+          await capture(`macroute-${version}-running-tip`,'#tip');
+          comparisons.push({version,...state});
+        }
+        await navigate('memory_live.html');
+        await show(readings.macroute);
+        const routeLines = [
+          'natedev or Mac',
+          'edits the tree',
+          'direct cargo command'];
+        const routeTips = [];
+        for (const [index,line] of routeLines.entries()) {
+          await evaluate(`showTip(proofTip('wait',${index}),700,420)`);
+          const tip = await evaluate(`({text:document.querySelector('#tip').innerText,html:document.querySelector('#tip').innerHTML})`);
+          assert.ok(tip.text.includes(line),tip.text);
+          if(index>0) assert.ok(!tip.text.includes("Mac: no,"),tip.text);
+          routeTips.push(tip.html);
+        }
+        await evaluate(`(() => {
+          document.querySelector('#tip').style.display='none';
+          const panel=document.createElement('div');
+          panel.style.cssText='position:fixed;left:24px;right:24px;top:250px;display:flex;align-items:flex-start;gap:18px;z-index:10000';
+          for(const html of ${JSON.stringify(routeTips)}) {
+            const tip=document.createElement('div');
+            tip.id='tip';
+            tip.className='on';
+            tip.style.cssText='position:relative;left:auto;top:auto;opacity:1;flex:0 1 auto;min-width:0';
+            tip.innerHTML=html;
+            panel.append(tip);
+          }
+          document.body.append(panel);
+        })()`);
+        const routeShot=await call('Page.captureScreenshot',{format:'png'});
+        await writeFile(join(folder,'macroute-dark-desktop.png'),Buffer.from(routeShot.data,'base64'));
+        comparisons.push({routeLines});
+
+        for (const theme of ['light','dark']) {
+          await call('Emulation.setEmulatedMedia',{features:[{name:'prefers-color-scheme',value:theme}]});
+          for (const width of [390,900,1400]) {
+            await call('Emulation.setDeviceMetricsOverride',{width,height:1100,deviceScaleFactor:1,mobile:false});
+            await navigate('memory_live.html');
+            const review = await evaluate(`(() => {
+              const fractional={...latest,read_at:220,cap:5.2,ram:{...latest.ram,
+                build_tools_bytes:1.04*GIB,rust_analyzer_bytes:1.04*GIB,sccache_bytes:0,other_build_tools_bytes:0,
+                queued_builds_bytes:1.04*GIB,ci_bytes:1.04*GIB,
+                swap_covered_bytes:GIB,swap_target_bytes:2*GIB,swap_missing_bytes:GIB,build_covered_bytes:1.04*GIB,room_bytes:1.04*GIB},
+                unmatched_priority_entries:[{unit:'research'},{unit:'cables'}],
+                walk:[{key:'fractional-run',name:'Codex servers',group:'codex',used:0.4,parts:[
+                  {who:'codex',pid:123,started_at:100,gib:0.2},{who:'codex',pid:456,started_at:100,gib:0.2}]}],
+                waiters:[{key:'fractional-wait',name:'fractional',first_in_line:true,need:1.06,free:1.04,head_room:{rows:[
+                  {label:'Queue cap',gib:5.2},{label:'− Builds',gib:3.12},
+                  {label:'− Build reserved',gib:1.04},{label:'= Free',gib:1.04}]}},
+                  {key:'fractional-slot',name:'slot',kind:'repository-slot',need:0,runs_on:'natedev'}]};
+              window.renderReading(fractional);
+              return {...Object.fromEntries(['g-builds','cap','room','swap','swap-pool:outside','walkhead','row:fractional-run','wait:fractional-wait','wait:fractional-slot']
+                .map(key=>[key,tooltipRows(key,fractional)])),
+                legend:Object.fromEntries(['builds','reserved','room'].map(key=>[key,document.querySelector('#v-cap-'+key).textContent]))};
+            })()`);
+            const amounts=rows=>Object.fromEntries(rows.map(row=>[row.label,row.value]));
+            const builds=review['g-builds'].filter(row=>row.kind!=='caption');
+            assert.equal(Math.round(parseFloat(builds[0].value)*10),
+              builds.slice(1).reduce((sum,row)=>sum+Math.round(parseFloat(row.value)*10),0));
+            const wait=amounts(review['wait:fractional-wait']);
+            assert.equal(Math.round(parseFloat(wait['Short by'])*10),
+              Math.round(parseFloat(wait.Needs)*10)-Math.round(parseFloat(wait['= Free'])*10));
+            const cap=amounts(review.cap);
+            assert.equal(cap.Builds,review.legend.builds);
+            assert.equal(cap['+ Build reserved'],review.legend.reserved);
+            assert.equal(cap['+ Free'],review.legend.room);
+            for(const [label,capLabel] of [['Queue cap','Queue cap'],['− Builds','Builds'],
+              ['− Build reserved','+ Build reserved'],['= Free','+ Free']]) assert.equal(wait[label],cap[capLabel]);
+            for(const key of ['cap','room','wait:fractional-wait']) assert.ok(!review[key].some(row=>/Safety net|Swap coming back/.test(row.label)));
+            assert.equal(review.swap.find(row=>row.kind==='caption').value,'RAM held for swap that comes back');
+            const swap=amounts(review['swap-pool:outside']);
+            assert.equal(swap['Swap coming back'],'1.0 GiB');
+            assert.equal(swap.Target,'2.0 GiB');
+            assert.equal(amounts(review.walkhead).Priority,'research, cables');
+            assert.equal(amounts(review['wait:fractional-slot'])['Waits for'],'build slot');
+            assert.ok(!review['wait:fractional-slot'].some(row=>['Needs','Free','Short by'].includes(row.label)));
+            assert.ok(review['row:fractional-run'].some(row=>row.label==='codex · 123 · 2 min'));
+            assert.ok(review['row:fractional-run'].some(row=>row.label==='codex · 456 · 2 min'));
+            const reserveProof = await evaluate(`(() => {
+              const cases=[];
+              for(const [key,reserve] of [['reserved','build'],['safety','safety'],
+                ['swap','swap'],['swap-pool:outside','swap']]) {
+                for(const target of [2,3]) {
+                  const reading={...latest,swap:{...latest.swap,outside_bytes:2*GIB},
+                    ram:{...latest.ram,[reserve+'_covered_bytes']:2*GIB,
+                      [reserve+'_target_bytes']:target*GIB,[reserve+'_missing_bytes']:(target-2)*GIB}};
+                  cases.push({key,target,rows:tooltipRows(key,reading)});
+                }
+              }
+              return cases;
+            })()`);
+            for(const {key,target,rows} of reserveProof) {
+              const title=rows.find(row=>row.kind==='title');
+              const targetRow=rows.find(row=>row.label==='Target');
+              assert.equal(title.value,'2.0 GiB',key);
+              if(target===2) assert.equal(targetRow,undefined,key);
+              else {
+                assert.equal(targetRow.value,'3.0 GiB',key);
+                assert.notEqual(targetRow.value,title.value,key);
+              }
+            }
+            const leafProof = await evaluate(`(() => {
+              const reading={...latest,cap:3.06,taken:2.04,ram:{...latest.ram,
+                rust_analyzer_bytes:1.02*GIB,sccache_bytes:0,other_build_tools_bytes:0,
+                build_tools_bytes:1.02*GIB,queued_builds_bytes:0,ci_bytes:0,
+                build_covered_bytes:1.02*GIB,room_bytes:1.02*GIB,
+                desktop_bytes:10*GIB,agents_bytes:0,programs:[],smaller_programs_bytes:0,other_programs_bytes:0,
+                compressed_swap_bytes:0,kernel_structures_bytes:0,kernel_counters_bytes:0,kernel_bytes:0,
+                cache_bytes:0,unattributed_bytes:-GIB,kernel_no_counter_bytes:0}};
+              window.renderReading(reading);
+              const keys=['tools','g-builds','cap','walksum','g-free','g-else','budget'];
+              return {tips:Object.fromEntries(keys.map(key=>[key,tooltipRows(key,reading)])),
+                legend:Object.fromEntries(['tools','g-builds','g-free','g-else','unattributed','cap']
+                  .map(key=>[key,document.querySelector('#v-'+key).textContent]))};
+            })()`);
+            const tenths=value=>Math.round(parseFloat(value)*10);
+            for(const [key,rows] of Object.entries(leafProof.tips)) {
+              const values=rows.filter(row=>row.value.endsWith(' GiB')).map(row=>tenths(row.value));
+              assert.equal(values[0],values.slice(1).reduce((sum,value)=>sum+value,0),key);
+              if(key in leafProof.legend) assert.equal(rows[0].value,leafProof.legend[key]);
+            }
+            assert.equal(leafProof.tips.cap[0].value,'3.0 GiB');
+            assert.equal(leafProof.tips.walksum[0].value,'2.0 GiB');
+            assert.equal(leafProof.tips['g-else'][0].value,'9.0 GiB');
+            assert.equal(leafProof.legend.unattributed,'-1.0 GiB');
+            assert.equal(leafProof.tips.tools[0].value,amounts(leafProof.tips['g-builds'])['Build tools']);
+            comparisons.push({leafRounding:true,theme,width,...leafProof});
+            comparisons.push({reviewFindings:true,theme,width,rows:review});
+          }
+        }
+
+        const localReason = 'edits the merged checkout on natedev with mend and fmt, and the push goes from there';
+        const legendReading={...structuredClone(base),cap:31,
+          ram:JSON.parse(await readFile(join(folder,'legend_ram.json'),'utf8'))};
+        for (const theme of ['light','dark']) {
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
+          for (const width of [390,900,1400]) {
+            await call('Emulation.setDeviceMetricsOverride',{width,height:1100,deviceScaleFactor:1,mobile:false});
+            await navigate('memory_live.html');
+            for (const [kind,reading,key] of [
+              ['waiting table',readings.head_memory,proofTip('wait',0,readings.head_memory)],
+              ['waiting row',readings.macroute_reason,proofTip('wait',2,readings.macroute_reason)],
+              ['running row',readings.step_owners,proofTip('row',0,readings.step_owners)],
+              ['Mac row',readings.macroute_running,'row:'+readings.macroute_running.walk.find(row=>row.kind==='mac-build').key],
+              ...(await evaluate('Object.keys(TIPS)')).map(key=>['legend or key',legendReading,key]),
+              ...readings.step_owners.walk.map(row=>['chart row',readings.step_owners,'row:'+row.key]),
+              ...readings.step_ci.walk.map(row=>['CI row',readings.step_ci,'row:'+row.key]),
+              ...readings.cloud.walk.map(row=>['AWS row',readings.cloud,'row:'+row.key]),
+              ...base.swap_by.map((row,index)=>['swap row',base,'swap:'+index]),
+              ...['builds_ci','outside'].map(pool=>['swap pool',base,'swap-pool:'+pool])]) {
+              await show(reading);
+              const alignment=await evaluate(`(() => {
+                showTip(${JSON.stringify(key)},${width/2},420);
+                const tip=document.querySelector('#tip'), rect=tip.getBoundingClientRect();
+                return {grids:tip.querySelectorAll('dl.tip').length,rows:tooltipRows(${JSON.stringify(key)},latest),
+                  text:tipText(${JSON.stringify(key)},latest),
+                  htmlText:[...tip.querySelectorAll('dd')].map(cell=>cell.previousElementSibling?.tagName==='DT'?
+                    (cell.previousElementSibling.textContent+'  '+cell.textContent).trimEnd():cell.textContent).join('\\n'),
+                  values:[...tip.querySelectorAll('dd:not(.caption):not(.long)')].map(cell=>({
+                  text:cell.textContent,align:getComputedStyle(cell).textAlign,
+                  right:cell.getBoundingClientRect().right,group:cell.parentElement.className})),
+                  labels:[...tip.querySelectorAll('dt')].map(cell=>({text:cell.textContent,
+                    align:getComputedStyle(cell).textAlign})),
+                  left:rect.left,right:rect.right,scroll:tip.scrollWidth,client:tip.clientWidth};
+              })()`);
+              assert.equal(alignment.grids,1,`${kind} ${key}: more than one grid`);
+              assert.equal(alignment.rows.filter(row=>row.kind==='title').length,1);
+              assert.ok(!alignment.rows.some(row=>/:$/.test(row.label)||/[a-z]\.$/.test(row.value)),
+                `${kind} ${key}: sentence punctuation`);
+              assert.equal(alignment.htmlText,alignment.text.filter(Boolean).join('\n'));
+              for(const row of alignment.rows) if(row.kind==='caption') assert.ok(row.value.length<=44);
+              assert.equal(new Set(alignment.rows.map(row=>row.label+'  '+row.value)).size,alignment.rows.length,
+                `${kind} ${key}: a repeated row`);
+              assert.ok(alignment.values.length>0,`${kind} ${key} has no value cells.`);
+              for(const cell of alignment.values) assert.equal(cell.align,'right',`${kind} ${key}: ${cell.text}`);
+              for(const label of alignment.labels) assert.equal(label.align,'left',`${kind} ${key}: ${label.text}`);
+              for(const group of new Set(alignment.values.map(cell=>cell.group))) {
+                const rights=alignment.values.filter(cell=>cell.group===group).map(cell=>cell.right);
+                assert.ok(Math.max(...rights)-Math.min(...rights)<=1,`${kind} ${key}: value edges differ.`);
+              }
+              assert.ok(alignment.left>=0 && alignment.right<=width && alignment.scroll<=alignment.client,
+                `${kind} ${key}: `+JSON.stringify(alignment));
+              comparisons.push({tooltipAlignment:true,kind,key,theme,width,...alignment});
+            }
+            await show(readings.macroute_reason);
+            await evaluate(`showTip(proofTip('wait', 2),${width/2},420)`);
+            const tip = await evaluate(`(() => {
+              const node=document.querySelector('#tip'), rect=node.getBoundingClientRect();
+              return {text:node.innerText,left:rect.left,right:rect.right,scroll:node.scrollWidth,client:node.clientWidth};
+            })()`);
+            assert.ok(tip.text.includes('natedev only') && tip.text.includes(localReason),tip.text);
+            assert.equal(tip.text.split(localReason).length-1,1,tip.text);
+            assert.ok(!tip.text.includes('Mac: no,'),tip.text);
+            const memory=await evaluate(`Object.fromEntries(tooltipRows(proofTip('wait', 2),latest).map(row=>[row.label,row.value]))`);
+            // The queue admits one step at a time, so a step after the first shows only what it needs.
+            assert.ok(memory.Needs && !('Free' in memory) && !('Short by' in memory),`A later step shows its room: ${tip.text}`);
+            assert.ok(tip.left>=0 && tip.right<=width && tip.scroll<=tip.client,JSON.stringify(tip));
+            comparisons.push({localReason:true,theme,width,...tip});
+          }
+        }
+        const reasonShot=await call('Page.captureScreenshot',{format:'png'});
+        await writeFile(join(folder,'direct-cargo-local-reason-dark-desktop.png'),Buffer.from(reasonShot.data,'base64'));
+        await capture('direct-cargo-local-reason-dark-tooltip','#tip');
+
+        await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+        await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1100,deviceScaleFactor:1,mobile:false});
+        await navigate('memory_live.html');
+        const shotAt = Date.now()/1000;
+        const mockState = structuredClone(legendReading);
+        const bytes = gib => gib * 1024**3;
+        Object.assign(mockState,{cap:11.3,total:44.4,taken:11.3,used:3.2,reserved:8.1,room:0,shortfall:0});
+        Object.assign(mockState.ram,{queued_builds_bytes:bytes(3.2),build_tools_bytes:0,ci_bytes:0,
+          rust_analyzer_bytes:0,sccache_bytes:0,other_build_tools_bytes:0,
+          safety_target_bytes:bytes(4),safety_covered_bytes:bytes(4),safety_missing_bytes:0,
+          swap_target_bytes:bytes(2.1),swap_covered_bytes:bytes(2.1),swap_missing_bytes:0,
+          build_covered_bytes:bytes(8.1),build_target_bytes:bytes(8.1),build_missing_bytes:0,
+          available_bytes:bytes(14.2),total_bytes:bytes(44.4),cap_bytes:bytes(11.3),room_bytes:0,shortfall_bytes:0});
+        mockState.waiters = [
+          {name:'fps test',unit:'fps',showrunner:'hana',since:shotAt-720,place:1,why:'memory',need:1,free:0,
+            runs_on:'natedev or Mac',first_in_line:true,head_room:{unavailable:'',rows:[{label:'Queue cap',gib:11.3},
+              {label:'− Builds',gib:3.2},
+              {label:'− Build reserved',gib:8.1},{label:'= Free',gib:0}]}},
+          {name:'cables build',unit:'cables',showrunner:'hana',since:shotAt-51*3600,
+            place:2,why:'memory',need:1,free:0,runs_on:'natedev only',because:'edits the merged checkout'},
+          {name:'cables build',unit:'cables',showrunner:'hana',since:shotAt-51*3600,
+            place:3,why:'memory',need:1,free:0,runs_on:'natedev only',because:localReason}];
+        mockState.walk = [{name:'cables build',unit:'cables',showrunner:'hana',runner:'worker',worker:'codex2',
+          started_at:shotAt-840,used:3.2,reserved:8.1,counted:11.3,queued:true,machine:'natedev',
+          progress:{kind:'RowProgress',phase:'testing',done:412,total:993,percent:100*412/993,unit:'tests'}}];
+        // Compare every global legend reference in both covered and shortfall states.
+        for(const state of [mockState,readings.head_memory,readings.head_shortfall,readings.head_swap_shortfall]) {
+          await show(state);
+          const references = await evaluate(`(() => {
+            const shown=shownReading(latest);
+            const legend = Object.fromEntries([
+              ...RAM_BLOCKS.map(([,name,amount])=>[name,ramAmount(amount(shown.ram))]),
+              ['Builds',document.querySelector('#v-g-builds').textContent],
+              ['Free RAM',document.querySelector('#v-g-free').textContent],
+              ['System reserved',document.querySelector('#v-system').textContent],
+              ['Queue cap',document.querySelector('#v-cap').textContent],
+              ['Everything else',document.querySelector('#v-g-else').textContent]]);
+            const keys=[...Object.keys(TIPS),...(latest.waiters||[]).flatMap((row,index)=>row.head_room?[proofTip('wait',index)]:[]),
+              ...(latest.walk.length===1 && latest.walk[0].queued ? [proofTip('row', 0)] : [])];
+            return keys.flatMap(key=>tooltipRows(key,latest).flatMap(row=> {
+              const label=row.label.replace(/^[+−=] /,'');
+              return label in legend ? [{key,label,value:row.value,legend:legend[label]}] : [];
+            }));
+          })()`);
+          for(const reference of references) assert.equal(reference.value,reference.legend,
+            'A tooltip changes a legend amount: '+JSON.stringify(reference));
+          const capSums=await evaluate(`Object.keys(TIPS).concat((latest.waiters||[]).map((row,index)=>proofTip('wait',index)))
+            .map(key=>({key,rows:tooltipRows(key,latest)})).filter(tip=>tip.rows.some(row=>row.label==='Queue cap'))`);
+          for(const tip of capSums) assert.ok(!tip.rows.some(row=>/Safety net|Swap coming back/.test(row.label)),
+            'A cap sum includes a system reserve: '+tip.key);
+          comparisons.push({legendReferences:references});
+        }
+        await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+        for(const [name,key] of [['waiting',proofTip('wait',1,mockState)],['first-in-line',proofTip('wait',0,mockState)],
+          ['running',proofTip('row',0,mockState)],['queue-cap','cap'],['build-reserved','reserved'],['long-reason',proofTip('wait',2,mockState)]]) {
+          const reading = mockState;
+          await show(reading);
+          await evaluate(`showTip(${JSON.stringify(key)},700,700)`);
+          await capture(name,'#tip');
+          const rows=await evaluate(`tooltipRows(${JSON.stringify(key)},latest)`);
+          const amounts=Object.fromEntries(rows.map(row=>[row.label,row.value]));
+          const tenths=value=>Math.round(parseFloat(value)*10);
+          if(amounts.Free||amounts['= Free']) assert.equal(tenths(amounts['Short by']||'0'),
+            Math.max(0,tenths(amounts.Needs)-tenths(amounts.Free||amounts['= Free'])));
+          if(name==='first-in-line') assert.equal(tenths(amounts['= Free']),
+            tenths(amounts['Queue cap'])-tenths(amounts['− Builds'])-tenths(amounts['− Build reserved']));
+          if(name==='running') assert.equal(tenths(amounts['= In queue cap']),tenths(amounts.Uses)+tenths(amounts['+ Build reserved']));
+          if(name==='queue-cap') assert.equal(tenths(amounts['Queue cap']),
+            tenths(amounts.Builds)+tenths(amounts['+ Build reserved'])+tenths(amounts['+ Free']));
+          comparisons.push({mock:name,rows});
+        }
+
+        // Both swap images use the same current reading and dark desktop viewport.
+        mockState.swap.reserve_share_percent=20;
+        for(const version of ['before','after']) {
+          if(version==='before' && !swapBeforePage) continue;
+          await navigate(version==='before'?'swap-before.html':'memory_live.html');
+          await show(mockState);
+          await evaluate("showTip('swap',700,700)");
+          const rows=version==='after' ? await evaluate("tooltipRows('swap',latest)")
+            : await evaluate("document.querySelector('#tip').innerText");
+          if(version==='after') {
+            const share=rows.findIndex(row=>row.label==='Share held');
+            assert.equal(rows[share].value,'20%');
+            assert.ok(!rows.some(row=>row.label==='Target'));
+            assert.equal(rows.find(row=>row.kind==='title').value,'2.1 GiB');
+            const alignment=await evaluate("getComputedStyle(document.querySelector('#tip dt').nextElementSibling).textAlign");
+            assert.equal(alignment,'right');
+          }
+          await capture('swap-'+version,'#tip');
+          comparisons.push({swapShare:version,rows});
+        }
+
+        // A gate job's tooltip says what the job does and what it changes, below its title (#109).
+        await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+        await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1100,deviceScaleFactor:1,mobile:false});
+        const gateReading=structuredClone(base);
+        const gateIndex=gateReading.walk.findIndex(row=>row.queued);
+        assert.ok(gateIndex>=0,'The base reading has no queued run.');
+        const gateAbout='Merges the handler checkpoint into the sdlc branch, tests every module, then pushes sdlc.';
+        Object.assign(gateReading.walk[gateIndex],{name:'natemerge integrate',unit:'natemerge',about:gateAbout,changes:'sdlc branch',
+          showrunner:'sdlc',machine:'natedev',used:6.2,reserved:2.8,counted:9,started_at:gateReading.read_at-600});
+        // The user, 11-16: "Uses 0.0 GiB? ... has to be a bug". The gate row shows a real use, not memory parts.
+        delete gateReading.walk[gateIndex].parts;
+        await show(gateReading);
+        await evaluate(`showTip(proofTip('row', ${gateIndex}),700,420)`);
+        const gateTip=await evaluate("[...document.querySelectorAll('#tip dt, #tip dd')].map(cell=>cell.textContent)");
+        assert.ok(gateTip[0].startsWith('natemerge · integrate'),'The gate tooltip title: '+gateTip[0]);
+        assert.ok(gateTip.includes(gateAbout),'The gate tooltip omits its description.');
+        assert.equal(gateTip[gateTip.indexOf('Changes')+1],'sdlc branch');
+        assert.equal(gateTip[gateTip.indexOf('Uses')+1],'6.2 GiB');
+        const gateFit=await evaluate(`[...document.querySelectorAll('#tip dt, #tip dd')].every(cell=>cell.scrollWidth<=cell.clientWidth)
+          && document.querySelector('#tip .tip').scrollWidth<=document.querySelector('#tip .tip').clientWidth`);
+        assert.ok(gateFit,'The gate tooltip clips its text.');
+        await capture('gate-tooltip-dark-desktop','#tip');
+        await show(base);
+        await evaluate('hideTip()');
+        const endClip=await evaluate(`(() => {
+          const start=document.querySelector('#swap').getBoundingClientRect();
+          const bottom=document.querySelector('main').getBoundingClientRect().bottom;
+          return {x:0,y:start.top+scrollY,width:innerWidth,height:bottom-start.top+24,scale:1};
+        })()`);
+        const endShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:endClip});
+        await writeFile(join(folder,'after-dark-desktop.png'),Buffer.from(endShot.data,'base64'));
         await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,
           failures:failures.map(({cards,...state})=>state)},null,2)+'\n');
         console.log(JSON.stringify({pass:true,views:proofs.length,...(callerFolder ? {output:folder} : {})}));

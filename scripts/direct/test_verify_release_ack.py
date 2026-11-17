@@ -71,7 +71,8 @@ PY
         (holders / "holder").unlink()
         self.environment = {
             **{name: value for name, value in os.environ.items()
-               if name not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID", "UNIT_DETACHED_RUN"}},
+               if name not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID"}
+               and not name.startswith("UNIT_DETACHED_")},
             "HOME": str(self.root), **interpreter_cache_environment(self.root / "cache"),
             "PATH": tool_path,
             "TMPDIR": str(self.root),

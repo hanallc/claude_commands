@@ -13,9 +13,12 @@ from pathlib import Path
 import re
 import select
 import signal
+import site
 import stat
 import sys
+import sysconfig
 import tempfile
+import time
 import traceback
 from types import ModuleType
 from typing import Callable, cast
@@ -47,6 +50,80 @@ class LoadedProgram:
 
 class SeparateProcess:
     """The path needs its original interpreter process."""
+
+
+@dataclass(frozen=True)
+class SourceStamp:
+    """What identifies one version of a source file on disk."""
+
+    modified: int
+    size: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class MissingSource:
+    """The source file is gone."""
+
+
+@dataclass(frozen=True)
+class ChangedDuringCall:
+    """The file changed after its call began, so its module can be older than the file."""
+
+
+def source_stamp(path: str) -> SourceStamp | MissingSource:
+    try:
+        status = os.stat(path)
+    except OSError:
+        return MissingSource()
+    return SourceStamp(status.st_mtime_ns, status.st_size, status.st_ino)
+
+
+def installation_roots() -> tuple[str, ...]:
+    """Folders of the Python installation, whose files do not change while the helper runs."""
+    paths = sysconfig.get_paths()
+    roots = {sys.base_prefix, sys.prefix, sys.exec_prefix, *site.getsitepackages(),
+             *(paths[key] for key in ("stdlib", "platstdlib", "purelib", "platlib") if key in paths)}
+    return tuple(os.path.join(os.path.realpath(root), "") for root in roots)
+
+
+class LoadedSources:
+    """The source files of the modules the helper loaded, as they were when it loaded them.
+
+    A tree update between two calls leaves old modules in sys.modules while a lazy
+    import reads a new file, and the two versions need not fit. A changed source
+    drops every tracked module, so the next call imports one consistent tree.
+    """
+
+    def __init__(self) -> None:
+        self.installation: tuple[str, ...] = installation_roots()
+        self.stamps: dict[str, SourceStamp | MissingSource | ChangedDuringCall] = {}
+        self.untracked: set[str] = set()
+
+    def record(self, started: int) -> None:
+        """Stamp each source module loaded since the last record, by a call that began at started."""
+        for name, module in list(sys.modules.items()):
+            if name == "__main__" or name in self.untracked:
+                continue
+            path = getattr(module, "__file__", None)
+            if (not isinstance(path, str) or not path.endswith(".py")
+                    or os.path.realpath(path).startswith(self.installation)):
+                self.untracked.add(name)
+            elif path not in self.stamps:
+                stamp = source_stamp(path)
+                changed = isinstance(stamp, SourceStamp) and stamp.modified >= started
+                self.stamps[path] = ChangedDuringCall() if changed else stamp
+
+    def refresh(self, programs: dict[str, LoadedProgram | SeparateProcess]) -> None:
+        """Drop every tracked module and loaded program when any tracked source changed."""
+        if all(source_stamp(path) == stamp for path, stamp in self.stamps.items()):
+            return
+        for name, module in list(sys.modules.items()):
+            if name != "__main__" and getattr(module, "__file__", None) in self.stamps:
+                del sys.modules[name]
+        programs.clear()
+        self.stamps.clear()
+        importlib.invalidate_caches()
 
 
 class FieldReader:
@@ -210,6 +287,7 @@ def main() -> int:
     parent = os.getppid()
     stop_when_parent_exits(parent)
     programs: dict[str, LoadedProgram | SeparateProcess] = {}
+    sources = LoadedSources()
     with os.fdopen(os.dup(0), "rb", buffering=0) as source, os.fdopen(os.dup(1), "wb") as reply:
         reader = FieldReader(source.fileno())
         while True:
@@ -222,7 +300,10 @@ def main() -> int:
                 call = read_call(reader)
             except EOFError:
                 break
+            sources.refresh(programs)
+            started = time.time_ns()
             result = run_call(call, programs)
+            sources.record(started)
             _ = reply.write(b"".join(os.fsencode(value) + b"\0" for value in result))
             reply.flush()
     if len(sys.argv) == 2:

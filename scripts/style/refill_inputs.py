@@ -16,6 +16,9 @@ from enum import Enum
 from typing import Protocol
 
 from scripts.style import candidate_generators as generators
+from scripts.style import style_reader
+from scripts.style.style_config import ReaderSource
+from scripts.style.git_process import CheckCouldNotRun
 from scripts.style.git_process import GitReadFailed, TreeEntry, blob_contents, run_git
 
 @dataclass(frozen=True)
@@ -104,7 +107,8 @@ class RefillInputs:
 
     root: Path = Path("/export")
 
-    def __init__(self, repo: Path, tree: str, facts: ImmutableCandidateFacts) -> None:
+    def __init__(self, repo: Path, tree: str, facts: ImmutableCandidateFacts, *,
+                 reader_source: ReaderSource = ReaderSource.PYTHON) -> None:
         self.repo: Path = repo
         self.tree: str = tree
         self.facts: ImmutableCandidateFacts = facts
@@ -112,7 +116,16 @@ class RefillInputs:
         self.entries: dict[str, TreeEntry] = {}
         self.trees: set[str] = set()
         self.manifests: dict[str, dict[str, object]] = {}
-        self._walk(tree, "")
+        if reader_source == ReaderSource.RUST:
+            try:
+                inventory = style_reader.read_trees(repo, (tree,))[tree]
+            except style_reader.ReaderError as error:
+                raise CheckCouldNotRun(str(error)) from error
+            self.trees = {tree, *(entry.object for entry in inventory.entries.values() if entry.kind == "tree")}
+            self.entries = {path: entry for path, entry in inventory.entries.items() if entry.kind != "tree"}
+            self.blobs = {path: entry.object for path, entry in self.entries.items() if entry.kind == "blob"}
+        else:
+            self._walk(tree, "")
         self._verify()
         self.directories: frozenset[str] = frozenset(
             parent.as_posix() for path in self.blobs for parent in PurePosixPath(path).parents

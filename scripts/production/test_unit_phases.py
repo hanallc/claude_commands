@@ -24,13 +24,14 @@ from typing import NamedTuple, cast, override
 from unittest.mock import Mock, patch
 
 
-from scripts.production import census, land_queue, land_runs, live_units, unit_queue
+from scripts.production import census, display_cells, land_queue, land_runs, live_units, unit_queue
 from scripts.accounts import session_state
-from scripts.lib import unit_runs
+from scripts.lib import conf, unit_runs
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
 from scripts.message import sessions
 from scripts.production import showrunners
 from scripts.production import unit_lookup
+from scripts.production import session_staff, unit_config
 from scripts.production import waits_on
 from scripts.herdr.herdr import HerdrPlace
 from scripts.production import unit_phases
@@ -100,8 +101,8 @@ def census_for(units: Sequence[live_units.LiveUnit]) -> census.Census:
                            if isinstance(selected.member, staff.StaffRow) and selected.status != "exited"])
 
 
-def table_of(units: list[live_units.LiveUnit], records: dict[str, object]) -> str:
-    return unit_phases.table(units, records, columns=1000, census_read=census_for(units))
+def table_of(units: list[live_units.LiveUnit], records: dict[str, object], repository: Path) -> str:
+    return unit_phases.table(units, records, columns=1000, census_read=census_for(units), repository=repository)
 
 
 class DetailRow(NamedTuple):
@@ -160,7 +161,6 @@ class UnitPhasesTests(unittest.TestCase):
                                                     "MERGE_GATE_STATE_DIR": str(self.root / "merge-gate")}))
         _ = self.enterContext(patch.object(process_table, "snapshot", return_value={}))
         _ = self.enterContext(patch.object(census, "read", return_value=LOCAL))
-        _ = self.enterContext(patch.object(unit_phases, "REPOSITORY", self.root))
 
     def test_unit_count_cache_filters_sources_and_retries_failed_reads(self) -> None:
         from scripts.statusline import counts_row
@@ -244,7 +244,7 @@ class UnitPhasesTests(unittest.TestCase):
 
     def blocks(self, members: Sequence[staff.StaffRow], records: dict[str, object], *,
                workers: Sequence[census.CensusWorker] = (), statuses: Sequence[str] = (), columns: int = 1000) -> str:
-        return unit_phases.table([unit(row.name, live(row.name)) for row in members], records,
+        return unit_phases.table([unit(row.name, live(row.name)) for row in members], records, repository=self.root,
             now=datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp(), zone=ZoneInfo("UTC"),
             columns=columns,
             census_read=tiles(workers=workers, sessions=[session_of(row, statuses[index] if statuses else "idle")
@@ -267,15 +267,76 @@ class UnitPhasesTests(unittest.TestCase):
         for session in (None, live("another-session"), unit_lookup.ClaudeNotRunning(),
                         unit_lookup.ClaudeUnknown("no records")):
             with self.subTest(session=session):
-                rendered = table_of([unit(member.name, session)], {})
+                rendered = table_of([unit(member.name, session)], {}, self.root)
                 status = "idle" if isinstance(session, unit_lookup.LiveClaude) else "exited"
                 self.assertEqual(rendered.splitlines(), [
                     "working 0 · waiting to merge 0 · waiting on other work 0 · idle 1 · 1 units", "",
-                    "| Unit | Status |", "| --- | --- |", f"| namecheck | {status} |", "",
+                    "| Unit | Director |", "| --- | --- |", f"| namecheck | {status} |", "",
                     "**namecheck** — idle", "",
                     "| Item | Work | State |", "| --- | --- | --- |",
-                    "| Now | Not recorded | Director's current step not recorded |",
-                    "| Next | Not recorded | The director has not chosen the next task |"])
+                    "| Now | Nothing to do | No plan or queued work |"])
+
+    def test_empty_units_are_idle_for_busy_and_idle_directors_without_a_next_row(self) -> None:
+        member = self.member("empty")
+        path = self.write_run(member, "empty", [])
+        cases: tuple[tuple[object, str], ...] = ((None, "No plan or queued work"),
+            ({"phases": []}, "No plan or queued work"),
+            (typed_record(self.root / "plan.md", "done"), "The plan is complete and the queue is empty"))
+        for status in ("busy", "idle"):
+            for record, expected in cases:
+                with self.subTest(status=status, record=record):
+                    with (patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads,
+                          patch.object(unit_queue, "read_items", wraps=unit_queue.read_items) as queues):
+                        rendered = self.blocks([member], {member.name: record}, statuses=[status])
+                    self.assertIn("**empty** — idle", rendered)
+                    self.assertEqual(detail_rows(rendered, member.name), [DetailRow("Now", "Nothing to do", expected)])
+                    self.assertEqual(rendered.splitlines()[0],
+                        "working 0 · waiting to merge 0 · waiting on other work 0 · idle 1 · 1 units")
+                    self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
+                    self.assertEqual(queues.call_count, 1)
+
+    def test_finished_steps_of_closed_phases_do_not_supply_now(self) -> None:
+        member = self.member("closed")
+        at = datetime(2026, 11, 15, 17, 57, tzinfo=UTC).timestamp()
+        for kind in ("pass", "activity"):
+            for queued in (False, True):
+                with self.subTest(kind=kind, queued=queued):
+                    _ = self.write_run(member, "closed", [("closed", "Closed delivery")], [
+                        self.phase_event(kind + "_started", "closed", pass_kind="impl", pass_instance_id="writer",
+                                         activity_instance_id="check", activity_text="Checks the closed delivery"),
+                        self.phase_event(kind + "_finished", "closed", pass_kind="impl", pass_instance_id="writer",
+                                         activity_instance_id="check", activity_text="Checks the closed delivery", timestamp_epoch=at),
+                        self.phase_event("phase_finished", "closed", status="completed")])
+                    _ = self.queue(member, *([unit_queue.QueuedItem("Next delivery")] if queued else []))
+                    rendered = self.blocks([member], {}, statuses=["busy"])
+                    rows = detail_rows(rendered, member.name)
+                    if queued:
+                        self.assertIn(("Now", "Not recorded", "Director's current step not recorded"), rows)
+                        self.assertIn(("Next", "Next delivery", "Ready"), rows)
+                    else:
+                        self.assertEqual(rows, [DetailRow("Now", "Nothing to do", "No plan or queued work")])
+                    self.assertNotIn("finished at", rendered)
+
+    def test_top_table_names_the_director_and_keeps_its_status_values(self) -> None:
+        member = self.member("director")
+        _ = self.write_run(member, "director", [("work", "Check delivery")], [
+            self.phase_event("activity_started", "work", activity_text="checks delivery")])
+        for status in ("idle", "busy"):
+            with self.subTest(status=status):
+                rendered = self.blocks([member], {}, statuses=[status])
+                self.assertIn("| Unit | Director |", rendered)
+                self.assertIn(f"| director | {status} |", rendered)
+                self.assertIn("**director** — working", rendered)
+                self.assertNotIn("| Status |", rendered)
+
+    def test_narrow_director_column_keeps_the_recorded_status_word(self) -> None:
+        for title in ("Director", "Status"):
+            with self.subTest(title=title):
+                _, rows = display_cells.wrapped(
+                    ("Unit", title, "Progress", "Phase", "ETA Next", "ETA Plan"),
+                    [("admin-console", "unreadable", "🟩" * 20, "restart-record-replace", "23:55", "23:55")], 40)
+                self.assertTrue(rows)
+                self.assertEqual([row[1] for row in rows if row[1]], ["unreadable"])
 
     def test_blocks_keep_full_text_at_each_width(self) -> None:
         member = self.member("wide")
@@ -309,32 +370,32 @@ class UnitPhasesTests(unittest.TestCase):
         members = [self.member(name) for name in ("zulu", "Beta", "alpha")]
         selected = [unit(row.name, live(row.name)) for row in members]
         selected[1] = selected[1]._replace(machine="mac")
-        rendered = unit_phases.table(selected, {}, census_read=census_for(selected))
+        rendered = unit_phases.table(selected, {}, repository=self.root, census_read=census_for(selected))
         self.assertEqual([line for line in rendered.splitlines() if line.startswith("**")],
                          ["**alpha** (natedev) — idle", "**Beta** (mac) — idle", "**zulu** (natedev) — idle"])
         self.assertEqual(rendered.count("\n\n"), 7)
         self.assertEqual(rendered.count("| Item | Work | State |"), 3)
         self.assertEqual(rendered.count("| Now |"), 3)
-        self.assertEqual(rendered.count("| Next |"), 3)
+        self.assertEqual(rendered.count("| Now | Nothing to do | No plan or queued work |"), 3)
+        self.assertNotIn("| Next |", rendered)
         for field in ("Also", "Wait", "Merge"):
             self.assertNotIn(f"| {field} |", rendered)
-        self.assertEqual(unit_phases.table([], {}, census_read=LOCAL).strip(),
+        self.assertEqual(unit_phases.table([], {}, repository=self.root, census_read=LOCAL).strip(),
                          "working 0 · waiting to merge 0 · waiting on other work 0 · idle 0 · 0 units")
 
     def test_phase_names_the_open_phase_or_where_the_plan_stands(self) -> None:
         member = self.member("plan")
-        cases: list[tuple[object, str, DetailRow, DetailRow, tuple[tuple[str, str], ...], unit_phases.PlanSource]] = [
+        cases: list[tuple[object, str, DetailRow, DetailRow | None, tuple[tuple[str, str], ...], unit_phases.PlanSource]] = [
             (typed_record(self.root / "plan.md", "done", "todo", "todo"), "unknown",
              DetailRow("Now", "Not recorded", "Director's current step not recorded"),
              DetailRow("Next", "Delivery 2 (2)", "Not started"), (), unit_phases.PlanSource.READABLE),
             (typed_record(self.root / "plan.md", "done"), "idle",
-             DetailRow("Now", "Not recorded", "Director's current step not recorded"),
-             DetailRow("Next", "Not recorded", "Nothing queued; the plan is complete"), (), unit_phases.PlanSource.READABLE),
+             DetailRow("Now", "Nothing to do", "The plan is complete and the queue is empty"),
+             None, (), unit_phases.PlanSource.READABLE),
             ({"current": None, "phases": []}, "idle",
-             DetailRow("Now", "Not recorded", "Director's current step not recorded"),
-             DetailRow("Next", "Not recorded", "The director has not chosen the next task"), (), unit_phases.PlanSource.EMPTY),
-            (None, "idle", DetailRow("Now", "Not recorded", "Director's current step not recorded"),
-             DetailRow("Next", "Not recorded", "The director has not chosen the next task"), (), unit_phases.PlanSource.ABSENT),
+             DetailRow("Now", "Nothing to do", "No plan or queued work"), None, (), unit_phases.PlanSource.EMPTY),
+            (None, "idle", DetailRow("Now", "Nothing to do", "No plan or queued work"),
+             None, (), unit_phases.PlanSource.ABSENT),
             ({"unavailable": "plan unreadable"}, "unknown",
              DetailRow("Now", "Not recorded", "Director's current step not recorded"),
              DetailRow("Next", "Not recorded", "The director has not chosen the next task"), (), unit_phases.PlanSource.UNAVAILABLE),
@@ -358,13 +419,93 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertIn(f"**plan** — {bucket}", rendered)
                 rows = detail_rows(rendered, "plan")
                 self.assertIn(now, rows)
-                self.assertIn(next_text, rows)
+                if next_text is None:
+                    self.assertEqual(rows, [now])
+                else:
+                    self.assertIn(next_text, rows)
                 self.assertEqual(len(seen), 1)
                 self.assertEqual(seen[0].plan_source, source)
                 if isinstance(record, phase_table.PhaseRecord) and len(record.phases) == 3:
                     self.assertIn(("Later", "Delivery 3 (3)", "Not started"), rows)
                 if source != unit_phases.PlanSource.READABLE:
                     self.assertNotIn("Nothing queued", rendered)
+
+    def test_configured_missing_plans_are_absent_only_in_existing_local_worktrees(self) -> None:
+        owner = fixture_member("showrunner", name="sdlc")
+        config = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plan.md")), unit_config.NoAppPort(), ())
+        cases: tuple[tuple[str, str, bool, OSError | UnicodeError], ...] = (
+            ("removed", "natedev", True, FileNotFoundError("plan removed")),
+            ("missing-tree", "natedev", False, FileNotFoundError("worktree missing")),
+            ("remote-tree", "mac", True, FileNotFoundError("remote plan unreadable here")),
+            ("permission", "natedev", True, PermissionError("plan denied")),
+            ("read-error", "natedev", True, OSError("plan read failed")),
+            ("encoding", "natedev", True, UnicodeError("plan encoding failed")),
+        )
+        for name, machine, exists, error in cases:
+            with self.subTest(name=name):
+                tree = self.root / name
+                if exists:
+                    tree.mkdir()
+                member = fixture_member("unit", name=name, parent=owner.id,
+                    worktree=staff.PresentWorktree(machine, tree))
+                with (patch.object(unit_lookup, "doc_units", return_value=[member]),
+                      patch.object(session_staff.RowResolver, "unit_config", return_value=config),
+                      patch.object(plan_history, "plan_phases", side_effect=error) as read):
+                    records = unit_phases.production_records(self.root / "production.md")
+                read.assert_called_once_with(tree / "docs/plan.md")
+                absent = name == "removed"
+                self.assertEqual(unit_phases.task_facts(records[name], ()).plan_source,
+                                 unit_phases.PlanSource.ABSENT if absent else unit_phases.PlanSource.UNAVAILABLE)
+                rendered = self.blocks([member], records, statuses=["busy"])
+                label = f" ({machine})" if machine != "natedev" else ""
+                self.assertIn(f"**{name}**{label} — {'idle' if absent else 'unknown'}", rendered)
+                if absent:
+                    self.assertEqual(detail_rows(rendered, name),
+                        [DetailRow("Now", "Nothing to do", "No plan or queued work")])
+                else:
+                    self.assertNotIn("Nothing to do", rendered)
+                    self.assertIn("unavailable", unit_phases.record_fields(records[name]))
+
+    def test_fallback_missing_plans_are_absent_only_in_existing_local_worktrees(self) -> None:
+        owner = fixture_member("showrunner", name="sdlc")
+        original_facts = unit_phases.task_facts
+        cases: tuple[tuple[str, str, bool, OSError | UnicodeError], ...] = (
+            ("removed", "natedev", True, FileNotFoundError("plan removed")),
+            ("missing-tree", "natedev", False, FileNotFoundError("worktree missing")),
+            ("remote-tree", "mac", True, FileNotFoundError("remote plan unreadable here")),
+            ("permission", "natedev", True, PermissionError("plan denied")),
+            ("read-error", "natedev", True, OSError("plan read failed")),
+            ("encoding", "natedev", True, UnicodeError("plan encoding failed")),
+        )
+        for name, machine, exists, error in cases:
+            with self.subTest(name=name):
+                tree = self.root / name
+                if exists:
+                    tree.mkdir()
+                member = fixture_member("unit", name=name, parent=owner.id,
+                    worktree=staff.PresentWorktree(machine, tree))
+                _ = self.write_run(member, name, (), plan="docs/plan.md")
+                sources: list[unit_phases.PlanSource] = []
+
+                def facts(record: object, events: Sequence[dict[str, object]]) -> unit_phases.UnitTaskFacts:
+                    found = original_facts(record, events)
+                    sources.append(found.plan_source)
+                    return found
+
+                with (patch.object(plan_history, "plan_phases", side_effect=error) as read,
+                      patch.object(unit_phases, "task_facts", side_effect=facts)):
+                    rendered = self.blocks([member], {name: {"unavailable": "configured plan unavailable"}},
+                                           statuses=["busy"])
+                read.assert_called_once_with(tree / "docs/plan.md")
+                absent = name == "removed"
+                self.assertEqual(sources, [unit_phases.PlanSource.ABSENT if absent else unit_phases.PlanSource.UNAVAILABLE])
+                label = f" ({machine})" if machine != "natedev" else ""
+                self.assertIn(f"**{name}**{label} — {'idle' if absent else 'unknown'}", rendered)
+                if absent:
+                    self.assertEqual(detail_rows(rendered, name),
+                        [DetailRow("Now", "Nothing to do", "No plan or queued work")])
+                else:
+                    self.assertNotIn("Nothing to do", rendered)
 
     def test_workers_join_the_open_pass_by_id_before_assignment(self) -> None:
         member = self.member("roles")
@@ -597,7 +738,7 @@ class UnitPhasesTests(unittest.TestCase):
                         read = tiles(workers=[census_worker("tester", member.id, status="idle")] if worker_wait else [],
                             sessions=[census.CensusSession(member.current_session, "idle",
                                 () if worker_wait else (census.CensusShell("Build delivery", now - 120),))])
-                        rendered = unit_phases.table([unit("style", live("style"))], {}, now=now,
+                        rendered = unit_phases.table([unit("style", live("style"))], {}, repository=self.root, now=now,
                                                      zone=ZoneInfo("UTC"), census_read=read)
                         self.assertIn(f"**style** — {bucket}", rendered)
                         self.assertIn("working 1" if bucket == "working" else "waiting on other work 1", rendered.splitlines()[0])
@@ -612,7 +753,7 @@ class UnitPhasesTests(unittest.TestCase):
         now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
         read = tiles(sessions=[census.CensusSession(member.current_session, "busy", (
             census.CensusShell("Run the AWS gate", now - 720), census.CensusShell("Watch CI", None)))])
-        rendered = unit_phases.table([unit("shells", live("shells"))], {}, now=now, zone=ZoneInfo("UTC"), census_read=read)
+        rendered = unit_phases.table([unit("shells", live("shells"))], {}, repository=self.root, now=now, zone=ZoneInfo("UTC"), census_read=read)
         self.assertIn("**shells** — working", rendered)
         self.assertIn(("Now", "Run the AWS gate", "Runs; the director waits for its result"), detail_rows(rendered, "shells"))
         self.assertIn(("Also", "Watch CI", "Runs; the director waits for its result"), detail_rows(rendered, "shells"))
@@ -634,7 +775,7 @@ class UnitPhasesTests(unittest.TestCase):
                                      wait_reason=reason, wait_started_epoch=now - 120, holder=holder)])
                 read = tiles(sessions=[census.CensusSession(member.current_session, "idle",
                     (census.CensusShell("Build delivery", now - 120),))])
-                rendered = unit_phases.table([unit("shells", live("shells"))], {}, now=now,
+                rendered = unit_phases.table([unit("shells", live("shells"))], {}, repository=self.root, now=now,
                                              zone=ZoneInfo("UTC"), census_read=read)
                 self.assertIn("**shells** — waiting on other work", rendered)
                 rows = detail_rows(rendered, "shells")
@@ -655,7 +796,8 @@ class UnitPhasesTests(unittest.TestCase):
                   "c" * 9: land_queue.Place(2, "show images", "shells images")}
         carrier = {"c" * 40: land_queue.Place(3, "show batch", "builder carrier")}
         views: list[tuple[land_queue.LandView, str]] = [
-            (land_queue.LandView({}, land_queue.NoLine(), {}, frozenset(), {}), "Merge position not recorded"),
+            (land_queue.LandView({}, land_queue.NoLine(), {}, frozenset(), {}),
+             "Checkpoint ccccccccc at time not recorded; not in sdlc's merge line"),
             (land_queue.LandView({"c" * 9: "shells images"}, {}, {}, frozenset(), {}), "sdlc merges it now"),
             (land_queue.LandView({"d" * 40: "other first"}, {}, {}, frozenset(), {}),
              "Checkpoint ccccccccc at time not recorded; not in sdlc's merge line"),
@@ -665,12 +807,12 @@ class UnitPhasesTests(unittest.TestCase):
             (land_queue.LandView({}, second, {"c" * 40: landed}, frozenset(), {}), "2nd in sdlc's merge line"),
             (land_queue.LandView({}, {}, {"c" * 12: failed}, frozenset(), {}),
              "sdlc cannot merge it: test_cards red"),
-            (land_queue.LandView({}, {}, {"c" * 40: landed}, frozenset(), {}), "sdlc merged it"),
+            (land_queue.LandView({}, {}, {"c" * 40: landed}, frozenset(), {}), ""),
             (land_queue.LandView({"c" * 40: "shells images"}, second, {"c" * 40: failed}, frozenset(), {}), "sdlc merges it now"),
             (land_queue.LandView({}, {}, {}, frozenset(), carrier), "3rd in sdlc's merge line"),
             (land_queue.LandView({}, {}, {"c" * 40: failed}, frozenset(), carrier),
              "3rd in sdlc's merge line"),
-            (land_queue.LandView({}, {}, {"c" * 40: landed}, frozenset(), carrier), "sdlc merged it"),
+            (land_queue.LandView({}, {}, {"c" * 40: landed}, frozenset(), carrier), ""),
             (land_queue.LandView({}, second, {}, frozenset(), carrier), "2nd in sdlc's merge line"),
             (land_queue.LandView({}, {}, {}, frozenset({"c" * 40}), {}), "sdlc merges it now"),
         ]
@@ -678,6 +820,16 @@ class UnitPhasesTests(unittest.TestCase):
             with self.subTest(merge=expected):
                 result = unit_phases.unit_lands("shells", view, open_sent={"images": unit_phases.phase_sent_work(events)},
                     now=now, zone=ZoneInfo("UTC"), on_main=lambda _commit: False, production="sdlc")
+                if not expected:
+                    self.assertEqual(result.entries, ())
+                    self.assertFalse(result.pending)
+                    _ = self.write_run(member, "landed-open", [("images", "Images")], [
+                        self.phase_event("checkpoint", "images", checkpoint_commit="c" * 40)])
+                    with patch.object(land_queue, "land_view", return_value=view):
+                        rendered = self.blocks([member], {})
+                    self.assertNotIn("Images (images)", [row.work for row in detail_rows(rendered, member.name)])
+                    self.assertNotIn("merged it", rendered)
+                    continue
                 matching = [entry for entry in result.entries
                             if entry.work == "Images" and expected.casefold() in entry.state_text.casefold()]
                 self.assertTrue(matching, result.entries)
@@ -704,7 +856,7 @@ class UnitPhasesTests(unittest.TestCase):
                     self.phase_event("checkpoint", "acctload", checkpoint_commit=commit, timestamp_epoch=recorded)])
                 with (patch.object(land_queue, "land_view", return_value=view),
                       patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads):
-                    rendered = unit_phases.table([unit(member.name, live(member.name))], {}, now=now,
+                    rendered = unit_phases.table([unit(member.name, live(member.name))], {}, repository=self.root, now=now,
                         zone=ZoneInfo(zone), columns=1000, census_read=tiles(sessions=[session_of(member, "idle")]))
                 self.assertIn(("Now", "Load the account (acctload)",
                                f"Checkpoint e34ccac01 at {expected}; not in sdlc's merge line"),
@@ -718,6 +870,375 @@ class UnitPhasesTests(unittest.TestCase):
                                        now=now, zone=ZoneInfo("UTC"), on_main=lambda _: False)
         self.assertEqual(result.entries, (unit_phases.WorkItem("Acctload",
                          "Checkpoint e34ccac01 at 17:20; not in the merge line"),))
+
+    def test_finished_checkpoints_remain_visible_until_they_merge(self) -> None:
+        member = self.member("finished")
+        base = self.repository()
+        commit = commit_repository(self.root, "Finished delivery", allow_empty=True)
+        now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
+        at = now - 600
+        empty = land_queue.LandView({}, {}, {}, frozenset(), {})
+        merged: land_runs.LandResult = {"commit": commit, "production": "sdlc", "unit": "finished", "phase": "delivery",
+            "landed": True, "step": "", "state": "", "detail": "", "time": "2026-11-15T17:55:00+00:00"}
+        cases = (
+            ("outside", empty, f"Checkpoint {commit[:9]} at 17:50; not in sdlc's merge line"),
+            ("unused", empty._replace(line=land_queue.NoLine()),
+             f"Checkpoint {commit[:9]} at 17:50; not in sdlc's merge line"),
+            ("in line", empty._replace(line={commit: land_queue.Place(2, "sdlc batch", "finished delivery")}),
+             "2nd in sdlc's merge line"),
+            ("running", empty._replace(running={commit: "finished delivery"}), "sdlc merges it now"),
+            ("merged", empty._replace(results={commit: merged}), ""),
+            ("on main", empty, ""))
+        for name, view, expected in cases:
+            for later_activity in (False, True):
+                with self.subTest(state=name, later_activity=later_activity):
+                    tail = [self.phase_event("checkpoint", "delivery", checkpoint_commit=base if name == "on main" else commit,
+                                              timestamp_epoch=at),
+                            self.phase_event("phase_finished", "delivery", status="completed", timestamp_epoch=at + 60)]
+                    if later_activity:
+                        tail.append(self.phase_event("activity_started", "delivery", activity_text="writes the phase report"))
+                    if name in ("merged", "on main"):
+                        tail.append({"event_type": "wait_started", "wait_scope": "unit", "target_work": "delivery",
+                            "wait_id": "hold", "wait_by": "sdlc", "wait_reason": "the user approves delivery",
+                            "wait_kind": "WaitingForUser", "wait_started_epoch": at + 120})
+                    path = self.write_run(member, "finished", [("delivery", "Completed delivery")], tail)
+                    with (patch.object(land_queue, "land_view", return_value=view),
+                          patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads):
+                        rendered = self.blocks([member], {})
+                    rows = detail_rows(rendered, member.name)
+                    if expected:
+                        self.assertIn(("Now", "Completed delivery (delivery)", expected), rows)
+                        self.assertIn("**finished** — waiting to merge", rendered)
+                    else:
+                        self.assertNotIn("Completed delivery (delivery)", [row.work for row in rows])
+                    self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
+
+    def test_finished_checkpoint_copies_share_main_and_checkpoint_reads(self) -> None:
+        member = self.member("copies")
+        other = self.member("shared")
+        base = self.repository()
+        _ = self.git("switch", "-q", "-c", "checkpoints")
+        subject = "checkpoint(delivery): show each page title"
+        with patch.dict(os.environ, {"GIT_AUTHOR_DATE": "2026-11-15T17:54:35+00:00"}):
+            _ = (self.root / "delivery.txt").write_text("delivery\n")
+            checkpoint = commit_repository(self.root, subject, "delivery.txt")
+        with patch.dict(os.environ, {"GIT_AUTHOR_DATE": "2026-11-15T17:54:36+00:00"}):
+            different_time = commit_repository(self.root, subject, allow_empty=True)
+        with patch.dict(os.environ, {"GIT_AUTHOR_DATE": "2026-11-15T17:54:35+00:00"}):
+            different_subject = commit_repository(self.root, "checkpoint(delivery): another title", allow_empty=True)
+        _ = self.git("switch", "-q", "main")
+        _ = (self.root / "main.txt").write_text("main progress\n")
+        _ = commit_repository(self.root, "Main progress", "main.txt")
+        with patch.dict(os.environ, {"GIT_COMMITTER_DATE": "2026-11-15T17:55:22+00:00"}):
+            _ = self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "cherry-pick", checkpoint)
+        copied = self.git("rev-parse", "HEAD")
+        _ = self.git("update-ref", "refs/remotes/origin/main", copied)
+        self.assertNotEqual(checkpoint, copied)
+        self.assertFalse(waits_on.on_main(self.root, checkpoint))
+        phases = [("copied", checkpoint), ("repeated", checkpoint), ("different-time", different_time),
+                  ("different-subject", different_subject), ("unreadable", "f" * 40),
+                  ("subject", "a" * 40), ("result", "b" * 40), ("ancestry", base),
+                  ("open-subject", "a" * 40), ("open-result", "d" * 40)]
+        path = self.write_run(member, "copies", [(phase, phase.capitalize() + " delivery") for phase, _ in phases],
+            [event for phase, commit in phases for event in (
+                self.phase_event("checkpoint", phase, checkpoint_commit=commit, timestamp_epoch=100),
+                self.phase_event("phase_finished", phase, status="completed"))
+             if event["event_type"] == "checkpoint" or not phase.startswith("open-")])
+        other_path = self.write_run(other, "shared-copy", [("copied", "Shared delivery")], [
+            self.phase_event("checkpoint", "copied", checkpoint_commit=checkpoint),
+            self.phase_event("phase_finished", "copied", status="completed")])
+        landed: land_runs.LandResult = {"commit": "b" * 40, "production": "sdlc", "unit": member.name,
+            "phase": "result", "landed": True, "step": "", "state": "", "detail": "", "time": "1970-01-01T00:03:20+00:00"}
+        open_landed: land_runs.LandResult = {**landed, "commit": "d" * 40, "phase": "open-result", "time": "bad time"}
+        view = land_queue.LandView({}, {}, {row["commit"]: row for row in (landed, open_landed)}, frozenset(), {})
+        with (patch.object(land_queue, "land_view", return_value=view),
+              patch.object(waits_on, "landed_phases", return_value={
+                  (member.name, "subject"): waits_on.PhaseMerge("c" * 40, 200, "a" * 9),
+                  (member.name, "open-subject"): waits_on.PhaseMerge("c" * 40, 50, "A" * 9)}),
+              patch.object(waits_on, "main_commit_identities", wraps=waits_on.main_commit_identities) as main_reads,
+              patch.object(waits_on, "copied_on_main", wraps=waits_on.copied_on_main) as checks,
+              patch.object(waits_on, "git", wraps=waits_on.git) as git_reads,
+              patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as run_reads):
+            rendered = self.blocks([member, other], {})
+        work = [row.work for row in detail_rows(rendered, member.name)]
+        for phase in ("copied", "repeated", "subject", "result", "ancestry", "open-subject", "open-result"):
+            self.assertNotIn(phase.capitalize() + f" delivery ({phase})", work)
+        for phase in ("different-time", "different-subject", "unreadable"):
+            self.assertIn(phase.capitalize() + f" delivery ({phase})", work)
+        self.assertNotIn("Shared delivery (copied)", [row.work for row in detail_rows(rendered, other.name)])
+        main_reads.assert_called_once_with(self.root)
+        expected = [checkpoint, different_time, different_subject, "f" * 40]
+        self.assertCountEqual([call.args[1] for call in checks.call_args_list], expected)
+        self.assertCountEqual([call.args[-1] for call in git_reads.call_args_list if call.args[1] == "show"], expected)
+        self.assertFalse(any(call.args[-1] in ("a" * 40, "b" * 40, "d" * 40)
+                             for call in git_reads.call_args_list))
+        self.assertEqual(sum(call.args[1:] == ("log", "origin/main", "--no-merges", "--format=%at%x00%s")
+                             for call in git_reads.call_args_list), 1)
+        self.assertCountEqual([call.args[0] for call in run_reads.call_args_list], [path, other_path])
+
+    def test_main_reads_merge_evidence_from_the_production_checkout(self) -> None:
+        _ = self.repository()
+        repository = self.root / "cargo-liner"
+        repository.mkdir()
+
+        def git(*arguments: str) -> str:
+            return subprocess.run(["git", "-C", str(repository), *arguments], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+
+        _ = git("init", "-q", "-b", "main")
+        base = commit_repository(repository, "Cargo base", allow_empty=True)
+        _ = git("switch", "-q", "-c", "checkpoint")
+        _ = (repository / "delivery").write_text("delivery\n")
+        checkpoint = commit_repository(repository, "Cargo checkpoint", "delivery")
+        pending = commit_repository(repository, "Cargo pending", allow_empty=True)
+        carrier = commit_repository(repository, "Cargo carrier", allow_empty=True)
+        _ = git("switch", "-q", "main")
+        _ = commit_repository(repository, "Cargo main progress", allow_empty=True)
+        _ = git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "cherry-pick", checkpoint)
+        _ = git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.assertFalse(waits_on.on_main(repository, checkpoint))
+        self.assertTrue(waits_on.on_main(repository, base))
+        self.assertFalse(waits_on.on_main(self.root, base))
+        doc = self.root / "cargo-production.md"
+        _ = doc.write_text(f"# Production\n- **Merge branch:** main\n"
+                           + f"- **Showrunner checkout:** {repository}\n- **Log:** LOG\n")
+        owner = fixture_member("showrunner", name="cargo-liner", doc=staff.LiveDoc("natedev", doc))
+        members = [fixture_member("unit", name=name, parent=owner.id,
+                                  worktree=staff.PresentWorktree("natedev", self.root / name))
+                   for name in ("handler", "port")]
+        for member in members:
+            _ = self.write_run(member, member.name, [("merged", "Merged work"), ("copied", "Copied work"),
+                                                    ("open-merged", "Open merged work"), ("open-copied", "Open copied work"),
+                                                    ("pending", "Pending work")],
+                [event for phase, commit in (("merged", base), ("copied", checkpoint), ("open-merged", base),
+                                            ("open-copied", checkpoint), ("pending", pending))
+                 for event in (self.phase_event("checkpoint", phase, checkpoint_commit=commit),
+                               self.phase_event("phase_finished", phase, status="completed"))
+                 if event["event_type"] == "checkpoint" or not phase.startswith("open-")])
+            _ = self.queue(member, unit_queue.QueuedItem("follow: Review delivery", base))
+        foreign = self.root / "aws"
+        foreign.mkdir()
+        _ = subprocess.run(["git", "init", "-q", "-b", "main", str(foreign)], check=True, capture_output=True)
+        foreign_commit = commit_repository(foreign, "AWS spend tool", allow_empty=True)
+        _ = subprocess.run(["git", "-C", str(foreign), "update-ref", "refs/remotes/origin/main", "HEAD"],
+                           check=True, capture_output=True)
+        foreign_doc = self.root / "aws-production.md"
+        _ = foreign_doc.write_text(f"# Production\n- **Merge branch:** main\n"
+                                   + f"- **Showrunner checkout:** {foreign}\n- **Log:** LOG\n")
+        foreign_owner = fixture_member("showrunner", name="aws-owner", doc=staff.LiveDoc("natedev", foreign_doc))
+        targets = [fixture_member("unit", name=name, parent=foreign_owner.id,
+                                  worktree=staff.PresentWorktree("natedev", self.root / name))
+                   for name in ("aws", "aws-other")]
+        for target in targets:
+            _ = self.write_run(target, target.name, [("spendtool", "Spend tool")], [
+                self.phase_event("checkpoint", "spendtool", checkpoint_commit=foreign_commit)])
+        plan = self.root / "dependencies.md"
+        _ = plan.write_text("# Plan\n### Phase later — Later delivery · status: todo\n"
+                            + "Depends on: aws/spendtool, handler/open-copied\n")
+        records: dict[str, object] = {member.name: {"plan": str(plan), "phases": [
+            {"phase": "later", "title": "Later delivery", "status": "todo"}]} for member in members}
+        for member in members:
+            _ = self.queue(member, unit_queue.QueuedItem("follow: Review delivery", base),
+                unit_queue.QueuedItem("copy: Review copy", "handler/open-copied"),
+                unit_queue.QueuedItem("aws: Review AWS", "aws/spendtool"),
+                unit_queue.QueuedItem("other: Review other", "aws-other/spendtool"))
+        listing = live_units.UnitListing([unit(member.name, live(member.name)) for member in members], ())
+        for running in (False, True):
+            with self.subTest(running=running):
+                with land_queue.edited() as items:
+                    items.clear()
+                if not running:
+                    land_queue.add("cargo-liner carrier", batch="", commits=[carrier], first=False, before=None)
+                output = io.StringIO()
+                with (land_runs.landing([carrier] if running else [], ["handler carrier"] if running else []),
+                      patch.object(live_units, "read_units", return_value=listing),
+                      patch.object(unit_phases, "production_records", return_value=records),
+                      patch.object(unit_phases, "send_anomalies"),
+                      patch.object(land_queue, "land_view", wraps=land_queue.land_view) as lands,
+                      patch.object(waits_on, "landed_phases", wraps=waits_on.landed_phases) as merges,
+                      patch.object(waits_on, "main_commit_identities", wraps=waits_on.main_commit_identities) as identities,
+                      patch.object(waits_on, "copied_on_main", wraps=waits_on.copied_on_main) as copies,
+                      patch.object(waits_on, "state", wraps=waits_on.state) as dependencies,
+                      patch.object(unit_phases, "read_production", wraps=read_production) as sources,
+                      patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as run_reads,
+                      contextlib.redirect_stdout(output)):
+                    self.assertEqual(unit_phases.main(["--production", owner.name], columns=1000), 0)
+                for member in members:
+                    rows = detail_rows(output.getvalue(), member.name)
+                    work = [row.work for row in rows]
+                    self.assertNotIn("Merged work (merged)", work)
+                    self.assertNotIn("Copied work (copied)", work)
+                    self.assertNotIn("Open merged work (open-merged)", work)
+                    self.assertNotIn("Open copied work (open-copied)", work)
+                    expected = "cargo-liner merges it now" if running else "1st in cargo-liner's merge line"
+                    self.assertTrue(any(row.work == "Pending work (pending)" and row.state == expected for row in rows), rows)
+                    self.assertIn(("Next", "Review delivery (follow)", "Ready"), rows)
+                    for work in ("Review copy (copy)", "Review AWS (aws)", "Review other (other)"):
+                        self.assertTrue(any(row.work == work and row.state == "Ready" for row in rows), rows)
+                    self.assertTrue(any(row.work == "Later delivery (later)" and row.state == "Not started"
+                                        for row in rows), rows)
+                self.assertNotIn("not in cargo-liner's merge line", output.getvalue())
+                for reads in (lands, merges, identities):
+                    self.assertCountEqual([call.args[0] for call in reads.call_args_list], [repository, foreign])
+                self.assertEqual([call.args[0] for call in sources.call_args_list], [owner.name, foreign_owner])
+                self.assertEqual(len(run_reads.call_args_list), 4)
+                self.assertEqual(len({call.args[0] for call in run_reads.call_args_list}), 4)
+                self.assertEqual(sum(call.args[1] == checkpoint for call in copies.call_args_list), 1)
+                self.assertTrue(all(call.args[0] == repository for call in copies.call_args_list))
+                self.assertCountEqual([(call.args[0], call.kwargs["repo"]) for call in dependencies.call_args_list],
+                    [(base, repository), ("handler/open-copied", repository), ("aws/spendtool", foreign),
+                     ("aws-other/spendtool", foreign)])
+
+    def test_finished_phases_use_merge_subjects_and_results_with_other_hashes(self) -> None:
+        member = self.member("finished")
+        _ = self.repository()
+        _ = self.git("switch", "-q", "-c", "checkpoint")
+        checkpoint = commit_repository(self.root, "Recorded checkpoint", allow_empty=True)
+        _ = self.git("switch", "-q", "main")
+        for phase in ("subject", "failed", "misleading"):
+            _ = self.git("switch", "-q", "-c", phase)
+            published = commit_repository(self.root, "Published delivery", allow_empty=True)
+            _ = self.git("switch", "-q", "main")
+            title = f"Merge finished phase {phase} ({published[:9]}) into sdlc"
+            if phase == "misleading":
+                title = "Revert " + title
+            _ = self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "merge", "-q", "--no-ff",
+                         "-m", title, phase)
+        _ = self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.assertFalse(waits_on.on_main(self.root, checkpoint))
+        phases = [(phase, phase.capitalize() + " delivery") for phase in ("subject", "failed", "result", "waiting", "misleading")]
+        tail = [event for phase, _ in phases for event in (
+            self.phase_event("checkpoint", phase, checkpoint_commit=checkpoint, timestamp_epoch=1_794_761_400),
+            self.phase_event("phase_finished", phase, status="completed"))]
+        path = self.write_run(member, "merged-other-hashes", phases, tail)
+        other = self.member("outside")
+        other_path = self.write_run(other, "unmerged-other-unit", [("subject", "Other delivery")], [
+            self.phase_event("checkpoint", "subject", checkpoint_commit=checkpoint),
+            self.phase_event("phase_finished", "subject", status="completed")])
+        failed: land_runs.LandResult = {"commit": "a" * 40, "production": "sdlc", "unit": "finished", "phase": "failed",
+            "landed": False, "step": "tests", "state": "failed", "detail": "old merge failure", "time": "2026-11-15T17:50:00+00:00"}
+        landed: land_runs.LandResult = {**failed, "commit": "b" * 40, "phase": "result", "landed": True}
+        newer_failure: land_runs.LandResult = {**failed, "commit": "c" * 40, "phase": "result", "time": "2026-11-15T17:55:00+00:00"}
+        view = land_queue.LandView({}, {}, {row["commit"]: row for row in (failed, landed, newer_failure)}, frozenset(), {})
+        with (patch.object(land_queue, "land_view", return_value=view),
+              patch.object(waits_on, "landed_phases", wraps=waits_on.landed_phases) as subjects,
+              patch.object(waits_on, "landed_phase", wraps=waits_on.landed_phase) as individual,
+              patch.object(waits_on, "on_main", wraps=waits_on.on_main) as ancestry,
+              patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads):
+            rendered = self.blocks([member, other], {})
+        work = [row.work for row in detail_rows(rendered, member.name)]
+        for phase in ("subject", "failed", "result"):
+            self.assertNotIn(phase.capitalize() + f" delivery ({phase})", work)
+        self.assertIn("Waiting delivery (waiting)", work)
+        self.assertIn("Misleading delivery (misleading)", work)
+        self.assertIn("Other delivery (subject)", [row.work for row in detail_rows(rendered, other.name)])
+        self.assertNotIn("old merge failure", rendered)
+        self.assertEqual(subjects.call_count, 1)
+        self.assertEqual(individual.call_count, 0)
+        self.assertEqual(ancestry.call_count, 1)
+        self.assertCountEqual([call.args[0] for call in reads.call_args_list], [path, other_path])
+
+    def test_earlier_merges_do_not_hide_a_later_finished_attempt(self) -> None:
+        member = self.member("finished")
+        _ = self.repository()
+        _ = self.git("switch", "-q", "-c", "checkpoint")
+        checkpoint = commit_repository(self.root, "Later checkpoint", allow_empty=True)
+        _ = self.git("switch", "-q", "main")
+        _ = self.git("switch", "-q", "-c", "published")
+        published = commit_repository(self.root, "Earlier delivery", allow_empty=True)
+        _ = self.git("switch", "-q", "main")
+        merge_date = "2026-11-15T18:00:00+00:00"
+        merge_at = datetime.fromisoformat(merge_date).timestamp()
+        with patch.dict(os.environ, {"GIT_COMMITTER_DATE": merge_date}):
+            _ = self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "merge", "-q", "--no-ff",
+                         "-m", f"Merge finished phase subject ({published[:9]}) into sdlc", "published")
+        _ = self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        landed: land_runs.LandResult = {"commit": published, "production": "sdlc", "unit": member.name,
+            "phase": "result", "landed": True, "step": "push", "state": "done", "detail": "", "time": merge_date}
+        for evidence in ("subject", "result"):
+            for offset in (-1, 0, 1, unit_phases.CheckpointTimeUnrecorded()):
+                with self.subTest(evidence=evidence, checkpoint_offset=offset):
+                    checkpoint_time: dict[str, object] = ({} if isinstance(offset, unit_phases.CheckpointTimeUnrecorded)
+                                                          else {"timestamp_epoch": merge_at + offset})
+                    old_failure: land_runs.LandResult = {**landed, "commit": "f" * 40, "phase": evidence,
+                        "landed": False, "detail": "old failed attempt", "time": "2026-11-15T17:50:00+00:00"}
+                    results = {old_failure["commit"]: old_failure}
+                    if evidence == "result":
+                        results[landed["commit"]] = landed
+                    view = land_queue.LandView({}, {checkpoint: land_queue.Place(2, "sdlc pending", f"finished {evidence}")},
+                                               results, frozenset(), {})
+                    path = self.write_run(member, "latest-attempt", [(evidence, "Delivery")], [
+                        self.phase_event("checkpoint", evidence, checkpoint_commit=published, timestamp_epoch=merge_at - 600),
+                        self.phase_event("phase_finished", evidence, status="completed"),
+                        self.phase_event("phase_started", evidence, phase_instance_id="new-attempt", phase_title="Delivery"),
+                        self.phase_event("checkpoint", evidence, phase_instance_id="new-attempt",
+                                         checkpoint_commit=checkpoint, **checkpoint_time),
+                        self.phase_event("phase_finished", evidence, phase_instance_id="new-attempt", status="completed")])
+                    with (patch.object(land_queue, "land_view", return_value=view),
+                          patch.object(waits_on, "landed_phases", wraps=waits_on.landed_phases) as subjects,
+                          patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads):
+                        rendered = self.blocks([member], {})
+                    rows = detail_rows(rendered, member.name)
+                    current = ("Now", f"Delivery ({evidence})", "2nd in sdlc's merge line")
+                    if isinstance(offset, unit_phases.CheckpointTimeUnrecorded) or offset > 0:
+                        self.assertIn(current, rows)
+                        self.assertIn("**finished** — waiting to merge", rendered)
+                    else:
+                        self.assertNotIn(f"Delivery ({evidence})", [row.work for row in rows])
+                    self.assertNotIn("old failed attempt", rendered)
+                    self.assertEqual(subjects.call_count, 1)
+                    self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
+
+    def test_undated_checkpoints_require_the_merged_checkpoint_hash(self) -> None:
+        member = self.member("finished")
+        _ = self.repository()
+        checkpoint = "a" * 40
+        _ = self.write_run(member, "undated-checkpoint", [("delivery", "Delivery")], [
+            self.phase_event("checkpoint", "delivery", checkpoint_commit=checkpoint),
+            self.phase_event("phase_finished", "delivery", status="completed")])
+        for evidence in ("subject-prefix", "subject-full", "result-exact", "result-untimed", "result-prefix", "ancestry"):
+            with self.subTest(evidence=evidence):
+                subjects: dict[tuple[str, str], waits_on.PhaseMerge] = {}
+                results: dict[str, land_runs.LandResult] = {}
+                if evidence.startswith("subject"):
+                    subjects[(member.name, "delivery")] = waits_on.PhaseMerge(
+                        "b" * 40, 10, checkpoint[:9] if evidence == "subject-prefix" else checkpoint)
+                if evidence.startswith("result"):
+                    commit = checkpoint[:9] if evidence == "result-prefix" else checkpoint
+                    results[commit] = {"commit": commit, "production": "sdlc", "unit": member.name,
+                        "phase": "delivery", "landed": True, "step": "push", "state": "done", "detail": "",
+                        "time": "invalid" if evidence == "result-untimed" else "1970-01-01T00:00:10+00:00"}
+                view = land_queue.LandView({}, {checkpoint: land_queue.Place(2, "sdlc pending", "finished delivery")},
+                                           results, frozenset(), {})
+                with (patch.object(land_queue, "land_view", return_value=view),
+                      patch.object(waits_on, "landed_phases", return_value=subjects),
+                      patch.object(waits_on, "on_main", return_value=evidence == "ancestry")):
+                    rendered = self.blocks([member], {})
+                rows = detail_rows(rendered, member.name)
+                if evidence == "result-prefix":
+                    self.assertIn(("Now", "Delivery (delivery)", "2nd in sdlc's merge line"), rows)
+                else:
+                    self.assertNotIn("Delivery (delivery)", [row.work for row in rows])
+
+    def test_invalid_result_times_from_another_unit_do_not_stop_the_board(self) -> None:
+        member = self.member("waiting")
+        _ = self.repository()
+        _ = self.write_run(member, "waiting-checkpoint", [("delivery", "Delivery")], [
+            self.phase_event("checkpoint", "delivery", checkpoint_commit="a" * 40),
+            self.phase_event("phase_finished", "delivery", status="completed")])
+        path = land_runs.results_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        invalid_times: tuple[object, ...] = (None, 42, [], {}, "", "invalid")
+        for recorded in invalid_times:
+            with self.subTest(recorded=recorded):
+                row: dict[str, object] = {"commit": "b" * 40, "production": "sdlc", "unit": "other", "phase": "delivery",
+                    "landed": True, "step": "push", "state": "done", "detail": "", "time": recorded}
+                _ = path.write_text(json.dumps(row) + "\n")
+                self.assertIn("b" * 40, land_runs.last_results())
+                rendered = self.blocks([member], {})
+                self.assertIn(("Now", "Delivery (delivery)",
+                    "Checkpoint aaaaaaaaa at time not recorded; not in sdlc's merge line"), detail_rows(rendered, member.name))
+                self.assertIn("**waiting** — waiting to merge", rendered)
 
     def test_eta_uses_the_latest_promise_and_local_calendar_time(self) -> None:
         member = self.member("eta")
@@ -743,7 +1264,7 @@ class UnitPhasesTests(unittest.TestCase):
                     tail.append(self.phase_event("wait_started", "work", pass_instance_id="writer", wait_id="memory",
                         wait_kind="memory", wait_reason="memory admission", wait_started_epoch=now - 120))
                 _ = self.write_run(member, "eta", [("work", "Write delivery")], tail)
-                rendered = unit_phases.table([unit("eta", live("eta"))], {}, now=now, zone=ZoneInfo(zone),
+                rendered = unit_phases.table([unit("eta", live("eta"))], {}, repository=self.root, now=now, zone=ZoneInfo(zone),
                     census_read=tiles(sessions=[session_of(member, "idle")], workers=workers))
                 task_lines = [row.state for row in detail_rows(rendered, "eta") if row.work == "Write delivery (work)"]
                 self.assertEqual(len(task_lines), 1)
@@ -839,7 +1360,7 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertIn(("Later 3", "After submission", "After dependency phase sent; not in the merge line"), rows)
         self.assertIn(("Later 4", "After open work", "After dependency phase open; started"), rows)
         self.assertIn(("Later 5", "After unknown work", "After missing-ref; dependency not found locally"), rows)
-        self.assertIn(("Later 6", "After branch", "After branch pending-branch; absent from the local copy of main"), rows)
+        self.assertIn(("Later 6", "After branch", "After branch pending-branch; not on main yet"), rows)
         self.assertIn(("Later 7", "Later work (2)", "After phase 1; started"), rows)
         self.assertIn(("Later 8", "Last work (3)", "Waits for " + waiting.strip()), rows)
         self.assertNotIn("Then 3", rendered)
@@ -853,7 +1374,7 @@ class UnitPhasesTests(unittest.TestCase):
                 (False, False, "unknown"), (False, True, "waiting on other work"),
                 (True, False, "waiting to merge"), (True, True, "waiting to merge")):
             with self.subTest(submitted=submitted, blocked_first=blocked_first):
-                tail = [self.phase_event("checkpoint", "1", checkpoint_commit=base)] if submitted else []
+                tail = [self.phase_event("checkpoint", "1", checkpoint_commit=sent)] if submitted else []
                 _ = self.write_run(member, "next", [("1", "Current work")], tail, plan=plan.name)
                 ready = unit_queue.QueuedItem("Clean records")
                 blocked = unit_queue.QueuedItem("Review next", "next/future")
@@ -1225,7 +1746,8 @@ class UnitPhasesTests(unittest.TestCase):
                         self.assertIn((work, f"Checkpoint {commit[:9]} at time not recorded; not in sdlc's merge line"),
                                       [(row.work, row.state) for row in rows if row.item in ("Now", "Also")])
                 elif name == "unused":
-                    self.assertIn(("Now", "First work (a)", "Merge position not recorded"), rows)
+                    self.assertIn(("Now", "First work (a)",
+                                   f"Checkpoint {first[:9]} at time not recorded; not in sdlc's merge line"), rows)
                 else:
                     self.assertEqual(sum("sdlc merges it now" == row.state for row in rows), 1)
                     self.assertTrue(any(row.work == "Second work (b)" and row.state == "Merges with a"
@@ -1269,7 +1791,7 @@ class UnitPhasesTests(unittest.TestCase):
                 if open_phase:
                     self.assertIn(("Now", "Current delivery (open)", "Director's current step not recorded"), rows)
 
-    def test_stopped_attempts_and_later_results_share_the_progress_history(self) -> None:
+    def test_stopped_attempts_disappear_after_later_completed_attempts_in_the_same_scope(self) -> None:
         member = self.member("admin-console")
         stopped = [
             ("unknown-reservation-repair", "Repair accepts a reservation the board no longer knows"),
@@ -1321,9 +1843,10 @@ class UnitPhasesTests(unittest.TestCase):
             DetailRow("Next", "Not recorded", "The director has not chosen the next task"),
             *(DetailRow("Stopped", f"{title} ({phase})", "Stopped; reason not recorded")
               for phase, title in stopped[:3]),
-            DetailRow("Done", stopped[3][1] + " (gate-time-limit)", "A later attempt finished on 14 Nov"),
-            DetailRow("Done", stopped[4][1] + " (image-pairs)", "The phases unit finished this work"),
         ])
+        self.assertNotIn("Done", [row.item for row in rows])
+        for phase, title in stopped[3:]:
+            self.assertNotIn(f"{title} ({phase})", [row.work for row in rows])
         self.assertIn("🟨", rendered.split("**admin-console**", 1)[0])
         self.assertIn("⬜", rendered.split("**admin-console**", 1)[0])
         self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
@@ -1351,6 +1874,77 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertTrue(any(row.item.startswith("Also") and row.work == answer[1] + " (answer-copy)"
                             and row.state == "sdlc cannot merge it: chart tests also fail on main" for row in rows))
         self.assertNotIn("Stopped", [row.item for row in rows if row.work == stopped[3][1] + " (gate-time-limit)"])
+        self.assertNotIn("Done", [row.item for row in rows])
+        self.assertNotIn(stopped[4][1] + " (image-pairs)", [row.work for row in rows])
+
+        with path.open("a") as stream:
+            _ = stream.write(json.dumps({
+                "event_type": "phase_finished", "phase_id": "gate-time-limit", "phase_instance_id": "gate-new",
+                "status": "stopped", "reason": "The user stopped the later attempt",
+                "timestamp_epoch": finished + 360, "phase_elapsed_seconds": 60,
+            }) + "\n")
+        with patch.object(land_queue, "land_view", return_value=merge):
+            rendered = self.blocks([member], {})
+        rows = detail_rows(rendered, member.name)
+        self.assertEqual([row for row in rows if row.item == "Stopped"
+                          and row.work == stopped[3][1] + " (gate-time-limit)"], [
+            DetailRow("Stopped", stopped[3][1] + " (gate-time-limit)",
+                      "Stopped; The user stopped the later attempt"),
+        ])
+
+        with path.open("a") as stream:
+            for phase in (stopped[0][0], "gate-time-limit"):
+                _ = stream.write(json.dumps(self.phase_event(
+                    "phase_dropped", phase, reason="The user removed this task")) + "\n")
+        with patch.object(land_queue, "land_view", return_value=merge):
+            rendered = self.blocks([member], {})
+        self.assertEqual([row for row in detail_rows(rendered, member.name) if row.item == "Stopped"], [
+            *(DetailRow("Stopped", f"{title} ({phase})", "Stopped; reason not recorded")
+              for phase, title in stopped[1:3]),
+            DetailRow("Stopped", stopped[3][1] + " (gate-time-limit)",
+                      "Stopped; The user stopped the later attempt"),
+        ])
+
+        with path.open("a") as stream:
+            for event in (
+                self.phase_event("phase_finished", answer[0], status="stopped"),
+                self.phase_event("phase_dropped", answer[0], reason="The user removed this task"),
+                {"event_type": "wait_started", "wait_scope": "unit", "wait_id": "old-hold",
+                 "target_work": answer[0], "wait_by": "the user", "wait_reason": "old approval",
+                 "wait_kind": "WaitingForUser", "wait_started_epoch": finished + 400},
+            ):
+                _ = stream.write(json.dumps(event) + "\n")
+        dropped_views = (merge, land_queue.LandView({}, {}, {}, frozenset(), {}),
+                         land_queue.LandView({"c" * 40: member.name + " " + answer[0]}, {}, {}, frozenset(), {}))
+        for dropped_view in dropped_views:
+            with (self.subTest(land=dropped_view),
+                  patch.object(land_queue, "land_view", return_value=dropped_view),
+                  patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads):
+                rendered = self.blocks([member], {})
+            self.assertNotIn(answer[1] + " (answer-copy)", [row.work for row in detail_rows(rendered, member.name)])
+            self.assertNotIn("old approval", rendered)
+            self.assertNotIn("chart tests also fail", rendered)
+            self.assertIn("waiting to merge 0", rendered.splitlines()[0])
+            self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
+
+        with path.open("a") as stream:
+            for event in (
+                {"event_type": "phase_started", "phase_id": answer[0], "phase_instance_id": "answer-later",
+                 "phase_title": answer[1], "phase_started_at": finished + 500},
+                {"event_type": "checkpoint", "phase_id": answer[0], "phase_instance_id": "answer-later",
+                 "checkpoint_commit": "d" * 40},
+                {"event_type": "phase_finished", "phase_id": answer[0], "phase_instance_id": "answer-later",
+                 "status": "completed", "timestamp_epoch": finished + 560, "phase_elapsed_seconds": 60},
+            ):
+                _ = stream.write(json.dumps(event) + "\n")
+        later_failed: land_runs.LandResult = {**failed, "commit": "d" * 40, "detail": "new failed merge",
+                                              "time": "2026-11-15T18:00:00+00:00"}
+        later_merge = merge._replace(results={"c" * 40: failed, "d" * 40: later_failed})
+        with patch.object(land_queue, "land_view", return_value=later_merge):
+            rendered = self.blocks([member], {})
+        self.assertIn(("Now", answer[1] + " (answer-copy)", "sdlc cannot merge it: new failed merge"),
+                      detail_rows(rendered, member.name))
+        self.assertIn("waiting to merge 1", rendered.splitlines()[0])
 
     def test_summary_counts_units_once_by_the_first_matching_rule(self) -> None:
         working, merging, waiting, idle, unknown = [self.member(name) for name in
@@ -1406,13 +2000,13 @@ class UnitPhasesTests(unittest.TestCase):
                         exited=staff.Exited("2026-11-15T17:00:00+00:00", by, why)
                                if hold == "exit" else staff.Active())
                     snapshot = staff.StaffSnapshot((held,))
-                    rendered = unit_phases.table([unit("holds", None)._replace(member=held)], {},
+                    rendered = unit_phases.table([unit("holds", None)._replace(member=held)], {}, repository=self.root,
                         now=datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp(), zone=ZoneInfo("UTC"),
                         snapshot=snapshot, census_read=LOCAL)
                     self.assertIn("**holds** — idle", rendered)
                     self.assertIn(("Now", "Not recorded", expected), detail_rows(rendered, "holds"))
         rendered = self.blocks([member], {}, statuses=["busy"])
-        self.assertIn(("Now", "Not recorded", "Director's current step not recorded"),
+        self.assertIn(("Now", "Nothing to do", "No plan or queued work"),
                       detail_rows(rendered, "holds"))
         from scripts.whoami import quota_state
         with patch.object(quota_state, "no_worker_mode", return_value=True):
@@ -1428,6 +2022,7 @@ class UnitPhasesTests(unittest.TestCase):
             rendered = self.blocks([member, other], {})
         self.assertIn("**unreadable** — unknown", rendered)
         self.assertIn(("Next", "Not recorded", "Queue unavailable; next task not recorded"), detail_rows(rendered, "unreadable"))
+        self.assertNotIn("Nothing to do", [row.work for row in detail_rows(rendered, "unreadable")])
         self.assertIn("**other** — idle", rendered)
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertIn(str(path), errors.getvalue())
@@ -1451,11 +2046,11 @@ class UnitPhasesTests(unittest.TestCase):
                   patch.object(sessions, "running_sessions", return_value=[sessions.SessionRecord(
                       sessionId=first.current_session, pid=1, name="first", status="idle",
                       messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])])):
-                return table_of(live_units.units_in(owner.name, every), {})
+                return table_of(live_units.units_in(owner.name, every), {}, self.root)
 
         initial = render()
         self.assertIn("**first** — idle", initial)
-        self.assertIn(("Now", "Not recorded", "Director's current step not recorded"), detail_rows(initial, "first"))
+        self.assertIn(("Now", "Nothing to do", "No plan or queued work"), detail_rows(initial, "first"))
         _ = staff.pause(second.id, "review the change")
         paused = render()
         self.assertIn("**first** — idle", paused)
@@ -1513,7 +2108,7 @@ class UnitPhasesTests(unittest.TestCase):
                     units = live_units.units_in(owner.name, listing)
                     self.assertEqual(units[0].status, expected)
                     self.assertEqual(units[0].machine, machine)
-                    output = unit_phases.table(units, {}, snapshot=snapshot,
+                    output = unit_phases.table(units, {}, repository=self.root, snapshot=snapshot,
                                                census_read=tiles(sessions=[session_of(member, expected)]))
                     if machine == "mac":
                         self.assertIn("**first** (mac) — idle", output)
@@ -1529,7 +2124,43 @@ class UnitPhasesTests(unittest.TestCase):
     def test_failed_anomaly_send_keeps_the_table_and_exit_code_and_adds_one_line(self) -> None:
         self.assert_anomaly_delivery(send_code=1)
 
-    def assert_anomaly_delivery(self, *, send_code: int) -> None:
+    def test_skipped_anomaly_send_keeps_the_table_and_exit_code_without_an_extra_line(self) -> None:
+        self.assert_anomaly_delivery(send_code=0, send_output="SKIPPED: repeat window")
+
+    def test_anomaly_keys_follow_the_joined_text_and_use_the_configured_window(self) -> None:
+        config = self.root / "table-conf/production.conf"
+        _ = config.write_text(config.read_text().replace("units_anomaly_repeat_minutes=60",
+                                                       "units_anomaly_repeat_minutes=2.5"))
+        messages = (("anomaly: census took longer than 10 s", "anomaly: café unreadable"),
+                    ("anomaly: census took longer than 10 s", "anomaly: café unreadable"),
+                    ("anomaly: census took longer than 11 s", "anomaly: café unreadable"))
+        sender = Mock(return_value=subprocess.CompletedProcess(["send.py"], 0, "SKIPPED: repeat window", ""))
+        output = io.StringIO()
+        with (patch.object(unit_phases, "subprocess", SimpleNamespace(run=sender)), contextlib.redirect_stdout(output)):
+            for message in messages:
+                unit_phases.send_anomalies(message)
+        self.assertEqual(sender.call_count, 3)
+        keys: list[str] = []
+        for call, message in zip(sender.call_args_list, messages, strict=True):
+            command = cast(list[str], call.args[0])
+            keys.append(command[command.index("--key") + 1])
+            self.assertEqual(command[command.index("--text") + 1], "\n".join(message))
+            self.assertEqual(command[command.index("--repeat-minutes") + 1], "2.5")
+        self.assertEqual(keys, ["unit-anomalies:b488aba285f2", "unit-anomalies:b488aba285f2",
+                               "unit-anomalies:7d046a634ca9"])
+        self.assertEqual(output.getvalue(), "")
+
+    def test_unreadable_anomaly_repeat_key_reports_one_line_without_a_send(self) -> None:
+        sender = Mock()
+        output = io.StringIO()
+        with (patch.object(conf.ConfigRead, "number", side_effect=conf.Unusable("repeat setting unavailable")) as number,
+              patch.object(unit_phases, "subprocess", SimpleNamespace(run=sender)), contextlib.redirect_stdout(output)):
+            unit_phases.send_anomalies(("anomaly: census unavailable",))
+        number.assert_called_once_with("units_anomaly_repeat_minutes")
+        sender.assert_not_called()
+        self.assertEqual(output.getvalue(), "anomaly: could not send unit anomalies: repeat setting unavailable\n")
+
+    def assert_anomaly_delivery(self, *, send_code: int, send_output: str = "") -> None:
         from scripts.production import session_staff
 
         doc = self.root / "production.md"
@@ -1549,7 +2180,7 @@ class UnitPhasesTests(unittest.TestCase):
 
         output, errors = io.StringIO(), io.StringIO()
         sender = Mock(return_value=subprocess.CompletedProcess(
-            ["send.py"], send_code, "fixture delivery detail" if send_code else "",
+            ["send.py"], send_code, "fixture delivery detail" if send_code else send_output,
             "fixture send failed\nfixture failure detail" if send_code else ""))
         with (patch.dict(os.environ, {"CONF_DIR": str(config)}),
               patch.object(unit_lookup, "observed_session_labels", side_effect=observed),
@@ -1563,11 +2194,10 @@ class UnitPhasesTests(unittest.TestCase):
         table_end = max(index for index, line in enumerate(lines) if line.startswith("| "))
         self.assertEqual(lines[:table_end + 1], [
             "working 0 · waiting to merge 0 · waiting on other work 0 · idle 1 · 1 units", "",
-            "| Unit | Status |", "| --- | --- |", "| member | exited |", "",
+            "| Unit | Director |", "| --- | --- |", "| member | exited |", "",
             "**member** — idle", "",
             "| Item | Work | State |", "| --- | --- | --- |",
-            "| Now | Not recorded | Director's current step not recorded |",
-            "| Next | Not recorded | The director has not chosen the next task |",
+            "| Now | Nothing to do | No plan or queued work |",
         ])
         anomalies = [line for line in lines if line.startswith("anomaly:")
                      and ("unread-codex" in line or "unread-claude" in line)]
@@ -1582,6 +2212,8 @@ class UnitPhasesTests(unittest.TestCase):
         assert call is not None
         command = cast(list[str], call.args[0])
         self.assertEqual(command[command.index("--to") + 1], "fixture-director")
+        self.assertRegex(command[command.index("--key") + 1], r"^unit-anomalies:[0-9a-f]{12}$")
+        self.assertEqual(command[command.index("--repeat-minutes") + 1], "60")
         message = command[command.index("--text") + 1]
         for line in anomalies:
             self.assertIn(line, message)
@@ -1665,13 +2297,14 @@ class UnitPhasesTests(unittest.TestCase):
             return {}
 
         def render(_units: list[live_units.LiveUnit], _records: dict[str, object], *, zone: ZoneInfo,
-                   census_read: census.Census | census.CensusFailed, columns: int | None) -> str:
+                   census_read: census.Census | census.CensusFailed, columns: int | None, repository: Path) -> str:
             self.assertIs(plan_history.run_started_event, headers)
             self.assertIs(plan_history.resolve_plan_path, paths)
             self.assertIs(plan_history.plan_runs, scans)
             self.assertIsInstance(zone, ZoneInfo)
             self.assertIs(census_read, LOCAL)
             self.assertIsNone(columns)
+            self.assertEqual(repository, self.root)
             calls.append("table")
             return "phase table"
 
@@ -1734,7 +2367,7 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertEqual(reads - 1, 1, "Read the run events once after the header read.")
         self.assertEqual(output.getvalue().splitlines(), [
             "working 0 · waiting to merge 0 · waiting on other work 0 · idle 0 · unknown 2 · 2 units", "",
-            "| Unit | Status | Progress | Phase | ETA Next |", "| --- | --- | --- | --- | --- |",
+            "| Unit | Director | Progress | Phase | ETA Next |", "| --- | --- | --- | --- | --- |",
             "| one | exited | 🟨⬜ | 1 | no ETA stated |", "| two | exited | 🟨⬜ | 1 | no ETA stated |", "",
             "Progress: 🟩 done · 🟨 open · ⬜ not started", "",
             "**one** — unknown", "",
@@ -1833,7 +2466,7 @@ class UnitPhasesTests(unittest.TestCase):
               contextlib.redirect_stdout(output)):
             self.assertEqual(unit_phases.main(["--production", "show"]), 0)
         phases.assert_called_once_with([product_unit], {}, zone=read_production("show").zone,
-                                                 census_read=LOCAL, columns=None)
+                                                 census_read=LOCAL, columns=None, repository=self.root)
         tickets.assert_called_once_with([style_unit], {}, doc=doc, ledger_paths={})
         self.assertEqual(doc.read_bytes(), before)
         self.assertEqual(output.getvalue(), "product table\n\nticket table\n")
@@ -1856,10 +2489,9 @@ class UnitPhasesTests(unittest.TestCase):
                 tickets.assert_not_called()
                 self.assertEqual(output.getvalue(),
                     "working 0 · waiting to merge 0 · waiting on other work 0 · idle 1 · 1 units\n\n"
-                    + "| Unit | Status |\n| --- | --- |\n| a | idle |\n\n"
+                    + "| Unit | Director |\n| --- | --- |\n| a | idle |\n\n"
                     + "**a** — idle\n\n| Item | Work | State |\n| --- | --- | --- |\n"
-                    + "| Now | Not recorded | Director's current step not recorded |\n"
-                    + "| Next | Not recorded | The director has not chosen the next task |\n")
+                    + "| Now | Nothing to do | No plan or queued work |\n")
 
                 unordered = [unit("zulu", live("zulu"))._replace(machine="natedev"),
                              unit("Beta", live("Beta"))._replace(machine="mac"),

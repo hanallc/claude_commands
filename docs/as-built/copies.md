@@ -11,16 +11,56 @@ The guard permits only original worktrees, the external upstream clone, and this
 The CLI converts its flags into these policies.
 
 Staged copies use a private source index and a synthetic commit without changing source refs.
-Every gate owns one temporary checkout under TMPDIR.
-A Cargo gate retains its target cache in a separate standing folder.
-The checkout links `target` to that cache.
-The cache record restores file times when tracked blob identities match.
-Rust release trials keep Cargo mend output under `target/mend-target` in the retained cache.
-A damaged private checkout index gets one recovery attempt.
-The caller holds the checkout lease until its command and result records finish.
+Each gate takes one detached repository slot through `build_slots.take_slot()`.
+The machine and repository select the pool; the owner does not select its path.
+The caller holds the slot lease through preparation, execution, and result publication.
+The lease keeps the staff id in `unit` and `gate` in `work`; `purpose` names the gated source revision's subject, including merge gates.
+A `<kind>(<slug>): phase <N> — <title>` subject gives `gate · <slug> phase <N> · <title>`; other subjects give `gate · <subject>`, and unreadable subjects give `gate`.
+Identical nested proofs reuse their held slot.
+Other revisions take another free slot or wait in the build queue.
+The configured `slots.wait_seconds` limits that wait.
+The Mac uses a finite kernel-lock wait because it has no admission service.
+
+Acquisition rescues source work before reset.
+Git resets changed files and retains unchanged file times.
+Default final Cargo output stays under the slot's `target/`.
+Acquisition replaces a target symlink with a directory inside the slot.
+Each slot uses its own Git `info/exclude` to hide `target/` from status.
+`CARGO_BUILD_BUILD_DIR` defaults to the slot's separate Cargo directory.
+Explicit caller output settings remain unchanged.
+Nested slots replace the enclosing slot's default directory with their own default.
+An acquisition above its configured size limit deletes generated output once.
+A failed rescue retains the source and output.
+A damaged index is saved as `.rescue-index-*` with source edits in the rescue commit.
+Recovery rebuilds the index before reset.
+A failed rescue restores the damaged index.
+Incomplete slot recovery rescues linked worktrees before deletion.
+Recovery retains a repository with a different object store.
+Acquisition removes a stale worktree index lock under the slot lease.
+Rust release trials retain Cargo mend output under `target/mend-target`.
+Slot preparation failures raise `CopyError` with command details.
+A lease release failure after use raises `PostUseError` and retains the caller error.
+
+`workspace()` keeps a named editable checkout under `roots.workspace`.
+The maker creates its folder, and the caller holds its lease during use.
+Edits and the selected branch remain between uses.
+Removal rescues work under the removal lease and retains the rescue in the source repository.
+The rescue includes clean local branches, tags, and every stash reflog entry.
+When no local source remains, removal exports the rescue into a sibling bare repository named `<workspace-root>-rescues.git`.
+Removal verifies the exported rescue before it deletes the workspace.
+Python callers pass slot lease descriptors to their build and test children.
+`clone()` keeps its task-owned return-a-path API and uses the maker outside the gate root.
+Its callers retain their existing task cleanup.
+
+`copies.py list` reads slot leases and remote mirror rows.
+`copies.py remove` removes owned editable and remote copies; it never removes a shared slot.
+The nightly slot sweep removes old free slots.
+`gates_root()` reads the configured machine slot root without creating it.
+The legacy `copies.root` key remains in configuration, but no code reads it.
 
 `RemoteMirror` records the owner, repository, host, mirror path, and holder session.
-The remote registry uses `.remote-mirrors` below the configured copies root.
+The `remote_registry` key in `config/copies.conf` selects the remote registry.
+Cutover moves the old `.remote-mirrors` folder and its lock files to that path before new commands run.
 Mac, Linux, and AWS copies use the same kind.
 The Mac path uses the validated `MacMirrorRoot` setting.
 

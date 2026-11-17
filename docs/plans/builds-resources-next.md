@@ -41,7 +41,7 @@
 
 - [ ] **The user's typed queue bump accepts a unit name**
   - Target: `scripts/build_queue/build_queue.py`, its selector and tests, `mods/unit-board/tests/queue.test.ts`, and `commands/build/queue.md`.
-  - Completion condition: `/build:queue bump <unit>` selects that unit's waiting step and sets or replaces priority through the existing writer.
+  - Completion condition: `/build:bump <position|session|folder>` selects a waiting step and adds its unit to the priority list.
   - Test a unit name that differs from every session label and folder name.
   - Preserve position, session and folder selectors.
   - Preserve access from any pane and the current direct-command behavior.

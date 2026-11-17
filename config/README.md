@@ -798,7 +798,7 @@ The next `up` removes a folder left by a dead run.
 Its `default` development shell uses the host tools.
 
 Paired trials use the installed scaler service and the existing `cloud_gate.conf` settings.
-Run `python3 -m scripts.aws_target.gate_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
+Run `python3 -m scripts.aws_target.aws_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
 Both refs must exist in pushed public history for `~/.claude`.
 Each module uses one box for all rounds.
 All module boxes run concurrently.
@@ -820,20 +820,6 @@ Unconfirmed cleanup uses the reserved lifetime and returns a nonzero status.
 The paired trial adds no settings.
 
 The paired trial replaces the size/start trials.
-The following settings are removed:
-
-1. `gate_trial_size_reserve_usd`.
-1. `gate_trial_start_reserve_usd`.
-1. `gate_trial_lifetime_minutes`.
-1. `gate_trial_url_lifetime_s`.
-1. `gate_trial_target_gate_s`.
-1. `gate_trial_module_limit_s`.
-1. `gate_trial_default_sizes`.
-1. `gate_trial_size_runs`.
-1. `gate_trial_start_runs`.
-1. `gate_trial_poll_pause_s`.
-1. `gate_trial_log_push_s`.
-1. `gate_trial_group_delete_wait_s`.
 
 The setup checks compare plain tool commands on both hosts.
 These stages need no other source repository.
@@ -843,11 +829,13 @@ The command edits no tracked file.
 
 ### Cloud gate regions
 
-`cloud_gate.conf` sets `regions=us-east-2 us-west-2` in launch order.
+`cloud_gate.conf` sets `regions` to all 19 regions of `spot_candidate_regions`.
 The first region must match the home region in `aws_target.conf`.
 The list must contain at least one region and must not repeat a region.
 The list can include other regions that the account policy permits.
-Each gate tries every configured type and public zone in one region before it tries the next region.
+Each gate tries its types, regions and zones in order of expected USD per run.
+`region_transfer_usd` sets the transfer USD per gate for a far region.
+`unmeasured_region_extra_seconds` adds seconds to the borrowed box time of a region without its own runs.
 Capacity refusals and unsupported types select the next variant.
 After all regions refuse, a normal gate can use natedev.
 All regions use the same daily and monthly spend caps.

@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Give each Claude session its own temp root and point its Bash commands' TMPDIR at it.
+"""Give each Claude session its own folder and point its Bash commands' TMPDIR at it.
 
 Test runs, mktemp and tempfile left their folders loose in /tmp, and nothing named their maker
-(user, 2026-10-27). Each session gets ROOT/<session id> at start (and again at resume, clear and
-compact, should the sweep have removed it), and Claude Code reads the `export TMPDIR=...` line this
-hook writes to $CLAUDE_ENV_FILE before each Bash command. Sessions run for weeks, so nothing waits
-on a session end: the hourly tmp sweep (scripts/lint/tmp_sweep.py) judges each entry in the root
-with its 4 h idle rule, and removes the root itself only once its session stops. The path stays
-short, so a Unix socket made in TMPDIR fits the 104-byte limit on the Mac.
+(user, 2026-10-27). Each session gets its session folder at start (and again at resume, clear and
+compact, should it be gone): /session/<shown name> (scripts/lib/session_folder.py), or
+/tmp/claude/session/<session id> until the session root exists. Claude Code reads the
+`export TMPDIR=...` line this hook writes to $CLAUDE_ENV_FILE before each Bash command. The path
+stays short, so a Unix socket made in TMPDIR fits the 104-byte limit on the Mac.
 """
 
 from __future__ import annotations
@@ -18,23 +17,20 @@ except FileNotFoundError:
 
 import json
 import os
-import re
 import shlex
 import sys
 from pathlib import Path
 from typing import cast
 
+
+# The former root; tmp_sweep.py judges its entries until cutover.
 ROOT = "/tmp/claude/session"
-ROOT_ENV = "SESSION_TEMP_ROOT"
-SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
 def temp_parent() -> Path:
-    return Path(os.environ.get(ROOT_ENV) or ROOT)
+    from scripts.lib import session_folder
 
-
-def temp_root(session_id: str) -> Path:
-    return temp_parent() / session_id
+    return session_folder.former_root()
 
 
 def export_line(path: Path) -> str:
@@ -42,20 +38,22 @@ def export_line(path: Path) -> str:
 
 
 def main() -> int:
-    from scripts.lib import build_folders
+    from scripts.lib import build_folders, session_folder
 
     try:
         raw = cast(object, json.loads(sys.stdin.read()))
     except (ValueError, UnicodeDecodeError):
         return 0
-    session_id = cast(dict[str, object], raw).get("session_id") if isinstance(raw, dict) else None
+    fields = cast(dict[str, object], raw) if isinstance(raw, dict) else {}
+    session_id, cwd = fields.get("session_id"), fields.get("cwd")
     env_file = os.environ.get("CLAUDE_ENV_FILE")
-    if not isinstance(session_id, str) or not SESSION_ID.fullmatch(session_id) or not env_file:
+    if not isinstance(session_id, str) or not session_folder.SESSION_ID.fullmatch(session_id) or not env_file:
         return 0
     try:
         # The session uses this TMPDIR after the startup hook exits.
-        path = build_folders.create_build_folder(build_folders.StableOwnerFolder(
-            session_id, build_folders.ExplicitBuildParent(temp_parent()), mode=0o700))
+        path = session_folder.session_folder(session_id, cwd if isinstance(cwd, str) else "") or build_folders.create_build_folder(
+            build_folders.StableOwnerFolder(
+                session_id, build_folders.ExplicitBuildParent(session_folder.former_root()), mode=0o700))
         line = export_line(path)
         env = Path(env_file)
         if line not in (env.read_text(encoding="utf-8") if env.exists() else ""):

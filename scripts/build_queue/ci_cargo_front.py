@@ -145,7 +145,8 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
         sidecar.chmod(0o644)
         request = wire.ServiceEstimateRequest(client.request_id(), wire.Owner(pid, start), tuple(argv), os.getcwd(),
             client.CLOCK.now(), str(sidecar), repository, worktree,
-            os.environ.get("RUNNER_NAME", ""), os.environ.get("GITHUB_JOB", ""), test_width)
+            os.environ.get("RUNNER_NAME", ""), os.environ.get("GITHUB_JOB", ""), test_width,
+            route=records.direct_cargo_route())
         with ExitStack() as reservation:
             try:
                 held = reservation.enter_context(queue_place.held_reservation(request))
@@ -196,19 +197,12 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    arguments = list(sys.argv[1:] if argv is None else argv)
-    explicit = ""
-    shared_folder: Path | JobTemporaryFolder = JobTemporaryFolder()
-    front = Path(__file__)
-    if arguments[:1] == ["--front"]:
-        front, arguments = Path(arguments[1]), arguments[2:]
+    call = parse.cargo_front_call(sys.argv[1:] if argv is None else argv)
+    arguments = list(call.arguments)
+    explicit = call.cargo
+    front = Path(call.front) if call.front else Path(__file__)
     # The admission service must read the counter files, and `nix develop` makes TMPDIR private.
-    if arguments[:1] == ["--shared-folder"]:
-        shared_folder, arguments = Path(arguments[1]), arguments[2:]
-    if arguments[:1] == ["--cargo"]:
-        explicit, arguments = arguments[1], arguments[2:]
-    if arguments[:1] == ["--"]:
-        arguments = arguments[1:]
+    shared_folder: Path | JobTemporaryFolder = Path(call.shared_folder) if call.shared_folder else JobTemporaryFolder()
     command, child_path = cargo_path(explicit, front)
     if not building_call(arguments):
         os.execve(command, [command, *arguments], dict(os.environ, PATH=child_path))

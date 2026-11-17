@@ -1,12 +1,12 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Load and prove a worktree's nix environment before starting a process.
 
-Envrc files below ~/rust, ~/worktrees or ~/.claude*, and in linked worktrees
-registered by repositories below those roots, are allowed automatically.
-Registered scratch copies and temporary gates also qualify when their regular top-level envrc
-matches the recorded source commit in a repository below those roots.
-Other directories keep direnv's explicit approval boundary.
-No envrc means the caller's environment is retained, without running direnv.
+Envrc files below ~/rust, ~/worktrees or ~/.claude* are allowed automatically.
+Linked worktrees registered by repositories below those roots also qualify.
+Slots qualify only when their regular top-level envrc matches their checked-out commit in a trusted source repository.
+Registered scratch copies qualify when their envrc matches their recorded source commit in a trusted repository.
+Other folders require explicit direnv approval.
+Without an envrc, the caller keeps its environment without running direnv.
 """
 from __future__ import annotations
 try:
@@ -15,6 +15,7 @@ except FileNotFoundError:
     pass
 
 import os
+from enum import Enum, auto
 import stat
 import sys
 from pathlib import Path
@@ -100,16 +101,68 @@ def _git_environment() -> dict[str, str]:
     return {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
 
 
+def _envrc_matches_commit(envrc: Path, git_directory: Path, commit: str) -> bool:
+    """Compare the file bytes with one commit in the proven repository."""
+    import subprocess
+
+    timeout = _settings().number("command_timeout_seconds")
+    environment = _git_environment()
+    command = ["git", "--git-dir", str(git_directory)]
+    expected = subprocess.run(
+        [*command, "rev-parse", "--verify", "--end-of-options", f"{commit}:.envrc"],
+        cwd=git_directory, env=environment, capture_output=True, text=True,
+        timeout=_remaining_timeout(timeout), check=True)
+    actual = subprocess.run(
+        [*command, "hash-object", "--no-filters", "--", str(envrc)],
+        cwd=git_directory, env=environment, capture_output=True, text=True,
+        timeout=_remaining_timeout(timeout), check=True)
+    return bool(expected.stdout.strip()) and expected.stdout.strip() == actual.stdout.strip()
+
+
+class SlotEnvrcTrust(Enum):
+    """A slot requires byte proof before any broader trust rule."""
+
+    NOT_A_SLOT = auto()
+    TRUSTED = auto()
+    NEEDS_APPROVAL = auto()
+
+
+def slot_envrc_trust(envrc: Path) -> SlotEnvrcTrust:
+    """Prove a slot's envrc against its checked-out source commit."""
+    import subprocess
+    from scripts.lib import build_slots, git_files
+
+    try:
+        root = build_slots.configured_slot_root()
+    except build_slots.SlotsNotConfigured:
+        return SlotEnvrcTrust.NOT_A_SLOT
+    folder = envrc.parent.resolve(strict=True)
+    if not folder.is_relative_to(root):
+        return SlotEnvrcTrust.NOT_A_SLOT
+    try:
+        if (folder.parent != root or envrc.name != ".envrc"
+                or not stat.S_ISREG(envrc.lstat().st_mode) or not registered_worktree(folder)):
+            return SlotEnvrcTrust.NEEDS_APPROVAL
+        checkout = git_files.at(folder)
+        return (SlotEnvrcTrust.TRUSTED if _envrc_matches_commit(envrc.absolute(), checkout.git_dir, "HEAD")
+                else SlotEnvrcTrust.NEEDS_APPROVAL)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return SlotEnvrcTrust.NEEDS_APPROVAL
+
+
 def registered_copy(envrc: Path) -> bool:
     """Prove a copy's envrc matches its recorded commit in a trusted source."""
     # Keep copy_record and subprocess off the no-envrc and trusted-root paths.
     import subprocess
 
     try:
+        slot = slot_envrc_trust(envrc)
+        if slot is not SlotEnvrcTrust.NOT_A_SLOT:
+            return slot is SlotEnvrcTrust.TRUSTED
         if not stat.S_ISREG(envrc.lstat().st_mode):
             return False
         folder = envrc.parent.resolve(strict=True)
-        from scripts.lib import copy_record
+        from scripts.lib import copy_record, git_files
 
         record_path = copy_record.record_path(folder)
         if envrc.name != ".envrc" or record_path is None:
@@ -124,15 +177,7 @@ def registered_copy(envrc: Path) -> bool:
         source = Path(source_path).resolve(strict=True)
         if not source.is_dir() or not trusted_root(source):
             return False
-        timeout = _settings().number("command_timeout_seconds")
-        environment = _git_environment()
-        expected = subprocess.run(
-            ["git", "rev-parse", "--verify", "--end-of-options", f"{source_commit}:.envrc"],
-            cwd=source, env=environment, capture_output=True, text=True, timeout=_remaining_timeout(timeout), check=True)
-        actual = subprocess.run(
-            ["git", "hash-object", "--no-filters", "--", str(folder / ".envrc")],
-            cwd=source, env=environment, capture_output=True, text=True, timeout=_remaining_timeout(timeout), check=True)
-        return bool(expected.stdout.strip()) and expected.stdout.strip() == actual.stdout.strip()
+        return _envrc_matches_commit(folder / ".envrc", git_files.at(source).git_dir, source_commit)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         return False
 
@@ -154,6 +199,9 @@ def generated_source(root: Path) -> bool:
 def trusted_envrc(envrc: Path) -> bool:
     """Approval belongs to the file's resolved location, never a symlink alias."""
     try:
+        slot = slot_envrc_trust(envrc)
+        if slot is not SlotEnvrcTrust.NOT_A_SLOT:
+            return slot is SlotEnvrcTrust.TRUSTED
         resolved = envrc.resolve(strict=True)
         return trusted_root(resolved) or registered_worktree(resolved.parent) or registered_copy(envrc)
     except (OSError, ValueError, RuntimeError):

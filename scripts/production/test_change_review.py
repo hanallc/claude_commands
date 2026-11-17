@@ -12,6 +12,7 @@ import json
 import os
 import select
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,7 @@ from unittest import mock
 
 from scripts.production import change_review
 from scripts.lib import copy_record
+from scripts.lib.checkout_test_support import write_python_tool
 from scripts.production import (
     showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc, unit_config, unit_lookup,
 )
@@ -68,6 +70,8 @@ LIST = """# Change review list
 """
 GRID = Visible("The grid fades more gently", "Run `hana` in a natedev terminal", "The grid lines fade out farther away")
 SEE = f"Change-Review: {GRID.change} | {GRID.check} | {GRID.see}"
+GRID_WITH_IMAGE = replace(GRID, image="012345abcdef")
+SEE_WITH_IMAGE = SEE + " | image " + GRID_WITH_IMAGE.image
 # A production doc as the vault records it; a write never reads the doc itself.
 PRODUCTION = Path.home() / "worktrees/demo-trunk/docs/plans/demo-production.md"
 DOC = "demo"
@@ -215,6 +219,9 @@ class ProducerWriterTests(ProducerFixture):
         binaries.mkdir()
         chrome = binaries / "google-chrome"
         _ = chrome.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nimport sys\n"
+            + "if '--dump-dom' in sys.argv:\n"
+            + "    print('<title>output-size:70</title>')\n"
+            + "    sys.exit(0)\n"
             + "shot = next(arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--screenshot='))\n"
             + "Path(shot).write_bytes(b'fixture rendered output')\n", encoding="utf-8")
         chrome.chmod(0o755)
@@ -679,8 +686,9 @@ class ReviewKindTest(unittest.TestCase):
 
 
 class ParseTest(unittest.TestCase):
-    def test_image_is_the_last_optional_field(self) -> None:
+    def test_merged_history_accepts_an_optional_last_image_field(self) -> None:
         identity = "012345abcdef"
+        self.assertEqual(change_review.parse("Change | Try | See"), Visible("Change", "Try", "See"))
         self.assertEqual(change_review.parse(f"Change | Try | See | image {identity}"),
                          Visible("Change", "Try", "See", image=identity))
         self.assertEqual(change_review.parse(f"Change | Try | See | after restart | image {identity}"),
@@ -706,14 +714,48 @@ class ParseTest(unittest.TestCase):
         self.assertIn("no Change-Review line", change_review.problem("checkpoint(x): y", "checkpoint(x): y\n", ("a.py",)))
         self.assertIn(change_review.FORM, change_review.problem("checkpoint(x): y", "checkpoint(x): y\n", ("a.py",)))
         self.assertIn(change_review.FORM, change_review.problem("checkpoint(x): y", "Change-Review: grid\n", ("a.py",)))
-        self.assertEqual(change_review.problem("checkpoint(x): y", SEE, ("a.py",)), "")
+        self.assertEqual(change_review.problem("checkpoint(x): y", SEE_WITH_IMAGE, ("a.py",)), "")
         for subject, files in (("Show waiting and starting session states", ("a.py",)),
                                ("docs: describe session states", ("a.md",)),
                                ("checkpoint(x): docs", ("a.md",))):
             with self.subTest(subject=subject, files=files):
                 self.assertIn("needs three parts", change_review.problem(subject, "Change-Review: a worker reads waiting", files))
                 self.assertEqual(change_review.problem(subject, subject, files), "")
-                self.assertEqual(change_review.problem(subject, SEE, files), "")
+                self.assertEqual(change_review.problem(subject, SEE_WITH_IMAGE, files), "")
+
+    def test_each_visible_line_requires_an_image_and_names_the_fix(self) -> None:
+        for suffix in ("", " | after restart"):
+            line = SEE + suffix
+            expected = (f"Change-Review line {line!r} has no image: register one with change_review.py image --image <png> "
+                        + "(or --output <text file> for terminal output), then end the line with | image <id>")
+            for subject, files in (("checkpoint(x): y", ("a.py",)), ("fix: y", ("a.py",)), ("checkpoint(x): docs", ("a.md",))):
+                with self.subTest(suffix=suffix, subject=subject):
+                    self.assertEqual(change_review.problem(subject, line, files), expected)
+                    self.assertEqual(change_review.problem(subject, SEE_WITH_IMAGE + "\n" + line, files), expected)
+                    self.assertEqual(change_review.problem(subject, line + " | image 012345abcdef", files), "")
+                    self.assertEqual(change_review.problem(subject, "Change-Review: none — scripts only", files), "")
+
+    def test_missing_names_the_commit_with_an_image_free_visible_line(self) -> None:
+        commit = change_review.Commit("abcdef0123456789", "checkpoint(x): y", "checkpoint(x): y\n\n" + SEE, ("a.py",),
+                                      change_review.IMAGES_CHECKED_FROM)
+        reason = change_review.problem(commit.subject, commit.message, commit.files)
+        self.assertEqual(change_review.missing([commit]), [f"abcdef01 checkpoint(x): y: {reason}"])
+        self.assertIn("has no image", reason)
+        self.assertEqual(change_review.visible([commit]), [GRID])
+
+    def test_only_the_missing_image_refusal_uses_the_commit_time_cutoff(self) -> None:
+        for timestamp in (1794805199, 1794805200):
+            with self.subTest(timestamp=timestamp):
+                commit = change_review.Commit("abcdef0123456789", "checkpoint(x): y", SEE, ("a.py",), timestamp)
+                if timestamp < change_review.IMAGES_CHECKED_FROM:
+                    self.assertEqual(change_review.missing([commit]), [])
+                else:
+                    self.assertIn("has no image", change_review.missing([commit])[0])
+                for message in ("Change-Review: incomplete", "Change-Review: A | B | C | image invalid"):
+                    self.assertIn("needs three parts", change_review.problem(
+                        commit.subject, message, commit.files, timestamp=timestamp))
+                self.assertIn("no Change-Review line", change_review.problem(
+                    commit.subject, "", commit.files, timestamp=timestamp))
 
     def test_a_line_without_exactly_three_full_parts_is_refused(self) -> None:
         for value in ("The grid fades | Look across the floor", "A | B | ", " | B | C", "A | B | C | D"):
@@ -723,7 +765,7 @@ class ParseTest(unittest.TestCase):
             self.assertIn(change_review.FORM, problem, value)
 
     def test_checkpoint_validation_accepts_a_named_live_step(self) -> None:
-        line = "Change-Review: New service | Open | New result | after restart"
+        line = "Change-Review: New service | Open | New result | after restart | image 012345abcdef"
         self.assertEqual(change_review.problem("checkpoint(x): service", line, ("service.py",)), "")
         item, = change_review.entries(line)
         self.assertIsInstance(item, Visible)
@@ -1347,6 +1389,72 @@ class ReadyListTests(ProducerFixture):
         self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Edited words"])
         self.assertEqual(self.listing.read_bytes(), written)
 
+    def test_an_edited_row_covers_only_its_units_checkpoint_in_a_shared_merge(self) -> None:
+        other = self.branch_unit("other", "other-unit", "other-branch", "other-plan.md")
+        _ = self.git("checkout", "-b", "old-branch")
+        for branch, words in (("other-branch", "Other change"), ("old-branch", "Original words")):
+            _ = self.git("commit", "--allow-empty", "-m",
+                         f"checkpoint({branch}): visible change\n\nChange-Review: {words} | Read | Result")
+            self.record_unit_commit(self.git("rev-parse", "HEAD"), branch)
+        _ = self.git("checkout", "integration")
+        _ = self.git("merge", "--no-ff", "old-branch", "-m", "Merge both units into integration")
+        merged = self.git("rev-parse", "HEAD")
+        _ = self.git("push", "origin", "integration")
+        self.promote()
+        _ = change_review.append_rows(self.listing, [Visible("Edited words", "Read", "Result")],
+                                      date(2026, 11, 7), merged[:8], self.doc,
+                                      producers=[self.unit.id], record=staff.snapshot())
+        code, output, error = self.ready()
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("C2", output)
+        self.assertEqual([(row["Change"], row["Producer"]) for row in change_review.pending(self.listing)],
+                         [("Edited words", self.unit.id), ("Other change", other.id)])
+        written = self.listing.read_bytes()
+        self.assertEqual(self.ready(), (0, "", ""))
+        self.assertEqual(self.listing.read_bytes(), written)
+
+    def test_positional_pairing_orders_ready_and_held_changes_for_each_producer(self) -> None:
+        other = staff.StaffId("other-producer")
+        for second_step in ("restart", "deploy"):
+            with self.subTest(second_step=second_step):
+                changes = [change_review.PublicationChange(item, change_review.UnresolvedSource(), producer, "checkpoint", "")
+                           for producer, item in (
+                               (self.unit.id, Visible("First held", "Read", "Result", change_review.AfterStep("restart"))),
+                               (other, Visible("Other held", "Read", "Result", change_review.AfterStep("deploy"))),
+                               (self.unit.id, Visible("First ready", "Read", "Result")),
+                               (self.unit.id, Visible("Second ready", "Read", "Result")),
+                               (self.unit.id, Visible("Second held", "Read", "Result", change_review.AfterStep(second_step))),
+                           )]
+                self.listing.unlink(missing_ok=True)
+                edited = [Visible(f"Edited words {index}", "Read", "Result") for index in range(4)]
+                record = staff.snapshot()
+                _ = change_review.append_rows(self.listing, edited, date(2026, 11, 7), "abcdef12", self.doc,
+                                              producers=[other, self.unit.id, self.unit.id, self.unit.id], record=record)
+                _ = change_review.append_rows(self.listing, changes, date(2026, 11, 7), "abcdef123456", self.doc,
+                                              record=record, repo=self.repo, merge_changes=changes)
+                expected = ["Second held"] if second_step == "restart" else ["First held", "Second held"]
+                self.assertEqual([row["Change"] for row in change_review.pending(self.listing)],
+                                 [item.change for item in edited] + expected)
+
+    def test_positional_pairing_requires_known_producers_but_text_matching_does_not(self) -> None:
+        for producer, row_producer in ((self.unit.id, ""), (change_review.UnknownProducer(), self.unit.id),
+                                      (change_review.UnknownProducer(), "")):
+            with self.subTest(producer=producer, row_producer=row_producer):
+                change = change_review.PublicationChange(Visible("Original words", "Read", "Result"),
+                    change_review.UnresolvedSource(), producer, "checkpoint", "")
+                self.listing.unlink(missing_ok=True)
+                record = staff.snapshot()
+                _ = change_review.append_rows(self.listing, [Visible("Edited words", "Read", "Result")],
+                                              date(2026, 11, 7), "abcdef12", self.doc,
+                                              producers=[staff.StaffId(row_producer)], record=record)
+                added = change_review.append_rows(self.listing, [change], date(2026, 11, 7), "abcdef12", self.doc,
+                                                  record=record, repo=self.repo, merge_changes=[change])
+                self.assertEqual(len(added), 1)
+                self.assertEqual([row["Change"] for row in change_review.pending(self.listing)],
+                                 ["Edited words", "Original words"])
+                self.assertEqual(change_review.append_rows(self.listing, [change], date(2026, 11, 7), "abcdef12", self.doc,
+                                                          record=record, repo=self.repo, merge_changes=[change]), [])
+
     def test_text_matching_reserves_its_row_before_an_edited_row_covers_another_change(self) -> None:
         _ = self.merge_change("Change-Review: First | Read | First result\n"
                               + "Change-Review: Second | Read | Second result")
@@ -1364,7 +1472,8 @@ class ReadyListTests(ProducerFixture):
                                    + "Change-Review: Second | Read | Second result")
         self.promote()
         _ = change_review.append_rows(self.listing, [Visible("First", "Read", "First result")],
-                                      date(2026, 11, 7), merged[:8], self.doc, record=staff.snapshot())
+                                      date(2026, 11, 7), merged[:8], self.doc,
+                                      producers=[self.unit.id], record=staff.snapshot())
         _ = change_review.edit_row(self.listing, "C1", Visible("Edited first", "Read", "First result"),
                                    date(2026, 11, 7), self.doc)
         code, output, error = self.ready()
@@ -2390,6 +2499,14 @@ class ActionTest(unittest.TestCase):
             self.assertEqual(len(error.splitlines()), 1, row)
         self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
 
+    def test_row_cleanup_reports_retained_folders(self) -> None:
+        folder = self.path.parent / "retained-copy"
+        result = scratch.TaskCleanup()
+        result.kept.append(scratch.KeptFolder(folder, "it has uncommitted changes"))
+        with mock.patch.object(scratch, "end", return_value=result):
+            lines = change_review.end_row_scratch(self.path, "C76")
+        self.assertEqual(lines, [f"kept {folder}: it has uncommitted changes"])
+
     def attached_lists(self) -> Path:
         earlier = self.path.with_name("change-review - child.md")
         _ = self.path.write_text(LIST.replace("C76", "C9"), encoding="utf-8")
@@ -2525,6 +2642,34 @@ class CommitTest(unittest.TestCase):
         return self.git("log", "-1", "--format=%s"), self.git("show", "--name-only", "--format=", "HEAD").splitlines()
 
     def test_add_commits_a_new_list_and_then_the_existing_one(self) -> None:
+        tools = self.repo.parent / "lease-git"
+        tools.mkdir()
+        log = self.repo.parent / "index-leases"
+        binary = shutil.which("git")
+        assert binary is not None
+        write_python_tool(tools / "git", """import fcntl, os, sys
+from pathlib import Path
+from scripts.lib import build_folders
+index = os.environ.get("GIT_INDEX_FILE", "")
+if index and Path(index).parent.name.startswith("change-review-index"):
+    folder = Path(index).parent
+    lock = folder.with_name(folder.name + ".lock").stat()
+    inherited = []
+    for entry in Path("/dev/fd").iterdir():
+        try:
+            if os.path.samestat(os.fstat(int(entry.name)), lock):
+                inherited.append(int(entry.name))
+        except OSError:
+            pass
+    assert inherited, "The Git child has no folder lease"
+    fcntl.flock(inherited[0], fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with open(""" + repr(str(log)) + """, "a") as output:
+        output.write(build_folders.build_folder_state(folder) + "\\n")
+os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
+""")
+        self.enterContext(mock.patch.dict(os.environ, {
+            "TMPDIR": str(self.repo.parent), "PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""),
+        }))
         source, *commits = origin_commits(self.repo.parent)
         merged = commits[-1][:8]
         self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C"), (0, "C1\n", ""))
@@ -2535,6 +2680,7 @@ class CommitTest(unittest.TestCase):
         _ = change_review.append_rows(self.path, [Visible("E", "F", "S"), Visible("G", "H", "S")], date(2026, 10, 15), "61b65bbf", PRODUCTION, record=staff.snapshot())
         self.assertEqual(self.last(), ("change-review: hana rows C3–C4 from 61b65bbf", ["change-review/change-review - hana.md"]))
         self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(set(log.read_text().splitlines()), {"held"})
 
     def test_a_verdict_commits_the_list(self) -> None:
         for row, held in (("C1", False), ("C2", True)):
@@ -2661,14 +2807,15 @@ class CommitTest(unittest.TestCase):
         competing: list[str] = []
 
         def move_head(command: list[str], *, capture_output: bool = False, text: bool = False,
-                      check: bool = False, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                      check: bool = False, env: dict[str, str] | None = None,
+                      pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
             if "update-ref" in command and not competing:
                 commit = real_run(["git", "-C", str(self.repo), "commit-tree", tree, "-p", previous,
                                    "-m", "Timer commit"], capture_output=True, text=True, check=True).stdout.strip()
                 _ = real_run(["git", "-C", str(self.repo), "update-ref", "HEAD", commit, previous],
                              capture_output=True, text=True, check=True)
                 competing.append(commit)
-            return real_run(command, capture_output=capture_output, text=text, check=check, env=env)
+            return real_run(command, capture_output=capture_output, text=text, check=check, env=env, pass_fds=pass_fds)
 
         with mock.patch.object(subprocess, "run", side_effect=move_head):
             result = run("edit", "--production", DOC, "--list", str(self.path), "--row", "C1",
@@ -2984,14 +3131,14 @@ class ProductionMergeCommitsTest(unittest.TestCase):
         self.assertNotIn(self.foreign[:8], refused[0])
 
     def test_imported_production_commits_need_no_cover_when_unit_has_its_line(self) -> None:
-        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE_WITH_IMAGE}")
         commits = self.commits()
         self.assertEqual([commit.sha for commit in commits], [own])
         self.assertEqual(change_review.missing(commits), [])
 
     def test_production_without_review_rows_keeps_its_commits_checked(self) -> None:
         _ = self.other_doc.write_text(f"- **Repository:** `{self.repo}`\n- **Merge branch:** `other-merge`\n")
-        _ = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        _ = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE_WITH_IMAGE}")
         self.assertEqual([item.split()[0] for item in change_review.missing(self.commits())], [self.foreign[:8]])
 
     def test_production_in_another_repository_keeps_its_commits_checked(self) -> None:
@@ -2999,11 +3146,11 @@ class ProductionMergeCommitsTest(unittest.TestCase):
         other.mkdir()
         _ = self.git("init", "-q", cwd=other)
         _ = self.other_doc.write_text(self.other_doc.read_text().replace(str(self.repo), str(other)))
-        _ = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        _ = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE_WITH_IMAGE}")
         self.assertEqual([item.split()[0] for item in change_review.missing(self.commits())], [self.foreign[:8]])
 
     def test_unreadable_production_doc_keeps_the_existing_exclusions(self) -> None:
-        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE_WITH_IMAGE}")
         with mock.patch.object(showrunners, "timer_docs", return_value={
             "own": self.own_doc, "other": self.other_doc, "missing": self.repo.parent / "missing.md",
         }):
@@ -3015,12 +3162,12 @@ class ProductionMergeCommitsTest(unittest.TestCase):
         checkout = self.repo.parent / "unit-checkout"
         _ = self.git("worktree", "add", "-q", "-b", "linked", str(checkout), "unit")
         self.repo = checkout
-        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE_WITH_IMAGE}")
         self.assertEqual([commit.sha for commit in self.commits()], [own])
         self.assertEqual(change_review.missing(self.commits()), [])
 
     def test_invalid_production_repository_keeps_valid_production_exclusions(self) -> None:
-        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE_WITH_IMAGE}")
         invalid_doc = self.repo.parent / "invalid-production.md"
         not_git = self.repo.parent / "not-git"
         not_git.mkdir()
@@ -3037,7 +3184,7 @@ class ProductionMergeCommitsTest(unittest.TestCase):
                 self.assertEqual(change_review.missing(commits), [])
 
     def test_incomplete_production_doc_keeps_valid_production_exclusions(self) -> None:
-        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE_WITH_IMAGE}")
         invalid_doc = self.repo.parent / "incomplete-production.md"
         _ = invalid_doc.write_text(f"- **Repository:** `{self.repo}`\n"
                                   + f"- **Change review:** `{self.repo.parent / 'review.md'}`\n",
@@ -3049,7 +3196,7 @@ class ProductionMergeCommitsTest(unittest.TestCase):
         self.assertEqual(change_review.missing(commits), [])
 
     def test_registered_productions_are_read_by_default(self) -> None:
-        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE_WITH_IMAGE}")
         with mock.patch.object(showrunners, "timer_docs", return_value={"own": self.own_doc, "other": self.other_doc}):
             commits = change_review.unit_commits(self.repo, "HEAD", self.previous, "own-merge")
         self.assertEqual([commit.sha for commit in commits], [own])
@@ -3058,16 +3205,16 @@ class ProductionMergeCommitsTest(unittest.TestCase):
         subdirectory = self.repo / "src"
         subdirectory.mkdir()
         _ = self.other_doc.write_text(self.other_doc.read_text().replace(str(self.repo), str(subdirectory)))
-        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE_WITH_IMAGE}")
         self.assertEqual([commit.sha for commit in self.commits()], [own])
 
     def test_absent_origin_branch_does_not_exclude_its_local_commits(self) -> None:
         _ = self.git("update-ref", "-d", "refs/remotes/origin/other-merge")
-        _ = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        _ = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE_WITH_IMAGE}")
         self.assertEqual([item.split()[0] for item in change_review.missing(self.commits())], [self.foreign[:8]])
 
     def test_unreadable_timer_registry_keeps_the_existing_exclusions(self) -> None:
-        _ = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        _ = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE_WITH_IMAGE}")
         with mock.patch.object(showrunners, "timer_docs", side_effect=OSError("cannot read production registry")):
             commits = change_review.unit_commits(self.repo, "HEAD", self.previous, "own-merge")
         self.assertEqual([item.split()[0] for item in change_review.missing(commits)], [self.foreign[:8]])
@@ -3107,19 +3254,35 @@ class RepositoryTest(unittest.TestCase):
         _ = self.git("checkout", "-q", "unit")
         _ = self.git("merge", "-q", "--no-ff", "-m", "merge(u): origin/merge", "origin/merge")
 
+    def test_the_image_cutoff_uses_committer_time_in_unit_and_merge_readers(self) -> None:
+        stamps = (1794805199, 1794805200)
+        checkpoints: list[str] = []
+        for timestamp in stamps:
+            _ = self.git("commit", "--allow-empty", "-m", "checkpoint(u): grid\n\n" + SEE,
+                         "--date=2026-11-17T12:00:00-05:00", day=f"@{timestamp} -0500")
+            checkpoints.append(self.git("rev-parse", "HEAD"))
+        unit_commits = change_review.unit_commits(self.repo, "HEAD", self.previous, "merge")
+        merged = self.merged("unit", "Merge u")
+        for commits in (unit_commits, change_review.merge_commits(self.repo, merged)):
+            with self.subTest(commits=[commit.sha for commit in commits]):
+                self.assertEqual({commit.sha: commit.timestamp for commit in commits}, dict(zip(checkpoints, stamps)))
+                refused, = change_review.missing(commits)
+                self.assertTrue(refused.startswith(checkpoints[1][:8]))
+                self.assertIn("has no image", refused)
+
     def test_only_the_units_own_checkpoints_are_read(self) -> None:
-        checkpoint = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE}")
+        checkpoint = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE_WITH_IMAGE}")
         commits = change_review.unit_commits(self.repo, checkpoint, self.previous, "merge")
         self.assertEqual([commit.subject for commit in commits], ["checkpoint(u): grid"])
         self.assertEqual(change_review.missing(commits), [])
-        self.assertEqual(change_review.visible(commits), [GRID])
+        self.assertEqual(change_review.visible(commits), [GRID_WITH_IMAGE])
 
         with self.subTest(subject="queue(7): grid"):
-            queued = self.commit("a.py", f"queue(7): grid\n\n{SEE}")
+            queued = self.commit("a.py", f"queue(7): grid\n\n{SEE_WITH_IMAGE}")
             commits = change_review.unit_commits(self.repo, queued, checkpoint, "merge")
             self.assertEqual([commit.subject for commit in commits], ["queue(7): grid"])
             self.assertEqual(change_review.missing(commits), [])
-            self.assertEqual(change_review.visible(commits), [GRID])
+            self.assertEqual(change_review.visible(commits), [GRID_WITH_IMAGE])
 
         _ = self.merged("unit", "Merge initial checkpoints")
         for layout in ("linear", "merged", "sibling", "checkpoints"):
@@ -3130,19 +3293,19 @@ class RepositoryTest(unittest.TestCase):
                 earlier_rows: list[Visible] = []
                 if layout == "checkpoints":
                     earlier.append(self.commit("earlier.py",
-                                               "checkpoint(u): earlier\n\nChange-Review: Earlier change | Read | Earlier result"))
-                    earlier_rows.append(Visible("Earlier change", "Read", "Earlier result"))
+                                               "checkpoint(u): earlier\n\nChange-Review: Earlier change | Read | Earlier result | image 012345abcdef"))
+                    earlier_rows.append(Visible("Earlier change", "Read", "Earlier result", image="012345abcdef"))
                 if layout == "merged":
                     _ = self.git("checkout", "-b", "draft-side")
                 _ = self.commit(f"draft-{layout}.py",
-                                "fix(u): draft\n\nChange-Review: Draft change | Draft check | Draft result")
+                                "fix(u): draft\n\nChange-Review: Draft change | Draft check | Draft result | image 012345abcdef")
                 if layout == "merged":
                     _ = self.git("checkout", "unit")
                     _ = self.git("merge", "--no-ff", "draft-side", "-m", "Merge worker draft")
-                final = self.commit(f"final-{layout}.py", f"checkpoint(u): final\n\n{SEE}")
+                final = self.commit(f"final-{layout}.py", f"checkpoint(u): final\n\n{SEE_WITH_IMAGE}")
                 _ = self.git("checkout", "-b", f"queue-{layout}", previous if layout == "sibling" else final)
                 queued = self.commit(f"queue-{layout}.py",
-                                     "queue(7): later change\n\nChange-Review: Queued later | Read | Queue result")
+                                     "queue(7): later change\n\nChange-Review: Queued later | Read | Queue result | image 012345abcdef")
                 _ = self.git("checkout", "unit")
                 _ = self.git("merge", "--no-ff", f"queue-{layout}", "-m", "Merge queued change")
                 tip = self.git("rev-parse", "HEAD")
@@ -3152,10 +3315,10 @@ class RepositoryTest(unittest.TestCase):
                     self.assertEqual(change_review.missing(commits), [])
                     self.assertCountEqual([commit.sha for commit in change_review.review_commits(commits)], [*earlier, final, queued])
                     self.assertCountEqual(change_review.visible(commits),
-                                          [*earlier_rows, GRID, Visible("Queued later", "Read", "Queue result")])
+                                          [*earlier_rows, GRID_WITH_IMAGE, Visible("Queued later", "Read", "Queue result", image="012345abcdef")])
 
     def test_a_merge_reads_its_parents_with_one_git_command_and_refuses_unknown_commits(self) -> None:
-        checkpoint = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE}")
+        checkpoint = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE_WITH_IMAGE}")
         merged = self.merged("unit", "Merge u")
         with mock.patch.object(subprocess, "run", wraps=subprocess.run) as commands:
             commits = change_review.merge_commits(self.repo, merged)
@@ -3167,7 +3330,7 @@ class RepositoryTest(unittest.TestCase):
             _ = change_review.merge_commits(self.repo, "f" * 40)
 
     def test_a_tree_reads_a_branch_first_parent_line_once(self) -> None:
-        checkpoint = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE}")
+        checkpoint = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE_WITH_IMAGE}")
         merged = self.merged("unit", "Merge u")
         doc = self.repo / "production.md"
         _ = doc.write_text(f"- **Repository:** {self.repo}\n- **Merge branch:** merge\n")
@@ -3181,10 +3344,10 @@ class RepositoryTest(unittest.TestCase):
 
     def test_a_markdown_only_checkpoint_needs_no_line_but_its_line_is_read(self) -> None:
         _ = self.commit("a.md", "checkpoint(u): doc without a line")
-        checkpoint = self.commit("b.md", f"checkpoint(u): doc with a line\n\n{SEE}")
+        checkpoint = self.commit("b.md", f"checkpoint(u): doc with a line\n\n{SEE_WITH_IMAGE}")
         commits = change_review.unit_commits(self.repo, checkpoint, self.previous, "merge")
         self.assertEqual(change_review.missing(commits), [])
-        self.assertEqual(change_review.visible(commits), [GRID])
+        self.assertEqual(change_review.visible(commits), [GRID_WITH_IMAGE])
 
     def test_a_checkpoint_without_a_line_is_refused_even_when_the_named_checkpoint_is_a_merge(self) -> None:
         _ = self.commit("a.py", "checkpoint(u): grid")
@@ -3201,15 +3364,15 @@ class RepositoryTest(unittest.TestCase):
         _ = self.git("checkout", "-qb", "side")
         _ = self.commit("b.md", "side change")
         _ = self.git("checkout", "-q", "unit")
-        for trailer in (SEE, change_review.COVERS + ": malformed"):
+        for trailer in (SEE_WITH_IMAGE, change_review.COVERS + ": malformed"):
             _ = self.git("merge", "-q", "--no-ff", "-m", "Merge side\n\n" + trailer, "side")
             with self.assertRaisesRegex(change_review.ChangeReviewError, "Put the lines on a plain commit after the merge"):
                 _ = change_review.unit_commits(self.repo, "HEAD", self.previous, "merge")
             _ = self.git("reset", "--hard", "HEAD^1")
-        _ = self.git("merge", "-q", "--no-ff", "-m", "Merge side\n\n" + SEE, "side")
+        _ = self.git("merge", "-q", "--no-ff", "-m", "Merge side\n\n" + SEE_WITH_IMAGE, "side")
         merged = self.git("rev-parse", "HEAD")
         _ = self.git("update-ref", "refs/remotes/origin/merge", merged)
-        plain = self.commit("repair.py", "checkpoint(u): repair\n\n" + SEE)
+        plain = self.commit("repair.py", "checkpoint(u): repair\n\n" + SEE_WITH_IMAGE)
         self.assertEqual([commit.sha for commit in change_review.unit_commits(self.repo, plain, self.previous, "merge")], [plain])
 
     def test_incoming_merge_with_a_none_line_is_left_out(self) -> None:
@@ -3226,14 +3389,14 @@ class RepositoryTest(unittest.TestCase):
     def test_a_later_checkpoint_covers_one_pushed_without_its_line(self) -> None:
         early = self.commit("a.py", "checkpoint(u): grid")
         self.assertEqual(len(change_review.missing(change_review.unit_commits(self.repo, "HEAD", self.previous, "merge"))), 1)
-        _ = self.commit("b.py", f"checkpoint(u): change review\n\n{SEE}\nChange-Review-Covers: {early[:8]}")
+        _ = self.commit("b.py", f"checkpoint(u): change review\n\n{SEE_WITH_IMAGE}\nChange-Review-Covers: {early[:8]}")
         commits = change_review.unit_commits(self.repo, "HEAD", self.previous, "merge")
         self.assertEqual(change_review.missing(commits), [])
-        self.assertEqual(change_review.visible(commits), [GRID])
+        self.assertEqual(change_review.visible(commits), [GRID_WITH_IMAGE])
 
     def test_a_checkpoint_made_before_the_rule_landed_is_not_read(self) -> None:
         _ = self.commit("a.py", "checkpoint(u): before the rule", day="2026-10-14T23:59:00-04:00")
-        checkpoint = self.commit("b.py", f"checkpoint(u): grid\n\n{SEE}")
+        checkpoint = self.commit("b.py", f"checkpoint(u): grid\n\n{SEE_WITH_IMAGE}")
         commits = change_review.unit_commits(self.repo, checkpoint, self.previous, "merge")
         self.assertEqual([commit.subject for commit in commits], ["checkpoint(u): grid"])
 
@@ -3248,7 +3411,7 @@ class RepositoryTest(unittest.TestCase):
 
 
     def test_backfill_fills_older_rows_from_their_merges_and_names_a_row_it_cannot_trace(self) -> None:
-        _ = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE}")
+        _ = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE_WITH_IMAGE}")
         unit_merge = self.merged("unit", "Merge u")
         _ = self.git("checkout", "-q", "-b", "side", "merge")
         _ = self.commit("b.py", "a plain commit")
@@ -3261,7 +3424,7 @@ class RepositoryTest(unittest.TestCase):
         _ = kid.write_text(f"- **Repository:** {self.repo}\n- **Merge branch:** kid\n", encoding="utf-8")
         path = folder / "change-review - top.md"
         _ = path.write_text("## To review\n\n| # | Change | Merged | How to check |\n| --- | --- | --- | --- |\n"
-                            + f"| C1 | {GRID.change} | 2026-10-15 · {unit_merge} | x |\n"
+                            + f"| C1 | {GRID_WITH_IMAGE.change} | 2026-10-15 · {unit_merge} | x |\n"
                             + f"| C2 | side change | 2026-10-15 · {side_merge} | x |\n"
                             + "| C3 | no hash | 2026-10-15 | x |\n\n"
                             + "## Reviewed\n\n| # | Change | Verdict | Date |\n| --- | --- | --- | --- |\n", encoding="utf-8")
@@ -3281,7 +3444,7 @@ class RepositoryTest(unittest.TestCase):
         self.assertEqual(change_review.backfill(path, tree, write=False), ({}, {"C3": "no merge hash"}))
 
     def test_backfill_credits_a_style_childs_hand_off_change_to_the_parent_that_merged_it(self) -> None:
-        _ = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE}")
+        _ = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE_WITH_IMAGE}")
         handoff = self.merged("unit", "Merge style hand-off")
         folder = self.repo / "docs"
         folder.mkdir()
@@ -3297,7 +3460,7 @@ class RepositoryTest(unittest.TestCase):
         _ = staff.move(child.id, staff.ReportsTo(owner.id))
         path = folder / "change-review - top.md"
         _ = path.write_text("## To review\n\n| # | Change | Merged | How to check |\n| --- | --- | --- | --- |\n"
-                            + f"| C1 | {GRID.change} | 2026-10-15 · {handoff} | x |\n\n"
+                            + f"| C1 | {GRID_WITH_IMAGE.change} | 2026-10-15 · {handoff} | x |\n\n"
                             + "## Reviewed\n\n| # | Change | Verdict | Date |\n| --- | --- | --- | --- |\n", encoding="utf-8")
         self.assertEqual(change_review.backfill(path, change_review.Tree([top, style]), write=True), ({"C1": owner.id}, {}))
 
@@ -3307,8 +3470,10 @@ class RepositoryTest(unittest.TestCase):
         top, kid = folder / "top-production.md", folder / "kid-production.md"
         _ = kid.write_text("# Kid\n", encoding="utf-8")
         _ = top.write_text("# Top\n", encoding="utf-8")
-        commits = [change_review.Commit("1", "checkpoint(u-plan): grid", f"checkpoint(u-plan): grid\n\n{SEE}", ()),
-                   change_review.Commit("2", "checkpoint(own): grid", f"checkpoint(own): grid\n\n{SEE}", ())]
+        commits = [change_review.Commit("1", "checkpoint(u-plan): grid", f"checkpoint(u-plan): grid\n\n{SEE_WITH_IMAGE}", (),
+                                       change_review.CHECKED_FROM),
+                   change_review.Commit("2", "checkpoint(own): grid", f"checkpoint(own): grid\n\n{SEE_WITH_IMAGE}", (),
+                                       change_review.CHECKED_FROM)]
         unit = recorded_unit("kid", "u", self.repo, kid, plan="docs/u-plan.md")
         _ = recorded_showrunner("top", top)
         _ = recorded_showrunner("kid", kid, parent="top")

@@ -25,6 +25,7 @@ from scripts.direct.test_tree_watch import write_workspace
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.build_folders_test_support import tool_folders
 
 
 def cancellation_lines(output: str, command: str) -> list[re.Match[str]]:
@@ -198,7 +199,7 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         # Formatting runs before clippy fix, then runs again without rewriting.
         for stage in ("mend", "fmt", "fix"):
             self.wait_for_running(self.control / (stage + ".rewritten"), process)
-            self.assertEqual(list((self.root / "tmp").glob("verify-tree.*")), [],
+            self.assertEqual(tool_folders(self.root / "tmp", "verify-tree"), [],
                              f"the watcher started during the {stage} rewrite")
             _ = (self.control / (stage + ".release")).touch()
 

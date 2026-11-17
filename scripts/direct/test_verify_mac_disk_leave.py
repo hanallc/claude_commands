@@ -235,7 +235,7 @@ class StepRetryPermissionTests(unittest.TestCase):
                             fixture.provider_evidence[key] = evidence
                             fixture.server.publish_host_evidence(evidence)
                         reply, = fixture.connect(request).replies()
-                        expected = (local_only == "0" and kind == "test" and writes_tree == "0"
+                        expected = (local_only == "0" and writes_tree == "0" and kind != "final"
                                     and any(reason == "disk" for _, reason in rows))
                         self.assertEqual(isinstance(reply, wire.Assignment), expected, repr(reply))
 

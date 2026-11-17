@@ -12,7 +12,7 @@ from scripts.lib.terminal_cells import terminal_width
 
 # The renderer includes the reply indent in its four-column allowance.
 REPLY_INDENT = 0
-_FIXED_COLUMNS = frozenset(("Unit", "Status", "Machine", "Progress"))
+_FIXED_COLUMNS = frozenset(("Unit", "Status", "Director", "Machine", "Progress"))
 
 
 class ColumnFit(NamedTuple):

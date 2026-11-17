@@ -18,6 +18,7 @@ from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode
 
+from scripts.review_links.test_page_frame import assert_status_states
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member
@@ -119,15 +120,41 @@ class ChangeImageTests(ImagesFixture):
             self.assertIn("background:#161b22", page.read_text())
             profile = next(value.split("=", 1)[1] for value in arguments if value.startswith("--user-data-dir="))
             self.assertTrue(Path(profile).is_relative_to(page.parent))
+            if "--dump-dom" in arguments:
+                self.assertIn("Math.ceil(document.body.getBoundingClientRect().height)", page.read_text())
+                return subprocess.CompletedProcess(arguments, 0, "<title>output-size:92</title>", "")
+            self.assertIn("--window-size=640,160", arguments)
             shot = next(value.split("=", 1)[1] for value in arguments if value.startswith("--screenshot="))
             _ = Path(shot).write_bytes(PNG)
             return subprocess.CompletedProcess(arguments, 0, "", "")
 
         with patch("scripts.review_links.image_store.subprocess.run", side_effect=chrome) as run:
             identity = image_store.register_output(output)
+        self.assertEqual(run.call_count, 2)
         self.assertTrue(image_store.change_image(self.root, identity))
         arguments = cast(list[str], run.call_args.args[0])
         self.assertFalse(Path(arguments[-1].removeprefix("file://")).parent.exists())
+
+    def test_output_sizes_wrapped_lines_with_a_minimum_height_and_a_cap(self) -> None:
+        output = self.temporary / "wrapped.txt"
+        _ = output.write_text("x" * 300 + "\n" + "short\n" * 5)
+        for content, height in ((70, 160), (160, 160), (246, 246), (5000, 4096)):
+            with self.subTest(content=content):
+                def chrome(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+                    self.assertIn("--force-device-scale-factor=1", arguments)
+                    if "--dump-dom" in arguments:
+                        self.assertIn("--window-size=1440,600", arguments)
+                        return subprocess.CompletedProcess(arguments, 0,
+                            f"<title>output-size:{content}</title>", "")
+                    self.assertIn(f"--window-size=1440,{height}", arguments)
+                    shot = next(value.split("=", 1)[1] for value in arguments if value.startswith("--screenshot="))
+                    _ = Path(shot).write_bytes(PNG)
+                    return subprocess.CompletedProcess(arguments, 0, "", "")
+
+                with patch("scripts.review_links.image_store.subprocess.run", side_effect=chrome) as run:
+                    identity = image_store.register_output(output)
+                self.assertEqual(run.call_count, 2)
+                self.assertTrue(image_store.change_image(self.root, identity))
 
 
 class ImagesTests(ImagesFixture):
@@ -186,29 +213,45 @@ class ImagesTests(ImagesFixture):
         self.assertEqual(source.count(page_frame.ZOOM_SCRIPT), 1)
         self.assertEqual(source.count(page_frame.MOTION_SCRIPT), 1)
         self.assertEqual(source.count(page_frame.REFRESH_SCRIPT), 1)
-        self.assertIn("createPageRefresh(refresh);", source)
+        self.assertIn("createPageRefresh(refresh,()=>0);", source)
         self.assertIn("prefers-reduced-motion: reduce", source)
         self.assertLess(source.index(older["id"]), source.index(newer["id"]))
         self.assertIn('<nav data-image-groups aria-label="Image groups"></nav>', source)
         self.assertIn("last.owner === card.dataset.owner", source)
         self.assertIn("link.href = '#' + row.card.id;", source)
         self.assertIn("document.getElementById('image-' + start.get('image'))", source)
-        self.assertIn("if (target.hidden) {", source)
+        self.assertIn(f'<article id="image-{older["id"]}"', source)
         self.assertIn("Newer shot", source)
         self.assertIn("shot-owner (unit)", source)
         self.assertIn("Phase console-images", source)
         self.assertIn(f'src="/images/{newer['id']}/image.png"', source)
         token = images.request_token(images.console_token(self.root), newer["id"])
         self.assertIn(f'name="token" value="{token}"', source)
-        self.assertIn('<option value="week" selected>', source)
+        self.assertNotIn('data-image-filter', source)
+        self.assertNotIn('image-window', source)
+        self.assertNotIn("start.get('show')", source)
         self.assertIn("card.remove();", source)
         self.assertIn("home.insertBefore(card, next?.parentNode === home ? next : null);", source)
         self.assertIn("status.textContent = 'Not sent: ' + error.message;", source)
         self.assertIn("new FormData(form, event.submitter)", source)
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_page_status_uses_the_real_images_loader(self) -> None:
+        older = self.register("Older shot")
+        _ = self.register("Newer shot")
+        older_folder = self.root / image_store.IMAGES_FOLDER / older["id"]
+        older["registered_at"] = (datetime.now(UTC) - timedelta(days=9)).isoformat(timespec="seconds")
+        image_store.write_record(older_folder, older)
+        source = images.render(self.root).decode()
+        self.assertIn('</h1><p class="page-status"', source)
+        self.assertLess(source.index('data-page-status '), source.index('<div data-image-layout'))
+        assert_status_states(self, source, 0)
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_updates_keep_zoom_and_feedback_working_after_an_older_script_reloads(self) -> None:
-        _ = self.register()
+        older = self.register()
+        older["registered_at"] = (datetime.now(UTC) - timedelta(days=9)).isoformat(timespec="seconds")
+        image_store.write_record(images.images_root(self.root) / older["id"], older)
         current = images.render(self.root).decode()
         marker = f'data-script="{images.SCRIPT_VERSION}"'
         self.assertEqual(current.count(marker), 1)
@@ -229,6 +272,9 @@ class ImagesTests(ImagesFixture):
  for (let step = 0; step < 100 && list() === before; step++) await wait(20);
  check(list() !== before, 'the update puts in a new list');
  const card = list().querySelector('article'), form = card.querySelector('form');
+ check(!document.querySelector('[data-image-filter], #image-window'), 'the page has no age filter');
+ check(!card.hidden && Date.now() - Date.parse(card.querySelector('time').dateTime) > 7*86400000,
+       'the image older than seven days stays visible after an update');
  const link = card.querySelector('a[data-image-zoom]');
  const zoom = document.querySelector('[data-image-zoom-dialog]');
  link.click();
@@ -346,7 +392,7 @@ class ImagesTests(ImagesFixture):
         path = f"/images/{record['id']}/image.png"
         token = images.request_token("token", record["id"])
         self.assertEqual(card, (
-            f'<article id="image-{record['id']}" data-image="{record['id']}" data-registered="1794712140"'
+            f'<article id="image-{record['id']}" data-image="{record['id']}"'
             + f' data-owner="{record['owner']}" data-owner-name="shot-owner">'
             + '<h2 class="caption">Look at &lt;the&gt; cards</h2><dl class="image-details">'
             + '<dt>Owner:</dt><dd>shot-owner (unit)</dd><dt>For  :</dt><dd>Phase console-images</dd>'

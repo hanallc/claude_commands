@@ -18,7 +18,7 @@ from unittest import mock
 from scripts.build_hold.owning_session import OwningSession
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
-from scripts.build_targets import build_targets, targets
+from scripts.build_targets import build_targets, target_config, targets
 from scripts.build_hold import build_hold
 from scripts.build_hold import owning_session as session_owner
 from scripts.mac_test import mac_test
@@ -337,8 +337,19 @@ class TargetStateTests(IsolatedTargetTest):
 
     def test_local_eta_is_expected_release(self) -> None:
         self.write_holder(END.isoformat())
-        self.assertEqual(targets.target_state(targets.LocalTarget("natedev", "linux")),
-                         targets.Held("hana", "render checks", SINCE, targets.ReleaseEstimated(END), targets.HolderSession("hana")))
+        before = (self.holders / "hana").read_bytes()
+        for now, end, text in (
+            (NOW, targets.ReleaseEstimated(END), "release expected 22:05 UTC"),
+            (END, targets.ReleaseOverdue(END), "release overdue since 22:05 UTC"),
+            (END + timedelta(seconds=1), targets.ReleaseOverdue(END), "release overdue since 22:05 UTC"),
+        ):
+            with self.subTest(now=now), mock.patch.object(targets, "utc_now", return_value=now), \
+                 mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(targets.target_state(targets.LocalTarget("natedev", "linux")),
+                                 targets.Held("hana", "render checks", SINCE, end, targets.HolderSession("hana")))
+                self.assertEqual(build_targets.command_status(), 0)
+                self.assertIn(f"natedev: held by hana since 20:05 UTC {text} — render checks", output.getvalue())
+                self.assertEqual((self.holders / "hana").read_bytes(), before)
 
     def test_local_without_eta_is_held_until_release(self) -> None:
         self.write_holder()
@@ -349,7 +360,7 @@ class TargetStateTests(IsolatedTargetTest):
         eta = NOW - timedelta(minutes=1)
         self.write_holder(eta.isoformat())
         self.assertEqual(targets.target_state(targets.LocalTarget("natedev", "linux")),
-                         targets.Held("hana", "render checks", SINCE, targets.ReleaseEstimated(eta), targets.HolderSession("hana")))
+                         targets.Held("hana", "render checks", SINCE, targets.ReleaseOverdue(eta), targets.HolderSession("hana")))
 
     def test_mac_without_block_or_claim_is_free(self) -> None:
         self.assertEqual(targets.target_state(self.mac()), targets.Free())
@@ -725,6 +736,7 @@ class ValueTests(unittest.TestCase):
             targets.StateUnreadable("holder access denied"),
             targets.ExpiresAt(END),
             targets.ReleaseEstimated(END),
+            targets.ReleaseOverdue(END),
             targets.UntilReleased(),
             targets.AwaitingBlockRemoval(),
         )
@@ -739,6 +751,7 @@ class ValueTests(unittest.TestCase):
         cases: tuple[tuple[targets.HoldEnd, str], ...] = (
             (targets.ExpiresAt(END), "until 22:05 UTC"),
             (targets.ReleaseEstimated(END), "expected release 22:05 UTC"),
+            (targets.ReleaseOverdue(END), "release overdue since 22:05 UTC"),
             (targets.UntilReleased(), "until released"),
             (targets.AwaitingBlockRemoval(END), "awaiting unblock; requested expiry was 22:05 UTC"),
             (targets.AwaitingBlockRemoval(), "awaiting unblock"),
@@ -747,6 +760,19 @@ class ValueTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertEqual(targets.end_text(end, timezone.utc), expected)
 
+    def test_step_route_follows_the_placement_client_order(self) -> None:
+        # Each case: local, mac_only, target, writes_tree, then the route.
+        cases: tuple[tuple[bool, bool, str, bool, target_config.StepRoute], ...] = (
+            (True, True, "mac", True, target_config.WRITES_TREE),
+            (True, True, "mac", False, target_config.LOCAL_CALLER),
+            (False, True, "natedev", False, target_config.MAC_ONLY),
+            (False, False, "natedev", False, target_config.PinnedTarget("natedev")),
+            (False, False, "", False, target_config.ANY_ELIGIBLE_TARGET),
+        )
+        for local, mac_only, target, writes_tree, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(target_config.step_route(local=local, mac_only=mac_only, target=target,
+                                                          writes_tree=writes_tree), expected)
 
 if __name__ == "__main__":
     _ = unittest.main()

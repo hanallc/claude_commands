@@ -1133,11 +1133,6 @@ class Deployment:
                 for zone in sorted(zones):
                     print(region, size, zone, str(latest.get((size, zone), 'unavailable')))
 
-    def spot_table(self) -> None:
-        """Print the local snapshot without AWS credentials or network calls."""
-        from scripts.aws_target import spot_table
-        print(spot_table.render(self.directory, int(self.clock()), settings_path=self.settings_path))
-
     def quota_request(self) -> bool:
         """Request both regional Spot quotas without duplicating open requests."""
         settings = read_deployment_settings(self.settings_path)
@@ -1232,7 +1227,7 @@ class Deployment:
 
     def gate_up(self, *, approve_resources: bool = False) -> bool:
         """Add the gate resources and preserve every Rust parameter."""
-        from scripts.aws_target import cloud_gate, gate_trial, gpu_size_trial
+        from scripts.aws_target import aws_trial, cloud_gate, gpu_size_trial
         self._authorize(approve_resources)
         with control_lock(self.directory / 'gate-up'):
             settings = read_deployment_settings(self.settings_path)
@@ -1244,7 +1239,7 @@ class Deployment:
             stack = ledger.rows(api.call('describe-stacks', '--stack-name', stack_id,
                                        service='cloudformation'), 'Stacks')[0]
             subnets = gate_subnets(api, settings.vpc_id)
-            revision = gate_trial.host_nixpkgs_revision()
+            revision = aws_trial.host_nixpkgs_revision()
             account = ledger.text(api.call('get-caller-identity', service='sts'), 'Account')
             partition = stack_id.split(':')[1]
             prefix = f'arn:{partition}:ec2:{settings.region}:{account}:'
@@ -1343,7 +1338,9 @@ def region_gate_template() -> dict[str, object]:
     resources = ledger.mapping(source['Resources'])
     def rewrite(value: object) -> object:
         if isinstance(value, str):
-            return value.replace('cloud-claude-gate-${DeploymentId}', 'cloud-gate-${DeploymentId}-${AWS::Region}')
+            # IAM role, Lambda and schedule names allow 64 characters; the shorter expiry prefix fits a 19-character region.
+            return (value.replace('cloud-claude-gate-${DeploymentId}-expiry', 'gate-${DeploymentId}-${AWS::Region}-expiry')
+                    .replace('cloud-claude-gate-${DeploymentId}', 'cloud-gate-${DeploymentId}-${AWS::Region}'))
         if isinstance(value, list):
             return [rewrite(item) for item in cast(list[object], value)]
         if isinstance(value, dict):
@@ -1450,13 +1447,13 @@ class DeploymentArguments(argparse.Namespace):
 
 def main() -> int:
     os.environ['AWS_SHARED_CREDENTIALS_FILE'] = str(admin_secrets.credentials_file())
-    if sys.argv[1:2] == ['gate-trial']:
-        from scripts.aws_target import gate_trial
+    if sys.argv[1:2] == ['aws-trial']:
+        from scripts.aws_target import aws_trial
         settings_path = conf.path('aws_target')
-        with step('gate-trial', 'running the trial', settings_path):
-            return gate_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
+        with step('aws-trial', 'running the trial', settings_path):
+            return aws_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'spot-table', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'apply'))
+    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'apply'))
     _ = parser.add_argument('trial_action', nargs='?', choices=('run',))
     _ = parser.add_argument('--trial-folder', type=Path)
     _ = parser.add_argument('--workload', choices=('merge-gates', 'hana'), default='merge-gates')
@@ -1483,8 +1480,6 @@ def main() -> int:
             return 0 if deploy.down(approve_destroy=args.approve_destroy) else 1
         elif args.command == 'remove-images':
             return 0 if deploy.remove_images(approve_destroy=args.approve_destroy) else 1
-        elif args.command == 'spot-table':
-            deploy.spot_table()
         elif args.command == 'prices':
             deploy.prices()
         elif args.command == 'quota-request':

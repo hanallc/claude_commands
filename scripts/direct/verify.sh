@@ -10,7 +10,7 @@
 #   lint [<package>]       repair and format code; check TOML and run Clippy
 #   doc [<package>]        document the staged workspace; deny warnings
 #   example [<package>]    run Clippy on examples on an eligible target
-#   build [<package>]      build binaries on natedev and print their paths
+#   build [<package>]      build binaries on an eligible target; print paths
 #   final [<package>]      check workspace targets; run tests on natedev
 #   help <command>       show details for one command
 #
@@ -75,6 +75,7 @@
 # UNIT_RUN_DIR, UNIT_SESSION_DIR or --session-dir enables saved results.
 # In that session, reuse a pass only when the tree and inputs still match.
 # Filtered runs have separate results. Failed tests always run again.
+# A run that a signal or a hold stop ends saves no pass.
 # Test keys include configured result variables and each --env value.
 # Tests use fixed terminal values from direct.conf on every target.
 # --no-cache ignores saved results. --target also ignores saved results.
@@ -101,6 +102,7 @@
 # In that session, reuse a pass or failure when the tree and inputs match.
 # A plain package lint result can answer another package in the workspace.
 # Do not save a result if edits change the tree after judgment.
+# Do not save a result from a run that a signal or a hold stop ends.
 # --no-cache ignores saved results.
 # End help.
 #
@@ -139,7 +141,7 @@
 # Usage: verify build [<package>] [--bin <name> | --example <name>]
 #                     [--release] [--features <list>] [--attached]
 #
-# Build binaries on natedev unless --target or --mac pins the step.
+# Build binaries on an eligible target. --target or --mac pins the step.
 # --local pins the step to natedev.
 # --bin selects one binary. --example selects one example.
 # Enable the example's required features when building an example.
@@ -595,7 +597,8 @@ verify_helper() {
         return 0
     fi
     (
-    local input="" has_input=0 status output errors entry
+    local input="" has_input=0 status output errors entry name
+    local names=()
     local forwarded=()
     if [[ "${1:-}" == --stdin ]]; then
         shift
@@ -614,9 +617,12 @@ verify_helper() {
             done
         fi
         exec 72>"$VERIFY_HELPER_LOCK"
-        if lock_file_descriptor 72 2>/dev/null && (
+        if compgen -V names -e 2>/dev/null && lock_file_descriptor 72 2>/dev/null && (
             printf '%s\0' "$1" "$PWD" "$(( $# - 1 ))" "${@:2}"
-            env -0
+            for name in "${names[@]}"; do
+                [[ -v "$name" && "${!name@a}" != *[aA]* ]] || continue
+                printf '%s=%s\0' "$name" "${!name}"
+            done
             printf '\0%s\0' "$input"
             if [[ ${#forwarded[@]} -gt 0 ]]; then printf '%s\0' "${forwarded[@]}"; fi
             printf '\0'
@@ -1110,7 +1116,7 @@ require_taplo() {
 
 workspace_taplo() (
     # Explicit paths retain Taplo's include/exclude rules and omit untracked files.
-    cd "$WORKSPACE_ROOT" || return
+    cd "$(git rev-parse --show-toplevel)" || return
     local listing file pattern character index
     local -a files=()
     listing="$(mktemp)" || return
@@ -1133,11 +1139,9 @@ workspace_taplo() (
     rm -f "$listing"
     # No paths means a repository scan to Taplo, so skip the empty set.
     (( ${#files[@]} )) || return 0
-    # During a copy pass Taplo writes the copy; the same relative paths name its files.
-    if [[ -n "${LINT_COPY_TREE:-}" ]]; then
-        local prefix
-        prefix="$(git rev-parse --show-prefix)" || return
-        cd "$LINT_COPY_TREE/$prefix" || return
+    # Format the copy, but judge the worktree that CI will receive.
+    if [[ -n "${LINT_COPY_TREE:-}" && "${1:-}" != --check ]]; then
+        cd "$LINT_COPY_TREE" || return
     fi
     local status=0
     run taplo fmt "$@" -- "${files[@]}" || status=$?
@@ -1509,125 +1513,8 @@ PHASE_TOKEN_OBSERVATION=""
 PHASE_TOKEN_HOLDER=""
 phase_wait_holder_flags() {
     local record_script="${STEP_RECORD_SCRIPT:-$PHASE_WAIT_RECORDER}"
-    VERIFY_PY_HELPER=PHASE_WAIT_HOLDER "$PY" - "$1" "${2:-}" \
-        "${BOARD_DIR:-$PHASE_WAIT_SESSION}" "${BUILD_HOLD_DIR-$HOME/.local/state/build-hold}" \
-        "$record_script" "${DOC_REPO_TOP:-$PWD}" <<'PY'
-import json
-import os
-from pathlib import Path
-import sys
-from uuid import UUID
-
-kind, payload, board_name, hold_name, recorder, repository = sys.argv[1:]
-with open(Path(recorder).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-
-
-def text(value):
-    return value.strip() if isinstance(value, str) and not any(c in value for c in "\r\n\t\0") else ""
-
-
-def read(path):
-    try:
-        return path.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        return ""
-
-
-def fields(raw):
-    try:
-        value = json.loads(raw)
-    except ValueError:
-        return {}
-    return value if isinstance(value, dict) else {}
-
-
-owner, owner_flag = "", "--holder-session"
-resource_kind, resource = "slot", "cargo"
-if kind == "token":
-    from scripts.production import staff
-    from scripts.lib import unit_runs
-
-    board = Path(board_name)
-    if payload == "director":
-        owner = unit_runs.director(board)
-    elif payload and payload != "unknown":
-        matches = []
-        if not matches:
-            for path in board.glob("impl_worker_*.json"):
-                worker = fields(read(path))
-                if (text(worker.get("slot")) == payload
-                        or path.stem == "impl_worker_" + payload):
-                    matches.append(worker)
-        state = fields(read(board / "progress_history_state.json"))
-        if matches:
-            reference = text(matches[0].get("staff_id")) if len(matches) == 1 else ""
-        else:
-            active_pass = state.get("pass", {})
-            worker = active_pass.get(payload, {}) if isinstance(active_pass, dict) else {}
-            if isinstance(active_pass, dict) and payload not in active_pass:
-                workers = [entry for entry in active_pass.values() if isinstance(entry, dict)
-                           and entry.get("worker_name") == payload]
-                worker = workers[0] if len(workers) == 1 else {}
-            reference = text(worker.get("worker_id")) if isinstance(worker, dict) else ""
-        try:
-            record = staff.snapshot()
-            member = record.by_id(staff.StaffId(reference)) if reference else None
-            if member is not None:
-                owner = member.current_session
-            if not owner:
-                unit = unit_runs.run_owner(state, record)
-                owner_flag = "--holder-unit"
-                owner = unit.name if isinstance(unit, staff.StaffRow) else ""
-        except (OSError, ValueError):
-            pass
-elif kind == "hold":
-    from scripts.build_hold import build_hold, owning_session
-    from scripts.build_targets import build_targets
-
-    resource = "natedev"
-    directory = Path(hold_name)
-    holder = build_targets.hold_waited_on(build_hold.natedev_holds(directory),
-                                        owning_session.owning_session(), directory, build_targets.current_caller_lineage())
-    if isinstance(holder, build_hold.Holder):
-        session = build_hold.holder_session(holder.key)
-        try:
-            UUID(session)
-            owner = session
-        except ValueError:
-            owner_flag, owner = "--holder-unit", text(holder.name)
-elif kind in ("mac", "target"):
-    from scripts.mac_test import mac_test
-
-    resource = payload or "mac"
-    paths = mac_test.state_paths("" if resource == "mac" else resource)
-    scope = mac_test.target_claim_scope(paths, repository)
-    session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    for claim in mac_test.read_claims(paths):
-        if mac_test.scopes_overlap(claim.scope, scope) and mac_test.run_is_live(claim.record):
-            candidate = text(claim.record.get("holder_session"))
-            if candidate and candidate != session:
-                owner = candidate
-                break
-elif kind == "provider":
-    diagnostic = fields(payload)
-    print(text(diagnostic.get("target")))
-    print(text(diagnostic.get("what")))
-elif kind in ("memory", "resource"):
-    holder = fields(payload)
-    if kind == "resource":
-        resource = text(holder.get("resource"))
-        print(resource)
-        print(text(holder.get("reason")))
-        holder = holder.get("holder", {})
-    else:
-        resource_kind, resource = "memory", "memory"
-    if holder.get("kind") == "session":
-        owner = text(holder.get("session_id"))
-    elif holder.get("kind") == "unit":
-        owner_flag, owner = "--holder-unit", text(holder.get("unit"))
-if owner:
-    print("\n".join(("--holder-resource-kind", resource_kind, "--holder-resource", resource, owner_flag, owner)))
-PY
+    VERIFY_PY_HELPER=PHASE_WAIT_HOLDER verify_helper "${record_script%/*}/phase_wait_holder.py" "$1" "${2:-}" \
+        "${BOARD_DIR:-$PHASE_WAIT_SESSION}" "${BUILD_HOLD_DIR-$HOME/.local/state/build-hold}" "${DOC_REPO_TOP:-$PWD}"
 }
 phase_wait_target_busy() {
     local holder
@@ -1899,6 +1786,7 @@ RUN_LOG_PIDS=()
 VERDICT_KEY=""
 VERDICT_TREE_KEY=""
 CLIPPY_FIX_LIMIT_REACHED=0
+PLACEMENT_FAILED=0
 RUN_STARTED=0
 CALL_NOTED=0
 TOKEN_WAIT_S=0
@@ -2044,7 +1932,7 @@ cancel_tree_run() {
 
 start_tree_watch() {
     [[ -z "$TREE_WATCH_PID" ]] || return 0
-    TREE_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" unique --kind verify-tree --owner "$$")"
+    TREE_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" tool --tool verify-tree --owner-pid "$$")"
     set_verdict_keys --watch-start "$TREE_WATCH_DIR/start"
     [[ -s "$TREE_WATCH_DIR/start" ]] || { verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"; TREE_WATCH_DIR=""; return 0; }
     local scope=()
@@ -2249,8 +2137,8 @@ try_mac_test() {
     trap 'forward_mac_runner_signal TERM 143' TERM
     trap 'forward_mac_runner_signal HUP 129' HUP
     REMOTE_BUILD_TARGET_DIR=""
-    local runner_status result_text="" result_word="" result_reason="" mac_owns_watch=0
-    local result_seconds="" result_holder="" result_fetch=failed mac_words=0 line name
+    local runner_status result_status result_text="" result_word="" result_reason="" mac_owns_watch=0
+    local result_seconds="" result_holder="" result_fetch=failed result_usable=0 name
     MAC_FIX_RESULT=""
     local runner_args=(run --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
         --package "$PKG" --call-id "$BUILDLOG_CALL_ID" --settings "$1"
@@ -2349,28 +2237,23 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     MAC_RUNNER_PID=""
     release_wait_claim
 
-    if [[ -f "$MAC_RESULT_FILE" && -r "$MAC_RESULT_FILE" \
-          && -s "$MAC_RESULT_FILE" ]]; then
-        result_text="$(< "$MAC_RESULT_FILE")"
-        while IFS= read -r line; do
-            case "$line" in
-                outcome=*)
-                    if [[ "$selected_is_mac" == 0 ]]; then
-                        ((mac_words += 1)); result_word="${line#outcome=}"
-                    fi
-                    ;;
-                mac=*)
-                    ((mac_words += 1))
-                    result_word="${line#mac=}"
-                    ;;
-                reason=*) result_reason="${line#reason=}" ;;
-                seconds=*) result_seconds="${line#seconds=}" ;;
-                holder=*) result_holder="${line#holder=}" ;;
-                fetch=*) result_fetch="${line#fetch=}" ;;
-                fix=*) MAC_FIX_RESULT="${line#fix=}" ;;
-                build_target_directory=*) REMOTE_BUILD_TARGET_DIR="${line#build_target_directory=}" ;;
-            esac
-        done <<< "$result_text"
+    if result_text="$(verify_helper "$VERIFY_START_DIR/runner_result.py" \
+        "$MAC_RESULT_FILE" "$runner_status" "$selected_is_mac")"; then
+        result_usable=1
+        {
+            IFS= read -r result_word || true
+            IFS= read -r result_reason || true
+            IFS= read -r result_seconds || true
+            IFS= read -r result_holder || true
+            IFS= read -r result_fetch || true
+            IFS= read -r MAC_FIX_RESULT || true
+            IFS= read -r REMOTE_BUILD_TARGET_DIR || true
+        } <<< "$result_text"
+    else
+        result_status=$?
+        if [[ "$result_status" != 1 ]]; then
+            printf 'verify.sh: runner_result.py failed (status %s); the Mac result is not used\n' "$result_status" >&2
+        fi
     fi
     if [[ -d "$MAC_RESULT_FILE" ]]; then
         rmdir "$MAC_RESULT_FILE" 2>/dev/null || true
@@ -2379,10 +2262,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     fi
     MAC_RESULT_FILE=""
 
-    if [[ "$mac_words" -ne 1 \
-          || ! "$result_word" =~ ^(passed|failed|lost|declined)$ \
-          || ( "$result_word" == passed && "$runner_status" -ne 0 ) \
-          || ( "$result_word" == failed && "$runner_status" -eq 0 ) ]]; then
+    if [[ "$result_usable" == 0 ]]; then
         BUILDLOG_MAC=declined
         BUILDLOG_MAC_REASON=runner
         BUILDLOG_MAC_S=""
@@ -2737,6 +2617,19 @@ PLACEMENT_COMMAND=()
 PLACEMENT_ASSIGNMENT_FILE=""
 PLACEMENT_GRANT_FILE=""
 PLACEMENT_PROVIDER=""
+MAC_BACKOFF_PROBED=0
+
+# A placement that fails before its step starts leaves the run without a
+# verdict. 78 (wait) and the left-queue status are not failures. A refusal (2)
+# prints its own reason; any other status is a crash of the placement tooling.
+placement_failed() {
+    case "$1" in
+        78|"$LINT_LEFT_QUEUE_STATUS") return 0 ;;
+        2) ;;
+        *) printf 'verify.sh: step placement failed with status %s before the step started; this is a tooling failure, not a result of the tree\n' "$1" >&2 ;;
+    esac
+    PLACEMENT_FAILED=1
+}
 
 placement_once() {
     local token=none reply line route="" status=0 monitor=0
@@ -2764,7 +2657,7 @@ placement_once() {
     elif [[ "${STEP_FORCE_MAC:-0}" != 0 ]]; then
         placement_args+=(--target mac)
     fi
-    [[ "${LOCAL_ONLY:-0}" == 0 ]] || placement_args+=(--local-only)
+    [[ "${LOCAL_ONLY:-0}" == 0 ]] || placement_args+=(--local-only --local-reason "$LOCAL_REASON")
     [[ "${STEP_WRITES_TREE:-0}" == 0 ]] || placement_args+=(--writes-tree)
     [[ "${MAC_ONLY:-0}" == 0 ]] || placement_args+=(--mac-only)
     # A builtin wait lets the parent handle TERM during a service outage.
@@ -2795,15 +2688,33 @@ placement_once() {
                     pinned_target_refuse "${line#*$'\t'}"
                 fi
                 BUILDLOG_MAC=declined BUILDLOG_MAC_REASON=${line#*$'\t'} BUILDLOG_MAC_S=0
+                # The backoff can outlast a short outage, so one fresh probe decides a Mac-only
+                # step. After it, the step waits while the service still reports the cleared backoff.
+                if [[ "$BUILDLOG_MAC_REASON" == backoff && "$MAC_ONLY" == 1 ]]; then
+                    local probe_args=(probe-backoff --target mac)
+                    [[ "$MAC_BACKOFF_PROBED" == 0 ]] || probe_args+=(--no-probe)
+                    if verify_helper "$BUILD_TARGETS_SCRIPT" "${probe_args[@]}"; then
+                        MAC_BACKOFF_PROBED=1
+                        return 78
+                    fi
+                    [[ "$MAC_BACKOFF_PROBED" == 1 ]] || BUILDLOG_MAC_REASON=unreachable
+                fi
                 mac_only_refuse "$BUILDLOG_MAC_REASON" ;;
             *) route=$line ;;
         esac
     done <<< "$reply"
-    (( status == 0 )) || return "$status"
+    if (( status != 0 )); then
+        placement_failed "$status"
+        return "$status"
+    fi
     IFS=$'\t' read -r PLACEMENT_PROVIDER STEP_ASSIGNED_TARGET STEP_ASSIGNED_HOST STEP_ASSIGNED_SLOT \
         PLACEMENT_EPISODE PLACEMENT_ATTEMPT <<< "$route"
     local metadata
-    metadata=$(verify_helper "$BUILD_TARGETS_SCRIPT" assigned-info --assignment-file "$PLACEMENT_ASSIGNMENT_FILE") || return $?
+    metadata=$(verify_helper "$BUILD_TARGETS_SCRIPT" assigned-info --assignment-file "$PLACEMENT_ASSIGNMENT_FILE") || {
+        status=$?
+        placement_failed "$status"
+        return "$status"
+    }
     IFS=$'\t' read -r STEP_ASSIGNED_SETTINGS STEP_ASSIGNED_PLATFORM PLACEMENT_SESSION <<< "$metadata"
     return 0
 }
@@ -2989,14 +2900,14 @@ route_test() {
 # Starts copy_watch.py beside the natedev step run() is about to start: while
 # the step compiles, it may run a copy of the same test on the Mac, and the
 # first result wins (see docs/as-built/mac-test-offload.md). Its folder sits in
-# the run's hold folder, so the EXIT trap removes both, and both names carry
-# the run's pid for tmp_sweep.py when a kill skips the trap.
+# the run's hold folder, so the EXIT trap removes both. Both lease records name
+# the run's pid, so the next run takes back a folder that a kill left.
 start_copy_watch() {
     # BASHPID identifies this shell inside a subshell. Bash 3.2 needs the child shell's PPID.
     local parent_pid="${BASHPID:-$(exec sh -c 'printf "%s\n" "$PPID"')}"
     local copy_parent=()
     [[ -z "${HOLD_WAIT_DIR:-}" ]] || copy_parent=(--parent "$HOLD_WAIT_DIR")
-    COPY_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" unique --kind verify-copy --owner "$$" "${copy_parent[@]}")"
+    COPY_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" tool --tool verify-copy --owner-pid "$$" "${copy_parent[@]}")"
     VERIFY_STEP_INFO_FILE="$COPY_WATCH_DIR/step"
     local watch_args=(--info "$VERIFY_STEP_INFO_FILE" --result "$COPY_WATCH_DIR/result"
         --runner "$MAC_RUNNER" --settings "$MAC_LEAVE_SETTINGS"
@@ -3207,11 +3118,12 @@ record_mac_pass() {
 }
 
 # A failed lint is the tree's own answer unless the run never reached a
-# verdict: a usage or tooling error (2), the sandbox (3), or a kill. A fix pass
-# that still changes the tree at the limit can leave more fixes for the next call.
+# verdict: a usage or tooling error (2), the sandbox (3), a kill, or a step
+# placement that failed before its step started. A fix pass that still changes
+# the tree at the limit can leave more fixes for the next call.
 lint_failure_is_the_tree() {
     [[ "$CMD" == lint ]] || return 1
-    (( CLIPPY_FIX_LIMIT_REACHED == 0 )) || return 1
+    (( CLIPPY_FIX_LIMIT_REACHED == 0 && PLACEMENT_FAILED == 0 )) || return 1
     (( EXIT_STATUS != 2 && EXIT_STATUS != 3 && EXIT_STATUS < 128 )) || return 1
     (( ${RUN_LAST_ATTEMPT_KILLED:-0} == 0 ))
 }
@@ -3260,7 +3172,7 @@ if [[ "$CMD" == test && -z "${GATE_METADATA}" ]]; then
     set_gate_metadata 2>/dev/null || true
 fi
 
-HOLD_WAIT_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" unique --kind verify-hold --owner "$$")"
+HOLD_WAIT_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" tool --tool verify --owner-pid "$$")"
 if [[ "$CMD" == lint ]]; then
     # The call owns these files. Cleanup removes them with the wait directory.
     export VERIFY_LINT_VERSIONS_FILE="$HOLD_WAIT_DIR/lint-versions"
@@ -4031,8 +3943,29 @@ verify_cleanup() {
     [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
 }
 # EXIT alone would report success for a failed cargo run, so branch on the
-# status the trap receives; a lint failure record keeps it.
-trap 'EXIT_STATUS=$?; [[ ${EXIT_STATUS} -eq 0 ]] && verify_cleanup completed || verify_cleanup error; finish_verify_run "$EXIT_STATUS"; exit "${EXIT_STATUS}"' EXIT
+# status the trap receives; a lint failure record keeps it. $2 is the command
+# that ended the shell. An untrapped fatal signal, such as SIGPIPE after a
+# hold stop ends the run-log readers, runs this trap with the status of the
+# last command, often 0. Only an exit command completes a run, so any other
+# command records the run as interrupted (status 128: the signal is
+# unknown here) and writes no pass. Cleanup is best effort: errexit is off,
+# so one failed cleanup command does not end the trap with its status.
+verify_exit() {
+    EXIT_STATUS=$1
+    set +e
+    if (( EXIT_STATUS == 0 )) && [[ "$2" != exit && "$2" != "exit "* ]]; then
+        EXIT_STATUS=128
+        interrupt_hold_wait
+        verify_cleanup interrupted
+    elif (( EXIT_STATUS == 0 )); then
+        verify_cleanup completed
+    else
+        verify_cleanup error
+    fi
+    finish_verify_run "$EXIT_STATUS"
+    exit "$EXIT_STATUS"
+}
+trap 'verify_exit "$?" "$BASH_COMMAND"' EXIT
 verify_interrupted() {
     trap - EXIT
     # A process-group stop can deliver the same signal more than once.
@@ -4208,11 +4141,13 @@ run_mac_lint_fix() {
 
 run_lint_held_sequence() {
     local STEP_FORCE_MAC=${1:-0}
+    LINT_HELD_CLIPPY_FAILED=0
     # Format locally; the Mac judges the resulting tree without fixes.
     lint_copy_begin
     lint_rewrite fmt_cargo --all
     workspace_taplo
     lint_copy_return || exit 1
+    workspace_taplo --check || exit "$?"
     lint_status=0
     if lint_config_enabled mend; then
         local mend_status=0
@@ -4234,7 +4169,10 @@ run_lint_held_sequence() {
     fi
     if lint_config_enabled clippy; then
         start_tree_watch
-        invoke_clippy --workspace --all-targets --all-features || lint_status=1
+        if ! invoke_clippy --workspace --all-targets --all-features; then
+            if (( lint_status == 0 )); then LINT_HELD_CLIPPY_FAILED=1; fi
+            lint_status=1
+        fi
         finish_tree_watch
     fi
     return 0
@@ -4317,6 +4255,10 @@ run_lint_sequence() {
                     rm -f "$MEND_LOG"
                     exit 0
                 fi
+                if [[ "$LINT_HELD_CLIPPY_FAILED" == 1 ]]; then
+                    rm -f "$MEND_LOG" "$HOLD_WAIT_DIR/lint-held"
+                    exit "$lint_status"
+                fi
                 HOLD_LINT=0
                 rm -f "$HOLD_WAIT_DIR/lint-held"
                 lint_copy_begin
@@ -4372,12 +4314,9 @@ run_lint_sequence() {
     if [[ -n "${RUN_LOG}" ]]; then
         set_verdict_keys
     fi
-    # Cargo's workspace root can differ from the caller's directory.
-    # Run there so Taplo uses the same config and scope as the push gate.
+    # Taplo checks the repository with its top-level config, as CI does.
     load_metadata
-    TAPLO_ARGS=(--check)
-    if [[ "$HOLD_LINT" == 1 ]]; then TAPLO_ARGS=(); fi
-    if workspace_taplo ${TAPLO_ARGS[@]+"${TAPLO_ARGS[@]}"}; then
+    if workspace_taplo --check; then
         :
     else
         taplo_status=$?
@@ -4519,3 +4458,5 @@ clean_tree()
         exit 2
         ;;
 esac
+# The EXIT trap counts only an exit command as a finished run.
+exit

@@ -1,5 +1,5 @@
 > Phase 10b supersedes the separate build-why instructions below.
-> Use `/build:queue <position|session|folder>` for the queue and its evidence on one page.
+> Use `/build:page` for the queue and its evidence.
 > The old command has no alias.
 
 # Build queue service: design and migration

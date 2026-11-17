@@ -13,7 +13,7 @@ it changes, and say so in one line.
 
 ## Steps
 
-1. **Top priority at once.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py bump <position|session|folder>` for a waiting step of the bumped unit. It gives that unit the queue priority until step 5 clears it; a second urgent request replaces the live priority at once. Make the work the whole production's top priority.
+1. **Top priority at once.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py <position|session|folder>` for a waiting step of the bumped unit. It gives that unit the queue priority until step 5 clears it; a second urgent request replaces the live priority at once. Make the work the whole production's top priority.
    Log it in `LOG` as `bump: <unit> <what>`. Tell every other unit director in
    one line: the bumped unit's merge goes first, and a build hold may come.
 2. **Checkpoint now.** Tell the owning unit director: "Bump: checkpoint and
@@ -30,7 +30,7 @@ it changes, and say so in one line.
 
    After the merge and push, start the demo build: the Mac run of
    <CIPoint/> on the pushed sha, or the build the production's rules name. If
-   natedev lacks memory, run `/build:hold clear bump: demo build of <unit>`.
+   natedev lacks memory, run `/build:hold clear bump: demo build of <unit> --release-eta HH:MM --zone <IANA zone>`.
    Release the hold when the build ends.
    A merge unit dispatches the demo build through a worker under `commands/unit/merge.md`.
 4. **Full suite after.** `--bump` starts the checkpoint gate on the pushed

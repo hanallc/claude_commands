@@ -21,10 +21,10 @@ from pathlib import Path
 import platform
 import sys
 from typing import TYPE_CHECKING, TypedDict, cast, override
-import tempfile
 import unittest
 
 
+from scripts.lib import build_folders
 from scripts.test_times.line_collector import (
     REPOSITORY, SHARED_TEST, SHARED_THREAD, ChildLaunch, ChildReport, ExecutedLine, LineCollector, read_child_reports,
 )
@@ -219,7 +219,7 @@ def child_causes(collector: LineCollector, evidence: ChildEvidence) -> dict[str,
 def collect(suite: Callable[[], unittest.TestSuite], repository: Path = REPOSITORY
             ) -> tuple[TimedResult, list[TestCoverage]]:
     """Run a suite through the shared timed runner and join its child reports."""
-    with tempfile.TemporaryDirectory(prefix="natest-coverage-") as directory:
+    with build_folders.tool_folder("natest-coverage") as directory:
         environment = ChildEnvironment(Path(directory))
 
         class CoverageResult(TimedResult):

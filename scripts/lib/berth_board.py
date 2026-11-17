@@ -32,6 +32,8 @@ class Reservation:
     scopes: tuple[str, ...]
     lifecycle: str
     edit_blocking_status: Literal["blocking", "clear"]
+    # The commit an outstanding reservation protects; empty in every other stage.
+    protected_tip: str = ""
 
     def blocks(self, path: str | Path) -> bool:
         if self.edit_blocking_status != "blocking":
@@ -45,6 +47,14 @@ class Reservation:
             elif candidate == scope.removeprefix("file:"):
                 return True
         return False
+
+    def names_file(self, path: str | Path) -> bool:
+        """Whether a blocking file scope names this exact path; a tree scope does not."""
+        if self.edit_blocking_status != "blocking":
+            return False
+        candidate = PurePosixPath(path).as_posix()
+        return any(not scope.startswith("tree:") and candidate == scope.removeprefix("file:")
+                   for scope in self.scopes)
 
 
 @dataclass(frozen=True)
@@ -111,8 +121,12 @@ def _reservation(value: dict[str, object]) -> Reservation:
     if isinstance(target, dict):
         target = cast(dict[str, object], target)["ref"]
     lifecycle = value["lifecycle"]
+    protected_tip = ""
     if isinstance(lifecycle, dict):
-        lifecycle = cast(dict[str, object], lifecycle)["stage"]
+        lifecycle_fields = cast(dict[str, object], lifecycle)
+        lifecycle = lifecycle_fields["stage"]
+        tip = lifecycle_fields.get("protected_tip")
+        protected_tip = tip if isinstance(tip, str) else ""
     status = value["edit_blocking_status"]
     if status not in ("blocking", "clear"):
         raise ValueError("unknown edit blocking status")
@@ -131,7 +145,7 @@ def _reservation(value: dict[str, object]) -> Reservation:
         raise ValueError("reservation has no scopes")
     return Reservation(
         _string(value["reservation_id"]), _string(target), Path(_string(holder["worktree_root"])),
-        _string(branch), tuple(scopes), _string(lifecycle), status,
+        _string(branch), tuple(scopes), _string(lifecycle), status, protected_tip,
     )
 
 

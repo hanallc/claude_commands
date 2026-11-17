@@ -25,7 +25,6 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import fake_herdr
 from scripts.herdr import herdr, pane_launch
 from scripts.agents import pane_record, remote
-from scripts.direct import progress_history
 from scripts.message import sessions
 from scripts.message import sessions as stop_sessions
 from scripts.direct.recorder_state import STATE_FILENAME
@@ -265,7 +264,6 @@ class FolderMoveFixture(StaffTestCase):
             "UNIT_HISTORY_DIR": str(self.history.parent.parent),
             "UNIT_RUN_ROOT": str(self.run_dir.parent),
             "SCRATCH_ROOT": str(self.root / "scratch"),
-            "PROGRESS_SESSION_ROOTS": str(self.run_dir.parent),
             "HERDR_PANE_RECORD_DIR": str(self.records),
             "HERDR_BIN": "/nonexistent/herdr",
             "GIT_CONFIG_GLOBAL": os.devnull,
@@ -273,7 +271,6 @@ class FolderMoveFixture(StaffTestCase):
         })))
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.records))
         _ = self.enterContext(mock.patch("scripts.production.stall_watch.STATE_DIR", self.root / "stall-watch"))
-        _ = self.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", (self.run_dir.parent,)))
         _ = self.enterContext(mock.patch.object(unit_runs, "RUN_ROOT", self.run_dir.parent))
         bind_private_run_roots(self, self.root)
         _ = self.folder_git(self.checkout, "init", "-b", "kept-branch")
@@ -483,9 +480,6 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
     environment.update(STAFF_FILE=str(case.staff_file), STAFF_TEST_OWNER_FILE=str(case.staff_file))
     _ = case.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))
     _ = case.enterContext(isolated_source_readers())
-    roots = tuple(Path(root) for root in environment.get(
-        "PROGRESS_SESSION_ROOTS", environment.get("UNIT_RUN_ROOT", str(case.root / "runs"))).split(":"))
-    _ = case.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", roots))
     for name, attribute, reader in (
         ("scripts.production.showrunners", "socket_for", FIXTURE_SOCKET_FOR),
         ("unit_lookup", "labeled_sessions", FIXTURE_LABELED_SESSIONS),

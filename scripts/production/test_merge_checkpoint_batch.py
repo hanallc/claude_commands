@@ -30,7 +30,7 @@ class MergeCheckpointBatchTests(MergeCheckpointFixture):
     def beta_checkpoint(self, relative: str, content: str, *, visible: bool = False) -> str:
         self.write(self.other, relative, content)
         _ = self.git("add", relative, cwd=self.other)
-        review = "Beta changes | Open beta | The beta change appears" if visible else "none — fixture code only"
+        review = "Beta changes | Open beta | The beta change appears | image 012345abcdef" if visible else "none — fixture code only"
         _ = self.git("commit", "-m", "checkpoint(beta): batch change\n\nChange-Review: " + review, cwd=self.other)
         checkpoint = self.git("rev-parse", "HEAD", cwd=self.other)
         _ = self.git("push", "origin", "beta-branch", cwd=self.other)
@@ -73,7 +73,7 @@ with Path(''' + repr(str(self.state / "pushed-refs")) + ''').open("a") as output
                 self.production_doc(change_review=review)
                 start = self.git("rev-parse", "HEAD")
                 first = self.checkpoint(subject="checkpoint(alpha): batch change\n\n"
-                                        + "Change-Review: Alpha changes | Open alpha | The alpha change appears")
+                                        + "Change-Review: Alpha changes | Open alpha | The alpha change appears | image 012345abcdef")
                 second = self.beta_checkpoint("src/beta.txt", "beta batch change\n", visible=True)
                 if wrapper_fails:
                     self.push = "validate_and_push"

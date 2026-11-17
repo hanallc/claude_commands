@@ -14,7 +14,7 @@ import unittest
 from collections.abc import Callable, Mapping
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, cast, override
@@ -262,6 +262,7 @@ class HoldEnforcerTests(unittest.TestCase):
              mock.patch.object(hold_enforcer, "wait_for_kept_runs", return_value=0), \
              mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()):
             self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
+                "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--proc-root", str(self.proc)]), 0)
 
     def test_drain_command_refuses_remote_targets(self) -> None:
@@ -304,6 +305,7 @@ class HoldEnforcerTests(unittest.TestCase):
              mock.patch.object(hold_enforcer, "start") as start, \
              mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()):
             self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "private clear",
+                "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--keep", "30", "--proc-root", str(self.proc)]), 0)
         start.assert_called_once_with()
         self.assertCountEqual(signals, [(10, signal.SIGTERM), (20, signal.SIGTERM), (21, signal.SIGTERM)])
@@ -322,6 +324,7 @@ class HoldEnforcerTests(unittest.TestCase):
              mock.patch.object(build_hold, "start_hold_recorder"), \
              mock.patch.object(hold_enforcer, "stop_waiting_run") as stop, redirect_stdout(io.StringIO()):
             self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "private clear",
+                "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--keep", "11", "--proc-root", str(self.proc)]), 0)
         stop.assert_not_called()
         decisions = hold_enforcer.decide_builds(self.table(), build_hold.natedev_holds(self.holders).in_force,
@@ -460,6 +463,7 @@ class HoldEnforcerTests(unittest.TestCase):
              mock.patch.object(hold_enforcer, "wait_for_kept_runs", side_effect=wait), \
              mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()):
             self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
+                "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--keep", "45", "--proc-root", str(self.proc)]), 0)
         clock.assert_called_once_with(time.CLOCK_BOOTTIME)
 
@@ -483,6 +487,7 @@ class HoldEnforcerTests(unittest.TestCase):
              mock.patch.object(hold_enforcer, "wait_for_kept_runs") as wait, \
              mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()) as output:
             self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
+                "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--proc-root", str(self.proc)]), 0)
         self.assertFalse((self.holders / member.id).exists())
         self.assertIn("the hold was released", output.getvalue())
@@ -1121,6 +1126,150 @@ class HoldEnforcerTests(unittest.TestCase):
         stopper.kill_survivors(table, build_hold.natedev_holds(self.holders).in_force, 999, self.claimed)
         self.assertEqual(sent, [(10, signal.SIGTERM), (20, signal.SIGTERM), (30, signal.SIGTERM)])
         self.assertEqual(stopper.terminating, {})
+
+    def test_run_reports_overdue_holds_once_across_restarts_and_retries_failed_sends(self) -> None:
+        directory = self.root / "enforcer"
+        path = self.holders / "holder"
+        release = datetime(2026, 10, 28, 12, 1, tzinfo=timezone.utc)
+        current = release - timedelta(seconds=1)
+        attempts: list[tuple[datetime, str, str]] = []
+        expected_per_pass: tuple[int, ...] = ()
+        fail_next = False
+        signals: list[int] = []
+        _ = self.process(30, "cargo", argv=("cargo", "check"))
+        stopper = hold_enforcer.StopBuildsAndTests(
+            self.proc, signal_process=lambda pid, _signum: signals.append(pid), clock=lambda: self.now)
+
+        def publish(since: datetime, eta: datetime) -> None:
+            _ = path.write_text(json.dumps({
+                "holder": "builder", "since": since.isoformat(), "for": "timed test",
+                "release_eta": eta.isoformat(), "keep": [],
+            }))
+
+        def send(key: str, text: str) -> build_hold.HolderMessageSent | build_hold.HolderMessageFailed:
+            nonlocal fail_next
+            attempts.append((current, key, text))
+            if fail_next:
+                fail_next = False
+                return build_hold.HolderMessageFailed("sender unavailable")
+            return build_hold.HolderMessageSent()
+
+        def passes(instants: tuple[datetime, ...], zones: tuple[str, ...] = ()) -> None:
+            nonlocal current
+            index = 0
+            current = instants[index]
+            before = path.read_bytes()
+            previous_attempts = list(attempts)
+            previous_markers = sorted((directory / "overdue-notices").glob("*"))
+            if zones:
+                os.environ["USER_ZONE"] = zones[index]
+
+            def advance(seconds: float) -> None:
+                nonlocal index, current
+                self.assertEqual(seconds, 1)
+                self.assertEqual(path.read_bytes(), before)
+                if expected_per_pass:
+                    self.assertEqual(len(attempts), expected_per_pass[index])
+                if os.environ.get("USER_ZONE") == "Invalid/Zone":
+                    self.assertEqual(attempts, previous_attempts)
+                    self.assertEqual(sorted((directory / "overdue-notices").glob("*")), previous_markers)
+                index += 1
+                if index == len(instants):
+                    raise InterruptedError("restart the fixture enforcer")
+                current = instants[index]
+                if zones:
+                    os.environ["USER_ZONE"] = zones[index]
+
+            with self.assertRaisesRegex(InterruptedError, "restart the fixture enforcer"):
+                _ = hold_enforcer.run(self.proc, self.holders, directory, uid=self.uid, enforcer_pid=999,
+                    stopper=stopper, sleep=advance, cgroup_root=self.root / "cgroup", send=send, clock=lambda: current)
+
+        publish(release - timedelta(minutes=1), release)
+        with mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            passes((release - timedelta(seconds=1),))
+            self.assertEqual(attempts, [])
+            passes((release, release + timedelta(seconds=1)))
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(attempts[0][:2], (release, "holder"))
+            for words in ("timed test", "12:01 UTC", "stays in force", "/build:hold release",
+                          "clear", "drain", "--release-eta"):
+                self.assertIn(words, attempts[0][2])
+            passes((release + timedelta(seconds=20), release + timedelta(seconds=30)))
+            self.assertEqual(len(attempts), 1)
+
+            next_release = release + timedelta(minutes=1)
+            publish(release + timedelta(seconds=30), next_release)
+            fail_next = True
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                passes((next_release - timedelta(seconds=1), next_release,
+                        next_release + timedelta(seconds=1), next_release + timedelta(seconds=59),
+                        next_release + timedelta(seconds=60), next_release + timedelta(seconds=61)))
+            self.assertEqual([attempt[0] for attempt in attempts],
+                             [release, next_release, next_release + timedelta(seconds=60)])
+            self.assertEqual(len(errors.getvalue().splitlines()), 1)
+            self.assertIn("sender unavailable", errors.getvalue())
+            passes((next_release + timedelta(seconds=62),))
+            self.assertEqual(len(attempts), 3)
+            self.assertEqual(signals, [30])
+
+            invalid_zone_release = next_release + timedelta(minutes=2)
+            publish(next_release + timedelta(minutes=1), invalid_zone_release)
+            _ = self.process(40, "cargo", argv=("cargo", "check"))
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                passes((invalid_zone_release, invalid_zone_release + timedelta(seconds=1),
+                        invalid_zone_release + timedelta(seconds=59), invalid_zone_release + timedelta(seconds=60)),
+                       ("Invalid/Zone", "UTC", "UTC", "UTC"))
+            self.assertEqual(len(attempts), 4)
+            self.assertEqual(attempts[-1][:2], (invalid_zone_release + timedelta(seconds=60), "holder"))
+            self.assertIn("Invalid/Zone", errors.getvalue())
+
+            for case in ("two holders", "failed first send", "failed marker write"):
+                with self.subTest(case=case):
+                    directory = self.root / case.replace(" ", "-")
+                    attempts.clear()
+                    publish(release - timedelta(minutes=1), release)
+                    second = self.holders / "second"
+                    second.unlink(missing_ok=True)
+                    fail_next = False
+                    if case == "failed marker write":
+                        directory.mkdir()
+                        _ = (directory / "overdue-notices").write_text("blocked marker directory\n")
+                        instants = (release, release + timedelta(seconds=60), release + timedelta(seconds=120))
+                        expected_per_pass = (1, 1, 1)
+                    else:
+                        _ = second.write_text(json.dumps({
+                            "holder": "second", "since": (release - timedelta(seconds=30)).isoformat(),
+                            "for": "second test", "release_eta": release.isoformat(), "keep": [],
+                        }))
+                        fail_next = case == "failed first send"
+                        instants = ((release, release + timedelta(seconds=1), release + timedelta(seconds=59),
+                                     release + timedelta(seconds=60), release + timedelta(seconds=61))
+                                    if fail_next else (release, release + timedelta(seconds=1)))
+                        expected_per_pass = (1, 2, 2, 3, 3) if fail_next else (1, 2)
+                    errors = io.StringIO()
+                    try:
+                        with redirect_stderr(errors):
+                            passes(instants)
+                    finally:
+                        second.unlink(missing_ok=True)
+                        if case == "failed marker write":
+                            (directory / "overdue-notices").unlink()
+                    if case == "failed marker write":
+                        self.assertEqual([attempt[1] for attempt in attempts], ["holder"])
+                        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                        self.assertIn("could not save overdue notice", errors.getvalue())
+                    else:
+                        self.assertEqual([attempt[1] for attempt in attempts],
+                                         ["holder", "second", "holder"] if case == "failed first send"
+                                         else ["holder", "second"])
+
+        self.assertEqual(signals, [30, 40])
+        path.unlink()
+        self.assertEqual(hold_enforcer.run(self.proc, self.holders, directory, uid=self.uid, enforcer_pid=999,
+            stopper=stopper, cgroup_root=self.root / "cgroup", send=send, clock=lambda: current), 0)
+        self.assertFalse((directory / "overdue-notices").exists())
 
     def test_run_stops_descendants_once_then_exits_on_file_removal_without_reading_another_table(self) -> None:
         _ = self.process(30, "cargo", argv=("cargo", "check"))

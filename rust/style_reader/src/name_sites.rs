@@ -28,6 +28,28 @@ pub(crate) enum NameSiteReading {
     Sites { sites: Vec<[usize; 2]> },
 }
 
+/// Shared normalized tokens and each declaration's name sites.
+pub(crate) struct BodyFacts {
+    pub(crate) tokens: BodyTokens,
+    pub(crate) sites:  Vec<NameSiteReading>,
+}
+
+/// Reuse original offsets, retain changed tokens, or report an unreadable body.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub(crate) enum BodyTokens {
+    State(BodyTokenState),
+    Tokens(Vec<Token>),
+}
+
+/// The normalized body needs no new token list, or cannot supply offsets.
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BodyTokenState {
+    Original,
+    Unreadable,
+}
+
 /// Python `str.splitlines`, excluding separators and a final empty line.
 fn source_lines(source: &[char]) -> Vec<&[char]> {
     let mut lines = Vec::new();
@@ -119,13 +141,17 @@ fn normalized_tokens<'a>(
 }
 
 /// Read every declared item's body, in declaration order.
-pub(crate) fn read(text: &[char], file: &DeclaredFile) -> Vec<NameSiteReading> {
+pub(crate) fn read_facts(text: &[char], file: &DeclaredFile) -> BodyFacts {
     let normalized = joined_lines(source_lines(text));
     let tokens = normalized_tokens(text, &normalized, &file.tokens);
     if tokens.iter().any(|token| token.kind == TokenKind::Unknown) {
-        return file.items.iter().map(|_| unreadable()).collect();
+        return BodyFacts {
+            tokens: BodyTokens::State(BodyTokenState::Unreadable),
+            sites:  file.items.iter().map(|_| unreadable()).collect(),
+        };
     }
-    file.items
+    let sites = file
+        .items
         .iter()
         .map(|item| {
             let first = file.items.iter().position(|candidate| candidate == item);
@@ -135,8 +161,19 @@ pub(crate) fn read(text: &[char], file: &DeclaredFile) -> Vec<NameSiteReading> {
                     body_sites(&normalized, &tokens, span, &item.name)
                 })
         })
-        .collect()
+        .collect();
+    BodyFacts {
+        sites,
+        tokens: match tokens {
+            Cow::Borrowed(_) => BodyTokens::State(BodyTokenState::Original),
+            Cow::Owned(tokens) => BodyTokens::Tokens(tokens),
+        },
+    }
 }
+
+/// Read only name sites for the existing unit tests.
+#[cfg(test)]
+fn read(text: &[char], file: &DeclaredFile) -> Vec<NameSiteReading> { read_facts(text, file).sites }
 
 #[cfg(test)]
 mod tests {

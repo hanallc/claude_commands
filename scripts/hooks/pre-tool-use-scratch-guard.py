@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Refuse a Bash command or file write that makes a new loose folder in /tmp, $TMPDIR, /tmp/claude,
-~/rust, ~/rust/scratch or the folder that holds the scratch and copies roots (/build/claude on natedev).
+"""Refuse a Bash command or file write that makes a new loose folder in ~, /tmp, $TMPDIR, /tmp/claude,
+~/rust, ~/rust/scratch, the session root (/session on natedev) or the folder that holds the scratch and
+copies roots (/build/claude on natedev).
 
 Agents made repo copies, repros and test trees in those folders, and nothing removed them
 (user, 2026-10-26: "i need a more robust solution"). A scratch folder now belongs to a task and
@@ -12,8 +13,10 @@ file's path. A command is refused when it makes a folder directly in one of the 
 exist yet. Folders in the roots that stay allowed: the session scratchpads (/tmp/claude-<uid>),
 /tmp/claude/unit, /tmp/claude/delegate, the session temp roots (/tmp/claude/session), the scratch roots
 (build_folders.conf roots.scratch, /tmp/claude/scratch, ~/rust/repro) and the copies roots (roots.copies, /tmp/claude/copies). A TMPDIR inside a session or run root still permits ordinary temporary files.
+In ~ no new folder is allowed (resources, 2026-11-15: gate_tree.sh once cloned 45 GiB into ~/port-gate-tree-test*).
+In the session root only the session-start hook makes folders (scripts/lib/session_folder.py).
 Repository copies under those roots require `build_folders.py run`.
-The hook restores the session temp folder from the hook input's session id.
+The hook restores the session folder from the hook input's session id.
 ~/worktrees is no root, and a make_a_worktree command is never judged. A path this scanner cannot follow (a variable other
 than HOME or TMPDIR, a command substitution, a command inside `bash -c` or ssh) is allowed: the
 hourly tmp sweep is the backstop.
@@ -39,23 +42,10 @@ from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, TypedDict, cast, override
+from typing import TypedDict, cast, override
 
 
-from scripts.lib import copy_record
-from scripts.lib.file_module import load_file_module
-
-
-class SessionTempPaths(Protocol):
-    """The session-start hook's path and session id rules."""
-
-    SESSION_ID: re.Pattern[str]
-
-    def temp_root(self, session_id: str) -> Path: ...
-
-
-SESSION_TEMP = cast(SessionTempPaths, cast(object, load_file_module(
-    "session_start_temp_root", Path(__file__).with_name("session-start-temp-root.py"))))
+from scripts.lib import copy_record, session_folder
 
 PUNCTUATION = ";&|(){}\n"
 HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
@@ -105,11 +95,18 @@ def real(path: str) -> Path:
     return Path(os.path.realpath(os.path.expanduser(path)))
 
 
+@functools.cache
+def session_root() -> Path:
+    """The configured session root, as a real path, whether or not it exists yet."""
+    return real(str(session_folder.configured_root()))
+
+
 def own_temp(temp: str) -> bool:
     """Whether TMPDIR is this session's or run's own: in a session temp root, a run folder or a
     scratchpad (a sandbox can point it there)."""
     path = real(temp)
     return (any(real(parent) in path.parents for parent in OWN_TEMP_PARENTS)
+            or session_root() in path.parents
             or any(SESSION_SCRATCHPAD.fullmatch(part) for part in path.parts))
 
 
@@ -121,7 +118,7 @@ def configured_roots() -> tuple[Path, Path]:
 
 def roots() -> list[Path]:
     """The folders in which a new loose folder is refused, as real paths, nested ones included."""
-    found = [real("/tmp"), real("/tmp/claude"), real("~/rust"), real("~/rust/scratch"),
+    found = [real("~"), real("/tmp"), real("/tmp/claude"), real("~/rust"), real("~/rust/scratch"), session_root(),
              *(root.parent for root in configured_roots())]
     temp = os.environ.get("TMPDIR")
     if temp and not own_temp(temp):
@@ -412,10 +409,7 @@ def repository_copy(words: list[str], cwd: Path) -> bool:
 
 def nested_build_copy(path: Path) -> bool:
     """Refuse repository copies below unit and session temporary roots."""
-    parents = [real(parent) for parent in OWN_TEMP_PARENTS]
-    configured_session = os.environ.get("SESSION_TEMP_ROOT")
-    if configured_session:
-        parents.append(real(configured_session))
+    parents = [*(real(parent) for parent in OWN_TEMP_PARENTS), real(str(session_folder.former_root())), session_root()]
     return any(parent in path.parents for parent in parents) or any(
         SESSION_SCRATCHPAD.fullmatch(part) for part in path.parts[:-1])
 
@@ -466,7 +460,7 @@ def refusal(folders: list[Path]) -> str:
     shown = ", ".join(str(folder) for folder in folders)
     return (
         f"Refused: this makes a new loose folder ({shown}). Nothing removes a loose folder in "
-        + "/tmp, /tmp/claude, ~/rust or ~/rust/scratch, so they piled up.\n"
+        + "~, /tmp, /tmp/claude, ~/rust or ~/rust/scratch, so they piled up.\n"
         + "For a build experiment, use build_folders.py run --owner O --name N -- CMD...; it removes the build folder.\n"
         + "Make scratch that belongs to a task, and it goes when the task ends:\n"
         + "  ~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py new [--task <run:<id> | "
@@ -513,24 +507,14 @@ def bash_input(raw: str) -> tuple[str, Path] | None:
 
 
 def remake_session_temp(raw: str) -> None:
-    """Restore only the input session's temp folder; an error leaves the call allowed."""
+    """Restore only the input session's folder; an error leaves the call allowed."""
     try:
         hook_input = cast(HookInput, json.loads(raw))
         session_id = hook_input.get("session_id")
     except (ValueError, AttributeError):
         return
-    if not isinstance(session_id, str) or not SESSION_TEMP.SESSION_ID.fullmatch(session_id):
-        return
-    path = SESSION_TEMP.temp_root(session_id)
-    try:
-        _ = os.stat(path)
-    except FileNotFoundError:
-        try:
-            path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        except OSError:
-            pass
-    except OSError:
-        pass
+    if isinstance(session_id, str) and session_folder.SESSION_ID.fullmatch(session_id):
+        session_folder.restore(session_id)
 
 
 def main() -> None:

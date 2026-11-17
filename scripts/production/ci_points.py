@@ -154,7 +154,7 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
     checkpoints = merged_checkpoints(production)
     checkpoint = (f"{checkpoints[-1].unit} phase {checkpoints[-1].phase}" if checkpoints else "production wrap")
     state_dir.mkdir(parents=True, exist_ok=True)
-    with copies.standing(str(production.owner.id), production.checkout, copies.CommittedSource(tip)) as checkout:
+    with copies.standing(str(production.owner.id), production.checkout, copies.CommittedSource(tip), step="ci") as checkout:
         source_url = required(git(checkout, "config", "--local", "--get", "remote.origin.url"), "ci start")
         settings = [(f"url.{push_origin}.pushInsteadOf", source_url)]
         for key in ("user.name", "user.email"):
@@ -174,7 +174,7 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
         try:
             with validation_log.open("w", encoding="utf-8") as output:
                 result = subprocess.run(argv, cwd=checkout, stdout=output, stderr=subprocess.STDOUT,
-                                        text=True, check=False)
+                                        text=True, check=False, pass_fds=copies.COMMAND_LOCKS.get())
             if result.returncode:
                 detail = f"exit {result.returncode}, no step named"
                 with validation_log.open(encoding="utf-8", errors="replace") as output:

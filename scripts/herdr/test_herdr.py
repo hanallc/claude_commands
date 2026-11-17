@@ -19,7 +19,7 @@ import math
 import sys
 import tempfile
 import time
-import unittest
+import unittest.mock
 from pathlib import Path
 from scripts.lib.script_envelope import script_prompt
 from scripts.herdr import herdr_types
@@ -35,6 +35,7 @@ from scripts.message import codex_daemon
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.lib.agent_scope import agents_slice
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import session_folder
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, fake_unit_host
 from scripts.production.cli_fixture import process_boundary, process_boundary_for_case
@@ -938,6 +939,65 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertEqual(set(self.ready_panes), {"destination:p1"})
         self.assertGreaterEqual(cast(Mock, self.read).call_count, 2)
 
+    def test_start_waits_for_a_changing_native_registry_before_checking_the_prompt_target(self) -> None:
+        for registry in ("ready after two reads", "identity changes after two reads", "changing until deadline", "unavailable"):
+            with self.subTest(registry=registry):
+                self.elapsed = 0
+                self.typed.clear()
+                self.enters.clear()
+                _ = self.path.write_bytes(b"")
+                self.submit_on_type = True
+                events: list[str] = []
+                requested = (herdr.SessionTranscript(self.transcript.config_dir, "before-native")
+                             if registry == "identity changes after two reads" else self.transcript)
+                publications: list[herdr.SessionTranscript] = []
+                original_check_target = herdr.check_target
+
+                def native_session(pane: str, kind: str, timeout: float) -> str:
+                    self.assertEqual((pane, kind), ("destination:p1", "claude"))
+                    self.assertGreater(timeout, 0)
+                    events.append("native")
+                    if registry in {"ready after two reads", "identity changes after two reads"} and events.count("native") == 3:
+                        return self.transcript.session_id
+                    try:
+                        if registry == "unavailable":
+                            raise herdr.NativeRegistryUnavailable("fixture registry unavailable")
+                        raise herdr.NativeRegistryChanging("fixture registry changes")
+                    except herdr.NativeRegistryUnavailable as error:
+                        raise herdr_types.HerdrFailure("fixture native identity unavailable") from error
+
+                def check_target(*_args: object, **_kwargs: object) -> object:
+                    self.assertEqual(events.count("native"), 3)
+                    events.append("target")
+                    return cast(object, unittest.mock.DEFAULT)
+
+                with (patch.object(self.client, "native_session", side_effect=native_session) as native,
+                      patch.object(herdr, "check_target", side_effect=check_target, wraps=original_check_target) as target,
+                      redirect_stderr(io.StringIO()) as errors):
+                    outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
+                        ["--resume", requested.session_id],
+                        herdr.OpeningPrompt("resume the saved work", requested, publications.append), 300)
+                if registry in {"ready after two reads", "identity changes after two reads"}:
+                    self.assertIsInstance(outcome, herdr.PromptSubmitted)
+                    self.assertEqual(native.call_count, 3)
+                    self.assertEqual(events[:4], ["native", "native", "native", "target"])
+                    self.assertEqual(target.call_args_list[0], call(self.transcript.session_id,
+                        action="keys", place=herdr.HerdrPlace(self.client.session, "destination:p1")))
+                    self.assertEqual(publications, [self.transcript])
+                    self.assertEqual([(pane, text) for pane, text, _at in self.typed],
+                        [("destination:p1", script_prompt("resume the saved work"))])
+                    self.assertEqual(errors.getvalue(), "")
+                else:
+                    self.assertEqual(outcome, herdr.PromptNotSubmitted("native session is unavailable; pane retained"))
+                    target.assert_not_called()
+                    self.assertEqual(self.typed, [])
+                    self.assertIn("native session is unavailable", errors.getvalue())
+                    if registry == "changing until deadline":
+                        self.assertAlmostEqual(self.elapsed, 0.3)
+                    else:
+                        self.assertEqual(native.call_count, 1)
+                        self.assertEqual(self.elapsed, 0)
+
     def test_slash_command_recorded_as_command_tags_is_submitted_once(self) -> None:
         text = "/showrunner:produce /x/doc.md resume"
         recorded = ("<command-message>showrunner:produce</command-message>\n"
@@ -1370,15 +1430,10 @@ class PromptSubmissionTests(unittest.TestCase):
         def publish(actual: herdr.SessionTranscript) -> None:
             publications.append(actual)
 
-        def native_session(*_args: object, **_kwargs: object) -> str:
-            native.return_value = herdr.NativeAgentProcess(
-                herdr.PaneSessionReport(self.transcript.session_id), "fixture-prompt-recipient", {})
-            return self.transcript.session_id
-
         cast(Mock, self.start).side_effect = start
         with (patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
-                  herdr.PaneSessionReport(requested.session_id), "fixture-prompt-recipient", {})) as native,
-              patch.object(self.client, "native_session", side_effect=native_session),
+                  herdr.PaneSessionReport(self.transcript.session_id), "fixture-prompt-recipient", {})),
+              patch.object(self.client, "native_session", return_value=self.transcript.session_id),
               patch.object(herdr.TranscriptCursor, "read_turns", read_turns),
               patch.object(json, "loads", wraps=json.loads) as parsed):
             outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
@@ -1928,6 +1983,33 @@ class LaunchDestinationTests(StaffTestCase):
                 prepared, "claude", [], herdr.NoOpeningPrompt(), 5000, agent="worker")
         self.assertIsInstance(result.outcome, herdr.PromptSubmissionNotRequired)
         started.assert_called_once()
+
+    def test_a_member_claude_launch_starts_in_the_member_session_folder(self) -> None:
+        member = fixture_member("showrunner", name="boss")
+        account = self.root / "folder-account"
+        account.mkdir()
+        session_root = Path(os.environ["SESSION_TEMP_ROOT"])
+        for root_exists in (False, True):
+            with self.subTest(root_exists=root_exists):
+                if root_exists:
+                    session_root.mkdir()
+                prepared = herdr.PreparedAgentEnvironment(self.root, {"CLAUDE_CONFIG_DIR": str(account)})
+                with (patch.object(herdr, "open_tab", return_value="unit-pane") as opened,
+                      patch.object(herdr.Herdr, "run_in_pane"),
+                      patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+                      patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired())):
+                    _ = herdr.launch_prepared_agent("agents", herdr.NewTab("units", "boss"), prepared, "claude",
+                        ["--resume", str(member.current_session)], herdr.NoOpeningPrompt(), 5000, agent="boss")
+                environment = cast(dict[str, str], opened.call_args.args[4])
+                folder = session_root / "boss"
+                if root_exists:
+                    self.assertEqual(environment["TMPDIR"], str(folder))
+                    self.assertEqual(environment[session_folder.FOLDER_ENV], "boss")
+                    self.assertEqual(session_folder.read_record(folder),
+                                     {"owner": str(member.id), "session_id": str(member.current_session)})
+                else:
+                    self.assertNotIn("TMPDIR", environment)
+                    self.assertNotIn(session_folder.FOLDER_ENV, environment)
 
     def test_failed_claude_trust_write_prints_one_anomaly_and_does_not_start(self) -> None:
         account = self.root / "broken-account"

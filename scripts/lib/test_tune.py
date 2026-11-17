@@ -54,6 +54,9 @@ class TuneTests(PublicationTestCase):
             ("example", "amount", "11", "valid reason", "approved"),
             ("example", "amount", "bad", "valid reason", "approved"),
             ("example", "mode", "unknown", "valid reason", "approved"),
+            ("example", "mode", "fast # comment", "valid reason", "approved"),
+            ("example", "mode", "fast\t# comment", "valid reason", "approved"),
+            ("example", "mode", " fast", "valid reason", "approved"),
             ("example", "amount", "3", "", "approved"),
             ("example", "amount", "3", "   ", "approved"),
             ("example", "amount", "3", "valid reason", ""),
@@ -110,6 +113,31 @@ class TuneTests(PublicationTestCase):
         self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
         self.assertIn("git fetch -q --no-write-fetch-head", repo.ssh_log.read_text())
         self.assertFalse((repo.root / "state/mac.json").exists())
+
+    def test_two_hex_color_saves_publish_each_value_and_keep_the_comment(self) -> None:
+        repo = self.repository
+        color_file = repo.config.with_name("statusline.conf")
+        _ = color_file.write_text("account.claude1=brown # account color\n")
+        _ = repo.git(repo.checkout, "add", "config/statusline.conf")
+        _ = repo.git(repo.checkout, "commit", "-qm", "account color fixture")
+        _ = repo.git(repo.checkout, "push", "-q", "origin", "main")
+        previous_value = "brown"
+        for value in ("#123456", "#abcdef"):
+            with self.subTest(value=value):
+                previous_commit = repo.head()
+                result = self.run_tune("statusline", "account.claude1", value, "--why", "Chosen account color",
+                                       "--user-words", f"Save claude1 color {value}")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                expected = f"account.claude1={value} # account color\n"
+                self.assertEqual(color_file.read_text(), expected)
+                self.assertNotEqual(repo.head(), previous_commit)
+                self.assertEqual(repo.git(repo.checkout, "rev-parse", "HEAD^"), previous_commit)
+                self.assertEqual(repo.remote_tip(), repo.head())
+                self.assertEqual(repo.git(repo.origin, "show", "main:config/statusline.conf"), expected.strip())
+                self.assertEqual(repo.git(repo.checkout, "status", "--porcelain=v1"), "")
+                self.assertEqual(repo.git(repo.checkout, "log", "-1", "--format=%s"),
+                                 f"tune(statusline): account.claude1 {previous_value} -> {value}")
+                previous_value = value
 
     def test_already_set_value_prints_one_line_without_a_write_and_completes_the_mac_pull(self) -> None:
         before = self.snapshot()
@@ -430,6 +458,13 @@ class TuneTests(PublicationTestCase):
         forwarded = shlex.split(sent[-1])
         self.assertEqual(forwarded[-len(arguments):], arguments)
         self.assertIn("tune.py", sent[-1])
+        for value in ("#af875f", "part#fragment"):
+            with self.subTest(value=value), mock.patch.dict(os.environ, repo.env, clear=True), \
+                    mock.patch("platform.system", return_value="Darwin"), \
+                    mock.patch.object(tune, "_forward", return_value=0) as forward:
+                arguments = ["statusline", "account.claude1", value, "--why", "Chosen color", "--user-words", "Save"]
+                self.assertEqual(tune.main(arguments), 0)
+                forward.assert_called_once_with(arguments, repo.env.get("ZONE_SSH") or "ssh")
 
 
 if __name__ == "__main__":

@@ -179,7 +179,8 @@ class ClaudeLaunchScanTests(unittest.TestCase):
                      "codex.py": 'import subprocess\ndef start():\n    argv = ["codex", "exec", "prompt"]\n    subprocess.Popen(argv)\n',
                      "exec.py": 'import os\nos.execvpe("claude", ["claude", "-p", "prompt"], {})\n',
                      "launch.sh": '#!/bin/sh\nexec claude --bg prompt\n',
-                     "herdr.py": 'import subprocess\nsubprocess.run(["herdr", "agent", "start", "worker", "--kind", "claude"])\n'}
+                     "herdr.py": 'import subprocess\nsubprocess.run(["herdr", "agent", "start", "worker", "--kind", "claude"])\n',
+                     "env.py": 'import subprocess\nsubprocess.run(["env", "-u", "--package", "claude", "--print", "prompt"])\n'}
             for name, source in cases.items():
                 _ = (root / name).write_text(source)
             for name in ("test_launch.py", "fake_launch.py", "launch_test_support.py"):
@@ -284,4 +285,5 @@ class ClaudeLaunchScanTests(unittest.TestCase):
             root = Path(temporary)
             _ = (root / "guard.sh").write_text('exec python3 nix_env.py exec /absolute/claude --print prompt\n')
             _ = (root / "query.py").write_text('import subprocess\nsubprocess.run(["claude", "agents", "--json"])\n')
+            _ = (root / "package.py").write_text('import subprocess\nsubprocess.run(["mac_queue_run.py", "--package=claude", "--", "zsh"])\n')
             self.assertEqual(unguarded_launches(root), [])

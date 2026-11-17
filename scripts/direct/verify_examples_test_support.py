@@ -176,8 +176,8 @@ esac
         self.environment = {
             **{
                 name: value for name, value in os.environ.items()
-                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
-                                "CODEX_SESSION_ID", "UNIT_DETACHED_RUN"}
+                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID", "CODEX_SESSION_ID"}
+                and not name.startswith("UNIT_DETACHED_")
             },
             "PATH": tool_path,
             "HOME": str(self.root),

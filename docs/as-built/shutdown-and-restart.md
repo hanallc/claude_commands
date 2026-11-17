@@ -541,6 +541,15 @@ Restart checks each unit director and showrunner that it starts with a continuat
 The check uses the launched account home and native session identity.
 It reads only turns after that director's start.
 The opening prompt and the Claude resume check share a cursor positioned before launch.
+Herdr waits for the native session identity and uses that identity to check the opening prompt's target.
+It retries only when the native registry changes while the process starts or exits.
+The launch deadline bounds this wait.
+For a Claude launch with an opening prompt, restart uses the greater of `START_SECONDS` and `OPENING_PROMPT_SECONDS`.
+`config/shutdown.conf` sets these limits to 20 seconds and 90 seconds.
+The operation deadline can reduce either limit.
+Other launches use `START_SECONDS`.
+The launch limit covers the start, input readiness, and proof of the opening prompt's user turn.
+The separate resume check then requires an assistant turn or tool call.
 The cursor skips complete historical records without parsing their JSON.
 Herdr preserves a caller's cursor and prepares one before the start command when the caller supplies none.
 If the native session identity changes, the cursor reads that transcript from byte zero and filters turns by the launch time.

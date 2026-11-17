@@ -47,11 +47,12 @@ class ProcessIdentity(Protocol):
 
 @dataclass(frozen=True)
 class NoLiveBuildRun:
-    pass
+    """The process has no identified live build run."""
 
 
 @dataclass(frozen=True)
 class LiveBuildRun:
+    """The live build run holds its process identifier and birth and start times."""
     pid: int
     start_time: str
     started_at: float
@@ -59,31 +60,34 @@ class LiveBuildRun:
 
 @dataclass(frozen=True)
 class EmptyBuildScope:
-    pass
+    """The build scope has no active processes."""
 
 
 @dataclass(frozen=True)
 class NotServiceSlice:
-    pass
+    """The scope is not a compiler service slice."""
 
 
 @dataclass(frozen=True)
 class IdleService:
-    pass
+    """The compiler service has no active job."""
 
 
 @dataclass(frozen=True)
 class RunningServiceJob:
+    """The compiler service job runs from this start time."""
     started_at: float
 
 
 @dataclass(frozen=True)
 class WaitingServiceJob:
+    """The compiler service job waits from this start time."""
     started_at: float
 
 
 @dataclass(frozen=True)
 class UnmatchedServiceJob:
+    """The service job has no matching owner from this start time."""
     started_at: float
 
 
@@ -92,12 +96,14 @@ ServiceJobState = RunningServiceJob | WaitingServiceJob | UnmatchedServiceJob | 
 
 @dataclass(frozen=True)
 class ScopeProcess:
+    """The scope member holds its process identifier and program name."""
     pid: int
     program: str
 
 
 @dataclass(frozen=True)
 class ScopeProcesses:
+    """The scope activity holds process members, caller identity, folder, and run evidence."""
     count: int
     session_id: str
     session_name: str

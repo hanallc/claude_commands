@@ -5,7 +5,6 @@ from __future__ import annotations
 from scripts.build_queue import admission_records
 from scripts.lib import test_phase
 
-from collections.abc import Sequence
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from dataclasses import replace
@@ -13,26 +12,20 @@ import json
 import os
 from pathlib import Path
 import tempfile
-import unittest
 from unittest import mock
-from typing import TYPE_CHECKING, cast, override
-from zoneinfo import ZoneInfo
+from typing import TYPE_CHECKING, cast
 
 from scripts.build_queue import snapshot_codec as codec
 from scripts.buildlog import store
 from scripts.lint import memory_admit as gate
-from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings, write_config_fixture, write_pressure_reading
-from scripts.build_queue.queue_lines import Line, plain
-from scripts.build_queue.scope_activity import LiveBuildRun, IdleService, RunningServiceJob, NotServiceSlice
+from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings, write_config_fixture
+from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, NotServiceSlice, LiveBuildRun
 
 if TYPE_CHECKING:
     from scripts.build_queue import queue_view
     from scripts.message.unit_labels import UnitLabels
 
 NOW = datetime(2026, 10, 30, 14, 46, 12, tzinfo=UTC).timestamp()
-ZONE = ZoneInfo("America/New_York")
-ASKING_SESSION = "id-work-lead"
-GOLDEN = Path(__file__).with_name("golden")
 
 # production, unit, session, step, need in GiB, minutes waited, folder
 STEPS = (
@@ -92,39 +85,6 @@ def write_memory_config(path: Path, **changes: str | None) -> None:
     _ = path.write_text("\n".join(lines) + "\n")
 
 
-def write_lines(path: Path, lines: Sequence[bytes], *, tail: bytes = b"") -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    content = b"".join(lines) + tail
-    if path.write_bytes(content) != len(content):
-        raise OSError("fixture log write was incomplete")
-
-
-def bump_line(at: float, *, session: str = "bumped-session", step: str = "check",
-              folder: str = "/tmp/bumped", actor: str = "actor-session", old_position: int = 3) -> bytes:
-    return (json.dumps({"kind": "queue_bump", "at": store.utc_iso(at), "session": session,
-                        "step": step, "folder": folder, "actor": actor, "old_position": old_position},
-                       separators=(",", ":"), ensure_ascii=False) + "\n").encode()
-
-
-def write_bumps(epoch: float, lines: Sequence[bytes], *, tail: bytes = b"") -> None:
-    write_lines(store.host_file(store.host_name(), epoch), lines, tail=tail)
-
-
-def queue_time_line(at: float, *, kind: str = "admitted", **fields: object) -> bytes:
-    return (json.dumps({"kind": kind, "at": at, **fields}, separators=(",", ":")) + "\n").encode()
-
-
-def token_gap_line(left_at: float, back_at: float, *, session: str = "head-session",
-                   step: str = "nextest", pid: int = 123, start_time: str = "123") -> bytes:
-    return queue_time_line(back_at, kind="token_gap", session_id=session, step=step, pid=pid,
-                           start_time=start_time, token_left_at=left_at, token_back_at=back_at)
-
-
-def write_token_gaps(lines: Sequence[bytes], *, tail: bytes = b"") -> None:
-    from scripts.build_queue import head_facts
-    write_lines(store.root() / head_facts.QUEUE_TIMES_PATH, lines, tail=tail)
-
-
 HEAD_NOW = datetime(2026, 10, 30, 11, 0, tzinfo=UTC).timestamp()
 
 
@@ -159,13 +119,6 @@ def fixture_reservation(pid: int, need: int, *, step: str = "check", folder: str
     return {"pid": pid, "start_time": str(pid), "need": need, "repo": "fixture",
             "step": step, "worktree": folder, "admitted_at": "", "sidecar": "",
             "test_threads": admission_records.NoTestWidth(), "call_id": test_phase.NoCallRecord()}
-
-
-def ci_step(bytes: int, job_state: RunningServiceJob | IdleService | NotServiceSlice) -> admission_records.RunningStep:
-    """Build one CI service reading without an admission reservation."""
-    return admission_records.RunningStep("ci", "ci", "service", "/ci", 0,
-        admission_records.UnownedSliceMemory(bytes, owner="hana-ci.slice", job_state=job_state, pid=admission_records.PidNotRecorded()),
-        pid=admission_records.PidNotRecorded())
 
 
 def blocking_slot(now: float, held: int = 0) -> admission_records.BetweenStepsSlot:
@@ -207,7 +160,7 @@ def queue_read_fixture(view: admission_records.QueueView, policy: admission_reco
     if view.waiting and not reservations:
         slots = (blocking_slot(view.now, view.promised),)
     inputs = admission_records.QueueInputs(ordered, view.running, reservations, host, pressure, spacing,
-                              admission_records.NoHeadAdmissionOverride(), view.now, slots=slots)
+                              view.now, slots=slots)
     return gate.queue_read_from(inputs, policy)
 
 
@@ -221,15 +174,6 @@ def head_reading(*, since: float = HEAD_NOW - 600, now: float = HEAD_NOW,
                             "session_name": step.session_name, "step": step.step,
                             "folder": step.folder, "order": admission_records.NormalOrder(), **(fields or {})}))
     return replace(reading, ordered=[(Path("123-123.waiting"), row)])
-
-
-def with_waiting_process(reading: admission_records.QueueRead, step: admission_records.WaitingStep, start: str) -> admission_records.QueueRead:
-    """Add a waiting row and its recorded process identity to the same snapshot."""
-    row: admission_records.RankedWaiter = {"pid": step.pid, "start_time": start, "need": step.need,
-                        "since": step.since, "session_id": step.session_id, "step": step.step,
-                        "order": admission_records.NormalOrder()}
-    return replace(reading, ordered=[*reading.ordered, (Path(f"{step.pid}-{start}.waiting"), row)],
-                   view=replace(reading.view, waiting=(*reading.view.waiting, step)))
 
 
 def fixture_queue_inputs(directory: Path, processes: dict[int, gate.ProcessIdentity], now: float,
@@ -252,7 +196,7 @@ def fixture_queue_inputs(directory: Path, processes: dict[int, gate.ProcessIdent
     readings = gate.QueueSnapshotReadings(processes, {}, host=host,
         pressure=gate.read_pressure(host if isinstance(host, admission_records.HostMemory) else admission_records.HostMemory(0, admission_records.UnknownHostTotal()), policy=policy), spacing=admission_records.ReadyToStart(),
         compilers=gate.sccache_memory(), policy=policy)
-    return gate.build_queue_inputs(ordered, reservations, readings, gate.read_head_override(directory), now, priority)
+    return gate.build_queue_inputs(ordered, reservations, readings, now, priority)
 
 
 def fixture_queue_read(directory: Path, processes: dict[int, gate.ProcessIdentity], now: float) -> admission_records.QueueRead:
@@ -289,7 +233,6 @@ class QueueFixture(ExitStack):
         _ = self.enter_context(mock.patch.object(roster, "roster",
             side_effect=AssertionError("a queue fixture must not read the live roster")))
         self.paths: list[Path] = []
-        self.moves: list[bytes] = []
         self.reservation: Path = self.directory / "900-900.reservation"
         if not captured:
             return
@@ -308,13 +251,8 @@ class QueueFixture(ExitStack):
         self.labels["id-widget"] = UnitLabels("widget-enhancements-title", "tool-based-ui", "widget")
         self.labels["id-widget-director"] = UnitLabels("widget", "tool-based-ui", "widget")
         self.write_running(used=int(5.1 * admission_records.GIB), need=int(11.1 * admission_records.GIB))
-        self.moves = [self.move(1, NOW - 372, 27), self.move(2, NOW - 372, 27),
-            bump_line(NOW - 192, session="id-widget", step="nextest", folder="/tmp/widget",
-                      actor="id-widget-director", old_position=29), self.move(1, NOW - 12, 1)]
         self.write_json(self.directory / "queue_priority.json", {"unit": "cables", "why": "captured priority",
             "set_at": NOW - 12, "set_by": "user", "transition": codec.snapshot_value(admission_records.SettledPriority())})
-        write_bumps(NOW, self.moves)
-        self.write_pace([NOW - 3600 + index * 80 for index in range(44)])
 
     @staticmethod
     def write_json(path: Path, row: dict[str, object]) -> None:
@@ -353,15 +291,6 @@ class QueueFixture(ExitStack):
         row.update(fields)
         self.write_json(path, row)
 
-    def move(self, position: int, at: float, old_position: int, *, actor: str = "id-work-lead") -> bytes:
-        row = cast(dict[str, object], json.loads(self.paths[position - 1].read_text()))
-        return bump_line(at, session=str(row["session_id"]), step=str(row["step"]),
-                         folder=str(row["folder"]), actor=actor, old_position=old_position)
-
-    def write_pace(self, ended: Sequence[float], *, tail: bytes = b"", host: str = "") -> None:
-        lines = [(json.dumps({"host": host or store.host_name(), "ended_at": store.utc_iso(at)}) + "\n").encode()
-                 for at in ended]
-        write_lines(self.directory / "anon_peaks.jsonl", lines, tail=tail)
 
     def inputs(self, policy: admission_records.AdmissionPolicy) -> admission_records.QueueInputs:
         """Resolve the fixed 10:46 queue once, including raw pressure."""
@@ -371,48 +300,13 @@ class QueueFixture(ExitStack):
         return fixture_queue_read(self.directory, gate.process_table(self.proc), NOW)
 
     def model(self) -> queue_view.QueueModel:
-        from scripts.build_queue import head_facts, queue_view
+        from scripts.build_queue import queue_view
 
-        reading = self.read()
-        return queue_view.QueueModel(reading, self.labels, head_facts.read_head_facts(reading),
-                                     head_facts.read_pace(NOW), ZONE, queue_view.HostLoadUnavailable(),
-                                     gate.smallest_head_release(reading.explanation),
-                                     ci_memory_slice=admission_records.read_memory_config().ci_memory_slice)
-
-    def cap_model(self) -> queue_view.QueueModel:
-        """Show the compact page with a clear pressure reading."""
-        write_pressure_reading(self.root / "pressure")
-        self.change(1, need=int(6.8 * admission_records.GIB), priority_since=NOW - 42)
-        return self.model()
+        return queue_view.QueueModel(self.read(), self.labels)
 
 
-class QueueFixtureTests(unittest.TestCase):
-    fixture: QueueFixture = cast(QueueFixture, cast(object, None))
-
-    @override
-    def setUp(self) -> None:
-        self.fixture = self.enterContext(QueueFixture())
-
-
-def with_waiting(model: queue_view.QueueModel, steps: Sequence[admission_records.WaitingStep]) -> queue_view.QueueModel:
-    """Replace displayed rows while retaining their matching admission row identities."""
-    by_pid = {row["pid"]: (path, row) for path, row in model.reading.ordered}
-    reading = replace(model.reading, view=replace(model.reading.view, waiting=tuple(steps)),
-                      ordered=[by_pid[step.pid] for step in steps])
-    return replace(model, reading=reading)
-
-
-def waiting_rows(lines: Sequence[Line]) -> list[str]:
-    """Identify step rows by the fixed place column, including a clipped name."""
-    import re
-    return [text for line in lines
-            if re.match(r"^ *[0-9]+(?: |▸)", text := plain([line]))]
-
-
-class AdmissionLogTests(unittest.TestCase):
-    root: Path = Path()
-
-    @override
-    def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root)}))
+def ci_step(bytes: int, job_state: RunningServiceJob | IdleService | NotServiceSlice) -> admission_records.RunningStep:
+    """Build one CI service reading without an admission reservation."""
+    return admission_records.RunningStep("ci", "ci", "service", "/ci", 0,
+        admission_records.UnownedSliceMemory(bytes, owner="hana-ci.slice", job_state=job_state, pid=admission_records.PidNotRecorded()),
+        pid=admission_records.PidNotRecorded())

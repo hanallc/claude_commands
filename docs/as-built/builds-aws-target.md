@@ -2,11 +2,11 @@
 
 ## Current model
 
-AWS runs temporary Spot boxes for merge gates, paired gate trials, and the GPU size trial.
+AWS runs temporary Spot boxes for merge gates, paired AWS trials, and the GPU size trial.
 Normal build jobs use `mac` and `natedev`, in that order.
 AWS has no permanent builder or build offload route.
 Cloud gates use `~/.local/state/build-targets/aws` without an `aws` target registration.
-The configured regions are `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, and `eu-south-1`.
+`regions` in `cloud_gate.conf` holds all 19 regions of `spot_candidate_regions`.
 The saved deployment record identifies the regions available for launch.
 Boxes boot the official NixOS image and fetch their tools at boot.
 GPU trial boxes then import the prepared GPU system and reboot.
@@ -34,6 +34,24 @@ Boxes receive signed URLs and no scaler credential file.
 These files do not provision a machine or add a deployment command.
 Phase D must install and enable the units before the box accepts work.
 `config/hana_aws.conf` keeps placement disabled and supplies all safety timing and resource values.
+
+`scripts/aws_target/hana_render.py` renders both the safety files and the receiver files from this repository's configuration.
+It writes nine files by base name and applies each `GuestFile` mode.
+Without `tool_setup`, `hana_guest.render_files()` omits `hana-tools.service`.
+Phase F2 supplies the tool setup service.
+
+The NixOS build uses the renderer from its pinned `claude-commands` input.
+`scripts/aws_target/hana_render.files` lists the files for the NixOS `lib.fileset` filter.
+The filter excludes unrelated repository changes from the image inputs.
+The NixOS integration replaces the manually copied guest files.
+
+Run this command from the repository root:
+
+```sh
+python3 -E -m scripts.aws_target.hana_render --device /dev/sdf <out_dir>
+```
+
+`-E` ignores `PYTHONPATH`, so the listed files alone supply the imports.
 
 The boot guard waits for a fresh permit within `guard_grace_seconds` from boot.
 It has no ordering or requirement dependency on the data disk, network, or tool setup.
@@ -329,7 +347,7 @@ Teardown still checks retained claims before deletion.
 
 ## Paired speed trials
 
-Run `python3 -m scripts.aws_target.gate_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
+Run `python3 -m scripts.aws_target.aws_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
 Both refs can name local commits in `~/.claude`.
 The trial pushes each commit to a fresh `gate-trial-<expires>-<id>-base|changed` branch with a plain push.
 The expires field records the trial's fixed expiry epoch in seconds.
@@ -339,7 +357,7 @@ The trial installs no signal handler.
 Ctrl-C and terminal command exceptions stop the paired service.
 SIGTERM or SIGHUP to the terminal can skip branch cleanup.
 The separate trial service then runs to its normal end and cleans its boxes.
-The paired unit uses `ExecStopPost` with `gate_trial --paired-cleanup <folder>`.
+The paired unit uses `ExecStopPost` with `aws_trial --paired-cleanup <folder>`.
 After a service stop, systemd runs this cleanup after killing the coordinator and its children.
 Cleanup requests termination for all recorded boxes before searching uncertain launches.
 Cleanup requests termination for each discovered box before the next search.
@@ -435,14 +453,15 @@ The command terminates boxes after results, errors, or cancellation.
 Uncertain launches retain their requests and reservations for reconciliation and expiry cleanup.
 
 The paired trial replaces the size/start trials.
-The twelve `gate_trial_*` settings are removed.
+The old size/start trial settings are removed.
 The paired trial uses the existing `cloud_gate.conf` settings.
 
 ## Cloud gate region fallback
 
 The deployed region list comes from `regions` in `cloud_gate.conf`.
 The list must start with the home region and must not repeat a region.
-The list contains `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, and `eu-south-1`.
+The list holds every region of `spot_candidate_regions`, so a region that becomes the cheapest gets the next gate.
+The user, 2026-11-15: "i want all regions availble so if one becomes cheaper then it will immediatelyh start being used".
 `us-east-2` remains the home region for shared artifacts.
 The list can include other regions that the account policy permits.
 The gate ranks deployed types and public zones by the expected USD per run before launch.
@@ -623,13 +642,14 @@ It normalizes that line's whitespace and redacts it again.
 A successful regional read removes previous prices for types or zones absent from the new reply.
 The snapshot does not change `controller.json`.
 
-`python3 scripts/aws_target/deploy.py spot-table` reads only the local snapshot, cost ledger and configuration.
-It prints two price tables: the standard types, then the GPU types.
+`spot_table.spot_tables` reads only the local snapshot, cost ledger and configuration.
+It is the one source of the price tables of the AWS page; no terminal output remains.
+The user, 2026-11-15, removed the `/aws_prices` command and its `deploy.py spot-table` output because the page shows the prices.
+It gives two price tables: the standard types, then the GPU types.
 Each has candidate regions as rows and machine types as columns.
 The user asked for this layout on 2026-11-15 through builds, because the regions outnumber the types.
 Each cell shows the lowest zone price in USD/h.
 A type that a region does not sell shows `—` (`spot_table.NOT_SOLD`), in `Table.not_sold`.
-One line `— not sold here` under the price tables names it.
 Another empty cell says `no snapshot` or `read failed`.
 Cached prices and quotas remain visible after a read failure.
 Their price cells include `read failed`, and the regional detail gives the last good age.
@@ -637,23 +657,22 @@ Old prices include `old <minutes> min` in their cells.
 Each failed region shows the saved error time, age, failed read, error class, and AWS error line.
 Each region without evidence says `no snapshot was ever taken`.
 The table never uses a bare `-` for an unavailable value.
-It splits wide tables into groups of columns to fit the terminal.
 Each region shows its snapshot age and a stale mark after `price_max_age_seconds`, under the prices.
-The `/aws_prices` command runs `spot-table` and shows its lines unchanged.
 Below the prices, two quota tables show the Standard quota and the G and VT quota in vCPUs.
 Each also shows the number of boxes of its types that fit: standard types in the first, GPU types in the second.
 One region read writes the prices and both quotas together, so the quota cells show no age.
 The box counts divide the quota by the existing type-size vCPU calculation and round downward.
 An absent snapshot explains missing quotas and box counts without creating files.
 The standard rows are `instance_types`, then `price_compare_instance_types`; the GPU rows are `gpu_instance_types`.
-The hourly snapshot reads prices for all three lists, so `/aws_prices` can compare types the gates do not use yet.
-Below the quotas, `/aws_prices` shows one block for each standard type, with one line for each candidate region.
+The hourly snapshot reads prices for all three lists, so the page can compare types the gates do not use yet.
+Below the quotas, the page shows one run table for each standard type, with one line for each candidate region.
 The user asked for this layout on 2026-11-14 through builds. Each line shows:
 1. The lowest zone Spot price in USD/h.
 2. The median merge gate box time in minutes with one decimal, such as `7.5`, from launch to finish, boot included.
    Times come from `cloud-gate-launches.jsonl` over the last `run_cost_days` days.
 3. Runs: the run count of that time.
    A region without its own runs uses the type's runs in other regions, and the cell says `elsewhere`.
+   A type without runs uses the runs of the types with its vCPU count, and the cell says `same vCPUs`.
 4. The estimate: Spot price times that box time, plus the refusal wait cost.
 5. Paid USD/h: the bill's `SpotUsage:<type>` cost for the type and region, over its billed hours.
 6. Paid USD/run: that bill split between the runs of both kinds by box time, for the merge gates only.
@@ -665,7 +684,6 @@ The bill names the region by its usage type prefix, such as `USE2-SpotUsage:c7a.
 `ledger.REGION_USAGE_PREFIXES` maps each prefix to a region.
 A launch row without a region ran in the home region, `region` in `aws_target.conf`.
 The next line names the cheapest merge gate by estimate.
-These blocks do not split for a narrow terminal.
 Below them, two tables show the refused requests and the launched boxes of each type and region.
 Refused requests are capacity and quota refusals.
 The last table shows billed hours / box hours for each type and region, from `run_cost.hours_checks`.
@@ -673,7 +691,15 @@ A cell is `<billed>/<box> (<gap>)`, such as `9.2/8.8 (4%)`, with `over` when `ho
 A type and region without a bill read shows `not billed`. Only types with hours have a row.
 An unreadable cost ledger shows a note in place of the billed hours.
 
-The AWS prices page shows the same tables, published by `aws_page.publish`.
+The AWS page shows the same tables, published by `aws_page.publish`.
+The user renamed it from AWS prices to AWS on 2026-11-15, because it holds spend, prices and quotas.
+The published file stays `aws_prices.html`, so older links still open it.
+A Spend card at the top shows today, yesterday and the month to date, with the month forecast below them.
+`spend.read_spend` and `spend.month_spend` give these numbers; the buildlog report reads the same functions, so both show the same values. Read the spend on the console AWS page; the `/aws_spend` command was removed on 2026-11-16.
+The day is the UTC day. The hourly buildlog run publishes the page, so the spend is current to the last hour.
+After each push to main, `.claude/config/post_push.sh` publishes it again
+when the push changes the page code and the pushing checkout is at the pushed commit, as the promotion step's ~/.claude is.
+The Prices and Quotas sections follow the Spend card.
 The user asked for these page changes on 2026-11-14 through builds:
 1. A switch above the two price cards shows `Spot price` or `Cost per gate`; the user asked for it on 2026-11-15 through builds.
    `Cost per gate` shows a second switch, `Merge gates`, `Targeted runs` or `Both`, and it sets both cards.
@@ -685,9 +711,13 @@ The user asked for these page changes on 2026-11-14 through builds:
    A white box marks the lowest and the highest cell of each type column, in both themes; the user asked for it on 2026-11-15 through builds.
    The box is 1 px white inside a 1 px dark edge, which keeps it visible on the light page. Equal cells all have the box.
    A column with only two values has no box, because the colors already show which is which.
-   The lowest and the highest cell of each table have only a 2 px gold outline (`--extreme`, `#f5b400`), the same in both themes.
-   The user asked for it on 2026-11-15 through builds. A legend line above the cards explains the colors.
-   A legend line under each price card that has a box names both outlines.
+   The cheapest cell of each table is bold on a gold background (`--cheapest`), with dark text and a 2 px white outline (`--mark-edge`).
+   The most expensive cell of each table is bold on a black background (`--dearest`) with white text and the same white outline.
+   Both are the same in both themes, and they replace the scale color and the box of that cell.
+   The user asked for them on 2026-11-15 through builds, because bold alone did not make the cheapest cell stand out.
+   The user asked for the white outline on the gold cell too, so both table marks match.
+   A legend line above the cards explains the colors.
+   A legend line under each price card that has a mark names the box, the gold cell and the black cell.
    Builds removed the vCPU group mark on 2026-11-15.
 3. Each standard and GPU table is its own card. The two cards sit side by side and stack below 760 px.
    The content fills the window width, less a 16 px gutter on each side; the user asked for it on 2026-11-15 through builds.
@@ -706,7 +736,7 @@ A region filter at the top of the page shows all regions by default; the user as
    `None` at the end clears every region, so one click then shows only that region; the user asked for it on 2026-11-15 through builds.
    With no region chosen, each card says `No region chosen.` A reload with no region saved shows every region.
 2. Every section follows it: tables with a region column drop the other columns, and tables with a region row drop the other rows.
-3. The colors and both outlines use only the chosen regions. `Table.values` holds the number of each cell.
+3. The colors, the box and the table marks use only the chosen regions. `Table.values` holds the number of each cell.
    One region shows no color and no box.
 4. The cheapest line names the cheapest estimate in the chosen regions (`RunCosts.estimates`, cheapest first).
 5. A snapshot line for one region shows only when that region is chosen.
@@ -729,7 +759,7 @@ It compares the billed Spot hours with the recorded box hours for each type, reg
    Billed hours with no box hours are also over.
 `run_cost.day_hours_checks` gives one `HoursCheck` per type, region and day in the window.
 Days run from the window start day up to, but not including, the end day, like the bill split.
-`run_cost.hours_checks` sums the days with a bill read for each type and region, for the `/aws_prices` table.
+`run_cost.hours_checks` sums the days with a bill read for each type and region, for the billed hours table on the AWS page.
 `HoursCheck` holds `billed_hours`, `box_hours`, `hours_gap_ratio` and `hours_gap_over`.
 Without a bill read, `billed_hours` and `hours_gap_ratio` are `None`, and `box_hours` counts every day.
 `aws_target.hourly` checks the last `run_cost_days` days after its price read.
@@ -789,18 +819,29 @@ That cost includes the hourly Spot price times the expected box hours and the re
 It also includes regional extra seconds times `gate_wait_usd_per_minute`, divided by 60.
 `region_extra_gate_seconds={}` holds a JSON map from region names to measured extra seconds.
 Missing regions contribute zero extra seconds.
+`unmeasured_region_extra_seconds` holds a JSON map from region names to seconds.
+A region without its own runs borrows box time from the other regions and adds its seconds from this map.
+The seeds come from the 2026-11-14 runs: Europe 15 s, Canada 10 s, South America and Asia Pacific 30 s.
+After the first run in a region, its own median box time replaces the borrowed time and the extra.
 `gate_wait_usd_per_minute=0` disables the wait cost until the delay trial and builds review set it.
 It also includes the expected refusals: refused requests per launch for the type and region, times the median wait of one refusal, times `gate_wait_usd_per_minute`.
 Refusals count the zone and quota codes below over the last `run_cost_days` days; `UnauthorizedOperation` does not count.
 Expected box time is the median box time, launch to finish, for the type, region and mode over the last `run_cost_days` days.
-A region without its own runs uses the type's runs in all regions; a type without runs uses all runs of the mode.
+A region without its own runs uses the type's runs in all regions.
+A type without runs uses the runs of the types with its vCPU count, so m7a.8xlarge uses the c7a.8xlarge runs.
+The user, 2026-11-16: "it should be entirley based on who has the lowest price per run".
+Without runs of that vCPU count, it uses all runs of the mode.
 Without any runs, it uses `lifetime_minutes`.
-`/aws_prices` shows the same expected cost and refusals per launch, without the remote transfer and regional delay.
+The AWS page shows the same expected cost and refusals per launch, without the remote transfer and regional delay.
+Its expected cost includes the unmeasured seconds.
 `remote_region_transfer_usd=0.00015` applies when the region differs from the home region.
 Local measurements cover 692 gates with a source bundle, request, and result.
 Their median sizes are 10,157, 32,926, and 7,051,583 bytes, respectively.
 The median combined size is 7,107,672 bytes.
 At $0.02 per decimal GB, this costs $0.00014215344; the configured value rounds upward.
+`region_transfer_usd` holds a JSON map from far regions to their transfer USD per gate.
+Each value is about 10 MB per gate, the 2026-11-14 bill, at that region's inter-region transfer price.
+A region outside the map uses `remote_region_transfer_usd`.
 Equal costs keep configured order.
 Missing or stale prices follow fresh prices.
 Without applicable fresh prices, the gate preserves configured order except for capacity cooldowns.
@@ -987,3 +1028,43 @@ Existing configuration values remain unchanged.
 | `aws_timeout_s` | `10` | Bound each provider and receiver request. |
 | `control_url_seconds` | `3600` | Bound signed access for one boot. |
 | `control_poll_seconds` | `1` | Read current permission before the watchdog interval ends. |
+
+
+## Hana source transport
+
+`hana_transport.SourceSender` captures exact source through `copies.capture_source`.
+The copies private index includes staged, unstaged, deleted, and permitted untracked files.
+`apply_changes` uses the same private tree capture.
+The caller's index and refs remain unchanged.
+The existing tree key and a second private capture detect content and executable mode changes.
+Both capture paths refuse new Git links with `NestedRepository`.
+The sender refuses unexpected ignored inputs, credential paths, Git links, and disallowed environment variables.
+It sends no ignored files, HOME, or target output.
+
+A frozen `SourceManifest` carries the repository key, private commit, bundle digest, signed URL, basis commits, command, features, environment, and toolchain digest.
+Its JSON fits the receiver's 65536-byte control limit.
+Each repository retains a bounded list of guest-acknowledged commits.
+Each snapshot commit has no parent, so bundles exclude the caller's Git history and deleted credential blobs.
+Later bundles exclude those commits and their reachable objects.
+A typed `MissingBasis` answer clears that repository's basis before a complete bundle retry.
+`retry_complete` retains the captured commit even when the caller changes working files.
+
+`AwsSourceObjects` implements the typed object boundary through the existing provider.
+It uses conditional `PutObject` and signed `GetObject` access under `source/<deployment>/`.
+The scaler policy grants only `s3:PutObject` and `s3:GetObject` for that deployment's source prefix.
+Each AWS call uses `aws_timeout_s`.
+The guest receives no AWS credentials.
+
+`hana_source.materialize` bounds the download, verifies sha256 and Git prerequisites, checks the advertised commit, and fetches verified objects.
+Curl enforces the total download timeout and maximum file size.
+The data disk retains one bare mirror for each repository under `/var/lib/hana/mirrors`.
+The shared maker allocates mirror metadata and temporary bundle files.
+`build_slots.take_slot` supplies the only working checkout and retains its lease through the caller's context.
+The slot API provides rescue before reset, stable Cargo output, and existing capacity refusal.
+The slot's `rust-toolchain.toml` digest must equal the manifest before execution.
+
+The guest must use host name `aws-hana`.
+Admission requires `roots.slots.aws-hana`, `slots.aws-hana.hana.max`, and `slots.aws-hana.hana.max_bytes`.
+Those values remain unset until the user approves them.
+The guest image needs Git, curl, Python, `hana_source`, and the shared maker, slot, rescue, and configuration modules.
+Phase F2 will deliver manifests and execute commands with inherited slot locks.

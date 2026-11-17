@@ -9,6 +9,7 @@ from scripts.agents import remote
 
 from scripts.production.fake_unit_host import labeled as labeled_host
 
+from scripts.copies.copies_test_support import copies_environment
 from scripts.lint.memory_test_support import config_environment
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import closing, contextmanager
@@ -55,7 +56,8 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
     def run(command: list[str], *, capture_output: bool = False, text: bool = False,
             check: bool = False, timeout: float | None = None, env: dict[str, str] | None = None,
             cwd: Path | str | None = None, stdin: int | None = None, stdout: int | None = None,
-            stderr: int | None = None, input: str | None = None) -> subprocess.CompletedProcess[str]:
+            stderr: int | None = None, input: str | None = None,
+            pass_fds: Sequence[int] = ()) -> subprocess.CompletedProcess[str]:
         child_env = dict(os.environ) if env is None else env
         child_cwd = Path.cwd() if cwd is None else Path(cwd)
         executable = Path(shutil.which(command[0], path=child_env.get("PATH")) or command[0])
@@ -75,7 +77,8 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
         if script == Path(progress_history.__file__):
             return invoke_recorder(args, child_env, child_cwd)
         return real_run(command, capture_output=capture_output, text=text, check=check,
-                        timeout=timeout, env=env, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr, input=input)
+                        timeout=timeout, env=env, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr, input=input,
+                        pass_fds=pass_fds)
 
     with mock.patch.object(subprocess, "run", run), mock.patch.object(
         change_review, "lists_directory", return_value=Path(environment["HOME"]) / "rust/hanadocs/change-review",
@@ -311,7 +314,9 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.bin = self.root / "bin"
         self.state = self.root / "stub-state"
         home = self.root / "home"
-        self.env = {**os.environ, **interpreter_cache_environment(root.parent / "interpreter-cache"), "CONF_DIR": str(self.root), "HOME": str(home), "STAFF_FILE": str(home / ".local/state/staff/staff.json"),
+        private = copies_environment(root, repository="origin")
+        _ = shutil.copyfile(Path(private["CONF_DIR"]) / "build_folders.conf", root / "build_folders.conf")
+        self.env = {**os.environ, **private, **interpreter_cache_environment(root.parent / "interpreter-cache"), "CONF_DIR": str(self.root), "HOME": str(home), "STAFF_FILE": str(home / ".local/state/staff/staff.json"),
                     "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(root.parent)), "GIT_CONFIG_NOSYSTEM": "1",
                     "MERGE_CHECKPOINT_STYLE_SYNC": str(self.bin / "style_sync.py"),
                     "MERGE_CHECKPOINT_STYLE_LEDGER": str(self.bin / "style_ledger.py"),
@@ -327,7 +332,7 @@ class MergeCheckpointFixture(unittest.TestCase):
                     "CLAUDE_PROBE_SESSION": ""}
 
     def build_fixture(self) -> None:
-        self.root.mkdir()
+        self.root.mkdir(exist_ok=True)
         _ = config_environment(self.root)
         self.bin.mkdir()
         self.state.mkdir()
@@ -508,14 +513,14 @@ class MergeCheckpointFixture(unittest.TestCase):
         )
         self.addCleanup(self.stop_bump_gates)
 
-    def refuse_bump_clone(self) -> None:
+    def refuse_bump_slot(self) -> None:
         git = shutil.which("git")
         assert git is not None
         self.executable(self.bin / "git", "#!/usr/bin/env python3\nimport os, sys\n"
                         + "arguments = sys.argv[1:]\n"
                         + "while arguments[:1] in (['-c'], ['-C']): arguments = arguments[2:]\n"
-                        + "if arguments[:1] == ['clone']:\n"
-                        + "    print('fixture clone refused', file=sys.stderr)\n    raise SystemExit(1)\n"
+                        + "if arguments[:2] == ['worktree', 'add']:\n"
+                        + "    print('fixture slot refused', file=sys.stderr)\n    raise SystemExit(1)\n"
                         + f"os.execv({git!r}, [{git!r}, *sys.argv[1:]])\n")
 
     @contextmanager
@@ -525,11 +530,12 @@ class MergeCheckpointFixture(unittest.TestCase):
         def launch(command: Sequence[str], *, stdin: int | None = None,
                    stdout: int | IO[str] | None = None, stderr: int | IO[str] | None = None,
                    cwd: str | Path | None = None, env: Mapping[str, str] | None = None,
-                   text: bool = False, start_new_session: bool = False) -> subprocess.Popen[str] | subprocess.Popen[bytes]:
+                   text: bool = False, start_new_session: bool = False,
+                   pass_fds: Sequence[int] = ()) -> subprocess.Popen[str] | subprocess.Popen[bytes]:
             if any(Path(word).name == "bump_gate.py" for word in command):
                 raise OSError("fixture gate launch refused")
             return original(command, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd, env=env,
-                            text=text, start_new_session=start_new_session)
+                            text=text, start_new_session=start_new_session, pass_fds=pass_fds)
 
         with mock.patch.object(subprocess, "Popen", side_effect=launch):
             yield
@@ -648,8 +654,6 @@ class MergeCheckpointFixture(unittest.TestCase):
                 _ = os.waitpid(run.gate_pid, 0)
             except ChildProcessError:
                 pass
-        if run.checkout.exists():
-            shutil.rmtree(run.checkout)
 
     def stop_bump_gates(self) -> None:
         for run in self.bump_gate_runs():

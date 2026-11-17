@@ -384,6 +384,8 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
         ("NOTIFIER_SESSIONS_DIR", "sessions"),
         ("HERDR_PANE_RECORD_DIR", "panes"),
         ("XDG_CONFIG_HOME", "config"),
+        # Session folders belong to staff members; a fixture member never makes one in the live root.
+        ("SESSION_TEMP_ROOT", "session"),
     ):
         _ = environment.setdefault(key, str(path.parent / folder))
     # A row removal edits the restart record; a fixture never edits the live one.
@@ -398,6 +400,7 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
             "NOTIFIER_SESSIONS_DIR": environment["NOTIFIER_SESSIONS_DIR"],
             "HERDR_PANE_RECORD_DIR": environment["HERDR_PANE_RECORD_DIR"],
             "XDG_CONFIG_HOME": environment["XDG_CONFIG_HOME"],
+            "SESSION_TEMP_ROOT": environment["SESSION_TEMP_ROOT"],
             "SHUTDOWN_STATE_DIR": environment["SHUTDOWN_STATE_DIR"],
             "CODEX_HOME": environment.get("CODEX_HOME", os.environ.get("CODEX_HOME", "")),
             "STAFF_CONFIG": os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf")),

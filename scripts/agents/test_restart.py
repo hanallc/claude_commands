@@ -1777,6 +1777,37 @@ class RestartTests(RestartTestCase):
                                             environment, herdr.NO_ENVIRONMENT_REMOVALS)
             self.assertEqual(pane, "w1:p0")
 
+    def test_start_row_uses_the_configured_opening_prompt_budget_only_for_claude_prompts(self) -> None:
+        for start_seconds, opening_seconds in ((7, 43), (51, 17)):
+            for kind, opening in (
+                    ("claude", herdr.OpeningPrompt("Continue where you stopped.")),
+                    ("claude", herdr.NoOpeningPrompt()),
+                    ("codex", herdr.OpeningPrompt("Continue where you stopped."))):
+                for deadline in (math.inf, 12.0):
+                    with self.subTest(start=start_seconds, prompt=opening_seconds, kind=kind,
+                                      opening=opening, deadline=deadline):
+                        self.running.clear()
+                        config = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
+                        write_text_atomic(config,
+                            f"# range: 1..\nSTART_SECONDS={start_seconds}\n"
+                            + f"# range: 1..\nOPENING_PROMPT_SECONDS={opening_seconds}\n")
+                        row = self.rows[0]
+                        arguments = (["--resume", str(row.current_session)] if kind == "claude" else
+                                     ["resume", str(row.current_session)])
+                        with (patch.object(restart, "session_launch", return_value=(kind, {}, arguments)),
+                              patch.object(time, "monotonic", return_value=0),
+                              patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                                  "w1:p0", herdr.PromptSubmissionNotRequired())) as launch):
+                            pane = restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents"),
+                                opening=opening, deadline=deadline)
+                        self.assertEqual(pane, "w1:p0")
+                        expected = (max(start_seconds, opening_seconds)
+                                    if kind == "claude" and isinstance(opening, herdr.OpeningPrompt) else start_seconds)
+                        self.assertEqual(launch.call_args.args[6], int(min(expected, deadline) * 1000))
+                        self.assertIsInstance(cast(object, launch.call_args.args[5]),
+                            herdr.OpeningPrompt if kind == "claude" and isinstance(opening, herdr.OpeningPrompt)
+                            else herdr.NoOpeningPrompt)
+
     def test_start_row_selects_the_workers_account_unless_the_target_is_explicit(self) -> None:
         self.running.clear()
         for row in (self.rows[0], replace(self.rows[0], kind="producer", unit_type=staff.NotUnit(), name="probe-codex")):

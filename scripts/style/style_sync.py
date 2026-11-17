@@ -179,8 +179,8 @@ def notify(repo_dir: Path, branch: str, tip: str) -> None:
 
 
 def lint_prefix() -> str:
-    """Read the current prefix for style lint folders."""
-    return build_folders.FOLDER_PREFIXES["style-sync-lint"]
+    """Name the start of each style lint folder; its sweep finds stopped runs by it."""
+    return "style-sync-lint-"
 
 
 def lint_temp_parent() -> Path:
@@ -369,8 +369,7 @@ def verify_lint(directory: Path) -> tuple[int, str]:
         verifier_command(directory, os.getpid()), cwd=directory / "checkout", env={**os.environ, "UNIT_DETACHED_RUN": "1",
             "CARGO_BUILD_BUILD_DIR": str((directory / "checkout/target").resolve() / "intermediates")},
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        start_new_session=True, preexec_fn=unblock_held_signals,
-    ) as child:
+        start_new_session=True, preexec_fn=unblock_held_signals, pass_fds=copies.COMMAND_LOCKS.get()) as child:
         try:
             with signal_mask(signal.SIG_UNBLOCK):
                 output, _ = child.communicate()
@@ -395,14 +394,15 @@ def remove_lint_dir(repo: Path, directory: Path) -> bool:
     try:
         if snapshot.is_symlink():
             snapshot.unlink()
-        elif snapshot.is_dir():
-            scratch.remove_with_cargo_output(snapshot, shutil.rmtree)
+        elif (snapshot.is_dir() or scratch.removal_mark(snapshot).exists()
+              or scratch.cargo_removal_mark(snapshot).exists()):
+            scratch.remove_with_cargo_output(snapshot)
         registered = {Path(line.removeprefix("worktree "))
                       for line in git(repo, "worktree", "list", "--porcelain").splitlines()
                       if line.startswith("worktree ")}
         if listed in registered:
             _ = git(repo, "worktree", "remove", "--force", "--force", str(listed))
-    except (Refusal, OSError) as error:
+    except (Refusal, OSError, scratch.ScratchError) as error:
         print(f"style_sync: kept {directory} for the next lint run; worktree registration: "
               + " ".join(str(error).splitlines()))
         return False
@@ -467,7 +467,7 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
     sweep_stale_lint_dirs()
     # Signals stay held outside the work, so the dir never exists without its record and its cleanup path.
     with (stop_signals_raise(),
-          copies.standing(gate_owner(repo), checkout, copies.CommittedSource(tip)) as snapshot,
+          copies.standing(gate_owner(repo), checkout, copies.CommittedSource(tip), step="lint") as snapshot,
           signal_mask(signal.SIG_BLOCK),
           build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
               lint_prefix(), build_folders.ExplicitBuildParent(lint_temp_parent()))) as directory):
@@ -480,8 +480,7 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
             saved = subprocess.run(
                 [str(PYTHON), str(Path(scratch.__file__)), "cargo-save", str(snapshot)],
                 env={**os.environ, "CARGO_BUILD_BUILD_DIR": str(intermediates)},
-                capture_output=True, text=True, check=False,
-            )
+                capture_output=True, text=True, check=False, pass_fds=copies.COMMAND_LOCKS.get())
             if saved.returncode:
                 raise Refusal(saved.stderr.strip() or "cannot save Cargo output roots")
             returncode, output = verify_lint(directory)

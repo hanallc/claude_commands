@@ -472,7 +472,7 @@ class FooterCountsTests(unittest.TestCase):
         self.tree = {"top": doc}
         config = self.root / "config"
         config.mkdir()
-        _ = (config / "review_links.conf").write_text("unrouted_alert_recipient=top\n")
+        _ = (config / "review_links.conf").write_text("unrouted_alert_recipient=top\nchanges_first_root=top\n")
         _ = (config / "change_review.conf").write_text(
             f"lists_directory={self.root}\nreview_links_directory={self.root / 'links'}\n")
         with (mock.patch.dict(os.environ, {"CONF_DIR": str(config)}),

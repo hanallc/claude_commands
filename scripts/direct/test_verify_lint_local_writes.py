@@ -17,6 +17,9 @@ class VerifyLintLocalWritesTests(VerifyStepRoutesFixture):
         shell = self.fixture.root / "hold-before-repair.sh"
         _ = shell.write_text('''
 hold_before_repair() {
+    if [[ "$TEST_REQUIRE_MEND_FIX" != 1 && "$BASH_COMMAND" != *'invoke_clippy_fix --workspace '* ]]; then
+        return 0
+    fi
     case "$BASH_COMMAND" in
         'invoke_mend --workspace --fix '*|'invoke_clippy_fix --workspace '*\
             |'lint_rewrite invoke_mend --workspace --fix '*|'lint_rewrite invoke_clippy_fix --workspace '*)

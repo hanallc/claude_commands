@@ -22,6 +22,7 @@ from scripts.build_queue.admission_test_support import caller_admission, caller_
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.build_folders_test_support import tool_folders
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file
@@ -840,13 +841,12 @@ class VerifyMemoryRouteHolderTests(RecordedHoldWaitFixture):
         def observe(request: wire.Request,
                     connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
             if isinstance(request, wire.PlacementRequest):
-                for path in Path(self.fixture.environment["TMPDIR"]).glob(
-                        f"verify-hold.{request.owner.pid}.*/placement-*.json.wait"):
+                holds = tool_folders(Path(self.fixture.environment["TMPDIR"]), "verify", pid=request.owner.pid)
+                for path in (wait for hold in holds for wait in hold.glob("placement-*.json.wait")):
                     notice = wire.parse_record(path.read_text(), admission_client.PlacementWaitNotice)
                     if isinstance(notice.last_reply, wire.Wait):
                         _ = controls.hosts.pop("mac", None)
-                first, = Path(self.fixture.environment["TMPDIR"]).glob(
-                    f"verify-hold.{request.owner.pid}.*/first-queued-at")
+                first, = (hold / "first-queued-at" for hold in holds if (hold / "first-queued-at").exists())
                 with (self.fixture.root / "memory-joins.jsonl").open("a") as output:
                     _ = output.write(json.dumps({"since": str(request.since).removesuffix(".0"),
                         "first": first.read_text()}) + "\n")

@@ -20,6 +20,7 @@ from typing import ClassVar, TextIO, cast, final, override
 from unittest import mock
 from datetime import UTC, datetime, timedelta, tzinfo
 from scripts.copies import copies
+from scripts.lib import build_folders
 from scripts.production import merge_gate, staff, showrunners
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member
 from scripts.production.gate_modules import GateRefused
@@ -37,10 +38,6 @@ class MergeGateTypesTests(GateSuitesFixture):
         _ = cast(object, self.enterContext(mock.patch.object(merge_gate, "push_nightly_result")))
 
     def run_nightly(self) -> subprocess.CompletedProcess[str]:
-        configuration = self.root / "copies.conf"
-        self.write(configuration, f"[copies]\nroot={self.root / 'copies'}\n"
-                   + "wait_seconds=1\ngit_timeout_seconds=60\nguard_timeout_seconds=10\n")
-        self.environment["COPIES_CONFIG"] = str(configuration)
         arguments = ["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration"]
         with mock.patch.object(merge_gate, "nightly_owner", return_value="fixture-showrunner"):
             return invoke_cli(merge_gate, lambda: merge_gate.main(arguments), arguments,
@@ -54,10 +51,12 @@ class MergeGateTypesTests(GateSuitesFixture):
         python = self.state / "runner/typecheck-venv/bin/python"
         self.assertEqual(type_call["args"], ["--pythonpath", str(python), "scripts"])
         self.assertNotEqual(type_call["cwd"], str(self.checkout))
-        self.assertFalse(Path(type_call["cwd"]).exists())
-        records = list((self.root / "copies").glob("*/*/.gate.json"))
+        self.assertTrue(Path(type_call["cwd"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(type_call["cwd"])), "free")
+        records = list((self.root / "slots").glob("*-slot*.lease.json"))
         self.assertEqual(len(records), 1)
-        self.assertTrue((records[0].parent / "target").is_dir())
+        self.assertTrue((Path(type_call["cwd"]) / "target").is_dir())
+        self.assertEqual(json.loads(records[0].read_text())["commit"], self.base)
         self.assert_all_modules_started()
         self.assertIn("basedpyright: OK", result.stdout)
         history, = self.gate_history()

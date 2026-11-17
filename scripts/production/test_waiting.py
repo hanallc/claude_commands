@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.copies.copies_test_support import copies_environment
+from scripts.lib import build_folders
+
 from scripts.production.fake_unit_host import labeled as labeled_host
 from scripts.direct import progress_history
 
@@ -191,7 +194,7 @@ class WaitingTests(unittest.TestCase):
             "default": CommandResponse(stdout="", code=1),
         }))
         self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(home),
+            **copies_environment(self.root), "HOME": str(home),
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
             "CODEX_HOME": str(home / "codex-fixture"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
@@ -328,7 +331,12 @@ class WaitingTests(unittest.TestCase):
 
     def assert_scratch_clean(self, worktrees: str, unit_tip: str, merge_tip: str,
                              local_refs: str, origin_refs: str) -> None:
-        self.assertEqual(self.worktrees(), worktrees)
+        slots = sorted(path for path in (self.root / "slots").glob("*-slot*") if path.is_dir())
+        expected = worktrees.split("\n\n")
+        for slot in slots:
+            expected.append(f"worktree {slot}\nHEAD {self.git('rev-parse', 'HEAD', cwd=slot)}\ndetached")
+            self.assertEqual(build_folders.build_folder_state(slot), "free")
+        self.assertCountEqual(self.worktrees().split("\n\n"), expected)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.alpha), unit_tip)
         self.assertEqual(self.git("rev-parse", "HEAD"), merge_tip)
         self.assertEqual(self.refs(self.checkout), local_refs)
@@ -523,29 +531,29 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         paths = observed.read_text().splitlines()
         self.assertEqual(len(paths), 4)
-        self.assertNotEqual(paths[0], paths[2])
-        self.assertFalse(any(Path(paths[index]).exists() for index in (0, 2)))
+        self.assertEqual(paths[0], paths[2])
+        self.assertTrue(all(Path(paths[index]).exists() for index in (0, 2)))
+        self.assertEqual({build_folders.build_folder_state(Path(paths[index])) for index in (0, 2)}, {"free"})
         self.assertEqual(paths[1], paths[3])
         self.assertTrue(Path(paths[1]).is_dir())
 
     def test_scratch_post_use_failure_preserves_green_and_red_verdicts(self) -> None:
-        from scripts.copies import copies
-
         _ = self.commit(self.alpha, "alpha.txt", "unit work\n")
         _ = self.commit(self.checkout, "merged.txt", "merge branch work\n")
         self.push_scratch_branches()
-        mark = copies.mark_target
+        replace = os.replace
         for code, verdict in ((0, "ok — green"), (7, "failed — red")):
             with self.subTest(code=code):
                 used = self.state / "gate-command-finished"
                 used.unlink(missing_ok=True)
 
-                def fail_after_use(tree: Path) -> None:
-                    if used.exists():
-                        raise OSError("cache marking refused")
-                    mark(tree)
+                def fail_after_use(source: str | Path, destination: str | Path, *,
+                                   src_dir_fd: int | None = None, dst_dir_fd: int | None = None) -> None:
+                    if str(destination).endswith(".lease.json") and used.exists():
+                        raise OSError("lease release refused")
+                    replace(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
-                with mock.patch.object(copies, "mark_target", side_effect=fail_after_use):
+                with mock.patch.object(os, "replace", side_effect=fail_after_use):
                     result = self.run_waiting("scratch-test", ALPHA, "--tests",
                                               f"printf 'tests ran\\n'; touch {shlex.quote(str(used))}; exit {code}",
                                               "--state-dir", str(self.state))
@@ -554,7 +562,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
                 self.assertEqual(len(lines), 2, result.stdout)
                 self.assertIn(verdict, lines[0])
                 self.assertTrue(lines[1].startswith("scratch-test: failed — post-use step:"), result.stdout)
-                self.assertIn("cache marking refused", lines[1])
+                self.assertIn("lease release refused", lines[1])
                 self.assertEqual(self.scratch_log(lines[0]).read_text(), "tests ran\n")
 
     def test_search_reports_other_unit_branch_and_uncommitted_worktree_sites(self) -> None:

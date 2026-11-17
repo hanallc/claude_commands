@@ -303,6 +303,29 @@ class DeclarationSite(StrEnum):
 
 
 @dataclass(frozen=True)
+class NormalizedSourceTokens:
+    """Keep normalized token values and offsets after temporary source indexes are released."""
+
+    words: bytes
+    kinds: bytes
+    offsets: tuple[array[int], array[int]]
+
+    def spans(self) -> tuple[style_footprint.TokenSpan, ...]:
+        """Expand the reader's normalized tokens without scanning source."""
+        words = cast(list[str], json.loads(zlib.decompress(self.words)))
+        kinds = cast(list[Literal["identifier", "literal", "punctuation", "unknown"]],
+                     json.loads(zlib.decompress(self.kinds)))
+        starts, ends = self.offsets
+        return tuple(style_footprint.TokenSpan(style_footprint.Token(word, kind), start, end)
+                     for word, kind, start, end in zip(words, kinds, starts, ends, strict=True))
+
+
+@dataclass(frozen=True)
+class UnreadNormalizedSource:
+    """The reader supplies no token reading for the normalized source."""
+
+
+@dataclass(frozen=True)
 class DeclaredFile:
     """A Rust file read once: its named items, and what a line needs to read as one of them."""
 
@@ -340,8 +363,18 @@ class DeclaredFile:
                      for word, kind, start, end in zip(self.word_values, kinds, starts, ends, strict=True))
 
     @cached_property
+    def normalized_source_tokens(self) -> NormalizedSourceTokens | style_footprint.UnreadableTokenSpans | UnreadNormalizedSource:
+        """The reader can supply normalized tokens without a Python source scan."""
+        return UnreadNormalizedSource()
+
+    @cached_property
     def normalized_token_spans(self) -> tuple[style_footprint.TokenSpan, ...]:
         """Share original offsets when line normalization leaves token positions unchanged."""
+        reading = self.normalized_source_tokens
+        if isinstance(reading, style_footprint.UnreadableTokenSpans):
+            raise style_footprint.UnreadableTokenSpans(str(reading))
+        if isinstance(reading, NormalizedSourceTokens):
+            return reading.spans()
         source = zlib.decompress(self._compressed_source).decode()
         normalized = "\n".join(self.source_lines)
         if source.startswith(normalized) and not source[len(normalized):].strip("\n"):
@@ -385,6 +418,11 @@ class DeclaredFile:
     @cached_property
     def _body_offsets(self) -> tuple[array[int], array[int]] | style_footprint.UnreadableTokenSpans:
         """Keep integer offsets without retaining token objects or source text."""
+        reading = self.normalized_source_tokens
+        if isinstance(reading, NormalizedSourceTokens):
+            return reading.offsets
+        if isinstance(reading, style_footprint.UnreadableTokenSpans):
+            return reading
         source = zlib.decompress(self._compressed_source).decode()
         normalized = "\n".join(self.source_lines)
         if source.startswith(normalized) and not source[len(normalized):].strip("\n"):
@@ -512,6 +550,134 @@ class DeclaredFile:
         return tuple(replace(binding, closure=replace(binding.closure, context=UnprovedClosureContext()))
                      if isinstance(binding.closure, OwningClosure) and contexts[(binding.scope, binding.closure.context)] != 1
                      else binding for binding in bindings)
+
+
+def _reader_fields(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("the declaration reader requires an object")
+    return cast(dict[str, object], value)
+
+
+def _reader_values(value: object) -> list[object]:
+    if not isinstance(value, list):
+        raise ValueError("the declaration reader requires an array")
+    return cast(list[object], value)
+
+
+def _reader_number(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError("the declaration reader requires a nonnegative integer")
+    return value
+
+
+def _reader_text(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("the declaration reader requires text")
+    return value
+
+
+def _reader_position(value: object) -> ImplPosition:
+    if value == "file_level":
+        return FileLevelImpl()
+    if value == "unproved":
+        return UnprovedImplPosition()
+    return BlockScopedImpl(_reader_number(_reader_fields(value)["block_scoped"]))
+
+
+def _reader_trait(value: object) -> TraitMembership:
+    if value == "none":
+        return NoImplementedTrait()
+    if value == "unreadable":
+        return UnreadableImplementedTrait()
+    fields = _reader_fields(value)
+    return ImplementedTrait(tuple(_reader_text(part) for part in _reader_values(fields["path"])),
+                            tuple(_reader_text(part) for part in _reader_values(fields["arguments"])),
+                            _reader_position(fields["position"]))
+
+
+def _reader_type(value: object) -> TypeMembership:
+    membership = _reader_trait(value)
+    if isinstance(membership, NoImplementedTrait):
+        return NoImplementedType()
+    if isinstance(membership, UnreadableImplementedTrait):
+        return UnreadableImplementedType()
+    return ImplementedType(membership.path, membership.arguments, membership.position)
+
+
+def _reader_span(value: object) -> _Span:
+    fields = _reader_fields(value)
+    body = fields["body"]
+    if body == "none":
+        return _Span(_reader_number(fields["keyword"]), _reader_number(fields["end"]), _NoBody())
+    bounds = _reader_fields(body)
+    return _Span(_reader_number(fields["keyword"]), _reader_number(fields["end"]),
+                 _Body(_reader_number(bounds["open"]), _reader_number(bounds["close"])))
+
+
+def _reader_body_spans(value: object, tokens: tuple[style_footprint.TokenSpan, ...]
+                       ) -> tuple[style_footprint.TokenSpan, ...] | style_footprint.UnreadableTokenSpans:
+    if value == "unreadable":
+        return style_footprint.UnreadableTokenSpans("the reader cannot locate normalized tokens")
+    if value == "original":
+        result = tokens
+    else:
+        spans: list[style_footprint.TokenSpan] = []
+        for entry in _reader_values(value):
+            fields = _reader_fields(entry)
+            word = _reader_text(fields["value"])
+            kind = _reader_text(fields["kind"])
+            if kind not in ("identifier", "literal", "punctuation", "unknown"):
+                raise ValueError("the declaration reader returned an unknown token kind")
+            start = _reader_number(fields["start"])
+            spans.append(style_footprint.TokenSpan(style_footprint.Token(word, kind), start, start + len(word)))
+        result = tuple(spans)
+    if any(span.token.kind == "unknown" for span in result):
+        return style_footprint.UnreadableTokenSpans("the reader returned an unknown normalized token")
+    return result
+
+
+def decode_reader_fact(text: str, tokens: tuple[style_footprint.TokenSpan, ...],
+                       value: dict[str, object], token_lines: tuple[int, ...]) -> DeclaredFile:
+    """Restore compact declaration facts without scanning Rust source."""
+    items: list[DeclaredItem] = []
+    for entry in _reader_values(value["items"]):
+        fields = _reader_fields(entry)
+        owner = fields["owner"]
+        items.append(DeclaredItem(
+            Declaration(_reader_text(fields["keyword"]), _reader_text(fields["name"]),
+                        ModuleItem() if owner == "module" else ImplOrTraitItem(_reader_text(_reader_fields(owner)["impl_or_trait"]))),
+            _reader_number(fields["keyword_line"]), _reader_number(fields["first_line"]),
+            _reader_number(fields["last_line"]), _reader_trait(fields["implemented_trait"]),
+            _reader_position(fields["import_position"]), _reader_type(fields["implemented_type"])))
+    spans = tuple(_reader_span(span) for span in _reader_values(value["spans"]))
+    others = tuple(_reader_span(span) for span in _reader_values(value["others"]))
+    if len(spans) != len(items):
+        raise ValueError("the declaration reader returned different item and span counts")
+    if any(span.keyword >= len(tokens) or span.end >= len(tokens) for span in (*spans, *others)):
+        raise ValueError("the declaration reader returned a span outside the tokens")
+    if len(token_lines) != len(tokens):
+        raise ValueError("the declaration reader returned different token and line counts")
+    lines = array("I", token_lines)
+    offsets: tuple[array[int], array[int]] | style_footprint.UnreadableTokenSpans
+    if any(span.token.kind == "unknown" for span in tokens):
+        offsets = style_footprint.UnreadableTokenSpans("the declaration reader returned an unknown token")
+    else:
+        offsets = array("I", (span.start for span in tokens)), array("I", (span.end for span in tokens))
+    archived_words = zlib.compress(json.dumps(tuple(span.token.value for span in tokens), ensure_ascii=True).encode(), level=1)
+    archived_kinds = zlib.compress(json.dumps(tuple(span.token.kind for span in tokens)).encode(), level=1)
+    file = DeclaredFile(tuple(items), zlib.compress(text.encode(), level=1), spans, others, lines,
+                        archived_words, archived_kinds, offsets)
+    normalized = _reader_body_spans(value["body_tokens"], tokens)
+    if isinstance(normalized, style_footprint.UnreadableTokenSpans):
+        file.__dict__["normalized_source_tokens"] = normalized
+    elif normalized is tokens and not isinstance(offsets, style_footprint.UnreadableTokenSpans):
+        file.__dict__["normalized_source_tokens"] = NormalizedSourceTokens(archived_words, archived_kinds, offsets)
+    else:
+        file.__dict__["normalized_source_tokens"] = NormalizedSourceTokens(
+            zlib.compress(json.dumps(tuple(span.token.value for span in normalized), ensure_ascii=True).encode(), level=1),
+            zlib.compress(json.dumps(tuple(span.token.kind for span in normalized)).encode(), level=1),
+            (array("I", (span.start for span in normalized)), array("I", (span.end for span in normalized))))
+    return file
 
 
 def read_declarations(text: str) -> DeclaredFile:

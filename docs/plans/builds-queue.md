@@ -1224,7 +1224,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 **Gotchas:**
 - A test that counts grants counts distinct reservations, because a replay resends the grant.
 - Tests and `verify.sh` fixtures use the private service socket, never the live one. A direct `handle_request` call in a test goes inside `fixture.loop_turn`.
-- Timing tests (`test_queue_view` render time, `review_links` `test_change_page`, `codex_mesh`) can fail once at load 60-100 and pass alone.
+- Timing tests (`test_queue_view` render time, `review_links` `test_change_page`) can fail once at load 60-100 and pass alone.
 
 **Ruled out:**
 - A shadow run beside the old checker (user, 2026-10-31): one cut-over, no second admitter.
@@ -1245,7 +1245,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 - `scripts/lib/build_folders.py`, `scripts/lib/unit_runs.py`, `scripts/lib/socket_test_support.py` — naming, run paths, markers, and short socket parents.
 - `scripts/production/{merge_gate,fast_track,waiting,bump_gate,ci_points}.py`, `scripts/style/{bulk_run,style_sync}.py` — temporary checkout and index callers.
 - `scripts/buildlog/rust_release.py` — shared trial prefix and inherited parent; Git creates the clone.
-- `scripts/direct/{verify,prepare_session,implement}.sh`, `scripts/lint/invoke.sh`, `scripts/agents/codex_mesh.py` — CLI allocations and run temporary folders.
+- `scripts/direct/{verify,prepare_session,implement}.sh`, `scripts/lint/invoke.sh` — CLI allocations and run temporary folders.
 - `scripts/hooks/{session-start-temp-root,pre-tool-use-checkpoint-doc-gate}.py` — stable session roots and temporary checkpoint folders.
 - `scripts/build_queue/{queue_place,admission_test_support}.py`, `scripts/mac_test/{copy_watch,linux_runner}.py`, `scripts/lint/style_review.py` — sidecar, admission, staging, and review folders.
 - `scripts/lint/{tmp_sweep,sweep,folder_audit,memory_admit}.py` — shared names, ownership classification, and sweep-state reads.

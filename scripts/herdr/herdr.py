@@ -51,7 +51,7 @@ from typing import BinaryIO, TYPE_CHECKING, Literal, NamedTuple, Never, NotRequi
 
 from scripts.herdr import pane_launch
 from scripts.agents import worker_lifecycle
-from scripts.lib import conf, models_registry, operation_deadline
+from scripts.lib import conf, models_registry, operation_deadline, session_folder
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
 from scripts.lib import legacy_identity
 from scripts.lib.atomic_file import write_text_atomic
@@ -2492,14 +2492,27 @@ class Herdr:
         if isinstance(opening, OpeningPrompt):
             if isinstance(opening.transcript, SessionTranscript):
                 transcript = opening.transcript
-                if transcript.session_id and not check_target(
-                        transcript.session_id, action="keys", place=HerdrPlace(self.session, pane)):
-                    return PromptNotSubmitted("prompt target is unknown; session retained")
                 try:
-                    identity = self.native_session(pane, kind, max(0.1, deadline - time.monotonic()))
+                    while True:
+                        try:
+                            identity = self.native_session(pane, kind, max(0.1, deadline - time.monotonic()))
+                            break
+                        except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                            cause: BaseException | None = error
+                            while cause is not None and not isinstance(cause, NativeRegistryChanging):
+                                cause = cause.__cause__ or cause.__context__
+                            remaining = deadline - time.monotonic()
+                            if not isinstance(cause, NativeRegistryChanging) or remaining <= 0:
+                                raise
+                            time.sleep(operation_deadline.remaining(min(PANE_POLL_SECONDS, remaining)))
+                            if time.monotonic() >= deadline:
+                                raise
                 except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                     print(f"herdr {name}:{pane}: native session is unavailable: {error}; pane retained", file=sys.stderr)
                     return PromptNotSubmitted("native session is unavailable; pane retained")
+                if transcript.session_id and not check_target(
+                        identity, action="keys", place=HerdrPlace(self.session, pane)):
+                    return PromptNotSubmitted("prompt target is unknown; session retained")
                 transcript = SessionTranscript(transcript.config_dir, identity)
                 if isinstance(opening.cursor, TranscriptCursor):
                     opening.cursor.bind_transcript(transcript)
@@ -5624,6 +5637,19 @@ class LaunchClientSource(Enum):
     NEW = "create a client for this launch"
 
 
+def in_session_folder(prepared: PreparedAgentEnvironment, member: session_folder.Member,
+                      session_id: str) -> PreparedAgentEnvironment:
+    """Start Claude Code with TMPDIR in the member's session folder, so its scratchpad is made there."""
+    try:
+        folder = session_folder.launch_folder(member, session_id)
+    except OSError as error:
+        print(f"herdr {member.name}: session folder: {error}", file=sys.stderr)
+        return prepared
+    if folder is None:
+        return prepared
+    return replace(prepared, env={**prepared.env, "TMPDIR": str(folder), session_folder.FOLDER_ENV: folder.name})
+
+
 def agent_alias_script(kind: str) -> str:
     """Clear the agent alias before the shell starts the agent."""
     return f"unalias {kind} 2>/dev/null; "
@@ -5649,12 +5675,14 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
     reuse_client = not isinstance(client, LaunchClientSource)
     client = Herdr(name) if isinstance(client, LaunchClientSource) else client
     member = ""
+    folder_member: session_folder.Member | None = None
     try:
         membership = _tab_staff()
         owner = membership.by_member_reference(session_id or agent) or membership.by_path(agent)
         if owner is not None:
             session_id = owner.current_session
             member = owner.id
+            folder_member = session_folder.member_for(owner, membership)
         observed = (read_conversation(session_id, kind,
                     **({"codex": codex} if isinstance(codex, CodexConversations) else {}))
                     if session_id else StoppedConversation())
@@ -5665,6 +5693,8 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
             raise HerdrFailure(f"would start a second copy of running session {session_id}", "already_running")
         if isinstance(observed, UnknownConversation) and not reported_unknown:
             conversation_note(observed)
+    if kind == "claude" and folder_member is not None:
+        prepared = in_session_folder(prepared, folder_member, session_id)
     if isinstance(destination, NewTab):
         pane = (client.open_tab(destination.space, destination.title, str(prepared.directory), prepared.env,
                                **({"member": member} if member else {})) if reuse_client else

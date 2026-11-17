@@ -35,7 +35,7 @@ from scripts.lib import cargo_target_config
 from scripts.lib import file_lock
 from scripts.message import send_budget, session_send
 from scripts.message.session_send_test_support import forbid_real_sender
-from scripts.lib import conf, copy_record
+from scripts.lib import build_folders, conf, copy_record
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.mac_test import floor_claims
@@ -44,6 +44,7 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 from scripts.buildlog.step_outputs_test_support import create_step_index, record_root_attempt
 from scripts.buildlog import index as build_index
 from scripts.buildlog import repository
+from scripts.copies.copies_test_support import copies_environment
 if TYPE_CHECKING:
     from scripts.copies import copies
     from scripts.production.cli_fixture import ImmutableGitSeed
@@ -262,7 +263,7 @@ class SweepCase(unittest.TestCase):
     def setUp(self) -> None:
         state = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            **config_environment(state / "config"),
+            **{key: value for key, value in copies_environment(state).items() if key != "HOME"},
             tmp_sweep.STATE_ENV: str(state / "sweep"),
             "BUILDLOG_DIR": str(state / "buildlog"),
             copy_record.ROOT_ENV: str(state / "scratch"),
@@ -2805,29 +2806,35 @@ class FloorTests(SweepCase):
         self.assertEqual(self.trim_rows(), [])
 
     def test_floor_keeps_a_standing_target_only_while_its_checkout_is_busy(self) -> None:
-        base = self.base()
-        seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
-                                       {"Cargo.toml": "[workspace]\n", "source.txt": "style source\n"})
-        with mock.patch.dict(os.environ, {"HOME": str(base), scratch.HOLDS_ENV: str(base / "holds.json")}):
-            with copies.standing("style-unit", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
-                target = (checkout / "target").resolve()
-                output = unit(target / "debug", "deps", "style", APP, time.time() - DAY)
-                with (mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()),
-                      mock.patch.object(sweep, "lock_holder", return_value=os.getpid()),
-                      mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT),
-                      mock.patch.object(sweep, "send_holder_message", return_value=sweep.FloorChannelOutcome.FAILED)):
-                    status, text = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB - 1], recorded=True)
+        for location in ("artifacts", "intermediates", "external"):
+            with self.subTest(location=location):
+                base = self.base()
+                seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
+                                               {"Cargo.toml": "[workspace]\n", "source.txt": "style source\n"})
+                with mock.patch.dict(os.environ, {"HOME": str(base), scratch.HOLDS_ENV: str(base / "holds.json")}):
+                    with copies.standing("style-unit", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
+                        target = ((checkout / "target").resolve() if location == "artifacts"
+                                  else Path(os.environ["CARGO_BUILD_BUILD_DIR"]) if location == "intermediates"
+                                  else base / "external-output")
+                        output = unit(target / "debug", "deps", "style", APP, time.time() - DAY)
+                        self.root_row(checkout, target, target)
+                        with (mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()),
+                              mock.patch.object(sweep, "lock_holder", return_value=os.getpid()),
+                              mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT),
+                              mock.patch.object(sweep, "send_holder_message", return_value=sweep.FloorChannelOutcome.FAILED)):
+                            status, text = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB - 1], recorded=True)
+                        self.assertEqual(status, 0, text)
+                        self.assertTrue(output.exists(), "The floor removed a standing target between Cargo commands")
+                        self.assertEqual(self.trim_rows(), [])
+                    self.assertTrue(checkout.exists())
+                    self.assertEqual(build_folders.build_folder_state(checkout), "free")
+                    self.assertTrue(checkout.with_name(checkout.name + ".lock").is_file())
+                    with mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()):
+                        status, text = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB], recorded=True)
                 self.assertEqual(status, 0, text)
-                self.assertTrue(output.exists(), "The floor removed a standing target between Cargo commands")
-                self.assertEqual(self.trim_rows(), [])
-            self.assertFalse(checkout.exists())
-            self.assertTrue((target.parent / scratch.BUSY).is_file())
-            with mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()):
-                status, text = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB], recorded=True)
-        self.assertEqual(status, 0, text)
-        self.assertFalse(output.exists(), "An idle standing checkout must permit target reclaim")
-        row, = self.trim_rows()
-        self.assertEqual((row["folder"], row["cause"]), (str(target), "floor take"))
+                self.assertFalse(output.exists(), "An idle standing checkout must permit target reclaim")
+                row, = self.trim_rows()
+                self.assertEqual((row["folder"], row["cause"]), (str(target), "floor take"))
 
     def test_floor_finds_and_reclaims_an_idle_retained_standing_target(self) -> None:
         base = self.base()
@@ -2849,11 +2856,7 @@ class FloorTests(SweepCase):
 
     def test_default_floor_discovers_configured_standing_targets_and_respects_busy_use(self) -> None:
         base = self.base()
-        pool = base / "configured-pool"
-        config = base / "copies.conf"
-        configured = (Path(__file__).resolve().parents[2] / "config/copies.conf").read_text()
-        _ = config.write_text("\n".join(f"root={pool}" if line.startswith("root=") else line
-                                           for line in configured.splitlines()))
+        pool = copies.gates_root()
         seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
                                        {"Cargo.toml": "[workspace]\n", "source.txt": "standing source\n"})
         discover = sweep.target_dirs
@@ -2865,7 +2868,7 @@ class FloorTests(SweepCase):
             return discover([str(pool)] if str(pool) in roots else [],
                             lint_settings=lint_settings, checkouts=checkouts, known_trees=known_trees)
 
-        with (mock.patch.dict(os.environ, {"COPIES_CONFIG": str(config), "HOME": str(base),
+        with (mock.patch.dict(os.environ, {"HOME": str(base),
                                           scratch.HOLDS_ENV: str(base / "holds.json")}),
               mock.patch.object(sweep, "target_dirs", side_effect=configured_targets),
               mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()),
@@ -3431,15 +3434,11 @@ class FloorTests(SweepCase):
 
     def base(self) -> Path:
         base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        config = base / "copies.conf"
-        configured = (Path(__file__).resolve().parents[2] / "config/copies.conf").read_text()
-        _ = config.write_text("\n".join(f"root={base / 'gates'}" if line.startswith("root=") else line
-                                           for line in configured.splitlines()) + "\n")
         self.enterContext(mock.patch.dict(os.environ, {
+            **{key: value for key, value in copies_environment(base).items() if key != "HOME"},
             tmp_sweep.STATE_ENV: str(base),
             "BUILDLOG_DIR": str(base / "buildlog"),
             "BUILD_HOLD_DIR": str(base / "build-hold"),
-            "COPIES_CONFIG": str(config),
         }))
         create_step_index(build_index.index_path())
         _ = self.enterContext(mock.patch.object(sweep, "output_device", return_value=base.stat().st_dev))
@@ -5048,7 +5047,9 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
         base = self.base()
         first, _ = cargo_target(base, "first", APP, time.time() - DAY)
         second, _ = cargo_target(base, "second", DEMO, time.time() - DAY)
+        targets = {str(tree.parent.parent): [str(tree.parent)] for tree in (first, second)}
         with (mock.patch.object(sweep, "hold_floor", return_value=0),
+              mock.patch.object(sweep, "cargo_roots", side_effect=targets.__getitem__),
               mock.patch.object(sweep, "sweep", return_value=1) as assess,
               mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as send,
               mock.patch.object(os, "getcwd") as cwd,
@@ -5056,7 +5057,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
             def run(tree: Path, assessed: int, expected: int) -> None:
                 assess.return_value = assessed
                 cwd.return_value = str(tree.parent.parent)
-                self.assertEqual(sweep.main([sweep.TARGET_DIR_FLAG, str(tree.parent)]), assessed)
+                self.assertEqual(sweep.main([]), assessed)
                 self.assertEqual(send.call_count, expected)
 
             for tree, expected in ((first, 1), (second, 2)):
@@ -5064,7 +5065,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                 with (tree / sweep.LOCK_NAMES[0]).open("a+") as lock:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     calls = assess.call_count
-                    self.assertEqual(sweep.main([sweep.TARGET_DIR_FLAG, str(tree.parent)]), 0)
+                    self.assertEqual(sweep.main([]), 0)
                     self.assertEqual(assess.call_count, calls)
                 run(tree, 1, expected)
             run(first, 0, 2)
@@ -7610,6 +7611,82 @@ class RepoNameTests(unittest.TestCase):
         self.assertEqual(repository.repo_name(str(base / "mergeclone")), "hana")
         git("clone", "-q", str(base / "mergeclone"), str(base / "clone88ci"), cwd=base)
         self.assertEqual(repository.repo_name(str(base / "clone88ci")), "hana")
+
+
+class RunnerTargetDirTests(SweepCase):
+    """A CI runner hook runs --target-dir as the runner account, which has no natedev config or state."""
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        # A runner home has no ~/.claude: conf recovers lint.conf from the repository copy.
+        home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {sweep.BUDGET_ENV: "1024", "HOME": str(home)})))
+        _ = os.environ.pop("CONF_DIR", None)
+
+    def test_a_target_dir_run_holds_no_floor_reads_no_index_and_sends_no_notice(self) -> None:
+        target = self.target()
+        with (redirect_stdout(io.StringIO()),
+              mock.patch.object(sweep, "hold_floor", side_effect=AssertionError("held the floor")),
+              mock.patch.object(sweep, "recorded_output_roots", side_effect=AssertionError("read the index")),
+              mock.patch.object(sweep, "notify_floor_problem", side_effect=AssertionError("sent a notice"))):
+            status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root)])
+        self.assertEqual(status, 0)
+
+    def test_a_target_dir_run_finishes_only_its_own_saved_trims(self) -> None:
+        target = self.target()
+        other = self.target()
+        own = sweep.TrimTake(str(target.root), "budget take", 0, at=time.time() - DAY)
+        unrelated = sweep.TrimTake(str(other.root), "budget take", 0, at=time.time() - DAY)
+        for take in (own, unrelated):
+            sweep.trim_intent_path(take.target).parent.mkdir(parents=True, exist_ok=True)
+            take.save()
+        # A live process on the host can claim every target; process use is not this test's subject.
+        with (redirect_stdout(io.StringIO()), mock.patch.object(sweep, "process_uses", return_value={}),
+              mock.patch.object(sweep, "hold_floor", side_effect=AssertionError("held the floor"))):
+            status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root)])
+        self.assertEqual(status, 0)
+        self.assertFalse(sweep.trim_intent_path(own.target).exists())
+        self.assertTrue(sweep.trim_intent_path(unrelated.target).exists())
+
+    def test_a_target_dir_run_skips_when_its_own_saved_trim_reaches_outside(self) -> None:
+        target = self.target()
+        other = self.target()
+        # A workspace sweep saved this paired take: its output is in two folders.
+        paired = sweep.TrimTake(str(target.root), "budget take", 1, at=time.time() - DAY,
+                                output_roots=(str(target.root), str(other.root)))
+        sweep.trim_intent_path(paired.target).parent.mkdir(parents=True, exist_ok=True)
+        paired.save()
+        output = io.StringIO()
+        with (redirect_stdout(output), mock.patch.object(sweep, "process_uses", return_value={}),
+              mock.patch.object(sweep.TrimTake, "recover", side_effect=AssertionError("finished the paired take")),
+              mock.patch.object(sweep, "hold_floor", side_effect=AssertionError("held the floor"))):
+            status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root)])
+        self.assertEqual(status, 0)
+        self.assertIn(f"lint sweep: {target.root} has a saved trim with output outside it; skipped", output.getvalue())
+        self.assertTrue(sweep.trim_intent_path(paired.target).exists())
+
+    def test_a_target_dir_failure_prints_to_the_job_log_and_sends_no_notice(self) -> None:
+        target = self.target()
+        errors = io.StringIO()
+        with (redirect_stdout(io.StringIO()),
+              redirect_stderr(errors),
+              mock.patch.object(sweep, "_sweep_workspace", side_effect=OSError("target folder unreadable")),
+              mock.patch.object(sweep, "notify_floor_problem", side_effect=AssertionError("sent a notice"))):
+            status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root)])
+        self.assertEqual(status, 1)
+        self.assertIn("target folder unreadable", errors.getvalue())
+
+    def test_target_dir_with_floor_only_is_an_error(self) -> None:
+        target = self.target()
+        errors = io.StringIO()
+        # The /tmp sweep reads the real /tmp: this test must never reach it.
+        with (redirect_stderr(errors), redirect_stdout(io.StringIO()),
+              mock.patch.object(tmp_sweep, "run_if_due", side_effect=AssertionError("swept /tmp")),
+              mock.patch.object(sweep, "hold_floor", side_effect=AssertionError("held the floor"))):
+            status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root), sweep.FLOOR_ONLY_FLAG])
+        self.assertEqual(status, 2)
+        self.assertIn("does not go with", errors.getvalue())
 
 
 if __name__ == "__main__":

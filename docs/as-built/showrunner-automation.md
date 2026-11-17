@@ -131,7 +131,8 @@ Helpers use `ConfigRead | UseConfiguredValue` with that named default.
 Each new `conf.read` observes the file again.
 Fault recovery occurs when a setting is used.
 
-The reader ignores section headers and text after `#`.
+The reader ignores section headers and comments.
+A `#` starts a comment only at the line start or after whitespace.
 The first key wins, and `key.<host>` overrides `key`.
 The comment immediately above a key defines its whole-number range, numeric range, or allowed words.
 An invalid setting warns on stderr and uses the newest usable committed value under that revision's limits.
@@ -143,6 +144,8 @@ Its `conf_value` uses shell builtins for valid integer and text settings and cal
 
 `/tune` publishes one user-approved setting through `scripts/lib/tune.py`.
 It validates the requested value and preserves the line's comments and spacing.
+Tune accepts a hex value such as `#af875f`.
+It refuses a `#` after whitespace and refuses outer whitespace.
 `scripts/lib/live_settings.py` writes the value live on natedev before any Git step.
 It records the change in `$XDG_STATE_HOME/live-settings/waiting.json` under a lock.
 `/tune` writes the value live on the Mac over ssh in the same step.
@@ -490,6 +493,125 @@ The [launch receipt contract](build-followups-fn-length-hook.md#production-launc
 
 - `produce.md` names each subcommand in `<LoadProduction/>`, `<OpenMergeBranch/>`, `<PromoteMain/>` and `<Wrap/>` and keeps the close-out approvals, the live smoke verdict and the CI, smoke and mirror text.
 
+### The List: `the_list.py`
+
+The List keeps one Markdown record at `<SHOWRUNNER_STATE_DIR>/<producer staff id>/list/L<n>.md`.
+The default root is `~/.local/state/showrunner`.
+The command requires the current `morty` producer row; its fixed staff ID selects the producer folder.
+The item's `owner` field names its showrunner.
+`nate` and `Not recorded` identify items without an assigned showrunner.
+The store context selects the producer folder; records do not repeat the producer ID.
+`record_store.NumberedRecords` supplies the folder, number allocation, frontmatter, file lock, and atomic replacement for both stores.
+Both stores use `file_lock.exclusive` and the shared `record_store.state_root` function.
+`update_registration` also uses this root function.
+Investigations retain their existing format and command behavior.
+
+`ListItem` stores the number, title, owner, unit, state, next check, ETA, unread time, and parked time.
+It also stores dependencies, related numbers, requester, opened time, updated time, closed time, and closing words.
+The body stores the next step, latest status, evidence, completion condition, and log.
+Length fields preserve headings and line endings inside each text section.
+The log keeps dated changes in file order, newest last, with the source on each line.
+The Added line preserves initial field values, including state, ETA, next step, and latest status.
+Quoted log values preserve line endings as JSON escapes.
+
+States are `New`, `Working`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`, `Paused`, and `Closed`.
+Parking sets a time without changing the state.
+ETA accepts an offset ISO time, two such times separated by `/`, or `Not asked`, `Pending`, `Paused`, or `Delivered`.
+ETA also accepts a text description when a time or status cannot express the estimate.
+The `eta_kind` field marks text descriptions as `text` and other estimates as `time or status`.
+The store validates text descriptions as one nonempty line and never parses them as times or ranges.
+Next check accepts a time or a text condition.
+Unknown opened and updated times remain empty.
+Time fields accept offset ISO times; a date alone uses midnight in the user's configured time zone.
+An empty optional time removes that time.
+
+1. Add an item with `the_list.py add --owner <showrunner staff id> --title <text> --source <source>`.
+2. Preserve an existing item number with `add --number <n>`.
+3. Change fields with `update --id L<n> --source <source>` and the corresponding field options.
+4. Park or unpark an item with `park --id L<n> --until <time-or-empty> --source <source>`.
+5. Close an item with `close --id L<n> --words <closing words> --source <source>`.
+6. Restore a Closed item as New with `reopen --id L<n> --source <source>`.
+7. Clear its unread time with `mark-read --id L<n> --source <source>`.
+8. Print the table with `list`; include parked items with `--include-parked`, or all records with `--all`.
+
+Add and update accept `--unit`, `--state`, `--next-check`, `--eta`, and `--requested-by nate|dwight`.
+They also accept `--next-step`, `--latest-status`, `--evidence`, and `--done-when`.
+`--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
+Either option with no values clears its field.
+References use numbers in the same producer folder.
+Add and update check references when they set dependency or related fields.
+The store refuses missing references, self-dependencies, and dependency cycles.
+Other changes, including mark-read, do not read referenced records.
+Closing a prerequisite preserves its dependents' conditions.
+
+Closed records remain on disk with their time and closing words.
+Automatic numbering includes invalid records and Closed records.
+An explicit number must name an unused path.
+Exact repeated operations change nothing.
+Other updates append a log line and mark the item unread; mark-read clears the unread time without sending a message.
+Update and park refuse Closed items until reopen restores them.
+The table uses `# | Owner | Item | State | Next step | ETA | Update`.
+It sorts Waiting for nate first, unread items second, and next check times third.
+State cells include the check time and identify overdue checks.
+Future parked items and Closed items remain hidden by default.
+
+`load`, `records`, `table`, and the write functions share this store with future console callers.
+`records` watches the folder and record paths, reports invalid records, and preserves their files.
+`create_records` validates a complete typed batch before writing into an empty list folder.
+It checks forward references and cycles under the same lock as other writes.
+The one-off converter lives outside the repository and uses this API.
+It preserves item numbers, source sections, and each item's JSON data in Evidence.
+Removed items become Closed records with their recorded removal times and words.
+A completed apply run records source and record hashes; an exact rerun prints `unchanged`.
+A partial apply run refuses another apply run.
+The converter reads question counts but does not create items from them.
+Morty writes items only through `the_list.py`; the old source files remain read-only.
+The page and feedback delivery belong to later phases.
+
+### Investigations: `investigation.py`
+
+An investigation records an answer that the user wants a session to find.
+The command resolves the caller's staff row from its current session.
+A caller without a staff row receives one refusal line.
+Units, showrunners, producers, and workers can own records.
+
+Records use `<SHOWRUNNER_STATE_DIR>/<owner staff id>/investigations/I<n>.md`.
+The default root is `~/.local/state/showrunner`.
+Each owner has its own number sequence.
+A file lock protects number selection and state changes.
+Number selection uses existing record filenames, including invalid records, so filing preserves their contents.
+Atomic replacement keeps each record complete.
+
+Frontmatter stores the id, fixed owner id, title, state, and filed, answered, and read times.
+The body contains the question and an `## Answer` section.
+A question length field preserves text that contains an Answer heading.
+The states are `open`, `answer ready`, and `read`, in that order.
+An exact repeat of an answer-ready or read operation changes nothing.
+Other state changes receive one refusal line.
+
+1. File an investigation with `investigation.py file --title "<one line>" --question "<full question>"`.
+2. Save its answer with `investigation.py answer --id I<n> --text "<answer>"`.
+3. Mark its answer read with `investigation.py read --id I<n>`.
+4. List waiting investigations with `investigation.py list`.
+5. Include read investigations with `investigation.py list --all`.
+
+Answer and read commands accept `--owner <staff id>` to select another owner's record.
+`records`, `load`, and `mark_read` provide the same store operations for console callers.
+`records` skips invalid records, reports each path and cause on stderr, and watches those paths for cache refresh.
+Invalid UTF-8 receives the same refusal as invalid record fields.
+
+The status line counts open and answer-ready investigations immediately after questions.
+A unit or producer counts only its own investigations.
+A showrunner counts its own investigations and its units' investigations through the existing production unit scope.
+A showrunner without a production document counts its own investigations and watches its investigation folder.
+Child showrunners retain their own counts.
+Read investigations do not count.
+The console's Investigations page shows questions and answers with Owner and Show filters.
+The user selects Mark read on an answer-ready card to remove it from the default view and the status line count.
+New answers mark the navigation entry until the user visits the page.
+The count cache watches each folder and record that it reads.
+A missing folder uses its nearest existing parent until the folder appears.
+
 ### Updates, time, log and questions: `update_registration.py`
 
 - `time <ISO or HH:MM>` prints `time: ok — HH:MM <zone>` in the user's zone, never UTC.
@@ -520,6 +642,11 @@ The [launch receipt contract](build-followups-fn-length-hook.md#production-launc
   `QuestionRecord(path, owner, asker, item, status)` stores the canonical question.
   `question_folder` uses the owner row's document to resolve its Proposals folder.
   Without that field, it uses `<SHOWRUNNER_STATE_DIR>/<showrunner staff id>/questions`.
+  A producer runs `update_registration.py ask --ask "<question>" --context "<why now>"` without `--production` or `--unit`.
+  `ProducerQuestions` retains its staff owner and user time zone without a production document.
+  Its records use `<SHOWRUNNER_STATE_DIR>/<producer staff id>/questions` and pass the same question review.
+  Its status count, `/next question`, and Questions page filter read those records.
+  Answers and follow-ups use the existing retry, alert, and recovery paths to the producer's current session.
   A missing showrunner owner gives `QuestionOwnerUnavailable`.
   A unit rename rewrites no question record.
   `questions-table` lists the open questions for `/showrunner:questions`.
@@ -742,6 +869,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `scripts/message/morty_identity.py` supplies the native ID on the producer staff row named `morty`.
     `CodexProcessThreads` reads it one time for each report. A process with that ID produces no anomaly.
     `unit_phases.send_anomalies` sends all lines once to `UNIT_ANOMALIES_TO` from `config/production.conf` (`sdlc`).
+    The same text to the same recipient sends once inside `units_anomaly_repeat_minutes`.
     A failed send adds one anomaly line and preserves the table and exit code.
   - **Pause and exit:** `agents pause <unit> --why "<why>"` records `paused: {since, by, why}` and stops the workers.
     The director finishes its current turn and holds at the prompt.
@@ -755,21 +883,32 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `since` uses the user zone. `by` uses the caller's staff name.
     Staff row copies retain the hold fields.
   - **Phase productions:** The count line, status table, Progress bar, legend, and ETA cells retain their existing behavior.
+    The top table names its session column `Director`; its census status values remain unchanged.
     `table()` creates one unit block from the same cached plan and run records that supply the bar.
     `UnitTaskFacts` retains the plan source, plan phases, and scoped run attempts.
     `PlanSource` distinguishes absent, unavailable, readable empty, and readable populated plans.
     A failed fallback plan read retains its unavailable state.
     Without a fallback plan, the configured source remains unchanged.
-    `TaskAttempt` retains the phase ID, plan scope, title, instance, outcome, finish time, and recorded stop reason.
+    `TaskAttempt` retains the phase ID, plan scope, title, instance, outcome, and recorded stop reason.
     The reader does not convert a stopped attempt into an unstarted task.
   - **Unit rows:** Each title precedes a blank line and an `Item | Work | State` table.
     `display_cells.wrapped(..., keep=(0, 1, 2))` preserves each cell before `display_cells.escaped` escapes it.
-    Rows follow this order: Now, Also, Next, Later, Stopped, Done.
+    Rows follow this order: Now, Also, Next, Later, Stopped.
     Now names the current task and its recorded worker, director action, resource wait, or merge state.
     The open phase takes priority over merge tasks for Now.
     Each current task has one row with no equal states; `state_sentence` joins its actors' states with semicolons.
     No task row has an empty Work cell; a cell longer than the line limit continues on the next row.
     A busy session does not prove that the director works on a phase.
+    With readable sources and no current task, open phase, pending merge, hold, or next work, the unit is idle.
+    The director's busy status does not change this result.
+    Its only current row is `Now | Nothing to do | The plan is complete and the queue is empty` for a complete readable plan.
+    Otherwise, its only current row is `Now | Nothing to do | No plan or queued work`.
+    The block has no Next row.
+    Only events from an open phase can supply a finished-step fallback.
+    Unreadable sources never produce `Nothing to do`.
+    A missing plan file in an existing local worktree is an absent plan.
+    A missing plan file keeps its unavailable state when the worktree is missing or remote.
+    Other plan read errors keep the plan unavailable.
     An unexplained task names the missing step and the latest matching finished step with its time, when recorded.
     Also names each additional current task.
     The first queue entry supplies Next; otherwise, the first unfinished plan phase supplies Next.
@@ -781,18 +920,38 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A matching finished activity produces a queue conflict instead of an unstarted claim.
     Missing next work uses `Not recorded` and `The director has not chosen the next task`.
     Only a readable plan with every phase done permits `Nothing queued; the plan is complete`.
-  - **Stopped history:** `past_tasks` retains one row per stopped task in the selected run.
-    A later completed attempt resolves only the same plan scope and phase ID.
-    Its Done row supplies the completion date in the production time zone.
-    An explicit title containing `the <unit> unit owns <id>` names the unit that finished the work.
-    Equal titles with different IDs do not prove a replacement.
+  - **Stopped history:** `past_tasks` retains one row per unresolved stopped task in the selected run.
+    A stopped attempt shows a Stopped row until a later completed attempt has the same plan scope and phase ID.
+    Then the board shows no row for that stopped attempt.
+    The board does not infer replacements from equal titles.
     A newer unfinished attempt remains current after an earlier completion.
     Unresolved attempts say `Stopped; reason not recorded` when the stop event supplies no reason.
   - **Merge and wait facts:** Each merge phase has its title in Work.
     State names the live merge rank, the production that merges it, or the short failure cause.
+    An open sent phase with a successful final merge state has no merge row and contributes no pending merge.
+    A checkpoint on main has no merge row even when its phase remains open.
     `SentCommit` retains the checkpoint's `timestamp_epoch`, or `CheckpointTimeUnrecorded` when the event has no time.
     A checkpoint outside the line uses `Checkpoint <9 hash characters> at <time>; not in <production>'s merge line`.
     Without a production name, the text ends with `not in the merge line`.
+    A finished phase counts as merged through checkpoint ancestry, a successful result for its unit and phase, or a matching merge subject.
+    A finished phase also counts as merged when main has a non-merge commit with the same author time and subject as its checkpoint.
+    The board reads main's non-merge commits once per render and caches each unresolved checkpoint's identity check.
+    The production document's `Showrunner checkout` supplies the repository for main and carried-commit checks.
+    A named phase dependency uses its owning production's checkout.
+    The board caches repository evidence and shares copied-checkpoint decisions with dependencies.
+    Exact successful results and matching merge subjects resolve open checkpoints before additional Git checks.
+    An unreadable checkpoint stays unmerged.
+    A successful result for the exact checkpoint hash counts, with or without a valid result time.
+    Other evidence needs a result time or merge commit time at or after the latest checkpoint time, when recorded.
+    Without a checkpoint time, the merge subject must name a prefix of the checkpoint hash, in any letter case.
+    The board ignores an invalid result time.
+    `waits_on.merged_phase_subject` requires the subject prefix `Merge <unit> phase <phase> (<hash>)`.
+    `waits_on.landed_phases` reads these subjects once per render.
+    Merged phases omit their checkpoint rows and older failed results.
+    Their rows use normal merge states when the checkpoints are in the merge line or currently merge.
+    `completed_unit_phases` supplies these checkpoints without a unit wait and excludes activity records after phase completion.
+    Carried work uses `merges with <owner> <name>`; queue work uses the production from its merge-line label.
+    Without a recorded owner, carried work uses `merges with <name>`.
     A second phase in the same merge names the first phase by ID (`Merges with phase 40`).
     A phase's shrink and repair items have no separate rows.
     The phase's live state takes priority over older failures from those items.
@@ -803,6 +962,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Phase ETA text retains its first-task placement and the production time zone.
     Dependencies use local `origin/main` without a fetch.
     Queue and plan dependencies use `After <dep>; <short state>`.
+    Queued dependencies show their line position and carrier, when present, without text from earlier failed attempts.
     Queue and plan dependencies share `wait_state` and `dependency_state_text`, including main checks and recorded holds.
     Plan references to this unit lose their unit prefix before the completed-phase filter.
     A queue dependency on main uses `Ready`; a plan dependency on main has no wait.
@@ -810,6 +970,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A local dependency uses its ID, with `phase` before a numeric ID.
     An external dependency uses `<unit> phase <id>` without its title.
     A bare commit dependency uses `After commit <first 9 hash characters>; <short state>`.
+    A missing commit, or a commit or branch not on main, uses `not on main yet`; other missing dependencies retain `dependency not found locally`.
     A git ref that is not hexadecimal, with or without `/`, uses `After branch <name>; <short state>`.
     A recorded phase ID keeps its phase form, even when it contains only hexadecimal characters.
     Recorded unit waits and plan `waits_for` conditions retain their text.
@@ -866,7 +1027,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
 - **Open proposals table (`proposals_table.py [--production <showrunner name>]`, `/showrunner:proposals`, user 2026-10-12).** Prints one Markdown table, `| Proposed by | Proposal | Date | State |`, of every proposal still open for the user. It reads only, and finds the doc as the units table does. Three sources, in this order:
   - **Issues** (2026-10-15, replacing the `proposals/index.md` table and the `docs/plans/proposal-*.md` scan): each `*.md` directly in the issues folder that the optional `- **Proposals:**` line names, of the production doc only (`proposals_folder.scope_docs`; the productions below list their own, user 2026-10-27), a file read once (`issues_folder`; a relative folder is taken from the showrunner checkout; without the line there are no issue rows). Subfolders hold research notes and are not read. `issues.py` reads the frontmatter between the leading `---` lines, a list inline (`[issue, proposal]`) or as `- item` lines, and strips quotes and a wiki link's brackets, keeping its alias over its target (`"[[2026-10-09]]"` reads `2026-10-09`). A row shows while `status` is `open` and `tags` holds `proposal`; rows sort by `date_created`. Proposed by is `proposed_by`, else `—`; the Proposal is the file's name; the Date is `date_created`.
   - **The plan backlog**: each line ending `proposed` or `deferred` of the ledger the `- **Improvement queue:**` line names (`proposals_folder.ledger`), for the doc only (user 2026-10-27); a production with no such line has no backlog rows. A file a line names is beside its ledger. The proposer is the `Proposed <date> by <who>` words of the file the line names, else `plan backlog`. Proposed lines join the issues waiting for review in `/next proposal` and the For-you proposals count; accepted and deferred lines do not count.
-  - **Add-ons**: each top-level entry of `next_items_pending.md` in `/tmp/claude/unit/<run id>/` or `/tmp/claude/delegate/<run id>/`, for every run of the unit's plan (`plan_history.plan_runs`), with the list's last change as its date. A plan that has moved to `docs/as-built` is also looked up under `docs/plans`, the path its runs recorded. An entry's text is its `Title:` line, else its bold lead, else the words after its action word, else the first sentence of its `Proposed`, `Need`, `Why needed` or `Why` line. An action word alone (`add`, `change`, `remove`) is never the text (user 2026-10-12, after two rows read `add`).
+  - **Add-ons**: each top-level entry of `next_items_pending.md` in `<run root>/<run id>/` for each run root `unit_runs.run_roots()` reads at use (`/session/<name>/run`, `/tmp/claude/unit`, `/tmp/claude/delegate`), for every run of the unit's plan (`plan_history.plan_runs`), with the list's last change as its date. A plan that has moved to `docs/as-built` is also looked up under `docs/plans`, the path its runs recorded. An entry's text is its `Title:` line, else its bold lead, else the words after its action word, else the first sentence of its `Proposed`, `Need`, `Why needed` or `Why` line. An action word alone (`add`, `change`, `remove`) is never the text (user 2026-10-12, after two rows read `add`).
 
   **State** says what the user can do, never a bare `next` (user 2026-10-12: "next after what?"). An issue that `proposal_issue.proposal_progress` reads as `InProgress` (its approval is recorded, or it has no answer and its `stage` is `active`) reads `in progress by <unit>` (`in progress` with no `unit`); else `waiting for your review`, as does a backlog line marked proposed. The waiting rows (issues and proposed backlog lines) come first in `scripts/lib/urgency.py` order (level from `review_urgency`, value the score of the proposed stars, prerequisite the first `depends_on`), then the in-progress ones, oldest first. A deferred backlog line reads `deferred until you ask for it`. An add-on is the showrunner's to settle (user 2026-10-12, below), so it reads `the showrunner decides: build, save for later, or drop`: the unit sends its add-ons to the showrunner, which answers `current`, `next` or `drop` for each.
 

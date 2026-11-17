@@ -318,19 +318,39 @@ def read_board(repo_root: Path) -> berth_board.Board | berth_board.BoardUnavaila
     return board
 
 
+# cargo-berth's lifecycle stage for a reservation that protects a tip until it merges.
+OUTSTANDING = "outstanding"
+
+
+def in_head_history(repo_root: Path, commit: str) -> bool:
+    """Whether commit is HEAD or an ancestor of HEAD; an unknown commit is not."""
+    try:
+        listed = subprocess.run(["git", "-C", str(repo_root), "merge-base", "--is-ancestor", commit, "HEAD"],
+                                capture_output=True, check=False)
+    except OSError:
+        return False
+    return listed.returncode == 0
+
+
 def hold_filter(repo_root: Path, changes: MirrorChanges,
                 board: berth_board.Board) -> tuple[MirrorChanges, tuple[Withheld, ...]]:
     """Keep the paths that this worktree holds; withhold every other path.
 
     A path that another worktree's blocking reservation holds is withheld with
-    that reservation. A path that no blocking reservation holds is withheld
-    with no holder. An unconfigured board keeps every path.
+    that reservation, unless this worktree's own reservation names the same
+    file: berth then lets both hold it. A tree scope of this worktree does not
+    win over another worktree's hold. An outstanding reservation whose protected tip is in this
+    worktree's HEAD history holds nothing here: its work is already in this
+    branch. A path that no blocking reservation holds is withheld with no
+    holder. An unconfigured board keeps every path.
     """
     if not board.configured:
         return changes, ()
     root = repo_root.resolve()
     reservations = [(reservation, reservation.holder_worktree_root.resolve() == root)
-                    for reservation in board.reservations()]
+                    for reservation in board.reservations()
+                    if not (reservation.lifecycle == OUTSTANDING and reservation.protected_tip
+                            and in_head_history(repo_root, reservation.protected_tip))]
     withheld: list[Withheld] = []
 
     def kept(paths: tuple[str, ...]) -> tuple[str, ...]:
@@ -338,7 +358,9 @@ def hold_filter(repo_root: Path, changes: MirrorChanges,
         for path in paths:
             holders = [(reservation, own) for reservation, own in reservations if reservation.blocks(path)]
             foreign = [reservation for reservation, own in holders if not own]
-            if foreign:
+            if any(own and reservation.names_file(path) for reservation, own in holders):
+                result.append(path)
+            elif foreign:
                 withheld.append(Withheld(path, f"{foreign[0].reservation_id} ({foreign[0].holder_branch})"))
             elif holders:
                 result.append(path)

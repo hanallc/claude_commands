@@ -41,6 +41,7 @@ from typing import BinaryIO, Protocol, TypedDict, cast
 from scripts.build_queue import queue_place
 
 
+from scripts.copies import copies
 from scripts.lib import berth_board
 from scripts.style import style_footprint
 from scripts.style import style_ledger
@@ -402,7 +403,7 @@ class RustAnalyzer:
         try:
             place = self.lifetime.enter_context(style_program_place(["rust-analyzer"], repo))
             self.process: subprocess.Popen[bytes] = place.popen(
-                ["rust-analyzer"], cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                ["rust-analyzer"], cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, pass_fds=copies.COMMAND_LOCKS.get())
         except BaseException:
             _ = self.lifetime.__exit__(*sys.exc_info())
             raise
@@ -1988,7 +1989,7 @@ def combine_file_renames(files: Sequence[FileRenames]) -> tuple[FileRenames, ...
 def cargo_output(repo: Path, arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
     """Capture Cargo output while the shared queue owns the program lifetime."""
     with style_program_place(arguments, repo) as place:
-        process = place.popen(arguments, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = place.popen(arguments, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=copies.COMMAND_LOCKS.get())
         try:
             output, errors = process.communicate()
             return subprocess.CompletedProcess(arguments, process.wait(), output.decode(), errors.decode())
@@ -2002,9 +2003,9 @@ def command(repo: Path, arguments: Sequence[str]) -> None:
     print("bulk rename: " + " ".join(arguments), flush=True)
     if arguments and Path(arguments[0]).name == "cargo":
         with style_program_place(arguments, repo) as place:
-            code = place.popen(arguments, cwd=repo).wait()
+            code = place.popen(arguments, cwd=repo, pass_fds=copies.COMMAND_LOCKS.get()).wait()
     else:
-        code = subprocess.run(arguments, cwd=repo, check=False).returncode
+        code = subprocess.run(arguments, cwd=repo, check=False, pass_fds=copies.COMMAND_LOCKS.get()).returncode
     if code:
         raise BulkRenameError(f"{' '.join(arguments)} exited {code}")
 
@@ -2179,7 +2180,7 @@ class BatchWorkspace:
         self.repo: Path = repo
         self.files: dict[str, FileRenames] = {file.path: file for file in files}
         self.packages: tuple[str, ...] = packages
-        names = subprocess.run(["git", "ls-files", "-z"], cwd=repo, capture_output=True, check=True).stdout.decode().split("\0")
+        names = subprocess.run(["git", "ls-files", "-z"], cwd=repo, capture_output=True, check=True, pass_fds=copies.COMMAND_LOCKS.get()).stdout.decode().split("\0")
         self.originals: dict[str, bytes] = {name: (repo / name).read_bytes() for name in names if name and not (repo / name).is_symlink()}
         self.last_good: dict[str, bytes] = {}
 

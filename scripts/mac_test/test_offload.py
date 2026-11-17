@@ -37,6 +37,7 @@ else:
     from scripts.buildlog import record as buildlog_record
     from scripts.buildlog import store as buildlog_store
 from scripts.lib import conf
+from scripts.production.cli_fixture import invoke_cli
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test.offload_test_support import OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN
@@ -874,9 +875,10 @@ class OffloadCommandTests(OffloadCommandFixture):
                              [placement.ExplicitProviderSettings(alternate.resolve())])
             return request_placement(request)
 
-        for target, settings in (("", alternate), ("", alternate.relative_to(self.root)),
-                                 ("mac", alternate), ("mac", Path(alternate.name)),
-                                 ("builder", alternate)):
+        for index, (target, settings) in enumerate((
+            ("", alternate), ("", alternate.relative_to(self.root)),
+            ("mac", alternate), ("mac", Path(alternate.name)), ("builder", alternate),
+        )):
             with self.subTest(target=target, settings=settings), mock.patch.object(
                     admission_client, "request_placement", side_effect=submit):
                 self.clear_events()
@@ -897,19 +899,50 @@ class OffloadCommandTests(OffloadCommandFixture):
                     self.assertEqual(self.events_for("rsync"), [])
                     scripts_copy.assert_not_called()
                     continue
-                result = self.command(settings=settings, runner_options=options, direct_placement=True)
+                if index == 0:
+                    result = self.command(settings=settings, runner_options=options, direct_placement=True)
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    self.assert_wire("passed", "")
+                    ssh = self.events_for("ssh")
+                    self.assertEqual(ssh[0]["args"][-2], "alternate-mac")
+                    self.assertEqual(ssh[1]["args"][-2], "alternate-mac")
+                    self.assertIn("LINT_SWEEP_BUDGET_GIB=8", ssh[1]["args"][-1])
+                    remote_words = shlex.split(ssh[1]["args"][-1].rpartition("; echo mac_exit=$?")[0])
+                    lint_index = remote_words.index("~/.claude/scripts/lint/lint")
+                    self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
+                    self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
+                    self.assertEqual(remote_words[lint_index + 1 :], ["nextest"])
+                    self.assertIn("alternate-mac:.local/state/mac-test/mirror/hana/", self.events_for("rsync")[0]["args"])
+                    continue
+                observed: list[tuple[eligibility.OffloadConfig, offload.OffloadRequest]] = []
+
+                def observe(_controller: offload.ProcessController, config: eligibility.OffloadConfig,
+                            request: offload.OffloadRequest, _started: float) -> offload.MacOffloadResult:
+                    observed.append((config, request))
+                    return offload.PassedOnMac(0)
+
+                with mock.patch.object(offload, "run_offload", side_effect=observe):
+                    result = invoke_cli(offload, offload.main, ["run", "--repo-root", str(self.repository),
+                        "--package", "hana", "--call-id", "settings", "--result", str(self.result_path),
+                        "--settings", str(settings), *options], self.environment, self.root,
+                        environment_lock=caller_admission(self, self.root, self.environment).loop_access)
                 self.assertEqual(result.returncode, 0, result.stdout)
                 self.assert_wire("passed", "")
-                ssh = self.events_for("ssh")
-                self.assertEqual(ssh[0]["args"][-2], "alternate-mac")
-                self.assertEqual(ssh[1]["args"][-2], "alternate-mac")
-                self.assertIn("LINT_SWEEP_BUDGET_GIB=8", ssh[1]["args"][-1])
-                remote_words = shlex.split(ssh[1]["args"][-1].rpartition("; echo mac_exit=$?")[0])
+                config, request = observed[0]
+                with mock.patch.dict(os.environ, self.environment, clear=True):
+                    prefix = offload.ssh_prefix(config)
+                    remote = offload.remote_test_command(config, request, HANA)
+                    mirror = offload.request_mirror(config, request, HANA)
+                    copied = copies.remote_rsync(self.repository, mirror, self.root / "excludes",
+                                                  offload.ssh_options(config.connection))
+                self.assertEqual(prefix[-1], "alternate-mac")
+                self.assertIn("LINT_SWEEP_BUDGET_GIB=8", remote)
+                remote_words = shlex.split(remote.rpartition("; echo mac_exit=$?")[0])
                 lint_index = remote_words.index("~/.claude/scripts/lint/lint")
                 self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
                 self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
                 self.assertEqual(remote_words[lint_index + 1 :], ["nextest"])
-                self.assertIn("alternate-mac:.local/state/mac-test/mirror/hana/", self.events_for("rsync")[0]["args"])
+                self.assertIn("alternate-mac:.local/state/mac-test/mirror/hana/", copied)
 
     def test_low_disk_declines_after_probe(self) -> None:
         self.fixture["probe_lines"] = ["free_gib=59", "host=Mac", "rc=0"]
@@ -1155,17 +1188,27 @@ class OffloadCommandTests(OffloadCommandFixture):
         for verb in ("nextest", "check", "clippy", "mend-check", "doc"):
             with self.subTest(verb=verb):
                 words = ("--workspace", "--all-features")
-                result = self.command(*words, verb=verb)
-                self.assertEqual(result.returncode, 0, result.stdout)
-                sent = shlex.split(self.events_for("ssh")[-1]["args"][-1].rpartition("; echo mac_exit=$?")[0])
+                if verb == "nextest":
+                    result = self.command(*words, verb=verb)
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    remote = self.events_for("ssh")[-1]["args"][-1]
+                    # The local claim is read by rsync before remote execution.
+                    held = self.events_for("rsync")[-1]
+                    self.assertTrue(held["claimed"])
+                    self.assertEqual(held.get("what"), f"{verb} hana")
+                else:
+                    with mock.patch.dict(os.environ, self.environment, clear=True):
+                        config = eligibility.read_config(self.config_path)
+                        request = offload.OffloadRequest(self.repository, "hana", "call-17",
+                            offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture", verb=verb)
+                        remote = offload.remote_test_command(config, request, HANA)
+                        claim = offload.claim_arguments(request, config)
+                    self.assertEqual(claim[claim.index("--what") + 1], f"{verb} hana")
+                sent = shlex.split(remote.rpartition("; echo mac_exit=$?")[0])
                 position = sent.index("~/.claude/scripts/lint/lint")
                 self.assertEqual(sent[position + 1:], [verb, *words])
                 if verb == "doc":
                     self.assertIn("LINT_CONFIG_FORCE=1", sent[:position])
-                # The local claim is read by rsync before remote execution.
-                held = self.events_for("rsync")[-1]
-                self.assertTrue(held["claimed"])
-                self.assertEqual(held.get("what"), f"{verb} hana")
 
     def test_no_package_names_the_mac_claim_for_the_workspace(self) -> None:
         self.write_portable_workspace()
@@ -1177,17 +1220,38 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.write_portable_workspace()
         self.fixture["run_status_line"] = "mac_exit=4"
         self.sync_fixture()
-        for verb in ("check", "clippy", "mend-check", "doc"):
+        for verb in ("check", "clippy", "mend-check", "doc", "nextest"):
             with self.subTest(verb=verb):
-                result = self.command("--workspace", verb=verb)
-                self.assertEqual(result.returncode, 4, result.stdout)
-                self.assertIn("fix the finding in the local worktree", result.stdout)
-                self.assertNotIn("only a test", result.stdout)
-                self.assert_wire("failed", "")
-        result = self.command("--workspace")
-        self.assertEqual(result.returncode, 75, result.stdout)
-        self.assertIn("mac_test: no test matched on the Mac; running on natedev instead", result.stdout)
-        self.assert_wire("declined", "no_tests")
+                if verb == "check":
+                    result = self.command("--workspace", verb=verb)
+                    status, output = result.returncode, result.stdout
+                else:
+                    controller = offload.ProcessController()
+                    request = offload.OffloadRequest(self.repository, "hana", "call-17",
+                        offload.ResultFile(self.result_path), ("--workspace",),
+                        owner="verify", holder_session="fixture", verb=verb)
+                    with (
+                        mock.patch.dict(os.environ, self.environment, clear=True),
+                        mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(120, "Mac")),
+                        mock.patch.object(offload, "copy_tree_with_key", return_value=offload.CopiedTree(offload.UNAVAILABLE_TREE_KEY)),
+                        mock.patch.object(copies, "register_remote"),
+                        mock.patch.object(offload, "release_claim"),
+                        mock.patch.object(controller, "stream_mac_run", return_value=offload.ReportedMacStatus(4, offload.CleanupKept())),
+                        redirect_stdout(io.StringIO()) as captured,
+                    ):
+                        config = eligibility.read_config(self.config_path)
+                        outcome = offload.claimed_run(controller, config, request, HANA, time.monotonic())
+                        status = offload.write_result(outcome, request.result, verb=verb)
+                    output = captured.getvalue()
+                if verb == "nextest":
+                    self.assertEqual(status, 75, output)
+                    self.assertIn("mac_test: no test matched on the Mac; running on natedev instead", output)
+                    self.assert_wire("declined", "no_tests")
+                else:
+                    self.assertEqual(status, 4, output)
+                    self.assertIn("fix the finding in the local worktree", output)
+                    self.assertNotIn("only a test", output)
+                    self.assert_wire("failed", "")
 
     def test_non_test_verbs_never_apply_nextest_skip_words_or_start_a_copy(self) -> None:
         self.write_portable_workspace()
@@ -1195,15 +1259,28 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.sync_config()
         for verb in ("check", "clippy", "mend-check", "doc"):
             with self.subTest(verb=verb):
-                result = self.command("-E", "leave-this-argument", verb=verb)
-                self.assertEqual(result.returncode, 0, result.stdout)
-                remote = self.events_for("ssh")[-1]["args"][-1]
+                if verb == "check":
+                    result = self.command("-E", "leave-this-argument", verb=verb)
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    remote = self.events_for("ssh")[-1]["args"][-1]
+                    self.assertFalse(self.events_for("rsync")[-1].get("copy_claim"))
+                else:
+                    with mock.patch.dict(os.environ, self.environment, clear=True):
+                        config = eligibility.read_config(self.config_path)
+                        request = offload.OffloadRequest(self.repository, "hana", "call-17",
+                            offload.NO_RESULT_FILE, ("-E", "leave-this-argument"),
+                            owner="verify", holder_session="fixture", verb=verb)
+                        remote = offload.remote_test_command(config, request, HANA)
+                        claim = offload.claim_arguments(request, config)
+                    self.assertNotIn("--copy", claim)
                 self.assertIn("-E leave-this-argument", remote)
                 self.assertNotIn("skip-this", remote)
-                self.assertFalse(self.events_for("rsync")[-1].get("copy_claim"))
                 for option in ("copy", "filter"):
                     with self.subTest(option=option):
-                        result = self.command(verb=verb, copy=option == "copy", filter_run=option == "filter")
+                        result = invoke_cli(offload, offload.main, ["run", "--repo-root", str(self.repository),
+                            "--call-id", "call-17", "--verb", verb,
+                            "--copy" if option == "copy" else "--filter-run"], self.environment, self.root,
+                            environment_lock=caller_admission(self, self.root, self.environment).loop_access)
                         self.assertEqual(result.returncode, 2, result.stdout)
 
     def test_linux_only_workspace_member_declines_a_workspace_build_before_claim(self) -> None:
@@ -1459,21 +1536,40 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertIn("LINT_SWEEP_BUDGET_GIB=64", remote_words)
         self.assertIn(shlex.quote(FILTER), remote)
 
-        stub = self.bin_directory / "command-stub"
-        original = stub.read_text()
         for stats, sent, received, complete in (
             ("Total bytes sent: 1,234\nTotal bytes received: 56\n", 1234, 56, True),
             ("sent 1,234 bytes  received 56 bytes  1.0 bytes/sec\n", 1234, 56, True),
             ("", 0, 0, False),
         ):
             with self.subTest(stats=stats):
-                _ = stub.write_text(original.replace('exit "$rsync_status"',
-                    "printf %s " + shlex.quote(stats) + '; exit "$rsync_status"'))
-                self.fixture["run_lines"] = [{"stream": "stdout", "text": "résultat"},
-                                             {"stream": "stderr", "text": "anomaly"}]
-                self.sync_fixture()
-                answer = self.command(*words, runner_options=("--target", "mac"), call_id="byte-record")
-                self.assertEqual(answer.returncode, 0, answer.stdout)
+                ssh = self.events_for("ssh")[-1]
+                self.assertIn("claim", ssh)
+                assert "claim" in ssh
+                claim = ssh["claim"]
+                identity = claim_state.ClaimIdentity(claim["claim_id"], claim["episode"], claim["attempt"])
+                marker = "dispatch_start_settled=" + offload.pending_start_key(identity) + "\n"
+                controller = offload.ProcessController()
+                controller.claim_identity = identity
+                wire_output = "résultat\nanomaly\nmac_exit=0\nmac_cleanup=0 32715571 59\n" + marker
+                copy_process = mock.Mock(communicate=mock.Mock(return_value=(stats.encode(), b"")), returncode=0)
+                run_process = mock.Mock(stdout=io.BytesIO(wire_output.encode("utf-8")),
+                                        wait=mock.Mock(return_value=0), poll=mock.Mock(return_value=0))
+                request = offload.OffloadRequest(self.repository, "hana", "byte-record",
+                    offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture", target="mac")
+                with (
+                    mock.patch.dict(os.environ, self.environment, clear=True),
+                    mock.patch.object(subprocess, "Popen", side_effect=[copy_process, run_process]),
+                    redirect_stdout(io.StringIO()) as captured,
+                ):
+                    controller.observe_command(["ssh", *probe], b"free_gib=120\nhost=Mac\nrc=0\n", b"")
+                    _ = controller.capture_copy(["rsync", *copy["args"]])
+                    outcome = controller.stream_mac_run(["ssh", *ssh["args"]])
+                    self.assertIsInstance(outcome, offload.ReportedMacStatus)
+                    if not isinstance(outcome, offload.ReportedMacStatus):
+                        self.fail("The runner did not send a completion status")
+                    self.assertEqual(outcome.status, 0, captured.getvalue())
+                with mock.patch.dict(os.environ, self.environment, clear=True):
+                    offload.persist_attempt(request, offload.PassedOnMac(0), controller.attempt_evidence, time.monotonic())
                 rows = [cast(dict[str, object], json.loads(line))
                         for path in (self.root / "buildlog").glob("*/*.jsonl")
                         for line in path.read_text().splitlines()]
@@ -1484,18 +1580,12 @@ class OffloadCommandTests(OffloadCommandFixture):
                                  ["ssh_control", "rsync_source", "ssh_run"])
                 self.assertEqual(transfers[1], {"operation": "rsync_source", "sent_bytes": sent,
                                                "received_bytes": received, "complete": complete})
-                ssh = self.events_for("ssh")[-1]
-                self.assertIn("claim", ssh)
-                assert "claim" in ssh
-                claim = ssh["claim"]
-                identity = claim_state.ClaimIdentity(claim["claim_id"], claim["episode"], claim["attempt"])
-                marker = "dispatch_start_settled=" + offload.pending_start_key(identity) + "\n"
                 self.assertEqual(transfers[2]["received_bytes"],
                     len(("résultat\nanomaly\nmac_exit=0\nmac_cleanup=0 32715571 59\n" + marker).encode("utf-8")))
                 self.assertEqual(attempt["sent_bytes"], sum(entry["sent_bytes"] for entry in transfers))
                 self.assertEqual(attempt["received_bytes"], sum(entry["received_bytes"] for entry in transfers))
-                self.assertIn("résultat\nanomaly\n", answer.stdout)
-                self.assertNotIn("Total bytes sent", answer.stdout)
+                self.assertIn("résultat\nanomaly\n", captured.getvalue())
+                self.assertNotIn("Total bytes sent", captured.getvalue())
 
     def test_non_ascii_ignored_directory_is_in_the_exclude_file(self) -> None:
         _ = (self.repository / ".gitignore").write_text(

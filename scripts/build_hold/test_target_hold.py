@@ -69,6 +69,7 @@ class TargetHoldTests(IsolatedTargetState):
                      mock.patch.object(build_hold, "print_hold_audit"), \
                      mock.patch.object(build_hold, "record_hold_event"):
                     result = self.invoke_hold([action, *selection, "--holder", "alice", "--for", "inspect local",
+                                               "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                                                "--proc-root", str(self.root / "proc")])
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     path = self.root / "holders" / build_hold.holder_of("alice").key

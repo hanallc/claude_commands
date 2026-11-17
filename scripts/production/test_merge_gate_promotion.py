@@ -45,7 +45,7 @@ class MergeGatePromotionTests(MergeGateFixture):
     def test_failed_main_push_leaves_rows_unlisted_until_promote_only_succeeds(self) -> None:
         review, _ = self.review_list()
         before = review.read_bytes()
-        checkpoint = self.checkpoint_commit("checkpoint(fixture): ready\n\nChange-Review: Published | Read | Ready")
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): ready\n\nChange-Review: Published | Read | Ready | image 012345abcdef")
         hook = self.origin / "hooks/pre-receive"
         self.write(hook, '#!/bin/sh\nwhile read old new ref; do\n'
                    + ' if [ "$ref" = refs/heads/main ]; then exit 1; fi\ndone\n')
@@ -68,7 +68,7 @@ class MergeGatePromotionTests(MergeGateFixture):
     def test_failed_mac_pull_leaves_rows_unlisted_until_the_next_good_promotion(self) -> None:
         review, _ = self.review_list()
         before = review.read_bytes()
-        checkpoint = self.checkpoint_commit("checkpoint(fixture): live\n\nChange-Review: Installed | Read | Live")
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): live\n\nChange-Review: Installed | Read | Live | image 012345abcdef")
         self.write(self.state / "mac-answer", "ff_rc=1\nfixture-head\n")
         failed = self.run_gate("--promote", "--production", "fixture-showrunner", checkpoint=checkpoint)
         self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)

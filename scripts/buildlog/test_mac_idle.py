@@ -784,7 +784,7 @@ done
 
     def test_disk_evidence_does_not_make_natedev_only_steps_wait_for_the_mac(self) -> None:
         for kind, reason in (("lint", "step writes the tree"), ("test", "local files"),
-                             ("build", "makes natedev artifacts"), ("final", "full gate runs on natedev")):
+                             ("build", "creates a Linux install"), ("final", "full gate runs on natedev")):
             with self.subTest(kind=kind, reason=reason):
                 step_record.write(step_record.StepRecord(
                     self.call.call_id, self.call.pid, self.call.start, Path(self.call.repo), kind,

@@ -534,9 +534,9 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         for subject, count in (("checkpoint(alpha): final change", 1), ("queue(7): final change", 2)):
             with self.subTest(subject=subject):
                 _ = self.checkpoint(content=f"draft for {subject}\n",
-                                    subject="fix(alpha): draft\n\nChange-Review: Draft change | Read | Draft result")
+                                    subject="fix(alpha): draft\n\nChange-Review: Draft change | Read | Draft result | image 012345abcdef")
                 final = self.checkpoint(content=f"final for {subject}\n",
-                                        subject=f"{subject}\n\nChange-Review: Final change | Read | Final result")
+                                        subject=f"{subject}\n\nChange-Review: Final change | Read | Final result | image 012345abcdef")
                 with mock.patch.object(showrunners, "timer_docs", return_value={"other": other_doc}):
                     accepted = self.run_checkpoint(final)
                 self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
@@ -701,6 +701,19 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         self.assertIn("scratch: ok — removed 2 folder(s) of phase:alpha/2: ", result.process.stdout)
         self.assertFalse(any(path.exists() for path in done))
         self.assertTrue(later.is_dir())
+
+    def test_a_code_checkpoint_reports_retained_scratch_folders(self) -> None:
+        plan = self.root / "scratch-plan.md"
+        _ = plan.write_text("### Phase 2 — Checkpoint\n")
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(scratch, "registered_plan", return_value=plan):
+            folder = scratch.new("phase:alpha/2", "unsaved")
+        _ = self.git("init", "-q", str(folder))
+        _ = (folder / "work").write_text("keep this work")
+        result = self.run_checkpoint(self.checkpoint())
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertIn(f"kept {folder}:", result.process.stdout)
+        self.assertIn("uncommitted changes", result.process.stdout)
+        self.assertEqual((folder / "work").read_text(), "keep this work")
     def test_real_merge_tests_run_only_the_two_commands_before_commentary(self) -> None:
         self.production_doc(merge_tests_line=REAL_MERGE_TESTS)
         self.env["CLAUDE_PYTHON"] = sys.executable

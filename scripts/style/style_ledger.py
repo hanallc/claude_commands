@@ -18,7 +18,6 @@ import re
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import tomllib
 import uuid
 from collections import Counter
@@ -34,6 +33,7 @@ from types import TracebackType
 from typing import Concatenate, Literal, TypedDict, cast
 
 from scripts.production.issues import Issue, frontmatter
+from scripts.lib import build_folders
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.git_blob import git_blob_id
 from scripts.production import staff, session_staff
@@ -52,6 +52,7 @@ from scripts.style.finding_sites import (FilingEligibleWithoutHistory as FilingE
                            SiteEvidence as SiteEvidence, UnchangedSite as UnchangedSite)
 from scripts.style import style_rules
 from scripts.style import style_config
+from scripts.style import style_reader
 from scripts.style import approved_renames
 from scripts.style.approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, FileRename, Folder, MissingFile,
                               NoAppliedCheck, NoOuterBindingBlock, OuterBindingBlocked as OuterBindingBlocked, OuterBindingUnproved as OuterBindingUnproved, RenameNotApplied, applied_check,
@@ -2016,6 +2017,22 @@ def _git_grep(repo: Path, *arguments: str) -> bytes:
     return result.stdout
 
 
+def _git_words(repo: Path, blob: str) -> frozenset[str]:
+    """Read the words that Git recognizes in the current search locale."""
+    return frozenset(_git_grep(
+        repo, "--no-line-number", "--no-column", "--no-color", "--no-heading", "--no-break",
+        "-a", "-h", "-o", "-E", "-e", "[[:alnum:]_]+", blob).decode(errors="replace").splitlines())
+
+
+@contextmanager
+def _reader_prerequisite() -> Generator[None]:
+    """Report reader failures through the existing prerequisite refusal."""
+    try:
+        yield
+    except style_reader.ReaderError as error:
+        raise CheckCouldNotRun(f"style reader: {error}") from error
+
+
 def _ticket_operation[**P, T](operation: str) -> Callable[[Callable[Concatenate[Ledger, str, P], T]], Callable[Concatenate[Ledger, str, P], T]]:
     """The public operation owns the refusal; nested operations retain its context."""
     def decorate(method: Callable[Concatenate[Ledger, str, P], T]) -> Callable[Concatenate[Ledger, str, P], T]:
@@ -2076,8 +2093,24 @@ def _is_ignored(path: str, patterns: tuple[str, ...]) -> bool:
     )
 
 
-def tree_entries(repo: Path, revision: str) -> dict[str, TreeEntry]:
-    """Read the complete inventory of a commit or bare tree, retaining modes and object kinds."""
+@dataclass(frozen=True)
+class ConfiguredReader:
+    """A caller without a ledger resolves the reader source from configuration."""
+
+
+CONFIGURED_READER = ConfiguredReader()
+
+
+def tree_entries(repo: Path, revision: str, *,
+                 reader_source: style_config.ReaderSource | ConfiguredReader = CONFIGURED_READER) -> dict[str, TreeEntry]:
+    """Read the complete inventory with the caller's resolved reader or the configured reader."""
+    if isinstance(reader_source, ConfiguredReader):
+        reader_source = style_config.refill_reader()
+    if reader_source == style_config.ReaderSource.RUST:
+        object_id = _git(repo, "rev-parse", "--verify", "--end-of-options", revision)
+        with _reader_prerequisite():
+            inventory = style_reader.read_trees(repo, (object_id,))[object_id]
+        return {path: entry for path, entry in inventory.entries.items() if entry.kind != "tree"}
     return parse_tree_listing(_git(repo, "ls-tree", "-rz", "--full-tree", revision))
 
 
@@ -2103,10 +2136,14 @@ def _check_ref_format(repo: Path, name: str) -> None:
 @lru_cache(maxsize=16)
 def _read_tip(repo: Path, commit: str) -> RepositoryTip:
     """A full commit name fixes its tip, so one process reads each tip once."""
-    return _tip(repo, commit)
+    return _tip(repo, commit, reader_source=style_config.ReaderSource.PYTHON)
 
 
-def _tip(repo: Path, commit: str) -> RepositoryTip:
+def _tip(repo: Path, commit: str, *,
+         reader_source: style_config.ReaderSource | ConfiguredReader = CONFIGURED_READER) -> RepositoryTip:
+    """Read a tip with the caller's resolved reader or the configured reader."""
+    if isinstance(reader_source, ConfiguredReader):
+        reader_source = style_config.refill_reader()
     command = ("git", "-C", str(repo), "rev-parse", "--end-of-options",
                f"{commit}^{{commit}}", f"{commit}^{{tree}}")
     reply = run_git(command).stdout.decode(errors="replace").splitlines()
@@ -2114,7 +2151,11 @@ def _tip(repo: Path, commit: str) -> RepositoryTip:
             or any(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", object_id) is None for object_id in reply[1:])):
         raise GitReadFailed(command, 0, f"{commit}: invalid Git response")
     commit, tree = reply[1:]
-    inventory = parse_tree_listing(_git(repo, "ls-tree", "-rzt", "--full-tree", commit))
+    if reader_source == style_config.ReaderSource.RUST:
+        with _reader_prerequisite():
+            inventory = style_reader.read_trees(repo, (commit,))[commit].entries
+    else:
+        inventory = parse_tree_listing(_git(repo, "ls-tree", "-rzt", "--full-tree", commit))
     entries = {path: entry for path, entry in inventory.items() if entry.kind != "tree"}
     blobs = {path: entry.object for path, entry in entries.items() if entry.kind == "blob"}
     inputs = _tip_input_blobs(blobs)
@@ -2723,6 +2764,8 @@ MIGRATIONS = {
         DELETE FROM refill_dependencies WHERE consumer_table='refill_cells'
             AND source_kind IN ('judgment_cell','rule_generations','scope_membership','history','removal_barriers');
     """ + _replaced_triggers(_judgment_version_triggers()),
+    # Module ownership now keeps declarations without token indexes or inline module positions.
+    47: "DELETE FROM refill_inputs WHERE input_kind='footprint_modules';",
 }
 
 
@@ -2737,6 +2780,7 @@ class GitReadCache:
 
     def __init__(self, repo: Path) -> None:
         self.repo: Path = repo
+        self.reader_source: style_config.ReaderSource = style_config.refill_reader()
         self.tips: dict[str, RepositoryTip] = {}
         self.contents: dict[str, bytes] = {}
         self.warmed: set[str] = set()
@@ -2745,7 +2789,8 @@ class GitReadCache:
         if not re.fullmatch(r"[0-9a-f]{40}", commit):
             commit = _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
         if commit not in self.tips:
-            self.tips[commit] = _read_tip(self.repo, commit)
+            self.tips[commit] = (_tip(self.repo, commit, reader_source=self.reader_source) if self.reader_source == style_config.ReaderSource.RUST
+                                 else _read_tip(self.repo, commit))
         return self.tips[commit]
 
     def read(self, commit: str, paths: Iterable[str]) -> None:
@@ -2863,6 +2908,8 @@ class Ledger:
                  access: LedgerAccess = LedgerAccess.READ_WRITE,
                  resolver: session_staff.RowResolver | None = None) -> None:
         self.repo: Path = repo
+        self._reader_source: style_config.ReaderSource = style_config.refill_reader()
+        self._reader_word_class: style_reader.NameWordClass = style_reader.names_word_class(self._search_locale())
         self._maintain_judgments: bool = access == LedgerAccess.READ_WRITE
         self._maintaining_cell: bool = False
         self._maintain_findings: bool = access == LedgerAccess.READ_WRITE
@@ -2898,6 +2945,11 @@ class Ledger:
         self._fingerprints: dict[tuple[str, CellInputScope, str], str] = {}
         self._inputs: dict[tuple[str, CellInputScope, str], dict[str, TreeEntry]] = {}
         self._rust_codes: dict[str, RustCode | NotTokenized] = {}
+        self._reader_blob_facts: dict[str, style_reader.BlobFacts | style_reader.UnreadableFact] = {}
+        self.reader_module_declarations: dict[str, approved_renames.ModuleDeclarations | approved_renames.UnreadableDeclarationText] = {}
+        self.crate_root_folders: dict[PurePosixPath, bool] = {}
+        self._reader_prepared_commits: set[str] = set()
+        self._reader_name_sites: dict[str, tuple[declarations.NameSites | declarations.UnreadableBody, ...]] = {}
         self._ancestors: dict[tuple[str, str], bool] = {}
         self._branch_tips: dict[str, str] = {}
         # The declaration step's git reads, by commit: what each stored judged commit resolves to, the paths changed
@@ -2906,6 +2958,9 @@ class Ledger:
         self._resolved_commits: dict[str, JudgedCommit | NoJudgedCommit] = {}
         self._changed_paths: dict[tuple[str, str], frozenset[str]] = {}
         self._named_files: dict[tuple[str, str, tuple[str, ...]], tuple[str, ...]] = {}
+        self._reader_word_blobs: dict[tuple[style_reader.NameWordClass, str], set[str]] = {}
+        self._reader_indexed_blobs: set[tuple[style_reader.NameWordClass, str]] = set()
+        self._reader_missing_blobs: set[str] = set()
         self._search_domains: dict[tuple[str, tuple[str, ...]], SearchDomain] = {}
         self._commit_files: dict[tuple[str, str], bytes | Folder | MissingFile] = {}
         self._binding_proofs: dict[tuple[str, str, str], BindingProof] = {}
@@ -3057,6 +3112,15 @@ class Ledger:
             raise LedgerError("no synced tip; run set-tip first")
         return rows[0][0]
 
+    @property
+    def reader_source(self) -> style_config.ReaderSource:
+        """The reader source resolved when this ledger opened."""
+        return self._reader_source
+
+    def tree_entries(self, revision: str) -> dict[str, TreeEntry]:
+        """Read an inventory without reading the reader configuration again."""
+        return tree_entries(self.repo, revision, reader_source=self._reader_source)
+
     def _synced_tip(self) -> RepositoryTip:
         return self._tip(self.synced_commit())
 
@@ -3068,13 +3132,38 @@ class Ledger:
             tip = self.git_cache.tip(commit)
         else:
             if commit not in self._tips:
-                self._tips[commit] = _read_tip(self.repo, commit)
+                self._tips[commit] = (_tip(self.repo, commit, reader_source=self._reader_source) if self._reader_source == style_config.ReaderSource.RUST
+                                      else _read_tip(self.repo, commit))
             tip = self._tips[commit]
+        if self.reader_source == style_config.ReaderSource.RUST and tip.commit not in self._reader_prepared_commits:
+            self.prepare_blob_facts(tuple(blob for path, blob in tip.blobs.items() if path.endswith(".rs")))
+            self._reader_prepared_commits.add(tip.commit)
         if self._maintaining_cell:
             self._judgment_reads.update(tip.read_objects)
         if self._maintaining_findings:
             self._finding_objects.add(self._tip_group(tip))
         return tip
+
+    def prepare_blob_facts(self, blobs: Sequence[str]) -> None:
+        """Read all missing Rust facts in one request for this ledger."""
+        if self.reader_source != style_config.ReaderSource.RUST:
+            return
+        unread = tuple(dict.fromkeys(blob for blob in blobs if blob not in self._reader_blob_facts))
+        if unread:
+            with _reader_prerequisite():
+                readings = style_reader.read_blob_facts(self.repo, unread)
+                self._reader_blob_facts.update(
+                    (blob, reading) for blob, reading in readings.items()
+                    if not isinstance(reading, style_reader.UnreadableFact)
+                    or reading.reason != style_reader.UnreadableReason.MISSING_BLOB)
+
+    def blob_facts(self, blob: str) -> style_reader.BlobFacts:
+        """Return a prepared blob reading or report an unavailable prerequisite."""
+        self.prepare_blob_facts((blob,))
+        reading = self._reader_blob_facts.get(blob, style_reader.UnreadableFact(style_reader.UnreadableReason.MISSING_BLOB))
+        if isinstance(reading, style_reader.UnreadableFact):
+            raise CheckCouldNotRun(f"reader blob {blob}: {reading.reason.value}")
+        return reading
 
     def _tip_group(self, tip: RepositoryTip) -> str:
         """Name the commit, trees and inputs that a tip read, stored once."""
@@ -3306,6 +3395,9 @@ class Ledger:
         self._judgment_reads.add(blob)
         if self._maintaining_findings:
             self._finding_objects.add(blob)
+        if self.reader_source == style_config.ReaderSource.RUST:
+            code = self.blob_facts(blob).code
+            return RustCode(code.digest) if isinstance(code, style_reader.CodeIdentity) else NOT_TOKENIZED
         facts = self._judgment_facts() if self._maintaining_cell else None
         if facts is not None and self._judgment_objects_available((blob,)):
             stored = facts.input_fact("rust_code", blob, JUDGMENT_READER_VERSION)
@@ -6182,6 +6274,10 @@ class Ledger:
             self._finding_objects.add(domain.group)
             if re.fullmatch(r"\w+", name) and pathspecs in (("*.rs",), ("*.rs", "*.md")):
                 return self._indexed_files_naming(domain, tip, name, pathspecs)
+        if (self._reader_source == style_config.ReaderSource.RUST
+                and re.fullmatch(r"\w+", name) and pathspecs in (("*.rs",), ("*.rs", "*.md"))
+                and name.isascii()):
+            return self._rust_files_naming(self._search_domain(tip, pathspecs), tip, name, pathspecs)
         if key not in self._named_files:
             result = _git_grep(self.repo, "-l", "-z", "-w", "-F", "-e", name, tip, "--", *pathspecs)
             self._named_files[key] = tuple(os.fsdecode(entry).removeprefix(f"{tip}:")
@@ -6202,12 +6298,15 @@ class Ledger:
                      + input_identity((tip.commit, pathspecs, SEARCH_DOMAIN_VERSION)))
             domain = SearchDomain(group, blobs, frozenset(blobs), {blob: tuple(names) for blob, names in paths.items()})
             self._search_domains[(commit, pathspecs)] = domain
-        _ = self._object_group(domain.group, domain.blobs)
+        if self._maintaining_findings:
+            _ = self._object_group(domain.group, domain.blobs)
         return domain
 
     def _indexed_files_naming(self, domain: SearchDomain, commit: str, name: str,
                               pathspecs: tuple[str, ...]) -> tuple[str, ...]:
         """Share each search inventory and query word matches together."""
+        if self._reader_source == style_config.ReaderSource.RUST:
+            return self._rust_files_naming(domain, commit, name, pathspecs)
         results = self._finding_results()
         key = (commit, name, pathspecs)
         if key not in self._named_files:
@@ -6218,12 +6317,39 @@ class Ledger:
             if (domain.group, locale) not in results.search.indexed_domains:
                 for blob in domain.blobs:
                     if blob not in missing:
-                        results.word_index(blob, locale, lambda blob=blob: frozenset(_git_grep(
-                            self.repo, "--no-line-number", "--no-column", "--no-color", "--no-heading", "--no-break",
-                            "-a", "-h", "-o", "-E", "-e", "[[:alnum:]_]+", blob).decode(errors="replace").splitlines()))
+                        results.word_index(blob, locale, lambda blob=blob: _git_words(self.repo, blob))
                 if not missing:
                     results.search.indexed_domains.add((domain.group, locale))
             matches = results.blobs_with_word(name, locale, domain.blob_set - missing if missing else domain.blob_set)
+            if missing and not matches:
+                _ = _git_bytes(self.repo, "cat-file", "blob", min(missing))
+            self._named_files[key] = tuple(sorted(path for blob in matches for path in domain.paths[blob]))
+        return self._named_files[key]
+
+    def _rust_files_naming(self, domain: SearchDomain, commit: str, name: str,
+                           pathspecs: tuple[str, ...]) -> tuple[str, ...]:
+        """Read each search domain in one reader request and reuse its word sets."""
+        key = (commit, name, pathspecs)
+        if key not in self._named_files:
+            # Fixed Git searches use byte boundaries; maintained regex searches use the locale.
+            word_class = self._reader_word_class if self._maintaining_findings else style_reader.NameWordClass.ASCII
+            unread = tuple(blob for blob in domain.blobs if (word_class, blob) not in self._reader_indexed_blobs)
+            if unread:
+                with _reader_prerequisite():
+                    names = style_reader.read_names(self.repo, unread, word_class)
+                for blob, words in names.items():
+                    if isinstance(words, style_reader.UnreadableNames):
+                        if words.reason == "missing_blob":
+                            self._reader_missing_blobs.add(blob)
+                            self._reader_indexed_blobs.add((word_class, blob))
+                            continue
+                        # Git can search bytes that the UTF-8 reader cannot decode.
+                        words = _git_words(self.repo, blob)
+                    for word in words:
+                        self._reader_word_blobs.setdefault((word_class, word), set()).add(blob)
+                    self._reader_indexed_blobs.add((word_class, blob))
+            matches = self._reader_word_blobs.get((word_class, name), set()) & domain.blob_set
+            missing = self._reader_missing_blobs & domain.blob_set
             if missing and not matches:
                 _ = _git_bytes(self.repo, "cat-file", "blob", min(missing))
             self._named_files[key] = tuple(sorted(path for blob in matches for path in domain.paths[blob]))
@@ -6244,7 +6370,11 @@ class Ledger:
         """Keep compact parsing by blob until the declaration step ends."""
         parsed = self._declared_blobs.get(blob)
         if parsed is None:
-            parsed = read_declarations(source)
+            if self.reader_source == style_config.ReaderSource.RUST and blob:
+                with _reader_prerequisite():
+                    parsed = self.blob_facts(blob).declared_file(source)
+            else:
+                parsed = read_declarations(source)
             self._declared_blobs[blob] = parsed
         self._active_declarations[blob] = parsed
         return parsed
@@ -6276,7 +6406,7 @@ class Ledger:
             self._finding_metadata.add(key)
         if key not in self._declared_files:
             blob = self._tip(commit).blobs.get(path, "")
-            if self._maintaining_findings and blob:
+            if self._maintaining_findings and blob and self.reader_source == style_config.ReaderSource.PYTHON:
                 self._finding_objects.add(blob)
                 if not self._judgment_objects_available((blob,)):
                     _ = _git_bytes(self.repo, "cat-file", "blob", blob)
@@ -6678,7 +6808,15 @@ class Ledger:
         """An old body is tokenized once for every candidate it is compared with."""
         key = (commit, path, item)
         if key not in self._name_sites:
-            self._name_sites[key] = declarations.name_sites(body, item.declaration.name)
+            if self.reader_source == style_config.ReaderSource.RUST:
+                blob = self._tip(commit).blobs[path]
+                file = self._declared_file(commit, path)
+                if blob not in self._reader_name_sites:
+                    with _reader_prerequisite():
+                        self._reader_name_sites[blob] = self.blob_facts(blob).name_sites(file)
+                self._name_sites[key] = self._reader_name_sites[blob][file.declared_items.index(item)]
+            else:
+                self._name_sites[key] = declarations.name_sites(body, item.declaration.name)
         return self._name_sites[key]
 
     def _item_body(self, commit: str, path: str, item: DeclaredItem) -> declarations.ReadableBody | declarations.UnreadableBody:
@@ -7904,7 +8042,7 @@ class Ledger:
             self._finding_anchors[finding] = anchor
             for path, blob in metadata:
                 # Findings in one file share its declarations at this tip; read and decode them once.
-                if (tip.commit, path) in self._declared_files:
+                if self.reader_source == style_config.ReaderSource.RUST or (tip.commit, path) in self._declared_files:
                     continue
                 items = results.facts.input_fact("finding_declarations", blob, 1)
                 if not isinstance(items, UnstoredFact):
@@ -7925,6 +8063,8 @@ class Ledger:
                 outcomes[finding.finding_id] = outcome
                 if self._judgment_objects_available(objects):
                     for path, blob in metadata:
+                        if self.reader_source == style_config.ReaderSource.RUST:
+                            continue
                         if isinstance(results.facts.input_fact("finding_declarations", blob, 1), UnstoredFact):
                             results.facts.publish_input("finding_declarations", blob, 1,
                                                         encode_proof(self._declared_files[(tip.commit, path)]))
@@ -8502,7 +8642,7 @@ class Ledger:
             self._refill_object_store = _git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
         facts = RefillFacts(self._connection, self._refill_object_store, catalog)
         with self._connection:
-            inputs = RefillInputs(self.repo, tip.tree, facts)
+            inputs = RefillInputs(self.repo, tip.tree, facts, reader_source=self.reader_source)
             ignored: list[str] = []
             for config in (".claude/config/berth.toml", "rustfmt.toml", ".rustfmt.toml"):
                 if config in tip.blobs:
@@ -9346,8 +9486,8 @@ def refill_lock(repo: Path) -> Generator[None]:
 def preview_ledger(repo: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO_GIT_READ_CACHE) -> Generator[Ledger]:
     """Read and migrate a temporary copy without changing the stored ledger."""
     location = ledger_location(repo)
-    with tempfile.TemporaryDirectory(prefix="style-ledger-preview-") as directory:
-        database = Path(directory) / "ledger.sqlite"
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder("style-ledger-preview-")) as directory:
+        database = directory / "ledger.sqlite"
         if location.database.exists():
             with (closing(sqlite3.connect(location.database.resolve().as_uri() + "?mode=ro", uri=True,
                                           timeout=BUSY_TIMEOUT_SECONDS)) as source,

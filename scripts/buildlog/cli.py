@@ -235,7 +235,7 @@ def hourly() -> int:
     status = 0
     for name, job in (("sync", sync.sync), ("vault", vault_pull.vault), ("ci", ci.ci),
                       ("screenshot", screenshot_hourly), ("rust release", rust_release.check_release),
-                      ("AWS snapshot", aws_snapshot), ("AWS prices page", aws_page)):
+                      ("AWS snapshot", aws_snapshot), ("AWS page", aws_page)):
         try:
             status |= job()
         except Exception as error:  # noqa: BLE001 -- one job's failure must not cost the other its run

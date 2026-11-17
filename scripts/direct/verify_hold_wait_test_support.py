@@ -37,6 +37,7 @@ from scripts.direct.verify_mac_offload_test_support import (
 )
 from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
 from scripts.lib import inotify
+from scripts.lib.build_folders_test_support import tool_folders
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
 
@@ -142,8 +143,9 @@ def release_registered_call(path: Path) -> Generator[None, None, None]:
                                     continue
                     if stop.is_set():
                         return
-                    queued = (any(root.glob("**/verify-hold.*/placement-*.json.queued"))
-                              or any(root.glob("**/verify-hold.*/waiter")))
+                    holds = tool_folders(root, "verify", nested=True)
+                    queued = any(any(hold.glob("placement-*.json.queued")) or (hold / "waiter").exists()
+                                 for hold in holds)
                     if path.exists() and queued:
                         grant_call(path)
                         return

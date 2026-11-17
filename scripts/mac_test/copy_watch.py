@@ -705,7 +705,7 @@ def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "mac_test/copy_watch.py")
     arguments = parser().parse_args(namespace=CliArguments())
     request = request_from_arguments(arguments)
-    with wakeup_on_signals(arguments.parent_pid) as wakeup, build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["copy-watch"])) as work:
+    with wakeup_on_signals(arguments.parent_pid) as wakeup, build_folders.tool_folder("copy-watch") as work:
         repository = eligibility.repository_identity(request.repo_root)
         if isinstance(repository, eligibility.UnknownRepository):
             report = wait_for_stop(wakeup)

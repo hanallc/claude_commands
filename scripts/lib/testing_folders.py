@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 
 from scripts.lib import build_folders
+from scripts.lib.session_folder import ROOT_ENV as SESSION_ROOT_ENV
 
 
 RUN_FOLDER_ENV = "DEVTOOLS_TEST_RUN_FOLDER"
@@ -20,8 +21,9 @@ def test_run_folder() -> Generator[Path]:
     """Set TMPDIR for one run and restore the caller's temporary parent afterward.
 
     A run with no BUILDLOG_DIR keeps its build log in the run folder, so no test writes the caller's log.
+    The session root is an absent folder in the run folder, so no fixture launch makes a live session folder.
     """
-    previous = {name: os.environ.get(name) for name in ("TMPDIR", RUN_FOLDER_ENV, BUILDLOG_ENV)}
+    previous = {name: os.environ.get(name) for name in ("TMPDIR", RUN_FOLDER_ENV, BUILDLOG_ENV, SESSION_ROOT_ENV)}
     old_tempdir = tempfile.tempdir
     inherited = build_folders.inherited_temporary_parent().resolve()
     parent = (inherited.parent if str(inherited) == previous[RUN_FOLDER_ENV]
@@ -34,6 +36,7 @@ def test_run_folder() -> Generator[Path]:
         os.environ[RUN_FOLDER_ENV] = str(path)
         if not previous[BUILDLOG_ENV]:
             os.environ[BUILDLOG_ENV] = str(path / "buildlog")
+        os.environ[SESSION_ROOT_ENV] = str(path / "session")
         tempfile.tempdir = None
         try:
             yield path

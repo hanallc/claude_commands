@@ -2,18 +2,40 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import cast, get_args
 
 from scripts.production import production_doc, staff
+from scripts.lib import conf
 from scripts.style import rules
 
 
 class StyleConfigError(ValueError):
     """The style configuration cannot supply the requested assignment or route."""
+
+
+class ReaderSource(StrEnum):
+    """The reader that supplies tree inventories and name searches."""
+
+    PYTHON = "python"
+    RUST = "rust"
+
+
+def refill_reader() -> ReaderSource:
+    """Read the configured reader for the next operation."""
+    if source := os.environ.get("STYLE_TEST_READER_SOURCE"):
+        return ReaderSource(source)
+    return ReaderSource(conf.read_or_repository("style_reader").text("reader"))
+
+
+def reader_install_folder() -> Path:
+    """Read the local folder that holds the reader binary and its stamp."""
+    return Path(conf.read_or_repository("style_reader").text("install_folder")).expanduser()
 
 
 @dataclass(frozen=True)

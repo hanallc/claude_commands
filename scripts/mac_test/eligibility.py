@@ -90,6 +90,7 @@ DEFAULT_MAC_SETTINGS = DefaultMacSettings()
 
 @dataclass(frozen=True)
 class SshConnectionSettings:
+    """The connection settings hold the SSH host and connection and cleanup timeouts."""
     host: str
     connect_timeout_s: float
     leftover_timeout_s: float
@@ -283,6 +284,7 @@ def read_mirror_busy(now: float, repository: str, target: str = "mac") -> Backof
 
 @dataclass(frozen=True)
 class IneligibleMacStep:
+    """The reason excludes the step from Mac execution."""
     reason: NonBusyMacDeclineReason
 
 

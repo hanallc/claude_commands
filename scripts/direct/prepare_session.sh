@@ -3,7 +3,8 @@
 #
 # Usage: prepare_session.sh
 #
-# Creates a unique run folder under /tmp/claude/unit/.
+# Creates a unique run folder in the director's session folder, <session root>/<name>/run/,
+# or under /tmp/claude/unit/ before the session root exists (unit_runs.new_run_root).
 # Stores the run pointer in the director's staff row.
 # end_session.sh clears the run pointer when the run ends.
 

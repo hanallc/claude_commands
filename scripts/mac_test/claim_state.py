@@ -141,6 +141,7 @@ MacBlockState = NoMacBlock | PendingMacBlock | ActiveMacBlock
 
 @dataclass(frozen=True)
 class MacBlockEvent:
+    """The event holds a block start or end, its time, and its target."""
     kind: Literal["began", "ended"]
     block: PendingMacBlock | ActiveMacBlock
     at: datetime

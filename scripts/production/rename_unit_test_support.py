@@ -109,7 +109,6 @@ class UnitRenameFixture(StaffTestCase):
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
             "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
-            "PROGRESS_SESSION_ROOTS": str(self.root / "sessions"),
             "PHASE_TABLE_VAULT": str(self.root / "vault/showrunners"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),

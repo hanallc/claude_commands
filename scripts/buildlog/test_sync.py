@@ -351,7 +351,7 @@ class SyncTests(unittest.TestCase):
         jobs = ((sync, "sync", "sync"), (vault_pull, "vault", "vault"),
                 (ci, "ci", "ci"), (cli, "screenshot_hourly", "screenshot"),
                 (rust_release, "check_release", "rust release"), (cli, "aws_snapshot", "AWS snapshot"),
-                (cli, "aws_page", "AWS prices page"), (index, "update", "index"))
+                (cli, "aws_page", "AWS page"), (index, "update", "index"))
         expected = [name for _, _, name in jobs]
         for failed in expected:
             for raises in (False, True):

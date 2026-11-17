@@ -235,12 +235,10 @@ merge_gate.run_suites(Path.cwd(), full=True)
         preamble = f'''import os
 from pathlib import Path
 import sys
-from scripts.lib import build_folders
-
 def cleanup_event(event, arguments):
     if event != "shutil.rmtree" or arguments[1] is None:
         return
-    if not Path(arguments[0]).name.startswith(build_folders.FOLDER_PREFIXES["merge-gate"]):
+    if not Path(arguments[0]).name.startswith("merge-gate"):
         return
     if {number}:
         os.kill(os.getpid(), {number})

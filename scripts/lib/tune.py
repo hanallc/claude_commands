@@ -10,6 +10,7 @@ import argparse
 import os
 from pathlib import Path
 import platform
+import re
 import shlex
 import sys
 
@@ -92,8 +93,8 @@ def main(arguments: list[str] | None = None) -> int:
         _one_line("key", args.key)
         if "\n" in args.value or "\r" in args.value:
             raise main_publish.Refusal("value must fit on one line")
-        if "#" in args.value or args.value != args.value.strip():
-            raise main_publish.Refusal("value must have no comment marker or outer whitespace")
+        if re.search(r"\s#", args.value) or args.value != args.value.strip():
+            raise main_publish.Refusal("value must have no whitespace comment marker or outer whitespace")
         if platform.system() == "Darwin":
             return _forward(argv, os.environ.get("ZONE_SSH") or "ssh")
         return change(args)

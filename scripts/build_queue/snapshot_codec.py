@@ -69,6 +69,10 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
             source = ({"kind": "SourceKeyKnown", "key": source} if source else
                       {"kind": "SourceKeyUnavailable", "reason": "older request has no source key"})
         return {**record, "source_key": source}
+    if (writing and schema.__module__ == "scripts.build_queue.admission_records"
+            and schema.__name__ == "QueueInputs"):
+        # Pinned clients require this inactive field in the wire record.
+        record = {**record, "override": {"kind": "NoHeadAdmissionOverride"}}
     if schema.__module__ == "scripts.build_queue.admission_records" and "running" in record:
         if writing:
             running = record["running"]

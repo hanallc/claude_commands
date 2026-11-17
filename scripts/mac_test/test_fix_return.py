@@ -49,8 +49,14 @@ def commit_all(root: Path) -> None:
 
 
 def reservation(reservation_id: str, root: Path, branch: str, *scopes: str,
-                status: Literal["blocking", "clear"] = "blocking") -> berth_board.Reservation:
-    return berth_board.Reservation(reservation_id, "lint", root, branch, scopes, "active", status)
+                status: Literal["blocking", "clear"] = "blocking", lifecycle: str = "active",
+                protected_tip: str = "") -> berth_board.Reservation:
+    return berth_board.Reservation(reservation_id, "lint", root, branch, scopes, lifecycle, status, protected_tip)
+
+
+def head(root: Path) -> str:
+    return subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], check=True, capture_output=True,
+                          text=True).stdout.strip()
 
 
 UNCONFIGURED = berth_board.Board((), configured=False)
@@ -361,6 +367,44 @@ class HoldFilterTests(unittest.TestCase):
         self.assertEqual(kept, fix_return.MirrorChanges(
             ("src/held.rs", "src/free.rs", "src/clear.rs"), ("src/gone.rs",)))
         self.assertEqual(withheld, (fix_return.Withheld("src/foreign.rs", "other-2 (theirs)"),))
+
+    def test_own_file_scope_keeps_a_path_another_worktree_also_holds(self) -> None:
+        # hana: the startup reservation and the caller's own reservation both name the file.
+        kept, withheld = self.hold(
+            reservation("own-1", self.ROOT, "mine", "src/foreign.rs", "file:src/gone.rs"),
+            reservation("other-2", Path("/fixture/other"), "theirs", "src/foreign.rs", "src/gone.rs"),
+        )
+        self.assertEqual(kept, fix_return.MirrorChanges(("src/foreign.rs",), ("src/gone.rs",)))
+        self.assertEqual(withheld, (fix_return.Withheld("src/held.rs", ""), fix_return.Withheld("src/free.rs", ""),
+                                    fix_return.Withheld("src/clear.rs", "")))
+
+    def test_outstanding_reservation_whose_tip_is_in_head_history_does_not_withhold(self) -> None:
+        # A later phase branch holds hook.rs by its tree; an earlier phase's outstanding reservation lists it.
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        git(root, "init", "-q")
+        _ = (root / "hook.rs").write_text("earlier phase\n")
+        commit_all(root)
+        merged = head(root)
+        git(root, "checkout", "-q", "-b", "side")
+        _ = (root / "hook.rs").write_text("side branch\n")
+        commit_all(root)
+        unmerged = head(root)
+        git(root, "checkout", "-q", "-")
+        _ = (root / "hook.rs").write_text("later phase\n")
+        commit_all(root)
+        changes = fix_return.MirrorChanges(("hook.rs",), ())
+        own = reservation("own-66", root, "tile-phase-66", "tree:.")
+
+        def hold(tip: str, lifecycle: str = "outstanding") -> tuple[fix_return.MirrorChanges, tuple[fix_return.Withheld, ...]]:
+            earlier = reservation("other-43j", Path("/fixture/other"), "tile-phase-43j", "file:hook.rs",
+                                  lifecycle=lifecycle, protected_tip=tip)
+            return fix_return.hold_filter(root, changes, berth_board.Board((own, earlier)))
+
+        self.assertEqual(hold(merged), (changes, ()))
+        withheld = (fix_return.Withheld("hook.rs", "other-43j (tile-phase-43j)"),)
+        for tip, lifecycle in ((unmerged, "outstanding"), ("0" * 40, "outstanding"), (merged, "active")):
+            with self.subTest(tip=tip, lifecycle=lifecycle):
+                self.assertEqual(hold(tip, lifecycle), (fix_return.MirrorChanges((), ()), withheld))
 
     def test_unconfigured_board_keeps_every_path(self) -> None:
         self.assertEqual(fix_return.hold_filter(self.ROOT, self.CHANGES, UNCONFIGURED), (self.CHANGES, ()))
