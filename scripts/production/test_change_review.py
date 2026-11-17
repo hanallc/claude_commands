@@ -19,6 +19,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Callable
 from datetime import date, datetime
 from dataclasses import replace
 from pathlib import Path
@@ -27,7 +28,7 @@ from unittest import mock
 
 
 from scripts.production import change_review
-from scripts.lib import copy_record
+from scripts.lib import copy_record, file_lock
 from scripts.lib.checkout_test_support import write_python_tool
 from scripts.production import (
     showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc, unit_config, unit_lookup,
@@ -86,6 +87,7 @@ def setUpModule() -> None:
     unittest.addModuleCleanup(folder.cleanup)
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
         "STAFF_FILE": str(Path(folder.name) / "staff.json"), "NEXT_STATE_DIR": folder.name,
+        "REVIEW_LINKS_ROOT": f"{folder.name}/reviews",
         "UNIT_HISTORY_DIR": f"{folder.name}/history", copy_record.ROOT_ENV: f"{folder.name}/scratch",
         scratch.VISIBLE_ROOT_ENV: f"{folder.name}/repro"}))
     _ = fixture_member("showrunner", name="fixture")
@@ -212,6 +214,122 @@ class ProducerFixture(unittest.TestCase):
         return self.git("rev-parse", "HEAD")
 
 class ProducerWriterTests(ProducerFixture):
+    def test_native_verdict_keeps_the_exchange_locked_until_the_list_save(self) -> None:
+        from scripts.review_links import change_page, review_page, test_review_page
+
+        case = test_review_page.ReviewPageTests('runTest')
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        delivery, _ = review_page.submit(case.root, case.body('page-owner/C1', 'validate', 'Check the current case.'), case.status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        change_page.deliver(delivery, case.status)
+        lock = case.root/'.review-link-delivery.lock'
+        record_verdict = change_review.record_verdict
+        blocked: list[bool] = []
+
+        def replace_before_write(path: Path, row: str, verdict: str, day: date, production: Path, *,
+                                 report_warning: Callable[[str], None]) -> change_review.VerdictRecorded | change_review.VerdictAlreadyRecorded | change_review.VerdictConflict:
+            with file_lock.exclusive(lock, wait=False) as held:
+                blocked.append(held == file_lock.LockResult.BUSY)
+                if held == file_lock.LockResult.ACQUIRED:
+                    case.status.write_slots(delivery.page, delivery.row,
+                        change_page.DeliverySlots(change_page.NoDelivery(), change_page.NoDelivery(),
+                            change_page.OpenQuestion('replacement', 'A newer question.', change_page.NoDelivery())))
+            return record_verdict(path, row, verdict, day, production, report_warning=report_warning)
+
+        with mock.patch.object(change_review, 'record_verdict', side_effect=replace_before_write):
+            result = change_review.save_verdict(delivery.page.review_list, delivery.row, 'works', case.fixture.production,
+                                                validation_id=delivery.attempt)
+        self.assertEqual(blocked, [True], 'The replacement cannot enter between the exchange check and the list save.')
+        self.assertIsInstance(result, change_review.VerdictSaved)
+        self.assertIsInstance(case.status.slots(delivery.page, delivery.row).question, change_page.NoQuestion)
+        self.assertEqual(next(row['Verdict'] for row in change_review.review_rows(delivery.page.review_list)
+                              if row['#'] == delivery.row), 'works')
+
+    def test_native_verdict_uses_the_current_validation_id(self) -> None:
+        from scripts.review_links import change_page, review_items, review_page, test_review_page
+
+        for verdict in ('works', 'not works: the spacing differs'):
+            for supplied in ('missing', 'old', 'current'):
+                with self.subTest(verdict=verdict, supplied=supplied):
+                    case = test_review_page.ReviewPageTests('runTest')
+                    case.setUp()
+                    try:
+                        key = 'page-owner/C1'
+                        old, _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the old case.'), case.status)
+                        assert isinstance(old, change_page.MessageDelivery)
+                        change_page.deliver(old, case.status)
+                        current, _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the new case.'), case.status)
+                        assert isinstance(current, change_page.MessageDelivery)
+                        change_page.deliver(current, case.status)
+                        listing = current.page.review_list
+                        record = case.status.path(current.page, current.row)
+                        before = listing.read_bytes(), record.read_bytes()
+                        identity = '' if supplied == 'missing' else old.attempt if supplied == 'old' else current.attempt
+                        arguments = ('verdict', '--production', 'page-owner', '--list', str(listing),
+                                     '--row', 'C1', '--verdict', verdict)
+                        if supplied != 'current':
+                            result = (change_review.save_verdict(listing, 'C1', verdict, case.fixture.production)
+                                      if supplied == 'missing' else
+                                      change_review.save_verdict(listing, 'C1', verdict, case.fixture.production, validation_id=identity))
+                            self.assertIsInstance(result, change_review.VerdictRefused)
+                            assert isinstance(result, change_review.VerdictRefused)
+                            reason = 'this question id does not match the current question'
+                            self.assertEqual((result.lines, result.reason), ([], reason))
+                            args = arguments+('--validation', identity) if identity else arguments
+                            code, output, errors = run(*args)
+                            self.assertEqual((code, output, errors.strip()), (1, '', reason))
+                            self.assertEqual((listing.read_bytes(), record.read_bytes()), before)
+                            continue
+                        if verdict == 'works':
+                            result = change_review.save_verdict(listing, 'C1', verdict, case.fixture.production, validation_id=identity)
+                            self.assertIsInstance(result, change_review.VerdictSaved)
+                        else:
+                            code, _, errors = run(*arguments, '--validation', identity)
+                            self.assertEqual((code, errors), (0, ''))
+                        updated = next(item for item in review_items.read(case.root) if item.key == key)
+                        self.assertEqual(updated.state, review_items.ReviewState.DONE if verdict == 'works' else review_items.ReviewState.FOR_YOU)
+                        if verdict != 'works':
+                            before = listing.read_bytes(), record.read_bytes()
+                            stale = change_review.save_verdict(listing, 'C1', 'works', case.fixture.production, validation_id=identity)
+                            self.assertIsInstance(stale, change_review.VerdictRefused)
+                            assert isinstance(stale, change_review.VerdictRefused)
+                            self.assertEqual(stale.reason, 'this row has no open question')
+                            code, output, errors = run(*arguments, '--validation', identity)
+                            self.assertEqual((code, output, errors.strip()), (1, '', 'this row has no open question'))
+                            self.assertEqual((listing.read_bytes(), record.read_bytes()), before)
+                    finally:
+                        case.doCleanups()
+
+    def test_native_verdict_refuses_a_superseded_validation(self) -> None:
+        from scripts.review_links import change_page, review_page, test_review_page
+
+        case = test_review_page.ReviewPageTests('runTest')
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        key = 'page-owner/C1'
+        old, _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the old case.'), case.status)
+        change_page.deliver(old, case.status)
+        current, _ = review_page.submit(case.root, case.body(key, 'question', 'Check the new case.'), case.status)
+        assert isinstance(current, change_page.MessageDelivery)
+        change_page.deliver(current, case.status)
+        listing = current.page.review_list
+        record = case.status.path(current.page, current.row)
+        before = listing.read_bytes(), record.read_bytes()
+        reason = 'this question id does not match the current question'
+        result = change_review.save_verdict(listing, 'C1', 'works', case.fixture.production)
+        self.assertIsInstance(result, change_review.VerdictRefused)
+        assert isinstance(result, change_review.VerdictRefused)
+        self.assertEqual(result.reason, reason)
+        self.assertEqual(result.lines, [])
+        code, output, errors = run('verdict', '--production', 'page-owner', '--list', str(listing),
+                                   '--row', 'C1', '--verdict', 'works')
+        self.assertEqual((code, output, errors.strip()), (1, '', reason))
+        self.assertEqual((listing.read_bytes(), record.read_bytes()), before)
+        request = case.status.slots(current.page, current.row).question
+        assert isinstance(request, change_page.OpenQuestion)
+        self.assertTrue(change_page.answer_item(key, 'The new case passes.', request.question_id, case.status))
+
     def test_output_capture_adds_an_image_to_add_edit_and_batch_rows(self) -> None:
         output = self.root / "output.txt"
         _ = output.write_text("All checks passed\n", encoding="utf-8")
@@ -1192,6 +1310,38 @@ class ReadyListTests(ProducerFixture):
     def live(self, merged: str, step: str = "restart") -> tuple[int, str, str]:
         return run("live", "--repo", str(self.repo), "--production", "top", "--merged", merged, "--step", step)
 
+    def test_add_list_ready_and_live_fill_optional_cells_in_the_pending_table(self) -> None:
+        _ = self.listing.write_text("""## To review
+
+| # | Change | Merged | Review log | How to check | Notes |
+| --- | --- | --- | --- | --- | --- |
+| C1 | Earlier change | 2026-11-13 | Earlier review | Read | Earlier note |
+""", encoding="utf-8")
+        merged = self.merge_change("Change-Review: Ready change | Read | Ready\n"
+                                   + "Change-Review: Held change | Read | Live | after restart")
+        self.promote()
+
+        with self.subTest(command="add"):
+            result = run("add", "--production", "top", "--repo", str(self.repo),
+                         "--change", "Manual change", "--check", "Read", "--see", "Manual")
+            self.assertEqual(result, (0, "C2\n", ""))
+        with self.subTest(command="list-ready"):
+            code, output, error = self.ready()
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("Ready change", output)
+        with self.subTest(command="live"):
+            code, output, error = self.live(merged)
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("Held change", output)
+
+        self.assertEqual([(row["Change"], row["Review log"], row["Notes"], row[change_review.CHECK])
+                          for row in change_review.pending(self.listing)], [
+            ("Earlier change", "Earlier review", "Earlier note", "Read"),
+            ("Manual change", "", "", "Read. You see: Manual"),
+            ("Ready change", "", "", "Read. You see: Ready"),
+            ("Held change", "", "", "Read. You see: Live"),
+        ])
+
     def test_list_ready_and_live_keep_images_and_report_a_missing_image(self) -> None:
         shot = self.root / "shot.png"
         _ = shot.write_bytes(b"fixture image")
@@ -2096,6 +2246,18 @@ class ActionTest(unittest.TestCase):
         _ = self.path.write_text(LIST, encoding="utf-8")
         self.fresh = Path(directory.name) / "change-review" / "change-review - natedev.md"
 
+    def test_add_accepts_a_row_without_an_image_on_a_list_without_an_image_column(self) -> None:
+        _ = self.path.write_text("""## To review
+
+| # | Change | Merged |
+| --- | --- | --- |
+""", encoding="utf-8")
+        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path),
+                             "--change", "Manual change", "--check", "Read", "--see", "Result"), (0, "C1\n", ""))
+        row, = change_review.pending(self.path)
+        self.assertEqual(row["Change"], "Manual change")
+        self.assertNotIn(change_review.IMAGE, row)
+
     def test_the_first_row_creates_a_missing_list_from_the_skeleton(self) -> None:
         rows = change_review.append_rows(self.fresh, [Visible("A", "B", "C")], date(2026, 10, 15), "", PRODUCTION, record=staff.snapshot())
         self.assertEqual(rows, [f"| C1 | A | 2026-10-15 | B. You see: C | {DEMO_ID} |  |"])
@@ -2853,6 +3015,68 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
         path = self.repo.parent / "batch.json"
         _ = path.write_text(json.dumps(items), encoding="utf-8")
         return run("batch", "--file", str(path))
+
+    def test_batch_verdicts_refuse_stale_exchanges_before_any_list_write(self) -> None:
+        from scripts.review_links import change_page
+
+        paths = self.batch_lists()
+        root = self.repo.parent/'links'
+        with mock.patch.dict(os.environ, {'REVIEW_LINKS_ROOT': str(root)}):
+            status = change_page.DeliveryStatus(root)
+            for index, state in enumerate(('question', 'old validation', 'missing validation', 'completed validation'), 1):
+                with self.subTest(state=state):
+                    row = f'C{index}'
+                    page = change_page.ReviewPage(paths[1], PRODUCTION, (row,), '')
+                    old = status.begin(page, row, 'validation', 'The old check.')
+                    current = status.begin(page, row, 'validation', 'The current check.')
+                    identity = '' if state == 'missing validation' else old
+                    if state == 'question':
+                        _ = status.ask(page, row, 'A newer question.')
+                    elif state == 'completed validation':
+                        status.clear(page, row, 'validation')
+                    before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+                    record = status.path(page, row)
+                    before_record = record.read_bytes() if record.exists() else b''
+                    head = self.git('rev-parse', 'HEAD')
+                    code, output, errors = self.run_batch([
+                        {'op': 'edit', 'production': DOC, 'list': str(paths[0]), 'row': row,
+                         'change': 'This edit must stay in memory', 'check': 'Read', 'see': 'Proof'},
+                        {'op': 'verdict', 'production': DOC, 'list': str(paths[1]), 'row': row,
+                         'verdict': 'works', 'validation': identity},
+                    ])
+                    reason = ('this row has no open question' if state == 'completed validation' else
+                              'this question id does not match the current question')
+                    self.assertEqual((code, output, errors.strip()), (1, '', 'batch item 1: '+reason))
+                    self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+                    self.assertEqual(record.read_bytes() if record.exists() else b'', before_record)
+                    self.assertEqual(self.git('rev-parse', 'HEAD'), head)
+                    self.assertEqual(self.git('diff', '--cached', '--name-only'), '')
+                    if state == 'old validation':
+                        self.assertEqual(status.slots(page, row).validation,
+                                         change_page.DeliveryIntent(current, 'validation', 'The current check.'))
+
+    def test_batch_verdict_accepts_the_current_validation_id_with_one_commit(self) -> None:
+        from scripts.review_links import change_page
+
+        paths = self.batch_lists()
+        root = self.repo.parent/'links'
+        with mock.patch.dict(os.environ, {'REVIEW_LINKS_ROOT': str(root)}):
+            status = change_page.DeliveryStatus(root)
+            page = change_page.ReviewPage(paths[1], PRODUCTION, ('C1',), '')
+            identity = status.begin(page, 'C1', 'validation', 'The current check.')
+            head = self.git('rev-parse', 'HEAD')
+            code, output, errors = self.run_batch([
+                {'op': 'edit', 'production': DOC, 'list': str(paths[0]), 'row': 'C1',
+                 'change': 'The accepted edit', 'check': 'Read', 'see': 'Proof'},
+                {'op': 'verdict', 'production': DOC, 'list': str(paths[1]), 'row': 'C1',
+                 'verdict': 'works', 'validation': identity},
+            ])
+        self.assertEqual((code, errors), (0, ''))
+        self.assertIn('The accepted edit', output)
+        self.assertIn('C1 landed', output)
+        self.assertEqual(self.git('rev-list', '--count', f'{head}..HEAD'), '1')
+        self.assertEqual(next(row['Change'] for row in change_review.pending(paths[0]) if row['#'] == 'C1'), 'The accepted edit')
+        self.assertEqual(next(row['Verdict'] for row in change_review.review_rows(paths[1]) if row['#'] == 'C1'), 'works')
 
     def test_a_batch_writes_two_lists_with_one_lock_and_commit(self) -> None:
         with mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.repo.parent / "links")}):
