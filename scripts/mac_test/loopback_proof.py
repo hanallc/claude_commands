@@ -133,6 +133,7 @@ def main() -> int:
     home = Path(created.stdout.strip())
     if not home.is_absolute() or len(created.stdout.splitlines()) != 1:
         raise ValueError('the remote scratch home is not an absolute path')
+    proof_status = 0
     try:
         listing = subprocess.run(['git', '-C', str(root), 'ls-files', '-z', 'scripts', 'config'],
                                  capture_output=True, text=True, check=True)
@@ -152,16 +153,20 @@ def main() -> int:
                             f'{host}:{shlex.quote(str(home / ".claude"))}/'], check=True, timeout=deadline)
         completed = subprocess.run([*ssh, shlex.join(['python3', '-c', REMOTE_PROOF, str(home), json.dumps(values)])],
                                    check=False, timeout=deadline)
-        return completed.returncode
+        proof_status = completed.returncode
     finally:
         cleanup = (
             'import sys; from pathlib import Path\n'
             'with open(Path.home()/".claude/scripts/lib/package_root.py") as package_root:\n'
             '    exec(package_root.read(), {"__file__": package_root.name})\n'
-            'from scripts.lib import scratch; scratch.end(sys.argv[1])'
+            'from scripts.lib import scratch; sys.exit(scratch.main(["end", "--task", sys.argv[1]]))'
         )
-        _ = subprocess.run([*ssh, shlex.join(['python3', '-c', cleanup, task])], check=True, timeout=deadline)
-        print(f'loopback: removed the managed scratch home {home}', flush=True)
+        cleaned = subprocess.run([*ssh, shlex.join(['python3', '-c', cleanup, task])], check=False, timeout=deadline)
+        if cleaned.returncode:
+            print(f'loopback: kept the managed scratch home {home}', file=sys.stderr, flush=True)
+        else:
+            print(f'loopback: removed the managed scratch home {home}', flush=True)
+    return cleaned.returncode or proof_status
 
 
 if __name__ == '__main__':

@@ -27,7 +27,7 @@ import time
 from typing import Literal, cast, final
 from uuid import uuid4
 
-from scripts.aws_target import admin_secrets, gate_box, ledger, run_cost
+from scripts.aws_target import admin_secrets, gate_box, ledger, run_cost, s3_presign
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges, largest_gate_vcpus
 from scripts.aws_target.config import account_settings_path, gate_deployment, gate_regions, money, read_settings
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place
@@ -660,11 +660,11 @@ class GateWorker:
                 seconds = budget.seconds if isinstance(budget, gate_record.GateTimeLimit) else 0.0
                 links['gate_time_limit_s'] = str(seconds)
                 credentials = self.api.call('export-credentials', '--format', 'process', service='configure')
-                signing = gate_box.SigningKey(ledger.text(credentials, 'AccessKeyId'), ledger.text(credentials, 'SecretAccessKey'),
+                signing = s3_presign.SigningKey(ledger.text(credentials, 'AccessKeyId'), ledger.text(credentials, 'SecretAccessKey'),
                     ledger.text(credentials, 'SessionToken') if 'SessionToken' in credentials else '')
                 at = int(self.clock())
                 def url(method: str, key: str) -> str:
-                    return gate_box.presign(method, ledger.text(deployment, 'bucket') + '.s3.' + self.api.region + '.amazonaws.com',
+                    return s3_presign.presign(method, ledger.text(deployment, 'bucket') + '.s3.' + self.api.region + '.amazonaws.com',
                         key, self.api.region, signing, datetime.fromtimestamp(at, UTC), max(1, ledger.instant(request, 'expires') - at))
                 links.update(production='true', step='size', expires=str(request['expires']),
                              guest=url('GET', 'requests/' + ledger.text(request, 'attempt') + '.guest.py'),

@@ -504,7 +504,8 @@ def ps_read(args: tuple[str, ...]) -> bool:
 
 def lsof_read(args: tuple[str, ...]) -> bool:
     return ((len(args) == 4 and args[:2] == ("-a", "-p") and args[2].isdecimal() and args[3] == "-Fn")
-        or (len(args) == 6 and args[:2] == ("-a", "-p") and args[2].isdecimal() and args[3:] == ("-d", "cwd", "-Fn"))
+        or (len(args) == 6 and args[:2] == ("-a", "-p") and all(pid.isdecimal() for pid in args[2].split(","))
+            and args[3:] == ("-d", "cwd", "-Fpn"))
         or args == ("-n", "-P", "-a", "-U", "-u", str(os.getuid()), "-F", "pfn"))
 
 

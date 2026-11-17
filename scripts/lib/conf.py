@@ -250,7 +250,7 @@ def _parse(source: str) -> dict[str, Setting]:
     settings: dict[str, Setting] = {}
     previous = ""
     for index, raw in enumerate(source.splitlines()):
-        line = raw.split("#", 1)[0].strip()
+        line = re.split(r"(?:^|\s)#", raw, maxsplit=1)[0].strip()
         if line and not line.startswith("["):
             key, separator, value = line.partition("=")
             if separator:

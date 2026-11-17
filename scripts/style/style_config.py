@@ -38,6 +38,16 @@ def reader_install_folder() -> Path:
     return Path(conf.read_or_repository("style_reader").text("install_folder")).expanduser()
 
 
+def reader_build_limit_seconds() -> float:
+    """Read how long the reader build may run, its memory queue wait included."""
+    return conf.read_or_repository("style_reader").number("build_limit_seconds")
+
+
+def reader_build_stop_grace_seconds() -> float:
+    """Read how long a stopped reader build has to end after TERM before KILL."""
+    return conf.read_or_repository("style_reader").number("build_stop_grace_seconds")
+
+
 @dataclass(frozen=True)
 class StyleUnitAssignment:
     unit: str

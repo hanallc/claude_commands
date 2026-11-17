@@ -160,6 +160,12 @@ buildlog_step_compiles() {
 }
 
 buildlog_exec() {
+    local BUILDLOG_RESERVED_STEP="${BUILDLOG_RESERVED_STEP:-}"
+    if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" ]]; then
+        printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
+            "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}"
+        export BUILDLOG_RESERVED_STEP
+    fi
     if [[ -z "${BUILDLOG_PEAK:-}" ]]; then
         "$@"
         return
@@ -349,9 +355,15 @@ buildlog_exec_with_progress() {
 }
 
 run_step_attempt() {
+    buildlog_check_nested_step || return $?
     if [[ -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
         build_check_stop 2 'a prior admission or hold check failed'
         return 2
+    fi
+    # The dev shell's programs reach this step only; the next step starts from the caller's PATH.
+    local PATH=$PATH
+    if [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then
+        lint_dev_shell_path || return $?
     fi
     printf '+ %s\n' "$*"
     if buildlog_step_compiles "$@"; then
@@ -427,6 +439,8 @@ run_step_attempt() {
     elif [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then
         nextest_thread_report "$@"
     fi
+    local LINT_PREBUILD_PREFIX=()
+    if [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then lint_prebuild_prefix; fi
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" && -n "${BUILDLOG_PEAK:-}" ]]; then
         BUILDLOG_TEST_PHASE_FILE="$BUILDLOG_PEAK.test-phase.json"
         buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "$BUILDLOG_MEM_MAX_PATH" "$parent_pid" \
@@ -446,7 +460,8 @@ run_step_attempt() {
     if [[ -t 1 ]]; then
         tty=1
         set +e
-        buildlog_exec_with_progress ${holder[@]+"${holder[@]}"} "$@" 9>&-
+        buildlog_exec_with_progress ${LINT_PREBUILD_PREFIX[@]+"${LINT_PREBUILD_PREFIX[@]}"} \
+            ${holder[@]+"${holder[@]}"} "$@" 9>&-
         status=$?
     else
         # $RANDOM too: a background sweep's run() shares this shell's $$.
@@ -456,7 +471,8 @@ run_step_attempt() {
         fi
         # Keep output streaming for heartbeat_watch.sh and the watching worker.
         set +e
-        buildlog_exec_with_progress ${holder[@]+"${holder[@]}"} "$@" 9>&- 2>&1 | tee "$log" | without_progress_frames
+        buildlog_exec_with_progress ${LINT_PREBUILD_PREFIX[@]+"${LINT_PREBUILD_PREFIX[@]}"} \
+            ${holder[@]+"${holder[@]}"} "$@" 9>&- 2>&1 | tee "$log" | without_progress_frames
         status=${PIPESTATUS[0]}
     fi
     set -e
@@ -662,6 +678,48 @@ nextest_token_width() {
 # Print the test threads and the load for a run that holds no tokens.
 nextest_thread_report() {
     buildlog_memory_python "$LINT_TEST_BUDGET_SCRIPT" report "$@"
+}
+
+# A workspace can declare artifacts that its tests need, under
+# workspace.metadata.dev.prebuild in its root Cargo.toml. prebuild.py goes in
+# front of the nextest command and its token holder, so the artifacts build
+# inside the step's own admission, on the host that runs the tests. LINT_WORKSPACE_MANIFEST names the
+# root manifest; without it, lint runs from the workspace root. A line that
+# holds the word "prebuild" adds the prefix, unless the word is after a "#" with
+# no quote before it (a comment). The check never misses a declaration in any
+# TOML form. The word in a value or another table starts Python once, which
+# reads no declaration and runs the tests unchanged. The shell reads the
+# manifest with no fork, so a manifest without the word starts no process.
+LINT_PREBUILD_SCRIPT="${BUILD_FOLDERS_SCRIPT%/*}/../lint/prebuild.py"
+lint_prebuild_prefix() {
+    local manifest=${LINT_WORKSPACE_MANIFEST:-$PWD/Cargo.toml} line before
+    LINT_PREBUILD_PREFIX=()
+    [[ -f "$manifest" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == *prebuild* ]] || continue
+        before=${line%%#*}
+        if [[ "$before" == *prebuild* || "$before" == *[\"\']* ]]; then
+            LINT_PREBUILD_PREFIX=("${BUILD_FOLDERS_SCRIPT%/*}/py" "$LINT_PREBUILD_SCRIPT" --manifest "$manifest" --)
+            return 0
+        fi
+    done < "$manifest"
+}
+
+# A test can need a program that the workspace's flake development shell
+# declares (SpacetimeDB for hana_catalyst). verify.sh on natedev runs inside
+# that shell; the Mac route and a bare lint call do not. Outside a nix shell,
+# dev_shell.py prints the shell's program folders, and the step adds them to
+# the END of PATH, so every tool the host has stays first. A workspace without
+# flake.nix, or a step inside a nix shell, starts no process. The evaluation
+# is cached per flake input change; a failed one fails the step.
+lint_dev_shell_path() {
+    local root=${LINT_WORKSPACE_MANIFEST:-$PWD/Cargo.toml} folders
+    root=${root%/*}
+    [[ -z "${IN_NIX_SHELL:-}" && -f "$root/flake.nix" ]] || return 0
+    # On a failure the helper prints the one line that names the cause.
+    folders=$("${BUILD_FOLDERS_SCRIPT%/*}/py" "${BUILD_FOLDERS_SCRIPT%/*}/dev_shell.py" path --root "$root") ||
+        return 1
+    [[ -z "$folders" ]] || PATH="$PATH:$folders"
 }
 
 run_nextest() {

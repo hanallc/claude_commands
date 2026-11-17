@@ -26,6 +26,10 @@ from typing import Literal, cast
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import build_hold
+from scripts.build_queue import admission_service, placement
+from scripts.aws_target import hana_placement
+from scripts.build_targets import target_config
+from scripts.mac_test import claim_state
 from scripts.buildlog.parse import CARGO_BUILD_VERBS, cargo_subcommand
 from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
 
@@ -168,18 +172,45 @@ def remote_step_callers() -> frozenset[build_hold.ProcessIdentity] | build_hold.
     return frozenset(callers)
 
 
+def hana_remote_waiters(
+    target: target_config.SshTarget, claim: claim_state.HeldClaim, proc_root: Path,
+) -> frozenset[build_hold.ProcessIdentity]:
+    """Return exact Hana waiters without changing protection for live claims."""
+    try:
+        if (target.platform != 'linux'
+                or not isinstance(target_config.read_execution_transport(target), hana_placement.HanaControlTransport)):
+            return frozenset()
+        state = admission_service.read_state(store.root() / 'admission')
+        record = claim.record
+        key = placement.attempt_key(record['episode'], record['attempt'])
+        saved = state.assignments.get(key)
+        if (saved is None or state.current_assignments.get(record['episode']) != key
+                or not isinstance(saved.state, placement.CurrentAssignment)):
+            return frozenset()
+        assignment = saved.assignment
+        if (assignment.destination.target != target.name or assignment.destination.scope != claim.scope
+                or record['claim_id'] != placement.assigned_claim_id(assignment.episode, assignment.attempt)
+                or record['submitting_session'] != claim_state.session_id(assignment.session)):
+            return frozenset()
+        coordinator = build_hold.ProcessIdentity(assignment.owner.pid, assignment.owner.start_time)
+        if (assignment.owner.host == store.host_name()
+                and build_hold.process_start_time(coordinator.pid, proc_root) == coordinator.start_time):
+            return frozenset({build_hold.ProcessIdentity(record['pid'], record['proc_start']), coordinator})
+    except (OSError, ValueError):
+        pass
+    return frozenset()
+
+
 def claimed_processes(proc_root: Path = build_hold.PROC_ROOT) -> build_hold.LiveClaims | build_hold.ClaimsUnreadable:
     """Read local claim and step records without contacting the Mac or AWS.
 
     A verify call routed to the Mac or AWS counts as claimed before its claim starts and after it ends.
     """
-    from scripts.build_targets import target_config
-    from scripts.mac_test import claim_state
-
     routed = remote_step_callers()
     if isinstance(routed, build_hold.ClaimsUnreadable):
         return routed
     claimed: set[build_hold.ProcessIdentity] = set()
+    waiters: set[build_hold.ProcessIdentity] = set()
     try:
         for target in target_config.read_targets():
             if not isinstance(target, target_config.SshTarget):
@@ -189,11 +220,12 @@ def claimed_processes(proc_root: Path = build_hold.PROC_ROOT) -> build_hold.Live
                 identity = build_hold.ProcessIdentity(claim.record["pid"], claim.record["proc_start"])
                 if build_hold.process_start_time(identity.pid, proc_root) == identity.start_time:
                     claimed.add(identity)
+                    waiters.update(hana_remote_waiters(target, claim, proc_root))
     except claim_state.ClaimStateUnreadable as error:
         return build_hold.ClaimsUnreadable(f"{error.path}: {error}")
     except target_config.ConfigError as error:
         return build_hold.ClaimsUnreadable(str(error))
-    return build_hold.LiveClaims(frozenset(claimed | routed), routed - claimed)
+    return build_hold.LiveClaims(frozenset(claimed | routed | waiters), routed - claimed - waiters, frozenset(waiters))
 
 
 def holds_claim(
@@ -235,7 +267,8 @@ def classify_drain_runs(
         family = [item for item in processes.values()
                   if item.identity == process.identity or process in ancestors[item.identity.pid]]
         identities = {item.identity for item in (*family, *ancestors[process.identity.pid])}
-        reason = ("cargo child" if any(build_hold.audit_command(item) in build_hold.CARGO_COMMANDS
+        reason = ("remote waiter" if holds_claim(process, processes, claimed.remote_waiters) else
+                  "cargo child" if any(build_hold.audit_command(item) in build_hold.CARGO_COMMANDS
                                         for item in family) else
                   "admission reservation" if identities & admitted else
                   "Mac or AWS claim" if holds_claim(process, processes, claimed.identities - claimed.routed) else "")

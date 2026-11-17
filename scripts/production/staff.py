@@ -15,6 +15,7 @@ import sys
 import time
 from collections.abc import Mapping, Callable, Generator, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import cached_property
@@ -559,6 +560,17 @@ class StaffSnapshot:
     # The session ids a caller already read. None reads the session registry at use.
     running_sessions: frozenset[str] | None = field(default=None, compare=False)
 
+    def encode(self) -> str:
+        return json.dumps({"rows": [row.to_json() for row in self.rows], "schema": self.schema,
+                           "pending_retire": list(self.pending_retire), "inputs": list(self.inputs)}, sort_keys=True)
+
+    @classmethod
+    def decode(cls, text: str) -> StaffSnapshot:
+        value = cast(object, json.loads(text))
+        if not isinstance(value, dict):
+            raise StaffUnreadable("staff snapshot must be an object")
+        return _snapshot_value(cast(dict[str, object], value))
+
     @cached_property
     def backends(self) -> Mapping[StaffId, ClaudeBackend | CodexBackend]:
         return _found_backends(self.rows, self.running_sessions)
@@ -790,7 +802,7 @@ def is_owner() -> bool:
 
 def child_environment(environment: Mapping[str, str]) -> dict[str, str]:
     """Remove row lock proofs, staff hints, and operation state from agent environments."""
-    from scripts.lib.models_registry import agent_environment
+    from scripts.lib.operation_environment import agent_environment
 
     return {key: value for key, value in agent_environment(environment).items()
             if not key.startswith("STAFF_ROW_FD_") and key != "STAFF_ID"}
@@ -1218,7 +1230,29 @@ def _all_rows() -> list[StaffRow]:
     return list(_load().rows) if is_owner() else _rows(_remote(["show"]))
 
 
+@dataclass(frozen=True)
+class ReadStaffAuthority:
+    """Read staff from its authority for this command."""
+
+
+_command_snapshot: ContextVar[StaffSnapshot | ReadStaffAuthority] = ContextVar(
+    "staff_snapshot", default=ReadStaffAuthority())
+
+
+@contextmanager
+def supplied_snapshot(record: StaffSnapshot) -> Generator[None]:
+    """Use the caller's staff snapshot for this command only."""
+    token = _command_snapshot.set(record)
+    try:
+        yield
+    finally:
+        _command_snapshot.reset(token)
+
+
 def snapshot() -> StaffSnapshot:
+    supplied = _command_snapshot.get()
+    if isinstance(supplied, StaffSnapshot):
+        return supplied
     if is_owner():
         return replace(_load(), production=not _file_override())
     value = _remote(["show", "--snapshot"])
@@ -1244,6 +1278,9 @@ def wait_for_writes() -> None:
 
 def initial_snapshot() -> StaffSnapshot:
     """Read a writer's starting record, including an installation not yet seeded."""
+    supplied = _command_snapshot.get()
+    if isinstance(supplied, StaffSnapshot):
+        return supplied
     try:
         return replace(snapshot(), production=False)
     except StaffAbsent:
@@ -2349,8 +2386,7 @@ def _main(arguments: _Arguments) -> int:
             return live_command()
         if arguments.snapshot:
             record = snapshot()
-            print(json.dumps({"rows": [row.to_json() for row in record.rows],
-                              "schema": record.schema, "pending_retire": list(record.pending_retire), "inputs": list(record.inputs)}, sort_keys=True))
+            print(record.encode())
             return 0
         rows = _all_rows()
         paths = _paths(rows)

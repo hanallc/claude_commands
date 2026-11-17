@@ -119,7 +119,7 @@ Recommendation: A until S8. If nate picks N1-B or N1-C, B follows.
 
 1. Delete `Cargo.toml`, `Cargo.lock`, `rust/` and `taplo.toml` at the repo root. The generic gate code then finds no Rust: `hooks/checkpoint_gate.py:883`, `production/checkpoint_gate.py:83-109`, `merge_checkpoint.py:827-834`. No code change there.
 2. Docs: `config/mac_test.conf:56-57` and `docs/direct/final_gate_commit.md:11-15` are true again with no edit. Mark the old reader plan as replaced by this plan.
-3. Config, with nate's go: delete `install_folder` in `config/style_reader.conf`, then delete `~/.local/state/style/reader` (7.2 MiB).
+3. Config, with nate's go: delete `install_folder`, `build_limit_seconds` and `build_stop_grace_seconds` in `config/style_reader.conf`, then delete `~/.local/state/style/reader` (7.2 MiB).
 4. Leftovers: delete the two scratch copies `reader-start-716d7d` and `reader-store-62d7e7` and their outputs under `/build/cargo/scratch` (1.3 GiB) through `scratch.py`. Clean the reader target in the Mac mirror of `.claude` through the Mac queue only.
 5. Not in this phase: `config/cloud_gate.conf:111` keeps cargo and rustc on the AWS box. builds removes them only after a `gate_trial.py` pass without them, with nate's go.
 

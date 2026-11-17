@@ -23,7 +23,7 @@ from typing import cast, override
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
-from scripts.aws_target import aws_trial, cloud_gate, gate_box, ledger
+from scripts.aws_target import aws_trial, cloud_gate, gate_box, ledger, s3_presign
 from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli, AwsUnavailable, largest_gate_vcpus
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant, numeric_settings, text_setting
@@ -1300,7 +1300,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(self.execute()['status'], 'fallback')
         cloud_gate.save(self.folder / 'launch.json', {'variant': 1})
         self.fake.launches.clear()
-        with mock.patch.object(gate_box, 'presign', side_effect=OSError('Cannot prepare the launch')):
+        with mock.patch.object(s3_presign, 'presign', side_effect=OSError('Cannot prepare the launch')):
             self.assertEqual(self.execute()['status'], 'fallback')
         self.assertEqual(self.fake.launches, [])
         self.assertEqual(cloud_gate.read(self.folder / 'launch.json'), {'variant': 1})

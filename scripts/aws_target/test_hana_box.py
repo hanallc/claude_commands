@@ -153,6 +153,72 @@ class HanaBoxTests(CostFixture):
                               hana_box.CommandPermission)
         self.assertEqual(len(self.provider.starts), 1)
 
+    def test_assigned_execution_guard_keeps_a_ready_claim_until_durable_settlement(self) -> None:
+        from scripts.aws_target import hana_execution
+        from scripts.build_queue import placement
+        from scripts.mac_test.claim_state import RepositoryScope
+
+        self.ready()
+        self.controller.bind_execution('execution-one')
+        self.assertFalse(self.controller.release('execution-one'))
+        reference = placement.ProviderClaimReference('ssh', 'fixture-target', RepositoryScope('hana', 'fixture-repository', 1),
+            'execution-one', 'fixture-episode', 'fixture-attempt')
+        settled = hana_execution.settle_unpublished_claim(self.state, reference,
+            release_claim=lambda: self.controller.release('execution-one'), reason='The capture was refused')
+        self.assertIsInstance(settled, hana_execution.HanaSettled)
+        self.assertEqual(self.record()['claims'], [])
+        self.assertTrue(self.controller.release('execution-one'))
+
+    def test_missing_or_corrupt_execution_journal_keeps_the_exact_claim_after_restart(self) -> None:
+        from scripts.aws_target import hana_execution
+
+        self.ready()
+        self.controller.bind_execution('execution-one')
+        restarted = hana_box.HanaController(self.state, self.settings, self.workload_path, self.provider, clock=self.clock)
+        self.assertFalse(restarted.release('execution-one'))
+        journal = hana_execution.execution_path(self.state, 'execution-one')
+        _ = journal.write_text('{')
+        self.assertFalse(restarted.release('execution-one'))
+
+    def test_execution_bound_checks_lifecycle_under_the_controller_lock(self) -> None:
+        def read_locked() -> hana_box.NoDeployment:
+            with (self.state / 'controller.lock').open('a') as lock:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return hana_box.NoDeployment()
+
+        with mock.patch.object(self.controller, '_read', side_effect=read_locked):
+            self.assertFalse(self.controller.execution_bound('never-bound'))
+        self.assertFalse(self.controller.execution_bound('never-bound'))
+        self.assertEqual(self.provider.calls, [])
+
+    def test_execution_bound_retains_a_guard_with_missing_or_corrupt_journal(self) -> None:
+        from scripts.aws_target import hana_execution
+
+        self.controller.bind_execution('execution-one')
+        self.assertTrue(self.controller.execution_bound('execution-one'))
+        _ = hana_execution.execution_path(self.state, 'execution-one').write_text('{')
+        self.assertTrue(self.controller.execution_bound('execution-one'))
+
+    def test_execution_bound_retains_matching_lifecycle_claims_and_operations(self) -> None:
+        _ = self.controller.request('execution-one')
+        self.assertTrue(self.controller.execution_bound('execution-one'))
+        self.assertFalse(self.controller.execution_bound('another-execution'))
+        row = self.record()
+        row['claims'] = []
+        row['operation'] = {'action': hana_box.Action.START.value, 'token': 'operation-token',
+            'at': self.clock.now, 'generation': 1, 'permit': None, 'expected_generation': 0,
+            'execution': 'execution-one'}
+        _ = self.controller.path.write_text(json.dumps(row))
+        self.assertTrue(self.controller.execution_bound('execution-one'))
+        self.assertFalse(self.controller.execution_bound('another-execution'))
+
+    def test_execution_bound_retains_unreadable_guard_or_lifecycle_evidence(self) -> None:
+        with mock.patch.object(Path, 'stat', side_effect=PermissionError('The guard cannot be read')):
+            self.assertTrue(self.controller.execution_bound('execution-one'))
+        _ = self.controller.path.write_text('{')
+        self.assertTrue(self.controller.execution_bound('execution-one'))
+
     def test_spending_refusal_makes_no_provider_mutation(self) -> None:
         workload = hana_spend.read_settings(conf.read(self.workload_path))
         self.costs({'daily_limit_usd': str(workload.storage_usd_per_month / 60)})

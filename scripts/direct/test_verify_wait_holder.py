@@ -667,32 +667,6 @@ if "--assignment-file" in arguments:''', 1)
             self.assertEqual(started, finished, snapshot)
         return snapshots
 
-    def test_token_wait_closes_before_a_reserved_remote_test_starts(self) -> None:
-        _ = self.prepare_target_wait()
-        config = self.fixture.root / "build_targets.conf"
-        _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=natedev,mac"))
-        session = Path(self.fixture.environment["UNIT_RUN_DIR"])
-        self.fixture.environment["TEST_TOKEN_RECORD"] = str(session / "locks/cargo.d/owned")
-        runner = self.fixture.runner
-        source = runner.read_text().replace(RUN_HISTORY, "")
-        self.fixture.write_executable(runner, source.replace("event = {", RUN_HISTORY + "event = {", 1))
-        acquired = subprocess.run(["bash", str(BOARD), "acquire", str(session), "fixture-impl", "cargo",
-                                   "--pid", str(os.getpid()), "--hold", "3600"],
-                                  env=self.fixture.environment, capture_output=True, text=True,
-                                  timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(acquired.returncode, 0, acquired.stdout + acquired.stderr)
-        process = self.start("test", "sample", "--no-cache")
-        code, output = self.finish(process)
-        self.assertEqual(code, 0, output)
-        snapshots = self.assert_closed_before_remote_steps()
-        snapshot, = snapshots
-        rows = cast(list[dict[str, object]], snapshot["waits"])
-        started, = [row for row in rows if row["event_type"] == "wait_started"]
-        self.assertEqual(started["wait_reason"], "cargo token")
-        self.assertEqual(recorded_holders(rows),
-                         [named_holder("slot", "cargo", fixture_runtime_id("thread-impl"))])
-        self.assertEqual(self.fixture.local_runs(), [])
-
     def test_pinned_linux_reservation_race_waits_only_with_a_live_claim(self) -> None:
         _ = self.prepare_target_wait()
         root = self.fixture.root

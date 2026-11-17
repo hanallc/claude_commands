@@ -51,6 +51,54 @@ def setUpModule() -> None:
 
 
 class ClientTests(unittest.TestCase):
+    def test_stale_outer_markers_do_not_refuse_admission(self) -> None:
+        for case in ("other-queue", "dead-holder", "released", "reused-pid"):
+            with self.subTest(case=case), AdmissionFixture() as fixture:
+                outer = fixture.request()
+                with fixture.loop_turn():
+                    grant, = fixture.server.handle_request(outer)
+                assert isinstance(grant, wire.Admitted)
+                directory = fixture.state_dir
+                if case == "other-queue":
+                    directory = fixture.root / "other-admission"
+                elif case == "dead-holder":
+                    fixture.proc.kill(outer.owner)
+                elif case == "released":
+                    fixture.release(grant)
+                marker = f"{grant.reservation}\t{outer.owner.pid}\t{directory.resolve()}"
+                nested = fixture.request()
+                start = "reused" if case == "reused-pid" else records.process_start_time(outer.owner.pid)
+                with mock.patch.dict(os.environ, {"BUILDLOG_RESERVED_STEP": marker}), \
+                        mock.patch.object(records, "process_start_time", return_value=start), \
+                        mock.patch.object(client, "_acquire", return_value=wire.Refused("fixture admission")) as acquire, \
+                        redirect_stderr(io.StringIO()) as errors:
+                    reply = client.admit(nested, lambda _wait: None, lambda: nested)
+                self.assertEqual(reply, wire.Refused("fixture admission"))
+                acquire.assert_called_once()
+                self.assertEqual(errors.getvalue(), "")
+
+    def test_nested_reserved_step_refuses_before_it_can_wait(self) -> None:
+        with AdmissionFixture() as fixture:
+            outer = fixture.request()
+            with fixture.loop_turn():
+                replies = fixture.server.handle_request(outer)
+            grant, = replies
+            assert isinstance(grant, wire.Admitted)
+            fixture.hold_starts()
+            marker = f"{grant.reservation}\t{outer.owner.pid}\t{fixture.state_dir.resolve()}"
+            nested = fixture.request()
+            def waiting(_wait: wire.Wait) -> None:
+                self.fail("the nested step waited for its outer reservation")
+            with mock.patch.dict(os.environ, {"BUILDLOG_RESERVED_STEP": marker}), fixture.serving(), \
+                    redirect_stderr(io.StringIO()) as errors, \
+                    mock.patch.object(client, "_connect", side_effect=AssertionError("nested admission opened a socket")) as connect:
+                reply = client.admit(nested, waiting, lambda: nested)
+            self.assertIsInstance(reply, wire.Refused)
+            self.assertEqual(errors.getvalue().splitlines(), [
+                f"verify step cannot run inside reserved step {grant.reservation} (pid {outer.owner.pid}); "
+                + "run it outside the outer step"])
+            connect.assert_not_called()
+
     def test_placement_status_cli_reads_current_closed_and_unknown_over_the_socket(self) -> None:
         from scripts.build_queue import admission_wire as status_wire, placement
         from scripts.build_queue.test_placement import placement_request
@@ -561,11 +609,15 @@ class ClientTests(unittest.TestCase):
                                     placement.TemporaryExclusion("busy")))
                             if execution_target == "mac-handoff":
                                 self.assertEqual(client.main(["report-prerequisite", "--assignment-file",
-                                    str(assignment_file), "--token", "required"]), 0)
+                                    str(assignment_file), "--token", "after-grant"]), 0)
                                 fixture.free(60 * GIB)
                             self.assertEqual(client.main(["claim-failed", "--assignment-file", str(assignment_file),
                                                           "--reason", "lost" if execution_target == "mac-retry-notice" else "busy"]), 0)
-                            self.assertFalse(fixture.caller_reservations())
+                            if execution_target == "mac-handoff":
+                                # The replacement needs no token check, so the next pass grants natedev.
+                                self.assertTrue(fixture.caller_reservations())
+                            else:
+                                self.assertFalse(fixture.caller_reservations())
 
                             if execution_target == "mac-retry-notice":
                                 assignment_file.unlink()
@@ -579,18 +631,12 @@ class ClientTests(unittest.TestCase):
                                         connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
                                     if isinstance(request, wire.PrerequisiteReport):
                                         fixture.free(60 * GIB)
-                                    return previous(request, connection)
+                                    replies = previous(request, connection)
+                                    if isinstance(request, wire.PlacementRequest):
+                                        observed.extend(replies)
+                                    return replies
 
-                                send = cast(Callable[[service.Connection, wire.Reply], None],
-                                    getattr(fixture.server, "_send"))
-
-                                def observe_sent_reply(connection: service.Connection, reply: wire.Reply) -> None:
-                                    if isinstance(connection.request, wire.PlacementRequest):
-                                        observed.append(reply)
-                                    send(connection, reply)
-
-                                with mock.patch.object(fixture.server, "handle_request", side_effect=free_after_first_reply), \
-                                        mock.patch.object(fixture.server, "_send", side_effect=observe_sent_reply):
+                                with mock.patch.object(fixture.server, "handle_request", side_effect=free_after_first_reply):
                                     self.assertEqual(client.main(arguments), 0, errors.getvalue())
                                 self.assertEqual(len(observed), 2, observed)
                                 self.assertIsInstance(observed[0], wire.PlacementWait)
@@ -601,13 +647,13 @@ class ClientTests(unittest.TestCase):
                                 def release_before_retry() -> None:
                                     fixture.free(60 * GIB)
 
-                                token_arguments = [*arguments[:arguments.index("--")], "--token", "required",
+                                token_arguments = [*arguments[:arguments.index("--")], "--token", "after-grant",
                                                    *arguments[arguments.index("--"):]]
+                                # After its first pass, a caller without its token can get a local grant;
+                                # it takes the token after the grant. The service marks every TokenRequired
+                                # row token-waiting, as a service from before this client does.
                                 with mock.patch.object(fixture.server, "before_admission", side_effect=release_before_retry):
-                                    self.assertEqual(client.main(token_arguments), 78, errors.getvalue())
-                                self.assertFalse(fixture.caller_reservations())
-                                token_arguments[token_arguments.index("required")] = "held"
-                                self.assertEqual(client.main(token_arguments), 0, errors.getvalue())
+                                    self.assertEqual(client.main(token_arguments), 0, errors.getvalue())
                             retry_grant = client.read_assignment(assignment_file)
                             self.assertIsInstance(retry_grant, wire.LocalPlacementGranted)
                             assert isinstance(retry_grant, wire.LocalPlacementGranted)

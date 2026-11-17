@@ -6,6 +6,7 @@ from scripts.agents import remote
 
 import contextlib
 import io
+import json
 import os
 import re
 import tempfile
@@ -21,7 +22,7 @@ from unittest import mock
 
 from scripts.production import change_review
 from scripts.production import footer_counts
-from scripts.production import next_item
+from scripts.production import next_item, investigation
 from scripts.production.production_doc import Production
 from scripts.production import proposals_folder
 from scripts.production import showrunners
@@ -45,6 +46,7 @@ ITEM = re.compile(r"\b(\w+)-item\b")
 LEDGER = """\
 - 2026-10-05 rust/nateroids: Build CI tests without debug info [gain/week: 2.5 h red CI] — deferred
 - 2026-10-12 rust/hana: Run the GPU tests 8 at a time [gain/week: 38 min waiting] — proposed
+- 2026-10-13 rust/hana: Keep the smaller check [gain/week: 12 min waiting] — proposed
 """
 
 
@@ -92,6 +94,7 @@ class NextItemTests(unittest.TestCase):
                                                Entry("C2", "C2 Later change", Urgency(urgency.LATER), since=at(2))]),
             "proposal": Queue("proposal-demo", [Entry("P1", "P1 A proposal", since=at(3), value=(9.0,))]),
             "efficiency": Queue("efficiency", []),
+            "investigation": Queue("investigation", []),
             "question": Queue("question-demo", [Entry("Q1", "demo: Which port?", Urgency(urgency.BLOCKS), since=at(4)),
                                                 Entry("Q2", "demo: Newest question", since=at(5))]),
         }
@@ -201,11 +204,11 @@ class NextItemTests(unittest.TestCase):
         assert owner is not None
         _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
         _ = doc.write_text(f"# Demo\n\n## Production Context\n\n- **Efficiency ledger:** {self.root / 'ledger.md'}\n")
-        line = LEDGER.splitlines()[0]
+        line = LEDGER.splitlines()[1]
         self.assertEqual(run("show", "--kind", "efficiency", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name), (0, f"efficiency\n{line}\n", ""))
         self.assertEqual(run("move-to-end", "--kind", "efficiency", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name)[0], 0)
         self.assertEqual(run("show", "--kind", "efficiency", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name)[1],
-                         f"efficiency\n{LEDGER.splitlines()[1]}\n")
+                         f"efficiency\n{LEDGER.splitlines()[2]}\n")
         # A production whose doc names no Efficiency ledger has no efficiency items.
         bare = doc.with_name("bare-production.md")
         _ = fixture_member("showrunner", name="bare", doc=staff.LiveDoc(remote.local_machine(), bare))
@@ -254,8 +257,15 @@ class NextItemTests(unittest.TestCase):
             if existing is not None:
                 _ = staff.move(existing.id, staff.ReportsTo(parent) if parent is not None else staff.StaffRoot())
             owner = fixture_member("showrunner", name=name, parent=parent, doc=staff.LiveDoc(remote.local_machine(), doc))
-            _ = (outstanding / f"{owner.id}.json").write_text(
-                f'[{{"since": "2026-10-06T09:00", "text": "{name}-item"}}]')
+            with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}):
+                item = investigation.file(owner.id, f"{name}-item", "Find the cause.")
+                _ = investigation.answer(owner.id, item.id, "The cause is known.")
+            fields = {"since": "2026-10-06T09:00", "text": f"{name}-item", "question": f"{name}-item next step?",
+                      "asked_by": owner.id}
+            _ = (issues_folder / f"question-{owner.id}.md").write_text(
+                "---\nrecord_type: question\nstatus: open\n"
+                + f"production_id: {owner.id}\nasked_by: {owner.id}\n"
+                + f"registration: {json.dumps(fields)}\n---\n")
             timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{name}"
             timer.mkdir(parents=True)
             _ = (timer / "conf").write_text(f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {owner.id}\n")
@@ -291,7 +301,7 @@ class NextItemTests(unittest.TestCase):
                 mock.patch.object(showrunner_tree, "descendants_of", descendants_of), \
                 mock.patch.object(showrunners, "timer_docs", return_value=docs), \
                 mock.patch.object(change_review, "production_list", the_list), \
-                mock.patch.object(next_item, "read_production", production), \
+                mock.patch("scripts.production.production_doc.read_production", production), \
                 mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}):
             for kind in next_item.KINDS:
                 # Each showrunner shows its own production: never the one above, and not the ones below.
@@ -308,6 +318,30 @@ class NextItemTests(unittest.TestCase):
                                     next_item.read_queue(kind, docs["kid"], True).name, kind)
             # Each showrunner pins its own change row, so one /next never moves the other's.
             self.assertNotEqual(next_item.change_queue(docs["top"]).name, next_item.change_queue(docs["kid"]).name)
+
+            producer = fixture_member("producer", name="planner")
+            ready = investigation.file(producer.id, "Producer investigation", "Read the producer log.")
+            ready = investigation.answer(producer.id, ready.id, "The producer answer is ready.")
+            with mock.patch.object(staff, "caller_identity", return_value=producer.current_session):
+                for arguments in (("show", "--kind", "investigation"), ("show",)):
+                    with self.subTest(finding="F025", arguments=arguments):
+                        code, output, error = run(*arguments)
+                        self.assertEqual((code, error), (0, ""))
+                        self.assertEqual(output.splitlines()[:2],
+                                         ["investigation", "planner/"+ready.id+" Producer investigation"])
+                for kind in ("change", "proposal", "efficiency"):
+                    with self.subTest(finding="F025", kind=kind):
+                        self.assertEqual(run("show", "--kind", kind),
+                                         (0, f"no {kind} is waiting for you\n", ""))
+                        queue = next_item.read_queue(kind, None)
+                        self.assertTrue(queue.name)
+                        self.assertEqual(queue.entries, [])
+                with self.subTest(finding="F025", selection="explicit production"):
+                    code, output, error = run("show", "--kind", "investigation", "--production", "top")
+                    self.assertEqual((code, error), (0, ""))
+                    self.assertIn("top-item", output)
+                    self.assertNotIn("Producer investigation", output)
+                self.assertEqual(urgency.pinned("next-"+producer.id), f"investigation/{producer.id}/{ready.id}")
 
     def test_a_child_with_no_change_review_line_reads_its_roots_list(self) -> None:
         path = self.root / "change-review - top.md"

@@ -31,7 +31,7 @@ from uuid import uuid4
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
 from scripts.production import change_review, investigation, staff, the_list
-from scripts.review_links import accounts_page, change_browser, change_page, console, investigations_page, list_page, serve
+from scripts.review_links import accounts_page, change_browser, change_page, console, investigations_page, list_page, review_page, serve
 from scripts.lib import atomic_file, conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -96,6 +96,15 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(reply.content_type, content_type)
                 self.assertEqual(reply.body.decode("utf-8"), text)
 
+    def test_review_request_passes_the_selected_show_view(self) -> None:
+        for query, show in (('', 'open'), ('?show=Done', 'Done'), ('?show=all', 'all'),
+                            ('?show=For+you', 'For you'), ('?show=Waiting', 'Waiting')):
+            with self.subTest(show=show), patch.object(review_page, 'render', return_value=b'Review') as render:
+                reply = self.request('/console/review.html'+query)
+                self.assertEqual(reply.status, 200)
+                self.assertEqual(reply.body, b'Review')
+                render.assert_called_once_with(self.root, show=show)
+
     def test_other_text_files_are_readable_as_utf8(self) -> None:
         text = "a report with no standard text extension — café\n"
         _ = (self.root / "report.log").write_text(text, encoding="utf-8")
@@ -127,7 +136,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertIn("frame-src 'self'", headers["content-security-policy"])
         self.assertNotEqual(headers.get("x-frame-options"), "DENY")
         self.assertIn(b"<h1>Hana console</h1>", body)
-        self.assertIn(b'data-url="/console/changes.html" data-title="Changes"', body)
+        self.assertIn(b'data-url="/console/review.html" data-title="Review"', body)
         self.assertIn(b'href="?page=rebuilds" data-page="rebuilds"\ndata-url="/console/rebuilds.html"', body)
         self.assertTrue((self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST).is_file())
         for path in ("/console", "/console?page=questions"):
@@ -153,11 +162,12 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
         _ = self.enterContext(patch.object(disks_page, "output_folder", return_value=self.root / "disks"))
         start = self.enterContext(patch.object(disks_page, "start_measure", return_value=disks_page.MeasureStart.STARTED))
-        report: slots.SlotReport = {"root": "/build/slot", "groups": []}
+        report: slots.SlotReport = {"root": "/build/slot", "machine": "natedev", "unused_days": 3, "groups": []}
         _ = self.enterContext(patch.object(slots, "slot_report", return_value=report))
         folders: sessions.SessionReport = {"root": "/session", "sessions": []}
         _ = self.enterContext(patch.object(sessions, "session_report", return_value=folders))
-        answer = b'{"state": "started", "slots": {"root": "/build/slot", "groups": []}, "sessions": {"root": "/session", "sessions": []}}'
+        answer = (b'{"state": "started", "slots": {"root": "/build/slot", "machine": "natedev", "unused_days": 3, "groups": []}, '
+                  + b'"sessions": {"root": "/session", "sessions": []}}')
         self.assertEqual(self.post("/disks/measure", ""), (200, answer))
         self.assertEqual(start.call_count, 1)
         self.assertNotEqual(self.post("/other/measure", "")[0], 200)
@@ -169,15 +179,15 @@ class ReviewLinksServerTests(unittest.TestCase):
             "STAFF_FILE": str(self.root.parent / "staff.json")})))
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
         _ = self.enterContext(patch.object(change_browser, "waiting_changes", return_value=frozenset({"a/C1"})))
-        questions = self.enterContext(patch.object(change_browser, "waiting_questions", return_value=frozenset({"q1"})))
-        self.assertEqual(self.post("/console/news", "open=changes"), (200, b'{"new": []}'))
+        questions = self.enterContext(patch.object(review_page, "waiting_items", return_value=frozenset({"q1"})))
+        self.assertEqual(self.post("/console/news", "open=images"), (200, b'{"new": []}'))
         questions.return_value = frozenset({"q1", "q2"})
-        self.assertEqual(self.post("/console/news", "open=changes"), (200, b'{"new": ["questions"]}'))
-        self.assertEqual(self.post("/console/news", "open=questions"), (200, b'{"new": []}'))
+        self.assertEqual(self.post("/console/news", "open=images"), (200, b'{"new": ["review"]}'))
+        self.assertEqual(self.post("/console/news", "open=review"), (200, b'{"new": []}'))
         # The Rebuilds page names no open page; the marks still follow new items.
         questions.return_value = frozenset({"q1", "q2", "q3"})
-        self.assertEqual(self.post("/console/news", "open="), (200, b'{"new": ["questions"]}'))
-        for body in ("open=nowhere", "", "open=changes&open=questions"):
+        self.assertEqual(self.post("/console/news", "open="), (200, b'{"new": ["review"]}'))
+        for body in ("open=nowhere", "", "open=images&open=review"):
             with self.subTest(body=body):
                 self.assertEqual(self.post("/console/news", body)[0], 400)
         self.assertEqual(self.request("/console/" + console.SEEN_NAME).status, 404)
@@ -189,7 +199,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         item = investigation.file(owner, "Find the cause", "Why?")
         fields = {"owner": owner, "id": item.id,
                   "token": investigations_page.request_token(self.root, owner, item.id)}
-        self.assertEqual(self.request(investigations_page.PAGE_PATH).status, 200)
+        self.assertEqual(self.request(investigations_page.PAGE_PATH).status, 303)
         self.assertEqual(self.post(investigations_page.PAGE_PATH, urlencode(fields))[0], 400)
         _ = investigation.answer(owner, item.id, "Found it.")
         for body in (urlencode({**fields, "token": "bad"}), urlencode(fields) + '&owner=other'):
@@ -343,6 +353,31 @@ class ReviewLinksServerTests(unittest.TestCase):
             reply = self.request(accounts_page.PAGE_PATH)
         self.assertEqual((reply.status, reply.content_type, reply.body), (200, "text/html; charset=utf-8", b"<p>board</p>"))
         render.assert_called_once_with()
+        with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
+            for result, expected, body in (
+                (accounts_page.Saved(), 200, {"state": "saved"}),
+                (accounts_page.Refused("Unknown key."), 400, {"reason": "Unknown key."}),
+                (accounts_page.SaveFailed("tune: refused"), 503, {"reason": "tune: refused"}),
+            ):
+                with self.subTest(result=result), patch.object(accounts_page, "save_color", return_value=result) as save:
+                    status, content = self.post(accounts_page.PAGE_PATH, "key=role.worker&value=%23af875f")
+                    self.assertEqual((status, json.loads(content)), (expected, body))
+                    save.assert_called_once_with("role.worker", "#af875f")
+                with self.subTest(move=result), patch.object(accounts_page, "save_next_move", return_value=result) as move:
+                    status, content = self.post(accounts_page.PAGE_PATH, "group=units&to=claude2")
+                    self.assertEqual((status, json.loads(content)), (expected, body))
+                    move.assert_called_once_with("units", "claude2")
+            for form in ("", "key=account.claude1", "label=claude1&value=x", "key=account.claude1&value=x&value=y",
+                         "key=account.claude1&value=x&extra=y", "group=units", "group=units&to=claude2&value=x",
+                         "key=account.claude1&to=claude2"):
+                with (self.subTest(form=form), patch.object(accounts_page, "save_color") as save,
+                      patch.object(accounts_page, "save_next_move") as move):
+                    status, _ = self.post(accounts_page.PAGE_PATH, form)
+                    self.assertEqual(status, 400)
+                    save.assert_not_called()
+                    move.assert_not_called()
+        with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b"new color", .5, 101)):
+            self.assertEqual(self.request(accounts_page.PAGE_PATH).body, b"new color")
 
     def test_accounts_cache_keeps_the_page_during_one_render_and_after_a_failure(self) -> None:
         cache = serve.AccountsPageCache()

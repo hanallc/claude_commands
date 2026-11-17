@@ -487,13 +487,17 @@ def ci_step_label(runner: str, job: str) -> str:
     return " · ".join(" ".join(part.split()) for part in label.split(" · ") if part.strip())
 
 
-class RunRow(RowQueueNotes):
+class SlotPlace(TypedDict):
+    # The slot folder's name and machine; the Disks page finds the step that holds a slot by them.
+    slot_folder: NotRequired[str]
+    slot_machine: NotRequired[str]
+
+
+class RunRow(RowQueueNotes, SlotPlace):
     admitted: NotRequired[bool]
     machine: NotRequired[str]
     vcpus: NotRequired[int | queue_view.UnknownCpuCount]
     slot: NotRequired[int | Literal["—"]]
-    slot_folder: NotRequired[str]
-    slot_machine: NotRequired[str]
     tokens: NotRequired[int]
     age: NotRequired[str]
     between_steps: NotRequired[bool]
@@ -612,7 +616,7 @@ class SwapReading:
     files_read: int
 
 
-class WaitRow(RowQueueNotes):
+class WaitRow(RowQueueNotes, SlotPlace):
     kind: NotRequired[Literal["repository-slot"]]
     name: str
     showrunner: str
@@ -633,7 +637,7 @@ class MemoryWaitRow(WaitRow):
     place: int
 
 
-class MacBuildRow(RowQueueNotes):
+class MacBuildRow(RowQueueNotes, SlotPlace):
     kind: Literal["mac-build"]
     name: str
     repository: str
@@ -1043,19 +1047,19 @@ def build_slot_number(folder: str, machine: str, roots: Mapping[str, str], *, ho
     return int(match[1]) if match and run_folder.parent == configured else "—"
 
 
-class SlotNotes(TypedDict):
+class SlotNotes(SlotPlace):
     slot: int | Literal["—"]
-    # The slot folder's name and machine; the Disks page finds the run that holds a slot by them.
-    slot_folder: NotRequired[str]
-    slot_machine: NotRequired[str]
+
+
+def slot_place(number: int | Literal["—"], folder: str, machine: str) -> SlotPlace:
+    """The slot folder and machine of a step in slot number; empty for a step in no slot."""
+    return {} if number == "—" else {"slot_folder": Path(os.path.normpath(folder)).name, "slot_machine": machine}
 
 
 def build_slot(folder: str, machine: str, roots: Mapping[str, str], *, home: str) -> SlotNotes:
     """A run's slot number, and the slot folder and machine when the run is in a slot."""
     number = build_slot_number(folder, machine, roots, home=home)
-    if number == "—":
-        return {"slot": number}
-    return {"slot": number, "slot_folder": Path(os.path.normpath(folder)).name, "slot_machine": machine}
+    return {"slot": number, **slot_place(number, folder, machine)}
 
 
 def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading,
@@ -2114,6 +2118,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         "why": wait_why(waiter.reason),
                         **(NO_TARGET_NOTES if ci_label else target_notes(
                             waiter.route, routes, waiter.step, waiter.folder, waiter.package)),
+                        # A waiting step names its slot, so the Disks page names the slot's work as this row does.
+                        **slot_place(build_slot_number(waiter.folder, host_name(), slot_roots, home=slot_homes[host_name()]),
+                                     waiter.folder, host_name()),
                         **job_notes(job, identity.unit, names)})
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)

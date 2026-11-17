@@ -15,7 +15,7 @@ import subprocess
 from copy import deepcopy
 from datetime import datetime, timezone
 from dataclasses import replace
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -2092,6 +2092,18 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertIn(result.pane, errors.getvalue())
                 self.assertIn("launched agent process changed", errors.getvalue())
 
+    def test_damaged_detached_record_prevents_idle_proof(self) -> None:
+        row = self.worker()
+        self.world.add(row, "w1:p1", live=False)
+        stopped = self.observation(row)
+        assert isinstance(stopped, worker_panes.StoppedWorker)
+        run = self.root / "run"
+        path = run / "detached_runs/000-damaged.json"
+        write_text_atomic(path, "{")
+        with self.assertRaises(worker_lifecycle.WorkerStateUnreadable) as raised:
+            _ = worker_panes.can_close(stopped, run=worker_panes.DispatchRun(run))
+        self.assertEqual(raised.exception.path, path)
+
     def test_active_submission_holds_the_worker_after_the_launcher_returns(self) -> None:
         opened = self.start()
         assert isinstance(opened, worker_panes.OpenWorker)
@@ -2331,6 +2343,183 @@ class WorkerPaneTests(StaffTestCase):
         second = self.start("second")
         self.assertIsInstance(second, worker_panes.OpenWorker)
         self.assertEqual(self.world.launches[1], herdr.SplitPane(first.pane, "down", 0.75, "unit-second"))
+
+    def failed_native_split(self, session: str, destination: herdr.SplitPane,
+                            prepared: herdr.PreparedAgentEnvironment, kind: str, arguments: list[str],
+                            opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *,
+                            agent: str, agent_name: str | herdr.AgentNameSource,
+                            code: str = "pane_not_found") -> herdr.AgentLaunched:
+        panes = deepcopy(self.world.locations)
+        launches = self.world.launches.copy()
+        path = pane_launch.record_directory() / f"{session}.json"
+        records = pane_launch.read_valid_entries(path)
+        with (patch.object(self.world, "result", side_effect=herdr_types.HerdrFailure(
+                    f"herdr pane split: {code}: pane not found", code)) as split,
+              patch.object(self.world, "label_pane") as label,
+              patch.object(self.world, "run_in_pane") as run,
+              patch.object(herdr, "start_agent") as start,
+              patch.object(pane_launch, "write") as write,
+              self.assertRaises(herdr_types.HerdrFailure) as failed):
+            _ = LAUNCH_PREPARED_AGENT(session, destination, prepared, kind, arguments, opening, timeout_ms,
+                                     agent=agent, agent_name=agent_name, client=self.world)
+        self.assertEqual(split.call_count, 1)
+        self.assertEqual(split.call_args.args[:3], ("pane", "split", destination.of_pane))
+        label.assert_not_called()
+        run.assert_not_called()
+        start.assert_not_called()
+        write.assert_not_called()
+        self.assertEqual(self.world.locations, panes)
+        self.assertEqual(self.world.launches, launches)
+        self.assertEqual(pane_launch.read_valid_entries(path), records)
+        raise failed.exception
+
+    def start_with_closing_anchor(self, *, hook_before_selection: bool) -> None:
+        from scripts.herdr import turn_end
+
+        siblings = [self.start(role, role) for role in ("fix", "review", "test")]
+        assert all(isinstance(result, worker_panes.OpenWorker) for result in siblings)
+        sibling = siblings[-1]
+        assert isinstance(sibling, worker_panes.OpenWorker)
+        attempts: list[herdr.SplitPane] = []
+
+        def start_during_close(close_anchor: Callable[[], None]) -> worker_panes.WorkerStart:
+            def split(session: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
+                      prepared: herdr.PreparedAgentEnvironment, kind: str, arguments: list[str],
+                      opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *, agent: str,
+                      agent_name: str | herdr.AgentNameSource = herdr.AgentNameSource.MEMBER_REFERENCE) -> herdr.AgentLaunched:
+                assert isinstance(destination, herdr.SplitPane)
+                attempts.append(destination)
+                if len(attempts) == 1:
+                    self.assertEqual(destination.of_pane, sibling.pane)
+                    close_anchor()
+                    self.assertNotIn(sibling.pane, self.world.locations)
+                    return self.failed_native_split(session, destination, prepared, kind, arguments, opening,
+                                                    timeout_ms, agent=agent, agent_name=agent_name)
+                self.assertEqual(len(attempts), 2)
+                self.assertEqual(destination, herdr.SplitPane("w1:p0", "right", 0.667, "unit-impl"))
+                return self.world.launch(session, destination, prepared, kind, arguments, opening, timeout_ms,
+                                         agent=agent, agent_name=agent_name)
+
+            with patch.object(herdr, "launch_prepared_agent", side_effect=split):
+                return self.start("impl")
+
+        event = turn_end.WorkerEvent(str(sibling.row.current_session), reply="ready")
+        with redirect_stderr(io.StringIO()) as notes:
+            if hook_before_selection:
+                close = worker_panes.close
+                starts: list[worker_panes.WorkerStart] = []
+
+                def close_during_selection(parent: worker_panes.StaffId, name: staff.WorkerName, *,
+                                           lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse
+                                               = worker_panes.WorkerLockAtUse.ACQUIRE
+                                           ) -> worker_panes.Closed | worker_panes.Kept | worker_panes.UncertainWorker:
+                    self.assertIsInstance(lock, worker_panes.WorkerLockHold)
+                    closed: list[worker_panes.Closed | worker_panes.Kept | worker_panes.UncertainWorker] = []
+
+                    def close_anchor() -> None:
+                        closed.append(close(parent, name, lock=lock))
+
+                    starts.append(start_during_close(close_anchor))
+                    self.assertEqual(len(closed), 1)
+                    return closed[0]
+
+                with patch.object(worker_panes, "close", side_effect=close_during_selection):
+                    self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.IGNORED)
+                self.assertEqual(len(starts), 1)
+                result = starts[0]
+            else:
+                def close_anchor() -> None:
+                    self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.IGNORED)
+
+                result = start_during_close(close_anchor)
+        self.assertIsInstance(result, worker_panes.OpenWorker, notes.getvalue())
+        assert isinstance(result, worker_panes.OpenWorker)
+        self.assertIn(result.pane, self.world.locations)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(len(self.world.launches), 4)
+        self.assertEqual(self.world.closed, [(sibling.pane, sibling.terminal)])
+
+    def test_first_implementation_split_keeps_its_anchor_until_ready_hooks_can_close_it(self) -> None:
+        self.start_with_closing_anchor(hook_before_selection=False)
+
+    def test_sibling_split_falls_back_when_the_ready_hook_already_holds_the_worker_lock(self) -> None:
+        self.start_with_closing_anchor(hook_before_selection=True)
+
+    def start_after_siblings_close_before_layout(self, *, parent_in_layout: bool) -> None:
+        from scripts.herdr import turn_end
+
+        siblings = [self.start(role, role) for role in ("fix", "review", "test")]
+        assert all(isinstance(result, worker_panes.OpenWorker) for result in siblings)
+        opened = [result for result in siblings if isinstance(result, worker_panes.OpenWorker)]
+        request = self.world.socket_request
+        closed = False
+
+        def export_after_close(method: str, **params: object) -> dict[str, object]:
+            nonlocal closed
+            if method == "layout.export" and not closed:
+                closed = True
+                for sibling in opened:
+                    self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(sibling.row.current_session), reply="ready")),
+                                     turn_end.TurnOutcome.IGNORED)
+                self.assertEqual(set(self.world.locations), {"w1:p0"})
+                if not parent_in_layout:
+                    return {"layout": {"root": {"type": "pane", "pane_id": "w1:unrelated"}}}
+            return request(method, **params)
+
+        with patch.object(self.world, "socket_request", side_effect=export_after_close), redirect_stderr(io.StringIO()) as notes:
+            result = self.start("impl")
+        self.assertTrue(closed)
+        self.assertEqual(self.world.closed, [(sibling.pane, sibling.terminal) for sibling in opened])
+        if parent_in_layout:
+            self.assertIsInstance(result, worker_panes.OpenWorker, notes.getvalue())
+            self.assertEqual(len(self.world.launches), 4)
+            self.assertEqual(self.world.launches[-1], herdr.SplitPane("w1:p0", "right", 0.667, "unit-impl"))
+        else:
+            self.assertIsInstance(result, worker_panes.UncertainWorker)
+            assert isinstance(result, worker_panes.UncertainWorker)
+            self.assertEqual(result.reason, "worker panes are absent from the split tree")
+            self.assertEqual(len(self.world.launches), 3)
+
+    def test_all_siblings_closed_before_layout_use_the_parent_anchor(self) -> None:
+        self.start_after_siblings_close_before_layout(parent_in_layout=True)
+
+    def test_a_layout_without_siblings_or_the_parent_keeps_the_start_uncertain(self) -> None:
+        self.start_after_siblings_close_before_layout(parent_in_layout=False)
+
+    def assert_split_failures(self, *, sibling: bool, codes: tuple[str, ...]) -> None:
+        if sibling:
+            self.assertIsInstance(self.start("fix", "fix"), worker_panes.OpenWorker)
+        attempts: list[herdr.SplitPane] = []
+
+        def split(session: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
+                  prepared: herdr.PreparedAgentEnvironment, kind: str, arguments: list[str],
+                  opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *, agent: str,
+                  agent_name: str | herdr.AgentNameSource = herdr.AgentNameSource.MEMBER_REFERENCE) -> herdr.AgentLaunched:
+            assert isinstance(destination, herdr.SplitPane)
+            attempts.append(destination)
+            self.assertLessEqual(len(attempts), len(codes))
+            return self.failed_native_split(session, destination, prepared, kind, arguments, opening,
+                timeout_ms, agent=agent, agent_name=agent_name, code=codes[len(attempts) - 1])
+
+        with patch.object(herdr, "launch_prepared_agent", side_effect=split), redirect_stderr(io.StringIO()):
+            result = self.start("failed")
+        self.assertIsInstance(result, worker_panes.UncertainWorker)
+        self.assertEqual(len(attempts), len(codes))
+        if sibling:
+            self.assertNotEqual(attempts[0].of_pane, "w1:p0")
+        else:
+            self.assertEqual(attempts[0].of_pane, "w1:p0")
+        if len(codes) == 2:
+            self.assertEqual(attempts[1], herdr.SplitPane("w1:p0", "right", 0.667, "unit-failed"))
+
+    def test_other_split_errors_do_not_retry_from_the_parent(self) -> None:
+        self.assert_split_failures(sibling=True, codes=("split_failed",))
+
+    def test_a_missing_parent_anchor_does_not_retry(self) -> None:
+        self.assert_split_failures(sibling=False, codes=("pane_not_found",))
+
+    def test_a_failed_parent_fallback_does_not_retry(self) -> None:
+        self.assert_split_failures(sibling=True, codes=("pane_not_found", "pane_not_found"))
 
     def test_start_rerun_after_agent_exit_keeps_the_same_pane(self) -> None:
         row = self.worker(family="codex")

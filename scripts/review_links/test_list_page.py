@@ -25,10 +25,11 @@ from uuid import uuid4
 from scripts.agents.remote import local_machine
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.production import change_review, change_routing, session_staff, showrunners, staff, the_list
+from scripts.production import change_review, change_routing, delivery_state, investigation, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page
 from scripts.review_links import change_browser, change_page
+from scripts.review_links import review_items, review_page
 from scripts.review_links.test_change_page import BrowserForms
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.statusline import counts_row, rebuild_row
@@ -94,9 +95,11 @@ class ListPageTests(unittest.TestCase):
             self.assertIn(f'<option value="{value}">{label}</option>', body)
         self.assertIn('<option value="' + OWNER.id + '">sdlc</option>', body)
         self.assertIn('<option value="' + OTHER.id + '">builds</option>', body)
-        for text in ('Latest status', 'Done when', 'Evidence', 'Log · newest first', 'Links', 'Closing words',
-                     'Check overdue', '14:00 EST', '15:00 EST', 'https://example.invalid/proof?x=1&amp;y=2'):
+        for text in ('Latest status', 'Done when', 'Log · newest first', 'Links', 'Closing words',
+                     'Check overdue', '14:00 EST', '15:00 EST'):
             self.assertIn(text, body)
+        self.assertNotIn('<h3>Evidence</h3>', body)
+        self.assertEqual(the_list.load(MORTY.id, items[0].id).evidence, items[0].evidence)
         self.assertEqual(body.count('<form method="post" data-feedback-form>'), 6)
         self.assertEqual(body.count('value="read">Mark read</button>'), 6)
         self.assertEqual([entry.item.number for entry in list_page.records()],
@@ -109,6 +112,115 @@ class ListPageTests(unittest.TestCase):
         self.assertNotIn('<script>New title', changed)
         self.assertIn('New status', changed)
 
+    def test_linked_reviews_share_one_current_read_and_link_to_the_review_cards(self) -> None:
+        def change(identity: str, state: review_items.ReviewState) -> review_items.ReviewItem:
+            source = review_items.ChangeSource(self.root / "changes.md", {"#": identity},
+                change_routing.ChangeAssignment(change_routing.ShowrunnerOwnChange(OWNER.id, OWNER.name), self.root / "sdlc.md"),
+                delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery()))
+            return review_items.ReviewItem("sdlc/" + identity, identity, review_items.ReviewType.CHANGE,
+                OWNER.id, OWNER.id, "Check " + identity, state, review_items.ReviewTimes(NOW, NOW), (), (), source)
+
+        ready = (change("C1", review_items.ReviewState.FOR_YOU), change("C2", review_items.ReviewState.FOR_YOU))
+        waiting = change("C3", review_items.ReviewState.WAITING)
+        done = change("C4", review_items.ReviewState.DONE)
+        later = replace(change("C5", review_items.ReviewState.FOR_YOU),
+                        times=review_items.ReviewTimes(NOW, NOW, NOW + timedelta(days=1)))
+        question = investigation.file(OWNER.id, "Find the cause", "Why did it stop?")
+        _ = investigation.answer(OWNER.id, question.id, "The cause is known.")
+        answer = review_items.investigation_items(staff.snapshot())[0]
+        reviews = [*ready, waiting, done, later, answer]
+        cases = (
+            ((ready[0].key, ready[1].key), "2 changes for you"),
+            ((ready[0].key, answer.key), "2 reviews for you"),
+            ((waiting.key, done.key, "missing/C9"), "1 review waiting on others"),
+            ((waiting.key, later.key), "2 reviews waiting on others"),
+            ((answer.key,), "1 review for you"),
+            ((done.key,), "Reviews done — decide: close, keep or park"),
+            (("missing/C9",), "Reviews done — decide: close, keep or park"),
+            ((), ""),
+            ((later.key,), "1 review waiting on others"),
+            ((ready[0].key, waiting.key, done.key), "1 change for you"),
+        )
+        items: list[the_list.ListItem] = []
+        for index, (identities, _) in enumerate(cases):
+            item = self.add(f"Review group {index}")
+            items.append(the_list.link(MORTY.id, item.id, identities, source="morty"))
+        paths = [the_list.folder(MORTY.id) / f"{item.id}.md" for item in items]
+        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+        root = self.root / "reviews"
+        with patch.object(review_items, "read", return_value=reviews) as read, patch.object(list_page, "counts_strip", return_value=""):
+            body = list_page.render(root).decode()
+        read.assert_called_once_with(root, members=staff.snapshot())
+        for item, (identities, expected) in zip(items, cases):
+            with self.subTest(item=item.id):
+                row = body.split(f'data-key="{MORTY.id}/{item.id}"', 1)[1].split('</tbody>', 1)[0]
+                state = row.split('<td data-label="State">', 1)[1].split('</td>', 1)[0]
+                if not identities:
+                    self.assertNotIn(review_page.PAGE_PATH, row)
+                    continue
+                self.assertIn(expected, state)
+                self.assertEqual(row.count(expected), 2)
+                self.assertIn(f'href="{review_page.PAGE_PATH}" target="_top">{expected}</a>', state)
+                detail = row.split('<div class="list-panel"><div>', 1)[1]
+                self.assertLess(detail.index(expected), detail.index('<form'))
+                positions: list[int] = []
+                for identity in identities:
+                    matching = [review for review in reviews if review.key == identity]
+                    if matching:
+                        href = html.escape(review_page.PAGE_PATH + '#' + urlencode({"item": identity}), quote=True)
+                        card = f'<a href="{href}" target="_top">{html.escape(matching[0].id)}</a>'
+                    else:
+                        card = html.escape(identity)
+                        self.assertNotIn('#' + urlencode({"item": identity}), detail)
+                    self.assertIn(card, detail)
+                    positions.append(detail.index(card))
+                self.assertEqual(positions, sorted(positions))
+        with patch.object(review_items, "read", return_value=[
+                replace(review, state=review_items.ReviewState.DONE) for review in reviews]) as read:
+            refreshed = list_page.render(root).decode()
+        read.assert_called_once()
+        first = refreshed.split(f'data-key="{MORTY.id}/{items[0].id}"', 1)[1].split('</tbody>', 1)[0]
+        self.assertIn("Reviews done — decide: close, keep or park", first)
+        self.assertNotIn("2 changes for you", first)
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
+
+    def test_unlinked_rows_do_not_read_the_review_stores(self) -> None:
+        _ = self.add("Work without reviews")
+        with patch.object(review_items, "read", side_effect=AssertionError("No review read is needed")) as read:
+            body = list_page.render(self.root / "reviews").decode()
+        read.assert_not_called()
+        self.assertIn('<strong>Work without reviews</strong>', body)
+        self.assertNotIn("Reviews done — decide", body)
+
+    def test_review_keys_keep_duplicate_ids_distinct_and_link_only_supported_cards(self) -> None:
+        source = review_items.ChangeSource(self.root / "changes.md", {"#": "C1"},
+            change_routing.ChangeAssignment(change_routing.ShowrunnerOwnChange(OWNER.id, OWNER.name), self.root / "sdlc.md"),
+            delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery()))
+        ready = review_items.ReviewItem("change/sdlc/C1", "C1", review_items.ReviewType.CHANGE,
+            OWNER.id, OWNER.id, "Check C1", review_items.ReviewState.FOR_YOU, review_items.ReviewTimes(NOW, NOW), (), (), source)
+        done = replace(ready, key="change/builds/C1", state=review_items.ReviewState.DONE)
+        proposal = replace(ready, key="proposal/sdlc/P1", id="P1", type=review_items.ReviewType.PROPOSAL,
+                           source=review_items.ProposalLedgerSource(self.root / "proposals.md"))
+        efficiency = replace(proposal, key="efficiency/sdlc/E1", id="sdlc/E1", type=review_items.ReviewType.EFFICIENCY,
+                             source=review_items.EfficiencySource(self.root / "efficiencies.md", "Result"))
+        for review, expected in ((ready, "1 change for you"), (done, "Reviews done — decide: close, keep or park"),
+                                 (proposal, "1 review for you"), (efficiency, "1 review for you")):
+            with self.subTest(key=review.key):
+                item = self.add("Review " + review.key)
+                _ = the_list.link(MORTY.id, item.id, (review.key,), source="morty")
+                with patch.object(review_items, "read", return_value=[ready, done, proposal, efficiency]) as read, patch.object(
+                        list_page, "counts_strip", return_value=""):
+                    body = list_page.render(self.root / "reviews").decode()
+                read.assert_called_once()
+                row = body.split(f'data-key="{MORTY.id}/{item.id}"', 1)[1].split('</tbody>', 1)[0]
+                self.assertIn(expected, row)
+                card = review_page.PAGE_PATH + '#' + urlencode({"item": review.key})
+                if review.type in review_page.TYPES:
+                    self.assertIn(f'<a href="{html.escape(card, quote=True)}" target="_top">{review.id}</a>', row)
+                else:
+                    self.assertNotIn(card, row)
+                    self.assertIn('<p>' + review.id + '</p>', row)
+
     def test_unknown_owners_and_unassigned_owners_keep_their_labels(self) -> None:
         missing = staff.StaffId("owner-without-row")
         for owner in (missing, the_list.UnassignedOwner.NATE, the_list.UnassignedOwner.NOT_RECORDED):
@@ -118,6 +230,45 @@ class ListPageTests(unittest.TestCase):
             self.assertIn('>' + label + '</option>', body)
         _ = (self.root / "staff.json").write_text('{"schema":1,"rows":[]}')
         self.assertEqual(len(list_page.records()), 3)
+
+    def test_feedback_button_belongs_to_the_words_box_and_starts_disabled(self) -> None:
+        item = self.add("Explain this item")
+        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret")
+        actions, words = form.split('</div>', 1)
+        self.assertNotIn('value="tell"', actions)
+        self.assertNotIn('<label for="words-', words)
+        self.assertIn('placeholder="Your words for morty about this item"', words)
+        self.assertIn('aria-label="Your words for morty about this item"', words)
+        self.assertIn('</textarea><div class="list-tell"><span role="status" data-send-status></span>'
+                      + '<button name="action" value="tell" disabled>Tell morty</button></div>', words)
+        self.assertIn("!words.value.trim()", list_page.SCRIPT)
+        self.assertIn("words.addEventListener('input',retain)", list_page.SCRIPT)
+        self.assertIn("buttons.forEach(button=>button.disabled=false);syncTell()", list_page.SCRIPT)
+
+    def test_record_fields_share_the_markdown_formatter(self) -> None:
+        item = self.add("Formatted record")
+        names = (("latest_status", "Status"), ("done_when", "Completion"), ("next_step", "Next"))
+
+        def text(heading: str) -> str:
+            return f"## {heading}\n\n**{heading} field:** Ready.\n- One\n- Two"
+
+        _ = the_list.update(MORTY.id, item.id, {"latest_status": text("Status"), "done_when": text("Completion"),
+            "evidence": text("Evidence"), "next_step": text("Next")}, source="morty")
+        _ = the_list.close(MORTY.id, item.id, "## Closing\n\n**Closing field:** Closed.\n1. First\n2. Second", source="nate")
+        body = list_page.render(self.root / "reviews").decode()
+        next_step = body.split('<td data-label="Next step">', 1)[1].split('</td>', 1)[0]
+        details = body.split('<div class="list-panel"><div>', 1)[1].split('<section><h3>Log · newest first', 1)[0]
+        self.assertNotIn('<h3>Evidence</h3>', details)
+        self.assertNotIn('<h2>Evidence</h2>', details)
+        self.assertEqual(the_list.load(MORTY.id, item.id).evidence, text("Evidence"))
+        for _, heading in (*names, ("closing_words", "Closing")):
+            rendered = next_step if heading == "Next" else details
+            self.assertIn(f'<h2>{heading}</h2>', rendered)
+            self.assertIn(f'<strong>{heading} field:</strong>', rendered)
+            self.assertNotIn('**', rendered)
+            self.assertNotIn('## ', rendered)
+        self.assertIn('<ul><li>One</li><li>Two</li></ul>', details)
+        self.assertIn('<ol><li>First</li><li>Second</li></ol>', details)
 
     def test_bad_records_leave_valid_rows_and_nav_news(self) -> None:
         good = self.add("Valid item")
@@ -262,7 +413,8 @@ class ListPageTests(unittest.TestCase):
             self.assertNotIn("<small>sent to morty,", list_page.render(root).decode())
             good = self.fields(item, "tell", words="Keep it.")
             for body in (urlencode({**good, "token": "bad"}), urlencode(good) + '&id=L2',
-                         urlencode({**good, "words": ""}), urlencode({**good, "action": "unknown"}),
+                         urlencode({**good, "words": ""}), urlencode({**good, "words": " \t\n "}),
+                         urlencode({**good, "action": "unknown"}),
                          urlencode({**good, "action": "park", "until": "2026-02-30"})):
                 with self.subTest(body=body), self.assertRaises(ValueError):
                     _ = list_page.submit(root, body)
@@ -439,6 +591,13 @@ const visible=()=>rows().filter(row=>!row.hidden);
 const change=(id,value,event='change')=>{const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event(event,{bubbles:true}));};
 try{
  await flush();
+ if(innerWidth>=960){
+  check(document.querySelector('main').getBoundingClientRect().width===1124,'the desktop uses the shared column width');
+  for(const header of document.querySelectorAll('[data-sort]')){
+   const label=document.createRange();label.selectNodeContents(header.firstChild);
+   check(label.getClientRects().length===1,'the desktop header fits on one line: '+header.textContent);
+  }
+ }
  check(visible().map(row=>row.dataset.number).join(',')==='58,105,106','the default order and Open filter');
  document.querySelector('[data-sort="0"]').click();
  check(visible().map(row=>row.dataset.number).join(',')==='58,105,106','the number sort is numeric');
@@ -466,7 +625,20 @@ try{
  change('list-search','console','input');
  const selected=visible().find(row=>row.dataset.number==='106');selected.querySelector('.list-toggle').click();
  check(!selected.querySelector('[data-detail]').hidden,'a row opens');
- const words=selected.querySelector('textarea');words.value='Keep my draft';words.dispatchEvent(new Event('input'));
+ const words=selected.querySelector('textarea'),tell=selected.querySelector('[value="tell"]');
+ check(tell.textContent==='Tell morty','the button names its recipient');
+ check(words.placeholder==='Your words for morty about this item' && words.getAttribute('aria-label')===words.placeholder,'the words box has its accessible name');
+ check(!selected.querySelector('label[for="'+words.id+'"]'),'the words box has no repeated visible label');
+ check(!tell.closest('.list-actions') && tell.parentElement.querySelector('[data-send-status]'),'the status stays beside the separate primary button');
+ const wordsRect=words.getBoundingClientRect(),tellRect=tell.getBoundingClientRect();
+ check(tellRect.top>=wordsRect.bottom && Math.abs(tellRect.right-wordsRect.right)<1,'the button sits below the box at its right edge');
+ check(tell.disabled,'empty words disable Tell morty');
+ words.value=' \t\n ';words.dispatchEvent(new Event('input'));
+ check(tell.disabled,'spaces disable Tell morty');
+ const emptyPosts=posts.length;tell.click();check(posts.length===emptyPosts,'empty words cannot send');
+ words.value='x';words.dispatchEvent(new Event('input'));check(!tell.disabled,'typed text enables Tell morty immediately');
+ words.value='';words.dispatchEvent(new Event('input'));check(tell.disabled,'cleared words disable Tell morty immediately');
+ words.value='Keep my draft';words.dispatchEvent(new Event('input'));
  const field=document.querySelector('#list-search');field.focus();field.setSelectionRange(1,3);
  document.body.style.minHeight='2400px';scrollTo(0,100);
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
@@ -477,6 +649,7 @@ try{
  check(document.activeElement.selectionStart===1 && document.activeElement.selectionEnd===3,'refresh keeps the selection');
  check(!refreshed.querySelector('[data-detail]').hidden,'refresh keeps open rows');
  check(refreshed.querySelector('textarea').value==='Keep my draft','refresh keeps feedback words');
+ check(!refreshed.querySelector('[value="tell"]').disabled,'a restored draft enables Tell morty');
  check(scrollY===100,'refresh keeps scroll');
  realFeedback=true;loseResponse=true;
  let retryForm=rows().find(row=>row.dataset.number==='106').querySelector('form');
@@ -494,6 +667,7 @@ try{
  check(posts.at(-1).get('request')===retryId && posts.at(-1).get('token')===retryToken,'the retry uses its original signature');
  retryForm=rows().find(row=>row.dataset.number==='106').querySelector('form');
  check(retryForm.elements.request.value!==retryId,'success clears the saved retry identity');
+ check(retryForm.elements.words.value==='' && retryForm.querySelector('[value="tell"]').disabled,'a successful send clears the box and disables Tell morty');
  realFeedback=false;failRefresh=true;
  const requestIds=[];
  for(const action of ['read','remove','park','tell']){
@@ -502,18 +676,34 @@ try{
   requestIds.push(form.elements.request.value);
   holdPost=action==='tell';
   form.requestSubmit(form.querySelector('[value="'+action+'"]'));
-  if(holdPost){await flush();form.elements.words.value='New draft during send';form.elements.words.dispatchEvent(new Event('input'));finishPost();}
+  if(holdPost){await flush();form.elements.words.value='New draft during send';form.elements.words.dispatchEvent(new Event('input'));
+   check(form.querySelector('[value="tell"]').disabled,'editing words during delivery keeps Tell morty disabled');finishPost();}
   check(form.querySelector('[data-send-status]').textContent===(action==='read' ? 'Saving…' : 'Sending…'),'immediate response '+action);
   await flush();await flush();
   check(posts.at(-1).get('action')===action && posts.at(-1).get('id')==='L106','signed feedback '+action);
   check(posts.at(-1).get('token').length===64,'the form carries its token');
   check(form.elements.request.value!==requestIds.at(-1),'success renews the request without refresh');
-  if(action==='tell') check(form.elements.words.value==='New draft during send','a newer draft survives the send');
+  if(action==='tell'){
+   check(form.elements.words.value==='New draft during send','a newer draft survives the send');
+   check(!form.querySelector('[value="tell"]').disabled,'the newer draft enables Tell morty after delivery');
+  }
   check(!rows().find(row=>row.dataset.number==='106').querySelector('[data-detail]').hidden,'feedback keeps the row open');
  }
  check(new Set(requestIds).size===4,'each new action uses a fresh request');
  location.hash=new URLSearchParams({show:'closed',sort:'#',dir:'desc'});await flush();
  check(visible().length===1 && visible()[0].dataset.number==='54','hash navigation restores the filters');
+
+ for(const target of rows().filter(row=>['Done','Closed'].includes(row.dataset.state) || row.dataset.parked==='true')){
+  location.hash=new URLSearchParams({item:target.dataset.key});await flush();
+  check(!target.hidden && !target.querySelector('[data-detail]').hidden,'an item link shows '+target.dataset.state);
+  check(document.getElementById('list-show').value==='all' && document.getElementById('list-owner').value==='' &&
+    document.getElementById('list-search').value==='','an item link clears filters');
+ }
+ const retained=rows().find(row=>row.dataset.number==='106');
+ location.hash=new URLSearchParams({item:retained.dataset.key,owner:retained.dataset.owner,show:'open',q:'106',sort:'#',dir:'desc'});await flush();
+ check(document.getElementById('list-owner').value===retained.dataset.owner && document.getElementById('list-show').value==='open' &&
+   document.getElementById('list-search').value==='106','an address with an open item keeps its filters');
+ check(!retained.hidden && !retained.querySelector('[data-detail]').hidden,'an address restores its open item');
  check(document.querySelectorAll('[data-feedback-form]').length===6,'each row has feedback controls');
  check(document.documentElement.scrollWidth<=innerWidth,'the page has no horizontal overflow');
  if(innerWidth<960){check(getComputedStyle(visible()[0]).display==='block','a phone row is a card');}

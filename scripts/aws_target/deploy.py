@@ -28,7 +28,7 @@ from typing import cast, final
 from uuid import uuid4
 
 
-from scripts.aws_target import admin_secrets, box, hana_box, hana_spend, ledger, remote, retained, spot_end, teardown
+from scripts.aws_target import admin_secrets, box, hana_box, hana_image, hana_spend, ledger, remote, retained, spot_end, teardown
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
@@ -423,6 +423,71 @@ class Deployment:
         print('Hana setup complete: the box is stopped; placement remains disabled')
         return True
 
+    def hana_image(self, result: Path, *, approve_resources: bool = False) -> bool:
+        """Upload the built Hana image to one snapshot, register it, and save the image and network identity."""
+        built = hana_image.read_built(result)
+        workload = conf.read_or_repository('hana_aws')
+        print(f'Hana image plan: {built.name}; {built.logical_bytes / 2**30:.1f} GiB; boot {built.boot_mode}')
+        print('Hana image resources: one EBS snapshot and one registered image; no instance')
+        print('Hana placement remains disabled')
+        if not approve_resources:
+            return False
+        self._authorize(True)
+        limits = hana_spend.read_settings(workload)
+        settings = replace(read_deployment_settings(self.settings_path), region=limits.region,
+                           timeout_s=workload.whole('aws_timeout_s'))
+        zone = workload.text('availability_zone')
+        upload_timeout = workload.whole('image_upload_timeout_s')
+        api = self._api(settings)
+        with control_lock(self.directory):
+            _ = self._guard()
+            subnets = [row for row in gate_subnets(api, settings.vpc_id) if row['zone'] == zone]
+            if not subnets:
+                raise DeploymentRefused(f'The gate VPC has no available public subnet in {zone}')
+            images = ledger.rows(api.call('describe-images', '--owners', 'self',
+                                          '--filters', 'Name=name,Values=' + built.name), 'Images')
+            if not images:
+                tag = conf.read(self.settings_path)
+                tags = '{Key=%s,Value=%s}' % (tag.text('cost_explorer_tag_key'), tag.text('cost_explorer_tag_value'))
+                raw = self.output / 'hana' / 'image.raw'
+                raw.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    with step('hana-image', 'converting the image to a raw disk', self.settings_path):
+                        _ = self.execute(['qemu-img', 'convert', '-f', built.source_format, '-O', 'raw',
+                                          str(built.file), str(raw)], capture_output=True, text=True,
+                                         timeout=upload_timeout, check=True)
+                    tool = self.execute(['nix', 'build', '--no-link', '--print-out-paths',
+                                         workload.text('image_upload_tool')], capture_output=True, text=True,
+                                        timeout=upload_timeout, check=True).stdout.strip().splitlines()[-1]
+                    with step('hana-image', 'uploading the snapshot', self.settings_path, hint='can take several minutes'):
+                        upload = self.admin.executor(self.execute)(
+                            [tool + '/bin/coldsnap', '--region', settings.region, 'upload', '--wait', '--no-progress',
+                             '--omit-zero-blocks', '--description', built.name, str(raw)],
+                            capture_output=True, text=True, timeout=upload_timeout, check=False)
+                    if upload.returncode or not upload.stdout.strip():
+                        raise DeploymentRefused('the Hana snapshot upload failed: ' + upload.stderr.strip())
+                finally:
+                    raw.unlink(missing_ok=True)
+                snapshot = upload.stdout.strip().splitlines()[-1]
+                with step('hana-image', 'registering the image', self.settings_path):
+                    image = ledger.text(api.call(
+                        'register-image', '--name', built.name, '--architecture', 'x86_64',
+                        '--virtualization-type', 'hvm', '--ena-support', '--sriov-net-support', 'simple',
+                        '--boot-mode', built.boot_mode, '--imds-support', 'v2.0',
+                        '--root-device-name', settings.root_device_name, '--block-device-mappings',
+                        f'DeviceName={settings.root_device_name},Ebs={{SnapshotId={snapshot},VolumeType=gp3,DeleteOnTermination=true}}',
+                        '--tag-specifications', f'ResourceType=image,Tags=[{tags}]',
+                        f'ResourceType=snapshot,Tags=[{tags}]'), 'ImageId')
+                    _ = api.call('wait', 'image-available', '--image-ids', image, timeout_s=upload_timeout)
+                images = ledger.rows(api.call('describe-images', '--image-ids', image), 'Images')
+            if len(images) != 1 or images[0].get('State') != 'available':
+                raise DeploymentRefused('the registered Hana image is not available')
+            path = hana_image.save(self.directory, hana_image.RegisteredImage(
+                built.name, ledger.text(images[0], 'ImageId'), ledger.text(images[0], 'OwnerId'),
+                settings.vpc_id, str(subnets[0]['id'])))
+        print(f'Hana image ready: saved in {path}; placement remains disabled')
+        return True
+
     def _hana_stack_change(self, api: AwsCli, settings: DeploymentSettings, template: Path, parameters: dict[str, str],
                            *, keep: str) -> None:
         """Change the Hana stack through a change set that refuses a box or disk replacement.
@@ -534,7 +599,16 @@ class Deployment:
         """Share the existing deployment validation and use only Hana sizes and prices."""
         workload = conf.read_or_repository('hana_aws')
         limits = hana_spend.read_settings(workload)
-        names = {key: workload.text(key) for key in ('stack_name', 'availability_zone', 'ami_id', 'ami_owner_id', 'vpc_id', 'subnet_id')}
+        # Empty identity values are allowed here; text() refuses an empty value.
+        present = workload.values()
+        names = {key: workload.text(key) for key in ('stack_name', 'availability_zone')}
+        names.update({key: present.get(key, '') for key in ('ami_id', 'ami_owner_id', 'vpc_id', 'subnet_id')})
+        registered = hana_image.saved(self.directory)
+        if isinstance(registered, hana_image.RegisteredImage):
+            # Configured values win; the saved registration keeps cloud identities out of the repository.
+            for key, value in (('ami_id', registered.image), ('ami_owner_id', registered.owner),
+                               ('vpc_id', registered.vpc), ('subnet_id', registered.subnet)):
+                names[key] = names[key] or value
         if not all(names.values()):
             raise DeploymentRefused('Configure the reviewed Hana image, owner, VPC, and subnet before prepare')
         settings = replace(read_deployment_settings(self.settings_path), **names,
@@ -1443,6 +1517,7 @@ class DeploymentArguments(argparse.Namespace):
         self.approve_destroy: bool = False
         self.trial_action: str | None = None
         self.trial_folder: Path = Path()
+        self.image: Path | None = None
 
 
 def main() -> int:
@@ -1453,9 +1528,10 @@ def main() -> int:
         with step('aws-trial', 'running the trial', settings_path):
             return aws_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'apply'))
+    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'hana-image', 'apply'))
     _ = parser.add_argument('trial_action', nargs='?', choices=('run',))
     _ = parser.add_argument('--trial-folder', type=Path)
+    _ = parser.add_argument('--image', type=Path)
     _ = parser.add_argument('--workload', choices=('merge-gates', 'hana'), default='merge-gates')
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
@@ -1486,6 +1562,10 @@ def main() -> int:
             return 0 if deploy.quota_request() else 1
         elif args.command == 'quota-status':
             return 0 if deploy.quota_status() else 1
+        elif args.command == 'hana-image':
+            if args.image is None:
+                raise DeploymentRefused('Use hana-image --image RESULT [--approve-resources]')
+            return 0 if deploy.hana_image(args.image, approve_resources=args.approve_resources) else 1
         elif args.command == 'hana-setup':
             return 0 if deploy.hana_setup(approve_resources=args.approve_resources) else 1
         elif args.command == 'prepare':

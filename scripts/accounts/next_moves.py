@@ -399,13 +399,18 @@ def insert_next_move(entry: NextMove, insertion: AppendToGroup | InsertAt = APPE
         raise NextMoveError(f"next: cannot add entry: {error}") from error
 
 
+def _new_next_move(group: NextMoveGroup, at_percent: float, to: str, hold_minutes: float | HoldMode = 0, *,
+                   fallback_targets: tuple[str, ...] = ()) -> NextMove:
+    # All text-to-domain conversions use the same boundary as file and remote reads.
+    return decode_next_moves(json.dumps([dict(id=uuid4().hex, group=group, at_percent=at_percent,
+        **encode_hold_mode(hold_minutes if isinstance(hold_minutes, (FixedHold, HalfPointHold)) else FixedHold(hold_minutes)),
+        to=to, **{"else": fallback_targets}, added_at=datetime.now(timezone.utc).isoformat())]))[0]
+
+
 def add_next_move(group: NextMoveGroup, at_percent: float, to: str,
                   hold_minutes: float | HoldMode = 0, *, fallback_targets: tuple[str, ...] = (),
                   insertion: AppendToGroup | InsertAt = APPEND_TO_GROUP) -> NextMove:
-    # All text-to-domain conversions use the same boundary as file and remote reads.
-    entry = decode_next_moves(json.dumps([dict(id=uuid4().hex, group=group, at_percent=at_percent,
-        **encode_hold_mode(hold_minutes if isinstance(hold_minutes, (FixedHold, HalfPointHold)) else FixedHold(hold_minutes)),
-        to=to, **{"else": fallback_targets}, added_at=datetime.now(timezone.utc).isoformat())]))[0]
+    entry = _new_next_move(group, at_percent, to, hold_minutes, fallback_targets=fallback_targets)
     if not role_map.is_role_map_host():
         try:
             arguments = ("next-write", encode_next_moves((entry,)))
@@ -420,6 +425,33 @@ def add_next_move(group: NextMoveGroup, at_percent: float, to: str,
         except (OSError, subprocess.TimeoutExpired) as error:
             raise NextMoveError(f"next: remote add failed: {error}") from error
     insert_next_move(entry, insertion)
+    return entry
+
+
+def console_next_move_percent() -> float:
+    """The weekly percent left at which a next move chosen on the console Accounts page runs."""
+    return conf.read("accounts").number("next_move_percent")
+
+
+def set_first_next_move(group: Literal["units", "showrunners"], at_percent: float, to: str) -> NextMove:
+    """Make `to` the group's first next move; the new entry replaces the group's current first entry."""
+    if not role_map.is_role_map_host():
+        if any(entry.group == group for entry in read_next_moves()):
+            remove_next_move(group, FIRST_GROUP_POSITION)
+        return add_next_move(group, at_percent, to, insertion=InsertAt(FIRST_GROUP_POSITION))
+    entry = _new_next_move(group, at_percent, to)
+    watcher = cast(NextMoveEdit, cast(object, import_module("scripts.accounts.refusal_watch")))
+    try:
+        with watcher.editing_next_moves() as edit:
+            entries = list(read_next_moves())
+            first = next((index for index, saved in enumerate(entries) if saved.group == group), None)
+            if first is None:
+                entries.append(entry)
+            else:
+                entries[first] = entry
+            edit.commit(tuple(entries))
+    except OSError as error:
+        raise NextMoveError(f"next: cannot set entry: {error}") from error
     return entry
 
 

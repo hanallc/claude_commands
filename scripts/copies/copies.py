@@ -65,7 +65,6 @@ class ActiveGate:
     tree: Path
     source: Path
     owner: str
-    cargo_dir: Path
 
 
 ACTIVE_GATES: ContextVar[tuple[ActiveGate, ...]] = ContextVar("active_gate_checkouts", default=())
@@ -667,6 +666,8 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
                                         suffix_length=0, suffix=destination.name)
     with build_folders.leased_build_folder(spec) as path:
         scratch.write_record(path, task, moment, scratch_settings=scratch_settings)
+        if scratch.in_session_folder(path):
+            _ = scratch.hold(path, task, "task clone in the session folder", scratch_settings=scratch_settings)
         _ = scratch.update_record(path, lambda record: {
             **(record.fields if isinstance(record, copy_record.Registered) else {}),
             "test_hana_clone": True, "source_path": str(source.resolve()),
@@ -686,7 +687,9 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
                         **(record.fields if isinstance(record, copy_record.Registered) else {}),
                         "claude_trust_folder": str(path.resolve()),
                     }, scratch_settings=scratch_settings)
-                    accounts.set_claude_folder_trust(path, trusted=True)
+                    trust = accounts.set_claude_folder_trust(path, trusted=True)
+                    if isinstance(trust, accounts.FolderTrustFailed):
+                        trust.report()
                 source_commit = git(path, "rev-parse", "HEAD").decode().strip()
                 _ = scratch.update_record(path, lambda record: {
                     **(record.fields if isinstance(record, copy_record.Registered) else {}),
@@ -942,8 +945,7 @@ def end_workspaces(task: str, paths: list[Path], *,
                     if not idle:
                         raise CopyError(f"{tree}: workspace is busy during task completion")
                     validate()
-                    scratch.remove_with_cargo_output(tree, scratch.remove)
-                    scratch.removal_mark(tree).unlink(missing_ok=True)
+                    scratch.remove_marked(tree)
             hold = scratch.holds().get(str(tree.resolve()))
             if hold is not None and hold["task"] == task:
                 _ = scratch.release(tree)
@@ -951,23 +953,21 @@ def end_workspaces(task: str, paths: list[Path], *,
         if not isinstance(record, copy_record.Registered) or record.task != task:
             raise CopyError(f"{tree}: workspace task differs")
         with (workspace_removal_guard(tree, record, run_lock=run_lock) as validate,
-              build_folders.collector_lease(tree, wait=False) as free,
-              claim_tree(tree, create=False) as state):
-            if not free or state is not ClaimState.ACQUIRED:
+              scratch.removal_lock(tree) as idle,
+              scratch.copy_record_lock(tree)):
+            if not idle:
                 raise CopyError(f"{tree}: workspace is busy during task completion")
             def ended(current: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
                 if not isinstance(current, copy_record.Registered) or current.task != task:
                     raise CopyError(f"{tree}: workspace task differs")
                 return {**current.fields, "ended": time.time(), "ended_task": task}
             validate()
-            # A removal marker proves that the first attempt saved the rescue.
+            # A deletion intent preserves ownership but does not certify saved work.
             if isinstance(scratch.pending_removal(tree), copy_record.NotRegistered):
                 _ = scratch.update_record(tree, ended)
-                if "crate_run" in record.fields:
-                    rescue_workspace(tree, record)
             if "crate_run" not in record.fields:
                 continue
-            scratch.remove_marked(tree, scratch.remove)
+            scratch.remove_marked(tree)
         _ = scratch.release(tree)
 
 
@@ -1053,10 +1053,10 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
         tree = slot.path
         descriptor = build_folders.build_folder_lock_fd(tree)
         token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), descriptor))
+        # A value under the slot cache root is another slot's lease, inherited from an outer gate or slot command.
         defaults = {key: value for key, value in slot.env.items()
-                    if key not in os.environ or any(os.environ[key] == str(active.cargo_dir)
-                                                   for active in ACTIVE_GATES.get())}
-        active_token = ACTIVE_GATES.set((*ACTIVE_GATES.get(), ActiveGate(tree, canonical, owner, slot.cargo_dir)))
+                    if key not in os.environ or Path(os.environ[key]).resolve().parent == slot.cargo_dir.parent}
+        active_token = ACTIVE_GATES.set((*ACTIVE_GATES.get(), ActiveGate(tree, canonical, owner)))
         previous = {key: os.environ.get(key) for key in defaults}
         os.environ.update(defaults)
         try:
@@ -1294,9 +1294,6 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
                 with workspace_removal_guard(tree, record) as validate:
                     def rescue_selected() -> None:
                         validate()
-                        if not tree.exists():
-                            return
-                        rescue_workspace(tree, record)
                     if not scratch.end_selected_copy(tree, record, time.time(), validate=rescue_selected):
                         with scratch.judgment_lock(tree) as idle:
                             if not idle:
@@ -1576,6 +1573,7 @@ def mirror_probe_setup(path: str) -> str:
 
 def mark_mirror(tree: Path, owner: str, repo: str, session: str, **extra: object) -> None:
     """Publish mirror metadata before removal authority can disappear."""
+    scratch.exclude_copy_metadata(tree, additional=floor_claims.MIRROR_METADATA)
     write_text_atomic(tree / floor_claims.MIRROR_RECORD, json.dumps({
         "kind": "remote-mirror", "owner": owner, "repo": repo, "session": session, **extra,
     }) + "\n")
@@ -1804,7 +1802,8 @@ def mirror_remove(args: CopyArguments) -> int:
     authority = floor_claims.removal_authority_path(tree)
     with local_mirror_lease(tree, args.session, create=False):
         with mirror_metadata_locks(tree) as claims:
-            if not tree.exists() and not authority.exists():
+            if (not tree.exists() and not authority.exists() and not scratch.removal_mark(tree).exists()
+                    and not scratch.cargo_removal_mark(tree).exists()):
                 return 0
             if tree.exists() and claims.holds(str(tree), tree.parent,
                     exemption=floor_claims.MirrorIdentity(args.host, args.path)):
@@ -1818,7 +1817,7 @@ def mirror_remove(args: CopyArguments) -> int:
                 task_record = copy_record.record_path(tree)
                 # A task clone or a temporary gate goes as one task folder; an editable copy keeps its folder rules.
                 if task_record is not None and copy_record.copy_folder(tree) != tree.resolve():
-                    scratch.remove_marked(task_record.parent, scratch.remove)
+                    scratch.remove_marked(task_record.parent)
                     # A task clone is its task folder, so its lock files sit in the scratch root.
                     if task_record.parent == tree.resolve():
                         for lock in (floor_claims.mirror_lock_path(tree), floor_claims.record_lock_path(tree)):
@@ -1826,6 +1825,8 @@ def mirror_remove(args: CopyArguments) -> int:
                 else:
                     clear_mirror_content(tree)
                     tree.rmdir()
+            if scratch.removal_mark(tree).exists() or scratch.cargo_removal_mark(tree).exists():
+                scratch.remove_marked(tree)
             authority.unlink(missing_ok=True)
     return 0
 

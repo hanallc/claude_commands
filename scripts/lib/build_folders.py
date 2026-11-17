@@ -354,6 +354,11 @@ def build_folder_lock_fd(path: Path) -> int:
     return next(descriptor for descriptor, candidate in reversed(_locks.items()) if candidate == path)
 
 
+def held_build_folder_descriptors() -> tuple[int, ...]:
+    """Retain all maker leases in source and command subprocesses."""
+    return tuple(_locks)
+
+
 def _release_build_folder(path: Path, *, descriptor: int | None = None) -> None:
     if descriptor is None:
         try:
@@ -511,12 +516,15 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                                 if checkout.common_dir != git_files.at(spec.slot_checkout.source).common_dir:
                                     raise ValueError(f"{path}: incomplete slot owns a different Git repository; retained")
                                 stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-                                _ = git_rescue.rescue(path, f"{path.name}-recovery-{stamp}", generated=[path / "target"])
+                                _ = git_rescue.rescue(path, f"{path.name}-recovery-{stamp}", generated=[path / "target"],
+                                                     pass_fds=(descriptor, *held_build_folder_descriptors()))
                             _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "prune", "--expire", "now"],
-                                               check=True, capture_output=True, pass_fds=(descriptor,), timeout=repository_git_timeout())
+                                               check=True, capture_output=True,
+                                               pass_fds=(descriptor, *held_build_folder_descriptors()), timeout=repository_git_timeout())
                             _remove_folder(path, directory, existing)
                             _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "prune", "--expire", "now"],
-                                               check=True, capture_output=True, pass_fds=(descriptor,), timeout=repository_git_timeout())
+                                               check=True, capture_output=True,
+                                               pass_fds=(descriptor, *held_build_folder_descriptors()), timeout=repository_git_timeout())
                             existing = None
                     new_folder = existing is None
                     if isinstance(spec.slot_checkout, SlotCheckout):
@@ -565,7 +573,8 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
 
                         _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "add", "--detach",
                                             str(path), spec.slot_checkout.commit], check=True,
-                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(descriptor,),
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                           pass_fds=(descriptor, *held_build_folder_descriptors()),
                                            timeout=repository_git_timeout())
                         _write_lease(path, directory, allocation)
                     os.set_inheritable(descriptor, True)
@@ -735,8 +744,12 @@ def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary:
                         dir_fd: int | None = None, wait: bool = True) -> bool:
     """Run cleanup under the free folder's lock, then remove temporary metadata."""
     with ExitStack() as parents:
-        directory = dir_fd if dir_fd is not None else parents.enter_context(
-            _folder_parent(path, path.parent, create=False))
+        try:
+            directory = dir_fd if dir_fd is not None else parents.enter_context(
+                _folder_parent(path, path.parent, create=False))
+        except FileNotFoundError:
+            # An absent parent has no folder or metadata to lock.
+            return cleanup() is not False
         descriptor = _open_lock(path, directory, create=True)
         try:
             if not _take_lock(descriptor, fcntl.LOCK_EX, wait=wait):

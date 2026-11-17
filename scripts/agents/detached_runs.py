@@ -7,6 +7,8 @@ A unit director that names its run folder owns its run; its result goes through 
 Reap finishes records whose supervisor disappeared and delivers their results.
 The command runs in its own session; the record names its process group.
 `stop` signals that group, and the supervisor records the exit status and delivers the result.
+A watcher in the command group holds the supervisor pipe. If the supervisor ends first, the watcher
+stops the command group and delivers the STOPPED result.
 Exit 3 means that the caller is neither a registered worker nor a director with a run folder.
 """
 
@@ -24,6 +26,7 @@ import fcntl
 import json
 import os
 import secrets
+import select
 import shlex
 import shutil
 import signal
@@ -34,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict, cast
+from typing import IO, Literal, NotRequired, TypedDict, cast, override
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
@@ -68,6 +71,13 @@ from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR as DETACHED_RUNS_D
 # A missing marker after the scope exits proves that the command did not start there.
 # The command then runs without a scope. BUILDLOG_SCOPE=0 disables the scope, as it does for invoke.sh.
 SCOPE_SCRIPT = ': > "$0" || exit 125; exec "$@"'
+# The gate shell keeps its PID across exec and waits for identity publication.
+# Its watcher reads the supervisor pipe. An end of input without "done" means that the supervisor ended
+# before the command: a kill of any kind or a crash. The watcher then runs `supervisor-gone`.
+COMMAND_GATE = ('read -r ready || exit 125; watcher_python=$1 watcher_script=$2; shift 2; '
+                + '(read -r end; [ "$end" = done ] || exec "$watcher_python" "$watcher_script" supervisor-gone '
+                + '"$UNIT_DETACHED_RECORD") <&0 & exec 0</dev/null; exec "$@"')
+SUPERVISOR_GONE_REASON = "the supervisor ended before the command, so its watcher stopped the command"
 
 
 class RunRecord(TypedDict):
@@ -503,13 +513,22 @@ def _prune_finished_locked(runs: Path) -> list[str]:
     return removed
 
 
+def _run_record_paths(runs: Path) -> list[Path]:
+    """List run records; only an absent folder counts as empty."""
+    try:
+        with os.scandir(runs) as entries:
+            return sorted(runs / entry.name for entry in entries if entry.name.endswith(".json"))
+    except FileNotFoundError:
+        return []
+
+
 def live_twin(runs: Path, worker: str, command: list[str], tree_key: str) -> RunRecord | None:
     """A running record of the same worker, command, folder and tree key whose supervisor lives.
     After an interrupt on 2026-10-21, hana_catalyst-inspectors started its lint run three times
     on one tree; each run took memory, the cargo token and build time."""
     if not tree_key:
         return None
-    for path in sorted(runs.glob("*.json")):
+    for path in _run_record_paths(runs):
         raw = worker_lifecycle.read_json_object(path)
         if (raw.get("status") == "running" and raw.get("worker") == worker and raw.get("command") == command
                 and raw.get("tree_key") == tree_key
@@ -521,7 +540,7 @@ def live_twin(runs: Path, worker: str, command: list[str], tree_key: str) -> Run
 def worker_runs(runs: Path, worker: str, *, since: float = 0) -> list[RunRecord]:
     """Read this worker's runs that started during the selected dispatch."""
     found: list[RunRecord] = []
-    for path in sorted(runs.glob("*.json")):
+    for path in _run_record_paths(runs):
         raw = worker_lifecycle.read_json_object(path)
         if raw.get("worker") == worker and _number(raw.get("started_at"), 0) >= since:
             found.append(cast(RunRecord, cast(object, raw)))
@@ -535,13 +554,45 @@ def delivered_worker_results(runs: Path, worker: str, *, since: float) -> set[st
                 (f"sent: worker {worker} at ", "already delivered: "))}
 
 
+@dataclass(frozen=True)
+class LiveRunReadError:
+    path: Path
+    error: OSError | ValueError
+
+    @override
+    def __str__(self) -> str:
+        return f"{self.path}: {self.error}"
+
+
+@dataclass(frozen=True)
+class LiveRunEvidence:
+    runs: tuple[RunRecord, ...]
+    read_errors: tuple[LiveRunReadError, ...]
+
+    def require_readable(self) -> list[RunRecord]:
+        if self.read_errors:
+            raise self.read_errors[0].error
+        return list(self.runs)
+
+    def report_errors(self) -> None:
+        for error in self.read_errors:
+            unit_runs.report_anomaly(" ".join(f"anomaly: {error}".splitlines()))
+
+
 def live_runs(runs: Path, worker: str) -> list[RunRecord]:
     """Return running records whose supervisor still owns the record."""
-    return _live_runs(runs, lambda raw: raw.get("worker") == worker)
+    evidence = _live_runs(runs, lambda raw: raw.get("worker") == worker)
+    return evidence.require_readable()
 
 
 def live_runs_for_staff(runs: Path, identities: frozenset[staff.StaffId]) -> list[RunRecord]:
     """Read live records for fixed staff identities, including renamed members."""
+    evidence = live_run_evidence_for_staff(runs, identities)
+    return evidence.require_readable()
+
+
+def live_run_evidence_for_staff(runs: Path, identities: frozenset[staff.StaffId]) -> LiveRunEvidence:
+    """Retain live runs and read errors so callers can distinguish idle from unknown."""
     return _live_runs(runs, lambda raw: isinstance(identity := raw.get("staff_id"), str) and identity in identities)
 
 
@@ -569,15 +620,24 @@ def live_runs_in_folders(folders: Mapping[Path, frozenset[staff.StaffId]]) -> li
     return found
 
 
-def _live_runs(runs: Path, owns: Callable[[dict[str, object]], bool]) -> list[RunRecord]:
+def _live_runs(runs: Path, owns: Callable[[dict[str, object]], bool]) -> LiveRunEvidence:
     """Read each record once and check its owner and supervisor."""
     found: list[RunRecord] = []
-    for path in sorted(runs.glob("*.json")):
-        raw = worker_lifecycle.read_json_object(path)
+    errors: list[LiveRunReadError] = []
+    try:
+        paths = _run_record_paths(runs)
+    except OSError as error:
+        return LiveRunEvidence((), (LiveRunReadError(runs, error),))
+    for path in paths:
+        try:
+            raw = worker_lifecycle.read_json_object(path)
+        except (OSError, ValueError) as error:
+            errors.append(LiveRunReadError(path, error))
+            continue
         if (raw.get("status") == "running" and owns(raw)
                 and detached_run_process.supervises(_integer(raw.get("pid")), path)):
             found.append(cast(RunRecord, cast(object, raw)))
-    return found
+    return LiveRunEvidence(tuple(found), tuple(errors))
 
 
 def resume_context(runs: Path, worker: str) -> str:
@@ -733,7 +793,8 @@ def _exit_words(result: CommandResult) -> str:
 def result_text(record: RunRecord, result: CommandResult) -> str:
     exit_code = result.code if isinstance(result, CompletedCommand) else result
     stop_reason = record.get("stop_reason", "")
-    verdict = (ORPHAN_VERDICT if isinstance(exit_code, SupervisorLost) else "PASS (exit 0)" if exit_code == 0
+    lost_verdict = "STOPPED (no exit status)" if stop_reason else ORPHAN_VERDICT
+    verdict = (lost_verdict if isinstance(exit_code, SupervisorLost) else "PASS (exit 0)" if exit_code == 0
                else SUPERSEDED_VERDICT if exit_code == SUPERSEDED_STATUS
                else TREE_CHANGED_VERDICT if exit_code == TREE_CHANGED_STATUS
                else f"STOPPED (exit {exit_code})" if stop_reason else f"FAIL (exit {exit_code})")
@@ -866,13 +927,14 @@ def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
     """Publish the command identity and group, then run the command in its own session.
 
     A stop signals the command group only, so the supervisor stays alive to record and deliver.
+    The gate input stays open until the command ends. Then the supervisor writes "done" to the watcher.
     """
-    # The shell keeps its PID across exec and waits for identity publication.
-    gate = 'read -r ready || exit 125; exec 0</dev/null; exec "$@"'
+    script = Path(__file__).resolve()
     try:
         with log.open("ab") as output:
-            child = subprocess.Popen(["/bin/sh", "-c", gate, "detached-command", *command],
-                                     env=environment, start_new_session=True,
+            child = subprocess.Popen(["/bin/sh", "-c", COMMAND_GATE, "detached-command",
+                                      str(script.parents[1] / "lib/py"), str(script), *command],
+                                     env=environment, start_new_session=True, bufsize=0,
                                      stdin=subprocess.PIPE, stdout=output, stderr=subprocess.STDOUT)
     except OSError as exc:
         with log.open("a", encoding="utf-8") as output:
@@ -880,12 +942,13 @@ def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
         return 127
 
     assert child.stdin is not None
-    # A group stop can end the gate shell before it reads its start line.
-    with contextlib.suppress(BrokenPipeError), child.stdin:
+    with child.stdin as gate:
         started = process_start.process_start(child.pid)
         if not isinstance(started, process_start.Started):
             with log.open("a", encoding="utf-8") as output:
                 _ = output.write("detached_runs: command identity is unavailable; command did not start\n")
+            # The gate shell reads the end of its input and exits 125.
+            gate.close()
         else:
             path = Path(environment["UNIT_DETACHED_RECORD"])
             with record_lock(path):
@@ -896,8 +959,17 @@ def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
                 if isinstance(supervisor, process_start.Started):
                     record["supervisor_started"] = supervisor.start
                 write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
-            _ = child.stdin.write(b"start\n")
-    return _exit_status(child.wait())
+            _send_gate_line(gate, b"start\n")
+        returncode = child.wait()
+        if not gate.closed:
+            _send_gate_line(gate, b"done\n")
+    return _exit_status(returncode)
+
+
+def _send_gate_line(gate: IO[bytes], line: bytes) -> None:
+    """A group stop can end the gate shell and its watcher before they read."""
+    with contextlib.suppress(BrokenPipeError):
+        _ = gate.write(line)
 
 
 def command_supervise(args: argparse.Namespace) -> int:
@@ -947,6 +1019,46 @@ def command_supervise(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_supervisor_gone(args: argparse.Namespace) -> int:
+    """Stop the command group of a run whose supervisor ended, then deliver its STOPPED result.
+
+    The gate watcher runs this when the supervisor pipe closes without "done".
+    """
+    path = Path(str(getattr(args, "record", "")))
+    # Leave the command group, so its TERM spares this watcher.
+    os.setsid()
+    command = command_group(path)
+    if command is None:
+        return 0
+    # POSIX reuses no group ID while the group has members, so a live group is this command's.
+    # A command that ended before its supervisor needs no stop, only the reap.
+    if _group_is_live(command.group):
+        with record_lock(path):
+            record = worker_lifecycle.read_json_object(path)
+            if record.get("status") != "running":
+                return 0
+            _ = record.setdefault("stop_reason", SUPERVISOR_GONE_REASON)
+            write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+        with contextlib.suppress(ProcessLookupError):
+            process_group.send_process_group(command.group, signal.SIGTERM)
+        _wait_for_leader(command)
+    _ = reap_orphans(str(path.resolve().parent.parent))
+    return 0
+
+
+def _wait_for_leader(command: CommandGroup) -> None:
+    """Wait until the command leader exits, so the reap reads the status that the command saved."""
+    try:
+        leader = os.pidfd_open(command.group)
+    except ProcessLookupError:
+        return
+    try:
+        if process_start.process_start(command.group) == process_start.Started(command.started):
+            _ = select.select([leader], [], [])
+    finally:
+        os.close(leader)
+
+
 def command_record_exit(args: argparse.Namespace) -> int:
     """Save the command status before its orphan record is completed."""
     path = Path(str(getattr(args, "record", "")))
@@ -992,6 +1104,9 @@ def main(argv: list[str] | None = None) -> int:
     supervise = verbs.add_parser("supervise", help="run one recorded command and deliver its result")
     _ = supervise.add_argument("record")
     supervise.set_defaults(handler=command_supervise)
+    gone = verbs.add_parser("supervisor-gone", help="stop and report a run whose supervisor ended first")
+    _ = gone.add_argument("record")
+    gone.set_defaults(handler=command_supervisor_gone)
     record_exit = verbs.add_parser("record-exit", help="save a command status without completing its run")
     _ = record_exit.add_argument("--pid", type=int, default=0)
     _ = record_exit.add_argument("record")
