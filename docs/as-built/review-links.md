@@ -292,7 +292,8 @@ Questions without an owner remain visible under Owner unavailable.
 These questions count as For you, as on the former Questions page.
 They have no answer control until an owner becomes available.
 
-This phase shows Questions, Changes and Investigations.
+The page shows Questions, Changes, Investigations, Proposals and Efficiencies.
+Proposals show `<owner>/P<n>` and efficiencies show `<owner>/E<n>`, where the owner is the production's showrunner.
 The table columns are Id, Type, Owner, Item, State and Age.
 One row can open its card in place.
 `record_table.py` supplies the table styles, filters, sorting and open-row controls for Review and The List.
@@ -305,17 +306,23 @@ The address retains the filters, sort and open item.
 An address with only `item` selects All and clears the filters.
 The default order uses the existing urgency levels and age.
 Questions use a violet circle-help icon; Changes use a blue diff icon; Investigations use a teal microscope icon.
+Proposals use a pink lamp icon; Efficiencies use a lime zap icon.
+A proposal card loads the issue text without its front matter when the card opens (`review.html?body=<key>`).
+The Open view does not carry the proposal texts.
+An efficiency card shows its ledger line.
 
 Questions offer Answer and Send feedback in the closing group.
 Changes offer Works, Does not work, Ask showrunner to check and Send feedback in that group.
 Investigations with an answer offer Mark read and Send feedback in that group.
+Proposals and efficiencies offer Approve, Decline and Send feedback in that group.
+A plan backlog proposal has no issue to hold an answer, so it offers only Later; the user answers it in chat.
 Each card has Ask question in a separate return group and Later with a date and time.
 The primary button comes first.
-The shared sender handles all three types, including retries, owner alerts and startup recovery.
+The shared sender handles all five types, including retries, owner alerts and startup recovery.
 Send feedback sends the words to the owner and finishes the item with the result **feedback sent**.
 Ask question sends the words to the owner and moves the item to Waiting.
 The owner's answer returns it to For you and stays in its log.
-Owners use `change_page.py answer-question --item <Review key> --text "<answer>"` for all three types.
+Owners use `change_page.py answer-question --item <Review key> --text "<answer>"` for all five types.
 Change messages also supply `--question <id>` to identify the pending exchange.
 Every request message includes the complete answer command.
 Later keeps the state and hides the item from every page view, the For you count and `/next` until its time.
@@ -333,9 +340,19 @@ The page does not open another card automatically.
 The shared status component refreshes the page every `page_refresh_seconds`, initially 15 seconds.
 Refresh retains the open row, scroll position and typed text.
 The Review navigation entry marks new For you items.
-Only Questions, Changes and Investigations can set this mark in this phase.
+Every type can set this mark.
 Approved and declined proposals become Done in the shared reader.
-Proposals and efficiencies join the page in the next phase.
+
+Approve and Decline make a proposal or an efficiency Done at once.
+Approve sends the words and the exact record command to the owner showrunner through the shared sender.
+For a proposal the command is `proposal_issue.py approve`; for an efficiency it is `candidates.py outcome E<n> accepted`.
+A proposal Decline stores the declined answer, as `proposal_issue.py decline-answer` does.
+Its message asks the owner to close the issue with `/close_issue`.
+An efficiency Decline writes `candidates.py outcome E<n> declined` on the ledger line and sends no message.
+A proposal keeps its page log in the `review_log` front matter list and its page mark in `review_state`.
+An efficiency keeps them in `<ledger stem>.review.json` beside the ledger.
+That file is keyed by the `E<n>` id and holds only the log and the mark, never a copy of the ledger line.
+The mark is `waiting` after Ask question and `done` after Approve or Send feedback.
 
 ### Accounts page
 
@@ -483,7 +500,7 @@ An older response cannot replace a newer response.
 Phone layouts show each row as a card.
 The counts strip uses the status line readers for questions, changes, and rebuilds.
 Each count links to its existing page.
-The strip omits proposals and efficiencies because they have no console page.
+The strip omits proposals and efficiencies.
 Closed items show no check text in the page or CLI.
 
 ### Images page

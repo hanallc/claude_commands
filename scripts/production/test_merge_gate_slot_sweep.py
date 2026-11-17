@@ -36,8 +36,11 @@ class NightlySlotSweepTests(unittest.TestCase):
                         self.assertEqual(list(argv[2:4]), ["exec", sys.executable])
                         self.assertTrue(argv[4].endswith("mac_queue_run.py"))
                         events.append("Mac")
-                        self.assertEqual(list(argv[5:13]),
-                                         ["--kind", "run", "--what", "Sweep Mac build slots", "--package", "claude", "--", "/bin/zsh"])
+                        self.assertEqual(list(argv[5:15]),
+                                         ["--kind", "run", "--what", "Sweep Mac build slots", "--package", "claude",
+                                          "--worktree", str(Path(merge_gate.__file__).resolve().parents[2]), "--", "/bin/zsh"])
+                        # The nightly runs from $HOME; the Mac queue refuses a worktree that is not a repository.
+                        self.assertTrue((Path(argv[12]) / ".git").exists())
                     else:
                         self.assertTrue(argv[1].endswith("send.py"))
                         self.assertEqual(list(argv[2:6]), ["--to", "builds", "--from", "nightly"])
@@ -67,7 +70,8 @@ class NightlySlotSweepTests(unittest.TestCase):
                     if argv[1].endswith("nix_env.py"):
                         self.assertEqual(list(argv[2:4]), ["exec", sys.executable])
                         self.assertTrue(argv[4].endswith("mac_queue_run.py"))
-                        raise subprocess.CalledProcessError(3, argv, stderr="Mac is unreachable\n")
+                        raise subprocess.CalledProcessError(2, argv, output="refused\trepo\n",
+                                                            stderr="Mac queue: Sweep Mac build slots\n")
                     self.assertTrue(argv[1].endswith("send.py"))
                     notices.append(argv[-1])
                     return subprocess.CompletedProcess(argv, 0, "", "")
@@ -82,7 +86,7 @@ class NightlySlotSweepTests(unittest.TestCase):
                 local.assert_called_once_with()
                 self.assertEqual(len(notices), 1)
                 self.assertIn("on Mac failed:", notices[0])
-                self.assertIn("Mac is unreachable", notices[0])
+                self.assertIn("Mac queue: Sweep Mac build slots refused\trepo", notices[0])
                 self.assertEqual(output.getvalue().strip(), notices[0])
 
     def test_gate_failure_still_sweeps_both_pools(self) -> None:
