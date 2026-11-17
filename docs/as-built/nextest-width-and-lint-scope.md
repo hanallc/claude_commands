@@ -44,6 +44,31 @@ natedev has 16 physical and 32 logical cores. The Mac reads 12 for both and has 
 
 A step records its width through its argv: `invoke.sh` puts `--test-threads N` before the caller's arguments, so the first width in argv is the one the build log's `steps.argv`, the memory gate's reservation row and the `anon_peaks.jsonl` record all carry. A run that holds fewer tokens than its width records the width it ran at: the build log takes the argv with N, and the holder rewrites the reservation's `test_threads`.
 
+### Test prebuilds (`scripts/lint/prebuild.py`)
+
+A workspace can declare an artifact that its tests need, in its root `Cargo.toml`:
+
+```toml
+[workspace.metadata.dev.prebuild.hana_agora_server]
+target = "wasm32-unknown-unknown"
+env = "HANA_AGORA_SERVER_WASM"
+for = ["hana_agora", "hana"]
+platforms = ["linux"]
+```
+
+`platforms` is optional. It lists the platforms that build the artifact, `linux` and `macos`; the default is both.
+
+1. `run_step_attempt` calls `lint_prebuild_prefix` for a `cargo nextest run` step. When the root manifest has a table header or a key with a `prebuild` part (`[workspace.metadata.dev.prebuild.P]`, or `prebuild.P = {…}` under `[workspace.metadata.dev]`), it puts `prebuild.py --manifest M --` in front of the token holder and the nextest command. The word in a comment or a value does not count. The shell reads the manifest without a fork, so a manifest without a declaration starts no process. `verify.sh` sets the manifest (`LINT_WORKSPACE_MANIFEST`) to the repository root `Cargo.toml`. A remote `lint nextest` runs in the mirror root and reads `$PWD/Cargo.toml`.
+2. `prebuild.py` reads the packages that the nextest arguments select. Plain `-p`/`--package` names select those packages; a glob selects the whole workspace. In each `-E`/`--filterset`, `&` binds tighter than `|`, as in nextest. A union (`|`, `+`, `or`) selects packages only when every operand does, and a conjunction (`&`, `and`) selects no more than its narrowest operand. The scanner reads each matcher argument as text, as nextest does: a `\` escapes the next character, and a regex `/…/` can hold a parenthesis. Only `package(NAME)` and `package(=NAME)` with a plain name select packages. `not`, a difference, a glob, `test()`, `all()` and no filter select the whole workspace.
+3. For each entry whose `for` list holds a selected package, or for every entry on a whole-workspace run, it runs `cargo build --release --manifest-path M -p <package> --target <target>`. A `--target-dir` in the nextest arguments goes to the build too.
+4. It reads cargo's JSON messages for the `cdylib` or `bin` artifact whose `package_id` names the package, so a renamed `[lib]` target works. It needs exactly one such file, and sets `<env>` to its path. Then it runs the nextest command with `exec`.
+
+- The build runs inside the step's admission and memory scope, on the host that runs the tests: natedev, the Mac or an SSH target.
+- On a platform that `platforms` leaves out, it prints `prebuild: <package> builds only on <platforms>; not built on <platform>` and runs the tests without the build.
+- Cargo's fingerprints make an unchanged build a no-op. There is no second cache.
+- A failed build exits with cargo's status and prints `the tests did not run`. An invalid declaration exits 2 with one line.
+- The profile is always `release`. The entry has no profile key.
+
 ### Width in the reservation (`scripts/lint/memory_admit.py`)
 
 - `test_threads(argv) -> int | None` returns the first width in argv, from `--test-threads N`, `--test-threads=N`, `-j N` or `-jN`; absent or non-integer (`num-cpus`) is `None`.
@@ -94,6 +119,7 @@ Order: `require_taplo`, mend `--fix`, nightly fmt of the package and changed mem
 ## Invariants
 
 - `invoke.sh` is the only place nextest policy flags are composed; callers own scope.
+- The prebuild prefix goes before the token holder: `nextest_tokens.py` reads `cargo nextest run --test-threads W` at the start of its command.
 - The caller's width wins: a width flag before `--`, or `NEXTEST_TEST_THREADS`, means `invoke.sh` adds nothing. Such a run takes no test tokens.
 - No counter: a run's tokens are the bytes it holds, and steve takes back the tokens of a dead process.
 - Width selection never fails, prints or changes a status; an unreadable core count adds no flag, and a pool that does not open runs at the full width.
