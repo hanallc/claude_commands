@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from array import array
 from collections.abc import Generator, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
@@ -14,12 +14,14 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import signal
 import subprocess
 import tempfile
 from typing import TYPE_CHECKING, BinaryIO, Literal, cast
 from uuid import uuid4
 import zlib
 
+from scripts.lib import process_group
 from scripts.style import style_config
 from scripts.style.git_process import GitReadFailed, TreeEntry, run_git
 
@@ -422,19 +424,40 @@ class ReaderSourceChanged:
     """The build finished after the checkout changed to another source tree."""
 
 
+def _end_build(process: subprocess.Popen[str]) -> None:
+    """End the build's process group: TERM first, so verify.sh gives back its queue place and Mac claim."""
+    with suppress(ProcessLookupError):
+        process_group.send_process_group(process.pid, signal.SIGTERM)
+    with suppress(subprocess.TimeoutExpired):
+        _ = process.communicate(timeout=style_config.reader_build_stop_grace_seconds())
+    # KILL ends each step that ignored TERM. Do not read the pipes again: a step outside the group can hold them.
+    with suppress(ProcessLookupError):
+        process_group.send_process_group(process.pid, signal.SIGKILL)
+    _ = process.wait()
+
+
 def _build(folder: Path, tree: str) -> Path | ReaderSourceChanged:
     command = ["bash", str(VERIFY_SCRIPT), *BUILD_ARGUMENTS]
     if platform.system() == "Darwin":
         command.extend(("--mac", "build the local style reader"))
     environment = {key: value for key, value in os.environ.items() if key != "CONF_DIR"}
-    result = subprocess.run(command, cwd=CHECKOUT, capture_output=True, text=True, env=environment)
+    limit = style_config.reader_build_limit_seconds()
+    # The build runs in its own process group, so the limit can end verify.sh and every step it started.
+    with subprocess.Popen(command, cwd=CHECKOUT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                          env=environment, start_new_session=True) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=limit)
+        except subprocess.TimeoutExpired:
+            _end_build(process)
+            raise ReaderError(f"reader build passed its {limit:g} s limit (style_reader build_limit_seconds); "
+                              + "its process group was ended") from None
     if _source_tree() != tree:
         return ReaderSourceChanged()
-    if result.returncode:
-        raise ReaderError(f"reader build exited {result.returncode}: {result.stdout}\n{result.stderr}")
-    paths = [line.removeprefix("binary: ") for line in result.stdout.splitlines() if line.startswith("binary: ")]
+    if process.returncode:
+        raise ReaderError(f"reader build exited {process.returncode}: {stdout}\n{stderr}")
+    paths = [line.removeprefix("binary: ") for line in stdout.splitlines() if line.startswith("binary: ")]
     if len(paths) != 1 or not Path(paths[0]).is_absolute():
-        raise ReaderError(f"the reader build did not return one local binary path: {result.stdout}")
+        raise ReaderError(f"the reader build did not return one local binary path: {stdout}")
     with tempfile.TemporaryDirectory(prefix=".install-", dir=folder) as temporary:
         staged = Path(temporary) / "bundle"
         staged.mkdir()

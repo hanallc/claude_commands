@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 from threading import Barrier
+import time
 import unittest
 from unittest.mock import patch
 
@@ -174,22 +175,36 @@ class ReaderClientTests(unittest.TestCase):
                         self.assertEqual(os.environ["CONF_DIR"], environment["CONF_DIR"])
 
     def test_failed_build_keeps_the_previous_installation_and_reports_output(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            install = root / "installed"
-            old = install / "old"
-            old.mkdir(parents=True)
-            _ = (old / "stamp").write_text("old tree\n")
-            _ = (old / "style_reader").write_text("old binary")
-            (install / "current").symlink_to("old", target_is_directory=True)
-            verifier = root / "verify.sh"
-            _ = verifier.write_text("#!/bin/sh\nprintf 'build failed\\n'\nprintf 'compiler detail\\n' >&2\nexit 9\n")
-            with (patch.object(style_reader, "VERIFY_SCRIPT", verifier),
-                  patch.object(style_config, "reader_install_folder", return_value=install),
-                  self.assertRaisesRegex(style_reader.ReaderError, "build failed[\\s\\S]*compiler detail")):
-                _ = style_reader.reader_binary()
-            self.assertEqual((install / "current" / "style_reader").read_text(), "old binary")
-            self.assertEqual((install / "current").resolve(), old)
+        # A child of a stuck build holds the output pipe, so only ending the whole group returns at once.
+        cases = (
+            ("failure", "printf 'build failed\\n'\nprintf 'compiler detail\\n' >&2\nexit 9\n",
+             "build failed[\\s\\S]*compiler detail", False),
+            ("stuck", "trap 'touch \"$0.stopped\"; exit 143' TERM\nsleep 5 &\nwait\n", "passed its 0.5 s limit", True),
+            ("ignores TERM", "trap '' TERM\nsleep 5 &\nwait\n", "passed its 0.5 s limit", False),
+        )
+        for name, body, message, stopped in cases:
+            with self.subTest(name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                install = root / "installed"
+                old = install / "old"
+                old.mkdir(parents=True)
+                _ = (old / "stamp").write_text("old tree\n")
+                _ = (old / "style_reader").write_text("old binary")
+                (install / "current").symlink_to("old", target_is_directory=True)
+                verifier = root / "verify.sh"
+                _ = verifier.write_text("#!/bin/sh\n" + body)
+                started = time.monotonic()
+                with (patch.object(style_reader, "VERIFY_SCRIPT", verifier),
+                      patch.object(style_config, "reader_install_folder", return_value=install),
+                      patch.object(style_config, "reader_build_limit_seconds", return_value=0.5),
+                      patch.object(style_config, "reader_build_stop_grace_seconds", return_value=0.5),
+                      self.assertRaisesRegex(style_reader.ReaderError, message)):
+                    _ = style_reader.reader_binary()
+                self.assertLess(time.monotonic() - started, 4)
+                # The stuck build got TERM before KILL, so verify.sh can give back its claims.
+                self.assertEqual(verifier.with_name("verify.sh.stopped").exists(), stopped)
+                self.assertEqual((install / "current" / "style_reader").read_text(), "old binary")
+                self.assertEqual((install / "current").resolve(), old)
 
     def test_reader_failure_and_invalid_output_raise_named_errors(self) -> None:
         cases = (
