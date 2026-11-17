@@ -186,7 +186,8 @@ class EndSessionTests(unittest.TestCase):
     def make_run(self, name: str, director: str) -> Path:
         run = self.runs / name
         (run / "verify_cache").mkdir(parents=True)
-        (run / "phases" / "p3" / "gate" / ".git").mkdir(parents=True)
+        _ = subprocess.run(["git", "init", "-q", str(run / "phases" / "p3" / "gate")],
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         _ = (run / "phases" / "p3" / "review.diff").write_text("diff\n", encoding="utf-8")
         (run / "p62_bin").mkdir()
         _ = (run / "p62_bin" / "CACHEDIR.TAG").write_text("tag\n", encoding="utf-8")
