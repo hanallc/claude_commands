@@ -1727,7 +1727,7 @@ def _review_snapshots(paths: Iterable[Path], *, sources: list[Path] | None = Non
 def record_review_log(path: Path, row: str, words: str, production: Path, who: str = "nate") -> None:
     """Keep the user's Review action in the authoritative table row."""
     from scripts.review_links import review_events
-    now = datetime.now().astimezone()
+    now = datetime.now().astimezone(user_zone())
     def write(lines: list[str]) -> None:
         for section in (SECTION, REVIEWED):
             if not any(line.strip() == section for line in lines):

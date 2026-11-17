@@ -1090,7 +1090,7 @@ def record_review_log(path: Path, words: str, who: str = "nate") -> None:
     with outstanding_lock(path.parent / ".review-ids"):
         record = _question_records([Issue(path, frontmatter(path))])[0]
         events = review_events.decode(record.item.get("review_log", ""))
-        event = review_events.ReviewLog(datetime.now().astimezone(), who, words)
+        event = review_events.ReviewLog(datetime.now().astimezone(user_zone()), who, words)
         record.item["review_log"] = review_events.encode(review_events.append(events, event))
         write_question_record(record)
 
@@ -1620,7 +1620,7 @@ def reply_record(record: QuestionRecord, text: str, who: str, *, identities: Que
             raise RegistrationFailure("reply", f"{current.item['text']}: no open follow-up waits for a reply")
         answer_followup(current.item, text)
         events = review_events.decode(current.item.get("review_log", ""))
-        event = review_events.ReviewLog(datetime.now().astimezone(), who, 'Answer: '+text)
+        event = review_events.ReviewLog(datetime.now().astimezone(user_zone()), who, 'Answer: '+text)
         current.item["review_log"] = review_events.encode(review_events.append(events, event))
         write_question_record(current)
     report("reply", "ok", f"{scope.name}: {current.item['text']}: back on the open-questions list with the reply")

@@ -60,7 +60,7 @@ It reads queued messages for the fixed staff ID and the current session without 
 A merge unit with this work keeps the wake above the threshold.
 Unknown state without work permits the stop and reports the read errors in one anomaly line.
 The detached-run scan skips each damaged record, reports its path, and retains other live runs.
-The list readers raise the original read error when a record is damaged.
+The scan retains folder read errors; the list readers raise read errors, and an absent folder counts as empty.
 Other directors keep the existing background-task and detached-run guards.
 Declared waits and paused status lines still permit a stop.
 
