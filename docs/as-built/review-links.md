@@ -425,7 +425,7 @@ Each preset shows its time on the right, such as `Tue 09:00`, in the user zone.
 The page computes the preset times each time the menu opens.
 A preset click hides the item at once.
 **Choose a time…** shows a calendar and a time field in the same menu.
-The calendar keeps a future Later draft when it opens, including a draft restored after a refresh.
+The calendar keeps a valid future Later draft when it opens, including a draft restored after a refresh.
 Otherwise, it opens on tomorrow in the user zone, with `later_morning` as its time.
 The month header has previous and next buttons.
 The grid starts on Sunday, marks today with a ring, and fills the selected day with the accent color.
@@ -435,8 +435,13 @@ A skipped wall time advances by the daylight saving gap.
 A repeated wall time uses the earlier instant.
 The presets use the same conversion.
 **Save** is disabled unless that time is in the future.
-The arrow keys move one day or one week, including across months.
-Enter saves, Escape closes, and Tab moves from the selected day to the time field and **Save**.
+In the calendar, the arrow keys move one day or one week, including across months.
+Tab moves from the selected day to the time field and **Save**.
+The **Time** field uses 24-hour `HH:MM` in every locale.
+It accepts `9:00`, `0900` and `09:00` and displays `09:00` when focus leaves the field or you press Enter.
+In the time field, Up and Down change the time by 15 minutes and wrap at midnight.
+An invalid time uses the error color and disables **Save**.
+Enter saves a valid future time. Escape closes the menu.
 The hidden `later` field keeps the wall time for the draft.
 The page converts that time to UTC for the request.
 A preset resolves its time again at the click.

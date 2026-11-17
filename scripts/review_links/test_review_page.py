@@ -1164,7 +1164,7 @@ window.fetch=async url=>{
                 self.assertNotIn('type="datetime-local"',form)
                 self.assertIn('type="hidden" name="later"',form)
                 self.assertIn('role="grid"',form)
-                self.assertIn('type="time" step="900"',form)
+                self.assertIn('<label class="later-time">Time<input type="text" inputmode="numeric" autocomplete="off" data-later-time></label>',form)
                 self.assertIn('value="later">Save',form)
                 self.assertNotIn('value="skip"',form)
 
@@ -2129,6 +2129,73 @@ window.fetch=async(_url,options={})=>{
                 self.assertEqual(results,[[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_later_time_displays_and_saves_24_hour_time(self) -> None:
+        _ = self.question()
+        with patch.dict(os.environ, {'USER_ZONE': 'UTC'}):
+            source = review_page.render(self.root).decode()
+        setup = r"""<script>
+const nativeFetch=fetch,posts=[];
+window.setInterval=()=>0;
+Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
+window.fetch=async(_url,options={})=>{
+ if(options.method==='POST') posts.push(new URLSearchParams(options.body));
+ return {ok:true,json:async()=>({answer:'later'})};
+};
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ try{
+  const row=document.querySelector('[data-type="question"]');
+  row.querySelector('.list-toggle').click();
+  const form=row.querySelector('form');
+  const field=form.querySelector('[data-later-time]'),save=form.querySelector('[value="later"]');
+  form.elements.later.value='2026-12-01T17:30';
+  form.querySelector('[data-later-toggle]').click();form.querySelector('[data-later-choose]').click();
+  check(field.type==='text' && field.value==='17:30',
+   'The 17:30 draft shows 17:30 without AM or PM (input type: '+field.type+')');
+  const key=name=>field.dispatchEvent(new KeyboardEvent('keydown',{key:name,bubbles:true,cancelable:true}));
+  const type=value=>{field.value=value;field.dispatchEvent(new Event('input',{bubbles:true}));};
+  field.focus();key('ArrowUp');
+  check(field.value==='17:45' && form.elements.later.value==='2026-12-01T17:45','ArrowUp adds 15 minutes');
+  key('ArrowDown');check(field.value==='17:30','ArrowDown subtracts 15 minutes');
+  type('23:45');key('ArrowUp');
+  check(field.value==='00:00' && form.elements.later.value==='2026-12-01T00:00','ArrowUp wraps at midnight');
+  key('ArrowDown');
+  check(field.value==='23:45' && form.elements.later.value==='2026-12-01T23:45','ArrowDown wraps at midnight');
+  for(const value of ['9:00','0900','09:00']){
+   field.focus();type(value);
+   check(field.getAttribute('aria-invalid')==='false' && !save.disabled &&
+    form.elements.later.value==='2026-12-01T09:00','The draft accepts '+value);
+   field.dispatchEvent(new FocusEvent('blur'));
+   check(field.value==='09:00','Blur shows 09:00 for '+value);
+  }
+  field.focus();
+  for(const value of ['','24:00','12:60','9:00 AM','17:30:00']){
+   type(value);key('Enter');
+   check(field.getAttribute('aria-invalid')==='true' && save.disabled && !form.elements.later.value && !posts.length,
+    'An invalid time blocks Save and Enter: '+JSON.stringify(value));
+  }
+  const error=document.createElement('span');error.style.color='var(--error)';form.append(error);
+  const errorColor=getComputedStyle(error).color,style=getComputedStyle(field);
+  check(style.color===errorColor && style.borderTopColor===errorColor,'An invalid time uses the console error color');
+  type('1730');
+  let submitted=false;
+  form.addEventListener('submit',event=>{
+   event.preventDefault();event.stopImmediatePropagation();submitted=event.submitter===save;
+  },{capture:true,once:true});
+  key('Enter');
+  check(field.value==='17:30' && field.getAttribute('aria-invalid')==='false' && !save.disabled && submitted,
+   'Enter shows 17:30 and submits Save');
+  save.click();
+  check(posts.at(-1)?.get('later')==='2026-12-01T17:30:00.000Z','Save sends T17:30 in UTC');
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_later_retains_drafts_and_resolves_daylight_saving_times(self) -> None:
         _ = self.question()
         with patch.dict(os.environ, {'USER_ZONE': 'America/New_York'}):
@@ -2230,6 +2297,50 @@ Date.now=()=>Date.parse(SCENARIO==='gap' ? '2027-03-13T15:00:00Z' :
                         server.shutdown()
                         thread.join(TEST_HANG_GUARD_SECS)
                 self.assertEqual(results, [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_later_chooser_validates_restored_drafts(self) -> None:
+        _ = self.question()
+        with patch.dict(os.environ, {'USER_ZONE': 'UTC'}):
+            source = review_page.render(self.root).decode()
+        setup = r"""<script>
+const nativeFetch=fetch;
+window.setInterval=()=>0;
+Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
+window.fetch=async()=>({ok:true,text:async()=>MARKUP});
+</script>""".replace('MARKUP', json.dumps(source).replace('</', '<\\/'))
+        probe = r"""<script>
+(async()=>{
+ const failures=[],errors=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const row=()=>document.querySelector('[data-type="question"]');
+ addEventListener('error',event=>errors.push(event.error?.name || event.message));
+ try{
+  row().querySelector('.list-toggle').click();
+  const fallback='2026-12-01T09:00';
+  for(const [draft,expected] of [
+   ['2026-12-08T7',fallback],['2026-12-08T24:00',fallback],['2026-12-08T23:60',fallback],
+   ['2026-12-08T',fallback],['2027-02-29T09:00',fallback],['2026-12-08T1730','2026-12-08T17:30']
+  ]){
+   const original=row(),wall=original.querySelector('[name="later"]');
+   wall.value=draft;wall.dispatchEvent(new Event('input',{bubbles:true}));
+   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+   await new Promise(resolve=>setTimeout(resolve,60));
+   const current=row(),form=current.querySelector('form');
+   check(current!==original && form.elements.later.value===draft,'Refresh restores '+draft);
+   const toggle=form.querySelector('[data-later-toggle]'),chooser=form.querySelector('[data-later-custom]');
+   toggle.click();form.querySelector('[data-later-choose]').click();
+   const selected=chooser.querySelector('[aria-selected="true"]')?.dataset.date;
+   const field=chooser.querySelector('[data-later-time]'),save=chooser.querySelector('[value="later"]');
+   check(!errors.length,'Opening '+draft+' raises '+errors.join(', '));errors.length=0;
+   check(!chooser.hidden && selected===expected.slice(0,10) && field.value===expected.slice(11) &&
+    form.elements.later.value===expected && !save.disabled,'Opening '+draft+' selects '+expected);
+   toggle.click();
+  }
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_uses_the_shared_status_with_the_real_loader(self) -> None:

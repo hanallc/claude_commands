@@ -162,7 +162,7 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, settings: CardSet
                +'<button type="button" tabindex="-1" data-later-month-step="-1" aria-label="Previous month">‹</button>'
                +'<button type="button" tabindex="-1" data-later-month-step="1" aria-label="Next month">›</button></div></div>'
                +'<div role="grid" aria-label="Choose a day" data-later-grid></div>'
-               +'<label class="later-time">Time<input type="time" step="900" data-later-time></label>'
+               +'<label class="later-time">Time<input type="text" inputmode="numeric" autocomplete="off" data-later-time></label>'
                +'<div class="later-save"><span data-later-summary aria-live="polite"></span>'
                +'<button class="primary" name="outcome" value="later">Save</button></div></div></div></div></div>')
     return ('<form method="post" data-review-form>'+hidden+f'<label for="words-{html.escape(item.key, quote=True)}">Your words</label>'
@@ -405,6 +405,7 @@ min-height:32px;padding:5px 10px;border:0;border-radius:6px;background:none;colo
 .review-actions [data-later-grid] button:focus-visible{outline:2px solid var(--ink);outline-offset:1px}
 [data-review-form] .later-time{display:flex;align-items:center;justify-content:space-between;font-size:12px;font-weight:400;margin:0 0 10px}
 .review-actions .later-time input{min-height:32px;width:120px;padding:3px 8px;color-scheme:light dark}
+.review-actions .later-time input[aria-invalid=true]{border-color:var(--error);color:var(--error)}
 .later-save [data-later-summary]{font-size:11px;white-space:nowrap;color:var(--ink-3)}
 .review-actions .later-save button{min-height:32px;padding:4px 10px;font-size:12px;flex-shrink:0}
 .review-actions .later-save button:disabled{opacity:.4}
@@ -560,7 +561,9 @@ function bind(){
    event.preventDefault();
    const outcome=event.submitter.value;
    if(outcome==='later'){
-    const at=laterEpoch(later.value);
+    const draft=parseLaterDraft(later.value);
+    if(!draft) return;
+    const at=laterEpoch(draft.date,draft.minutes);
     if(!(at>Date.now())) return;
     closeLater(form.querySelector('[data-later-menu]'),false);
     void send(outcome,new Date(at).toISOString());return;
@@ -586,11 +589,26 @@ function zoneEpoch(year,month,day,minutes){
  const candidates=[...offsets].map(offset=>wall-offset),exact=candidates.filter(epoch=>shownWall(epoch)===wall);
  return exact.length ? Math.min(...exact) : Math.max(...candidates);
 }
-function laterEpoch(wall){
- const [date,clock]=wall.split('T');
- if(!date || !clock) return NaN;
- const [year,month,day]=date.split('-').map(Number),[hour,minute]=clock.split(':').map(Number);
- return zoneEpoch(year,month,day,hour*60+minute);
+function parseLaterDraft(wall){
+ const match=/^(\d{4}-\d{2}-\d{2})T([^T]+)$/.exec(wall);
+ if(!match) return null;
+ const [,day,clock]=match,minutes=laterMinutes(clock);
+ if(!Number.isFinite(minutes)) return null;
+ const date=new Date(day+'T00:00:00Z');
+ if(!Number.isFinite(date.getTime()) || date.toISOString().slice(0,10)!==day) return null;
+ return {date,minutes};
+}
+function laterEpoch(date,minutes){
+ return zoneEpoch(date.getUTCFullYear(),date.getUTCMonth()+1,date.getUTCDate(),minutes);
+}
+function laterMinutes(value){
+ const text=value.trim(),match=/^(\d{1,2}):(\d{2})$/.exec(text) || /^(\d{2})(\d{2})$/.exec(text);
+ if(!match) return NaN;
+ const hour=Number(match[1]),minute=Number(match[2]);
+ return hour<24 && minute<60 ? hour*60+minute : NaN;
+}
+function laterClock(minutes){
+ return String(Math.floor(minutes/60)).padStart(2,'0')+':'+String(minutes%60).padStart(2,'0');
 }
 function laterTimes(now){
  const settings=JSON.parse(content.dataset.later),today=zoneParts(now);
@@ -631,13 +649,17 @@ function bindLater(form,pick){
  const summary=new Intl.DateTimeFormat('en-GB',{timeZone:content.dataset.zone,weekday:'short',day:'numeric',month:'short'});
  let selected=new Date(),display=new Date();
  const today=()=>{const now=zoneParts(Date.now());return new Date(Date.UTC(now.year,now.month-1,now.day));};
- const update=()=>{
-  form.elements.later.value=dayText(selected)+'T'+time.value;
+ const update=(normalize=false)=>{
+  const minutes=laterMinutes(time.value),valid=Number.isFinite(minutes);
+  const clock=valid ? laterClock(minutes) : '';
+  time.setAttribute('aria-invalid',String(!valid));
+  if(valid && normalize) time.value=clock;
+  form.elements.later.value=valid ? dayText(selected)+'T'+clock : '';
   form.elements.later.dispatchEvent(new Event('input',{bubbles:true}));
-  const at=laterEpoch(form.elements.later.value);
-  const clock=Number.isFinite(at) ? zoneParts(at) : {};
-  custom.querySelector('[data-later-summary]').textContent=Number.isFinite(at) ? 'Hides until '+summary.format(at)+' '+
-   String(clock.hour).padStart(2,'0')+':'+String(clock.minute).padStart(2,'0') : 'Choose a time';
+  const at=valid ? laterEpoch(selected,minutes) : NaN;
+  const resolved=Number.isFinite(at) ? zoneParts(at) : null;
+  custom.querySelector('[data-later-summary]').textContent=resolved ? 'Hides until '+summary.format(at)+' '+
+   laterClock(resolved.hour*60+resolved.minute) : 'Choose a time';
   save.disabled=!(at>Date.now());
  };
  const draw=()=>{
@@ -666,13 +688,12 @@ function bindLater(form,pick){
   update();
  };
  menu.querySelector('[data-later-choose]').addEventListener('click',()=>{
-  const wall=form.elements.later.value;
-  if(laterEpoch(wall)>Date.now()){
-   const [date,clock]=wall.split('T');selected=new Date(date+'T00:00:00Z');time.value=clock;
+  const draft=parseLaterDraft(form.elements.later.value);
+  if(draft && laterEpoch(draft.date,draft.minutes)>Date.now()){
+   selected=draft.date;time.value=laterClock(draft.minutes);
   }else{
    selected=today();selected.setUTCDate(selected.getUTCDate()+1);
-   const morning=JSON.parse(content.dataset.later).morning;
-   time.value=String(Math.floor(morning/60)).padStart(2,'0')+':'+String(morning%60).padStart(2,'0');
+   time.value=laterClock(JSON.parse(content.dataset.later).morning);
   }
   display=new Date(selected);
   custom.hidden=false;menu.dataset.choosing='true';draw();grid.querySelector('[tabindex="0"]').focus();
@@ -681,7 +702,16 @@ function bindLater(form,pick){
   display=new Date(Date.UTC(display.getUTCFullYear(),display.getUTCMonth()+Number(button.dataset.laterMonthStep),1));
   draw();
  }));
- time.addEventListener('input',update);time.addEventListener('change',update);
+ time.addEventListener('input',()=>update());
+ time.addEventListener('blur',()=>update(true));
+ time.addEventListener('keydown',event=>{
+  const step={ArrowUp:15,ArrowDown:-15}[event.key];
+  if(step===undefined) return;
+  event.preventDefault();
+  const minutes=laterMinutes(time.value);
+  if(!Number.isFinite(minutes)) return;
+  time.value=laterClock((minutes+step+1440)%1440);update();
+ });
  grid.addEventListener('keydown',event=>{
   const days={ArrowLeft:-1,ArrowRight:1,ArrowUp:-7,ArrowDown:7}[event.key];
   if(days===undefined) return;
@@ -693,7 +723,7 @@ function bindLater(form,pick){
   if(event.key==='Escape'){event.preventDefault();closeLater(menu,true);return;}
   if(custom.contains(event.target)){
    if(event.key==='Enter'){
-    event.preventDefault();update();if(!save.disabled) form.requestSubmit(save);
+    event.preventDefault();update(true);if(!save.disabled) form.requestSubmit(save);
    }
    return;
   }
