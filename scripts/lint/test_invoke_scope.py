@@ -300,11 +300,12 @@ class BuildScopeTests(unittest.TestCase):
             result = subprocess.run(
                 ["/bin/sh", "-c", 'exec 3>&2; exec /bin/sh -c "$@"',
                  "scope-test", command, str(marker), "sh", "-c",
-                 'test -f "$1.cgroup" && cat "$1.cgroup"', "step", str(marker)],
+                 'test -f "$1.cgroup" && cat "$1.cgroup" && printf "%s\\n" "$BUILDLOG_STEP_SCOPE"', "step", str(marker)],
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(result.stdout.strip(), str(scope))
+            # The step names its scope, so a compiler that sccache runs is charged to it.
+            self.assertEqual(result.stdout.splitlines(), [str(scope), str(scope)])
             self.assertEqual((root / "peak.cgroup").read_text().strip(), str(scope))
 
     def test_failed_score_write_is_silent_and_step_runs_under_exported_errexit(self) -> None:
