@@ -1606,7 +1606,12 @@ assert not loaded, loaded
                                        "BUILD_TARGETS_CONFIG": str(config.parent / "build_targets.conf")})
         sources = Path(__file__).resolve().parents[2] / "config"
         for source in sources.glob("*.conf"):
-            self.assertEqual((config.parent / source.name).read_bytes(), source.read_bytes())
+            private = config.parent / source.name
+            if source.name == "build_admission.conf":
+                shipped = conf.read(source).values()
+                self.assertEqual(conf.read(private).values(), shipped | {"min_pass_gap_seconds": "0"})
+            else:
+                self.assertEqual(private.read_bytes(), source.read_bytes())
         _ = write_config_fixture(config, "prefixes.admit-test=admit-test-\nroots.system=/tmp\n")
         original = config.read_text()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
