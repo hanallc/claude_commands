@@ -32,7 +32,7 @@ def page_url() -> str:
 
 def waiting_items(request: console.NewsRequest) -> frozenset[str]:
     now = datetime.now(user_zone())
-    return frozenset(item.key+'/'+item.times.updated.isoformat() for item in request.shared(review_items.read)
+    return frozenset(item.key+'/'+item.times.updated.isoformat() for item in request.shared(review_items.read_open)
                      if item.type in TYPES and item.for_you(now))
 
 
@@ -143,27 +143,34 @@ def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: sta
             +f'<tr data-detail id="{panel}" hidden><td colspan="6">'+details(item, browser, members)+'</td></tr></tbody>')
 
 
-def render(root: Path) -> bytes:
+def render(root: Path, *, show: str = 'open') -> bytes:
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
     now = datetime.fromtimestamp(read_at, user_zone())
-    items = [item for item in review_items.read(root, members=members) if item.type in TYPES]
+    if show not in dict(SHOWS):
+        show = 'open'
+    owners: dict[staff.StaffId, str] = {}
+    records = review_items.read(root, members=members, kinds=TYPES, show=show, owner_options=owners)
+    items = [item for item in records
+             if not item.hidden_until(now) and (show == 'all' or
+                 show == 'open' and item.state != ReviewState.DONE or item.state == show)
+             and not (show == 'open' and item.state == ReviewState.WAITING and
+                 isinstance(item.source, review_items.ChangeSource) and item.source.slots.validation_requested)]
     items.sort(key=lambda item: (item.state != ReviewState.FOR_YOU, item.state == ReviewState.DONE))
     token, initial = change_browser.browser_manifest(change_page.console_folder(root))
     browser = change_page.ReviewBrowser(token, initial)
-    visible = [item for item in items if not item.hidden_until(now) and item.state != ReviewState.DONE]
-    owners = {item.owner:owner_name(item, members) for item in items}
+    visible = items
     options = ''.join(f'<option value="{html.escape(owner, quote=True)}" data-owner-name="{html.escape(name, quote=True)}">{html.escape(name)} '
-                     +f'({sum(item.owner == owner for item in visible)})</option>'
+                     +f'({sum(item.owner == owner or item.type == ReviewType.INVESTIGATION and item.source_unit == owner for item in visible)})</option>'
                      for owner, name in sorted(owners.items(), key=lambda pair:pair[1].casefold()))
     chips = '<button type="button" data-type-chip="" aria-pressed="true">All <b>'+str(len(visible))+'</b></button>'
     chips += ''.join('<button type="button" data-type-chip="'+kind+'" aria-pressed="false">'+icon(kind)+LABELS[kind]
                      +' <b>'+str(sum(item.type == kind for item in visible))+'</b></button>' for kind in TYPES)
-    shows = ''.join(f'<option value="{value}">{label}</option>' for value, label in SHOWS)
+    shows = ''.join(f'<option value="{value}"'+(' selected' if value == show else '')+f'>{label}</option>' for value, label in SHOWS)
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       +'<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
     content = (record_table.STYLE+STYLE+page_frame.title('Review', 'review')
-        +f'<div data-review data-refresh-seconds="{conf.read("review_links").number("page_refresh_seconds")}">'
+        +f'<div data-review data-show="{show}" data-refresh-seconds="{conf.read("review_links").number("page_refresh_seconds")}">'
         +'<div class="review-types">'+chips+'</div><div class="list-filters">'
         +'<label for="list-owner">Owner</label><select id="list-owner"><option value="">All ('+str(len(visible))+')</option>'+options+'</select>'
         +'<label for="list-show">Show</label><select id="list-show">'+shows+'</select>'
@@ -234,19 +241,14 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 
 SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + review_legacy.SCRIPT + r'''(() => {
 let content=document.querySelector('[data-review]'),saving=0;
+let selectedShow=content.dataset.show,requestedShow=selectedShow;
 const drafts=new Map(),saved=new Map();
 const view=createRecordTable({content:()=>content,single:true,
  place:reviewPlace,
  resolveOwner:owner=>{
   const menu=content.querySelector('#list-owner');
   const option=[...menu.options].find(option=>option.value===owner || option.dataset.ownerName===owner);
-  if(option) return option.value;
-  const sources=[...content.querySelectorAll('[data-list-item]')].filter(row=>row.dataset.type==='investigation' && row.dataset.sourceOwner===owner);
-  if(sources.length){
-   const count=sources.filter(row=>row.dataset.state!=='Done' && row.dataset.parked!=='true').length;
-   menu.add(new Option(sources[0].dataset.sourceName+' ('+count+')',owner));
-  }
-  return owner;
+  return option ? option.value : owner;
  },
  shows:['open','For you','Waiting','Done','all'],
  visible:(data,{owner,show,query,type,sourceOwner})=>!saved.has(data.key) && data.parked!=='true' &&
@@ -255,8 +257,27 @@ const view=createRecordTable({content:()=>content,single:true,
   (!sourceOwner || data.sourceOwner===sourceOwner) &&
   (!query || data.number.includes(query) || data.title.includes(query)) &&
   (show==='all' || (show==='open' ? data.state!=='Done' : data.state===show)),
- counts:items=>['For you','Waiting','Done'].map(state=>items.filter(item=>!saved.has(item.dataset.key) && item.dataset.state===state && item.dataset.parked!=='true').length+' '+state.toLowerCase()).join(' · '),
- applied:(items,{type})=>content.querySelectorAll('[data-type-chip]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.typeChip===type)))
+ counts:items=>{
+  const show=content.querySelector('#list-show').value;
+  const states=show==='all' ? ['For you','Waiting','Done'] : show==='open' ? ['For you','Waiting'] : [show];
+  return states.map(state=>items.filter(item=>!saved.has(item.dataset.key) && item.dataset.state===state && item.dataset.parked!=='true').length+' '+state.toLowerCase()).join(' · ');
+ },
+ applied:(items,{type,show})=>{
+  selectedShow=show;
+  const shown=items.filter(item=>!saved.has(item.dataset.key) && item.dataset.parked!=='true' &&
+   !(show==='open' && item.dataset.state==='Waiting' && item.dataset.checking==='true') &&
+   (show==='all' || (show==='open' ? item.dataset.state!=='Done' : item.dataset.state===show)));
+  content.querySelectorAll('[data-type-chip]').forEach(button=>{
+   button.setAttribute('aria-pressed',String(button.dataset.typeChip===type));
+   button.querySelector('b').textContent=shown.filter(item=>!button.dataset.typeChip || item.dataset.type===button.dataset.typeChip).length;
+  });
+  [...content.querySelector('#list-owner').options].forEach(option=>{
+   const count=shown.filter(item=>!option.value || item.dataset.owner===option.value ||
+    item.dataset.type==='investigation' && item.dataset.sourceOwner===option.value).length;
+   option.textContent=(option.dataset.ownerName || (option.value ? option.textContent.replace(/ \(\d+\)$/,'') : 'All'))+' ('+count+')';
+  });
+  if(show!==requestedShow){requestedShow=show;queueMicrotask(()=>pageRefresh.refresh(true));}
+ }
 });
 function bind(){
  view.replace();
@@ -290,17 +311,21 @@ function bind(){
      closes:!['validate','question','later'].includes(data.get('outcome'))});
     view.opened.delete(key);view.apply(false);
    }catch(error){notice.textContent='Not saved: '+error.message;buttons.forEach(button=>button.disabled=false);}
-   finally{delete form.dataset.sending;saving--;}
+   finally{
+    delete form.dataset.sending;saving--;
+    if(!saving && selectedShow!==content.dataset.show) void pageRefresh.refresh(true);
+   }
   });
  });
 }
 async function refresh(_supersede=false,current=()=>true){
  if(saving) return;
- const response=await fetch(location.pathname,{cache:'no-store'});
+ const show=selectedShow;
+ const response=await fetch(location.pathname+'?'+new URLSearchParams({show}),{cache:'no-store'});
  if(!response.ok) throw new Error('HTTP '+response.status);
  const page=new DOMParser().parseFromString(await response.text(),'text/html'),fresh=page.querySelector('[data-review]');
  if(!fresh) throw new Error('The page has no review table.');
- if(saving || !current()) return;
+ if(saving || !current() || show!==selectedShow) return;
  const top=scrollY,focus=document.activeElement?.id,start=document.activeElement?.selectionStart,end=document.activeElement?.selectionEnd;
  content.replaceWith(fresh);content=fresh;
  for(const [key,result] of saved){
