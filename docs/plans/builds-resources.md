@@ -2677,3 +2677,27 @@ The cutover removal commit deletes the script after the run.
 - Checkpoint `456dfc4c5`: `test_sweep` 366 tests pass; basedpyright 0.
 
 **Files:** `scripts/lint/test_sweep.py`.
+
+### Phase 140 — The Phase 8 guard passes in the gate checkout layout  · status: done
+
+The AWS cloud gate runs the suite with HOME equal to the passwd home, which has only `.claude/config`. The Phase 8 and 135 set failed 169 modules there with "ADMISSION_SOCKET is set …; the installed scripts … do not run with it".
+
+#### Cause
+
+- Phase 8's `caller_admission()` linked the checkout's `lint`, `build_hold`, `build_queue` and `build_targets` into `Path.home()/.claude/scripts`. In the gate, that is the passwd home, so the guard then took the checkout for the installed copy. On natedev the real install is there, so nothing was written.
+- Through the same links, `test_linux_runner` overwrote the checkout's `scripts/lint/lint`.
+- Phase 137 removes those writes. So 8 and 135 merge only with 137, as one set.
+
+#### Work
+
+- `test_record.test_shell_completion_branches_preserve_the_folder_and_refresh_saved_arguments` sets `BUILD_HELPER_ROOT` to its fixture `.claude/scripts`.
+- `test_test_phase_peak.test_terminal_and_tee_steps_keep_the_token_width_after_admission_release` runs `$BUILD_HELPER_ROOT/lib/py`, not `$HOME/.claude/scripts/lib/py`.
+
+#### Proof
+
+- Gate layout on natedev: a fresh HOME with only `.claude/config`, and a `sitecustomize` that makes the passwd home equal to it.
+- 8+135 in that layout: 247 tests, 11 failures, 101 errors, helper links under HOME (the gate red).
+- 8+135+137: 2,082 tests, only the two methods above fail; HOME gets no `.claude/scripts`.
+- With this fix on main a3218b819: both modules pass (98 tests) in the gate layout and with normal startup; basedpyright 0/0.
+
+**Files:** `scripts/buildlog/test_record.py`, `scripts/buildlog/test_test_phase_peak.py`.
