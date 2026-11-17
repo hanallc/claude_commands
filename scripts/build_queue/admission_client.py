@@ -1281,7 +1281,10 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                 output.placement_notices(answer, placement_events=args.wait_events)
             if not isinstance(answer, wire.PlacementWait):
                 break
-            if isinstance(answer.wait, wire.Wait) and not isinstance(prerequisite, placement.TokenRequired):
+            # The first pass only lets a free remote target take the step; it is no memory wait.
+            token_check = (isinstance(prerequisite, placement.TokenRequired)
+                           and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
+            if isinstance(answer.wait, wire.Wait) and not token_check:
                 output(answer.wait)
                 notice = PlacementWaitNotice(output.started, output.last_reasons,
                     output.last_position, answer.wait, output.elapsed_memory_seconds, output.last_provider_diagnostics)

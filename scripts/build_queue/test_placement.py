@@ -281,13 +281,14 @@ class PlacementTests(unittest.TestCase):
             self.assertEqual([step.route for step in view.reading.view.running if step.pid == local.owner.pid],
                              [LOCAL_CALLER])
 
-    def test_token_readiness_blocks_local_memory_but_allows_remote_placement(self) -> None:
-        cases = ((False, False, False, True), (True, False, False, True),
-                 (False, True, False, True), (True, True, False, True),
-                 (True, True, True, True), (True, True, True, False), (True, False, True, True))
-        for remote_ready, local_first, unchecked, available_after_check in cases:
+    def test_only_the_first_token_check_keeps_a_step_off_natedev(self) -> None:
+        # (remote_ready, local_first, unchecked, first reply)
+        cases = ((False, False, False, "local"), (True, False, False, "mac"),
+                 (False, True, False, "local"), (True, True, False, "local"),
+                 (True, True, True, "wait"), (True, False, True, "mac"), (False, False, True, "wait"))
+        for remote_ready, local_first, unchecked, expected in cases:
             with self.subTest(remote_ready=remote_ready, local_first=local_first,
-                              unchecked=unchecked, available_after_check=available_after_check), PlacementFixture() as fixture:
+                              unchecked=unchecked), PlacementFixture() as fixture:
                 request = placement_request(fixture)
                 _ = publish_candidate(fixture, request, ALLOWED_HOST if remote_ready
                                       else placement.TemporaryExclusion("disk"))
@@ -299,26 +300,20 @@ class PlacementTests(unittest.TestCase):
                 request = replace(request, prerequisite=prerequisite, constraints=replace(
                     request.constraints, candidates=candidates))
                 reply, = fixture.connect(request).replies()
-                remote_selected = remote_ready and not (unchecked and local_first)
-                self.assertIsInstance(reply, wire.Assignment if remote_selected else wire.PlacementWait)
-                self.assertEqual(fixture.caller_reservations(), {})
-                if remote_selected:
+                if expected == "mac":
                     assert isinstance(reply, wire.Assignment)
                     self.assertEqual(reply.assignment.destination.provider, "mac")
-                else:
-                    confirmed = (placement.TokenHeld() if available_after_check else
-                                 placement.TokenRequired(placement.TokenUnavailable()))
-                    _ = fixture.connect(wire.PrerequisiteReport(
-                        "token-checked", request.episode, request.owner, confirmed)).replies()
+                    self.assertEqual(fixture.caller_reservations(), {})
+                    continue
+                if expected == "wait":
+                    self.assertIsInstance(reply, wire.PlacementWait)
+                    self.assertEqual(fixture.caller_reservations(), {})
+                    # The caller holds no token; after the first pass, natedev can grant at once.
+                    _ = fixture.connect(wire.PrerequisiteReport("token-checked", request.episode, request.owner,
+                        placement.TokenRequired(placement.TokenUnavailable()))).replies()
                     reply, = fixture.connect(request).replies()
-                    if available_after_check:
-                        self.assertIsInstance(reply, wire.LocalPlacementGranted)
-                        self.assertEqual(set(fixture.server.reservations), {request.episode})
-                    else:
-                        self.assertIsInstance(reply, wire.Assignment)
-                        assert isinstance(reply, wire.Assignment)
-                        self.assertEqual(reply.assignment.destination.provider, "mac")
-                        self.assertEqual(fixture.caller_reservations(), {})
+                self.assertIsInstance(reply, wire.LocalPlacementGranted)
+                self.assertEqual(set(fixture.server.reservations), {request.episode})
 
     def test_released_local_grants_cannot_authorize_a_replayed_step(self) -> None:
         for ending in ("release", "cancel"):
@@ -341,7 +336,7 @@ class PlacementTests(unittest.TestCase):
                 replay, = fixture.connect(request).replies()
                 self.assertNotIsInstance(replay, wire.LocalPlacementGranted)
 
-    def test_restart_requires_token_confirmation_before_a_local_grant(self) -> None:
+    def test_a_restart_needs_no_token_confirmation_before_a_local_grant(self) -> None:
         with PlacementFixture() as fixture:
             fixture.free(0)
             fixture.hold_starts()
@@ -349,15 +344,10 @@ class PlacementTests(unittest.TestCase):
             request = replace(request, prerequisite=placement.TokenHeld(), constraints=replace(
                 request.constraints, candidates=(local_candidate(fixture),)))
             self.assertIsInstance(fixture.connect(request).replies()[-1], wire.PlacementWait)
-            places = dict(fixture.server.run_places)
             fixture.restart()
             fixture.free(60 * GIB)
             write_pressure_reading(fixture.root / "pressure")
-            self.assertIsInstance(fixture.connect(request).replies()[-1], wire.PlacementWait)
-            self.assertEqual(fixture.caller_reservations(), {})
-            self.assertEqual(fixture.server.run_places, places)
-            _ = fixture.connect(wire.PrerequisiteReport(
-                "token-reconfirmed", request.episode, request.owner, placement.TokenHeld())).replies()
+            # A placement waiter holds no cargo token, so the restored row is not token-waiting.
             self.assertIsInstance(fixture.connect(request).replies()[-1], wire.LocalPlacementGranted)
             self.assertEqual(set(fixture.server.reservations), {request.episode})
 

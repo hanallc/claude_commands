@@ -565,7 +565,11 @@ class ClientTests(unittest.TestCase):
                                 fixture.free(60 * GIB)
                             self.assertEqual(client.main(["claim-failed", "--assignment-file", str(assignment_file),
                                                           "--reason", "lost" if execution_target == "mac-retry-notice" else "busy"]), 0)
-                            self.assertFalse(fixture.caller_reservations())
+                            if execution_target == "mac-handoff":
+                                # The replacement needs no token check, so the next pass grants natedev.
+                                self.assertTrue(fixture.caller_reservations())
+                            else:
+                                self.assertFalse(fixture.caller_reservations())
 
                             if execution_target == "mac-retry-notice":
                                 assignment_file.unlink()
@@ -597,11 +601,10 @@ class ClientTests(unittest.TestCase):
 
                                 token_arguments = [*arguments[:arguments.index("--")], "--token", "required",
                                                    *arguments[arguments.index("--"):]]
+                                # After its first pass, a caller without its token can get a local grant;
+                                # it takes the token after the grant.
                                 with mock.patch.object(fixture.server, "before_admission", side_effect=release_before_retry):
-                                    self.assertEqual(client.main(token_arguments), 78, errors.getvalue())
-                                self.assertFalse(fixture.caller_reservations())
-                                token_arguments[token_arguments.index("required")] = "held"
-                                self.assertEqual(client.main(token_arguments), 0, errors.getvalue())
+                                    self.assertEqual(client.main(token_arguments), 0, errors.getvalue())
                             retry_grant = client.read_assignment(assignment_file)
                             self.assertIsInstance(retry_grant, wire.LocalPlacementGranted)
                             assert isinstance(retry_grant, wire.LocalPlacementGranted)

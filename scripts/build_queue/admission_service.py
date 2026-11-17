@@ -2782,8 +2782,12 @@ done
                 row["order_since"] = min(run_place.since, row.get("order_since", row["since"]))
             row["build_run"] = _live_run(request.run)
         row["route"] = request.route
+        # The first pass, before the caller reads its token, starts nothing local, so a free
+        # remote target can take the step. A later pass can grant natedev; the caller then
+        # takes its cargo token, so a placement waiter is never token-waiting after that pass.
         prerequisite = self.prerequisites.get(request.episode, placement.TokenRequired())
-        if isinstance(prerequisite, placement.TokenRequired):
+        if (isinstance(prerequisite, placement.TokenRequired)
+                and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked)):
             row["token_left_at"] = row.get("token_left_at", request.since)
             _ = row.pop("token_back_at", None)
         else:
