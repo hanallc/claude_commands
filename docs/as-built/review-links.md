@@ -469,9 +469,21 @@ Open excludes Done, Closed, and items with a future parking time.
 The search field matches an item number or title.
 The address retains the owner, view, search, column, and direction.
 
-A row opens to show its latest status, completion condition, evidence, item links, and log.
+A row opens to show its latest status, completion condition, item links, and log.
+The open row does not show Evidence; the record keeps it.
 The log shows its newest entry first.
-Each expanded row has Remove, Park with a date, and Tell morty with a Send button.
+Each expanded row has Remove, Park with a date, and a text box with a Tell morty button.
+The text box shows “Your words for morty about this item” as its placeholder and accessible name.
+The primary button sits below the box at its right edge, beside the send status.
+The button stays disabled until the box contains words.
+Clearing the box, including after a successful send, disables the button again.
+Record text uses the shared review formatter for bold text, headings, lists, code spans, and links.
+Code spans take priority over links and bold text.
+URLs keep unmatched backticks and interior `*` characters, but a URL never ends with `*`.
+A matched code span ends the URL before its opening backtick.
+Bold delimiters require adjacent text and a valid whitespace or punctuation boundary.
+Bold content is nonempty and cannot start or end with whitespace or `/`.
+Delimiters between word characters or slashes stay literal, so `src/**/test/**/file.py` stays literal while `**read/write**` becomes bold.
 Mark read appears only when the item has an unread update.
 Mark read clears the dot and adds a log entry without sending a message.
 Remove, Park, and Tell morty send nate's words and the item number to morty's current session.
