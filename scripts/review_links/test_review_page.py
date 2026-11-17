@@ -19,7 +19,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import override
 from unittest.mock import patch
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode
 
 from scripts.agents.remote import local_machine
 from scripts.production.production_doc import read_production
@@ -31,6 +31,7 @@ from scripts.review_links import change_browser, change_page, console, record_ta
 from scripts.review_links import question_record
 from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, review_actions, review_later
+from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.statusline import counts_row
 
@@ -57,7 +58,7 @@ class ReviewPageTests(unittest.TestCase):
         item = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.QUESTION)
         unknown = replace(item, owner=staff.StaffId('nate'), source_unit=staff.StaffId('unknown-source'))
         plain = review_page.item_rows(unknown, change_page.ReviewBrowser('private'), staff.snapshot(),
-                                      datetime.now(user_zone()), 0, 100, 3)
+                                      datetime.now(user_zone()), 0, 100, review_page.CardSettings(3, 'In 1 hour'))
         self.assertIn('<td data-label="Owner">nate<small>· unknown-source</small></td>', plain)
         self.assertIn('Owner: nate · Source: unknown-source</p>', plain)
 
@@ -135,7 +136,7 @@ class ReviewPageTests(unittest.TestCase):
         title = 'Check the spacing'
         token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
         browser = change_page.ReviewBrowser(token, initial)
-        row = review_page.item_rows(replace(item, title=title), browser, staff.snapshot(), datetime.now(user_zone()), 0, 100, 4)
+        row = review_page.item_rows(replace(item, title=title), browser, staff.snapshot(), datetime.now(user_zone()), 0, 100, review_page.CardSettings(4, 'In 1 hour'))
         detail = row.split('data-detail', 1)[1]
         self.assertIn('<h3>Item</h3><p>'+title+'</p>', detail)
         self.assertEqual(detail.count(title), 1)
@@ -166,7 +167,7 @@ class ReviewPageTests(unittest.TestCase):
         self.assertEqual(item.title, investigation_record.question)
         token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
         browser = change_page.ReviewBrowser(token, initial)
-        detail = review_page.details(item, browser, staff.snapshot(), 4).split('data-review-body>', 1)[1]
+        detail = review_page.details(item, browser, staff.snapshot(), review_page.CardSettings(4, 'In 1 hour')).split('data-review-body>', 1)[1]
         self.assertIn('<h3>You asked</h3>', detail)
         self.assertEqual(detail.count(html.escape(item.title)), 1)
         self.assertNotIn('<h3>Item</h3>', detail)
@@ -179,7 +180,7 @@ class ReviewPageTests(unittest.TestCase):
         source = replace(item.source, row={**item.source.row, 'What you see': title})
         token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
         browser = change_page.ReviewBrowser(token, initial)
-        detail = review_page.details(replace(item, title=title, source=source), browser, staff.snapshot(), 4).split('data-review-body>', 1)[1]
+        detail = review_page.details(replace(item, title=title, source=source), browser, staff.snapshot(), review_page.CardSettings(4, 'In 1 hour')).split('data-review-body>', 1)[1]
         self.assertIn('<h3>Proof</h3><p>'+title+'</p>', detail)
         self.assertEqual(detail.count(title), 1)
         self.assertNotIn('<h3>Item</h3>', detail)
@@ -194,7 +195,7 @@ class ReviewPageTests(unittest.TestCase):
         _ = self.decisions()
         for item in review_items.read(self.root):
             with self.subTest(kind=item.type):
-                row = review_page.item_rows(replace(item, title=title), browser, members, datetime.now(user_zone()), 0, 100, 4)
+                row = review_page.item_rows(replace(item, title=title), browser, members, datetime.now(user_zone()), 0, 100, review_page.CardSettings(4, 'In 1 hour'))
                 self.assert_row_title(row, title, title.splitlines()[0][:100]+'…')
                 detail = row.split('data-detail', 1)[1]
                 for line in title.splitlines():
@@ -255,9 +256,9 @@ class ReviewPageTests(unittest.TestCase):
         self.assertEqual({item.type for item in items},{review_items.ReviewType.QUESTION,review_items.ReviewType.CHANGE,review_items.ReviewType.INVESTIGATION})
         question = next(item for item in items if item.key == key)
         self.assertRegex(question.id,r'^page-owner/Q[1-9][0-9]*$')
-        self.assertEqual(question.state,review_items.ReviewState.FOR_YOU)
+        self.assertEqual(question.state,review_items.ReviewState.OPEN)
         states = {item.key:item.state for item in items}
-        self.assertEqual(states[f'investigation/{ready.owner}/{ready.id}'],review_items.ReviewState.FOR_YOU)
+        self.assertEqual(states[f'investigation/{ready.owner}/{ready.id}'],review_items.ReviewState.OPEN)
         self.assertEqual(states[f'investigation/{waiting.owner}/{waiting.id}'],review_items.ReviewState.WAITING)
         _ = investigation.mark_read(ready.owner,ready.id)
         self.assertEqual(next(item.state for item in review_items.read(self.root) if item.key.endswith('/'+ready.id)),review_items.ReviewState.DONE)
@@ -333,7 +334,7 @@ class ReviewPageTests(unittest.TestCase):
         _ = change_review.save_verdict(self.fixture.review_list, 'C1', 'not works: the spacing differs',
                                        self.fixture.production, validation_id=delivery.attempt)
         returned = next(item for item in review_items.read(self.root) if item.key == key)
-        self.assertEqual(returned.state, review_items.ReviewState.FOR_YOU)
+        self.assertEqual(returned.state, review_items.ReviewState.OPEN)
         self.assertIn('the spacing differs', returned.log[-1].words)
         _,answer = review_page.submit(self.root,self.body('page-owner/C2','feedback','Adjust the spacing.'),self.status)
         self.assertEqual(answer,'feedback sent')
@@ -372,10 +373,568 @@ class ReviewPageTests(unittest.TestCase):
             self.assertIn(f'data-type-chip="{kind}"',source)
         for action in ('Answer','Works','Does not work','Ask showrunner to check','Ask question','Send feedback','Mark read'):
             self.assertIn('>'+action+'</button>',source)
-        self.assertIn('>Later</button>',source)
+        self.assertIn('data-later-toggle>Later <span',source)
         self.assertIn('createPageRefresh(refresh,()=>content.dataset.refreshSeconds)',source)
         self.assertIn('class="lucide lucide-microscope"',source)
         self.assertIn('data-refresh-seconds="15.0"',source)
+
+    def test_open_state_replaces_for_you_without_changing_the_user_totals(self) -> None:
+        _ = self.decisions()
+        _ = self.question()
+        _ = self.investigation()
+        _ = self.investigation(False)
+        records = review_items.read(self.root)
+        actionable = [item for item in records if item.for_you(datetime.now(user_zone()))]
+        self.assertEqual(len(actionable), 7, 'The user totals retain all seven actionable records.')
+        self.assertEqual({item.type for item in actionable}, set(review_items.ReviewType))
+        self.assertEqual({item.state.value for item in actionable}, {'Open'})
+        self.assertEqual(tuple(state.value for state in review_items.ReviewState), ('Open', 'Waiting', 'Done'))
+        self.assertTrue(all(item.actions for item in actionable))
+        self.assertEqual(review_items.read(self.root, show='open'), actionable)
+        self.assertEqual(review_page.SHOWS,
+                         (('open', 'Open'), ('Waiting', 'Waiting'), ('Done', 'Done'), ('all', 'All')))
+        for spelling in ('For you', 'for-you', 'for you'):
+            with self.subTest(spelling=spelling):
+                markup = review_page.render(self.root, show=spelling).decode()
+                self.assertIn('data-show="open"', markup)
+                self.assertNotIn('data-state="For you"', markup)
+                self.assertNotIn('data-show-chip="For you"', markup)
+                self.assertNotIn('data-state="Waiting"', markup)
+
+    def test_open_decisions_keep_their_actions_counts_and_queues(self) -> None:
+        keys = self.decisions()
+        _ = self.question()
+        _ = self.investigation()
+        _ = self.investigation(False)
+        doc = self.fixture.production
+        _ = doc.write_text(doc.read_text()+'Status: PRODUCTION — running\n')
+        members = staff.snapshot()
+        owner = next(row for row in members.rows if row.name == 'page-owner')
+        identities = update_registration.QuestionStaff.for_record(members)
+        items = {item.key:item for item in review_items.read(self.root)}
+        for key in keys:
+            with self.subTest(key=key):
+                item = items[key]
+                self.assertEqual(item.state, 'Open', 'A proposal or efficiency waits in Open.')
+                self.assertEqual(item.actions, review_items.DECISION_ACTIONS)
+                self.assertTrue(item.for_you(datetime.now(user_zone())), 'Open decisions remain eligible for automation.')
+                self.assertIn(item, review_items.read(self.root, show='open'))
+                self.assertIn(item, review_items.read(self.root, show='For you'))
+                markup = review_page.render(self.root).decode()
+                row = markup.partition('data-key="'+key+'"')[2].partition('</tbody>')[0]
+                self.assertIn('data-state="Open"', row)
+                self.assertIn('>Open</span>', row)
+                self.assertIn(key, review_page.render(self.root, show='For you').decode())
+        with self.subTest(check='queue and footer totals'):
+            counts = footer_counts.read_counts(doc, questions=1, record=members)
+            self.assertEqual((counts.proposals, counts.efficiency), (1, 1))
+            for kind in ('proposal', 'efficiency'):
+                queue = next_item.read_queue(kind, doc)
+                self.assertEqual(len(queue.entries), 1)
+            instance = self.fixture.temporary / ('showrunner-'+owner.id)
+            instance.mkdir()
+            line, _ = counts_row.row(instance, [], identities=identities)
+            self.assertEqual(line, footer_counts.counts_line(counts), 'The status line keeps the footer totals.')
+
+    def test_show_chips_replace_the_review_select(self) -> None:
+        _ = self.question()
+        _ = self.investigation(False)
+        for show, _ in review_page.SHOWS:
+            with self.subTest(show=show):
+                source = review_page.render(self.root, show=show).decode()
+                group = source.partition('<div class="review-types review-shows"')[2].partition('</div>')[0]
+                self.assertTrue(group, 'Show has a second chip row')
+                self.assertNotIn('<select id="list-show"', source)
+                self.assertNotIn('<label for="list-show">', source)
+                self.assertEqual(group.count('aria-pressed="true"'), 1)
+                self.assertIn(f'data-show-chip="{show}" aria-pressed="true"', group)
+                for value, label in review_page.SHOWS:
+                    self.assertIn(f'type="button" data-show-chip="{value}"', group)
+                    self.assertIn('>'+label+' <b', group)
+
+    def test_filter_index_has_only_filter_and_sort_values(self) -> None:
+        _ = self.question('A title with </script><b>text</b> & words?')
+        waiting = self.investigation(False)
+        done = self.investigation()
+        _ = investigation.mark_read(done.owner, done.id)
+        records = review_items.read(self.root)
+        members = staff.snapshot()
+        entries = review_page.filter_index(records, members, datetime.now(user_zone()))
+        self.assertEqual(len(entries), len(records))
+        self.assertEqual({entry['state'] for entry in entries}, {'Open', 'Waiting', 'Done'})
+        self.assertIn(f'investigation/{waiting.owner}/{waiting.id}', {entry['key'] for entry in entries})
+        self.assertEqual(set(entries[0]), {'key', 'id', 'type', 'owner', 'sourceOwner', 'ownerName',
+                                        'title', 'state', 'filed', 'updated', 'hiddenUntil'})
+        self.assertEqual([entry['updated'] for entry in entries], [item.times.updated.isoformat() for item in records])
+        encoded = review_page.index_json(entries)
+        self.assertNotIn('<', encoded)
+        self.assertNotIn('&', encoded)
+        self.assertEqual(json.loads(encoded), entries)
+        for show, _ in review_page.SHOWS:
+            source = review_page.render(self.root, show=show).decode()
+            payload = source.split('data-review-index>', 1)[1].split('</script>', 1)[0]
+            self.assertEqual(json.loads(payload), entries, 'Every Show carries the same complete index.')
+            self.assertNotIn('<span data-list-count', source)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_show_chips_keep_counts_address_reload_and_refresh(self) -> None:
+        self.maxDiff: int | None = None
+        _ = self.decisions()
+        _ = self.question()
+        _ = self.investigation()
+        _ = self.investigation(False)
+        finished = self.investigation()
+        _ = investigation.mark_read(finished.owner, finished.id)
+        _ = review_page.submit(self.root, self.body('page-owner/C1', 'validate'), self.status)
+        pages = {show: review_page.render(self.root, show=show).decode() for show, _ in review_page.SHOWS}
+        setup = r"""<script>
+const nativeFetch=fetch,nativeTimeout=setTimeout;
+window.setInterval=()=>0;window.clearInterval=()=>{};
+window.refreshRequests=[];
+const showPages=PAGES;
+window.fetch=async(url,options)=>{
+ if(options?.method==='POST') return {ok:true,json:async()=>({answer:'saved'})};
+ window.refreshRequests.push(url);
+ const show=new URL(url,location.href).searchParams.get('show') || 'open';
+ return {ok:true,text:async()=>showPages[show]};
+};
+</script>""".replace('PAGES', json.dumps(pages).replace('</', '<\\/'))
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const flush=()=>new Promise(resolve=>nativeTimeout(resolve,80));
+ const chip=(value,doc=document)=>doc.querySelector('[data-show-chip="'+value+'"]');
+ const pressed=(doc=document)=>[...doc.querySelectorAll('[data-show-chip][aria-pressed="true"]')];
+ const selected=(value,doc=document)=>pressed(doc).length===1 && pressed(doc)[0].dataset.showChip===value;
+ const count=(value,doc=document)=>chip(value,doc)?.querySelector('b');
+ try{
+  await flush();
+  check([...document.querySelectorAll('[data-show-chip]')].map(button=>button.dataset.showChip).join('|')===
+    'open|Waiting|Done|all','Show chips have the required order');
+  check(selected('open'),'exactly one Open chip starts pressed');
+  check(count('open')?.textContent==='6' && count('Waiting')?.textContent==='2' &&
+    count('Done')?.textContent==='1' && count('all')?.textContent==='9',
+    'F001: Open shows complete counts, including the active check in Waiting');
+  const decisions=()=>[...document.querySelectorAll('[data-list-item]')].filter(row=>
+   ['proposal','efficiency'].includes(row.dataset.type));
+  check(decisions().length===2 && decisions().every(row=>row.dataset.state==='Open' && !row.hidden &&
+   row.querySelector('.list-state').textContent==='Open'),'decision rows use Open in their badge and data-state');
+  check(!document.querySelector('[data-list-count]'),
+   'The Show chips replace the right count text.');
+  const beforeRequests=window.refreshRequests.length,beforeAddress=location.href;
+  chip('open')?.click();await flush();
+  check(selected('open') && window.refreshRequests.length===beforeRequests && location.href===beforeAddress,
+    'pressing the selected chip changes nothing');
+  chip('Waiting')?.focus();chip('Waiting')?.click();await flush();await flush();
+  check(count('Waiting')?.textContent==='2','F001: Waiting retains its complete count after the load');
+  check(document.activeElement===chip('Waiting'),'F002: the pressed Show chip keeps focus after the load');
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+  check(document.activeElement===chip('Waiting'),'F002: the Show chip keeps focus after refresh');
+  const typeChip=()=>document.querySelector('[data-type-chip="change"]');
+  typeChip().focus();typeChip().click();
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+  check(document.activeElement===typeChip(),'F002: the type chip keeps focus after refresh');
+  document.querySelector('[data-type-chip=""]').click();
+  chip('Done')?.click();await flush();await flush();
+  check(selected('Done') && new URLSearchParams(location.hash.slice(1)).get('show')==='Done',
+    'a Show chip changes the pressed state and address');
+  check(document.querySelector('[data-review]').dataset.show==='Done' &&
+    [...document.querySelectorAll('[data-list-item]')].every(row=>row.dataset.state==='Done'),
+    'a Show chip loads only the selected server rows');
+  check(count('Done')?.textContent==='1' && count('open')?.textContent==='6' && count('Waiting')?.textContent==='2' &&
+    [...document.querySelectorAll('[data-show-chip] b')].every(number=>!number.hidden),
+    'F001: Done retains all complete Show counts');
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+  check(selected('Done') && new URL(window.refreshRequests.at(-1),location.href).searchParams.get('show')==='Done',
+    'refresh requests the pressed Show view');
+  const reload=document.createElement('iframe');reload.src='/reload'+location.hash;
+  const loaded=new Promise(resolve=>reload.addEventListener('load',resolve,{once:true}));document.body.append(reload);await loaded;
+  await flush();await flush();
+  check(selected('Done',reload.contentDocument) && reload.contentDocument.querySelector('[data-review]').dataset.show==='Done',
+    'a reload keeps the shared Show address');reload.remove();
+  for(const value of ['Waiting','all','open']){
+   chip(value)?.click();await flush();await flush();
+   check(selected(value),'exactly one chip stays pressed for '+value);
+   if(value==='open') check(decisions().length===2 && decisions().every(row=>!row.hidden),
+    'Open retains the two decision rows after a Show load');
+  }
+  chip('all')?.click();await flush();await flush();
+  check(['open','Waiting','Done','all'].map(value=>count(value)?.textContent).join('|')==='6|2|1|9' &&
+    [...document.querySelectorAll('[data-show-chip] b')].every(number=>!number.hidden),
+    'All supplies the count for every Show chip');
+  const groups=[...document.querySelectorAll('.review-types')],buttons=[...document.querySelectorAll('[data-show-chip]')];
+  check(groups.length===3 && groups[1].getBoundingClientRect().top>=groups[0].getBoundingClientRect().bottom &&
+    groups[2].getBoundingClientRect().top>=groups[1].getBoundingClientRect().bottom,
+    'Show follows Type and Owner follows Show');
+  check(buttons.length===4 && buttons.every(button=>button.type==='button' && button.tabIndex===0),
+    'Show chips use native keyboard buttons in tab order');
+  chip('Waiting')?.focus();
+  check(document.activeElement===chip('Waiting'),'a Show chip accepts keyboard focus');
+  check(document.documentElement.scrollWidth<=innerWidth && groups.every(group=>
+    getComputedStyle(group).gap==='8px' && [...group.querySelectorAll('button')].every(button=>{
+     const box=button.getBoundingClientRect();return box.left>=0 && box.right<=innerWidth;
+    })),'the three chip rows wrap with even spacing and no clipping');
+
+  for(const spelling of ['For you','for-you','for you','FOR YOU']){
+   const legacyShow=document.createElement('iframe');
+   legacyShow.src='/reload#'+new URLSearchParams({show:spelling});
+   const loadedShow=new Promise(resolve=>legacyShow.addEventListener('load',resolve,{once:true}));
+   document.body.append(legacyShow);await loadedShow;await flush();await flush();
+   const legacyPage=legacyShow.contentDocument;
+   check(selected('open',legacyPage) &&
+    [...legacyPage.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).every(row=>row.dataset.state==='Open') &&
+    new URLSearchParams(legacyShow.contentWindow.location.hash.slice(1)).get('show')==='open',
+    'the legacy Show spelling opens Open: '+spelling);
+   legacyShow.remove();
+  }
+  const ownerChip=(value,doc=document)=>doc.querySelector('[data-owner-chip="'+value+'"]');
+  const ownerChips=()=>[...document.querySelectorAll('[data-owner-chip]:not([hidden])')];
+  const selectedOwner=(doc=document)=>doc.querySelector('[data-owner-chip][aria-pressed="true"]');
+  const chooseOwner=value=>ownerChip(value).click();
+  const chooseType=value=>document.querySelector('[data-type-chip="'+value+'"]').click();
+  const builder=document.querySelector('[data-type="investigation"]').dataset.sourceOwner;
+  chip('open').click();await flush();await flush();
+  chooseOwner(builder);chooseType('question');
+  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 1' &&
+    ownerChips().some(button=>button.textContent==='page-owner 1') &&
+    ownerChip(builder).hidden,
+    'F007: Owner lists only owners with the selected type and words in any Show.');
+  check(selectedOwner().dataset.ownerChip==='' && !new URLSearchParams(location.hash.slice(1)).get('owner') &&
+    ['open','Waiting','Done','all'].map(value=>count(value)?.textContent).join('|')==='1|0|0|1',
+    'F007: an owner without the selected type resets to All with matching counts.');
+  check([...document.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1,
+    'F007: the question appears after the owner resets.');
+  chooseType('investigation');
+  check(ownerChips().some(button=>button.dataset.ownerChip===builder) && ownerChips()[0].textContent==='All 1',
+    'a type change restores owners and counts');
+  chooseOwner(builder);chip('Done').click();await flush();await flush();
+  check(ownerChips()[0].textContent==='All 1' && selectedOwner().dataset.ownerChip===builder,
+    'Show limits Owner counts and retains an owner with matching loaded rows');
+  chip('open').click();await flush();await flush();
+  chooseType('question');chooseOwner(ownerChips().find(button=>button.dataset.ownerName==='page-owner')?.dataset.ownerChip);
+  chip('Waiting').click();await flush();await flush();
+  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 0' && selectedOwner().dataset.ownerChip!=='' &&
+    ownerChips()[1].textContent==='page-owner 0',
+    'Show retains the selected owner with a zero count.');
+  chip('open').click();await flush();await flush();
+  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 1','Show restores matching owners');
+  chooseType('investigation');chooseOwner(builder);
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+  check(selectedOwner().dataset.ownerChip===builder && ownerChips()[0].textContent==='All 1' &&
+    ownerChips().every(button=>button.querySelector('b').textContent!=='0'),'refresh retains the matching owner list and selection');
+  const legacy=document.createElement('iframe');
+  legacy.src='/reload#'+new URLSearchParams({owner:builder,type:'question',show:'open'});
+  const legacyLoaded=new Promise(resolve=>legacy.addEventListener('load',resolve,{once:true}));document.body.append(legacy);
+  await legacyLoaded;await flush();await flush();
+  check(selectedOwner(legacy.contentDocument).dataset.ownerChip==='' &&
+    [...legacy.contentDocument.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1 &&
+    !new URLSearchParams(legacy.contentWindow.location.hash.slice(1)).get('owner'),
+    'F007: a legacy owner without the selected type resets to All.');legacy.remove();
+  chooseType('question');
+  const navigated=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  location.hash=new URLSearchParams({owner:'builder-unit',type:'investigation',show:'open'});
+  await navigated;await flush();await flush();
+  check(selectedOwner().dataset.ownerChip===builder && [...document.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1,
+    'F004: hash navigation resolves an owner name whose chip was hidden by Questions');
+  const translated=document.createElement('iframe');
+  translated.src='/reload#'+new URLSearchParams({legacy:'investigation',owner:'no-investigations',type:'investigation',show:'not-read'});
+  const translatedLoaded=new Promise(resolve=>translated.addEventListener('load',resolve,{once:true}));
+  document.body.append(translated);await translatedLoaded;await flush();await flush();
+  const translatedPage=translated.contentDocument,translatedAddress=new URLSearchParams(translated.contentWindow.location.hash.slice(1));
+  check(selectedOwner(translatedPage).dataset.ownerChip==='' &&
+    selectedOwner(translatedPage).textContent==='All 1' &&
+    !translatedAddress.get('owner') && !translatedAddress.has('source-owner') &&
+    [...translatedPage.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1 &&
+    count('open',translatedPage)?.textContent==='1',
+    'F003: a legacy investigation reset clears both owner constraints and shows the All rows');
+  translated.remove();
+  chooseType('question');chooseOwner(ownerChips().find(button=>button.dataset.ownerName==='page-owner')?.dataset.ownerChip);
+  const question=document.querySelector('[data-type="question"]');question.querySelector('.list-toggle').click();
+  const form=question.querySelector('[data-review-form]');form.elements.feedback.value='Use this layout.';
+  form.querySelector('[value="answer"]').click();await new Promise(resolve=>nativeTimeout(resolve,1100));
+  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 0' && selectedOwner().dataset.ownerChip!=='' && question.hidden &&
+    count('Done').textContent==='1',
+    'A save retains the selected owner and moves its count to Done.');
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 0' && selectedOwner().dataset.ownerChip!=='' &&
+    count('Done').textContent==='1',
+    'Refresh retains the zero count for the selected owner.');
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        for width in (1440, 390):
+            with self.subTest(width=width):
+                base = pages['open'].replace('<head>', '<head>'+setup, 1)
+                body = base.replace('</body>', probe+'</body>').encode()
+                results: list[list[str]] = []
+                complete = threading.Event()
+
+                class Probe(BaseHTTPRequestHandler):
+                    def do_GET(self) -> None:
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'text/html; charset=utf-8')
+                        self.end_headers()
+                        if self.path == '/complete':
+                            _ = complete.wait(20)
+                        else:
+                            _ = self.wfile.write(base.encode() if self.path == '/reload' else body if self.path == '/page' else
+                                b'<iframe src="/page" style="border:0;width:100vw;height:100vh"></iframe><img hidden src="/complete">')
+
+                    def do_POST(self) -> None:
+                        results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                        complete.set()
+                        self.send_response(204)
+                        self.end_headers()
+
+                    @override
+                    def log_message(self, format: str, *args: object) -> None:
+                        pass
+
+                with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    try:
+                        with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
+                            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
+                                '--window-size', f'{width},900', '--screenshot', str(self.fixture.temporary/'show-chips.png'),
+                                f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                        self.assertEqual(done.returncode, 0, done.stderr)
+                    finally:
+                        server.shutdown()
+                        thread.join(TEST_HANG_GUARD_SECS)
+                self.assertEqual(results, [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_filter_counts_share_the_complete_index(self) -> None:
+        _ = self.question()
+        _ = self.investigation(False)
+        _ = review_page.submit(self.root, self.body('page-owner/C1', 'works'), self.status)
+        pages = {show: review_page.render(self.root, show=show).decode() for show, _ in review_page.SHOWS}
+        setup = r"""<script>
+const nativeFetch=fetch,nativeTimeout=setTimeout;
+window.setInterval=()=>0;window.clearInterval=()=>{};
+const showPages=PAGES;
+window.fetch=async(url,options)=>{
+ if(options?.method==='POST'){window.didSave=true;return {ok:true,json:async()=>({answer:'saved'})};}
+ const show=new URL(url,location.href).searchParams.get('show') || 'open';
+ const page=new DOMParser().parseFromString(showPages[show],'text/html');
+ if(window.didSave){const payload=page.querySelector('[data-review-index]'),entries=JSON.parse(payload.textContent);
+  entries.find(entry=>entry.type==='question').state='Done';
+  entries.find(entry=>entry.id==='page-owner/C2').state='Waiting';payload.textContent=JSON.stringify(entries);}
+ return {ok:true,text:async()=>page.documentElement.outerHTML};
+};
+</script>""".replace('PAGES', json.dumps(pages).replace('</', '<\\/'))
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const flush=()=>new Promise(resolve=>nativeTimeout(resolve,120));
+ const show=value=>document.querySelector('[data-show-chip="'+value+'"]');
+ const type=value=>document.querySelector('[data-type-chip="'+value+'"]');
+ const counts=selector=>[...document.querySelectorAll(selector+' b')].map(node=>Number(node.textContent)).join('|');
+ const search=value=>{const field=document.querySelector('#list-search');field.value=value;field.dispatchEvent(new Event('input'));};
+ try{
+  await flush();
+  check(!document.querySelector('[data-list-count]'),'The Show chips replace the right count text.');
+  check(counts('[data-show-chip]')==='3|1|1|5','The index counts states outside the rendered view.');
+  const ownerChip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
+  const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
+  const builder=document.querySelector('[data-type="change"]').dataset.sourceOwner;
+  const chooseOwner=value=>ownerChip(value).click();
+  show('all').click();await flush();await flush();
+  chooseOwner(builder);
+  check(counts('[data-show-chip]')==='0|1|0|1','Show counts use the selected owner.');
+  check(type('change').querySelector('b').textContent==='0' && type('investigation').querySelector('b').textContent==='1',
+   'Type counts use the selected owner.');
+  type('change').click();
+  check(selectedOwner().dataset.ownerChip==='' && counts('[data-show-chip]')==='2|0|1|3',
+   'F007: an owner without the selected type resets to All.');
+  type('investigation').click();
+  chooseOwner(builder);show('open').click();await flush();await flush();
+  check(selectedOwner().dataset.ownerChip===builder && counts('[data-show-chip]')==='0|1|0|1' &&
+   [...document.querySelectorAll('[data-list-item]')].every(row=>row.hidden),
+   'F007: the user case keeps an owner with rows in another Show.');
+  show('all').click();await flush();await flush();
+  check(counts('[data-show-chip]')==='0|1|0|1','Show counts combine the type and owner.');
+  search('gate');
+  check(counts('[data-show-chip]')==='0|1|0|1' && ownerChip('').textContent==='All 1',
+   'All counts combine the words, owner, type and Show filters.');
+  search('');chooseOwner('');type('').click();show('open').click();await flush();await flush();
+  type('change').click();
+  check(counts('[data-show-chip]')==='2|0|1|3','Show counts use the selected type.');
+  search('Numbered');
+  check(counts('[data-show-chip]')==='1|0|1|2','Show counts use the words filter.');
+  check(type('change').querySelector('b').textContent==='1' && type('question').querySelector('b').textContent==='0',
+   'Type counts use the words filter and Show.');
+  check(selectedOwner().textContent==='All 1',
+   'Owner counts use the type, Show and words.');
+  search('no matching title');
+  check(counts('[data-show-chip]')==='0|0|0|0' && [...document.querySelectorAll('[data-type-chip] b')].every(n=>n.textContent==='0') &&
+   selectedOwner().textContent==='All 0',
+   'An empty filtered view has zero in every applicable count.');
+  search('');show('all').click();await flush();await flush();
+  check(type('change').querySelector('b').textContent==='3','Type counts include the selected Show.');
+  type('question').click();
+  const row=document.querySelector('[data-list-item][data-type="question"]');
+  row.querySelector('.list-toggle').click();
+  const form=row.querySelector('form');form.elements.feedback.value='Use the first layout.';
+  form.requestSubmit(form.querySelector('[value="answer"]'));
+  await new Promise(resolve=>nativeTimeout(resolve,1100));
+  check(counts('[data-show-chip]')==='0|0|1|1','A save moves the index entry to Done.');
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  await flush();await flush();
+  check(counts('[data-show-chip]')==='0|0|1|1','A refresh retains the saved state from the server index.');
+  type('change').click();
+  check(counts('[data-show-chip]')==='1|1|1|3','A refresh replaces an unsaved entry in the index.');
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/result',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        for width in (1440, 390):
+            with self.subTest(width=width):
+                base = pages['open'].replace('<head>', '<head>'+setup, 1)
+                body = base.replace('</body>', probe+'</body>').encode()
+                results: list[list[str]] = []
+                complete = threading.Event()
+
+                class Probe(BaseHTTPRequestHandler):
+                    def do_GET(self) -> None:
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'text/html; charset=utf-8')
+                        self.end_headers()
+                        if self.path == '/complete':
+                            _ = complete.wait(20)
+                        else:
+                            _ = self.wfile.write(base.encode() if self.path == '/reload' else body if self.path == '/page' else
+                                b'<iframe src="/page" style="border:0;width:100vw;height:100vh"></iframe><img hidden src="/complete">')
+
+                    def do_POST(self) -> None:
+                        results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                        complete.set()
+                        self.send_response(204)
+                        self.end_headers()
+
+                    @override
+                    def log_message(self, format: str, *args: object) -> None:
+                        pass
+
+                with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    try:
+                        with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
+                            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
+                                '--window-size', f'{width},900', '--screenshot', str(self.fixture.temporary/'show-chips.png'),
+                                f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                        self.assertEqual(done.returncode, 0, done.stderr)
+                    finally:
+                        server.shutdown()
+                        thread.join(TEST_HANG_GUARD_SECS)
+                self.assertEqual(results, [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_owner_counts_follow_the_type_and_show_chips(self) -> None:
+        _ = self.decisions()
+        _ = self.question()
+        _ = self.investigation()
+        examples = {item.type: item for item in review_items.read(self.root)}
+        owners = {fixture_member('showrunner', name=name).id: name
+                  for name in ('natedev', 'second-owner', 'third-owner')}
+        states = review_items.REVIEW_STATES
+        records: list[review_items.ReviewItem] = []
+        for owner_index, owner in enumerate(owners):
+            for type_index, kind in enumerate(review_items.REVIEW_TYPES):
+                record_states = list(states)
+                for offset in range(owner_index + type_index):
+                    record_states.append(states[(type_index + offset) % len(states)])
+                for number, state in enumerate(record_states, 1):
+                    key = f'{kind}/{owner}/{number}'
+                    records.append(replace(examples[kind], key=key, id=key, owner=owner, source_unit=owner,
+                                           state=state, actions=()))
+
+        show_states = {'open': (review_items.ReviewState.OPEN,), 'Waiting': (review_items.ReviewState.WAITING,),
+                       'Done': (review_items.ReviewState.DONE,), 'all': states}
+        expected: dict[str, dict[str, dict[str, int]]] = {}
+        for show, selected_states in show_states.items():
+            expected[show] = {}
+            for kind in ('', *review_items.REVIEW_TYPES):
+                counts = {str(owner): sum(item.owner == owner and item.state in selected_states and
+                                          (not kind or item.type == kind) for item in records)
+                          for owner in owners}
+                expected[show][kind] = {'': sum(counts.values()), **counts}
+
+        def read_fixture(_root: Path, *, owner_options: dict[staff.StaffId, str],
+                         **_filters: object) -> list[review_items.ReviewItem]:
+            owner_options.update(owners)
+            return records
+
+        with patch.object(review_items, 'read', side_effect=read_fixture):
+            pages = {show: review_page.render(self.root, show=show).decode() for show in show_states}
+
+        setup = r"""<script>
+const nativeFetch=fetch,showPages=PAGES;
+window.setInterval=()=>0;window.clearInterval=()=>{};
+window.fetch=async url=>{
+ const show=new URL(url,location.href).searchParams.get('show');
+ return new Response(showPages[show]);
+};
+</script>""".replace('PAGES', json.dumps(pages).replace('</', '<\\/'))
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const expected=EXPECTED;
+ const chip=(group,value)=>document.querySelector('[data-'+group+'-chip="'+value+'"]');
+ const selected=group=>document.querySelector('[data-'+group+'-chip][aria-pressed="true"]')
+  ?.getAttribute('data-'+group+'-chip');
+ const count=owner=>chip('owner',owner)?.querySelector('b')?.textContent;
+ const counts=()=>Object.keys(expected.open['']).map(count).join('|');
+ const checkCounts=(show,type)=>{
+  const wanted=expected[show][type];
+  const visible=[...document.querySelectorAll('[data-owner-chip]:not([hidden])')];
+  check(visible.length===Object.keys(wanted).length && visible.every(button=>Object.hasOwn(wanted,button.dataset.ownerChip)),
+   show+' / '+(type || 'All types')+': the Owner chips match the fixture owners.');
+  for(const [owner,total] of Object.entries(wanted)){
+   const label=chip('owner',owner)?.dataset.ownerName || owner || 'All';
+   check(count(owner)===String(total),
+    show+' / '+(type || 'All types')+' / '+label+': expected '+total+', got '+count(owner));
+  }
+ };
+ const changeShow=async show=>{
+  const replaced=new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{
+    if(document.querySelector('[data-review]').dataset.show===show){observer.disconnect();resolve();}
+   });
+   observer.observe(document.body,{childList:true,subtree:true});
+  });
+  chip('show',show).click();await replaced;
+ };
+ try{
+  const beforeType=counts();
+  chip('type','change').click();
+  check(selected('type')==='change' && selected('show')==='open' && counts()!==beforeType,
+   'The Owner counts change when only Type changes.');
+  const beforeShow=counts();
+  await changeShow('all');
+  check(selected('type')==='change' && selected('show')==='all' && counts()!==beforeShow,
+   'The Owner counts change when only Show changes.');
+  checkCounts('all','change');
+  chip('type','').click();checkCounts('all','');
+  const allTypes=counts();
+  chip('type','change').click();checkCounts('all','change');
+  check(counts()!==allTypes,'Type alone changes the Owner counts in Show All.');
+  const allStates=counts();
+  await changeShow('Waiting');checkCounts('Waiting','change');
+  check(counts()!==allStates,'Show alone changes the Owner counts for Changes.');
+  for(const [show,types] of Object.entries(expected)){
+   if(selected('show')!==show) await changeShow(show);
+   for(const type of Object.keys(types)){
+    chip('type',type).click();
+    checkCounts(show,type);
+   }
+  }
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>""".replace('EXPECTED', json.dumps(expected))
+        markup = pages['open'].replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
     def test_server_renders_only_the_selected_show_view(self) -> None:
         ready = self.investigation()
@@ -385,7 +944,7 @@ class ReviewPageTests(unittest.TestCase):
         waiting_key = f'investigation/{waiting.owner}/{waiting.id}'
         opened = review_page.render(self.root).decode()
         self.assertNotIn(f'data-key="{done_key}"', opened)
-        self.assertIn(f'data-key="{waiting_key}"', opened)
+        self.assertNotIn(f'data-key="{waiting_key}"', opened)
         self.assertNotIn('data-state="Done"', opened)
         done = review_page.render(self.root, show='Done').decode()
         self.assertIn(f'data-key="{done_key}"', done)
@@ -395,14 +954,14 @@ class ReviewPageTests(unittest.TestCase):
         all_items = review_page.render(self.root, show='all').decode()
         self.assertIn(f'data-key="{done_key}"', all_items)
         self.assertIn(f'data-key="{waiting_key}"', all_items)
-        for show in ('For you', 'Waiting'):
+        for show in ('open', 'Waiting'):
             with self.subTest(show=show):
                 source = review_page.render(self.root, show=show).decode()
                 self.assertIn(f'data-show="{show}"', source)
                 self.assertNotIn('data-state="Done"', source)
-                owner_menu = source.partition('<select id="list-owner">')[2].partition('</select>')[0]
-                self.assertIn(f'value="{waiting.owner}"', owner_menu,
-                              'F002: the unit Owner option remains when its Show view has no rows')
+                owner_row = source.partition('id="list-owner"')[2].partition('</div>')[0]
+                self.assertIn(f'data-owner-chip="{waiting.owner}"', owner_row,
+                              'F002: the unit Owner chip remains when its Show view has no rows')
 
     def test_open_read_skips_done_payloads_and_retains_full_selected_records(self) -> None:
         question_key = self.question()
@@ -422,7 +981,7 @@ class ReviewPageTests(unittest.TestCase):
                 review_items, 'question_item', wraps=review_items.question_item) as project_question, patch.object(
                 investigation, 'load', wraps=investigation.load) as load_investigation:
             opened = review_items.read(self.root, show='open', owner_options=owners)
-        self.assertEqual(opened, [item for item in all_items if item.state != review_items.ReviewState.DONE])
+        self.assertEqual(opened, [item for item in all_items if item.state == review_items.ReviewState.OPEN])
         self.assertEqual(owners, expected_owners, 'The owner menu includes owners of omitted Done records.')
         self.assertTrue(project_change.called)
         self.assertFalse(any(cast(dict[str, str], call.args[1]).get('Verdict') for call in project_change.call_args_list),
@@ -430,7 +989,7 @@ class ReviewPageTests(unittest.TestCase):
         self.assertFalse(project_question.called, 'An Open read does not project a closed question.')
         self.assertNotIn(ready.id, [call.args[1] for call in load_investigation.call_args_list],
                          'An Open read does not load a read investigation.')
-        for show in ('For you', 'Waiting', 'Done', 'all'):
+        for show in ('Open', 'Waiting', 'Done', 'all'):
             with self.subTest(show=show):
                 expected = all_items if show == 'all' else [item for item in all_items if item.state == show]
                 self.assertEqual(review_items.read(self.root, show=show), expected)
@@ -457,7 +1016,7 @@ class ReviewPageTests(unittest.TestCase):
         _ = self.fixture.review_list.write_text(text.replace('| works |', '|  |'))
         all_items = review_items.read(self.root)
         expected = next(item for item in all_items if item.key == 'page-owner/C1')
-        self.assertEqual(expected.state, review_items.ReviewState.FOR_YOU)
+        self.assertEqual(expected.state, review_items.ReviewState.OPEN)
         opened = review_items.read(self.root, show='open')
         self.assertEqual(next((item for item in opened if item.key == expected.key), None), expected,
                          'F005: the Verdict decides the state in both Reviewed and Open.')
@@ -596,12 +1155,36 @@ class ReviewPageTests(unittest.TestCase):
                 continue
             with self.subTest(kind=item.type):
                 self.assertEqual(item.actions,expected[item.key])
-                form = review_page.form(item,change_page.ReviewBrowser(token,initial),4)
+                form = review_page.form(item,change_page.ReviewBrowser(token,initial),review_page.CardSettings(4,'In 1 hour'))
                 self.assertIn('Closes the item',form)
                 self.assertIn('The item returns to you',form)
-                self.assertIn('type="datetime-local"',form)
-                self.assertIn('value="later">Later',form)
+                self.assertIn('aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later',form)
+                for label in ('In 1 hour','This evening','Tomorrow morning','Next week','Choose a time…'):
+                    self.assertIn('<span>'+label+'</span>',form)
+                self.assertNotIn('type="datetime-local"',form)
+                self.assertIn('type="hidden" name="later"',form)
+                self.assertIn('role="grid"',form)
+                self.assertIn('type="time" step="900"',form)
+                self.assertIn('value="later">Save',form)
                 self.assertNotIn('value="skip"',form)
+
+    def test_later_presets_read_their_settings(self) -> None:
+        for minutes, label in ((1,'In 1 minute'),(90,'In 90 minutes'),(60,'In 1 hour'),(120,'In 2 hours')):
+            with self.subTest(minutes=minutes):
+                self.assertEqual(review_page.soon_label(minutes),label)
+        lines = ('# whole: 1..1440','later_soon_minutes=60','later_evening=18:00','later_evening_until=17:00','later_morning=09:00',
+                 'later_week_day=Monday','later_week_time=09:30')
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'review_links.conf'
+            _ = path.write_text('\n'.join(lines)+'\n',encoding='utf-8')
+            self.assertEqual(review_page.later_settings(conf.read(path)),
+                             {'soon':60,'evening':1080,'eveningUntil':1020,'morning':540,'weekDay':1,'weekTime':570})
+            for bad in ('later_week_day=Mon','later_morning=9:00'):
+                with self.subTest(bad=bad):
+                    key = bad.split('=')[0]
+                    _ = path.write_text('\n'.join(line for line in lines if not line.startswith(key+'='))+'\n'+bad+'\n',encoding='utf-8')
+                    with self.assertRaisesRegex(ValueError,key):
+                        _ = review_page.later_settings(conf.read(path))
 
     def test_ask_question_and_one_owner_answer_command_for_each_type(self) -> None:
         decisions = self.decisions()
@@ -626,7 +1209,7 @@ class ReviewPageTests(unittest.TestCase):
                 args += ['--question',request.question_id]
                 self.assertEqual(change_page.main(args),0)
                 returned = next(item for item in review_items.read(self.root) if item.key == key)
-                self.assertEqual(returned.state,review_items.ReviewState.FOR_YOU)
+                self.assertEqual(returned.state, review_items.ReviewState.OPEN)
                 self.assertEqual(sum('The second case passes.' in entry.words for entry in returned.log),1)
                 self.assertEqual(sum('Check the second case.' in entry.words for entry in returned.log),1)
 
@@ -658,7 +1241,7 @@ class ReviewPageTests(unittest.TestCase):
                 self.assertEqual(change_page.main(['answer-question','--item',key,'--question',pending.question_id,'--text','Answer for '+key]),0,
                                  'F022: the exact item selects its record despite identical subtree text')
                 returned = next(item for item in review_items.read(self.root) if item.key == key)
-                self.assertEqual(returned.state,review_items.ReviewState.FOR_YOU)
+                self.assertEqual(returned.state,review_items.ReviewState.OPEN)
                 self.assertIn('Answer for '+key, returned.log[-1].words)
                 if key == question:
                     self.assertEqual(change_page.main(['answer-question','--item',key,'--question',pending.question_id,'--text','Repeat parent answer']),1,
@@ -674,6 +1257,7 @@ class ReviewPageTests(unittest.TestCase):
         keys = (question, 'page-owner/C1', f'investigation/{report.owner}/{report.id}', *decisions)
         token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
         browser = change_page.ReviewBrowser(token, initial)
+        cards = review_page.CardSettings(conf.read('review_links').whole('review_words_rows'), 'In 1 hour')
         for key in keys:
             opened = next(item for item in review_items.read(self.root) if item.key == key)
             delivery, _ = review_page.submit(self.root, self.body(key, 'question', 'Check the old case.'), self.status)
@@ -682,7 +1266,7 @@ class ReviewPageTests(unittest.TestCase):
             with self.subTest(kind=opened.type):
                 self.assertEqual(waiting.state, review_items.ReviewState.WAITING)
                 self.assertEqual(waiting.actions, opened.actions)
-                self.assertEqual(review_page.form(waiting, browser, 3), review_page.form(opened, browser, 3))
+                self.assertEqual(review_page.form(waiting, browser, cards), review_page.form(opened, browser, cards))
 
     def waiting_actions(self, kind: review_items.ReviewType, actions: tuple[str, ...], wait: str = 'question') -> None:
         """Use a fresh record for each action and check the displaced answer."""
@@ -745,7 +1329,7 @@ class ReviewPageTests(unittest.TestCase):
                         self.assertIn('--question '+request.question_id, delivery.message)
                         _ = change_page.answer_item(key, 'The new case passes.', request.question_id, case.status)
                         self.assertEqual(next(item.state for item in review_items.read(case.root) if item.key == key),
-                                         review_items.ReviewState.FOR_YOU)
+                                         review_items.ReviewState.OPEN)
                 finally:
                     case.doCleanups()
 
@@ -1181,33 +1765,44 @@ window.fetch=async(url)=>{
         setup = r"""<script>
 const nativeFetch=fetch, nativeTimeout=setTimeout, original=MARKUP;
 window.doneMarkup=DONE_MARKUP;
+window.waitingMarkup=WAITING_MARKUP;
 window.setInterval=()=>0;window.clearInterval=()=>{};
 const refreshed=new DOMParser().parseFromString(original,'text/html');
 const refreshedForm=refreshed.querySelector('[data-type="question"] form');
 refreshedForm.elements.token.value+='-refreshed';refreshedForm.elements.row.value+='-refreshed';
 window.refreshMarkup=refreshed.documentElement.outerHTML;
 window.refreshRequests=[];
+window.posts=[];
 window.fetch=async(_url,options={})=>{
- if(options.method==='POST') return {ok:true,json:async()=>({answer:'works'})};
- window.refreshRequests.push(_url);return {ok:true,text:async()=>window.refreshMarkup};
+ if(options.method==='POST'){window.posts.push(new URLSearchParams(options.body));return {ok:true,json:async()=>({answer:'works'})};}
+ window.refreshRequests.push(_url);return {ok:true,text:async()=>new URL(_url,location.href).searchParams.get('show')==='Waiting' ? window.waitingMarkup : window.refreshMarkup};
 };
-</script>""".replace('DONE_MARKUP',json.dumps(done_source).replace('</','<\\/')).replace('MARKUP',json.dumps(source).replace('</','<\\/'))
+</script>""".replace('WAITING_MARKUP',json.dumps(review_page.render(self.root, show='Waiting').decode()).replace('</','<\\/')).replace('DONE_MARKUP',json.dumps(done_source).replace('</','<\\/')).replace('MARKUP',json.dumps(source).replace('</','<\\/'))
         probe = r"""<script>
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
  const flush=()=>new Promise(resolve=>nativeTimeout(resolve,60));
  const rows=()=>[...document.querySelectorAll('[data-list-item]')];
  const shown=()=>rows().filter(row=>!row.hidden);
- const choose=(id,value,event='change')=>{const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event(event,{bubbles:true}));};
+ const choose=(id,value,event='change')=>{
+  if(id==='list-show'){document.querySelector('[data-show-chip="'+value+'"]').click();return;}
+  if(id==='list-owner'){document.querySelector('[data-owner-chip="'+value+'"]').click();return;}
+  const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event(event,{bubbles:true}));
+ };
+ const showValue=(doc=document)=>doc.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip;
+ const selectedOwner=(doc=document)=>doc.querySelector('[data-owner-chip][aria-pressed="true"]');
  try{
   await flush();
-  check(shown().length===6,'Open includes For you and Waiting');
-  check(document.querySelector('[data-list-count]').textContent==='5 for you · 1 waiting',
-    'F007: Open counts only For you and Waiting when Done records exist');
+  check(shown().length===5 && shown().every(row=>row.dataset.state==='Open'),'Open includes only Open records');
+  check(document.querySelector('[data-show-chip="open"] b').textContent==='5',
+    'F007: Open excludes Waiting and Done records');
+  check(document.querySelector('[data-show-chip="Waiting"] b').textContent==='1',
+    'F007: Waiting has its own count');
   document.querySelector('[data-type-chip="question"]').click();
   choose('list-search','Q1','input');check(shown().length===1,'type and ID filters');
   choose('list-search','','input');document.querySelector('[data-type-chip=""]').click();
-  choose('list-show','Waiting');check(shown().length===1,'Waiting filter');choose('list-show','open');
+  choose('list-show','Waiting');await flush();await flush();check(shown().length===1,'Waiting filter');
+  choose('list-show','open');await flush();await flush();
   const question=rows().find(row=>row.dataset.type==='question');question.querySelector('.list-toggle').click();
   const title=question.querySelector('.review-title'),titleHeight=title.getBoundingClientRect().height;
   title.textContent='A long review title '.repeat(20);
@@ -1236,7 +1831,7 @@ window.fetch=async(_url,options={})=>{
   await flush();check(form.querySelector('[data-send-status]').textContent==='Saved: works','the row shows the saved result');
   await new Promise(resolve=>nativeTimeout(resolve,950));
   check(target.hidden,'the saved row leaves the view');
-  check(document.querySelector('[data-list-count]').textContent.startsWith('4 for you'),'the count excludes the saved row');
+  check(document.querySelector('[data-show-chip="open"] b').textContent==='4','the count excludes the saved row');
   check(rows().every(row=>row.querySelector('[data-detail]').hidden),'no next card opens');
   choose('list-show','all');
   const allTarget=rows().find(row=>row.dataset.type==='change' && row!==target);allTarget.querySelector('.list-toggle').click();
@@ -1249,13 +1844,13 @@ window.fetch=async(_url,options={})=>{
   const reloadComplete=new Promise(resolve=>reloaded.addEventListener('load',resolve,{once:true}));document.body.append(reloaded);await reloadComplete;
   const linkedTarget=reloaded.contentDocument.querySelector('[data-key="'+target.dataset.key+'"]');
   check(!linkedTarget.hidden && !linkedTarget.querySelector('[data-detail]').hidden,'a Review item link shows the saved row');
-  check(reloaded.contentDocument.getElementById('list-show').value==='all' && reloaded.contentDocument.getElementById('list-owner').value==='' &&
+  check(showValue(reloaded.contentDocument)==='all' && selectedOwner(reloaded.contentDocument).dataset.ownerChip==='' &&
     reloaded.contentDocument.getElementById('list-search').value==='','a Review item link clears filters');
   reloaded.remove();
-  const retained={item:fresh.dataset.key,type:'question',owner:fresh.dataset.owner,show:'For you',q:'Q1',sort:'Age',dir:'desc'};
+  const retained={item:fresh.dataset.key,type:'question',owner:fresh.dataset.owner,show:'open',q:'Q1',sort:'Age',dir:'desc'};
   location.hash=new URLSearchParams(retained);await flush();
   fresh=rows().find(row=>row.dataset.type==='question');
-  check(document.getElementById('list-owner').value===retained.owner && document.getElementById('list-show').value==='For you' &&
+  check(selectedOwner().dataset.ownerChip===retained.owner && showValue()==='open' &&
     document.getElementById('list-search').value==='Q1' && document.querySelector('[data-type-chip="question"]').getAttribute('aria-pressed')==='true',
     'F014: restore the filters with an open row');
   check(!fresh.hidden && !fresh.querySelector('[data-detail]').hidden,'F014: restore the open row');
@@ -1264,26 +1859,110 @@ window.fetch=async(_url,options={})=>{
   const legacy=document.createElement('iframe');
   legacy.src='/console/changes.html?type=questions#'+new URLSearchParams({showrunner:'page-owner',show:'Waiting',q:'layout',sort:'Age',dir:'desc'});
   const loaded=new Promise(resolve=>legacy.addEventListener('load',resolve,{once:true}));document.body.append(legacy);await loaded;
+  await flush();await flush();
   const restored=legacy.contentDocument;
-  check(restored.getElementById('list-owner').value===fresh.dataset.owner && restored.getElementById('list-show').value==='Waiting' &&
+  check(selectedOwner(restored).dataset.ownerChip===fresh.dataset.owner &&
+    selectedOwner(restored).textContent==='page-owner 0' && showValue(restored)==='Waiting' &&
     restored.getElementById('list-search').value==='layout' && restored.querySelector('[data-type-chip="question"]').getAttribute('aria-pressed')==='true',
-    'F012: a direct legacy link keeps its fragment filters');
+    'F012: a legacy link retains the zero owner and its other filters.');
   check(restored.querySelector('[data-sort="5"]').parentElement.getAttribute('aria-sort')==='descending','F012: the legacy link keeps its sort');
   legacy.remove();
 
   check(document.documentElement.scrollWidth<=innerWidth,'no horizontal overflow');
   if(innerWidth<960) check(getComputedStyle(shown()[0]).display==='block','phone rows are cards');
-  const laterForm=fresh.querySelector('form');laterForm.elements.later.value='2099-01-01T09:00';
-  laterForm.requestSubmit(laterForm.querySelector('[value="later"]'));
+  const laterToggle=fresh.querySelector('[data-later-toggle]'),laterMenu=fresh.querySelector('[data-later-menu]');
+  laterToggle.click();
+  const menuItems=()=>[...laterMenu.querySelectorAll('[role=menuitem]')].filter(item=>!item.hidden);
+  const presetTime=name=>laterMenu.querySelector('[data-later-preset="'+name+'"] small').textContent;
+  check(!laterMenu.hidden && laterToggle.getAttribute('aria-expanded')==='true' && document.activeElement===menuItems()[0],
+    'Later opens its menu with the first preset in focus');
+  check(/^[A-Z][a-z]{2} [0-9]{2}:[0-9]{2}$/.test(presetTime('soon')) && /^[A-Z][a-z]{2} 09:00$/.test(presetTime('morning')) &&
+    /^Mon 09:00$/.test(presetTime('week')),'each preset shows its resolved time in the user zone');
+  menuItems()[0].dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowUp',bubbles:true}));
+  check(document.activeElement===menuItems().at(-1),'ArrowUp moves from the first item to the last');
+  menuItems().at(-1).dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true}));
+  check(document.activeElement===menuItems()[0],'ArrowDown moves from the last item to the first');
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();
+  check(fresh.isConnected && !laterMenu.hidden,'an open Later menu holds the page refresh');
+  const chooserDraft=fresh.querySelector('[name="later"]');chooserDraft.value='';
+  chooserDraft.dispatchEvent(new Event('input',{bubbles:true}));
+  const chooserNow=Date.now;Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
+  laterMenu.querySelector('[data-later-choose]').click();
+  const calendar=laterMenu.querySelector('[role=grid]'),timeField=laterMenu.querySelector('[data-later-time]');
+  check(!laterMenu.querySelector('[data-later-custom]').hidden && document.activeElement===calendar?.querySelector('[tabindex="0"]'),
+    'Choose a time shows the calendar with the selected day in focus');
+  const chooserChecks=['the grid opens on tomorrow in the user zone','arrows move the selected day across months',
+    'a past day cannot be picked','Save is disabled for a time before now','the summary shows the selected wall time',
+    'the chooser fits within the menu and viewport'];
+  let submitter='';const watch=event=>{submitter=event.submitter.value;event.preventDefault();event.stopImmediatePropagation();};
+  fresh.querySelector('form').addEventListener('submit',watch,{capture:true});
+  if(calendar){
+   const wall=()=>fresh.querySelector('[name="later"]').value;
+   const selected=()=>calendar.querySelector('[tabindex="0"]');
+   check(wall()==='2026-12-01T09:00' && timeField.value==='09:00',chooserChecks[0]);
+   selected().dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowLeft',bubbles:true,cancelable:true}));
+   check(wall()==='2026-11-30T09:00' && laterMenu.querySelector('[data-later-month]').textContent==='November 2026',chooserChecks[1]);
+   const past=calendar.querySelector('[data-date="2026-11-29"]');past.click();
+   check(past.disabled && wall()==='2026-11-30T09:00',chooserChecks[2]);
+   check(laterMenu.querySelector('[value="later"]').disabled,chooserChecks[3]);
+   selected().dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true,cancelable:true}));
+   selected().dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}));
+   check(wall()==='2026-12-08T09:00','ArrowDown moves the selected day by one week');
+   selected().dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowUp',bubbles:true,cancelable:true}));
+   timeField.value='10:15';timeField.dispatchEvent(new Event('input',{bubbles:true}));
+   check(wall()==='2026-12-01T10:15' && laterMenu.querySelector('[data-later-summary]').textContent==='Hides until Tue 1 Dec 10:15',chooserChecks[4]);
+   const box=laterMenu.getBoundingClientRect(),grid=calendar.getBoundingClientRect();
+   check(box.left>=0 && box.right<=innerWidth && grid.left>=box.left && grid.right<=box.right &&
+     laterMenu.scrollWidth<=laterMenu.clientWidth,chooserChecks[5]);
+   selected().dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  }else{
+   chooserChecks.forEach(label=>check(false,label));
+   check(false,'ArrowDown moves the selected day by one week');
+   document.activeElement.value='2099-01-01T09:00';
+   document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  }
+  fresh.querySelector('form').removeEventListener('submit',watch,{capture:true});
+  check(submitter==='later','Enter in the chooser saves it as Later');
+  document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+  check(laterMenu.hidden && laterMenu.querySelector('[data-later-custom]').hidden && document.activeElement===laterToggle,
+    'Escape closes the menu and returns focus to Later');
+  Date.now=chooserNow;
+  laterToggle.click();const week=laterMenu.querySelector('[data-later-preset="week"]'),weekAt=Number(week.dataset.at);
+  week.click();
   await new Promise(resolve=>nativeTimeout(resolve,1000));
+  check(window.posts.at(-1).get('outcome')==='later' && window.posts.at(-1).get('later')===new Date(weekAt).toISOString(),
+    'a preset sends its time at once');
   check(fresh.hidden,'Later removes the question from the page');
-  check(document.querySelector('[data-list-count]').textContent.startsWith('2 for you'),'Later removes the question from the count');
-  const nativeNow=Date.now;Date.now=()=>new Date('2099-01-01T09:00').getTime()+1000;
+  check(document.querySelector('[data-show-chip="open"] b').textContent==='0','Later removes the question from the filtered count');
+  const laterOwner=selectedOwner().dataset.ownerChip;
+  choose('list-search','','input');choose('list-owner','');
+  document.querySelector('[data-type-chip=""]').click();
+  check(document.querySelector('[data-show-chip="open"] b').textContent==='2','Later removes the question from the count');
+  document.querySelector('[data-type-chip="question"]').click();
+  choose('list-owner',laterOwner);choose('list-search',retained.q,'input');
+  const nativeNow=Date.now;Date.now=()=>weekAt+1000;
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
-  const returned=rows().find(row=>row.dataset.type==='question');
-  check(!returned.hidden && returned.dataset.state==='For you','Later returns the question with its original state');
+  let returned=rows().find(row=>row.dataset.type==='question');
+  check(!returned.hidden && returned.dataset.state==='Open','Later returns the question with its original state');
   Date.now=nativeNow;
   returned.querySelector('.list-toggle').click();
+  Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
+  returned.querySelector('[data-later-toggle]').click();returned.querySelector('[data-later-choose]').click();
+  const customGrid=returned.querySelector('[role=grid]');
+  if(customGrid){
+   customGrid.querySelector('[tabindex="0"]').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+   await new Promise(resolve=>nativeTimeout(resolve,1000));
+   check(window.posts.at(-1).get('outcome')==='later' && window.posts.at(-1).get('later')==='2026-12-01T14:00:00.000Z',
+     'Enter posts Later with the expected ISO UTC time');
+   Date.now=()=>Date.parse('2026-12-01T14:00:01Z');
+   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+   returned=rows().find(row=>row.dataset.type==='question');returned.querySelector('.list-toggle').click();
+  }else{
+   check(false,'Enter posts Later with the expected ISO UTC time');
+   returned.querySelector('[data-later-toggle]').dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+   returned.querySelector('[data-later-menu]').querySelector('[data-later-choose]').dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+  }
+  Date.now=nativeNow;
   const answerForm=returned.querySelector('form');answerForm.elements.later.value='';
   answerForm.requestSubmit(answerForm.querySelector('[value="later"]'));await flush();
   answerForm.requestSubmit(answerForm.querySelector('[value="answer"]'));await flush();
@@ -1295,35 +1974,39 @@ window.fetch=async(_url,options={})=>{
   const pending=rows().find(row=>row.dataset.number==='page-owner/c3'),pendingKey=pending.dataset.key;
   pending.querySelector('.list-toggle').click();
   const pendingForm=pending.querySelector('form');pendingForm.elements.feedback.value='Wait for a new answer.';
-  const initialCount=Number(document.querySelector('[data-list-count]').textContent.split(' ')[0]);
+  const initialCount=Number(document.querySelector('[data-show-chip="open"] b').textContent);
   pendingForm.requestSubmit(pendingForm.querySelector('[value="question"]'));
   await new Promise(resolve=>nativeTimeout(resolve,1000));
   const revision=pending.dataset.updated;
   for(const [state,updated,revealed] of [
-    ['For you',revision,false],['Waiting',revision,false],
-    ['Waiting','2099-02-01T09:00:00+00:00',false],['For you','2099-02-01T10:00:00+00:00',true]]){
+    ['Open',revision,false],['Waiting',revision,false],
+    ['Waiting','2099-02-01T09:00:00+00:00',false],['Open','2099-02-01T10:00:00+00:00',true]]){
    const update=new DOMParser().parseFromString(original,'text/html');
    const updatedRow=update.querySelector('[data-key="'+pendingKey+'"]');
    updatedRow.dataset.state=state;updatedRow.dataset.updated=updated;
+   const payload=update.querySelector('[data-review-index]'),entries=JSON.parse(payload.textContent);
+   const entry=entries.find(entry=>entry.key===pendingKey);entry.state=state;entry.updated=updated;
+   payload.textContent=JSON.stringify(entries);
    window.refreshMarkup=update.documentElement.outerHTML;
    dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
    const shownPending=rows().find(row=>row.dataset.key===pendingKey);
    check(shownPending.hidden!==revealed,'F021: state and revision control return for '+state+' '+updated);
-   check(Number(document.querySelector('[data-list-count]').textContent.split(' ')[0])===initialCount-(revealed?0:1),
-     'F021: only the new For you response restores the count');
+   check(Number(document.querySelector('[data-show-chip="open"] b').textContent)===initialCount-(revealed?0:1),
+     'F021: only the new Open response restores the count');
   }
   window.refreshMarkup=window.doneMarkup;
   choose('list-show','Done');await flush();await flush();
-  check(document.querySelector('[data-list-count]').textContent==='3 done',
-    'F007: Done counts only Done records');
+  check(document.querySelector('[data-show-chip="Done"] b').textContent==='6',
+    'Done counts the three server records and three saved records.');
   check(new URL(window.refreshRequests.at(-1),location.href).searchParams.get('show')==='Done',
-    'the Show menu requests the selected rows');
+    'the Show chips request the selected rows');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
   check(new URL(window.refreshRequests.at(-1),location.href).searchParams.get('show')==='Done' &&
-    document.getElementById('list-show').value==='Done','the refresh keeps the selected Show view');
+    showValue()==='Done','the refresh keeps the selected Show view');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
+        self_root = self.root
         body = source.replace('<head>','<head>'+setup,1).replace('</body>',probe+'</body>').encode()
         for width in (1440,390):
             with self.subTest(width=width):
@@ -1342,7 +2025,8 @@ window.fetch=async(_url,options={})=>{
                         if self.path == '/complete':
                             _ = complete.wait(20)
                         else:
-                            _ = self.wfile.write(source.encode() if self.path.startswith('/console/review.html') else
+                            _ = self.wfile.write(review_page.render(self_root, show=parse_qs(self.path.partition('?')[2]).get('show', ['open'])[0])
+                                if self.path.startswith('/console/review.html') else
                                 body if self.path == '/page' else b'<iframe src="/page" style="border:0;width:100vw;height:100vh"></iframe><img hidden src="/complete">')
                     def do_POST(self) -> None:
                         results.append(cast(list[str],json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
@@ -1365,6 +2049,109 @@ window.fetch=async(_url,options={})=>{
                         server.shutdown()
                         thread.join(TEST_HANG_GUARD_SECS)
                 self.assertEqual(results,[[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_later_retains_drafts_and_resolves_daylight_saving_times(self) -> None:
+        _ = self.question()
+        with patch.dict(os.environ, {'USER_ZONE': 'America/New_York'}):
+            source = review_page.render(self.root).decode()
+        setup = r"""<script>
+const nativeFetch=fetch,nativeTimeout=setTimeout;
+window.setInterval=()=>0;window.clearInterval=()=>{};
+window.posts=[];
+window.fetch=async(_url,options={})=>{
+ if(options.method==='POST'){
+  window.posts.push(new URLSearchParams(options.body));return {ok:true,json:async()=>({answer:'later'})};
+ }
+ return {ok:true,text:async()=>MARKUP};
+};
+Date.now=()=>Date.parse(SCENARIO==='gap' ? '2027-03-13T15:00:00Z' :
+ SCENARIO==='repeat' ? '2027-11-06T14:00:00Z' : '2026-11-30T15:00:00Z');
+</script>""".replace('MARKUP', json.dumps(source).replace('</', '<\\/'))
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const flush=()=>new Promise(resolve=>nativeTimeout(resolve,60));
+ const form=()=>document.querySelector('[data-type="question"] form');
+ const open=()=>{form().querySelector('[data-later-toggle]').click();form().querySelector('[data-later-choose]').click();};
+ const close=()=>form().querySelector('[data-later-time]').dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+ const time=value=>{const field=form().querySelector('[data-later-time]');field.value=value;field.dispatchEvent(new Event('input',{bubbles:true}));};
+ const selected=()=>form().querySelector('[role=grid] [aria-selected="true"]')?.dataset.date;
+ try{
+  check(document.querySelector('[data-review]').dataset.zone==='America/New_York','the fixture sets America/New_York');
+  if(SCENARIO==='draft'){
+   open();
+   form().querySelector('[role=grid] [tabindex="0"]').dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true,cancelable:true}));
+   time('10:15');close();open();
+   check(form().elements.later.value==='2026-12-02T10:15' && selected()==='2026-12-02' &&
+    form().querySelector('[data-later-time]').value==='10:15','F004: Escape and reopen retain the selected day and time');
+   time('11:45');
+   const restored=form().elements.later.value;
+   close();
+   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+   check(form().elements.later.value===restored,'F004: refresh restores the Later draft');
+   open();
+   check(form().elements.later.value===restored && selected()===restored.slice(0,10) &&
+    form().querySelector('[data-later-time]').value==='11:45','F004: opening the chooser retains the restored draft');
+  }else{
+   const gap=SCENARIO==='gap',clock=gap ? '02:30' : '01:30';
+   const expected=gap ? '2027-03-14T07:30:00.000Z' : '2027-11-07T05:30:00.000Z';
+   const content=document.querySelector('[data-review]'),settings=JSON.parse(content.dataset.later);
+   settings.morning=gap ? 150 : 90;content.dataset.later=JSON.stringify(settings);
+   form().querySelector('[data-later-toggle]').click();
+   const preset=form().querySelector('[data-later-preset="morning"]');
+   check(new Date(Number(preset.dataset.at)).toISOString()===expected,'F005: '+SCENARIO+' preset uses compatible resolution');
+   form().querySelector('[data-later-choose]').click();time(clock);
+   check(form().querySelector('[data-later-summary]').textContent===
+    (gap ? 'Hides until Sun 14 Mar 03:30' : 'Hides until Sun 7 Nov 01:30'),
+    'F005: '+SCENARIO+' summary shows the saved instant');
+   form().requestSubmit(form().querySelector('[value="later"]'));await flush();
+   check(window.posts.at(-1)?.get('later')===expected,'F005: '+SCENARIO+' Save sends the compatible instant');
+  }
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        for scenario in ('draft', 'gap', 'repeat'):
+            with self.subTest(scenario=scenario):
+                page = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+                body = page.replace('SCENARIO', json.dumps(scenario)).encode()
+                results: list[list[str]] = []
+                complete = threading.Event()
+
+                class Probe(BaseHTTPRequestHandler):
+                    def do_GET(self) -> None:
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'text/html; charset=utf-8')
+                        self.end_headers()
+                        if self.path == '/complete':
+                            _ = complete.wait(20)
+                        else:
+                            _ = self.wfile.write(body if self.path == '/page' else
+                                b'<iframe src="/page" style="width:100vw;height:100vh"></iframe><img hidden src="/complete">')
+
+                    def do_POST(self) -> None:
+                        results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                        complete.set()
+                        self.send_response(204)
+                        self.end_headers()
+
+                    @override
+                    def log_message(self, format: str, *args: object) -> None:
+                        pass
+
+                with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    try:
+                        with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
+                            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
+                                '--window-size', '1440,900', '--screenshot', str(self.fixture.temporary/'later-time.png'),
+                                f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                        self.assertEqual(done.returncode, 0, done.stderr)
+                    finally:
+                        server.shutdown()
+                        thread.join(TEST_HANG_GUARD_SECS)
+                self.assertEqual(results, [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_uses_the_shared_status_with_the_real_loader(self) -> None:
