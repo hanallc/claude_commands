@@ -217,6 +217,8 @@ function response(status=200){
 window.fetch=async(url,options={})=>{
  if(options.method==='HEAD') return response();
  if(String(url).includes('report.json')) return {ok:false,status:404};
+ // The Disks page also reads the Builds data; the status checks count only the page's own reads.
+ if(original.includes('<title>Disks</title>') && String(url).includes('memory.json')) return {ok:false,status:404};
  if(options.method==='POST' && String(url)!=='measure')
   return saveFails ? {...response(502),json:async()=>({reason:'HTTP 502'})} : response();
  if(String(url)==='measure') return {ok:!measureFails,status:measureFails ? 502 : 200,
