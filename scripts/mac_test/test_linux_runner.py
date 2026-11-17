@@ -20,6 +20,8 @@ from typing import Literal, NamedTuple, TypedDict, cast, override
 import unittest
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test import eligibility, claim_state, linux_runner, mac_test, offload, test_target_slots
@@ -228,9 +230,7 @@ class LinuxShellTests(unittest.TestCase):
         for tool in ("nix", "df", "rm", "rustup", "cargo-nextest", "cargo-mend"):
             self.write_tool(tools / tool)
         self.write_tool(self.root / ".claude/scripts/lint/lint")
-        for folder in ("lib", "copies"):
-            (self.root / ".claude/scripts" / folder).symlink_to(
-                Path(__file__).resolve().parents[1] / folder, target_is_directory=True)
+        _ = copy_helpers(self.root, *COPY_HELPERS)
         _ = self.enterContext(mock.patch.object(linux_runner, "boot_identity", return_value="fixture-boot"))
         real_rm = shutil.which("rm")
         if real_rm is None:
@@ -1783,7 +1783,7 @@ class LinuxCopyTests(unittest.TestCase):
         _ = self.write_source("src/lib.rs", "first source\n")
         remote_home = self.root / "remote-home"
         remote_home.mkdir()
-        (remote_home / ".claude").symlink_to(Path(__file__).resolve().parents[2], target_is_directory=True)
+        _ = copy_helpers(remote_home, *COPY_HELPERS, "config")
         ssh = self.root / "ssh"
         _ = ssh.write_text('#!/bin/bash\nwhile [[ $1 == -o ]]; do shift 2; done\n'
                            + '[[ $1 == natedev ]] && exit 255\n'
