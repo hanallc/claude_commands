@@ -424,7 +424,8 @@ The render value's hover text shows the median of at most 10 successful renders.
 `/console/list.html` reads the producer's numbered List records on each request.
 The navigation label is List, and the page title is The List.
 The page uses the shared status line in `page_frame.py`.
-The columns are #, Owner, Item, State, Next step, ETA, and Update.
+The columns are #, Owner, Producer, Item, State, Next step, ETA, and Update.
+The Producer cell shows the name of the record's producer.
 The default order uses `the_list.order`, which the CLI also uses.
 User decisions come first, then unread updates, then the earliest next check.
 A column button sorts its values; a second click reverses that order.
@@ -445,6 +446,12 @@ Repeated links and absent links cause no write or log entry.
 Each changed record gets one log entry with the resolved keys.
 Old records without the reviews field load with no links.
 
+Each List record stores a `producer`: the fixed staff ID of a staff row with the producer role.
+`the_list.py add` and `update` take `--producer <name or staff id>`.
+The option refuses a name or ID that does not resolve to exactly one current producer row.
+A new item without the option, and an old record without the field, belong to the record keeper, morty.
+The terminal list shows a Producer column after Owner.
+
 When List records have review links, the page reads review items once per render and indexes them by key.
 It stores no review states on the List record.
 The State cell shows “N changes for you” when every review that needs nate is a change.
@@ -459,10 +466,12 @@ Only types in `review_page.TYPES` link to Review cards.
 Other types and missing reviews show plain text.
 
 The Owner menu includes record owners without a current staff row.
+The Producer menu beside it lists each producer that a record names.
+An address with a producer that no record names shows all producers.
 The Show menu contains Open, Needs me, Unread, Done, Parked, Closed, and All.
 Open excludes Done, Closed, and items with a future parking time.
 The search field matches an item number or title.
-The address retains the owner, view, search, column, and direction.
+The address retains the owner, producer, view, search, column, and direction.
 
 A row opens to show its latest status, completion condition, item links, and log.
 The open row does not show Evidence; the record keeps it.
