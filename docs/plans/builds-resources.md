@@ -2667,3 +2667,21 @@ The cutover removal commit deletes the script after the run.
 - Checkpoint `13f982741`: 73 tests alone and 537 with the other `mac_test` modules, with and without test startup; basedpyright 0.
 
 **Files:** `scripts/mac_test/test_offload.py`.
+
+### Phase 139 — The unknown-folder disk test does not read its own temp path  · status: done
+**Source:** builds showrunner 2026-11-16 23:5x. `test_measured_target_folder_has_no_cargo_or_rebuild_claim` (`scripts/lint/test_sweep.py:4878`, from Phase 63) fails when the temp path holds `rebuild`. The message includes the folder path, and the test asserts that `rebuild`, `Cargo` and `compiled` are not in the whole message.
+
+#### Work Order
+
+**Goal:** the test checks the message words, not the folder path that the message quotes.
+
+**Spec:**
+1. Remove the folder path from each attempt's text before the three `assertNotIn` checks. Keep the `assertIn(folder, attempt.text)` check on the full text.
+2. Add one row that runs the same case with a folder path that holds `rebuild`, `Cargo` and `compiled`, and passes.
+3. Change no product file.
+
+**Files:** `scripts/lint/test_sweep.py`: the one test above, and the new row at the end of its class.
+
+**Workers:** `1 tester`
+
+**Acceptance gate:** `scripts.lint.test_sweep` passes alone with test startup; basedpyright reports zero on the file.
