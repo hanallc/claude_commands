@@ -24,6 +24,7 @@ description: Read agent message rules and delivery.
 
 - For Claude sessions on this machine, use ListAgents and SendMessage.
 - For staff workers, unit-director and showrunner relationships, or the other machine, run `~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py`; `--json` gives `entries` and `problems`.
+  The roster hides closed workers by default; `--all` includes them.
 - Send to a roster address with `send.py --to <address> --from "<your session name>" --text "<message>"`.
   Use `session:<id>` for Claude, `worker:<unit>/<short name>` for staff workers, or `codex:<thread id>` for Codex daemon sessions.
   A unique name also works.
