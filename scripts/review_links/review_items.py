@@ -223,7 +223,7 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
     local = path.absolute() == current.absolute()
     return ReviewItem(prefix+'/'+row['#'], shown, ReviewType.CHANGE, identity, source,
         row['Change'], state, ReviewTimes(filed, logs[-1].time), tuple(logs),
-        ('works', 'not works', 'validate', 'feedback', 'question') if state == ReviewState.FOR_YOU else (),
+        ('works', 'not works', 'validate', 'feedback', 'question') if state != ReviewState.DONE else (),
         ChangeSource(path, row, assignment, slots), entry.urgency, after, queue,
         row['#'] if local else prefix+'/'+row['#'], change_review.prerequisite_key(entry.after, path, current),
         entry.value, change_review.describe(row | {'#':shown},record=members),
@@ -319,7 +319,7 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
     opened = update_registration.OpenItem(name(owner, members), parsed, name(asker, members) if asker else '')
     return ReviewItem(key, identity, ReviewType.QUESTION, owner, asker, fields['text'], state,
         ReviewTimes(filed, logs[-1].time, later), tuple(logs),
-        ('answer', 'feedback', 'question') if state == ReviewState.FOR_YOU and not unowned else (), source, entry.urgency, '',
+        ('answer', 'feedback', 'question') if state != ReviewState.DONE and not unowned else (), source, entry.urgency, '',
         update_registration.question_queue_name(owner), entry.key, entry.after, entry.value, opened.line(),
         review_events.waiting_why(fields.get('waiting_why', '')))
 
@@ -401,7 +401,7 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
             identity_text = name(record.owner, members)+'/'+record.id
             found.append(ReviewItem(key, identity_text, ReviewType.INVESTIGATION, owner, record.owner, record.title, state,
                 ReviewTimes(filed, logs[-1].time), tuple(logs),
-                ('read', 'feedback', 'question') if state == ReviewState.FOR_YOU else (), InvestigationSource(record),
+                ('read', 'feedback', 'question') if state != ReviewState.DONE else (), InvestigationSource(record),
                 queue='investigation-'+owner, queue_key=key,
                 text=identity_text+' '+record.title+'\n'+record.question+'\n\nAnswer\n'+record.answer,
                 waiting_why=review_events.waiting_why(record.waiting_why)))
@@ -424,7 +424,7 @@ def proposal_item(key: str, issue: Issue, owner: staff.StaffId, who: staff.Staff
     state = proposal_state(issue)
     logs = (ReviewLog(filed,name(who,members),'Proposed'), *review_log(issue))
     identity = name(owner,members)+'/'+(issue.value('proposal_id') or issue.path.stem)
-    actions = DECISION_ACTIONS if state == ReviewState.FOR_YOU else ()
+    actions = DECISION_ACTIONS if state != ReviewState.DONE else ()
     if entry is None:
         return ReviewItem(key,identity,ReviewType.PROPOSAL,owner,who,title,state,ReviewTimes(filed,logs[-1].time),logs,
                           actions,ProposalSource(issue),waiting_why=review_events.waiting_why(issue.value('waiting_why')))
@@ -578,7 +578,7 @@ def efficiency_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], 
             logs = (ReviewLog(filed,name(owner,members),result), *review.log)
             found.append(ReviewItem(key,name(owner,members)+f'/E{index+1}',ReviewType.EFFICIENCY,owner,who,
                 head[13:],state,ReviewTimes(filed,logs[-1].time),logs,
-                DECISION_ACTIONS if state == ReviewState.FOR_YOU else (),
+                DECISION_ACTIONS if state != ReviewState.DONE else (),
                 EfficiencySource(path,line),entry.urgency,queue=candidates.QUEUE,queue_key=entry.key,
                 value=entry.value,text=line,waiting_why=review_events.waiting_why(review.waiting_why)))
     return found

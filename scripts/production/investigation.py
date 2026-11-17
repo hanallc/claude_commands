@@ -14,7 +14,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import cast
 
-from scripts.production import record_store, staff
+from scripts.production import change_routing, delivery_state, record_store, staff, update_registration
 from scripts.review_links import review_events
 from scripts.review_links.review_events import ReviewLog
 from scripts.production.record_store import state_root as state_root
@@ -123,13 +123,20 @@ def file(owner: staff.StaffId, title: str, question: str, *, waiting_why: str = 
         return item
 
 
-def answer(owner: staff.StaffId, identity: str, text: str) -> Investigation:
-    """Save an answer once; accept an exact repeat without writing."""
+def answer(owner: staff.StaffId, identity: str, text: str, *, question_id: str = '') -> Investigation:
+    """Save an answer and refuse a stale Review exchange ID."""
     if not text.strip():
         raise InvestigationError("answer must not be empty")
-    _ = _path(owner, identity)
+    path = _path(owner, identity)
     with _store(owner).locked():
         item = load(owner, identity)
+        delivery = change_routing.delivery_path(change_routing.review_root(), path, identity)
+        question = change_routing.delivery_slots(delivery).question
+        if question_id or isinstance(question, delivery_state.OpenQuestion):
+            try:
+                _ = update_registration.question_exchange_for_reply(question, question_id, text.strip())
+            except update_registration.StaleQuestionExchange as error:
+                raise InvestigationError(str(error)) from None
         if item.state == InvestigationState.ANSWER_READY and item.answer == text:
             return item
         if item.state != InvestigationState.OPEN:
