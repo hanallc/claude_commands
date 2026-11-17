@@ -2637,6 +2637,7 @@ class RosterTests(unittest.TestCase):
         authority = roster.PeerAuthority.decode(Path(str(self.ssh_log) + ".stdin").read_text())
         self.assertEqual(authority.membership, staff.initial_snapshot())
         self.assertEqual(authority.accounts, role_map.read_role_map())
+        self.assertEqual(authority.documents, session_staff.RowResolver(authority.membership).production_document_facts())
         self.assertEqual(staff_reads.call_count, 1)
         self.assertIn('"$HOME/.claude/scripts/lib/py"', commands[0][-1])
 
@@ -2706,12 +2707,15 @@ class RosterTests(unittest.TestCase):
         record = staff.initial_snapshot()
         supplied = replace(record, rows=tuple(
             replace(row, name="supplied-unit") if row.name == "unit-one" else row for row in record.rows))
-        authority = roster.PeerAuthority(supplied, role_map.read_role_map())
+        authority = roster.PeerAuthority(supplied, role_map.read_role_map(),
+                                         session_staff.RowResolver(supplied).production_document_facts())
         valid_document = authority.encode()
         with (role_map.supplied_role_map(authority.accounts),
               mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions())):
             expected = roster.roster(os.environ, roster.ThisMachine(), membership=supplied)
-        for document in (valid_document, "not JSON", '{"staff": {}, "role_map": {}}'):
+        invalid_facts = cast(dict[str, object], json.loads(valid_document))
+        invalid_facts["production_documents"] = []
+        for document in (valid_document, "not JSON", '{"staff": {}, "role_map": {}}', json.dumps(invalid_facts)):
             output = io.StringIO()
             with (self.subTest(document=document),
                   mock.patch.object(sys, "stdin", io.StringIO(document)),
@@ -2720,6 +2724,7 @@ class RosterTests(unittest.TestCase):
                 if document == valid_document:
                     with (mock.patch.object(staff, "is_owner", return_value=False),
                           mock.patch.object(staff, "_remote", side_effect=AssertionError("staff ssh")),
+                          mock.patch.object(session_staff, "_read_facts", side_effect=AssertionError("document fact read")),
                           mock.patch.object(role_map, "is_role_map_host", return_value=False),
                           mock.patch.object(role_map, "ssh_role_map", side_effect=AssertionError("role-map ssh"))):
                         status = roster.main(["--here", "--snapshot"])
