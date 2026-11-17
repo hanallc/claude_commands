@@ -4704,3 +4704,25 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The 767 Python CLI starts (13.2 CPU s on natedev, 14 ms each; `-S` does not make a start cheaper) are gone.
 - natedev `module_cost.py`: 27.93 to 11.52 CPU s. aws pair, 3 rounds: 26.25 to 8.48 CPU s, a saving of 17.77 CPU s; all passed.
 - Main-based commit c7507d49c (branch `natest-restart335`) went to builds. The herdr call count of a stop or restart of all rows, and an existing flake in `test_count_fixture_selects_linux_readers_on_macos` (1 of 12 runs on main), went to the natedev showrunner through builds.
+
+### Phase 336 — The lifecycle tests run the phase table archive in the test process  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### Work Order
+
+**Goal:** `production/test_production_lifecycle.py` uses less aws CPU; every behavior check stays.
+
+**Spec:**
+1. Each in-process wrap starts `phase_table.py archive` as a new interpreter: 28 starts, 4.7 of 18.0 CPU s on natedev.
+2. `run_lifecycle` in `production_lifecycle_test_support.py` patches `production_lifecycle.command`. The phase table call runs `phase_table.main` through `invoke_cli` with the same environment, arguments and folder. A nonzero status raises the same `LifecycleStop`. Every other command runs as before.
+3. `test_in_process_cli_matches_process_output_and_status` keeps the real process path and compares it with the in-process path.
+
+**Files:** `scripts/production/production_lifecycle_test_support.py`.
+
+**Workers:** none; no-worker mode. The director writes and proves it.
+
+**Acceptance gate:**
+- The module passes 3 times in a copy of origin/main with the change.
+- basedpyright reports 0 errors and 0 warnings on the file.
+- An aws pair shows the saving.
