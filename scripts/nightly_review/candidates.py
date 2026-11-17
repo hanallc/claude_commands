@@ -309,32 +309,44 @@ def outcome_words(state: str, applied: str, today: str) -> str:
             "relayed": f"relayed {today}"}.get(state, state)
 
 
-def outcome(identity: str, state: str, applied: str, ledger: Path) -> int:
-    """Write one candidate's outcome on its own ledger line; E<n> is the line's number."""
+class OutcomeRefused(ValueError):
+    """The ledger line is not an open candidate."""
+
+
+def record_outcome(identity: str, state: str, applied: str, ledger: Path) -> tuple[bool, str]:
+    """Write one candidate's outcome on its own ledger line; E<n> is the line's number.
+
+    Returns whether the line changed, and the line.
+    """
     found = EFFICIENCY_ID.match(identity)
-    if found is None or state not in OUTCOMES or (state == "accepted") != bool(applied):
-        print(USAGE, file=sys.stderr)
-        return 2
+    assert found is not None
     lines = read_lines(ledger)
     index = int(found["number"]) - 1
     line = lines[index] if index < len(lines) else ""
     words = outcome_words(state, applied, now().astimezone(user_zone()).strftime("%Y-%m-%d"))
     if line.endswith(" — " + words):
-        print(f"E{index + 1} unchanged: {line}")
-        return 0
+        return False, line
     if open_candidate(line) is None:
-        print(f"candidates: E{index + 1} is not an open candidate in {ledger}", file=sys.stderr)
-        return 1
+        raise OutcomeRefused(f"E{index + 1} is not an open candidate in {ledger}")
     lines[index] = OPEN_END.sub(" — " + words, lines[index])
-    try:
-        write_text_atomic(ledger, "\n".join(lines) + "\n")
-    except OSError as error:
-        print(f"candidates: {error}", file=sys.stderr)
-        return 1
-    print(f"E{index + 1}: {lines[index]}")
+    write_text_atomic(ledger, "\n".join(lines) + "\n")
     if ledger == state_root() / "ledger.md":
         open_candidates = ordered(lines)
         write_note(table(open_candidates) if open_candidates else "no open candidates")
+    return True, lines[index]
+
+
+def outcome(identity: str, state: str, applied: str, ledger: Path) -> int:
+    found = EFFICIENCY_ID.match(identity)
+    if found is None or state not in OUTCOMES or (state == "accepted") != bool(applied):
+        print(USAGE, file=sys.stderr)
+        return 2
+    try:
+        changed, line = record_outcome(identity, state, applied, ledger)
+    except (OutcomeRefused, OSError) as error:
+        print(f"candidates: {error}", file=sys.stderr)
+        return 1
+    print(f"E{found['number']}: {line}" if changed else f"E{found['number']} unchanged: {line}")
     return 0
 
 

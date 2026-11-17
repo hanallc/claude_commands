@@ -213,12 +213,12 @@ def issue_urgency(issue: Issue, *, sources: list[Path] | None = None) -> urgency
         return urgency.Urgency()
 
 
-def issue_row(issue: Issue, *, sources: list[Path] | None = None) -> IssueRow:
+def issue_row(issue: Issue, record: staff.StaffSnapshot, *, sources: list[Path] | None = None) -> IssueRow:
     """The issue's row, its title the P number and the file's name, with its progress read once."""
     progress = proposal_progress(issue)
     level = issue_urgency(issue, sources=sources) if isinstance(progress, AwaitingApproval) else urgency.Urgency()
     shown = urgency.cell(level)
-    row = Row(staff_name(issue.value("proposed_by")) if issue.value("proposed_by") else NONE, f"{issue.value('proposal_id')} {issue.path.stem}".lstrip(),
+    row = Row(staff_name(issue.value("proposed_by"), record) if issue.value("proposed_by") else NONE, f"{issue.value('proposal_id')} {issue.path.stem}".lstrip(),
               issue.value("date_created") or NONE,
               issue_state(issue, progress) + (f" · {shown}" if shown else ""))
     waits = isinstance(progress, AwaitingApproval)
@@ -228,9 +228,14 @@ def issue_row(issue: Issue, *, sources: list[Path] | None = None) -> IssueRow:
     return IssueRow(progress, entry)
 
 
-def issue_entries(found: list[Issue], *, sources: list[Path] | None = None) -> tuple[list[urgency.Entry[Row]], list[Row]]:
+def issue_entries(found: list[Issue], *, sources: list[Path] | None = None,
+                  record: staff.StaffSnapshot | None = None) -> tuple[list[urgency.Entry[Row]], list[Row]]:
     """The waiting issues, to be ordered, and the rows of the ones in progress, oldest first."""
-    rows = sorted((issue_row(issue, sources=sources) for issue in found), key=IssueRow.order)
+    rows: list[IssueRow] = []
+    if found:
+        # One staff read serves every row.
+        members = staff.snapshot() if record is None else record
+        rows = sorted((issue_row(issue, members, sources=sources) for issue in found), key=IssueRow.order)
     folder = {issue.path.stem: str(issue.path) for issue in found}
     # `depends_on` names an issue by its file name; an entry's prerequisite is its key, the path.
     waiting = [replace(row.entry, after=folder.get(row.entry.after, ""))
@@ -358,7 +363,8 @@ def improvement_ledgers(doc: Path, below: bool = False) -> list[Path]:
 
 
 def waiting_entries(doc: Path, below: bool = False, *, sources: list[Path] | None = None,
-                    issues: list[Issue] | None = None) -> tuple[list[urgency.Entry[Row]], list[Row]]:
+                    issues: list[Issue] | None = None,
+                    record: staff.StaffSnapshot | None = None) -> tuple[list[urgency.Entry[Row]], list[Row]]:
     """The proposals waiting for the user's review, to be ordered, then the other issue and backlog rows.
 
     Only the production's own, and with `below` those of each production below it: issues their
@@ -366,7 +372,7 @@ def waiting_entries(doc: Path, below: bool = False, *, sources: list[Path] | Non
     A caller that already holds the `scope_issues` result gives it as `issues`, so the folder is read once.
     """
     scoped = scope_issues(doc, below, sources=sources) if issues is None else issues
-    waiting, in_progress = issue_entries(scoped, sources=sources)
+    waiting, in_progress = issue_entries(scoped, sources=sources, record=record)
     rest = list(in_progress)
     for found in improvement_ledgers(doc, below):
         for row in ledger_rows(found, sources=sources):
