@@ -211,7 +211,7 @@ exec bash "''' + str(agent_exec) + '''" "$@"
         records = self.root / "fast-track-state/records.jsonl"
         with records.open("a") as output:
             _ = output.write(json.dumps(later) + "\n")
-        for lens in ("adversary", "contract"):
+        for lens in ("craft", "adversary", "contract"):
             with self.subTest(lens=lens):
                 result = subprocess.run(self.review_command(session, lens, ""), env=environment,
                                         capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
