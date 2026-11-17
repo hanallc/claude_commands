@@ -629,6 +629,7 @@ class WaitRow(RowQueueNotes, SlotPlace):
     fits: bool
     why: str
     free: NotRequired[float]
+    test_grant_wait: NotRequired[str]
 
 
 class MemoryWaitRow(WaitRow):
@@ -2101,11 +2102,13 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         need = check.need if check is not None else waiter.need
         identity = feed_step_labels(waiter, labels, ci_runners)
         reason = reason_phrase(waiter.reason, parsed.view.waiting)
+        why = wait_why(waiter.reason)
         if isinstance(waiter.reason, admission_records.BehindHead):
             reason += ": the first step in line gets memory first"
         ci_label = waiter.session_name if waiter.unit in ci_runners else ""
         job = NotGateStep() if ci_label else step_job(waiter.step, waiter.pid)
-        shown_waiter = replace(waiter, step=job_step(job, waiter.step))
+        label_step = "nextest" if waiter.step == admission_records.NEXTEST_TEST_STEP else waiter.step
+        shown_waiter = replace(waiter, step=job_step(job, label_step))
         waiters.append({"name": names.for_owner(shown_waiter.step, identity.unit if identity.unit != "—" else "", identity.role,
                             ci=bool(ci_label), current_name=step_text(shown_waiter, names, labels=labels)),
                         **page_owner_labels(identity, ci_label=ci_label),
@@ -2115,13 +2118,21 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         "fits": need <= captured.signed_room, "place": place,
                         "free": gib(max(0, check.room)) if check is not None else
                                 gib(waiter.reason.free) if isinstance(waiter.reason, admission_records.NeedsMemory) else gib(ram["room_bytes"]),
-                        "why": wait_why(waiter.reason),
+                        "why": why,
                         **(NO_TARGET_NOTES if ci_label else target_notes(
                             waiter.route, routes, waiter.step, waiter.folder, waiter.package)),
                         # A waiting step names its slot, so the Disks page names the slot's work as this row does.
                         **slot_place(build_slot_number(waiter.folder, host_name(), slot_roots, home=slot_homes[host_name()]),
                                      waiter.folder, host_name()),
                         **job_notes(job, identity.unit, names)})
+        if waiter.step == admission_records.NEXTEST_TEST_STEP:
+            match why:
+                case "memory" | "memory pressure":
+                    waiters[-1]["test_grant_wait"] = "Built. Waits for memory to run tests."
+                case "GPU slot":
+                    waiters[-1]["test_grant_wait"] = "Built. Waits for a GPU slot to run tests."
+                case _:
+                    waiters[-1]["test_grant_wait"] = "Built. Waits for its turn to run tests."
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
     if mac_status:

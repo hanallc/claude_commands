@@ -165,7 +165,7 @@ buildlog_memory_event() { :; }
 
 buildlog_wait_for_memory() {
     buildlog_check_nested_step || return $?
-    BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=MeminfoUnavailable BUILDLOG_MEM_RESERVATION=""
+    BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=MeminfoUnavailable BUILDLOG_MEM_RESERVATION="" BUILDLOG_MEM_NEXTEST_HANDOFF=0
     if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
         source "$BUILDLOG_SELECTED_LOCAL_GRANT" || return $?
         return 0
@@ -207,7 +207,7 @@ buildlog_wait_for_memory() {
 }
 
 buildlog_release_memory() {
-    local reservation="${BUILDLOG_MEM_RESERVATION:-}"
+    local reservation="${BUILDLOG_MEM_RESERVATION:-}" release_status=0
     BUILDLOG_MEM_RESERVATION=""
     export BUILDLOG_MEM_CLEANUP_TIMING
     [[ -n "$reservation" ]] || return 0
@@ -221,11 +221,15 @@ buildlog_release_memory() {
         if [[ -s "${HOLD_WAIT_DIR:-/nonexistent}/token-lost" ]]; then
             finish_args+=(--token after-grant)
         fi
-        buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" "${finish_args[@]}" >/dev/null 2>&1 || true
+        buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" "${finish_args[@]}" >/dev/null 2>&1 || release_status=$?
         BUILDLOG_MEM_PRELAUNCH_REASON=""
         rm -f "${BUILDLOG_SELECTED_LOCAL_GRANT:-/nonexistent}"
         BUILDLOG_SELECTED_LOCAL_GRANT="" BUILDLOG_PLACEMENT_FILE=""
     else
-        buildlog_memory_python "$BUILDLOG_QUEUE_PLACE_SCRIPT" release "$reservation" "${1:-0}" >/dev/null 2>&1 || true
+        buildlog_memory_python "$BUILDLOG_QUEUE_PLACE_SCRIPT" release "$reservation" "${1:-0}" >/dev/null 2>&1 || release_status=$?
+    fi
+    if (( release_status != 0 )) && [[ -n "${BUILDLOG_NEXTEST_ADMISSION_STEP:-}" ]]; then
+        build_check_stop "$release_status" 'cannot release the nextest memory grant'
+        return "$release_status"
     fi
 }

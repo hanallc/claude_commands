@@ -3585,6 +3585,233 @@ class RoomAndSlotTests(unittest.TestCase):
             self.assertEqual(set(fixture.server.waiters), {request.episode for request in gates})
 
 
+class NextestGrantTests(unittest.TestCase):
+    def nextest_test(self, fixture: AdmissionFixture, build: wire.AdmitRequest,
+                     grant: wire.Admitted, need: int) -> wire.AdmitRequest:
+        test = fixture.request(owner=build.owner, run=build.run, episode=f"{build.episode}:test", need=need)
+        return replace(test, sidecar=str(fixture.root / "nextest-test.cgroup"),
+                       profile=replace(test.profile, repo=build.profile.repo, repository=build.profile.repository),
+                       test_phase=wire.NextestTests(wire.NextestBuildGrant(grant.reservation)))
+
+    def test_later_waiter_cannot_take_memory_between_build_and_tests(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.assertEqual(Path(os.environ["ADMISSION_SOCKET"]), fixture.socket_path)
+            build = fixture.request(run=fixture.run_owner(), step=records.NEXTEST_BUILD_STEP, need=8 * GIB)
+            build = replace(build, sidecar=str(fixture.scope(build.owner)))
+            built = only_admitted(fixture.server.handle_request(build))
+            self.assertTrue(built.supports_nextest_handoff)
+            fixture.scoped_peak(built, 7 * GIB)
+
+            fixture.allow_next_start()
+            fixture.free(11 * GIB)
+            later = fixture.request(need=6 * GIB)
+            self.assertIsInstance(fixture.server.handle_request(later)[0], wire.Wait)
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.reservations), {build.episode})
+
+            test = self.nextest_test(fixture, build, built, 3 * GIB)
+            tested = only_admitted(fixture.server.handle_request(test))
+            self.assertEqual(set(fixture.server.reservations), {test.episode})
+            self.assertIn(later.episode, fixture.server.waiters)
+            self.assertFalse(fixture.server.nextest_test_holds)
+            self.assertEqual(tested.need, 3 * GIB)
+            self.assertNotEqual(tested.reservation, built.reservation)
+            self.assertEqual(fixture.server.reservations[test.episode].step, records.NEXTEST_TEST_STEP)
+
+            fixture.free(13 * GIB)
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.reservations), {later.episode, test.episode})
+            fixture.scoped_peak(tested, 4 * GIB)
+            fixture.release(tested)
+            compiler_row, test_row = fixture.history()
+            self.assertEqual(compiler_row["build_phase_peak_bytes"], 7 * GIB)
+            self.assertEqual(test_row["test_phase_peak_bytes"], 4 * GIB)
+            self.assertEqual(test_row["need"], 3 * GIB)
+
+    def test_only_head_keeps_memory_when_two_test_grants_need_growth(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(18 * GIB + admission_policy_fixture().safety_bytes)
+            builds: list[tuple[wire.AdmitRequest, wire.Admitted]] = []
+            for _ in range(2):
+                build = fixture.request(owner=fixture.proc.spawn(used=0), run=fixture.run_owner(),
+                                        step=records.NEXTEST_BUILD_STEP, need=8 * GIB)
+                builds.append((build, only_admitted(fixture.server.handle_request(build))))
+                fixture.allow_next_start()
+            fixture.hold_starts()
+            tests = [self.nextest_test(fixture, build, grant, 11 * GIB) for build, grant in builds]
+            for test in tests:
+                self.assertIsInstance(fixture.server.handle_request(test)[0], wire.Wait)
+
+            write_pressure_reading(fixture.root / "pressure", full_avg10=0)
+            _ = fixture.run_pass()
+            first, second = tests
+            self.assertEqual(set(fixture.server.reservations), {first.episode})
+            self.assertIn(second.episode, fixture.server.waiters)
+            fixture.release(only_admitted([fixture.server.ledger[first.episode].reply]))
+            assert isinstance(first.run, wire.RunIdentity)
+            fixture.end_run(first.run)
+            fixture.allow_next_start()
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.reservations), {second.episode})
+            self.assertFalse(fixture.server.nextest_test_holds)
+
+    def test_non_head_test_waits_for_full_memory_at_build_queue_age_after_restart(self) -> None:
+        with AdmissionFixture() as fixture:
+            build = fixture.request(owner=fixture.proc.spawn(used=0), run=fixture.run_owner(),
+                                    step=records.NEXTEST_BUILD_STEP, need=8 * GIB)
+            built = only_admitted(fixture.server.handle_request(build))
+            fixture.allow_next_start()
+            fixture.free(14 * GIB)
+            older = fixture.request(need=4 * GIB, since=build.since - 1)
+            self.assertIsInstance(fixture.server.handle_request(older)[0], wire.Wait)
+            fixture.hold_starts()
+            test = self.nextest_test(fixture, build, built, 11 * GIB)
+            self.assertIsInstance(fixture.server.handle_request(test)[0], wire.Wait)
+
+            hold = fixture.server.nextest_test_holds[built.reservation]
+            self.assertEqual(hold.bytes, 0)
+            self.assertEqual(hold.order_since, build.since)
+            self.assertNotIn(build.episode, fixture.server.reservations)
+            fixture.restart()
+            self.assertEqual(fixture.server.nextest_test_holds[built.reservation], hold)
+            self.assertIsInstance(fixture.server.handle_request(older)[0], wire.Wait)
+            self.assertIsInstance(fixture.server.handle_request(test)[0], wire.Wait)
+            self.assertEqual(fixture.server.waiters[test.episode].row.get("order_since"), build.since)
+
+            write_pressure_reading(fixture.root / "pressure", full_avg10=0)
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.reservations), {older.episode})
+            fixture.release(only_admitted([fixture.server.ledger[older.episode].reply]))
+            fixture.allow_next_start()
+            fixture.free(14 * GIB)
+            _ = fixture.run_pass()
+            tested = only_admitted([fixture.server.ledger[test.episode].reply])
+            self.assertEqual(tested.need, 11 * GIB)
+            self.assertFalse(fixture.server.nextest_test_holds)
+
+    def test_refresh_shrinks_the_head_test_hold_to_the_new_need(self) -> None:
+        with AdmissionFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf", gpu_test_slots="1", gpu_test_repositories="hana")
+            gpu = fixture.request(need=GIB)
+            gpu = replace(gpu, profile=replace(gpu.profile, repo="hana"))
+            _ = only_admitted(fixture.server.handle_request(gpu))
+            fixture.allow_next_start()
+            build = fixture.request(run=fixture.run_owner(), step=records.NEXTEST_BUILD_STEP, need=8 * GIB)
+            build = replace(build, profile=replace(build.profile, repo="hana"))
+            built = only_admitted(fixture.server.handle_request(build))
+            test = self.nextest_test(fixture, build, built, 11 * GIB)
+            peer = fixture.connect(test)
+            self.assertIsInstance(peer.replies()[0], wire.Wait)
+            self.assertEqual(fixture.server.nextest_test_holds[built.reservation].bytes, 8 * GIB)
+
+            smaller = self.nextest_test(fixture, build, built, 3 * GIB)
+            _ = peer.socket.sendall(wire.encode_request(smaller).encode())
+            self.assertIsInstance(peer.replies()[0], wire.Wait)
+            self.assertEqual(fixture.server.nextest_test_holds[built.reservation].bytes, 3 * GIB)
+
+    def test_disconnect_ends_test_memory_when_release_fails_and_service_restarts(self) -> None:
+        with AdmissionFixture() as fixture:
+            build = fixture.request(run=fixture.run_owner(), step=records.NEXTEST_BUILD_STEP, need=8 * GIB)
+            built = only_admitted(fixture.server.handle_request(build))
+            fixture.hold_starts()
+            test = self.nextest_test(fixture, build, built, 11 * GIB)
+            peer = fixture.connect(test)
+            self.assertIsInstance(peer.replies()[0], wire.Wait)
+            self.assertEqual(fixture.server.nextest_test_holds[built.reservation].bytes, 8 * GIB)
+
+            peer.close()
+            fixture.server.run_once(0)
+            with mock.patch.object(client, "_call", return_value=wire.Refused("release connection failed")):
+                self.assertIsInstance(client.release(built.reservation, 1, built.cleanup_timing), wire.Refused)
+            self.assertNotIn(test.episode, fixture.server.waiters)
+            self.assertEqual(fixture.server.nextest_test_holds[built.reservation].bytes, 0)
+            fixture.restart()
+            self.assertIsInstance(fixture.proc.owner_start(build.owner.pid), service.LiveOwnerIdentity)
+            self.assertEqual(fixture.server.nextest_test_holds[built.reservation].bytes, 0)
+            self.assertIsInstance(fixture.server.handle_request(test)[0], wire.Wait)
+            self.assertEqual(fixture.server.nextest_test_holds[built.reservation].bytes, 0)
+
+    def test_restart_drops_head_memory_when_the_waiter_connection_closes(self) -> None:
+        with AdmissionFixture() as fixture:
+            build = fixture.request(run=fixture.run_owner(), step=records.NEXTEST_BUILD_STEP, need=8 * GIB)
+            built = only_admitted(fixture.server.handle_request(build))
+            fixture.hold_starts()
+            test = self.nextest_test(fixture, build, built, 11 * GIB)
+            peer = fixture.connect(test)
+            self.assertIsInstance(peer.replies()[0], wire.Wait)
+            self.assertEqual(fixture.server.nextest_test_holds[built.reservation].bytes, 8 * GIB)
+            fixture.restart()
+            self.assertEqual(fixture.server.nextest_test_holds[built.reservation].bytes, 0)
+            self.assertIsInstance(fixture.server.handle_request(test)[0], wire.Wait)
+            self.assertEqual(fixture.server.waiters[test.episode].row.get("order_since"), build.since)
+
+    def test_test_handoff_keeps_only_the_test_promise_while_it_waits_for_gpu(self) -> None:
+        with AdmissionFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf", gpu_test_slots="1", gpu_test_repositories="hana")
+            gpu = fixture.request(need=GIB)
+            gpu = replace(gpu, profile=replace(gpu.profile, repo="hana"))
+            occupied = only_admitted(fixture.server.handle_request(gpu))
+            fixture.allow_next_start()
+            build = fixture.request(run=fixture.run_owner(), step=records.NEXTEST_BUILD_STEP, need=8 * GIB)
+            build = replace(build, profile=replace(build.profile, repo="hana"))
+            built = only_admitted(fixture.server.handle_request(build))
+
+            test = self.nextest_test(fixture, build, built, 3 * GIB)
+            waiting, = fixture.server.handle_request(test)
+            self.assertIsInstance(waiting, wire.Wait)
+            assert isinstance(waiting, wire.Wait)
+            reason = waiting.reason.cause if isinstance(waiting.reason, records.HeadAdmissionStatus) else waiting.reason
+            self.assertIsInstance(reason, records.GpuSlotWait)
+            self.assertEqual(fixture.server.nextest_test_holds[built.reservation].bytes, 3 * GIB)
+            fixture.release(occupied)
+            _ = fixture.run_pass()
+            self.assertEqual(only_admitted([fixture.server.ledger[test.episode].reply]).need, 3 * GIB)
+
+    def test_build_release_cancels_a_waiting_test_handoff(self) -> None:
+        with AdmissionFixture() as fixture:
+            build = fixture.request(run=fixture.run_owner(), step=records.NEXTEST_BUILD_STEP, need=8 * GIB)
+            built = only_admitted(fixture.server.handle_request(build))
+            fixture.hold_starts()
+            test = self.nextest_test(fixture, build, built, 11 * GIB)
+            peer = fixture.connect(test)
+            self.assertTrue(any(isinstance(reply, wire.Wait) for reply in peer.replies()))
+            fixture.release(built)
+            self.assertEqual(peer.replies(), [wire.Refused("nextest test grant was cancelled")])
+            self.assertNotIn(test.episode, fixture.server.waiters)
+            self.assertFalse(fixture.server.nextest_test_holds)
+
+    def test_pass_log_follows_the_grant_on_the_socket(self) -> None:
+        with AdmissionFixture() as fixture:
+            peer = fixture.connect(fixture.request())
+
+            def append_after_grant(_row: dict[str, object]) -> None:
+                grant = peer.socket.recv(65536, socket.MSG_PEEK)
+                self.assertIsInstance(wire.parse_reply(grant.splitlines()[0]), wire.Admitted)
+
+            with mock.patch.object(fixture.server, "_append_pass_log", side_effect=append_after_grant) as observed:
+                _ = only_admitted(peer.replies())
+            self.assertTrue(observed.called)
+
+    def test_each_pass_records_the_head_and_unused_promise(self) -> None:
+        with AdmissionFixture() as fixture:
+            holder = fixture.request(step=records.NEXTEST_BUILD_STEP, need=8 * GIB)
+            holder = replace(holder, sidecar=str(fixture.scope(holder.owner, anonymous=2 * GIB)))
+            _ = only_admitted(fixture.server.handle_request(holder))
+            fixture.hold_starts()
+            head = fixture.request(step=records.NEXTEST_TEST_STEP, need=3 * GIB)
+            self.assertIsInstance(fixture.server.handle_request(head)[0], wire.Wait)
+            path = fixture.state_dir / "admission_passes.log"
+            before = list(store.locked_rows(path))
+            _ = fixture.run_pass()
+            after = list(store.locked_rows(path))
+            self.assertEqual(len(after), len(before) + 1)
+            row = after[-1]
+            self.assertEqual(row["head_need_bytes"], 3 * GIB)
+            self.assertIn("nextest-test", str(row["head"]))
+            self.assertEqual(row["unused_promise_bytes_by_holder"],
+                             {fixture.server.reservations[holder.episode].reservation_id: 6 * GIB})
+
+
 class QueueLifecycleTests(unittest.TestCase):
     @staticmethod
     def interrupt_append(kind: str) -> Callable[[Path, dict[str, object], float], None]:

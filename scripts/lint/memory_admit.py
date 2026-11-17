@@ -454,12 +454,19 @@ def estimate_expired(waiter: Waiter, now: float, policy: AdmissionPolicy) -> boo
                  if waiter.get("fresh_test", False) else policy.timing.estimate_refresh_seconds))
 
 
+def claim_starts_first(slot: ContinuationSlot, row: Waiter) -> bool:
+    """Additional nextest memory follows the run's queue age."""
+    return row.get("step") != records.NEXTEST_TEST_STEP or row["need"] <= slot.slot.bytes
+
+
 def ranked_queue_waiters(inputs: QueueInputs) -> list[tuple[Path, RankedWaiter]]:
     """Resolve order metadata without adding it to captured waiter rows."""
-    claims = {slot.owner for slot in inputs.slots if isinstance(slot, ContinuationSlot)}
+    claims = {slot.owner: slot for slot in inputs.slots if isinstance(slot, ContinuationSlot)}
+    first = {owner for _, row in inputs.ordered if (owner := records.waiter_owner(row)) in claims
+             and claim_starts_first(claims[owner], row)}
     return sorted(((path, rank_waiter(row, inputs.waiter_orders[records.waiter_owner(row)]))
                    for path, row in inputs.ordered),
-                  key=lambda item: (records.waiter_owner(item[1]) not in claims, waiter_order(item[1])))
+                  key=lambda item: (records.waiter_owner(item[1]) not in first, waiter_order(item[1])))
 
 
 
@@ -1436,8 +1443,12 @@ def token_gap_recorded(rows: Iterator[dict[str, object]], event: dict[str, objec
 
 
 def append_queue_time(directory: Path, event: dict[str, object], now: float) -> None:
-    """Append under the history lock; a token gap can be retried after a stop."""
-    path = directory / "queue_times.jsonl"
+    """Append a queue event. A token gap can be retried after a stop."""
+    append_queue_history(directory / "queue_times.jsonl", event, now)
+
+
+def append_queue_history(path: Path, event: dict[str, object], now: float) -> None:
+    """Append a queue log entry under its history lock."""
     with store.locked_append(path) as handle:
         with closing(queue_times_backward(handle)) as rows:
             last = next(rows, cast(dict[str, object], {}))
@@ -1760,7 +1771,9 @@ def ended_step_slot(row: Reservation, ended_at: float,
     """Keep a live caller's accepted need during the gap after its step ends."""
     origin = row.get("run_origin", FoundRun(row.get("build_run", NoLiveBuildRun())))
     if isinstance(origin, CallerRun) and isinstance(origin.run, LiveBuildRun):
-        return BetweenStepsSlot(origin.run, row.get("reservation_id", ""), row["need"], ended_at + policy.timing.slot_gap_seconds)
+        need = 0 if row["step"] == records.NEXTEST_BUILD_STEP else row["need"]
+        return BetweenStepsSlot(origin.run, row.get("reservation_id", ""), need,
+                                ended_at + policy.timing.slot_gap_seconds)
     return NoEndedStepSlot()
 
 
@@ -2000,14 +2013,17 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     else:
         remaining, readable = 0, False
     claims = {slot.owner: slot for slot in inputs.slots if isinstance(slot, ContinuationSlot)}
-    ordinary_head = first_queued_waiter(row for _, row in ordered if records.waiter_owner(row) not in claims)
+    first_claims = {owner for _, row in ordered if (owner := records.waiter_owner(row)) in claims
+                    and claim_starts_first(claims[owner], row)}
+    ordinary_head = first_queued_waiter(row for _, row in ordered if records.waiter_owner(row) not in first_claims)
     decisions: list[WaiterAdmission] = []
     clear = isinstance(inputs.pressure, NoPressureHold)
     due = not isinstance(inputs.spacing, NextStartAt) or now >= inputs.spacing.at
     head_owner = records.waiter_owner(head.waiter) if isinstance(head, QueuedHead) else ""
     ordinary_row = records.stored_waiter(ordinary_head.waiter) if isinstance(ordinary_head, QueuedWaiter) else NoWaiter()
     ordinary_owner = records.waiter_owner(ordinary_row) if not isinstance(ordinary_row, NoWaiter) else ""
-    ordinary_need = ordinary_row["need"] if not isinstance(ordinary_row, NoWaiter) else 0
+    ordinary_hold = claims[ordinary_owner].slot.bytes if ordinary_owner in claims else 0
+    ordinary_need = max(0, ordinary_row["need"] - ordinary_hold) if not isinstance(ordinary_row, NoWaiter) else 0
     no_runs = not inputs.reservations and not inputs.slots
     new_started = False
     gpu = policy.gpu_tests
@@ -2021,13 +2037,13 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         held = claim.slot.bytes if claim is not None else 0
         need = row["need"]
         extra = max(0, need - held)
-        reused = claim is not None
-        within = reused and need <= held
+        starts_first = owner in first_claims
+        within = claim is not None and need <= held
         state = waiter_state(row)
         fresh = not estimate_expired(row, now, policy)
         first = head_owner == owner
-        alone = first and no_runs
-        protected_need = ordinary_need if ordinary_owner != owner and not reused else 0
+        alone = first and no_runs and row.get("step") != records.NEXTEST_TEST_STEP
+        protected_need = ordinary_need if ordinary_owner != owner and not starts_first else 0
         protected_need += protected_extra
         checked_room = remaining - protected_need
         fits = extra <= checked_room
@@ -2037,12 +2053,12 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         spacing = (inputs.spacing.at if isinstance(inputs.spacing, NextStartAt) and not due else
                    next_start.at if new_started else 0.0)
         can_start = (within or readable and clear and room_passes) and fresh
-        can_start = can_start and isinstance(state, QueuedWaiter) and (reused or due and not new_started)
+        can_start = can_start and isinstance(state, QueuedWaiter) and (starts_first or due and not new_started)
         gpu_step = gpu.holds(row.get("repository_name", ""), row.get("step", ""))
         gpu_wait = GpuSlotWait(gpu_used, gpu.slots) if gpu_step and gpu_used >= gpu.slots else GpuSlotFree()
         can_start = can_start and isinstance(gpu_wait, GpuSlotFree)
         order_hold: NoOrderHold | HeldBehindHead = NoOrderHold()
-        if not reused and protected_need and not fits:
+        if not starts_first and protected_need and not fits:
             if not isinstance(protected_claim, NoWaiter):
                 order_hold = HeldBehindHead(protected_claim)
             elif not isinstance(ordinary_row, NoWaiter):
@@ -2051,15 +2067,15 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
             extra + kept + safety, kept, safety, used,
             NO_PRESSURE_HOLD if within else inputs.pressure,
             used + kept,
-            room_passes, order_hold, 0.0 if reused else spacing,
-            reused_slot=reused, room=RoomCheck(extra, checked_room, room_passes, basis=basis), gpu=gpu_wait)
+            room_passes, order_hold, 0.0 if starts_first else spacing,
+            reused_slot=starts_first, room=RoomCheck(extra, checked_room, room_passes, basis=basis), gpu=gpu_wait)
         decisions.append(WaiterAdmission(row, decision, state))
         if can_start:
             remaining += held - need
             gpu_used += gpu_step
-            if not reused:
+            if not starts_first:
                 new_started = True
-        elif reused:
+        elif starts_first:
             protected_extra += extra
             protected_claim = records.stored_waiter(row)
     return decisions
@@ -2511,6 +2527,11 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
                     "package": row.get("package", ""), "filters": row.get("filters", []),
                     "ended_at": intent["ended_at"],
                 }
+                # Each scope of a split nextest run has its own sampled maximum.
+                if row["step"] == records.NEXTEST_BUILD_STEP:
+                    history["build_phase_peak_bytes"] = intent["peak"]
+                elif row["step"] == records.NEXTEST_TEST_STEP:
+                    history["test_phase_peak_bytes"] = intent["peak"]
                 if "status" in intent:
                     history["status"] = intent["status"]
                 if "shape" in row:

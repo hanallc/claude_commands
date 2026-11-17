@@ -187,6 +187,30 @@ class HolderTests(PoolCase):
                                               "nextest run --test-threads 8 -E test(one) -- --nocapture"])
         self.assertEqual(self.free_tokens(), 12)
 
+    def test_prepared_binaries_skip_cargo_build_after_the_grant(self) -> None:
+        self.fill(4)
+        binaries = self.root / "binaries.json"
+        _ = binaries.write_text("{}")
+        result = subprocess.run([str(PY), str(HOLDER), "--pool", str(self.pool),
+            "--reuse-binaries", str(binaries), "--", *HANA_RUN], env={**self.environment,
+            "ADMISSION_SOCKET": str(self.root / "private.sock")}, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.cargo_calls(), [
+            f"nextest run --test-threads 4 --binaries-metadata {binaries} --no-fail-fast -E {HANA_RUN[10]}"])
+        self.assertEqual(self.free_tokens(), 4)
+
+    def test_prepare_binaries_writes_a_list_and_takes_no_test_tokens(self) -> None:
+        self.fill(4)
+        binaries = self.root / "binaries.json"
+        result = subprocess.run([str(PY), str(HOLDER), "--pool", str(self.pool),
+            "--prepare-binaries", str(binaries), "--", *HANA_RUN], env={**self.environment,
+            "ADMISSION_SOCKET": str(self.root / "private.sock")}, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.cargo_calls(), [
+            f"nextest list --list-type binaries-only --message-format json {' '.join(HANA_RUN[6:])}"])
+        self.assertEqual(binaries.read_text(), "tested\n")
+        self.assertEqual(self.free_tokens(), 4)
+
     def test_compile_failure_takes_no_token_and_runs_no_tests(self) -> None:
         self.fill(4)
         child = self.holder("cargo", "nextest", "run", "--test-threads", "8", extra={"FAKE_BUILD_STATUS": "101"})
