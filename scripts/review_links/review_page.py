@@ -113,7 +113,8 @@ def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: sta
     values = (item.id, item.type.value, owner, item.title, item.state.value, item.times.filed.timestamp())
     attrs = {'key':item.key, 'number':item.id.casefold(), 'title':item.title.casefold(), 'owner':str(item.owner),
              'state':item.state.value, 'type':item.type.value, 'order':str(index), 'sort-values':json.dumps(values),
-             'parked':str(item.hidden_until(now)).lower(), 'updated':item.times.updated.isoformat()}
+             'parked':str(item.hidden_until(now)).lower(), 'updated':item.times.updated.isoformat(),
+             'checking':str(isinstance(item.source, review_items.ChangeSource) and item.source.slots.validation_requested).lower()}
     attributes = ''.join(f' data-{key}="{html.escape(value, quote=True)}"' for key, value in attrs.items())
     panel = 'review-detail-'+str(index)
     toggle = (f'<button type="button" class="list-toggle" aria-expanded="false" aria-controls="{panel}">'
@@ -137,7 +138,7 @@ def render(root: Path) -> bytes:
     browser = change_page.ReviewBrowser(token, initial)
     visible = [item for item in items if not item.hidden_until(now) and item.state != ReviewState.DONE]
     owners = {item.owner:review_items.name(item.owner, members) for item in items}
-    options = ''.join(f'<option value="{html.escape(owner, quote=True)}">{html.escape(name)} '
+    options = ''.join(f'<option value="{html.escape(owner, quote=True)}" data-owner-name="{html.escape(name, quote=True)}">{html.escape(name)} '
                      +f'({sum(item.owner == owner for item in visible)})</option>'
                      for owner, name in sorted(owners.items(), key=lambda pair:pair[1].casefold()))
     chips = '<button type="button" data-type-chip="" aria-pressed="true">All <b>'+str(len(visible))+'</b></button>'
@@ -212,8 +213,11 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + r'''(() => {
 let content=document.querySelector('[data-review]'),saving=0;
 const drafts=new Map(),saved=new Map();
-const view=createRecordTable({content:()=>content,single:true,shows:['open','For you','Waiting','Done','all'],
- visible:(data,{owner,show,query,type})=>!saved.has(data.key) && data.parked!=='true' &&
+const view=createRecordTable({content:()=>content,single:true,
+ resolveOwner:owner=>[...content.querySelectorAll('#list-owner option')].find(option=>option.value===owner || option.dataset.ownerName===owner)?.value ?? owner,
+ shows:['open','For you','Waiting','Done','all'],
+ visible:(data,{owner,show,query,type})=>(show==='all' || !saved.has(data.key) && data.parked!=='true') &&
+  !(show==='open' && data.state==='Waiting' && data.checking==='true') &&
   (!owner || data.owner===owner) && (!type || data.type===type) &&
   (!query || data.number.includes(query) || data.title.includes(query)) &&
   (show==='all' || (show==='open' ? data.state!=='Done' : data.state===show)),

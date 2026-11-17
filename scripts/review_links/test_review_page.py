@@ -194,6 +194,11 @@ window.fetch=async(_url,options={})=>options.method==='POST' ?
   await new Promise(resolve=>nativeTimeout(resolve,950));
   check(target.hidden,'the saved row leaves the view');
   check(rows().every(row=>row.querySelector('[data-detail]').hidden),'no next card opens');
+  location.hash=new URLSearchParams({item:target.dataset.key,type:'question',owner:'missing',show:'open',q:'missing'});await flush();
+  check(!target.hidden && !target.querySelector('[data-detail]').hidden,'a Review item link shows the saved row');
+  check(document.getElementById('list-show').value==='all' && document.getElementById('list-owner').value==='' &&
+    document.getElementById('list-search').value==='','a Review item link clears filters');
+
   check(document.documentElement.scrollWidth<=innerWidth,'no horizontal overflow');
   if(innerWidth<960) check(getComputedStyle(shown()[0]).display==='block','phone rows are cards');
  }catch(error){failures.push(String(error));}

@@ -1478,9 +1478,9 @@ def _list_lock(path: Path) -> Generator[None]:
         os.close(descriptor)
 
 
-def describe(row: dict[str, str]) -> str:
+def describe(row: dict[str, str], *, record: staff.StaffSnapshot | None = None) -> str:
     """One row in plain lines: its id and change, how to check it, then each other column that has a value."""
-    record = staff.initial_snapshot()
+    record = staff.initial_snapshot() if record is None else record
     shown = dict(row)
     member = record.by_id(staff.StaffId(row.get(PRODUCTION, "")))
     if member is not None and not row.get("Verdict"):
