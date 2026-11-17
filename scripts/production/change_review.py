@@ -1827,15 +1827,14 @@ class VerdictRefused:
 
 def _require_verdict_exchange(slots: delivery_state.DeliverySlots, verdict: str, validation_id: str) -> None:
     """Apply the same exchange checks to a single verdict and a batch verdict."""
-    from scripts.production import update_registration
     try:
         if isinstance(slots.question, delivery_state.OpenQuestion):
-            _ = update_registration.question_exchange_for_reply(slots.question, '', verdict)
+            _ = delivery_state.question_exchange_for_reply(slots.question, '', verdict)
         if validation_id or slots.validation_requested:
-            update_registration.require_exchange_id(
+            delivery_state.require_exchange_id(
                 slots.validation if isinstance(slots.validation, delivery_state.NoDelivery) else slots.validation.attempt,
                 validation_id)
-    except update_registration.StaleQuestionExchange as error:
+    except delivery_state.StaleQuestionExchange as error:
         raise ChangeReviewError(str(error)) from error
 
 

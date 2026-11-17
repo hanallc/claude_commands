@@ -467,8 +467,8 @@ class DeliveryStatus:
         """Apply the existing exchange identity rule to each Review type."""
         question = self.slots(page, row).question
         try:
-            return update_registration.question_exchange_for_reply(question, question_id, text)
-        except update_registration.StaleQuestionExchange as error:
+            return delivery_state.question_exchange_for_reply(question, question_id, text)
+        except delivery_state.StaleQuestionExchange as error:
             raise AnswerRefused(str(error)) from error
 
     def supersede_wait(self, page: ReviewPage, row: dict[str, str], outcome: str) -> str:
