@@ -1084,13 +1084,13 @@ def write_question_record(record: QuestionRecord) -> None:
         write_text_atomic(record.path, text)
 
 
-def record_review_log(path: Path, words: str) -> None:
+def record_review_log(path: Path, words: str, who: str = "nate") -> None:
     """Keep the user's action on the canonical question record."""
     from scripts.review_links import review_events
     with outstanding_lock(path.parent / ".review-ids"):
         record = _question_records([Issue(path, frontmatter(path))])[0]
         events = review_events.decode(record.item.get("review_log", ""))
-        event = review_events.ReviewLog(datetime.now().astimezone(), "nate", words)
+        event = review_events.ReviewLog(datetime.now().astimezone(), who, words)
         record.item["review_log"] = review_events.encode(review_events.append(events, event))
         write_question_record(record)
 

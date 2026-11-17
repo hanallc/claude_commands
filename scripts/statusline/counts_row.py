@@ -29,7 +29,7 @@ from zoneinfo import ZoneInfo
 from scripts.lib import conf
 from scripts.hooks import showrunner_footer  # noqa: E402
 from scripts.production import staff
-from scripts.review_links import review_items
+from scripts.review_links import review_items, review_later
 from scripts.production.update_registration import QuestionStaff
 from scripts.lib.user_zone import user_zone
 
@@ -126,6 +126,9 @@ def write(instance: Path) -> Path:
     sources = [instance / "conf", staff.record_path()]
     try:
         line, due = row(instance, sources, require_complete=True)
+        sources.append(review_later.path())
+        later = review_later.deadline()
+        due = str(min(int(value) for value in (due,later) if value)) if due or later else ''
     except (OSError, ValueError, showrunner_footer.FooterError):
         line = ""
         due = retry_due(sources)
@@ -155,6 +158,9 @@ def write_unit(identity: str) -> Path:
             instance = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier") / f"showrunner-{owner.id}"
             sources.append(instance / "conf")
             line, due = row(instance, sources, identities=identities, source=identity, require_complete=True)
+        sources.append(review_later.path())
+        later = review_later.deadline()
+        due = str(min(int(value) for value in (due,later) if value)) if due or later else ''
     except (OSError, ValueError, staff.StaffRefused, showrunner_footer.FooterError):
         line = ""
         due = retry_due(sources)

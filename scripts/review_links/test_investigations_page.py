@@ -44,6 +44,18 @@ class InvestigationsPageTests(unittest.TestCase):
         with patch.object(investigation, "_now", return_value=moment):
             return investigation.file(owner, title, "Read the report.\n\n1. Check the first result.\n2. Check the second result.")
 
+    def test_review_question_returns_the_answer_and_feedback_keeps_each_exchange(self) -> None:
+        record = self.file(UNIT.id,'Check both cases','2026-11-16T13:05:00+00:00')
+        _ = investigation.answer(UNIT.id,record.id,'The first case passes.')
+        waiting = investigation.review_action(UNIT.id,record.id,'question','Check the second case.')
+        self.assertEqual(waiting.state,investigation.InvestigationState.OPEN)
+        returned = investigation.answer(UNIT.id,record.id,'The second case passes.')
+        self.assertEqual(returned.state,investigation.InvestigationState.ANSWER_READY)
+        done = investigation.review_action(UNIT.id,record.id,'feedback','Keep both checks.')
+        self.assertEqual(done.state,investigation.InvestigationState.READ)
+        self.assertEqual([entry.words for entry in done.log],['Answer: The first case passes.',
+            'question: Check the second case.','Answer: The second case passes.','feedback sent: Keep both checks.'])
+
     def test_cards_show_the_state_text_footer_and_owner_filters(self) -> None:
         ready = self.file(UNIT.id, "Find the cause <now>", "2026-11-16T13:05:00+00:00")
         _ = investigation.answer(UNIT.id, ready.id, "The cause is known.\nThe repair is ready.")

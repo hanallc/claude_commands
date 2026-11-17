@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import cast, override
 import unittest
 from urllib.parse import urlencode, urlsplit
+from unittest.mock import patch
 
 from scripts.lib import urgency
 from scripts.lib.user_zone import user_zone
@@ -69,6 +70,35 @@ class ReviewRepairsTests(unittest.TestCase):
     def test_a_missing_efficiency_ledger_has_a_named_absence(self) -> None:
         self.assertIsInstance(review_items.efficiency_ledger(self.case.fixture.production),review_items.NoEfficiencyLedger)
         self.assertIsInstance(footer_counts.efficiency_ledger(self.case.fixture.production),review_items.NoEfficiencyLedger)
+
+    def test_primary_actions_keep_the_user_words_on_each_record(self) -> None:
+        question = self.case.question()
+        ready = self.case.investigation()
+        cases = ((question,'answer'),('page-owner/C1','works'),('page-owner/C2','not works'),
+                 (f'investigation/{ready.owner}/{ready.id}','read'))
+        for key,action in cases:
+            with self.subTest(action=action):
+                delivery,_ = review_page.submit(self.case.root,self.case.body(key,action,'Keep these words.'),self.case.status)
+                change_page.deliver(delivery,self.case.status)
+                item = next(item for item in review_items.read(self.case.root) if item.key == key)
+                self.assertEqual(item.state,review_items.ReviewState.DONE)
+                self.assertTrue(any('Keep these words.' in entry.words for entry in item.log))
+
+    def test_investigation_feedback_uses_the_shared_retry_and_owner_alert(self) -> None:
+        ready = self.case.investigation()
+        key = f'investigation/{ready.owner}/{ready.id}'
+        delivery,_ = review_page.submit(self.case.root,self.case.body(key,'feedback','Check the next report.'),self.case.status)
+        calls: list[str] = []
+        def send(_recipient: staff.StaffId, _sender: str, message: str) -> None:
+            calls.append(message)
+            if not message.startswith('Change review delivery needs attention'):
+                raise RuntimeError('fixture send failed')
+        with patch.object(change_page,'send_to_staff',side_effect=send):
+            change_page.deliver(delivery,self.case.status)
+        self.assertEqual(len(calls),4)
+        self.assertIn('Check the next report.',calls[-1])
+        self.assertIn('Last error: fixture send failed',calls[-1])
+        self.assertEqual(next(item.state for item in review_items.read(self.case.root) if item.key == key),review_items.ReviewState.DONE)
 
     def test_automation_docs_name_review_and_only_answer_ready_counts(self) -> None:
         source = (Path(__file__).parents[2]/'docs/as-built/showrunner-automation.md').read_text()
