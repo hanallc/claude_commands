@@ -178,6 +178,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/direct/assign_launcher_test_support.py` | write | by_id, local_snapshot, rename, set_worktree |
 | `scripts/direct/claude_worker.py` | read | runtime_id |
 | `scripts/direct/end_session.sh` | write | clear-run (shell); reads the current pointer through unit_runs.open_run |
+| `scripts/direct/pass_record.py` | read | StaffRow, StaffSnapshot, StaffId, SessionHome, WorktreeUnfilled, ReportsTo, initial_snapshot, by_id |
 | `scripts/direct/phase_reservation.py` | read | snapshot, WorktreeUnfilled |
 | `scripts/direct/phase_reviewers.py` | read | local_snapshot, find; clear_phase_review.sh runs it |
 | `scripts/direct/phase_table.py` | read | active, snapshot |
@@ -256,6 +257,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/ci_points.py` | read | Production.owner.id |
 | `scripts/production/fast_track.py` | read | copies.source_owner |
 | `scripts/production/waiting.py` | read | Production.owner.id |
+| `scripts/production/gate.py` | read | snapshot, initial_snapshot, doc_owner |
 | `scripts/production/merge_gate.py` | read | snapshot, initial_snapshot, doc_owner |
 | `scripts/production/gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/production/next_item.py` | read | snapshot |
