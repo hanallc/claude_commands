@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timedelta
@@ -262,6 +263,16 @@ def scratch_verdict(state: ScratchGreen | ScratchRed | ScratchConflict) -> bool:
     return True
 
 
+def command_words_need_no_shell_processing(command: str) -> bool:
+    """Accept literal words whose shell arguments match shlex.split."""
+    if any(character in command for character in "$`\\*?[]<>()|&;=~{}#!\n\r"):
+        return False
+    try:
+        return bool(shlex.split(command))
+    except ValueError:
+        return False
+
+
 def scratch_test(production: Production, name: str, tests: str, state_dir: Path) -> None:
     unit = named_unit(production, name)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -269,8 +280,10 @@ def scratch_test(production: Production, name: str, tests: str, state_dir: Path)
     log = state_dir / f"scratch-test-{unit.name}-{stamp}.log"
     passed = False
     try:
-        with copies.standing(str(production.owner.id), production.checkout, copies.CommittedSource(unit.branch),
-                             step="test", merge=copies.MergeRevision(production.merge_branch)) as worktree:
+        command = shlex.split(tests) if command_words_need_no_shell_processing(tests) else ["sh", "-c", tests]
+        # Commands that need shell processing keep the existing slot order.
+        with copies.command_tree(str(production.owner.id), production.checkout, copies.CommittedSource(unit.branch),
+                                 command, step="test", merge=copies.MergeRevision(production.merge_branch)) as worktree:
             try:
                 with log.open("w", encoding="utf-8") as output:
                     test = subprocess.run(["sh", "-c", tests], cwd=worktree, stdout=output,
