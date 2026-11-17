@@ -4602,34 +4602,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 ### Phase 326 — The crate run tests use less aws CPU  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `style/test_crate_run.py` uses less CPU in aws pairs, with the same tests and assertions, or the phase names its floor.
-
-**Decision:** after Phase 325 (a floor), the aws ranking (`show.py top --host aws`, rows as of 2026-11-16 20:50) puts this module next: median 43.7 CPU s; slowest kept test `CrateRunTests.test_crate_trees_keep_ownership_and_use_two_standing_caches` 5.1 s. Phases 193, 194, 264 and 265 cut it before (class frozen seeds, the terminal-stage return, fewer copies.py Git calls); this phase measures what is left. builds rejected new shared layers for one module's gain (2026-11-16): the change stays in the test file.
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD style/test_crate_run.py --tests 15 --commands 15`, under `systemd-run --user --scope -q -p MemoryMax=2G`. Name the top costs by test, fixture and command.
-2. Remove the largest repeated cost in the test file that a test does not check, with the shared methods of Phases 235-238, 251, 254, 255, 193 and 323: class seeds copied per test, in-process calls where no process boundary is asserted, a forked child with loaded modules where a boundary is asserted but a new interpreter is not, one render where several tests read the same output.
-3. Keep every Git state, lock, race and recovery that a test asserts on, and every exit status. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
-4. If the largest remaining cost is product work (`crate_run.py`, `copies.py`, Git), do not change product code. Report the cost and the floor.
-5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-6. The director runs the aws pairs.
-
-**Files:**
-- `scripts/style/test_crate_run.py`
-
-**Workers:** 1 writer; one test module.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere. No lazy imports inside functions.
-- Phase 252: every fixture binds private run roots through `bind_private_run_roots`; keep it. Phase 242: in-process calls bind per call the module state that the real process reads at start.
-- Phase 193: one single-file frozen class seed and the default `frozen_tests` seed; each test restores its private files and opens its own ledger. `setUp` registers the root cleanup before `copytree`.
-- Phase 323: a forked child with loaded imports keeps a real kill point and exit status; create output files and child cleanup before the fork.
-- sdlc terms: test files only; every test and assertion stays; merge only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain, or the report names the floor; peak memory reported.
+- No source changed. The pass is a floor result for `style/test_crate_run.py`.
+- The module already copies its initial, frozen and single-file frozen class seeds and calls crate_run in process. The class fixture costs 0.23 CPU s.
+- Remaining cost is live crate_run.py, copies.py and Git work that the tests check: Git 13.0 to 14.9 CPU s over about 20,400 starts, module Python 9.1 to 10.6 s. Local module CPU varied 23.9 to 48.2 s with the same source, from host load.
+- The costly tests check moved refs, retained claims, standing caches, worker removal and private dirty bytes. Every behavior check stays. Checkpoint 5685b50dc.
