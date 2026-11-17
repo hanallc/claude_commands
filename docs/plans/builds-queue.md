@@ -2717,13 +2717,13 @@ Move the other `copies.standing` callers to the 44ax order with the same code: m
 ### Phase 44az — A waiting step says why it stays off the Mac, and a dead holder's claim no longer looks busy  · status: todo
 **Depends on:** nothing; urgent. builds gave the go on 2026-11-17 11:15 EST. ETA 2026-11-17 13:45 EST.
 **User words (via builds):** "this cargo-liner is in the queue - the mac could be working on it - why isn't it?"
-**Ruling (builds):** final stays on natedev; no policy change.
+**Ruling (builds):** steps of a `verify.sh final` run stay on natedev; no policy change.
 
 1. The waiter shows natedev only, with the exclusion reason, in the Builds page tooltip and in status.
 2. build_targets.py status shows a dead-holder claim as kept for cleanup, not running, and prints the MAC IDLE line. The claim stays.
 3. A test shows that a true AnyEligibleTarget step still moves to a free Mac past a dead kept claim.
 
-**Built:** checkpoint db645f5c0 on origin branch `builds-queue-macidle-cp`, sent to builds 2026-11-17 12:08 EST. Five readers of running work share `mac_test.run_holds_work`. The review found two minor defects: two more readers counted a kept claim as busy. Proof image f8cc0e1a08b2.
+**Built:** checkpoint ab6bfb6e5 on origin branch `builds-queue-macidle-cp2`, sent to builds 2026-11-17 12:20 EST. It replaces db645f5c0, whose proof image named a "final" step that does not exist. Five readers of running work share `mac_test.run_holds_work`. The review found two minor defects: two more readers counted a kept claim as busy. Proof image 444f6e564073 shows a waiting cargo-liner check step from a `verify.sh final` run. The admission_service.py diagnostic takes effect at the next service reload.
 
 ### Phase 45 — Merge gates take their route from the queue  · status: todo
 **Depends on:** 44 and aws-unit's repair of the uncertain cloud launch. Checkpoint 3 of section 8 in `docs/plans/builds-queue-placement.md`. `merge_gate --tests-only` takes the same queue route as a full gate and keeps its exit codes. Tell the sdlc showrunner before this phase edits `merge_gate.py`, because natest phase 119 changed `run_gate_suites`. Phase 119 is at 14581684f on builds-natest: merge builds first, keep its selection lines before the `cloud.route` call, and keep its empty-selection result. Tell the sdlc showrunner when this phase is on main. The Work Order follows at phase start.
