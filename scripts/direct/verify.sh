@@ -672,7 +672,7 @@ FIX_RETURN_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../mac_test/fix
 # fix_return.py places the lint copy, and that place can decide whether lint passes.
 lint_code_files() {
     LINT_CODE_FILES=("${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh"
-        "$HOME/.claude/scripts/lint/prebuild.py" "${FIX_RETURN_SCRIPT:-}"
+        "$HOME/.claude/scripts/lint/prebuild.py" "$HOME/.claude/scripts/lib/dev_shell.py" "${FIX_RETURN_SCRIPT:-}"
         "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}")
 }
 

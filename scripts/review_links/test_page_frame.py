@@ -28,7 +28,7 @@ class PageStatusTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(Path(__file__).resolve().parents[2] / "config")})))
 
     def test_title_places_one_status_directly_after_the_title(self) -> None:
-        for page in ('accounts', 'aws', 'builds', 'changes', 'disks', 'images', 'investigations', 'list', 'questions'):
+        for page in ('accounts', 'aws', 'builds', 'disks', 'images', 'list', 'review'):
             with self.subTest(page=page):
                 markup = page_frame.title(page.title(), page)
                 self.assertIn('</h1><p class="page-status"', markup)
@@ -38,18 +38,18 @@ class PageStatusTests(unittest.TestCase):
                 self.assertIn('aria-live="polite" data-status-announcement', markup)
 
     def test_each_page_uses_the_same_states_and_retains_the_last_good_read(self) -> None:
-        for page in ('accounts', 'aws', 'builds', 'changes', 'disks', 'images', 'investigations', 'list', 'questions'):
+        for page in ('accounts', 'aws', 'builds', 'disks', 'images', 'list', 'review'):
             with self.subTest(page=page):
                 assert_component_states(self, page_frame.title(page.title(), page))
 
     def test_only_the_configured_status_pages_have_age_limits(self) -> None:
         limits = {key for key in conf.read_or_repository("console").values() if key.startswith("status.") and key.endswith(".age_limit_seconds")}
         self.assertEqual(limits, {f"status.{page}.age_limit_seconds" for page in (
-            "accounts", "aws", "builds", "changes", "disks", "images", "investigations", "list", "questions")})
+            "accounts", "aws", "builds", "disks", "images", "list", "review")})
 
     def test_age_uses_seconds_then_whole_minutes_on_every_page(self) -> None:
         node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
-        for page in ('accounts', 'aws', 'builds', 'changes', 'disks', 'images', 'investigations', 'list', 'questions'):
+        for page in ('accounts', 'aws', 'builds', 'disks', 'images', 'list', 'review'):
             with self.subTest(page=page):
                 match = re.search(r'data-status-options="([^"]+)"', page_frame.title(page.title(), page))
                 assert match is not None
@@ -87,7 +87,7 @@ setImmediate(()=>{
                 self.assertEqual((done.returncode, done.stdout.strip()), (0, 'PASS'), done.stderr)
 
     def test_failed_visibility_refresh_keeps_initial_facts_before_the_first_frames(self) -> None:
-        markup = page_frame.title("Investigations", "investigations")
+        markup = page_frame.title("Review", "review")
         match = re.search(r'data-status-options="([^"]+)"', markup)
         assert match is not None
         environment = self.environment(html.unescape(match[1])).replace(
@@ -238,7 +238,7 @@ function response(status=200){
  const doc=new DOMParser().parseFromString(mode==='cached' ? failedPage : original,'text/html');
  const facts=doc.querySelector('[data-page-status]');
  facts.dataset.readAt=wall/1000;facts.dataset.renderSeconds=.42;
- const root=doc.querySelector('[data-accounts],[data-review-content],[data-images],[data-investigations],[data-list]');
+ const root=doc.querySelector('[data-accounts],[data-review-content],[data-images],[data-investigations],[data-list],[data-review]');
  if(root) root.dataset.loaded='true';
  const aws=doc.querySelector('#aws-prices-data');
  if(aws) aws.textContent=JSON.stringify({...JSON.parse(aws.textContent),read_at:wall/1000,render_seconds:.42});
@@ -297,9 +297,11 @@ window.fetch=async(url,options={})=>{
   check(positions.length===4 && positions[0].matches('.page-status-state') && positions[1]===part('age') &&
    positions[2]===part('trip') && positions[3]===part('render'),'the Live line has the same four positions');
   const title=document.querySelector('.page-title'),titleBox=title.getBoundingClientRect(),lineBox=line.getBoundingClientRect();
-  const mainBox=document.querySelector('main').getBoundingClientRect(),width=document.documentElement.clientWidth;
-  check(mainBox.width===Math.min(width,1124) && Math.abs(mainBox.left-(width-mainBox.right))<1,
-   'the page uses the shared centered column');
+  const main=document.querySelector('main'),mainBox=main.getBoundingClientRect(),width=document.documentElement.clientWidth;
+  // A wide page uses the pane width; a text page keeps the 1124 px column.
+  check(mainBox.width===(main.classList.contains('page-wide')?width:Math.min(width,1124)) &&
+   Math.abs(mainBox.left-(width-mainBox.right))<1,'the page uses the shared centered column');
+  check(main.classList.contains('page-wide')===(document.title==='Builds'),'only the Builds page is wide');
   check(titleBox.x===mainBox.x+32 && titleBox.y+scrollY===32,'the title starts at the shared column edge');
   check(lineBox.x===titleBox.x && lineBox.y===titleBox.bottom+8,'the line follows the title in the same column');
   check(lineBox.width===titleBox.width && lineBox.height===21,'the line uses the full title width and shared height');
@@ -311,11 +313,11 @@ window.fetch=async(url,options={})=>{
   check(getComputedStyle(title).color===getComputedStyle(ink).color,'the title uses the shared ink color');ink.remove();
   check(getComputedStyle(document.body).backgroundColor===getComputedStyle(line).backgroundColor,
    'the line uses the page background without a separate band');
-  const content=document.querySelector('[data-review-content],[data-investigations],[data-image-layout],[data-list]');
+  const content=document.querySelector('[data-review-content],[data-investigations],[data-image-layout],[data-list],[data-review]');
   if(content) check(content.getBoundingClientRect().x===titleBox.x,'the page content starts at the title edge');
   const icon=line.querySelector('[data-status-icon=Live] svg').getBoundingClientRect();
   check(icon.width===16 && icon.height===16,'the Live icon uses the shared size');
-  const root=document.querySelector('[data-accounts],[data-review-content],[data-images],[data-investigations],[data-list]');
+  const root=document.querySelector('[data-accounts],[data-review-content],[data-images],[data-investigations],[data-list],[data-review]');
   if(root) check(root.dataset.loaded==='true','the real loader replaces page content');
   if(expectedPeriod) check(!!requestTimer(),'the real request period runs');
   else check([...intervals.values()].every(timer=>timer.ms===1000),'the zero-period page has only its age timer');
@@ -403,11 +405,13 @@ window.fetch=async(url,options={})=>{
     match = re.search(r'<title>([^<]+)</title>', markup)
     assert match is not None
     identity = 'list' if match[1] == 'The List' else match[1].split()[0].lower()
+    if identity in ('changes', 'questions', 'investigations'):
+        identity = 'review'
     with patch.dict(os.environ, {"CONF_DIR": str(Path(__file__).resolve().parents[2] / "config")}):
         settings = conf.read("console").values()
         pages = tuple(console.ConsolePage(name, settings[f"page.{name}.label"], settings[f"page.{name}.icon"],
                                          settings[f"page.{name}.title"], console.AvailablePage('/page'))
-                      for name in ('accounts', 'aws', 'builds', 'changes', 'disks', 'images', 'investigations', 'list', 'questions'))
+                      for name in ('accounts', 'aws', 'builds', 'disks', 'images', 'list', 'review'))
         shell = console.render(pages, console.UnavailablePage()).replace(b'</body>', b'<img hidden src="/complete"></body>')
     results: list[list[str]] = []
     complete = threading.Event()

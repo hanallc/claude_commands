@@ -119,7 +119,8 @@ def materialize_and_run(request: HanaExecutionRequest, *, root: Path = source.SO
                 return HanaExecutionRefused('MissingBasis: ' + json.dumps(
                     {'repository': leased.repository, 'commits': leased.commits}, separators=(',', ':')))
             execution = linux_runner.LeasedSlotExecution(leased.slot, leased.descriptors)
-            shell = linux_runner.prepare_shell(leased.path, root / 'shells', settings.shell, settings.shell_timeout_s)
+            shell = linux_runner.prepare_shell(leased.path, root / 'shells', settings.shell, settings.shell_timeout_s,
+                pass_fds=linux_runner.execution_descriptors())
             result = linux_runner.run_slot(execution, request.argv, dict(request.manifest.environment), shell=shell,
                 compiler_version=settings.compiler_version, free_floor_gib=settings.free_floor_gib,
                 output_max_bytes=output_max_bytes, timeout_s=settings.command_timeout_s)

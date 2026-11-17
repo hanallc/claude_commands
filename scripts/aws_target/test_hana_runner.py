@@ -569,9 +569,12 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
                         _ = runner.materialize_and_run(self.request, root=self.root / 'guest', fetch=fetch)
                 else:
                     prepare = linux_runner.prepare_shell
-                    def shell(root: Path, cache: Path, selector: str, timeout_s: float):
+                    def shell(root: Path, cache: Path, selector: str, timeout_s: float, *,
+                              pass_fds: tuple[int, ...]):
+                        self.assertTrue(pass_fds)
+                        self.assertEqual(pass_fds, linux_runner.execution_descriptors())
                         expire()
-                        return prepare(root, cache, selector, timeout_s)
+                        return prepare(root, cache, selector, timeout_s, pass_fds=pass_fds)
                     with mock.patch.object(linux_runner, 'prepare_shell', side_effect=shell):
                         _ = self.run_request(self.request)
                 self.assertEqual(commands[0], ['systemctl', 'kill', '--kill-whom=all', '--signal=KILL', guest.WORK_SLICE])

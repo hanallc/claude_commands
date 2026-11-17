@@ -285,6 +285,26 @@ class DirectorStopTests(unittest.TestCase):
             self.assertIn(str(damaged), result.stderr)
             self.assertFalse((fixture.run / "compaction_wake_line").exists())
 
+    def test_unreadable_run_folder_reports_one_anomaly_and_allows_stop(self) -> None:
+        with director_stop_fixture() as fixture:
+            fixture.set_unit_type("merge")
+            runs = fixture.run / "detached_runs"
+            runs.mkdir()
+            scandir = os.scandir
+
+            def read_folder(path: str | os.PathLike[str]) -> object:
+                if Path(path) == runs:
+                    raise PermissionError(13, "Permission denied", str(runs))
+                return scandir(path)
+
+            with mock.patch("os.scandir", side_effect=read_folder):
+                result = fixture.call_with_mocked_reads()
+            self.assertEqual((result.returncode, result.stdout), (0, ""))
+            self.assertEqual(len(result.stderr.splitlines()), 1)
+            self.assertIn("anomaly:", result.stderr)
+            self.assertIn(str(runs), result.stderr)
+            self.assertFalse((fixture.run / "compaction_wake_line").exists())
+
     def test_merge_unit_with_an_active_dispatch_still_gets_a_wake(self) -> None:
         with director_stop_fixture() as fixture:
             fixture.set_unit_type("merge")

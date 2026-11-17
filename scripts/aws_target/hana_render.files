@@ -34,6 +34,7 @@ scripts/lib/cargo_output.py
 scripts/lib/conf.py
 scripts/lib/conf_reads.py
 scripts/lib/copy_record.py
+scripts/lib/dev_shell.py
 scripts/lib/file_lock.py
 scripts/lib/git_files.py
 scripts/lib/git_index.py

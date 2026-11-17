@@ -747,6 +747,11 @@ The proof creates a managed scratch home and a tiny Rust fixture.
 It uses private memory files and executes test, check, and staged doc in one warm slot.
 It removes the scratch home when the proof ends. Automated tests never execute this proof.
 
+## dev_shell.conf
+
+A test step outside a nix shell adds the flake development shell's program folders to the end of `PATH` (`scripts/lib/dev_shell.py`).
+`selector` names the `devShells` output, `cache` gives the cache folder relative to the home folder, and `timeout_s` bounds one evaluation.
+
 ## production.conf
 
 The production launch scripts read these settings through the shared reader at use.

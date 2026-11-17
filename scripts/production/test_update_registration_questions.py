@@ -22,6 +22,17 @@ from scripts.production.update_registration_test_support import setUpModule as s
 
 
 class RegistrationTests(RegistrationFixture):
+    def test_closed_review_questions_keep_answer_words_after_replay_history_expires(self) -> None:
+        _ = self.run_ask('Choose the layout','Which layout should we use?')
+        path = self.question_record_path('Choose the layout')
+        registration.record_review_log(path,'answer: Keep the plain layout.')
+        done = self.run_command('answer','--item','Choose the layout')
+        self.assertEqual(done.returncode,0,done.stdout+done.stderr)
+        self.assertEqual(registration.answered_items(self.outstanding(),datetime.now(timezone.utc)+timedelta(days=3)),[])
+        saved = frontmatter(path)
+        self.assertEqual(saved['status'],['closed'])
+        self.assertIn('Keep the plain layout.',saved['registration'][0])
+
     def test_shared_proposals_and_questions_follow_staff_rename_and_transfer_without_rewrites(self) -> None:
         owner_id = self.owner_id
         unit_id = self.fixture_staff_id("alpha")
@@ -295,7 +306,7 @@ class RegistrationTests(RegistrationFixture):
         records = list(folder.glob("question-*.md"))
         self.assertEqual(len(records), 1)
         self.assertEqual(json.loads(legacy.read_text()), [reminder])
-        self.assertEqual(next(row for row in self.open_rows() if "question" in row), question)
+        self.assertEqual(next(row for row in self.open_rows() if "question" in row), question | {"review_id": "Q1"})
         self.assertEqual(list((self.root / "issues").iterdir()), [])
         paths = [legacy, *records]
         before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}

@@ -42,6 +42,20 @@ class RequestedBy(StrEnum):
     DWIGHT = "dwight"
 
 
+@dataclass(frozen=True)
+class ReviewByShownId:
+    """Select a review through its shown ID, which can be ambiguous."""
+
+    value: str
+
+
+@dataclass(frozen=True)
+class ReviewByKey:
+    """Select a review through an exact key."""
+
+    value: str
+
+
 class NoTimestamp(StrEnum):
     UNSET = ""
 
@@ -131,6 +145,7 @@ class ListItem:
     evidence: str
     done_when: str
     log: tuple[ItemChange, ...]
+    reviews: tuple[str, ...] = ()
 
     @property
     def id(self) -> str:
@@ -265,6 +280,10 @@ def _validate(item: ListItem) -> None:
         raise ListError("a dependency number must occur only once")
     if any(number < 1 or number == item.number for number in item.related_to):
         raise ListError("a related number must name another positive item")
+    if len(set(item.reviews)) != len(item.reviews):
+        raise ListError("a review key must occur only once")
+    for review in item.reviews:
+        _line(review, "review key")
     for change in item.log:
         _line(change.what, "log text")
         _line(change.source, "source")
@@ -297,6 +316,16 @@ def _related(text: str) -> tuple[int, ...]:
     return tuple(cast(list[int], entries))
 
 
+def _review_keys(text: str) -> tuple[str, ...]:
+    value = cast(object, json.loads(text))
+    if not isinstance(value, list):
+        raise ListError("reviews must be a list of keys")
+    entries = cast(list[object], value)
+    if any(not isinstance(entry, str) for entry in entries):
+        raise ListError("reviews must be a list of keys")
+    return tuple(cast(list[str], entries))
+
+
 def load(keeper: staff.StaffId, identity: str, *, sources: list[Path] | None = None) -> ListItem:
     store = _store(keeper)
     fields, body = store.read(identity, sources=sources)
@@ -326,7 +355,8 @@ def load(keeper: staff.StaffId, identity: str, *, sources: list[Path] | None = N
                         time_value(fields["unread_since"]), time_value(fields["parked_until"]),
                         _dependencies(fields["blocked_by"]), _related(fields["related_to"]), RequestedBy(fields["requested_by"]),
                         time_value(fields["opened"]), time_value(fields["updated"]), time_value(fields["closed"]),
-                        fields["closing_words"], texts[0], texts[1], texts[2], texts[3], tuple(changes))
+                        fields["closing_words"], texts[0], texts[1], texts[2], texts[3], tuple(changes),
+                        _review_keys(fields.get("reviews", "[]")))
         if item.id != identity or not changes:
             raise ListError("the item number must match its path and the log must not be empty")
         _validate(item)
@@ -343,7 +373,8 @@ def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
               "eta_kind": "text" if isinstance(item.eta, EtaDescription) else "time or status",
               "unread_since": _time_text(item.unread_since), "parked_until": _time_text(item.parked_until),
               "blocked_by": json.dumps([(entry.number, entry.condition) for entry in item.blocked_by], ensure_ascii=False),
-              "related_to": json.dumps(item.related_to), "requested_by": item.requested_by.value,
+              "related_to": json.dumps(item.related_to), "reviews": json.dumps(item.reviews),
+              "requested_by": item.requested_by.value,
               "opened": _time_text(item.opened), "updated": _time_text(item.updated),
               "closed": _time_text(item.closed), "closing_words": item.closing_words}
     body = "## Next step\n\n" + item.next_step
@@ -457,35 +488,61 @@ def _open(item: ListItem) -> None:
         raise ListError(f"{item.id}: reopen the Closed item before changing it")
 
 
+def _without_evidence_block(evidence: str, start: int, end: int) -> str:
+    before = re.sub(r"(?:\r?\n[ \t]*)+\Z", "", evidence[:start])
+    if not before.strip():
+        before = ""
+    after = re.sub(r"\A(?:[ \t]*\r?\n)+", "", evidence[end:])
+    return before + (("\n\n" if before else "") + after if after.strip() else "")
+
+
+def _without_checkins_copy(evidence: str) -> str:
+    marker = re.search(r"(?m)^Source checkins\.json item:\r?\n", evidence)
+    if marker is None:
+        return evidence
+    tail = evidence[marker.end():]
+    copied_text = tail.lstrip()
+    try:
+        copied, end = cast(tuple[object, int], json.JSONDecoder().raw_decode(copied_text))
+    except ValueError:
+        return evidence
+    if not isinstance(copied, dict) or re.match(r"[ \t]*(?:\r?\n|\Z)", copied_text[end:]) is None:
+        return evidence
+    return _without_evidence_block(evidence, marker.start(), marker.end() + len(tail) - len(copied_text) + end)
+
+
+def _without_row_copy(evidence: str, number: int) -> str:
+    heading = (rf"(?m)^## {number}\. [^\r\n]+\r?\n(?:[ \t]*\r?\n)+"
+               + r"\*\*List state:\*\*[^\r\n]*\r?\n(?:[ \t]*\r?\n)+(?=- \*\*[^*\r\n]+:\*\*)")
+    for match in reversed(list(re.finditer(heading, evidence))):
+        end = match.end()
+        for line in evidence[end:].splitlines(keepends=True):
+            if line.strip() and re.match(r"(?:- \*\*[^*\r\n]+:\*\*|(?: {2,}|\t)[ \t]*\S)", line) is None:
+                break
+            end += len(line)
+        evidence = _without_evidence_block(evidence, match.start(), end)
+    return evidence
+
+
 def clean_evidence(keeper: staff.StaffId, *, source: str) -> tuple[int, int]:
-    """Remove the one-off migration copy from each record's Evidence section."""
+    """Remove migration copies from each record's Evidence section."""
     _line(source, "source")
     store = _store(keeper)
     changed = unchanged = 0
     with store.locked():
         for item in records(keeper, include_closed=True):
-            marker = re.search(r"(?m)^Source checkins\.json item:\r?\n", item.evidence)
-            if marker is None:
+            evidence = _without_checkins_copy(item.evidence)
+            cleaned = _without_row_copy(evidence, item.number)
+            if cleaned == item.evidence:
                 unchanged += 1
                 continue
-            copied_text = item.evidence[marker.end():].lstrip()
-            try:
-                copied, end = cast(tuple[object, int], json.JSONDecoder().raw_decode(copied_text))
-            except ValueError:
-                unchanged += 1
-                continue
-            if not isinstance(copied, dict) or re.match(r"[ \t]*(?:\r?\n|\Z)", copied_text[end:]) is None:
-                unchanged += 1
-                continue
-            evidence = re.sub(r"(?:\r?\n[ \t]*)+\Z", "", item.evidence[:marker.start()])
-            if not evidence.strip():
-                evidence = ""
-            remaining = re.sub(r"\A(?:[ \t]*\r?\n)+", "", copied_text[end:])
-            if remaining.strip():
-                evidence += ("\n\n" if evidence else "") + remaining
             moment = now()
-            entry = ItemChange(moment, "Removed the migration copy of checkins.json from Evidence", source)
-            _save(store, replace(item, evidence=evidence, updated=moment, log=(*item.log, entry)))
+            entries: list[ItemChange] = []
+            if evidence != item.evidence:
+                entries.append(ItemChange(moment, "Removed the migration copy of checkins.json from Evidence", source))
+            if cleaned != evidence:
+                entries.append(ItemChange(moment, "Removed the migration copy of the List row from Evidence", source))
+            _save(store, replace(item, evidence=cleaned, updated=moment, log=(*item.log, *entries)))
             changed += 1
     return changed, unchanged
 
@@ -501,6 +558,26 @@ def update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source
         return changed
     what = "Updated " + _change_text(changes)
     return _change(keeper, identity, edit, what, source)
+
+
+def link(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, source: str) -> ListItem:
+    """Add unique review keys after the command resolves the requested reviews."""
+    chosen = tuple(dict.fromkeys(reviews))
+    for review in chosen:
+        _line(review, "review key")
+    def edit(item: ListItem, _: datetime) -> ListItem:
+        _open(item)
+        return replace(item, reviews=tuple(dict.fromkeys((*item.reviews, *chosen))))
+    return _change(keeper, identity, edit, "Linked reviews: " + ", ".join(chosen), source)
+
+
+def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, source: str) -> ListItem:
+    """Remove review keys while retaining the order of the other keys."""
+    chosen = tuple(dict.fromkeys(reviews))
+    def edit(item: ListItem, _: datetime) -> ListItem:
+        _open(item)
+        return replace(item, reviews=tuple(review for review in item.reviews if review not in chosen))
+    return _change(keeper, identity, edit, "Unlinked reviews: " + ", ".join(chosen), source)
 
 
 def park(keeper: staff.StaffId, identity: str, until: Timestamp, *, source: str) -> ListItem:
@@ -692,11 +769,15 @@ def _cli_changes(args: argparse.Namespace) -> ItemChanges:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("add", "update", "park", "close", "reopen", "mark-read", "clean-evidence", "list"):
+    for name in ("add", "update", "park", "close", "reopen", "mark-read", "clean-evidence", "link", "unlink", "list"):
         command = commands.add_parser(name)
         if name != "list":
             _ = command.add_argument("--source", required=True)
-        if name not in ("add", "list", "clean-evidence"):
+        if name in ("link", "unlink"):
+            _ = command.add_argument("id")
+            _ = command.add_argument("--review", dest="reviews", action="append", type=ReviewByShownId, default=[])
+            _ = command.add_argument("--review-key", dest="reviews", action="append", type=ReviewByKey, default=[])
+        elif name not in ("add", "list", "clean-evidence"):
             _ = command.add_argument("--id", required=True)
         if name in ("add", "update"):
             _ = command.add_argument("--title", required=name == "add")
@@ -717,6 +798,9 @@ def main(argv: list[str] | None = None) -> int:
             _ = command.add_argument("--all", action="store_true")
             _ = command.add_argument("--include-parked", action="store_true")
     args = parser.parse_args(argv)
+    name = cast(str, args.command)
+    if name in ("link", "unlink") and not cast(list[ReviewByShownId | ReviewByKey], args.reviews):
+        parser.error("use --review or --review-key")
     try:
         record = staff.snapshot()
         caller = record.by_current_session(staff.caller_identity())
@@ -725,7 +809,6 @@ def main(argv: list[str] | None = None) -> int:
         if caller.kind != "producer" or caller.name != "morty":
             raise ListError("the current session must be the morty producer")
         keeper = caller.id
-        name = cast(str, args.command)
         if name == "list":
             print(table(keeper, include_closed=cast(bool, args.all),
                         include_parked=cast(bool, args.all) or cast(bool, args.include_parked)))
@@ -734,6 +817,33 @@ def main(argv: list[str] | None = None) -> int:
         if name == "clean-evidence":
             changed, unchanged = clean_evidence(keeper, source=source)
             print(f"{changed} changed; {unchanged} unchanged")
+        elif name in ("link", "unlink"):
+            identity = cast(str, args.id)
+            selections = cast(list[ReviewByShownId | ReviewByKey], args.reviews)
+            current = load(keeper, identity)
+            _open(current)
+            from scripts.review_links import review_items, review_link
+
+            needs_read = any(isinstance(selection, ReviewByShownId)
+                             or (name == "link" and selection.value not in current.reviews) for selection in selections)
+            known = ({item.key: item for item in review_items.read(review_link.review_root(), members=record)}
+                     if needs_read else {})
+            resolved: list[str] = []
+            for selection in selections:
+                if isinstance(selection, ReviewByKey):
+                    if name == "link" and selection.value not in current.reviews and selection.value not in known:
+                        raise ListError("unknown review key: " + selection.value)
+                    resolved.append(selection.value)
+                    continue
+                matches = [item for item in known.values() if item.id == selection.value]
+                if len(matches) > 1:
+                    choices = ", ".join(f"{item.key} ({item.type.value})" for item in matches)
+                    raise ListError(f"ambiguous review id: {selection.value}; {choices}")
+                if not matches and name == "link":
+                    raise ListError("unknown review id: " + selection.value)
+                resolved.extend(item.key for item in matches)
+            edit_reviews = link if name == "link" else unlink
+            _ = edit_reviews(keeper, identity, resolved, source=source)
         elif name == "add":
             changes = _cli_changes(args)
             number = cast(dict[str, object], vars(args)).get("number")

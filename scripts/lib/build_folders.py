@@ -744,8 +744,12 @@ def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary:
                         dir_fd: int | None = None, wait: bool = True) -> bool:
     """Run cleanup under the free folder's lock, then remove temporary metadata."""
     with ExitStack() as parents:
-        directory = dir_fd if dir_fd is not None else parents.enter_context(
-            _folder_parent(path, path.parent, create=False))
+        try:
+            directory = dir_fd if dir_fd is not None else parents.enter_context(
+                _folder_parent(path, path.parent, create=False))
+        except FileNotFoundError:
+            # An absent parent has no folder or metadata to lock.
+            return cleanup() is not False
         descriptor = _open_lock(path, directory, create=True)
         try:
             if not _take_lock(descriptor, fcntl.LOCK_EX, wait=wait):

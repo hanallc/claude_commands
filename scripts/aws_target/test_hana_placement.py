@@ -276,4 +276,4 @@ class HanaPlacementTests(CostFixture):
             claims = hold_enforcer.claimed_processes(self.root / 'proc')
             assert isinstance(claims, build_hold.LiveClaims)
             self.assertEqual(claims.remote_waiters, frozenset())
-            self.assertEqual(claims.identities, frozenset())
+            self.assertEqual(claims.identities, frozenset({build_hold.ProcessIdentity(self.holder.pid, self.holder.start_time)}))

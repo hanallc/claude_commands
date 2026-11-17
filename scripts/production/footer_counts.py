@@ -1,25 +1,21 @@
 """Count the user's waiting items through the same staff routing as the change page."""
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 from scripts.production import change_review
+from scripts.review_links.review_items import NoEfficiencyLedger
 from scripts.lib import conf
-from scripts.production import change_routing, investigation, staff, unit_lookup
+from scripts.production import change_routing, staff
 from scripts.production import proposals_folder
-from scripts.production import proposals_table
-from scripts.production.production_doc import Refusal, production_field
 from scripts.production.issues import Issue, source_paths
 
 if TYPE_CHECKING:
     from scripts.production.update_registration import QuestionStaff
 
-EFFICIENCY_LEDGER_FIELD = "Efficiency ledger"
 COUNTS_HEAD = "For you: "
-EFFICIENCY_LINE = re.compile(r"^- \d{4}-\d\d-\d\d (?P<head>.*?) — (?P<status>.*)$")
 
 
 class FooterCounts(NamedTuple):
@@ -37,25 +33,9 @@ def total(each: list[FooterCounts]) -> FooterCounts:
 
 def change_counts(doc: Path, record: staff.StaffSnapshot, *, source: str = "",
                   sources: list[Path] | None = None) -> tuple[int, int]:
-    """Count the production tab and the unrouted tab in one routed pass."""
-    try:
-        scope = change_review.review_scope(doc, False, record)
-        listing = (change_review.scope_list(doc, record=record) if sources is None
-                   else change_review.scope_list(doc, record=record, sources=sources))
-        if sources is None:
-            routed = change_review.routed_review_entries(listing, doc, record=record)
-        else:
-            routed = change_review.routed_review_entries(listing, doc, record=record, sources=sources)
-        return (sum(owner.tab in scope and (not source or row.get("Producer") == source)
-                    for _, owner, row in routed),
-                0 if source else sum(isinstance(owner, change_routing.UnroutedChange) for _, owner, _ in routed))
-    except OSError:
-        if sources is not None:
-            raise
-        return 0, 0
-    except change_review.ChangeReviewError:
-        return 0, 0
-
+    """Read change counts through the shared review reader."""
+    from scripts.review_links import review_items
+    return review_items.change_counts(doc, record, source=source, sources=sources)
 
 def changes(doc: Path) -> int:
     return change_counts(doc, staff.snapshot())[0]
@@ -67,53 +47,26 @@ def unrouted_changes(doc: Path) -> int:
 
 
 def proposals(doc: Path, *, source: str = "", sources: list[Path] | None = None,
-              own: list[Issue] | None = None) -> int:
-    """Count the waiting proposals. `own` is the doc's `open_proposals` when the caller already read them."""
-    found = proposals_table.scope_issues(doc, sources=sources) if own is None else own
-    if source:
-        waiting = proposals_table.issue_entries(
-            [issue for issue in found if issue.value("proposed_by") == source], sources=sources)[0]
-        return len(waiting)
-    return len(proposals_table.waiting_entries(doc, sources=sources, issues=found)[0])
-
+              own: list[Issue] | None = None, record: staff.StaffSnapshot | None = None) -> int:
+    """Read proposal counts through the shared review reader."""
+    from scripts.review_links import review_items
+    return review_items.proposals(doc, source=source, sources=sources, own=own, record=record)
 
 def open_efficiency(line: str, *, source: str = "") -> bool:
-    """Match an open ledger line and its source before the first status delimiter."""
-    match = EFFICIENCY_LINE.match(line)
-    return (match is not None and match.group("status").strip().startswith(("proposed", "deferred"))
-            and (not source or match.group("head").rstrip().endswith(f" [by: {source}]")))
+    """Read an efficiency line through the shared review reader."""
+    from scripts.review_links import review_items
+    return review_items.open_efficiency(line, source=source)
 
+def efficiency_ledger(doc: Path) -> Path | NoEfficiencyLedger:
+    """Find the ledger through the shared review reader."""
+    from scripts.review_links import review_items
+    return review_items.efficiency_ledger(doc)
 
-def efficiency_ledger(doc: Path) -> Path | None:
-    """Read the configured efficiency ledger, or return None when it is unconfigured."""
-    try:
-        return Path(production_field(doc.read_text(encoding="utf-8").splitlines(), EFFICIENCY_LEDGER_FIELD)).expanduser()
-    except Refusal:
-        return None
-
-
-def efficiency(doc: Path, *, source: str = "", sources: list[Path] | None = None) -> int:
-    """Proposed and deferred efficiency proposals in the doc's ledger."""
-    try:
-        path = efficiency_ledger(doc)
-    except (OSError, UnicodeError):
-        if sources is not None:
-            raise
-        return 0
-    try:
-        if path is None:
-            return 0
-        if sources is not None:
-            sources.append(path)
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return 0
-    except (OSError, UnicodeError):
-        if sources is not None:
-            raise
-        return 0
-    return sum(open_efficiency(line, source=source) for line in lines)
-
+def efficiency(doc: Path, *, source: str = "", sources: list[Path] | None = None,
+               record: staff.StaffSnapshot | None = None) -> int:
+    """Read efficiency counts through the shared review reader."""
+    from scripts.review_links import review_items
+    return review_items.efficiency(doc, source=source, sources=sources, record=record)
 
 def read_counts(doc: Path, *, questions: int = 0, record: staff.StaffSnapshot | None = None,
                 source: str = "", sources: list[Path] | None = None,
@@ -126,8 +79,8 @@ def read_counts(doc: Path, *, questions: int = 0, record: staff.StaffSnapshot | 
         record = record if record is not None else staff.snapshot()
         investigation_count = investigations(doc, record, source=source, sources=sources)
         change_count, unrouted_count = change_counts(doc, record, source=source, sources=sources)
-        return FooterCounts(change_count, proposals(doc, source=source, sources=sources, own=own), questions,
-                            efficiency(doc, source=source, sources=sources), unrouted_count, investigation_count)
+        return FooterCounts(change_count, proposals(doc, source=source, sources=sources, own=own, record=record), questions,
+                            efficiency(doc, source=source, sources=sources, record=record), unrouted_count, investigation_count)
     except OSError:
         if sources is not None:
             raise
@@ -136,16 +89,9 @@ def read_counts(doc: Path, *, questions: int = 0, record: staff.StaffSnapshot | 
 
 def investigations(doc: Path, record: staff.StaffSnapshot, *, source: str = "",
                    sources: list[Path] | None = None) -> int:
-    """Count the owner and the same units used by production proposals."""
-    if source:
-        return len(investigation.records(staff.StaffId(source), sources=sources))
-    try:
-        owner = unit_lookup.doc_owner(doc, record)
-    except staff.StaffUnreadable:
-        return 0
-    owners = (owner, *unit_lookup.doc_units(doc, record))
-    return sum(len(investigation.records(member.id, sources=sources)) for member in owners)
-
+    """Read investigation counts through the shared review reader."""
+    from scripts.review_links import review_items
+    return review_items.investigations(doc, record, source=source, sources=sources)
 
 def routing_sources(record: staff.StaffSnapshot | None = None, *, sources: list[Path] | None = None) -> list[Path]:
     """Watch configuration, staff, review lists, and delivery records for count changes."""
@@ -194,8 +140,8 @@ def sources(doc: Path, *, identities: QuestionStaff | None = None,
     except OSError:
         if read_sources is not None:
             raise
-        efficiency_queue = None
-    if efficiency_queue is not None:
+        efficiency_queue = NoEfficiencyLedger()
+    if isinstance(efficiency_queue, Path):
         found.append(efficiency_queue)
     if own is not None:
         found.extend(issue.path for issue in own)

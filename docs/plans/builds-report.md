@@ -1696,7 +1696,7 @@ Files: a new `scripts/disks/` folder (report owns it) and `config/disks.conf`. T
 #### Phase 95 — Measure and data file
 
 1. `config/disks.conf` keys: `drives.<machine>` (the mount points, natedev `/build` and `/`), `cache_seconds=600`, `slider.default_gib=10`, `slider.min_gib=1`, `measure.keep_bytes` (the smallest folder the data keeps, below the slider minimum), `measure.memory_max=2G`, `measure.timeout_seconds`.
-2. `scripts/disks/measure.py` measures one drive at a time. It runs `du -x -B1 --threshold=<keep_bytes>` under `systemd-run --user --scope -p MemoryMax=<memory_max>`, `nice -n 19` and `ionice -c3`.
+2. `scripts/disks/measure.py` measures the drives at the same time. Each drive runs `dust -x -D -j -P -o b -z <keep_bytes - 1> --config scripts/disks/dust.toml` under `systemd-run --user --scope -p MemoryMax=<memory_max>` and `nice -n 19` (sdlc-phases phase 44 replaced one `du` for each drive, one drive after the other).
 3. A file lock lets only one measure run. A second request while one runs does nothing.
 4. The result is a tree for each drive: path, size and children. The size of a folder's "Other" is its size minus its named children, so each level adds up to its parent.
 5. A chain of single large children collapses into one row, such as `/home/natepiano`.
@@ -1706,13 +1706,13 @@ Files: a new `scripts/disks/` folder (report owns it) and `config/disks.conf`. T
 
 ##### Phase 95 as-built
 
-- `config/disks.conf`: `output_folder` (`ysbjmg` under the review root), `drives` with the host key `drives.natedev=/build /`, `cache_seconds`, `slider.default_gib`, `slider.min_gib`, `measure.keep_bytes` (256 MiB), `measure.memory_max`, `measure.timeout_seconds`.
+- `config/disks.conf`: `output_folder` (`ysbjmg` under the review root), `drives` with the host key `drives.natedev=/build /`, `cache_seconds`, `slider.default_gib`, `slider.min_gib`, `measure.keep_bytes` (256 MiB), `measure.memory_max`, `measure.max_depth` and `measure.max_lines` (dust's depth and line limits), `measure.timeout_seconds`.
 - `scripts/disks/measure.py`:
-  - `du_command` runs `systemd-run --user --scope --quiet -p MemoryMax=<max> -- nice -n 19 ionice -c3 du -x -B1 --threshold=<keep_bytes> <mount>`. du exit 1 with output counts as a measure; some folders cannot be read.
+  - `dust_command` runs `systemd-run --user --scope --quiet -p MemoryMax=<max> -- nice -n 19 dust -x -D -j -P -o b -z <keep_bytes - 1> -d <measure.max_depth> -n <measure.max_lines> --config <scripts/disks/dust.toml> <mount>`. dust keeps a folder only above `-z`, so `keep_bytes - 1` keeps a folder of exactly `keep_bytes`. The empty `scripts/disks/dust.toml` stops dust from reading a personal config. dust counts a hard link once. A folder it cannot read leaves out its size, and the walk still counts as a measure. `parse_dust` reads its JSON into the sizes that `folder_tree` takes. `ionice` is gone: natedev's IO scheduler is `none`, so it had no effect.
   - `folder_tree`: each folder hangs from its nearest listed ancestor, largest first. `other` is the size less the listed children. `collapse` joins a folder with its only child while the folder's own files are below `keep_bytes`, as `home/natepiano`. The drive root never joins.
   - `drive_floors`: the home disk floor from `disk.read_floor`, and the other floors from `sweep.filesystem_floors`, matched by device.
-  - `measure` takes `disks.lock` without a wait; a busy lock exits 3. A timeout, a start failure or a failed du gives the drive an `error`, and the next drive still runs. `disks.json` holds `measured_at`, `keep_bytes` and the drives, with total, used, free, floor and tree.
-- Tests: `scripts/disks/test_measure.py` (the tree, Other, the collapse, the root, the command, a measure, the timeout, a failed du, the lock).
+  - `measure` takes `disks.lock` without a wait; a busy lock exits 3. It walks the drives at the same time, one thread for each drive, and keeps the config order. A timeout, a start failure (dust not on PATH) or a failed dust gives the drive an `error`, and the other drive still runs. `disks.json` holds `measured_at`, `keep_bytes` and the drives, with total, used, free, floor and tree.
+- Tests: `scripts/disks/test_measure.py` (the tree, Other, the collapse, the root, the command, a measure, both drives at once, the timeout, a start failure, a failed dust, the lock).
 - First real measure on natedev: 261 seconds for `/build` and `/`.
 
 #### Phase 96 — Drive cards: slider and walk
