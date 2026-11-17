@@ -356,19 +356,20 @@ class ReviewLinksServerTests(unittest.TestCase):
         with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
             for result, expected, body in (
                 (accounts_page.Saved(), 200, {"state": "saved"}),
-                (accounts_page.Refused("Unknown account."), 400, {"reason": "Unknown account."}),
+                (accounts_page.Refused("Unknown key."), 400, {"reason": "Unknown key."}),
                 (accounts_page.SaveFailed("tune: refused"), 503, {"reason": "tune: refused"}),
             ):
                 with self.subTest(result=result), patch.object(accounts_page, "save_color", return_value=result) as save:
-                    status, content = self.post(accounts_page.PAGE_PATH, "label=claude1&value=%23af875f")
+                    status, content = self.post(accounts_page.PAGE_PATH, "key=role.worker&value=%23af875f")
                     self.assertEqual((status, json.loads(content)), (expected, body))
-                    save.assert_called_once_with("claude1", "#af875f")
+                    save.assert_called_once_with("role.worker", "#af875f")
                 with self.subTest(move=result), patch.object(accounts_page, "save_next_move", return_value=result) as move:
                     status, content = self.post(accounts_page.PAGE_PATH, "group=units&to=claude2")
                     self.assertEqual((status, json.loads(content)), (expected, body))
                     move.assert_called_once_with("units", "claude2")
-            for form in ("", "label=claude1", "label=claude1&value=x&value=y", "label=claude1&value=x&extra=y",
-                         "group=units", "group=units&to=claude2&value=x", "label=claude1&to=claude2"):
+            for form in ("", "key=account.claude1", "label=claude1&value=x", "key=account.claude1&value=x&value=y",
+                         "key=account.claude1&value=x&extra=y", "group=units", "group=units&to=claude2&value=x",
+                         "key=account.claude1&to=claude2"):
                 with (self.subTest(form=form), patch.object(accounts_page, "save_color") as save,
                       patch.object(accounts_page, "save_next_move") as move):
                     status, _ = self.post(accounts_page.PAGE_PATH, form)

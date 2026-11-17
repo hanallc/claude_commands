@@ -16,6 +16,7 @@ from scripts.lib import conf
 from scripts.review_links import change_page, console_theme, page_frame, review_link
 
 PAGE_NAME = "accounts.html"
+SWATCH_COLUMNS = ("label", "roles")
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/{PAGE_NAME}"
 # The child process keeps the status read's stderr capture away from the server's request log.
 CHILD = (str(Path(__file__).resolve().parents[1] / "lib/py"), "-m", "scripts.review_links.accounts_page")
@@ -40,20 +41,20 @@ class SaveFailed:
     reason: str
 
 
-def save_color(label: str, value: str) -> Saved | Refused | SaveFailed:
-    """Validate the account color and publish it through this checkout's tune."""
+def save_color(key: str, value: str) -> Saved | Refused | SaveFailed:
+    """Validate an account or role color and publish it through this checkout's tune."""
     try:
         colors = conf.read("statusline").values()
     except (OSError, ValueError) as error:
         return SaveFailed(" ".join(str(error).split()))
-    if f"account.{label}" not in colors:
-        return Refused("The account has no configured color.")
+    if not (key.startswith("account.") or key in accounts.ROLE_COLOR_KEYS.values()) or key not in colors:
+        return Refused("The page has no configured color for that key.")
     if not re.fullmatch(r"#[0-9a-f]{6}", value):
         return Refused("Use a color in #rrggbb format.")
     try:
-        done = subprocess.run((*TUNE, "statusline", f"account.{label}", value,
+        done = subprocess.run((*TUNE, "statusline", key, value,
             "--why", "The user chose this color with the Accounts page color chooser.",
-            "--user-words", f"{label} color set to {value} with Save on the console Accounts page"),
+            "--user-words", f"{key} set to {value} with Save on the console Accounts page"),
             capture_output=True, text=True, check=False)
     except OSError as error:
         return SaveFailed(" ".join(str(error).split()))
@@ -102,6 +103,8 @@ def _spans(spans: list[accounts.BoardSpan]) -> str:
     for span in spans:
         color = accounts.account_color(span.get("color", ""))
         style = f' style="color:{color.css}"' if isinstance(color, accounts.AccountColor) else ""
+        if "color_key" in span:
+            style += f' data-color-text="{html.escape(span["color_key"], quote=True)}"'
         parts.append(f'<span class="{span["tone"]}{" bold" if span["kind"] == "bold" else ""}"{style}>{html.escape(span["text"])}</span>')
     return "".join(parts)
 
@@ -126,21 +129,23 @@ def board(reading: accounts.StatusReading) -> str:
                if (spans := row["cells"]["label"]) and spans[0]["text"] in claude]
     percent = next_moves.format_next_move_percent(next_moves.console_next_move_percent())
     def swatch(spans: list[accounts.BoardSpan]) -> str:
-        if not spans or "color" not in spans[0]:
+        if not spans or "color_key" not in spans[0]:
             return ""
-        label = spans[0]["text"]
-        color = accounts.account_color(spans[0]["color"])
-        css = color.css if isinstance(color, accounts.AccountColor) else "#000000"
-        return (f'<button type="button" class="color-swatch" data-account-color="{html.escape(label, quote=True)}" '
-                + f'data-saved-color="{css.lower()}" style="background:{css}" '
-                + f'aria-label="Change {html.escape(label, quote=True)} color" aria-haspopup="dialog"></button>')
+        name = html.escape(spans[0]["text"], quote=True)
+        color = accounts.account_color(spans[0].get("color", ""))
+        css = color.css.lower() if isinstance(color, accounts.AccountColor) else ""
+        return (f'<button type="button" class="color-swatch" data-color-key="{html.escape(spans[0]["color_key"], quote=True)}" '
+                + f'data-color-name="{name}" data-saved-color="{css}" style="background:{css}" '
+                + f'aria-label="Change {name} color" aria-haspopup="dialog"></button>')
+    # A headerless swatch column follows each column whose first span can carry a configured color.
     head = "".join(f'<th class="{column["align"]}">{html.escape(column["heading"])}</th>'
-                   for column in table["columns"]) + '<th class="left">Color</th>'
+                   + ('<th class="left"></th>' if column["key"] in SWATCH_COLUMNS else "") for column in table["columns"])
     rows = "".join(
         _row_open(row)
         + "".join(f'<td class="{column["align"]}"{" data-account-name" if column["key"] == "label" else ""}>'
-                  + f'{_spans(row["cells"][column["key"]])}</td>' for column in table["columns"])
-        + f'<td class="left">{swatch(row["cells"]["label"])}</td>'
+                  + f'{_spans(row["cells"][column["key"]])}</td>'
+                  + (f'<td class="left">{swatch(row["cells"][column["key"]])}</td>' if column["key"] in SWATCH_COLUMNS else "")
+                  for column in table["columns"])
         + "</tr>" for row in table["rows"])
     moves = "".join(f"<li>{html.escape(line)}</li>" for line in reading.upcoming_moves if line)
     problems = "".join(f"<li>{html.escape(note.removeprefix('* '))}</li>" for note in reading.notes)
@@ -243,7 +248,7 @@ background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
 </style>"""
 
 POPUP = '''<dialog class="color-picker" aria-labelledby="color-title" data-color-picker>
-<div id="color-title" class="color-title">Account color</div>
+<div id="color-title" class="color-title">Color</div>
 <div class="color-area" data-color-area role="slider" tabindex="0" aria-label="Saturation and brightness"
 aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
 aria-describedby="color-area-help"><span class="color-cursor" data-color-cursor></span></div>
@@ -332,7 +337,7 @@ hue.addEventListener('keydown',event=>{
  event.preventDefault();pickHSV();
 });
 picker.addEventListener('input',readHex);
-const pendingSaves=new Set(), accountColors=new WeakMap();
+const pendingSaves=new Set(), queues=new Map();
 const message=document.createElement('span');
 message.className='color-save-error';message.dataset.colorSaveError='';message.hidden=true;
 message.setAttribute('role','status');message.setAttribute('aria-live','polite');
@@ -341,8 +346,8 @@ let selected=null;
 const menu=document.querySelector('[data-move-menu]'), menuItems=menu.querySelector('[data-move-items]');
 let menuRow=null;
 const pendingMoves=new Set();
-const hold=()=>selected ? 'An account color is being edited.' : menuRow ? 'An account move is being chosen.'
- : pendingSaves.size ? 'Account colors are being saved.' : pendingMoves.size ? 'An account move is being saved.' : '';
+const hold=()=>selected ? 'A color is being edited.' : menuRow ? 'An account move is being chosen.'
+ : pendingSaves.size ? 'Colors are being saved.' : pendingMoves.size ? 'An account move is being saved.' : '';
 async function refresh(supersede=false,current=()=>true) {
   if (hold()) return;
   const request = ++newestRequest;
@@ -364,71 +369,73 @@ function position(){
  popup.style.left=Math.max(8,Math.min(box.left,innerWidth-size.width-8))+'px';
  popup.style.top=Math.max(8,Math.min(box.bottom+8,innerHeight-size.height-8))+'px';
 }
-function accountName(button=selected){return button.closest('tr').querySelector('[data-account-name] span');}
-function colors(button){
- if(!accountColors.has(button)) accountColors.set(button,{savedText:accountName(button).style.color,queue:[]});
- return accountColors.get(button);
+// Every swatch and word of one key, such as units on each units row, shows one color.
+function swatches(key){return [...document.querySelectorAll('[data-color-key]')].filter(button=>button.dataset.colorKey===key);}
+function words(key){return [...document.querySelectorAll('[data-color-text]')].filter(word=>word.dataset.colorText===key);}
+function queue(key){
+ if(!queues.has(key)) queues.set(key,[]);
+ return queues.get(key);
 }
-function paint(value,button=selected){
- button.style.background=value;
- accountName(button).style.color=value;
+function savedColor(key){return swatches(key)[0]?.dataset.savedColor || '';}
+function paint(key,value){
+ for(const button of swatches(key)) button.style.background=value;
+ for(const word of words(key)) word.style.color=value;
 }
-function restore(button){
- const state=colors(button), pending=state.queue.at(-1);
- paint(pending ? pending.value : button.dataset.savedColor,button);
- accountName(button).style.color=pending ? pending.value : state.savedText;
+function restore(key){
+ const pending=queue(key).at(-1);
+ paint(key,pending ? pending.value : savedColor(key));
 }
 function close(restoreSaved){
- if(restoreSaved) restore(selected);
- const button=selected;selected=null;popup.close();button.focus({preventScroll:true});updates.changed();
+ const button=selected;selected=null;
+ if(restoreSaved) restore(button.dataset.colorKey);
+ popup.close();button.focus({preventScroll:true});updates.changed();
 }
 document.addEventListener('click',event=>{
- const button=event.target instanceof Element ? event.target.closest('[data-account-color]') : null;
+ const button=event.target instanceof Element ? event.target.closest('[data-color-key]') : null;
  if(!button) return;
  if(selected) close(true);
  selected=button;
- const state=colors(button);
- picker.value=state.queue.at(-1)?.value || button.dataset.savedColor;
+ picker.value=queue(button.dataset.colorKey).at(-1)?.value || button.dataset.savedColor;
  readHex();
- popup.querySelector('#color-title').textContent='Change '+button.dataset.accountColor+' color';
+ popup.querySelector('#color-title').textContent='Change '+button.dataset.colorName+' color';
  popup.showModal();position();area.focus();updates.abandon();
 });
-popup.querySelector('[data-color-try]').addEventListener('click',()=>{if(readHex()) paint(picker.value);});
+popup.querySelector('[data-color-try]').addEventListener('click',()=>{if(readHex()) paint(selected.dataset.colorKey,picker.value);});
 popup.querySelector('[data-color-cancel]').addEventListener('click',()=>close(true));
 popup.addEventListener('cancel',event=>{event.preventDefault();close(true);});
 popup.addEventListener('keydown',event=>{
  if(event.key==='Escape'){event.preventDefault();close(true);}
 });
-async function publish(save,state){
+async function publish(save){
+ const pending=queue(save.key);
  try{
   const response=await fetch(location.pathname,{method:'POST',
    headers:{'Content-Type':'application/x-www-form-urlencoded'},
-   body:new URLSearchParams({label:save.account,value:save.value}).toString()});
+   body:new URLSearchParams({key:save.key,value:save.value}).toString()});
   const result=await response.json();
   if(!response.ok) throw new Error(result.reason || 'The color could not be saved.');
-  save.button.dataset.savedColor=save.value;state.savedText=save.value;
+  for(const button of swatches(save.key)) button.dataset.savedColor=save.value;
  }catch(error){
-  save.button.dataset.savedColor=save.oldColor;state.savedText=save.oldText;
-  paint(save.oldColor,save.button);accountName(save.button).style.color=save.oldText;
-  if(selected===save.button){picker.value=save.oldColor;readHex();}
-  message.textContent=save.account+': '+(error.message || 'The color could not be saved.');message.hidden=false;
+  for(const button of swatches(save.key)) button.dataset.savedColor=save.oldColor;
+  paint(save.key,save.oldColor);
+  if(selected?.dataset.colorKey===save.key){picker.value=save.oldColor;readHex();}
+  message.textContent=save.name+': '+(error.message || 'The color could not be saved.');message.hidden=false;
  }finally{
-  state.queue.shift();pendingSaves.delete(save);
-  const next=state.queue[0];
-  if(next){next.oldColor=save.button.dataset.savedColor;next.oldText=state.savedText;void publish(next,state);}
-  if(selected!==save.button) restore(save.button);
+  pending.shift();pendingSaves.delete(save);
+  const next=pending[0];
+  if(next){next.oldColor=savedColor(save.key);void publish(next);}
+  if(selected?.dataset.colorKey!==save.key) restore(save.key);
   updates.changed();
   if(!pendingSaves.size) void updates.refresh(true);
  }
 }
 popup.querySelector('[data-color-save]').addEventListener('click',()=>{
  if(!readHex()){picker.reportValidity();return;}
- const button=selected,state=colors(button);
- const save={button,account:button.dataset.accountColor,value:picker.value,
-  oldColor:button.dataset.savedColor,oldText:state.savedText};
- paint(save.value);state.queue.push(save);pendingSaves.add(save);
+ const button=selected,key=button.dataset.colorKey,pending=queue(key);
+ const save={key,name:button.dataset.colorName,value:picker.value,oldColor:button.dataset.savedColor};
+ paint(key,save.value);pending.push(save);pendingSaves.add(save);
  message.textContent='';message.hidden=true;close(false);
- if(state.queue.length===1) void publish(save,state);
+ if(pending.length===1) void publish(save);
 });
 addEventListener('resize',position);addEventListener('scroll',position,{passive:true});
 function closeMenu(){
