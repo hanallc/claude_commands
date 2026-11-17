@@ -44,6 +44,7 @@ scripts/lib/process_group.py
 scripts/lib/scratch.py
 scripts/lib/session_folder.py
 scripts/lib/session_paths.py
+scripts/lib/slot_root.py
 scripts/lib/transcripts.py
 scripts/lib/unit_runs.py
 scripts/lib/user_zone.py
