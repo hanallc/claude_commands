@@ -120,10 +120,10 @@ class ListPageTests(unittest.TestCase):
             return review_items.ReviewItem("sdlc/" + identity, identity, review_items.ReviewType.CHANGE,
                 OWNER.id, OWNER.id, "Check " + identity, state, review_items.ReviewTimes(NOW, NOW), (), (), source)
 
-        ready = (change("C1", review_items.ReviewState.FOR_YOU), change("C2", review_items.ReviewState.FOR_YOU))
+        ready = (change("C1", review_items.ReviewState.OPEN), change("C2", review_items.ReviewState.OPEN))
         waiting = change("C3", review_items.ReviewState.WAITING)
         done = change("C4", review_items.ReviewState.DONE)
-        later = replace(change("C5", review_items.ReviewState.FOR_YOU),
+        later = replace(change("C5", review_items.ReviewState.OPEN),
                         times=review_items.ReviewTimes(NOW, NOW, NOW + timedelta(days=1)))
         question = investigation.file(OWNER.id, "Find the cause", "Why did it stop?")
         _ = investigation.answer(OWNER.id, question.id, "The cause is known.")
@@ -197,7 +197,7 @@ class ListPageTests(unittest.TestCase):
             change_routing.ChangeAssignment(change_routing.ShowrunnerOwnChange(OWNER.id, OWNER.name), self.root / "sdlc.md"),
             delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery()))
         ready = review_items.ReviewItem("change/sdlc/C1", "C1", review_items.ReviewType.CHANGE,
-            OWNER.id, OWNER.id, "Check C1", review_items.ReviewState.FOR_YOU, review_items.ReviewTimes(NOW, NOW), (), (), source)
+            OWNER.id, OWNER.id, "Check C1", review_items.ReviewState.OPEN, review_items.ReviewTimes(NOW, NOW), (), (), source)
         done = replace(ready, key="change/builds/C1", state=review_items.ReviewState.DONE)
         proposal = replace(ready, key="proposal/sdlc/P1", id="P1", type=review_items.ReviewType.PROPOSAL,
                            source=review_items.ProposalLedgerSource(self.root / "proposals.md"))
