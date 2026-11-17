@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from contextlib import redirect_stderr
 from typing import override
 from unittest import mock
 
@@ -58,6 +60,16 @@ class RemoveRunScratchTests(unittest.TestCase):
         (outside / ".git").mkdir(parents=True)
         (run / "scratch" / "linked").symlink_to(outside)
         return run, outside
+
+    def test_tracked_cleanup_reports_retained_folders(self) -> None:
+        run, outside = self.make_run()
+        result = scratch.TaskCleanup()
+        result.kept.append(scratch.KeptFolder(outside, scratch.BUSY_REASON))
+        error = io.StringIO()
+        with (mock.patch.object(scratch, "end", return_value=result),
+              mock.patch.object(workers, "protected_working_directories", return_value=[]), redirect_stderr(error)):
+            self.assertEqual(remove_run_scratch.end_tracked_scratch(run), 0)
+        self.assertIn(f"kept {outside}: {scratch.BUSY_REASON}", error.getvalue())
 
     def test_a_bad_cargo_removal_mark_does_not_stop_other_folder_removals(self) -> None:
         run, _ = self.make_run()
