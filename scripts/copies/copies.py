@@ -21,7 +21,6 @@ import os
 from pathlib import Path
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -39,6 +38,7 @@ from scripts.lib.copy_record import (
     ALL_REPOSITORIES as ALL_REPOSITORIES,
 )
 from scripts.buildlog.store import host_name
+from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
@@ -244,19 +244,39 @@ MergePolicy = NoMerge | MergeRevision
 NO_MERGE = NoMerge()
 
 
-def staged_tree(source: Path) -> str:
-    """Read the staged tree without changing the source index."""
+def _private_index_git(source: Path, index: Path, *arguments: str) -> bytes:
+    """Run Git with the private index and retain its preparation errors."""
+    timeout = load_config().git_timeout_seconds
+    try:
+        result = subprocess.run(["git", "-C", str(source), *arguments],
+                                env={**os.environ, "GIT_INDEX_FILE": str(index)},
+                                capture_output=True, timeout=timeout,
+                                pass_fds=(build_folders.build_folder_lock_fd(index.parent),))
+    except subprocess.TimeoutExpired as error:
+        raise PreparationError(f"git {' '.join(arguments)} in {source}: timed out after {timeout:g} seconds") from error
+    if result.returncode:
+        raise PreparationError(result.stderr.decode(errors="replace"))
+    return result.stdout
+
+
+def staged_tree(source: Path, *, include_worktree: bool = False) -> str:
+    """Read staged or working files through a private index."""
     with build_folders.tool_folder("copies-index") as temporary:
         index = Path(git(source, "rev-parse", "--path-format=absolute", "--git-path", "index").decode().strip())
         private = temporary / "index"
         if index.exists():
             git_index.private_copy(index, private)
-        result = subprocess.run(["git", "-C", str(source), "write-tree"],
-                                env={**os.environ, "GIT_INDEX_FILE": str(private)},
-                                capture_output=True, timeout=load_config().git_timeout_seconds)
-        if result.returncode:
-            raise PreparationError(result.stderr.decode(errors="replace"))
-        return result.stdout.decode().strip()
+        if include_worktree:
+            _ = _private_index_git(source, private, "add", "--all", "--", ".")
+        tree = _private_index_git(source, private, "write-tree").decode().strip()
+        if include_worktree:
+            head_links = {row.split(b"\t", 1)[1] for row in git(source, "ls-tree", "-rz", "HEAD").split(b"\0")
+                          if row.startswith(b"160000 ")}
+            for row in git(source, "ls-tree", "-rz", tree).split(b"\0"):
+                if row.startswith(b"160000 ") and row.split(b"\t", 1)[1] not in head_links:
+                    path = os.fsdecode(row.split(b"\t", 1)[1])
+                    raise PreparationError(f"NestedRepository: {path}: new Git links cannot supply working files")
+        return tree
 
 
 def source_commit(source: Path, policy: SourcePolicy) -> str:
@@ -267,6 +287,20 @@ def source_commit(source: Path, policy: SourcePolicy) -> str:
     return git(source, "-c", "user.name=copies.py", "-c", "user.email=copies@localhost",
                "commit-tree", tree, "-p", commit_at(source, "HEAD"),
                data=b"copies: staged source\n").decode().strip()
+
+
+def capture_source(source: Path) -> str:
+    """Commit exact working files through the private index without changing caller refs."""
+    before = treekey.tree_key(str(source))
+    head = source_commit(source, WorktreeSource("HEAD", source))
+    index = staged_tree(source)
+    tree = staged_tree(source, include_worktree=True)
+    if (staged_tree(source, include_worktree=True) != tree or not before
+            or treekey.tree_key(str(source)) != before or staged_tree(source) != index
+            or commit_at(source, "HEAD") != head):
+        raise PreparationError("SourceChanged: inputs changed during source capture")
+    return git(source, "-c", "user.name=copies.py", "-c", "user.email=copies@localhost",
+               "commit-tree", tree, data=b"copies: source snapshot\n").decode().strip()
 
 
 class BusyCopy(CopyError):
@@ -673,31 +707,16 @@ def apply_changes(tree: Path, worktree: Path, base: str) -> None:
     try:
         changed = [os.fsdecode(name) for name in git(worktree, "diff", "--name-only", "-z", "HEAD").split(b"\0")
                    if name]
-        diff = git(worktree, "diff", "--binary", "HEAD", "--")
-        if diff:
-            _ = git(tree, "apply", "--index", "--3way", "--binary", "-", data=diff)
         for name in git(worktree, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0"):
             if not name:
                 continue
-            relative = Path(os.fsdecode(name))
-            changed.append(str(relative))
-            if relative.parts[0] in (scratch.BUSY, ".git", CLONE_STAGE):
-                raise CopyError(f"{relative}: path conflicts with gate metadata")
-            original, destination = worktree / relative, tree / relative
-            mode = original.lstat().st_mode
-            if not destination.parent.resolve().is_relative_to(tree.resolve()):
-                raise CopyError(f"{relative}: path escapes the gate checkout")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if destination.is_symlink():
-                destination.unlink()
-            if stat.S_ISLNK(mode):
-                destination.symlink_to(os.readlink(original))
-            elif stat.S_ISREG(mode):
-                _ = shutil.copyfile(original, destination)
-                shutil.copymode(original, destination)
-            else:
-                raise CopyError(f"{relative}: not a regular file or symlink")
-            _ = git(tree, "--literal-pathspecs", "add", "--force", "--", str(relative))
+            changed.append(os.fsdecode(name))
+            if Path(os.fsdecode(name)).parts[0] in (scratch.BUSY, ".git", CLONE_STAGE):
+                raise CopyError(f"{os.fsdecode(name)}: path conflicts with gate metadata")
+        snapshot = staged_tree(worktree, include_worktree=True)
+        diff = git(worktree, "diff", "--binary", "HEAD", snapshot, "--")
+        if diff:
+            _ = git(tree, "apply", "--index", "--3way", "--binary", "-", data=diff)
         short = git(tree, "rev-parse", "--short", base).decode().strip()
         _ = git(tree, "-c", "user.name=copies.py", "-c", "user.email=copies@localhost",
                 "-c", "commit.gpgsign=false", "commit", "--quiet", "--no-verify", "--allow-empty", "-m",
@@ -926,8 +945,7 @@ def end_workspaces(task: str, paths: list[Path], *,
                     if not idle:
                         raise CopyError(f"{tree}: workspace is busy during task completion")
                     validate()
-                    scratch.remove_with_cargo_output(tree, scratch.remove)
-                    scratch.removal_mark(tree).unlink(missing_ok=True)
+                    scratch.remove_marked(tree)
             hold = scratch.holds().get(str(tree.resolve()))
             if hold is not None and hold["task"] == task:
                 _ = scratch.release(tree)
@@ -935,23 +953,21 @@ def end_workspaces(task: str, paths: list[Path], *,
         if not isinstance(record, copy_record.Registered) or record.task != task:
             raise CopyError(f"{tree}: workspace task differs")
         with (workspace_removal_guard(tree, record, run_lock=run_lock) as validate,
-              build_folders.collector_lease(tree, wait=False) as free,
-              claim_tree(tree, create=False) as state):
-            if not free or state is not ClaimState.ACQUIRED:
+              scratch.removal_lock(tree) as idle,
+              scratch.copy_record_lock(tree)):
+            if not idle:
                 raise CopyError(f"{tree}: workspace is busy during task completion")
             def ended(current: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
                 if not isinstance(current, copy_record.Registered) or current.task != task:
                     raise CopyError(f"{tree}: workspace task differs")
                 return {**current.fields, "ended": time.time(), "ended_task": task}
             validate()
-            # A removal marker proves that the first attempt saved the rescue.
+            # A deletion intent preserves ownership but does not certify saved work.
             if isinstance(scratch.pending_removal(tree), copy_record.NotRegistered):
                 _ = scratch.update_record(tree, ended)
-                if "crate_run" in record.fields:
-                    rescue_workspace(tree, record)
             if "crate_run" not in record.fields:
                 continue
-            scratch.remove_marked(tree, scratch.remove)
+            scratch.remove_marked(tree)
         _ = scratch.release(tree)
 
 
@@ -1288,9 +1304,6 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
                 with workspace_removal_guard(tree, record) as validate:
                     def rescue_selected() -> None:
                         validate()
-                        if not tree.exists():
-                            return
-                        rescue_workspace(tree, record)
                     if not scratch.end_selected_copy(tree, record, time.time(), validate=rescue_selected):
                         with scratch.judgment_lock(tree) as idle:
                             if not idle:
@@ -1799,7 +1812,8 @@ def mirror_remove(args: CopyArguments) -> int:
     authority = floor_claims.removal_authority_path(tree)
     with local_mirror_lease(tree, args.session, create=False):
         with mirror_metadata_locks(tree) as claims:
-            if not tree.exists() and not authority.exists():
+            if (not tree.exists() and not authority.exists() and not scratch.removal_mark(tree).exists()
+                    and not scratch.cargo_removal_mark(tree).exists()):
                 return 0
             if tree.exists() and claims.holds(str(tree), tree.parent,
                     exemption=floor_claims.MirrorIdentity(args.host, args.path)):
@@ -1813,7 +1827,7 @@ def mirror_remove(args: CopyArguments) -> int:
                 task_record = copy_record.record_path(tree)
                 # A task clone or a temporary gate goes as one task folder; an editable copy keeps its folder rules.
                 if task_record is not None and copy_record.copy_folder(tree) != tree.resolve():
-                    scratch.remove_marked(task_record.parent, scratch.remove)
+                    scratch.remove_marked(task_record.parent)
                     # A task clone is its task folder, so its lock files sit in the scratch root.
                     if task_record.parent == tree.resolve():
                         for lock in (floor_claims.mirror_lock_path(tree), floor_claims.record_lock_path(tree)):
@@ -1821,6 +1835,8 @@ def mirror_remove(args: CopyArguments) -> int:
                 else:
                     clear_mirror_content(tree)
                     tree.rmdir()
+            if scratch.removal_mark(tree).exists() or scratch.cargo_removal_mark(tree).exists():
+                scratch.remove_marked(tree)
             authority.unlink(missing_ok=True)
     return 0
 

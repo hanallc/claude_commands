@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.accounts import new_account
 from scripts.hooks import showrunner_footer
+from scripts.lib import conf
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production import footer_counts, investigation, session_labels, staff
 from scripts.rebuild import need
@@ -38,6 +39,21 @@ SHELL_ENVIRONMENT = {"__NIXOS_SET_ENVIRONMENT_DONE": "1", "__ETC_ZSHENV_SOURCED"
 SHELLS = ("/bin/sh", "zsh") if shutil.which("zsh") else ("/bin/sh",)
 # Where NixOS's glibc finds zone files; Claude Code's environment carries it.
 ZONE_FILES = {"TZDIR": os.environ["TZDIR"]} if "TZDIR" in os.environ else {}
+
+
+def shipped_account_label(label: str) -> str:
+    """Derive the expected account escape from the shipped configuration."""
+    colors = conf.read(SHIPPED_COLORS).values()
+    key = f"account.{label}"
+    if key not in colors:
+        return label
+    codes = {name: str(30 + index) for index, name in enumerate(
+        ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"))}
+    codes.update({f"bright-{name}": str(90 + index) for index, name in enumerate(
+        ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"))})
+    codes.update({"orange": "38;5;208", "purple": "38;5;141", "pink": "38;5;211",
+                  "teal": "38;5;30", "brown": "38;5;137", "mauve": "38;5;139"})
+    return f"\x1b[{codes[colors[key]]}m{label}\x1b[0m"
 
 
 def status_lines(*inputs: object, labels: Path | None = None, account: str = "claude1",
@@ -134,7 +150,7 @@ class ColorTests(unittest.TestCase):
             with self.subTest(record=record):
                 self.assertEqual(status_lines(payload, colors=SHIPPED_COLORS, staff_text=record, STAFF_ID=UNIT.id), [
                     "unassigned | /tmp/project",
-                    "\x1b[38;5;137mclaude1\x1b[0m | Opus | weekly \x1b[92m40% left\x1b[0m",
+                    f"{shipped_account_label('claude1')} | Opus | weekly \x1b[92m40% left\x1b[0m",
                 ])
 
     def test_the_user_s_examples_render_the_role_with_its_path_then_the_account_model_tokens_and_weekly(self) -> None:
@@ -173,13 +189,15 @@ class ColorTests(unittest.TestCase):
                 self.assertEqual(line.split(" | ")[0], expected)
 
     def test_shipped_account_colors_and_unknown_label(self) -> None:
-        for account, expected in (
-            ("claude1", "\x1b[38;5;137mclaude1\x1b[0m"), ("claude2", "\x1b[35mclaude2\x1b[0m"),
-            ("claude3", "\x1b[34mclaude3\x1b[0m"), ("claude4", "\x1b[38;5;208mclaude4\x1b[0m"),
-            ("claude99", "claude99"),
-        ):
+        colors = conf.read(SHIPPED_COLORS).values()
+        for key in colors:
+            if not key.startswith("account."):
+                continue
+            account = key.removeprefix("account.")
             with self.subTest(account=account):
-                self.assertEqual(status_lines({}, account=account, colors=SHIPPED_COLORS)[1].split(" | ")[0], expected)
+                self.assertEqual(status_lines({}, account=account, colors=SHIPPED_COLORS)[1].split(" | ")[0],
+                                 shipped_account_label(account))
+        self.assertEqual(status_lines({}, account="claude99", colors=SHIPPED_COLORS)[1].split(" | ")[0], "claude99")
 
     def test_unassigned_stays_uncolored_without_its_role_color(self) -> None:
         line = status_lines({}, colors="role.showrunner=purple\n")[0]
@@ -251,7 +269,7 @@ class ColorTests(unittest.TestCase):
                 with self.subTest(family=family, threshold=threshold):
                     config = SHIPPED_COLORS.read_text(encoding="utf-8") + f"\n{family}.{threshold}=not-a-number\n"
                     lines = status_lines({**payload, **usage}, colors=config)
-                    account = "\x1b[38;5;137mclaude1\x1b[0m"
+                    account = shipped_account_label("claude1")
                     if family == "tokens":
                         self.assertEqual(lines[1], f"{account} | 90,000 | 5-hour \x1b[91m5% left\x1b[0m | weekly \x1b[93m10% left\x1b[0m")
                     else:
@@ -268,7 +286,7 @@ class ColorTests(unittest.TestCase):
         self.assertEqual([ANSI.sub("", line) for line in colored], plain)
         self.assertEqual(colored, [
             "\x1b[38;5;141mshow showrunner\x1b[0m | /tmp/project",
-            "\x1b[38;5;137mclaude1\x1b[0m | Opus high | \x1b[93m80,000\x1b[0m | 5-hour \x1b[93m9% left\x1b[0m until 07:00 EST | weekly \x1b[91m5% left\x1b[0m until Thu 07:00 EST",
+            f"{shipped_account_label('claude1')} | Opus high | \x1b[93m80,000\x1b[0m | 5-hour \x1b[93m9% left\x1b[0m until 07:00 EST | weekly \x1b[91m5% left\x1b[0m until Thu 07:00 EST",
         ])
 
     def test_the_counts_row_colors_each_part_by_its_type_and_keeps_the_number_bold(self) -> None:
@@ -829,7 +847,7 @@ class RoleTests(unittest.TestCase):
         _ = self.write_staff(OWNER, UNIT)
         self.assertEqual(self.command_lines({**payload, "session_id": UNIT.id}, CLAUDE_CONFIG_DIR=str(config)), [
             "\x1b[33mtrunk unit for show\x1b[0m | ~/project | main",
-            "\x1b[38;5;208mclaude4\x1b[0m | Opus | \x1b[91m90,000\x1b[0m | 5-hour \x1b[91m5% left\x1b[0m | weekly \x1b[92m11% left\x1b[0m",
+            f"{shipped_account_label('claude4')} | Opus | \x1b[91m90,000\x1b[0m | 5-hour \x1b[91m5% left\x1b[0m | weekly \x1b[92m11% left\x1b[0m",
         ])
 
     def test_settings_command_with_a_missing_config_keeps_plain_text(self) -> None:

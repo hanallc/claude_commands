@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from contextvars import copy_context
 from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 import fcntl
@@ -396,6 +396,39 @@ class StandingTests(unittest.TestCase):
                         self.assertEqual(os.environ['CARGO_BUILD_BUILD_DIR'], output)
                     self.assertEqual(os.environ['CARGO_BUILD_BUILD_DIR'], output)
 
+    def test_rescued_workspace_retry_removes_unchanged_source_and_keeps_new_edits(self) -> None:
+        for changed in (False, True):
+            with self.subTest(changed=changed):
+                name = f"rescued-retry-{changed}"
+                task = f"gate:{name}"
+                tree = copies.workspace_path(self.owner_id, self.source, name)
+                manifest = self.base / f"{name}.json"
+                _ = manifest.write_text(json.dumps({"version": 2, "canonical": str(self.source), "base": self.head,
+                    "crates": {"saved": {"checkout": str(tree), "stage": "abandoned"}}}))
+                with copies.workspace(self.owner_id, self.source, self.head, name=name, branch="worker",
+                                      task=task, run_manifest=manifest):
+                    _ = (tree / "tracked.txt").write_text("saved dirty workspace\n")
+                with (mock.patch.object(copies, "rescue_workspace", wraps=copies.rescue_workspace) as rescue,
+                      mock.patch.object(scratch, "remove", side_effect=OSError("stop after intent"))):
+                    with self.assertRaisesRegex(copies.CopyError, "stop after intent"):
+                        copies.end_workspaces(task, [tree])
+                    rescue.assert_called_once()
+                self.assertTrue(scratch.removal_mark(tree).is_file())
+                if changed:
+                    _ = (tree / "tracked.txt").write_text("new edit after rescue\n")
+                with mock.patch.object(copies, "rescue_workspace", side_effect=AssertionError("duplicate rescue")):
+                    if changed:
+                        with self.assertRaisesRegex((copies.CopyError, scratch.ScratchError), "uncommitted changes"):
+                            copies.end_workspaces(task, [tree])
+                    else:
+                        copies.end_workspaces(task, [tree])
+                if changed:
+                    self.assertEqual((tree / "tracked.txt").read_text(), "new edit after rescue\n")
+                    self.assertTrue(scratch.removal_mark(tree).is_file())
+                else:
+                    self.assertFalse(tree.exists())
+                    self.assertFalse(scratch.removal_mark(tree).exists())
+
     def test_workspace_cleanup_exports_clean_branch_commits_before_deletion(self) -> None:
         run_git = copies.git
 
@@ -653,6 +686,37 @@ class StandingTests(unittest.TestCase):
         self.assertFalse(checkout.exists())
         self.assert_clone_project_removed(checkout, paths)
 
+    def test_mirror_retry_keeps_authority_until_absent_source_cargo_recovery_finishes(self) -> None:
+        checkout = copies.clone(self.source, "gate:mirror-recovery")
+        copies.mark_mirror(checkout, "clone-owner", "hana", "fixture")
+        authority = floor_claims.removal_authority_path(checkout)
+        cargo_mark, task_mark = scratch.cargo_removal_mark(checkout), scratch.removal_mark(checkout)
+        scratch.atomic_record(cargo_mark, [])
+        processes = copies.MirrorProcessScan(tmp_sweep.ProcessUsesKnown([]), frozenset())
+        with (mock.patch.object(copies, "scan_mirror_processes", return_value=processes),
+              mock.patch.object(copies, "mirror_metadata_locks",
+                                return_value=nullcontext(floor_claims.ClaimSnapshot(frozenset())))):
+            with mock.patch.object(scratch, "finish_removal", side_effect=OSError("stop after source deletion")):
+                first = self.cli("mirror-remove", "--path", str(checkout), "--owner", "clone-owner",
+                                 "--repository", "hana", "--session", "fixture")
+            self.assertNotEqual(first.returncode, 0)
+            self.assertFalse(checkout.exists())
+            self.assertTrue(authority.is_file())
+            with mock.patch.object(scratch, "clean_cargo_outputs", side_effect=scratch.CargoOutputKept("Cargo refuses recovery")):
+                refused = self.cli("mirror-remove", "--path", str(checkout), "--owner", "clone-owner",
+                                   "--repository", "hana", "--session", "fixture")
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("Cargo refuses recovery", refused.stderr)
+            self.assertTrue(authority.is_file())
+            self.assertTrue(task_mark.is_file())
+            self.assertTrue(cargo_mark.is_file())
+            finished = self.cli("mirror-remove", "--path", str(checkout), "--owner", "clone-owner",
+                                "--repository", "hana", "--session", "fixture")
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        self.assertFalse(authority.exists())
+        self.assertFalse(task_mark.exists())
+        self.assertFalse(cargo_mark.exists())
+
     def test_temporary_sweep_clears_clone_trust(self) -> None:
         paths = self.clone_trust_files()
         checkout = copies.clone(self.source, "gate:sweep-trust")
@@ -877,12 +941,13 @@ class StandingTests(unittest.TestCase):
             (folder / copy_record.RECORD).unlink()
             raise OSError("stopped removal")
 
-        with self.assertRaisesRegex(OSError, "stopped removal"):
-            scratch.remove_marked(checkout, stopped)
+        with mock.patch.object(scratch, "remove", side_effect=stopped):
+            with self.assertRaisesRegex(OSError, "stopped removal"):
+                scratch.remove_marked(checkout)
         self.assertTrue(scratch.removal_mark(checkout).exists())
         self.assert_clone_project_removed(checkout, paths)
         before = {path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns) for path in paths}
-        scratch.remove_marked(checkout, scratch.remove)
+        scratch.remove_marked(checkout)
         self.assertFalse(checkout.exists())
         self.assertFalse(scratch.removal_mark(checkout).exists())
         self.assertEqual({path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns) for path in paths}, before)
@@ -1640,6 +1705,43 @@ class StandingTests(unittest.TestCase):
         self.assertEqual({key: value for key, value in self.snapshot(self.source).items() if not key.startswith(".git/")}, before)
         self.assertEqual((self.source / ".git/index").read_bytes(), source_index)
 
+    def test_apply_changes_refuses_an_untracked_nested_repository(self) -> None:
+        nested = self.source / "nested"
+        nested.mkdir()
+        _ = self.git(nested, "init", "--quiet")
+        _ = (nested / "file").write_text("nested source\n")
+        _ = self.git(nested, "add", ".")
+        _ = self.git(nested, "commit", "-qm", "nested source")
+        with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
+            with self.assertRaisesRegex(copies.PreparationError, "NestedRepository: nested"):
+                copies.apply_changes(tree, self.source, self.head)
+            self.assertFalse((tree / "nested").exists())
+
+    def test_apply_changes_error_names_untracked_files(self) -> None:
+        _ = (self.source / "untracked.txt").write_text("new source\n")
+        with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
+            with mock.patch.object(copies, "staged_tree", side_effect=copies.PreparationError("fixture failure")):
+                with self.assertRaisesRegex(copies.PreparationError, "files: untracked.txt; fixture failure"):
+                    copies.apply_changes(tree, self.source, self.head)
+
+    def test_private_capture_timeout_exits_three_and_names_changed_files(self) -> None:
+        _ = (self.source / "tracked.txt").write_text("changed source\n")
+        _ = (self.source / "untracked.txt").write_text("new source\n")
+        real_run = cast(Callable[..., object], subprocess.run)
+        for step in ("add", "write-tree"):
+            with self.subTest(step=step):
+                def timeout_capture(arguments: list[str], **options: object) -> object:
+                    if arguments[:3] == ["git", "-C", str(self.source)] and arguments[3] == step:
+                        raise subprocess.TimeoutExpired(arguments, float(self.settings["git_timeout_seconds"]))
+                    return real_run(arguments, **options)
+                with mock.patch("scripts.copies.copies.subprocess.run", side_effect=timeout_capture):
+                    result = self.run_cli("--apply-uncommitted", str(self.source))
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertIn("tracked.txt", result.stderr)
+                self.assertIn("untracked.txt", result.stderr)
+                arguments = "add --all -- ." if step == "add" else "write-tree"
+                self.assertIn(f"git {arguments} in {self.source}: timed out after 10 seconds", result.stderr)
+
     def test_merge_fetches_source_ref_and_creates_a_merge_commit(self) -> None:
         incoming = self.incoming()
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head), merge=copies.MergeRevision("incoming")) as tree:
@@ -2124,8 +2226,9 @@ class StandingTests(unittest.TestCase):
         self.assertEqual(self.git(child, "cat-file", "-p", self.head), self.git(parent, "cat-file", "-p", self.head))
         for pending in (child, parent):
             with self.subTest(pending=pending):
-                with self.assertRaisesRegex(RuntimeError, "interrupted removal"):
-                    scratch.remove_marked(pending, mock.Mock(side_effect=RuntimeError("interrupted removal")))
+                with mock.patch.object(scratch, "remove", side_effect=RuntimeError("interrupted removal")):
+                    with self.assertRaisesRegex(RuntimeError, "interrupted removal"):
+                        scratch.remove_marked(pending)
                 with self.assertRaisesRegex(copies.CopyError, "borrowed"):
                     copies.remove_trees(self.owner_id)
                 self.assertTrue(parent.exists())

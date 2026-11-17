@@ -65,14 +65,17 @@ def scratch_folders(run: Path) -> list[Path]:
         current = frontier.pop()
         try:
             with os.scandir(current) as entries:
-                folders = [entry.path for entry in entries if entry.is_dir(follow_symlinks=False)]
+                listed = list(entries)
+                folders = {entry.path for entry in listed if entry.is_dir(follow_symlinks=False)}
+                folders.update(str(path) for path in scratch.marked_folders(Path(entry.path) for entry in listed))
         except OSError:
             continue
         for folder in sorted(folders):
             candidate = Path(folder).resolve()
             if candidate in protected:
                 continue
-            if (current == str(run) and os.path.basename(folder) == VERIFY_CACHE) or is_copy(folder):
+            if ((current == str(run) and os.path.basename(folder) == VERIFY_CACHE)
+                    or is_copy(folder) or scratch.removal_mark(Path(folder)).exists()):
                 if not any(candidate in cwd.parents for cwd in protected):
                     found.append(Path(folder))
             else:
@@ -101,7 +104,7 @@ def git(common: Path, *arguments: str) -> bool:
 
 
 def remove(folder: Path) -> None:
-    scratch.remove_with_cargo_output(folder, remove_tree)
+    scratch.remove_marked(folder, source_deletion=scratch.SourceDeletion.RUN)
 
 
 def remove_tree(folder: Path) -> None:
@@ -142,7 +145,7 @@ def main() -> int:
         for folder in scratch_folders(run):
             try:
                 remove(folder)
-            except OSError as error:
+            except (OSError, scratch.ScratchError) as error:
                 failed += 1
                 print(f"remove_run_scratch: could not remove {folder}: {error}", file=sys.stderr)
                 continue

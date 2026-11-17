@@ -1149,6 +1149,7 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
                 yield KeptEntry(entry.path, SMALL_IN_LIVE_SESSION)
                 continue
             pending = root in roots.copies and isinstance(scratch.pending_removal(Path(entry.path), scratch_settings=scratch_settings), copy_record.Registered)
+            # The coordinator checks pending sources against the intent under the removal lock.
             git = GitWork.SAVED if pending or scratch.is_throwaway(Path(entry.path)) else git_work(Path(entry.path))
             if git is not GitWork.SAVED:
                 yield KeptEntry(entry.path, git.value)
@@ -1164,22 +1165,7 @@ def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
 ) -> bool:
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
-    lock = scratch.judgment_lock if dry_run else scratch.removal_lock
-    with lock(Path(entry.path)) as idle, scratch.copy_record_lock(Path(entry.path), scratch_settings=scratch_settings):
-        if not idle:
-            result.keep(entry.path, "busy: .claude-busy is locked")
-            return False
-        if copy_record.copy_folder(Path(entry.path)) == Path(entry.path).resolve():
-            state = scratch.record_lifetime(Path(entry.path), time.time(), scratch_settings=scratch_settings)
-            if not isinstance(state, scratch.Ended):
-                result.keep(entry.path, state.why if isinstance(state, scratch.Live) else state.reason)
-                return False
-            pending = isinstance(scratch.pending_removal(Path(entry.path), scratch_settings=scratch_settings), copy_record.Registered)
-            git = GitWork.SAVED if pending or scratch.is_throwaway(Path(entry.path)) else git_work(Path(entry.path))
-            if git is not GitWork.SAVED:
-                result.keep(entry.path, git.value)
-                return False
-        return remove_idle_entry(entry, result, dry_run, scratch_settings=scratch_settings)
+    return remove_idle_entry(entry, result, dry_run, scratch_settings=scratch_settings)
 
 
 def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
@@ -1190,18 +1176,25 @@ def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
         if parent.is_symlink() or not parent.is_dir() or os.path.realpath(parent) != entry.root:
             result.keep(entry.path, "its phases parent changed")
             return False
-    if not dry_run:
-        try:
-            path = Path(entry.path)
-            scratch.remove_marked(path, lambda folder: delete_tree(str(folder)), scratch_settings=scratch_settings)
-        except scratch.CargoOutputKept as error:
-            print(f"tmp sweep: keep {entry.path}: {error}")
-            result.keep(entry.path, CARGO_OUTPUT_KEPT)
+    try:
+        outcome = scratch.remove_folder(Path(entry.path), scratch.ExpiredFolderRemoval(time.time()),
+                                        source_deletion=scratch.SourceDeletion.SWEEP, dry_run=dry_run,
+                                        scratch_settings=scratch_settings)
+        if isinstance(outcome, scratch.KeptFolder):
+            reason = "busy: .claude-busy is locked" if outcome.reason == scratch.BUSY_REASON else outcome.reason
+            result.keep(entry.path, reason)
             return False
-        except OSError as error:
-            if os.path.lexists(entry.path):
-                result.failed.append(FailedEntry(path=entry.path, error=str(error)))
-            return False
+    except scratch.CargoOutputKept as error:
+        print(f"tmp sweep: keep {entry.path}: {error}")
+        result.keep(entry.path, CARGO_OUTPUT_KEPT)
+        return False
+    except scratch.ScratchError as error:
+        result.keep(entry.path, str(error))
+        return False
+    except OSError as error:
+        if os.path.lexists(entry.path):
+            result.failed.append(FailedEntry(path=entry.path, error=str(error)))
+        return False
     result.freed += entry.size
     result.deleted.append(DeletedEntry(path=entry.path, gib=round(entry.size / GIB, 3),
                                        last_change=when(entry.newest), reason=entry.reason))
@@ -1252,7 +1245,8 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR, *,
             pass
     if not dry_run:
         for root in roots.copies:
-            scratch.clear_finished_copy_removals(Path(root), scratch_settings=scratch_settings)
+            for kept in scratch.clear_finished_copy_removals(Path(root), scratch_settings=scratch_settings):
+                result.keep(str(kept.path), kept.reason)
             scratch.remove_empty_copy_pairs(Path(root))
         for root in roots.dataclass_code:
             result.dataclass_code_removed += prune_dataclass_code(root, now, lint_settings.whole("dataclass_code_days"))

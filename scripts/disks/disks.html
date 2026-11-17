@@ -30,9 +30,6 @@ body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 syste
 __PAGE_FRAME_STYLE__
 h2 { font-size: 1.05rem; margin: 0; }
 h2 .path { font-size: 0.86rem; font-weight: 400; color: var(--ink-3); margin-left: 6px; }
-.status { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font-size: 0.88rem; margin: 0 0 16px; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--room); flex: none; }
-.dot.old { background: var(--ink-3); }
 .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 0 0 16px; align-items: start; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 14px; min-width: 0; }
 .head { display: flex; align-items: baseline; justify-content: space-between; gap: 4px 12px; flex-wrap: wrap; }
@@ -46,8 +43,10 @@ h2 .path { font-size: 0.86rem; font-weight: 400; color: var(--ink-3); margin-lef
 .limit { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; font-size: 0.86rem; color: var(--ink-2); margin: 0 0 6px; }
 .limit .range { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 220px; }
 .limit input { flex: 1; min-width: 60px; accent-color: var(--accent); }
-.limit output { min-width: 64px; text-align: right; color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
-.limit .end { color: var(--ink-3); font-size: 0.78rem; font-variant-numeric: tabular-nums; }
+/* Fixed widths keep the slider the same width while its value text changes during a drag. */
+.limit output { width: 72px; flex: none; white-space: nowrap; text-align: right; color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.limit .end.low { text-align: right; }
+.limit .end { min-width: 52px; flex: none; white-space: nowrap; color: var(--ink-3); font-size: 0.78rem; font-variant-numeric: tabular-nums; }
 table { border-collapse: collapse; width: 100%; font-size: 0.86rem; table-layout: fixed; }
 th, td { text-align: left; padding: 5px 0 5px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 th:first-child, td:first-child { padding-left: 0; }
@@ -108,8 +107,7 @@ tr[aria-expanded="true"] .twist svg { transform: rotate(90deg); }
 </head>
 <body>
 <main>
-  <h1 class="page-title">Disks</h1>
-  <div class="status"><span class="dot" id="dot" hidden></span><span id="status">Reading the sizes…</span></div>
+  __PAGE_TITLE__
   <div class="grid" id="drives"></div>
   <div class="grid" id="cards">
     <section class="card" id="slots" hidden></section>
@@ -162,31 +160,87 @@ function topPath(mount, name) {
   return (mount.endsWith("/") ? mount : mount + "/") + name;
 }
 
-// The rows of a folder's children at a limit. Children below the limit join one Other row with the
-// folder's own files, which hold its files and its folders below the measure's limit.
-// One small child shows by its name. Own files below the measure's limit alone get no row.
-function treeRows(node, mount, state, keepBytes, path = "", depth = 0, start = 0, out = []) {
+// The size filter names top folders only. Smaller top folders join one Other row, which opens to list them.
+// One small top folder shows by its name. Below the top, every measured folder shows. A folder's own files hold
+// its files and its folders below the measure's limit; own files below the measure's limit alone get no row.
+function treeRows(node, mount, state, keepBytes) {
+  const out = [];
   const children = [...node.children].sort((a, b) => b.size - a.size);
   let shown = children.filter(child => child.size >= state.limit);
   let rest = children.filter(child => child.size < state.limit);
   if (rest.length === 1) { shown = [...shown, rest[0]]; rest = []; }
-  let at = start;
-  for (const child of shown) {
-    const childPath = depth === 0 ? topPath(mount, child.name) : path + "/" + child.name;
-    const folds = child.children.length > 0;
-    const open = folds && state.opened.has(childPath);
-    out.push({kind: folds ? (open ? "open" : "shut") : "leaf", path: childPath, name: depth === 0 ? childPath : child.name,
-              depth, size: child.size, parentSize: node.size, parentStart: start, start: at});
-    if (open) treeRows(child, mount, state, keepBytes, childPath, depth + 1, at, out);
-    at += child.size;
-  }
+  const at = folderRows(shown, node.size, mount, state, keepBytes, "", 0, 0, out);
   const files = node.other >= keepBytes;
-  if (rest.length || files) {
-    const restSize = rest.reduce((total, child) => total + child.size, 0) + node.other;
-    const name = rest.length ? `Other · ${rest.length} folders${files ? " and files" : ""}` : "Files and small folders";
-    out.push({kind: "other", path: "", name, depth, size: restSize, parentSize: node.size, parentStart: start, start: at});
+  if (!rest.length) {
+    if (files) out.push(filesRow(node.other, 0, node.size, 0, at));
+    return out;
+  }
+  const size = rest.reduce((total, child) => total + child.size, 0) + node.other;
+  const path = otherPath(mount);
+  const open = state.opened.has(path);
+  out.push({kind: open ? "open" : "shut", other: true, path, name: `Other · ${rest.length} folders${files ? " and files" : ""}`,
+            depth: 0, size, parentSize: node.size, parentStart: 0, start: at});
+  if (open) {
+    const end = folderRows(rest, size, mount, state, keepBytes, "", 1, at, out);
+    if (files) out.push(filesRow(node.other, 1, size, at, end));
   }
   return out;
+}
+
+// The Other row's key. A folder path starts with "/", so no folder has this key.
+function otherPath(mount) {
+  return "other:" + mount;
+}
+
+// Rows for the folders of one parent, each at its running offset; an open folder lists all its measured folders.
+// The path is empty for top folders. Returns the offset after the last folder.
+function folderRows(children, parentSize, mount, state, keepBytes, path, depth, start, out) {
+  let at = start;
+  for (const child of children) {
+    const childPath = path ? path + "/" + child.name : topPath(mount, child.name);
+    const folds = child.children.length > 0;
+    const open = folds && state.opened.has(childPath);
+    out.push({kind: folds ? (open ? "open" : "shut") : "leaf", path: childPath, name: path ? child.name : childPath,
+              depth, size: child.size, parentSize, parentStart: start, start: at});
+    if (open) {
+      const inner = [...child.children].sort((a, b) => b.size - a.size);
+      const end = folderRows(inner, child.size, mount, state, keepBytes, childPath, depth + 1, at, out);
+      if (child.other >= keepBytes) out.push(filesRow(child.other, depth + 1, child.size, at, end));
+    }
+    at += child.size;
+  }
+  return at;
+}
+
+function filesRow(size, depth, parentSize, parentStart, start) {
+  return {kind: "files", path: "", name: "Files and small folders", depth, size, parentSize, parentStart, start};
+}
+
+// The keys a drive's rows can have: its Other row and each folder path, made as folderRows makes them.
+// A folder name can hold "/" (a chain the measure joins), so the walk adds whole names.
+function driveKeys(drive) {
+  const keys = new Set([otherPath(drive.mount)]);
+  const walk = (children, path) => {
+    for (const child of children) {
+      const childPath = path ? path + "/" + child.name : topPath(drive.mount, child.name);
+      keys.add(childPath);
+      walk(child.children, childPath);
+    }
+  };
+  walk(drive.tree.children, "");
+  return keys;
+}
+
+// The open-row keys to keep. The drive with the longest mount owns a path; a path whose drive has no tree is kept.
+function knownFolders(drives, paths) {
+  const keys = new Map(drives.filter(drive => drive.tree).map(drive => [drive.mount, driveKeys(drive)]));
+  const owner = path => drives
+    .filter(drive => path === otherPath(drive.mount) || path.startsWith(topPath(drive.mount, "")))
+    .reduce((best, drive) => !best || drive.mount.length > best.mount.length ? drive : best, null);
+  return new Set([...paths].filter(path => {
+    const drive = owner(path);
+    return drive && (!drive.tree || keys.get(drive.mount).has(path));
+  }));
 }
 
 function clock(seconds) {
@@ -211,14 +265,6 @@ function measuredText(measuredAt, now) {
 function minutes(seconds) {
   const count = Math.round(seconds / 60);
   return `${count} minute${count === 1 ? "" : "s"}`;
-}
-
-// The status line: the age of the sizes, then a running measure or when the next measure starts, then a problem.
-function statusText(measuredAt, now, measuring, problem, cacheSeconds) {
-  if (measuredAt == null) return measuring ? "Measuring the drives. The first measure takes some minutes." : problem || "No sizes yet.";
-  const next = measuring ? "Measuring…"
-    : `The page measures again when you open it and the sizes are more than ${minutes(cacheSeconds)} old.`;
-  return [measuredText(measuredAt, now), next, problem].filter(Boolean).join(" ");
 }
 
 function floorNote(drive) {
@@ -291,19 +337,20 @@ const settings = JSON.parse(document.getElementById("disks-settings").textConten
 const DATA_FILE = "disks.json";
 const MEASURE = "measure";
 const states = new Map();
-const openGroups = new Set();
+// Open folders and slot repositories, kept across new data and reloads. Every row starts closed.
+const OPEN_KEY = "disks-open";
+const opened = readOpen();
 const driveViews = new Map();
 let data = null;
 let slotReport = null;
 let sessionReport = null;
 let measuring = null;
-let problem = "";
 
 // A walk bar: the parent's span as a band, and this row's part of it at its running offset, on one scale for the drive.
 function walk(row, scale) {
   const pct = bytes => (100 * bytes / scale).toFixed(3) + "%";
   return `<div class="walk"><div class="span${row.depth ? " inner" : ""}" style="left:${pct(row.parentStart)};width:${pct(row.parentSize)}"></div>`
-    + `<div class="seg${row.kind === "other" ? " other" : ""}" style="left:${pct(row.start)};width:${pct(row.size)}"></div></div>`;
+    + `<div class="seg${row.kind === "files" || row.other ? " other" : ""}" style="left:${pct(row.start)};width:${pct(row.size)}"></div></div>`;
 }
 
 function rowHtml(row, scale) {
@@ -312,17 +359,55 @@ function rowHtml(row, scale) {
   const twist = row.kind === "open" || row.kind === "shut" ? CHEVRON : "";
   const toggle = row.kind === "open" || row.kind === "shut"
     ? ` tabindex="0" aria-expanded="${row.kind === "open"}" data-path="${esc(row.path)}"` : "";
-  const place = row.kind === "other" ? `<td class="dim" ${indent}>` : `<td class="path" ${indent} title="${esc(row.path)}">`;
+  const dim = row.kind === "files" || row.other;
+  const place = dim ? `<td class="dim" ${indent}>` : `<td class="path" ${indent} title="${esc(row.path)}">`;
   return `<tr${toggle}>${place}<span class="twist">${twist}</span>${esc(row.name)}</td>`
-    + `<td class="n${row.kind === "other" ? " dim" : ""}">${size(row.size)}</td><td class="n dim pct">${share(row.size, row.parentSize)}</td>`
+    + `<td class="n${dim ? " dim" : ""}">${size(row.size)}</td><td class="n dim pct">${share(row.size, row.parentSize)}</td>`
     + `<td>${walk(row, scale)}</td></tr>`;
 }
 
 function stateFor(drive, range) {
   if (!states.has(drive.mount)) {
-    states.set(drive.mount, {limit: startLimit(range, settings), opened: new Set()});
+    states.set(drive.mount, {limit: startLimit(range, settings), opened: opened.folders});
   }
   return states.get(drive.mount);
+}
+
+// Browser storage can be missing or blocked; the page then works with closed rows.
+function readOpen() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(OPEN_KEY) || "{}");
+    return {folders: new Set(saved.folders || []), groups: new Set(saved.groups || [])};
+  } catch {
+    return {folders: new Set(), groups: new Set()};
+  }
+}
+
+function saveOpen() {
+  try {
+    localStorage.setItem(OPEN_KEY, JSON.stringify({folders: [...opened.folders], groups: [...opened.groups]}));
+  } catch {
+    // The open rows then last until the page closes.
+  }
+}
+
+// Drop each kept key whose folder or repository is gone, so the store holds only rows the data still has.
+function forgetGone() {
+  const before = opened.folders.size + opened.groups.size;
+  if (data) {
+    const known = knownFolders(data.drives, opened.folders);
+    for (const path of opened.folders) if (!known.has(path)) opened.folders.delete(path);
+  }
+  if (slotReport) {
+    const repositories = new Set(slotReport.groups.map(group => group.repository));
+    for (const repository of opened.groups) if (!repositories.has(repository)) opened.groups.delete(repository);
+  }
+  if (opened.folders.size + opened.groups.size !== before) saveOpen();
+}
+
+function toggleOpen(set, key) {
+  if (!set.delete(key)) set.add(key);
+  saveOpen();
 }
 
 function headHtml(drive) {
@@ -367,8 +452,10 @@ function driveView(card) {
            treeRows(drive.tree, drive.mount, state, data.keep_bytes).map(row => rowHtml(row, drive.tree.size)).join(""));
   };
   const build = () => {
-    card.innerHTML = `<div class="top"></div><label class="limit">Name folders of at least<span class="range">`
-      + `<span class="end low"></span><input type="range" min="0" max="${SLIDER_STEPS}"><span class="end high"></span><output></output></span></label>`
+    // A div, not a label: a label around the slider can take the press that starts a drag.
+    card.innerHTML = `<div class="top"></div><div class="limit">Name top folders of at least<span class="range">`
+      + `<span class="end low"></span><input type="range" min="0" max="${SLIDER_STEPS}" aria-label="Name top folders of at least">`
+      + `<span class="end high"></span><output></output></span></div>`
       + `<table class="tree"><colgroup><col class="place"><col class="size"><col class="pct"><col class="walk"></colgroup>`
       + `<thead><tr><th>Place</th><th class="n">Size</th><th class="n pct">Of parent</th><th aria-label="Place in the drive"></th></tr></thead>`
       + `<tbody></tbody></table>`;
@@ -378,7 +465,7 @@ function driveView(card) {
       fill();
     });
     onToggle(card.querySelector("tbody"), "tr[data-path]", row => {
-      if (!state.opened.delete(row.dataset.path)) state.opened.add(row.dataset.path);
+      toggleOpen(state.opened, row.dataset.path);
       fill();
     });
   };
@@ -396,26 +483,20 @@ function driveView(card) {
     card.querySelector(".end.low").textContent = size(range.min);
     card.querySelector(".end.high").textContent = size(range.max);
     slider.disabled = range.max <= range.min;
-    slider.value = String(toSlider(state.limit, range));
+    const position = String(toSlider(state.limit, range));
+    if (slider.value !== position) slider.value = position;
     fill();
   };
-}
-
-function renderStatus() {
-  const now = Date.now() / 1000, dot = document.getElementById("dot");
-  dot.hidden = !data;
-  if (data) dot.classList.toggle("old", now - data.measured_at > settings.cache_seconds);
-  document.getElementById("status").textContent =
-    statusText(data ? data.measured_at : null, now, Boolean(measuring), problem, settings.cache_seconds);
 }
 
 function renderSlots() {
   const card = document.getElementById("slots");
   card.hidden = !slotReport;
-  if (slotReport) refill(card, "data-group", slotsHtml(slotReport, data ? data.keep_bytes : 0, Date.now() / 1000, openGroups));
+  if (slotReport) refill(card, "data-group", slotsHtml(slotReport, data ? data.keep_bytes : 0, Date.now() / 1000, opened.groups));
 }
 
 function renderCards() {
+  forgetGone();
   renderSlots();
   const card = document.getElementById("sessions");
   card.hidden = !sessionReport;
@@ -436,84 +517,52 @@ function render() {
   }
   for (const drive of data.drives) driveViews.get(drive.mount)(drive);
   renderCards();
-  renderStatus();
 }
 
 async function readData() {
   const response = await fetch(DATA_FILE + "?" + Date.now(), {cache: "no-store"});
-  if (response.status === 404) return null;
-  if (!response.ok) throw new Error(`the server answered ${response.status}`);
+  if (response.status === 404 && !data) return null;
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
 }
 
 function show(next) {
   data = next;
-  if (data) render(); else { renderCards(); renderStatus(); }
+  if (data) render(); else { renderCards(); }
 }
 
 // Ask the server for a measure and the slots and sessions in use now. The server starts a measure only when the sizes
 // are old. The page keeps the old sizes and reads the data file again until it changes.
-async function askMeasure() {
-  try {
-    const response = await fetch(MEASURE, {method: "POST", body: "",
-                                           headers: {"Content-Type": "application/x-www-form-urlencoded"}});
-    const answer = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(answer.reason || `the server answered ${response.status}`);
-    slotReport = answer.slots || null;
-    sessionReport = answer.sessions || null;
-    if (answer.state === "current") {
-      // The page's sizes are old only when another measure finished since the page read them.
-      show(!data || Date.now() / 1000 - data.measured_at >= settings.cache_seconds ? await readData() : data);
-      return;
-    }
-    renderCards();
-    measuring = {since: Date.now() / 1000, before: data ? data.measured_at : null};
-    setTimeout(poll, settings.poll_seconds * 1000);
-  } catch (error) {
-    problem = `The page could not start a measure: ${error.message}.`;
-  }
-  renderStatus();
+async function askMeasure(current) {
+  const response=await fetch(MEASURE,{method:"POST",body:"",
+    headers:{"Content-Type":"application/x-www-form-urlencoded"}});
+  const answer=await response.json();
+  if(!current()) return;
+  if(!response.ok) throw new Error(answer.reason || `HTTP ${response.status}`);
+  slotReport=answer.slots || null;sessionReport=answer.sessions || null;renderCards();
+  if(answer.state!=="current" && !measuring)
+    measuring={since:Date.now()/1000,before:data ? data.measured_at : null};
 }
-
-async function poll() {
-  try {
-    const next = await readData();
-    if (next && next.measured_at !== measuring.before) {
-      // A new measure gives new slot and session sizes, so the page asks once more; the server answers "current".
-      measuring = null;
-      show(next);
-      await askMeasure();
-      return;
-    }
-  } catch (error) {
-    // A failed read leaves the measure running; the next read tries again.
-  }
-  if (Date.now() / 1000 - measuring.since > settings.wait_seconds) {
-    measuring = null;
-    problem = "The measure did not finish.";
-    renderStatus();
-    return;
-  }
-  setTimeout(poll, settings.poll_seconds * 1000);
+async function loadDisks(supersede=false,current=()=>true){
+ const next=await readData();
+ if(!current()) return;
+ if(next && (!data || next.measured_at!==data.measured_at)){measuring=null;show(next);}
+ let failure='';
+ try{if(!measuring) await askMeasure(current);}
+ catch(error){if(!data) throw error;failure=error.message;}
+ if(!current()) return;
+ if(measuring && Date.now()/1000-measuring.since>settings.wait_seconds){
+  measuring=null;throw new Error("The measure did not finish.");
+ }
+ if(data) return {readAt:data.measured_at,renderSeconds:data.render_seconds,failure};
 }
-
-async function start() {
-  try {
-    data = await readData();
-  } catch (error) {
-    document.getElementById("status").textContent = `No sizes: ${error.message}.`;
-    return;
-  }
-  show(data);
-  await askMeasure();
-}
-
 onToggle(document.getElementById("slots"), "tr[data-group]", row => {
-  if (!openGroups.delete(row.dataset.group)) openGroups.add(row.dataset.group);
+  toggleOpen(opened.groups, row.dataset.group);
   renderSlots();
 });
-start();
-setInterval(renderStatus, 30000);
+__PAGE_REFRESH_SCRIPT__
+const pageRefresh=createPageRefresh(loadDisks,()=>settings.poll_seconds);
+void pageRefresh.refresh();
 </script>
 </body>
 </html>

@@ -28,6 +28,7 @@ from collections.abc import Callable, Generator
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
+from scripts.review_links.test_page_frame import assert_status_states
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, urgency
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
@@ -601,10 +602,10 @@ class ChangePageTests(unittest.TestCase):
         changes = self.request("/console/changes.html", {})
         self.assertEqual(changes.status, 200)
         self.assertIn("if(parent!==window) parent.postMessage('console-place',location.origin);", changes.body)
-        self.assertIn("const paused=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;", changes.body)
+        self.assertIn("const hidden=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;", changes.body)
         self.assertIn("event.data==='console-shown')", changes.body)
-        self.assertIn("restart();refresh(true);", changes.body)
-        self.assertIn("createPageRefresh(refreshPage,()=>content.dataset.refreshSeconds)", changes.body)
+        self.assertIn("restart();void refresh(true);", changes.body)
+        self.assertIn("createPageRefresh(refreshPage,()=>content.dataset.refreshSeconds,()=>", changes.body)
         self.assertEqual(self.request("/console/rebuilds.html", {}).status, 200)
         self.assertEqual(change_page.page_url(), "/console/changes.html")
         self.assertEqual(manifest.read_bytes(), token)
@@ -1657,11 +1658,15 @@ class ChangePageTests(unittest.TestCase):
                 self.assertIn(footer, section)
                 self.assertLess(section.index('No showrunner owns this question.'), section.index(footer))
 
-    def test_all_lists_load_once_and_the_browser_contains_the_whole_waiting_queue(self) -> None:
+    def file_other_change(self) -> Path:
         other = self.temporary / "change-review - another.md"
         owner = fixture_member("showrunner", name="another", doc=staff.LiveDoc(local_machine(), self.production))
         _ = change_review.append_rows(other, [change_review.Visible("Other change", "Read the proof", "It agrees")],
                                       date(2026, 11, 2), "", self.production, producers=[owner.id], record=staff.snapshot())
+        return other
+
+    def test_all_lists_load_once_and_the_browser_contains_the_whole_waiting_queue(self) -> None:
+        other = self.file_other_change()
         path = change_page.page_url()
         with patch.object(change_review, "read", wraps=change_review.read) as reads:
             reply = self.request(path, {})
@@ -1815,6 +1820,20 @@ class ChangePageTests(unittest.TestCase):
                               + '<dd>Older</dd></dl></div><div data-owner><h3>Unknown session</h3>', grouped)
                 self.assertIn('<p>The change list is not available yet.</p>', change_browser.rebuild_list(
                     rebuild_row.RebuildAnswer(("mac",), False, compared=("mac",)), {}, staff.snapshot()))
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_page_status_uses_the_real_changes_loader(self) -> None:
+        _ = self.file_other_change()
+        _ = self.file_user_question()
+        _, _, body = self.browser()
+        assert_status_states(self, body, 15)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_page_status_uses_the_real_questions_loader(self) -> None:
+        _ = self.file_other_change()
+        _ = self.file_user_question()
+        _, _, body = self.browser("questions")
+        assert_status_states(self, body, 15)
 
     def test_user_question_answers_follow_each_typed_relay(self) -> None:
         destination = fixture_member("showrunner", name="destination")
@@ -3075,8 +3094,8 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("go(following?.dataset.key || '')", body)
         self.assertNotIn("rows.push(row)", body)
         with self.subTest(refresh="visibility, held content, and position"):
-            for rule in ("document.visibilityState!=='visible'", "setInterval(()=>refresh(),Number(seconds())*1000)",
-                         "createPageRefresh(refreshPage,()=>content.dataset.refreshSeconds)", "pageRefresh.restart()",
+            for rule in ("document.visibilityState!=='visible'", "void refresh();",
+                         "createPageRefresh(refreshPage,()=>content.dataset.refreshSeconds,()=>", "pageRefresh.restart()",
                          "document.addEventListener('visibilitychange'", "fetch(location.href,{cache:'no-store'})",
                          "new DOMParser()", "content.replaceWith(fresh)", "fresh.outerHTML===shownPage",
                          "if(!heldPage || activeSaves", "field.value!==''", "document.addEventListener('input'",
@@ -3088,14 +3107,15 @@ class ChangePageTests(unittest.TestCase):
             self.assertIn('if(fresh.dataset.script!==content.dataset.script){location.reload();return;}', body)
         with self.subTest(refresh="one automatic load and a replacement load after saving"):
             self.assertIn("activeLoads && !supersede", body)
-            self.assertIn("activeLoads++", body)
-            self.assertIn("finally{activeLoads--;}", body)
+            self.assertIn("activeLoads=true", body)
+            self.assertIn("finally{if(request===newestRequest) activeLoads=false;}", body)
             self.assertIn("heldPage=null;newestRequest++;pageRefresh.refresh(true)", body)
-            self.assertIn("if(request!==newestRequest || !fresh) return", body)
+            self.assertIn("if(request!==newestRequest || !current()) return", body)
+            self.assertIn("if(!fresh) throw new Error('The page has no review list.')", body)
         with self.subTest(refresh="a visible tab replaces an active load"):
-            self.assertIn("async function refreshPage(supersede=false)", body)
-            self.assertIn("document.addEventListener('visibilitychange',()=>{restart();refresh(true);})", body)
-            self.assertIn("if(!paused()) return load(supersede)", body)
+            self.assertIn("async function refreshPage(supersede=false,current=()=>true)", body)
+            self.assertIn("document.addEventListener('visibilitychange',()=>{restart();void refresh(true);})", body)
+            self.assertIn("if(hidden()){draw();return;}", body)
         with self.subTest(navigation="one kind and a showrunner menu"):
             self.assertNotIn('role="tablist"', body)
             self.assertIn('data-kind="changes"', body)
@@ -3117,7 +3137,7 @@ class ChangePageTests(unittest.TestCase):
         with self.subTest(navigation="Skip joins the action row"):
             self.assertIn("target?.querySelector('form:not([hidden]) .answer-actions')", body)
             self.assertIn('.navigation:empty{display:none}', body)
-            self.assertNotIn('position:sticky', body)
+            self.assertNotIn('position:sticky', change_browser.PAGE_STYLE)
         with self.subTest(card="title and metadata"):
             card = body.split('<section hidden data-type="changes"', 1)[1].split('</section>', 1)[0]
             proof, metadata = card.split('<dl class="change-details">', 1)

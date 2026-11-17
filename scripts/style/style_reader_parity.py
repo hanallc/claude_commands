@@ -21,6 +21,7 @@ from scripts.style.ledger_test_support import LedgerTestCase, PARENT_FILE
 from scripts.style.refill_findings import encode_proof
 from scripts.style.refill_inputs import input_identity
 
+CONFIGURED_READER = style_config.refill_reader
 
 @dataclass(frozen=True)
 class SearchAnswer:
@@ -71,6 +72,10 @@ def refill_readings(settings: Path) -> dict[str, str]:
     fixture = LedgerTestCase(methodName="runTest")
     try:
         fixture.setUp()
+        # The fixture pins tests to Python; this comparison selects each reader through the settings file.
+        _ = cast(object, fixture.enterContext(mock.patch.object(style_config, "refill_reader", CONFIGURED_READER)))
+        _ = cast(object, fixture.enterContext(mock.patch.dict(os.environ)))
+        _ = os.environ.pop("STYLE_TEST_READER_SOURCE", None)
         _ = settings.write_text("reader=python\n")
         ledger, rule, finding = fixture.site_fixture(
             source="//! Work.\r\nfn work() {\r\n    let old = 791;\r\n    work();\r\n}\r\n", line=3, keep_ticket_open=True)
