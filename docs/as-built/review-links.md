@@ -335,6 +335,7 @@ Proposals show `<owner>/P<n>` and efficiencies show `<owner>/E<n>`, where the ow
 The table columns are Id, Type, Owner, Item, State and Age.
 One row can open its card in place.
 `record_table.py` supplies the table styles, filters, sorting and open-row controls for Review and The List.
+The shared `record-id` class keeps each ID and its expand arrow on one line.
 Each row becomes a card at phone width.
 Type chips and the Owner menu show counts.
 Show offers Open, For you, Waiting, Done and All.
@@ -502,6 +503,14 @@ An item without links shows no review line.
 The open row repeats the line above its actions and shows each review's shown ID.
 Only types in `review_page.TYPES` link to Review cards.
 Other types and missing reviews show plain text.
+Review links use the console place query, so the navigator remains visible.
+A card link selects and opens that exact card, including Done and parked reviews.
+A summary link selects the linked review keys through the All view.
+An explicit item target joins the linked selection and opens its card.
+The shared table names each linked key that the page cannot find.
+It keeps the found cards when another linked key is missing.
+Linked counts use only the selected cards, including selected parked cards.
+The List number column and the Review ID column use the shared no-wrap rule.
 
 The Owner menu includes record owners without a current staff row.
 The Producer menu beside it lists each producer that a record names.
