@@ -682,8 +682,14 @@ The supervisor uses default TERM, INT, and HUP dispositions.
 It installs no signal handler.
 `detached_runs.py stop` checks the supervisor and command identity, then signals the command group.
 The supervisor stays alive, records the exit status and delivers the result.
+The command gate starts a watcher in the command group. The watcher reads the supervisor pipe.
+The supervisor writes "done" to the pipe after the command ends.
+If the pipe closes without "done", the supervisor ended first: a signal, a SIGKILL or a crash.
+The watcher then runs `detached_runs.py supervisor-gone`. It leaves the command group and saves a stop reason.
+It sends TERM to the command group, waits for the command leader and reaps the record.
+So a supervisor end never leaves the command running, and the worker gets a STOPPED result.
 If the supervisor dies, the next start, worker restore, or explicit `detached_runs.py reap` finishes its record and delivers its result.
-The result reports no exit status unless the supervisor saved the command's status before it died.
+The result reports no exit status unless the command or the supervisor saved one. `verify.sh` saves its own status at exit.
 The record, the log and the exit code stay in the run folder's `detached_runs` directory.
 After the command ends, the supervisor starts a new Python process to deliver the result from the current code tree.
 The supervisor waits for delivery before it marks the run finished.
