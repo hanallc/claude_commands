@@ -61,11 +61,17 @@ class DevShellTests(unittest.TestCase):
         call = (self.root / "calls").read_text()
         self.assertTrue(call.startswith("print-dev-env path:") and call.endswith("#default\n"), call)
 
-    def test_failed_evaluation_names_nix_error(self) -> None:
+    def test_failed_evaluation_names_its_cause_in_one_line(self) -> None:
         result = self.program_path(NIX_FAILS="1")
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stdout, "")
-        self.assertIn("nix print-dev-env failed: error: flake has no devShells.default", result.stderr)
+        self.assertEqual((result.returncode, result.stdout), (1, ""))
+        self.assertEqual(result.stderr, f"dev_shell: {self.root / 'workspace'}: nix print-dev-env failed: "
+                         + "error: flake has no devShells.default\n")
+        # A flake outside the input contract fails before nix runs.
+        (self.root / "workspace/flake.lock").unlink()
+        result = self.program_path()
+        self.assertEqual((result.returncode, result.stdout), (1, ""))
+        self.assertEqual(result.stderr.count("\n"), 1, result.stderr)
+        self.assertIn("missing shell input", result.stderr)
 
     def test_exports_without_a_path_give_no_folders(self) -> None:
         exports = self.root / "exports.sh"
@@ -88,8 +94,7 @@ class DevShellTests(unittest.TestCase):
         rows: tuple[tuple[dict[str, str], str, str], ...] = (
             ({}, f"0 /host/bin:{library}:/nix/store/x-tools/bin\n", ""),
             ({"IN_NIX_SHELL": "impure"}, f"0 /host/bin:{library}\n", ""),
-            ({"HELPER_FAILS": "1"}, f"1 /host/bin:{library}\n",
-             "lint: the flake development shell did not load; the tests did not run\n"),
+            ({"HELPER_FAILS": "1"}, f"1 /host/bin:{library}\n", ""),
         )
         for extra, stdout, stderr in rows:
             with self.subTest(extra=extra):

@@ -704,10 +704,9 @@ lint_dev_shell_path() {
     local root=${LINT_WORKSPACE_MANIFEST:-$PWD/Cargo.toml} folders
     root=${root%/*}
     [[ -z "${IN_NIX_SHELL:-}" && -f "$root/flake.nix" ]] || return 0
-    folders=$("${BUILD_FOLDERS_SCRIPT%/*}/py" "${BUILD_FOLDERS_SCRIPT%/*}/dev_shell.py" path --root "$root") || {
-        printf '%s\n' 'lint: the flake development shell did not load; the tests did not run' >&2
+    # On a failure the helper prints the one line that names the cause.
+    folders=$("${BUILD_FOLDERS_SCRIPT%/*}/py" "${BUILD_FOLDERS_SCRIPT%/*}/dev_shell.py" path --root "$root") ||
         return 1
-    }
     [[ -z "$folders" ]] || PATH="$PATH:$folders"
 }
 

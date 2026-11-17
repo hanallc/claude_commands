@@ -74,8 +74,9 @@ A test can need a program that the workspace's flake development shell declares,
 
 1. `run_step_attempt` makes `PATH` local, and for a `cargo nextest run` step it calls `lint_dev_shell_path` before admission.
 2. When `IN_NIX_SHELL` is not set and the workspace root has `flake.nix`, `dev_shell.py path --root R` prints the shell's `/nix/store` program folders. The step adds them to the END of `PATH`. Every tool the host has stays first: the Mac cargo gate, rustup's cargo and the system compiler. No other variable changes, so the step builds as before.
-3. The evaluation (`nix print-dev-env path:<inputs>#<selector>`) is cached per flake input change under `config/dev_shell.conf` `cache`. A failed evaluation fails the step with `lint: the flake development shell did not load; the tests did not run`, after nix's last error line.
-4. A workspace without `flake.nix`, or a step inside a nix shell, starts no process. The next step starts from the caller's `PATH`.
+3. The evaluation (`nix print-dev-env path:<inputs>#<selector>`) is cached per flake input change under `config/dev_shell.conf` `cache`. The inputs are `flake.nix`, `flake.lock` and the `nix/` folder, the same contract as the Linux SSH runner. A flake that reads another file, or has no `flake.lock`, fails the evaluation.
+4. A failed evaluation fails the step with one line from `dev_shell.py`: `dev_shell: <root>: nix print-dev-env failed: <nix's last error line>`, or the input problem. The tests do not run.
+5. A workspace without `flake.nix`, or a step inside a nix shell, starts no process. The next step starts from the caller's `PATH`.
 
 A program that the shell has and the host lacks is visible to build scripts too. Adding the folders last limits this to tools that the host does not have.
 
