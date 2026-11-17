@@ -147,14 +147,19 @@ class MemoryHoverTests(unittest.TestCase):
         inputs = memory_tests.ProgressKeepAsideTests.inputs((row,), (adjusted,))
         stage = memory_feed.row_progress(inputs.running, progress.TOKEN_WAIT_REASON)
         self.assertEqual(stage, {"kind": "TokenWaitProgress", "stage": "waiting for jobserver tokens", "tokens": 4})
-        data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "waiters": [],
-                "walk": [{"name": "hana nextest", "queued": True, "progress": stage}]}
+        running: dict[str, object] = {"name": "hana nextest", "queued": True, "progress": stage}
+        data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "waiters": [], "walk": [running]}
         rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
         root = ElementTree.fromstring(f"<root>{rendered}</root>")
         cells = root.find(".//tr[@data-tip='row:fixture-run-0']")
         assert cells is not None
-        self.assertEqual(cells[0].text, "waiting for jobserver tokens")
+        # The Stage column shows a short word; the tooltip gives the full reason.
+        self.assertEqual(cells[0].text, "waiting")
         self.assertEqual(cells[1].text, "—")
+        running.update(used=1, reserved=0, counted=1)
+        grid = ElementTree.fromstring(cast(str, self.page_expression("tooltipHtml('row:fixture-run-0', data)", data, walk=True)))
+        fields = [(cell.text, grid[index+1].text) for index, cell in enumerate(grid) if cell.tag == "dt"]
+        self.assertIn(("Stage", "Waiting for jobserver tokens"), fields)
 
     def test_the_running_table_shows_tokens_and_the_header_shows_the_pool(self) -> None:
         data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "waiters": [],

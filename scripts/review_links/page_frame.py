@@ -154,11 +154,12 @@ def code_block_html(block: re.Match[str]) -> str:
 
 
 # The title, status and content share one centered column and page background.
+# A text page keeps a 1124 px column; a page whose main has the page-wide class uses the pane width.
 # A page that measures its layout uses the desktop gutter.
 STYLE = (':root{scrollbar-gutter:stable}'
          + 'body{background:var(--bg,Canvas);color:var(--ink,CanvasText)}'
          + 'main{box-sizing:border-box;margin:0 auto;padding:32px 32px 64px}'
-         + 'main:has(>.page-status){max-width:1124px}'
+         + 'main:has(>.page-status):not(.page-wide){max-width:1124px}'
          + '.page-title{font:700 26px/1.25 system-ui,sans-serif;letter-spacing:normal;margin:0 0 8px;color:var(--ink,CanvasText)}'
          + '@media (max-width:560px){:root:not(.layout-measuring) main{padding:24px 16px 48px}}'
          + r'''
