@@ -4767,19 +4767,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 ### Phase 341 — two tests set their own environment  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts.copies.test_live_roots_guard` and `scripts.statusline.test_statusline` pass in any caller environment, a Codex worker included.
-
-**Spec:**
-1. `test_live_roots_guard` sets its own TMPDIR. A caller TMPDIR under /session/verify/test-runs must not make the copy guard see a live root.
-2. `test_statusline` sets its own color environment. COLORTERM=truecolor does not cause the failure. First find, in a Codex worker run, the variable that gives RGB colors. Then the test sets that variable itself, so the 9 color assertions pass.
-3. Every behavior check stays.
-
-**Files:** `scripts/copies/test_live_roots_guard.py`, `scripts/statusline/test_statusline.py`.
-
-**Workers:** 1 writer. Two small test files; one pass.
-- `impl`: both files.
-- `test`: opens as impl.
-
-**Acceptance gate:** both modules pass in a Codex worker run, with TMPDIR under /session/verify/test-runs, and in a plain run.
+- Cause: the 9 statusline failures were not a terminal variable. /tune moved role colors to hex, and the tests expected the shipped escapes. The copy test inherited the caller's TMPDIR and SESSION_TEMP_ROOT and put its fixture inside a live root.
+- `test_live_roots_guard` computes the caller's live roots first, creates its fixture in the first writable folder outside all of them, clears every `GIT_*` variable before setup, and sets a fixture Git timeout. The guard rejects any program whose arguments name a path under a live root.
+- `test_statusline` (branch only) runs the renderer from a runtime copy with a fixture `statusline.conf`: colors, thresholds, routing paths and time zone. builds-report fixed the same color failures on main first (8e952ffbb); the next main merge takes main's file.
+- Both modules pass plain and with a Codex TMPDIR, SESSION_TEMP_ROOT=/tmp, SESSION_TEMP_ROOT=/var/tmp and a caller GIT_DIR.
+- Main-based commit 04c45e3cc (branch `natest-envtests341`, copy test only) went to builds.
