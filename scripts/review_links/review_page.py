@@ -8,6 +8,7 @@ import secrets
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 from urllib.parse import parse_qs, parse_qsl, urlencode
 
 from scripts.lib import conf
@@ -16,6 +17,7 @@ from scripts.production import change_review, proposal_issue, staff
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_link
 from scripts.review_links import review_legacy
 from scripts.review_links import review_actions
+from scripts.review_links import staff_names
 from scripts.review_links.review_items import ReviewItem, ReviewState, ReviewType
 
 PAGE_PATH = '/console/review.html'
@@ -90,7 +92,9 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int) 
             + '<div class="review-actions">'+groups+'</div><span role="status" data-send-status></span></form>')
 
 
-def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, words_rows: int) -> str:
+def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, words_rows: int,
+            names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
+    names = staff_names.for_page(names, members)
     source = item.source
     if isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
         question = source.record.item
@@ -127,13 +131,13 @@ def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff
     fallback = '<section data-title-fallback hidden><h3>Item</h3><p>'+html.escape(item.title)+'</p></section>'
     logs = ''.join('<li><time datetime="'+entry.time.isoformat()+'">'
         +entry.time.astimezone(user_zone()).strftime('%b %d %H:%M')+'</time><span>'+html.escape(entry.words)
-        +' <small>— '+html.escape(entry.who)+'</small></span></li>' for entry in reversed(item.log))
+        +' <small>— '+names.html(entry.who)+'</small></span></li>' for entry in reversed(item.log))
     owner = owner_name(item, members)
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+'<div data-review-body>'+body
             +'</div></div><section><h3>Log · newest first</h3>'
             +'<ol class="list-log">'+logs+'</ol></section>'+form(item, browser, words_rows)
-            +'<p class="review-source">Owner: '+html.escape(owner)+' · Source: '
-            +html.escape(review_items.name(item.source_unit, members))+'</p></div>')
+            +'<p class="review-source">Owner: '+names.html(item.owner, owner)+' · Source: '
+            +names.html(item.source_unit, review_items.name(item.source_unit, members))+'</p></div>')
 
 
 def owner_name(item: ReviewItem, members: staff.StaffSnapshot) -> str:
@@ -146,7 +150,9 @@ def age(filed: datetime, now: datetime) -> str:
 
 
 def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, now: datetime, index: int,
-              title_limit: int, words_rows: int) -> str:
+              title_limit: int, words_rows: int,
+              names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
+    names = staff_names.for_page(names, members)
     owner = owner_name(item, members)
     source = review_items.name(item.source_unit, members)
     title = ('<strong class="review-title" title="'+html.escape(item.title, quote=True)+'">'
@@ -164,18 +170,19 @@ def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: sta
     toggle = (f'<button type="button" class="list-toggle" aria-expanded="false" aria-controls="{panel}">'
               +'<span class="list-chevron" aria-hidden="true">›</span>'+html.escape(item.id)+'</button>')
     state = '<span class="list-state '+('warning' if item.state == ReviewState.FOR_YOU else 'muted')+'">'+item.state+'</span>'
-    cells = (toggle, icon(item.type)+item.type.title(), html.escape(owner)+('<small>· '+html.escape(source)+'</small>' if source != owner else ''),
+    cells = (toggle, icon(item.type)+item.type.title(), names.html(item.owner, owner)+('<small>· '+names.html(item.source_unit, source)+'</small>' if source != owner else ''),
              title, state, age(item.times.filed, now))
     row = ''.join(f'<td data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden = ' hidden' if item.state == ReviewState.DONE or item.hidden_until(now) else ''
     return ('<tbody data-list-item'+attributes+hidden+'><tr class="list-row">'+row+'</tr>'
-            +f'<tr data-detail id="{panel}" hidden><td colspan="6">'+details(item, browser, members, words_rows)+'</td></tr></tbody>')
+            +f'<tr data-detail id="{panel}" hidden><td colspan="6">'+details(item, browser, members, words_rows, names)+'</td></tr></tbody>')
 
 
 def render(root: Path, *, show: str = 'open') -> bytes:
     started, read_at = time.perf_counter(), time.time()
     title_limit = conf.read_or_repository('production').whole('question_title_max_chars')
     members = staff.snapshot()
+    names = staff_names.StaffNames(members)
     now = datetime.fromtimestamp(read_at, user_zone())
     if show not in dict(SHOWS):
         show = 'open'
@@ -192,7 +199,7 @@ def render(root: Path, *, show: str = 'open') -> bytes:
     settings = conf.read('review_links')
     words_rows = settings.whole('review_words_rows')
     visible = items
-    options = ''.join(f'<option value="{html.escape(owner, quote=True)}" data-owner-name="{html.escape(name, quote=True)}">{html.escape(name)} '
+    options = ''.join(f'<option value="{html.escape(owner, quote=True)}" data-owner-name="{html.escape(name, quote=True)}"{names.style(owner)}>{html.escape(name)} '
                      +f'({sum(item.owner == owner or item.type == ReviewType.INVESTIGATION and item.source_unit == owner for item in visible)})</option>'
                      for owner, name in sorted(owners.items(), key=lambda pair:pair[1].casefold()))
     chips = '<button type="button" data-type-chip="" aria-pressed="true">All <b>'+str(len(visible))+'</b></button>'
@@ -210,7 +217,7 @@ def render(root: Path, *, show: str = 'open') -> bytes:
         +'<span data-list-count role="status"></span></div><div class="list-table"><table aria-label="Review">'
         +'<colgroup><col style="width:13%"><col style="width:13%"><col style="width:14%"><col style="width:41%">'
         +'<col style="width:12%"><col style="width:7%"></colgroup><thead><tr>'+headers+'</tr></thead>'
-        +''.join(item_rows(item,browser,members,now,index,title_limit,words_rows) for index,item in enumerate(items))
+        +''.join(item_rows(item,browser,members,now,index,title_limit,words_rows,names) for index,item in enumerate(items))
         +'</table><p data-empty hidden>No items in this view.</p></div></div><script>'+SCRIPT+'</script>')
     return page_frame.rendered(change_page.document(content, 'Review'), started, read_at)
 
@@ -242,12 +249,23 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus) -> tuple[c
             return change_page.NoMessageDelivery(),review_actions.later(item,fields.get('later',[''])[0],words)
         if outcome not in item.actions:
             raise change_page.AnswerRefused('choose an action on this card')
-        if item.type == ReviewType.INVESTIGATION:
-            return review_actions.investigation_action(item,outcome,words,status)
-        return review_actions.decision_action(item,outcome,words,status)
+        delivery, answer = (review_actions.investigation_action(item,outcome,words,status)
+                            if item.type == ReviewType.INVESTIGATION else
+                            review_actions.decision_action(item,outcome,words,status))
+        if outcome == 'question' and isinstance(delivery, change_page.MessageDelivery):
+            delivery = review_actions.track_question(delivery, key, words, status)
+        return delivery, answer
     _ = fields.pop('later',None)
-    delivery, answer = change_browser.submit(browser, urlencode({key:values[0] for key,values in fields.items()}), status,
-                                               feedback_closes=True)
+    item = next((item for item in review_items.read(root, kinds=(ReviewType.QUESTION,)) if item.key == key), None) if key.startswith('question/') else None
+    if item is not None and item.state == ReviewState.WAITING:
+        if outcome not in item.actions:
+            raise change_page.AnswerRefused('choose an action on this card')
+        delivery, answer = review_actions.question_action(item, cast(change_page.QuestionOutcome, outcome), words, status)
+    else:
+        delivery, answer = change_browser.submit(browser, urlencode({key:values[0] for key,values in fields.items()}), status,
+                                                   feedback_closes=True)
+    if key.startswith('question/') and outcome == 'question' and isinstance(delivery, change_page.MessageDelivery):
+        delivery = review_actions.track_question(delivery, key, words, status)
     words = ('feedback sent' if outcome == 'feedback' else outcome)+(': '+fields['feedback'][0] if fields['feedback'][0] else '')
     if isinstance(delivery, change_page.MessageDelivery):
         if not isinstance(delivery.page, change_page.UserQuestionPage):

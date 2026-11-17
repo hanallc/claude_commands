@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.checkpoint_gate import report
 
-from scripts.production import showrunners, session_staff, showrunner_tree, staff, unit_lookup
+from scripts.production import change_routing, delivery_state, showrunners, session_staff, showrunner_tree, staff, unit_lookup
 from scripts.production.proposals_folder import issues_folder
 from scripts.production.store_owner import showrunner_id
 from scripts.production.record_store import state_root
@@ -49,6 +49,27 @@ from scripts.agents.remote import local_machine
 
 class InputError(Exception):
     pass
+
+
+class StaleQuestionExchange(ValueError):
+    """The answer does not belong to the current question exchange."""
+
+
+def require_exchange_id(current_id: str | delivery_state.NoQuestion | delivery_state.NoDelivery, reply_id: str) -> None:
+    """Require the current exchange ID before a native answer saves."""
+    if not isinstance(current_id, str):
+        raise StaleQuestionExchange('this row has no open question')
+    if current_id != reply_id:
+        raise StaleQuestionExchange('this question id does not match the current question')
+
+
+def question_exchange_for_reply(question: delivery_state.NoQuestion | delivery_state.OpenQuestion | delivery_state.AnsweredQuestion,
+                                question_id: str, text: str) -> delivery_state.OpenQuestion | delivery_state.AnsweredQuestion:
+    """Apply the existing exchange identity rule without changing a record."""
+    require_exchange_id(question if isinstance(question, delivery_state.NoQuestion) else question.question_id, question_id)
+    if isinstance(question, delivery_state.AnsweredQuestion) and question.answer != text:
+        raise StaleQuestionExchange('this row has no open question')
+    return cast(delivery_state.OpenQuestion | delivery_state.AnsweredQuestion, question)
 
 
 STARTED = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
@@ -252,7 +273,7 @@ def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
             raise InputError(f"{where}: expected an object")
         fields = cast(dict[str, object], entry)
         check_keys(fields, {"since", "text", "after", "question", "parts", "reviewed", "review_unavailable", "urgency",
-                            "due", "marked", "follows", "asked_by", "followup", "followups", "review_id", "review_log"}, where)
+                            "due", "marked", "follows", "asked_by", "followup", "followups", "review_id", "review_log", "waiting_why"}, where)
         if "parts" in fields:
             _ = read_parts(fields["parts"], where)
         rank = read_ranking(fields, where)
@@ -336,6 +357,7 @@ class FollowupExchange(TypedDict):
 
 
 class OutstandingItem(TypedDict):
+    waiting_why: NotRequired[str]
     review_id: NotRequired[str]
     review_log: NotRequired[str]
     since: str
@@ -1120,6 +1142,9 @@ def write_question_record(record: QuestionRecord) -> None:
             checked = check_question_title(title)
             if isinstance(checked, RefusedQuestionTitle):
                 raise RegistrationFailure("questions", f"{field}: {checked.reason}")
+    if "waiting_why" not in item:
+        if stored and stored[0].item.get("waiting_why"):
+            item["waiting_why"] = stored[0].item.get("waiting_why", "")
     if "review_id" not in item:
         if stored and stored[0].item.get("review_id"):
             item["review_id"] = stored[0].item.get("review_id", "")
@@ -1641,19 +1666,36 @@ def change_open_question(production: QuestionScope, name: str, text: str, identi
 
 
 def followup(production: QuestionScope, text: str, words: str, *, identities: QuestionStaff | None = None) -> AnswerRelay:
-    """Send the asker a follow-up: the question leaves the due list until the asker replies."""
+    """Send the asker a follow-up: the question leaves the due list until the asker replies.
+
+    The follow-up words are the item's why this is waiting text.
+    """
+    from scripts.review_links.review_events import require_waiting_why
     identities = identities if identities is not None else QuestionStaff.read()
     if not words.strip():
         raise RegistrationFailure("followup", "the follow-up is empty")
+    reason = require_waiting_why(words)
     sent = datetime.now(production.zone).strftime("%Y-%m-%dT%H:%M")
 
     def add(entry: OutstandingItem) -> None:
         if "followup" in entry:
             raise RegistrationFailure("followup", f"{text}: a follow-up already waits for the asker's reply")
         entry["followup"] = PendingFollowup(text=words.strip(), sent=sent)
+        entry["waiting_why"] = reason
 
     changed = change_open_question(production, production.name, text, identities, "followup", add)
     return answer_relay(production, production.name, question_asker(changed, OpenItemWithoutAsker(), identities), identities)
+
+
+def set_waiting_why(record: QuestionRecord, text: str) -> None:
+    from scripts.review_links.review_events import require_waiting_why
+    reason = require_waiting_why(text)
+    with outstanding_lock(state_root() / "outstanding" / (record.owner + ".json")):
+        current = _question_records([Issue(record.path, frontmatter(record.path))])[0]
+        if current.status != "open" or "followup" not in current.item:
+            raise RegistrationFailure("waiting-why", "The item is not Waiting.")
+        current.item["waiting_why"] = reason
+        write_question_record(current)
 
 
 def answer_followup(entry: OutstandingItem, text: str) -> None:
@@ -1664,7 +1706,7 @@ def answer_followup(entry: OutstandingItem, text: str) -> None:
     entry["followups"] = [*entry.get("followups", []), FollowupExchange(followup=pending["text"], reply=text.strip())]
 
 
-def reply_record(record: QuestionRecord, text: str, who: str, *, identities: QuestionStaff) -> None:
+def reply_record(record: QuestionRecord, text: str, who: str, *, identities: QuestionStaff, question_id: str = '') -> None:
     """Answer the exact record under its owner's lock and keep the answer in its log."""
     from scripts.review_links import review_events
     if not text.strip():
@@ -1672,6 +1714,10 @@ def reply_record(record: QuestionRecord, text: str, who: str, *, identities: Que
     scope = question_scope(record.owner, identities.record)
     with outstanding_lock(outstanding_path(scope)):
         current = _question_records([Issue(record.path, frontmatter(record.path))])[0]
+        delivery = change_routing.delivery_path(change_routing.review_root(), current.path, current.path.stem)
+        exchange = change_routing.delivery_slots(delivery).question
+        if question_id or isinstance(exchange, delivery_state.OpenQuestion):
+            _ = question_exchange_for_reply(exchange, question_id, text.strip())
         if current.status != "open" or "followup" not in current.item:
             raise RegistrationFailure("reply", f"{current.item['text']}: no open follow-up waits for a reply")
         answer_followup(current.item, text)
@@ -1695,8 +1741,11 @@ def reply(production: QuestionScope, words: str, text: str, *, identities: Quest
     if len(found) != 1:
         raise RegistrationFailure("reply", f"{len(found)} questions with a follow-up match {wanted!r}; name one by its exact text")
 
-    _ = change_open_question(production, found[0], wanted, identities, "reply", lambda entry: answer_followup(entry, text))
-    report("reply", "ok", f"{found[0]}: {wanted}: back on the open-questions list with the reply")
+    scope = production if found[0] == production.name else question_scope(found[0], identities.record)
+    record = next(record for record in question_records(scope, identities)
+                  if record.status == 'open' and 'followup' in record.item and record.item['text'] == wanted)
+    owner = identities.record.by_id(record.owner)
+    reply_record(record, text, owner.name if owner is not None else str(record.owner), identities=identities)
 
 
 def state_block(production: Production, state: ShowrunnerState, timestamp: str) -> str:
@@ -1813,6 +1862,8 @@ def keep_layout_fields(entry: OutstandingItem, stored: OutstandingItem) -> None:
         entry["followup"] = stored["followup"]
     if "followups" in stored:
         entry["followups"] = stored["followups"]
+    if "waiting_why" in stored:
+        entry["waiting_why"] = stored["waiting_why"]
 
 
 class HeldRegistrationQuestion(NamedTuple):
@@ -1955,11 +2006,10 @@ def main() -> int:
             _ = subcommand.add_argument("--item", required=True, help="the question's exact one-line text")
             _ = subcommand.add_argument("--text", required=True, help="your reply to the user's follow-up")
         elif action == "ask":
-            title_limit = conf.read_or_repository("production").whole("question_title_max_chars")
             _ = subcommand.add_argument("--text", default="",
-                                        help=f"the one-line title, at most {title_limit} characters; the default is --ask")
+                                        help="the one-line item the count and lists name, at most question_title_max_chars characters (config/production.conf); the default is --ask")
             _ = subcommand.add_argument("--ask", required=True,
-                                        help=f"the question in one line, at most {title_limit} characters; put the rest in --context and --item")
+                                        help="the question in one line, at most question_title_max_chars characters (config/production.conf); the parts below give the page its layout")
             _ = subcommand.add_argument("--context", default="", help="two sentences at most: why it is asked now and what waits on it")
             _ = subcommand.add_argument("--item", dest="items", action="append", default=[],
                                         help="one fact, step or command; a command in backticks; repeat it")
@@ -2048,6 +2098,9 @@ def main() -> int:
         else:
             questions(production, cast(Path | None, args.state))
         return 0
+    except StaleQuestionExchange as error:
+        report(action, "failed", str(error))
+        return 1
     except (staff.StaffRefused, RegistrationFailure, InputError, Refusal, OSError, ValueError, json.JSONDecodeError) as error:
         step = error.step if isinstance(error, RegistrationFailure) else action
         report(step, "failed", str(error).replace("\n", "; "))
