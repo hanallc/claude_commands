@@ -139,6 +139,7 @@ class ReviewItem:
     queue_after: str = ''
     value: tuple[float, ...] = ()
     text: str = ''
+    waiting_why: str = ''
 
     def for_you(self, now: datetime) -> bool:
         """Count Open records whose next action belongs to the user."""
@@ -226,7 +227,8 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
         ('works', 'not works', 'validate', 'feedback', 'question') if state != ReviewState.DONE else (),
         ChangeSource(path, row, assignment, slots), entry.urgency, after, queue,
         row['#'] if local else prefix+'/'+row['#'], change_review.prerequisite_key(entry.after, path, current),
-        entry.value, change_review.describe(row | {'#':shown},record=members))
+        entry.value, change_review.describe(row | {'#':shown},record=members),
+        review_events.waiting_why(slots.waiting_why))
 
 
 def change_queue_name(doc: Path, members: staff.StaffSnapshot, current: Path, below: bool = False) -> str:
@@ -319,7 +321,8 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
     return ReviewItem(key, identity, ReviewType.QUESTION, owner, asker, fields['text'], state,
         ReviewTimes(filed, logs[-1].time, later), tuple(logs),
         ('answer', 'feedback', 'question') if state != ReviewState.DONE and not unowned else (), source, entry.urgency, '',
-        update_registration.question_queue_name(owner), entry.key, entry.after, entry.value, opened.line())
+        update_registration.question_queue_name(owner), entry.key, entry.after, entry.value, opened.line(),
+        review_events.waiting_why(fields.get('waiting_why', '')))
 
 
 def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
@@ -401,7 +404,8 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
                 ReviewTimes(filed, logs[-1].time), tuple(logs),
                 ('read', 'feedback', 'question') if state != ReviewState.DONE else (), InvestigationSource(record),
                 queue='investigation-'+owner, queue_key=key,
-                text=identity_text+' '+record.title+'\n'+record.question+'\n\nAnswer\n'+record.answer))
+                text=identity_text+' '+record.title+'\n'+record.question+'\n\nAnswer\n'+record.answer,
+                waiting_why=review_events.waiting_why(record.waiting_why)))
     return found
 
 
@@ -424,10 +428,11 @@ def proposal_item(key: str, issue: Issue, owner: staff.StaffId, who: staff.Staff
     actions = DECISION_ACTIONS if state != ReviewState.DONE else ()
     if entry is None:
         return ReviewItem(key,identity,ReviewType.PROPOSAL,owner,who,title,state,ReviewTimes(filed,logs[-1].time),logs,
-                          actions,ProposalSource(issue))
+                          actions,ProposalSource(issue),waiting_why=review_events.waiting_why(issue.value('waiting_why')))
     return ReviewItem(key,identity,ReviewType.PROPOSAL,owner,who,title,state,ReviewTimes(filed,logs[-1].time),logs,
                       actions,ProposalSource(issue),entry.urgency,'proposal/'+entry.after if entry.after else '',queue,
-                      entry.key,entry.after,entry.value,proposals_table.proposal_text(entry))
+                      entry.key,entry.after,entry.value,proposals_table.proposal_text(entry),
+                      review_events.waiting_why(issue.value('waiting_why')))
 
 
 def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
@@ -576,7 +581,7 @@ def efficiency_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], 
                 head[13:],state,ReviewTimes(filed,logs[-1].time),logs,
                 DECISION_ACTIONS if state != ReviewState.DONE else (),
                 EfficiencySource(path,line),entry.urgency,queue=candidates.QUEUE,queue_key=entry.key,
-                value=entry.value,text=line))
+                value=entry.value,text=line,waiting_why=review_events.waiting_why(review.waiting_why)))
     return found
 
 
@@ -616,7 +621,7 @@ def ordered(items: list[ReviewItem]) -> list[ReviewItem]:
 
 def read(root: Path, *, members: staff.StaffSnapshot | None = None,
          kinds: tuple[ReviewType, ...] = REVIEW_TYPES, show: str = 'all',
-         owner_options: dict[staff.StaffId, str] | None = None) -> list[ReviewItem]:
+         owner_options: dict[staff.StaffId, str] | None = None, assign_ids: bool = True) -> list[ReviewItem]:
     """Read each record from its existing store without another stored copy."""
     members = staff.snapshot() if members is None else members
     documents = tuple(dict.fromkeys(member.doc.path for member in members.rows
@@ -624,7 +629,7 @@ def read(root: Path, *, members: staff.StaffSnapshot | None = None,
     states = selected_states(show)
     items: list[ReviewItem] = []
     if ReviewType.QUESTION in kinds:
-        items.extend(question_items(members,documents,assign_ids=True,states=states,owner_options=owner_options))
+        items.extend(question_items(members,documents,assign_ids=assign_ids,states=states,owner_options=owner_options))
     if ReviewType.CHANGE in kinds:
         items.extend(change_items(root,members,states=states,owner_options=owner_options))
     if ReviewType.INVESTIGATION in kinds:

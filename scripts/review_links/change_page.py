@@ -127,6 +127,7 @@ def _decode_slots(value: object) -> DeliverySlots:
 
 
 class StoredDeliverySlots(TypedDict, total=False):
+    waiting_why: str
     validation: StoredValidationIntent | StoredValidationRequested
     verdict: StoredDeliveryIntent
     question: StoredOpenQuestion | StoredAnsweredQuestion
@@ -335,6 +336,8 @@ class DeliveryStatus:
     def write_slots(self, page: ReviewPage, row: str, slots: DeliverySlots) -> None:
         """Write both slots while the caller holds the delivery lock."""
         fields: StoredDeliverySlots = {}
+        if slots.waiting_why:
+            fields["waiting_why"] = slots.waiting_why
         if isinstance(page, UserQuestionPage):
             fields["user_answer"] = page.saved
             if page.saved.get('kind') == 'question' and isinstance(slots.question, NoQuestion):
@@ -379,11 +382,24 @@ class DeliveryStatus:
                 for attempt in stale:
                     del self.request_attempts[attempt]
 
-    def begin(self, page: ReviewPage, row: str, kind: Literal["verdict", "validation"], feedback: str = "", *, recipients: tuple[staff.StaffId, ...] = ()) -> str:
+    def set_waiting_why(self, page: ReviewPage, row: str, text: str) -> None:
+        """Store the reason with the change's delivery state under its lock."""
+        reason = delivery_state.require_waiting_why(text)
+        with self.locked():
+            current = next((value for value in change_review.review_rows(page.review_list) if value["#"] == row), None)
+            slots = self.slots(page, row)
+            if current is None or current.get("Verdict") or slots.waits_for_user(False):
+                raise AnswerRefused("The item is not Waiting.")
+            self.write_slots(page, row, replace(slots, waiting_why=reason))
+
+    def begin(self, page: ReviewPage, row: str, kind: Literal["verdict", "validation"], feedback: str = "", *,
+              recipients: tuple[staff.StaffId, ...] = (), waiting_why: str = "") -> str:
+        reason = delivery_state.require_waiting_why(waiting_why or feedback) if kind == "validation" else ""
         attempt = secrets.token_hex()
         intent = DeliveryIntent(attempt, kind, feedback if kind == "validation" else "", recipients)
         with self.locked():
-            self.write_slots(page, row, self.slots(page, row).updated(kind, intent))
+            slots = self.slots(page, row).updated(kind, intent)
+            self.write_slots(page, row, replace(slots, waiting_why=reason) if reason else slots)
             self.request_attempts[attempt] = AttemptOwnership(self.path(page, row), "claimed")
         return attempt
 
@@ -411,6 +427,7 @@ class DeliveryStatus:
     def ask(self, page: ReviewPage, row: str, text: str, *, recipients: tuple[staff.StaffId, ...] = (),
             kind: Literal["question", "feedback"] = "question") -> QuestionDelivery | NoDelivery:
         """Save a new question without changing an existing open question."""
+        reason = delivery_state.require_waiting_why(text)
         with self.locked():
             slots = self.slots(page, row)
             question = slots.question
@@ -421,7 +438,8 @@ class DeliveryStatus:
             intent = DeliveryIntent(secrets.token_hex(), "question", recipients=recipients)
             question_id = secrets.token_hex(4)
             request = OpenFeedback if kind == "feedback" else OpenQuestion
-            self.write_slots(page, row, replace(slots, validation=NoDelivery(), question=request(question_id, text, intent)))
+            self.write_slots(page, row, replace(slots, validation=NoDelivery(), question=request(question_id, text, intent),
+                                                waiting_why=reason))
             self.request_attempts[intent.attempt] = AttemptOwnership(self.path(page, row), "claimed")
             return QuestionDelivery(question_id, text, intent.attempt)
 
@@ -1026,8 +1044,9 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         if status.slots(page, row_id).validation_requested:
             return NoMessageDelivery()
         _ = next_item.move_to_end(next_item.CHANGE, page.production, key=queue_key(page, row_id),
-                                 prepared=next_item.READ_CHANGE_LISTS if superseded else prepared)
-        attempt = status.begin(page, row_id, "validation", feedback, recipients=recipients)
+                                  prepared=next_item.READ_CHANGE_LISTS if superseded else prepared)
+        attempt = status.begin(page, row_id, "validation", feedback, recipients=recipients,
+                               waiting_why=feedback.strip() or "The user asked the showrunner to validate this change.")
         message = validation_message(message_page, row, attempt, feedback)
         if superseded:
             message += '\n'+superseded
