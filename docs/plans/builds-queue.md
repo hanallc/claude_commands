@@ -1519,7 +1519,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Gotchas:** Cargo does not track `CARGO_MANIFEST_DIR`, because Cargo sets it for rustc. A dependency macro that reads the variable at expansion, in a caller without that text, stays outside this rule.
 
-### Phase 44 — Every verify step runs where the queue places it  · status: todo
+### Phase 44 — Every verify step runs where the queue places it  · status: done (on main 16a9610e7, 2026-11-13)
 **Depends on:** 10g. Checkpoint 2 of section 8 in `docs/plans/builds-queue-placement.md`. This phase first fixes the 14:04 disk-decline defect. verify-unit has the function list.
 
 **Constraints from 10g (architect review of 10g, 2026-11-10).** The Work Order settles each item below before work is divided.
@@ -2073,7 +2073,7 @@ Contact no live service, session, Mac, or AWS account.
 32. **Caller coverage:** Exercise test, check, build, doc, example, lint, and `final` through converted paths.
     Exercise direct offload and fixed local shared lint callers.
 
-### Phase 44c — The queue service lets a run that a drain keeps pass the hold  · status: todo
+### Phase 44c — The queue service lets a run that a drain keeps pass the hold  · status: done (on main 16a9610e7, 2026-11-13)
 **Depends on:** 44 and 44b (44b is on builds and main at b09bc83ae). It lands with Phase 44 in one deploy: the showrunner holds the Phase 44 merge until this phase is ready. Found by the 44b architect review, 2026-11-10. Schedule change (user, 2026-11-12: "do what you can to parallelize"): 44c starts at once in its own worktree, on a local snapshot of the Phase 44 tree with builds merged in, while Phase 44 finishes its final test run and review. Its merge resolution is recorded and reused for the Phase 44 checkpoint merge.
 
 #### Work Order
