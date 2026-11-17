@@ -462,11 +462,22 @@ class ProgressAdjustedMemory(MeasuredMemory):
 
 
 @dataclass(frozen=True)
+class CompilerJob:
+    """The compilers that sccache runs for one step scope, which the scope's step owns."""
+    scope: Path
+    use: AnonymousRunUse | RunUseUnavailable
+
+
+@dataclass(frozen=True)
 class CompilerServiceMemory(MeasuredMemory):
-    """Compiler charge, without a build reservation or run-alone veto."""
+    """Compiler charge, without a build reservation or run-alone veto.
+
+    The bytes leave out the jobs: each job counts in the step that names its scope.
+    """
 
     job_state: IdleService = IdleService()
     pid: int | PidNotRecorded = field(kw_only=True)
+    jobs: tuple[CompilerJob, ...] = field(default=(), kw_only=True)
 
 
 @dataclass(frozen=True)

@@ -228,9 +228,14 @@ The launcher fixture replaces non-Git commands; the formatter still runs real ta
 
 ## What it is
 
-`scripts/production/merge_gate.py` merges a checkpoint into a production's merge branch and tests all modules before it pushes the merge.
+`scripts/production/gate.py` merges a checkpoint into the production's merge branch.
+It tests all modules before it pushes the merge.
 It discovers every `scripts/**/test_*.py` module outside `__pycache__`.
-`scripts/production/targeted_test.py --checkout TREE [--full]` runs a unit's targeted tests through the same runner.
+`scripts/production/gate.py --affected --checkout TREE [--full]` runs a unit's targeted tests through the same runner.
+`python3 -m scripts.production.gate` accepts the same options.
+The former `merge_gate.py` and `targeted_test.py` entry points remain available until their removal.
+`build_steps.command_job` reads these command forms for the memory feed and copy lease names.
+It names integration, promotion, nightly tests, all tests, affected tests, or selected modules from the arguments.
 Targeted tests select modules by direct imports, file tokens, changed test modules, and folders of changed Python source files.
 File tokens can occur in a test or its imported test-support modules.
 A changed shell script (a non-Python file under `scripts/` that ends in `.sh` or has an execute bit) also selects the tests that name any script that calls it, directly or through other scripts.

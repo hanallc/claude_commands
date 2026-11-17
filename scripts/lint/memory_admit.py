@@ -63,6 +63,7 @@ from scripts.build_queue.admission_records import (
     CapNotRecorded,
     CapUnavailable,
     CappedAtBudget,
+    CompilerJob,
     CompilerServiceMemory,
     ContinuationSlot,
     DevSizeHeadroom,
@@ -1123,8 +1124,38 @@ def member_programs(members: Iterable[int], proc: Path, *, skip_unreadable: bool
     return programs
 
 
+STEP_SCOPE_ENTRY = b"BUILDLOG_STEP_SCOPE="
+
+
+@dataclass(frozen=True)
+class NoStepScope:
+    """The process names no step scope."""
+
+
+def named_step_scope(pid: int, proc: Path) -> Path | NoStepScope:
+    """Read the step scope that invoke.sh exports; sccache gives each compiler its client's environment."""
+    try:
+        environment = (proc / str(pid) / "environ").read_bytes()
+    except OSError:
+        return NoStepScope()
+    for entry in environment.split(b"\0"):
+        if entry.startswith(STEP_SCOPE_ENTRY):
+            return Path(os.fsdecode(entry.removeprefix(STEP_SCOPE_ENTRY)))
+    return NoStepScope()
+
+
+def compiler_jobs(members: Iterable[int], proc: Path) -> tuple[CompilerJob, ...]:
+    """Group the compiler service processes by the step scope that each one names."""
+    scopes: dict[Path, set[int]] = {}
+    for pid in members:
+        scope = named_step_scope(pid, proc)
+        if isinstance(scope, Path):
+            scopes.setdefault(scope, set()).add(pid)
+    return tuple(CompilerJob(scope, process_memory(pids, proc).anonymous) for scope, pids in sorted(scopes.items()))
+
+
 def sccache_memory(proc: Path = PROC) -> list[StepMemory]:
-    """Charge the compiler service once, outside all step process trees."""
+    """Charge the compiler service once, outside all step process trees; each step's compilers count in that step."""
     directory = builds_slice_cgroup()
     try:
         reading = slice_working_set(directory / "sccache.service")
@@ -1132,11 +1163,13 @@ def sccache_memory(proc: Path = PROC) -> list[StepMemory]:
             members = (directory / "sccache.service" / "cgroup.procs").read_text().split()
         except OSError:
             members = []
-        programs = member_programs((int(member) for member in members if member.isdecimal()), proc,
-                                   skip_unreadable=True)
+        pids = [int(member) for member in members if member.isdecimal()]
+        programs = member_programs(pids, proc, skip_unreadable=True)
         servers = [pid for pid, program in programs.items() if program == "sccache"]
-        return [CompilerServiceMemory(reading.bytes, swap_bytes=reading.swap_bytes,
-                                      pid=min(servers) if servers else PidNotRecorded())]
+        jobs = compiler_jobs(pids, proc)
+        charged = sum(job.use.bytes for job in jobs if isinstance(job.use, AnonymousRunUse))
+        return [CompilerServiceMemory(max(0, reading.bytes - charged), swap_bytes=reading.swap_bytes,
+                                      pid=min(servers) if servers else PidNotRecorded(), jobs=jobs)]
     except (OSError, ValueError):
         return []
 
@@ -1761,9 +1794,20 @@ class AttributedStepUse:
     owns_source: bool
 
 
+def compiler_job_uses(running: Iterable[RunningStep]) -> dict[Path, AnonymousRunUse | RunUseUnavailable]:
+    """Sum the compilers that sccache runs for each step scope."""
+    uses: dict[Path, AnonymousRunUse | RunUseUnavailable] = {}
+    for step in running:
+        if isinstance(step.measured, CompilerServiceMemory):
+            for job in step.measured.jobs:
+                uses[job.scope] = sum_swap_backed_use((uses.get(job.scope, AnonymousRunUse(0)), job.use))
+    return uses
+
+
 def attributed_step_uses(inputs: QueueInputs) -> tuple[tuple[Reservation, RunningStep, AttributedStepUse], ...]:
-    """Assign each scope and process to one step before any grouping."""
+    """Assign each scope, process and compiler job to one step before any grouping."""
     attributed: list[tuple[Reservation, RunningStep, AttributedStepUse]] = []
+    compiled = compiler_job_uses(inputs.running)
     active = tuple(zip(inputs.reservations, (step for step in inputs.running if running_has_reservation(step)), strict=True))
     scope_holders: dict[Path, tuple[str, int, MeasuredMemory]] = {}
     process_holders: dict[int, tuple[int, str, int]] = {}
@@ -1808,6 +1852,8 @@ def attributed_step_uses(inputs: QueueInputs) -> tuple[tuple[Reservation, Runnin
                                                for child in children.get(source.directory, ()))
                     use = (AnonymousRunUse(max(0, use.bytes - nested.bytes))
                            if isinstance(nested, AnonymousRunUse) else nested)
+                if owns_source and source.directory in compiled:
+                    use = sum_swap_backed_use((use, compiled[source.directory]))
             elif isinstance(source, ProcessSource):
                 assigned = tuple(item for item in source.processes
                                  if item.pid in unclaimed and process_holders[item.pid][2] == index)

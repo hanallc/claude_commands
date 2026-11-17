@@ -4,6 +4,7 @@ from __future__ import annotations
 from scripts.lib.checkout_test_support import python_tool_source
 
 import importlib.util
+import json
 import os
 import select
 import shutil
@@ -24,12 +25,13 @@ from unittest.mock import patch
 
 from typing import cast, override
 from urllib.parse import urlencode
+from uuid import uuid4
 
 
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
-from scripts.production import change_review, investigation, staff
-from scripts.review_links import accounts_page, change_browser, change_page, console, investigations_page, serve
+from scripts.production import change_review, investigation, staff, the_list
+from scripts.review_links import accounts_page, change_browser, change_page, console, investigations_page, list_page, serve
 from scripts.lib import atomic_file, conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -201,6 +203,18 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(investigation.load(owner, item.id).state, investigation.InvestigationState.ANSWER_READY)
         self.assertEqual(self.post(investigations_page.PAGE_PATH, urlencode(fields)), (200, b'{"state": "read"}'))
         self.assertEqual(investigation.load(owner, item.id).state, investigation.InvestigationState.READ)
+        item = the_list.add(owner, "Read the List page", owner=the_list.UnassignedOwner.NATE,
+                            source="nate", changes={})
+        response = self.request(list_page.PAGE_PATH)
+        self.assertEqual(response.status, 200)
+        self.assertIn(b"Read the List page", response.body)
+        _ = the_list.update(owner, item.id, {"title": "Read the new List page"}, source="morty")
+        self.assertIn(b"Read the new List page", self.request(list_page.PAGE_PATH).body)
+        self.assertNotEqual(self.post(list_page.PAGE_PATH, "id=L1")[0], 200)
+        with patch.object(list_page, "render", side_effect=OSError("fixture read failed")):
+            failed = self.request(list_page.PAGE_PATH)
+            self.assertEqual(failed.status, 503)
+            self.assertIn(b"The List page is not available.", failed.body)
 
     def test_older_console_browser_and_rebuild_links_forward_to_the_fixed_address(self) -> None:
         for path, location in (
@@ -221,6 +235,67 @@ class ReviewLinksServerTests(unittest.TestCase):
             with self.subTest(path=path):
                 with self.assertRaises(FileNotFoundError):
                     _ = serve.old_console_link(self.root, path)
+
+    def test_list_feedback_saves_before_delivery_and_recovers_at_server_start(self) -> None:
+        morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
+                               current_session=staff.StaffId("fixture-morty-session"))
+        item = the_list.add(morty.id, "The feedback item", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
+        sent = threading.Event()
+        completed = threading.Event()
+        real_deliver = list_page.deliver
+        def complete_delivery(message: list_page.ListFeedbackDelivery | change_page.NoMessageDelivery) -> None:
+            real_deliver(message)
+            completed.set()
+        def send(_recipient: staff.StaffId, _sender: str, _message: str) -> None:
+            sent.set()
+        with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(list_page, "deliver", side_effect=complete_delivery),
+              patch.object(change_page, "send_to_staff", side_effect=send) as delivery):
+            request = uuid4().hex
+            fields = {"keeper": morty.id, "id": item.id, "request": request,
+                    "token": list_page.request_token(self.root, morty.id, item.id, request),
+                    "action": "read", "words": "Explain this simply.", "until": "2026-12-03"}
+            for action in ("read", "remove", "park", "tell"):
+                fields["action"] = action
+                with self.subTest(action=action):
+                    before = the_list.load(morty.id, item.id)
+                    self.assertEqual(self.post(list_page.PAGE_PATH, urlencode({**fields, "token": "bad"}))[0], 400)
+                    self.assertEqual(the_list.load(morty.id, item.id), before)
+                    sent.clear()
+                    completed.clear()
+                    code, body = self.post(list_page.PAGE_PATH, urlencode(fields))
+                    self.assertEqual(code, 200)
+                    self.assertTrue(completed.wait(TEST_HANG_GUARD_SECS))
+                    self.assertEqual(json.loads(body)["state"], "read" if action == "read" else "sent")
+                    response = cast(dict[str, str], json.loads(body))
+                    self.assertNotEqual(response["request"], fields["request"])
+                    self.assertEqual(response["token"], list_page.request_token(self.root, morty.id, item.id, response["request"]))
+                    fields.update(request=response["request"], token=response["token"])
+                    if action == "read":
+                        delivery.assert_not_called()
+                    else:
+                        self.assertTrue(sent.wait(TEST_HANG_GUARD_SECS))
+                        self.assertIn("nate's words for item 1", cast(str, delivery.call_args.args[2]))
+            self.assertEqual(the_list.load(morty.id, item.id).state, item.state)
+            fields["request"] = uuid4().hex
+            fields["token"] = list_page.request_token(self.root, morty.id, item.id, fields["request"])
+            _ = list_page.submit(self.root, urlencode(fields))
+            sent.clear()
+            recovered = threading.Event()
+            recover = list_page.recover_pending
+            def recover_and_finish() -> None:
+                try:
+                    recover()
+                finally:
+                    recovered.set()
+            with patch.object(list_page, "recover_pending", side_effect=recover_and_finish):
+                restarted = serve.ReviewLinksServer(("127.0.0.1", 0), self.root)
+                try:
+                    self.assertTrue(recovered.wait(TEST_HANG_GUARD_SECS))
+                    self.assertTrue(sent.is_set())
+                finally:
+                    restarted.server_close()
 
     def test_undeletable_expired_snapshot_does_not_prevent_bind_or_other_links(self) -> None:
         expired = self.root / "aaaaaa"

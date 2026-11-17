@@ -735,7 +735,7 @@ def promote(runner: GitRunner, production: str, repo: Path, commit: str, unit: s
         promotion = production_doc.promotion_from_doc(production_doc.read_production(production).doc.read_text().splitlines())
         if isinstance(promotion, production_doc.PromoteTo) and not promotion.checkouts and isinstance(promotion.mac, production_doc.MacCheckout):
             # The pull helper needs a local main ref at the published commit.
-            with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource(commit)) as source:
+            with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource(commit), step="promote") as source:
                 _ = runner.git(source, "update-ref", "refs/heads/main", commit)
                 merge_checkpoint.promote_targets(promotion, "main", commit, source=source, label=f"fast-track {unit}")
         else:
@@ -765,7 +765,7 @@ def push_patch(runner: GitRunner, repo: Path, production: str, unit: str, why: s
     digest = hashlib.sha256(patch).hexdigest()
     with build_folders.tool_folder("fast-track") as temporary:
         fetch_main(runner, repo, settings_read)
-        with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource("origin/main")) as copy:
+        with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource("origin/main"), step="fast-track") as copy:
             _ = runner.git(copy, "remote", "set-url", "origin", runner.git(repo, "remote", "get-url", "origin").strip())
             identity = commit_identity(runner, repo)
             patch_file = temporary / "fix.patch"
