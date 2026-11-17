@@ -28,7 +28,7 @@ class PageStatusTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(Path(__file__).resolve().parents[2] / "config")})))
 
     def test_title_places_one_status_directly_after_the_title(self) -> None:
-        for page in ('accounts', 'aws', 'builds', 'changes', 'disks', 'images', 'investigations', 'list', 'questions', 'review'):
+        for page in ('accounts', 'aws', 'builds', 'disks', 'images', 'list', 'review'):
             with self.subTest(page=page):
                 markup = page_frame.title(page.title(), page)
                 self.assertIn('</h1><p class="page-status"', markup)
@@ -38,18 +38,18 @@ class PageStatusTests(unittest.TestCase):
                 self.assertIn('aria-live="polite" data-status-announcement', markup)
 
     def test_each_page_uses_the_same_states_and_retains_the_last_good_read(self) -> None:
-        for page in ('accounts', 'aws', 'builds', 'changes', 'disks', 'images', 'investigations', 'list', 'questions', 'review'):
+        for page in ('accounts', 'aws', 'builds', 'disks', 'images', 'list', 'review'):
             with self.subTest(page=page):
                 assert_component_states(self, page_frame.title(page.title(), page))
 
     def test_only_the_configured_status_pages_have_age_limits(self) -> None:
         limits = {key for key in conf.read_or_repository("console").values() if key.startswith("status.") and key.endswith(".age_limit_seconds")}
         self.assertEqual(limits, {f"status.{page}.age_limit_seconds" for page in (
-            "accounts", "aws", "builds", "changes", "disks", "images", "investigations", "list", "questions", "review")})
+            "accounts", "aws", "builds", "disks", "images", "list", "review")})
 
     def test_age_uses_seconds_then_whole_minutes_on_every_page(self) -> None:
         node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
-        for page in ('accounts', 'aws', 'builds', 'changes', 'disks', 'images', 'investigations', 'list', 'questions', 'review'):
+        for page in ('accounts', 'aws', 'builds', 'disks', 'images', 'list', 'review'):
             with self.subTest(page=page):
                 match = re.search(r'data-status-options="([^"]+)"', page_frame.title(page.title(), page))
                 assert match is not None
@@ -87,7 +87,7 @@ setImmediate(()=>{
                 self.assertEqual((done.returncode, done.stdout.strip()), (0, 'PASS'), done.stderr)
 
     def test_failed_visibility_refresh_keeps_initial_facts_before_the_first_frames(self) -> None:
-        markup = page_frame.title("Investigations", "investigations")
+        markup = page_frame.title("Review", "review")
         match = re.search(r'data-status-options="([^"]+)"', markup)
         assert match is not None
         environment = self.environment(html.unescape(match[1])).replace(
@@ -391,11 +391,13 @@ window.fetch=async(url,options={})=>{
     match = re.search(r'<title>([^<]+)</title>', markup)
     assert match is not None
     identity = 'list' if match[1] == 'The List' else match[1].split()[0].lower()
+    if identity in ('changes', 'questions', 'investigations'):
+        identity = 'review'
     with patch.dict(os.environ, {"CONF_DIR": str(Path(__file__).resolve().parents[2] / "config")}):
         settings = conf.read("console").values()
         pages = tuple(console.ConsolePage(name, settings[f"page.{name}.label"], settings[f"page.{name}.icon"],
                                          settings[f"page.{name}.title"], console.AvailablePage('/page'))
-                      for name in ('accounts', 'aws', 'builds', 'changes', 'disks', 'images', 'investigations', 'list', 'questions'))
+                      for name in ('accounts', 'aws', 'builds', 'disks', 'images', 'list', 'review'))
         shell = console.render(pages, console.UnavailablePage()).replace(b'</body>', b'<img hidden src="/complete"></body>')
     results: list[list[str]] = []
     complete = threading.Event()

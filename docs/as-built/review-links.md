@@ -121,6 +121,7 @@ Round trip covers request start through the first frame after the data appears.
 Render time comes from the server or the data writer.
 The browser does not estimate render time.
 `config/console.conf` sets timing limits, the Reading delay and each page's age limit.
+`status.review.age_limit_seconds` supplies the age limit for Review and the legacy renderers.
 Values above the timing limits use `--warning`.
 Late and Failed remain at the top during scrolling.
 The line wraps between its positions on a phone.
@@ -183,6 +184,9 @@ Older browser folders still accept answers that a page posts to them.
 `config/console.conf` defines entries in file order.
 The server reads it through `conf.read("console")` at each console request.
 Each entry defines `page.<id>.label`, `.icon`, `.title`, and `.url`, and can define `.items`.
+The entries are Accounts, AWS, Builds, Disks, Images, List and Review.
+The configuration has no Changes, Investigations or Questions entries or age limits.
+The console renders every configured entry without a skip rule for Review.
 The URL value has the form `python:<module>:<function>`.
 The function takes no arguments and returns a URL path under the review root.
 The console also accepts a full URL from the configured review origin and converts it to a path.
