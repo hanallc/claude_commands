@@ -13,7 +13,7 @@ from scripts.review_links import change_page, review_items, review_later
 
 def record_action(item: review_items.ReviewItem, words: str) -> None:
     source = item.source
-    if isinstance(source, review_items.QuestionSource):
+    if isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
         update_registration.record_review_log(source.record.path,words)
     elif isinstance(source, review_items.InvestigationSource):
         investigation.record_review_log(source.record.owner,source.record.id,words)

@@ -319,6 +319,30 @@ class NextItemTests(unittest.TestCase):
             # Each showrunner pins its own change row, so one /next never moves the other's.
             self.assertNotEqual(next_item.change_queue(docs["top"]).name, next_item.change_queue(docs["kid"]).name)
 
+            producer = fixture_member("producer", name="planner")
+            ready = investigation.file(producer.id, "Producer investigation", "Read the producer log.")
+            ready = investigation.answer(producer.id, ready.id, "The producer answer is ready.")
+            with mock.patch.object(staff, "caller_identity", return_value=producer.current_session):
+                for arguments in (("show", "--kind", "investigation"), ("show",)):
+                    with self.subTest(finding="F025", arguments=arguments):
+                        code, output, error = run(*arguments)
+                        self.assertEqual((code, error), (0, ""))
+                        self.assertEqual(output.splitlines()[:2],
+                                         ["investigation", "planner/"+ready.id+" Producer investigation"])
+                for kind in ("change", "proposal", "efficiency"):
+                    with self.subTest(finding="F025", kind=kind):
+                        self.assertEqual(run("show", "--kind", kind),
+                                         (0, f"no {kind} is waiting for you\n", ""))
+                        queue = next_item.read_queue(kind, None)
+                        self.assertTrue(queue.name)
+                        self.assertEqual(queue.entries, [])
+                with self.subTest(finding="F025", selection="explicit production"):
+                    code, output, error = run("show", "--kind", "investigation", "--production", "top")
+                    self.assertEqual((code, error), (0, ""))
+                    self.assertIn("top-item", output)
+                    self.assertNotIn("Producer investigation", output)
+                self.assertEqual(urgency.pinned("next-"+producer.id), f"investigation/{producer.id}/{ready.id}")
+
     def test_a_child_with_no_change_review_line_reads_its_roots_list(self) -> None:
         path = self.root / "change-review - top.md"
         top, kid = self.root / "top-production.md", self.root / "kid-production.md"

@@ -489,6 +489,8 @@ def _read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.St
               own: list[Issue] | None = None) -> list[ReviewItem]:
     """Read the selected store into ReviewItem records for all consumers."""
     if isinstance(scope,staff.StaffRow):
+        if kind in (ReviewType.CHANGE, ReviewType.PROPOSAL, ReviewType.EFFICIENCY):
+            return []
         documents: tuple[Path,...] = ()
         owner = scope
     else:
@@ -588,7 +590,9 @@ def next_queue(kind: str, scope: Path | staff.StaffRow, below: bool, members: st
     now = datetime.now(user_zone())
     selected = [item for item in items if item.for_you(now) and not
                 (isinstance(item.source,ChangeSource) and isinstance(item.source.assignment.owner,change_routing.UnroutedChange))]
-    if kind == 'change':
+    if isinstance(scope, staff.StaffRow) and kind in ('change', 'proposal', 'efficiency'):
+        queue = urgency.scope_queue(kind+'-'+scope.id,below)
+    elif kind == 'change':
         assert isinstance(scope,Path)
         queue = change_queue_name(scope,members,change_review.scope_list(scope,record=members),below)
     elif kind == 'question':

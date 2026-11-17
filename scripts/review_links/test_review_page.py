@@ -83,6 +83,18 @@ class ReviewPageTests(unittest.TestCase):
             self.assertEqual(orphan.actions, ())
             self.assertIn('Owner unavailable', review_page.render(self.root).decode())
             self.assertTrue(any(item.startswith(key+'/') for item in review_page.waiting_items(console.NewsRequest(self.root))))
+            until = datetime.now(user_zone()).replace(second=0, microsecond=0)+timedelta(days=1)
+            body = self.body(key, 'later', 'Read the ownerless question tomorrow.')+'&'+urlencode({'later':until.isoformat()})
+            _, result = review_page.submit(self.root, body, self.status)
+            self.assertIn('later until', result)
+            saved = next(item for item in review_items.read(self.root) if item.key == key)
+            self.assertEqual(saved.state, orphan.state)
+            self.assertFalse(saved.for_you(datetime.now(user_zone())))
+            self.assertTrue(saved.for_you(until+timedelta(seconds=1)))
+            self.assertEqual(review_later.times()[key], until)
+            self.assertEqual([(entry.who, entry.words) for entry in saved.log if entry.words.startswith('Later until ')],
+                             [('nate', 'Later until '+until.isoformat()+': Read the ownerless question tomorrow.')],
+                             'F024: Later keeps the action and words on an ownerless question')
 
     def test_question_ids_remain_after_closure_and_later_registration(self) -> None:
         key = self.question('First question?')
