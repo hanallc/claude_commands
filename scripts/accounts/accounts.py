@@ -4363,9 +4363,16 @@ class BoardColumn(TypedDict):
     align: Literal["left", "right"]
 
 
+class BoardGroup(TypedDict):
+    """A Claude group that this account line serves; the console Accounts page sets its next move."""
+    account: str
+    group: Literal["units", "showrunners"]
+
+
 class BoardRow(TypedDict):
     """The cells of one table line."""
     cells: dict[str, list[BoardSpan]]
+    group: NotRequired[BoardGroup]
 
 
 class Board(TypedDict):
@@ -4592,7 +4599,11 @@ def _account_board_rows(row: StatusRow, reading: StatusReading, *, account_confi
                  **{key: [_span(value)] for key, value in counts.items()},
                  "resets": [_span(reset)] if first else [], "credits": [_span(balance)] if first else [],
                  "enabled": [_span("yes" if row.use_credits else "")] if first else []}
-        lines.append(BoardRow(cells=cells))
+        line = BoardRow(cells=cells)
+        group = role.removesuffix(" ✓")
+        if row.tool == "claude" and group in row.selected_roles and (group == "units" or group == "showrunners"):
+            line["group"] = BoardGroup(account=row.label, group=group)
+        lines.append(line)
     return lines
 
 

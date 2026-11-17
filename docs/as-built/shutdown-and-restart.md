@@ -547,8 +547,10 @@ The check uses the launched account home and native session identity.
 It reads only turns after that director's start.
 The opening prompt and the Claude resume check share a cursor positioned before launch.
 Herdr waits for the native session identity and uses that identity to check the opening prompt's target.
-It retries only when the native registry changes while the process starts or exits.
-The launch deadline bounds this wait.
+A starting agent can lack its registry record, its process start time or its argv.
+Herdr retries the identity read and the target check until the launch deadline.
+The pause between tries starts at `PANE_POLL_SECONDS` and doubles up to `START_RETRY_MAX_SECONDS`.
+Only a failure at the deadline prints the native session error.
 For a Claude launch with an opening prompt, restart uses the greater of `START_SECONDS` and `OPENING_PROMPT_SECONDS`.
 `config/shutdown.conf` sets these limits to 20 seconds and 90 seconds.
 The operation deadline can reduce either limit.
