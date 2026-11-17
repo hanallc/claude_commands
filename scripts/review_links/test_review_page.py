@@ -46,7 +46,7 @@ class ReviewPageTests(unittest.TestCase):
         item = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.QUESTION)
         unknown = replace(item, owner=staff.StaffId('nate'), source_unit=staff.StaffId('unknown-source'))
         plain = review_page.item_rows(unknown, change_page.ReviewBrowser('private'), staff.snapshot(),
-                                      datetime.now(user_zone()), 0)
+                                      datetime.now(user_zone()), 0, 3)
         self.assertIn('<td data-label="Owner">nate<small>· unknown-source</small></td>', plain)
         self.assertIn('Owner: nate · Source: unknown-source</p>', plain)
 
@@ -413,7 +413,7 @@ class ReviewPageTests(unittest.TestCase):
                 continue
             with self.subTest(kind=item.type):
                 self.assertEqual(item.actions,expected[item.key])
-                form = review_page.form(item,change_page.ReviewBrowser(token,initial))
+                form = review_page.form(item,change_page.ReviewBrowser(token,initial),4)
                 self.assertIn('Closes the item',form)
                 self.assertIn('The item returns to you',form)
                 self.assertIn('type="datetime-local"',form)

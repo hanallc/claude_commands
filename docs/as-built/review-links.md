@@ -800,11 +800,11 @@ An older row without Kind shows no kind line.
 The page shows every row with its recorded kind.
 
 The Review address is `/console/review.html`.
-Each Change card shows its check text and recorded proof.
-Only fenced code gets a box and a copy control.
-Other text keeps its line breaks in plain paragraphs.
-The **Your words** box accepts line breaks for every outcome.
-The setting starts at 5.
+Each Change card shows its check text and recorded proof as plain paragraphs that keep their line breaks.
+A showrunner Answer on a Change or Investigation card, and a Reply on a Question card, show code blocks with a copy control.
+A code block is fenced code or a line that holds only one backtick span.
+Other backtick spans stay inline code.
+The **Your words** box is `review_words_rows` lines high; the setting starts at 4.
 The box accepts line breaks for every outcome.
 The server converts CRLF, CR, and Unicode line separators to newline characters.
 The verdict cell joins stripped, nonblank lines with one space.
@@ -1180,6 +1180,7 @@ The scripts read `config/review_links.conf` through `scripts/lib/conf.py` when e
 `snapshot_allocation_tries` limits folder allocation attempts.
 `delivery_tries` and `delivery_pause_seconds` control message attempts.
 `feedback_rows` sets the textarea height from 1 to 20 rows and starts at 5.
+`review_words_rows` sets the height of the Review page **Your words** box from 1 to 20 rows and starts at 4.
 `unrouted_alert_recipient` selects the alert recipient and the root showrunner for changes that nobody can take.
 This owner rule applies to routed changes when the list has no staff showrunner or its production document is gone.
 An unknown producer id or a broken parent chain keeps the change unrouted.
