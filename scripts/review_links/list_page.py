@@ -159,9 +159,9 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[st
     sections = ''.join('<section><h3>' + heading + '</h3>'
                        + change_browser.question_paragraphs(text or "Not recorded") + '</section>'
                        for heading, text in (("Latest status", item.latest_status), ("Done when", item.done_when)))
-    links = [f'<li><a href="{html.escape(item_link(entry.keeper, link.number), quote=True)}">#{link.number}</a>'
+    links = [f'<li><a data-record-jump href="{html.escape(item_link(entry.keeper, link.number), quote=True)}">#{link.number}</a>'
              + ' — ' + html.escape(link.condition) + '</li>' for link in item.blocked_by]
-    links.extend(f'<li>Related: <a href="{html.escape(item_link(entry.keeper, number), quote=True)}">#{number}</a></li>'
+    links.extend(f'<li>Related: <a data-record-jump href="{html.escape(item_link(entry.keeper, number), quote=True)}">#{number}</a></li>'
                  for number in item.related_to)
     if links:
         sections += '<section><h3>Links</h3><ul>' + ''.join(links) + '</ul></section>'
@@ -444,6 +444,7 @@ def render(root: Path) -> bytes:
                + '<label class="list-search-label" for="list-search">Search</label>'
                + '<input type="search" id="list-search" placeholder="Filter by number, owner, item or state">'
                + '<span data-list-count role="status" aria-live="polite"></span></div>'
+               + '<p data-missing-item role="status" hidden></p>'
                + '<p data-hidden-action-status role="status" hidden></p>'
                + '<div class="list-table"><table aria-label="The List"><colgroup><col style="width:6%"><col style="width:8%">'
                + '<col style="width:10%"><col style="width:17%"><col style="width:14%"><col style="width:23%"><col style="width:14%">'
@@ -501,6 +502,10 @@ function syncUnread(item,form,unread){
 const tableView=createRecordTable({content:()=>content,
  shows:['open','needs-me','unread','done','parked','closed','all'],
  filters:['producer'],
+ missingItem:key=>{
+  const number=key.match(/\/L([1-9]\d*)$/)?.[1];
+  return number ? 'Item #'+number+' is not on the List' : '';
+ },
  visible:(data,{owner,show,query:search,filters})=>{
   if(owner && data.owner!==owner) return false;
   if(filters.producer && data.producer!==filters.producer) return false;
@@ -637,6 +642,7 @@ async function refresh(_supersede=false,current=()=>true){
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
 }
 place();bind();apply();
-addEventListener('hashchange',()=>{place();apply(false);});
+addEventListener('popstate',tableView.restorePlace);
+addEventListener('hashchange',tableView.restorePlace);
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
 })();'''
