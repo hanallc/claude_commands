@@ -15,6 +15,10 @@ GPU trial boxes then import the prepared GPU system and reboot.
 `config/cloud_gate.conf` supplies launch, expiry, trial, and artifact settings.
 The ledger reserves spending before launch and records confirmed termination.
 The configuration files remain the source for cap values.
+The spending guard reads `notification_recipient` and `notification_timeout_s` when it attempts delivery of a limit notice.
+The guard retries a failed notice after the saved retry deadline while its accounting period is current.
+When the guard checks a pending notice after its period ends in `accounting_zone`, it marks the notice as `expired`.
+The ledger keeps expired notices as history.
 
 `report.py` reads the AWS state folder without target registration.
 Its AWS section retains the account bill, daily gate spend, and historical builder comparisons.

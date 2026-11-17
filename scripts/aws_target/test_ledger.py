@@ -868,6 +868,66 @@ class LedgerTests(CostFixture):
         self.assertIsInstance(self.guard(now), ledger.SpendingRefused)
         self.assertEqual(len(self.notices), 1)
 
+    def test_guard_loads_legacy_pending_notice_and_delivers_with_live_settings(self) -> None:
+        now = self.reach_limit()
+        self.assertIsInstance(self.book.guard(self.settings, "admission", now, lambda _event: False),
+                              ledger.SpendingRefused)
+        document = ledger.mapping(cast(object, json.loads(self.book.path.read_text())))
+        old_event, = ledger.rows(document, "events")
+        old_settings = config.read_settings(self.settings)
+        old_event.update(recipient=old_settings.notification_recipient, timeout_s=old_settings.notification_timeout_s)
+        _ = self.book.path.write_text(json.dumps(document))
+        self.book = ledger.CostLedger(self.state)
+        pending, = self.book.read_snapshot().events
+        self.assertEqual(pending.delivery, ledger.DeliveryState.PENDING)
+
+        self.text_setting("notification_recipient", "live-fixture-recipient")
+        self.replace("notification_timeout_s", "23")
+        sends: list[tuple[str, object]] = []
+
+        def message(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if arguments[0] == "git":
+                return git_only(arguments, **options)
+            self.assertEqual(Path(arguments[1]).name, "send.py")
+            sends.append((arguments[arguments.index("--to") + 1], options["timeout"]))
+            return subprocess.CompletedProcess(list(arguments), 0, "SENT: fixture recipient\n", "")
+
+        with mock.patch.object(subprocess, "run", side_effect=message):
+            self.assertIsInstance(self.book.guard(self.settings, "admission", pending.retry_after),
+                                  ledger.SpendingRefused)
+        self.assertEqual(sends, [("live-fixture-recipient", 23)])
+        delivered, = self.saved_events()
+        self.assertEqual(delivered["event_id"], pending.event_id)
+        self.assertEqual(delivered["delivery"], "delivered")
+        self.assertNotIn("recipient", delivered)
+        self.assertNotIn("timeout_s", delivered)
+
+    def test_guard_expires_pending_notices_at_accounting_boundaries(self) -> None:
+        self.text_setting("accounting_zone", "America/New_York")
+        created_at = instant("2026-01-30T23:59:59-05:00")
+        month_ends = instant("2026-02-01T00:00:00-05:00")
+        daily = ledger.LimitEvent("daily:2026-01-30", created_at, "daily", Decimal(20), Decimal(20),
+                                  retry_after=month_ends + 1, owner=ledger.DeliveryOwner("interrupted"))
+        monthly = replace(daily, event_id="monthly:2026-01", period="monthly")
+        with self.book.transaction() as state:
+            state.events.extend((daily, monthly))
+
+        notify = mock.Mock(return_value=True)
+        _ = self.book.guard(self.settings, "admission", created_at, notify)
+        self.assertEqual(self.book.read_snapshot().events, [daily, monthly])
+        _ = self.book.guard(self.settings, "admission", created_at + 1, notify)
+        expired_daily = replace(daily, delivery=ledger.DeliveryState.EXPIRED, owner=ledger.DeliveryUnowned())
+        self.assertEqual(self.book.read_snapshot().events, [expired_daily, monthly])
+        _ = self.book.guard(self.settings, "admission", month_ends - 1, notify)
+        self.assertEqual(self.book.read_snapshot().events, [expired_daily, monthly])
+        _ = self.book.guard(self.settings, "admission", month_ends, notify)
+        expired_monthly = replace(monthly, delivery=ledger.DeliveryState.EXPIRED, owner=ledger.DeliveryUnowned())
+        self.assertEqual(self.book.read_snapshot().events, [expired_daily, expired_monthly])
+        self.book = ledger.CostLedger(self.state)
+        _ = self.book.guard(self.settings, "admission", month_ends + 1, notify)
+        self.assertEqual(self.book.read_snapshot().events, [expired_daily, expired_monthly])
+        notify.assert_not_called()
+
     def test_guard_retries_delivery_after_notifier_exception(self) -> None:
         now = self.reach_limit()
         with mock.patch.object(self, "notice", side_effect=RuntimeError("fixture delivery failure")):

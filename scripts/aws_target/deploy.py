@@ -249,7 +249,7 @@ class Deployment:
     def __init__(self, settings_path: Path, directory: Path, output: Path, *,
                  execute: AwsExecutor = execute_command, clock: Callable[[], float] = time.time,
                  pause: Callable[[float], None] = time.sleep,
-                 notify: Callable[[ledger.LimitEvent], bool] = ledger.send_limit_event) -> None:
+                 notify: Callable[[ledger.LimitNotice], bool] = ledger.send_limit_event) -> None:
         self.settings_path = settings_path
         self.directory = directory
         self.output = output
