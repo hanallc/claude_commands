@@ -22,6 +22,7 @@ from scripts.production.production_doc import Production
 from scripts.production.issues import frontmatter
 from scripts.production.change_routing import UnavailableProduction
 from scripts.review_links import change_page, console, page_frame
+from scripts.review_links import staff_names
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
 from scripts.statusline import rebuild_row
 
@@ -344,8 +345,20 @@ def choice_list(choices: list[str]) -> str:
 def followup_sections(item: update_registration.OutstandingItem) -> str:
     """Show each follow-up the user sent and the asker's reply."""
     return "".join('<h2>Follow-up</h2>' + change_page.review_text_html(each["followup"], inline=True)
-                   + '<h2>Reply</h2>' + change_page.review_text_html(each["reply"], inline=True)
+                   + '<h2>Reply</h2>' + answer_html(each["reply"])
                    for each in item.get("followups", []))
+
+
+def answer_html(text: str) -> str:
+    """Show a showrunner reply or answer; a line that holds only a command is a code block with a copy button."""
+    content: list[str] = []
+    start = 0
+    for block in page_frame.CODE_BLOCK.finditer(text):
+        content.append(question_paragraphs(text[start:block.start()]))
+        content.append(page_frame.code_block_html(block))
+        start = block.end()
+    content.append(question_paragraphs(text[start:]))
+    return "".join(content)
 
 
 def question_text(item: update_registration.OutstandingItem) -> tuple[str, str]:
@@ -440,16 +453,20 @@ def question_parts(item: update_registration.OutstandingItem) -> tuple[str, str]
 ANSWER_HELP = "A choice fills this. Edit it or write your own. Nothing sends until you press Answer."
 
 
-def question_details(question: WaitingQuestion) -> str:
+def question_details(question: WaitingQuestion,
+                     names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
     """Show the source and the filed time under the question's buttons."""
     filed = datetime.fromisoformat(question.record.item["since"])
+    names = names if isinstance(names, staff_names.StaffNames) else staff_names.read()
+    source = names.source(question.record.asker) if question.record.asker in names.rows else html.escape(question.asker)
     lines = (("source", question.asker), ("date", filed.strftime("%Y-%m-%d")), ("time", filed.strftime("%H:%M")))
     return ('<dl class="change-details">'
-            + ''.join(f'<dt>{label}:</dt><dd>{html.escape(value)}</dd>' for label, value in lines)
+            + ''.join(f'<dt>{label}:</dt><dd>{source if label == "source" else html.escape(value)}</dd>' for label, value in lines)
             + '</dl>')
 
 
-def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback_rows: int) -> str:
+def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback_rows: int,
+                     names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
     key = html.escape(question.key)
     body, choices = question_parts(question.record.item)
     title = question.record.item["text"] if "parts" in question.record.item else question_text(question.record.item)[0]
@@ -468,7 +485,7 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
     return f'''<section hidden data-type="questions" data-key="{key}" data-tab="{html.escape(question.tab)}" data-pending="true">
 <h1>{html.escape(title)}</h1>
 {body}{shown_choices}
-<p role="status" data-save-state></p>{form}{question_details(question)}</section>'''
+<p role="status" data-save-state></p>{form}{question_details(question, names)}</section>'''
 
 
 @dataclass(frozen=True)
@@ -498,20 +515,22 @@ def rebuild_list(answer: rebuild_row.RebuildAnswer, changes: dict[str, tuple[reb
                  for item in records]
         items += [Rebuild(change.at, who(change.session), change.reason)
                   for change in changes.get(machine_name, ()) if change.commit not in filed]
-        listed = owner_groups(items) if items else '<p>The change list is not available yet.</p>'
+        listed = owner_groups(items, staff_names.StaffNames(record)) if items else '<p>The change list is not available yet.</p>'
         blocks.append(f'<article data-machine="{html.escape(machine_name)}"><h2>Rebuild {html.escape(name)}</h2>{listed}</article>')
     label = f"Rebuild {' and '.join(names)}" if names else ""
     return (f'<div data-rebuilds data-count="{len(names)}" data-label="{html.escape(label, quote=True)}">'
             + (''.join(blocks) if blocks else '<p>No rebuilds needed.</p>') + '</div>')
 
 
-def owner_groups(items: list[Rebuild]) -> str:
+def owner_groups(items: list[Rebuild],
+                 names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
     """Name each owner once, newest change first; under an owner, changes at one shown time share that time."""
     owners: dict[str, dict[str, list[Rebuild]]] = {}
+    names = names if isinstance(names, staff_names.StaffNames) else staff_names.read()
     for item in sorted(items, key=lambda item: datetime.fromisoformat(item.at), reverse=True):
         owners.setdefault(item.owner, {}).setdefault(shown_time(datetime.fromisoformat(item.at)), []).append(item)
     return ''.join(
-        f'<div data-owner><h3>{html.escape(owner)}</h3><dl>'
+        f'<div data-owner><h3>{names.html(owner)}</h3><dl>'
         + ''.join(f'<dt><time datetime="{html.escape(group[0].at, quote=True)}">{html.escape(shown)}</time></dt>'
                   + ''.join(f'<dd>{html.escape(item.reason)}</dd>' for item in group)
                   for shown, group in times.items())
@@ -541,6 +560,7 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
     feedback_rows = settings.whole("feedback_rows")
     refresh_seconds = settings.number("page_refresh_seconds")
     prepared = prepare(browser, status, settings=settings)
+    names_read = staff_names.read()
     kind = browser.kind
     names = prepared.queues if kind == "changes" else prepared.question_tabs
     menus: list[str] = []
@@ -549,9 +569,9 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
                  else sum(item.tab == name for item in prepared.questions))
         label = "Owner unavailable" if name == "unrouted" else name
         menus.append(f'<option data-showrunner="{html.escape(name)}" '
-                     + f'data-count="{count}" value="{html.escape(name)}">{html.escape(label)} ({count})</option>')
+                     + f'data-count="{count}"{names_read.style(name)} value="{html.escape(name)}">{html.escape(label)} ({count})</option>')
     cards = (''.join(section(item, feedback_rows) for item in prepared.changes) if kind == "changes"
-             else ''.join(question_section(item, browser, feedback_rows) for item in prepared.questions))
+             else ''.join(question_section(item, browser, feedback_rows, names_read) for item in prepared.questions))
     content = (PAGE_STYLE + page_frame.title(change_page.TITLES[kind], "review") + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}" data-script="{SCRIPT_VERSION}">'
                + '<div data-showrunner-filter><label for="review-showrunner">Showrunner:</label>'
                + '<select id="review-showrunner" aria-label="Showrunner"><option value="">All</option></select></div>'

@@ -750,7 +750,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         """Start a Disks page measure in the background and answer at once with the slots and sessions in use now."""
         now = time.time()
         try:
-            started = disks_page.start_measure(now)
+            length = int(self.headers.get("Content-Length", "0"))
+            fields = parse_qs(self.rfile.read(length).decode("utf-8"))
+            started = disks_page.start_measure(now, force=fields.get("force") == ["1"])
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             self.browser_failure(503, "The measure could not start.", error)
             return
@@ -764,7 +766,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except (OSError, ValueError) as error:
             print(f"review-links disks sessions: {error}", file=sys.stderr)
             folders = None
-        self.json_response(200, {"state": started.value, "slots": report, "sessions": folders})
+        self.json_response(200, {"state": started.state.value, "target": started.target, "slots": report, "sessions": folders})
 
     def browser_failure(self, status: int, reason: str, error: Exception) -> None:
         print(f"review-links browser answer: {error}", file=sys.stderr)

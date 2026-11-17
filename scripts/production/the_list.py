@@ -175,6 +175,7 @@ class ListItem:
     number: int
     title: str
     owner: ItemOwner
+    producer: staff.StaffId
     unit: str
     state: ItemState
     next_check: NextCheck
@@ -203,6 +204,7 @@ class ListItem:
 class ItemChanges(TypedDict, total=False):
     title: str
     owner: ItemOwner
+    producer: staff.StaffId
     unit: str
     state: ItemState
     next_check: NextCheck
@@ -297,12 +299,17 @@ def _line(value: str, name: str) -> None:
         raise ListError(f"{name} must have one nonempty line")
 
 
+def _staff_id(value: str, name: str) -> None:
+    if not value or Path(value).name != value or value in (".", ".."):
+        raise ListError(f"invalid {name} staff id")
+
+
 def _validate(item: ListItem) -> None:
     if item.number < 1:
         raise ListError("number must be positive")
     _line(item.title, "title")
-    if not item.owner or Path(item.owner).name != item.owner or item.owner in (".", ".."):
-        raise ListError("invalid owner staff id")
+    _staff_id(item.owner, "owner")
+    _staff_id(item.producer, "producer")
     if item.unit and item.unit.splitlines() != [item.unit]:
         raise ListError("unit must have one line")
     for moment in (item.opened, item.updated, item.next_check, item.unread_since, item.parked_until, item.closed):
@@ -398,6 +405,7 @@ def load(keeper: staff.StaffId, identity: str, *, sources: list[Path] | None = N
             changes.append(ItemChange(_required_time(date + "T" + clock), what, source))
         item = ListItem(int(fields["number"]), fields["title"],
                         UnassignedOwner(fields["owner"]) if fields["owner"] in UnassignedOwner else staff.StaffId(fields["owner"]),
+                        staff.StaffId(fields.get("producer", keeper)),
                         fields["unit"], ItemState(fields["state"]), next_check_value(fields["next_check"]),
                         EtaDescription(fields["eta"]) if fields["eta_kind"] == "text" else eta_value(fields["eta"]),
                         time_value(fields["unread_since"]), time_value(fields["parked_until"]),
@@ -416,7 +424,7 @@ def load(keeper: staff.StaffId, identity: str, *, sources: list[Path] | None = N
 def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
     _validate(item)
     fields = {"id": item.id, "number": str(item.number), "title": item.title,
-              "owner": item.owner, "unit": item.unit, "state": item.state.value,
+              "owner": item.owner, "producer": item.producer, "unit": item.unit, "state": item.state.value,
               "next_check": next_check_text(item.next_check), "eta": eta_text(item.eta),
               "eta_kind": "text" if isinstance(item.eta, EtaDescription) else "time or status",
               "unread_since": _time_text(item.unread_since), "parked_until": _time_text(item.parked_until),
@@ -499,12 +507,13 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
         if store.path(identity).exists():
             raise ListError(f"{identity}: the item already exists")
         moment = now()
-        item = ListItem(chosen, title, owner, "", ItemState.NEW, NoTimestamp.UNSET, EtaStatus.NOT_ASKED,
+        item = ListItem(chosen, title, owner, keeper, "", ItemState.NEW, NoTimestamp.UNSET, EtaStatus.NOT_ASKED,
                         moment, NoTimestamp.UNSET, (), (), requested_by, moment, moment, NoTimestamp.UNSET, "",
                         "", "", "", "", ())
         if changes:
             item = replace(item, **changes)
-        initial: ItemChanges = {"title": item.title, "owner": item.owner, "state": item.state, "eta": item.eta,
+        initial: ItemChanges = {"title": item.title, "owner": item.owner, "producer": item.producer,
+                                "state": item.state, "eta": item.eta,
                                 "next_step": item.next_step, "latest_status": item.latest_status}
         initial.update(changes)
         item = replace(item, log=(ItemChange(moment, "Added; " + _change_text(initial), source),))
@@ -860,7 +869,8 @@ def table(keeper: staff.StaffId, *, include_closed: bool = False, include_parked
     items = [item for item in items if include_parked or not isinstance(item.parked_until, datetime) or item.parked_until <= moment]
     items.sort(key=order)
     record = staff.snapshot()
-    lines = ["| # | Owner | Item | State | Next step | ETA | Update |", "| --- | --- | --- | --- | --- | --- | --- |"]
+    lines = ["| # | Owner | Producer | Item | State | Next step | ETA | Update |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- |"]
     for item in items:
         owner = record.by_id(item.owner) if not isinstance(item.owner, UnassignedOwner) else None
         state = item.state.value
@@ -870,13 +880,23 @@ def table(keeper: staff.StaffId, *, include_closed: bool = False, include_parked
             state += "; check: " + item.next_check.text
         if isinstance(item.parked_until, datetime) and item.parked_until > moment:
             state += "; parked until " + item.parked_until.isoformat()
-        cells = (str(item.number), owner.name if owner is not None else item.owner, item.title, state,
+        producer = record.by_id(item.producer)
+        cells = (str(item.number), owner.name if owner is not None else item.owner,
+                 producer.name if producer is not None else item.producer, item.title, state,
                  item.next_step, eta_text(item.eta), "●" if isinstance(item.unread_since, datetime) else "—")
         lines.append("| " + " | ".join(" ".join(cell.split()).replace("|", "\\|") for cell in cells) + " |")
     return "\n".join(lines)
 
 
-def _cli_changes(args: argparse.Namespace) -> ItemChanges:
+def producer_id(members: staff.StaffSnapshot, reference: str) -> staff.StaffId:
+    """Resolve a producer name or fixed staff id; refuse every other staff row."""
+    matches = [row for row in staff.active(members, "producer") if reference in (row.id, row.name)]
+    if len(matches) != 1:
+        raise ListError("producer must name one producer staff row by name or staff id")
+    return matches[0].id
+
+
+def _cli_changes(args: argparse.Namespace, members: staff.StaffSnapshot) -> ItemChanges:
     options = cast(dict[str, object], vars(args))
     changes: ItemChanges = {}
     text_fields: tuple[Literal["title", "unit", "next_step", "latest_status", "evidence", "done_when"], ...] = (
@@ -890,10 +910,13 @@ def _cli_changes(args: argparse.Namespace) -> ItemChanges:
         if owner_id in UnassignedOwner:
             changes["owner"] = UnassignedOwner(owner_id)
         else:
-            owner = staff.snapshot().by_id(staff.StaffId(owner_id))
+            owner = members.by_id(staff.StaffId(owner_id))
             if owner is None or owner.kind != "showrunner":
                 raise ListError("owner must name a showrunner staff id")
             changes["owner"] = owner.id
+    producer = options.get("producer")
+    if isinstance(producer, str):
+        changes["producer"] = producer_id(members, producer)
     state, next_check, eta, requested = (options.get(key) for key in ("state", "next_check", "eta", "requested_by"))
     if isinstance(state, str):
         changes["state"] = ItemState(state)
@@ -931,6 +954,7 @@ def main(argv: list[str] | None = None) -> int:
         if name in ("add", "update"):
             _ = command.add_argument("--title", required=name == "add")
             _ = command.add_argument("--owner", required=name == "add")
+            _ = command.add_argument("--producer")
             for key in ("unit", "next-check", "eta", "next-step", "latest-status", "evidence", "done-when"):
                 _ = command.add_argument("--" + key)
             _ = command.add_argument("--state", choices=[state.value for state in ItemState if state != ItemState.CLOSED])
@@ -994,7 +1018,7 @@ def main(argv: list[str] | None = None) -> int:
             edit_reviews = link if name == "link" else unlink
             _ = edit_reviews(keeper, identity, resolved, source=source)
         elif name == "add":
-            changes = _cli_changes(args)
+            changes = _cli_changes(args, record)
             number = cast(dict[str, object], vars(args)).get("number")
             owner = changes.get("owner")
             if owner is None:
@@ -1002,7 +1026,7 @@ def main(argv: list[str] | None = None) -> int:
             print(add(keeper, cast(str, args.title), owner=owner, source=source,
                       number=number if isinstance(number, int) else NextNumber.AVAILABLE, changes=changes).id)
         elif name == "update":
-            _ = update(keeper, cast(str, args.id), _cli_changes(args), source=source)
+            _ = update(keeper, cast(str, args.id), _cli_changes(args, record), source=source)
         elif name == "park":
             _ = park(keeper, cast(str, args.id), time_value(cast(str, args.until)), source=source)
         elif name == "close":

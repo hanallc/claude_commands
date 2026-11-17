@@ -19,6 +19,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode
 
 from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member
@@ -158,6 +159,14 @@ class ChangeImageTests(ImagesFixture):
 
 
 class ImagesTests(ImagesFixture):
+    def test_staff_image_owners_have_role_colors_and_unknown_owners_stay_plain(self) -> None:
+        record = self.register()
+        body = images.render(self.root).decode()
+        self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>shot-owner</span>')
+        unknown = record.copy()
+        unknown["owner"] = "missing-owner"
+        self.assertIn('Unknown session: missing-owner</dd>', images.card(unknown, "private", staff.snapshot(), 2))
+
     def test_register_copies_the_image_into_a_folder_that_the_record_owns(self) -> None:
         record = self.register()
         folder = self.root / image_store.IMAGES_FOLDER / record["id"]
@@ -222,7 +231,7 @@ class ImagesTests(ImagesFixture):
         self.assertIn("document.getElementById('image-' + start.get('image'))", source)
         self.assertIn(f'<article id="image-{older["id"]}"', source)
         self.assertIn("Newer shot", source)
-        self.assertIn("shot-owner (unit)", source)
+        self.assertIn("shot-owner (unit)", without_role_colors(source))
         self.assertIn("Phase console-images", source)
         self.assertIn(f'src="/images/{newer['id']}/image.png"', source)
         token = images.request_token(images.console_token(self.root), newer["id"])
@@ -391,7 +400,7 @@ class ImagesTests(ImagesFixture):
         card = images.card(record, "token", staff.snapshot(), 3)
         path = f"/images/{record['id']}/image.png"
         token = images.request_token("token", record["id"])
-        self.assertEqual(card, (
+        self.assertEqual(without_role_colors(card), (
             f'<article id="image-{record['id']}" data-image="{record['id']}"'
             + f' data-owner="{record['owner']}" data-owner-name="shot-owner">'
             + '<h2 class="caption">Look at &lt;the&gt; cards</h2><dl class="image-details">'
