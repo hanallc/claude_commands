@@ -2232,7 +2232,8 @@ class WorkerRenameTests(StaffTestCase):
                                 self.assertEqual(result.returncode, 0, result.stderr)
                             unqualified = scenario in (QualifiedWorkerCase.UNDECIDED, QualifiedWorkerCase.UNDECIDED_DASHED_ROLE)
                             unchanged_count = len(bare_twins) + int(unqualified)
-                            summary = (f"{unchanged_count} worker names unchanged: no qualified prefix for {owner.name}\n"
+                            worker_names = "worker name" if unchanged_count == 1 else "worker names"
+                            summary = (f"{unchanged_count} {worker_names} unchanged: no qualified prefix for {owner.name}\n"
                                        if unchanged_count else "")
                             self.assertTrue(result.stderr.endswith(summary), result.stderr)
                             migration_errors = result.stderr.removesuffix(summary) if summary else result.stderr
@@ -2282,7 +2283,8 @@ class WorkerRenameTests(StaffTestCase):
                             current = staff.by_id(qualified.id)
                             still_qualified = current is not None and current.name == qualified.name and not unqualified
                             unchanged_count = len(remaining) - int(still_qualified)
-                            repeated_summary = (f"{unchanged_count} worker names unchanged: no qualified prefix for {owner.name}\n"
+                            worker_names = "worker name" if unchanged_count == 1 else "worker names"
+                            repeated_summary = (f"{unchanged_count} {worker_names} unchanged: no qualified prefix for {owner.name}\n"
                                                 if unchanged_count else "")
                             self.assertEqual(again.stderr, migration_errors + repeated_summary)
                             self.assertEqual(again.stdout, "unchanged\n")
@@ -2346,7 +2348,7 @@ class WorkerRenameTests(StaffTestCase):
                 result = invoke_cli(shutdown, lambda: shutdown.main(arguments), arguments,
                                     dict(os.environ), CHECKOUT)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stderr, "1 worker names unchanged: no qualified prefix for TEST-widget\n")
+                self.assertEqual(result.stderr, "1 worker name unchanged: no qualified prefix for TEST-widget\n")
                 self.assertEqual(staff.by_id(old_worker.id), old_worker)
                 self.assertEqual(fixture.staff_file.read_bytes(), before)
 
@@ -3492,7 +3494,7 @@ class UnitRenameTests(UnitRenameFixture):
                         self.assertEqual(len(messages), 3)
                         settled = self.invoke(["rename", str(row.id), "omega"])
                         self.assertEqual((settled.returncode, settled.stdout, settled.stderr),
-                                         (0, "unchanged\n", "1 worker names unchanged: no qualified prefix for omega\n"))
+                                         (0, "unchanged\n", "1 worker name unchanged: no qualified prefix for omega\n"))
                         self.assertEqual(len(messages), 3)
                         continue
                     if followup == "first notice timeout":
@@ -3504,7 +3506,7 @@ class UnitRenameTests(UnitRenameFixture):
                         self.assertEqual([message[0] for message in messages], [str(worker.id), str(row.id)])
                     rerun = self.rename()
                     self.assertEqual((rerun.returncode, rerun.stdout, rerun.stderr),
-                                     (0, "unchanged\n", "1 worker names unchanged: no qualified prefix for gamma\n"))
+                                     (0, "unchanged\n", "1 worker name unchanged: no qualified prefix for gamma\n"))
                     if followup == "document rename after promotion":
                         self.assertIsInstance(row.parent, staff.ReportsTo)
                         assert isinstance(row.parent, staff.ReportsTo)

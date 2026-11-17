@@ -889,6 +889,32 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 2. basedpyright scripts/review_links: 0 errors, 0 warnings.
 3. The review_links suites pass.
 
+### Phase 57 — A rename summary for one worker says "1 worker name unchanged"  · status: done
+**Result (2026-11-17):** `rename_qualified_workers` in `scripts/agents/shutdown.py` prints "1 worker name unchanged" for one and "worker names" for other counts; the four singular assertions changed to match.
+
+**Depends on:** Phase 47
+
+#### Work Order
+
+**Goal:** the add-on the sdlc showrunner approved 2026-11-17: the rename summary line says "1 worker names unchanged"; use "1 worker name unchanged" for one.
+
+**Spec:**
+1. `scripts/agents/shutdown.py:2156` prints "worker name" for a count of one and "worker names" for any other count.
+2. Change each test assertion that expects "1 worker names unchanged" to the singular text. Keep the plural assertions.
+
+**Files:**
+- `scripts/agents/shutdown.py`
+- `scripts/agents/test_shutdown_cli.py`
+- `scripts/production/test_unit_move.py`
+
+**Workers:** 1 writer (`design`).
+
+**State:** none.
+
+**Acceptance gate:**
+1. basedpyright on the three files: 0 errors, 0 warnings.
+2. `scripts.agents.test_shutdown_cli` and `scripts.production.test_unit_move` pass.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
