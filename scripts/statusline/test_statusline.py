@@ -4,10 +4,12 @@ from __future__ import annotations
 from scripts.lib.checkout_test_support import copy_runtime
 
 import json
+import io
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -1205,6 +1207,59 @@ class CountsRowTests(unittest.TestCase):
     def test_nothing_counted_shows_no_row(self) -> None:
         self.assertEqual(len(self.lines()), 1)
         self.assertEqual(self.cache.read_text(encoding="utf-8").splitlines()[:2], ["", ""])
+
+    def test_assignment_refreshes_counts_in_its_process_and_reuses_the_cache(self) -> None:
+        self.questions({"since": "2026-10-16T19:00", "text": "A"})
+        environment = {"HOME": str(self.home),
+                       "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
+                       "NOTIFIER_STATE_DIR": str(self.home / ".local/state/notifier"),
+                       "SHOWRUNNER_STATE_DIR": str(self.home / ".local/state/showrunner")}
+        with patch.dict(os.environ, environment), \
+                patch.object(counts_row, "write", wraps=counts_row.write) as refresh, \
+                patch.object(os, "execvp") as render, \
+                patch.object(subprocess, "Popen") as child:
+            for reading in ("first", "cached"):
+                with self.subTest(reading=reading), \
+                        patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": OWNER.current_session}))), \
+                        patch.object(sys, "argv", ["assignment.py", "--arg", "pwd", str(self.home)]):
+                    assignment.main()
+                    arguments = cast(list[str], render.call_args.args[1])
+                    position = arguments.index("counts")
+                    self.assertEqual(arguments[position + 1], f"{OWNER.current_session} For you: 1 question\n")
+                    self.assertEqual(refresh.call_count, 1)
+                    child.assert_not_called()
+
+            for damage, due in (("text", "damaged"), ("too many digits", "9" * 5000)):
+                _ = self.cache.write_text(f"For you: 99 questions\n{due}\n", encoding="utf-8")
+                before = refresh.call_count
+                with self.subTest(deadline=damage), \
+                        patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": OWNER.current_session}))), \
+                        patch.object(sys, "argv", ["assignment.py", "--arg", "pwd", str(self.home)]):
+                    render.reset_mock()
+                    assignment.main()
+                    render.assert_called_once()
+                    arguments = cast(list[str], render.call_args.args[1])
+                    self.assertEqual(arguments[arguments.index("counts") + 1],
+                                     f"{OWNER.current_session} For you: 1 question\n")
+                    self.assertEqual(refresh.call_count, before + 1)
+                    child.assert_not_called()
+
+            _ = Path(environment["STAFF_FILE"]).write_text(staff_text(OWNER, UNIT), encoding="utf-8")
+            for owner, writer, expected in (
+                    (UNIT, "write_unit", ""),
+                    (OWNER, "write", f"{OWNER.current_session} For you: 99 questions\n")):
+                cache = self.cache.with_name(owner.id)
+                _ = cache.write_text("For you: 99 questions\n0\n", encoding="utf-8")
+                with self.subTest(failed_refresh=owner.kind), \
+                        patch.object(counts_row, writer, side_effect=staff.StaffRefused("fixture refusal")), \
+                        patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": owner.current_session}))), \
+                        patch.object(sys, "argv", ["assignment.py", "--arg", "pwd", str(self.home)]):
+                    render.reset_mock()
+                    assignment.main()
+                    render.assert_called_once()
+                    arguments = cast(list[str], render.call_args.args[1])
+                    self.assertEqual(arguments[arguments.index("counts") + 1], expected)
+                    child.assert_not_called()
 
     def test_failed_reads_retry_and_restore_the_full_row(self) -> None:
         _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
