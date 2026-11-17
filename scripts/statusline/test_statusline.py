@@ -6,6 +6,7 @@ from scripts.lib.checkout_test_support import copy_runtime
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -14,6 +15,7 @@ import unittest
 from contextlib import ExitStack
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from functools import cache
 from pathlib import Path
 from collections.abc import Callable
 from typing import NotRequired, TextIO, TypedDict, cast, final, override
@@ -22,19 +24,46 @@ from zoneinfo import ZoneInfo
 
 from scripts.accounts import new_account
 from scripts.hooks import showrunner_footer
-from scripts.lib import conf
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.lint.memory_test_support import config_environment
 from scripts.production import footer_counts, investigation, session_labels, staff
 from scripts.production.issues import ALL_FIELDS, Issue
 from scripts.rebuild import need
 from scripts.agents import remote
 from scripts.statusline import adhoc_items, assignment, counts_row, rebuild_row
 
-PROGRAM = Path(__file__).with_name("statusline.jq")
-SHIPPED_COLORS = PROGRAM.parents[2] / "config/statusline.conf"
-# The settings.json statusLine command, naming this folder in place of ~/.claude's.
-COMMAND = f'statusline="{Path(__file__).parent}"; . "$statusline/statusline.sh"'
 USER_ZONE = ZoneInfo("America/New_York")
+STATUSLINE_SETTINGS = {
+    "role.showrunner": "#a379fd",
+    "role.unit-director": "#fcffc6",
+    "role.producer": "pink",
+    "role.astra-designer": "mauve",
+    "role.astra-reviewer": "bright-green",
+    "role.worker": "#ff04a3",
+    "account.claude1": "#53d5fd",
+    "account.claude2": "#cd54f2",
+    "account.claude3": "#ffc800",
+    "account.claude4": "#ff8700",
+    "account.codex1": "#ff1261",
+    "account.codex2": "#4bf331",
+    "account.claude5": "#19d772",
+    "counts.questions": "bright-red",
+    "counts.changes": "bright-cyan",
+    "counts.efficiency": "bright-green",
+    "counts.proposals": "purple",
+    "counts.adhoc_items": "pink",
+    "level.ok": "bright-green",
+    "level.warn": "bright-yellow",
+    "level.alarm": "bright-red",
+    "tokens.warn": "80",
+    "tokens.alarm": "90",
+    "left.warn": "10",
+    "left.alarm": "5",
+    "rebuild.cache": "~/.local/state/showrunner/rebuilds",
+}
+STATUSLINE_CONFIG = "# whole: 1..\ncounts.retry_seconds=5\n" + "".join(
+    f"{key}={value}\n" for key, value in STATUSLINE_SETTINGS.items()
+)
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # Preserve the fixture PATH when NixOS starts a child shell.
 SHELL_ENVIRONMENT = {"__NIXOS_SET_ENVIRONMENT_DONE": "1", "__ETC_ZSHENV_SOURCED": "1"}
@@ -43,17 +72,51 @@ SHELLS = ("/bin/sh", "zsh") if shutil.which("zsh") else ("/bin/sh",)
 ZONE_FILES = {"TZDIR": os.environ["TZDIR"]} if "TZDIR" in os.environ else {}
 
 
-def shipped_account_label(label: str) -> str:
-    """Derive the expected account escape from the shipped configuration."""
-    return shipped_label(f"account.{label}", label)
+def write_statusline_routing(config: Path) -> None:
+    """Use fixture paths and a fixture recipient for counts routing."""
+    lists = config / "change-lists"
+    reviews = config / "review-links"
+    lists.mkdir()
+    reviews.mkdir()
+    _ = (config / "change_review.conf").write_text(
+        f"lists_directory={lists}\nreview_links_directory={reviews}\n", encoding="utf-8")
+    _ = (config / "review_links.conf").write_text(f"unrouted_alert_recipient={OWNER.name}\n", encoding="utf-8")
+    _ = config_environment(config)
 
 
-def shipped_label(key: str, label: str) -> str:
-    """Derive the expected escape for one configured key from the shipped configuration."""
-    colors = conf.read(SHIPPED_COLORS).values()
-    if key not in colors:
-        return label
-    color = colors[key]
+@cache
+def statusline_runtime() -> Path:
+    """Copy the renderer and install the test configuration once for this module."""
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    unittest.addModuleCleanup(statusline_runtime.cache_clear)
+    copy_runtime(root, configuration=False)
+    config = root / "config"
+    config.mkdir()
+    _ = (config / "statusline.conf").write_text(STATUSLINE_CONFIG, encoding="utf-8")
+    _ = (config / "user_zone.conf").write_text(f"zone={USER_ZONE.key}\n", encoding="utf-8")
+    write_statusline_routing(config)
+    return root
+
+
+def fixture_colors() -> Path:
+    return statusline_runtime() / "config/statusline.conf"
+
+
+def renderer(name: str) -> Path:
+    return statusline_runtime() / "scripts/statusline" / name
+
+
+def statusline_command(root: Path) -> str:
+    return f'statusline={shlex.quote(str(root / "scripts/statusline"))}; . "$statusline/statusline.sh"'
+
+
+def fixture_account_label(label: str) -> str:
+    return fixture_label(f"account.{label}", label)
+
+
+def fixture_label(key: str, label: str) -> str:
+    """Derive the expected escape from the exact fixture key."""
+    color = STATUSLINE_SETTINGS[key]
     if re.fullmatch(r"#[0-9a-fA-F]{6}", color):
         rgb = ";".join(str(int(color[index:index + 2], 16)) for index in (1, 3, 5))
         return f"\x1b[38;2;{rgb}m{label}\x1b[0m"
@@ -63,7 +126,11 @@ def shipped_label(key: str, label: str) -> str:
         ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"))})
     codes.update({"orange": "38;5;208", "purple": "38;5;141", "pink": "38;5;211",
                   "teal": "38;5;30", "brown": "38;5;137", "mauve": "38;5;139"})
-    return f"\x1b[{codes[colors[key]]}m{label}\x1b[0m"
+    return f"\x1b[{codes[color]}m{label}\x1b[0m"
+
+
+def fixture_count_label(kind: str, count: int, words: str) -> str:
+    return fixture_label(f"counts.{kind}", f"\x1b[1m{count}\x1b[22m {words}")
 
 
 def status_lines(*inputs: object, labels: Path | None = None, account: str = "claude1",
@@ -89,7 +156,7 @@ def status_lines(*inputs: object, labels: Path | None = None, account: str = "cl
             configured = ["--rawfile", "colors", str(path)]
         result = subprocess.run(
             ["jq", "-r", "--arg", "pwd", "/tmp", "--arg", "account", account,
-             *stored, *parent, *configured, "-f", str(PROGRAM)],
+             *stored, *parent, *configured, "-f", str(renderer("statusline.jq"))],
             input=stdin, capture_output=True, text=True, check=True,
             env={**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "TZ": USER_ZONE.key, **ZONE_FILES, **marks},
         )
@@ -101,7 +168,7 @@ def seed_rebuild_cache(home: Path) -> None:
     seed_interpreter_cache(home / ".cache")
     cache = home / ".local/state/showrunner/rebuilds"
     cache.parent.mkdir(parents=True, exist_ok=True)
-    _ = cache.write_text("\n9999999999\n" + str(SHIPPED_COLORS) + "\n", encoding="utf-8")
+    _ = cache.write_text("\n9999999999\n" + str(fixture_colors()) + "\n", encoding="utf-8")
 
 
 OWNER = staff.StaffRow(staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"), "showrunner", "show", staff.StaffRoot(), current_session=staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"))
@@ -139,7 +206,7 @@ class ColorTests(unittest.TestCase):
                     result = subprocess.run(
                         ["jq", "-r", "--arg", "pwd", "/tmp/fallback",
                          "--arg", "role", "showrunner", *arguments,
-                         "--rawfile", "colors", str(colors), "-f", str(PROGRAM)],
+                         "--rawfile", "colors", str(colors), "-f", str(renderer("statusline.jq"))],
                         input=json.dumps({"workspace": {"current_dir": "/tmp/project"}}),
                         capture_output=True, text=True, check=True,
                         env={**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"]},
@@ -150,17 +217,17 @@ class ColorTests(unittest.TestCase):
                     self.assertNotIn("\x1b", line)
 
     def test_direct_jq_colors_the_entire_staff_assignment(self) -> None:
-        line = status_lines({"session_id": UNIT.id}, colors=SHIPPED_COLORS, staff_text=staff_text(OWNER, UNIT))[0]
-        self.assertEqual(line.split(" | ")[0], "\x1b[33mtrunk unit for show\x1b[0m")
+        line = status_lines({"session_id": UNIT.id}, colors=fixture_colors(), staff_text=staff_text(OWNER, UNIT))[0]
+        self.assertEqual(line.split(" | ")[0], fixture_label("role.unit-director", "trunk unit for show"))
 
     def test_direct_jq_with_invalid_or_non_object_staff_text_keeps_both_lines(self) -> None:
         payload = {**limits({"used_percentage": 38}, {"used_percentage": 60}),
                    "workspace": {"current_dir": "/tmp/project"}, "model": {"display_name": "Opus"}}
         for record in ('{"schema":1,"rows":', "42", "[]"):
             with self.subTest(record=record):
-                self.assertEqual(status_lines(payload, colors=SHIPPED_COLORS, staff_text=record, STAFF_ID=UNIT.id), [
+                self.assertEqual(status_lines(payload, colors=fixture_colors(), staff_text=record, STAFF_ID=UNIT.id), [
                     "unassigned | /tmp/project",
-                    f"{shipped_account_label('claude1')} | Opus | weekly \x1b[92m40% left\x1b[0m",
+                    f"{fixture_account_label('claude1')} | Opus | weekly {fixture_label('level.ok', '40% left')}",
                 ])
 
     def test_the_user_s_examples_render_the_role_with_its_path_then_the_account_model_tokens_and_weekly(self) -> None:
@@ -187,27 +254,30 @@ class ColorTests(unittest.TestCase):
 
     def test_shipped_role_colors_and_plain_unassigned(self) -> None:
         cases = (
-            ("\x1b[38;5;141mshow showrunner\x1b[0m", OWNER.id),
-            ("\x1b[33mtrunk unit for show\x1b[0m", UNIT.id),
-            (shipped_label("role.worker", "worker"), WORKER.id),
-            ("unassigned", ""),
+            ("showrunner", "show showrunner", OWNER.id),
+            ("unit-director", "trunk unit for show", UNIT.id),
+            ("worker", "worker", WORKER.id),
+            ("unassigned", "unassigned", ""),
         )
-        for expected, identity in cases:
-            with self.subTest(role=expected):
-                line = status_lines({"session_id": identity}, colors=SHIPPED_COLORS,
-                                    staff_text=staff_text(OWNER, UNIT, WORKER), STAFF_ID=identity)[0]
+        record = staff_text(OWNER, UNIT, WORKER)
+        for role, label, identity in cases:
+            with self.subTest(role=role):
+                self.assertEqual(assignment.assignment(assignment.staff_record(record), identity)[1], role)
+                expected = label if role == "unassigned" else fixture_label(f"role.{role}", label)
+                line = status_lines({"session_id": identity}, colors=fixture_colors(),
+                                    staff_text=record, STAFF_ID=identity)[0]
                 self.assertEqual(line.split(" | ")[0], expected)
 
     def test_shipped_account_colors_and_unknown_label(self) -> None:
-        colors = conf.read(SHIPPED_COLORS).values()
+        colors = STATUSLINE_SETTINGS
         for key in colors:
             if not key.startswith("account."):
                 continue
             account = key.removeprefix("account.")
             with self.subTest(account=account):
-                self.assertEqual(status_lines({}, account=account, colors=SHIPPED_COLORS)[1].split(" | ")[0],
-                                 shipped_account_label(account))
-        self.assertEqual(status_lines({}, account="claude99", colors=SHIPPED_COLORS)[1].split(" | ")[0], "claude99")
+                self.assertEqual(status_lines({}, account=account, colors=fixture_colors())[1].split(" | ")[0],
+                                 fixture_account_label(account))
+        self.assertEqual(status_lines({}, account="claude99", colors=fixture_colors())[1].split(" | ")[0], "claude99")
 
     def test_unassigned_stays_uncolored_without_its_role_color(self) -> None:
         line = status_lines({}, colors="role.showrunner=purple\n")[0]
@@ -235,7 +305,8 @@ class ColorTests(unittest.TestCase):
 
     def test_shipped_roles_and_accounts_use_hues_and_accounts_have_distinct_colors(self) -> None:
         accounts: list[str] = []
-        for key, value in conf.read(SHIPPED_COLORS).values().items():
+        roles: list[str] = []
+        for key, value in STATUSLINE_SETTINGS.items():
             if not key.startswith(("account.", "role.")):
                 continue
             color = value.lower()
@@ -245,9 +316,12 @@ class ColorTests(unittest.TestCase):
                     self.assertRegex(color, r"^#[0-9a-f]{6}$")
                     channels = tuple(int(color[index:index + 2], 16) for index in (1, 3, 5))
                     self.assertGreater(max(channels), min(channels))
-            if key.strip().startswith("account."):
+            if key.startswith("account."):
                 accounts.append(color)
+            else:
+                roles.append(color)
         self.assertEqual(len(set(accounts)), len(accounts))
+        self.assertEqual(len(set(roles)), len(roles))
 
     def test_every_new_account_palette_color_is_renderable_by_the_status_line(self) -> None:
         for color in new_account.STATUSLINE_PALETTE:
@@ -256,30 +330,37 @@ class ColorTests(unittest.TestCase):
                 self.assertRegex(field, r"^\x1b\[[0-9;]+mclaude1\x1b\[0m$")
 
     def test_token_thresholds_use_the_unrounded_window_percentage(self) -> None:
-        for tokens, code in ((79_000, 92), (79_999, 92), (80_000, 93),
-                             (89_000, 93), (89_999, 93), (90_000, 91)):
+        warn = 1000 * int(STATUSLINE_SETTINGS["tokens.warn"])
+        alarm = 1000 * int(STATUSLINE_SETTINGS["tokens.alarm"])
+        for tokens, level in ((warn - 1000, "ok"), (warn - 1, "ok"), (warn, "warn"),
+                              (alarm - 1000, "warn"), (alarm - 1, "warn"), (alarm, "alarm")):
             with self.subTest(tokens=tokens):
                 payload = ContextInput(context_window=ContextWindow(total_input_tokens=tokens, context_window_size=100_000))
-                field = status_lines(payload, colors=SHIPPED_COLORS)[1].split(" | ")[1]
-                self.assertEqual(field, f"\x1b[{code}m{tokens:,}\x1b[0m")
+                field = status_lines(payload, colors=fixture_colors())[1].split(" | ")[1]
+                self.assertEqual(field, fixture_label(f"level.{level}", f"{tokens:,}"))
 
     def test_tokens_without_a_positive_window_size_are_uncolored(self) -> None:
         for window in (ContextWindow(total_input_tokens=90_000),
                        ContextWindow(total_input_tokens=90_000, context_window_size=0),
                        ContextWindow(total_input_tokens=90_000, context_window_size=-1)):
             with self.subTest(window=window):
-                self.assertEqual(status_lines(ContextInput(context_window=window), colors=SHIPPED_COLORS)[1].split(" | ")[1], "90,000")
+                self.assertEqual(status_lines(ContextInput(context_window=window), colors=fixture_colors())[1].split(" | ")[1], "90,000")
 
     def test_each_usage_window_colors_the_integer_left_at_both_thresholds(self) -> None:
+        warn = int(STATUSLINE_SETTINGS["left.warn"])
+        alarm = int(STATUSLINE_SETTINGS["left.alarm"])
         for name, index in (("5-hour", 1), ("weekly", -1)):
-            for used, left, code in ((89, 11, 92), (90, 10, 93), (94, 6, 93), (95, 5, 91), (89.1, 10, 93)):
+            for left, fraction, level in ((warn + 1, 0, "ok"), (warn, 0, "warn"),
+                                          (alarm + 1, 0, "warn"), (alarm, 0, "alarm"), (warn, -0.9, "warn")):
                 # The 5-hour window shows only when under 10% of it is left.
                 if name == "5-hour" and left >= 10:
                     continue
+                used = 100 - left + fraction
                 with self.subTest(window=name, used=used):
                     payload = limits({"used_percentage": used}, {"used_percentage": used})
-                    field = status_lines(payload, colors=SHIPPED_COLORS)[1].split(" | ")[index]
-                    self.assertEqual(field, f"{name} \x1b[{code}m{left}% left\x1b[0m")
+                    field = status_lines(payload, colors=fixture_colors())[1].split(" | ")[index]
+                    expected = fixture_label(f"level.{level}", f"{left}% left")
+                    self.assertEqual(field, f"{name} {expected}")
 
     def test_empty_config_unknown_keys_and_invalid_colors_leave_the_piece_uncolored(self) -> None:
         for config in (Path("/dev/null"), "unknown.setting=bright-red\n",
@@ -293,13 +374,16 @@ class ColorTests(unittest.TestCase):
         for family in ("tokens", "left"):
             for threshold in ("warn", "alarm"):
                 with self.subTest(family=family, threshold=threshold):
-                    config = SHIPPED_COLORS.read_text(encoding="utf-8") + f"\n{family}.{threshold}=not-a-number\n"
+                    config = STATUSLINE_CONFIG + f"\n{family}.{threshold}=not-a-number\n"
                     lines = status_lines({**payload, **usage}, colors=config)
-                    account = shipped_account_label("claude1")
+                    account = fixture_account_label("claude1")
                     if family == "tokens":
-                        self.assertEqual(lines[1], f"{account} | 90,000 | 5-hour \x1b[91m5% left\x1b[0m | weekly \x1b[93m10% left\x1b[0m")
+                        hour = fixture_label("level.alarm", "5% left")
+                        weekly = fixture_label("level.warn", "10% left")
+                        self.assertEqual(lines[1], f"{account} | 90,000 | 5-hour {hour} | weekly {weekly}")
                     else:
-                        self.assertEqual(lines[1], f"{account} | \x1b[91m90,000\x1b[0m | 5-hour 5% left | weekly 10% left")
+                        tokens = fixture_label("level.alarm", "90,000")
+                        self.assertEqual(lines[1], f"{account} | {tokens} | 5-hour 5% left | weekly 10% left")
 
     def test_colors_wrap_only_the_fields_and_preserve_both_plain_lines(self) -> None:
         reset = int(datetime(2026, 12, 3, 12, tzinfo=timezone.utc).timestamp())
@@ -308,20 +392,23 @@ class ColorTests(unittest.TestCase):
                    "model": {"display_name": "Opus"}, "effort": {"level": "high"},
                    "context_window": ContextWindow(total_input_tokens=80_000, context_window_size=100_000)}
         plain = status_lines(payload, staff_text=staff_text(OWNER), STAFF_ID=OWNER.id)
-        colored = status_lines(payload, staff_text=staff_text(OWNER), STAFF_ID=OWNER.id, colors=SHIPPED_COLORS)
+        colored = status_lines(payload, staff_text=staff_text(OWNER), STAFF_ID=OWNER.id, colors=fixture_colors())
         self.assertEqual([ANSI.sub("", line) for line in colored], plain)
+        tokens = fixture_label("level.warn", "80,000")
+        hour = fixture_label("level.warn", "9% left")
+        weekly = fixture_label("level.alarm", "5% left")
         self.assertEqual(colored, [
-            "\x1b[38;5;141mshow showrunner\x1b[0m | /tmp/project",
-            f"{shipped_account_label('claude1')} | Opus high | \x1b[93m80,000\x1b[0m | 5-hour \x1b[93m9% left\x1b[0m until 07:00 EST | weekly \x1b[91m5% left\x1b[0m until Thu 07:00 EST",
+            f"{fixture_label('role.showrunner', 'show showrunner')} | /tmp/project",
+            f"{fixture_account_label('claude1')} | Opus high | {tokens} | 5-hour {hour} until 07:00 EST | weekly {weekly} until Thu 07:00 EST",
         ])
 
     def test_the_counts_row_colors_each_part_by_its_type_and_keeps_the_number_bold(self) -> None:
         row = "sid For you: 1 question, 2 changes, 130 efficiency, 2 proposals"
-        line = status_lines({"session_id": "sid"}, colors=SHIPPED_COLORS, counts=row)[-1]
-        self.assertEqual(line, "For you: \x1b[91m\x1b[1m1\x1b[22m question\x1b[0m, "
-                         + "\x1b[96m\x1b[1m2\x1b[22m changes\x1b[0m, "
-                         + "\x1b[92m\x1b[1m130\x1b[22m efficiency\x1b[0m, "
-                         + "\x1b[38;5;141m\x1b[1m2\x1b[22m proposals\x1b[0m")
+        line = status_lines({"session_id": "sid"}, colors=fixture_colors(), counts=row)[-1]
+        self.assertEqual(line, "For you: " + ", ".join((
+            fixture_count_label("questions", 1, "question"), fixture_count_label("changes", 2, "changes"),
+            fixture_count_label("efficiency", 130, "efficiency"), fixture_count_label("proposals", 2, "proposals"),
+        )))
 
     def test_a_counts_type_without_a_color_key_keeps_only_its_bold_number(self) -> None:
         row = "sid For you: 2 questions, 1 change, 1 proposal"
@@ -334,15 +421,15 @@ class ColorTests(unittest.TestCase):
             for text in ("3 adhoc items", "1 adhoc item"):
                 with self.subTest(session=identity, adhoc=text):
                     line = status_lines(
-                        {"session_id": identity}, colors=SHIPPED_COLORS, adhoc=text,
+                        {"session_id": identity}, colors=fixture_colors(), adhoc=text,
                         counts=f"{identity} For you: 1 question, 2 changes, 130 efficiency",
                         staff_text=staff_text(OWNER, UNIT),
                     )[-1]
                     count, words = text.split(" ", 1)
-                    self.assertEqual(line, f"For you: \x1b[38;5;211m\x1b[1m{count}\x1b[22m {words}\x1b[0m, "
-                                     + "\x1b[91m\x1b[1m1\x1b[22m question\x1b[0m, "
-                                     + "\x1b[96m\x1b[1m2\x1b[22m changes\x1b[0m, "
-                                     + "\x1b[92m\x1b[1m130\x1b[22m efficiency\x1b[0m")
+                    self.assertEqual(line, "For you: " + ", ".join((
+                        fixture_count_label("adhoc_items", int(count), words), fixture_count_label("questions", 1, "question"),
+                        fixture_count_label("changes", 2, "changes"), fixture_count_label("efficiency", 130, "efficiency"),
+                    )))
 
 
 class AdhocItemsTests(unittest.TestCase):
@@ -553,15 +640,16 @@ class RoleTests(unittest.TestCase):
     def first_line(self, session_id: str = "aaaa-1111", **marks: str) -> str:
         return ANSI.sub("", self.command_lines({"session_id": session_id}, **marks)[0])
 
-    def command_lines(self, payload: object, *, command: str = COMMAND, shell: str = "/bin/sh", **marks: str) -> list[str]:
+    def command_lines(self, payload: object, *, command: str = "", shell: str = "/bin/sh", **marks: str) -> list[str]:
         """Run the statusLine command as Claude Code does, with only `marks` beside a bare environment."""
         seed_rebuild_cache(self.home)
         self.seed_empty_counts(Path(marks.get("STAFF_FILE", self.home / ".local/state/staff/staff.json")),
                                Path(marks.get("SHOWRUNNER_STATE_DIR", self.home / ".local/state/showrunner")))
         read_log = {"CONF_READ_LOG": os.environ["CONF_READ_LOG"]} if "CONF_READ_LOG" in os.environ else {}
-        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), **read_log, **marks}
+        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home),
+               "CONF_DIR": str(fixture_colors().parent), **read_log, **marks}
         result = subprocess.run(
-            [shell, "-c", command], input=json.dumps(payload), capture_output=True, text=True,
+            [shell, "-c", command or statusline_command(statusline_runtime())], input=json.dumps(payload), capture_output=True, text=True,
             check=True, env=env, cwd=self.home,
         )
         return result.stdout.splitlines()
@@ -590,7 +678,7 @@ class RoleTests(unittest.TestCase):
                     self.skipTest("dash is not on PATH")
                 _ = reads.write_text("")
                 line = self.command_lines(payload, shell=shell, USER_ZONE_CONF=str(conf), CONF_READ_LOG=str(reads))[1]
-                self.assertIn("5-hour \x1b[91m5% left\x1b[0m until 08:00 AST", line)
+                self.assertIn(f"5-hour {fixture_label('level.alarm', '5% left')} until 08:00 AST", line)
                 self.assertIn("statusline", reads.read_text().splitlines())
                 self.assertIn(conf.stem, reads.read_text().splitlines())
                 pinned = self.command_lines(payload, shell=shell, USER_ZONE_CONF=str(conf),
@@ -706,7 +794,7 @@ class RoleTests(unittest.TestCase):
         for shell in SHELLS:
             with self.subTest(shell=shell):
                 line = self.command_lines({"session_id": UNIT.id}, shell=shell)[0]
-                self.assertEqual(line.split(" | ")[0], "\x1b[33mtrunk unit for show\x1b[0m")
+                self.assertEqual(line.split(" | ")[0], fixture_label("role.unit-director", "trunk unit for show"))
                 self.assertEqual(self.command_lines({"session_id": "other-id"}, shell=shell)[0].split(" | ")[0],
                                  "unassigned")
 
@@ -728,7 +816,7 @@ class RoleTests(unittest.TestCase):
                 self.assertEqual(ANSI.sub("", line), "worker | ~")
                 self.assertEqual(self.command_lines({"session_id": OWNER.id}, shell=shell, STAFF_ID=WORKER.id,
                                                     SHOWRUNNER_UNIT="wrong")[0].split(" | ")[0],
-                                 "\x1b[38;5;141mshow showrunner\x1b[0m")
+                                 fixture_label("role.showrunner", "show showrunner"))
 
     def test_unknown_staff_identity_never_adopts_a_same_named_row(self) -> None:
         _ = self.write_staff(OWNER, UNIT)
@@ -855,7 +943,7 @@ class RoleTests(unittest.TestCase):
 
         self.assertEqual(lines, [
             "unassigned | /tmp/project",
-            "Opus | weekly \x1b[92m40% left\x1b[0m",
+            f"Opus | weekly {fixture_label('level.ok', '40% left')}",
         ])
         self.assertFalse((self.home / ".local/state/notifier").exists())
 
@@ -871,19 +959,17 @@ class RoleTests(unittest.TestCase):
                    "model": {"display_name": "Opus"},
                    "context_window": ContextWindow(total_input_tokens=90_000, context_window_size=100_000)}
         _ = self.write_staff(OWNER, UNIT)
+        tokens = fixture_label("level.alarm", "90,000")
+        hour = fixture_label("level.alarm", "5% left")
+        weekly = fixture_label("level.ok", "11% left")
         self.assertEqual(self.command_lines({**payload, "session_id": UNIT.id}, CLAUDE_CONFIG_DIR=str(config)), [
-            "\x1b[33mtrunk unit for show\x1b[0m | ~/project | main",
-            f"{shipped_account_label('claude4')} | Opus | \x1b[91m90,000\x1b[0m | 5-hour \x1b[91m5% left\x1b[0m | weekly \x1b[92m11% left\x1b[0m",
+            f"{fixture_label('role.unit-director', 'trunk unit for show')} | ~/project | main",
+            f"{fixture_account_label('claude4')} | Opus | {tokens} | 5-hour {hour} | weekly {weekly}",
         ])
 
     def test_settings_command_with_a_missing_config_keeps_plain_text(self) -> None:
-        scripts = self.home / "scripts/statusline"
-        scripts.mkdir(parents=True)
-        for name in ("statusline.sh", "statusline.jq"):
-            _ = (scripts / name).write_text((PROGRAM.parent / name).read_text(encoding="utf-8"), encoding="utf-8")
-        (scripts / "assignment.py").symlink_to(PROGRAM.with_name("assignment.py"))
         copy_runtime(self.home, configuration=False)
-        command = f'statusline="{scripts}"; . "$statusline/statusline.sh"'
+        command = statusline_command(self.home)
         payload = {**limits({"used_percentage": 95}, {"used_percentage": 90}),
                    "context_window": ContextWindow(total_input_tokens=90_000, context_window_size=100_000)}
         _ = self.write_staff(OWNER, UNIT, WORKER)
@@ -933,6 +1019,11 @@ class CountsRowTests(unittest.TestCase):
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         seed_rebuild_cache(self.home)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+            "CONF_DIR": str(fixture_colors().parent), "CHANGE_REVIEW_DIR": "", "REVIEW_LINKS_ROOT": "",
+            "USER_ZONE": USER_ZONE.key,
+        }, clear=True)))
         doc = self.home / "docs/plans/show-production.md"
         doc.parent.mkdir(parents=True)
         self.ledger = self.home / "ledger.md"
@@ -965,8 +1056,8 @@ class CountsRowTests(unittest.TestCase):
 
     def lines(self, session_id: str = OWNER.id, shell: str = "/bin/sh") -> list[str]:
         env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
-               "STAFF_FILE": str(self.home / ".local/state/staff/staff.json")}
-        result = subprocess.run([shell, "-c", COMMAND], input=json.dumps({"session_id": session_id}),
+               "CONF_DIR": os.environ["CONF_DIR"], "STAFF_FILE": str(self.home / ".local/state/staff/staff.json")}
+        result = subprocess.run([shell, "-c", statusline_command(statusline_runtime())], input=json.dumps({"session_id": session_id}),
                                 capture_output=True, text=True, check=True, env=env, cwd=self.home)
         return [ANSI.sub("", line) for line in result.stdout.splitlines()]
 
@@ -1003,12 +1094,12 @@ class CountsRowTests(unittest.TestCase):
         _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
         self.questions(*(OutstandingItem(since="2026-10-16T19:00", text=f"Q{n}") for n in range(12)))
         env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
-               "STAFF_FILE": str(self.home / ".local/state/staff/staff.json")}
-        result = subprocess.run(["/bin/sh", "-c", COMMAND], input=json.dumps({"session_id": OWNER.id}),
+               "CONF_DIR": os.environ["CONF_DIR"], "STAFF_FILE": str(self.home / ".local/state/staff/staff.json")}
+        result = subprocess.run(["/bin/sh", "-c", statusline_command(statusline_runtime())], input=json.dumps({"session_id": OWNER.id}),
                                 capture_output=True, text=True, check=True, env=env, cwd=self.home)
-        self.assertEqual(result.stdout.splitlines()[-1],
-                         "For you: \x1b[91m\x1b[1m12\x1b[22m questions\x1b[0m, "
-                         + "\x1b[38;5;141m\x1b[1m1\x1b[22m proposal\x1b[0m")
+        questions = fixture_count_label("questions", 12, "questions")
+        proposal = fixture_count_label("proposals", 1, "proposal")
+        self.assertEqual(result.stdout.splitlines()[-1], f"For you: {questions}, {proposal}")
 
     def test_a_producer_session_counts_its_own_questions_without_a_timer(self) -> None:
         producer = staff.StaffRow(staff.StaffId("dd65ec85-c812-4a59-bfa1-2a8c31b8f510"), "producer", "dwight",
@@ -1249,8 +1340,9 @@ class CountsRowTests(unittest.TestCase):
         question_folder = self.cache.parent.parent / OWNER.id / "questions"
         question_folder.mkdir(parents=True)
         config = self.home / "config"
-        _ = shutil.copytree(SHIPPED_COLORS.parent, config)
+        config.mkdir()
         _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        write_statusline_routing(config)
         instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
         environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
                        "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent)}
@@ -1341,8 +1433,9 @@ class CountsRowTests(unittest.TestCase):
         doc = self.home / "docs/plans/show-production.md"
         _ = doc.write_text(doc.read_text() + f"- **Change review:** {listing}\n")
         config = self.home / "config"
-        _ = shutil.copytree(SHIPPED_COLORS.parent, config)
+        config.mkdir()
         _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        write_statusline_routing(config)
         instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
         environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
                        "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent)}
@@ -1385,8 +1478,9 @@ class CountsRowTests(unittest.TestCase):
         doc = self.home / "docs/plans/show-production.md"
         document = doc.read_text()
         config = self.home / "config"
-        _ = shutil.copytree(SHIPPED_COLORS.parent, config)
+        config.mkdir()
         _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        write_statusline_routing(config)
         links = self.home / "links"
         links.mkdir()
         instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
@@ -1440,8 +1534,9 @@ class CountsRowTests(unittest.TestCase):
         doc = self.home / "docs/plans/show-production.md"
         document = doc.read_text()
         config = self.home / "config"
-        _ = shutil.copytree(SHIPPED_COLORS.parent, config)
+        config.mkdir()
         _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        write_statusline_routing(config)
         lists, links, proposals = (self.home / name for name in ("lists", "links", "proposals"))
         questions = self.cache.parent.parent / OWNER.id / "questions"
         folders = (lists, links, proposals, questions)
@@ -1477,8 +1572,9 @@ class CountsRowTests(unittest.TestCase):
 
     def test_unreadable_routing_config_retries_and_keeps_the_config_source(self) -> None:
         config = self.home / "config"
-        _ = shutil.copytree(SHIPPED_COLORS.parent, config)
+        config.mkdir()
         _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        write_statusline_routing(config)
         settings = config / "change_review.conf"
         instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
         environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
@@ -1500,12 +1596,16 @@ class CountsRowTests(unittest.TestCase):
         self.assertIn(str(settings), sources)
         with patch.dict(os.environ, environment):
             cache = counts_row.write(instance)
-        self.assertEqual(cache.read_text().splitlines()[:2], ["", ""])
+        line, due, *sources = cache.read_text().splitlines()
+        self.assertEqual([line, due], ["", ""])
+        self.assertIn(str(config / "change-lists"), sources)
+        self.assertIn(str(config / "review-links"), sources)
 
     def test_later_config_failure_does_not_count_a_committed_list_directory(self) -> None:
         config = self.home / "config"
-        _ = shutil.copytree(SHIPPED_COLORS.parent, config)
+        config.mkdir()
         _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        write_statusline_routing(config)
         live, committed, links = (self.home / name for name in ("live", "committed", "links"))
         for folder in (live, committed, links):
             folder.mkdir()
@@ -1872,7 +1972,7 @@ class RebuildRowTests(unittest.TestCase):
                 with self.subTest(line=line):
                     _ = cache.write_text(line + "\n9999999999\n" + str(config) + "\n", encoding="utf-8")
                     result = subprocess.run(
-                        ["python3", str(PROGRAM.with_name("rebuild_row.py")), "read", "--config", str(config)],
+                        ["python3", str(renderer("rebuild_row.py")), "read", "--config", str(config)],
                         capture_output=True, text=True, check=False,
                     )
                     self.assertEqual((result.returncode, result.stdout, result.stderr), (0, machines, ""))
@@ -1899,7 +1999,7 @@ class RebuildRowTests(unittest.TestCase):
             self.assertTrue(answer.refresh_due)
             self.assertEqual(answer.row(), "rebuild natedev, rebuild mac")
             result = subprocess.run(
-                ["python3", str(PROGRAM.with_name("rebuild_row.py")), "read", "--config", str(config)],
+                ["python3", str(renderer("rebuild_row.py")), "read", "--config", str(config)],
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "natedev\nmac\n", ""))
@@ -2044,6 +2144,7 @@ class RebuildRowTests(unittest.TestCase):
                     self.assertEqual(status_lines({}, rebuild=answer.row())[-1], "For you: rebuild mac")
 
     def test_shell_reads_a_fresh_cache_without_running_the_refresh(self) -> None:
+        command = statusline_command(statusline_runtime())
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             cache = home / ".local/state/showrunner/rebuilds"
@@ -2055,7 +2156,7 @@ class RebuildRowTests(unittest.TestCase):
                     (home / ".local/state/rebuild/needs/unreadable.json").mkdir(parents=True)
                 for shell in SHELLS:
                     with self.subTest(shell=shell, unreadable=unreadable):
-                        result = subprocess.run([shell, "-c", COMMAND], input="{}", capture_output=True, text=True,
+                        result = subprocess.run([shell, "-c", command], input="{}", capture_output=True, text=True,
                                                 check=True, env={**SHELL_ENVIRONMENT, "HOME": directory,
                                                                  "PATH": os.environ["PATH"]}, cwd=home)
                         self.assertEqual(result.stdout.splitlines()[-1], "For you: rebuild natedev")

@@ -4764,7 +4764,7 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Accepted limit: a candidate `_missing_` that names the old values only to raise passes admission, then the guest rejects it.
 - 382 tests pass; basedpyright clean. Main-based commit 0622a8585 (branch `natest-gatewire2`) went to builds as "builds gatewire".
 
-### Phase 341 — two tests set their own environment  · status: todo
+### Phase 341 — two tests set their own environment  · status: done
 **Depends on:** none
 
 #### Work Order
