@@ -25,7 +25,7 @@ from scripts.review_links import review_items, review_page
 from scripts.statusline import counts_row, rebuild_row
 
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/list.html"
-HEADERS = ("#", "Owner", "Item", "State", "Next step", "ETA", "Update")
+HEADERS = ("#", "Owner", "Producer", "Item", "State", "Next step", "ETA", "Update")
 SHOWS = (("open", "Open"), ("needs-me", "Needs me"), ("unread", "Unread"), ("done", "Done"),
          ("parked", "Parked"), ("closed", "Closed"), ("all", "All"))
 
@@ -169,13 +169,15 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
               reviews: Mapping[str, review_items.ReviewItem]) -> str:
     item = entry.item
     owner = owner_name(members, item.owner)
+    producer = owner_name(members, item.producer)
     unread = isinstance(item.unread_since, datetime)
     parked = isinstance(item.parked_until, datetime) and item.parked_until > today
     eta = item.eta.earliest if isinstance(item.eta, the_list.EtaRange) else item.eta
     eta_sort: tuple[int, float | str] = (0, eta.timestamp()) if isinstance(eta, datetime) else (1, eta_text(eta, today).casefold())
-    values = (item.number, owner.casefold(), item.title.casefold(), item.state.value.casefold(),
+    values = (item.number, owner.casefold(), producer.casefold(), item.title.casefold(), item.state.value.casefold(),
               item.next_step.casefold(), eta_sort, item.unread_since.timestamp() if isinstance(item.unread_since, datetime) else 0)
-    attributes = {"key": entry.key, "number": str(item.number), "owner": str(item.owner), "state": item.state.value,
+    attributes = {"key": entry.key, "number": str(item.number), "owner": str(item.owner), "producer": item.producer,
+                  "keeper-produces": str(item.producer == entry.keeper).lower(), "state": item.state.value,
                   "unread": str(unread).lower(), "parked": str(parked).lower(), "title": item.title.lower(),
                   "order": str(index), "sort-values": json.dumps(values, ensure_ascii=False)}
     attrs = ''.join(f' data-{key}="{html.escape(value, quote=True)}"' for key, value in attributes.items())
@@ -207,12 +209,12 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
         if feedback.state == "alerted":
             notice = "not sent; " + feedback.alerted_to + " told" if feedback.alerted_to else "not sent; no showrunner for alert"
         update += '<small>' + html.escape(notice + ", " + local_time(sent, today)) + '</small>'
-    cells = (number, html.escape(owner), title, state, change_browser.question_paragraphs(item.next_step or "Not recorded"),
+    cells = (number, html.escape(owner), html.escape(producer), title, state, change_browser.question_paragraphs(item.next_step or "Not recorded"),
              html.escape(eta_text(item.eta, today)), update)
     row = ''.join(f'<td data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden = ' hidden' if parked or item.state in (the_list.ItemState.DONE, the_list.ItemState.CLOSED) else ''
     return (f'<tbody data-list-item{attrs}{hidden}><tr class="list-row">' + row
-            + f'</tr><tr data-detail id="{panel}" hidden><td colspan="7">' + details(entry, today, secret, reviews) + '</td></tr></tbody>')
+            + f'</tr><tr data-detail id="{panel}" hidden><td colspan="{len(HEADERS)}">' + details(entry, today, secret, reviews) + '</td></tr></tbody>')
 
 
 @dataclass(frozen=True)
@@ -362,6 +364,12 @@ def counts_strip(members: staff.StaffSnapshot) -> str:
             + ''.join(chips) + '</aside>') if chips else ''
 
 
+def filter_options(names: Mapping[str, str]) -> str:
+    """Write one menu option for each staff ID, sorted by its shown name."""
+    return ''.join(f'<option value="{html.escape(value, quote=True)}">{html.escape(name)}</option>'
+                   for value, name in sorted(names.items(), key=lambda pair: (pair[1].casefold(), pair[0])))
+
+
 def render(root: Path) -> bytes:
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
@@ -370,23 +378,24 @@ def render(root: Path) -> bytes:
                if any(entry.item.reviews for entry in items) else {})
     today = datetime.fromtimestamp(read_at, user_zone())
     secret = change_browser.browser_manifest(change_page.console_folder(root))[0]
-    owners = {str(entry.item.owner): owner_name(members, entry.item.owner) for entry in items}
-    options = ''.join(f'<option value="{html.escape(owner, quote=True)}">{html.escape(name)}</option>'
-                      for owner, name in sorted(owners.items(), key=lambda pair: (pair[1].casefold(), pair[0])))
+    owners = filter_options({str(entry.item.owner): owner_name(members, entry.item.owner) for entry in items})
+    producers = filter_options({str(entry.item.producer): owner_name(members, entry.item.producer) for entry in items})
     shows = ''.join(f'<option value="{value}">{label}</option>' for value, label in SHOWS)
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
     seconds = conf.read("review_links").number("page_refresh_seconds")
     content = (STYLE + page_frame.title("The List", "list")
                + f'<div data-list data-refresh-seconds="{seconds}"><div class="list-filters">'
-               + '<label for="list-owner">Owner</label><select id="list-owner"><option value="">All</option>' + options + '</select>'
+               + '<label for="list-owner">Owner</label><select id="list-owner"><option value="">All</option>' + owners + '</select>'
+               + '<label for="list-producer">Producer</label><select id="list-producer"><option value="">All</option>'
+               + producers + '</select>'
                + '<label for="list-show">Show</label><select id="list-show">' + shows + '</select>'
                + '<label class="list-search-label" for="list-search">Search</label>'
                + '<input type="search" id="list-search" placeholder="Filter by number or title">'
                + '<span data-list-count role="status" aria-live="polite"></span></div>'
                + '<div class="list-table"><table aria-label="The List"><colgroup><col style="width:5%"><col style="width:8%">'
-               + '<col style="width:22%"><col style="width:15%"><col style="width:25%"><col style="width:17%"><col style="width:8%">'
-               + '</colgroup><thead><tr>' + headers + '</tr></thead>'
+               + '<col style="width:10%"><col style="width:18%"><col style="width:14%"><col style="width:23%"><col style="width:14%">'
+               + '<col style="width:8%"></colgroup><thead><tr>' + headers + '</tr></thead>'
                + ''.join(item_rows(entry, members, today, index, secret, reviews) for index, entry in enumerate(items)) + '</table>'
                + '<p data-empty hidden>No items in this view.</p></div>' + counts_strip(members) + '</div><script>' + SCRIPT + '</script>')
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
@@ -397,6 +406,15 @@ STYLE = record_table.STYLE + '''<style>
 .list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
 .list-tell button{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
 .list-tell button:disabled{opacity:.45;cursor:default}.list-tell [data-send-status]{margin-left:0}
+.list-table td[data-label="State"]{color:var(--ink)}
+.list-table td[data-label="Producer"],.list-table td[data-label="ETA"]{color:var(--ink-2)}
+@media(max-width:960px){
+.list-table .list-row td[data-label="Producer"]{font-size:inherit}.list-table .list-row td[data-label="Item"]{font-size:17px}
+.list-table .list-row td[data-label="State"]::before{content:none}
+.list-table [data-keeper-produces=true] .list-row td[data-label="Producer"]{display:none}
+.list-table .list-row td[data-label="Producer"]::before,.list-table .list-row td[data-label="ETA"]::before{
+content:attr(data-label) ': ';color:var(--ink-3)}
+}
 </style>'''
 
 SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + r'''(() => {
@@ -405,8 +423,10 @@ let saving=0;
 const drafts=new Map();
 const tableView=createRecordTable({content:()=>content,
  shows:['open','needs-me','unread','done','parked','closed','all'],
- visible:(data,{owner,show,query:search})=>{
+ filters:['producer'],
+ visible:(data,{owner,show,query:search,filters})=>{
   if(owner && data.owner!==owner) return false;
+  if(filters.producer && data.producer!==filters.producer) return false;
   const number=search.replace(/^#?l?(?=\d)/,'');
   if(search && !data.number.includes(number) && !data.title.includes(search)) return false;
   switch(show){

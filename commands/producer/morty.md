@@ -53,6 +53,8 @@ Read The List records and morty's other `checkins.json` state at startup and aft
 Use `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all` to read every item.
 Save substantive item changes through `the_list.py add`, `update`, `park`, `close`, `reopen`, `mark-read`, `link`, or `unlink`.
 Use `--review <shown id>` or `--review-key <key>` with `link` and `unlink`; both options can repeat and mix.
+Use `--producer <name or staff id>` with `add` or `update` for an item that another producer, such as dwight, runs.
+An item without the option is morty's.
 Closed items retain their records and logs.
 Do not write `current.md`, the `items` or `removed_items` parts of `checkins.json`, or `open-questions.json`.
 Each item has a stable number, showrunner owner, state, next action, ETA, latest report, source time, and unread flag.
@@ -143,6 +145,7 @@ State missing or unreadable coverage explicitly. Do not treat missing data as ze
 `phone list` shows the visible items for a narrow screen. Use no table and no code block.
 Use these bold group labels in order: `Needs you`, `Working`, `Delivered, not proven`, `Quiet`.
 In the first three groups, write `**#N Short title** · owner`, with `●` when unread.
+When the item's producer is not morty, write `· owner · producer`.
 Under it, write one line of 12 words or fewer: nate's action, or the next step and its time.
 `Quiet` gives the numbers of the done, paused, and waiting items, one line for each state.
 End with the open question counts on one line and the parked numbers on one line.
