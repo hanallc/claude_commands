@@ -14,7 +14,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import cast
 
-from scripts.production import change_routing, delivery_state, record_store, staff, update_registration
+from scripts.production import change_routing, delivery_state, record_store, staff
 from scripts.review_links import review_events
 from scripts.review_links.review_events import ReviewLog
 from scripts.production.record_store import state_root as state_root
@@ -134,8 +134,8 @@ def answer(owner: staff.StaffId, identity: str, text: str, *, question_id: str =
         question = change_routing.delivery_slots(delivery).question
         if question_id or isinstance(question, delivery_state.OpenQuestion):
             try:
-                _ = update_registration.question_exchange_for_reply(question, question_id, text.strip())
-            except update_registration.StaleQuestionExchange as error:
+                _ = delivery_state.question_exchange_for_reply(question, question_id, text.strip())
+            except delivery_state.StaleQuestionExchange as error:
                 raise InvestigationError(str(error)) from None
         if item.state == InvestigationState.ANSWER_READY and item.answer == text:
             return item
