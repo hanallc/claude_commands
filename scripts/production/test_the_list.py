@@ -131,6 +131,72 @@ class TheListTests(unittest.TestCase):
         _ = the_list.update(MORTY.id, item.id, {}, source="morty")
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
+    def test_clean_evidence_removes_only_the_migration_copy_once(self) -> None:
+        block = 'Source checkins.json item:\n\n{"owner": "sdlc", "nested": {"state": "Delivered"}}\n'
+        cases = (
+            ("Keep these words.  \n\n## A heading\n\nKeep this line.\n\n \t\n" + block,
+             "Keep these words.  \n\n## A heading\n\nKeep this line.", False),
+            (" \t\n\n" + block, "", False),
+            ("Closed evidence.\r\n\r\n" + block.replace("\n", "\r\n"), "Closed evidence.", True),
+            ("Earlier words.\n\n" + block + "\n\nRecorded identity evidence:\n\nKeep these later words.  \n\n",
+             "Earlier words.\n\nRecorded identity evidence:\n\nKeep these later words.  \n\n", False),
+            ("Keep every line.\n\n", "Keep every line.\n\n", False),
+            ("The Source checkins.json item: words stay.\n", "The Source checkins.json item: words stay.\n", False),
+            ("Source checkins.json item:\nA person wrote this.", "Source checkins.json item:\nA person wrote this.", False),
+            ('Source checkins.json item:\n{"owner": "sdlc"}}\n', 'Source checkins.json item:\n{"owner": "sdlc"}}\n', False),
+            ('Source checkins.json item:\n{"owner": "sdlc"},\n', 'Source checkins.json item:\n{"owner": "sdlc"},\n', False),
+        )
+        originals: list[tuple[the_list.ListItem, str]] = []
+        for evidence, expected, closed in cases:
+            item = self.add(changes={"evidence": evidence, "next_step": block,
+                                     "latest_status": block, "done_when": block})
+            if closed:
+                item = the_list.close(MORTY.id, item.id, "The user removed it", source="nate")
+            originals.append((item, expected))
+        paths = [the_list.folder(MORTY.id) / f"{item.id}.md" for item, _ in originals]
+        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": OWNER.current_session}):
+            self.assertEqual(self.command("clean-evidence", "--source", "morty"),
+                             (1, "", "the_list: the current session must be the morty producer\n"))
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
+        moment = START + timedelta(minutes=1)
+        with patch.object(the_list, "now", return_value=moment):
+            self.assertEqual(self.command("clean-evidence", "--source", "morty"), (0, "4 changed; 5 unchanged\n", ""))
+        for index, (original, expected) in enumerate(originals):
+            with self.subTest(item=original.id):
+                cleaned = the_list.load(MORTY.id, original.id)
+                self.assertEqual(cleaned.evidence, expected)
+                if original.evidence != expected:
+                    entry = the_list.ItemChange(moment, "Removed the migration copy of checkins.json from Evidence", "morty")
+                    self.assertEqual(cleaned, replace(original, evidence=expected, updated=moment, log=(*original.log, entry)))
+                else:
+                    self.assertEqual(cleaned, original)
+                    self.assertEqual((paths[index].read_bytes(), paths[index].stat().st_mtime_ns), before[index])
+        after = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+        self.assertEqual(self.command("clean-evidence", "--source", "morty"), (0, "0 changed; 9 unchanged\n", ""))
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], after)
+
+    def test_page_events_only_mark_read_or_append_feedback(self) -> None:
+        item = self.add(number=106)
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": OWNER.current_session}):
+            self.assertEqual(self.command("mark-read", "--id", item.id, "--source", "nate")[0], 1)
+            read = the_list.mark_read(MORTY.id, item.id, source=the_list.PAGE_SOURCE)
+        self.assertEqual(replace(read, unread_since=item.unread_since, log=item.log), item)
+        self.assertEqual(read.log[-1].what, "Marked read")
+        words = 'Explain this simply.\nKeep "these" words.'
+        self.assertEqual(the_list.save_feedback(MORTY.id, item.id, the_list.PageFeedback("request", words)),
+                         the_list.PageFeedback("request", words))
+        sent = the_list.load(MORTY.id, item.id)
+        self.assertEqual(replace(sent, log=read.log), read)
+        self.assertIn(json.dumps(words), sent.log[-1].what)
+        self.assertEqual(the_list.sent_to_morty(sent), START)
+        self.assertIs(sent.unread_since, the_list.NoTimestamp.UNSET)
+        again = the_list.mark_read(MORTY.id, item.id, source=the_list.PAGE_SOURCE)
+        self.assertEqual(the_list.sent_to_morty(again), START)
+        with patch.object(the_list, "now", return_value=START + timedelta(minutes=1)):
+            changed = the_list.update(MORTY.id, item.id, {"latest_status": "Morty acts."}, source="owner report")
+        self.assertIs(the_list.sent_to_morty(changed), the_list.NoTimestamp.UNSET)
+
     def test_parking_hides_the_item_until_its_time_without_changing_state(self) -> None:
         item = self.add(changes={"state": the_list.ItemState.WORKING})
         with patch.object(the_list, "user_zone", return_value=ZoneInfo("America/New_York")):
@@ -159,6 +225,12 @@ class TheListTests(unittest.TestCase):
         self.assertIn("check overdue", output)
         self.assertIn("●", output)
         self.assertIn("—", output)
+        for check in (START - timedelta(minutes=1), START + timedelta(hours=1), the_list.CheckCondition("The review ends")):
+            closed = self.add("Closed check", changes={"next_check": check})
+            _ = the_list.close(MORTY.id, closed.id, "The user removed it", source="nate")
+            row = next(line for line in self.command("list", "--all")[1].splitlines()
+                       if line.startswith(f"| {closed.number} |"))
+            self.assertEqual(row.split("|")[4].strip(), "Closed")
 
     def test_item_links_keep_conditions_and_refuse_cycles(self) -> None:
         first, second, third = self.add("First"), self.add("Second"), self.add("Third")
