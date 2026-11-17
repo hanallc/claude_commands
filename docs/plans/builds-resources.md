@@ -2688,3 +2688,9 @@ The cutover removal commit deletes the script after the run.
 - Checkpoint `a081dcdb8`. Blind review: APPROVE, no findings.
 
 **Files:** `scripts/buildlog/test_record.py`, `scripts/buildlog/test_test_phase_peak.py`.
+
+### Phase 141 — Helper copies include scripts/aws_target  · status: todo
+
+Since Hana E-G, `build_targets.py` imports `scripts.aws_target.hana_placement`. Tests that copy helper trees (`scripts/lib/helper_tree_test_support.py` `COPY_HELPERS`) lacked `scripts/aws_target`, and 197 tests failed in the 8–140 set on main. Row 140 of that set (`cc1002178`) adds the package; this phase brings the same line to this branch and gets it a blind review.
+
+**Files:** `scripts/lib/helper_tree_test_support.py`.
