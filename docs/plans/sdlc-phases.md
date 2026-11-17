@@ -768,6 +768,37 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 1. `scripts.agents.test_shutdown_cli` passes, with a test for the `startup-unit` to `startup` case (no anomaly lines, folder and branch unchanged) and one for a folder that ends with neither name (anomaly kept).
 2. basedpyright reports 0 errors and 0 warnings on the changed Python files.
 
+### Phase 53 — The image question code has no import cycle, and page_question has its staff accessor row  · status: done
+**Depends on:** Phase 48
+
+#### Work Order
+
+**Goal:** the showrunner (2026-11-17, urgent): phase 48 cca97ba30 is red. (1) basedpyright reportImportCycles, 4 errors: `image_store.py` imports `change_page` and `page_question`; `change_page` imports `change_review`; `change_review` imports `image_store` (plus 3 longer chains through `update_registration`, `merge_checkpoint`, `merge_gate` and `next_item`). (2) `test_staff_accessors.test_document_lists_every_tracked_accessor` fails with rolenames 9ba1885e155f: `page_question.py` imports `staff` and has no row in `docs/as-built/staff-accessors.md`.
+
+**Spec:**
+1. Break the cycle at its cause: `image_store.py` is a low-level store that `change_review` uses, so it must not import `change_page`, `page_question` or any module that imports `change_review`. Move the image question store and its page-level types up, or move the shared record types down into a module with no page imports. No lazy import, no `TYPE_CHECKING` workaround.
+2. The `page_question` public surface stays as phase 48 shipped it (unit-board's listask uses it).
+3. Merge rolenames 9ba1885e155f and add the `page_question.py` row to `docs/as-built/staff-accessors.md`.
+
+**Files:**
+- `scripts/review_links/image_store.py`
+- `scripts/review_links/images.py`
+- `scripts/review_links/page_question.py`
+- `scripts/review_links/change_page.py`
+- `scripts/review_links/test_images.py`
+- `scripts/review_links/test_page_question.py`
+- `docs/as-built/staff-accessors.md`
+
+**Workers:** 1 writer (`test`).
+
+**State:** none.
+
+**Constraints from prior phases:** tests write a fixture config; no test reads a tunable value. Keep phase 48 behavior unchanged.
+
+**Acceptance gate:**
+1. basedpyright on `scripts/production` and `scripts/review_links` reports 0 errors and 0 warnings (reportImportCycles included).
+2. The full `scripts.production` suite and the review_links suites pass.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 

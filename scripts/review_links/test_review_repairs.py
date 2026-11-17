@@ -19,6 +19,7 @@ from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, footer_counts, investigation, next_item, staff, update_registration
 from scripts.production.production_doc import read_production
 from scripts.review_links import change_page, console, review_actions, review_items, review_page, test_review_page
+from scripts.review_links import question_record
 
 
 class ReviewRepairsTests(unittest.TestCase):
@@ -122,7 +123,7 @@ class ReviewRepairsTests(unittest.TestCase):
             for action in ('answer', 'feedback', 'question'):
                 with self.subTest(action=action):
                     self.assertNotIn(f'value="{action}"', form)
-                    with self.assertRaises(change_page.AnswerRefused):
+                    with self.assertRaises(question_record.AnswerRefused):
                         _ = review_page.submit(self.case.root, self.case.body(key, action, 'Use the new case.'), self.case.status)
                     self.assertEqual(waiting.source.record.path.read_bytes(), before)
 

@@ -3,37 +3,20 @@ from __future__ import annotations
 
 import html
 import json
-import re
 import secrets
 import shlex
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol, TypedDict, cast
+from typing import Protocol, cast
 
 from scripts.production import staff
-from scripts.review_links import change_page
-
-
-@dataclass(frozen=True)
-class Answer:
-    text: str
-    answered_at: str
-
-
-@dataclass(frozen=True)
-class Question:
-    """A missing answer means that the owner must answer this question."""
-
-    question_id: str
-    asked_at: str
-    words: str
-    answer: Answer | None = None
+from scripts.review_links import change_page, question_record
 
 
 @dataclass(frozen=True)
 class Answered:
-    question: Question
+    question: question_record.Question
 
 
 @dataclass(frozen=True)
@@ -44,52 +27,11 @@ class AnswerRefused:
 class QuestionStore(Protocol):
     """Read atomic records; serialize adds and answer checks under the record's lock."""
 
-    def questions(self, item: str) -> tuple[Question, ...]: ...
-    def add(self, item: str, question: Question) -> None: ...
-    def set_answer(self, item: str, question_id: str, answer: Answer) -> None:
-        """Refuse an unknown or answered id with change_page.AnswerRefused."""
+    def questions(self, item: str) -> tuple[question_record.Question, ...]: ...
+    def add(self, item: str, question: question_record.Question) -> None: ...
+    def set_answer(self, item: str, question_id: str, answer: question_record.Answer) -> None:
+        """Refuse an unknown or answered id with question_record.AnswerRefused."""
         ...
-
-
-class StoredAnswer(TypedDict):
-    text: str
-    answered_at: str
-
-
-class StoredQuestion(TypedDict):
-    question_id: str
-    asked_at: str
-    words: str
-    answer: StoredAnswer | None
-
-
-def stored(question: Question) -> StoredQuestion:
-    answer = question.answer
-    return {'question_id': question.question_id, 'asked_at': question.asked_at, 'words': question.words,
-            'answer': None if answer is None else {'text': answer.text, 'answered_at': answer.answered_at}}
-
-
-def read(value: object) -> Question:
-    """Check a stored question before it enters the page's domain."""
-    if not isinstance(value, dict):
-        raise ValueError('invalid stored question')
-    fields = cast(dict[str, object], value)
-    identity, asked_at, words = (fields.get(key) for key in ('question_id', 'asked_at', 'words'))
-    if not isinstance(identity, str) or re.fullmatch(r'Q[1-9][0-9]*', identity) is None or not isinstance(
-            asked_at, str) or not isinstance(words, str) or not words.strip() or 'answer' not in fields:
-        raise ValueError('invalid stored question')
-    _ = datetime.fromisoformat(asked_at)
-    value = fields['answer']
-    if value is None:
-        return Question(identity, asked_at, words)
-    if not isinstance(value, dict):
-        raise ValueError('invalid stored answer')
-    answer = cast(dict[str, object], value)
-    text, answered_at = answer.get('text'), answer.get('answered_at')
-    if not isinstance(text, str) or not text.strip() or not isinstance(answered_at, str):
-        raise ValueError('invalid stored answer')
-    _ = datetime.fromisoformat(answered_at)
-    return Question(identity, asked_at, words, Answer(text, answered_at))
 
 
 def ask(store: QuestionStore, item: str, owner: staff.StaffId, source_path: Path, row: str, title: str,
@@ -101,7 +43,7 @@ def ask(store: QuestionStore, item: str, owner: staff.StaffId, source_path: Path
     """
     words = words.strip()
     if not words:
-        raise change_page.AnswerRefused('Enter a question first.')
+        raise question_record.AnswerRefused('Enter a question first.')
     with status.locked():
         questions = store.questions(item)
         question = next((question for question in questions
@@ -109,7 +51,7 @@ def ask(store: QuestionStore, item: str, owner: staff.StaffId, source_path: Path
         new_question = question is None
         if question is None:
             number = max((int(question.question_id[1:]) for question in questions), default=0) + 1
-            question = Question(f'Q{number}', datetime.now(UTC).isoformat(), words)
+            question = question_record.Question(f'Q{number}', datetime.now(UTC).isoformat(), words)
         command = answer_command.format(item=shlex.quote(item), question_id=question.question_id)
         message = f'{row}: Ask question\n{title}\n{words}\nAnswer with this command: {command}'
         delivery_row = f'{row}/{question.question_id}'
@@ -157,21 +99,21 @@ def answer(store: QuestionStore, item: str, question_id: str, text: str) -> Answ
         return AnswerRefused('Unknown question id.')
     if question.answer is not None:
         return AnswerRefused('This question already has an answer.')
-    response = Answer(text.strip(), datetime.now(UTC).isoformat())
+    response = question_record.Answer(text.strip(), datetime.now(UTC).isoformat())
     try:
         store.set_answer(item, question_id, response)
-    except change_page.AnswerRefused as error:
+    except question_record.AnswerRefused as error:
         return AnswerRefused(str(error))
-    return Answered(Question(question.question_id, question.asked_at, question.words, response))
+    return Answered(question_record.Question(question.question_id, question.asked_at, question.words, response))
 
 
-def open_question_html(question: Question) -> str:
+def open_question_html(question: question_record.Question) -> str:
     return (f'<section class="page-question" data-question="{html.escape(question.question_id, quote=True)}">'
             + f'<h3>Question {html.escape(question.question_id)} — waiting for an answer</h3>'
             + f'<p>{html.escape(question.words)}</p></section>')
 
 
-def answered_question_html(question: Question) -> str:
+def answered_question_html(question: question_record.Question) -> str:
     if question.answer is None:
         raise ValueError('This question has no answer.')
     return (f'<section class="page-question" data-question="{html.escape(question.question_id, quote=True)}">'

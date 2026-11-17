@@ -14,6 +14,7 @@ from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import investigation, staff
 from scripts.review_links import change_browser, change_page, console, page_frame, review_link
+from scripts.review_links import question_record
 from scripts.review_links import staff_names
 
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/investigations.html"
@@ -114,11 +115,11 @@ def submit(root: Path, body: str) -> None:
     """Mark the record named by a signed form as read."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) != {"owner", "id", "token"} or any(len(value) != 1 for value in fields.values()):
-        raise change_page.AnswerRefused("use the form on this page")
+        raise question_record.AnswerRefused("use the form on this page")
     owner, identity = fields["owner"][0], fields["id"][0]
     expected = request_token(root, owner, identity)
     if not secrets.compare_digest(fields["token"][0].encode(), expected.encode()):
-        raise change_page.AnswerRefused("the investigation token does not match this page")
+        raise question_record.AnswerRefused("the investigation token does not match this page")
     _ = investigation.mark_read(staff.StaffId(owner), identity)
 
 

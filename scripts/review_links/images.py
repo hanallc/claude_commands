@@ -18,6 +18,7 @@ from scripts.lib import conf, file_lock
 from scripts.lib.user_zone import shown_time
 from scripts.production import staff
 from scripts.review_links import staff_names
+from scripts.review_links import question_record
 from scripts.review_links import change_browser, change_page, console, image_store, page_frame, page_question, review_link
 
 PAGE_NAME = "images.html"
@@ -140,7 +141,7 @@ def picture(record: image_store.ImageRecord, label: str, file: str) -> str:
     return f'<figure><figcaption>{label}</figcaption>{linked}</figure>' if label else linked
 
 
-def question_html(question: page_question.Question, failed_questions: frozenset[str],
+def question_html(question: question_record.Question, failed_questions: frozenset[str],
                   pending_questions: frozenset[str]) -> str:
     """Show the answer, a delivery failure, or a pending delivery for this question."""
     if question.answer is not None:
@@ -168,7 +169,7 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
     names = staff_names.for_page(names, members)
     member = members.by_id(staff.StaffId(record["owner"]))
     shown_owner = names.html(record["owner"], name) + f" ({member.kind})" if member is not None else html.escape(owner)
-    questions = sorted((page_question.read(saved) for saved in record.get('questions', [])),
+    questions = sorted((question_record.read(saved) for saved in record.get('questions', [])),
                        key=lambda question: (question.answer is not None, int(question.question_id[1:])))
     return (f'<article id="image-{record["id"]}"{' class="pair"' if pair else ''} data-image="{record["id"]}" '
             + f'data-owner="{html.escape(record["owner"], quote=True)}" data-owner-name="{html.escape(name, quote=True)}">'
@@ -242,16 +243,16 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
     # A page loaded before Send feedback existed posts only the image and its token, which means delete.
     if not {"image", "token"} <= set(fields) <= {"image", "token", "feedback", "action"} or any(
             len(value) != 1 for value in fields.values()):
-        raise change_page.AnswerRefused("use the form on this page")
+        raise question_record.AnswerRefused("use the form on this page")
     identity = fields["image"][0]
     if not image_store.IDENTITY.fullmatch(identity):
-        raise change_page.AnswerRefused("not an image id")
+        raise question_record.AnswerRefused("not an image id")
     expected = request_token(console_token(root), identity)
     if not secrets.compare_digest(fields["token"][0].encode(), expected.encode()):
-        raise change_page.AnswerRefused("the image token does not match this page")
+        raise question_record.AnswerRefused("the image token does not match this page")
     action = fields.get("action", ["delete"])[0]
     if action not in ACTIONS:
-        raise change_page.AnswerRefused("use the form on this page")
+        raise question_record.AnswerRefused("use the form on this page")
     if action == 'question':
         return ask_question(root, identity, fields.get('feedback', [''])[0], status)
     if action in ANSWERS:
@@ -261,7 +262,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
         try:
             delete(root, identity)
         except ValueError as error:
-            raise change_page.AnswerRefused(str(error)) from error
+            raise question_record.AnswerRefused(str(error)) from error
     return change_page.NoMessageDelivery()
 
 
@@ -279,7 +280,7 @@ def ask_question(root: Path, identity: str, words: str, status: change_page.Deli
 def answer_question(root: Path, identity: str, question_id: str, text: str) -> None:
     result = page_question.answer(image_store.ImageQuestionStore(images_root(root)), identity, question_id, text)
     if isinstance(result, page_question.AnswerRefused):
-        raise change_page.AnswerRefused(result.reason)
+        raise question_record.AnswerRefused(result.reason)
 
 
 def answer_message(record: image_store.ImageRecord, answer: str, feedback: str) -> str:
@@ -297,12 +298,12 @@ def answer_message(record: image_store.ImageRecord, answer: str, feedback: str) 
 def send_answer(root: Path, identity: str, answer: str, feedback: str) -> None:
     """Send feedback, then hide the image unless a question received an answer during delivery."""
     if answer == "feedback" and not feedback:
-        raise change_page.AnswerRefused("enter feedback")
+        raise question_record.AnswerRefused("enter feedback")
     folder = images_root(root) / identity
     try:
         record = image_store.read_record(folder)
     except (OSError, ValueError) as error:
-        raise change_page.AnswerRefused(f"no image {identity}") from error
+        raise question_record.AnswerRefused(f"no image {identity}") from error
     answered_question_ids = {question['question_id'] for question in record.get('questions', [])
                             if question['answer'] is not None}
     settings = conf.read("review_links")

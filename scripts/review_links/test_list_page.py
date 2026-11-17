@@ -30,7 +30,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import change_review, change_routing, delivery_state, investigation, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, staff_names
-from scripts.review_links import change_browser, change_page
+from scripts.review_links import change_browser, change_page, question_record
 from scripts.review_links import review_items, review_page
 from scripts.review_links.test_change_page import BrowserForms
 from scripts.review_links.test_page_frame import assert_status_states
@@ -1014,7 +1014,7 @@ window.fetch=async(_path,options={})=>{
     def test_refused_tell_keeps_the_unread_update_and_log(self) -> None:
         item = self.add("Keep the unread update after a refusal")
         for words in ("", " \t\n "):
-            with self.subTest(words=words), self.assertRaises(change_page.AnswerRefused):
+            with self.subTest(words=words), self.assertRaises(question_record.AnswerRefused):
                 _ = list_page.submit(self.root / "reviews", urlencode(self.fields(item, "tell", words=words)))
             self.assertEqual(the_list.load(MORTY.id, item.id), item)
 
