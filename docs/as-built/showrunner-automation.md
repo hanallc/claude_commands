@@ -371,6 +371,8 @@ Each local Promote checkout must exist before the command pushes.
   It scans first-parent merges on the production's merge branch from 2026-11-06.
   Older merges add no rows.
   It excludes foreign history through origin merge refs and `_publication_exclusions`.
+  It skips each merge on the first-parent chain of an outside production's merge branch.
+  A child branch starts on its parent's merges, and those rows belong to the parent's scan.
   A local gate branch remains eligible when its name differs from the production merge branch.
   `review_commits` keeps every checkpoint and other commits without a descendant checkpoint in that merge range.
   The count includes only selected commits with review lines that parse.

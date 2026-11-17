@@ -1639,6 +1639,60 @@ class ReadyListTests(ProducerFixture):
         self.assertEqual(row["Producer"], child_unit.id)
         self.assertIn("  Production: child\n", change_review.describe(row) + "\n")
 
+    def hand_merged_base(self) -> tuple[Path, dict[str, staff.StaffRow]]:
+        """Two hand merges on integration, then a child production that branches from them."""
+        units: dict[str, staff.StaffRow] = {}
+        child_doc = self.root / "child.md"
+        _ = child_doc.write_text(f"# Child\n- **Repository:** `{self.repo}`\n"
+            + f"- **Showrunner checkout:** `{self.repo}`\n- **Merge branch:** `child-integration`\n"
+            + f"- **Change review:** `{self.listing}`\n")
+        units["praxis"] = recorded_unit("child", "praxis", self.root / "praxis", child_doc, plan="praxis.md")
+        units["top"] = recorded_showrunner("top", self.doc)
+        units["child"] = recorded_showrunner("child", child_doc, parent="top")
+        _ = self.enterContext(mock.patch.object(showrunners, "timer_docs",
+                                                return_value={"top": self.doc, "child": child_doc}))
+        base = (("cables-fix", "fix(cables): draw the cable\n\nChange-Review: Cable | Read | Drawn",
+                 "merge(cables): a cable stays drawn (1234567)"),
+                ("chain-b", "checkpoint(triggers): phase 2\n\nChange-Review: Fires | Read | Fired",
+                 "merge(chain-b): trigger fires survive (7654321)"))
+        for branch, message, subject in base:
+            _ = self.git("checkout", "-b", branch, "integration")
+            _ = self.git("commit", "--allow-empty", "-m", message)
+            _ = self.git("checkout", "integration")
+            _ = self.git("merge", "--no-ff", branch, "-m", subject)
+        _ = self.git("checkout", "-b", "praxis", "integration")
+        _ = self.git("commit", "--allow-empty", "-m", "checkpoint(praxis): phase 1\n\nChange-Review: Door | Read | Opened")
+        _ = self.git("checkout", "-b", "child-integration", "integration")
+        _ = self.git("merge", "--no-ff", "praxis", "-m", "Merge praxis phase 1 (abcdef0) into child-integration")
+        change_review.record_merge_producer(change_review.KnownMergeProducer(self.git("rev-parse", "HEAD"),
+                                                                             units["praxis"].id))
+        _ = self.git("push", "origin", "integration", "child-integration", "child-integration:main")
+        return child_doc, units
+
+    def test_a_child_scan_skips_the_merges_its_parent_made_before_the_fork(self) -> None:
+        child_doc, units = self.hand_merged_base()
+        _ = change_review.list_ready(self.repo, child_doc, "child-integration")
+        rows = change_review.pending(self.listing)
+        self.assertEqual([(row["Change"], row["Producer"], row["Production"]) for row in rows],
+                         [("Door", units["praxis"].id, units["child"].id)])
+
+    def test_a_hand_merge_row_names_the_merging_production_and_no_producer(self) -> None:
+        _, units = self.hand_merged_base()
+        _ = change_review.list_ready(self.repo, self.doc, "integration")
+        rows = change_review.pending(self.listing)
+        self.assertEqual([(row["Change"], row["Producer"], row["Production"]) for row in rows],
+                         [("Cable", "", units["top"].id), ("Fires", "", units["top"].id)])
+
+    def test_the_parent_scan_adds_its_own_merges_after_a_child_scan(self) -> None:
+        child_doc, _ = self.hand_merged_base()
+        _ = change_review.list_ready(self.repo, child_doc, "child-integration")
+        added = change_review.list_ready(self.repo, self.doc, "integration")
+        self.assertEqual([change_review.row_id(row) for row in added], ["C2", "C3"])
+        self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Door", "Cable", "Fires"])
+        before = self.listing.read_bytes()
+        self.assertEqual(change_review.list_ready(self.repo, self.doc, "integration"), [])
+        self.assertEqual(self.listing.read_bytes(), before)
+
     def test_a_returned_change_gets_a_new_row_for_a_later_checkpoint_with_the_same_words(self) -> None:
         first = self.merge_change("Change-Review: Same words | Read | First result")
         self.promote()

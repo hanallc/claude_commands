@@ -1977,6 +1977,12 @@ def _publication_exclusions(repo: Path, merge: str, refs: Iterable[str]) -> list
     return sorted(excluded)
 
 
+def _foreign_merges(repo: Path, refs: Iterable[str]) -> frozenset[str]:
+    """The merges that each outside production made on its own merge branch."""
+    return frozenset(sha for ref in refs for sha in _git(
+        repo, "rev-list", "--first-parent", "--merges", f"--since={READY_FROM}T00:00:00Z", ref, "--").split())
+
+
 def list_ready(repo: Path, production: Path, merge_branch: str, *,
                review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
                selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
@@ -2004,6 +2010,7 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
     outside_docs = [row.doc.path for row in record.find(kind="showrunner")
                     if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and row.doc.path not in scoped]
     outside_refs = set(reviewed_merge_refs(repo, lambda: outside_docs, record=record))
+    foreign = _foreign_merges(repo, outside_refs)
     rows: list[str] = []
     matched_step = False
     recorded = checkpoint_producers(record)
@@ -2011,7 +2018,7 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
         merge, subject = entry.split("\t", 1)
         if any(subject.endswith(f" into {ref.removeprefix('origin/')}") for ref in outside_refs):
             continue
-        if not on_main(repo, merge):
+        if merge in foreign or not on_main(repo, merge):
             continue
         commits = merge_commits(repo, merge, excluded_refs=_publication_exclusions(repo, merge, outside_refs))
         short = _git(repo, "rev-parse", f"--short={SHORT}", merge).strip()
