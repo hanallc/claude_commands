@@ -30,7 +30,11 @@ conf_value() {
         while IFS= read -r raw || [[ -n "$raw" ]]; do
             raw="${raw%$'\r'}"
             if [[ "$raw" == *$'\r'* ]]; then valid=0; break; fi
-            line="${raw%%#*}"
+            if [[ "$raw" == \#* ]]; then
+                line=""
+            else
+                line="${raw%%[[:space:]]\#*}"
+            fi
             line="${line#"${line%%[![:space:]]*}"}"
             line="${line%"${line##*[![:space:]]}"}"
             if [[ "$line" != \[* && "$line" == *=* ]]; then
