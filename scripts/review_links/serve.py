@@ -35,7 +35,7 @@ STARTED_NS = time.time_ns()
 from scripts.disks import disks_page, sessions, slots
 from scripts.lib import conf
 from scripts.production import change_routing, change_review
-from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, image_store, images, investigations_page
+from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, image_store, images, investigations_page, list_page
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
@@ -285,6 +285,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             except (OSError, ValueError) as error:
                 print(f"review-links investigations: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Investigations page is not available.</p>"))
+                return None
+            self.html_response(200, content)
+            return None
+        if route.path == list_page.PAGE_PATH:
+            try:
+                content = list_page.render(root)
+            except (OSError, ValueError) as error:
+                print(f"review-links list: {error}", file=sys.stderr)
+                self.html_response(503, change_page.document("<p>The List page is not available.</p>"))
                 return None
             self.html_response(200, content)
             return None

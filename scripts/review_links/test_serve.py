@@ -28,8 +28,8 @@ from urllib.parse import urlencode
 
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
-from scripts.production import change_review, investigation, staff
-from scripts.review_links import accounts_page, change_browser, change_page, console, investigations_page, serve
+from scripts.production import change_review, investigation, staff, the_list
+from scripts.review_links import accounts_page, change_browser, change_page, console, investigations_page, list_page, serve
 from scripts.lib import atomic_file, conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -201,6 +201,18 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(investigation.load(owner, item.id).state, investigation.InvestigationState.ANSWER_READY)
         self.assertEqual(self.post(investigations_page.PAGE_PATH, urlencode(fields)), (200, b'{"state": "read"}'))
         self.assertEqual(investigation.load(owner, item.id).state, investigation.InvestigationState.READ)
+        item = the_list.add(owner, "Read the List page", owner=the_list.UnassignedOwner.NATE,
+                            source="nate", changes={})
+        response = self.request(list_page.PAGE_PATH)
+        self.assertEqual(response.status, 200)
+        self.assertIn(b"Read the List page", response.body)
+        _ = the_list.update(owner, item.id, {"title": "Read the new List page"}, source="morty")
+        self.assertIn(b"Read the new List page", self.request(list_page.PAGE_PATH).body)
+        self.assertNotEqual(self.post(list_page.PAGE_PATH, "id=L1")[0], 200)
+        with patch.object(list_page, "render", side_effect=OSError("fixture read failed")):
+            failed = self.request(list_page.PAGE_PATH)
+            self.assertEqual(failed.status, 503)
+            self.assertIn(b"The List page is not available.", failed.body)
 
     def test_older_console_browser_and_rebuild_links_forward_to_the_fixed_address(self) -> None:
         for path, location in (
