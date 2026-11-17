@@ -4316,6 +4316,25 @@ class StatusRow:
 
 
 @dataclass(frozen=True)
+class FirstNextMoveTargets:
+    """Each group maps to its first queued target; an absent group has no entry."""
+    targets: dict[next_moves.NextMoveGroup, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class NextMovesUnavailable:
+    """The local first targets could not be read."""
+    reason: str = "Next moves have not been read."
+
+
+@dataclass(frozen=True)
+class UpcomingMoves:
+    """One read supplies the upcoming list and the first targets."""
+    lines: tuple[str, ...]
+    first: FirstNextMoveTargets | NextMovesUnavailable
+
+
+@dataclass(frozen=True)
 class StatusReading:
     rows: tuple[StatusRow, ...]
     notes: tuple[str, ...]
@@ -4325,6 +4344,7 @@ class StatusReading:
     represented_stderr: tuple[str, ...] = ()
     session_inputs: tuple[str, ...] = ()
     upcoming_moves: tuple[str, ...] = ()
+    first_next_moves: FirstNextMoveTargets | NextMovesUnavailable = field(default_factory=NextMovesUnavailable)
 
 
 class StatusAccountDocument(TypedDict):
@@ -5461,21 +5481,35 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     return replace(reading, notes=tuple(dict.fromkeys(notes)))
 
 
-def _upcoming_move_lines() -> tuple[str, ...]:
+def _read_upcoming_moves() -> UpcomingMoves:
     try:
         if not role_map.is_role_map_host():
-            return role_map.read_role_map().upcoming_moves or (
+            lines = role_map.read_role_map().upcoming_moves or (
                 f"Upcoming moves: unavailable; {role_map.ROLE_MAP_HOST} unreachable",)
-        upcoming = next_moves.list_next_moves()
-        return ("Upcoming moves: none",) if upcoming == "nothing set up" else ("Upcoming moves:", *upcoming.splitlines())
+            return UpcomingMoves(lines, NextMovesUnavailable("First targets require the role-map host."))
+        entries = next_moves.read_next_moves()
+        targets: dict[next_moves.NextMoveGroup, str] = {}
+        for entry in entries:
+            if entry.group not in targets:
+                targets[entry.group] = next_moves.target_label(entry)
+        upcoming = next_moves.render_next_moves(entries)
+        lines = ("Upcoming moves: none",) if upcoming == "nothing set up" else ("Upcoming moves:", *upcoming.splitlines())
+        return UpcomingMoves(lines, FirstNextMoveTargets(targets))
     except role_map.RoleMapUnavailable:
-        return (f"Upcoming moves: unavailable; {role_map.ROLE_MAP_HOST} unreachable",)
+        reason = f"{role_map.ROLE_MAP_HOST} unreachable"
+        return UpcomingMoves((f"Upcoming moves: unavailable; {reason}",), NextMovesUnavailable(reason))
     except (next_moves.NextMoveError, ValueError) as error:
-        return (f"Upcoming moves: unavailable from {role_map.ROLE_MAP_HOST}; {str(error).splitlines()[0]}",)
+        reason = str(error).splitlines()[0]
+        return UpcomingMoves((f"Upcoming moves: unavailable from {role_map.ROLE_MAP_HOST}; {reason}",), NextMovesUnavailable(reason))
+
+
+def _upcoming_move_lines() -> tuple[str, ...]:
+    return _read_upcoming_moves().lines
 
 
 def _with_upcoming_moves(reading: StatusReading) -> StatusReading:
-    return replace(reading, upcoming_moves=_upcoming_move_lines())
+    upcoming = _read_upcoming_moves()
+    return replace(reading, upcoming_moves=upcoming.lines, first_next_moves=upcoming.first)
 
 
 def status_report(*, detail: bool = False, source: UsageSource = REFRESH_STALE_USAGE, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:

@@ -428,7 +428,14 @@ Cancel or Escape restores the saved color.
 Save publishes the color through this checkout's `scripts/lib/tune.py` and refreshes the board.
 The page pauses refresh while the chooser is open.
 A board line of a selected Claude group (`units` or `showrunners`) carries `group`: its account and group.
-The Accounts page opens its next move menu on a right click of that line.
+The Accounts page adds a `next` column after the role color swatch.
+A selected Claude group shows its first target, or `none`, and an arrow button opens its move menu.
+A selected Codex workers line shows its first target, or `auto`, without a button.
+Other lines show a minus icon; the total cell stays empty.
+`StatusReading.first_next_moves` distinguishes first targets from an unavailable read with its reason.
+One queue read supplies both the first targets and the unchanged upcoming list.
+Off the role-map host, first targets are unavailable.
+The menu marks the current target and can remove the group's first entry.
 Its `stale_at` is the next local midnight, when its reset text changes.
 The text table appends `Login ends` in the user's zone, with the same date format as `Weekly resets`.
 Each JSON account exports `login_ends_at` as an ISO 8601 UTC string, or null for an unknown date or Codex.

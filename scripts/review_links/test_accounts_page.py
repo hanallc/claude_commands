@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import html
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -18,7 +19,8 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.review_links.test_page_frame import assert_status_states
-from scripts.accounts import accounts, next_moves
+from scripts.accounts import accounts, next_moves, role_map
+from scripts.accounts.home_test_support import scratch_account_home
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.review_links import accounts_page, console_theme, page_frame, serve
@@ -36,9 +38,9 @@ def status_row(label: str) -> accounts.StatusRow:
 
 
 MENU_SETUP = '''<script>
-let reads=0;const saves=[];const realFetch=fetch;
+let reads=0;const saves=[];const realFetch=fetch;let freshPage=FRESH_PAGE;
 window.fetch=(path,options)=>options?.method==='POST' ? new Promise(resolve=>saves.push({options,resolve}))
- : (reads++,Promise.resolve({ok:true,text:async()=>FRESH_PAGE}));
+ : (reads++,Promise.resolve({ok:true,text:async()=>freshPage}));
 </script>'''
 
 MENU_PROBE = '''<script>
@@ -48,8 +50,9 @@ MENU_PROBE = '''<script>
  const state=()=>document.querySelector('[data-page-status]').dataset.state;
  const menu=document.querySelector('[data-move-menu]');
  const items=()=>[...menu.querySelectorAll('[data-move-target]')];
- const right=(cell,x=40,y=60)=>{const event=new MouseEvent('contextmenu',{bubbles:true,cancelable:true,clientX:x,clientY:y});
-  cell.dispatchEvent(event);return event;};
+ const button=()=>document.querySelector('[data-next-button]');
+ const open=()=>button().click();
+ const activate=name=>button().dispatchEvent(new KeyboardEvent('keydown',{key:name,bubbles:true,cancelable:true}));
  const key=name=>menu.dispatchEvent(new KeyboardEvent('keydown',{key:name,bubbles:true,cancelable:true}));
  const groupRow=()=>document.querySelector('tr[data-move-group]');
  try{
@@ -57,11 +60,9 @@ MENU_PROBE = '''<script>
   frameElement.style.width='800px';frameElement.style.height='480px';await flush();
   check(document.querySelectorAll('tr[data-move-group]').length===1 && groupRow().dataset.moveAccount==='claude1'
    && groupRow().dataset.moveGroup==='units','only the selected Claude group line takes the menu');
-  check(getComputedStyle(groupRow()).cursor==='context-menu','the group line shows the menu cursor');
-  const plain=right(document.querySelector('[data-color-key="account.claude2"]').closest('tr').cells[1]);
-  check(!plain.defaultPrevented && menu.hidden,'another line keeps the browser menu');
-  const opened=right(groupRow().cells[3]);
-  check(opened.defaultPrevented && !menu.hidden,'a right click on the group line opens the page menu');
+  check(document.querySelectorAll('[data-next-button]').length===1,'only the selected Claude line has a button');
+  open();
+  check(!menu.hidden && button().getAttribute('aria-expanded')==='true','a click opens the menu');
   check(menu.querySelector('[data-move-title]').textContent==='When claude1 reaches 1%, move units to',
    'the title names the account, percent and group');
   check(JSON.stringify(items().map(item=>item.dataset.moveTarget))==='["claude2","claude3"]','the menu lists the other Claude accounts');
@@ -71,22 +72,30 @@ MENU_PROBE = '''<script>
   check(items()[0].querySelector('.move-left').className==='move-left','a healthy percent keeps the plain tone');
   check(document.activeElement===items()[0],'the first item takes the focus');
   key('ArrowDown');check(document.activeElement===items()[1],'ArrowDown moves to the next item');
+  key('ArrowDown');check(document.activeElement===menu.querySelector('[data-move-clear]'),'ArrowDown reaches No next move');
   key('ArrowDown');check(document.activeElement===items()[0],'ArrowDown wraps to the first item');
-  key('ArrowUp');check(document.activeElement===items()[1],'ArrowUp wraps to the last item');
+  key('ArrowUp');check(document.activeElement===menu.querySelector('[data-move-clear]'),'ArrowUp wraps to the last item');
   key('Home');check(document.activeElement===items()[0],'Home moves to the first item');
-  key('End');check(document.activeElement===items()[1],'End moves to the last item');
+  key('End');check(document.activeElement===menu.querySelector('[data-move-clear]'),'End moves to the last item');
   const box=menu.getBoundingClientRect();
   check(box.left>=0 && box.right<=innerWidth && box.top>=0 && box.bottom<=innerHeight,'the menu fits the viewport');
-  right(groupRow().cells[3],innerWidth-2,innerHeight-2);
+  check(items()[0].getAttribute('role')==='menuitemradio' && items()[0].getAttribute('aria-checked')==='true'
+   && items()[1].getAttribute('aria-checked')==='false','the current target is marked');
+  key('Escape');
+  button().style.cssText='position:fixed;right:0;bottom:0';open();
   const edge=menu.getBoundingClientRect();
   check(edge.left>=8 && edge.top>=8 && edge.right<=innerWidth-7.5 && edge.bottom<=innerHeight-7.5,
-   'a right click at the corner keeps the menu inside the viewport:'+JSON.stringify([edge.left,edge.top,edge.right,edge.bottom,innerWidth,innerHeight]));
+   'a button at the corner keeps the menu inside the viewport:'+JSON.stringify([edge.left,edge.top,edge.right,edge.bottom,innerWidth,innerHeight]));
   check(state()==='Paused','an open menu pauses refresh');
-  key('Escape');check(menu.hidden && state()!=='Paused','Escape closes the menu and resumes refresh');
-  right(groupRow().cells[3]);
+  key('Escape');check(menu.hidden && state()!=='Paused' && document.activeElement===button()
+   && button().getAttribute('aria-expanded')==='false','Escape closes the menu, returns focus and resumes refresh');
+  button().style.cssText='';activate('Enter');check(!menu.hidden,'Enter opens the menu');
+  key('Escape');activate(' ');check(!menu.hidden,'Space opens the menu');
+  key('Escape');
+  open();
   document.body.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true}));
-  check(menu.hidden,'a click outside closes the menu');
-  right(groupRow().cells[3]);
+  check(menu.hidden && document.activeElement===button(),'a click outside closes the menu and returns focus');
+  open();
   const readsBefore=reads;
   items()[1].click();
   check(menu.hidden && saves.length===1,'a choice closes the menu and posts once');
@@ -96,10 +105,22 @@ MENU_PROBE = '''<script>
   check(state()==='Paused','a pending move holds refresh');
   saves[0].resolve({ok:true,json:async()=>({state:'saved'})});await flush();await flush();
   check(reads===readsBefore+1 && state()!=='Paused','a saved move reloads the board');
-  right(groupRow().cells[3]);items()[0].click();
+  open();items()[0].click();
   saves[1].resolve({ok:false,json:async()=>({reason:'next: cannot set entry: busy'})});await flush();
   const error=document.querySelector('[data-color-save-error]');
   check(!error.hidden && error.textContent==='units: next: cannot set entry: busy','a failed move reports its reason in the status line');
+  open();menu.querySelector('[data-move-clear]').click();
+  const cleared=new URLSearchParams(saves[2].options.body);
+  check(cleared.get('group')==='units' && cleared.get('clear')==='first' && [...cleared.keys()].length===2,
+   'No next move posts only the group and clear=first');
+  check(menu.hidden && document.activeElement===button(),'clear returns focus to the button');
+  freshPage=EMPTY_PAGE;
+  saves[2].resolve({ok:true,json:async()=>({state:'saved'})});await flush();
+  check(button().closest('td').querySelector('.next-muted').textContent==='none','clear refreshes the cell to none');
+  open();check(!menu.querySelector('[data-move-clear]'),'an empty group has no clear item');key('Escape');
+  open();dispatchEvent(new Event('resize'));check(menu.hidden,'resize closes the menu');
+  open();dispatchEvent(new Event('scroll'));check(menu.hidden,'scroll closes the menu');
+
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
@@ -155,7 +176,7 @@ class AccountsPageTests(unittest.TestCase):
     def setUp(self) -> None:
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory())) / "config"
         _ = shutil.copytree(Path(__file__).resolve().parents[2] / "config", configuration)
-        _ = (configuration / "statusline.conf").write_text("account.claude1=#af875f\naccount.claude2=#b294bb\nrole.unit-director=#d7af00\n",
+        _ = (configuration / "statusline.conf").write_text("account.claude1=#af875f\naccount.claude2=#b294bb\naccount.codex2=#123456\nrole.unit-director=#d7af00\n",
                                                             encoding="utf-8")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
@@ -170,7 +191,7 @@ class AccountsPageTests(unittest.TestCase):
         table = accounts.status_board(reading)
         self.assertEqual([column["key"] for column in table["columns"]][1:4], ["label", "left", "roles"])
         self.assertIn('<thead><tr><th class="left"></th><th class="left">account</th><th class="left"></th>'
-                      + '<th class="right">left</th><th class="left">role</th><th class="left"></th><th class="right">busy</th>', markup)
+                      + '<th class="right">left</th><th class="left">role</th><th class="left"></th><th class="left">next</th><th class="right">busy</th>', markup)
         self.assertNotIn(">Color<", markup)
         self.assertEqual(markup.count('<tr class="account">'), 2)
         self.assertEqual(markup.count("<tr>"), 1)
@@ -183,7 +204,8 @@ class AccountsPageTests(unittest.TestCase):
                       + '<td class="left"><button type="button" class="color-swatch" data-color-key="role.unit-director" '
                       + 'data-color-name="units" data-saved-color="#808000" style="background:#808000" '
                       + 'aria-label="Change units color" aria-haspopup="dialog"></button></td>'
-                      + '<td class="right"><span class="default">1</span></td>', markup)
+                      + '<td class="left next-cell"><span class="next-muted next-minus" title="Not the selected account for a role">'
+                      + page_frame.icon_svg("minus") + '</span></td><td class="right"><span class="default">1</span></td>', markup)
         self.assertIn('<td class="left" data-account-name><span class="default bold">total</span></td>', markup)
         self.assertIn('<td class="left"></td>', markup)
         self.assertIn('<td class="right"><span class="default">60%</span></td>', markup)
@@ -197,7 +219,7 @@ class AccountsPageTests(unittest.TestCase):
         self.assertIn('<td class="left"><span class="default">spare</span></td><td class="left"></td>', markup)
         self.assertNotIn('data-color-name="total"', markup)
         table = accounts.status_board(multiple_roles)
-        self.assertEqual(markup.count("<td "), len(table["rows"]) * (len(table["columns"]) + 2))
+        self.assertEqual(markup.count("<td "), len(table["rows"]) * (len(table["columns"]) + 3))
 
     def test_account_labels_use_terminal_colors_and_hex_without_css_injection(self) -> None:
         reading = accounts.StatusReading((status_row("claude1"),), (), (), timezone.utc, AT)
@@ -269,6 +291,59 @@ class AccountsPageTests(unittest.TestCase):
         _ = settings.write_text(settings.read_text().replace("next_move_percent=1\n", "next_move_percent=2.5\n"))
         self.assertIn('data-move-percent="2.5"', accounts_page.board(reading))
 
+    def test_next_cells_show_first_targets_empty_groups_unselected_roles_and_unavailable_reads(self) -> None:
+        rows = (replace(status_row("claude1"), roles=("units", "showrunners"), selected_roles=("units", "showrunners")),
+                status_row("claude2"), replace(status_row("claude3"), roles=("spare",)),
+                replace(status_row("codex1"), tool="codex", roles=("workers",), selected_roles=("workers",)),
+                replace(status_row("codex2"), tool="codex", roles=("spare",)))
+        for first in (accounts.FirstNextMoveTargets({"units": "claude2", "workers": "codex2"}),
+                      accounts.FirstNextMoveTargets(), accounts.NextMovesUnavailable("fixture damaged log")):
+            with self.subTest(first=first):
+                markup = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=first))
+                cells = cast(list[str], re.findall(r'<td class="left next-cell">(.*?)</td>', markup, re.S))
+                self.assertEqual(len(cells), 7)
+                self.assertEqual(cells[-1], "")
+                for index in (2, 3, 5):
+                    self.assertIn('title="Not the selected account for a role"', cells[index])
+                    self.assertIn('lucide-minus', cells[index])
+                for index, group in ((0, "units"), (1, "showrunners")):
+                    self.assertIn(f'aria-label="Choose the next account for {group}"', cells[index])
+                    self.assertIn('aria-haspopup="menu" aria-expanded="false"', cells[index])
+                    self.assertIn('lucide-chevron-down', cells[index])
+                self.assertNotIn('<button', cells[4])
+                if isinstance(first, accounts.NextMovesUnavailable):
+                    for index in (0, 1, 4):
+                        self.assertIn('>unavailable</span>', cells[index])
+                        self.assertIn('fixture damaged log', cells[index])
+                else:
+                    self.assertIn('>none</span>', cells[1])
+                    if first.targets:
+                        self.assertIn('class="default bold" style="color:#b294bb">claude2</span>', cells[0])
+                        self.assertIn('class="default bold"', cells[4])
+                        self.assertIn('style="color:#123456">codex2</span>', cells[4])
+                    else:
+                        self.assertIn('>none</span>', cells[0])
+                        self.assertIn('title="Codex workers move between the Codex accounts by themselves">auto</span>', cells[4])
+
+    def test_clear_removes_only_the_first_group_entry_and_refuses_an_empty_group(self) -> None:
+        home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        with (scratch_account_home(home, {}, clear=True), patch.object(role_map, "is_role_map_host", return_value=True)):
+            for group in ("units", "showrunners"):
+                with self.subTest(group=group):
+                    _ = next_moves.add_next_move(group, 1, "claude2")
+                    later = next_moves.add_next_move(group, 2, "claude3")
+                    other = next_moves.add_next_move("workers", 3, "codex2")
+                    self.assertEqual(accounts_page.clear_next_move(group), accounts_page.Saved())
+                    self.assertEqual(next_moves.read_next_moves(), (later, other))
+                    self.assertEqual(accounts_page.clear_next_move(group), accounts_page.Saved())
+                    before = next_moves.next_moves_file().read_bytes()
+                    self.assertEqual(accounts_page.clear_next_move(group), accounts_page.Refused("The group has no next move."))
+                    self.assertEqual(accounts_page.clear_next_move("workers"), accounts_page.Refused("Choose units or showrunners."))
+                    self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
+                    next_moves.remove_next_move("workers", next_moves.FIRST_GROUP_POSITION)
+            with patch.object(next_moves, "read_next_moves", side_effect=next_moves.NextMoveError("fixture damaged log")):
+                self.assertEqual(accounts_page.clear_next_move("units"), accounts_page.SaveFailed("fixture damaged log"))
+
     def test_next_move_save_checks_the_group_and_account_then_sets_the_first_entry_at_the_configured_percent(self) -> None:
         with patch.object(next_moves, "set_first_next_move") as setter:
             self.assertEqual(accounts_page.save_next_move("workers", "claude2"),
@@ -286,16 +361,20 @@ class AccountsPageTests(unittest.TestCase):
                                  accounts_page.SaveFailed("next: cannot set entry: busy"))
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
-    def test_a_right_click_on_a_group_line_opens_the_move_menu_and_saves_the_chosen_account(self) -> None:
+    def test_the_next_button_opens_the_move_menu_and_saves_or_clears_the_chosen_account(self) -> None:
         rows = (replace(status_row("claude1"), selected_roles=("units",)), status_row("claude2"),
                 replace(status_row("claude3"), weekly_left_percent=accounts.StatusUnavailable("unavailable")),
                 replace(status_row("codex1"), tool="codex"))
-        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT)
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT,
+            first_next_moves=accounts.FirstNextMoveTargets({"units": "claude2"}))
         with patch.object(accounts, "read_status", return_value=reading):
             content = accounts_page.page()
         initial = accounts_page.AccountsRender(content, 0.5, 200).with_recent_times((0.5,)).decode()
+        with patch.object(accounts, "read_status", return_value=replace(reading, first_next_moves=accounts.FirstNextMoveTargets())):
+            empty = accounts_page.page().decode()
+        probe = MENU_PROBE.replace("EMPTY_PAGE", json.dumps(empty).replace("</", "<\\/"))
         setup = MENU_SETUP.replace("FRESH_PAGE", json.dumps(initial).replace("</", "<\\/"))
-        page = initial.replace("<script>", setup + "<script>", 1).replace("</body>", MENU_PROBE + "</body>").encode()
+        page = initial.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>").encode()
         self.assertEqual(firefox_probe_results(page), [[]])
 
     def test_page_reads_stored_status_and_holds_the_refresh_root(self) -> None:
@@ -440,7 +519,8 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   const heads=[...document.querySelectorAll('thead th')].map(head=>head.textContent);
   check(cell===row.cells[2] && row.cells[1].contains(label()) && heads[1]==='account' && heads[2]==='' && heads[3]==='left',
    'the swatch column without a heading sits between account and left');
-  check(heads[4]==='role' && heads[5]==='' && heads[6]==='busy','the role swatch column sits between role and busy');
+  check(heads[4]==='role' && heads[5]==='' && heads[6]==='next' && heads[7]==='busy',
+   'the next column follows the role swatch and precedes busy');
   check(getComputedStyle(cell).textAlign==='left' && getComputedStyle(swatch).marginLeft==='0px' &&
    Math.abs(swatch.getBoundingClientRect().left-cell.getBoundingClientRect().left-parseFloat(getComputedStyle(cell).paddingLeft))<1,
    'the swatch aligns with the cell content on the left');
