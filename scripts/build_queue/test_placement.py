@@ -1203,6 +1203,28 @@ class MacOrderTests(unittest.TestCase):
     def assigned(fixture: PlacementFixture, *requests: wire.PlacementRequest) -> list[str]:
         return [request.episode for request in requests if request.episode in fixture.server.current_assignments]
 
+    def test_a_freed_mac_scope_goes_only_to_the_oldest_waiter(self) -> None:
+        """11-17 04:35-04:50: each time the hana scope freed, about ten waiters got attempts in a few seconds.
+
+        The fastest claim won, so the queue head (waiting since 01:26) lost the Mac to four younger steps.
+        """
+        with PlacementFixture() as fixture:
+            older = placement_request(fixture, since=fixture.clock.now() - 600)
+            younger = placement_request(fixture, session=OwningSession("younger-session"), since=fixture.clock.now() - 60)
+            for request in (older, younger):
+                _ = publish_candidate(fixture, request)
+                _ = fixture.connect(request).replies()
+            for _pass in range(3):
+                _ = fixture.run_pass()
+                self.assertEqual(self.assigned(fixture, older, younger), [older.episode])
+            first = fixture.server.assignments[fixture.server.current_assignments[older.episode]].assignment
+            # The claim on the Mac refuses the attempt; the next attempt again goes to the older step.
+            _ = fixture.server.handle_request(wire.ClaimFailure("claim-refused", first, "busy"))
+            _ = fixture.run_pass()
+            self.assertEqual(self.assigned(fixture, older, younger), [older.episode])
+            self.assertNotEqual(fixture.server.current_assignments[older.episode], placement.attempt_key(
+                first.episode, first.attempt))
+
     def test_the_older_request_is_probed_next_and_takes_the_mac(self) -> None:
         with PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
             order = self.mac_order(fixture)

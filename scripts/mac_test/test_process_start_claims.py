@@ -51,7 +51,10 @@ class ClaimProcessStartTests(unittest.TestCase):
                     request = replace(request, constraints=replace(request.constraints,
                         candidates=(placement.PlacementCandidate(destination),)))
                     _ = publish_candidate(fixture, request)
-                    assignments.append(assignment_for(fixture, request))
+                    # The service gives a scope one unclaimed attempt at a time. This test checks the provider rule
+                    # under that guard, so the service issues both attempts with its guard off.
+                    with mock.patch.object(fixture.server, "_unclaimed_remote_attempts", return_value=[]):
+                        assignments.append(assignment_for(fixture, request))
                     requests.append(request)
 
                 def acquire(assignment: placement.PlacementAssignment) -> int:

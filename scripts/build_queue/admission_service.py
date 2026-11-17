@@ -3138,6 +3138,19 @@ done
         return wire.PlacementWait(request.episode, request.since, position,
             self.placement_eligibility.get(request.episode, ()), provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions, retry_notices=retry_notices)
 
+    def _unclaimed_remote_attempts(self) -> list[placement.PlacementDestination]:
+        """Return the remote destinations whose current attempt has not consumed its permission.
+
+        A remote scope has one unclaimed attempt at a time, so a freed scope goes to the oldest waiter in queue
+        order. Without this, each pass gave the scope to the next waiter, and the fastest claim won the race.
+        """
+        return [saved.assignment.destination for key in self.current_assignments.values()
+                if (saved := self.assignments.get(key)) is not None
+                and saved.assignment.destination.provider not in ("local", "scaler")
+                and isinstance(saved.state, placement.CurrentAssignment)
+                and isinstance(saved.permission, placement.PermissionAvailable)
+                and isinstance(saved.terminal_report, placement.NoTerminalReport)]
+
     def _placement_pass(self, inputs: records.QueueInputs, policy: records.AdmissionPolicy) -> records.QueueInputs:
         """Remove remote selections before the local planner commits any effects."""
         if not any(self._placement_waiting(request) for request in self.placement_requests.values()):
@@ -3171,7 +3184,7 @@ done
             and isinstance(submitted.purpose, placement.SpeculativeCopy)]
         removed: set[str] = set()
         held: list[PlacementHold] = []
-        taken: list[placement.PlacementDestination] = []
+        taken = self._unclaimed_remote_attempts()
         holds: dict[tuple[str, placement.PlacementDestination], float] = {}
         answers: dict[tuple[str, placement.PlacementDestination], float] = {}
         for _, row in ordered:

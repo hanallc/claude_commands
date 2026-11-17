@@ -2838,7 +2838,10 @@ class PlacementRestartTests(unittest.TestCase):
                 consumed = placement_request(fixture, since=fixture.clock.now() - 10)
                 _ = publish_candidate(fixture, pending)
                 pending_assignment = assignment_for(fixture, pending)
-                consumed_assignment = assignment_for(fixture, consumed)
+                # The service gives a scope one unclaimed attempt at a time. Saved state from an older service can
+                # hold both permission states on one scope, so the service issues the second attempt with its guard off.
+                with mock.patch.object(fixture.server, "_unclaimed_remote_attempts", return_value=[]):
+                    consumed_assignment = assignment_for(fixture, consumed)
                 claim = adopt_assignment(fixture, consumed, consumed_assignment)
                 consume = consume_permission("first-consumption", consumed_assignment, claim)
                 self.assertEqual(fixture.server.handle_request(consume),

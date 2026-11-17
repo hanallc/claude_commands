@@ -142,6 +142,7 @@ Saved disk exclusions remain diagnostic evidence.
 An unavailable key permits placement and sends no source key with the copy.
 `PlacementWait` carries the original queue time, position and candidate eligibility.
 `Assignment` carries a persisted destination and attempt; it grants no execution permission.
+A remote scope has at most one attempt that has not consumed its permission. The next attempt waits until that attempt claims or closes, so a freed scope goes to the oldest waiter in queue order.
 `ClaimFailure` closes the exact assignment before another placement decision.
 `ConsumePermission` carries the exact assignment, adopted provider claim reference, and checked claim-holder identity.
 The coordinator remains separate from its offload child.
