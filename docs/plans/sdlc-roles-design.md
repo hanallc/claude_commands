@@ -1,6 +1,6 @@
 # Duties and names in the development process
 
-> **Status: RECORD — frozen.** This doc records how the duty and name answers were reached. `docs/as-built/roles-and-names.md` states what is true now. The baselines, change-file lists and step logs below name files as they stood when measured. `codex_mesh.py`, `mesh_runs.py` and the review pool are removed. Those tables do not say that the files exist now.
+> **Status: RECORD — frozen.** This document records how the duty and name answers were reached. `docs/as-built/roles-and-names.md` states the current facts. The baselines, change-file lists and step logs record their dated source trees. Commit `ce529466f` removed `codex_mesh.py` and `mesh_runs.py` on 2026-11-08. The review pool is also removed. The historical tables do not request edits to removed files.
 
 Scope: duties and names as `docs/as-built/roles-and-names.md` records them. Duties and names belong here. Structure belongs to hierarchies-unit; designer and reviewer contracts belong to guilds-unit; phase steps and the document pipeline belong to phases-unit; repair rules belong to fix-rounds-unit. This document refers to their work and does not replace it.
 

@@ -17,7 +17,7 @@ from unittest import mock
 import unittest
 from zoneinfo import ZoneInfo
 
-from scripts.aws_target import config, gate_trial, ledger
+from scripts.aws_target import aws_trial, config, ledger
 from scripts.aws_target.ledger_test_support import CostFixture, git_only, instant
 from scripts.lib import conf
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
@@ -276,27 +276,27 @@ class LedgerTests(CostFixture):
         ended = ledger.GateTerminated(request.expires, 'i-allowance')
         self.book.resolve_gate(request.attempt, ended)
         before = self.book.path.read_bytes()
-        cost = gate_trial.trial_cost(self.book, {request.attempt}, self.settings, request.expires + 120)
+        cost = aws_trial.trial_cost(self.book, {request.attempt}, self.settings, request.expires + 120)
         self.assertGreater(cost[0], Decimal(0))
         for outcome in (ledger.GateRunning('i-other'), ledger.GateTerminated(request.expires + 60, 'i-other'),
                         ledger.GateTerminated(request.expires - 60, 'i-allowance'), ledger.GateAbsent(request.expires + 60)):
             with self.subTest(outcome=outcome):
                 self.book.resolve_gate(request.attempt, outcome, instance_type='m7a.4xlarge')
                 self.assertEqual(self.book.path.read_bytes(), before)
-                self.assertEqual(gate_trial.trial_cost(self.book, {request.attempt}, self.settings, request.expires + 120), cost)
+                self.assertEqual(aws_trial.trial_cost(self.book, {request.attempt}, self.settings, request.expires + 120), cost)
 
     def test_stale_absence_preserves_confirmed_termination_and_cost(self) -> None:
         request = self.allowance_gate()
         ended = ledger.GateTerminated(request.expires, 'i-allowance')
         self.book.resolve_gate(request.attempt, ended)
         before = self.book.read_snapshot().gate_reservations[0]
-        cost = gate_trial.trial_cost(self.book, {request.attempt}, self.settings, request.expires + 60)
+        cost = aws_trial.trial_cost(self.book, {request.attempt}, self.settings, request.expires + 60)
         self.assertGreater(cost[0], Decimal(0))
         self.book.resolve_gate(request.attempt, ledger.GateAbsent(request.expires + 60))
         after = self.book.read_snapshot().gate_reservations[0]
         self.assertEqual(after, before)
         self.assertEqual(after.state, ended)
-        self.assertEqual(gate_trial.trial_cost(self.book, {request.attempt}, self.settings, request.expires + 60), cost)
+        self.assertEqual(aws_trial.trial_cost(self.book, {request.attempt}, self.settings, request.expires + 60), cost)
 
     def test_bill_allowance_corrects_the_saved_estimate_once(self) -> None:
         request = self.allowance_gate()
@@ -341,7 +341,7 @@ class LedgerTests(CostFixture):
         self.assertEqual(ledger.gate_allowance(saved), expected)
         self.assertEqual(sum((row.usd for row in estimate.intervals if row.source.startswith('gate storage and transfer:')),
                              Decimal(0)), expected.usd)
-        cost, complete = gate_trial.trial_cost(self.book, {request.attempt}, self.settings, now)
+        cost, complete = aws_trial.trial_cost(self.book, {request.attempt}, self.settings, now)
         self.assertTrue(complete)
         self.assertEqual(cost, Decimal('.847'))
         later = self.allowance_bill('2026-01-16', multiplier=Decimal(10))

@@ -168,6 +168,17 @@ class ReleaseSendFailed:
 
 
 @dataclass(frozen=True)
+class HolderMessageSent:
+    """The sender delivered or queued the holder's message."""
+
+
+@dataclass(frozen=True)
+class HolderMessageFailed:
+    """The sender could not deliver or queue the holder's message."""
+    reason: str
+
+
+@dataclass(frozen=True)
 class KnownReleaseEta:
     at: datetime
 
@@ -181,6 +192,14 @@ ReleaseEta = KnownReleaseEta | UnknownReleaseEta
 
 
 @dataclass(frozen=True)
+class CurrentTime:
+    """Read the current time at the rendering entry point."""
+
+
+CURRENT_TIME = CurrentTime()
+
+
+@dataclass(frozen=True)
 class NoReleaseEta:
     pass
 
@@ -191,7 +210,13 @@ class ClockReleaseEta:
     zone: ZoneInfo
 
 
-ReleaseRequest = NoReleaseEta | ClockReleaseEta
+@dataclass(frozen=True)
+class DatedReleaseEta:
+    """The request names a release date and time in its zone."""
+    when: datetime
+
+
+ReleaseRequest = NoReleaseEta | ClockReleaseEta | DatedReleaseEta
 
 
 @dataclass(frozen=True)
@@ -683,6 +708,24 @@ def holder_address(key: str) -> str:
     return key if member is not None else f"session:{key}"
 
 
+def send_holder_message(key: str, text: str) -> HolderMessageSent | HolderMessageFailed:
+    """Send one holder message within the configured timeout."""
+    from scripts.lib import conf
+
+    try:
+        with conf.diagnostics(report=False):
+            timeout = conf.read("build_targets").number("hold_sender_timeout_seconds")
+        result = subprocess.run(session_send.send_argv("--to", holder_address(key), "--text", text),
+                                capture_output=True, text=True, errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        return HolderMessageFailed(f"send timed out after {error.timeout:g} seconds")
+    except (OSError, conf.Unusable) as error:
+        return HolderMessageFailed(str(error))
+    if result.returncode in (0, 1):
+        return HolderMessageSent()
+    return HolderMessageFailed(failure_detail(result))
+
+
 def holder_session(key: str) -> str:
     """Use a staff holder's current session; keep a native session key as it is."""
     from scripts.production import staff
@@ -822,8 +865,16 @@ def release_eta_text(release: ReleaseEta) -> str:
     return release.at.astimezone(user_zone()).strftime("%H:%M %Z")
 
 
-def holder_text(holder: Holder) -> str:
-    return f"{holder.name} (for {holder.purpose}, release eta {release_eta_text(holder.release)})"
+def release_overdue(release: ReleaseEta, now: datetime) -> bool:
+    """A known release is overdue at or after its instant."""
+    return (isinstance(release, KnownReleaseEta)
+            and release.at.astimezone(timezone.utc) <= now.astimezone(timezone.utc))
+
+
+def holder_text(holder: Holder, now: datetime | CurrentTime = CURRENT_TIME) -> str:
+    instant = datetime.now(timezone.utc) if isinstance(now, CurrentTime) else now
+    overdue = ", overdue" if release_overdue(holder.release, instant) else ""
+    return f"{holder.name} (for {holder.purpose}, release eta {release_eta_text(holder.release)}{overdue})"
 
 
 def live_kept_runs(holder: Holder, proc_root: Path = PROC_ROOT) -> tuple[ProcessIdentity, ...]:
@@ -862,7 +913,8 @@ def ci_placement_lines(proc_root: Path) -> list[str]:
 
 
 def resume_refusal(holders: tuple[Holder, ...]) -> str:
-    return ("a hold is in force (" + "; ".join(holder_text(holder) for holder in holders)
+    now = datetime.now(timezone.utc)
+    return ("a hold is in force (" + "; ".join(holder_text(holder, now) for holder in holders)
             + "); --resume only continues a release already begun. Release that hold without --resume.")
 
 
@@ -873,12 +925,15 @@ def release_request(release_time: str | None, zone_name: str | None) -> ReleaseR
         return NoReleaseEta()
     if zone_name is None:
         raise ValueError("--zone goes with --release-eta")
-    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", release_time):
-        raise ValueError("release ETA must be HH:MM")
+    dated = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d", release_time))
+    if not dated and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", release_time):
+        raise ValueError("release ETA must be HH:MM or YYYY-MM-DDTHH:MM")
     try:
         zone = ZoneInfo(zone_name)
     except ZoneInfoNotFoundError:
         raise ValueError(f"unknown IANA zone: {zone_name}") from None
+    if dated:
+        return DatedReleaseEta(datetime.fromisoformat(release_time).replace(tzinfo=zone))
     hour, minute = map(int, release_time.split(":"))
     return ClockReleaseEta(ClockTime(hour, minute), zone)
 
@@ -902,9 +957,10 @@ def write_hold(directory: Path, identity: HolderIdentity, purpose: str, request:
     if isinstance(request, NoReleaseEta):
         release_eta = "unknown"
     else:
-        release = datetime.combine(now.astimezone(request.zone).date(), request.clock, request.zone)
-        if release <= now:
-            raise ValueError("release ETA has already passed today")
+        release = (request.when if isinstance(request, DatedReleaseEta)
+                   else datetime.combine(now.astimezone(request.zone).date(), request.clock, request.zone))
+        if release.astimezone(timezone.utc) <= now.astimezone(timezone.utc):
+            raise ValueError("release ETA has already passed")
         release_eta = release.isoformat()
     directory.mkdir(parents=True, exist_ok=True)
     path = holder_path(directory, identity.key)
@@ -988,7 +1044,7 @@ def release_hold(directory: Path, holder: Holder) -> str:
     state = read_holders(directory)
     if isinstance(state, NoHolders):
         return "released, builds may resume."
-    return "released; still held by " + "; ".join(holder_text(holder) for holder in state.holders)
+    return "released; still held by " + "; ".join(holder_text(holder, now) for holder in state.holders)
 
 
 def release_directory() -> Path:
@@ -1618,7 +1674,8 @@ def release_cycle(directory: Path, name: str, *, resume: bool = False,
             return finish_release_intent(intent)
         remaining = live_holds(cycle, directory)
         if remaining:
-            return "released; still held by " + "; ".join(holder_text(other) for other in remaining)
+            now = clock()
+            return "released; still held by " + "; ".join(holder_text(other, now) for other in remaining)
         cycle["release_started_at"] = clock().isoformat()
         save_cycle(cycle)
         if isinstance(intent, NoReleaseIntent):
@@ -1790,6 +1847,9 @@ def main(arguments: list[str]) -> int:
                 else:
                     result = release_mac_hold(identity, target_name)
                 return print_mac_hold_result(result)
+        if action in {"clear", "drain"} and cast(str | None, options.release_eta) is None:
+            print("build_hold: give --release-eta HH:MM --zone <IANA zone> for a natedev hold")
+            return 2
         if action == "drain":
             request = release_request(cast(str | None, options.release_eta), cast(str | None, options.zone))
             identity = holder_of(cast(str | None, options.holder))
@@ -1892,12 +1952,14 @@ def main(arguments: list[str]) -> int:
         elif action == "audit":
             print("\n".join(audit_lines(audit_hold(holder_directory(), cast(Path, options.proc_root)))))
         else:
+            now = datetime.now(timezone.utc)
             state = read_holders(holder_directory())
             if isinstance(state, NoHolders):
                 print("no build hold")
             else:
                 for holder in state.holders:
-                    print(f"{holder.name} since {holder.since.astimezone(user_zone()):%H:%M %Z}, for {holder.purpose} - release eta: {release_eta_text(holder.release)} - {holder_state(holder, cast(Path, options.proc_root))}")
+                    overdue = ", overdue" if release_overdue(holder.release, now) else ""
+                    print(f"{holder.name} since {holder.since.astimezone(user_zone()):%H:%M %Z}, for {holder.purpose} - release eta: {release_eta_text(holder.release)}{overdue} - {holder_state(holder, cast(Path, options.proc_root))}")
                     for run in live_kept_runs(holder, cast(Path, options.proc_root)):
                         print(f"  kept by {holder.name}: pid {run.pid}, start {run.start_time}")
                 for line in ci_placement_lines(cast(Path, options.proc_root)):

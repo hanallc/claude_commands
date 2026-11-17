@@ -15,7 +15,6 @@ import re
 import secrets
 import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -24,6 +23,7 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, urlsplit
 
+from scripts.lib import build_folders
 from scripts.production import change_review as change_review
 from scripts.production import unit_lookup
 from scripts.production import update_registration
@@ -36,7 +36,7 @@ from scripts.production.delivery_state import (
 from scripts.lib import atomic_file, conf, file_lock, urgency
 from scripts.production.production_doc import Refusal as Refusal, production_field
 from scripts.feature_log import feature_log
-from scripts.review_links import page_frame, review_link
+from scripts.review_links import console_theme, page_frame, review_link
 
 MANIFEST = ".review-link-changes.json"
 PAGE_NAME = "changes.html"
@@ -413,7 +413,7 @@ def script_version(script: str) -> str:
     return hashlib.sha256(script.encode()).hexdigest()[:12]
 
 
-CHANGE_IMAGE_STYLE = """main:has(.change-image){max-width:1056px}
+CHANGE_IMAGE_STYLE = """main:not(:has(>.page-status)):has(.change-image){max-width:1056px}
 :is(section[data-type="changes"],section[data-change-card]){max-width:680px}:is(section[data-type="changes"],section[data-change-card]):has(>.change-image){max-width:992px;display:grid;grid-template-columns:minmax(0,680px) 280px;gap:32px;align-items:start}
 .change-text{min-width:0}.change-image{display:block;width:280px;max-width:100%}
 .change-image img{display:block;box-sizing:border-box;width:280px;max-width:100%;max-height:420px;object-fit:cover;object-position:top left;border:1px solid #8886;border-radius:6px}
@@ -438,7 +438,7 @@ def document(content: str, title: str = TITLES["changes"]) -> bytes:
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>''' + html.escape(title) + '''</title><style>
 :root{color-scheme:light dark;font:17px/1.55 system-ui,sans-serif}
-body{margin:0}''' + page_frame.STYLE + page_frame.ZOOM_STYLE + '''main{max-width:744px}
+body{margin:0}''' + console_theme.TOKENS + page_frame.STYLE + page_frame.ZOOM_STYLE + '''main{max-width:744px}
 ''' + CHANGE_IMAGE_STYLE + '''h1{font-size:26px;line-height:1.25;margin:0 0 16px}section h1,h2{font-size:20px;line-height:1.3}
 h2{margin:16px 0}p{white-space:pre-wrap;margin:16px 0}main{overflow-wrap:anywhere}
 section h2{font-size:17px}section details{margin:16px 0}
@@ -517,6 +517,15 @@ def change_details(row: dict[str, str], key: str) -> str:
     return ('<dl class="change-details">'
             + "".join(f"<dt>{label}:</dt><dd>{html.escape(value)}</dd>" for label, value in ChangeDetails.read(row, key).lines())
             + "</dl>")
+
+
+def source_name(members: staff.StaffSnapshot, owner: staff.StaffId) -> str:
+    """Include the parent showrunner in a unit's source line."""
+    member = members.by_id(owner)
+    if member is None:
+        return str(owner)
+    parent = members.parent_of(member) if member.kind == "unit" else None
+    return f"{parent.name} · {member.name}" if parent is not None else member.name
 
 
 def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
@@ -741,7 +750,7 @@ def publish(production: Path, review_list: Path, rows: list[str]) -> str:
     # A fresh page has its own immutable row allowlist. Only metadata is stored
     # beside the HTML: every GET reads the answers from the review record.
     root = review_link.review_root()
-    with tempfile.TemporaryDirectory(prefix="review-changes-") as temporary:
+    with build_folders.tool_folder("review-changes") as temporary:
         source = Path(temporary) / PAGE_NAME
         _ = source.write_text("<!doctype html><title>Changes to review</title>", encoding="utf-8")
         url = review_link.snapshot_at(root, [source], new=True)[0]
@@ -978,25 +987,31 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
         status.request_attempts[delivery.attempt] = AttemptOwnership(status.path(delivery.page, delivery.row), "sending")
     failures = (send_with_retries(SENDER, delivery.recipients, delivery.message, tries, pause) if delivery.recipients
                 else [DeliveryFailure(MissingRecipient(), "no showrunner to send to")])
-    alert_delivery_failures(delivery, failures, tries)
+    _ = alert_delivery_failures(failures, tries, source=delivery.page.review_list, row=delivery.row,
+                            message=delivery.message, recipients=delivery.alert_recipients)
     status.record(delivery)
 
 
-def alert_delivery_failures(delivery: MessageDelivery, failures: list[DeliveryFailure], tries: int) -> None:
+def alert_delivery_failures(failures: list[DeliveryFailure], tries: int, *, source: Path, row: str,
+                            message: str, recipients: tuple[staff.StaffId, ...],
+                            title: str = "Change review delivery needs attention") -> bool:
+    reached = False
     for failure in failures:
         target = "no recipient" if isinstance(failure.recipient, MissingRecipient) else failure.recipient
         error = failure.error
-        alert = "\n".join(("Change review delivery needs attention", f"List: {delivery.page.review_list}",
-                           f"Row: {delivery.row}", f"Recipient: {target}", f"Tries: {tries}",
-                           f"Last error: {error}", "The user's answer is saved. Pass it on by hand.", delivery.message))
-        if not delivery.alert_recipients:
-            print(f"review-links delivery {delivery.row}: {error}; no showrunner for the alert", file=sys.stderr)
-        for runner in delivery.alert_recipients:
+        alert = "\n".join((title, f"List: {source}",
+                           f"Row: {row}", f"Recipient: {target}", f"Tries: {tries}",
+                           f"Last error: {error}", "The user's answer is saved. Pass it on by hand.", message))
+        if not recipients:
+            print(f"review-links delivery {row}: {error}; no showrunner for the alert", file=sys.stderr)
+        for runner in recipients:
             try:
                 send_to_staff(runner, SENDER, alert)
+                reached = True
             except SEND_ERRORS as failure:
-                print(f"review-links delivery alert {delivery.row}: " + " ".join(str(failure).splitlines()), file=sys.stderr)
-                return
+                print(f"review-links delivery alert {row}: " + " ".join(str(failure).splitlines()), file=sys.stderr)
+                return reached
+    return reached
 
 
 def recover_pending(status: DeliveryStatus) -> None:
@@ -1082,7 +1097,9 @@ def recover_question_answers(status: DeliveryStatus) -> None:
                 page = UserQuestionPage(Path(saved["source"]), Path(saved["production"]),
                                         (Path(saved["source"]).stem,), "", saved)
                 identities = update_registration.QuestionStaff.read()
-                question = next((item for item in update_registration.question_records_for_document(page.production, identities)
+                owner = identities.record.by_id(staff.StaffId(saved["owner"]))
+                source = owner if owner is not None and owner.kind == "producer" else page.production
+                question = next((item for item in update_registration.question_records_for_document(source, identities)
                                  if item.path == page.review_list), None)
                 # An answer closes its question; a follow-up or a skip leaves it open.
                 if question is None or question.status != ("closed" if saved.get("kind", "answer") == "answer" else "open"):

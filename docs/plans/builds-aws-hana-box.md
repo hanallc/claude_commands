@@ -304,7 +304,7 @@ Queue dependencies gate the named phases, rather than unrelated guest safety and
 | E | Provider placement through the configured SSH target and existing capabilities. | D; queue 44; queue 44c before activation. |
 | F1 | Offload fencing, settlement, and local admission release. | E; queue 44; queue 44c before activation. |
 | G | Results and costs: linked rows, source checks, schema, and ledger reporting. | C, F1; queue 44; queue 44c before activation. |
-| B | Exact source into shared slots through the maker and S3 transport. | Build folders 3; deliver with build folders 4. |
+| B | Built: exact source into shared slots through the maker and S3 transport. | Build folders 3; deliver with build folders 4. |
 | F2 | Execution on the leased slot with inherited process locks. | B, D, F1; build folders 4. |
 | H | Acceptance: equivalent results, complete slot sizes, safety, latency, and first-day costs. | G, F2; build folders 4; owner agreements and the user's go. |
 

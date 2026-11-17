@@ -220,7 +220,7 @@ def running_job_text(job: RunningJob,
 def format_state(name: str, state: TargetState,
                  labels: Mapping[RunningJob | Held, roster.UnitLabels] = _NO_UNIT_LABELS) -> str:
     from scripts.build_targets.targets import (
-        ExpiresAt, Free, ReleaseEstimated, Running, StateUnreadable, Unreachable,
+        ExpiresAt, Free, ReleaseEstimated, ReleaseOverdue, Running, StateUnreadable, Unreachable,
     )
 
     name = display_field(name)
@@ -239,6 +239,8 @@ def format_state(name: str, state: TargetState,
         line += f" until {local_time(state.end.when)}"
     elif isinstance(state.end, ReleaseEstimated):
         line += f" release expected {local_time(state.end.when)}"
+    elif isinstance(state.end, ReleaseOverdue):
+        line += f" release overdue since {local_time(state.end.when)}"
     reason = display_field(state.reason)
     return f"{line} — {reason}" if reason else line
 
@@ -1170,28 +1172,12 @@ def command_register_local(_call_id: str, *, pid: int,
 
 def tell_wait_holder(holder: build_hold.Holder, line: str, caller: str) -> None:
     """Tell the holder about unresolved ownership without ending the wait."""
-    import subprocess
-
     from scripts.build_hold import build_hold
-    from scripts.lib import conf
-    from scripts.lib.process_failure import failure_detail
-    from scripts.message import session_send
 
-    try:
-        with conf.diagnostics(report=False):
-            timeout = conf.read("build_targets").number("hold_sender_timeout_seconds")
-        result = subprocess.run(session_send.send_argv("--to", build_hold.holder_address(holder.key), "--text", line),
-                                capture_output=True, text=True, errors="replace", timeout=timeout)
-    except subprocess.TimeoutExpired as error:
-        reason = f"send timed out after {error.timeout:g} seconds"
-    except (OSError, conf.Unusable) as error:
-        reason = str(error)
-    else:
-        if result.returncode == 0:
-            return
-        reason = failure_detail(result)
-    print(f"{speaker(caller)}: could not tell {display_field(holder.name)}: {display_field(reason)}",
-          file=sys.stderr, flush=True)
+    result = build_hold.send_holder_message(holder.key, line)
+    if isinstance(result, build_hold.HolderMessageFailed):
+        print(f"{speaker(caller)}: could not tell {display_field(holder.name)}: {display_field(result.reason)}",
+              file=sys.stderr, flush=True)
 
 
 def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", caller: str = "",

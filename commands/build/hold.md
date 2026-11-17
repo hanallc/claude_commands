@@ -10,9 +10,9 @@ Use `/build:mac block <why>` and `/build:mac unblock` for the Mac.
 
 ## Clear existing work
 
-1. Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_hold/build_hold.py clear [target] --for '<why>'`.
+1. Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_hold/build_hold.py clear [target] --for '<why>' --release-eta HH:MM --zone <IANA zone>`.
 2. Add `--keep <pid>` for each run that must continue.
-3. Add `--release-eta HH:MM --zone <IANA zone>` only for a measured time later today.
+3. Use `YYYY-MM-DDTHH:MM` instead of `HH:MM` for a later date.
 4. Send the printed notice with `/notify_top_level --here`.
 
 Your fixed staff ID owns the hold.
@@ -28,9 +28,9 @@ Other CI requests stay queued until release.
 
 ## Drain existing work
 
-1. Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_hold/build_hold.py drain [target] --for '<why>'`.
+1. Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_hold/build_hold.py drain [target] --for '<why>' --release-eta HH:MM --zone <IANA zone>`.
 2. Add `--keep <pid>` for an additional run that must continue.
-3. Add `--release-eta HH:MM --zone <IANA zone>` only for a measured time later today.
+3. Use `YYYY-MM-DDTHH:MM` instead of `HH:MM` for a later date.
 
 The command keeps existing outermost gates, CI workers, and builds that the enforcer could stop.
 It publishes the hold and repeats discovery before starting the enforcer.
@@ -50,6 +50,10 @@ Ctrl-C returns 130 and retains the hold.
 
 Status derives `draining (N runs left)` or `held` from live keep entries.
 It names each queued or running CI job and the time that state began.
+Clear and drain require a future release time in the named zone.
+At that time, status adds `overdue` and the enforcer sends the holder one message.
+The hold stays in force until release.
+Release the hold or repeat clear or drain with a later ETA to end the overdue state.
 `quiet` waits up to ten minutes for every user's cargo and compiler processes to end.
 Load alone does not delay it.
 Exit 1 names remaining builds by user.
@@ -75,7 +79,7 @@ The existing Bash guard uses the same hold and caller check.
 Eligible `verify.sh` test steps can use the Mac while natedev remains held.
 
 Inspect any path named by `state unreadable`.
-Repair your natedev holder record with `clear --for '<why>'`, or remove it with `release`.
+Repair your natedev holder record with `clear --for '<why>' --release-eta HH:MM --zone <IANA zone>`, or remove it with `release`.
 `/build:hold release` sets a damaged release record aside.
 For a damaged Mac claim, check its holder and running job before repairing the file.
 Use `/build:mac block` or `/build:mac unblock` for a Mac block.

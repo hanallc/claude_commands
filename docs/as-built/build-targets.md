@@ -90,9 +90,15 @@ The retained remote helpers remain unreachable from these three commands.
 
 `clear` stops existing queued gates and running builds outside the hold's allow rules.
 `drain` keeps existing runs that work until they finish; a run that only waits waits for the release.
-Both accept `--keep PID`, `--release-eta HH:MM`, and `--zone IANA`.
+Both accept `--keep PID` and require `--release-eta HH:MM --zone IANA`.
+The dated form `YYYY-MM-DDTHH:MM` permits a later date in that zone.
+The release time must be in the future.
 Both keep the target held until explicit release.
 A holder file uses its holder's fixed staff ID.
+Its `release_eta` stores the release instant; old `"unknown"` values remain readable.
+At that instant, status shows `release overdue since HH:MM <zone>`.
+The enforcer sends the holder one overdue message and keeps the hold in force.
+The holder releases the hold or repeats clear or drain with a later ETA.
 `HolderIdentity.name` supplies the current display name.
 An explicit holder outside staff keeps its given key.
 Without `--holder`, the caller's native session must resolve to a staff member.

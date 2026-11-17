@@ -147,6 +147,11 @@ approved change; commit and push only when the user says so.
 
 ## question
 
+In a producer session, `/next question` reads that producer's own question folder without a production document.
+The Questions page sends an answer to the producer's current session.
+For a chat answer, run `update_registration.py answer --production <producer name> --item "<its text>"`.
+Use its relay line to send the answer to the producer.
+
 The current open question. A question with a follow-up that waits for the asker's reply is not shown.
 A question skipped on the Questions page comes after the other questions. Mark: `update_registration.py mark-important
 --production <showrunner name> --item "<its text>"`. Ask it in full: what is asked,

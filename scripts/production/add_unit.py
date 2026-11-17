@@ -26,7 +26,7 @@ from scripts.herdr import herdr_types
 from scripts.herdr import pane_launch
 from scripts.herdr import herdr
 from scripts.agents import remote
-from scripts.lib import git_exclude, git_files, models_registry
+from scripts.lib import build_folders, git_exclude, git_files, models_registry
 from scripts.lib.transcripts import open_transcript, transcript_paths
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -726,8 +726,8 @@ def ensure_worktree(request: UnitLaunch) -> None:
     if worktree.exists():
         _ = worktree_on_branch(request)
     else:
-        _ = git(production, "worktree", "add", str(worktree), "-b", request.branch,
-                production.merge_branch)
+        _ = build_folders.create_build_folder(build_folders.LinkedEditableRepository(
+            worktree, production.checkout, build_folders.NewWorktreeBranch(request.branch, production.merge_branch)))
     if isinstance(request.plan, PlanGiven):
         destination = worktree / request.plan.path
         if not destination.exists():

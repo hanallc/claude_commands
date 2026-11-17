@@ -14,7 +14,7 @@ from typing import override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import hana_guest as guest
+from scripts.aws_target import hana_guest as guest, hana_receiver
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -206,6 +206,16 @@ class HanaGuestTests(unittest.TestCase):
         self.assertIn('ConditionPathIsMountPoint=' + str(guest.DATA), files['hana-tools.service'].content)
         self.assertEqual(files['safety.py'].mode, 0o600)
         self.assertEqual(files['safety.json'].mode, 0o600)
+        receiver = hana_receiver.render_files(hana_receiver.ReceiverSettings(10, 1))[-1].content
+        for unit in (guard, files['hana-watchdog.service'].content, receiver):
+            self.assertIn('Environment=PATH=' + guest.SYSTEM_BIN + '\n', unit)
+
+    def test_no_tool_setup_omits_only_the_tool_unit(self) -> None:
+        files = {file.path.name: file for file in guest.render_files(
+            self.settings, device=Path('/dev/disk/by-label/hana-data'))}
+        expected = self.files()
+        _ = expected.pop('hana-tools.service')
+        self.assertEqual(files, expected)
 
     def test_rendered_program_runs_without_repository_imports(self) -> None:
         control = self.root / 'control'

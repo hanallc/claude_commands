@@ -14,6 +14,8 @@ Staged copies use a private source index and a synthetic commit without changing
 Each gate takes one detached repository slot through `build_slots.take_slot()`.
 The machine and repository select the pool; the owner does not select its path.
 The caller holds the slot lease through preparation, execution, and result publication.
+The lease keeps the staff id in `unit` and `gate` in `work`; `purpose` names the gated source revision's subject, including merge gates.
+A `<kind>(<slug>): phase <N> — <title>` subject gives `gate · <slug> phase <N> · <title>`; other subjects give `gate · <subject>`, and unreadable subjects give `gate`.
 Identical nested proofs reuse their held slot.
 Other revisions take another free slot or wait in the build queue.
 The configured `slots.wait_seconds` limits that wait.

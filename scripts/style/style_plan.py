@@ -38,7 +38,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.copies import copies
 from scripts.direct import phase_reservation
-from scripts.lib import berth_board
+from scripts.lib import berth_board, build_folders
 from scripts.whoami import quota_state
 from scripts.lib.git_blob import git_blob_id
 from scripts.lib.process_failure import failure_detail
@@ -1323,7 +1323,7 @@ def candidate_source(repo: Path, commit: str) -> Generator[TicketSourceView]:
     """Use the unit's reused copy with the candidate changes visible against its parent."""
     with publication_path(repo, "candidate.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource(commit)) as tree:
+        with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource(commit), step="style") as tree:
             _ = git(tree, "config", "user.name", "Style gate")
             _ = git(tree, "config", "user.email", "style-gate@example.invalid")
             parent = git(tree, "rev-parse", commit + "^").strip()
@@ -3794,7 +3794,8 @@ def restore_ticket_worker(run: Path, worktree: Path, plan: Path, ticket_id: str,
     phase_id = phase.group(1)
     slot = "style-ticket-" + ticket_id
     directory = phase_reservation.phase_directory(run, phase_id)
-    directory.mkdir(parents=True, exist_ok=True)
+    directory = build_folders.create_build_folder(build_folders.StableOwnerFolder(
+        directory.name, build_folders.ExplicitBuildParent(directory.parent)))
     prompt = directory / "ticket-work-order.md"
     if not prompt.exists():
         header = (

@@ -230,6 +230,8 @@ Own what a build may use and when it starts: memory admission and the memory que
    Cover `release_records_for_change()`, `complete_release_record()` and `set_aside_damaged_record()` through that capability.
    Do not take the same flock again inside a helper. Keep hold status read-only.
    Refuse mixed private and real directories before either real directory changes.
+   Guard the hold stop: `hold_enforcer.stop_waiting_run()` (`scripts/build_hold/hold_enforcer.py:358`) stops live runs and writes their run record through `detached_runs.stop_with_reason()` (`scripts/agents/detached_runs.py:198`) outside `release_lock()`.
+   Refuse an imported call from a non-installed copy before any signal or record write. Keep the command-group stop and the supervisor's result delivery (Phase 129).
    `read_cycle()` (`build_hold.py:1016`) returns `HoldCycle | None`, and `cycle_path()` (`build_hold.py:1005`) returns `Path | None`, for the same no-current-cycle state.
    Return the existing `NoCycle` (`build_hold.py:73`) from both in place of `None`. Add no second type for this state.
    Update `read_cycle_for_change()` and its test callers.
@@ -271,6 +273,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 - `scripts/lint/memory_admit.py`, `scripts/lint/memory_gate.sh`, `scripts/lint/invoke.sh` — caller routing.
 - `scripts/lint/test_memory_admit.py`, `scripts/lint/test_invoke_scope.py` — caller tests.
 - `scripts/build_hold/override_guard.py`, `scripts/build_hold/build_hold.py` — shared guard and hold mutation boundary.
+- `scripts/build_hold/hold_enforcer.py` — the hold stop guard; its imported-call refusal test goes in `scripts/build_hold/test_hold_enforcer.py`.
 - `scripts/build_hold/test_override_guard.py`, `scripts/build_hold/test_build_hold.py` — guard and hold recovery tests.
 - `scripts/build_hold/test_hold_enforcer.py`, `scripts/build_targets/test_build_targets.py`, `scripts/direct/test_verify_mac_lifecycle.py`, `scripts/direct/verify_mac_offload_test_support.py`, `scripts/direct/verify_hold_wait_test_support.py` — `read_cycle()` callers that narrow to `HoldCycle`.
 - `scripts/build_queue/queue_view.py`, `scripts/build_queue/queue_card.py` — separate repository and step displays.
@@ -285,14 +288,12 @@ Own what a build may use and when it starts: memory admission and the memory que
 - `test` owns the listed test files, routing fixtures and display goldens.
 
 **Acceptance gate:**
-- Preserve these existing tests unchanged:
-  1. `test_live_priority_marks_and_cards_use_the_snapshot_without_bump_history` in `scripts/build_queue/test_queue_view.py`.
-  2. `test_token_wait_keeps_place_one_and_head_status_moves_to_the_eligible_row` in `scripts/build_queue/test_queue_view.py`.
-  3. `test_priority_override_and_frozen_release_keep_the_resolved_head` in `scripts/build_queue/test_admission_service.py`.
-  4. `test_each_pass_matches_the_shared_rule_and_view_uses_its_frozen_limits` in `scripts/build_queue/test_admission_service.py`.
-  5. `test_view_release_and_admit_pass_capture_the_same_continuation_slot` in `scripts/build_queue/test_admission_service.py`.
-  6. `test_a_younger_run_cannot_take_the_room_protected_for_the_head` in `scripts/build_queue/test_admission_service.py`.
-  7. `test_an_oversized_head_starts_alone_but_unreadable_host_or_pressure_holds_it` in `scripts/build_queue/test_admission_service.py`.
+- Preserve these existing tests unchanged. builds-queue 3ef82d3ab (`/build:bump`) removed the two earlier `test_queue_view.py` tests this list named; do not restore them.
+  1. `test_priority_and_frozen_release_keep_the_resolved_head` in `scripts/build_queue/test_admission_service.py`.
+  2. `test_each_pass_matches_the_shared_rule_and_view_uses_its_frozen_limits` in `scripts/build_queue/test_admission_service.py`.
+  3. `test_view_release_and_admit_pass_capture_the_same_continuation_slot` in `scripts/build_queue/test_admission_service.py`.
+  4. `test_a_younger_run_cannot_take_the_room_protected_for_the_head` in `scripts/build_queue/test_admission_service.py`.
+  5. `test_an_oversized_head_starts_alone_but_unreadable_host_or_pressure_holds_it` in `scripts/build_queue/test_admission_service.py`.
 - Preserve `test_restart_retries_an_interrupted_cancellation_with_its_original_time` unchanged in `scripts/build_queue/test_admission_service.py`.
 - Preserve `test_full_queue_holds_gate_until_the_running_charge_is_released` and `test_admission_error_refuses_before_any_module_starts` unchanged.
   Both tests are in `scripts/production/test_merge_gate_suites_admission.py`.
@@ -2531,7 +2532,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `queue_evidence.room_text` puts the swapped term in the cap calculation: `… − safety 3.0 GiB − 12.0 GiB swapped outside builds; kept aside …`.
 - `queue_view.cap_bar` draws the swapped block (`▓`, inactive) between the cap line and safety.
 - `memory_feed.memory_shares` places the swapped share first. The reserved share stops at free − safety − swapped, so on the page the reserved block ends at the cap line.
-- `memory_live.html`: the swapped-memory, shortfall and room-equation text say the swapped memory is outside the cap; the legend row for the swapped memory comes before safety.
+- `memory_live.html`: the swapped-memory and shortfall text say the swapped memory is outside the cap; the legend row for the swapped memory comes before safety.
 
 **Files:**
 - `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py` — `test_swap_outside_the_build_and_ci_slices_is_demand` (cap and room rows, "swapped past the cap").
@@ -2637,3 +2638,83 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 **Files:** `scripts/agents/detached_runs.py`, `scripts/build_hold/hold_enforcer.py`, their tests, `scripts/direct/test_verify_tree_cancel_lint.py`, `commands/unit/direct.md`, `docs/direct/write_prompt_contract.md` and three as-built docs.
 
 **Gotchas:** `kill -TERM -- -<supervisor pid>` now ends only the supervisor; use the `stop` verb. A `timeout` child that leaves the command group needs its own group stop.
+
+### Phase 130 — The cutover deletes each free legacy gate folder after a Git rescue  · status: done
+
+#### As-built
+
+- `scripts/lint/gate_folders_delete.py --root <path> [--dry-run]` is a one-time cutover command. It reads no config key.
+- For each `<root>/<repository>/<gate>` it holds `scratch.removal_lock(gate)`, or `scratch.judgment_lock(gate)` with `--dry-run` (it creates no file). A held lock keeps the gate as busy.
+- Under the lock it keeps a gate that holds its own repository (a `.git` folder), or a linked worktree whose common Git directory lies inside the gate. Otherwise it rescues each linked worktree with `git_rescue.rescue(worktree, f"{name}-{stamp}", generated=[worktree / "target"])`. A `RescueError` keeps the gate.
+- It then deletes the gate and runs `git worktree prune --expire now` once in each source repository. It deletes empty repository folders. Dot-entries, files and symlinks at the root are kept.
+- Each decision prints one line: `deleted|would delete <path>: <n> GiB[; prune failed <source>: <error>]` or `kept <path>: <reason>`. Sizes use `sweep.gib`.
+- A filesystem error keeps that folder, and the run continues. The exit status is 1 when a gate is kept for a rescue failure or a filesystem error, or a prune fails; busy, repository and root-entry keeps give 0.
+- No signal handler, mask or disposition.
+
+**Files:** `scripts/lint/gate_folders_delete.py`, `scripts/lint/test_gate_folders_delete.py` (real Git fixtures under a temporary root).
+
+**Binds later work:** the cutover run on natedev, Thu 11-19, after build-folders Phase 4 is on main:
+1. `~/.claude/scripts/lib/py ~/.claude/scripts/lint/gate_folders_delete.py --root ~/worktrees/gates --dry-run`. Read each line.
+2. The same command without `--dry-run`.
+3. Run step 2 again after each busy gate's task ends.
+The cutover removal commit deletes the script after the run.
+
+**Gotchas:** a `.git` file does not prove that the Git store is outside the gate (`git init --separate-git-dir`); resolve the common directory first. Rescue refs stay in each source under `refs/rescue/`.
+
+### Phase 131 — The disk-floor sweep measures and alarms; it deletes nothing  · status: todo
+**Source:** build-folders Phase 8 (stall watch and alarm-only sweep), the resources part. builds showrunner 2026-11-15. Devtools owns the stall watch and `folder_audit.py`.
+**Depends on:** build-folders Phase 7 on main (planned Thu 11-19 morning), and devtools' stall watch on held lease owners on main first. Builds owns the order of `test_sweep.py` and `test_tmp_sweep.py` edits: claim them through berth and builds before an edit.
+
+#### Work Order
+
+**Goal:** the automatic disk-floor sweep measures and alarms and deletes nothing; explicit cleanup goes through the maker's lock and rescue path.
+
+**Spec:**
+1. Change `scripts/lint/tmp_sweep.py` and the floor callers in `scripts/lint/sweep.py` to measurement and alarms. They delete nothing.
+2. Send each eligible one-off to the maker's lock and rescue path (`build_folders`). Keep explicit maker cleanup.
+   `tmp_sweep.py --apply` (`apply_cleanup_plan()`, which deletes through `remove_entry()` at `scripts/lint/tmp_sweep.py:1456`) is explicit cleanup of a saved plan: route each entry through the same maker path. Keep no direct delete in it.
+3. Retire each competing managed-folder delete path after its legacy users drain.
+4. Keep `~/.cache` out of every root. Add no cleanup tool.
+
+**Files:**
+- `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py` — alarm-only floor callers and the explicit cleanup route.
+- `scripts/lint/test_sweep.py`, `scripts/lint/test_tmp_sweep.py` — alarm, explicit cleanup and saved-plan rows (claim through berth and builds first).
+- `docs/as-built/build-memory-admission.md` — the alarm-only floor rule beside its `tmp_sweep` lines.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py` and the documentation.
+- `test` owns both test modules and the alarm, cleanup and saved-plan fixtures.
+
+**Acceptance gate:** a low-disk check keeps every fixture folder; the floor alarm still sends once per crossing; explicit maker cleanup still rescues and removes an unlocked one-off; `tmp_sweep.py --apply` on a saved plan removes through the maker path and keeps a locked one. Run the sweep, tmp sweep, folder audit and source enforcement tests. The full gate runs after the final migration.
+
+### Phase 132 — hana_shot launch refuses a new app at the local app cap  · status: done
+**Source:** builds showrunner 2026-11-15 23:1x, natedev decision after the 11-15 swap peak: 8 research `hana_shot.py launch` apps on ports 15820-15827 pushed swap to 36.6 GiB at 16:15 EST. An interim step; queue's memory gate for app launches (queue phase A) replaces it.
+
+#### As built
+
+- Removed 2026-11-16 before it reached main: queue's app memory gate (`scripts/build_queue/app_gate.py`) holds each `hana_shot.py launch` app's measured memory in the memory queue, so one way limits app launches. `config/hana_shot.conf` has no `local_app_cap` key.
+- `same_binary` stays: it matches the recorded binary as one whole argument of the pid (`/proc/<pid>/cmdline` on Linux, `ps -ww -p <pid> -o command=` on macOS). A reused pid that runs another program, a path prefix, or a process that exits during the read gives `False`, so `shutdown` signals no reused Mac pid. The `shutdown` test in `LaunchRecordRecoveryTests` covers it.
+
+### Phase 133 — Each gate slot lease names the work it gates  · status: done
+
+#### As-built
+
+- `copies.gate_purpose(subject)` names the gated work: a `<kind>(<slug>): phase <N> — <title>` subject gives `gate · <slug> phase <N> · <title>`, any other subject gives `gate · <subject>`, and an empty subject gives `gate`.
+- `copies.standing` reads the subject of `base` with one `git log -1 --format=%s` in the slot source and passes it as the slot lease `purpose`. A failed read gives `gate`. The lease keeps the staff id in `unit` and `gate` in `work`. The `ACTIVE_GATES` reuse path takes no slot and is unchanged.
+- A `MergeRevision` gate also names `base`: in `waiting.scratch_test`, `merge.revision` is the production merge branch, not the gated work.
+- `build_folders.build_folder_path` checks only `repository` for a slot path (`<repository>-slot<N>`). The other slot fields are lease labels, so a subject with a `/` is a valid purpose. Other folder kinds keep the full component check.
+- The Disks page "Used by" column shows the purpose (`scripts/disks/slots.py`).
+- No signal handler, mask or disposition.
+
+**Files:** `scripts/copies/copies.py`, `scripts/lib/build_folders.py`, `scripts/copies/test_copies.py` (StandingTests lease rows), `docs/as-built/copies.md`.
+
+### Phase 134 — A natedev hold names its release time and reports when it is overdue  · status: done
+
+#### As-built
+
+- `build_hold.py drain` and `clear` on natedev refuse without `--release-eta` (exit 2, nothing written). The flag takes `HH:MM` (later today) or `YYYY-MM-DDTHH:MM` (`DatedReleaseEta`), both in `--zone`; a past time gives `release ETA has already passed`. The Mac and SSH `clear` paths are unchanged. The library keeps `NoReleaseEta` and reads a stored `"unknown"`.
+- `build_hold.release_overdue(release, now)` is the one overdue rule. `targets.ReleaseOverdue` is the `HoldEnd` for it: `end_text` gives `release overdue since HH:MM <zone>` (the Builds page), `build_targets.py status` gives ` release overdue since …`, and `build_hold.py status` and `holder_text` add `, overdue`.
+- The hold enforcer run loop sends at most one overdue notice per pass to `holder_address(key)` through `build_hold.send_holder_message` (also used by `tell_wait_holder`; exit 0 or 1, a queued message, counts as sent). A sent notice writes a marker `overdue-notices/<sha of key, since, release>.json` under the enforcer state directory and stays marked in memory for the run if the write fails. The send comes before the marker, so a crash between them can repeat a notice but never lose it. A failed send or notice text (for example an invalid user zone) prints one stderr line and retries no sooner than 60 seconds within the run; enforcement continues. The loop removes the marker folder when no hold is in force.
+- The hold never ends by itself. No config key changed. No signal handler, mask or disposition.
+
+**Files:** `scripts/build_hold/build_hold.py`, `scripts/build_hold/hold_enforcer.py`, `scripts/build_targets/targets.py`, `scripts/build_targets/build_targets.py`, their tests, `commands/build/hold.md`, `commands/build/status.md`, `commands/showrunner/bump.md`, `docs/as-built/build-targets.md`, `docs/as-built/build-memory-admission.md`.

@@ -1822,8 +1822,8 @@ The changes below can change director work without changing that hash.
 Each line is a first-parent main commit, its UTC main time and the watched files it changed.
 
 Recorder, launcher, hook, wait publisher and `phase_process.py` changes inside the after window (95).
-The watched files are `progress_history.py`, `phase_process.py`, `codex_mesh.py`, `mesh_runs.py`, `implement.sh`, `review.sh`, `verify.sh`, `merge_checkpoint.py`, `stop-direct-continue.py`, `user-prompt-submit-conversation-pause.py` and `conversation_pause.py`.
-`aac335c11` (hierarchies Phase 30) deletes `codex_mesh.py`.
+The historical file list included `codex_mesh.py` and `mesh_runs.py` before their deletion at `aac335c11` on 2026-11-09.
+The other watched files were `progress_history.py`, `phase_process.py`, `implement.sh`, `review.sh`, `verify.sh`, `merge_checkpoint.py`, `stop-direct-continue.py`, `user-prompt-submit-conversation-pause.py` and `conversation_pause.py`.
 
 ```text
 270935b38 2026-11-08T01:21:02Z codex_mesh.py,conversation_pause.py,merge_checkpoint.py,mesh_runs.py
