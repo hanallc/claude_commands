@@ -433,6 +433,26 @@ The account details include the dot, label, swatch, allowance, reset, credits, a
 A separated row shows the account details again.
 A lone producer row shows all account details.
 The helper preserves the complete input rows for later sorts.
+The Accounts page sorts through four focusable column headers:
+
+1. Account sorts by label and then by role order.
+2. Left sorts by the full quota value, least first, then by account and role order.
+3. Role sorts by role name and then by account.
+4. Busy sorts by count, most first, then by account.
+
+The role order is units, showrunners, workers, producers, spare, and no role.
+The default sort uses account order.
+Missing values stay last in both directions.
+Clicking the selected header reverses its order.
+Enter performs the same action on a focused header.
+Each sortable header reserves space for its arrow.
+`account_board_sort_orders` prepares both directions and uses `account_details_in_row_order` for each order.
+The browser moves the existing rows and restores the account details for each consecutive account run.
+The total row stays last.
+Sorting preserves the total values and upcoming moves.
+Browser storage keeps each viewer's choice through refreshes and page visits.
+Failed storage reads use the default sort.
+Failed storage writes keep the current choice for the open page.
 The shipped value of `role.producer` is `pink`.
 The value accepts a color name or a six-digit hex color.
 A board span with a valid configured color carries its key as `color_key`; the role check mark is a separate span.

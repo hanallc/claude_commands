@@ -4498,6 +4498,7 @@ def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime, *, acc
 
 
 COUNT_COLUMNS = ("busy", "idle", "paused", "exited", "total")
+ACCOUNT_ROLE_ORDER = ("units", "showrunners", "workers", "producers", "spare", "")
 BOARD_COLUMNS: tuple[BoardColumn, ...] = (
     BoardColumn(key="dot", heading="", align="left"), BoardColumn(key="label", heading="account", align="left"),
     BoardColumn(key="left", heading="left", align="right"), BoardColumn(key="roles", heading="role", align="left"),
@@ -4611,7 +4612,8 @@ def _account_board_rows(row: StatusRow, reading: StatusReading, *, account_confi
     dot: BoardTone = "success" if _read_ok(row, reading, account_config=account_config) else "error"
     roles = list(row.roles) or [""]
     lines: list[BoardRow] = []
-    for index, role in sorted(enumerate(roles), key=lambda item: item[1] == "producers"):
+    for index, role in sorted(enumerate(roles), key=lambda item: (
+            ACCOUNT_ROLE_ORDER.index(item[1]) if item[1] in ACCOUNT_ROLE_ORDER else len(ACCOUNT_ROLE_ORDER))):
         counts = _count_cells(row.role_counts[index] if index < len(row.role_counts) else None)
         cells = {"dot": [_span("●", dot)], "label": [_account_label(row.label, colors)],
                  "left": [_span(left, tone)], "roles": _role_spans(role, role in row.selected_roles, colors),
@@ -4638,6 +4640,71 @@ def account_details_in_row_order(rows: list[BoardRow]) -> list[BoardRow]:
         result.append({**row, "cells": cells})
         previous = label
     return result
+
+
+class AccountRowPlacement(TypedDict):
+    """The source row index and account detail visibility for one sorted row."""
+    index: int
+    details: bool
+
+
+def account_board_sort_orders(reading: StatusReading, board: Board) -> dict[str, list[AccountRowPlacement]]:
+    """Prepare both directions of each page sort from the complete account rows."""
+    facts = {row.label: row for row in reading.rows}
+    complete: list[BoardRow] = []
+    labels: list[str] = []
+    details: dict[str, list[BoardSpan]] = {}
+    label = ""
+    for row in board["rows"][:-1]:
+        cells = row["cells"]
+        if cells["label"]:
+            label = "".join(span["text"] for span in cells["label"])
+            details = {key: cells[key] for key in ("dot", "label", "left", "resets", "credits", "enabled")}
+        labels.append(label)
+        complete.append({**row, "cells": {**cells, **details}})
+
+    def role(index: int) -> str:
+        spans = complete[index]["cells"]["roles"]
+        return spans[0]["text"] if spans else ""
+
+    def quota(index: int) -> float:
+        value = facts[labels[index]].weekly_left_percent
+        return value if isinstance(value, (float, int)) else 0
+
+    def busy(index: int) -> int:
+        return int(complete[index]["cells"]["busy"][0]["text"] or "0")
+
+    def key(index: int, column: str) -> tuple[float | str, ...]:
+        account = labels[index].casefold()
+        role_name = role(index)
+        rank = ACCOUNT_ROLE_ORDER.index(role_name) if role_name in ACCOUNT_ROLE_ORDER else len(ACCOUNT_ROLE_ORDER)
+        if column == "left":
+            return quota(index), account, rank
+        if column == "role":
+            return role_name, account
+        if column == "busy":
+            return -busy(index), account
+        return account, rank
+
+    def missing(index: int, column: str) -> bool:
+        if column == "left":
+            return not isinstance(facts[labels[index]].weekly_left_percent, (float, int))
+        if column == "busy":
+            return not complete[index]["cells"]["busy"][0]["text"]
+        return column == "role" and not role(index)
+
+    orders: dict[str, list[AccountRowPlacement]] = {}
+    for column in ("account", "left", "role", "busy"):
+        for reverse in (False, True):
+            present = [index for index in range(len(complete)) if not missing(index, column)]
+            absent = [index for index in range(len(complete)) if missing(index, column)]
+            indices = sorted(present, key=lambda index: key(index, column), reverse=reverse)
+            indices += sorted(absent, key=lambda index: key(index, column), reverse=reverse)
+            ordered = account_details_in_row_order([complete[index] for index in indices])
+            orders[column + ("-reverse" if reverse else "")] = [
+                AccountRowPlacement(index=index, details=bool(row["cells"]["label"]))
+                for index, row in zip(indices, ordered)]
+    return orders
 
 
 def status_board(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> Board:
