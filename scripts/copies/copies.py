@@ -1149,6 +1149,34 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
             COMMAND_LOCKS.reset(token)
 
 
+@contextmanager
+def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
+                 merge: MergePolicy = NO_MERGE, step: str = "") -> Generator[Path]:
+    """Admit a queue command before preparing its slot, then hold the slot through the caller scope."""
+    job = command_job(command)
+    label = step or (job.step if isinstance(job, StepJob) else PurePath(command[0]).name if command else "run")
+    try:
+        with ExitStack() as scope:
+            if isinstance(job, StepJob):
+                source = Path(repo).expanduser().resolve()
+                if isinstance(verify_command(command), VerifyCommand):
+                    source = scope.enter_context(requested_source(source, policy, merge))
+                    policy = CommittedSource(commit_at(source, "HEAD"))
+                    merge = NO_MERGE
+                admitted = scope.enter_context(first_step.admitted_run(command, source))
+                tree = scope.enter_context(standing(owner, source, policy, merge=merge, step=label,
+                    queue_position=admitted.queue_position))
+                admitted.handoff(tree)
+            else:
+                # OtherCommand has no first queue step to admit.
+                tree = scope.enter_context(standing(owner, repo, policy, merge=merge, step=label))
+            yield tree
+    except first_step.FirstStepRefused as error:
+        failure = CopyError(str(error))
+        failure.exit_code = error.exit_code
+        raise failure from error
+
+
 def list_trees() -> None:
     root = gates_root()
     staff_names = ListStaffNames()
@@ -2086,21 +2114,7 @@ def main(argv: list[str] | None = None) -> int:
             policy: SourcePolicy = (WorktreeSource(args.commit, args.apply_uncommitted) if args.apply_uncommitted else
                                     CommittedSource(args.commit))
             merge: MergePolicy = MergeRevision(args.merge) if args.merge else NoMerge()
-            job = command_job(command)
-            with ExitStack() as run:
-                if isinstance(job, StepJob):
-                    source = Path(args.repo or "").expanduser().resolve()
-                    if isinstance(verify_command(command), VerifyCommand):
-                        source = run.enter_context(requested_source(source, policy, merge))
-                        policy = CommittedSource(commit_at(source, "HEAD"))
-                        merge = NO_MERGE
-                    admitted = run.enter_context(first_step.admitted_run(command, source))
-                    tree = run.enter_context(standing(caller_owner(), source, policy, merge=merge,
-                        step=job.step, queue_position=admitted.queue_position))
-                    admitted.handoff(tree)
-                else:
-                    tree = run.enter_context(standing(caller_owner(), args.repo or "", policy, merge=merge,
-                        step=PurePath(command[0]).name))
+            with command_tree(caller_owner(), args.repo or "", policy, command, merge=merge) as tree:
                 result = subprocess.run([part.replace("{tree}", str(tree)) for part in command],
                                         cwd=tree, pass_fds=COMMAND_LOCKS.get())
                 command_exit = result.returncode if result.returncode >= 0 else 128 - result.returncode
