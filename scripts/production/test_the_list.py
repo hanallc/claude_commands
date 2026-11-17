@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 from scripts.lib import atomic_file
 from scripts.production import investigation, record_store, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
-from scripts.review_links import change_page, page_question, review_items
+from scripts.review_links import change_page, question_record, review_items
 
 MORTY = staff.StaffRow(staff.StaffId("536997b5-4415-4cb1-b683-d777e02e9a22"), "producer", "morty", staff.StaffRoot(),
                        current_session=staff.StaffId("20fa30c6-3cad-493a-b74a-0e408a93f865"))
@@ -423,7 +423,7 @@ class TheListTests(unittest.TestCase):
                          (0, f"answered {item.id} Q1\n", ""))
         answered = the_list.load(MORTY.id, item.id)
         answer = answered.questions[0].answer
-        assert isinstance(answer, page_question.Answer)
+        assert isinstance(answer, question_record.Answer)
         self.assertEqual(answer.text, "The check passed.")
         self.assertEqual(answered.unread_since, START)
         self.assertEqual(len(answered.log), len(opened.log) + 1)
@@ -442,7 +442,7 @@ class TheListTests(unittest.TestCase):
                          (0, f"answered {item.id} Q1\n", ""))
         saved = the_list.load(MORTY.id, item.id)
         answer = saved.questions[0].answer
-        assert isinstance(answer, page_question.Answer)
+        assert isinstance(answer, question_record.Answer)
         self.assertEqual(answer.text, text)
         self.assertEqual(saved.unread_since, START)
 

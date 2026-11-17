@@ -22,7 +22,7 @@ from typing import Literal, TypedDict, cast
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed
 from scripts.lib.user_zone import user_zone
 from scripts.production import record_store, staff
-from scripts.review_links import change_page, page_question
+from scripts.review_links import change_page, page_question, question_record
 
 
 class ListError(ValueError):
@@ -202,7 +202,7 @@ class ListItem:
     done_when: str
     log: tuple[ItemChange, ...]
     reviews: tuple[str, ...] = ()
-    questions: tuple[page_question.Question, ...] = ()
+    questions: tuple[question_record.Question, ...] = ()
 
     @property
     def id(self) -> str:
@@ -394,11 +394,11 @@ def _review_keys(text: str) -> tuple[str, ...]:
     return tuple(cast(list[str], entries))
 
 
-def _read_questions(text: str) -> tuple[page_question.Question, ...]:
+def _read_questions(text: str) -> tuple[question_record.Question, ...]:
     value = cast(object, json.loads(text))
     if not isinstance(value, list):
         raise ListError("invalid List questions")
-    questions = tuple(page_question.read(question) for question in cast(list[object], value))
+    questions = tuple(question_record.read(question) for question in cast(list[object], value))
     if len({question.question_id for question in questions}) != len(questions):
         raise ListError("duplicate question id")
     return questions
@@ -459,7 +459,7 @@ def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
               "opened": _time_text(item.opened), "updated": _time_text(item.updated),
               "closed": _time_text(item.closed), "closing_words": item.closing_words}
     if item.questions:
-        fields["questions"] = json.dumps([page_question.stored(question) for question in item.questions], ensure_ascii=False)
+        fields["questions"] = json.dumps([question_record.stored(question) for question in item.questions], ensure_ascii=False)
     body = "## Next step\n\n" + item.next_step
     log = "\n".join(f"- {entry.time.isoformat(sep=' ')} {entry.what} — {entry.source}" for entry in item.log)
     for key, text, heading, following in (("next_step", item.next_step, "Latest status", item.latest_status),
@@ -831,26 +831,26 @@ class _ListQuestionStore:
     keeper: staff.StaffId
     ask_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT
 
-    def questions(self, item: str) -> tuple[page_question.Question, ...]:
+    def questions(self, item: str) -> tuple[question_record.Question, ...]:
         return load(self.keeper, item).questions
 
-    def add(self, item: str, question: page_question.Question) -> None:
+    def add(self, item: str, question: question_record.Question) -> None:
         # ask_question holds the List lock from the receipt check through this write.
         assert isinstance(self.ask_request, PageRequest)
         current = load(self.keeper, item)
         self.save_request(replace(current, questions=(*current.questions, question)), self.ask_request, question)
 
-    def save_request(self, item: ListItem, request: PageRequest, question: page_question.Question) -> None:
+    def save_request(self, item: ListItem, request: PageRequest, question: question_record.Question) -> None:
         receipt = _request_receipt(request, now(), question_id=question.question_id)
         _ = _save_page_request(_store(self.keeper), self.keeper, replace(item, log=(*item.log, receipt)), request)
 
-    def set_answer(self, item: str, question_id: str, answer: page_question.Answer) -> None:
+    def set_answer(self, item: str, question_id: str, answer: question_record.Answer) -> None:
         store = _store(self.keeper)
         with store.locked():
             current = load(self.keeper, item)
             question = next((question for question in current.questions if question.question_id == question_id), None)
             if question is None or question.answer is not None:
-                raise change_page.AnswerRefused("This item has no open question with that id.")
+                raise question_record.AnswerRefused("This item has no open question with that id.")
             questions = tuple(replace(question, answer=answer) if question.question_id == question_id else question
                               for question in current.questions)
             moment = now()
@@ -867,7 +867,7 @@ def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
                  status: change_page.DeliveryStatus) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
     """Save the question and its signed request receipt before delivery."""
     if request.action != "question" or not request.words.strip() or len(request.words) > 10000:
-        raise change_page.AnswerRefused("Enter a question first.")
+        raise question_record.AnswerRefused("Enter a question first.")
     request = replace(request, words=request.words.strip())
     store = _store(keeper)
     source = store.path(identity)
