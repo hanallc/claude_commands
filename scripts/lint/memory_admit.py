@@ -611,9 +611,8 @@ def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory]
     returning_swap = min(swapped_outside, host.swap_in_window_bytes)
     agent_swap_demand = (returning_swap * policy.agent_swap_share_percent + 99) // 100
     safety = policy.safety_bytes
-    holds = tuple(RunKeepAside(run,
-                  max(0, run.need - run.use.bytes) + run.held
-                  if isinstance(run.use, AnonymousRunUse) else run.need + run.held) for run in runs)
+    holds = tuple(RunKeepAside(run, records.keep_aside_parts(run, policy.build_reserve_share_percent).bytes)
+                  for run in runs)
     used = sum(run.use.bytes for run in runs if isinstance(run.use, AnonymousRunUse))
     kept = sum(run.bytes for run in holds)
     unavailable = tuple(run for run in runs if isinstance(run.use, RunUseUnavailable))
@@ -622,7 +621,7 @@ def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory]
                                  else max(0, used + ci_use + host.available - safety - agent_swap_demand))
     return MemoryRoom(host.available, safety, used, kept,
                       host.available - safety - kept - agent_swap_demand, cap, holds, total=host.total,
-                      ci_use=ci_use, agent_swap_demand=agent_swap_demand)
+                      ci_use=ci_use, agent_swap_demand=agent_swap_demand, returning_swap=returning_swap)
 
 
 def has_running_step(running: list[StepMemory]) -> bool:
