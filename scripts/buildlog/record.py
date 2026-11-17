@@ -83,6 +83,7 @@ from scripts.lib.test_phase import (
 from scripts.buildlog import cgroup_capture, store, step_context
 from scripts.buildlog.repository import (
     GIT_TIMEOUT_S as GIT_TIMEOUT_S,
+    MANIFEST_IDENTITY_PREFIX,
     output as output,
     remote_identity as remote_identity,
     repository_key as repository_key,
@@ -990,7 +991,8 @@ def step(args: list[str]) -> None:
         tree = tree_facts(os.environ.get("BUILDLOG_TREE_START"), treekey.tree_key(directory))
         step_caller = caller(tty)
         sent_identity = sent_repository_identity()
-        if (repo_identity == store.UNKNOWN_IDENTITY and step_caller in ("verify-mac", "verify-linux")
+        if ((repo_identity == store.UNKNOWN_IDENTITY or repo_identity.startswith(MANIFEST_IDENTITY_PREFIX))
+                and step_caller in ("verify-mac", "verify-linux")
                 and isinstance(sent_identity, SentRepositoryIdentity)):
             repo_identity = sent_identity.value
         sent_key = sent_tree_key()
