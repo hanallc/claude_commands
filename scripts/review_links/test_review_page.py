@@ -1187,8 +1187,12 @@ const refreshedForm=refreshed.querySelector('[data-type="question"] form');
 refreshedForm.elements.token.value+='-refreshed';refreshedForm.elements.row.value+='-refreshed';
 window.refreshMarkup=refreshed.documentElement.outerHTML;
 window.refreshRequests=[];
+let nextPost;
 window.fetch=async(_url,options={})=>{
- if(options.method==='POST') return {ok:true,json:async()=>({answer:'works'})};
+ if(options.method==='POST'){
+  if(nextPost){const response=nextPost;nextPost=null;return response;}
+  return {ok:true,json:async()=>({answer:'works'})};
+ }
  window.refreshRequests.push(_url);return {ok:true,text:async()=>window.refreshMarkup};
 };
 </script>""".replace('DONE_MARKUP',json.dumps(done_source).replace('</','<\\/')).replace('MARKUP',json.dumps(source).replace('</','<\\/'))
@@ -1199,6 +1203,18 @@ window.fetch=async(_url,options={})=>{
  const rows=()=>[...document.querySelectorAll('[data-list-item]')];
  const shown=()=>rows().filter(row=>!row.hidden);
  const choose=(id,value,event='change')=>{const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event(event,{bubbles:true}));};
+ const submitPending=row=>{
+  let reject;
+  nextPost=new Promise((_resolve,rejectPost)=>{reject=rejectPost;});
+  const form=row.querySelector('form');
+  form.requestSubmit(form.querySelector('[value="works"]'));
+  return reason=>reject(new Error(reason));
+ };
+ const expanded=row=>!row.querySelector('[data-detail]').hidden;
+ const visibleStatus=text=>{
+  const status=document.querySelector('[data-hidden-action-status]');
+  return status.getClientRects().length>0 && status.textContent.includes(text);
+ };
  try{
   await flush();
   check(shown().length===6,'Open includes For you and Waiting');
@@ -1231,11 +1247,48 @@ window.fetch=async(_url,options={})=>{
   check(fresh.querySelector('input[name=choice]:checked')?.value===picked.value,'F018: refresh keeps the selected choice');
   check(fresh.querySelector('form').elements.row.value===fresh.dataset.key+'-refreshed' &&
     fresh.querySelector('form').elements.token.value.endsWith('-refreshed'),'F018: refresh supplies the row and token');
-  const target=rows().find(row=>row.dataset.type==='change');target.querySelector('.list-toggle').click();
-  const form=target.querySelector('form');form.requestSubmit(form.querySelector('[value="works"]'));
+  const [target,other]=rows().filter(row=>row.dataset.type==='change');
+  target.querySelector('.list-toggle').click();
+  const rejectFirst=submitPending(target);
+  other.querySelector('.list-toggle').click();
+  rejectFirst('Fixture first refusal');await flush();
+  check(!target.hidden && !expanded(target) && expanded(other),'F003: a late failure keeps the newer card open');
+  check(visibleStatus('Not saved: Fixture first refusal'),'F003: the closed card has a visible reason');
+
+  target.querySelector('.list-toggle').click();
+  const rejectTarget=submitPending(target);
+  other.querySelector('.list-toggle').click();
+  const rejectOther=submitPending(other);
+  rejectTarget('Fixture overlapping refusal');rejectOther('Fixture newer refusal');await flush();
+  const targetMotion=target.nextElementSibling;
+  check(targetMotion?.matches('[data-record-motion]') &&
+    !targetMotion.querySelector('[data-detail]:not([hidden])'),
+    'F003: overlapping failures keep the returning copy of the older card closed');
+  check(!expanded(target) && expanded(other),'F003: overlapping failures keep the newer card open');
+
+  target.querySelector('.list-toggle').click();
+  const form=target.querySelector('form'),works=form.querySelector('[value="works"]');
+  const losePost=submitPending(target);
+  const leaving=target.nextElementSibling;
+  check(target.hidden && leaving?.getAnimations({subtree:true}).length,'Review starts the shared animation before the response');
+  check(leaving?.querySelector('[data-detail]:not([hidden])'),'Review fades the open details with the row');
+  losePost('Fixture lost Review response');await flush();
+  const returning=target.nextElementSibling;
+  check(!target.hidden && returning && returning!==leaving,'a lost Review response slides the card back');
+  check(!target.querySelector('[data-detail]').hidden && !works.disabled &&
+    form.querySelector('[data-send-status]').textContent==='Not saved: Fixture lost Review response',
+    'the restored Review card shows its reason and enables a retry');
+  other.querySelector('.list-toggle').click();
+  check(!expanded(target) && !target.nextElementSibling.querySelector('[data-detail]:not([hidden])'),
+    'F003: opening a card updates the copy of the returning card');
+  target.querySelector('.list-toggle').click();
+  form.requestSubmit(works);
   await flush();check(form.querySelector('[data-send-status]').textContent==='Saved: works','the row shows the saved result');
+  check(visibleStatus('Saved: works'),'F004: the Review result is visible above the table');
+  check(visibleStatus('Not saved: Fixture newer refusal'),'F003: saving one card preserves the other card’s reason');
   await new Promise(resolve=>nativeTimeout(resolve,950));
   check(target.hidden,'the saved row leaves the view');
+  check(visibleStatus('Saved: works'),'F004: the result remains visible after the animation');
   check(document.querySelector('[data-list-count]').textContent.startsWith('4 for you'),'the count excludes the saved row');
   check(rows().every(row=>row.querySelector('[data-detail]').hidden),'no next card opens');
   choose('list-show','all');

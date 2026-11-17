@@ -458,7 +458,6 @@ STYLE = record_table.STYLE + '''<style>
 .list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
 .list-tell [value="tell"]{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
 .list-tell button:disabled{opacity:.45;cursor:default}.list-tell [data-send-status]{margin-left:0}
-[data-hidden-action-status]{white-space:pre-line}
 .page-question p{white-space:pre-wrap;overflow-wrap:anywhere}
 .list-table td[data-label="State"]{color:var(--ink)}
 .list-table td[data-label="Producer"],.list-table td[data-label="ETA"]{color:var(--ink-2)}
@@ -474,7 +473,6 @@ content:attr(data-label) ': ';color:var(--ink-3)}
 SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + r'''(() => {
 let content=document.querySelector('[data-list]');
 let saving=0;
-const failedActions=new Map();
 const drafts=new Map();
 function matchesWords(data,search){
  if(!search) return true;
@@ -518,17 +516,6 @@ const tableView=createRecordTable({content:()=>content,
  counts:(items,count)=>count+' of '+items.length+' items shown · '+
   items.filter(item=>item.dataset.state==='Waiting for nate' && item.dataset.parked!=='true').length+' need you · '+
   items.filter(item=>item.dataset.unread==='true').length+' unread',
- applied:items=>{
-  const status=content.querySelector('[data-hidden-action-status]');
-  const messages=[];
-  for(const [key,{number,message}] of failedActions){
-   const item=items.find(item=>item.dataset.key===key);
-   if(!item || item.hidden || item.querySelector('[data-detail]').hidden) messages.push('Item '+number+': '+message);
-  }
-  const text=messages.join('\n');
-  if(status.textContent!==text) status.textContent=text;
-  status.hidden=!text;
- }
 });
 const apply=(write=true)=>tableView.apply(write),place=()=>tableView.place();
 function bind(){
@@ -536,7 +523,7 @@ function bind(){
  content.querySelectorAll('[data-feedback-form]').forEach(form=>{
   const item=form.closest('[data-list-item]'),key=item.dataset.key;
   const notice=form.querySelector('[data-send-status]');
-  if(failedActions.has(key)) notice.textContent=failedActions.get(key).message;
+  notice.textContent=tableView.actionNotice(item);
   const confirmed={state:item.dataset.state,parked:item.dataset.parked};
   const words=form.elements.words,until=form.elements.until;
   const tell=form.querySelector('[value="tell"]'),ask=form.querySelector('[value="question"]');
@@ -570,11 +557,13 @@ function bind(){
    retainDraft();
    form.dataset.sending='true';saving++;pageRefresh.abandon();
    let buttons=[...item.querySelectorAll('button')],saved=false,refused=false;
-   const clearedFailure=failedActions.delete(key);
    buttons.forEach(button=>button.disabled=true);notice.textContent=action==='read' ? 'Saving…' : 'Sending…';
+   const clearsUnread=action==='read' || action==='tell',unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
    if(action==='remove') item.dataset.state='Closed';
    if(action==='park') item.dataset.parked='true';
-   if(action==='remove' || action==='park' || clearedFailure) apply(false);
+   if(clearsUnread) item.dataset.unread='false';
+   tableView.startAction(item);
+   const hidUnread=clearsUnread && wasVisible && item.hidden;
    try{
     const response=await fetch(location.pathname,{method:'POST',body:data});
     refused=!response.ok && (action!=='question' || response.status<500);
@@ -594,6 +583,7 @@ function bind(){
     state.className='list-state '+({'Waiting for nate':'warning',Blocked:'error',Working:'accent',Delivered:'room',Done:'room'}[item.dataset.state] || 'muted');
     const sortValues=JSON.parse(item.dataset.sortValues);sortValues[3]=item.dataset.state.toLowerCase();item.dataset.sortValues=JSON.stringify(sortValues);
     if(['true','false'].includes(result.unread)) syncUnread(item,form,unread);
+    else if(clearsUnread) item.dataset.unread=unreadBefore;
     if(typeof result.parked_until==='string'){
      let note=item.querySelector('[data-parked-note]');
      if(result.parked_until){
@@ -601,15 +591,13 @@ function bind(){
       note.textContent='Parked until '+result.parked_until;
      }else note?.remove();
     }
-    apply(false);
+    tableView.applyAction();
    }catch(error){
-    if(refused){
-     Object.assign(item.dataset,confirmed);
-     tableView.opened.add(key);
-    }
-    notice.textContent=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
-    failedActions.set(key,{number:item.dataset.number,message:notice.textContent});
-    apply(false);
+    if(clearsUnread) item.dataset.unread=unreadBefore;
+    if(refused) Object.assign(item.dataset,confirmed);
+    if(refused || hidUnread) tableView.opened.add(key);
+    const message=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
+    tableView.showActionResult(item,'Item '+item.dataset.number,message);
    }
    finally{
     if(saved || refused) unconfirmed.delete(attempt);
@@ -628,6 +616,7 @@ async function refresh(_supersede=false,current=()=>true){
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
  const fresh=page.querySelector('[data-list]');
  if(!fresh) throw new Error('The page has no list.');
+ await tableView.settled();
  if(saving || !current()) return;
  const top=scrollY,focus=document.activeElement?.id;
  const field=document.activeElement,start=field?.selectionStart,end=field?.selectionEnd;

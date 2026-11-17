@@ -216,7 +216,8 @@ def render(root: Path, *, show: str = 'open') -> bytes:
         +'<label for="list-owner">Owner</label><select id="list-owner"><option value="">All ('+str(len(visible))+')</option>'+options+'</select>'
         +'<label for="list-show">Show</label><select id="list-show">'+shows+'</select>'
         +'<label class="list-search-label" for="list-search">Search</label><input type="search" id="list-search" placeholder="Filter by id or words">'
-        +'<span data-list-count role="status"></span></div><div class="list-table"><table aria-label="Review">'
+        +'<span data-list-count role="status"></span></div><p data-hidden-action-status role="status" hidden></p>'
+        +'<div class="list-table"><table aria-label="Review">'
         +'<colgroup><col style="width:17%"><col style="width:13%"><col style="width:14%"><col style="width:37%">'
         +'<col style="width:12%"><col style="width:7%"></colgroup><thead><tr>'+headers+'</tr></thead>'
         +''.join(item_rows(item,browser,members,now,index,title_limit,words_rows,names) for index,item in enumerate(items))
@@ -307,7 +308,7 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + review_legacy.SCRIPT + r'''(() => {
 let content=document.querySelector('[data-review]'),saving=0;
 let selectedShow=content.dataset.show,requestedShow=selectedShow;
-const drafts=new Map(),saved=new Map(),bodies=new Map();
+const drafts=new Map(),departures=new Map(),bodies=new Map();
 const view=createRecordTable({content:()=>content,single:true,
  place:reviewPlace,
  resolveOwner:owner=>{
@@ -316,7 +317,7 @@ const view=createRecordTable({content:()=>content,single:true,
   return option ? option.value : owner;
  },
  shows:['open','For you','Waiting','Done','all'],
- visible:(data,{owner,show,query,type,sourceOwner,keys})=>!saved.has(data.key) && (data.parked!=='true' || keys.has(data.key)) &&
+ visible:(data,{owner,show,query,type,sourceOwner,keys})=>!departures.has(data.key) && (data.parked!=='true' || keys.has(data.key)) &&
   !(show==='open' && data.state==='Waiting' && data.checking==='true') &&
   (!owner || data.owner===owner || data.type==='investigation' && data.sourceOwner===owner) && (!type || data.type===type) &&
   (!sourceOwner || data.sourceOwner===sourceOwner) &&
@@ -325,11 +326,11 @@ const view=createRecordTable({content:()=>content,single:true,
  counts:(items,_count,{keys})=>{
   const show=content.querySelector('#list-show').value;
   const states=show==='all' ? ['For you','Waiting','Done'] : show==='open' ? ['For you','Waiting'] : [show];
-  return states.map(state=>items.filter(item=>!saved.has(item.dataset.key) && item.dataset.state===state && (item.dataset.parked!=='true' || keys.has(item.dataset.key))).length+' '+state.toLowerCase()).join(' · ');
+  return states.map(state=>items.filter(item=>!departures.has(item.dataset.key) && item.dataset.state===state && (item.dataset.parked!=='true' || keys.has(item.dataset.key))).length+' '+state.toLowerCase()).join(' · ');
  },
  applied:(items,{type,show,keys})=>{
   selectedShow=show;loadBodies();
-  const shown=items.filter(item=>!saved.has(item.dataset.key) && (item.dataset.parked!=='true' || keys.has(item.dataset.key)) &&
+  const shown=items.filter(item=>!departures.has(item.dataset.key) && (item.dataset.parked!=='true' || keys.has(item.dataset.key)) &&
    !(show==='open' && item.dataset.state==='Waiting' && item.dataset.checking==='true') &&
    (show==='all' || (show==='open' ? item.dataset.state!=='Done' : item.dataset.state===show)));
   content.querySelectorAll('[data-type-chip]').forEach(button=>{
@@ -379,6 +380,8 @@ function bind(){
  view.replace();
  content.querySelectorAll('[data-review-form]').forEach(form=>{
   const row=form.closest('[data-list-item]'),key=row.dataset.key,words=form.elements.feedback,later=form.elements.later;
+  const notice=form.querySelector('[data-send-status]');
+  notice.textContent=view.actionNotice(row);
   const choices=[...row.querySelectorAll('input[name=choice]')];
   if(drafts.has(key)){
    const draft=drafts.get(key);words.value=draft.feedback;later.value=draft.later;
@@ -394,19 +397,25 @@ function bind(){
    const valid=later.reportValidity();later.required=false;
    if(!valid) return;
    form.dataset.sending='true';saving++;pageRefresh.abandon();
-   const buttons=[...form.querySelectorAll('button')],notice=form.querySelector('[data-send-status]');
-   buttons.forEach(button=>button.disabled=true);notice.textContent='Saving…';
+   const buttons=[...form.querySelectorAll('button')];
+   buttons.forEach(button=>button.disabled=true);notice.textContent='';
+   departures.set(key,{kind:'pending'});
+   view.startAction(row);
    try{
     const response=await fetch(location.pathname,{method:'POST',body:data});
     const result=await response.json();if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
-    notice.textContent='Saved: '+result.answer;drafts.delete(key);
-    await new Promise(resolve=>setTimeout(resolve,900));
-    saved.set(key,{updated:form.closest('[data-list-item]').dataset.updated,
+    drafts.delete(key);
+    departures.set(key,{kind:'saved',updated:row.dataset.updated,
      later:data.get('outcome')==='later' ? Date.parse(data.get('later')) : 0,
      question:data.get('outcome')==='question',
      closes:!['validate','question','later'].includes(data.get('outcome'))});
-    view.opened.delete(key);view.apply(false);
-   }catch(error){notice.textContent='Not saved: '+error.message;buttons.forEach(button=>button.disabled=false);}
+    view.opened.delete(key);
+    view.showActionResult(row,form.elements.row.value,'Saved: '+result.answer);
+   }catch(error){
+    departures.delete(key);
+    view.showActionResult(row,form.elements.row.value,'Not saved: '+error.message);
+    buttons.forEach(button=>button.disabled=false);
+   }
    finally{
     delete form.dataset.sending;saving--;
     if(!saving && selectedShow!==content.dataset.show) void pageRefresh.refresh(true);
@@ -421,24 +430,30 @@ async function refresh(_supersede=false,current=()=>true){
  if(!response.ok) throw new Error('HTTP '+response.status);
  const page=new DOMParser().parseFromString(await response.text(),'text/html'),fresh=page.querySelector('[data-review]');
  if(!fresh) throw new Error('The page has no review table.');
+ await view.settled();
  if(saving || !current() || show!==selectedShow) return;
  const top=scrollY,restoreFocus=restoreFocusAfterRefresh();
  content.replaceWith(fresh);content=fresh;
- for(const [key,result] of saved){
-  if(result.later){if(Date.now()>=result.later) saved.delete(key);continue;}
+ for(const [key,result] of departures){
+  if(result.kind==='pending') continue;
+  if(result.later){if(Date.now()>=result.later) departures.delete(key);continue;}
   if(result.closes) continue;
   const row=content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
   if(result.question){
-   if(row?.dataset.state==='For you' && row.dataset.updated!==result.updated) saved.delete(key);
+   if(row?.dataset.state==='For you' && row.dataset.updated!==result.updated) departures.delete(key);
    continue;
   }
-  if(!row || row.dataset.state!=='For you' || row.dataset.updated!==result.updated) saved.delete(key);
+  if(!row || row.dataset.state!=='For you' || row.dataset.updated!==result.updated) departures.delete(key);
  }
  bind();view.apply(false);
  restoreFocus();
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
 }
 view.place();bind();view.apply();
-addEventListener('hashchange',()=>{const item=new URLSearchParams(location.hash.slice(1)).get('item');if(item && !saved.get(item)?.closes && !saved.get(item)?.question) saved.delete(item);view.place();view.apply(false);});
+addEventListener('hashchange',()=>{
+ const item=new URLSearchParams(location.hash.slice(1)).get('item'),departure=departures.get(item);
+ if(departure?.kind==='saved' && !departure.closes && !departure.question) departures.delete(item);
+ view.place();view.apply(false);
+});
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
 })();'''

@@ -351,6 +351,13 @@ Proposals show `<owner>/P<n>` and efficiencies show `<owner>/E<n>`, where the ow
 The table columns are Id, Type, Owner, Item, State and Age.
 One row can open its card in place.
 `record_table.py` supplies the table styles, filters, sorting and open-row controls for Review and The List.
+When the user submits a Review action, the row and its open details fade and collapse together in 200 ms.
+The rows below slide into place as the row collapses.
+If the request fails, the row slides back into view and the current card stays selected.
+The animation updates when the user opens or closes a card during the transition.
+The status region above the table shows the result when the row or its details are hidden.
+Filter and sort changes apply at once.
+The reduced motion preference disables row animations.
 The shared `record-id` class keeps each ID and its expand arrow on one line.
 Each row becomes a card at phone width.
 Type chips and the Owner menu show counts.
@@ -613,15 +620,21 @@ A delivery failure does not reverse the completed item action.
 Tell morty sends the user's words without changing the item's state or parking time.
 Remove leaves Open at once when the user presses the button.
 Park leaves Open and enters Parked at once.
+The row leaves Unread as soon as the user presses Mark read or Tell morty.
+The row returns if the server reports an unread update.
+The shared table fades and collapses the row and its open details when an action hides them.
+The request starts without waiting for the animation.
 The page disables all row buttons while the request runs.
 A second press sends no request.
 The page applies the saved state and parking status from the response.
 The page uses the saved date to update one parking label.
 A refusal restores the last state and parking status from the server.
+A failed Mark read or Tell morty request restores the unread state.
 The page opens the restored row and shows the reason there.
+The restored row slides back into view.
 The page keeps a separate failure notice for each row.
 The notice appears above the table while the row or its details hide the inline notice.
-If the connection fails, the page keeps the row in its new view and reports that it cannot confirm the save.
+If Remove or Park loses its response, the page keeps the row in its new view and reports that the save is unconfirmed.
 A new action uses a new request ID, even if the previous response did not arrive.
 The page keeps each unconfirmed request ID for an exact retry, even after another action.
 An HTTP 5xx response to Ask question leaves the request unconfirmed.

@@ -735,6 +735,8 @@ window.fetch=async(_path,options={})=>{
   check(!refused.querySelector('[value="remove"]').disabled,'a refused Remove enables another attempt');
   refused.elements.until.value='2026-12-03';const parked=submit('105','park');
   check(row('105').hidden,'Park hides the row before the response');
+  check(document.querySelector('[data-record-motion]')?.getAnimations({subtree:true}).length,
+   'Park animates the row when it leaves Open');
   submit('105','park');check(requests.length===3,'a second Park press sends nothing');
   finishPost({item_state:'Working',parked:'true'});await flush();await flush();
   check(row('105').hidden,'Park stays outside Open after success');
@@ -748,8 +750,11 @@ window.fetch=async(_path,options={})=>{
   check(row('58').dataset.unread==='true' && row('58').querySelector('.list-dot'),'an unread response restores the dot');
   check(Boolean(form.querySelector('[value="read"]')),'an unread response restores Mark read');
   if(form.querySelector('[value="read"]')){
+   choose('unread','58');
    submit('58','read');finishPost({item_state:'Waiting for nate',parked:'false',unread:'false'});await flush();await flush();
    check(!row('58').querySelector('.list-dot') && !form.querySelector('[value="read"]'),'the restored Mark read button works');
+   check(row('58').hidden && document.querySelector('[data-record-motion]')?.getAnimations({subtree:true}).length,
+    'Mark read animates the row when it leaves Unread');
   }
  }catch(error){failures.push(String(error));}
  const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
@@ -961,8 +966,92 @@ window.fetch=async(_path,options={})=>{
  check(hiddenStatus.hidden,'the page hides the extra notice when the restored row is visible');
 ''')
 
-    def browser_action_sequence(self, steps: str) -> None:
-        _ = self.add("Test List action retries", number=1)
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_remove_collapses_and_refusal_restores_the_row(self) -> None:
+        _ = self.add("Next item", number=2)
+        self.browser_action_sequence(r"""
+ document.querySelector('[data-sort="0"]').click();
+ const next=document.querySelector('[data-number="2"]');
+ const top=element=>element.getBoundingClientRect().top;
+ const start=top(next),first=top(row);
+ const motion=()=>document.querySelector('[data-record-motion]');
+ const sample=(animation,time)=>{animation.pause();animation.currentTime=time;};
+ submit('remove');
+ check(row.hidden && requests.length===1,'Remove starts the POST and hides the record in the same turn');
+ const leaving=motion();
+ check(leaving?.querySelector('[data-detail]:not([hidden])'),'the open details leave with the row');
+ const exit=leaving?.getAnimations({subtree:true})[0];
+ check(exit,'Remove starts the shared animation');
+ if(!exit) throw new Error('No exit animation');
+ sample(exit,100);
+ const opacity=Number(getComputedStyle(exit.effect.target).opacity);
+ check(opacity>0 && opacity<1,'the row fades before it disappears');
+ check(top(next)<start && top(next)>first,'the next row moves up during the fade');
+ exit.finish();await flush();
+ check(!motion() && Math.abs(top(next)-first)<2,'the next row ends in the removed row position');
+ finishPost({reason:'Fixture refuses Remove'});await flush();
+ const restored=motion()?.getAnimations({subtree:true})[0];
+ check(!row.hidden && restored,'the refusal restores the row with an animation');
+ if(!restored) throw new Error('No restore animation');
+ sample(restored,100);
+ check(top(next)<start && top(next)>first,'the next row moves down during restore');
+ submit('remove');
+ const secondExit=motion()?.getAnimations({subtree:true})[0];
+ check(row.hidden && secondExit && secondExit!==restored,'a second Remove reverses the restore');
+ secondExit?.finish();await flush();
+ check(!motion() && Math.abs(top(next)-first)<2,'the second Remove leaves the final layout intact');
+ finishPost({item_state:'Closed'});await flush();
+ show('closed');
+ check(!row.hidden && !motion(),'a filter change shows the row at once');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_remove_respects_reduced_motion(self) -> None:
+        _ = self.add("Check the motion preference", number=1)
+        for reduced_motion in (False, True):
+            with self.subTest(reduced_motion=reduced_motion):
+                self.browser_action_sequence(r"""
+ const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
+ check(reduced===EXPECTED_REDUCTION,'the browser uses the selected motion preference');
+ submit('remove');
+ check(row.hidden,'Remove hides the item before the response');
+ check(Boolean(document.querySelector('[data-record-motion]'))===!reduced,
+  'only the full motion setting animates the exit');
+ finishPost({reason:'Fixture refuses Remove'});await flush();
+ check(!row.hidden,'the refusal restores the row');
+ check(Boolean(document.querySelector('[data-record-motion]'))===!reduced,
+  'only the full motion setting animates the restoration');
+""".replace('EXPECTED_REDUCTION', json.dumps(reduced_motion)), reduced_motion=reduced_motion, add_item=False)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_mark_read_fades_at_click_and_restores_after_a_lost_response(self) -> None:
+        item = self.add("Check the unread update", number=1)
+        _ = the_list.update(MORTY.id, item.id, {"latest_status": "An update is ready."}, source="morty")
+        self.browser_action_sequence(r"""
+ show('unread');
+ const motion=()=>document.querySelector('[data-record-motion]')?.getAnimations({subtree:true})[0];
+ const read=submit('read'),firstExit=motion();
+ check(row.hidden && firstExit,'Mark read starts the fade before the response');
+ losePost();await flush();
+ const restored=motion();
+ check(!row.hidden && restored && restored!==firstExit,'a lost Mark read response slides the row back');
+ check(form.querySelector('[data-send-status]').textContent==='Save not confirmed: Fixture lost response',
+  'the restored item shows the failure reason');
+ check(!form.querySelector('[value="read"]').disabled,'the restored item can retry Mark read');
+ check(submit('read').id===read.id,'the exact Mark read retry uses the same ID');
+ finishPost({unread:'true'});await flush();
+ check(!row.hidden && row.dataset.unread==='true','a newer unread update returns the row to Unread');
+ form.elements.words.value='Send the update.';
+ form.elements.words.dispatchEvent(new Event('input'));
+ submit('tell');
+ check(row.hidden && motion(),'Tell morty starts the fade before the response in Unread');
+ finishPost({unread:'false'});await flush();
+ check(row.hidden,'Tell morty keeps the row outside Unread after confirmation');
+""", add_item=False)
+
+    def browser_action_sequence(self, steps: str, *, reduced_motion: bool = False, add_item: bool = True) -> None:
+        if add_item:
+            _ = self.add("Test List action retries", number=1)
         with patch.object(list_page, "counts_strip", return_value=""):
             markup = list_page.render(self.root / "reviews").decode()
         setup = '''<script>
@@ -1000,12 +1089,13 @@ window.fetch=async(_path,options={})=>{
  const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
 })();
 </script>'''
-        self.browser_actions(markup, setup, probe)
+        self.browser_actions(markup, setup, probe, reduced_motion=reduced_motion)
 
-    def browser_actions(self, markup: str, setup: str, probe: str) -> None:
+    def browser_actions(self, markup: str, setup: str, probe: str, *, reduced_motion: bool = False) -> None:
         page = self.root / 'actions.html'
         _ = page.write_text(markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>'))
         result = subprocess.run(['google-chrome', '--headless', '--no-sandbox', '--disable-gpu',
+            *(['--force-prefers-reduced-motion'] if reduced_motion else []),
             '--user-data-dir=' + str(self.root / 'chrome-actions'), '--virtual-time-budget=1500',
             '--dump-dom', page.as_uri()], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
