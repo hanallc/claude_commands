@@ -76,6 +76,20 @@ let content=contentProxy(),owner='',show='open',query='',sort='',direction='asc'
 const opened=new Set(),filterNames=options.filters || [],filters={};
 const columns=[...content.querySelectorAll('[data-sort]')].map(button=>button.textContent);
 const rowMotion=new Map(),actionResults=new Map();
+const sortValues=data=>options.sortValues?.(data) ?? JSON.parse(data.sortValues);
+function filterControl(id,attribute){
+ const control=content.querySelector(id);
+ return {
+  set(value){
+   if(control.matches('select')) control.value=value;
+   else control.querySelectorAll('['+attribute+']').forEach(button=>button.setAttribute('aria-pressed',String(button.getAttribute(attribute)===value)));
+  },
+  bind(change){
+   if(control.matches('select')) control.addEventListener('change',event=>change(event.target.value));
+   else control.querySelectorAll('['+attribute+']').forEach(button=>button.addEventListener('click',()=>change(button.getAttribute(attribute))));
+  }
+ };
+}
 function place(){
  const params=new URLSearchParams(location.search);
  const fragment=new URLSearchParams(location.hash.slice(1));
@@ -144,8 +158,8 @@ function animateRow(table,item,showRow){
  const finished=animation.finished.then(()=>{
   if(rowMotion.get(item)?.animation===animation) stopMotion(item);
  },()=>{});
- rowMotion.set(item,{spacer,clip,copy,animation,finished,sortValues:showRow ? item.dataset.sortValues :
-  previous?.sortValues ?? item.dataset.sortValues});
+ rowMotion.set(item,{spacer,clip,copy,animation,finished,sortValues:showRow ? sortValues(item.dataset) :
+  previous?.sortValues ?? sortValues(item.dataset)});
 }
 function showHiddenActionResults(items){
  const status=content.querySelector('[data-hidden-action-status]');
@@ -167,18 +181,23 @@ function showActionResult(item,label,message){
 function apply(write=true,animate=false){
  const motion=animate && !matchMedia('(prefers-reduced-motion: reduce)').matches;
  if(!motion) for(const item of rowMotion.keys()) stopMotion(item);
+ const previousOwner=owner;
  owner=options.resolveOwner?.(owner) ?? owner;
- content.querySelector('#list-owner').value=owner;content.querySelector('#list-show').value=show;
+ const search=query.trim().toLowerCase();
+ owner=options.selectOwner?.({owner,type,query:search,keys}) ?? owner;
+ if(previousOwner && !owner) sourceOwner='';
+ filterControl('#list-owner','data-owner-chip').set(owner);
+ filterControl('#list-show','data-show-chip').set(show);
  content.querySelector('#list-search').value=query;
  for(const name of filterNames){
   const menu=content.querySelector('#list-'+name);menu.value=filters[name];if(menu.value!==filters[name]) filters[name]='';
  }
- const rows=[...content.querySelectorAll('[data-list-item]')],search=query.trim().toLowerCase();
+ const rows=[...content.querySelectorAll('[data-list-item]')];
  const selected=item=>!keys.size || keys.has(item.dataset.key);
  const visible=item=>selected(item) &&
   options.visible(item.dataset,{owner,show,query:search,type,sourceOwner,keys,filters:{...filters}});
  const column=columns.indexOf(sort);
- const sortValue=item=>JSON.parse(rowMotion.get(item)?.sortValues ?? item.dataset.sortValues)[column];
+ const sortValue=item=>(rowMotion.get(item)?.sortValues ?? sortValues(item.dataset))[column];
  const items=rows.toSorted((a,b)=>column<0 ? Number(a.dataset.order)-Number(b.dataset.order) :
   (compare(sortValue(a),sortValue(b)) ||
    Number(a.dataset.order)-Number(b.dataset.order))*(direction==='desc' ? -1 : 1));
@@ -202,25 +221,34 @@ function apply(write=true,animate=false){
   button.parentElement.setAttribute('aria-sort',active ? direction==='desc' ? 'descending' : 'ascending' : 'none');
   button.querySelector('[data-sort-mark]').textContent=active ? direction==='desc' ? ' ↓' : ' ↑' : '';
  });
- const available=new Set(items.map(item=>item.dataset.key));
- const missing=[...keys].filter(key=>!available.has(key));
  const empty=content.querySelector('[data-empty]');
+ const hasKey=options.hasKey ?? (key=>items.some(item=>item.dataset.key===key));
+ const missing=[...keys].filter(key=>!hasKey(key));
  let notice=content.querySelector('[data-missing-keys]');
- if(!notice){notice=document.createElement('p');notice.dataset.missingKeys='';notice.setAttribute('role','status');empty.after(notice);}
- notice.textContent=missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n');
- notice.hidden=!missing.length;empty.hidden=count>0 || missing.length>0;
- const selection=items.filter(selected);
- content.querySelector('[data-list-count]').textContent=options.counts(selection,count,{keys});
+ if(missing.length || notice){
+  if(!notice){
+   notice=document.createElement('p');notice.dataset.missingKeys='';notice.setAttribute('role','status');
+   empty.after(notice);
+  }
+  notice.textContent=missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n');
+  notice.hidden=!missing.length;
+ }
+ empty.hidden=count>0 || missing.length>0;
+ const selection=keys.size ? items.filter(selected) : items;
+ const countLine=content.querySelector('[data-list-count]');
+ if(countLine) countLine.textContent=options.counts(selection,count,{show,keys});
  showHiddenActionResults(items);
- options.applied?.(selection,{owner,show,query,type,keys});
- if(write){const place=new URLSearchParams({owner,show,q:query,sort,dir:direction,...(type ? {type} : {}),...(sourceOwner ? {'source-owner':sourceOwner} : {}),
-  ...Object.fromEntries(filterNames.filter(name=>filters[name]).map(name=>[name,filters[name]])),...(opened.size ? {item:[...opened][0]} : {})});
-  keys.forEach(key=>place.append('key',key));history.replaceState(null,'',location.pathname+'#'+place);
+ options.applied?.(selection,{owner,show,query:search,type,sourceOwner,keys});
+ if(write || owner!==previousOwner){
+  const address=new URLSearchParams({owner,show,q:query,sort,dir:direction,...(type ? {type} : {}),...(sourceOwner ? {'source-owner':sourceOwner} : {}),
+   ...Object.fromEntries(filterNames.filter(name=>filters[name]).map(name=>[name,filters[name]])),...(opened.size ? {item:[...opened][0]} : {})});
+  keys.forEach(key=>address.append('key',key));
+  history.replaceState(null,'',location.pathname+'#'+address);
   if(parent!==window) parent.postMessage('console-place',location.origin);}
 }
 function bind(){
- content.querySelector('#list-owner').addEventListener('change',event=>{owner=event.target.value;sourceOwner='';apply();});
- content.querySelector('#list-show').addEventListener('change',event=>{show=event.target.value;apply();});
+ filterControl('#list-owner','data-owner-chip').bind(value=>{if(value===owner) return;owner=value;sourceOwner='';apply();});
+ filterControl('#list-show','data-show-chip').bind(value=>{if(value===show) return;show=value;apply();});
  for(const name of filterNames)
   content.querySelector('#list-'+name).addEventListener('change',event=>{filters[name]=event.target.value;apply();});
  content.querySelector('#list-search').addEventListener('input',event=>{query=event.target.value;apply();});

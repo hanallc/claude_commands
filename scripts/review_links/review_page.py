@@ -6,13 +6,14 @@ import json
 import re
 import secrets
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import TypedDict, cast
 from urllib.parse import parse_qs, parse_qsl, urlencode
 
 from scripts.lib import conf
-from scripts.lib.user_zone import user_zone
+from scripts.lib.user_zone import user_zone, user_zone_name
 from scripts.production import change_review, proposal_issue, staff
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_link
 from scripts.review_links import question_record
@@ -26,10 +27,75 @@ HEADERS = ('Id', 'Type', 'Owner', 'Item', 'State', 'Age')
 TYPES = tuple(ReviewType)
 ICONS = {ReviewType.QUESTION: 'circle-help', ReviewType.CHANGE: 'diff', ReviewType.INVESTIGATION: 'microscope',
          ReviewType.PROPOSAL: 'lamp', ReviewType.EFFICIENCY: 'zap'}
-SHOWS = (('open', 'Open'), ('For you', 'For you'), ('Waiting', 'Waiting'), ('Done', 'Done'), ('all', 'All'))
+SHOWS = (('open', 'Open'), ('Waiting', 'Waiting'), ('Done', 'Done'), ('all', 'All'))
 LABELS = {ReviewType.QUESTION: 'Questions', ReviewType.CHANGE: 'Changes', ReviewType.INVESTIGATION: 'Investigations',
           ReviewType.PROPOSAL: 'Proposals', ReviewType.EFFICIENCY: 'Efficiencies'}
+# The Later menu's presets, in menu order; the client resolves each time when the menu opens.
+LATER_PRESETS = (('soon', ''), ('evening', 'This evening'), ('morning', 'Tomorrow morning'), ('week', 'Next week'))
+# Weekday names in the order of the browser's getUTCDay.
+WEEKDAYS = ('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')
+CLOCK = re.compile(r'([01][0-9]|2[0-3]):([0-5][0-9])')
 FRONT_MATTER = re.compile(r'\A\ufeff?---[ \t]*\r?\n.*?\r?\n---[ \t]*(?:\r?\n|\Z)', re.DOTALL)
+
+
+class ReviewIndexEntry(TypedDict):
+    """Filter and column values for one Review item, without its body."""
+    key: str
+    id: str
+    type: ReviewType
+    owner: str
+    sourceOwner: str
+    ownerName: str
+    title: str
+    state: ReviewState
+    filed: int
+    updated: str
+    hiddenUntil: float
+
+
+def filter_index(records: list[ReviewItem], members: staff.StaffSnapshot, now: datetime) -> list[ReviewIndexEntry]:
+    """Build the one index for Review counts, filters and column sorting."""
+    return [ReviewIndexEntry(key=item.key, id=item.id, type=item.type, owner=str(item.owner),
+            sourceOwner=str(item.source_unit), ownerName=owner_name(item, members), title=item.title,
+            state=item.state, filed=int(item.times.filed.timestamp()), updated=item.times.updated.isoformat(),
+            hiddenUntil=item.times.later.timestamp() * 1000
+            if isinstance(item.times.later, datetime) and item.times.later > now else 0)
+            for item in records]
+
+
+def index_json(entries: list[ReviewIndexEntry]) -> str:
+    """Encode the index for an HTML script element without executable text."""
+    return json.dumps(entries, ensure_ascii=False, separators=(',', ':')).replace('&', '\\u0026').replace('<', '\\u003c').replace('>', '\\u003e')
+
+
+@dataclass(frozen=True)
+class CardSettings:
+    """Settings that every Review card form shares in one render."""
+    words_rows: int
+    soon_label: str
+
+
+def clock_minutes(settings: conf.ConfigRead, key: str) -> int:
+    value = settings.text(key)
+    match = CLOCK.fullmatch(value)
+    if match is None:
+        raise ValueError(f'review_links.conf: {key}={value!r} is not a time such as 09:00')
+    return int(match[1])*60+int(match[2])
+
+
+def later_settings(settings: conf.ConfigRead) -> dict[str, int]:
+    """Return the Later menu's preset settings for the page script, in minutes and getUTCDay numbers."""
+    day = settings.text('later_week_day')
+    if day not in WEEKDAYS:
+        raise ValueError(f'review_links.conf: later_week_day={day!r} is not a weekday name such as Monday')
+    return {'soon': settings.whole('later_soon_minutes'), 'evening': clock_minutes(settings, 'later_evening'),
+            'eveningUntil': clock_minutes(settings, 'later_evening_until'), 'morning': clock_minutes(settings, 'later_morning'),
+            'weekDay': WEEKDAYS.index(day), 'weekTime': clock_minutes(settings, 'later_week_time')}
+
+
+def soon_label(minutes: int) -> str:
+    count, unit = (minutes//60, 'hour') if minutes % 60 == 0 else (minutes, 'minute')
+    return f'In {count} {unit}'+('s' if count > 1 else '')
 
 
 def page_url() -> str:
@@ -70,7 +136,7 @@ def answer_section(text: str) -> str:
     return '<section><h3>Answer</h3>'+change_browser.answer_html(text)+'</section>'
 
 
-def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int) -> str:
+def form(item: ReviewItem, browser: change_page.ReviewBrowser, settings: CardSettings) -> str:
     fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key)}
     hidden = ''.join(f'<input type="hidden" name="{key}" value="{html.escape(value, quote=True)}">' for key, value in fields.items())
     closes: list[str] = []
@@ -84,16 +150,28 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int) 
     groups = '<div class="review-action-group"><span>Closes the item</span><div>'+''.join(closes)+'</div></div>' if closes else ''
     if returns:
         groups += '<div class="review-action-group"><span>The item returns to you</span><div>'+''.join(returns)+'</div></div>'
-    groups += ('<div class="review-action-group review-later"><span>Hides it until</span><div>'
-               +'<input type="datetime-local" name="later" aria-label="Later, until">'
-               +'<button name="outcome" value="later">Later</button></div></div>')
+    presets = ''.join(f'<button type="button" role="menuitem" tabindex="-1" data-later-preset="{key}">'
+                      +f'<span>{html.escape(label or settings.soon_label)}</span><small></small></button>' for key, label in LATER_PRESETS)
+    groups += ('<div class="review-action-group review-later"><span>Hides it until</span><div class="later-menu">'
+               +'<button type="button" aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later <span aria-hidden="true">▾</span></button>'
+               +'<div role="menu" aria-label="Hide until" data-later-menu hidden>'+presets+'<hr>'
+               +'<button type="button" role="menuitem" tabindex="-1" data-later-choose><span>Choose a time…</span></button>'
+               +'<div class="later-custom" data-later-custom hidden>'
+               +'<input type="hidden" name="later">'
+               +'<div class="later-month-header"><strong data-later-month aria-live="polite"></strong><div>'
+               +'<button type="button" tabindex="-1" data-later-month-step="-1" aria-label="Previous month">‹</button>'
+               +'<button type="button" tabindex="-1" data-later-month-step="1" aria-label="Next month">›</button></div></div>'
+               +'<div role="grid" aria-label="Choose a day" data-later-grid></div>'
+               +'<label class="later-time">Time<input type="time" step="900" data-later-time></label>'
+               +'<div class="later-save"><span data-later-summary aria-live="polite"></span>'
+               +'<button class="primary" name="outcome" value="later">Save</button></div></div></div></div></div>')
     return ('<form method="post" data-review-form>'+hidden+f'<label for="words-{html.escape(item.key, quote=True)}">Your words</label>'
-            + f'<textarea id="words-{html.escape(item.key, quote=True)}" name="feedback" rows="{words_rows}" '
+            + f'<textarea id="words-{html.escape(item.key, quote=True)}" name="feedback" rows="{settings.words_rows}" '
             + 'placeholder="Type your words. They go with the button that you press."></textarea>'
             + '<div class="review-actions">'+groups+'</div><span role="status" data-send-status></span></form>')
 
 
-def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, words_rows: int,
+def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, settings: CardSettings,
             names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
     names = staff_names.for_page(names, members)
     source = item.source
@@ -136,7 +214,7 @@ def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff
     owner = owner_name(item, members)
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+'<div data-review-body>'+body
             +'</div></div><section><h3>Log · newest first</h3>'
-            +'<ol class="list-log">'+logs+'</ol></section>'+form(item, browser, words_rows)
+            +'<ol class="list-log">'+logs+'</ol></section>'+form(item, browser, settings)
             +'<p class="review-source">Owner: '+names.html(item.owner, owner)+' · Source: '
             +names.html(item.source_unit, review_items.name(item.source_unit, members))+'</p></div>')
 
@@ -151,7 +229,7 @@ def age(filed: datetime, now: datetime) -> str:
 
 
 def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, now: datetime, index: int,
-              title_limit: int, words_rows: int,
+              title_limit: int, settings: CardSettings,
               names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
     names = staff_names.for_page(names, members)
     owner = owner_name(item, members)
@@ -164,20 +242,19 @@ def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: sta
     attrs = {'key':item.key, 'number':item.id.casefold(), 'title':item.title.casefold(), 'owner':str(item.owner),
              'source-owner':str(item.source_unit), 'source-name':source,
              'state':item.state.value, 'type':item.type.value, 'order':str(index), 'sort-values':json.dumps(values),
-             'parked':str(item.hidden_until(now)).lower(), 'updated':item.times.updated.isoformat(),
-             'checking':str(isinstance(item.source, review_items.ChangeSource) and item.source.slots.validation_requested).lower()}
+             'parked':str(item.hidden_until(now)).lower(), 'updated':item.times.updated.isoformat()}
     attributes = ''.join(f' data-{key}="{html.escape(value, quote=True)}"' for key, value in attrs.items())
     panel = 'review-detail-'+str(index)
     toggle = (f'<button type="button" class="list-toggle" aria-expanded="false" aria-controls="{panel}">'
               +'<span class="list-chevron" aria-hidden="true">›</span>'+html.escape(item.id)+'</button>')
-    state = '<span class="list-state '+('warning' if item.state == ReviewState.FOR_YOU else 'muted')+'">'+item.state+'</span>'
+    state = '<span class="list-state '+('warning' if item.state == ReviewState.OPEN else 'muted')+'">'+item.state+'</span>'
     cells = (toggle, icon(item.type)+item.type.title(), names.html(item.owner, owner)+('<small>· '+names.html(item.source_unit, source)+'</small>' if source != owner else ''),
              title, state, age(item.times.filed, now))
     row = ''.join(f'<td' + (' class="record-id"' if label == 'Id' else '')
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden = ' hidden' if item.state == ReviewState.DONE or item.hidden_until(now) else ''
     return ('<tbody data-list-item'+attributes+hidden+'><tr class="list-row">'+row+'</tr>'
-            +f'<tr data-detail id="{panel}" hidden><td colspan="6">'+details(item, browser, members, words_rows, names)+'</td></tr></tbody>')
+            +f'<tr data-detail id="{panel}" hidden><td colspan="6">'+details(item, browser, members, settings, names)+'</td></tr></tbody>')
 
 
 def render(root: Path, *, show: str = 'open') -> bytes:
@@ -189,38 +266,44 @@ def render(root: Path, *, show: str = 'open') -> bytes:
     if show not in dict(SHOWS):
         show = 'open'
     owners: dict[staff.StaffId, str] = {}
-    records = review_items.read(root, members=members, kinds=TYPES, show=show, owner_options=owners)
+    records = review_items.read(root, members=members, kinds=TYPES, owner_options=owners)
     items = [item for item in records
-             if (show == 'all' or not item.hidden_until(now)) and (show == 'all' or
-                 show == 'open' and item.state != ReviewState.DONE or item.state == show)
-             and not (show == 'open' and item.state == ReviewState.WAITING and
-                 isinstance(item.source, review_items.ChangeSource) and item.source.slots.validation_requested)]
-    items.sort(key=lambda item: (item.state != ReviewState.FOR_YOU, item.state == ReviewState.DONE))
+             if show == 'all' or (show == 'open' and item.state == ReviewState.OPEN) or item.state == show]
+    items.sort(key=lambda item: (item.state != ReviewState.OPEN, item.state == ReviewState.DONE))
     token, initial = change_browser.browser_manifest(change_page.console_folder(root))
     browser = change_page.ReviewBrowser(token, initial)
     settings = conf.read('review_links')
-    words_rows = settings.whole('review_words_rows')
-    visible = items
-    options = ''.join(f'<option value="{html.escape(owner, quote=True)}" data-owner-name="{html.escape(name, quote=True)}"{names.style(owner)}>{html.escape(name)} '
-                     +f'({sum(item.owner == owner or item.type == ReviewType.INVESTIGATION and item.source_unit == owner for item in visible)})</option>'
-                     for owner, name in sorted(owners.items(), key=lambda pair:pair[1].casefold()))
-    chips = '<button type="button" data-type-chip="" aria-pressed="true">All <b>'+str(len(visible))+'</b></button>'
-    chips += ''.join('<button type="button" data-type-chip="'+kind+'" aria-pressed="false">'+icon(kind)+LABELS[kind]
-                     +' <b>'+str(sum(item.type == kind for item in visible))+'</b></button>' for kind in TYPES)
-    shows = ''.join(f'<option value="{value}"'+(' selected' if value == show else '')+f'>{label}</option>' for value, label in SHOWS)
+    later = later_settings(settings)
+    cards = CardSettings(settings.whole('review_words_rows'), soon_label(later['soon']))
+    entries = filter_index(records, members, now)
+    owner_chips = '<button id="review-owner-all" type="button" data-owner-chip="" aria-pressed="true">All <b></b></button>'
+    for owner, name in sorted(owners.items(), key=lambda pair:pair[1].casefold()):
+        identity = html.escape(owner, quote=True)
+        owner_chips += (f'<button id="review-owner-id-{identity}" type="button" data-owner-chip="{identity}"'
+                        f' data-owner-name="{html.escape(name, quote=True)}" aria-pressed="false">'
+                        f'{names.html(owner, name)} <b></b></button>')
+    chips = '<button id="review-type-all" type="button" data-type-chip="" aria-pressed="true">All <b></b></button>'
+    chips += ''.join('<button id="review-type-'+kind+'" type="button" data-type-chip="'+kind+'" aria-pressed="false">'+icon(kind)+LABELS[kind]
+                     +' <b></b></button>' for kind in TYPES)
+    shows = ''.join('<button id="review-show-'+value.lower().replace(' ', '-')+'" type="button" data-show-chip="'
+                    +value+'" aria-pressed="'+str(value == show).lower()+'">'+label
+                    +' <b></b></button>' for value, label in SHOWS)
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       +'<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
     content = (record_table.STYLE+STYLE+page_frame.title('Review', 'review')
-        +f'<div data-review data-show="{show}" data-refresh-seconds="{settings.number("page_refresh_seconds")}">'
-        +'<div class="review-types">'+chips+'</div><div class="list-filters">'
-        +'<label for="list-owner">Owner</label><select id="list-owner"><option value="">All ('+str(len(visible))+')</option>'+options+'</select>'
-        +'<label for="list-show">Show</label><select id="list-show">'+shows+'</select>'
+        +f'<div data-review data-show="{show}" data-refresh-seconds="{settings.number("page_refresh_seconds")}"'
+        +f' data-zone="{html.escape(user_zone_name(), quote=True)}" data-later="{html.escape(json.dumps(later), quote=True)}">'
+        +'<div class="review-types" role="group" aria-label="Type">'+chips+'</div>'
+        +'<div class="review-types review-shows" id="list-show" role="group" aria-label="Show">'+shows+'</div>'
+        +'<div class="review-types" id="list-owner" role="group" aria-label="Owner">'+owner_chips+'</div>'
+        +'<div class="list-filters">'
         +'<label class="list-search-label" for="list-search">Search</label><input type="search" id="list-search" placeholder="Filter by id or words">'
-        +'<span data-list-count role="status"></span></div><p data-hidden-action-status role="status" hidden></p>'
+        +'</div><p data-hidden-action-status role="status" hidden></p>'
+        +'<script type="application/json" data-review-index>'+index_json(entries)+'</script>'
         +'<div class="list-table"><table aria-label="Review">'
         +'<colgroup><col style="width:17%"><col style="width:13%"><col style="width:14%"><col style="width:37%">'
         +'<col style="width:12%"><col style="width:7%"></colgroup><thead><tr>'+headers+'</tr></thead>'
-        +''.join(item_rows(item,browser,members,now,index,title_limit,words_rows,names) for index,item in enumerate(items))
+        +''.join(item_rows(item,browser,members,now,index,title_limit,cards,names) for index,item in enumerate(items))
         +'</table><p data-empty hidden>No items in this view.</p></div></div><script>'+SCRIPT+'</script>')
     return page_frame.rendered(change_page.document(content, 'Review'), started, read_at)
 
@@ -297,6 +380,34 @@ color:var(--ink);border:1px solid var(--line);border-radius:8px;resize:vertical}
 .review-later{margin-left:auto}.review-actions input{font:inherit;min-height:40px;max-width:100%;box-sizing:border-box;
 padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink)}
 .list-log span{white-space:pre-wrap}
+.later-menu{position:relative}
+[data-later-menu]{position:absolute;right:0;bottom:calc(100% + 6px);z-index:5;width:280px;max-width:calc(100vw - 32px);padding:5px;box-sizing:border-box;
+background:var(--card);border:1px solid var(--line);border-radius:10px;box-shadow:0 10px 28px rgba(0,0,0,.35)}
+[data-later-menu] [hidden]{display:none!important}
+.review-actions [data-later-menu] [role=menuitem]{display:flex;justify-content:space-between;align-items:center;gap:24px;width:100%;
+min-height:32px;padding:5px 10px;border:0;border-radius:6px;background:none;color:var(--ink);text-align:left}
+.review-actions [data-later-menu] [role=menuitem]:is(:hover,:focus){background:var(--accent);color:#fff;outline:none}
+[data-later-menu] small{font-size:12px;color:var(--ink-3)}
+[data-later-menu] [role=menuitem]:is(:hover,:focus) small{color:inherit;opacity:.85}
+[data-later-menu] hr{border:0;border-top:1px solid var(--line);margin:5px 4px}
+[data-later-menu][data-choosing]>:is([role=menuitem],hr){display:none}
+.later-custom{padding:6px}
+.later-month-header,.later-month-header>div,.later-save{display:flex;align-items:center;justify-content:space-between;gap:4px}
+.later-month-header strong{font-size:14px}
+.review-actions .later-month-header button{min-height:28px;width:28px;padding:0;border:0;font-size:24px;background:none}
+[data-later-grid]{margin:8px 0 12px}
+[data-later-grid]>[role=row]{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:2px;text-align:center}
+[data-later-grid] [role=columnheader]{font-size:11px;color:var(--ink-3);padding:4px 0}
+.review-actions [data-later-grid] button{width:100%;min-width:0;min-height:30px;padding:0;border:1px solid transparent;border-radius:50%;font-size:13px;background:none}
+.review-actions [data-later-grid] [aria-current=date]{border-color:var(--accent)}
+.review-actions [data-later-grid] [aria-selected=true]{background:var(--accent);color:#fff}
+.review-actions [data-later-grid] button:disabled{opacity:.3}
+.review-actions [data-later-grid] button:focus-visible{outline:2px solid var(--ink);outline-offset:1px}
+[data-review-form] .later-time{display:flex;align-items:center;justify-content:space-between;font-size:12px;font-weight:400;margin:0 0 10px}
+.review-actions .later-time input{min-height:32px;width:120px;padding:3px 8px;color-scheme:light dark}
+.later-save [data-later-summary]{font-size:11px;white-space:nowrap;color:var(--ink-3)}
+.review-actions .later-save button{min-height:32px;padding:4px 10px;font-size:12px;flex-shrink:0}
+.review-actions .later-save button:disabled{opacity:.4}
 .review-actions button{margin:0;font:inherit;min-height:40px;padding:6px 14px;border:1px solid var(--ink-3);border-radius:8px;
 background:var(--card);color:var(--ink)}.review-actions .primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
 .review-source{grid-column:1/-1;color:var(--ink-3);font-size:12px;margin-top:16px!important}
@@ -309,38 +420,64 @@ SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + review_legacy.SCRIPT 
 let content=document.querySelector('[data-review]'),saving=0;
 let selectedShow=content.dataset.show,requestedShow=selectedShow;
 const drafts=new Map(),departures=new Map(),bodies=new Map();
+let index=readIndex();
+function readIndex(){
+ return new Map(JSON.parse(content.querySelector('[data-review-index]').textContent).map(entry=>[entry.key,entry]));
+}
+function matchesOwner(entry,owner){
+ return !owner || entry.owner===owner || entry.type==='investigation' && entry.sourceOwner===owner;
+}
+function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys}){
+ const linked=keys.has(entry.key);
+ return (!keys.size || linked) && (linked || entry.hiddenUntil<=Date.now()) &&
+  matchesOwner(entry,owner) &&
+  (!type || entry.type===type) && (!sourceOwner || entry.sourceOwner===sourceOwner) &&
+  (!query || entry.id.toLowerCase().includes(query) || entry.title.toLowerCase().includes(query)) &&
+  (show==='all' || entry.state===(show==='open' ? 'Open' : show));
+}
+function matching(filters,includePending=false){
+ return [...index.values()].filter(entry=>{
+  const departure=departures.get(entry.key);
+  if(departure?.kind==='pending' && !includePending) return false;
+  const projected=departure?.kind==='saved'
+   ? {...entry,state:departure.state,hiddenUntil:departure.hiddenUntil}
+   : entry;
+  return matches(projected,filters);
+ });
+}
 const view=createRecordTable({content:()=>content,single:true,
  place:reviewPlace,
  resolveOwner:owner=>{
-  const menu=content.querySelector('#list-owner');
-  const option=[...menu.options].find(option=>option.value===owner || option.dataset.ownerName===owner);
-  return option ? option.value : owner;
+  const button=[...content.querySelectorAll('[data-owner-chip]')].find(button=>
+   button.dataset.ownerChip===owner || button.dataset.ownerName===owner);
+  return button ? button.dataset.ownerChip : owner;
  },
- shows:['open','For you','Waiting','Done','all'],
- visible:(data,{owner,show,query,type,sourceOwner,keys})=>!departures.has(data.key) && (data.parked!=='true' || keys.has(data.key)) &&
-  !(show==='open' && data.state==='Waiting' && data.checking==='true') &&
-  (!owner || data.owner===owner || data.type==='investigation' && data.sourceOwner===owner) && (!type || data.type===type) &&
-  (!sourceOwner || data.sourceOwner===sourceOwner) &&
-  (!query || data.number.includes(query) || data.title.includes(query)) &&
-  (show==='all' || (show==='open' ? data.state!=='Done' : data.state===show)),
- counts:(items,_count,{keys})=>{
-  const show=content.querySelector('#list-show').value;
-  const states=show==='all' ? ['For you','Waiting','Done'] : show==='open' ? ['For you','Waiting'] : [show];
-  return states.map(state=>items.filter(item=>!departures.has(item.dataset.key) && item.dataset.state===state && (item.dataset.parked!=='true' || keys.has(item.dataset.key))).length+' '+state.toLowerCase()).join(' · ');
+ selectOwner:({owner,type,query,keys})=>matching({owner,type,query,keys},true).length ? owner : '',
+ shows:['open','Waiting','Done','all'],
+ hasKey:key=>index.has(key),
+ visible:(data,filters)=>{
+  const entry=index.get(data.key);
+  return Boolean(entry && !departures.has(data.key) && matches(entry,filters));
  },
- applied:(items,{type,show,keys})=>{
+ sortValues:data=>{
+  const entry=index.get(data.key);
+  return entry && [entry.id,entry.type,entry.ownerName,entry.title,entry.state,entry.filed];
+ },
+ applied:(_items,{type,show,owner,query,sourceOwner,keys})=>{
   selectedShow=show;loadBodies();
-  const shown=items.filter(item=>!departures.has(item.dataset.key) && (item.dataset.parked!=='true' || keys.has(item.dataset.key)) &&
-   !(show==='open' && item.dataset.state==='Waiting' && item.dataset.checking==='true') &&
-   (show==='all' || (show==='open' ? item.dataset.state!=='Done' : item.dataset.state===show)));
+  const eligibleOwners=matching({type,query,keys},true);
+  const shownOwners=matching({show,type,query,keys});
+  content.querySelectorAll('[data-owner-chip]').forEach(button=>{
+   const value=button.dataset.ownerChip;
+   button.hidden=Boolean(value) && !eligibleOwners.some(entry=>matchesOwner(entry,value));
+   button.querySelector('b').textContent=shownOwners.filter(entry=>matchesOwner(entry,value)).length;
+  });
+  content.querySelectorAll('[data-show-chip]').forEach(button=>{
+   button.querySelector('b').textContent=matching({type,owner,query,sourceOwner,keys,show:button.dataset.showChip}).length;
+  });
   content.querySelectorAll('[data-type-chip]').forEach(button=>{
    button.setAttribute('aria-pressed',String(button.dataset.typeChip===type));
-   button.querySelector('b').textContent=shown.filter(item=>!button.dataset.typeChip || item.dataset.type===button.dataset.typeChip).length;
-  });
-  [...content.querySelector('#list-owner').options].forEach(option=>{
-   const count=shown.filter(item=>!option.value || item.dataset.owner===option.value ||
-    item.dataset.type==='investigation' && item.dataset.sourceOwner===option.value).length;
-   option.textContent=(option.dataset.ownerName || (option.value ? option.textContent.replace(/ \(\d+\)$/,'') : 'All'))+' ('+count+')';
+   button.querySelector('b').textContent=matching({owner,show,query,sourceOwner,keys,type:button.dataset.typeChip}).length;
   });
   if(show!==requestedShow){requestedShow=show;queueMicrotask(()=>pageRefresh.refresh(true));}
  }
@@ -390,12 +527,10 @@ function bind(){
   const remember=()=>drafts.set(key,{feedback:words.value,later:later.value,choice:choices.find(choice=>choice.checked)?.value || ''});
   choices.forEach(choice=>choice.addEventListener('change',()=>{words.value=choice.value;remember();words.focus();}));
   [words,later].forEach(field=>{field.addEventListener('input',remember);field.addEventListener('change',remember);});
-  form.addEventListener('submit',async event=>{
-   event.preventDefault();if(form.dataset.sending) return;
-   const data=new URLSearchParams(new FormData(form));data.set('outcome',event.submitter.value);
-   later.required=data.get('outcome')==='later';
-   const valid=later.reportValidity();later.required=false;
-   if(!valid) return;
+  const send=async(outcome,until)=>{
+   if(form.dataset.sending) return;
+   const data=new URLSearchParams(new FormData(form));data.set('outcome',outcome);
+   if(outcome==='later') data.set('later',until);
    form.dataset.sending='true';saving++;pageRefresh.abandon();
    const buttons=[...form.querySelectorAll('button')];
    buttons.forEach(button=>button.disabled=true);notice.textContent='';
@@ -405,10 +540,10 @@ function bind(){
     const response=await fetch(location.pathname,{method:'POST',body:data});
     const result=await response.json();if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
     drafts.delete(key);
-    departures.set(key,{kind:'saved',updated:row.dataset.updated,
-     later:data.get('outcome')==='later' ? Date.parse(data.get('later')) : 0,
-     question:data.get('outcome')==='question',
-     closes:!['validate','question','later'].includes(data.get('outcome'))});
+    const waits=outcome==='validate' || outcome==='question';
+    departures.set(key,{kind:'saved',outcome,updated:row.dataset.updated,previousState:row.dataset.state,
+     state:waits ? 'Waiting' : outcome==='later' ? row.dataset.state : 'Done',
+     hiddenUntil:outcome==='later' ? Date.parse(until) : 0});
     view.opened.delete(key);
     view.showActionResult(row,form.elements.row.value,'Saved: '+result.answer);
    }catch(error){
@@ -420,11 +555,162 @@ function bind(){
     delete form.dataset.sending;saving--;
     if(!saving && selectedShow!==content.dataset.show) void pageRefresh.refresh(true);
    }
+  };
+  form.addEventListener('submit',event=>{
+   event.preventDefault();
+   const outcome=event.submitter.value;
+   if(outcome==='later'){
+    const at=laterEpoch(later.value);
+    if(!(at>Date.now())) return;
+    closeLater(form.querySelector('[data-later-menu]'),false);
+    void send(outcome,new Date(at).toISOString());return;
+   }
+   void send(outcome,later.value);
   });
+  bindLater(form,until=>void send('later',until));
  });
 }
+// The Later menu: presets resolve in the user zone each time the menu opens.
+function zoneParts(epoch){
+ const parts=Object.fromEntries(new Intl.DateTimeFormat('en-US',{timeZone:content.dataset.zone,hourCycle:'h23',
+  year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'numeric',second:'numeric'})
+  .formatToParts(epoch).map(part=>[part.type,Number(part.value)]));
+ return parts;
+}
+function zoneEpoch(year,month,day,minutes){
+ // Use both offsets near the wall time. Choose the earlier repeat or advance through a skipped hour.
+ const wall=Date.UTC(year,month-1,day,0,minutes);
+ const shownWall=epoch=>{const shown=zoneParts(epoch);
+  return Date.UTC(shown.year,shown.month-1,shown.day,shown.hour,shown.minute,shown.second);};
+ const offsets=new Set([-86400000,0,86400000].map(delta=>shownWall(wall+delta)-(wall+delta)));
+ const candidates=[...offsets].map(offset=>wall-offset),exact=candidates.filter(epoch=>shownWall(epoch)===wall);
+ return exact.length ? Math.min(...exact) : Math.max(...candidates);
+}
+function laterEpoch(wall){
+ const [date,clock]=wall.split('T');
+ if(!date || !clock) return NaN;
+ const [year,month,day]=date.split('-').map(Number),[hour,minute]=clock.split(':').map(Number);
+ return zoneEpoch(year,month,day,hour*60+minute);
+}
+function laterTimes(now){
+ const settings=JSON.parse(content.dataset.later),today=zoneParts(now);
+ const at=(days,minutes)=>zoneEpoch(today.year,today.month,today.day+days,minutes);
+ const weekday=new Date(Date.UTC(today.year,today.month-1,today.day)).getUTCDay();
+ return {soon:now+settings.soon*60000,
+  evening:today.hour*60+today.minute<settings.eveningUntil ? at(0,settings.evening) : 0,
+  morning:at(1,settings.morning),week:at((settings.weekDay-weekday+7)%7 || 7,settings.weekTime)};
+}
+function closeLater(menu,focus){
+ menu.hidden=true;menu.querySelector('[data-later-custom]').hidden=true;delete menu.dataset.choosing;
+ const toggle=menu.parentElement.querySelector('[data-later-toggle]');toggle.setAttribute('aria-expanded','false');
+ if(focus) toggle.focus();
+}
+function bindLater(form,pick){
+ const toggle=form.querySelector('[data-later-toggle]'),menu=form.querySelector('[data-later-menu]');
+ const custom=menu.querySelector('[data-later-custom]'),items=()=>[...menu.querySelectorAll('[role=menuitem]:not([hidden])')];
+ const shown=new Intl.DateTimeFormat('en-US',{timeZone:content.dataset.zone,weekday:'short',hour:'2-digit',minute:'2-digit',hourCycle:'h23'});
+ toggle.addEventListener('click',()=>{
+  if(!menu.hidden){closeLater(menu,true);return;}
+  const times=laterTimes(Date.now());
+  menu.querySelectorAll('[data-later-preset]').forEach(item=>{
+   const at=times[item.dataset.laterPreset];item.hidden=!at;item.dataset.at=at ? String(at) : '';
+   item.querySelector('small').textContent=at ? shown.format(at) : '';
+  });
+  menu.hidden=false;toggle.setAttribute('aria-expanded','true');items()[0].focus();
+ });
+ menu.querySelectorAll('[data-later-preset]').forEach(item=>item.addEventListener('click',()=>{
+  // Resolve the time again at the click, so a menu left open does not send a stale time.
+  const at=laterTimes(Date.now())[item.dataset.laterPreset] || Number(item.dataset.at);
+  closeLater(menu,false);pick(new Date(at).toISOString());
+ }));
+ const grid=custom.querySelector('[data-later-grid]'),time=custom.querySelector('[data-later-time]');
+ const save=custom.querySelector('[value="later"]'),month=custom.querySelector('[data-later-month]');
+ const dayText=date=>date.toISOString().slice(0,10);
+ const monthText=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',month:'long',year:'numeric'});
+ const dayLabel=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',dateStyle:'full'});
+ const summary=new Intl.DateTimeFormat('en-GB',{timeZone:content.dataset.zone,weekday:'short',day:'numeric',month:'short'});
+ let selected=new Date(),display=new Date();
+ const today=()=>{const now=zoneParts(Date.now());return new Date(Date.UTC(now.year,now.month-1,now.day));};
+ const update=()=>{
+  form.elements.later.value=dayText(selected)+'T'+time.value;
+  form.elements.later.dispatchEvent(new Event('input',{bubbles:true}));
+  const at=laterEpoch(form.elements.later.value);
+  const clock=Number.isFinite(at) ? zoneParts(at) : {};
+  custom.querySelector('[data-later-summary]').textContent=Number.isFinite(at) ? 'Hides until '+summary.format(at)+' '+
+   String(clock.hour).padStart(2,'0')+':'+String(clock.minute).padStart(2,'0') : 'Choose a time';
+  save.disabled=!(at>Date.now());
+ };
+ const draw=()=>{
+  month.textContent=monthText.format(display);grid.replaceChildren();
+  grid.setAttribute('aria-label',month.textContent);
+  const header=document.createElement('div');header.setAttribute('role','row');
+  ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'].forEach(day=>{
+   const cell=document.createElement('span');cell.setAttribute('role','columnheader');cell.setAttribute('aria-label',day);
+   cell.textContent=day[0];header.append(cell);
+  });grid.append(header);
+  const first=new Date(Date.UTC(display.getUTCFullYear(),display.getUTCMonth(),1));
+  const count=new Date(Date.UTC(display.getUTCFullYear(),display.getUTCMonth()+1,0)).getUTCDate();
+  let row;
+  for(let cell=0;cell<first.getUTCDay()+count;cell++){
+   if(cell%7===0){row=document.createElement('div');row.setAttribute('role','row');grid.append(row);}
+   const day=cell-first.getUTCDay()+1;
+   if(day<1){const blank=document.createElement('span');blank.setAttribute('role','gridcell');row.append(blank);continue;}
+   const date=new Date(Date.UTC(display.getUTCFullYear(),display.getUTCMonth(),day)),button=document.createElement('button');
+   button.type='button';button.setAttribute('role','gridcell');button.textContent=day;
+   button.dataset.date=dayText(date);button.setAttribute('aria-label',dayLabel.format(date));
+   button.setAttribute('aria-selected',String(dayText(date)===dayText(selected)));
+   button.tabIndex=dayText(date)===dayText(selected) ? 0 : -1;button.disabled=date<today();
+   if(dayText(date)===dayText(today())) button.setAttribute('aria-current','date');
+   button.addEventListener('click',()=>{selected=date;draw();grid.querySelector('[tabindex="0"]').focus();});row.append(button);
+  }
+  update();
+ };
+ menu.querySelector('[data-later-choose]').addEventListener('click',()=>{
+  const wall=form.elements.later.value;
+  if(laterEpoch(wall)>Date.now()){
+   const [date,clock]=wall.split('T');selected=new Date(date+'T00:00:00Z');time.value=clock;
+  }else{
+   selected=today();selected.setUTCDate(selected.getUTCDate()+1);
+   const morning=JSON.parse(content.dataset.later).morning;
+   time.value=String(Math.floor(morning/60)).padStart(2,'0')+':'+String(morning%60).padStart(2,'0');
+  }
+  display=new Date(selected);
+  custom.hidden=false;menu.dataset.choosing='true';draw();grid.querySelector('[tabindex="0"]').focus();
+ });
+ custom.querySelectorAll('[data-later-month-step]').forEach(button=>button.addEventListener('click',()=>{
+  display=new Date(Date.UTC(display.getUTCFullYear(),display.getUTCMonth()+Number(button.dataset.laterMonthStep),1));
+  draw();
+ }));
+ time.addEventListener('input',update);time.addEventListener('change',update);
+ grid.addEventListener('keydown',event=>{
+  const days={ArrowLeft:-1,ArrowRight:1,ArrowUp:-7,ArrowDown:7}[event.key];
+  if(days===undefined) return;
+  event.preventDefault();const date=new Date(selected);date.setUTCDate(date.getUTCDate()+days);
+  if(date<today()) return;
+  selected=date;display=new Date(date);draw();grid.querySelector('[tabindex="0"]').focus();
+ });
+ menu.addEventListener('keydown',event=>{
+  if(event.key==='Escape'){event.preventDefault();closeLater(menu,true);return;}
+  if(custom.contains(event.target)){
+   if(event.key==='Enter'){
+    event.preventDefault();update();if(!save.disabled) form.requestSubmit(save);
+   }
+   return;
+  }
+  const list=items(),index=list.indexOf(document.activeElement);
+  const next={ArrowDown:index+1,ArrowUp:index-1+list.length,Home:0,End:list.length-1}[event.key];
+  if(next===undefined) return;
+  event.preventDefault();list[next%list.length].focus();
+ });
+}
+document.addEventListener('pointerdown',event=>{
+ content.querySelectorAll('[data-later-menu]:not([hidden])').forEach(menu=>{
+  if(!menu.parentElement.contains(event.target)) closeLater(menu,false);
+ });
+});
 async function refresh(_supersede=false,current=()=>true){
- if(saving) return;
+ // An open Later menu holds the page, so a refresh does not close it under the pointer.
+ if(saving || [...content.querySelectorAll('[data-later-menu]:not([hidden])')].some(menu=>menu.getClientRects().length)) return;
  const show=selectedShow;
  const response=await fetch(location.pathname+'?'+new URLSearchParams({show}),{cache:'no-store'});
  if(!response.ok) throw new Error('HTTP '+response.status);
@@ -433,26 +719,30 @@ async function refresh(_supersede=false,current=()=>true){
  await view.settled();
  if(saving || !current() || show!==selectedShow) return;
  const top=scrollY,restoreFocus=restoreFocusAfterRefresh();
- content.replaceWith(fresh);content=fresh;
+ const active=document.activeElement;
+ const focusedOwnerId=active?.hasAttribute('data-owner-chip') ? active.id : '';
+ content.replaceWith(fresh);content=fresh;index=readIndex();
  for(const [key,result] of departures){
   if(result.kind==='pending') continue;
-  if(result.later){if(Date.now()>=result.later) departures.delete(key);continue;}
-  if(result.closes) continue;
-  const row=content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
-  if(result.question){
-   if(row?.dataset.state==='For you' && row.dataset.updated!==result.updated) departures.delete(key);
-   continue;
+  const entry=index.get(key);
+  if(!entry || (result.outcome==='later' && Date.now()>=result.hiddenUntil)) {departures.delete(key);continue;}
+  // The index includes the state and revision of rows outside this Show.
+  const submitted=entry.state===result.previousState && entry.updated===result.updated;
+  if(!submitted && (entry.state!==result.state || result.outcome==='validate')){
+   departures.delete(key);
   }
-  if(!row || row.dataset.state!=='For you' || row.dataset.updated!==result.updated) departures.delete(key);
  }
  bind();view.apply(false);
- restoreFocus();
+ const ownerChip=focusedOwnerId ? document.getElementById(focusedOwnerId) : null;
+ if(focusedOwnerId && (!ownerChip || ownerChip.hidden)){
+  content.querySelector('[data-owner-chip][aria-pressed="true"]')?.focus({preventScroll:true});
+ }else restoreFocus();
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
 }
 view.place();bind();view.apply();
 addEventListener('hashchange',()=>{
  const item=new URLSearchParams(location.hash.slice(1)).get('item'),departure=departures.get(item);
- if(departure?.kind==='saved' && !departure.closes && !departure.question) departures.delete(item);
+ if(departure?.kind==='saved' && ['validate','later'].includes(departure.outcome)) departures.delete(item);
  view.place();view.apply(false);
 });
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
