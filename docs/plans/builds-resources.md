@@ -2710,8 +2710,15 @@ The cutover removal commit deletes the script after the run.
 
 **Files:** none.
 
-### Phase 143 — Measure what a slot-for-every-build model gains  · status: todo
+### Phase 143 — Measure what a slot-for-every-build model gains  · status: done
 
-The user asked how best to use the slot model: disk allows many slots and caller affinity. Today verify.sh check, build, test and lint run in the caller's worktree with one Cargo directory under `/build/cargo/<folder>`; slots serve doc, copies.py run, bump gate, CI points and fast track. The proposal to test: every build takes a slot, and a caller gets its last slot when that slot is free. Analysis only: build records for the last 7 days, no code or config change, no new build.
+#### As-built
+
+- Read-only analysis of buildlog records for 2026-11-10 to 11-17; no build, code or config change. Report: `phases/143/slot_report.md` in the unit session folder.
+- First runs in a new Cargo folder: Hana 5.2% of worker calls, matched nextest 634 s against 113 s for a repeat; cargo-liner 3.6%, 101 s against 12 s.
+- No gate record measures a slot revision change. From slot steps, a Hana nextest after a different revision took 367 s at the median (21 steps).
+- Disk: `/build/cargo` 2201 GiB (Hana 1948); 877 GiB free. The 7-day peak with last-slot preference needs Hana 6 slots, cargo-liner 4.
+- Recommendation sent to builds: keep the worktree Cargo folders. At 46–59% own-slot reuse, a typical Hana nextest gets about 1.8 min slower on slots. Seeding a new folder from a warm sibling takes the first-run gain instead.
+- Checkpoint `989f9049e`.
 
 **Files:** none.
