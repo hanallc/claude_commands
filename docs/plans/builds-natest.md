@@ -4578,3 +4578,37 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `production/test_fast_track.py`: the interruption tests start each fast-track child as a fork of the test process with its modules loaded (`command`); the former in-process body moves unchanged to `invoke_command`. The real Git wrapper still sends SIGKILL at the tested boundary, and each test reads the real exit status. The complete command case and the concurrent second process keep fresh interpreters. Output files and child cleanup exist before the process starts.
 - Profile before the change: 42.8 natedev CPU s; Git 12.1 s over 6,749 starts; 22 fast-track children 11.6 s. The class seed already existed. Remaining cost: Git starts, which tests check.
 - aws pairs (3 rounds, c7a.4xlarge): 55.37 -> 45.36 CPU s (paired median saving 10.07 s, lower in every round); peak 200.7 -> 205.5 MiB. 50 tests and 312 assertions unchanged; both reviews approve. Checkpoint a0463a3b9.
+
+### Phase 324 — The verify wait-holder tests use less aws CPU  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `direct/test_verify_wait_holder.py` uses less CPU in aws pairs, with the same tests and assertions, or the phase names its floor and an architecture proposal.
+
+**Decision:** after Phase 323, the aws ranking (`show.py top --host aws`, rows as of 2026-11-16 20:07) puts this module next: median 49.6 CPU s for 27 tests; slowest kept test `VerifyTokenHolderTests.test_token_wait_names_the_owner_and_updates_it_on_the_next_pass` 7.9 s. Earlier phases cut it (class seeds, runpy observers, direct hold and route calls); this phase measures what is left.
+
+**Spec:**
+1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD direct/test_verify_wait_holder.py --tests 15 --commands 15`, under `systemd-run --user --scope -q -p MemoryMax=2G`. Name the top costs by test, fixture and command.
+2. Remove the largest repeated cost in the test file that a test does not check, with the shared methods of Phases 235-238, 251, 254, 255 and 323: class seeds copied per test, in-process calls where no process boundary is asserted, a forked child with loaded modules where a boundary is asserted but a new interpreter is not.
+3. Keep every process boundary, wait, signal and exit status a test asserts. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
+4. If the largest remaining cost is product work (`verify.sh` startup, the recorder, admission), do not change product code. Report the cost, the floor and a concrete architecture proposal to the director.
+5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
+6. The director runs the aws pairs.
+
+**Files:**
+- `scripts/direct/test_verify_wait_holder.py`
+
+**Workers:** 1 writer; one test module.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 232: no signal handlers anywhere. No lazy imports inside functions.
+- Phase 252: every fixture binds private run roots through `bind_private_run_roots`; keep it. Phase 242: in-process calls bind per call the module state that the real process reads at start.
+- Phase 323: a forked child with loaded imports keeps a real kill point and exit status; create output files and child cleanup before the fork.
+- sdlc terms: test files only; every test and assertion stays; merge only on a measured aws gain; report paired peak memory.
+
+**Acceptance gate:**
+- The same test count and assertions; the module passes three times.
+- `module_cost.py` CPU before and after, with the top costs named.
+- aws pairs (3 rounds) show a gain, or the report names the floor and the proposal; peak memory reported.
