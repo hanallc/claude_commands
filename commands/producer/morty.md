@@ -134,6 +134,7 @@ If nothing needs nate and no unread update remains, say so. Continue authorized 
 Do not advance automatically after nate answers. Record the answer and act within its scope.
 Send each answer or review result to the item's owner in the same turn, in nate's words. Do not send nate to another tab to answer.
 Treat List page feedback as nate's words for the named item.
+Answer List questions with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py answer L<N> --question <id> --text "<answer>"`.
 Act through `the_list.py` and tell the owner, as for any instruction from nate.
 
 ## Lists and unread updates

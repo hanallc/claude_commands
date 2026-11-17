@@ -20,7 +20,7 @@ from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, footer_counts, record_store, session_staff, staff, the_list
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
-from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_link
+from scripts.review_links import change_browser, change_page, console, page_frame, page_question, record_table, review_link
 from scripts.review_links import review_items, review_page
 from scripts.review_links import staff_names
 from scripts.review_links import question_record
@@ -113,6 +113,7 @@ def feedback_form(entry: ListRecord, secret: str) -> str:
             + f'<textarea name="words" id="words-{key}" rows="2" maxlength="10000" '
             + 'placeholder="Your words for morty about this item" aria-label="Your words for morty about this item"></textarea>'
             + '<div class="list-tell"><span role="status" data-send-status></span>'
+            + '<button name="action" value="question" disabled>Ask question</button>'
             + '<button name="action" value="tell" disabled>Tell morty</button></div></form>')
 
 
@@ -169,6 +170,8 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[st
     if item.reviews:
         cards = (review_card(identity, reviews) for identity in item.reviews)
         sections += '<p>' + review_summary(item, reviews, today) + '</p><p>' + ' · '.join(cards) + '</p>'
+    sections += ''.join(page_question.open_question_html(question) if question.answer is None
+                        else page_question.answered_question_html(question) for question in item.questions)
     log = ''.join('<li><time datetime="' + change.time.isoformat() + '">' + html.escape(local_time(change.time, today))
                   + '</time><span>' + html.escape(change.what) + ' <small>— ' + names.html(change.source)
                   + '</small></span></li>' for change in reversed(item.log) if not the_list.is_page_request_receipt(change))
@@ -240,6 +243,12 @@ class ListFeedbackDelivery:
     request: str
 
 
+@dataclass(frozen=True)
+class ListQuestionDelivery:
+    delivery: change_page.MessageDelivery
+    status: change_page.DeliveryStatus
+
+
 def fresh_request(root: Path, keeper: str, identity: str) -> dict[str, str]:
     request = secrets.token_hex(16)
     item = the_list.load(staff.StaffId(keeper), identity)
@@ -250,7 +259,8 @@ def fresh_request(root: Path, keeper: str, identity: str) -> dict[str, str]:
             "parked": str(bool(parked_until)).lower(), "parked_until": parked_until}
 
 
-def submit(root: Path, body: str) -> ListFeedbackDelivery | change_page.NoMessageDelivery:
+def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = None
+           ) -> ListFeedbackDelivery | ListQuestionDelivery | change_page.NoMessageDelivery:
     """Accept signed item actions and save their notices for morty."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) != {"keeper", "id", "request", "token", "action", "words", "until"} or any(len(values) != 1 for values in fields.values()):
@@ -265,6 +275,10 @@ def submit(root: Path, body: str) -> ListFeedbackDelivery | change_page.NoMessag
     if morty is None or morty.kind != "producer" or morty.name != "morty":
         raise question_record.AnswerRefused("the item has no morty producer")
     action, words, until = fields["action"][0], fields["words"][0].strip(), fields["until"][0]
+    if action == "question":
+        status = change_page.DeliveryStatus(root) if status is None else status
+        question = the_list.ask_question(morty.id, identity, the_list.PageRequest(request, "question", words), status)
+        return ListQuestionDelivery(question, status) if isinstance(question, change_page.MessageDelivery) else question
     if action == "read":
         _ = the_list.mark_read(morty.id, identity, source=the_list.PAGE_SOURCE,
                                page_request=the_list.PageRequest(request, "read", words))
@@ -307,9 +321,12 @@ def alert_showrunners(item: the_list.ListItem, members: staff.StaffSnapshot) -> 
     return ()
 
 
-def deliver(delivery: ListFeedbackDelivery | change_page.NoMessageDelivery) -> None:
+def deliver(delivery: ListFeedbackDelivery | ListQuestionDelivery | change_page.NoMessageDelivery) -> None:
     """Send saved List words with the shared retry and alert helpers."""
     if isinstance(delivery, change_page.NoMessageDelivery):
+        return
+    if isinstance(delivery, ListQuestionDelivery):
+        change_page.deliver(delivery.delivery, delivery.status)
         return
     def send(item: the_list.ListItem, feedback: the_list.PageFeedback) -> the_list.PageFeedback:
         settings = conf.read("review_links")
@@ -439,8 +456,10 @@ def render(root: Path) -> bytes:
 STYLE = record_table.STYLE + '''<style>
 .list-table td[data-label="Next step"]>:first-child{margin-top:0}.list-table td[data-label="Next step"]>:last-child{margin-bottom:0}
 .list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
-.list-tell button{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.list-tell [value="tell"]{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
 .list-tell button:disabled{opacity:.45;cursor:default}.list-tell [data-send-status]{margin-left:0}
+[data-hidden-action-status]{white-space:pre-line}
+.page-question p{white-space:pre-wrap;overflow-wrap:anywhere}
 .list-table td[data-label="State"]{color:var(--ink)}
 .list-table td[data-label="Producer"],.list-table td[data-label="ETA"]{color:var(--ink-2)}
 @media(max-width:960px){
@@ -455,6 +474,7 @@ content:attr(data-label) ': ';color:var(--ink-3)}
 SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + r'''(() => {
 let content=document.querySelector('[data-list]');
 let saving=0;
+const failedActions=new Map();
 const drafts=new Map();
 function matchesWords(data,search){
  if(!search) return true;
@@ -500,19 +520,27 @@ const tableView=createRecordTable({content:()=>content,
   items.filter(item=>item.dataset.unread==='true').length+' unread',
  applied:items=>{
   const status=content.querySelector('[data-hidden-action-status]');
-  if(status.dataset.key) status.hidden=!items.find(item=>item.dataset.key===status.dataset.key)?.hidden;
+  const messages=[];
+  for(const [key,{number,message}] of failedActions){
+   const item=items.find(item=>item.dataset.key===key);
+   if(!item || item.hidden || item.querySelector('[data-detail]').hidden) messages.push('Item '+number+': '+message);
+  }
+  const text=messages.join('\n');
+  if(status.textContent!==text) status.textContent=text;
+  status.hidden=!text;
  }
 });
 const apply=(write=true)=>tableView.apply(write),place=()=>tableView.place();
 function bind(){
  tableView.replace();
- const hiddenStatus=content.querySelector('[data-hidden-action-status]');
  content.querySelectorAll('[data-feedback-form]').forEach(form=>{
   const item=form.closest('[data-list-item]'),key=item.dataset.key;
+  const notice=form.querySelector('[data-send-status]');
+  if(failedActions.has(key)) notice.textContent=failedActions.get(key).message;
   const confirmed={state:item.dataset.state,parked:item.dataset.parked};
   const words=form.elements.words,until=form.elements.until;
-  const tell=form.querySelector('[value="tell"]');
-  const syncTell=()=>{tell.disabled=Boolean(form.dataset.sending) || !words.value.trim();};
+  const tell=form.querySelector('[value="tell"]'),ask=form.querySelector('[value="question"]');
+  const syncTell=()=>{ask.disabled=tell.disabled=Boolean(form.dataset.sending) || !words.value.trim();};
   const signed={request:form.elements.request.value,token:form.elements.token.value};
   let fresh=signed;
   const newRequest=()=>({
@@ -531,7 +559,8 @@ function bind(){
   form.addEventListener('submit',async event=>{
    event.preventDefault();if(form.dataset.sending) return;
    const action=event.submitter?.value || 'tell';
-   if(action==='tell' && !words.value.trim()) return;
+   const usesWords=action==='tell' || action==='question';
+   if(usesWords && !words.value.trim()) return;
    if(action==='park' && !until.value){form.querySelector('[data-send-status]').textContent='Choose a parking date.';return;}
    const retry=matching(action);
    const attempt=retry ?? {...fresh,action,words:words.value,until:until.value};
@@ -541,23 +570,23 @@ function bind(){
    retainDraft();
    form.dataset.sending='true';saving++;pageRefresh.abandon();
    let buttons=[...item.querySelectorAll('button')],saved=false,refused=false;
-   const notice=form.querySelector('[data-send-status]');
-   if(hiddenStatus.dataset.key===key){delete hiddenStatus.dataset.key;hiddenStatus.hidden=true;hiddenStatus.textContent='';}
+   const clearedFailure=failedActions.delete(key);
    buttons.forEach(button=>button.disabled=true);notice.textContent=action==='read' ? 'Saving…' : 'Sending…';
    if(action==='remove') item.dataset.state='Closed';
    if(action==='park') item.dataset.parked='true';
-   if(action==='remove' || action==='park') apply(false);
+   if(action==='remove' || action==='park' || clearedFailure) apply(false);
    try{
     const response=await fetch(location.pathname,{method:'POST',body:data});
-    refused=!response.ok;
+    refused=!response.ok && (action!=='question' || response.status<500);
     const result=await response.json();
-    if(refused) throw new Error(result.reason || 'HTTP '+response.status);
+    if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
     saved=true;
     const unread=result.unread==='true';
     notice.textContent=action==='remove' ? 'Removed' : action==='park' ? 'Parked' : action==='read' ? 'Marked read' :
+     action==='question' ? 'Question saved' :
      action==='tell' && unread ? 'sent to morty; update remains unread' : 'sent to morty';
     signed.request=result.request;signed.token=result.token;fresh=signed;
-    if(action==='tell' && words.value===data.get('words')) words.value='';
+    if(usesWords && words.value===data.get('words')) words.value='';
     if(typeof result.item_state==='string') confirmed.state=result.item_state;
     if(['true','false'].includes(result.parked)) confirmed.parked=result.parked;
     Object.assign(item.dataset,confirmed);
@@ -577,12 +606,10 @@ function bind(){
     if(refused){
      Object.assign(item.dataset,confirmed);
      tableView.opened.add(key);
-     apply(false);
     }
     notice.textContent=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
-    hiddenStatus.dataset.key=key;
-    hiddenStatus.textContent='Item '+item.dataset.number+': '+notice.textContent;
-    hiddenStatus.hidden=!item.hidden;
+    failedActions.set(key,{number:item.dataset.number,message:notice.textContent});
+    apply(false);
    }
    finally{
     if(saved || refused) unconfirmed.delete(attempt);

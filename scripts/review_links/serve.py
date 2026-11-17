@@ -662,7 +662,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if not 0 < length <= 100000:
                 raise ValueError("invalid List request size")
             body = self.rfile.read(length).decode("utf-8")
-            delivery = list_page.submit(server.root, body)
+            delivery = list_page.submit(server.root, body, server.delivery_status)
         except ValueError as error:
             self.browser_failure(400, str(error), error)
             return
@@ -671,7 +671,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         try:
             fields = parse_qs(body)
-            self.json_response(200, {"state": "read" if fields["action"] == ["read"] else "sent",
+            state = {"read": "read", "question": "saved"}.get(fields["action"][0], "sent")
+            self.json_response(200, {"state": state,
                 **list_page.fresh_request(server.root, fields["keeper"][0], fields["id"][0])})
         finally:
             try:

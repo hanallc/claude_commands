@@ -594,11 +594,11 @@ The address retains the owner, producer, view, search, column, and direction.
 A row opens to show its latest status, completion condition, item links, and log.
 The open row does not show Evidence; the record keeps it.
 The log shows its newest entry first.
-Each expanded row has Remove, Park with a date, and a text box with a Tell morty button.
+Each expanded row has Remove, Park with a date, and a text box for Ask question and Tell morty.
 The text box shows “Your words for morty about this item” as its placeholder and accessible name.
-The primary button sits below the box at its right edge, beside the send status.
-The button stays disabled until the box contains words.
-Clearing the box, including after a successful send, disables the button again.
+Ask question and Tell morty sit below the box at its right edge, beside the send status.
+Both buttons stay disabled until the box contains words.
+Clearing the box disables both buttons.
 Record text uses the shared review formatter for bold text, headings, lists, code spans, and links.
 Code spans take priority over links and bold text.
 URLs keep unmatched backticks and interior `*` characters, but a URL never ends with `*`.
@@ -625,6 +625,15 @@ The page shows “sent to morty; update remains unread” and keeps the unread c
 The same notice appears when a newer update remains unread.
 It applies the current filter again, so a read item leaves the Unread view at once.
 Tell morty with empty words changes no record.
+Ask question saves an open question in the item record under the List lock.
+The page uses the question and delivery code shared with Images.
+The server replies to the browser before it sends morty the item number, title, question, and answer command.
+Equal words retry an open question. Different words create a new question.
+An exact request retry uses the same question ID, even after morty answers it.
+The expanded row shows each question and its answer when available.
+Morty runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
+The answer adds one log entry and marks the item unread.
+The command refuses an unknown ID, a second answer, and empty text.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
 Park writes the chosen date through `the_list.park` with the same source.
 Park uses midnight in the user's time zone.
@@ -645,10 +654,12 @@ The page applies the saved state and parking status from the response.
 The page uses the saved date to update one parking label.
 A refusal restores the last state and parking status from the server.
 The page opens the restored row and shows the reason there.
-If the current filters hide the row, the page shows the reason above the table.
+The page keeps a separate failure notice for each row.
+The notice appears above the table while the row or its details hide the inline notice.
 If the connection fails, the page keeps the row in its new view and reports that it cannot confirm the save.
 A new action uses a new request ID, even if the previous response did not arrive.
 The page keeps each unconfirmed request ID for an exact retry, even after another action.
+An HTTP 5xx response to Ask question leaves the request unconfirmed.
 The page discards each request ID when it receives a success or refusal for that request.
 A sent or alerted notice sends no second message.
 The one-off `the_list.py clean-evidence --source morty` command removes migration JSON copies and matching List row blocks from Evidence.
