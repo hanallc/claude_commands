@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.checkpoint_gate import report
 
-from scripts.production import showrunners, session_staff, showrunner_tree, staff, unit_lookup
+from scripts.production import change_routing, delivery_state, showrunners, session_staff, showrunner_tree, staff, unit_lookup
 from scripts.production.proposals_folder import issues_folder
 from scripts.production.store_owner import showrunner_id
 from scripts.production.record_store import state_root
@@ -1632,7 +1632,7 @@ def answer_followup(entry: OutstandingItem, text: str) -> None:
     entry["followups"] = [*entry.get("followups", []), FollowupExchange(followup=pending["text"], reply=text.strip())]
 
 
-def reply_record(record: QuestionRecord, text: str, who: str, *, identities: QuestionStaff) -> None:
+def reply_record(record: QuestionRecord, text: str, who: str, *, identities: QuestionStaff, question_id: str = '') -> None:
     """Answer the exact record under its owner's lock and keep the answer in its log."""
     from scripts.review_links import review_events
     if not text.strip():
@@ -1640,6 +1640,10 @@ def reply_record(record: QuestionRecord, text: str, who: str, *, identities: Que
     scope = question_scope(record.owner, identities.record)
     with outstanding_lock(outstanding_path(scope)):
         current = _question_records([Issue(record.path, frontmatter(record.path))])[0]
+        delivery = change_routing.delivery_path(change_routing.review_root(), current.path, current.path.stem)
+        exchange = change_routing.delivery_slots(delivery).question
+        if question_id or isinstance(exchange, delivery_state.OpenQuestion):
+            _ = delivery_state.question_exchange_for_reply(exchange, question_id, text.strip())
         if current.status != "open" or "followup" not in current.item:
             raise RegistrationFailure("reply", f"{current.item['text']}: no open follow-up waits for a reply")
         answer_followup(current.item, text)
@@ -1663,8 +1667,11 @@ def reply(production: QuestionScope, words: str, text: str, *, identities: Quest
     if len(found) != 1:
         raise RegistrationFailure("reply", f"{len(found)} questions with a follow-up match {wanted!r}; name one by its exact text")
 
-    _ = change_open_question(production, found[0], wanted, identities, "reply", lambda entry: answer_followup(entry, text))
-    report("reply", "ok", f"{found[0]}: {wanted}: back on the open-questions list with the reply")
+    scope = production if found[0] == production.name else question_scope(found[0], identities.record)
+    record = next(record for record in question_records(scope, identities)
+                  if record.status == 'open' and 'followup' in record.item and record.item['text'] == wanted)
+    owner = identities.record.by_id(record.owner)
+    reply_record(record, text, owner.name if owner is not None else str(record.owner), identities=identities)
 
 
 def state_block(production: Production, state: ShowrunnerState, timestamp: str) -> str:
@@ -2014,6 +2021,9 @@ def main() -> int:
         else:
             questions(production, cast(Path | None, args.state))
         return 0
+    except delivery_state.StaleQuestionExchange as error:
+        report(action, "failed", str(error))
+        return 1
     except (staff.StaffRefused, RegistrationFailure, InputError, Refusal, OSError, ValueError, json.JSONDecodeError) as error:
         step = error.step if isinstance(error, RegistrationFailure) else action
         report(step, "failed", str(error).replace("\n", "; "))

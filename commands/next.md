@@ -189,7 +189,7 @@ Run that command when the message arrives.
 Decline records the answer at once: a proposal's declined answer, or an efficiency's `declined` outcome.
 Send feedback sends the words to the owner and closes the item.
 Ask question moves it to Waiting.
-Answer it with `change_page.py answer-question --item <Review key> --text "<answer>"`.
-For a change, include the `--question <id>` from its request message.
+Answer it with `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"`.
+Use the question ID from the request message for all five Review types.
 The item returns to For you with the answer in its log.
 Later takes a date and time and hides the item from Review, the count and `/next` until then.
