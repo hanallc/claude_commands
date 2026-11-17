@@ -4681,3 +4681,30 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - natedev `module_cost.py`: 25.5 to 19.0 CPU s; the test 9.5 to 4.1 CPU s. The module passes 16 of 16 runs.
 - aws pair, 3 rounds: 27.07 to 23.60 CPU s, a saving of 3.47 CPU s; peak memory 149 to 150 MiB; all passed.
 - The largest costs left are `python3 -` helper starts (57, 3.4 CPU s), `fast_track.py` starts (12, 2.0 CPU s) and `pass_record.py` starts (24, 2.6 CPU s), all product starts that the tests check.
+
+### Phase 334 — The deploy command stops waiting gates and never leaves a half state  · status: done
+**Depends on:** Phase 322
+**Owner:** natest writes; builds gave six calls on 11-17 07:55 after nate gave the go for the gate rename deploy.
+
+#### Work Order
+
+**Goal:** a waiting gate cannot make the phase 322 deploy command loop or leave the gate folder moved with old step names.
+
+**Spec:**
+1. After the drain wait, stop each gate that only waits (no cargo child, no reservation, no Mac or AWS claim). Use `hold_enforcer.classify_drain_runs` and `hold_enforcer.stop_waiting_run`: a detached run stops through its run record; a foreground gate stops by its exact pid and start time. Never stop by pattern. Print each stopped run with its owner, record, command and folder.
+2. Before the services stop, check the hold, the waiting callers and the old AWS uploads. A refusal stops the command before any change.
+3. Before the folder move, stop new waiting gates again and check every `rename_step_names.py` refusal condition (`--check full`) and every `move_gate_state.py` condition (`--check`). A process that holds the old folder refuses; it does not wait.
+4. If the move or the conversion fails, move the folder back before recovery starts the services. A saved `moved_folder` field marks the window.
+5. A drain wait probe prints the kept run count and the largest remaining minutes.
+6. The command stays outside the repository (Phase 322).
+
+**Files:** `/tmp/claude/scratch/natest-probe/p89/deploy_gate_rename.py`, `rename_step_names.py`, `move_gate_state.py`, `drain_wait.py`.
+
+**Workers:** none; no-worker mode. The director writes and proves it.
+
+**Acceptance gate:**
+- A dry run against a fixture with one waiting gate completes; the gate stops and its owner prints.
+- A non-gate waiting caller refuses before any service stop or record change.
+- A failure at the move and at the conversion moves the folder back; a rerun completes.
+- A stop after each step and a rerun complete.
+- basedpyright reports 0 errors and 0 warnings on the changed files.
