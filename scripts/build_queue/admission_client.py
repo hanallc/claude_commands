@@ -6,7 +6,8 @@ except FileNotFoundError:
     pass
 
 import argparse
-from contextlib import nullcontext
+from collections.abc import Generator
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -190,6 +191,15 @@ def request_placement(request: wire.PlacementRequest
     if isinstance(reply, (wire.Assignment, wire.LocalPlacementGranted, wire.PlacementWait, wire.DispatchStatus)):
         return reply
     raise wire.AdmissionUnavailable("invalid placement answer")
+
+
+def acquire_placement(request: wire.PlacementRequest
+                      ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | LeftQueue:
+    """Return cancellation as an outcome for callers outside the command parser."""
+    try:
+        return request_placement(request)
+    except _QueueLeft:
+        return LeftQueue()
 
 
 def report_prerequisite(request: wire.PrerequisiteReport) -> wire.Ok:
@@ -379,6 +389,18 @@ class AcquisitionRetry:
 
 
 _ACQUISITION_RETRY: ContextVar[AcquisitionRetry | None] = ContextVar("acquisition_retry", default=None)
+
+
+@contextmanager
+def placement_acquisition() -> Generator[None]:
+    """Preserve one leave schedule across placement replies and estimate requests."""
+    token = _ACQUISITION_RETRY.set(AcquisitionRetry(float("inf")))
+    try:
+        yield
+    except _QueueUnreachable as error:
+        raise wire.AdmissionUnavailable(str(error)) from error
+    finally:
+        _ACQUISITION_RETRY.reset(token)
 
 
 def _no_attempt_hook() -> None:
@@ -1081,6 +1103,8 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
     from scripts.build_queue import step_estimator, admission_records as records
     from scripts.buildlog import store
 
+    if isinstance(run, wire.NoRun):
+        run = parse_run_identity(os.environ.get("BUILDLOG_RUN", ""))
     if isinstance(profile, InferProfileAtUse):
         profile = records.INFER_FROM_ARGV
     config = records.read_memory_config()
@@ -1218,6 +1242,7 @@ class ClientArguments(argparse.Namespace):
     once: bool = False
     reason: str = ""
     status: int = 0
+    request_file: Path | None = None
 
 
 def _place_step(args: ClientArguments, output: WaitOutput) -> int:
@@ -1314,6 +1339,9 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                 if args.parent_episode else placement.NormalStep(),
             route=target_config.step_route(local=args.local_only, mac_only=args.mac_only, target=args.target,
                                            writes_tree=args.writes_tree, local_reason=args.local_reason))
+        if args.request_file is not None:
+            write_text_atomic(args.request_file, wire.encode_request(request), new_file_mode=0o600)
+            return 0
         if already_queued:
             _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex, episode, owner, prerequisite))
         while True:
@@ -1401,6 +1429,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = placement_parser.add_argument("--call-started", type=float, default=0.0)
     _ = placement_parser.add_argument("--assignment-file", type=Path, required=True)
     _ = placement_parser.add_argument("--shell-state", type=Path)
+    _ = placement_parser.add_argument("--request-file", type=Path)
     _ = placement_parser.add_argument("--token", choices=(*TOKEN_REQUIRED_CHOICES, "held", "none"), default="none")
     _ = placement_parser.add_argument("--writes-tree", action="store_true")
     _ = placement_parser.add_argument("--local-only", action="store_true")

@@ -69,6 +69,27 @@ class OtherCommand:
 OTHER_COMMAND = OtherCommand()
 
 
+@dataclass(frozen=True)
+class VerifyCommand:
+    """The arguments that verify.sh reads for this command."""
+
+    arguments: tuple[str, ...]
+
+
+def verify_command(argv: Sequence[str]) -> VerifyCommand | OtherCommand:
+    """Read verify arguments through the same interpreter rules as command_job."""
+    program = _program(argv)
+    if isinstance(program, OtherCommand) or program[0] != "verify.sh":
+        return OTHER_COMMAND
+    return VerifyCommand(tuple(program[1]))
+
+
+def command_program(argv: Sequence[str]) -> str:
+    """Name the script after interpreter arguments."""
+    program = _program(argv)
+    return "" if isinstance(program, OtherCommand) else program[0]
+
+
 def _option(arguments: Sequence[str], name: str) -> str:
     for index, argument in enumerate(arguments):
         if argument == name and index + 1 < len(arguments):
