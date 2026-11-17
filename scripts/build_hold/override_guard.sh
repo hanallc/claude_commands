@@ -3,6 +3,19 @@
 # bash 5.3.9, 2026-10-12).
 BUILD_OVERRIDE_VARIABLES="ADMISSION_SOCKET CONF_DIR BUILD_HOLD_DIR BUILD_HOLD_RELEASE_DIR MAC_TEST_STATE_DIR MAC_TEST_CONFIG BUILD_TARGETS_SCRIPT BUILD_TARGETS_CONFIG BUILD_TARGETS_NOW"
 
+# build_helper_root <caller file>
+build_helper_root() {
+    local file="$1" name IFS=$' \t\n'
+    for name in $BUILD_OVERRIDE_VARIABLES; do
+        if [[ -n "${!name+x}" ]]; then
+            [[ "$file" == */* ]] || file="./$file"
+            (cd -- "${file%/*}/.." && pwd -P)
+            return
+        fi
+    done
+    printf '%s\n' "$HOME/.claude/scripts"
+}
+
 # build_override_refusal <file> <its path under scripts/> [<user home>]
 build_override_refusal() {
     local file="$1" relative="$2" user_home="${3:-}" name found="" IFS=$' \t\n'

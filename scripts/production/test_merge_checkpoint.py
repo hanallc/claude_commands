@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import copy_helpers
+
 from scripts.production import checkpoint_gate
 
 from scripts.agents import remote
@@ -115,8 +117,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         config = self.root / "staff.conf"
         _ = config.write_text((checkout / "config/staff.conf").read_text())
         self.env.update({"WORKTREES_STATE_DIR": str(records), "STAFF_CONFIG": str(config)})
-        library = Path(self.env["HOME"]) / ".claude/scripts/lib"
-        library.symlink_to(checkout / "scripts/lib", target_is_directory=True)
+        _ = copy_helpers(Path(self.env["HOME"]))
         _ = self.git("remote", "set-head", "origin", "production")
         checkpoint = self.checkpoint()
         trees = {"landed-work": self.root / "landed-work", "dirty-work": self.root / "dirty-work"}

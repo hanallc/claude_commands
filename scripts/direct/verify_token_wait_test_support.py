@@ -1,6 +1,8 @@
 """Independent tools, state and process cleanup for verify token tests."""
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
 from scripts.build_queue import admission_records
 
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
@@ -94,7 +96,7 @@ class VerifyTokenWaitFixture(unittest.TestCase):
             "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         home = self.root / "home"
         home.mkdir()
-        (home / ".claude").symlink_to(VERIFY.parent.parent.parent, target_is_directory=True)
+        _ = copy_helpers(home, *VERIFY_HELPERS)
         stubs = self.root / "stubs"
         stubs.mkdir()
         cargo = stubs / "cargo"
@@ -374,7 +376,9 @@ esac
                 if (record := cast(Record, json.loads(line))).get("kind") == "call"]
 
     def verify(self, environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+        script = (Path(environment["HOME"]) / ".claude/scripts/direct/verify.sh"
+                  if environment["HOME"] != self.environment["HOME"] else VERIFY)
+        return subprocess.run(["bash", str(script), "check", "sample"], cwd=self.root,
                               env=environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def wait_for_running(self, path: Path, process: subprocess.Popen[str] | subprocess.Popen[bytes]) -> None:
@@ -559,7 +563,7 @@ exit "$status"
         return process
 
     def start_check(self, environment: dict[str, str]) -> subprocess.Popen[str]:
-        process = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root, env=environment,
+        process = subprocess.Popen(["bash", str(Path(environment["HOME"]) / ".claude/scripts/direct/verify.sh"), "check", "sample"], cwd=self.root, env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                    start_new_session=True)
         self.started_groups.add(process.pid)

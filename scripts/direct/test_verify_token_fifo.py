@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import subprocess
 import unittest
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, BOARD
 from scripts.lib.test_hang_guard import FixtureHang, TEST_HANG_GUARD_SECS
 
@@ -58,12 +60,7 @@ class VerifyTokenFifoTests(VerifyTokenWaitFixture):
         home = self.root / "busy-home"
         direct_dir = home / ".claude/scripts/direct"
         direct_dir.mkdir(parents=True)
-        for source in VERIFY.parent.parent.iterdir():
-            if source.name != "direct":
-                (direct_dir.parent / source.name).symlink_to(source, target_is_directory=source.is_dir())
-        for source in VERIFY.parent.iterdir():
-            if source.name != "board.sh":
-                (direct_dir / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        _ = copy_helpers(home, *VERIFY_HELPERS)
         _ = (direct_dir / "board.sh").write_text('''#!/bin/bash
 if [[ "$1" == acquire ]]; then
     count=$(( $(cat "$TEST_ACQUIRES" 2>/dev/null || echo 0) + 1 ))

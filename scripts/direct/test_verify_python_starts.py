@@ -84,7 +84,8 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         _ = fix_return.write_text("# places the lint copy\n")
         harness = self.root / "code-key.sh"
         _ = harness.write_text("\n".join(shell_function(VERIFY.read_text(), name) for name in ("hash_stream", "lint_code_files", "lint_code_key")))
-        environment = {**self.environment, "HOME": str(home), "LINT_CONFIG_FILE": str(self.config),
+        environment = {**self.environment, "HOME": str(home), "BUILD_HELPER_ROOT": str(home / ".claude/scripts"),
+                       "LINT_CONFIG_FILE": str(self.config),
                        "FIX_RETURN_SCRIPT": str(fix_return), "PY": str(self.root / "python-must-not-start")}
         bash = shutil.which("bash")
         assert bash is not None
@@ -208,7 +209,8 @@ printf '%s\\n' "$VERDICT_KEY" "$VERDICT_TREE_KEY"
             "PY": sys.executable, "TEST_METADATA": json.dumps(self.metadata),
             "TREE_WATCH_SCRIPT": str(VERIFY.with_name("tree_watch.py")),
             "CACHE_DIR": str(session / "cache"), "LINT_CONFIG_FILE": str(session / "lint.conf"),
-            "HOME": str(self.root), "FILTER_RUN": "0", "HOLD_WAIT_DIR": str(session),
+            "HOME": str(self.root), "BUILD_HELPER_ROOT": str(self.root / ".claude/scripts"),
+            "FILTER_RUN": "0", "HOLD_WAIT_DIR": str(session),
         })
 
     def assert_pair(self, *words: str) -> None:

@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from typing import cast
 from unittest.mock import patch
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
-from scripts.build_queue.admission_test_support import install_private_admission_helpers
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.lib import test_hang_guard
 
@@ -403,7 +402,6 @@ buildlog_sample_anon "$1" "$2" "$$"
     def test_sampler_exits_when_its_parent_shell_dies(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            install_private_admission_helpers(root)
             shell: subprocess.Popen[str] = subprocess.Popen(
                 ["bash", "-c", 'source "$1"; parent=$BASHPID; buildlog_sample_anon "$2" "$3" "$parent" & printf "%s\\n" "$!"; wait',
                  "sampler-test", str(INVOKE), str(root / "scope.cgroup"), str(root / "maximum")],
@@ -454,7 +452,6 @@ buildlog_sample_anon "$1" "$2" "$$"
     def test_unreserved_scoped_step_removes_cgroup_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            install_private_admission_helpers(root)
             scope = root / "fake-cgroup"
             scope.mkdir()
             _ = (scope / "memory.peak").write_text("123\n")
@@ -511,7 +508,6 @@ class SweepStartupTests(unittest.TestCase):
     def sweep_run(self, switch: str, systemd_cat: str = JOURNAL_WRITER) -> SweepRun:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            install_private_admission_helpers(root)
             tools = root / "bin"
             tools.mkdir()
             journal = root / "journal.txt"
@@ -526,6 +522,7 @@ class SweepStartupTests(unittest.TestCase):
                 cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 pass_fds=(writer,),
                 env={**os.environ, "HOME": directory, "TMPDIR": directory,
+                     "BUILD_HOLD_DIR": str(root / "holders"),
                      "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
                      "XDG_RUNTIME_DIR": str(root / "runtime"), "LINT_INVOKE_SOURCED": "",
                      "LINT_CONFIG_READER": str(root / "missing-config"), "LINT_SKIP_SWEEP": switch,
@@ -662,7 +659,6 @@ sweep_after_step() { :; }
         environment: dict[str, str] | None = None, cwd: Path | None = None,
         terminal: bool = False,
     ) -> subprocess.CompletedProcess[str]:
-        install_private_admission_helpers(root)
         command = ["bash", "-c", 'set -euo pipefail; source "$1"; shift; ' + shell,
                    "admission-test", str(INVOKE), *arguments]
         isolated = {**os.environ,

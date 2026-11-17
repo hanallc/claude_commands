@@ -10,6 +10,8 @@ import subprocess
 from typing import override
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import copy_helpers
+
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import herdr_types
 from scripts.production import staff, unit_config, unit_command
@@ -403,9 +405,7 @@ class UnitCommandTests(StaffTestCase):
             "unavailable: duplicate live panes: first (herdr:agents:w1:p1), second (herdr:agents:w1:p2)"))
 
     def test_the_executable_entry_forwards_the_id_and_failure_status(self) -> None:
-        shim = Path.home() / ".claude/scripts/lib/py"
-        shim.parent.mkdir(parents=True, exist_ok=True)
-        shim.symlink_to(CHECKOUT / "scripts/lib/py")
+        _ = copy_helpers(Path.home())
         completed = subprocess.run(
             [str(CHECKOUT / "scripts/production/unit"), "missing-entry-id"],
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)

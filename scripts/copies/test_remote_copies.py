@@ -20,6 +20,8 @@ from typing import cast, final, override
 import unittest
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+
 from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.lib.build_slots_test_support import private_slot_config
@@ -685,9 +687,7 @@ class RemoteCopiesTests(unittest.TestCase):
             self.assertEqual(scan.call_count, 1)
 
     def probe_command(self) -> subprocess.CompletedProcess[str]:
-        scripts = self.root / ".claude/scripts"
-        scripts.parent.mkdir(exist_ok=True)
-        scripts.symlink_to(Path(__file__).resolve().parents[1], target_is_directory=True)
+        _ = copy_helpers(self.root, *COPY_HELPERS)
         tools = self.root / "probe-tools"
         tools.mkdir()
         log = self.root / "probe-calls"

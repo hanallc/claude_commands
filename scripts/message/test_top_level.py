@@ -114,13 +114,12 @@ class TopLevelTests(unittest.TestCase):
 
         def record(command: list[str], **_options: object) -> subprocess.CompletedProcess[bytes]:
             self.assertEqual(Path(command[1]).name, "build_hold.py")
-            self.assertEqual(Path(command[1]), self.folder / ".claude/scripts/build_hold/build_hold.py")
+            self.assertEqual(Path(command[1]), Path(top_level.__file__).resolve().parents[1] / "build_hold/build_hold.py")
             self.assertEqual(command[2], "record-recipient")
             recorded.append((command[command.index("--name") + 1], command[command.index("--session-id") + 1]))
             return subprocess.CompletedProcess(command, record_exit, b"", b"")
 
         with (mock.patch.object(subprocess, "run", new=record),
-              mock.patch.object(top_level, "user_home", return_value=self.folder),
               redirect_stdout(output), redirect_stderr(errors)):
             result = top_level.main(list(argv))
         return result, output.getvalue().splitlines(), errors.getvalue().splitlines(), recorded

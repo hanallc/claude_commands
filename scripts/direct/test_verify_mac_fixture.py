@@ -21,6 +21,26 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, FixtureHang
 
 @final
 class VerifyMacFixtureTests(VerifyMacOffloadFixture):
+    def test_condition_can_become_true_between_its_check_and_process_exit(self) -> None:
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read(1)"],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True) as process:
+            first = True
+
+            def ended() -> bool:
+                nonlocal first
+                if first:
+                    first = False
+                    assert process.stdin is not None
+                    _ = process.stdin.write("x")
+                    process.stdin.flush()
+                    _ = process.wait(timeout=1)
+                    return False
+                return process.poll() is not None
+
+            self.wait_until(ended, "the child exit", (process,))
+            self.assertEqual(process.returncode, 0)
+
     def test_targets_wrapper_interrupted_publication_keeps_complete_state(self) -> None:
         arguments = ["--leave-hook", "hook with spaces \N{SNOWMAN}"]
         publications = (

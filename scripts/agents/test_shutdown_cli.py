@@ -25,7 +25,6 @@ from typing import ClassVar, cast, final, override
 from unittest import mock
 
 from scripts.accounts import accounts
-from scripts.build_hold import override_guard
 from scripts.lib.state_home_test_support import isolate_state_home
 from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
@@ -761,7 +760,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         call = [Path(argv[1]).name, *argv[2:]] if argv[0] == sys.executable else argv
         self.calls.append(call)
         if call[:2] == ["build_hold.py", "release"]:
-            self.assertEqual(Path(argv[1]), override_guard.user_home() / ".claude/scripts/build_hold/build_hold.py")
+            self.assertEqual(Path(argv[1]), Path(shutdown.__file__).resolve().parents[1] / "build_hold/build_hold.py")
             (Path(os.environ["BUILD_HOLD_DIR"]) / call[call.index("--holder") + 1]).unlink(missing_ok=True)
         stdout = ""
         return subprocess.CompletedProcess(argv, 0, stdout, "")

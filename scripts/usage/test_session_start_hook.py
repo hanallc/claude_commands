@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.lib.helper_tree_test_support import copy_helpers
+
 from scripts.usage import agents_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -70,7 +72,8 @@ class SessionStartHookTests(unittest.TestCase):
         home = self.root / "hook-home"
         if not home.exists():
             home.mkdir()
-            (home / ".claude").symlink_to(REPOSITORY, target_is_directory=True)
+            _ = copy_helpers(home, "scripts/usage", "scripts/production", "scripts/agents",
+                             "scripts/herdr", "scripts/message", "scripts/hooks")
         working_directory = self.root / "unrelated-working-directory"
         working_directory.mkdir(exist_ok=True)
         environment = os.environ.copy()

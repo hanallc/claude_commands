@@ -6,8 +6,11 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import textwrap
 import unittest
 from typing import cast, override
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, caller_provider_controls
 from scripts.build_queue import placement
 from scripts.build_queue import admission_protocol as wire
@@ -81,24 +84,16 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
         self.addCleanup(self.clean_fixture)
         scripts = self.fixture.home / ".claude/scripts"
         lint = scripts / "lint"
-        lint.unlink()
-        lint.mkdir()
-        source = offload_tests.VERIFY.parent.parent / "lint"
-        for path in source.iterdir():
-            target = lint / path.name
-            if path.name in {"invoke.sh", "memory_gate.sh"}:
-                _ = shutil.copyfile(path, target)
-            else:
-                target.symlink_to(path, target_is_directory=path.is_dir())
+        _ = copy_helpers(self.fixture.home, *VERIFY_HELPERS)
         queue = scripts / "build_queue"
-        queue.unlink()
-        queue.mkdir()
-        for path in (source.parent / "build_queue").iterdir():
-            if path.name != "queue_place.py":
-                (queue / path.name).symlink_to(path, target_is_directory=path.is_dir())
         self.memory = queue / "queue_place.py"
         self.restore_client()
         self.invoke = lint / "invoke.sh"
+        # Keep the early temporary-folder setup outside the library failure under test.
+        prepare = 'source "$VERIFY_INVOKE_DIR/../lint/invoke.sh" --prepare-temp'
+        copied = self.fixture.verify_script.read_text()
+        original = offload_tests.VERIFY.parent.parent / "lint/invoke.sh"
+        _ = self.fixture.verify_script.write_text(copied.replace(prepare, f'source "{original}" --prepare-temp'))
         self.targets = self.fixture.root / "check.py"
         _ = self.targets.write_text(CHECK_STUB)
         holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
@@ -209,11 +204,7 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
 
     def test_installed_hold_helper_and_explicit_override_both_route_the_step(self) -> None:
         directory = self.fixture.home / ".claude/scripts/build_targets"
-        directory.unlink()
-        directory.mkdir()
-        for source in (offload_tests.VERIFY.parent.parent / "build_targets").iterdir():
-            if source.name != "build_targets.py":
-                (directory / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        _ = copy_helpers(self.fixture.home, *VERIFY_HELPERS)
         installed = directory / "build_targets.py"
         calls = self.fixture.root / "helper-calls.jsonl"
         recording = ("import json, sys\nfrom pathlib import Path\n"
@@ -223,7 +214,11 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
             with self.subTest(entry=entry, override=override):
                 self.reset_observations()
                 calls.unlink(missing_ok=True)
-                _ = installed.write_text(recording + CHECK_STUB)
+                library = (offload_tests.VERIFY.parent.parent / "build_targets/build_targets.py").read_text()
+                library = library.partition('\nif __name__ == "__main__":')[0]
+                command = "\ndef main():\n" + textwrap.indent(recording + CHECK_STUB, "    ")
+                command += '\nif __name__ == "__main__":\n    main()\n'
+                _ = installed.write_text(library + command)
                 _ = self.targets.write_text(recording + CHECK_STUB)
                 if override:
                     self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(self.targets)

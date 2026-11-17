@@ -551,6 +551,7 @@ BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
 source "$BUILD_OVERRIDE_GUARD_DIR/../build_hold/override_guard.sh" || exit 2
 build_override_refusal "${BASH_SOURCE[0]}" direct/verify.sh || exit 2
+BUILD_HELPER_ROOT="$(build_helper_root "${BASH_SOURCE[0]}")" || exit 2
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
@@ -671,7 +672,7 @@ FIX_RETURN_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../mac_test/fix
 # on, in addition to the tree. A change to one of them makes the record stale.
 # fix_return.py places the lint copy, and that place can decide whether lint passes.
 lint_code_files() {
-    LINT_CODE_FILES=("${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" "${FIX_RETURN_SCRIPT:-}"
+    LINT_CODE_FILES=("${BASH_SOURCE[0]}" "$BUILD_HELPER_ROOT/lint/invoke.sh" "${FIX_RETURN_SCRIPT:-}"
         "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}")
 }
 
@@ -700,15 +701,15 @@ LINT_LOADED_CODE_KEY="$(lint_code_key)"
 # The single bottom layer: run(), lint.conf gating, fmt_cargo, run_nextest,
 # invoke_clippy_fix, invoke_clippy, and sandbox-failure detection come from here.
 # shellcheck source=/dev/null
-source "$HOME/.claude/scripts/lint/invoke.sh" || {
+source "$BUILD_HELPER_ROOT/lint/invoke.sh" || {
     printf 'verify.sh: cannot load admission and hold checks; step refused\n' >&2
     exit 2
 }
 # The queue selects the host before the local hold check.
 LINT_QUEUE_PLACEMENT=1
-BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$HOME/.claude/scripts/build_targets/build_targets.py}"
-LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$HOME/.claude/scripts/direct/local_release_wait.py}"
-STEP_RECORD_SCRIPT="$HOME/.claude/scripts/direct/step_record.py"
+BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$BUILD_HELPER_ROOT/build_targets/build_targets.py}"
+LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$BUILD_HELPER_ROOT/direct/local_release_wait.py}"
+STEP_RECORD_SCRIPT="$BUILD_HELPER_ROOT/direct/step_record.py"
 FINAL_PASS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/final_pass.py"
 VERIFY_METADATA_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify_metadata.py"
 FINAL_PASS_START=""
@@ -1418,7 +1419,7 @@ esac
 # Exit 4 refuses the run at its live-run limit; never run that command attached.
 # The detached run sets UNIT_DETACHED_RUN, so it does not detach again.
 # A build call with --attached does not detach: its caller reads the binary line inline.
-DETACHED_RUNS_SCRIPT="${VERIFY_DETACHED_RUNS_SCRIPT:-$HOME/.claude/scripts/agents/detached_runs.py}"
+DETACHED_RUNS_SCRIPT="${VERIFY_DETACHED_RUNS_SCRIPT:-$BUILD_HELPER_ROOT/agents/detached_runs.py}"
 verify_helper --start
 if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" && " ${*:2} " != *" --attached "* ]]; then
     VERIFY_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -2056,8 +2057,8 @@ note_event() {
         </dev/null >/dev/null 2>&1 || true
 }
 
-MAC_RUNNER="${VERIFY_MAC_RUNNER:-$HOME/.claude/scripts/mac_test/offload.py}"
-MAC_TEST_SCRIPT="${VERIFY_MAC_TEST_SCRIPT:-$HOME/.claude/scripts/mac_test/mac_test.py}"
+MAC_RUNNER="${VERIFY_MAC_RUNNER:-$BUILD_HELPER_ROOT/mac_test/offload.py}"
+MAC_TEST_SCRIPT="${VERIFY_MAC_TEST_SCRIPT:-$BUILD_HELPER_ROOT/mac_test/mac_test.py}"
 export BUILDLOG_MAC_IDLE_HOOK=""
 MAC_COPY_WATCH="${VERIFY_MAC_COPY_WATCH:-$(dirname "$MAC_RUNNER")/copy_watch.py}"
 COPY_WATCH_PID=""
@@ -3213,7 +3214,7 @@ trap - INT TERM HUP
 # while it runs verification itself: an activity, not a pass, so findings.py
 # never counts it toward convergence. The launcher-owns-its-own-pass
 # rule applies here too — the thing that runs the work opens the window.
-PROGRESS_HISTORY="${HOME}/.claude/scripts/direct/progress_history.py"
+PROGRESS_HISTORY="${BUILD_HELPER_ROOT}/direct/progress_history.py"
 ACTIVITY_SESSION_DIR="${UNIT_SESSION_DIR:-}"
 
 # A phase runs two workers against one target/ directory and one Cargo lock,
@@ -3225,7 +3226,7 @@ ACTIVITY_SESSION_DIR="${UNIT_SESSION_DIR:-}"
 # UNIT_RUN_DIR is deliberately not UNIT_SESSION_DIR: that
 # variable also opens a progress activity window, and concurrent windows
 # would collide in a recorder that keeps one.
-BOARD_HELPER="${HOME}/.claude/scripts/direct/board.sh"
+BOARD_HELPER="${BUILD_HELPER_ROOT}/direct/board.sh"
 BOARD_DIR="${UNIT_RUN_DIR:-}"
 BOARD_SLOT="${UNIT_TEAM_ROLE:-}"
 # The unit director's own run (a session dir, no board, no team role) takes the

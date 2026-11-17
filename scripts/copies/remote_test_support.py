@@ -16,6 +16,8 @@ from types import SimpleNamespace
 from typing import cast, final
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+
 from scripts.copies.copies_test_support import copies_environment
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.mac_test import floor_claims
@@ -107,9 +109,7 @@ def local_remote_transport(root: Path) -> Generator[None]:
     repository = Path(__file__).resolve().parents[2]
     tools = root / "remote-tools"
     tools.mkdir(exist_ok=True)
-    scripts = root / ".claude/scripts"
-    scripts.parent.mkdir(exist_ok=True)
-    scripts.symlink_to(repository / "scripts", target_is_directory=True)
+    _ = copy_helpers(root, *COPY_HELPERS)
     ssh = tools / "ssh"
     _ = ssh.write_text(f"#!{sys.executable}\n" + '''import os, sys
 environment = dict(os.environ)

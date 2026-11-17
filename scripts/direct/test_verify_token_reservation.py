@@ -1,6 +1,8 @@
 """Real verify.sh token reservation behavior."""
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
 from scripts.build_queue import admission_records
 
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
@@ -111,12 +113,7 @@ trap probe_local_attempt DEBUG
         home = self.root / "busy-home"
         delegate = home / ".claude/scripts/direct"
         delegate.mkdir(parents=True)
-        for source in VERIFY.parent.parent.iterdir():
-            if source.name != "direct":
-                (delegate.parent / source.name).symlink_to(source, target_is_directory=source.is_dir())
-        for source in VERIFY.parent.iterdir():
-            if source.name != "board.sh":
-                (delegate / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        _ = copy_helpers(home, *VERIFY_HELPERS)
         _ = (delegate / "board.sh").write_text(
             '#!/bin/bash\n'
             + 'if [[ "$1" == acquire ]]; then printf "token\\n" >> "$TEST_SLEEP_LOG"; fi\n'

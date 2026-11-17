@@ -1073,22 +1073,6 @@ def caller_provider_controls(test: unittest.TestCase, fixture: AdmissionFixture)
     return controls
 
 
-def install_private_admission_helpers(home: Path) -> None:
-    """Install helper paths for a caller that uses a private home."""
-    scripts = home / ".claude/scripts"
-    scripts.mkdir(parents=True, exist_ok=True)
-    source = Path(__file__).resolve().parents[1]
-    for name in ("lint", "build_hold", "build_queue", "build_targets"):
-        destination = scripts / name
-        if not destination.exists() and not destination.is_symlink():
-            destination.symlink_to(source / name, target_is_directory=True)
-    library = scripts / "lib"
-    library.mkdir(exist_ok=True)
-    launcher = library / "py"
-    if not launcher.exists() and not launcher.is_symlink():
-        launcher.symlink_to(source / "lib/py")
-
-
 def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str, str],
                      *, skip_idle_spacing: bool = True) -> AdmissionFixture:
     """Use the one server for existing caller fixtures and their child processes."""
@@ -1110,10 +1094,6 @@ def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str,
             key, fixture.clock.now(), "the caller fixture has no provider transport")
 
     fixture.server.host_probe = provider
-    home = Path.home()
-    install_private_admission_helpers(home)
-    if "HOME" in environment and Path(environment["HOME"]) != home:
-        install_private_admission_helpers(Path(environment["HOME"]))
     _ = environment.setdefault("LINT_CONFIG_READER", os.environ["LINT_CONFIG_READER"])
     for key in ("XDG_CACHE_HOME", "USER_ZONE", "ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
                 "BUILDLOG_MEMORY_PRESSURE", "BUILDLOG_BUILDS_CGROUP", "BUILDLOG_CI_CGROUP", "BUILDLOG_LIVE_MEMORY_TRIPWIRE"):

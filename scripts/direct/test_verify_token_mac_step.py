@@ -7,6 +7,8 @@ from pathlib import Path
 import subprocess
 import unittest
 
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
 from scripts.build_queue import admission_client, admission_protocol as wire, placement
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -36,11 +38,7 @@ class VerifyTokenMacStepTests(VerifyMacOffloadFixture):
             'lint_config_enabled() { [[ "$1" == mend || "$1" == fmt ]]; }\n'
             + 'lint_config_skip_notice() { :; }\n')
         direct = self.home / ".claude/scripts/direct"
-        direct.unlink()
-        direct.mkdir()
-        for source in VERIFY.parent.iterdir():
-            if source.name != "board.sh":
-                (direct / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        _ = copy_helpers(self.home, *VERIFY_HELPERS)
         observer = self.root / "observe-local-token.py"
         _ = observer.write_text('''
 import os

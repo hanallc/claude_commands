@@ -18,6 +18,8 @@ from unittest.mock import patch
 from uuid import uuid4
 
 
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 
 
@@ -81,9 +83,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="worktree-lifecycle-")))
         self.home = self.root / "home"
         self.home.mkdir()
-        scripts = self.home / ".claude/scripts"
-        scripts.parent.mkdir()
-        scripts.symlink_to(CHECKOUT / "scripts", target_is_directory=True)
+        _ = copy_helpers(self.home, *COPY_HELPERS, "scripts/worktree", "config")
         self.origin = self.root / "origin.git"
         self.repository = self.root / "clone"
         self.merge_tree = self.root / "integration"

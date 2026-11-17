@@ -4,7 +4,6 @@ from __future__ import annotations
 import fcntl
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -12,6 +11,8 @@ from threading import Event
 import time
 import unittest
 from unittest import mock
+
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
 from scripts.direct import verify_lint_scope_test_support as lint_support
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
@@ -395,20 +396,7 @@ class LintInputIdentityTests(VerifyLintCacheFixture):
 
     def private_scripts(self) -> tuple[Path, Path]:
         scripts = Path(self.environment["HOME"]) / ".claude" / "scripts"
-        scripts.unlink()
-        scripts.mkdir()
-        for entry in SCRIPTS.iterdir():
-            target = scripts / entry.name
-            if entry.name in ("direct", "lint"):
-                target.mkdir()
-                for child in entry.iterdir():
-                    destination = target / child.name
-                    if child.name in ("verify.sh", "invoke.sh"):
-                        _ = shutil.copy2(child, destination)
-                    else:
-                        destination.symlink_to(child, target_is_directory=child.is_dir())
-            else:
-                target.symlink_to(entry, target_is_directory=entry.is_dir())
+        _ = copy_helpers(Path(self.environment["HOME"]), *VERIFY_HELPERS)
         return scripts / "direct" / "verify.sh", scripts / "lint" / "invoke.sh"
 
     def test_script_edits_during_lint_add_no_fix_pass_or_tree_change_notice(self) -> None:
@@ -488,6 +476,7 @@ class LintKeyInputTests(unittest.TestCase):
 verify_helper() { printf '%s\0' "$@"; }
 CMD=lint ARGS=(sample) FILTER_RUN=0 CACHE_DIR=cache GATE_METADATA={} VERIFY_USER_ENVIRONMENT=()
 TREE_WATCH_SCRIPT=tree_watch.py FIX_RETURN_SCRIPT=fix_return.py
+BUILD_HELPER_ROOT=$HOME/.claude/scripts
 tree_key --with-tree-content
 ''')
             result = subprocess.run(["bash", "-e", str(script)], cwd=root, text=True, capture_output=True,

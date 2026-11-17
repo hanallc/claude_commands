@@ -48,9 +48,12 @@ Hold status reads records without a lock or a mutation capability.
 The hold stop guards the real process root and hold, release, and enforcer directories before any signal or record write.
 The stop still targets the command group and preserves supervisor result delivery.
 
-Shell callers use the installed admission, hold, target, release wait, and detached run helpers.
-Existing test overrides remain available.
-Top-level recipient registration and unit retirement use the installed hold writer.
+`override_guard.helper_root()` and `build_helper_root()` select the helpers for Python and shell callers.
+A caller with any `OVERRIDE_VARIABLES` name set uses the helpers beside its own file.
+An empty override value also selects those helpers.
+Other callers use `$HOME/.claude/scripts`.
+This rule covers admission, hold, target, release wait, detached run, recipient registration, and unit retirement helpers.
+Test fixtures create no helper links in the real home.
 `merge_gate.py` already runs from the installed copy; its hold reader remains unchanged.
 
 Service waiters retain `repository_name` separately from `step`.

@@ -23,6 +23,9 @@ fi
 [[ "${1:-}" == --prepare-temp ]] && return 0
 LINT_INVOKE_SOURCED=1
 
+source "${BASH_SOURCE[0]%/*}/../build_hold/override_guard.sh" || return 2
+BUILD_HELPER_ROOT="$(build_helper_root "${BASH_SOURCE[0]}")" || return 2
+
 # macOS sandboxes cannot nest. A dependency whose build script shells out to
 # Swift Package Manager — apple-cf, apple-metal, screencapturekit, anything
 # wrapping a macOS framework — makes SwiftPM call sandbox-exec, which fails
@@ -33,7 +36,7 @@ SANDBOX_SIGNATURE='sandbox_apply: Operation not permitted'
 
 # Lint policy. Missing reader means every check runs — a caller must never be
 # silently under-verified because a config script moved.
-LINT_CONFIG_READER="${LINT_CONFIG_READER:-$HOME/.claude/scripts/lint/lint_config.sh}"
+LINT_CONFIG_READER="${LINT_CONFIG_READER:-$BUILD_HELPER_ROOT/lint/lint_config.sh}"
 if [[ -f "$LINT_CONFIG_READER" ]]; then
     # shellcheck source=/dev/null
     source "$LINT_CONFIG_READER"
@@ -101,10 +104,10 @@ fi
 # option), and run() runs it plainly.
 # The scope sets oom_score_adj from lint.conf, so earlyoom kills build steps before
 # CI (100) and sessions (200), the largest first.
-BUILDLOG_RECORD="$HOME/.claude/scripts/buildlog/record.py"
+BUILDLOG_RECORD="$BUILD_HELPER_ROOT/buildlog/record.py"
 BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; printf "%s\n" "$cgroup" > "$0.cgroup"; { echo @BUILD_OOM_SCORE_ADJ@ > /proc/self/oom_score_adj; } 2>/dev/null || true; "$@"; s=$?; cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true; cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
 BUILDLOG_SCOPE_SH="${BUILDLOG_SCOPE_SH//@BUILD_OOM_SCORE_ADJ@/$BUILD_OOM_SCORE_ADJ}"
-source "$HOME/.claude/scripts/lint/memory_gate.sh" || {
+source "$BUILD_HELPER_ROOT/lint/memory_gate.sh" || {
     printf 'invoke.sh: cannot load admission and hold checks; step refused\n' >&2
     return 2
 }
@@ -120,7 +123,7 @@ buildlog_now() {
 
 buildlog_read_context() {
     local context known_folder="${BUILD_TARGET_DIR:-${BUILDLOG_TEST_TARGET_DIR:-}}"
-    context="$(BUILDLOG_KNOWN_TARGET_DIR="$known_folder" "$HOME/.claude/scripts/lib/py" "${BUILDLOG_RECORD%/*}/step_context.py" step-context ${1+"$@"} <<< "${GATE_METADATA:-}" 2>/dev/null)" || context=$'\n'
+    context="$(BUILDLOG_KNOWN_TARGET_DIR="$known_folder" "$BUILD_HELPER_ROOT/lib/py" "${BUILDLOG_RECORD%/*}/step_context.py" step-context ${1+"$@"} <<< "${GATE_METADATA:-}" 2>/dev/null)" || context=$'\n'
     BUILDLOG_TREE="${context%%$'\n'*}"
     BUILDLOG_TARGET_FOLDER="${context#*$'\n'}"
 }
@@ -172,7 +175,7 @@ buildlog_exec() {
 buildlog_write_step() {
     BUILDLOG_TARGET_FOLDER="${BUILDLOG_TARGET_FOLDER:-}" BUILDLOG_TEST_PHASE_FILE="${BUILDLOG_TEST_PHASE_FILE:-}" \
         BUILDLOG_TREE_START="${BUILDLOG_TREE:-}" BUILDLOG_MEM_WAIT_S="${BUILDLOG_MEM_WAIT_S:-0}" \
-        "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step "$@" </dev/null >/dev/null 2>&1
+        "$BUILD_HELPER_ROOT/lib/py" "$BUILDLOG_RECORD" step "$@" </dev/null >/dev/null 2>&1
 }
 
 # buildlog_end STATUS LOG TTY ARGV...
@@ -822,5 +825,5 @@ invoke_sweep() {
         lint_config_skip_notice sweep "lint sweep"
         return 0
     fi
-    run "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lint/sweep.py" "$@"
+    run "$BUILD_HELPER_ROOT/lib/py" "$BUILD_HELPER_ROOT/lint/sweep.py" "$@"
 }

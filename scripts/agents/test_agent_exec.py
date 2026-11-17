@@ -1,6 +1,8 @@
 """Shell launchers select the caller's Claude account or the mapped Codex workers home."""
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import copy_helpers
+
 from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
 from scripts.direct.assign_launcher_test_support import backend_fixture_command
 from scripts.direct import test_claude_worker
@@ -170,9 +172,7 @@ class ClaudeLauncherTests(unittest.TestCase):
             "STAFF_CONFIG": str(SCRIPTS.parent / "config/staff.conf"),
             "CONF_DIR": str(SCRIPTS.parent / "config"),
             **source_environment(self.home / "sources")}, clear=True)))
-        shim = self.home / ".claude/scripts/lib/py"
-        shim.parent.mkdir(parents=True)
-        shim.symlink_to(SCRIPTS / "lib/py")
+        _ = copy_helpers(self.home)
         _ = (self.home / ".claude.json").write_text("{}")
         for label in ("claude1", "claude3"):
             create_claude_account(label, f"{label}@example.invalid")

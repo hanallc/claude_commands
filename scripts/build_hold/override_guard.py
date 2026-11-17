@@ -33,6 +33,13 @@ OVERRIDE_VARIABLES: tuple[str, ...] = (
 REFUSED_STATUS = 2
 
 
+def helper_root(script: Path) -> Path:
+    """Select checkout helpers for overrides and installed helpers for other calls."""
+    if any(name in os.environ for name in OVERRIDE_VARIABLES):
+        return script.resolve().parents[1]
+    return Path.home() / ".claude/scripts"
+
+
 @lru_cache(maxsize=1)
 def user_home() -> Path:
     return Path(pwd.getpwuid(os.getuid()).pw_dir)

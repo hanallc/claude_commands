@@ -12,6 +12,8 @@ import unittest
 from typing import ClassVar, cast, override
 from unittest.mock import patch
 
+from scripts.lib.helper_tree_test_support import copy_helpers
+
 from scripts.direct import simplify_daily
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.git_test_support import commit_repository
@@ -80,9 +82,7 @@ class DailySimplifyTests(NixFixture):
             "TMPDIR": str(self.root / "tmp"),
         })
         Path(self.env["TMPDIR"]).mkdir()
-        shim = self.home / ".claude/scripts/lib/py"
-        shim.parent.mkdir(parents=True)
-        shim.symlink_to(ROOT / "scripts/lib/py")
+        _ = copy_helpers(self.home)
         _ = (self.home / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "unit@example.invalid"},
         }))

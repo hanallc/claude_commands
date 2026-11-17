@@ -1,6 +1,8 @@
 """Find a unit's review history through the command with disposable local and Mac roots."""
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import copy_helpers
+
 from scripts.agents import remote
 
 import json
@@ -69,7 +71,8 @@ class UnitRunTests(unittest.TestCase):
         self.ssh_log = self.root / "ssh.jsonl"
         mac_home = self.root / "mac-home"
         mac_home.mkdir()
-        (mac_home / ".claude").symlink_to(REPOSITORY, target_is_directory=True)
+        _ = copy_helpers(mac_home, "scripts/production", "scripts/usage", "scripts/agents",
+                         "scripts/herdr", "scripts/message")
         bin_directory = self.root / "bin"
         bin_directory.mkdir()
         ssh = bin_directory / "ssh"
