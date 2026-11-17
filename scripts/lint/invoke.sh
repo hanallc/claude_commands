@@ -422,6 +422,8 @@ run_step_attempt() {
     elif [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then
         nextest_thread_report "$@"
     fi
+    local LINT_PREBUILD_PREFIX=()
+    if [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then lint_prebuild_prefix; fi
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" && -n "${BUILDLOG_PEAK:-}" ]]; then
         BUILDLOG_TEST_PHASE_FILE="$BUILDLOG_PEAK.test-phase.json"
         buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "$BUILDLOG_MEM_MAX_PATH" "$parent_pid" \
@@ -441,7 +443,8 @@ run_step_attempt() {
     if [[ -t 1 ]]; then
         tty=1
         set +e
-        buildlog_exec_with_progress ${holder[@]+"${holder[@]}"} "$@" 9>&-
+        buildlog_exec_with_progress ${LINT_PREBUILD_PREFIX[@]+"${LINT_PREBUILD_PREFIX[@]}"} \
+            ${holder[@]+"${holder[@]}"} "$@" 9>&-
         status=$?
     else
         # $RANDOM too: a background sweep's run() shares this shell's $$.
@@ -451,7 +454,8 @@ run_step_attempt() {
         fi
         # Keep output streaming for heartbeat_watch.sh and the watching worker.
         set +e
-        buildlog_exec_with_progress ${holder[@]+"${holder[@]}"} "$@" 9>&- 2>&1 | tee "$log" | without_progress_frames
+        buildlog_exec_with_progress ${LINT_PREBUILD_PREFIX[@]+"${LINT_PREBUILD_PREFIX[@]}"} \
+            ${holder[@]+"${holder[@]}"} "$@" 9>&- 2>&1 | tee "$log" | without_progress_frames
         status=${PIPESTATUS[0]}
     fi
     set -e
@@ -657,6 +661,28 @@ nextest_token_width() {
 # Print the test threads and the load for a run that holds no tokens.
 nextest_thread_report() {
     buildlog_memory_python "$LINT_TEST_BUDGET_SCRIPT" report "$@"
+}
+
+# A workspace can declare artifacts that its tests need, under
+# workspace.metadata.dev.prebuild in its root Cargo.toml. prebuild.py goes in
+# front of the nextest command and its token holder, so the artifacts build
+# inside the step's own admission, on the host that runs the tests. LINT_WORKSPACE_MANIFEST names the
+# root manifest; without it, lint runs from the workspace root. Only a line
+# that holds the word outside a comment adds the prefix, and the shell reads
+# the manifest with no fork, so a manifest without a declaration starts no
+# process.
+LINT_PREBUILD_SCRIPT="${BUILD_FOLDERS_SCRIPT%/*}/../lint/prebuild.py"
+lint_prebuild_prefix() {
+    local manifest=${LINT_WORKSPACE_MANIFEST:-$PWD/Cargo.toml} line
+    LINT_PREBUILD_PREFIX=()
+    [[ -f "$manifest" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%%#*}
+        if [[ "$line" == *prebuild* ]]; then
+            LINT_PREBUILD_PREFIX=("${BUILD_FOLDERS_SCRIPT%/*}/py" "$LINT_PREBUILD_SCRIPT" --manifest "$manifest" --)
+            return 0
+        fi
+    done < "$manifest"
 }
 
 run_nextest() {
