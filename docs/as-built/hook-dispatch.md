@@ -53,7 +53,16 @@ The user sees only "Continuing the unit run".
 The hook wakes above the threshold only when the final line differs from the last wake.
 The hook permits a stop when the final status matches `paused_status_pattern`.
 Holding and blocked prefixes alone do not prevent the wake.
-The existing guards and declared wait records stay the same.
+A merge unit stops without a wake when it has no live runner, active dispatch, or queued message.
+An open recorder phase or an old worker status file alone does not prove that the merge unit has work.
+The hook reads the staff unit type, active dispatches, live detached runs, and CLI background tasks.
+It reads queued messages for the fixed staff ID and the current session without consuming them.
+A merge unit with this work keeps the wake above the threshold.
+Unknown state without work permits the stop and reports the read errors in one anomaly line.
+The detached-run scan skips each damaged record, reports its path, and retains other live runs.
+The scan retains folder read errors; the list readers raise read errors, and an absent folder counts as empty.
+Other directors keep the existing background-task and detached-run guards.
+Declared waits and paused status lines still permit a stop.
 
 These hooks stay outside the dispatcher, as their own entries:
 

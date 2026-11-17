@@ -180,6 +180,20 @@ def target_state(target: LocalTarget | SshTarget) -> TargetState:
     """Load the state reader only when the command reads target state."""
     from scripts.build_targets.targets import target_state as read_target_state
 
+    if isinstance(target, SshTarget):
+        from scripts.aws_target import hana_placement
+        transport = hana_placement.read_execution_transport(target)
+        if isinstance(transport, hana_placement.HanaControlTransport):
+            from scripts.build_targets.targets import Free, StateUnreadable, Unreachable
+            from scripts.aws_target import hana_box
+            snapshot = hana_placement.controller_for(transport, read_only=True).inspect()
+            if isinstance(snapshot, hana_placement.HanaLifecycleUnavailable):
+                return StateUnreadable(snapshot.reason)
+            if isinstance(snapshot, hana_placement.HanaUnprovisioned):
+                return Unreachable('Hana is unprovisioned')
+            if snapshot.claims or snapshot.state not in (hana_box.Lifecycle.READY, hana_box.Lifecycle.IDLE_STOPPED):
+                return Unreachable('Hana is busy or recovering')
+            return Free()
     return read_target_state(target)
 
 
@@ -249,6 +263,9 @@ def probe_target(target: SshTarget) -> TargetState:
     from scripts.build_targets.targets import Unreachable
     from scripts.mac_test import eligibility, offload
 
+    from scripts.aws_target import hana_placement
+    if isinstance(hana_placement.read_execution_transport(target), hana_placement.HanaControlTransport):
+        return target_state(target)
     config = eligibility.read_config(target.settings)
     result = offload.probe_reachability(offload.ProcessController(), config)
     if isinstance(result, offload.UnreachableHost):
@@ -374,6 +391,23 @@ def fixed_placement_constraints(
         if isinstance(provider_settings, ExplicitProviderSettings) and isinstance(selection, Pinned) and target.name == selection.target:
             target = replace(target, settings=provider_settings.path)
             selected_settings = provider_settings
+        from scripts.aws_target import hana_placement
+        transport = target_config.read_execution_transport(target)
+        if isinstance(transport, hana_placement.HanaControlTransport):
+            scope = (claim_state.RepositoryScope(repository.name, repository.key, 1)
+                     if isinstance(repository, eligibility.KnownRepository) else claim_state.WHOLE_MAC)
+            policy = hana_placement.fixed_policy(transport, str(repo_root), kind)
+            if isinstance(rule, NatedevOnly):
+                host_eligibility = placement.FixedExclusion(rule.reason)
+            elif isinstance(policy, hana_placement.HanaStepRefused):
+                host_eligibility = placement.FixedExclusion(policy.reason)
+            elif command:
+                judgment = hana_placement.classify_command('check' if kind == 'check' else 'clippy', kind, command)
+                if isinstance(judgment, hana_placement.HanaStepRefused):
+                    host_eligibility = placement.FixedExclusion('command')
+            destination = placement.PlacementDestination('ssh', target.name, transport.host, scope, 1)
+            candidates.append(placement.PlacementCandidate(destination, host_eligibility, selected_settings))
+            continue
         config = eligibility.read_config(target.settings)
         scope = claim_state.target_claim_scope(claim_state.state_paths(target.name), str(repo_root))
         if isinstance(rule, NatedevOnly):
@@ -657,6 +691,25 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
     from scripts.mac_test import eligibility, mac_test
 
     session = claim_state.submitting_session(session)
+    from scripts.aws_target import hana_placement
+    transport = hana_placement.read_execution_transport(target)
+    if isinstance(transport, hana_placement.HanaControlTransport):
+        if isinstance(routing, LocalRequired):
+            return ExcludedTarget(target, routing.reason)
+        policy = hana_placement.fixed_policy(transport, str(repo_root), kind)
+        if isinstance(policy, hana_placement.HanaStepRefused):
+            return ExcludedTarget(target, policy.reason)
+        snapshot = hana_placement.controller_for(transport, read_only=True).inspect()
+        if isinstance(snapshot, hana_placement.HanaUnprovisioned):
+            return ExcludedTarget(target, 'unprovisioned')
+        if isinstance(snapshot, hana_placement.HanaLifecycleUnavailable):
+            return ExcludedTarget(target, 'state unreadable')
+        from scripts.aws_target import hana_box
+        if snapshot.claims:
+            return ExcludedTarget(target, 'busy')
+        if snapshot.state not in (hana_box.Lifecycle.READY, hana_box.Lifecycle.IDLE_STOPPED):
+            return ExcludedTarget(target, 'starting' if snapshot.state == hana_box.Lifecycle.STARTING else 'recovery')
+        return EligibleTarget(target)
     if target.platform == "macos" or isinstance(routing, LocalRequired):
         answer = mac_test.free_now(mac_test.state_paths(target.name), target.settings, repo_root, session=session)
         if new_step and not isinstance(selection, Pinned) and answer == "bad":
@@ -690,6 +743,10 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
 def ssh_target_config(target: SshTarget) -> eligibility.OffloadConfig | ExcludedTarget:
     """Read execution settings for a registered SSH target."""
     from scripts.mac_test import eligibility
+    from scripts.aws_target import hana_placement
+
+    if isinstance(hana_placement.read_execution_transport(target), hana_placement.HanaControlTransport):
+        return ExcludedTarget(target, 'Hana requires an exact queue assignment')
 
     return eligibility.read_config(target.settings)
 
@@ -819,6 +876,23 @@ def reserve_assigned(args: CliArguments) -> int:
         raise ValueError("reservation requires a remote assignment")
     assignment = saved.assignment
     target = target_config.configured_ssh_target(assignment.destination.target)
+    from scripts.aws_target import hana_placement
+    transport = target_config.read_execution_transport(target)
+    if isinstance(transport, hana_placement.HanaControlTransport):
+        from scripts.buildlog import store
+        from scripts.lib import process_start
+        owner = process_start.process_start(args.pid)
+        if not isinstance(owner, process_start.Started):
+            return 78
+        holder = placement.ClaimHolderIdentity(store.host_name(), args.pid, owner.start)
+        checked = hana_placement.validate_assignment(assignment, holder)
+        if isinstance(checked, hana_placement.HanaClaimRefused):
+            return 1
+        # F1 commits lifecycle demand after this process-bound reservation handoff.
+        identity = claim_state.ClaimIdentity(placement.assigned_claim_id(assignment.episode, assignment.attempt),
+            assignment.episode, assignment.attempt)
+        publish_wait_reservation(args, target, identity, assignment.session)
+        return 0
     paths = mac_test.state_paths(target.name)
     if args.recover_only:
         from scripts.lib import process_start

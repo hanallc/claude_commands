@@ -252,7 +252,8 @@ class HanaSourceTests(unittest.TestCase):
         runner.assert_called_once_with(
             ['curl', '--fail', '--silent', '--max-time', str(limits.download_timeout_s),
              '--max-filesize', '4', '--output', str(destination), manifest.bundle_url],
-            check=True, capture_output=True, timeout=limits.download_timeout_s)
+            check=True, capture_output=True, timeout=limits.download_timeout_s,
+            pass_fds=build_folders.held_build_folder_descriptors())
         for failure in (subprocess.TimeoutExpired('curl', limits.download_timeout_s),
                         subprocess.CalledProcessError(63, 'curl')):
             with self.subTest(failure=type(failure).__name__):

@@ -20,7 +20,7 @@ class VerifyTokenWaitTests(VerifyTokenWaitFixture):
         super().setUp()
         _ = caller_admission(self, self.root, self.environment)
 
-    def test_token_wait_restores_the_original_place_and_runs_with_memory_and_token(self) -> None:
+    def test_placement_waits_without_the_token_and_cargo_runs_with_memory_and_token(self) -> None:
         observer = self.root / "observe-token.py"
         observations = self.root / "token-observations.json"
         _ = observer.write_text('import sys\n' + f"with open({str(Path(__file__).resolve().parents[2] / 'scripts/lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{'__file__': package_root.name}})\n" + '''import json
@@ -33,22 +33,25 @@ phase = sys.argv[1]
 state = read_state(Path(os.environ["BUILDLOG_DIR"]) / "admission")
 reservations = list(state.reservations.values())
 lock = Path(os.environ["UNIT_SESSION_DIR"]) / "locks/cargo.d"
-assert lock.is_dir(), phase
 capture = Path(os.environ["TEST_TOKEN_OBSERVATIONS"])
 rows = json.loads(capture.read_text()) if capture.exists() else {}
 if phase == "admission":
+    # The placement wait holds neither the token nor a reservation.
     assert phase not in rows, rows
+    assert not lock.exists(), phase
     assert not reservations, reservations
+    rows[phase] = {"holder": ""}
 else:
+    assert lock.is_dir(), phase
     assert len(reservations) == 1, reservations
-rows[phase] = {"holder": (lock / "holder_pid").read_text()}
+    rows[phase] = {"holder": (lock / "holder_pid").read_text()}
 capture.write_text(json.dumps(rows))
 ''')
         shell = self.root / "observe.sh"
         _ = shell.write_text('''set -T
 observe_admission() {
     if [[ "${FUNCNAME[1]:-}" == placement_once && "$BASH_COMMAND" == 'PLACEMENT_CLIENT_ACTIVE=1' \
-          && "${TOKEN_HELD:-0}" == 1 && ! -e "$TEST_TOKEN_OBSERVATIONS" ]]; then
+          && "${TOKEN_HELD:-0}" == 0 && ! -e "$TEST_TOKEN_OBSERVATIONS" ]]; then
         python3 "$TEST_TOKEN_OBSERVER" admission || exit 95
     fi
 }
@@ -59,7 +62,8 @@ trap observe_admission DEBUG
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         captured = cast(dict[str, Record], json.loads(observations.read_text()))
         self.assertEqual(set(captured), {"admission", "run"})
-        self.assertEqual(captured["admission"]["holder"], captured["run"]["holder"])
+        self.assertEqual(captured["admission"]["holder"], "")
+        self.assertRegex(str(captured["run"]["holder"]), r"^[0-9]+\n?$")
         directory = self.root / "buildlog/admission"
         times = directory / "queue_times.jsonl"
         rows = [cast(Record, json.loads(line)) for line in times.read_text().splitlines()] if times.exists() else []

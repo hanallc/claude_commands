@@ -964,17 +964,18 @@ class AttachedListTest(unittest.TestCase):
         self.assertIn(str(self.current), errors.getvalue())
 
     def test_a_collector_retains_unreadable_lists_while_default_readers_skip_them(self) -> None:
-        read_text = Path.read_text
+        open_path = Path.open
 
-        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        def read(path: Path, mode: str = "r", buffering: int = -1, encoding: str | None = None,
+                 errors: str | None = None, newline: str | None = None) -> TextIO:
             if path == self.current:
                 raise PermissionError(f"{path}: unreadable")
-            return read_text(path, encoding=encoding, errors=errors)
+            return cast(TextIO, open_path(path, mode, buffering, encoding, errors, newline))
 
         record = staff.snapshot()
         errors = io.StringIO()
         sources: list[Path] = []
-        with mock.patch.object(Path, "read_text", read), redirect_stderr(errors):
+        with mock.patch.object(Path, "open", read), redirect_stderr(errors):
             routed = change_review.routed_review_entries(self.current, self.doc, record=record)
             with self.assertRaises(ValueError) as raised:
                 _ = change_review.routed_review_entries(self.current, self.doc, record=record, sources=sources)
@@ -2498,6 +2499,14 @@ class ActionTest(unittest.TestCase):
             self.assertEqual((code, output), (1, ""), row)
             self.assertEqual(len(error.splitlines()), 1, row)
         self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
+
+    def test_row_cleanup_reports_retained_folders(self) -> None:
+        folder = self.path.parent / "retained-copy"
+        result = scratch.TaskCleanup()
+        result.kept.append(scratch.KeptFolder(folder, "it has uncommitted changes"))
+        with mock.patch.object(scratch, "end", return_value=result):
+            lines = change_review.end_row_scratch(self.path, "C76")
+        self.assertEqual(lines, [f"kept {folder}: it has uncommitted changes"])
 
     def attached_lists(self) -> Path:
         earlier = self.path.with_name("change-review - child.md")

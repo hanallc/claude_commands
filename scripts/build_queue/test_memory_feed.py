@@ -263,7 +263,8 @@ class MemoryFeedTests(unittest.TestCase):
                 _ = (self.root / "build_folders.conf").write_text(settings)
                 reading = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
                 step = replace(reading.view.running[0], folder=str(folder))
-                reading = replace(reading, view=replace(reading.view, running=(step,)),
+                waiter = replace(reading.view.waiting[0], folder=str(folder))
+                reading = replace(reading, view=replace(reading.view, running=(step,), waiting=(waiter,)),
                     explanation=replace(reading.explanation,
                         running=(replace(reading.explanation.running[0], step=step),)))
                 build = queue_view.MacBuild(710001, str(folder), reading.explanation.now - 30,
@@ -284,6 +285,10 @@ class MemoryFeedTests(unittest.TestCase):
                 shown_rows = cast(list[dict[str, object]], payload["walk"])
                 self.assertEqual(next(row["slot"] for row in shown_rows if row["machine"] == machine), expected)
                 self.assertTrue(all("slot" not in row for row in page["waiters"]))
+                # A natedev step that waits in a slot names it too; the waiting table shows no slot number.
+                in_slot = expected != "—" if machine == "natedev" else label == "other machine root"
+                self.assertEqual([(row.get("slot_folder"), row.get("slot_machine")) for row in page["waiters"]],
+                                 [(folder.name, "natedev") if in_slot else (None, None)])
 
     def test_mac_reading_collects_and_preserves_the_remote_home(self) -> None:
         mac_home = str(self.root / "remote-home")

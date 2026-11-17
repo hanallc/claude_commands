@@ -16,7 +16,7 @@ from unittest import mock
 
 from scripts.direct import verify_mac_offload_test_support
 from scripts.direct.verify_mac_offload_test_support import (
-    CARGO_STUB, SLEEP_STUB, VERIFY, VerifyMacOffloadFixture, install_fixed_cargo,
+    CARGO_STUB, VERIFY, VerifyMacOffloadFixture, install_fixed_cargo,
 )
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -163,9 +163,9 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
     def test_int_during_long_busy_poll_stops_every_child(self) -> None:
         real_sleep = shutil.which("sleep")
         assert real_sleep is not None
-        self.write_executable(self.bin_directory / "sleep", '#!/bin/sh\n'
+        self.route_waits_through_sleep('#!/bin/sh\n'
             + 'printf "sleeping\\n" > "$TEST_RUNNER_STATE/routing-sleep"\n'
-            + f'exec {shlex.quote(real_sleep)} "$@"\n')
+            + f'exec {shlex.quote(real_sleep)} "$1"\n')
         process = self.start_verify("test", "sample", "--mac", "why", extra={
             "TEST_RUNNER_MAC": "declined", "TEST_RUNNER_REASON": "busy",
             "BUILD_TARGETS_POLL_S": "3600"})
@@ -250,7 +250,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
                 self.assertEqual(self.call_records(), previous_calls)
 
     def test_busy_then_pass_never_runs_on_natedev(self) -> None:
-        self.write_executable(self.bin_directory / "sleep", SLEEP_STUB)
+        self.route_waits_through_sleep()
         free = self.runner_state / "mac-free"
         process = self.start_verify("test", "sample", "--mac", "needs macOS", extra={
             "TEST_RUNNER_BUSY_UNTIL": str(free), "TEST_RUNNER_MAC": "passed",
@@ -503,7 +503,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
 
     def test_term_during_busy_wait_stops_every_child(self) -> None:
-        self.write_executable(self.bin_directory / "sleep", SLEEP_STUB)
+        self.route_waits_through_sleep()
         process = self.start_verify("test", "sample", "--mac", "why", extra={
             "TEST_RUNNER_MAC": "declined", "TEST_RUNNER_REASON": "busy",
             "TEST_PAUSE_ROUTING_SLEEP": "1"})

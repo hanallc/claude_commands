@@ -225,12 +225,12 @@ class FolderAuditTests(unittest.TestCase):
             folder_audit.clean_checkout_cargo_output(path)
         with unittest.mock.patch.object(scratch, "clean_cargo_outputs", side_effect=clean):
             with self.assertRaisesRegex(OSError, "index is empty or unreadable"):
-                scratch.remove_with_cargo_output(checkout, scratch.remove)
+                scratch.remove_with_cargo_output(checkout)
             self.assertTrue(checkout.exists())
             self.assertTrue(cache.exists())
             self.assertTrue(scratch.cargo_removal_mark(checkout).exists())
             _ = index.write_text(valid_index)
-            scratch.remove_with_cargo_output(checkout, scratch.remove)
+            scratch.remove_with_cargo_output(checkout)
         self.assertFalse(checkout.exists())
         self.assertFalse(cache.exists())
         self.assertFalse(scratch.cargo_removal_mark(checkout).exists())
@@ -346,7 +346,7 @@ class FolderAuditTests(unittest.TestCase):
             folder_audit.clean_checkout_cargo_output(checkout)
         self.assertFalse(cache.exists())
         self.assertTrue(scratch.cargo_removal_mark(checkout).exists())
-        scratch.remove_with_cargo_output(checkout, lambda path: path.rmdir())
+        scratch.remove_with_cargo_output(checkout)
         self.assertFalse(checkout.exists())
         self.assertFalse(scratch.cargo_removal_mark(checkout).exists())
 
@@ -705,7 +705,8 @@ class FolderAuditTests(unittest.TestCase):
             self.rust, [], frozenset[str](), time.time(), files=[], removing=True,
             proc=str(self.root / "proc"), sockets=str(self.root / "unix"),
             clone_roots=[self.root / "scratch"], mac=True, free_space=lambda _: 0)
-        self.assertIn((clone, folder_audit.REMOVED), [(entry.path, entry.outcome) for entry in found])
+        outcome = next(entry.outcome for entry in found if entry.path == clone)
+        self.assertEqual(outcome, folder_audit.REMOVED)
         self.assertFalse(clone.exists())
         self.assertIsInstance(scratch.pending_removal(clone), copy_record.NotRegistered)
 
@@ -921,6 +922,8 @@ class FolderAuditTests(unittest.TestCase):
                                 capture_output=True, text=True, check=True).stdout
         self.assertNotIn(str(worktree), listed)
         self.assertFalse(list(folder_audit.state_dir().glob("*.prune")))
+        self.assertFalse(scratch.removal_mark(worktree).exists())
+        self.assertFalse(scratch.cargo_removal_mark(worktree).exists())
 
     def test_missing_source_finishes_removal_and_clears_prune_record(self) -> None:
         candidate = folder(self.rust / "missing-source-worktree")

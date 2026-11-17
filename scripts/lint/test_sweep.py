@@ -268,6 +268,8 @@ class SweepCase(unittest.TestCase):
             "BUILDLOG_DIR": str(state / "buildlog"),
             copy_record.ROOT_ENV: str(state / "scratch"),
         })))
+        # A run inside a build slot carries that slot's Cargo cache; a test gate must lease its own.
+        _ = os.environ.pop("CARGO_BUILD_BUILD_DIR", None)
         skip_host_ci_targets(state)
 
     def target(self) -> Target:

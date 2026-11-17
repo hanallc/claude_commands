@@ -893,6 +893,9 @@ def _read_git_identity(directory: str, cwd: str) -> tuple[Repository, str]:
     key = repository.repository_key(directory)
     if key == store.UNKNOWN_IDENTITY:
         return UnknownRepository(), worktree
+    if key.startswith(repository.MANIFEST_IDENTITY_PREFIX):
+        manifest = Path(key.removeprefix(repository.MANIFEST_IDENTITY_PREFIX))
+        return RepositoryIdentity(key, manifest.parent.name), Path(directory).resolve().name
     checkout_name = Path(facts["repo_path"] or cwd).name
     if key.startswith("git-root:"):
         return RepositoryIdentity(key, checkout_name), worktree

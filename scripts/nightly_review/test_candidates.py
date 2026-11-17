@@ -203,6 +203,39 @@ class CandidatesTests(unittest.TestCase):
         code, out, _ = self.run_main([])
         self.assertEqual((code, out.splitlines()[2].split(" | ")[0]), (0, "| recommended"))
 
+    def test_outcome_writes_each_state_on_its_own_line_and_a_rerun_changes_nothing(self) -> None:
+        ledger = self.root / "ledger.md"
+        head = "- 2026-10-12 rust/hana: Run the GPU tests 8 at a time [gain/week: 38 min waiting] [by: unit-1]"
+        other = "- 2026-10-05 config: Other [gain/week: 2 min waiting] — proposed"
+        moment = datetime(2026, 10, 13, 9, 0, tzinfo=ZoneInfo("America/New_York"))
+        cases: tuple[tuple[str, list[str], str], ...] = (("accepted", ["--applied", "claude abc123"], "accepted 2026-10-13, applied (claude abc123)"),
+                 ("declined", [], "declined"), ("deferred", [], "deferred"),
+                 ("done", [], "done 2026-10-13"), ("relayed", [], "relayed 2026-10-13"))
+        with mock.patch.object(candidates, "now", return_value=moment):
+            for state, options, words in cases:
+                with self.subTest(state=state):
+                    _ = ledger.write_text(f"{other}\n{head} — proposed\n")
+                    code, out, err = self.run_main(["outcome", "sdlc/E2", state, *options])
+                    self.assertEqual((code, err), (0, ""))
+                    self.assertEqual(ledger.read_text(), f"{other}\n{head} — {words}\n")
+                    self.assertEqual(out, f"E2: {head} — {words}\n")
+                    self.assertEqual(self.run_main(["outcome", "E2", state, *options]),
+                                     (0, f"E2 unchanged: {head} — {words}\n", ""))
+            self.assertIn("Other", self.note.read_text())
+            self.note.unlink()
+            elsewhere = self.root / "elsewhere.md"
+            _ = elsewhere.write_text(f"{head} — proposed\n")
+            self.assertEqual(self.run_main(["outcome", "E1", "declined", "--ledger", str(elsewhere)])[0], 0)
+            self.assertEqual((elsewhere.read_text(), self.note.exists()), (f"{head} — declined\n", False))
+            _ = ledger.write_text(f"{other}\n{head} — declined\n")
+            code, _, err = self.run_main(["outcome", "E2", "done"])
+            self.assertEqual((code, err.split(":")[0]), (1, "candidates"))
+            self.assertEqual(ledger.read_text(), f"{other}\n{head} — declined\n")
+            for arguments in (["outcome", "E2", "accepted"], ["outcome", "E2", "declined", "--applied", "x"],
+                              ["outcome", "P2", "declined"], ["outcome", "E0", "declined"], ["outcome", "E2", "kept"]):
+                with self.subTest(arguments=arguments):
+                    self.assertEqual(self.run_main(arguments)[0], 2)
+
     def test_a_line_gives_its_night_area_gain_and_state(self) -> None:
         self.assertEqual(
             candidates.open_candidate("- 2026-10-11 config, also found: Duplicate CLAUDE.md [gain/week: 0.4% of tokens] — proposed"),

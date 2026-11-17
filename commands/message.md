@@ -12,6 +12,8 @@ description: Read agent message rules and delivery.
   `send.py` delivers by session name and keeps what does not arrive under the recipient's session id, so a rename loses nothing (`send.py pending` prints and clears what is kept for your own session, whatever it is called now). It reaches a Codex worker by its `worker:` address or worker name.
   A `session:`, `codex:`, or staff address finds its machine without `--machine`.
   A name resolves on this machine first, then on the other machine.
+  Staff names take precedence over registry names, without regard to case.
+  Without a staff match, a unique registry name selects a live freestanding Claude session.
   For Claude recipients, `send.py` tries the running postmaster session first and relays otherwise.
 - **The first line stands alone.** It is the recipient's preview and the inbox log entry. If it would open mid-thought or with a bare name, open with `Message from <your name>: <gist>`.
 - **Carry the context.** The recipient shares no memory with you: name the repo, worktree, branch, paths, commit or test. No tokens or secrets.
@@ -22,6 +24,7 @@ description: Read agent message rules and delivery.
 
 - For Claude sessions on this machine, use ListAgents and SendMessage.
 - For staff workers, unit-director and showrunner relationships, or the other machine, run `~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py`; `--json` gives `entries` and `problems`.
+  The roster hides closed workers by default; `--all` includes them.
 - Send to a roster address with `send.py --to <address> --from "<your session name>" --text "<message>"`.
   Use `session:<id>` for Claude, `worker:<unit>/<short name>` for staff workers, or `codex:<thread id>` for Codex daemon sessions.
   A unique name also works.

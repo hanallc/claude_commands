@@ -14,6 +14,7 @@ except FileNotFoundError:
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -33,10 +34,16 @@ def replace_value(source: str, index: int, value: str) -> str:
     body = line.rstrip("\r\n")
     ending = line[len(body):]
     key, _, right = body.partition("=")
-    old, marker, comment = right.partition("#")
+    # The equals sign precedes the value, so only whitespace can start its comment.
+    parts = re.split(r"(?<=\s)#", right, maxsplit=1)
+    old = parts[0]
+    comment = "#" + parts[1] if len(parts) == 2 else ""
     leading = old[:len(old) - len(old.lstrip())]
-    trailing = old[len(old.rstrip()):] if old.strip() else ""
-    lines[index] = f"{key}={leading}{value}{trailing}{marker}{comment}{ending}"
+    trailing = old[len(old.rstrip()):] if old.strip() else old if comment else ""
+    if value.startswith("#"):
+        # A hash value must touch the equals sign to avoid a comment.
+        leading = ""
+    lines[index] = f"{key}={leading}{value}{trailing}{comment}{ending}"
     return "".join(lines)
 
 

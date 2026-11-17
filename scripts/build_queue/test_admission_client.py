@@ -561,11 +561,15 @@ class ClientTests(unittest.TestCase):
                                     placement.TemporaryExclusion("busy")))
                             if execution_target == "mac-handoff":
                                 self.assertEqual(client.main(["report-prerequisite", "--assignment-file",
-                                    str(assignment_file), "--token", "required"]), 0)
+                                    str(assignment_file), "--token", "after-grant"]), 0)
                                 fixture.free(60 * GIB)
                             self.assertEqual(client.main(["claim-failed", "--assignment-file", str(assignment_file),
                                                           "--reason", "lost" if execution_target == "mac-retry-notice" else "busy"]), 0)
-                            self.assertFalse(fixture.caller_reservations())
+                            if execution_target == "mac-handoff":
+                                # The replacement needs no token check, so the next pass grants natedev.
+                                self.assertTrue(fixture.caller_reservations())
+                            else:
+                                self.assertFalse(fixture.caller_reservations())
 
                             if execution_target == "mac-retry-notice":
                                 assignment_file.unlink()
@@ -601,13 +605,13 @@ class ClientTests(unittest.TestCase):
                                 def release_before_retry() -> None:
                                     fixture.free(60 * GIB)
 
-                                token_arguments = [*arguments[:arguments.index("--")], "--token", "required",
+                                token_arguments = [*arguments[:arguments.index("--")], "--token", "after-grant",
                                                    *arguments[arguments.index("--"):]]
+                                # After its first pass, a caller without its token can get a local grant;
+                                # it takes the token after the grant. The service marks every TokenRequired
+                                # row token-waiting, as a service from before this client does.
                                 with mock.patch.object(fixture.server, "before_admission", side_effect=release_before_retry):
-                                    self.assertEqual(client.main(token_arguments), 78, errors.getvalue())
-                                self.assertFalse(fixture.caller_reservations())
-                                token_arguments[token_arguments.index("required")] = "held"
-                                self.assertEqual(client.main(token_arguments), 0, errors.getvalue())
+                                    self.assertEqual(client.main(token_arguments), 0, errors.getvalue())
                             retry_grant = client.read_assignment(assignment_file)
                             self.assertIsInstance(retry_grant, wire.LocalPlacementGranted)
                             assert isinstance(retry_grant, wire.LocalPlacementGranted)

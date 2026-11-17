@@ -140,14 +140,16 @@ class LeasedSource:
     def path(self) -> Path:
         return self.slot.path
 
+    @property
+    def descriptors(self) -> tuple[int, ...]:
+        """Retain the mirror and slot leases in every command child."""
+        return build_folders.held_build_folder_descriptors()
+
 
 def git(repository: Path, limits: SourceLimits, *arguments: str, accepted: tuple[int, ...] = (0,)) -> str:
-    try:
-        leases = (build_folders.build_folder_lock_fd(repository),)
-    except StopIteration:
-        leases = ()
     result = subprocess.run(['git', '-C', str(repository), *arguments], capture_output=True,
-                            text=True, timeout=limits.git_timeout_s, pass_fds=leases)
+                            text=True, timeout=limits.git_timeout_s,
+                            pass_fds=build_folders.held_build_folder_descriptors())
     if result.returncode not in accepted:
         raise SourceRefused('GitSourceRefused: ' + ' '.join(arguments[:2]))
     return result.stdout.strip()
@@ -165,7 +167,8 @@ def download(url: str, destination: Path, limits: SourceLimits) -> None:
     try:
         _ = subprocess.run(['curl', '--fail', '--silent', '--max-time', str(limits.download_timeout_s),
                             '--max-filesize', str(limits.max_bytes), '--output', str(destination), url],
-                           check=True, capture_output=True, timeout=limits.download_timeout_s)
+                           check=True, capture_output=True, timeout=limits.download_timeout_s,
+                           pass_fds=build_folders.held_build_folder_descriptors())
         if destination.stat().st_size > limits.max_bytes:
             raise SourceRefused('SourceDownloadBound: source download exceeds its size bound')
     except (OSError, subprocess.SubprocessError):
@@ -204,7 +207,8 @@ def admit_slot_keys(repository: str) -> None:
 @contextmanager
 def materialize(manifest: SourceManifest, limits: SourceLimits, *, showrunner: str, unit: str, work: str,
                 root: Path = SOURCE_ROOT,
-                fetch: Callable[[str, Path, SourceLimits], None] = download) -> Generator[LeasedSource | MissingBasis]:
+                fetch: Callable[[str, Path, SourceLimits], None] = download,
+                selection: build_slots.SlotSelection = build_slots.LOWEST_FREE_SLOT) -> Generator[LeasedSource | MissingBasis]:
     """Verify a bundle and retain the slot lease through the caller's command."""
     validate_manifest(manifest, limits)
     repository_name = manifest.repository.rsplit('-', 1)[0]
@@ -250,7 +254,8 @@ def materialize(manifest: SourceManifest, limits: SourceLimits, *, showrunner: s
                 raise SourceRefused('SourceCommitMismatch: fetched commit differs from the manifest')
         fcntl.flock(lock, fcntl.LOCK_UN)
         with build_slots.take_slot(mirror, manifest.commit, showrunner=showrunner, unit=unit, work=work,
-                                  purpose='hana-source', wait_policy=build_slots.SlotWaitPolicy.REFUSE) as slot:
+                                  purpose='hana-source', wait_policy=build_slots.SlotWaitPolicy.REFUSE,
+                                  selection=selection) as slot:
             if toolchain_identity(slot.path) != manifest.toolchain:
                 raise SourceRefused('ToolchainMismatch: slot toolchain differs from the manifest')
             yield LeasedSource(slot, SourceIdentity(manifest.repository, manifest.commit, manifest.toolchain))

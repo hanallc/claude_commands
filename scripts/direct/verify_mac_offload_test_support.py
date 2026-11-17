@@ -1344,7 +1344,7 @@ mkdir -p "$HOLD_WAIT_DIR"
 BUILDLOG_HOLD_WAIT_FILE=$HOLD_WAIT_DIR/seconds
 ROUTING_WAIT_STARTED="" PHASE_WAIT_SESSION="" PHASE_RESOURCE_WAIT=""
 PHASE_TOKEN_OBSERVATION="" PHASE_TOKEN_HOLDER=""
-PLACEMENT_WAIT_MEMORY=0 PLACEMENT_RETRY_NOTICE_SHOWN=0 STEP_DEFER_LOCAL=0
+PLACEMENT_WAIT_MEMORY=0 PLACEMENT_RETRY_NOTICE_SHOWN=0
 CACHE_DIR=$UNIT_RUN_DIR/verify_cache
 MAC_RUNNER=$VERIFY_MAC_RUNNER MAC_TEST_SCRIPT=$VERIFY_MAC_TEST_SCRIPT
 BUILDLOG_MAC_IDLE_HOOK=""
@@ -1477,14 +1477,18 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
     def wait_for_path(self, path: Path, processes: Sequence[subprocess.Popen[str]] = ()) -> None:
         self.wait_until(path.exists, str(path), processes)
 
+    def route_waits_through_sleep(self, script: str = SLEEP_STUB) -> None:
+        """Send placement waits through the sleep stand-in, so a test can pause or count them."""
+        self.write_executable(self.bin_directory / "sleep", script)
+        routing_wait = self.root / "routing-wait.py"
+        self.write_executable(routing_wait, ROUTING_WAIT_STUB)
+        self.environment["VERIFY_LOCAL_RELEASE_WAIT_SCRIPT"] = str(routing_wait)
+
     def routing_fixture(self) -> Path:
         wrapper = self.root / "targets-wrapper.py"
         self.write_executable(wrapper, TARGETS_WRAPPER)
-        self.write_executable(self.bin_directory / "sleep", SLEEP_STUB)
-        routing_wait = self.root / "routing-wait.py"
-        self.write_executable(routing_wait, ROUTING_WAIT_STUB)
+        self.route_waits_through_sleep()
         self.environment.update({"BUILD_TARGETS_SCRIPT": str(wrapper),
-                                 "VERIFY_LOCAL_RELEASE_WAIT_SCRIPT": str(routing_wait),
                                  "TEST_REAL_TARGETS": str(VERIFY.parent.parent / "build_targets" / "build_targets.py")})
         with self.hold_environment():
             holders = Path(self.environment["BUILD_HOLD_DIR"])

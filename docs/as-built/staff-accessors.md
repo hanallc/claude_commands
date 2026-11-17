@@ -207,7 +207,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/hooks/session-start-direct-resume.py` | read | local_by_current_session, unit_command |
 | `scripts/hooks/showrunner_footer.py` | read | snapshot |
 | `scripts/hooks/staff_session_identity.py` | write | initial_snapshot, native_id, runtime_id, update_current_session |
-| `scripts/hooks/stop-direct-continue.py` | read | local_by_current_session, unit_command |
+| `scripts/hooks/stop-direct-continue.py` | read | local_by_current_session, unit_command, local_snapshot; active_dispatch reads the worker's fixed staff ID |
 | `scripts/hooks/user-prompt-submit-conversation-pause.py` | read | StaffSnapshot (type); conversation_pause.session_staff reads the row |
 | `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
 | `scripts/lib/resume_message.py` | read | StaffId |
@@ -305,9 +305,12 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/worker_capacity.py` | read | snapshot, local_snapshot, WorkerName.parse, CodexBackend; staff writes go through restart.stop_row and worker_panes.close |
 | `scripts/review_links/branch_page.py` | read | snapshot, worktree_machine, by_id, by_current_session, caller_identity; session_staff.RowResolver reads branches and production docs |
 | `scripts/review_links/change_browser.py` | read | QuestionStaff.read resolves question answer recipients; the shared routing record supplies question owners |
-| `scripts/review_links/change_page.py` | read | snapshot; QuestionStaff.read resolves saved question records during delivery recovery; source_name uses by_id and parent_of to name a question or investigation source |
+| `scripts/review_links/change_page.py` | read | snapshot resolves Review owners; QuestionStaff.read resolves saved questions during delivery recovery and owner answers; source_name names each source |
 | `scripts/review_links/images.py` | read | snapshot().by_id checks each image owner at register and names the owner on the Images page |
-| `scripts/review_links/investigations_page.py` | read | snapshot and by_id name each investigation owner on the Investigations page |
+| `scripts/review_links/review_items.py` | read | snapshot, by_id and parent_of resolve the Review owner and source unit |
+| `scripts/review_links/review_actions.py` | read | snapshot names the owner showrunner in a proposal or efficiency Approve outcome |
+| `scripts/review_links/review_page.py` | read | snapshot resolves the Review owner and source unit for the table and actions |
+| `scripts/review_links/investigations_page.py` | read | snapshot and by_id resolve legacy investigation submissions |
 | `scripts/review_links/list_page.py` | read | snapshot, by_id, and parent_of name List owners, validate morty, resolve the alert showrunner, and supply identities to the shared count readers |
 | `scripts/agents/inventory.py` | read | local_snapshot |
 | `scripts/agents/launch_names.py` | read | initial_snapshot |

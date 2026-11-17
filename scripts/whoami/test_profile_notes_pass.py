@@ -228,7 +228,9 @@ always=
             environment = dict(os.environ)
         removed = {key: value for key, value in environment.items() if key not in inherited or key == "PRIVATE_UNRELATED"}
         for command in (("ps", "-eo", "pid=,ppid=,comm=,args="),
-                        ("lsof", "-a", "-p", "4242", "-Fn"), ("herdr", "pane", "list")):
+                        ("lsof", "-a", "-p", "4242", "-Fn"),
+                        ("lsof", "-a", "-p", "4242,4243", "-d", "cwd", "-Fpn"),
+                        ("herdr", "pane", "list")):
             with self.subTest(command=command):
                 for supplied in (environment, removed):
                     _ = profile.checked_child(policy, command, supplied)

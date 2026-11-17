@@ -1073,6 +1073,10 @@ def _interrupted_pane(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
     return herdr.NoPane(name)
 
 
+def _parent_split(pane: str, ratio: float, label: str) -> herdr.SplitPane:
+    return herdr.SplitPane(pane, "right", ratio, label)
+
+
 def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
                  client: herdr.Herdr) -> herdr.SplitPane | herdr.ExistingPane | StartRefused | UncertainWorker | ProcessUnknownWorker:
     parents = evidence.scan.found.get(parent.id, [])
@@ -1095,18 +1099,23 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
     workers.update(_text(pane, "pane_id") for pane in evidence.panes
                    if _text(pane, "terminal_id") in evidence.layout_terminals and _text(pane, "tab_id") == tab)
     if not workers:
-        return herdr.SplitPane(_text(parent_pane, "pane_id"), "right", ratio, label)
+        return _parent_split(_text(parent_pane, "pane_id"), ratio, label)
     layout = herdr.json_object(client.socket_request("layout.export", tab_id=tab).get("layout"), "worker layout")
     nodes = [layout.get("root")]
     ordered: list[str] = []
+    parent_in_layout = False
     while nodes:
         node = herdr.json_object(nodes.pop(), "layout node")
         if node.get("type") == "pane":
-            if (pane := _text(node, "pane_id")) in workers:
+            pane = _text(node, "pane_id")
+            parent_in_layout = parent_in_layout or pane == _text(parent_pane, "pane_id")
+            if pane in workers:
                 ordered.append(pane)
         else:
             nodes.extend((node.get("second"), node.get("first")))
     if not ordered:
+        if parent_in_layout:
+            return _parent_split(_text(parent_pane, "pane_id"), ratio, label)
         return _uncertain(parent, "worker panes are absent from the split tree")
     return herdr.SplitPane(ordered[-1], "down", ratio, label)
 
@@ -1346,6 +1355,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     def start(handoff: worker_admission.FamilyHandoff) -> str:
         del handoff
         launch_destination = destination
+        launch_evidence = evidence
         if isinstance(launch_destination, DestinationAfterSourceRelease):
             if isinstance(current, (OpenWorker, StoppedWorker)):
                 if not client.close_tab_confirmed(current.pane, target=str(current.row.current_session), terminal=current.terminal):
@@ -1358,12 +1368,25 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             if isinstance(selected, (UncertainWorker, ProcessUnknownWorker)):
                 raise worker_admission.AdmissionRefused(selected.reason)
             launch_destination = selected
+            launch_evidence = fresh
         identity = str(row.current_session) if row is not None and not switching else ""
         launch = partial(herdr.launch_prepared_agent, codex=codex) if isinstance(codex, herdr.CodexConversations) else herdr.launch_prepared_agent
         arguments = launch_arguments(policy, identity, directory)
-        launched = launch(client.session, launch_destination, prepared, policy.settings.kind,
-            arguments, herdr.NoOpeningPrompt(),
-            int(start_seconds * 1000), agent=name.value, agent_name=agent_name(owner, name.value))
+        def launch_at(selected: herdr.SplitPane | herdr.ExistingPane) -> herdr.AgentLaunched:
+            return launch(client.session, selected, prepared, policy.settings.kind,
+                arguments, herdr.NoOpeningPrompt(),
+                int(start_seconds * 1000), agent=name.value, agent_name=agent_name(owner, name.value))
+
+        try:
+            launched = launch_at(launch_destination)
+        except herdr_types.HerdrFailure as error:
+            parents = launch_evidence.scan.found.get(owner.id, [])
+            if (error.code != "pane_not_found" or not isinstance(launch_destination, herdr.SplitPane)
+                    or len(parents) != 1 or launch_destination.of_pane == _text(parents[0], "pane_id")):
+                raise
+            launch_destination = _parent_split(_text(parents[0], "pane_id"), launch_destination.ratio,
+                                               launch_destination.label)
+            launched = launch_at(launch_destination)
         launches.append(launched)
         launch_destinations[launched.pane] = launch_destination
         pane = client.pane_row(launched.pane)

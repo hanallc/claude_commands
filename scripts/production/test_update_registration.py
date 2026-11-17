@@ -474,7 +474,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(self.outstanding().read_bytes(), original)
         self.migrate()
         rows = self.question_rows()
-        self.assertEqual(rows, [{**legacy, "asked_by": self.asker_id}])
+        self.assertEqual(rows, [{**legacy, "asked_by": self.asker_id, "review_id": "Q1"}])
         remaining: object = cast(object, json.loads(self.outstanding().read_text())) if self.outstanding().exists() else []
         self.assertEqual(remaining, [])
         before = self.store_snapshot()
@@ -534,7 +534,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(self.store_snapshot(), before)
 
     def test_next_keeps_local_items_when_a_remote_child_has_a_local_reminder(self) -> None:
-        self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "Choose the layout"})
+        self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "Choose the layout", "question": "Choose the layout?"})
         parent = staff.by_id(self.asker_id)
         assert parent is not None
         child = fixture_member("showrunner", name="remote-child", parent=parent.parent,

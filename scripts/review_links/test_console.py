@@ -63,24 +63,24 @@ class ConsoleTests(unittest.TestCase):
         self.assertTrue((folder / change_page.BROWSER_MANIFEST).is_file())
         markup = ConsoleMarkup()
         markup.feed(source)
-        self.assertEqual(markup.pages, ["accounts", "aws", "builds", "changes", "disks", "images", "investigations", "list", "questions"])
+        self.assertEqual(markup.pages, ["accounts", "aws", "builds", "disks", "images", "list", "review"])
         self.assertEqual(markup.sources, [])
         # Each page has its own icon and a hidden new mark; the menu button has one more mark.
-        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 23)
-        self.assertEqual(source.count('class="lucide lucide-sparkle"'), 10)
-        self.assertEqual(source.count('<span class="new-mark" hidden>'), 9)
+        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 19)
+        self.assertEqual(source.count('class="lucide lucide-sparkle"'), 8)
+        self.assertEqual(source.count('<span class="new-mark" hidden>'), 7)
         self.assertIn('<span class="new-mark" id="menu-new" hidden>', source)
         self.assertIn('data-news="/console/news"', source)
         self.assertIn("showNews();\n    loadNews();\n    if (navigate && phone.matches) collapse(true);", source)
         self.assertIn("const value = fresh.has(entry.dataset.page) && !entry.hasAttribute('aria-current');", source)
         self.assertIn("function refresh() { loadRebuilds(); loadNews(); }", source)
         base = f"/{change_page.CONSOLE_FOLDER}"
-        changes = f"{base}/{change_page.PAGE_NAME}"
-        self.assertIn(f'data-url="{changes}" data-title="Changes"', source)
-        self.assertIn(f'data-url="{changes}?type=questions" data-title="Questions"', source)
-        self.assertIn('data-url="/console/investigations.html" data-title="Investigations"', source)
+        changes = f"{base}/review.html"
+        self.assertIn(f'data-url="{changes}" data-title="Review"', source)
+        self.assertNotIn('data-page="questions"', source)
+        self.assertNotIn('data-page="investigations"', source)
         self.assertIn('data-url="/console/list.html" data-title="The List"', source)
-        self.assertIn('class="lucide lucide-search"', source)
+        self.assertIn('data-page="review"', source)
         self.assertIn(f'data-url="{base}/{change_page.REBUILDS_NAME}" data-title="Rebuilds needed" hidden>', source)
         retry = conf.read("review_links").number("frame_retry_seconds")
         self.assertIn(f'data-frame-retry-seconds="{retry}"', source)
@@ -135,13 +135,13 @@ class ConsoleTests(unittest.TestCase):
         _ = (self.configuration / "console.conf").write_text("\n\n".join(reversed(blocks)))
         with patch.object(memory_feed, "page_url", side_effect=FileNotFoundError("fixture page absent"), create=True):
             pages = console.read_pages()
-        self.assertEqual([page.identity for page in pages], ["questions", "list", "investigations", "images", "disks", "changes", "builds", "aws", "accounts"])
+        self.assertEqual([page.identity for page in pages], ["review", "list", "images", "disks", "builds", "aws", "accounts"])
         self.assertIsInstance(pages[2].destination, console.AvailablePage)
-        self.assertIsInstance(pages[6].destination, console.UnavailablePage)
+        self.assertIsInstance(pages[4].destination, console.UnavailablePage)
         markup = ConsoleMarkup()
         source = console.render(pages, console.UnavailablePage()).decode()
         markup.feed(source)
-        self.assertEqual(markup.pages, ["questions", "list", "investigations", "images", "disks", "changes", "builds", "aws", "accounts"])
+        self.assertEqual(markup.pages, ["review", "list", "images", "disks", "builds", "aws", "accounts"])
         self.assertIn('data-page="rebuilds"\ndata-url="" data-title', source)
         self.assertIn('aria-label="Builds — Not available"', source)
         self.assertNotIn("fixture page absent", source)
@@ -153,9 +153,9 @@ class ConsoleTests(unittest.TestCase):
             "python:scripts.build_queue.memory_feed:fixture_page_url_absent")
         _ = configuration.write_text(source)
         pages = console.read_pages()
-        self.assertEqual([page.identity for page in pages], ["accounts", "aws", "builds", "changes", "disks", "images", "investigations", "list", "questions"])
+        self.assertEqual([page.identity for page in pages], ["accounts", "aws", "builds", "disks", "images", "list", "review"])
         self.assertIsInstance(pages[2].destination, console.UnavailablePage)
-        self.assertIsInstance(pages[3].destination, console.AvailablePage)
+        self.assertIsInstance(pages[-1].destination, console.AvailablePage)
         self.assertIn('aria-label="Builds — Not available"', console.render(pages, console.read_rebuilds()).decode())
 
     def test_url_functions_cannot_put_an_external_page_in_the_frame(self) -> None:
@@ -166,12 +166,14 @@ class ConsoleTests(unittest.TestCase):
                 self.assertIsInstance(pages[2].destination, console.UnavailablePage)
 
     def news_pages(self, changes: set[str], questions: set[str]) -> tuple[console.ConsolePage, ...]:
-        with (patch.object(change_browser, "waiting_changes", return_value=frozenset(changes)),
-              patch.object(change_browser, "waiting_questions", return_value=frozenset(questions))):
-            return console.read_pages()
+        return (console.ConsolePage("changes", "Changes", "list-checks", "Changes", console.AvailablePage("/console/review.html"),
+                    lambda _request: frozenset(changes)),
+                console.ConsolePage("questions", "Questions", "list-checks", "Questions", console.AvailablePage("/console/review.html"),
+                    lambda _request: frozenset(questions)))
 
     def test_ready_investigation_answers_mark_the_page_until_a_visit(self) -> None:
-        pages = tuple(page for page in console.read_pages() if page.identity == "investigations")
+        pages = (console.ConsolePage("investigations", "Investigations", "search", "Investigations",
+                    console.AvailablePage("/console/review.html"), investigations_page.waiting_investigations),)
         root = self.root / "snapshots"
         owner = staff.StaffId("orphan-owner")
         self.assertEqual(console.news(root, pages, "changes"), ())
@@ -204,7 +206,9 @@ class ConsoleTests(unittest.TestCase):
         _ = console.news(root, self.news_pages({"a/C1"}, {"q1"}), "changes")
         with (patch.object(change_browser, "waiting_changes", return_value=frozenset({"a/C1"})),
               patch.object(change_browser, "waiting_questions", side_effect=OSError("fixture list unreadable"))):
-            pages = console.read_pages()
+            pages = tuple(console.ConsolePage(page.identity,page.label,page.icon,page.title,page.destination,
+                change_browser.waiting_questions if page.identity == "questions" else page.items)
+                for page in self.news_pages({"a/C1"}, {"q1"}))
         self.assertEqual(console.news(root, pages, "questions"), ())
         self.assertEqual(console.news(root, self.news_pages({"a/C1"}, {"q1", "q2"}), "changes"), ("questions",))
         unavailable = tuple(console.ConsolePage(page.identity, page.label, page.icon, page.title, console.UnavailablePage(), page.items)
@@ -217,7 +221,9 @@ class ConsoleTests(unittest.TestCase):
         reviews = change_browser.PreparedReviews(
             changes=(change,), queues={}, orders={}, questions=(question,), question_tabs=(), record=staff.StaffSnapshot(()))
         with patch.object(change_browser, "console_reviews", return_value=reviews) as read:
-            self.assertEqual(console.news(self.root / "snapshots", console.read_pages(), "changes"), ())
+            self.assertEqual(console.news(self.root / "snapshots", (
+                console.ConsolePage("changes","Changes","list-checks","Changes",console.AvailablePage("/console/review.html"),change_browser.waiting_changes),
+                console.ConsolePage("questions","Questions","list-checks","Questions",console.AvailablePage("/console/review.html"),change_browser.waiting_questions)), "changes"), ())
         self.assertEqual(read.call_count, 1)
         seen = cast(dict[str, list[str]], json.loads((self.root / "snapshots" / change_page.CONSOLE_FOLDER / console.SEEN_NAME).read_text()))
         self.assertEqual((seen["changes"], seen["questions"]), (["a/C1"], ["question/q1"]))
