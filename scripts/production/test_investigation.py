@@ -14,6 +14,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.production import investigation, staff
+from scripts.review_links import change_page, review_page, test_review_page
 
 RUNNER = staff.StaffRow(staff.StaffId("32102748-cf44-498e-9a53-b710c2a70916"), "showrunner", "show", staff.StaffRoot(),
                         current_session=staff.StaffId("2b7d4419-b8d4-4c43-b9b2-48bed9337f27"))
@@ -33,6 +34,7 @@ class InvestigationTests(unittest.TestCase):
         _ = staff_file.write_text(json.dumps({"schema": 1, "rows": [RUNNER.to_json(), OWNER.to_json(), OTHER.to_json()]}))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "STAFF_FILE": str(staff_file), "SHOWRUNNER_STATE_DIR": str(self.root / "state"),
+            "REVIEW_LINKS_ROOT": str(self.root / 'reviews'),
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": OWNER.current_session})))
 
     def command(self, *args: str) -> tuple[int, str, str]:
@@ -86,6 +88,61 @@ class InvestigationTests(unittest.TestCase):
         _ = investigation.mark_read(OWNER.id, item.id)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), (before, timestamp))
         self.assertEqual(self.command("answer", "--id", item.id, "--text", "The cause is known.")[0], 1)
+
+    def test_native_answer_refuses_a_superseded_review_exchange(self) -> None:
+        for wait in ('native', 'question'):
+            with self.subTest(wait=wait):
+                case = test_review_page.ReviewPageTests('runTest')
+                case.setUp()
+                try:
+                    report = case.investigation(wait == 'question')
+                    key = f'investigation/{report.owner}/{report.id}'
+                    if wait == 'question':
+                        old, _ = review_page.submit(case.root, case.body(key, 'question', 'Check the old case.'), case.status)
+                        change_page.deliver(old, case.status)
+                    delivery, _ = review_page.submit(case.root, case.body(key, 'question', 'Check the replacement case.'), case.status)
+                    assert isinstance(delivery, change_page.MessageDelivery)
+                    change_page.deliver(delivery, case.status)
+                    path = investigation.folder(report.owner)/(report.id+'.md')
+                    delivery_path = case.status.path(delivery.page, delivery.row)
+                    before = path.read_bytes(), delivery_path.read_bytes()
+                    with patch.dict(os.environ, {'CODEX_THREAD_ID': case.fixture.unit.current_session,
+                                                 'CLAUDE_CODE_SESSION_ID': ''}):
+                        self.assertEqual(self.command('answer', '--id', report.id, '--owner', report.owner,
+                                                      '--text', 'The old answer.'),
+                                         (1, '', 'investigation: this question id does not match the current question\n'))
+                    with self.assertRaisesRegex(investigation.InvestigationError,
+                                                'this question id does not match the current question'):
+                        _ = investigation.answer(report.owner, report.id, 'The old answer.')
+                    self.assertEqual((path.read_bytes(), delivery_path.read_bytes()), before)
+                    request = case.status.slots(delivery.page, delivery.row).question
+                    assert isinstance(request, change_page.OpenQuestion)
+                    self.assertTrue(change_page.answer_item(key, 'The replacement case passes.', request.question_id, case.status))
+                    self.assertEqual(investigation.load(report.owner, report.id).state,
+                                     investigation.InvestigationState.ANSWER_READY)
+                    self.assertIsInstance(case.status.slots(delivery.page, delivery.row).question, change_page.AnsweredQuestion)
+                finally:
+                    case.doCleanups()
+
+    def test_native_question_can_follow_a_completed_review_exchange(self) -> None:
+        case = test_review_page.ReviewPageTests('runTest')
+        case.setUp()
+        try:
+            report = case.investigation()
+            key = f'investigation/{report.owner}/{report.id}'
+            delivery, _ = review_page.submit(case.root, case.body(key, 'question', 'Check the Review case.'), case.status)
+            assert isinstance(delivery, change_page.MessageDelivery)
+            change_page.deliver(delivery, case.status)
+            request = case.status.slots(delivery.page, delivery.row).question
+            assert isinstance(request, change_page.OpenQuestion)
+            self.assertTrue(change_page.answer_item(key, 'The Review case passes.', request.question_id, case.status))
+            _ = investigation.review_action(report.owner, report.id, 'question', 'Check the native case.')
+            answered = investigation.answer(report.owner, report.id, 'The native case passes.')
+            self.assertEqual(answered.state, investigation.InvestigationState.ANSWER_READY)
+            self.assertEqual(answered.answer, 'The native case passes.')
+            self.assertIsInstance(case.status.slots(delivery.page, delivery.row).question, change_page.AnsweredQuestion)
+        finally:
+            case.doCleanups()
 
     def test_each_owner_numbers_records_under_a_lock(self) -> None:
         def file_one(number: int) -> str:

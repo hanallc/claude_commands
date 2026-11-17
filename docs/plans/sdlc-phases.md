@@ -338,7 +338,19 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 
 - `_commit(paths, what)` in `change_review.py` commits one or more lists of one repository by plumbing only. It runs from the repository top level: `hash-object -w --path` for each list, then `read-tree` of HEAD (or `--empty`), `update-index --cacheinfo` and `write-tree` in a temporary `GIT_INDEX_FILE`. It sets each list's entry in the real index, then runs `commit-tree` and `update-ref HEAD <new> <old HEAD>`. A moved HEAD retries up to 5 times. A tree equal to HEAD's makes no commit. No command refreshes the index, so clean filters on other modified files never run. A write in a repository shaped like hanadocs takes 0.01-0.06 s, down from about 3.1 s.
 - A failure warns "written but not committed: <reason>; the next write commits it" and moves no ref.
-- `change_review.py batch --file <json>` takes an array of `edit` and `verdict` items (`op`, `production`, `row`, optional `list`; `change`, `check`, `see`, `image`, `output` for `edit`; `verdict` for `verdict`). It checks every item and registers images before the lock. All lists must be in one folder, and a row named twice is refused. Under one lock it writes every list, then makes one commit over every target list, changed or not: subject `change-review: batch <N> writes (<owner> <count>, ...)`. Any error exits 1 and names the item index. A rerun after a stopped batch finishes the remaining writes and commits every list.
+- `change_review.py batch --file <json>` accepts an array of `edit` and `verdict` items.
+  Each item requires `op`, `production` and `row`; `list` is optional.
+  Edit items accept `change`, `check`, `see`, `image` and `output`.
+  Verdict items require `verdict`.
+  A showrunner check also requires `validation` with the ID from its validation message.
+  The command checks item fields and registers images before it takes the locks.
+  All lists must share one folder; the command refuses a repeated row.
+  It takes the delivery lock before the list lock.
+  It checks exchange IDs and stages each verdict while it holds both locks.
+  Every item must pass before the command writes a list.
+  One commit includes every target list, with subject `change-review: batch <N> writes (<owner> <count>, ...)`.
+  An error exits 1 and names the item index.
+  A rerun after a stopped batch completes the remaining writes and commits every list.
 - `edit_row` and `record_verdict` share `_edit_write` and `_verdict_write` (a `RowWrite` with `write` and `after`) with `batch`.
 - `add`, `edit` and batch `edit` items accept `--output` like the `image` action; `--image` with `--output` is refused.
 - `show --row <id>` prints that row with `describe`; a row not on the list exits 1.
