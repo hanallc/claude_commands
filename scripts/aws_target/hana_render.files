@@ -23,6 +23,7 @@ scripts/build_targets/execution_transport.py
 scripts/build_targets/target_config.py
 scripts/buildlog/__init__.py
 scripts/buildlog/store.py
+scripts/buildlog/transfer_bytes.py
 scripts/buildlog/treekey.py
 scripts/copies/copies.py
 scripts/lib/atomic_file.py
