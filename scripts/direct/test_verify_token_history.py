@@ -77,11 +77,13 @@ exit 0
         self.assertEqual(first_wait, 0)
         self.assertEqual(second_wait, 20)
         self.assertGreater(second_wait, first_wait)
-        started, = [row for row in self.phase_waits(board) if row["event_type"] == "wait_started"]
-        finished, = [row for row in self.phase_waits(board) if row["event_type"] == "wait_finished"]
-        self.assertEqual((started["wait_kind"], started["wait_reason"], started["phase_id"]),
-                         ("WaitingForMemoryOrSlot", "cargo token", "6"))
-        self.assertEqual(started["wait_id"], finished["wait_id"])
+        starts = [row for row in self.phase_waits(board) if row["event_type"] == "wait_started"]
+        finished = [row for row in self.phase_waits(board) if row["event_type"] == "wait_finished"]
+        # The second call waits for its start time after the first start, then for the token.
+        self.assertEqual([(row["wait_kind"], row["wait_reason"], row["phase_id"]) for row in starts],
+                         [("WaitingForMemoryOrSlot", "memory admission", "6"),
+                          ("WaitingForMemoryOrSlot", "cargo token", "6")], second_output)
+        self.assertEqual([row["wait_id"] for row in starts], [row["wait_id"] for row in finished])
 
     def test_unblocked_verification_records_no_resource_wait(self) -> None:
         session = Path(self.environment["UNIT_SESSION_DIR"])

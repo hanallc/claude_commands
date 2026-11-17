@@ -52,6 +52,7 @@ from scripts.message import codex_daemon
 from scripts.message.codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
 from scripts.message import process_table
 from scripts.message import roster
+from scripts.accounts import role_map
 from scripts.message import send
 from scripts.production import unit_lookup
 from scripts.lib import unit_runs
@@ -136,6 +137,7 @@ class RosterTests(unittest.TestCase):
             f"#!{sys.executable}\n"
             + "import json, os, sys\n"
             + "with open(os.environ['SSH_RECORD'], 'a') as log: log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            + "with open(os.environ['SSH_RECORD'] + '.stdin', 'w') as log: log.write(sys.stdin.read())\n"
             + "print(os.environ['SSH_SNAPSHOT'])\n"
             + "raise SystemExit(int(os.environ.get('SSH_STATUS', '0')))\n",
             encoding="utf-8",
@@ -792,6 +794,7 @@ class RosterTests(unittest.TestCase):
         daemon_result = self._daemon_sessions() if daemon is None else daemon
         with mock.patch.object(codex_daemon, "loaded_sessions", return_value=daemon_result), \
                 mock.patch.object(staff, "runtime_id", return_value=native_identity), \
+                mock.patch.object(sys, "stdin", io.StringIO("")), \
                 redirect_stdout(output), redirect_stderr(errors):
             result = roster.main([*( ["--here"] if here else []), *arguments])
         return result, output.getvalue().splitlines(), errors.getvalue().splitlines()
@@ -2621,7 +2624,8 @@ class RosterTests(unittest.TestCase):
     def test_default_scope_merges_peer_rows_after_local_rows_with_one_snapshot_call(self) -> None:
         peer = replace(self._entry("Mac Claude", "freestanding", "session:mac-id"), machine="mac")
         self.peer_snapshot(roster.Roster([peer], []))
-        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
+        with (mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()),
+              mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as staff_reads):
             result = roster.roster(os.environ, roster.AllMachines())
         self.assertEqual(result.problems, [])
         self.assertEqual(result.entries[-1], peer)
@@ -2630,6 +2634,10 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(len(commands), 1)
         self.assertEqual(commands[0][:2], ["-o", "BatchMode=yes"])
         self.assertIn("--here --snapshot", commands[0][-1])
+        authority = roster.PeerAuthority.decode(Path(str(self.ssh_log) + ".stdin").read_text())
+        self.assertEqual(authority.membership, staff.initial_snapshot())
+        self.assertEqual(authority.accounts, role_map.read_role_map())
+        self.assertEqual(staff_reads.call_count, 1)
         self.assertIn('"$HOME/.claude/scripts/lib/py"', commands[0][-1])
 
     def test_unreachable_peer_is_one_problem_while_local_rows_still_print(self) -> None:
@@ -2694,6 +2702,41 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(director.reach, roster.CannotReceiveMessages("no messaging socket"))
         self.assertEqual(worker.director, roster.UnderDirector("unit-one", "unit-one", "session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b"))
         self.assertEqual(self.ssh_calls(), [])
+
+        record = staff.initial_snapshot()
+        supplied = replace(record, rows=tuple(
+            replace(row, name="supplied-unit") if row.name == "unit-one" else row for row in record.rows))
+        authority = roster.PeerAuthority(supplied, role_map.read_role_map())
+        valid_document = authority.encode()
+        with (role_map.supplied_role_map(authority.accounts),
+              mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions())):
+            expected = roster.roster(os.environ, roster.ThisMachine(), membership=supplied)
+        for document in (valid_document, "not JSON", '{"staff": {}, "role_map": {}}'):
+            output = io.StringIO()
+            with (self.subTest(document=document),
+                  mock.patch.object(sys, "stdin", io.StringIO(document)),
+                  mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()),
+                  redirect_stdout(output)):
+                if document == valid_document:
+                    with (mock.patch.object(staff, "is_owner", return_value=False),
+                          mock.patch.object(staff, "_remote", side_effect=AssertionError("staff ssh")),
+                          mock.patch.object(role_map, "is_role_map_host", return_value=False),
+                          mock.patch.object(role_map, "ssh_role_map", side_effect=AssertionError("role-map ssh"))):
+                        status = roster.main(["--here", "--snapshot"])
+                else:
+                    status = roster.main(["--here", "--snapshot"])
+                received = roster.RosterSnapshot.decode(output.getvalue()).result
+                if document == valid_document:
+                    self.assertEqual(status, 0)
+                    self.assertEqual(received, expected)
+                    supplied_director = next(row for row in received.entries if row.name == "supplied-unit")
+                    self.assertEqual(supplied_director.session, director.session)
+                    self.assertNotIn("unit-one", [row.name for row in received.entries])
+                else:
+                    self.assertEqual(status, 1)
+                    self.assertIn("peer authority stdin", received.problems[0])
+                    self.assertIn(director, received.entries)
+        self.assertEqual(staff.initial_snapshot(), record)
 
     def test_snapshot_is_hidden_from_help_and_public_json_has_no_session_field(self) -> None:
         output = io.StringIO()
