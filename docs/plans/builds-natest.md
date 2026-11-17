@@ -4660,38 +4660,16 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Git starts by caller: `models_registry.py` publication 1,683 (about 13 per store); test bodies and `setUp` 582 (about 2.6 natedev CPU s). No large test-owned cost. Floor.
 - Proposal to builds: one registry store combines its Git reads (one `cat-file --batch` for the `show` reads, one `rev-parse` for HEAD, branch and Git paths). Bound: about half the product Git starts, about 5 aws CPU s in this module.
 
-### Phase 332 — A registry store starts fewer Git commands  · status: todo
+### Phase 332 — A registry store starts fewer Git commands  · status: done
 **Depends on:** Phase 331
 
-#### Work Order
+#### As-built
 
-**Goal:** one `models_registry.py` store starts fewer Git commands, with the same publication output and the same stored files.
-
-**Decision:** builds assigned this change to natest on the Phase 331 proposal (2026-11-17). Of 1,778 product Git starts in `test_models_conf_publish`, the reads below run in separate commands with no write between them.
-
-**Spec:**
-1. `_publish_repository` reads the top level and the absolute Git directory with one `rev-parse`. `SharedRegistry` keeps the Git directory; `_publish_lock_path` uses it with no Git command.
-2. `_preflight_fast_forward` reads the `MERGE_HEAD` path, the index path and the parent commit with one `rev-parse --path-format=absolute`. The check order and the refusal texts stay.
-3. `_publish` reads HEAD and its branch with one `rev-parse HEAD --symbolic-full-name HEAD`. A detached HEAD refuses publication as before.
-4. The `show` reads stay separate: a write or fetch is between each pair. Report this to builds in place of one `cat-file --batch`.
-5. Keep every publication message, exit status and stored file. Change no test assertion.
-6. Merge main after the builds import-cycle fix (7bc6a5842) merges, before the checkpoint.
-7. Run `test_models_conf_publish`, `lib/test_models_registry.py` and the other `models_registry` callers' tests. Run an aws pair on `agents/test_models_conf_publish.py`, 3 rounds.
-
-**Files:**
-- `scripts/lib/models_registry.py`
-
-**Workers:** 1 writer; the director writes it (no worker capacity).
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 331: product publication starts about 13 Git commands per store; the tests start 582 Git commands.
-- Phase 232: no signal handlers. No lazy imports inside functions.
-
-**Acceptance gate:**
-- basedpyright reports no errors or warnings on the file.
-- The registry and publication tests pass with no assertion change.
-- The aws pair shows the CPU change on `test_models_conf_publish`.
+- `models_registry.py` combines its Git reads. `_publish_repository` reads the top level and the Git directory in one `rev-parse` (`SharedRegistry.git_directory`); the publish lock path uses that directory. `_preflight_fast_forward` reads `MERGE_HEAD`, the index path and the base commit in one `rev-parse`. `_publish` reads HEAD and its branch reference in one `rev-parse` and still refuses a detached HEAD.
+- The publication output and the stored files stay the same. The `show` reads stay separate; one `cat-file --batch` for them was not needed for the saving.
+- natedev: `test_models_conf_publish` 4,598 to 4,383 processes, 24.1 to 22.0 CPU s.
+- aws pair, 3 rounds: `test_models_conf_publish` 37.67 to 35.65 CPU s (saving 2.02); `test_models_registry` saves 0.24.
+- Built on main after the import-cycle fix (b66325154) as 72fe30815, branch `natest-332`; builds-natest receives it through main. basedpyright 0 errors; 316 tests in 10 registry, tune and models modules pass.
 
 ### Phase 333 — The review launcher tests use less aws CPU  · status: done
 **Depends on:** none
