@@ -1932,7 +1932,7 @@ As built:
 - Slider: a drag works in Chrome and Firefox, on the page alone and inside the console frame. The user's failure did not show on natedev. These changes guard it: the label is a `div`, so a press on the text does not move the thumb; the ends and the value have fixed widths, so the track does not change size during a drag; the value is written only when it changes.
 - Tests: `test_disks_page` checks that only top folders are filtered and that Other opens, and that open rows stay across a reload until their folder or repository is gone, with rows for a joined name, a folder named `|other` and a drive inside a drive with no tree. Both fail on the old page.
 
-#### gatenames — gate steps get readable names and a description (#108, #109, #97) · status: next
+#### gatenames — gate steps get readable names and a description (#108, #109, #97) · status: done
 
 The user approved mockup version 2 at 13:58 EST on 2026-11-16 (`~/rust/hanadocs/morty/gate-tooltip-mockup-v2.png`). Use "integrate" for "land" and "test nightly" for "nightly". Promote gets no step.
 
@@ -1941,7 +1941,7 @@ The user approved mockup version 2 at 13:58 EST on 2026-11-16 (`~/rust/hanadocs/
 | integrate | Merges the `<unit>` checkpoint into the `<showrunner>` branch, tests every module, then pushes `<showrunner>`. | branch `<showrunner>` | `merge_gate.py --checkpoint` |
 | test all | Tests every module of `<unit>`. | no branch | `merge_gate.py --tests-only --full` |
 | test modules | Tests `<N>` named modules of `<unit>`. | no branch | `merge_gate.py --tests-only --module X` |
-| test affected | Tests the `<N>` modules that the `<unit>` change affects. | no branch | `targeted_test.py` |
+| test affected | Tests the modules that the `<unit>` change affects. | no branch | `targeted_test.py` |
 | test nightly | Tests the `<showrunner>` branch each night and records a red result with its owner. | no branch | `merge_gate.py --nightly` |
 
 1. The row name is "`<unit>` `<step>`". The tooltip title is "`<unit>` · `<step>`".
@@ -1951,6 +1951,71 @@ The user approved mockup version 2 at 13:58 EST on 2026-11-16 (`~/rust/hanadocs/
 5. A `--promote` run shows integrate only.
 6. Disks "Used by" (#97) uses the same name source: "`<unit>` `<step>`", for example "handler integrate".
 7. From the user (via builds), on the Slots pane: "how could the cargo-liner slots both be showing the same merge?" Cause: `copies.py` `standing()` writes `work='gate'` and `purpose='gate · <base commit subject>'` for every slot take, so a `verify.sh test` or `lint` run shows as a gate of main's last merge. Fix at the source: the lease names the real work (the unit and the step, such as test or lint) from the same name source. Never "gate" for a run that is not a gate, and never the base commit subject.
+
+As built:
+
+- `build_steps.command_job` finds the script after a python or shell interpreter, then reads its arguments. `merge_gate.py` gives integrate, test all, test modules, test nightly or promote; `--tests-only` tests every module. `targeted_test.py` gives test affected, test all with `--full` or test modules with `--module`. `verify.sh [--session-dir <dir>] <step>` gives that step. `--promote` gives integrate. Any other command is `OtherCommand`.
+- `config/build_steps.conf` holds the step names, the `[about]` sentences and the `[changes]` text. `StepNames.about` and `StepNames.changes` fill them. An unknown unit gives no sentence.
+- The feed reads `/proc/<pid>/cmdline` for a merge-gate or targeted-test row (`memory_feed.step_job`). The result is a job or a named state: not a gate step, pid not recorded, command unreadable, or another command. The row name and the tooltip title use the job step; the row carries `about` and `changes`. The queue is unchanged.
+- The tooltip shows the description as a caption under the title, then a Changes row, then the rows it showed before.
+- Slot lease: `copies.standing` takes a `step` key. It writes `work=<step>` and `purpose=<shown step name>`. `copies.run` passes the job of its command, else the program name. Every other caller names its work: `merge_gate.py --nightly` test-nightly, `bump_gate.py` integrate, `fast_track.py` promote and fast-track, `ci_points` ci, `waiting.scratch_test` test, `rust_release` toolchain-trial, the style checks style, lint or test, and `copies.py hold` hold. Only test fixtures use the default step run. `gate_purpose` and the base commit subject are gone.
+- Disks Used by: `slots.slot_use` names the staff id from the staff record and builds "`<unit>` `<step>`" with the same owner template as the Builds page, then shows the showrunner.
+- Director calls: the names use the unit that runs the job ("natemerge integrate"), as the mockup shows. "test affected" has no module count; the Testing row shows it. An unknown command uses its program name as the step.
+- Tests: `test_memory_feed` (each gate command gives its job, description and changes; the feed puts them on running and waiting rows), `test_memory_hover` (the caption and Changes rows follow the title), `test_copies` (the lease names the step), `test_slots` and `test_disks_page` (Used by). `memory_page_proof.mjs` checks the gate tooltip and saves `gate-tooltip-dark-desktop.png`.
+
+#### diskpanels — Slots and Sessions get definitions and row tooltips; Sessions gets a size filter · status: done
+
+From the user (via sdlc and builds, 2026-11-16): "sessions and slots should show a hoverable definition of what they are and how they work / what they contain - every row should contain a tooltip that for slots should be the same tooltip that is shown in the build queue so they share code and data  sessions should show all sessions and have a filter that limits the minimum size - like disks". The showrunner's terms: reuse the Builds page slot tooltip code and data, with no copy; Sessions shows every session (it showed 10, then "24 more") with a minimum-size filter like the drive cards.
+
+As built:
+
+- Shared code: `memory_live.html` marks its tooltip rules and its tooltip code with `shared:step-tip:start` and `shared:step-tip:end`. The code part holds `field`, `tooltipRows`, `tooltipHtml`, a new `tipRowsHtml`, a new `placeTipAt` and a new `hoverTips`, which holds the hover and click handlers. The Builds page now calls `hoverTips`; `showTip`, `hideTip` and `placeTip` stay as names.
+- `disks_page.shared_step_tip` reads both marked parts from the Builds page source at publish. The Disks page puts the rules in its style and the code in one function, so the names of the two pages do not collide.
+- Shared data: each Builds row in a slot carries `slot_folder` and `slot_machine` beside `slot` (`memory_feed.build_slot`). The Disks settings carry `builds_data`, the link from the Disks folder to the Builds `memory.json`. The page reads it at start and at each poll interval while it shows.
+- `scripts/build_queue/memory_files.py` holds the Builds page source, its data file name and its output folder. The Disks publisher reads them without the 0.4 s import of `memory_feed`.
+- A held slot that a Builds step runs in shows that step's tooltip, the same HTML as on the Builds page. The Builds data must be newer than `page.builds_max_age_seconds` (30). Any other slot shows its name and state, repository, size, last use, its user and showrunner, and the nightly sweep note. A repository band shows its slot count, size, slots in use and limit.
+- The Slots and Sessions titles carry an info mark and a definition tooltip. The slot definition takes the sweep age from `slots.unused_days`; the slot report now carries `machine` and `unused_days`.
+- Sessions shows every session. A slider "Show sessions of at least" starts at "any size"; its other steps run on a log scale from the measure's least folder to the largest session. The smaller sessions join one row with its own tooltip. Each session row shows a tooltip with its state, size and held folders with their tasks. The card is built once, so a drag goes on across new data. When new data leaves the slider no range, the filter goes back to "any size".
+- `page.sessions_shown` is deleted from `config/disks.conf`.
+- Tests: `test_disks_page` (the published page holds the marked parts; the filter rows; the sessions card keeps its slider and limit across new data; the tooltip of each row kind, and a slot run tooltip equal to `tooltipHtml` of its Builds row on the right machine), `test_memory_feed` (`slot_folder` and `slot_machine`), `test_memory_hover`. A Chrome check on live data hovers each tooltip, checks that none is cut or outside the window, and saves the dark desktop shot.
+
+#### gatefix — A build's Uses counts its compilers; the tooltip names the branch first; CI rows say their job · status: done
+
+From the user (via the Images page, 2026-11-16), on the gate tooltip shot: "why do you say branch sdlc instead of sdlc branch which is more natural? SHowrunner - can you use a real one? i don't know what fixture-production is Runs on "fixture" what is fixture? Uses 0.0 GiB? why does it say that - uses 0.0 has to be a bug - isn't that the bug we have right now? please do better". On the Disks shot: "yes - it should use the same tooltip - a working, fixed tooltip, to be sure!".
+
+Cause of "Uses 0.0 GiB": `~/.cargo/config.toml` sets `rustc-wrapper = "sccache"`. The sccache server starts each compiler in `builds.slice/sccache.service`, not in the step scope. A build's Uses held only cargo, and the compile memory showed in the compiler cache row. The queue also kept the full need aside for that build while its compilers already took that RAM from MemAvailable. On 2026-11-16 the research build in `hana-slot4` showed 0.0 GiB at 778 of 831 units; its scope peak at the link was 13.7 GiB.
+
+As built:
+
+- `invoke.sh`: the step scope exports `BUILDLOG_STEP_SCOPE`, its cgroup folder. sccache gives each compiler its client's environment (checked on natedev with a marker variable). sccache hashes `CARGO_*` variables and the variables that rustc dependency data names. No crate reads `BUILDLOG_STEP_SCOPE`, so cache keys do not change.
+- `memory_admit.sccache_memory` groups the service's processes by the scope each one names (`CompilerJob`, a new field `jobs` on `CompilerServiceMemory`). The compiler cache bytes leave out the jobs.
+- `memory_admit.attributed_step_uses` adds a scope's jobs to the step that holds that scope. Uses, Build reserved, the cap and the progress profiles now count the step's compilers. A job whose scope has no reservation counts in "Other build tools".
+- `memory_feed.build_tool_ram` leaves the jobs out of the compiler cache line.
+- `config/build_steps.conf`: Changes reads "sdlc branch" and "main branch".
+- The Builds proof uses real names: showrunner sdlc, unit handler, machine natedev, and a real Uses for the gate row.
+- Steps that started before the merge keep the old reading until they end. The admission service and the review-links server load the new code on their own.
+
+From the user (via builds, 2026-11-16): "the \"showrunner\" underneath the CI steps in the build queue are messed up - too long - and the actual CI step  that says CI /run/hana-ci-admission/.. - i don't even know what that is but it has to be a bug".
+
+Cause: each hana runner's `cargo` is a store front, `ci_cargo_front.py --front <cargo> --shared-folder /run/hana-ci-admission/<runner> -- <words>`. `memory_feed.cargo_job` matched the `--front` value as cargo and read the shared folder as the job.
+
+- `parse.cargo_front_call` splits the front's options from cargo's words. `ci_cargo_front.main` and `memory_feed.cargo_job` both use it, so a CI row says its job ("CI build", "CI tests").
+- Under a CI step the Builds page shows the label's first part ("hana CI"). The tooltip title keeps the whole label with the runner and the job.
+
+#### overcap — The Builds bar draws build reserved over the queue cap · status: done
+
+From the user (via builds, 2026-11-16), on two Builds shots: "how am i to interpret this overage of 34.6 of 29.9 taken - i see the que cap of 29.9 - but where does it show that it has been overtaken in the memory bar above? I don't think it does". Then: "the rserved is actually a number that we're NOT taking we're just reporting it - we're eating back into the reserve but we're pretty safe because there is still so much of it". The user approved mockup 0f8ecf5d1a1c: "Go: report builds it as in the mockup".
+
+Cause: build reserved is room that running steps may still grow into, not RAM in use. Free RAM covers the safety net and swap coming back first. The bar drew only the covered part of the reserve and stopped at the cap line. Taken counts the full reserve, so it read 34.6 of 29.9 with no box for the 4.7. "builds 12.7" was 3.4 build tools + 9.1 queued builds + 0.2 hana CI, a part too narrow to see.
+
+As built:
+
+- `memory_live.html`: when build reserved is over the cap, a red dashed box (`b-overlay`) lies past the cap line over the safety net and swap, and a dashed "over cap" brace (`b-over`) sits beside "queue cap". The build reserved brace reads "<full> · <covered> covered".
+- The `over` tooltip shows Build reserved (full) − Free RAM after safety net and swap = Over cap. Then it shows what the reserve takes first if steps grow: the safety net, swap coming back, then cache and other programs.
+- `statusLine`: when only the build reserve is not covered, the line says it is over the cap and that a reserve is not RAM in use. An uncovered safety net or swap keeps "reserves exceed free RAM".
+- The hana CI part is at least 3 px wide. Bar parts can shrink, so the bar still ends at its right edge.
+- Tests: `test_memory_hover` (brace list, status line row), the Builds proof (box at the cap line, brace and box widths, labels, tooltip sums, no box when nothing is over the cap; the shot `over-cap-dark-desktop.png`).
+- Tests: `test_memory_admit` (a step's use and kept bytes count its compilers; the sccache reading groups compilers by scope and leaves out the server), `test_invoke_scope` (the step sees `BUILDLOG_STEP_SCOPE`), `test_memory_feed`, `test_memory_hover`, and the Builds proof.
 
 ### Tokens — The Builds page shows the jobserver tokens · status: done
 

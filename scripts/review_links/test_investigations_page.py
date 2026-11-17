@@ -13,6 +13,7 @@ from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import urlencode
 
+from scripts.review_links.test_page_frame import assert_status_states
 from scripts.production import investigation, staff
 from scripts.review_links import console, investigations_page
 
@@ -64,6 +65,17 @@ class InvestigationsPageTests(unittest.TestCase):
         self.assertLess(body.index(f'<option value="{RUNNER.id}"'), body.index(f'<option value="{UNIT.id}"'))
         self.assertIn(f'<option value="{UNIT.id}">Builder</option>', body)
         self.assertIn(f'<option value="{ORPHAN}">{ORPHAN}</option>', body)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_page_status_uses_the_real_investigations_loader(self) -> None:
+        ready = self.file(UNIT.id, "Find the cause <now>", "2026-11-16T13:05:00+00:00")
+        _ = investigation.answer(UNIT.id, ready.id, "The cause is known.\nThe repair is ready.")
+        _ = self.file(RUNNER.id, "Find the next cause", "2026-11-16T14:00:00+00:00")
+        read = self.file(ORPHAN, "Read answer", "2026-11-16T12:00:00+00:00")
+        _ = investigation.answer(ORPHAN, read.id, "An answer.")
+        _ = investigation.mark_read(ORPHAN, read.id)
+        body = investigations_page.render(self.root / "reviews").decode()
+        assert_status_states(self, body, 15)
 
     def test_order_uses_answer_time_then_filed_time_then_read_time(self) -> None:
         items: list[investigation.Investigation] = []

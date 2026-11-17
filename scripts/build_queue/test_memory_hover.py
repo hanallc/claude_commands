@@ -15,6 +15,7 @@ from scripts.build_queue import memory_feed, progress_profile as progress
 from scripts.lint.memory_test_support import admission_policy_fixture
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import test_hang_guard
+from scripts.review_links import page_frame
 GIB = admission_records.GIB
 MIB = 1024 ** 2
 RAM_FIXTURE: dict[str, object] = {
@@ -38,7 +39,7 @@ class MemoryHoverTests(unittest.TestCase):
     def test_builds_page_has_no_navigation_or_framing_restriction(self) -> None:
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         self.assertIn("<title>Builds</title>", page)
-        self.assertIn('<h1 class="page-title">Builds</h1>', page)
+        self.assertIn('<h1 class="page-title">Builds</h1>', page_frame.template(page, "Builds", "builds"))
         elements: list[tuple[str, dict[str, str]]] = []
 
         def collect(tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -260,6 +261,22 @@ class MemoryHoverTests(unittest.TestCase):
                     self.assertEqual(fields[1:1+len(expected)], expected)
                     self.assertNotIn("Unit", [pair[0] for pair in fields])
                     self.assertNotIn("not recorded", html)
+
+    def test_a_gate_hover_says_what_the_job_does_and_changes_below_its_title(self) -> None:
+        about = "Merges the handler checkpoint into the sdlc branch, tests every module, then pushes sdlc."
+        row = {"name": "natemerge integrate", "queued": True, "used": 1, "reserved": 0, "counted": 1,
+               "showrunner": "builds", "unit": "natemerge", "runner": "unit director",
+               "about": about, "changes": "sdlc branch"}
+        data = {"read_at": 200, "walk": [row], "waiters": [{**row, "need": 2, "since": 100, "why": "its turn"}]}
+        for key in ("row:fixture-run-0", "wait:fixture-wait-0"):
+            with self.subTest(key=key):
+                html = cast(str, self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True))
+                grid = ElementTree.fromstring(html)
+                cells = [(cell.text or "", cell.get("class") or "") for cell in grid]
+                self.assertTrue(cells[0][0].startswith("natemerge · integrate"))
+                self.assertIn((about, "caption"), cells[2:4])
+                fields = [(cell.text, grid[index+1].text) for index, cell in enumerate(grid) if cell.tag == "dt"]
+                self.assertEqual(fields[1:3], [("Changes", "sdlc branch"), ("Showrunner", "builds")])
 
     def test_a_ci_hover_keeps_its_ci_line(self) -> None:
         data = {"read_at": 200, "walk": [{"name": "hana CI", "ci": True, "ci_label": "hana CI · runner-1",
@@ -637,15 +654,19 @@ class MemoryHoverTests(unittest.TestCase):
         loop = html[html.index("const consoleHidden ="):html.index("</script>")]
         javascript = """
 const calls = [];
-let listener = null;
+const listeners = [];
 const parent = {name: "console"};
 const location = {origin: "http://natedev:8080", pathname: "/memory_live.html"};
 const window = {frameElement: JSON.parse(process.argv[1])};
 const SECONDS = 5;
 const fetch = url => { calls.push(String(url).split("?")[0]); return new Promise(() => {}); };
-const setInterval = () => 0;
-const addEventListener = (kind, handler) => { listener = handler; };
-""" + loop + """
+const setInterval = () => 0, clearInterval = () => {}, setTimeout = () => 0, clearTimeout = () => {};
+const performance = {now:()=>0,getEntriesByType:()=>[]};
+const document = {visibilityState:'visible',querySelector:()=>null,addEventListener:()=>{}};
+const addEventListener = (kind, handler) => { listeners.push(handler); };
+window.addEventListener = addEventListener;
+const listener = event => listeners.forEach(run=>run(event));
+""" + page_frame.REFRESH_SCRIPT + loop + """
 const loaded = calls.length;
 listener({source: {}, origin: location.origin, data: "console-shown"});
 listener({source: parent, origin: "http://other", data: "console-shown"});
@@ -676,13 +697,21 @@ const location = {origin: "http://natedev:8080", pathname: "/memory_live.html"};
 const window = {frameElement: null};
 const SECONDS = 5;
 const fetch = url => { calls.push(String(url).split("?")[0]); return new Promise(() => {}); };
-const setInterval = () => 0;
+const setInterval = () => 0, clearInterval = () => {}, setTimeout = () => 0, clearTimeout = () => {};
+const performance = {now:()=>0,getEntriesByType:()=>[]};
+const parts = {};
+const line = {dataset:{statusOptions:'{}'},querySelectorAll:()=>[],querySelector:selector=>
+  parts[selector] ||= {hidden:false,textContent:'',classList:{toggle(){}}}};
+const document = {visibilityState:'visible',querySelector:()=>line,addEventListener:()=>{}};
 const badge = {hidden: true};
 const $ = () => badge;
-const lastRead = null;
-function updateReadingStatus() {}
-const addEventListener = (kind, handler) => { handlers[kind] = handler; };
-""" + loop + """
+const listeners = {};
+const addEventListener = (kind, handler) => {
+  (listeners[kind] ||= []).push(handler);
+  handlers[kind] = event => listeners[kind].forEach(run=>run(event));
+};
+window.addEventListener = addEventListener;
+""" + page_frame.REFRESH_SCRIPT + loop + """
 const steps = [];
 const record = label => steps.push([label, calls.length, badge.hidden]);
 const outside = {closest: () => null};
@@ -692,15 +721,20 @@ press(outside, {});
 tick();
 reloadWhenPageChanges();
 record("paused");
+if (line.dataset.state !== "Paused") throw new Error("Space must set the shared status to Paused.");
+if (parts['[data-status-reason]'].textContent !== "Press space to resume.")
+  throw new Error("The shared status must show the pause reason.");
 const typed = [];
 press({closest: selector => { typed.push(selector); return {}; }}, {});
 press(outside, {repeat: true});
 press(outside, {ctrlKey: true});
 record("ignored");
+if (line.dataset.state !== "Paused") throw new Error("A control must keep the shared status Paused.");
 handlers.message({source: {}, origin: location.origin, data: "console-space"});
 record("foreign");
 handlers.message({source: parent, origin: location.origin, data: "console-space"});
 record("resumed");
+if (line.dataset.state === "Paused") throw new Error("Resume must clear the shared pause status.");
 steps.push(typed);
 process.stdout.write(JSON.stringify(steps));
 """
@@ -715,10 +749,10 @@ process.stdout.write(JSON.stringify(steps));
     def page_expression(self, expression: str, data: object, *, walk: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("function field("):html.index("const tip =")]
-        constants = html[html.index("const f1 ="):html.index("function setSeg(")]
+        constants = ""
         if walk:
             functions += html[html.index("function renderWalk(d)"):html.index("function fitAxisLabels()")]
-            functions += html[html.index("function esc(s)"):html.index("let lastRead =")]
+            functions += html[html.index("function esc(s)"):html.index("const consoleHidden =")]
             constants += """
 const elements = new Map();
 const $ = id => {
@@ -804,9 +838,9 @@ function fitLabels() {}
         self.assertNotIn("How free is worked out", page)
         # The user, 11-15: braces name builds, free RAM and everything else; free RAM has three parts.
         self.assertEqual([part.split('"')[0] for part in bar.split('class="brace ')[1:]],
-                         ["l1", "l1 free", "l1", "l2 reserved", "l2 free", "l2", "cap"])
+                         ["l1", "l1 free", "l1", "l2 reserved", "l2 free", "l2", "cap", "cap over"])
         self.assertEqual([part.split('"')[0] for part in bar.split('id="b-')[1:]],
-                         ["builds", "free", "else", "reserved", "room", "system", "cap"])
+                         ["builds", "free", "else", "reserved", "room", "system", "overlay", "cap", "over"])
         # The user, 11-15: the queue cap starts at 0 and ends at the end of free.
         self.assertIn('<div class="brace cap" id="b-cap" data-tip="cap">', bar)
         for removed in ("updateNativeOwnerTips", "pageOwnerTipFields", "nativeTipText", 'id="mark"', 'id="marklabel"'):
@@ -866,6 +900,10 @@ function fitLabels() {}
             ("pressure", RAM_FIXTURE, "Memory pressure prevents a new start; free is 18.0 GiB."),
             ("shortfall", {**RAM_FIXTURE, "room_bytes": 0, "shortfall_bytes": 3 * GIB},
              "Nothing is free: reserves exceed free RAM by 3.0 GiB."),
+            # The user, 11-16: a build reserve over the cap is a promise, not RAM in use.
+            ("shortfall", {**RAM_FIXTURE, "room_bytes": 0, "shortfall_bytes": 3 * GIB, "build_missing_bytes": 3 * GIB,
+                           "safety_missing_bytes": 0, "swap_missing_bytes": 0},
+             "Nothing is free: build reserved is 3.0 GiB over the cap. A reserve is room a step may still grow into, not RAM in use."),
             ("no_room", {**RAM_FIXTURE, "room_bytes": 0},
              "Nothing is free: the safety net, swap coming back and build reserved use all free RAM."),
             ("one_running_memory_wait", RAM_FIXTURE, "One build runs; another needs 12.0 GiB, but free is 9.0 GiB."),

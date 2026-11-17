@@ -36,7 +36,7 @@ from scripts.production.delivery_state import (
 from scripts.lib import atomic_file, conf, file_lock, urgency
 from scripts.production.production_doc import Refusal as Refusal, production_field
 from scripts.feature_log import feature_log
-from scripts.review_links import page_frame, review_link
+from scripts.review_links import console_theme, page_frame, review_link
 
 MANIFEST = ".review-link-changes.json"
 PAGE_NAME = "changes.html"
@@ -438,7 +438,7 @@ def document(content: str, title: str = TITLES["changes"]) -> bytes:
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>''' + html.escape(title) + '''</title><style>
 :root{color-scheme:light dark;font:17px/1.55 system-ui,sans-serif}
-body{margin:0}''' + page_frame.STYLE + page_frame.ZOOM_STYLE + '''main{max-width:744px}
+body{margin:0}''' + console_theme.TOKENS + page_frame.STYLE + page_frame.ZOOM_STYLE + '''main{max-width:744px}
 ''' + CHANGE_IMAGE_STYLE + '''h1{font-size:26px;line-height:1.25;margin:0 0 16px}section h1,h2{font-size:20px;line-height:1.3}
 h2{margin:16px 0}p{white-space:pre-wrap;margin:16px 0}main{overflow-wrap:anywhere}
 section h2{font-size:17px}section details{margin:16px 0}
@@ -987,25 +987,31 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
         status.request_attempts[delivery.attempt] = AttemptOwnership(status.path(delivery.page, delivery.row), "sending")
     failures = (send_with_retries(SENDER, delivery.recipients, delivery.message, tries, pause) if delivery.recipients
                 else [DeliveryFailure(MissingRecipient(), "no showrunner to send to")])
-    alert_delivery_failures(delivery, failures, tries)
+    _ = alert_delivery_failures(failures, tries, source=delivery.page.review_list, row=delivery.row,
+                            message=delivery.message, recipients=delivery.alert_recipients)
     status.record(delivery)
 
 
-def alert_delivery_failures(delivery: MessageDelivery, failures: list[DeliveryFailure], tries: int) -> None:
+def alert_delivery_failures(failures: list[DeliveryFailure], tries: int, *, source: Path, row: str,
+                            message: str, recipients: tuple[staff.StaffId, ...],
+                            title: str = "Change review delivery needs attention") -> bool:
+    reached = False
     for failure in failures:
         target = "no recipient" if isinstance(failure.recipient, MissingRecipient) else failure.recipient
         error = failure.error
-        alert = "\n".join(("Change review delivery needs attention", f"List: {delivery.page.review_list}",
-                           f"Row: {delivery.row}", f"Recipient: {target}", f"Tries: {tries}",
-                           f"Last error: {error}", "The user's answer is saved. Pass it on by hand.", delivery.message))
-        if not delivery.alert_recipients:
-            print(f"review-links delivery {delivery.row}: {error}; no showrunner for the alert", file=sys.stderr)
-        for runner in delivery.alert_recipients:
+        alert = "\n".join((title, f"List: {source}",
+                           f"Row: {row}", f"Recipient: {target}", f"Tries: {tries}",
+                           f"Last error: {error}", "The user's answer is saved. Pass it on by hand.", message))
+        if not recipients:
+            print(f"review-links delivery {row}: {error}; no showrunner for the alert", file=sys.stderr)
+        for runner in recipients:
             try:
                 send_to_staff(runner, SENDER, alert)
+                reached = True
             except SEND_ERRORS as failure:
-                print(f"review-links delivery alert {delivery.row}: " + " ".join(str(failure).splitlines()), file=sys.stderr)
-                return
+                print(f"review-links delivery alert {row}: " + " ".join(str(failure).splitlines()), file=sys.stderr)
+                return reached
+    return reached
 
 
 def recover_pending(status: DeliveryStatus) -> None:
