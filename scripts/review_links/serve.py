@@ -458,7 +458,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.review_post()
             return
         if urlsplit(self.path).path == accounts_page.PAGE_PATH:
-            self.account_color_post()
+            self.accounts_post()
             return
         if urlsplit(self.path).path == images.PAGE_PATH:
             self.image_post()
@@ -618,22 +618,24 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         finally:
             change_page.deliver(delivery, server.delivery_status)
 
-    def account_color_post(self) -> None:
-        """Validate and publish one color from the Accounts page."""
+    def accounts_post(self) -> None:
+        """Validate and save one account color or one next move from the Accounts page."""
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 4096:
-                raise ValueError("Invalid color request size.")
+                raise ValueError("Invalid accounts request size.")
             fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
-            if set(fields) != {"label", "value"} or any(len(values) != 1 for values in fields.values()):
-                raise ValueError("Use one label and one color value.")
+            if (set(fields) not in ({"label", "value"}, {"group", "to"})
+                    or any(len(values) != 1 for values in fields.values())):
+                raise ValueError("Use one label and one color value, or one group and one account.")
         except (ValueError, UnicodeError) as error:
             self.json_response(400, {"reason": str(error)})
             return
-        result = accounts_page.save_color(fields["label"][0], fields["value"][0])
-        if isinstance(result, accounts_page.ColorRefused):
+        result = (accounts_page.save_color(fields["label"][0], fields["value"][0]) if "label" in fields
+                  else accounts_page.save_next_move(fields["group"][0], fields["to"][0]))
+        if isinstance(result, accounts_page.Refused):
             self.json_response(400, {"reason": result.reason})
-        elif isinstance(result, accounts_page.ColorSaveFailed):
+        elif isinstance(result, accounts_page.SaveFailed):
             self.json_response(503, {"reason": result.reason})
         else:
             cast(ReviewLinksServer, self.server).accounts_cache = AccountsPageCache()

@@ -79,6 +79,17 @@ class StatusBoardTests(unittest.TestCase):
         self.assertEqual([column["align"] for column in board["columns"]],
                          ["left", "left", "right", "left", *["right"] * 5, "right", "right", "left"])
 
+    def test_only_selected_claude_group_lines_name_their_group_for_the_move_menu(self) -> None:
+        rows = (row("claude1", ("units", "showrunners", "workers"), (counts(1, 0, 0, 0),) * 3, 50, None, None,
+                    selected=("units", "showrunners")),
+                row("claude2", ("units",), (counts(0, 1, 0, 0),), 70, None, None),
+                replace(row("codex1", ("units",), (counts(0, 0, 0, 0),), 80, None, None, selected=("units",)), tool="codex"))
+        board = accounts.status_board(accounts.StatusReading(rows, (), (), ZONE, NOW))
+        self.assertEqual([(text(line["cells"]["roles"]), line.get("group")) for line in board["rows"]], [
+            ("units ✓", accounts.BoardGroup(account="claude1", group="units")),
+            ("showrunners ✓", accounts.BoardGroup(account="claude1", group="showrunners")),
+            ("workers", None), ("units", None), ("units ✓", None), ("", None)])
+
     def test_tones_mark_access_and_low_quota(self) -> None:
         rows = {text(line["cells"]["label"]): line for line in accounts.status_board(fixture())["rows"]}
         self.assertEqual({label: line["cells"]["dot"][0]["tone"] for label, line in rows.items() if line["cells"]["dot"]},

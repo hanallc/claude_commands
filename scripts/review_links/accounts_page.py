@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import html
+import json
 from pathlib import Path
 import re
 from statistics import median
@@ -10,7 +11,7 @@ import subprocess
 import sys
 import time
 
-from scripts.accounts import accounts
+from scripts.accounts import accounts, next_moves
 from scripts.lib import conf
 from scripts.review_links import change_page, console_theme, page_frame, review_link
 
@@ -23,43 +24,58 @@ TUNE = (str(Path(__file__).resolve().parents[1] / "lib/py"),
 
 
 @dataclass(frozen=True)
-class ColorSaved:
-    """Tune published the account color."""
+class Saved:
+    """The page change is saved."""
 
 
 @dataclass(frozen=True)
-class ColorRefused:
-    """The request contains an unsupported account or color."""
+class Refused:
+    """The request names an unsupported account, color or group."""
     reason: str
 
 
 @dataclass(frozen=True)
-class ColorSaveFailed:
-    """Tune could not publish the account color."""
+class SaveFailed:
+    """The checked change could not be saved."""
     reason: str
 
 
-def save_color(label: str, value: str) -> ColorSaved | ColorRefused | ColorSaveFailed:
+def save_color(label: str, value: str) -> Saved | Refused | SaveFailed:
     """Validate the account color and publish it through this checkout's tune."""
     try:
         colors = conf.read("statusline").values()
     except (OSError, ValueError) as error:
-        return ColorSaveFailed(" ".join(str(error).split()))
+        return SaveFailed(" ".join(str(error).split()))
     if f"account.{label}" not in colors:
-        return ColorRefused("The account has no configured color.")
+        return Refused("The account has no configured color.")
     if not re.fullmatch(r"#[0-9a-f]{6}", value):
-        return ColorRefused("Use a color in #rrggbb format.")
+        return Refused("Use a color in #rrggbb format.")
     try:
         done = subprocess.run((*TUNE, "statusline", f"account.{label}", value,
             "--why", "The user chose this color with the Accounts page color chooser.",
             "--user-words", f"{label} color set to {value} with Save on the console Accounts page"),
             capture_output=True, text=True, check=False)
     except OSError as error:
-        return ColorSaveFailed(" ".join(str(error).split()))
+        return SaveFailed(" ".join(str(error).split()))
     if done.returncode:
         lines = done.stderr.strip().splitlines()
-        return ColorSaveFailed(" ".join(lines[-1].split()) if lines else f"Tune exited {done.returncode}.")
-    return ColorSaved()
+        return SaveFailed(" ".join(lines[-1].split()) if lines else f"Tune exited {done.returncode}.")
+    return Saved()
+
+
+def save_next_move(group: str, target: str) -> Saved | Refused | SaveFailed:
+    """Make the target the group's first next move at the configured percent."""
+    if group != "units" and group != "showrunners":
+        return Refused("Choose units or showrunners.")
+    try:
+        _ = accounts.claude_account_dir(target)
+    except accounts.AccountsError as error:
+        return Refused(" ".join(str(error).split()))
+    try:
+        _ = next_moves.set_first_next_move(group, next_moves.console_next_move_percent(), target)
+    except (OSError, ValueError) as error:
+        return SaveFailed(" ".join(str(error).split()))
+    return Saved()
 
 
 @dataclass(frozen=True)
@@ -90,9 +106,25 @@ def _spans(spans: list[accounts.BoardSpan]) -> str:
     return "".join(parts)
 
 
+def _row_open(row: accounts.BoardRow) -> str:
+    """Open a table line; a line of a Claude group carries the account and group its move menu needs."""
+    group = row.get("group")
+    move = (f' data-move-account="{html.escape(group["account"], quote=True)}" data-move-group="{group["group"]}"'
+            if group else "")
+    return f'<tr class="account"{move}>' if row["cells"]["label"] else f"<tr{move}>"
+
+
 def board(reading: accounts.StatusReading) -> str:
     """The accounts board table, then the upcoming moves and the problems."""
     table = accounts.status_board(reading)
+    claude = {row.label for row in reading.rows if row.tool == "claude"}
+    def target(spans: list[accounts.BoardSpan], left: list[accounts.BoardSpan]) -> list[str]:
+        color = accounts.account_color(spans[0].get("color", ""))
+        return [spans[0]["text"], "".join(span["text"] for span in left),
+                color.css if isinstance(color, accounts.AccountColor) else "", left[0]["tone"] if left else "default"]
+    targets = [target(spans, row["cells"]["left"]) for row in table["rows"]
+               if (spans := row["cells"]["label"]) and spans[0]["text"] in claude]
+    percent = next_moves.format_next_move_percent(next_moves.console_next_move_percent())
     def swatch(spans: list[accounts.BoardSpan]) -> str:
         if not spans or "color" not in spans[0]:
             return ""
@@ -105,14 +137,15 @@ def board(reading: accounts.StatusReading) -> str:
     head = "".join(f'<th class="{column["align"]}">{html.escape(column["heading"])}</th>'
                    for column in table["columns"]) + '<th class="left">Color</th>'
     rows = "".join(
-        ('<tr class="account">' if row["cells"]["label"] else "<tr>")
+        _row_open(row)
         + "".join(f'<td class="{column["align"]}"{" data-account-name" if column["key"] == "label" else ""}>'
                   + f'{_spans(row["cells"][column["key"]])}</td>' for column in table["columns"])
         + f'<td class="left">{swatch(row["cells"]["label"])}</td>'
         + "</tr>" for row in table["rows"])
     moves = "".join(f"<li>{html.escape(line)}</li>" for line in reading.upcoming_moves if line)
     problems = "".join(f"<li>{html.escape(note.removeprefix('* '))}</li>" for note in reading.notes)
-    return ('<section class="card"><div class="scroll"><table>'
+    return (f'<section class="card" data-move-percent="{percent}" '
+            + f'data-move-targets="{html.escape(json.dumps(targets), quote=True)}"><div class="scroll"><table>'
             + f"<thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></div>"
             + (f'<ul class="moves">{moves}</ul>' if moves else "")
             + (f'<h2>Problems</h2><ul class="problems">{problems}</ul>' if problems else "") + "</section>")
@@ -125,7 +158,7 @@ def page() -> bytes:
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             + '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Accounts</title>'
             + f'{STYLE}</head><body><main data-refresh-seconds="{refresh_seconds}">' + page_frame.title("Accounts", "accounts")
-            + f'<div data-accounts>{body}</div></main>' + POPUP
+            + f'<div data-accounts>{body}</div></main>' + POPUP + MENU
             + f"<script>{SCRIPT}</script></body></html>").encode()
 
 
@@ -194,6 +227,17 @@ background:var(--bg);color:var(--ink);cursor:pointer}.color-actions button:hover
 .color-swatch:focus-visible,.color-picker :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 /* A thin red or amber digit falls under 4.5:1; the heavier stroke keeps it at the token contrast. */
 .error,.warning{font-weight:600}
+tr[data-move-group]{cursor:context-menu}
+.move-menu{position:fixed;margin:0;padding:6px;width:max-content;min-width:220px;max-width:calc(100vw - 16px);box-sizing:border-box;
+border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink);box-shadow:0 4px 20px var(--edge);
+font-size:.86rem;font-variant-numeric:tabular-nums}
+.move-menu[hidden]{display:none}
+.move-title{padding:6px 10px 8px;margin-bottom:4px;color:var(--ink-2);border-bottom:1px solid var(--line)}
+.move-menu button{display:flex;justify-content:space-between;gap:24px;width:100%;padding:6px 10px;border:0;border-radius:6px;
+background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
+.move-menu button:hover,.move-menu button:focus-visible{background:var(--hover);outline:none}
+.move-name{font-weight:600}.move-left{color:var(--ink-2)}.move-left.warning{color:var(--warning)}.move-left.error{color:var(--error)}
+.move-empty{padding:6px 10px;color:var(--ink-3)}
 .moves,.problems{list-style:none;padding:0;margin:12px 0 0;font-size:.86rem;color:var(--ink-2)}
 .moves li,.problems li{padding:2px 0}.problems li{color:var(--warning)}.problems li::before{content:"• "}
 </style>"""
@@ -213,6 +257,9 @@ maxlength="7" spellcheck="false" autocomplete="off" required>
 <div class="color-actions"><button type="button" data-color-try>Try</button>
 <button type="button" data-color-save>Save</button>
 <button type="button" data-color-cancel>Cancel</button></div></dialog>'''
+
+MENU = ('<div class="move-menu" role="menu" tabindex="-1" aria-labelledby="move-title" hidden data-move-menu>'
+        + '<div id="move-title" class="move-title" data-move-title></div><div data-move-items></div></div>')
 
 SCRIPT = page_frame.REFRESH_SCRIPT + r"""(() => {
 let view = document.querySelector('[data-accounts]');
@@ -291,15 +338,19 @@ message.className='color-save-error';message.dataset.colorSaveError='';message.h
 message.setAttribute('role','status');message.setAttribute('aria-live','polite');
 document.querySelector('[data-page-status]').append(message);
 let selected=null;
-const hold=()=>selected ? 'An account color is being edited.' : pendingSaves.size ? 'Account colors are being saved.' : '';
+const menu=document.querySelector('[data-move-menu]'), menuItems=menu.querySelector('[data-move-items]');
+let menuRow=null;
+const pendingMoves=new Set();
+const hold=()=>selected ? 'An account color is being edited.' : menuRow ? 'An account move is being chosen.'
+ : pendingSaves.size ? 'Account colors are being saved.' : pendingMoves.size ? 'An account move is being saved.' : '';
 async function refresh(supersede=false,current=()=>true) {
-  if (selected || pendingSaves.size) return;
+  if (hold()) return;
   const request = ++newestRequest;
   const response = await fetch(location.pathname, {cache: 'no-store'});
   if (!response.ok) throw new Error('HTTP ' + response.status);
   const page = new DOMParser().parseFromString(await response.text(), 'text/html');
   const fresh = page.querySelector('[data-accounts]');
-  if (request !== newestRequest || !current() || selected || pendingSaves.size) return;
+  if (request !== newestRequest || !current() || hold()) return;
   if (!fresh) throw new Error('The page has no accounts.');
   const top = scrollY;
   view.replaceWith(fresh);view = fresh;
@@ -380,6 +431,75 @@ popup.querySelector('[data-color-save]').addEventListener('click',()=>{
  if(state.queue.length===1) void publish(save,state);
 });
 addEventListener('resize',position);addEventListener('scroll',position,{passive:true});
+function closeMenu(){
+ if(!menuRow) return;
+ menuRow=null;menu.hidden=true;menuItems.replaceChildren();updates.changed();
+}
+function menuItem([label,left,color,tone]){
+ const item=document.createElement('button');
+ item.type='button';item.setAttribute('role','menuitem');item.dataset.moveTarget=label;
+ const name=document.createElement('span'), room=document.createElement('span');
+ name.className='move-name';name.textContent=label;if(color) name.style.color=color;
+ room.className='move-left'+(tone==='default' ? '' : ' '+tone);room.textContent=left && left!=='—' ? left+' left' : '';
+ item.append(name,room);return item;
+}
+function openMenu(row,x,y){
+ if(selected) close(true);
+ const card=view.querySelector('[data-move-targets]');
+ const account=row.dataset.moveAccount, group=row.dataset.moveGroup;
+ const targets=JSON.parse(card.dataset.moveTargets).filter(([label])=>label!==account);
+ menuRow=row;
+ menu.querySelector('[data-move-title]').textContent='When '+account+' reaches '+card.dataset.movePercent+'%, move '+group+' to';
+ const empty=document.createElement('div');
+ empty.className='move-empty';empty.textContent='No other Claude account';
+ menuItems.replaceChildren(...(targets.length ? targets.map(menuItem) : [empty]));
+ menu.hidden=false;
+ const size=menu.getBoundingClientRect();
+ menu.style.left=Math.max(8,Math.min(x,innerWidth-size.width-8))+'px';
+ menu.style.top=Math.max(8,Math.min(y,innerHeight-size.height-8))+'px';
+ (menuItems.querySelector('button') || menu).focus({preventScroll:true});
+ updates.abandon();
+}
+async function saveMove(group,target){
+ const save={group,target};
+ pendingMoves.add(save);message.textContent='';message.hidden=true;
+ try{
+  const response=await fetch(location.pathname,{method:'POST',
+   headers:{'Content-Type':'application/x-www-form-urlencoded'},
+   body:new URLSearchParams({group,to:target}).toString()});
+  const result=await response.json();
+  if(!response.ok) throw new Error(result.reason || 'The move could not be saved.');
+ }catch(error){
+  message.textContent=group+': '+(error.message || 'The move could not be saved.');message.hidden=false;
+ }finally{
+  pendingMoves.delete(save);updates.changed();
+  if(!hold()) void updates.refresh(true);
+ }
+}
+document.addEventListener('contextmenu',event=>{
+ const row=event.target instanceof Element ? event.target.closest('tr[data-move-group]') : null;
+ if(!row){closeMenu();return;}
+ event.preventDefault();closeMenu();openMenu(row,event.clientX,event.clientY);
+});
+document.addEventListener('pointerdown',event=>{
+ if(menuRow && !(event.target instanceof Node && menu.contains(event.target))) closeMenu();
+});
+menu.addEventListener('click',event=>{
+ const item=event.target instanceof Element ? event.target.closest('[data-move-target]') : null;
+ if(!item || !menuRow) return;
+ void saveMove(menuRow.dataset.moveGroup,item.dataset.moveTarget);closeMenu();
+});
+menu.addEventListener('keydown',event=>{
+ const items=[...menuItems.querySelectorAll('button')], at=items.indexOf(document.activeElement);
+ if(event.key==='Escape' || event.key==='Tab'){event.preventDefault();closeMenu();return;}
+ if(!items.length || !['ArrowDown','ArrowUp','Home','End'].includes(event.key)) return;
+ event.preventDefault();
+ const down=event.key==='ArrowDown';
+ const next=event.key==='Home' ? 0 : event.key==='End' ? items.length-1
+  : at<0 ? (down ? 0 : items.length-1) : (at+(down ? 1 : -1)+items.length)%items.length;
+ items[next].focus();
+});
+for(const name of ['resize','scroll','blur']) addEventListener(name,closeMenu,{passive:true});
 })();"""
 
 
