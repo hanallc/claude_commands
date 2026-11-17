@@ -2699,8 +2699,13 @@ The cutover removal commit deletes the script after the run.
 
 **Files:** `scripts/lib/helper_tree_test_support.py`.
 
-### Phase 142 — Name what holds natedev memory outside the build and CI slices  · status: todo
+### Phase 142 — Name what holds natedev memory outside the build and CI slices  · status: done
 
-At 13:48 EST, 34.65 GiB of natedev memory (61 GiB total) was in use outside the build and CI slices, and the queue head waited 148 minutes for 7.9 GiB. A read-only probe groups those processes by PSS and names what is safe to reclaim. Nothing is stopped or changed.
+#### As-built
+
+- Read-only probe at 13:58 EST on 2026-11-17, under `MemoryMax=2G`. It excluded `builds.slice` (with `builds-detached.slice` and `sccache.service`) and `/hana.slice`. It rebuilt 33.9 of the 34.65 GiB.
+- Main holders: 46 Claude sessions 11.5 GiB PSS, zram compressed swap 8.2 GiB, kernel 3.1, file cache 3.5, services and desktop 2.9 (KDE Baloo 1.48), other 2.1, Codex 1.7.
+- Two orphan headless Chrome trees (0.05 GiB) from report's screenshot scripts were stopped by pid. Cause: `timeout` stops node before its `chrome.kill()`, and Chrome runs in its own scope. Builds has the owner and the defect.
+- Checkpoint `0d39e750f`. No repository code changed.
 
 **Files:** none.
