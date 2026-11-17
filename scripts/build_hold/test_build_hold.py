@@ -1126,6 +1126,44 @@ class ReleaseDeliveryTests(IsolatedBuildHoldTest):
             self.assertEqual(build_hold.send_release(entry, "/test/socket", build_hold.RELEASE_NOTICE),
                              build_hold.ReleaseSendFailed("send unavailable"))
 
+        for recipient in ("codex:t1", "claude-worker"):
+            for code, delivery in ((0, "Delivered"), (1, "QueuedUnconfirmed"), (2, "DeliveryFailed"), (3, "DeliveryFailed")):
+                with self.subTest(recipient=recipient, code=code):
+                    folder = self.scratch / "holders"
+                    _ = build_hold.start_hold(folder, build_hold.HolderIdentity("holder", "holder"),
+                                              "worker tests", build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+                    self.assertIn("registered", build_hold.register_wait(recipient, "worker"))
+                    status = invoke_hold(["status"], dict(os.environ))
+                    self.assertEqual(status.returncode, 0, status.stderr)
+                    self.assertIn(f"worker [{recipient}]: NotAttempted", status.stdout)
+                    with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/worker/socket")) as lookup, \
+                         mock.patch.object(build_hold, "send_release_broadcast"), \
+                         mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                             [], code, "", "recipient refused")) as send, redirect_stderr(io.StringIO()) as errors:
+                        _ = build_hold.release_cycle(folder, "holder")
+                        cycle = build_hold.read_cycle()
+                        assert not isinstance(cycle, build_hold.NoCycle)
+                        entry, = build_hold.release_entries(cycle, cycle["recipients"])
+                        self.assertEqual((entry["session_id"], entry["delivery"]), (recipient, delivery))
+                        send.assert_called_once()
+                        arguments = cast(list[str], send.call_args.args[0])
+                        self.assertEqual(Path(arguments[1]).name, "send.py")
+                        self.assertEqual(arguments[arguments.index("--to") + 1],
+                                         recipient if recipient.startswith("codex:") else "uds:/worker/socket")
+                        self.assertEqual(arguments[arguments.index("--text") + 1],
+                                         f"{build_hold.release_notice(cycle['holders'])} Session {recipient}.")
+                    if recipient.startswith("codex:"):
+                        lookup.assert_not_called()
+                        if code > 1:
+                            self.assertIn("recipient refused", errors.getvalue())
+                    else:
+                        lookup.assert_called_once_with(recipient)
+                    with build_hold.release_lock() as held:
+                        completed, = build_hold.recorded_releases(held)
+                    notices = completed.intent["notices"]
+                    assert notices["kind"] == "cycle"
+                    self.assertEqual(notices["recipients"], {recipient: "worker"})
+
         for record in ("current-cycle", "old-cycle", "multiple-holders", "recovered-cycle", "broadcast", "same-minute"):
             with self.subTest(record=record), mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York", "TZ": "UTC"}):
                 texts: list[str] = []

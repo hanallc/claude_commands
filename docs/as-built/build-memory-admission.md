@@ -1347,7 +1347,12 @@ Each stopped root writes a permanent `hold_build` row through the shared audit w
 Schema 21 adds `action=audit|stopped`; readers treat old rows as audit rows.
 The row carries the root's `call_id` from `BUILDLOG_CALL_ID`, or an empty value.
 Verify can thus find a stop after the hold ends.
-The owning session registers for one release notice.
+Both stop paths register the owning session before the first signal.
+They also register the nearest command agent when its recipient key differs from the owner's session id.
+`run_agent(process, ancestors)` returns `RunAgent(session_id)` or `NoRunAgent`.
+It checks the command first, then each ancestor in order.
+At each process, `CODEX_THREAD_ID` gives the key `codex:<thread>` before `CLAUDE_CODE_SESSION_ID` gives a Claude session key.
+The cycle keeps both recipients without adding a field.
 The enforcer does not signal `verify.sh`, `targeted_test.py`, or `merge_gate.py` without a call id.
 Each waits at its own hold gate.
 With a call id, the record decides.
@@ -1442,7 +1447,21 @@ These fields no longer control a build.
 
 **Release** (`release_cycle`). Under `release.lock`, `release_hold` first removes the holder file and queues the `ended` event. Only then does `release_cycle` record the holder's `released_at`. With another holder file present it prints `released; still held by <holder> (for ..., release eta ...)` and sends no notice. After the last file is gone it records `release_started_at` and sends notices. A stopped release leaves either a present file that still holds, or no file and a released hold; cycle fields grant nothing. All `wait-local` calls can then return and enter their memory gates. No waiter acknowledgement or turn can delay release. The memory gate orders the builds and starts each only when memory is available.
 
-After the file is gone, `notify_release` sends one notice to each recorded recipient: start builds and BRP launches now; the memory gate orders them. No answer is needed. A notice's outcome is saved after its sender returns; a stopped send stays pending and is retried, so a session can receive a notice twice. `socket_for` returns `RecipientLive | RecipientGone | RecipientLookupFailed`; lookup exit 1 means gone, other failures retry three times with one second between tries. Send exit 0 is delivered, 1 queued but unconfirmed, other failed. `Not reached, tell them yourself: <session name> (<reason>)` names failed, gone and unconfirmed deliveries. `cycle_status_lines` prints delivery outcomes. Release waits for no answer, build or memory allocation.
+After the file is gone, `notify_release` sends one notice to each recorded recipient.
+The notice says to start builds and BRP launches now; the memory gate orders them.
+No answer is needed.
+Claude session keys use `socket_for`, which returns `RecipientLive | RecipientGone | RecipientLookupFailed`.
+Lookup exit 1 means gone; other lookup failures retry three times with one second between tries.
+`codex:` keys bypass socket lookup and use `session_send.send_argv` with `send.py --to codex:<thread> --text <notice>`.
+Both routes use the same notice text.
+The sender handles a closed worker pane through its holder.
+Send exit 0 gives `Delivered`; exit 1 gives `QueuedUnconfirmed`; other exits give `DeliveryFailed`.
+A failed Codex send prints the sender's error detail on stderr.
+The cycle saves the outcome after the sender returns.
+A stopped send stays pending and can repeat the notice on retry.
+`Not reached, tell them yourself: <session name> (<reason>)` names failed, gone and unconfirmed deliveries.
+`cycle_status_lines` prints delivery outcomes.
+Release waits for no answer, build or memory allocation.
 
 `release --resume` supports a file left by an old release. It refuses while any hold is in force. With no cycle, the holder broadcasts the release. `open_cycle`, `save_cycle` and `write_hold` write a complete temporary file before `os.replace`; holder temporary files stay outside the holder directory.
 
