@@ -408,7 +408,40 @@ Changes offer Works, Does not work, Ask showrunner to check and Send feedback in
 Investigations offer Mark read and Send feedback in that group.
 Proposals and efficiencies offer Approve, Decline and Send feedback in that group.
 A plan backlog proposal has no issue to hold an answer, so it offers only Later; the user answers it in chat.
-Each card has Ask question in a separate return group and Later with a date and time.
+Each card has Ask question in a separate return group and a **Later** button that opens a menu.
+The menu lists four presets, then a divider and **Choose a time…**:
+1. **In 1 hour**: `later_soon_minutes` from now; the label follows the setting.
+2. **This evening**: `later_evening` today. The item shows only before `later_evening_until`.
+3. **Tomorrow morning**: `later_morning` tomorrow.
+4. **Next week**: `later_week_time` on the next `later_week_day`.
+Each preset shows its time on the right, such as `Tue 09:00`, in the user zone.
+The page computes the preset times each time the menu opens.
+A preset click hides the item at once.
+**Choose a time…** shows a calendar and a time field in the same menu.
+The calendar keeps a valid future Later draft when it opens, including a draft restored after a refresh.
+Otherwise, it opens on tomorrow in the user zone, with `later_morning` as its time.
+The month header has previous and next buttons.
+The grid starts on Sunday, marks today with a ring, and fills the selected day with the accent color.
+Past days are dimmed and disabled.
+A summary shows the resolved time beside **Save**.
+A skipped wall time advances by the daylight saving gap.
+A repeated wall time uses the earlier instant.
+The presets use the same conversion.
+**Save** is disabled unless that time is in the future.
+In the calendar, the arrow keys move one day or one week, including across months.
+Tab moves from the selected day to the time field and **Save**.
+The **Time** field uses 24-hour `HH:MM` in every locale.
+It accepts `9:00`, `0900` and `09:00` and displays `09:00` when focus leaves the field or you press Enter.
+In the time field, Up and Down change the time by 15 minutes and wrap at midnight.
+An invalid time uses the error color and disables **Save**.
+Enter saves a valid future time. Escape closes the menu.
+The hidden `later` field keeps the wall time for the draft.
+The page converts that time to UTC for the request.
+A preset resolves its time again at the click.
+The arrow keys, Home and End move between items, Enter picks one and Escape closes the menu.
+A click outside the menu closes it.
+The page refresh waits while a Later menu is open.
+The server stores a preset time, sent as UTC, in the user zone.
 Waiting cards retain the actions of their Open cards, in the same groups and order.
 Unowned questions retain only Later.
 Waiting cards keep their state and counts until the user acts.
@@ -1327,6 +1360,11 @@ The scripts read `config/review_links.conf` through `scripts/lib/conf.py` when e
 `delivery_tries` and `delivery_pause_seconds` control message attempts.
 `feedback_rows` sets the textarea height from 1 to 20 rows and starts at 5.
 `review_words_rows` sets the height of the Review page **Your words** box from 1 to 20 rows and starts at 4.
+The `later_*` keys set the Review page Later presets; each render reads them.
+`later_soon_minutes` is 1 to 1440 minutes and starts at 60.
+`later_evening`, `later_evening_until`, `later_morning` and `later_week_time` are HH:MM times in the user zone.
+They start at 18:00, 17:00, 09:00 and 09:00.
+`later_week_day` is a weekday name and starts at Monday.
 `unrouted_alert_recipient` selects the alert recipient and the root showrunner for changes that nobody can take.
 This owner rule applies to routed changes when the list has no staff showrunner or its production document is gone.
 An unknown producer id or a broken parent chain keeps the change unrouted.

@@ -146,8 +146,8 @@ def later(item: review_items.ReviewItem, value: str, words: str) -> str:
             item.source.assignment.production, change_routing.UnavailableProduction):
         raise question_record.AnswerRefused("the production document is not available")
     until = datetime.fromisoformat(value)
-    if until.tzinfo is None:
-        until = until.replace(tzinfo=user_zone())
+    # A menu preset sends UTC; the record and the answer use the user zone.
+    until = until.replace(tzinfo=user_zone()) if until.tzinfo is None else until.astimezone(user_zone())
     record_action(item,'Later until '+until.isoformat()+(': '+words if words else ''))
     review_later.save(item.key,until)
     return 'later until '+until.strftime('%Y-%m-%d %H:%M %Z')
