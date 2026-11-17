@@ -63,6 +63,8 @@ class FakeEc2:
     stack: bool = False
     replace: bool = False
     fail_wait: str = ''
+    failure: dict[str, str] = field(default_factory=dict)
+    raise_once: str = ''
     fail: str = ''
     launch_on_cancel: bool = False
     launch_on_execute: bool = False
@@ -115,6 +117,9 @@ class FakeEc2:
         rest = list(arguments[offset + 2:-2])
         label = operation + (' ' + rest[0] if operation == 'wait' else '')
         self.operations.append(label)
+        if self.raise_once == label:
+            self.raise_once = ''
+            raise OSError('fixture local error')
         if self.fail in (operation, label):
             return subprocess.CompletedProcess(list(arguments), 1, '', 'fixture failure')
         value: dict[str, object] = {}
@@ -162,6 +167,8 @@ class FakeEc2:
             self.stack = False
             self.events = []
         elif operation == 'wait' and rest[0] == self.fail_wait:
+            if self.failure:
+                self.events.append({**self.failure, 'Timestamp': datetime.now(UTC).isoformat().replace('+00:00', 'Z')})
             self.roll_back()
             return subprocess.CompletedProcess(list(arguments), 255, '', 'Waiter failed: fixture rollback')
         elif operation in ('describe-stack-resources', 'describe-stack-events') and not self.stack:
@@ -277,6 +284,30 @@ class SpotEndTests(CostFixture):
             self.change(fake)
         self.assertEqual(fake.leftovers(), ([], [], ['other-disk'], [], False))
         self.assertLess(fake.operations.index('describe-stack-events'), fake.operations.index('delete-stack'))
+
+    def test_a_failed_create_names_each_failed_resource_and_its_reason(self) -> None:
+        fake = FakeEc2(launch_on_execute=True, fail_wait='stack-create-complete',
+                       failure={'LogicalResourceId': 'Instance', 'ResourceType': 'AWS::EC2::Instance',
+                                'ResourceStatus': 'CREATE_FAILED', 'ResourceStatusReason': 'Fixture Spot price too low'})
+        # A failure from an earlier change is not this change's cause.
+        fake.events.append({'LogicalResourceId': 'Old', 'ResourceType': 'AWS::S3::Bucket',
+                            'ResourceStatus': 'CREATE_FAILED', 'ResourceStatusReason': 'Old reason', 'Timestamp': OLD_EVENT})
+        with self.assertRaises(AwsUnavailable) as raised:
+            self.change(fake)
+        text = str(raised.exception)
+        self.assertIn('Waiter failed: fixture rollback\nInstance (AWS::EC2::Instance): CREATE_FAILED: Fixture Spot price too low\n'
+                      + 'the failed Hana change ended 1 Spot boxes', text)
+        self.assertNotIn('Old reason', text)
+        # The failed rows are read before any box end or stack delete changes the events.
+        self.assertEqual(fake.operations.index('describe-stack-events'), fake.operations.index('wait stack-create-complete') + 1)
+
+    def test_an_unreadable_event_list_keeps_the_error_and_the_cleanup(self) -> None:
+        fake = FakeEc2(launch_on_execute=True, fail_wait='stack-create-complete', raise_once='describe-stack-events')
+        with self.assertRaises(AwsUnavailable) as raised:
+            self.change(fake)
+        self.assertIn('Waiter failed: fixture rollback\nstack events are unavailable\n'
+                      + 'the failed Hana change ended 1 Spot boxes', str(raised.exception))
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
 
     def test_rollback_of_a_failed_update_keeps_only_the_recorded_box(self) -> None:
         fake = FakeEc2(stack=True, launch_on_execute=True, fail_wait='stack-update-complete')

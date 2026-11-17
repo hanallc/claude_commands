@@ -246,7 +246,9 @@ It registers the deployment only after the Spot request and stopped state match.
 Setup adds no route, target, or slot capacity.
 Setup changes the stack through a change set, never through `cloudformation deploy`.
 It refuses an Instance, Volume or VolumeAttachment replace or remove before it executes the change set.
-A failed create or update calls `spot_end.end_boxes` before it reports the error.
+A failed create or update first reads the stack events and keeps each failed row since the change started.
+The error it reports names each failed resource, its type, its status and the AWS reason.
+It then calls `spot_end.end_boxes` before it reports the error.
 That call keeps only the box that `hana/setup.json` records.
 It then deletes, through `retained.delete`, the disks and buckets that the rollback kept (`DELETE_SKIPPED`).
 A failed create also deletes the failed stack.
