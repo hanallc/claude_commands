@@ -4714,3 +4714,25 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The 28 `phase_table.py archive` interpreter starts (4.7 CPU s on natedev) are gone. `test_in_process_cli_matches_process_output_and_status` still compares the real process path with the in-process one.
 - natedev `module_cost.py`: 18.02 to 15.48 CPU s. aws pair, 3 rounds: 23.88 to 18.98 CPU s, a saving of 4.90 CPU s; all passed.
 - Main-based commit 908816d60 (branch `natest-lifecycle336`) went to builds.
+
+### Phase 337 — Fixture copies of the runtime take the compiled bytecode with each module  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### Work Order
+
+**Goal:** tests that copy the runtime into a temporary checkout use less aws CPU; every behavior check stays.
+
+**Spec:**
+1. `copy_runtime`, `copy_startup` and `copy_test_runner` in `scripts/lib/checkout_test_support.py` copy source files only. Each Python start in the copy compiles every module it imports from source again: 1.3 CPU s in `mac_test/test_offload_lifecycle.py` alone.
+2. Add one helper, `copy_with_bytecode(source, destination)`. It copies the file with `shutil.copy2`. For a `.py` file, it also copies the cached bytecode at `importlib.util.cache_from_source(source)` to `cache_from_source(destination)` when that file exists.
+3. The three copy functions use the helper. `copy2` keeps the source time, so the bytecode header stays valid; Python sets the code file name to the copy path when it loads. Stale or absent bytecode makes Python compile, as before.
+
+**Files:** `scripts/lib/checkout_test_support.py`.
+
+**Workers:** 1 writer: `impl` holds the one file.
+
+**Acceptance gate:**
+- The importers of `checkout_test_support` pass in a copy of origin/main with the change.
+- basedpyright reports 0 errors and 0 warnings on the file.
+- An aws pair shows the saving. natedev, 3 runs, bytecode on: offload lifecycle 20.87 to 15.40, fast track 44.76 to 33.26, and 5 more modules lower.
