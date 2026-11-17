@@ -2153,7 +2153,8 @@ def rename_qualified_workers(owner: staff.StaffRow) -> bool:
                 except staff.StaffRefused as error:
                     print(pair + " ".join(str(error).splitlines()), file=sys.stderr)
     if unchanged:
-        print(f"{unchanged} worker names unchanged: no qualified prefix for {owner.name}", file=sys.stderr)
+        worker_names = "worker name" if unchanged == 1 else "worker names"
+        print(f"{unchanged} {worker_names} unchanged: no qualified prefix for {owner.name}", file=sys.stderr)
     return changed
 
 

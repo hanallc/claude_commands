@@ -6,6 +6,7 @@ import html
 import os
 import re
 import json
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -3559,6 +3560,16 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual([recipient for recipient, _, _ in self.messages], ["page-owner"])
         self.assertIn("C1: the user asks you to validate this", self.messages[0][2])
         self.assertIn(words, self.messages[0][2])
+        validation = change_page.DeliveryStatus(self.root).slots(self.page, "C1").validation
+        assert isinstance(validation, change_page.ValidationRequested)
+        message_lines = self.messages[0][2].splitlines()
+        self.assertIn(f"Validation id: {validation.attempt}", message_lines)
+        command = message_lines[message_lines.index("Answer with this command:") + 1]
+        self.assertEqual(shlex.split(command), [
+            "~/.claude/scripts/lib/py", "~/.claude/scripts/production/change_review.py", "verdict",
+            "--production", "page-owner", "--list", str(self.review_list), "--row", "C1",
+            "--validation", validation.attempt, "--verdict", "<works or problem>",
+        ])
         page = self.request(self.page_path, {}).body
         self.assertNotIn("changes left", page)
         self.assertIn('value="next">Skip for now', page)
