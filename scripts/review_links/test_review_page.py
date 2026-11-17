@@ -1210,10 +1210,14 @@ window.fetch=async(_url,options={})=>{
   const draftLater=question.querySelector('[name="later"]');draftLater.value='2098-12-31T16:30';
   draftLater.dispatchEvent(new Event('change',{bubbles:true}));
   const picked=question.querySelector('input[name=choice]');picked.click();
-  question.querySelector('textarea').value='Keep this draft';question.querySelector('textarea').dispatchEvent(new Event('input'));
+  const draft=question.querySelector('textarea');draft.value='Keep this draft';draft.dispatchEvent(new Event('input'));
+  draft.focus();draft.setSelectionRange(2,7,'backward');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
   let fresh=rows().find(row=>row.dataset.type==='question');
   check(!fresh.querySelector('[data-detail]').hidden && fresh.querySelector('textarea').value==='Keep this draft','refresh keeps the card and draft');
+  const refreshedDraft=fresh.querySelector('textarea');
+  check(document.activeElement===refreshedDraft && refreshedDraft.selectionStart===2 &&
+    refreshedDraft.selectionEnd===7 && refreshedDraft.selectionDirection==='backward','refresh keeps focus and selection');
   check(fresh.querySelector('[name="later"]').value==='2098-12-31T16:30','F018: refresh keeps the picked Later date and time');
   check(fresh.querySelector('input[name=choice]:checked')?.value===picked.value,'F018: refresh keeps the selected choice');
   check(fresh.querySelector('form').elements.row.value===fresh.dataset.key+'-refreshed' &&
