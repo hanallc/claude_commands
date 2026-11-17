@@ -199,6 +199,47 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual(sent, [(800, signal.SIGTERM)])
         self.assertNotIn('enforcement waits', errors.getvalue())
 
+    def test_hana_match_errors_keep_live_claims_and_do_not_pause_enforcement(self) -> None:
+        target, paths = self.hana_claim()
+        _ = self.process(800, 'cargo', argv=('cargo', 'check'), session='other')
+        claim, = claim_state.read_claims(paths)
+        assignment = placement.PlacementAssignment('fixture-episode', 'fixture-attempt',
+            placement.PlacementDestination('ssh', target.name, 'fixture-hana', claim.scope, 1),
+            placement.SourceKeyKnown('fixture-source'),
+            placement.SubmittingOwner(store.host_name(), 700, '11000'), OwningSession('other'), 100)
+        key = placement.attempt_key(assignment.episode, assignment.attempt)
+        state = admission_service.ServiceState({}, {}, {}, admission_records.ReadyToStart())
+        state.current_assignments[assignment.episode] = key
+        state.assignments[key] = admission_records.SavedPlacementAssignment(assignment)
+
+        def release(_seconds: float) -> None:
+            (self.holders / 'holder').unlink()
+
+        for module, operation in ((target_config, 'read_execution_transport'),
+                (placement, 'attempt_key'), (placement, 'assigned_claim_id')):
+            for error_type in (OSError, ValueError):
+                with self.subTest(operation=operation, error=error_type.__name__):
+                    self.write_holder()
+                    sent: list[tuple[int, int]] = []
+                    errors = io.StringIO()
+                    with (mock.patch.object(target_config, 'read_targets', return_value=(target,)),
+                            mock.patch.object(claim_state, 'state_paths', return_value=paths),
+                            mock.patch.object(admission_service, 'read_state', return_value=state),
+                            mock.patch.object(module, operation, side_effect=error_type('private Hana match failure')),
+                            mock.patch.object(hold_enforcer, 'claimed_processes', side_effect=self.claim_reader),
+                            redirect_stderr(errors)):
+                        claims = self.claim_reader(self.proc)
+                        assert isinstance(claims, build_hold.LiveClaims)
+                        self.assertEqual(claims.remote_waiters, frozenset())
+                        self.assertIn(build_hold.ProcessIdentity(701, '11000'), claims.identities)
+                        result = hold_enforcer.run(self.proc, self.holders, self.root / 'enforcer', uid=self.uid,
+                            enforcer_pid=999, stopper=hold_enforcer.StopBuildsAndTests(self.proc,
+                                signal_process=lambda pid, signum: sent.append((pid, signum))),
+                            sleep=release, cgroup_root=self.root / 'cgroup')
+                    self.assertEqual(result, 0)
+                    self.assertEqual(sent, [(800, signal.SIGTERM)])
+                    self.assertNotIn('enforcement waits', errors.getvalue())
+
     def test_local_cargo_under_a_remote_coordinator_stays_an_audit_violation(self) -> None:
         _ = self.hana_claim()
         _ = self.process(800, 'cargo', parent=700, argv=('cargo', 'check'))
