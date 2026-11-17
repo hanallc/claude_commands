@@ -613,6 +613,32 @@ class MemoryHoverTests(unittest.TestCase):
                     self.assertEqual(rows[labels.index("Share held")]["value"], f"{share}%")
                     self.assertLess(labels.index("Share held"), labels.index("Target"))
 
+    def test_reserve_tooltips_show_the_basis_of_each_target(self) -> None:
+        # The user, 11-17: the swap tooltip shows the swap-in it takes a share of; build reserved shows its share of growth.
+        swap = {**SWAP_FIXTURE, "reserve_share_percent": 20, "window_seconds": 600, "swap_in_window_bytes": 3 * GIB}
+        # The page takes each target as covered + missing.
+        ram = {**RAM_FIXTURE, "swap_target_bytes": 3 * GIB * 20 // 100, "swap_covered_bytes": 3 * GIB * 20 // 100,
+               "build_target_bytes": 10 * GIB, "build_covered_bytes": 10 * GIB}
+        for basis, expected in (
+            ({"growth_bytes": 10 * GIB, "share_percent": 80, "between_steps_bytes": 2 * GIB, "unread_bytes": 0},
+             [("Room to grow", "10.0 GiB"), ("× Share held", "80%"), ("+ Held between steps", "2.0 GiB"), ("= Target", "10.0 GiB")]),
+            ({"growth_bytes": 5 * GIB, "share_percent": 80, "between_steps_bytes": 0, "unread_bytes": 6 * GIB},
+             [("Room to grow", "5.0 GiB"), ("× Share held", "80%"), ("+ Steps with no memory reading", "6.0 GiB"),
+              ("= Target", "10.0 GiB")]),
+        ):
+            with self.subTest(basis=basis):
+                rows = cast(list[dict[str, object]], self.page_expression(
+                    "tooltipRows('reserved', data)", {"ram": ram, "build_reserve": basis}))
+                self.assertEqual([(row["label"], row["value"]) for row in rows[2:]], expected)
+        rows = cast(list[dict[str, object]], self.page_expression("tooltipRows('swap', data)", {"ram": ram, "swap": swap}))
+        self.assertEqual([(row["label"], row["value"]) for row in rows[2:]],
+                         [("Swap-in, last 10 min", "3.0 GiB"), ("× Share held", "20%"), ("= Target", "0.6 GiB")])
+        no_target = cast(list[dict[str, object]], self.page_expression("tooltipRows('reserved', data)", {
+            "ram": {**RAM_FIXTURE, "build_target_bytes": 0, "build_covered_bytes": 0},
+            "build_reserve": {"growth_bytes": 0, "share_percent": 80, "between_steps_bytes": 0, "unread_bytes": 0}}))
+        self.assertEqual(len(no_target), 2)
+        self.assertEqual(self.page_expression("reserveAlert(data.ram)", {}), "")
+
     def test_reserve_targets_appear_only_above_the_covered_amount(self) -> None:
         for key, reserve, title in (("reserved", "build", "Build reserved"),
                                     ("safety", "safety", "Safety net"),
@@ -842,7 +868,7 @@ function fitLabels() {}
         # The user, 11-15: each legend group sits under its own heading, so the legend ties to the bar.
         self.assertEqual([part.split('"')[0] for part in legend.split('data-tip="')[1:]], [
             "g-builds", *builds, "cap", "g-builds", "reserved", "room", "cap",
-            "g-free", "reserved", "room", "system", "safety", "swap", "shortfall", "g-else", *other])
+            "g-free", "reserved", "room", "system", "safety", "swap", "g-else", *other])
         # The user, 11-15: the waiting and progress key sits under the Running and Queued chart.
         walk_card = page[page.index('<div class="walk" id="walk">'):page.index('<section class="card" id="leftovers"')]
         key = walk_card[walk_card.index('<div class="walk-key">'):]
@@ -853,9 +879,12 @@ function fitLabels() {}
         self.assertNotIn("How free is worked out", page)
         # The user, 11-15: braces name builds, free RAM and everything else; free RAM has three parts.
         self.assertEqual([part.split('"')[0] for part in bar.split('class="brace ')[1:]],
-                         ["l1", "l1 free", "l1", "l2 reserved", "l2 free", "l2", "cap", "cap over"])
+                         ["l1", "l1 free", "l1", "l2 reserved", "l2 free", "l2", "cap"])
         self.assertEqual([part.split('"')[0] for part in bar.split('id="b-')[1:]],
-                         ["builds", "free", "else", "reserved", "room", "system", "overlay", "cap", "over"])
+                         ["builds", "free", "else", "reserved", "room", "system", "cap"])
+        # The user, 11-17: a short reserve has a red outline; the over-cap box, brace and Shortfall row are gone.
+        for removed in ('data-tip="over"', 'data-tip="shortfall"', 'id="bc-reserved"', "bar-over"):
+            self.assertNotIn(removed, page)
         # The user, 11-15: the queue cap starts at 0 and ends at the end of free.
         self.assertIn('<div class="brace cap" id="b-cap" data-tip="cap">', bar)
         for removed in ("updateNativeOwnerTips", "pageOwnerTipFields", "nativeTipText", 'id="mark"', 'id="marklabel"'):
@@ -891,10 +920,11 @@ function fitLabels() {}
                "kernel_bytes": {"kind": "ReadingUnavailable", "reason": "meminfo is missing"},
                "kernel_no_counter_bytes": 0}
         tips = cast(list[list[str]], self.page_expression(
-            "[tipText('shortfall', data), tipText('reserved', data), tipText('kernel', data), tipText('tools', data)," +
+            "[reserveAlert(data.ram), tipText('reserved', data), tipText('kernel', data), tipText('tools', data)," +
             " ramAmount(0), tipText('unattributed', data), tipText('system', data)]", {"ram": ram}))
-        self.assertEqual(tips[0], ["Shortfall  7.0 GiB", "Reserves that free RAM does not cover\nUncovered swap  1.0 GiB\n+ Uncovered reserve  6.0 GiB"])
-        self.assertEqual(tips[1], ["Build reserved  0.0 GiB", "Held for running builds to grow into\nTarget  6.0 GiB\nNot covered  6.0 GiB"])
+        # The user, 11-17: one line names each reserve that free RAM does not fill.
+        self.assertEqual(tips[0], "Free RAM is short by 7.0 GiB. Swap coming back holds 1.0 of 2.0 GiB; Build reserved holds 0.0 of 6.0 GiB.")
+        self.assertEqual(tips[1], ["Build reserved  0.0 GiB", "Held for running builds to grow into\nTarget  6.0 GiB\nMissing  6.0 GiB"])
         self.assertEqual(tips[2], ["Kernel  unavailable", ""])
         self.assertEqual(tips[3], ["Build tools  0.5 GiB", "RAM that build tools use now\nrust-analyzer  0.0 GiB\n+ sccache  0.0 GiB\n+ Other build tools  0.5 GiB"])
         self.assertEqual(tips[5], ["Not attributed  2.0 GiB", "RAM that the readings do not explain\nKernel, no counter  0.0 GiB\n+ No program name  2.0 GiB"])
@@ -914,11 +944,11 @@ function fitLabels() {}
              "A GPU test waits: another GPU test holds the GPU test slot. It also needs 12.0 GiB, and free is 9.0 GiB."),
             ("pressure", RAM_FIXTURE, "Memory pressure prevents a new start; free is 18.0 GiB."),
             ("shortfall", {**RAM_FIXTURE, "room_bytes": 0, "shortfall_bytes": 3 * GIB},
-             "Nothing is free: reserves exceed free RAM by 3.0 GiB."),
+             "Nothing is free: the reserves need more than free RAM."),
             # The user, 11-16: a build reserve over the cap is a promise, not RAM in use.
             ("shortfall", {**RAM_FIXTURE, "room_bytes": 0, "shortfall_bytes": 3 * GIB, "build_missing_bytes": 3 * GIB,
                            "safety_missing_bytes": 0, "swap_missing_bytes": 0},
-             "Nothing is free: build reserved is 3.0 GiB over the cap. A reserve is room a step may still grow into, not RAM in use."),
+             "Nothing is free: build reserved needs more than free RAM. A reserve is room a step may still grow into, not RAM in use."),
             ("no_room", {**RAM_FIXTURE, "room_bytes": 0},
              "Nothing is free: the safety net, swap coming back and build reserved use all free RAM."),
             ("one_running_memory_wait", RAM_FIXTURE, "One build runs; another needs 12.0 GiB, but free is 9.0 GiB."),
