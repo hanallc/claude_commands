@@ -224,7 +224,9 @@ class ListFeedbackDelivery:
 
 def fresh_request(root: Path, keeper: str, identity: str) -> dict[str, str]:
     request = secrets.token_hex(16)
-    return {"request": request, "token": request_token(root, keeper, identity, request)}
+    item = the_list.load(staff.StaffId(keeper), identity)
+    return {"request": request, "token": request_token(root, keeper, identity, request),
+            "unread": str(isinstance(item.unread_since, datetime)).lower()}
 
 
 def submit(root: Path, body: str) -> ListFeedbackDelivery | change_page.NoMessageDelivery:
@@ -243,9 +245,6 @@ def submit(root: Path, body: str) -> ListFeedbackDelivery | change_page.NoMessag
         raise change_page.AnswerRefused("the item has no morty producer")
     item = the_list.load(morty.id, identity)
     action, words, until = fields["action"][0], fields["words"][0].strip(), fields["until"][0]
-    if action == "read":
-        _ = the_list.mark_read(morty.id, identity, source=the_list.PAGE_SOURCE)
-        return change_page.NoMessageDelivery()
     if action == "remove":
         words = f"Remove {item.number}"
     elif action == "park":
@@ -253,12 +252,25 @@ def submit(root: Path, body: str) -> ListFeedbackDelivery | change_page.NoMessag
             raise change_page.AnswerRefused("enter a parking date")
         _ = date.fromisoformat(until)
         words = f"Park {item.number} until {until}"
-    elif action != "tell" or not words or len(words) > 10000:
+    elif action != "read" and (action != "tell" or not words or len(words) > 10000):
         raise change_page.AnswerRefused("enter words for morty")
-    saved = the_list.save_feedback(morty.id, identity, the_list.PageFeedback(request, words))
-    if saved.state != "pending":
-        return change_page.NoMessageDelivery()
-    return ListFeedbackDelivery(morty.id, identity, request)
+    delivery: ListFeedbackDelivery | change_page.NoMessageDelivery = change_page.NoMessageDelivery()
+    mark = action == "read"
+    update: the_list.UnreadUpdate | the_list.ReadCurrentUpdate = the_list.ReadCurrentUpdate.CURRENT
+    if action != "read":
+        target = the_list.unread_update(item) if action == "tell" else the_list.NoUnreadUpdate.ABSENT
+        saved = the_list.save_feedback(morty.id, identity, the_list.PageFeedback(request, words, read_update=target))
+        if saved.state == "pending":
+            delivery = ListFeedbackDelivery(morty.id, identity, request)
+        if action == "tell" and isinstance(saved.read_update, the_list.UnreadUpdate) and saved.read_update == target:
+            mark, update = True, saved.read_update
+    if mark:
+        try:
+            _ = the_list.mark_read(morty.id, identity, source=the_list.PAGE_SOURCE, update=update)
+        except (OSError, the_list.ListError):
+            if action == "read":
+                raise
+    return delivery
 
 
 def alert_showrunners(item: the_list.ListItem, members: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
@@ -452,10 +464,12 @@ function bind(){
    try{
     const response=await fetch(location.pathname,{method:'POST',body:data});
     const result=await response.json();if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
-    notice.textContent=action==='read' ? 'Marked read' : 'sent to morty';
+    const unread=result.unread==='true';
+    notice.textContent=action==='read' ? 'Marked read' :
+     action==='tell' && unread ? 'sent to morty; update remains unread' : 'sent to morty';
     fresh.request=result.request;fresh.token=result.token;attempt=undefined;
     if(action==='tell' && words.value===data.get('words')) words.value='';retain();
-    if(action==='read'){
+    if((action==='read' || action==='tell') && result.unread==='false'){
      const item=form.closest('[data-list-item]');item.dataset.unread='false';
      item.querySelector('.list-dot')?.remove();form.querySelector('[value="read"]')?.remove();apply(false);
     }

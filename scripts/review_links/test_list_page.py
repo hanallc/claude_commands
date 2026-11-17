@@ -419,6 +419,141 @@ class ListPageTests(unittest.TestCase):
                 with self.subTest(body=body), self.assertRaises(ValueError):
                     _ = list_page.submit(root, body)
 
+    def test_tell_marks_an_unread_update_read_once_and_saves_feedback(self) -> None:
+        item = self.add("Read the update before sending feedback")
+        fields = self.fields(item, "tell", words="Keep this result.")
+        with patch.object(the_list, "mark_read", wraps=the_list.mark_read) as mark:
+            for _ in range(2):
+                _ = list_page.submit(self.root / "reviews", urlencode(fields))
+        mark.assert_called_once_with(MORTY.id, item.id, source=the_list.PAGE_SOURCE, update=the_list.unread_update(item))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertIs(saved.unread_since, the_list.NoTimestamp.UNSET)
+        self.assertEqual([(entry.what, entry.source) for entry in saved.log if entry.what == "Marked read"],
+                         [("Marked read", the_list.PAGE_SOURCE)])
+        self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].words, "Keep this result.")
+
+    def test_tell_on_a_read_item_adds_no_read_log_entry(self) -> None:
+        item = self.add("An update already read")
+        item = the_list.mark_read(MORTY.id, item.id, source="nate")
+        before = tuple(entry for entry in item.log if entry.what == "Marked read")
+        fields = self.fields(item, "tell", words="Keep this result.")
+        with patch.object(the_list, "mark_read", wraps=the_list.mark_read) as mark:
+            _ = list_page.submit(self.root / "reviews", urlencode(fields))
+        mark.assert_not_called()
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(tuple(entry for entry in saved.log if entry.what == "Marked read"), before)
+        self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].words, "Keep this result.")
+
+    def test_refused_tell_keeps_the_unread_update_and_log(self) -> None:
+        item = self.add("Keep the unread update after a refusal")
+        for words in ("", " \t\n "):
+            with self.subTest(words=words), self.assertRaises(change_page.AnswerRefused):
+                _ = list_page.submit(self.root / "reviews", urlencode(self.fields(item, "tell", words=words)))
+            self.assertEqual(the_list.load(MORTY.id, item.id), item)
+
+    def test_tell_storage_failure_keeps_the_unread_update_and_log(self) -> None:
+        item = self.add("Keep the update when feedback storage fails")
+        fields = self.fields(item, "tell", words="Keep this result.")
+        with patch.object(the_list, "save_feedback", side_effect=OSError("Fixture storage failure")):
+            with self.assertRaises(OSError):
+                _ = list_page.submit(self.root / "reviews", urlencode(fields))
+        self.assertEqual(the_list.load(MORTY.id, item.id), item)
+
+    def test_tell_read_failure_keeps_feedback_and_reports_the_unread_update(self) -> None:
+        item = self.add("Keep feedback when the read write fails")
+        root = self.root / "reviews"
+        fields = self.fields(item, "tell", words="Keep this result.")
+        with patch.object(the_list, "mark_read", side_effect=OSError("Fixture read failure")):
+            delivery = list_page.submit(root, urlencode(fields))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved.unread_since, item.unread_since)
+        self.assertFalse(any(entry.what == "Marked read" for entry in saved.log))
+        self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].words, "Keep this result.")
+        self.assertEqual(list_page.fresh_request(root, MORTY.id, item.id)["unread"], "true")
+        with patch.object(change_page, "send_to_staff") as send:
+            list_page.deliver(delivery)
+        send.assert_called_once()
+
+    def test_repeated_tell_keeps_a_newer_update_unread(self) -> None:
+        item = self.add("Read only the original update")
+        fields = self.fields(item, "tell", words="Keep this result.")
+        root = self.root / "reviews"
+        _ = list_page.submit(root, urlencode(fields))
+        newer = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result arrived."}, source="morty")
+        _ = list_page.submit(root, urlencode(fields))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved, newer)
+        self.assertEqual(len(the_list.feedback_requests(saved)), 1)
+        self.assertEqual(sum(entry.what == "Marked read" for entry in saved.log), 1)
+
+    def test_conflicting_tell_keeps_a_newer_update_unread(self) -> None:
+        item = self.add("Refuse new words under the saved request")
+        fields = self.fields(item, "tell", words="Keep this result.")
+        root = self.root / "reviews"
+        _ = list_page.submit(root, urlencode(fields))
+        newer = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result arrived."}, source="morty")
+        with self.assertRaises(the_list.ListError):
+            _ = list_page.submit(root, urlencode({**fields, "words": "Different words."}))
+        self.assertEqual(the_list.load(MORTY.id, item.id), newer)
+
+    def test_tell_keeps_an_update_that_arrives_after_feedback_storage_unread(self) -> None:
+        item = self.add("Keep the update that arrives during Tell")
+        fields = self.fields(item, "tell", words="Keep this result.")
+        save_feedback = the_list.save_feedback
+
+        def save(keeper: staff.StaffId, identity: str, feedback: the_list.PageFeedback) -> the_list.PageFeedback:
+            saved = save_feedback(keeper, identity, feedback)
+            _ = the_list.update(keeper, identity, {"latest_status": "A newer result arrived."}, source="morty")
+            return saved
+
+        with patch.object(the_list, "save_feedback", side_effect=save):
+            _ = list_page.submit(self.root / "reviews", urlencode(fields))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved.unread_since, item.unread_since)
+        self.assertEqual(saved.latest_status, "A newer result arrived.")
+        self.assertFalse(any(entry.what == "Marked read" for entry in saved.log))
+        self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].words, "Keep this result.")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_read_and_tell_clear_the_unread_controls_without_a_refresh(self) -> None:
+        _ = self.add("Check the update")
+        with patch.object(list_page, "counts_strip", return_value=""):
+            markup = list_page.render(self.root / "reviews").decode()
+        setup = '''<script>
+window.fetch=async(_path,options={})=>{
+ if(options.method!=='POST') throw new Error('Fixture refresh refused');
+ return {ok:true,json:async()=>({unread:'UNREAD',request:'a'.repeat(32),token:'b'.repeat(64)})};
+};
+</script>'''
+        probe = '''<script>
+(async()=>{
+ const row=document.querySelector('[data-list-item]'),form=row.querySelector('form');
+ const show=document.getElementById('list-show');show.value='unread';show.dispatchEvent(new Event('change'));
+ const before=row.dataset.unread==='true' && row.querySelector('.list-dot') && form.querySelector('[value="read"]') && !row.hidden;
+ form.elements.words.value='Keep this result.';form.elements.words.dispatchEvent(new Event('input'));
+ form.requestSubmit(form.querySelector('[value="ACTION"]'));
+ await new Promise(resolve=>setTimeout(resolve,0));
+ const cleared=row.dataset.unread==='false' && !row.querySelector('.list-dot') && !form.querySelector('[value="read"]') && row.hidden;
+ const retained=row.dataset.unread==='true' && row.querySelector('.list-dot') && form.querySelector('[value="read"]') && !row.hidden;
+ const after=EXPECTED_UNREAD ? retained : cleared;
+ const notice=form.querySelector('[data-send-status]').textContent;
+ const result=document.createElement('p');result.id='probe-result';
+ result.textContent=before && after && notice==='NOTICE' ? 'PASS' : 'FAIL';document.body.append(result);
+})();
+</script>'''
+        for action, unread, notice in (("read", "false", "Marked read"), ("tell", "false", "sent to morty"),
+                                      ("tell", "true", "sent to morty; update remains unread")):
+            with self.subTest(action=action, unread=unread):
+                page = self.root / f"{action}-{unread}.html"
+                _ = page.write_text(markup.replace('<head>', '<head>' + setup.replace('UNREAD', unread), 1).replace('</body>',
+                    probe.replace('ACTION', action).replace('NOTICE', notice).replace('EXPECTED_UNREAD', unread) + '</body>'))
+                result = subprocess.run(['google-chrome', '--headless', '--no-sandbox', '--disable-gpu',
+                    '--user-data-dir=' + str(self.root / f'chrome-{action}-{unread}'), '--virtual-time-budget=1000',
+                    '--dump-dom', page.as_uri()], capture_output=True, text=True, timeout=20)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue('<p id="probe-result">PASS</p>' in result.stdout,
+                                f"The {action} action must show the saved unread state and apply the Unread filter.")
+
     def test_feedback_recovers_after_restart_and_alerts_after_failed_tries(self) -> None:
         root = self.root / "reviews"
         item = self.add("Recover the message")
@@ -571,7 +706,7 @@ window.fetch=async(_path,options={})=>{
    row.dataset.unread='false';row.querySelector('.list-dot')?.remove();row.querySelector('[value="read"]')?.remove();
    original=page.documentElement.outerHTML;
   }
-  const result={ok:true,status:200,json:async()=>({state:'sent',request:String(posts.length).padStart(32,'0'),token:'b'.repeat(64)})};
+  const result={ok:true,status:200,json:async()=>({state:'sent',unread:'false',request:String(posts.length).padStart(32,'0'),token:'b'.repeat(64)})};
   if(holdPost) return await new Promise(resolve=>finishPost=()=>resolve(result));
   return result;
  }
@@ -652,20 +787,22 @@ try{
  check(!refreshed.querySelector('[value="tell"]').disabled,'a restored draft enables Tell morty');
  check(scrollY===100,'refresh keeps scroll');
  realFeedback=true;loseResponse=true;
- let retryForm=rows().find(row=>row.dataset.number==='106').querySelector('form');
+ const tellRow=rows().find(row=>row.dataset.number==='105');tellRow.querySelector('.list-toggle').click();
+ check(tellRow.dataset.unread==='true' && tellRow.querySelector('[value="read"]'),'Tell starts with a fresh unread row');
+ let retryForm=tellRow.querySelector('form');
  retryForm.elements.words.value='Deliver this feedback once';retryForm.elements.words.dispatchEvent(new Event('input'));
  const retryId=retryForm.elements.request.value,retryToken=retryForm.elements.token.value,startPosts=posts.length;
  retryForm.requestSubmit(retryForm.querySelector('[value="tell"]'));
  await flush();await flush();await flush();await flush();
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  await flush();await flush();
- retryForm=rows().find(row=>row.dataset.number==='106').querySelector('form');
+ retryForm=rows().find(row=>row.dataset.number==='105').querySelector('form');
  check(retryForm.elements.request.value===retryId && retryForm.elements.token.value===retryToken,'refresh keeps the failed request identity');
  retryForm.requestSubmit(retryForm.querySelector('[value="tell"]'));
  await flush();await flush();await flush();await flush();
  check(posts.length===startPosts+2,'the lost response has one retry');
  check(posts.at(-1).get('request')===retryId && posts.at(-1).get('token')===retryToken,'the retry uses its original signature');
- retryForm=rows().find(row=>row.dataset.number==='106').querySelector('form');
+ retryForm=rows().find(row=>row.dataset.number==='105').querySelector('form');
  check(retryForm.elements.request.value!==retryId,'success clears the saved retry identity');
  check(retryForm.elements.words.value==='' && retryForm.querySelector('[value="tell"]').disabled,'a successful send clears the box and disables Tell morty');
  realFeedback=false;failRefresh=true;
@@ -712,6 +849,9 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
 })();</script>'''.replace('OWNER', json.dumps(OWNER.id))
         for width in (1440, 390):
             with self.subTest(width=width):
+                for identity in ("L105", "L106"):
+                    _ = the_list.update(MORTY.id, identity,
+                        {"latest_status": f"The fixture uses a width of {width} pixels."}, source="morty")
                 markup = list_page.render(self.root / "reviews").decode()
                 setup_for_width = setup.replace('MARKUP', json.dumps(markup).replace('</', '<\\/'))
                 page = markup.replace('<head>', '<head>' + setup_for_width, 1).replace('</body>', probe + '</body>').encode()
