@@ -1232,6 +1232,44 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(footer_counts.changes(self.production), forms.counts["page-owner"])
         self.assert_no_delivery_controls(content)
 
+    def test_delivery_failure_survives_restart_until_the_same_row_succeeds(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        recipient = staff.StaffId('fixture-recipient')
+        attempt = status.begin(self.page, 'C1', 'verdict', recipients=(recipient,))
+        delivery = change_page.MessageDelivery(self.page, 'C1', (recipient,), 'Saved answer', attempt)
+        with patch.object(change_page, 'send_to_staff', side_effect=RuntimeError('owner offline')):
+            change_page.deliver(delivery, status)
+        expected = change_page.FailedDelivery(attempt, self.page.review_list, 'C1', 'owner offline')
+        restarted = change_page.DeliveryStatus(self.root)
+        self.assertEqual(restarted.failed_delivery(self.page, 'C1'), expected)
+        self.assert_record_cleared()
+        # A repeated completion cannot erase the failure from its finished attempt.
+        restarted.record(delivery)
+        self.assertEqual(restarted.failed_delivery(self.page, 'C1'), expected)
+        with patch.object(change_page, 'send_to_staff') as sender:
+            restarted.notify_closeout_failure(self.page, 'C1', 'Earlier alert', (recipient,))
+            other_attempt = restarted.begin(self.page, 'C3', 'verdict', recipients=(recipient,))
+            change_page.deliver(replace(delivery, row='C3', attempt=other_attempt), restarted)
+            self.assertEqual(restarted.failed_delivery(self.page, 'C1'), expected)
+            retry = restarted.begin(self.page, 'C1', 'verdict', recipients=(recipient,))
+            change_page.deliver(replace(delivery, attempt=retry), restarted)
+            restarted.notify_closeout_failure(self.page, 'C1', 'Earlier alert', (recipient,))
+        self.assertEqual(sender.call_count, 3)
+        self.assertIsInstance(change_page.DeliveryStatus(self.root).failed_delivery(self.page, 'C1'),
+                              change_page.NoFailedDelivery)
+        self.assert_record_cleared()
+
+    def test_a_late_failure_cannot_replace_a_newer_attempts_result(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        old = status.begin(self.page, 'C1', 'verdict')
+        current = status.begin(self.page, 'C1', 'verdict')
+        delivery = change_page.MessageDelivery(self.page, 'C1', (), 'Saved answer', current)
+        failed = change_page.FailedDelivery(current, self.page.review_list, 'C1', 'current error')
+        status.record(delivery, failed)
+        status.record(replace(delivery, attempt=old),
+                      change_page.FailedDelivery(old, self.page.review_list, 'C1', 'old error'))
+        self.assertEqual(status.failed_delivery(self.page, 'C1'), failed)
+
     def test_a_queued_result_finishes_delivery_without_an_alert(self) -> None:
         runner = staff.snapshot().by_path("page-owner")
         assert runner is not None

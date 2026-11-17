@@ -60,6 +60,17 @@ REFRESH_SCRIPT = r'''function pageRefreshFacts(page=document){
  return {readAt:Number(line.dataset.readAt),renderSeconds:Number(line.dataset.renderSeconds),
   renderMedian:line.dataset.renderMedian,renderCount:line.dataset.renderCount,failure:line.dataset.readError};
 }
+function restoreFocusAfterRefresh(){
+ const {id,selectionStart,selectionEnd,selectionDirection}=document.activeElement || {};
+ return ()=>{
+  if(!id) return;
+  const field=document.getElementById(id);
+  field?.focus({preventScroll:true});
+  if(typeof field?.setSelectionRange==='function' && typeof selectionStart==='number' && typeof selectionEnd==='number'){
+   field.setSelectionRange(selectionStart,selectionEnd,selectionDirection);
+  }
+ };
+}
 function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
  const line=document.querySelector('[data-page-status]');
  const options=line ? JSON.parse(line.dataset.statusOptions) : {};

@@ -314,7 +314,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         if route.path == images.PAGE_PATH:
             try:
-                content = images.render(root)
+                content = images.render(cast(ReviewLinksServer, self.server).delivery_status)
             except (OSError, ValueError) as error:
                 print(f"review-links images: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Images page is not available.</p>"))
@@ -695,13 +695,14 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         self.json_response(200, {"state": "read"})
 
     def image_post(self) -> None:
-        """Delete an image or send its feedback; the page shows the reason of a failure on the card."""
-        root = cast(ReviewLinksServer, self.server).root
+        """Answer the browser before the shared sender delivers an image question."""
+        server = cast(ReviewLinksServer, self.server)
+        root = server.root
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0:
                 raise ValueError("empty image request")
-            images.submit(root, self.rfile.read(length).decode("utf-8"))
+            delivery = images.submit(root, self.rfile.read(length).decode("utf-8"), server.delivery_status)
         except change_page.AnswerRefused as error:
             self.browser_failure(400, str(error), error)
             return
@@ -714,7 +715,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except OSError as error:
             self.browser_failure(503, "The image could not be changed. Try again.", error)
             return
-        self.json_response(200, {"state": "done"})
+        try:
+            self.json_response(200, {"state": "done"})
+        finally:
+            change_page.deliver(delivery, server.delivery_status)
 
     def news_post(self) -> None:
         """Record the page the console shows, and name the other pages that hold new items."""

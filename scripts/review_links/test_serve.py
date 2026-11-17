@@ -31,7 +31,7 @@ from uuid import uuid4
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
 from scripts.production import change_review, investigation, staff, the_list
-from scripts.review_links import accounts_page, change_browser, change_page, console, investigations_page, list_page, review_page, serve
+from scripts.review_links import accounts_page, change_browser, change_page, console, images, investigations_page, list_page, review_page, serve
 from scripts.lib import atomic_file, conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -381,6 +381,55 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(reply.status, 200)
         self.assertEqual(reply.content_type, "image/png")
         self.assertEqual(reply.body, image)
+
+    def test_an_image_question_answers_the_browser_before_delivery_finishes(self) -> None:
+        _ = self.enterContext(patch.object(serve, 'tailscale_ip', return_value='127.0.0.1'))
+        page = change_page.ReviewPage(self.root / 'fixture-image', self.root, ('Images fixture/Q1',), '')
+        delivery = change_page.MessageDelivery(page, page.rows[0], (), 'Fixture question', 'fixture-attempt')
+        started, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+        def send(message: change_page.MessageDelivery | change_page.NoMessageDelivery,
+                 status: change_page.DeliveryStatus) -> None:
+            self.assertIs(message, delivery)
+            self.assertEqual(status.root, self.root)
+            started.set()
+            try:
+                self.assertTrue(release.wait(TEST_HANG_GUARD_SECS))
+            finally:
+                finished.set()
+
+        with patch.object(images, 'submit', return_value=delivery) as submit, patch.object(
+                change_page, 'deliver', side_effect=send):
+            try:
+                code, body = self.post(images.PAGE_PATH, 'fixture-question')
+                self.assertEqual((code, json.loads(body)), (200, {'state': 'done'}))
+                self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
+                self.assertFalse(finished.is_set())
+                submit.assert_called_once()
+                self.assertEqual(submit.call_args.args[:2], (self.root, 'fixture-question'))
+            finally:
+                release.set()
+                if started.is_set():
+                    self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
+
+    def test_an_image_question_delivers_when_the_browser_response_fails(self) -> None:
+        _ = self.enterContext(patch.object(serve, 'tailscale_ip', return_value='127.0.0.1'))
+        page = change_page.ReviewPage(self.root / 'fixture-image', self.root, ('Images fixture/Q1',), '')
+        delivery = change_page.MessageDelivery(page, page.rows[0], (), 'Fixture question', 'fixture-attempt')
+        completed = threading.Event()
+
+        def send(message: change_page.MessageDelivery | change_page.NoMessageDelivery,
+                 status: change_page.DeliveryStatus) -> None:
+            self.assertIs(message, delivery)
+            self.assertEqual(status.root, self.root)
+            completed.set()
+
+        with patch.object(images, 'submit', return_value=delivery), patch.object(
+                change_page, 'deliver', side_effect=send), patch.object(
+                serve.ReviewLinksHandler, 'json_response', side_effect=BrokenPipeError('fixture disconnect')):
+            with self.assertRaises(OSError):
+                _ = self.post(images.PAGE_PATH, 'fixture-question')
+            self.assertTrue(completed.wait(TEST_HANG_GUARD_SECS))
 
     def test_accounts_route_renders_per_request_and_reports_a_failed_read(self) -> None:
         with (patch.object(accounts_page, "render_with_facts", side_effect=OSError("staff file absent")),
