@@ -1096,6 +1096,24 @@ def step_identity(step: str, worktree: str) -> wire.Identity:
                          identity["folder"], identity.get("unit", ""))
 
 
+def verify_call() -> records.VerifyStep:
+    """Read the verify call facts from the shell that starts the step."""
+    from scripts.build_queue import admission_records as records
+
+    name = os.environ.get("BUILDLOG_VERIFY_VERB")
+    call = os.environ.get("BUILDLOG_VERIFY_CALL", "")
+    if name not in records.VERIFY_VERBS or not call:
+        return records.NotVerifyCall()
+    try:
+        position = int(os.environ.get("BUILDLOG_VERIFY_POSITION", ""))
+        total = int(os.environ.get("BUILDLOG_VERIFY_TOTAL", ""))
+    except ValueError:
+        return records.NotVerifyCall()
+    if 1 <= position <= total:
+        return records.VerifyCall(name, call, position, total)
+    return records.NotVerifyCall()
+
+
 def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sidecar: str,
                  episode: str, profile: records.InferFromArgv | wire.Profile | InferProfileAtUse = INFER_PROFILE_AT_USE,
                  *, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
@@ -1116,7 +1134,7 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
     width_value_typed: records.TestWidth = (records.RequestedTestWidth(width_value) if width_value else
         records.UnspecifiedTestWidth() if estimate.profile.step == "nextest" else records.NoTestWidth())
     call = os.environ.get("BUILDLOG_CALL_ID", "")
-    identity = step_identity(estimate.profile.step, estimate.profile.worktree)
+    identity = replace(step_identity(estimate.profile.step, estimate.profile.worktree), verify=verify_call())
     if isinstance(estimate.profile, records.ProgramProfile):
         identity = replace(identity, folder=estimate.profile.worktree)
     return wire.AdmitRequest(episode, owner, tuple(argv), cwd, since, sidecar,

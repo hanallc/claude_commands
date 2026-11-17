@@ -113,6 +113,49 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(root.findtext(".//tr[@data-tip='wait:fixture-wait-0']/td[@class='place']"), "1")
                 self.assertEqual(root.findtext(".//tr[@data-tip='wait:fixture-wait-0']/th[@class='step']/span"), "first")
 
+    def test_verify_column_and_tooltip_use_the_recorded_call(self) -> None:
+        data: dict[str, object] = {"total": 64, "cap": 48, "taken": 4, "read_at": 200,
+            "walk": [{"name": "demo nextest", "queued": True, "started_at": 100, "used": 1,
+                      "reserved": 0, "counted": 1, "verify": {"verb": "final", "step": "nextest",
+                          "call": "verify final demo", "position": 2, "total": 2}}],
+            "waiters": [{"name": "demo clippy", "since": 100, "need": 1, "reason": "free memory",
+                         "verify": {"verb": "example", "step": "clippy", "position": 1, "total": 1,
+                                    "call": "verify example demo --name sample"}},
+                        {"name": "rust-analyzer", "since": 100, "need": 1, "reason": "free memory"}]}
+        rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+        root = ElementTree.fromstring(f"<root>{rendered}</root>")
+        self.assertEqual([cell.text for cell in root.findall(".//th[@class='verify']")], ["Verify", "Verify"])
+        for key, verb, step, call in (
+            ("row:fixture-run-0", "final", "nextest (2 of 2)", "verify final demo"),
+            ("wait:fixture-wait-0", "example", "clippy", "verify example demo --name sample"),
+            ("wait:fixture-wait-1", "", "", ""),
+        ):
+            with self.subTest(key=key):
+                self.assertEqual(root.findtext(f".//tr[@data-tip='{key}']/td[@class='verify']"), verb)
+                tip = str(self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True))
+                grid = ElementTree.fromstring(tip)
+                labels = {cell.text: grid[index + 1].text for index, cell in enumerate(grid) if cell.tag == "dt"}
+                if verb:
+                    self.assertEqual(labels["Step"], step)
+                    self.assertEqual(labels["Call"], call)
+                    self.assertEqual(grid[-2].text, "Call")
+                    self.assertEqual(grid[-1].get("class"), "call group")
+                else:
+                    self.assertNotIn("Step", labels)
+                    self.assertNotIn("Call", labels)
+
+    def test_unavailable_memory_keeps_the_verify_tooltip_fields(self) -> None:
+        verify = {"verb": "final", "step": "nextest", "position": 2, "total": 2, "call": "verify final demo"}
+        data = {"walk": [{"kind": "mac-build", "name": "demo nextest", "used": {"kind": "MacMemoryUnavailable"},
+                          "verify": verify}],
+                "waiters": [{"name": "demo nextest", "head_room": {"unavailable": True}, "verify": verify}]}
+        for key in ("row:fixture-run-0", "wait:fixture-wait-0"):
+            with self.subTest(key=key):
+                rows = cast(list[dict[str, object]], self.page_expression(f"tooltipRows('{key}', data)", data))
+                self.assertEqual([(row["label"], row["value"]) for row in rows],
+                                 [("demo nextest", "unavailable"), ("Step", "nextest (2 of 2)"),
+                                  ("Call", "verify final demo")])
+
     def test_the_done_column_uses_each_counter_and_preserves_unknown_progress(self) -> None:
         for phase, unit, done, total, percent, expected in (
             ("building", "units", 7, 10, 70, "70.0%"),
@@ -414,7 +457,7 @@ class MemoryHoverTests(unittest.TestCase):
                 assert table is not None
                 headers = table.findall("./thead/tr/th")
                 self.assertEqual([cell.text for cell in headers],
-                                 ["Stage", "Done", "Step", "Dur", "Unit", "Pid", "Target", "vCPU", "Slot", "Tokens"])
+                                 ["Stage", "Done", "Step", "Dur", "Verify", "Unit", "Pid", "Target", "vCPU", "Slot", "Tokens"])
                 self.assertEqual(table.findall(".//*[@class='stage']"), [])
                 for index, expected in enumerate(("building", "testing", "—", "testing", "—", "testing", "—", "building")):
                     row = table.find(f"./tbody/tr[@data-tip='row:fixture-run-{index}']")
@@ -431,7 +474,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(len(spacers), int(waiting))
                 if waiting:
                     self.assertEqual([cell.text for cell in queue_headers[0]],
-                                     ["#", "Done", "Step", "Waiting", "Unit", "Pid", "Target", "vCPU"])
+                                     ["#", "Done", "Step", "Waiting", "Verify", "Unit", "Pid", "Target", "vCPU"])
                     self.assertTrue(all(cell.get("scope") == "col" for cell in queue_headers[0]))
                     for index, expected in enumerate(("1", "cloud", "2")):
                         row = table.find(f"./tbody/tr[@data-tip='wait:fixture-wait-{index}']")
@@ -506,8 +549,9 @@ class MemoryHoverTests(unittest.TestCase):
         root = ElementTree.fromstring(f"<root>{result[0]}</root>")
         row = root.find(".//tr[@data-tip='row:fixture-run-0']")
         assert row is not None
-        self.assertEqual([row[index].text for index in (0, 3, 5, 7)], ["—", "—", "—", "—"])
-        self.assertEqual(row[4][0].text, "—")
+        for column in ("place", "duration", "pid", "vcpus"):
+            self.assertEqual(row.findtext(f"td[@class='{column}']"), "—")
+        self.assertEqual(row.findtext("td[@class='unit']/span"), "—")
         self.assertEqual(result[1].count("unavailable"), 1)
 
     def test_queue_notes_appear_once_in_their_row_tooltips(self) -> None:

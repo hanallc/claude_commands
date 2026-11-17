@@ -337,7 +337,26 @@ class HeadRoom(TypedDict):
     rows: list[RoomRow]
 
 
-class RowQueueNotes(TypedDict):
+class PageVerifyCall(TypedDict):
+    verb: admission_records.VerifyVerb
+    call: str
+    position: int
+    total: int
+    step: str
+
+
+class VerifyNotes(TypedDict, total=False):
+    verify: PageVerifyCall
+
+
+def verify_notes(call: admission_records.VerifyStep, step: str) -> VerifyNotes:
+    if isinstance(call, admission_records.VerifyCall):
+        return {"verify": {"verb": call.verb, "call": call.call, "position": call.position,
+                           "total": call.total, "step": step}}
+    return {}
+
+
+class RowQueueNotes(VerifyNotes):
     key: NotRequired[str]
     # A gate job's description sentence and what it changes (build_steps about. and changes.).
     about: NotRequired[str]
@@ -2005,6 +2024,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "need": gib(hold.memory.need), "need_part": need_in_next_part(steps_by_owner.get(hold.memory.owner, ())),
                      **(target_notes(step.route, routes, step.step, step.folder, step.package)
                         if step is not None and not ci_label else NO_TARGET_NOTES),
+                     **(verify_notes(step.verify, step.step) if step is not None else VerifyNotes()),
                      **job_notes(job, unit, names)})
     groups: dict[str, list[RunRow]] = {}
     remote_groups: set[str] = set()
@@ -2026,6 +2046,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 "progress": row_progress((step,), progress.TOKEN_WAIT_REASON),
                 "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
                 "machine": admission_records.execution_host(step, host_name()), "vcpus": queue_view.UnknownCpuCount(),
+                **verify_notes(step.verify, step.step),
                 **build_slot(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
                     home=slot_homes.get(admission_records.execution_host(step, host_name()), ""))}
             walk.append(remote_row)
@@ -2116,6 +2137,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         "free": gib(max(0, check.room)) if check is not None else
                                 gib(waiter.reason.free) if isinstance(waiter.reason, admission_records.NeedsMemory) else gib(ram["room_bytes"]),
                         "why": wait_why(waiter.reason),
+                        **verify_notes(waiter.verify, waiter.step),
                         **(NO_TARGET_NOTES if ci_label else target_notes(
                             waiter.route, routes, waiter.step, waiter.folder, waiter.package)),
                         # A waiting step names its slot, so the Disks page names the slot's work as this row does.
@@ -2131,9 +2153,16 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             "stage": queue_view.MacStageUnavailable(), "vcpus": queue_view.MacJobsUnavailable(), "status": mac_status})
     else:
         mac_units = mac_build_units(mac_reading.builds, target_availability.mac_claims(snapshots))
-        work_rows.extend(mac_work_row(build, mac_reading, mac_units.get(build.pid, unit_labels.UnitLabels("")),
-                                     names=names, slot_roots=slot_roots, slot_machine=mac_machine)
-                         for build in mac_reading.builds)
+        mac_calls = {step.mac_placement: verify_notes(step.verify, step.step)
+                     for step in parsed.view.running if step.mac_placement}
+        for build in mac_reading.builds:
+            mac_row = mac_work_row(build, mac_reading, mac_units.get(build.pid, unit_labels.UnitLabels("")),
+                                   names=names, slot_roots=slot_roots, slot_machine=mac_machine)
+            if build.gate_label is queue_view.MacGateLabel.PLACEMENT:
+                notes = mac_calls.get(build.gate_placement)
+                if notes is not None and "verify" in notes:
+                    mac_row["verify"] = notes["verify"]
+            work_rows.append(mac_row)
     work_rows.sort(key=lambda row: row["started_at"])
     waiting_rows: list[WaitRow | CloudWaitRow] = list(waiters)
     model = queue_view.QueueModel(parsed, labels, names=names)
@@ -2158,6 +2187,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             identity = queue_view.cloud_step_labels(cloud, model)
             values: CloudWorkRow = {"kind": "cloud", "name": queue_view.cloud_step_name(cloud, model),
                 **page_owner_labels(identity), "pid": cloud.owner.pid,
+                **verify_notes(cloud.identity.verify, cloud.identity.step),
                 "detail": identity.unit, "machine": "" if isinstance(cloud.wait, wire.CloudSlotWait) else "aws",
                 "vcpus": information.vcpus,
                 "state": information.state, "status": plain([queue_view.cloud_page_status(cloud, information)]),

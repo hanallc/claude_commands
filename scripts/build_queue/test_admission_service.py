@@ -696,6 +696,34 @@ class StateCheckTests(unittest.TestCase):
             self.assertEqual((root / "state.json").read_bytes(), before)
 
 
+    def test_verify_metadata_in_stored_placement_is_optional_in_both_versions(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            old = service.ServiceState({}, {}, {}, records.ReadyToStart(),
+                placement_requests={request.episode: request})
+            state = fixture.state_dir / "state.json"
+            write_text_atomic(state, wire.encode_record(old))
+            self.assertEqual(service.read_state(fixture.state_dir), old)
+            facts = records.VerifyCall("test", "verify test sample --no-cache", 1, 1)
+            request = replace(request, identity=replace(request.identity, verify=facts))
+            current = replace(old, placement_requests={request.episode: request})
+            write_text_atomic(state, wire.encode_record(current))
+            self.assertEqual(service.read_state(fixture.state_dir), current)
+
+            current_fields = codec.snapshot_fields
+
+            def fields_before_verify(schema: type) -> dict[str, object]:
+                fields = current_fields(schema)
+                if schema is wire.Identity:
+                    return {name: kind for name, kind in fields.items() if name != "verify"}
+                return fields
+
+            with mock.patch.object(codec, "snapshot_fields", side_effect=fields_before_verify):
+                self.assertEqual(service.read_state(fixture.state_dir), old)
+
+
 class LocalHoldPlacementTests(unittest.TestCase):
     def test_close_between_the_loop_check_and_clear_does_not_lose_its_wake(self) -> None:
         from queue import Queue
