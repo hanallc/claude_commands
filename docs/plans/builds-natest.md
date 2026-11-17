@@ -4612,37 +4612,12 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 ### Phase 327 — The Mac-only verify tests use less aws CPU  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `direct/test_verify_mac_only.py` uses less CPU in aws pairs, with the same tests and assertions, or the phase names its floor.
-
-**Decision:** Phases 324-326 ended at floors. The aws ranking (rows as of 2026-11-16 21:36) then puts this module next; `production/test_mac_run.py` ranks above it, but its Phase 313 cut is not on main yet. Median 41.7 CPU s; slowest kept test `VerifyMacOnlyTests.test_runner_refusals_never_fall_back_or_retry` 6.6 s. Phases 271, 276 and 278 cut it to 27.9 aws CPU s; it grew back, and two tests were added on 2026-11-16. Find what grew first. builds rejected new shared layers for one module's gain (2026-11-16): the change stays in the test file.
-
-**Spec:**
-1. Compare the module at Phase 278's commit 3f52df2c3 with the current tree: name each test and helper change since then that adds CPU. Then profile: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD direct/test_verify_mac_only.py --tests 15 --commands 15`, under `systemd-run --user --scope -q -p MemoryMax=2G`. Name the top costs by test, fixture and command.
-2. Remove the largest repeated cost in the test file that a test does not check, with the shared methods of Phases 235-238, 251, 254, 255, 271, 276 and 323: class seeds copied per test, in-process calls where no process boundary is asserted, a forked child with loaded modules where a boundary is asserted but a new interpreter is not, one render where several tests read the same output.
-3. Keep every full `verify.sh` call that a test asserts on, every refusal text, every signal and exit status. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
-4. If the largest remaining cost is product work (`verify.sh`, `verify_helper.py`, the runner), do not change product code. Report the cost and the floor.
-5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-6. The director runs the aws pairs.
-
-**Files:**
-- `scripts/direct/test_verify_mac_only.py`
-
-**Workers:** 1 writer; one test module.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere. No lazy imports inside functions.
-- Phase 252: every fixture binds private run roots through `bind_private_run_roots`; keep it. Phase 242: in-process calls bind per call the module state that the real process reads at start.
-- Phase 271: `test_runner_refusals_never_fall_back_or_retry` checks the reason texts through the real `mac_only_refuse` in one shell; five full `verify.sh` calls cover each runner mode and each `placement.retry_decision` class. Phase 276: the Mac offload targets and record wrappers run inside verify_helper.
-- Phase 323: a forked child with loaded imports keeps a real kill point and exit status; create output files and child cleanup before the fork.
-- sdlc terms: test files only; every test and assertion stays; merge only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain, or the report names the floor; peak memory reported.
+- No source changed. The pass is a floor result for `direct/test_verify_mac_only.py`: 34.5 to 38.8 natedev CPU s.
+- Growth since Phase 278 (3f52df2c3): two backoff tests add two full `verify.sh` calls (1.9 CPU s together). The shared helper changes add no calls in this module.
+- Remaining cost is product work: `verify_helper.py` 9.0 to 9.9 CPU s over 29 starts, `verify.sh` 4.4 to 5.1 s. The class setup costs 0.1 s and already uses a class seed and the loaded targets and record wrappers.
+- `verify_helper.py` now checks the file stamps of its loaded sources before each request (2dd881828). This pass does not isolate that cost; Phase 328 measures `verify_helper.py` across all modules. Every behavior check stays. Checkpoint 7bfb419b0.
 
 ### Phase 328 — Measure which commands use the suite's CPU  · status: todo
 **Depends on:** none
