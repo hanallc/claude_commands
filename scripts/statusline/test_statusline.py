@@ -1904,6 +1904,37 @@ class RebuildRowTests(unittest.TestCase):
             rebuild_row.write(config, run)
             self.assertEqual(cache.read_text(encoding="utf-8").splitlines()[0], "")
 
+    def test_running_system_probe_availability_survives_cache_round_trip(self) -> None:
+        for failed in ("natedev", "mac", ""):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as directory:
+                config = Path(directory) / "statusline.conf"
+                cache = Path(directory) / "cache"
+                _ = config.write_text("rebuild.repo=/fixture/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
+                    + "rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=120\n"
+                    + f"rebuild.eval_retry_seconds=600\nrebuild.cache={cache}\n", encoding="utf-8")
+
+                def run(command: list[str], *, timeout: int = 30) -> str:
+                    _ = timeout
+                    if command[0] == "git":
+                        return "a" * 40
+                    if command[0] == "nix":
+                        return json.dumps({"natedev": "/nix/store/expected", "mac": "/nix/store/expected"})
+                    machine = "mac" if command[0] == "ssh" else "natedev"
+                    if machine == failed:
+                        failure = subprocess.CompletedProcess(command, 255, "", "Fixture probe failure.")
+                        with patch.object(subprocess, "run", return_value=failure):
+                            return rebuild_row.command_output(command)
+                    return "/nix/store/expected"
+
+                rebuild_row.write(config, run)
+                details = cast(dict[str, object], json.loads(cache.read_text().splitlines()[3]))
+                self.assertEqual(details.get("running_system_probes"),
+                                 {"natedev": failed != "natedev", "mac": failed != "mac"})
+                answer = rebuild_row.read(config)
+                self.assertEqual(answer.probes.natedev, failed != "natedev")
+                self.assertEqual(answer.probes.mac, failed != "mac")
+                self.assertEqual(answer.row(), "")
+
     def test_changes_list_commits_after_each_switch_with_the_session_that_wrote_them(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
