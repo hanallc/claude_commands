@@ -176,6 +176,67 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(self.command("clean-evidence", "--source", "morty"), (0, "0 changed; 9 unchanged\n", ""))
         self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], after)
 
+    def test_clean_evidence_removes_the_matching_row_copy_once(self) -> None:
+        block = ("## {number}. The former title\n\n**List state:** Working\n\n"
+                 + "- **Owner:** sdlc\n- **Next:** Check the result\n  on the other machine.\n")
+        copied_json = 'Source checkins.json item:\n\n{"owner": "sdlc"}\n'
+        cases = (
+            (block, "", 0, 1),
+            (block + "\nKeep these later words.  \n\n", "Keep these later words.  \n\n", 0, 1),
+            ("Keep earlier words.\n\n" + block + "\n## Human evidence\n\nKeep this proof.\n",
+             "Keep earlier words.\n\n## Human evidence\n\nKeep this proof.\n", 0, 1),
+            (block.replace("{number}", "999"), block.replace("{number}", "999"), 0, 0),
+            (block.replace("**List state:** Working\n\n", ""),
+             block.replace("**List state:** Working\n\n", ""), 0, 0),
+            ("## {number}. Title\n\n**List state:** Working\n\nKeep human evidence.\n",
+             "## {number}. Title\n\n**List state:** Working\n\nKeep human evidence.\n", 0, 0),
+            (block.replace("\n", "\r\n"), "", 0, 1),
+            (copied_json + "\n" + block + "\nKeep the proof.\n", "Keep the proof.\n", 1, 1),
+            (block + "\n" + copied_json + "\nKeep the proof.\n", "Keep the proof.\n", 1, 1),
+        )
+        originals: list[tuple[the_list.ListItem, str, int, int]] = []
+        for number, (evidence, expected, json_entries, row_entries) in enumerate(cases, 54):
+            item = self.add(number=number, changes={"evidence": evidence.replace("{number}", str(number))})
+            if number == 54:
+                item = the_list.close(MORTY.id, item.id, "Finished", source="nate")
+            originals.append((item, expected.replace("{number}", str(number)), json_entries, row_entries))
+        moment = START + timedelta(minutes=1)
+        with patch.object(the_list, "now", return_value=moment), patch.object(
+                record_store.NumberedRecords, "write", autospec=True, side_effect=record_store.NumberedRecords.write) as save:
+            self.assertEqual(self.command("clean-evidence", "--source", "morty"), (0, "6 changed; 3 unchanged\n", ""))
+        self.assertEqual(save.call_count, 6)
+        for original, expected, json_entries, row_entries in originals:
+            with self.subTest(item=original.id):
+                entries = (
+                    (the_list.ItemChange(moment, "Removed the migration copy of checkins.json from Evidence", "morty"),)
+                    * json_entries
+                    + (the_list.ItemChange(moment, "Removed the migration copy of the List row from Evidence", "morty"),)
+                    * row_entries
+                )
+                cleaned = the_list.load(MORTY.id, original.id)
+                self.assertEqual(cleaned, replace(original, evidence=expected,
+                    updated=moment if entries else original.updated, log=(*original.log, *entries)))
+        paths = [the_list.folder(MORTY.id) / f"{item.id}.md" for item, _, _, _ in originals]
+        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+        self.assertEqual(self.command("clean-evidence", "--source", "morty"), (0, "0 changed; 9 unchanged\n", ""))
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
+
+    def test_clean_evidence_keeps_a_human_bullet_after_the_row_copy(self) -> None:
+        proof = "- Deployment failed. Keep this proof.\n"
+        block = "## 54. Former title\n\n**List state:** Working\n\n- **Owner:** sdlc\n"
+        item = self.add(number=54, changes={"evidence": block + "\n" + proof})
+        self.assertEqual(self.command("clean-evidence", "--source", "morty"), (0, "1 changed; 0 unchanged\n", ""))
+        self.assertEqual(the_list.load(MORTY.id, item.id).evidence, proof)
+        self.assertEqual(self.command("clean-evidence", "--source", "morty"), (0, "0 changed; 1 unchanged\n", ""))
+
+    def test_clean_evidence_keeps_text_with_one_leading_space_after_the_row_copy(self) -> None:
+        proof = " Keep this proof.\n"
+        block = "## 54. Former title\n\n**List state:** Working\n\n- **Owner:** sdlc\n"
+        item = self.add(number=54, changes={"evidence": block + "\n" + proof})
+        self.assertEqual(self.command("clean-evidence", "--source", "morty"), (0, "1 changed; 0 unchanged\n", ""))
+        self.assertEqual(the_list.load(MORTY.id, item.id).evidence, proof)
+        self.assertEqual(self.command("clean-evidence", "--source", "morty"), (0, "0 changed; 1 unchanged\n", ""))
+
     def test_page_events_only_mark_read_or_append_feedback(self) -> None:
         item = self.add(number=106)
         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": OWNER.current_session}):

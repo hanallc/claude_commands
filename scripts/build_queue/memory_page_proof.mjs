@@ -473,17 +473,22 @@ try {
                   return {chart:rect(chart).top-rect(document.querySelector('.walk-chart-head')).bottom,
                     table:rect(metadata).top-rect(table.querySelector('thead tr')).bottom};
                 }),
-                compact:document.querySelector('#walk').classList.contains('compact'),
-                cut:(() => {
-                  // A cell is cut when it ends outside the table box or its text is wider than its box.
-                  const box=rect(table);
-                  const cells=[...table.querySelectorAll('tr > *')].filter(cell=>cell.getClientRects().length);
-                  return [...cells.map(cell=>[cell,cell.querySelector('.cell-text')||cell]),
-                    ...[...document.querySelectorAll('.walk-chart .row-label .name')].map(name=>[name,name])]
-                    .filter(([cell,text])=>rect(cell).left<box.left-0.5 || rect(cell).right>box.right+0.5 ||
-                      text.scrollWidth>text.clientWidth)
-                    .map(([cell])=>cell.className+': '+cell.textContent);
+                // The label column is as wide as the widest Running label, Free row or queued word.
+                labelColumn:(() => {
+                  const walk=document.querySelector('#walk');
+                  const width=(source,text)=>{
+                    const probe=source.cloneNode(false);probe.textContent=text;
+                    Object.assign(probe.style,{position:'absolute',whiteSpace:'nowrap',width:'auto',visibility:'hidden'});
+                    walk.append(probe);const result=probe.getBoundingClientRect().width;probe.remove();return result;
+                  };
+                  const widths=[...walk.querySelectorAll('.row-label .name, .row-label .owner')].flatMap(label=>
+                    label.closest('.wrow.wait') ? label.textContent.split(/\s+/).map(word=>width(label,word)) : [width(label,label.textContent)]);
+                  const room=walk.querySelector('.wrow.room .row-heading');
+                  widths.push(width(room,room.textContent.replace(/(Free)/,'$1 '))+8);
+                  return {column:parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--amt')),
+                    needed:Math.max(...widths),cap:12*parseFloat(getComputedStyle(document.documentElement).fontSize)};
                 })(),
+                stageCut:[...table.querySelectorAll('td.place')].filter(cell=>cell.scrollWidth>cell.clientWidth).map(cell=>cell.textContent),
                 roomRow:(() => {
                   const room=table.querySelector('tr.room');
                   return room.getClientRects().length?room.textContent:null;
@@ -524,12 +529,14 @@ try {
             assert.equal(proof.queueHeaderHeight,proof.queueSpacerHeight);
             assert.ok(proof.stages.includes('testing'));
             assert.ok(proof.stages.every(stage => ['building','testing','—'].includes(stage)));
-            // The stacked table leaves out the room row, so only the beside table matches the chart row for row.
-            if(proof.layout==='beside') for(const offsets of proof.rowOffsets)
+            // The table never moves under the chart; a narrow pane scrolls the step chart sideways.
+            assert.equal(proof.layout,'beside','The table moved under the chart at '+width+' px.');
+            for(const offsets of proof.rowOffsets)
               assert.ok(Math.abs(offsets.chart-offsets.table)<=1,'The chart and table rows differ. '+JSON.stringify({theme,width,offsets,all:proof.rowOffsets}));
-            if(proof.layout==='stacked') assert.deepEqual(proof.cut,[],'A stacked table cell is cut at '+width+' px.');
-            assert.equal(proof.roomRow,proof.layout==='beside'?'':null,'The table room row is empty beside the chart and left out under it.');
-            assert.equal(proof.compact,width===390,'Only the phone table uses two lines for each step.');
+            assert.equal(proof.roomRow,'','The table room row is empty beside the chart.');
+            assert.deepEqual(proof.stageCut,[],'A Stage value is wider than its column at '+width+' px.');
+            assert.ok(proof.labelColumn.column<=Math.min(proof.labelColumn.needed,proof.labelColumn.cap)+2,
+              'The label column is wider than its widest label. '+JSON.stringify(proof.labelColumn));
             assert.equal(proof.machine, 'fixture');
             assert.match(proof.room, /GiB/);
             for (const age of ['45 min','19 h','2 d']) assert.ok(proof.leftover.includes(age), age);
@@ -594,7 +601,8 @@ try {
               }
               assert.ok(matches,label+' '+JSON.stringify({x,y,actual,expected}));
             };
-            checkPixel(proof.roomBar.left+5,(proof.roomBar.top+proof.roomBar.bottom)/2,proof.roomColor,'The room pixels differ.');
+            // The room value label sits at the bar's middle, so read the bar color above it.
+            checkPixel(proof.roomBar.left+5,proof.roomBar.top+4,proof.roomColor,'The room pixels differ at '+theme+' '+width+' px, bar '+JSON.stringify(proof.roomBar)+'.');
             proofs.push({theme,width,metrics:proof});
             const slotReview=structuredClone(base);
             const running=slotReview.walk.find(row=>row.queued&&!row.ci);
@@ -2056,7 +2064,7 @@ try {
                   })()`);
                   assert.equal(layout.tables,1);
                   assert.equal(layout.lists,0);
-                  assert.equal(layout.layout,width===1400?'beside':'stacked');
+                  assert.equal(layout.layout,'beside');
                   for(const value of ['= Free for builds',review.priority_text,'Why it waits: '])
                     assert.equal(layout.head.split(value).length-1,1);
                   responsive.push({width,...layout});

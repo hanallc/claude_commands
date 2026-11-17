@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast, override
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
@@ -503,13 +503,22 @@ def _prune_finished_locked(runs: Path) -> list[str]:
     return removed
 
 
+def _run_record_paths(runs: Path) -> list[Path]:
+    """List run records; only an absent folder counts as empty."""
+    try:
+        with os.scandir(runs) as entries:
+            return sorted(runs / entry.name for entry in entries if entry.name.endswith(".json"))
+    except FileNotFoundError:
+        return []
+
+
 def live_twin(runs: Path, worker: str, command: list[str], tree_key: str) -> RunRecord | None:
     """A running record of the same worker, command, folder and tree key whose supervisor lives.
     After an interrupt on 2026-10-21, hana_catalyst-inspectors started its lint run three times
     on one tree; each run took memory, the cargo token and build time."""
     if not tree_key:
         return None
-    for path in sorted(runs.glob("*.json")):
+    for path in _run_record_paths(runs):
         raw = worker_lifecycle.read_json_object(path)
         if (raw.get("status") == "running" and raw.get("worker") == worker and raw.get("command") == command
                 and raw.get("tree_key") == tree_key
@@ -521,7 +530,7 @@ def live_twin(runs: Path, worker: str, command: list[str], tree_key: str) -> Run
 def worker_runs(runs: Path, worker: str, *, since: float = 0) -> list[RunRecord]:
     """Read this worker's runs that started during the selected dispatch."""
     found: list[RunRecord] = []
-    for path in sorted(runs.glob("*.json")):
+    for path in _run_record_paths(runs):
         raw = worker_lifecycle.read_json_object(path)
         if raw.get("worker") == worker and _number(raw.get("started_at"), 0) >= since:
             found.append(cast(RunRecord, cast(object, raw)))
@@ -535,13 +544,45 @@ def delivered_worker_results(runs: Path, worker: str, *, since: float) -> set[st
                 (f"sent: worker {worker} at ", "already delivered: "))}
 
 
+@dataclass(frozen=True)
+class LiveRunReadError:
+    path: Path
+    error: OSError | ValueError
+
+    @override
+    def __str__(self) -> str:
+        return f"{self.path}: {self.error}"
+
+
+@dataclass(frozen=True)
+class LiveRunEvidence:
+    runs: tuple[RunRecord, ...]
+    read_errors: tuple[LiveRunReadError, ...]
+
+    def require_readable(self) -> list[RunRecord]:
+        if self.read_errors:
+            raise self.read_errors[0].error
+        return list(self.runs)
+
+    def report_errors(self) -> None:
+        for error in self.read_errors:
+            unit_runs.report_anomaly(" ".join(f"anomaly: {error}".splitlines()))
+
+
 def live_runs(runs: Path, worker: str) -> list[RunRecord]:
     """Return running records whose supervisor still owns the record."""
-    return _live_runs(runs, lambda raw: raw.get("worker") == worker)
+    evidence = _live_runs(runs, lambda raw: raw.get("worker") == worker)
+    return evidence.require_readable()
 
 
 def live_runs_for_staff(runs: Path, identities: frozenset[staff.StaffId]) -> list[RunRecord]:
     """Read live records for fixed staff identities, including renamed members."""
+    evidence = live_run_evidence_for_staff(runs, identities)
+    return evidence.require_readable()
+
+
+def live_run_evidence_for_staff(runs: Path, identities: frozenset[staff.StaffId]) -> LiveRunEvidence:
+    """Retain live runs and read errors so callers can distinguish idle from unknown."""
     return _live_runs(runs, lambda raw: isinstance(identity := raw.get("staff_id"), str) and identity in identities)
 
 
@@ -569,15 +610,24 @@ def live_runs_in_folders(folders: Mapping[Path, frozenset[staff.StaffId]]) -> li
     return found
 
 
-def _live_runs(runs: Path, owns: Callable[[dict[str, object]], bool]) -> list[RunRecord]:
+def _live_runs(runs: Path, owns: Callable[[dict[str, object]], bool]) -> LiveRunEvidence:
     """Read each record once and check its owner and supervisor."""
     found: list[RunRecord] = []
-    for path in sorted(runs.glob("*.json")):
-        raw = worker_lifecycle.read_json_object(path)
+    errors: list[LiveRunReadError] = []
+    try:
+        paths = _run_record_paths(runs)
+    except OSError as error:
+        return LiveRunEvidence((), (LiveRunReadError(runs, error),))
+    for path in paths:
+        try:
+            raw = worker_lifecycle.read_json_object(path)
+        except (OSError, ValueError) as error:
+            errors.append(LiveRunReadError(path, error))
+            continue
         if (raw.get("status") == "running" and owns(raw)
                 and detached_run_process.supervises(_integer(raw.get("pid")), path)):
             found.append(cast(RunRecord, cast(object, raw)))
-    return found
+    return LiveRunEvidence(tuple(found), tuple(errors))
 
 
 def resume_context(runs: Path, worker: str) -> str:

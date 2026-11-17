@@ -166,7 +166,8 @@ The [change page](review-links.md) uses the same saved answers and ownership.
 Open questions and their replay files use the owner's fixed staff id.
 `answer` records the answer under the list lock before it removes the open item.
 The replay resolves current names and parents through staff, including after rename or transfer.
-Its 48-hour retained record supports retry. It is not complete answer history.
+Its 48-hour replay record supports retry.
+Canonical Review question logs retain the user's answer words without that limit.
 
 ### Checkpoints and durable records
 

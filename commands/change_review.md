@@ -10,8 +10,15 @@ Each action refuses an option it does not read.
 
 For `/change_review` with no action:
 
-The command prints the Hana console link with Changes selected.
-The console navigation switches between Changes and Builds.
+The command prints the Hana console link.
+Review combines questions, changes and investigations.
+Each card has Your words, closing actions, Ask question and Later with a date and time.
+Send feedback closes the item with the result **feedback sent**.
+Ask question sends the words to the owner and returns the item after the owner answers.
+Owners use `change_page.py answer-question --item <Review key> --text "<answer>"` for all three types.
+For changes, include `--question <id>` from the message.
+Later keeps the state and hides the item from Review, the For you count and `/next` until its time.
+The canonical question log retains the user's answer words without a time limit.
 
 1. Run the page script:
 
@@ -241,11 +248,12 @@ Owned question cards show the title before the filed text, choices, and `Asked b
 They omit the separate Question label.
 Choices show as radio items; a choice fills the **Your answer** box.
 An **Owner unavailable** card shows `No showrunner owns this question.` without an answer form; the server refuses an answer.
-Answer records the answer and opens the next waiting question.
-Followup sends the text to the asker; the question returns with the reply after the asker runs `update_registration.py reply`.
-Skip moves the question to the end of the list without an answer.
-Answer and Followup need text in the box.
-Questions have no Ask showrunner to check or Ask a question controls.
+Answer records the words and finishes the question.
+Send feedback sends the words to the owner and finishes the question.
+Ask question moves it to Waiting until the owner uses the shared answer command.
+Later replaces Skip on the Review card.
+Older selected-row forms retain Followup and Skip for compatibility.
+Review does not open another card after a save.
 A stale question refuses an answer if another session already answered it.
 Saved question answers use the same delivery attempts, startup recovery, and failure alert as changes.
 The delivery record stores `saved: false` before the answer saves and `saved: true` after it saves.
@@ -403,23 +411,28 @@ showrunner of the row's tab to check the change in place of the user:
 
 Use the `verdict` command above for both. The row stays out of the user's count until the verdict saves.
 
-## Question
+## Ask question
 
-1. Read the question and its `Question id` in the change review message.
-2. Check the change or ask its unit.
+1. Read the Review item key and the user's words in the message.
+2. Check the item or ask its source unit.
 3. Save the answer with this command:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <showrunner name> --list <list> --row <showrunner>/C<n> --question <id> --text "<answer>"
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --item <Review-key> --text "<answer>"
 ```
 
-The row returns to the user's count with the question and answer below the change.
+For a change, include `--question <id>` from the request message.
+The item returns to For you with the answer in its log.
 The answer and cells can hold several lines; lines that start with `- ` or `1. ` show as lists.
 The user can give a verdict or ask another question.
 The same question ID and answer text change nothing and exit 0 on a rerun.
 The command refuses an old or unknown ID, a different answer, or a row without an open question.
 
 ## Feedback
+
+Send feedback finishes the Review item.
+Send any resulting work as a new item.
+The following reply form applies only to a pending feedback request from an older selected-row page.
 
 1. Read the feedback and its `Feedback id` in the change review message.
 2. Complete the directed action.
