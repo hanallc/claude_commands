@@ -293,6 +293,27 @@ class MemoryHoverTests(unittest.TestCase):
                 fields = [(cell.text, grid[index+1].text) for index, cell in enumerate(grid) if cell.tag == "dt"]
                 self.assertEqual(fields[1:3], [("Changes", "sdlc branch"), ("Showrunner", "builds")])
 
+    def test_fixed_final_route_names_natedev_and_its_reason_in_the_tooltip(self) -> None:
+        from datetime import UTC
+        from scripts.build_queue import admission_client, placement, target_availability
+        from scripts.build_targets import target_config
+        from scripts.mac_test import claim_state
+        from scripts.build_hold.owning_session import NoOwningSession
+
+        mac = placement.PlacementDestination("mac", "mac", "fixture-mac", claim_state.WHOLE_MAC)
+        local = placement.PlacementDestination("local", "natedev", "fixture-local", claim_state.WHOLE_MAC)
+        constraints = placement.PlacementConstraints(placement.SourceKeyKnown("source"), ("cargo", "check"),
+            "/fixture", "", NoOwningSession(), (placement.PlacementCandidate(mac,
+                placement.FixedExclusion("full gate runs on natedev")), placement.PlacementCandidate(local)))
+        route = admission_client.constrained_step_route(target_config.ANY_ELIGIBLE_TARGET, constraints)
+        shown = memory_feed.step_runs_on(route, target_availability.MacRoutes((), {}, UTC), "check", "/fixture", "")
+        data = {"read_at": 200, "waiters": [{"name": "cargo-liner check", "since": 100, "need": 5,
+            "runs_on": shown.text(), "because": shown.reason}]}
+        hover = str(self.page_expression("tipText('wait:fixture-wait-0', data)", data))
+        self.assertIn("Runs on  natedev only", hover)
+        self.assertIn("full gate runs on natedev", hover)
+        self.assertNotIn("natedev or Mac", hover)
+
     def test_a_ci_hover_keeps_its_ci_line(self) -> None:
         data = {"read_at": 200, "walk": [{"name": "hana CI", "ci": True, "ci_label": "hana CI · runner-1",
                 "detail": "busy", "unit": "", "keep_text": "", "runner": "unknown"}]}
