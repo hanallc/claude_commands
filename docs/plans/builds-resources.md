@@ -2673,28 +2673,17 @@ The cutover removal commit deletes the script after the run.
 5. The build_hold, hold_enforcer, override_guard and target_hold tests pass; basedpyright reports zero on the changed files.
 
 ### Phase 137 — The Phase 8 private-home fixtures pass the gate  · status: done
-**Source:** builds showrunner 2026-11-16 16:1x: batch728 went red at 15:47 on Phase 8 (`f41980455`). Both failures reproduce alone on this branch.
-1. `scripts/lint/test_nextest_tokens.py` (4 failures): the test runs the checkout `invoke.sh` with a fixture `CONF_DIR` and the real `HOME`. Since Phase 8, `invoke.sh` sources `$HOME/.claude/scripts/lint/memory_gate.sh`, the installed copy, and that copy refuses `CONF_DIR` (exit 2).
-2. `scripts/mac_test/test_failed_probe_mark.py:594`: `FileExistsError` on `<tmp>/home/.claude`. `OffloadCommandFixture.setUp()` calls `caller_admission()`, which since Phase 8 installs the private helpers into the caller's `HOME`. The test then makes `home/.claude` again.
-**Depends on:** Phase 8, Phase 135.
 
-**Review 1 (REQUEST CHANGES):** a private-home link does not fix the gate box. `caller_admission()` also installs the helpers into `Path.home()`; on the gate box that is the real `/home/gate-trial`, so per-name links make the checkout the installed copy, and every later override is refused (the `test_build_hold` `ADMISSION_SOCKET` rows in the same log). On a host without an installed copy it leaves a lasting link in the real home.
+#### As-built
 
-#### Work Order
+- `override_guard.helper_root()` (Python) and `build_helper_root()` in `override_guard.sh` pick the helper root with one rule. A caller with any `OVERRIDE_VARIABLES` name set, an empty value included, uses the helpers beside its own file. Any other caller uses `$HOME/.claude/scripts`. `memory_gate.sh`, `invoke.sh`, `verify.sh`, `top_level.py` and `shutdown.py` take their helper paths through it. The installed copy's override refusal and the shared-state guards are unchanged.
+- `install_private_admission_helpers()` is removed; no test makes a link in a real home.
+- `scripts/lib/helper_tree_test_support.py` builds every fixture `HOME/.claude/scripts` as a private copy of the packages that fixture names. It leaves out `test_*.py` and `__pycache__`, except the runtime files from `checkout_test_support.runtime_files()`. A relative link whose target is inside the copy stays a link; other links are copied or refused. No fixture HOME links `.claude` into a checkout or the installed copy.
+- `verify_mac_offload_test_support.VerifyMacOffloadFixture.wait_until` checks its condition again after the process exits (the race was also on the base).
+- New rows: `test_a_fixture_home_write_does_not_change_the_checkout`, `test_copied_gate_links_find_the_copied_configuration_reader` (`test_cargo_gate`), `test_condition_can_become_true_between_its_check_and_process_exit`.
+- Checkpoint `7fad3a152`: 2771 tests in 185 modules pass together with test startup.
 
-**Goal:** a test copy finds its helpers without any link in a home; the installed copy still refuses overrides; no test writes the real home.
-
-**Spec:**
-1. One rule picks the helper root, in `override_guard.sh` and its twin in `override_guard.py`: a caller with any `OVERRIDE_VARIABLES` name set (a test) uses the helpers beside its own file; a caller with none uses `$HOME/.claude/scripts`.
-2. `memory_gate.sh`, `invoke.sh`, `verify.sh`, `top_level.py` and `shutdown.py` take their Phase 8 installed-helper paths through that rule.
-3. Remove `install_private_admission_helpers()` and each call. Restore `test_failed_probe_mark.py` and `test_nextest_tokens.py` to their Phase 8 text.
-4. The installed copy's override refusal and the shared-state guards do not change.
-5. (builds, 16:30): no fixture HOME links `.claude` or `.claude/scripts` to a real checkout or to the installed copy. One shared fixture helper copies only the files a test reads. One test row proves that a write under the fixture HOME stays in the temp folder. Known sites: `test_failed_probe_mark`, `test_linux_runner`, `test_resume_command`, `test_disk`, `test_remote_copies`, `remote_test_support`, `verify_doc_test_support`, `verify_examples_test_support`, `verify_lint_scope_test_support`, `verify_mac_offload_test_support`, `verify_hold_wait_test_support`, `verify_token_wait_test_support`, `test_mac_run`, `test_unit_run`, `test_session_start_hook`, `test_worktrees`, and the `scripts/direct` tests `test_verify_checks_fail_closed`, `test_verify_token_fifo`, `test_verify_token_mac_step`, `test_verify_token_reservation`, `test_verify_token_renew` and `test_verify_run_place`; any other such site is in scope; a file link counts too. The shared helper is `scripts/lib/helper_tree_test_support.py`. Done when a search finds no link under a fixture HOME/.claude into a checkout or the installed copy.
-
-**Workers:** `1 writer`
-- `impl` owns the files above and every test file that calls the removed helper.
-
-**Acceptance gate:** `test_nextest_tokens`, `test_failed_probe_mark`, `test_admission_service`, `test_invoke_scope`, `test_memory_admit`, `test_override_guard`, `test_build_hold`, `test_top_level`, `test_shutdown_cli`, `test_offload`, `test_linux_runner`, `test_resume_command`, `test_disk` and `test_remote_copies` pass on natedev; no run adds a file under the checkout `scripts/`; no run creates a path under the real `~/.claude`; basedpyright reports zero on the changed Python files.
+**Files:** `override_guard.py`, `override_guard.sh`, `memory_gate.sh`, `invoke.sh`, `verify.sh`, `top_level.py`, `shutdown.py`, `admission_test_support.py`, `helper_tree_test_support.py`, about 40 test and fixture files (list in checkpoint `7fad3a152`), `docs/as-built/build-memory-admission.md`.
 
 ### Phase 138 — test_offload keeps its proof folder in a temp folder  · status: todo
 **Source:** builds showrunner 2026-11-16 18:0x. A Phase 137 run without test startup showed the leak: `GeneratedSourceTests.test_no_envrc_source_requires_generated_source_outside_trusted_roots` (`scripts/mac_test/test_offload.py:54`) calls `scratch.new('gate:offload-generated-source', 'proof')`. It patches only `SCRATCH_ROOT`, so `scratch.new` puts `proof` under the live worker session (`/session/<worker>/proof`). Task cleanup by that name then removed a second worker's folder.
