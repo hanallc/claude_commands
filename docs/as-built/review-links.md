@@ -98,6 +98,7 @@ The left navigation has icons and labels for Accounts, AWS, Builds, Changes, Dis
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`.
 Each page centers its main column in the console frame, with a maximum width of 1124px.
+A page whose `main` has the `page-wide` class uses the full pane width instead; the Builds page is the only one.
 The title starts 32px from the top and left edges of that column.
 Each navigation page places `page_frame.title()` directly above its content.
 The title, status line and content use the same centered column on all nine pages.

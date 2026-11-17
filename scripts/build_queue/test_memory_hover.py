@@ -147,14 +147,19 @@ class MemoryHoverTests(unittest.TestCase):
         inputs = memory_tests.ProgressKeepAsideTests.inputs((row,), (adjusted,))
         stage = memory_feed.row_progress(inputs.running, progress.TOKEN_WAIT_REASON)
         self.assertEqual(stage, {"kind": "TokenWaitProgress", "stage": "waiting for jobserver tokens", "tokens": 4})
-        data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "waiters": [],
-                "walk": [{"name": "hana nextest", "queued": True, "progress": stage}]}
+        running: dict[str, object] = {"name": "hana nextest", "queued": True, "progress": stage}
+        data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "waiters": [], "walk": [running]}
         rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
         root = ElementTree.fromstring(f"<root>{rendered}</root>")
         cells = root.find(".//tr[@data-tip='row:fixture-run-0']")
         assert cells is not None
-        self.assertEqual(cells[0].text, "waiting for jobserver tokens")
+        # The Stage column shows a short word; the tooltip gives the full reason.
+        self.assertEqual(cells[0].text, "waiting")
         self.assertEqual(cells[1].text, "—")
+        running.update(used=1, reserved=0, counted=1)
+        grid = ElementTree.fromstring(cast(str, self.page_expression("tooltipHtml('row:fixture-run-0', data)", data, walk=True)))
+        fields = [(cell.text, grid[index+1].text) for index, cell in enumerate(grid) if cell.tag == "dt"]
+        self.assertIn(("Stage", "Waiting for jobserver tokens"), fields)
 
     def test_the_running_table_shows_tokens_and_the_header_shows_the_pool(self) -> None:
         data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "waiters": [],
@@ -193,6 +198,16 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual([(row["label"], row["value"]) for row in rows], [
             ("hana nextest", "running 2 min"), ("Runs on", "Mac"), ("Uses", "3.5 GiB"),
             ("Reading age", "<1 min"), ("In queue cap", "no"), ("Testing", "7 of 10 tests"), ("Done", "70.0%")])
+
+    def test_a_queued_run_with_an_empty_part_list_shows_its_own_use(self) -> None:
+        data = {"read_at": 400, "walk": [{"name": "merge gate", "unit": "fixture", "showrunner": "fixture-production",
+            "started_at": 100, "used": 4.7, "reserved": 0.5, "counted": 5.2, "queued": True, "keep_text": "",
+            "parts": list[dict[str, object]]()}]}
+        rows = cast(list[dict[str, object]], self.page_expression("tooltipRows('row:fixture-run-0', data)", data))
+        amounts = {row["label"]: row["value"] for row in rows}
+        self.assertEqual(amounts["Uses"], "4.7 GiB")
+        self.assertEqual(amounts["+ Build reserved"], "0.5 GiB")
+        self.assertEqual(amounts["= In queue cap"], "5.2 GiB")
 
     def test_a_queued_run_hover_says_its_use_need_room_and_progress(self) -> None:
         row = memory_tests.ProgressKeepAsideTests.reservation("merge-gate", need=4 * GIB)
