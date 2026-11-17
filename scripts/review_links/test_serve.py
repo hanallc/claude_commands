@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from http.client import HTTPConnection
 from io import StringIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 
 from typing import cast, override
@@ -161,17 +161,21 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
         _ = self.enterContext(patch.object(disks_page, "output_folder", return_value=self.root / "disks"))
-        start = self.enterContext(patch.object(disks_page, "start_measure", return_value=disks_page.MeasureStart.STARTED))
+        start = self.enterContext(patch.object(disks_page, "start_measure", return_value=disks_page.MeasureRequest(disks_page.MeasureStart.STARTED, 7)))
         report: slots.SlotReport = {"root": "/build/slot", "machine": "natedev", "unused_days": 3, "groups": []}
         _ = self.enterContext(patch.object(slots, "slot_report", return_value=report))
         folders: sessions.SessionReport = {"root": "/session", "sessions": []}
         _ = self.enterContext(patch.object(sessions, "session_report", return_value=folders))
-        answer = (b'{"state": "started", "slots": {"root": "/build/slot", "machine": "natedev", "unused_days": 3, "groups": []}, '
+        answer = (b'{"state": "started", "target": 7, "slots": {"root": "/build/slot", "machine": "natedev", "unused_days": 3, "groups": []}, '
                   + b'"sessions": {"root": "/session", "sessions": []}}')
         self.assertEqual(self.post("/disks/measure", ""), (200, answer))
         self.assertEqual(start.call_count, 1)
+        start.assert_called_once_with(ANY, force=False)
         self.assertNotEqual(self.post("/other/measure", "")[0], 200)
         self.assertEqual(start.call_count, 1)
+        start.reset_mock()
+        self.assertEqual(self.post("/disks/measure", "force=1"), (200, answer))
+        start.assert_called_once_with(ANY, force=True)
 
     def test_console_news_records_the_open_page_and_names_pages_with_new_items(self) -> None:
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
