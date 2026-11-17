@@ -1239,6 +1239,20 @@
             {
               "Effect": "Allow",
               "Action": [
+                "servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota"
+              ],
+              "Resource": [
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:servicequotas:*:${AWS::AccountId}:ec2/L-34B43A08"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:servicequotas:*:${AWS::AccountId}:ec2/L-3819A6DF"
+                }
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
                 "s3:AbortMultipartUpload"
               ],
               "Resource": {
