@@ -45,13 +45,19 @@ border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;max-width
 .list-counts{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:20px;color:var(--ink-2);font-size:13px}
 .list-count-chip{border:1px solid var(--line);border-radius:999px;background:var(--card);padding:5px 12px}
 [data-empty],[data-missing-keys]{padding:16px;margin:0;color:var(--ink-2)}
-[data-missing-keys]{white-space:pre-line}
+[data-missing-keys],[data-hidden-action-status]{white-space:pre-line}
 [data-missing-item]{color:var(--ink-2);scroll-margin-top:16px}
+.list-table .record-motion-source{display:none!important}
+.list-table td.record-motion-cell{padding:0;border:0;text-align:left}
+.record-motion-clip{position:relative;overflow:hidden;overflow-anchor:none}
+.list-table .record-motion-clip>table{position:absolute;inset:0 0 auto;width:100%}
 @media(max-width:960px){
 .list-table{border:0;background:none;border-radius:0}.list-table table,.list-table tbody{display:block;width:100%}
 .list-table colgroup{display:none}.list-table thead{display:flex;margin-bottom:12px}.list-table thead tr{display:flex;flex-wrap:wrap}
 .list-table th{border:0}.list-table th button{border:1px solid var(--line);border-radius:8px;width:auto;padding:8px;margin:0 6px 6px 0}
 .list-table tbody{border:1px solid var(--line);border-radius:12px;background:var(--card);margin-bottom:16px;overflow:hidden}
+.list-table [data-record-motion]{margin:0;border:0;background:none}
+.list-table .record-motion-cell{display:block}
 .list-row{display:grid;grid-template-columns:72px minmax(0,1fr)}.list-table .list-row td{border:0;padding:5px 14px}
 .list-table .list-row td:first-child{grid-column:1;grid-row:1;padding-top:14px}
 .list-table .list-row td:nth-child(2){grid-column:2;grid-row:1;padding-top:14px;text-align:right}
@@ -72,6 +78,8 @@ let linkedItem='';
 let placeHash=location.hash;
 const opened=new Set(),filterNames=options.filters || [],filters={};
 const columns=[...content.querySelectorAll('[data-sort]')].map(button=>button.textContent);
+const rowMotion=new Map(),actionResults=new Map();
+const sortValues=data=>options.sortValues?.(data) ?? JSON.parse(data.sortValues);
 function filterControl(id,attribute){
  const control=content.querySelector(id);
  return {
@@ -119,14 +127,78 @@ function compare(a,b){
  if(Array.isArray(a)) return a[0]-b[0] || compare(a[1],b[1]);
  return typeof a==='number' ? a-b : a.localeCompare(b,undefined,{numeric:true,sensitivity:'base'});
 }
+function stopMotion(item){
+ const motion=rowMotion.get(item);
+ if(!motion) return;
+ rowMotion.delete(item);
+ motion.animation.cancel();
+ motion.spacer.remove();
+ item.classList.remove('record-motion-source');
+}
+function setExpanded(item,expanded){
+ const detail=item.querySelector('[data-detail]'),changed=detail.hidden===expanded;
+ detail.hidden=!expanded;
+ item.querySelector('.list-toggle').setAttribute('aria-expanded',String(expanded));
+ item.querySelector('.list-row').classList.toggle('open',expanded);
+ return changed;
+}
+function animateRow(table,item,showRow){
+ const previous=rowMotion.get(item);
+ const heightBefore=previous?.clip.getBoundingClientRect().height;
+ const opacityBefore=previous ? Number(getComputedStyle(previous.clip).opacity) : Number(!showRow);
+ stopMotion(item);
+ const height=item.getBoundingClientRect().height+parseFloat(getComputedStyle(item).marginBottom);
+ if(!height) return;
+ // A copy can fade and shrink while the record leaves the view at once.
+ const spacer=document.createElement('tbody');
+ spacer.dataset.recordMotion='';spacer.inert=true;spacer.setAttribute('aria-hidden','true');
+ const cell=spacer.insertRow().insertCell();
+ const columns=table.querySelector(':scope > colgroup');
+ cell.colSpan=columns.children.length;cell.className='record-motion-cell';
+ const clip=document.createElement('div');clip.className='record-motion-clip';
+ const copyTable=document.createElement('table'),copy=item.cloneNode(true);
+ for(const name of ['data-list-item','data-key','data-number']) copy.removeAttribute(name);
+ copy.querySelectorAll('[id]').forEach(element=>element.removeAttribute('id'));
+ copyTable.append(columns.cloneNode(true),copy);clip.append(copyTable);cell.append(clip);
+ item.after(spacer);
+ if(showRow) item.classList.add('record-motion-source');
+ const animation=clip.animate([
+  {height:(heightBefore ?? (showRow ? 0 : height))+'px',opacity:opacityBefore},
+  {height:(showRow ? height : 0)+'px',opacity:Number(showRow)},
+ ],{duration:200,easing:'ease-in-out',fill:'both'});
+ const finished=animation.finished.then(()=>{
+  if(rowMotion.get(item)?.animation===animation) stopMotion(item);
+ },()=>{});
+ rowMotion.set(item,{spacer,clip,copy,animation,finished,sortValues:showRow ? sortValues(item.dataset) :
+  previous?.sortValues ?? sortValues(item.dataset)});
+}
+function showHiddenActionResults(items){
+ const status=content.querySelector('[data-hidden-action-status]');
+ if(!status) return;
+ const messages=[];
+ for(const [key,{label,message}] of actionResults){
+  const item=items.find(item=>item.dataset.key===key);
+  if(!item || item.hidden || item.querySelector('[data-detail]').hidden) messages.push(label+': '+message);
+ }
+ const text=messages.join('\n');
+ if(status.textContent!==text) status.textContent=text;
+ status.hidden=!text;
+}
+function showActionResult(item,label,message){
+ actionResults.set(item.dataset.key,{label,message});
+ item.querySelector('[data-send-status]').textContent=message;
+ apply(false,{animate:true});
+}
 function isSelected(item){return !keys.size || keys.has(item.dataset.key);}
 function matches(item,selection={}){
  return isSelected(item) &&
   options.visible(item.dataset,{owner,show,query:query.trim().toLowerCase(),type,sourceOwner,keys,filters:{...filters},...selection});
 }
-function apply(write=true,{dismissMissingItem=false,pushPlace=false}={}){
- const items=[...content.querySelectorAll('[data-list-item]')];
- const hasKey=options.hasKey ?? (key=>items.some(item=>item.dataset.key===key));
+function apply(write=true,{animate=false,dismissMissingItem=false,pushPlace=false}={}){
+ const motion=animate && !matchMedia('(prefers-reduced-motion: reduce)').matches;
+ if(!motion) for(const item of rowMotion.keys()) stopMotion(item);
+ const rows=[...content.querySelectorAll('[data-list-item]')];
+ const hasKey=options.hasKey ?? (key=>rows.some(item=>item.dataset.key===key));
  const missingLinkedItem=linkedItem!=='' && !hasKey(linkedItem);
  if(missingLinkedItem){
   keys.delete(linkedItem);
@@ -144,17 +216,24 @@ function apply(write=true,{dismissMissingItem=false,pushPlace=false}={}){
  for(const name of filterNames)
   filters[name]=filterControl('#list-'+name,'data-'+name+'-chip').set(filters[name]);
  const column=columns.indexOf(sort);
- items.sort((a,b)=>column<0 ? Number(a.dataset.order)-Number(b.dataset.order) :
-  (compare((options.sortValues?.(a.dataset) ?? JSON.parse(a.dataset.sortValues))[column],
-           (options.sortValues?.(b.dataset) ?? JSON.parse(b.dataset.sortValues))[column]) ||
+ const sortValue=item=>(rowMotion.get(item)?.sortValues ?? sortValues(item.dataset))[column];
+ const items=rows.toSorted((a,b)=>column<0 ? Number(a.dataset.order)-Number(b.dataset.order) :
+  (compare(sortValue(a),sortValue(b)) ||
    Number(a.dataset.order)-Number(b.dataset.order))*(direction==='desc' ? -1 : 1));
  const table=content.querySelector('table');let count=0;
+ if(items.some((item,index)=>item!==rows[index])) for(const item of items){
+  table.append(item);
+  const spacer=rowMotion.get(item)?.spacer;
+  if(spacer) table.append(spacer);
+ }
  items.forEach(item=>{
-  item.hidden=!matches(item);if(!item.hidden) count++;
-  const expanded=opened.has(item.dataset.key);
-  item.querySelector('[data-detail]').hidden=!expanded;
-  item.querySelector('.list-toggle').setAttribute('aria-expanded',String(expanded));
-  item.querySelector('.list-row').classList.toggle('open',expanded);table.append(item);
+  const showRow=matches(item),wasShown=!item.hidden;
+  if(motion && wasShown && !showRow) animateRow(table,item,false);
+  item.hidden=!showRow;if(showRow) count++;
+  const expanded=opened.has(item.dataset.key),expansionChanged=setExpanded(item,expanded);
+  const transition=rowMotion.get(item);
+  if(motion && showRow && (!wasShown || (expansionChanged && transition))) animateRow(table,item,true);
+  else if(expansionChanged && transition) setExpanded(transition.copy,expanded);
  });
  content.querySelectorAll('[data-sort]').forEach((button,index)=>{
   const active=column===index;
@@ -182,6 +261,7 @@ function apply(write=true,{dismissMissingItem=false,pushPlace=false}={}){
  const selection=keys.size ? items.filter(isSelected) : items;
  const countLine=content.querySelector('[data-list-count]');
  if(countLine) countLine.textContent=options.counts(selection,count,{show,keys});
+ showHiddenActionResults(items);
  options.applied?.(selection,{owner,show,query:search,type,sourceOwner,keys});
  if(write || owner!==previousOwner) writePlace(pushPlace);
 }
@@ -261,12 +341,21 @@ function bind(){
   const key=row.parentElement.dataset.key;
   linkedItem='';
   if(opened.has(key)) opened.delete(key);else {if(options.single) opened.clear();opened.add(key);}
-  apply();
+  apply(true,{animate:true});
  }));
  content.querySelectorAll('[data-type-chip]').forEach(button=>button.addEventListener('click',()=>{
   type=button.dataset.typeChip;changePlace();
  }));
 }
-return {place,apply,bind,opened,restorePlace,replace(){content=contentProxy();bind();apply(false);}};
+return {place,apply,bind,opened,restorePlace,
+ startAction(item){
+  actionResults.delete(item.dataset.key);
+  apply(false,{animate:true});
+ },
+ showActionResult,
+ actionNotice(item){return actionResults.get(item.dataset.key)?.message ?? '';},
+ applyAction(){apply(false,{animate:true});},
+ settled(){return Promise.all([...rowMotion.values()].map(motion=>motion.finished));},
+ replace(){content=contentProxy();bind();apply(false);}};
 }
 '''

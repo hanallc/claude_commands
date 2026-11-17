@@ -298,7 +298,8 @@ def render(root: Path, *, show: str = 'open') -> bytes:
         +'<div class="review-types" id="list-owner" role="group" aria-label="Owner">'+owner_chips+'</div>'
         +'<div class="list-filters">'
         +'<label class="list-search-label" for="list-search">Search</label><input type="search" id="list-search" placeholder="Filter by id or words">'
-        +'</div><script type="application/json" data-review-index>'+index_json(entries)+'</script>'
+        +'</div><p data-hidden-action-status role="status" hidden></p>'
+        +'<script type="application/json" data-review-index>'+index_json(entries)+'</script>'
         +'<div class="list-table"><table aria-label="Review">'
         +'<colgroup><col style="width:17%"><col style="width:13%"><col style="width:14%"><col style="width:37%">'
         +'<col style="width:12%"><col style="width:7%"></colgroup><thead><tr>'+headers+'</tr></thead>'
@@ -419,7 +420,7 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + review_legacy.SCRIPT + r'''(() => {
 let content=document.querySelector('[data-review]'),saving=0;
 let selectedShow=content.dataset.show,requestedShow=selectedShow;
-const drafts=new Map(),saved=new Map(),bodies=new Map();
+const drafts=new Map(),departures=new Map(),bodies=new Map();
 let index=readIndex();
 function readIndex(){
  return new Map(JSON.parse(content.querySelector('[data-review-index]').textContent).map(entry=>[entry.key,entry]));
@@ -435,10 +436,15 @@ function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys
   (!query || entry.id.toLowerCase().includes(query) || entry.title.toLowerCase().includes(query)) &&
   (show==='all' || entry.state===(show==='open' ? 'Open' : show));
 }
-function matching(filters){return [...index.values()].filter(entry=>matches(entry,filters));}
-function savedEntry(key,result){
- const entry=index.get(key);if(!entry) return;
- entry.state=result.state;entry.hiddenUntil=result.later;
+function matching(filters,includePending=false){
+ return [...index.values()].filter(entry=>{
+  const departure=departures.get(entry.key);
+  if(departure?.kind==='pending' && !includePending) return false;
+  const projected=departure?.kind==='saved'
+   ? {...entry,state:departure.state,hiddenUntil:departure.hiddenUntil}
+   : entry;
+  return matches(projected,filters);
+ });
 }
 const view=createRecordTable({content:()=>content,single:true,
  place:reviewPlace,
@@ -447,17 +453,20 @@ const view=createRecordTable({content:()=>content,single:true,
    button.dataset.ownerChip===owner || button.dataset.ownerName===owner);
   return button ? button.dataset.ownerChip : owner;
  },
- selectOwner:({owner,type,query,keys})=>matching({owner,type,query,keys}).length ? owner : '',
+ selectOwner:({owner,type,query,keys})=>matching({owner,type,query,keys},true).length ? owner : '',
  shows:['open','Waiting','Done','all'],
  hasKey:key=>index.has(key),
- visible:(data,filters)=>!saved.has(data.key) && index.has(data.key) && matches(index.get(data.key),filters),
+ visible:(data,filters)=>{
+  const entry=index.get(data.key);
+  return Boolean(entry && !departures.has(data.key) && matches(entry,filters));
+ },
  sortValues:data=>{
   const entry=index.get(data.key);
-  return [entry.id,entry.type,entry.ownerName,entry.title,entry.state,entry.filed];
+  return entry && [entry.id,entry.type,entry.ownerName,entry.title,entry.state,entry.filed];
  },
  applied:(_items,{type,show,owner,query,sourceOwner,keys})=>{
   selectedShow=show;loadBodies();
-  const eligibleOwners=matching({type,query,keys});
+  const eligibleOwners=matching({type,query,keys},true);
   const shownOwners=matching({show,type,query,keys});
   content.querySelectorAll('[data-owner-chip]').forEach(button=>{
    const value=button.dataset.ownerChip;
@@ -509,6 +518,8 @@ function bind(){
  view.replace();
  content.querySelectorAll('[data-review-form]').forEach(form=>{
   const row=form.closest('[data-list-item]'),key=row.dataset.key,words=form.elements.feedback,later=form.elements.later;
+  const notice=form.querySelector('[data-send-status]');
+  notice.textContent=view.actionNotice(row);
   const choices=[...row.querySelectorAll('input[name=choice]')];
   if(drafts.has(key)){
    const draft=drafts.get(key);words.value=draft.feedback;later.value=draft.later;
@@ -522,22 +533,25 @@ function bind(){
    const data=new URLSearchParams(new FormData(form));data.set('outcome',outcome);
    if(outcome==='later') data.set('later',until);
    form.dataset.sending='true';saving++;pageRefresh.abandon();
-   const buttons=[...form.querySelectorAll('button')],notice=form.querySelector('[data-send-status]');
-   buttons.forEach(button=>button.disabled=true);notice.textContent='Saving…';
+   const buttons=[...form.querySelectorAll('button')];
+   buttons.forEach(button=>button.disabled=true);notice.textContent='';
+   departures.set(key,{kind:'pending'});
+   view.startAction(row);
    try{
     const response=await fetch(location.pathname,{method:'POST',body:data});
     const result=await response.json();if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
-    notice.textContent='Saved: '+result.answer;drafts.delete(key);
-    await new Promise(resolve=>setTimeout(resolve,900));
-    const row=form.closest('[data-list-item]');
-    saved.set(key,{updated:row.dataset.updated,previousState:row.dataset.state,
-     state:['validate','question'].includes(outcome) ? 'Waiting' : outcome==='later' ? row.dataset.state : 'Done',
-     later:data.get('outcome')==='later' ? Date.parse(data.get('later')) : 0,
-     question:data.get('outcome')==='question',
-     closes:!['validate','question','later'].includes(data.get('outcome'))});
-    savedEntry(key,saved.get(key));
-    view.opened.delete(key);view.apply(false);
-   }catch(error){notice.textContent='Not saved: '+error.message;buttons.forEach(button=>button.disabled=false);}
+    drafts.delete(key);
+    const waits=outcome==='validate' || outcome==='question';
+    departures.set(key,{kind:'saved',outcome,updated:row.dataset.updated,previousState:row.dataset.state,
+     state:waits ? 'Waiting' : outcome==='later' ? row.dataset.state : 'Done',
+     hiddenUntil:outcome==='later' ? Date.parse(until) : 0});
+    view.opened.delete(key);
+    view.showActionResult(row,form.elements.row.value,'Saved: '+result.answer);
+   }catch(error){
+    departures.delete(key);
+    view.showActionResult(row,form.elements.row.value,'Not saved: '+error.message);
+    buttons.forEach(button=>button.disabled=false);
+   }
    finally{
     delete form.dataset.sending;saving--;
     if(!saving && selectedShow!==content.dataset.show) void pageRefresh.refresh(true);
@@ -732,22 +746,22 @@ async function refresh(_supersede=false,current=()=>true){
  if(!response.ok) throw new Error('HTTP '+response.status);
  const page=new DOMParser().parseFromString(await response.text(),'text/html'),fresh=page.querySelector('[data-review]');
  if(!fresh) throw new Error('The page has no review table.');
+ await view.settled();
  if(saving || !current() || show!==selectedShow) return;
  const top=scrollY,restoreFocus=restoreFocusAfterRefresh();
  const active=document.activeElement;
  const focusedOwnerId=active?.hasAttribute('data-owner-chip') ? active.id : '';
  content.replaceWith(fresh);content=fresh;index=readIndex();
- for(const [key,result] of saved){
+ for(const [key,result] of departures){
+  if(result.kind==='pending') continue;
   const entry=index.get(key);
-  if(!entry || (result.later && Date.now()>=result.later)) {saved.delete(key);continue;}
-  // The complete index supplies the state and revision, even when this Show omits the row.
+  if(!entry || (result.outcome==='later' && Date.now()>=result.hiddenUntil)) {departures.delete(key);continue;}
+  // The index includes the state and revision of rows outside this Show.
   const submitted=entry.state===result.previousState && entry.updated===result.updated;
-  if(!submitted && entry.state!==result.state){saved.delete(key);continue;}
-  if(!result.closes && !result.question && !result.later && !submitted){
-   saved.delete(key);
+  if(!submitted && (entry.state!==result.state || result.outcome==='validate')){
+   departures.delete(key);
   }
  }
- for(const [key,result] of saved) savedEntry(key,result);
  bind();view.apply(false);
  const ownerChip=focusedOwnerId ? document.getElementById(focusedOwnerId) : null;
  if(focusedOwnerId && (!ownerChip || ownerChip.hidden)){
@@ -756,6 +770,10 @@ async function refresh(_supersede=false,current=()=>true){
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
 }
 view.place();bind();view.apply();
-addEventListener('hashchange',()=>{const item=new URLSearchParams(location.hash.slice(1)).get('item');if(item && !saved.get(item)?.closes && !saved.get(item)?.question) saved.delete(item);view.place();view.apply(false);});
+addEventListener('hashchange',()=>{
+ const item=new URLSearchParams(location.hash.slice(1)).get('item'),departure=departures.get(item);
+ if(departure?.kind==='saved' && ['validate','later'].includes(departure.outcome)) departures.delete(item);
+ view.place();view.apply(false);
+});
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
 })();'''

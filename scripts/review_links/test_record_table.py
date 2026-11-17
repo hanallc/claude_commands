@@ -56,7 +56,7 @@ const content={
 const document={createElement:element};
 const location={search:'',hash:fragment,pathname:'/console/review.html'};
 const history={replaceState(_state,_title,url){this.url=url;}};
-const window={},parent=window,saved=new Map();
+const window={},parent=window,departures=new Map();
 let selectedShow='all',requestedShow='all';
 const reviewPlace=()=>{},loadBodies=()=>{},pageRefresh={refresh(){}};
 ''' + record_table.SCRIPT + '\n' + callbacks + r'''
