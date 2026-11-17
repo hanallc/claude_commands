@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from array import array
 from collections.abc import Generator, Iterator, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
@@ -14,14 +14,14 @@ import os
 from pathlib import Path
 import platform
 import shutil
-import signal
 import subprocess
 import tempfile
+import time
 from typing import TYPE_CHECKING, BinaryIO, Literal, cast
 from uuid import uuid4
 import zlib
 
-from scripts.lib import process_group
+from scripts.lib import time_limit
 from scripts.style import style_config
 from scripts.style.git_process import GitReadFailed, TreeEntry, run_git
 
@@ -424,37 +424,31 @@ class ReaderSourceChanged:
     """The build finished after the checkout changed to another source tree."""
 
 
-def _end_build(process: subprocess.Popen[str]) -> None:
-    """End the build's process group: TERM first, so verify.sh gives back its queue place and Mac claim."""
-    with suppress(ProcessLookupError):
-        process_group.send_process_group(process.pid, signal.SIGTERM)
-    with suppress(subprocess.TimeoutExpired):
-        _ = process.communicate(timeout=style_config.reader_build_stop_grace_seconds())
-    # KILL ends each step that ignored TERM. Do not read the pipes again: a step outside the group can hold them.
-    with suppress(ProcessLookupError):
-        process_group.send_process_group(process.pid, signal.SIGKILL)
-    _ = process.wait()
-
-
 def _build(folder: Path, tree: str) -> Path | ReaderSourceChanged:
-    command = ["bash", str(VERIFY_SCRIPT), *BUILD_ARGUMENTS]
+    limit = style_config.reader_build_limit_seconds()
+    grace = style_config.reader_build_stop_grace_seconds()
+    runner = Path(time_limit.__file__).resolve()
+    command = [str(runner.with_name("py")), str(runner), f"{limit:g}", f"{grace:g}",
+               "bash", str(VERIFY_SCRIPT), *BUILD_ARGUMENTS]
     if platform.system() == "Darwin":
         command.extend(("--mac", "build the local style reader"))
     environment = {key: value for key, value in os.environ.items() if key != "CONF_DIR"}
-    limit = style_config.reader_build_limit_seconds()
-    # The build runs in its own process group, so the limit can end verify.sh and every step it started.
-    with subprocess.Popen(command, cwd=CHECKOUT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                          env=environment, start_new_session=True) as process:
-        try:
-            stdout, stderr = process.communicate(timeout=limit)
-        except subprocess.TimeoutExpired:
-            _end_build(process)
+    # The limit runner has its own session, so the limit holds after this process ends. Files, not pipes,
+    # take the output: a process that outlives the build cannot keep this call waiting.
+    with tempfile.TemporaryFile("w+") as output, tempfile.TemporaryFile("w+") as errors:
+        started = time.monotonic()
+        returncode = subprocess.run(command, cwd=CHECKOUT, stdin=subprocess.DEVNULL, stdout=output, stderr=errors,
+                                    env=environment, start_new_session=True, check=False).returncode
+        if returncode == time_limit.TIMED_OUT and time.monotonic() - started >= limit:
             raise ReaderError(f"reader build passed its {limit:g} s limit (style_reader build_limit_seconds); "
-                              + "its process group was ended") from None
+                              + "its process group was ended")
+        _ = output.seek(0)
+        _ = errors.seek(0)
+        stdout, stderr = output.read(), errors.read()
     if _source_tree() != tree:
         return ReaderSourceChanged()
-    if process.returncode:
-        raise ReaderError(f"reader build exited {process.returncode}: {stdout}\n{stderr}")
+    if returncode:
+        raise ReaderError(f"reader build exited {returncode}: {stdout}\n{stderr}")
     paths = [line.removeprefix("binary: ") for line in stdout.splitlines() if line.startswith("binary: ")]
     if len(paths) != 1 or not Path(paths[0]).is_absolute():
         raise ReaderError(f"the reader build did not return one local binary path: {stdout}")
