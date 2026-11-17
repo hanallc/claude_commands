@@ -652,6 +652,66 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual((records / "fixture.json").read_bytes(), retained_bytes)
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
+    def test_producer_counts_use_process_accounts_and_separate_roles(self) -> None:
+        from scripts.herdr import pane_launch
+        from scripts.production import session_staff
+
+        for label in ("codex1", "codex2"):
+            self.write_note(label, label + "@example.invalid")
+            self.codex_login(label + "@example.invalid", self.home / ("." + label))
+        machine = cast(Callable[[], str], getattr(accounts, "_session_counts_machine"))()
+        claude = fixture_member("producer", name="fixture-claude")
+        codex = fixture_member("producer", name="fixture-codex")
+        paused = replace(fixture_member("producer", name="fixture-paused"),
+                         paused=staff.Paused("now", "user", "hold"))
+        stopped = replace(fixture_member("producer", name="fixture-stopped"),
+                          home=staff.SessionHome(self.home / ".codex1"))
+        remote_member = replace(fixture_member("producer", name="fixture-remote"),
+                               doc=staff.LiveDoc(remote.other_machine(), self.root / "remote.md"))
+        unmapped = fixture_member("producer", name="fixture-unmapped")
+        runner = fixture_member("showrunner", name="fixture-runner")
+        membership = staff.StaffSnapshot((claude, codex, paused, stopped, remote_member, unmapped, runner))
+        registry = write_registry(self.root / "producer-models.conf", {"producers": {
+            member.name: "claude:opus:max" if member == claude else "codex:gpt-test:high"
+            for member in (claude, codex, paused, stopped, remote_member, unmapped)}})
+        live = [sessions.SessionRecord(pid=990901 + index, sessionId=member.current_session,
+            name=member.name, messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status="busy")
+            for index, member in enumerate((claude, runner))]
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+        with (patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "PATH": MODELS_RESOLVER_PATH}),
+              patch.object(staff, "local_snapshot", return_value=membership),
+              patch.object(sessions, "running_sessions", return_value=live),
+              patch.object(pane_launch, "record_directory", return_value=self.root / "private-launches"),
+              patch.object(session_staff, "pane_parents", return_value=()),
+              patch.object(session_state, "running_detached_work", return_value=session_state.NO_DETACHED_WORK),
+              patch.object(accounts, "_session_counts_machine", return_value=machine),
+              patch.object(accounts, "_session_config_dir",
+                           return_value=account.ConfiguredClaudeFolder(self.home / ".claude4")),
+              patch.object(agent_accounts, "observe_workers_home", return_value=agent_accounts.NoWorkersHome("unmapped fixture")),
+              patch.object(accounts, "_local_codex_processes", return_value={
+                  codex.current_session: accounts.CodexRoleProcess(990903, "idle"),
+                  paused.current_session: accounts.CodexRoleProcess(990904, "busy"),
+                  remote_member.current_session: accounts.CodexRoleProcess(990905, "busy")}),
+              patch.object(account, "process_codex_home", return_value=account.ProcessCodexHome(self.home / ".codex2"))):
+            read_sessions = cast(Callable[[accounts.GroupAccounts], accounts.LocalRoleSessions],
+                                 getattr(accounts, "_read_local_role_sessions"))
+            observed = read_sessions({"showrunners": "claude1"})
+        self.assertEqual(observed.counts, {
+            (self.home / ".claude4", "producers"): {claude.current_session: "busy"},
+            (self.home / ".claude4", "showrunners"): {runner.current_session: "busy"},
+            (self.home / ".codex2", "producers"): {codex.current_session: "idle", paused.current_session: "paused"},
+            (self.home / ".codex1", "producers"): {stopped.current_session: "exited"}})
+        self.assertEqual({member.session_id for member in observed.members["showrunners"]},
+                         {claude.current_session, runner.current_session})
+        self.assertIn("producer fixture-unmapped: unmapped fixture", observed.session_lines)
+        publish = cast(Callable[[dict[tuple[Path, str], dict[str, session_state.SessionState]]], accounts.MachineSessionCounts],
+                       getattr(accounts, "_session_counts_document"))
+        document = publish(observed.counts)
+        decoded = decode_session_counts(json.dumps(document), machine)
+        self.assertEqual(decoded["accounts"]["codex2"]["producers"]["total"], 2)
+        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_board_and_group_move_share_staff_membership_and_the_live_process_account(self) -> None:
         from scripts.herdr import pane_launch
         from scripts.agents import inventory
@@ -728,7 +788,8 @@ class AccountsTests(unittest.TestCase):
                     self.assertEqual(errors.getvalue(), "")
                 document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
                 rows = {row["label"]: row for row in document["accounts"]}
-                self.assertEqual(rows["claude4"]["roles"], [group] if family == "claude" else [])
+                board_role = "producers" if kind == "producer" else group
+                self.assertEqual(rows["claude4"]["roles"], [board_role] if family == "claude" else [])
                 if state == "paused":
                     self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 0, "paused": 1, "exited": 0, "idle": 0, "total": 1}])
                 else:

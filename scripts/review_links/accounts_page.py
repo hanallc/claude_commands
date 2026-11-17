@@ -200,7 +200,7 @@ table{border-collapse:collapse;font-size:.86rem;font-variant-numeric:tabular-num
 th,td{padding:5px 0 5px 18px;white-space:nowrap}th:first-child,td:first-child{padding-left:0}
 th{color:var(--ink-2);font-weight:600;border-bottom:1px solid var(--line)}
 .left{text-align:left}.right{text-align:right}
-tr.account td{border-top:1px solid var(--line)}tbody tr:last-child td{border-top:1px solid var(--ink-3)}
+tbody tr td{border-top:1px solid var(--line)}tbody tr:last-child td{border-top:1px solid var(--ink-3)}
 tbody tr:hover td{background:var(--hover)}
 .bold{font-weight:600}.success{color:var(--room)}.error{color:var(--error)}.warning{color:var(--warning)}
 .inactive{color:var(--ink-3)}
