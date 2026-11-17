@@ -4573,34 +4573,8 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 ### Phase 323 — The fast-track tests use less aws CPU  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `production/test_fast_track.py` uses less CPU in aws pairs, with the same tests and assertions.
-
-**Decision:** the aws ranking (`show.py top --host aws`, rows as of 2026-11-16 20:07) puts this module first: median 55.6 CPU s for 50 tests; slowest kept test `FastTrackTests.test_reruns_after_restore_or_promotion_failure_do_not_push_twice` 5.0 s. It goes before Phase 253: the shutdown CLI module is no longer in the aws top eight.
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD production/test_fast_track.py --tests 15 --commands 15`, under `systemd-run --user --scope -q -p MemoryMax=2G`. Name the top costs by test, fixture and command.
-2. Remove the largest repeated cost the profile names, with the shared methods Phases 235-238, 251, 254 and 255 used: build each Git repository and remote once per class and copy it per test; run a CLI in process where the test does not check the process boundary; keep a process boundary a test asserts.
-3. Keep tested fetches, pushes, commits, retries, restores and promotions real. Copy only the state a test reads before its tested step. A copy holds no path into the seed.
-4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
-5. If the profile names a cost outside this module (a shared support module or a product path), report it to the director before you change the plan.
-6. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-7. The director runs the aws pairs.
-
-**Files:**
-- `scripts/production/test_fast_track.py`
-
-**Workers:** 1 writer; one test module.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere.
-- Phase 252: every fixture binds private run roots through `bind_private_run_roots`; keep it.
-- Phases 33, 150 and 192 already cut this module: Git starts directly where no interruption fixture is needed, the zone drain runs in process, and fixture-only rare-case tests are gone. Do not undo them.
-- sdlc terms: test files only; every test and assertion stays; merge only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
+- `production/test_fast_track.py`: the interruption tests start each fast-track child as a fork of the test process with its modules loaded (`command`); the former in-process body moves unchanged to `invoke_command`. The real Git wrapper still sends SIGKILL at the tested boundary, and each test reads the real exit status. The complete command case and the concurrent second process keep fresh interpreters. Output files and child cleanup exist before the process starts.
+- Profile before the change: 42.8 natedev CPU s; Git 12.1 s over 6,749 starts; 22 fast-track children 11.6 s. The class seed already existed. Remaining cost: Git starts, which tests check.
+- aws pairs (3 rounds, c7a.4xlarge): 55.37 -> 45.36 CPU s (paired median saving 10.07 s, lower in every round); peak 200.7 -> 205.5 MiB. 50 tests and 312 assertions unchanged; both reviews approve. Checkpoint a0463a3b9.
