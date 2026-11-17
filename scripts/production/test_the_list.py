@@ -131,6 +131,51 @@ class TheListTests(unittest.TestCase):
         _ = the_list.update(MORTY.id, item.id, {}, source="morty")
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
+    def test_clean_evidence_removes_only_the_migration_copy_once(self) -> None:
+        block = 'Source checkins.json item:\n\n{"owner": "sdlc", "nested": {"state": "Delivered"}}\n'
+        cases = (
+            ("Keep these words.  \n\n## A heading\n\nKeep this line.\n\n \t\n" + block,
+             "Keep these words.  \n\n## A heading\n\nKeep this line.", False),
+            (" \t\n\n" + block, "", False),
+            ("Closed evidence.\r\n\r\n" + block.replace("\n", "\r\n"), "Closed evidence.", True),
+            ("Earlier words.\n\n" + block + "\n\nRecorded identity evidence:\n\nKeep these later words.  \n\n",
+             "Earlier words.\n\nRecorded identity evidence:\n\nKeep these later words.  \n\n", False),
+            ("Keep every line.\n\n", "Keep every line.\n\n", False),
+            ("The Source checkins.json item: words stay.\n", "The Source checkins.json item: words stay.\n", False),
+            ("Source checkins.json item:\nA person wrote this.", "Source checkins.json item:\nA person wrote this.", False),
+            ('Source checkins.json item:\n{"owner": "sdlc"}}\n', 'Source checkins.json item:\n{"owner": "sdlc"}}\n', False),
+            ('Source checkins.json item:\n{"owner": "sdlc"},\n', 'Source checkins.json item:\n{"owner": "sdlc"},\n', False),
+        )
+        originals: list[tuple[the_list.ListItem, str]] = []
+        for evidence, expected, closed in cases:
+            item = self.add(changes={"evidence": evidence, "next_step": block,
+                                     "latest_status": block, "done_when": block})
+            if closed:
+                item = the_list.close(MORTY.id, item.id, "The user removed it", source="nate")
+            originals.append((item, expected))
+        paths = [the_list.folder(MORTY.id) / f"{item.id}.md" for item, _ in originals]
+        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": OWNER.current_session}):
+            self.assertEqual(self.command("clean-evidence", "--source", "morty"),
+                             (1, "", "the_list: the current session must be the morty producer\n"))
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
+        moment = START + timedelta(minutes=1)
+        with patch.object(the_list, "now", return_value=moment):
+            self.assertEqual(self.command("clean-evidence", "--source", "morty"), (0, "4 changed; 5 unchanged\n", ""))
+        for index, (original, expected) in enumerate(originals):
+            with self.subTest(item=original.id):
+                cleaned = the_list.load(MORTY.id, original.id)
+                self.assertEqual(cleaned.evidence, expected)
+                if original.evidence != expected:
+                    entry = the_list.ItemChange(moment, "Removed the migration copy of checkins.json from Evidence", "morty")
+                    self.assertEqual(cleaned, replace(original, evidence=expected, updated=moment, log=(*original.log, entry)))
+                else:
+                    self.assertEqual(cleaned, original)
+                    self.assertEqual((paths[index].read_bytes(), paths[index].stat().st_mtime_ns), before[index])
+        after = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+        self.assertEqual(self.command("clean-evidence", "--source", "morty"), (0, "0 changed; 9 unchanged\n", ""))
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], after)
+
     def test_page_events_only_mark_read_or_append_feedback(self) -> None:
         item = self.add(number=106)
         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": OWNER.current_session}):
