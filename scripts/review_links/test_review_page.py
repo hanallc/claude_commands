@@ -1,6 +1,8 @@
 """Check the shared review records, signed actions and table behavior."""
 from __future__ import annotations
 
+from scripts.production.change_review_test_support import pictured_changes
+
 import shutil
 import json
 import os
@@ -491,7 +493,7 @@ class ReviewPageTests(unittest.TestCase):
 
     def test_later_hides_each_type_from_the_shared_queue_and_then_returns(self) -> None:
         _ = change_review.append_rows(self.fixture.review_list,
-            [change_review.Visible('Unrouted change', 'Read the log.', 'The result is present.')],
+            pictured_changes([change_review.Visible('Unrouted change', 'Read the log.', 'The result is present.')]),
             datetime.now(user_zone()).date(), '', self.fixture.production,
             producers=[staff.StaffId('missing-producer')], record=staff.snapshot())
         decisions = self.decisions()

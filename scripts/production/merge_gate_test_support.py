@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.change_review_test_support import registered_fixture_image
+
 from scripts.lib.checkout_test_support import copy_runtime, copy_test_runner
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
@@ -422,7 +424,7 @@ class MergeGateFixture(unittest.TestCase):
         git_config = write_fixture_git_config(root.parent)
         self.environment = {
             **os.environ, **copies_environment(root, repository="origin"), **interpreter_cache_environment(root / "cache"),
-            "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
+            "REVIEW_LINKS_ROOT": str(self.root / "links"), "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
             "CODEX_HOME": str(home / "codex"), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": str(git_config),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
@@ -736,6 +738,7 @@ class MergeGateFixture(unittest.TestCase):
 
     def checkpoint_commit(self, message: str) -> str:
         """A checkpoint(...) commit on the unit branch, dated after the Change-Review rule landed."""
+        _ = registered_fixture_image(Path(self.environment["REVIEW_LINKS_ROOT"]), "012345abcdef")
         self.write(self.unit / "visible.txt", message)
         _ = self.git(self.unit, "add", ".")
         self.environment["GIT_COMMITTER_DATE"] = "2026-10-15T12:00:00-04:00"

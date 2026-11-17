@@ -1,6 +1,8 @@
 """Check fixed producer routing and shared fixtures for the count readers."""
 from __future__ import annotations
 
+from scripts.production.change_review_test_support import pictured_changes
+
 from scripts.agents import remote
 
 import json
@@ -407,7 +409,7 @@ class StaffRoutingTests(unittest.TestCase):
         retired = fixture_member("unit", name="retired", parent=self.child.id,
                                 worktree=staff.RemovedWorktree(remote.local_machine(), self.root / "removed"))
         _ = staff.rename(self.unit.id, "renamed")
-        _ = change_review.append_rows(listing, [change_review.Visible(f"Change {i}", "Read", "Proof") for i in range(5)],
+        _ = change_review.append_rows(listing, pictured_changes([change_review.Visible(f"Change {i}", "Read", "Proof") for i in range(5)]),
             date(2026, 11, 2), "", docs["top"],
             producers=[self.unit.id, change_review.UnknownProducer(), staff.StaffId(fixture_runtime_id("missing-producer")), retired.id, self.child.id], record=staff.snapshot())
         with (mock.patch.object(change_review, "lists_directory", return_value=self.root), mock.patch.object(cli_review, "lists_directory", return_value=self.root),
@@ -550,7 +552,7 @@ class StaffRoutingTests(unittest.TestCase):
                 _ = listing.write_text("## To review\n\n| # | Change | Production |\n| --- | --- | --- |\n| C1 | Known | natedev |\n")
                 docs = {name: root / f"{name}-production.md" for name in ("natedev", "builds")}
                 producer_rows(root, docs, {listing: "natedev"})
-                written = change_review.append_rows(listing, [change_review.Visible("Unknown AWS change", "Read", "Proof")],
+                written = change_review.append_rows(listing, pictured_changes([change_review.Visible("Unknown AWS change", "Read", "Proof")]),
                                                date(2026, 11, 2), "e41fa2a4", docs["builds"], record=staff.snapshot())
                 _ = listing.write_text(listing.read_text().replace("| C2 |", "| C777 |"))
                 runner = staff.snapshot().by_path("builds")
