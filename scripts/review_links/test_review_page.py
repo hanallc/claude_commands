@@ -1161,7 +1161,10 @@ window.fetch=async url=>{
                 self.assertIn('aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later',form)
                 for label in ('In 1 hour','This evening','Tomorrow morning','Next week','Choose a time…'):
                     self.assertIn('<span>'+label+'</span>',form)
-                self.assertIn('type="datetime-local"',form)
+                self.assertNotIn('type="datetime-local"',form)
+                self.assertIn('type="hidden" name="later"',form)
+                self.assertIn('role="grid"',form)
+                self.assertIn('type="time" step="900"',form)
                 self.assertIn('value="later">Save',form)
                 self.assertNotIn('value="skip"',form)
 
@@ -1881,19 +1884,49 @@ window.fetch=async(_url,options={})=>{
   check(document.activeElement===menuItems()[0],'ArrowDown moves from the last item to the first');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();
   check(fresh.isConnected && !laterMenu.hidden,'an open Later menu holds the page refresh');
+  const chooserDraft=fresh.querySelector('[name="later"]');chooserDraft.value='';
+  chooserDraft.dispatchEvent(new Event('input',{bubbles:true}));
+  const chooserNow=Date.now;Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
   laterMenu.querySelector('[data-later-choose]').click();
-  check(!laterMenu.querySelector('[data-later-custom]').hidden && document.activeElement===fresh.querySelector('[name="later"]'),
-    'Choose a time shows the date and time field');
+  const calendar=laterMenu.querySelector('[role=grid]'),timeField=laterMenu.querySelector('[data-later-time]');
+  check(!laterMenu.querySelector('[data-later-custom]').hidden && document.activeElement===calendar?.querySelector('[tabindex="0"]'),
+    'Choose a time shows the calendar with the selected day in focus');
+  const chooserChecks=['the grid opens on tomorrow in the user zone','arrows move the selected day across months',
+    'a past day cannot be picked','Save is disabled for a time before now','the summary shows the selected wall time',
+    'the chooser fits within the menu and viewport'];
   let submitter='';const watch=event=>{submitter=event.submitter.value;event.preventDefault();event.stopImmediatePropagation();};
   fresh.querySelector('form').addEventListener('submit',watch,{capture:true});
-  document.activeElement.value='2099-01-01T09:00';
-  document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  if(calendar){
+   const wall=()=>fresh.querySelector('[name="later"]').value;
+   const selected=()=>calendar.querySelector('[tabindex="0"]');
+   check(wall()==='2026-12-01T09:00' && timeField.value==='09:00',chooserChecks[0]);
+   selected().dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowLeft',bubbles:true,cancelable:true}));
+   check(wall()==='2026-11-30T09:00' && laterMenu.querySelector('[data-later-month]').textContent==='November 2026',chooserChecks[1]);
+   const past=calendar.querySelector('[data-date="2026-11-29"]');past.click();
+   check(past.disabled && wall()==='2026-11-30T09:00',chooserChecks[2]);
+   check(laterMenu.querySelector('[value="later"]').disabled,chooserChecks[3]);
+   selected().dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true,cancelable:true}));
+   selected().dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}));
+   check(wall()==='2026-12-08T09:00','ArrowDown moves the selected day by one week');
+   selected().dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowUp',bubbles:true,cancelable:true}));
+   timeField.value='10:15';timeField.dispatchEvent(new Event('input',{bubbles:true}));
+   check(wall()==='2026-12-01T10:15' && laterMenu.querySelector('[data-later-summary]').textContent==='Hides until Tue 1 Dec 10:15',chooserChecks[4]);
+   const box=laterMenu.getBoundingClientRect(),grid=calendar.getBoundingClientRect();
+   check(box.left>=0 && box.right<=innerWidth && grid.left>=box.left && grid.right<=box.right &&
+     laterMenu.scrollWidth<=laterMenu.clientWidth,chooserChecks[5]);
+   selected().dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  }else{
+   chooserChecks.forEach(label=>check(false,label));
+   check(false,'ArrowDown moves the selected day by one week');
+   document.activeElement.value='2099-01-01T09:00';
+   document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  }
   fresh.querySelector('form').removeEventListener('submit',watch,{capture:true});
-  check(submitter==='later','Enter in the date and time field saves it as Later');
-  document.activeElement.value='';
+  check(submitter==='later','Enter in the chooser saves it as Later');
   document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
   check(laterMenu.hidden && laterMenu.querySelector('[data-later-custom]').hidden && document.activeElement===laterToggle,
     'Escape closes the menu and returns focus to Later');
+  Date.now=chooserNow;
   laterToggle.click();const week=laterMenu.querySelector('[data-later-preset="week"]'),weekAt=Number(week.dataset.at);
   week.click();
   await new Promise(resolve=>nativeTimeout(resolve,1000));
@@ -1901,12 +1934,35 @@ window.fetch=async(_url,options={})=>{
     'a preset sends its time at once');
   check(fresh.hidden,'Later removes the question from the page');
   check(document.querySelector('[data-show-chip="open"] b').textContent==='0','Later removes the question from the filtered count');
+  const laterOwner=selectedOwner().dataset.ownerChip;
+  choose('list-search','','input');choose('list-owner','');
+  document.querySelector('[data-type-chip=""]').click();
+  check(document.querySelector('[data-show-chip="open"] b').textContent==='2','Later removes the question from the count');
+  document.querySelector('[data-type-chip="question"]').click();
+  choose('list-owner',laterOwner);choose('list-search',retained.q,'input');
   const nativeNow=Date.now;Date.now=()=>weekAt+1000;
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
   let returned=rows().find(row=>row.dataset.type==='question');
   check(!returned.hidden && returned.dataset.state==='Open','Later returns the question with its original state');
   Date.now=nativeNow;
   returned.querySelector('.list-toggle').click();
+  Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
+  returned.querySelector('[data-later-toggle]').click();returned.querySelector('[data-later-choose]').click();
+  const customGrid=returned.querySelector('[role=grid]');
+  if(customGrid){
+   customGrid.querySelector('[tabindex="0"]').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+   await new Promise(resolve=>nativeTimeout(resolve,1000));
+   check(window.posts.at(-1).get('outcome')==='later' && window.posts.at(-1).get('later')==='2026-12-01T14:00:00.000Z',
+     'Enter posts Later with the expected ISO UTC time');
+   Date.now=()=>Date.parse('2026-12-01T14:00:01Z');
+   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+   returned=rows().find(row=>row.dataset.type==='question');returned.querySelector('.list-toggle').click();
+  }else{
+   check(false,'Enter posts Later with the expected ISO UTC time');
+   returned.querySelector('[data-later-toggle]').dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+   returned.querySelector('[data-later-menu]').querySelector('[data-later-choose]').dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+  }
+  Date.now=nativeNow;
   const answerForm=returned.querySelector('form');answerForm.elements.later.value='';
   answerForm.requestSubmit(answerForm.querySelector('[value="later"]'));await flush();
   answerForm.requestSubmit(answerForm.querySelector('[value="answer"]'));await flush();
@@ -1993,6 +2049,109 @@ window.fetch=async(_url,options={})=>{
                         server.shutdown()
                         thread.join(TEST_HANG_GUARD_SECS)
                 self.assertEqual(results,[[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_later_retains_drafts_and_resolves_daylight_saving_times(self) -> None:
+        _ = self.question()
+        with patch.dict(os.environ, {'USER_ZONE': 'America/New_York'}):
+            source = review_page.render(self.root).decode()
+        setup = r"""<script>
+const nativeFetch=fetch,nativeTimeout=setTimeout;
+window.setInterval=()=>0;window.clearInterval=()=>{};
+window.posts=[];
+window.fetch=async(_url,options={})=>{
+ if(options.method==='POST'){
+  window.posts.push(new URLSearchParams(options.body));return {ok:true,json:async()=>({answer:'later'})};
+ }
+ return {ok:true,text:async()=>MARKUP};
+};
+Date.now=()=>Date.parse(SCENARIO==='gap' ? '2027-03-13T15:00:00Z' :
+ SCENARIO==='repeat' ? '2027-11-06T14:00:00Z' : '2026-11-30T15:00:00Z');
+</script>""".replace('MARKUP', json.dumps(source).replace('</', '<\\/'))
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const flush=()=>new Promise(resolve=>nativeTimeout(resolve,60));
+ const form=()=>document.querySelector('[data-type="question"] form');
+ const open=()=>{form().querySelector('[data-later-toggle]').click();form().querySelector('[data-later-choose]').click();};
+ const close=()=>form().querySelector('[data-later-time]').dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+ const time=value=>{const field=form().querySelector('[data-later-time]');field.value=value;field.dispatchEvent(new Event('input',{bubbles:true}));};
+ const selected=()=>form().querySelector('[role=grid] [aria-selected="true"]')?.dataset.date;
+ try{
+  check(document.querySelector('[data-review]').dataset.zone==='America/New_York','the fixture sets America/New_York');
+  if(SCENARIO==='draft'){
+   open();
+   form().querySelector('[role=grid] [tabindex="0"]').dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true,cancelable:true}));
+   time('10:15');close();open();
+   check(form().elements.later.value==='2026-12-02T10:15' && selected()==='2026-12-02' &&
+    form().querySelector('[data-later-time]').value==='10:15','F004: Escape and reopen retain the selected day and time');
+   time('11:45');
+   const restored=form().elements.later.value;
+   close();
+   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+   check(form().elements.later.value===restored,'F004: refresh restores the Later draft');
+   open();
+   check(form().elements.later.value===restored && selected()===restored.slice(0,10) &&
+    form().querySelector('[data-later-time]').value==='11:45','F004: opening the chooser retains the restored draft');
+  }else{
+   const gap=SCENARIO==='gap',clock=gap ? '02:30' : '01:30';
+   const expected=gap ? '2027-03-14T07:30:00.000Z' : '2027-11-07T05:30:00.000Z';
+   const content=document.querySelector('[data-review]'),settings=JSON.parse(content.dataset.later);
+   settings.morning=gap ? 150 : 90;content.dataset.later=JSON.stringify(settings);
+   form().querySelector('[data-later-toggle]').click();
+   const preset=form().querySelector('[data-later-preset="morning"]');
+   check(new Date(Number(preset.dataset.at)).toISOString()===expected,'F005: '+SCENARIO+' preset uses compatible resolution');
+   form().querySelector('[data-later-choose]').click();time(clock);
+   check(form().querySelector('[data-later-summary]').textContent===
+    (gap ? 'Hides until Sun 14 Mar 03:30' : 'Hides until Sun 7 Nov 01:30'),
+    'F005: '+SCENARIO+' summary shows the saved instant');
+   form().requestSubmit(form().querySelector('[value="later"]'));await flush();
+   check(window.posts.at(-1)?.get('later')===expected,'F005: '+SCENARIO+' Save sends the compatible instant');
+  }
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        for scenario in ('draft', 'gap', 'repeat'):
+            with self.subTest(scenario=scenario):
+                page = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+                body = page.replace('SCENARIO', json.dumps(scenario)).encode()
+                results: list[list[str]] = []
+                complete = threading.Event()
+
+                class Probe(BaseHTTPRequestHandler):
+                    def do_GET(self) -> None:
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'text/html; charset=utf-8')
+                        self.end_headers()
+                        if self.path == '/complete':
+                            _ = complete.wait(20)
+                        else:
+                            _ = self.wfile.write(body if self.path == '/page' else
+                                b'<iframe src="/page" style="width:100vw;height:100vh"></iframe><img hidden src="/complete">')
+
+                    def do_POST(self) -> None:
+                        results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                        complete.set()
+                        self.send_response(204)
+                        self.end_headers()
+
+                    @override
+                    def log_message(self, format: str, *args: object) -> None:
+                        pass
+
+                with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    try:
+                        with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
+                            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
+                                '--window-size', '1440,900', '--screenshot', str(self.fixture.temporary/'later-time.png'),
+                                f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                        self.assertEqual(done.returncode, 0, done.stderr)
+                    finally:
+                        server.shutdown()
+                        thread.join(TEST_HANG_GUARD_SECS)
+                self.assertEqual(results, [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_uses_the_shared_status_with_the_real_loader(self) -> None:

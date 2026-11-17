@@ -157,8 +157,14 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, settings: CardSet
                +'<div role="menu" aria-label="Hide until" data-later-menu hidden>'+presets+'<hr>'
                +'<button type="button" role="menuitem" tabindex="-1" data-later-choose><span>Choose a time…</span></button>'
                +'<div class="later-custom" data-later-custom hidden>'
-               +'<input type="datetime-local" name="later" aria-label="Later, until">'
-               +'<button name="outcome" value="later">Save</button></div></div></div></div>')
+               +'<input type="hidden" name="later">'
+               +'<div class="later-month-header"><strong data-later-month aria-live="polite"></strong><div>'
+               +'<button type="button" tabindex="-1" data-later-month-step="-1" aria-label="Previous month">‹</button>'
+               +'<button type="button" tabindex="-1" data-later-month-step="1" aria-label="Next month">›</button></div></div>'
+               +'<div role="grid" aria-label="Choose a day" data-later-grid></div>'
+               +'<label class="later-time">Time<input type="time" step="900" data-later-time></label>'
+               +'<div class="later-save"><span data-later-summary aria-live="polite"></span>'
+               +'<button class="primary" name="outcome" value="later">Save</button></div></div></div></div></div>')
     return ('<form method="post" data-review-form>'+hidden+f'<label for="words-{html.escape(item.key, quote=True)}">Your words</label>'
             + f'<textarea id="words-{html.escape(item.key, quote=True)}" name="feedback" rows="{settings.words_rows}" '
             + 'placeholder="Type your words. They go with the button that you press."></textarea>'
@@ -374,7 +380,7 @@ color:var(--ink);border:1px solid var(--line);border-radius:8px;resize:vertical}
 padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink)}
 .list-log span{white-space:pre-wrap}
 .later-menu{position:relative}
-[data-later-menu]{position:absolute;right:0;bottom:calc(100% + 6px);z-index:5;min-width:260px;padding:5px;box-sizing:border-box;
+[data-later-menu]{position:absolute;right:0;bottom:calc(100% + 6px);z-index:5;width:280px;max-width:calc(100vw - 32px);padding:5px;box-sizing:border-box;
 background:var(--card);border:1px solid var(--line);border-radius:10px;box-shadow:0 10px 28px rgba(0,0,0,.35)}
 [data-later-menu] [hidden]{display:none!important}
 .review-actions [data-later-menu] [role=menuitem]{display:flex;justify-content:space-between;align-items:center;gap:24px;width:100%;
@@ -383,7 +389,24 @@ min-height:32px;padding:5px 10px;border:0;border-radius:6px;background:none;colo
 [data-later-menu] small{font-size:12px;color:var(--ink-3)}
 [data-later-menu] [role=menuitem]:is(:hover,:focus) small{color:inherit;opacity:.85}
 [data-later-menu] hr{border:0;border-top:1px solid var(--line);margin:5px 4px}
-.later-custom{display:flex;gap:8px;padding:6px 4px 2px}
+[data-later-menu][data-choosing]>:is([role=menuitem],hr){display:none}
+.later-custom{padding:6px}
+.later-month-header,.later-month-header>div,.later-save{display:flex;align-items:center;justify-content:space-between;gap:4px}
+.later-month-header strong{font-size:14px}
+.review-actions .later-month-header button{min-height:28px;width:28px;padding:0;border:0;font-size:24px;background:none}
+[data-later-grid]{margin:8px 0 12px}
+[data-later-grid]>[role=row]{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:2px;text-align:center}
+[data-later-grid] [role=columnheader]{font-size:11px;color:var(--ink-3);padding:4px 0}
+.review-actions [data-later-grid] button{width:100%;min-width:0;min-height:30px;padding:0;border:1px solid transparent;border-radius:50%;font-size:13px;background:none}
+.review-actions [data-later-grid] [aria-current=date]{border-color:var(--accent)}
+.review-actions [data-later-grid] [aria-selected=true]{background:var(--accent);color:#fff}
+.review-actions [data-later-grid] button:disabled{opacity:.3}
+.review-actions [data-later-grid] button:focus-visible{outline:2px solid var(--ink);outline-offset:1px}
+[data-review-form] .later-time{display:flex;align-items:center;justify-content:space-between;font-size:12px;font-weight:400;margin:0 0 10px}
+.review-actions .later-time input{min-height:32px;width:120px;padding:3px 8px;color-scheme:light dark}
+.later-save [data-later-summary]{font-size:11px;white-space:nowrap;color:var(--ink-3)}
+.review-actions .later-save button{min-height:32px;padding:4px 10px;font-size:12px;flex-shrink:0}
+.review-actions .later-save button:disabled{opacity:.4}
 .review-actions button{margin:0;font:inherit;min-height:40px;padding:6px 14px;border:1px solid var(--ink-3);border-radius:8px;
 background:var(--card);color:var(--ink)}.review-actions .primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
 .review-source{grid-column:1/-1;color:var(--ink-3);font-size:12px;margin-top:16px!important}
@@ -523,9 +546,10 @@ function bind(){
    event.preventDefault();
    const outcome=event.submitter.value;
    if(outcome==='later'){
-    later.required=true;const valid=later.reportValidity();later.required=false;
-    if(!valid) return;
+    const at=laterEpoch(later.value);
+    if(!(at>Date.now())) return;
     closeLater(form.querySelector('[data-later-menu]'),false);
+    void send(outcome,new Date(at).toISOString());return;
    }
    void send(outcome,later.value);
   });
@@ -540,14 +564,19 @@ function zoneParts(epoch){
  return parts;
 }
 function zoneEpoch(year,month,day,minutes){
- // Convert a wall time in the user zone to an epoch. The second pass corrects for a daylight saving change near that time.
+ // Use both offsets near the wall time. Choose the earlier repeat or advance through a skipped hour.
  const wall=Date.UTC(year,month-1,day,0,minutes);
- let epoch=wall;
- for(let pass=0;pass<2;pass++){
-  const shown=zoneParts(epoch);
-  epoch=wall-(Date.UTC(shown.year,shown.month-1,shown.day,shown.hour,shown.minute,shown.second)-epoch);
- }
- return epoch;
+ const shownWall=epoch=>{const shown=zoneParts(epoch);
+  return Date.UTC(shown.year,shown.month-1,shown.day,shown.hour,shown.minute,shown.second);};
+ const offsets=new Set([-86400000,0,86400000].map(delta=>shownWall(wall+delta)-(wall+delta)));
+ const candidates=[...offsets].map(offset=>wall-offset),exact=candidates.filter(epoch=>shownWall(epoch)===wall);
+ return exact.length ? Math.min(...exact) : Math.max(...candidates);
+}
+function laterEpoch(wall){
+ const [date,clock]=wall.split('T');
+ if(!date || !clock) return NaN;
+ const [year,month,day]=date.split('-').map(Number),[hour,minute]=clock.split(':').map(Number);
+ return zoneEpoch(year,month,day,hour*60+minute);
 }
 function laterTimes(now){
  const settings=JSON.parse(content.dataset.later),today=zoneParts(now);
@@ -558,7 +587,7 @@ function laterTimes(now){
   morning:at(1,settings.morning),week:at((settings.weekDay-weekday+7)%7 || 7,settings.weekTime)};
 }
 function closeLater(menu,focus){
- menu.hidden=true;menu.querySelector('[data-later-custom]').hidden=true;
+ menu.hidden=true;menu.querySelector('[data-later-custom]').hidden=true;delete menu.dataset.choosing;
  const toggle=menu.parentElement.querySelector('[data-later-toggle]');toggle.setAttribute('aria-expanded','false');
  if(focus) toggle.focus();
 }
@@ -580,12 +609,78 @@ function bindLater(form,pick){
   const at=laterTimes(Date.now())[item.dataset.laterPreset] || Number(item.dataset.at);
   closeLater(menu,false);pick(new Date(at).toISOString());
  }));
- menu.querySelector('[data-later-choose]').addEventListener('click',()=>{custom.hidden=false;form.elements.later.focus();});
+ const grid=custom.querySelector('[data-later-grid]'),time=custom.querySelector('[data-later-time]');
+ const save=custom.querySelector('[value="later"]'),month=custom.querySelector('[data-later-month]');
+ const dayText=date=>date.toISOString().slice(0,10);
+ const monthText=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',month:'long',year:'numeric'});
+ const dayLabel=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',dateStyle:'full'});
+ const summary=new Intl.DateTimeFormat('en-GB',{timeZone:content.dataset.zone,weekday:'short',day:'numeric',month:'short'});
+ let selected=new Date(),display=new Date();
+ const today=()=>{const now=zoneParts(Date.now());return new Date(Date.UTC(now.year,now.month-1,now.day));};
+ const update=()=>{
+  form.elements.later.value=dayText(selected)+'T'+time.value;
+  form.elements.later.dispatchEvent(new Event('input',{bubbles:true}));
+  const at=laterEpoch(form.elements.later.value);
+  const clock=Number.isFinite(at) ? zoneParts(at) : {};
+  custom.querySelector('[data-later-summary]').textContent=Number.isFinite(at) ? 'Hides until '+summary.format(at)+' '+
+   String(clock.hour).padStart(2,'0')+':'+String(clock.minute).padStart(2,'0') : 'Choose a time';
+  save.disabled=!(at>Date.now());
+ };
+ const draw=()=>{
+  month.textContent=monthText.format(display);grid.replaceChildren();
+  grid.setAttribute('aria-label',month.textContent);
+  const header=document.createElement('div');header.setAttribute('role','row');
+  ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'].forEach(day=>{
+   const cell=document.createElement('span');cell.setAttribute('role','columnheader');cell.setAttribute('aria-label',day);
+   cell.textContent=day[0];header.append(cell);
+  });grid.append(header);
+  const first=new Date(Date.UTC(display.getUTCFullYear(),display.getUTCMonth(),1));
+  const count=new Date(Date.UTC(display.getUTCFullYear(),display.getUTCMonth()+1,0)).getUTCDate();
+  let row;
+  for(let cell=0;cell<first.getUTCDay()+count;cell++){
+   if(cell%7===0){row=document.createElement('div');row.setAttribute('role','row');grid.append(row);}
+   const day=cell-first.getUTCDay()+1;
+   if(day<1){const blank=document.createElement('span');blank.setAttribute('role','gridcell');row.append(blank);continue;}
+   const date=new Date(Date.UTC(display.getUTCFullYear(),display.getUTCMonth(),day)),button=document.createElement('button');
+   button.type='button';button.setAttribute('role','gridcell');button.textContent=day;
+   button.dataset.date=dayText(date);button.setAttribute('aria-label',dayLabel.format(date));
+   button.setAttribute('aria-selected',String(dayText(date)===dayText(selected)));
+   button.tabIndex=dayText(date)===dayText(selected) ? 0 : -1;button.disabled=date<today();
+   if(dayText(date)===dayText(today())) button.setAttribute('aria-current','date');
+   button.addEventListener('click',()=>{selected=date;draw();grid.querySelector('[tabindex="0"]').focus();});row.append(button);
+  }
+  update();
+ };
+ menu.querySelector('[data-later-choose]').addEventListener('click',()=>{
+  const wall=form.elements.later.value;
+  if(laterEpoch(wall)>Date.now()){
+   const [date,clock]=wall.split('T');selected=new Date(date+'T00:00:00Z');time.value=clock;
+  }else{
+   selected=today();selected.setUTCDate(selected.getUTCDate()+1);
+   const morning=JSON.parse(content.dataset.later).morning;
+   time.value=String(Math.floor(morning/60)).padStart(2,'0')+':'+String(morning%60).padStart(2,'0');
+  }
+  display=new Date(selected);
+  custom.hidden=false;menu.dataset.choosing='true';draw();grid.querySelector('[tabindex="0"]').focus();
+ });
+ custom.querySelectorAll('[data-later-month-step]').forEach(button=>button.addEventListener('click',()=>{
+  display=new Date(Date.UTC(display.getUTCFullYear(),display.getUTCMonth()+Number(button.dataset.laterMonthStep),1));
+  draw();
+ }));
+ time.addEventListener('input',update);time.addEventListener('change',update);
+ grid.addEventListener('keydown',event=>{
+  const days={ArrowLeft:-1,ArrowRight:1,ArrowUp:-7,ArrowDown:7}[event.key];
+  if(days===undefined) return;
+  event.preventDefault();const date=new Date(selected);date.setUTCDate(date.getUTCDate()+days);
+  if(date<today()) return;
+  selected=date;display=new Date(date);draw();grid.querySelector('[tabindex="0"]').focus();
+ });
  menu.addEventListener('keydown',event=>{
   if(event.key==='Escape'){event.preventDefault();closeLater(menu,true);return;}
   if(custom.contains(event.target)){
-   // Enter in the date and time field saves it; the form's first button is a different outcome.
-   if(event.key==='Enter' && event.target===form.elements.later){event.preventDefault();form.requestSubmit(custom.querySelector('[value="later"]'));}
+   if(event.key==='Enter'){
+    event.preventDefault();update();if(!save.disabled) form.requestSubmit(save);
+   }
    return;
   }
   const list=items(),index=list.indexOf(document.activeElement);
