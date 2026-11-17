@@ -110,7 +110,8 @@ It shows the state, data time, round trip and server render time, in that order.
 Live uses `radio` and `--room`; Reading uses `loader-circle` and `--accent`.
 Late uses `clock-alert` and `--warning`; Failed uses `triangle-alert` and `--error`.
 Paused uses `circle-pause` and `--ink-3`.
-The state order is Paused, Failed, Late, Reading, Live.
+A hidden page or a replacement hold shows Paused before the other states.
+Otherwise, the state order is Failed, Late, a busy Paused state, Reading, Live.
 Late, Failed and Paused show a reason after the last data time instead of timings.
 Builds and Disks keep the shown data time when a later read or measure fails.
 A first read shows only Reading until data arrives.
@@ -133,6 +134,10 @@ Accounts, Changes, Investigations, List and Questions read their rendered page a
 Builds reads `memory.json` at its feed interval.
 Disks reads `disks.json` at `page.poll_seconds` intervals and requests a new measure when needed.
 Disks shows Paused with the reason **Measuring…** while a measure runs and reads succeed.
+The loader result carries `busy:'Measuring…'` while the measure runs within `wait_seconds`.
+The shared component records the data, age and answer time from each busy result.
+Failed and Late override this busy reason.
+The `hold` function delays page replacement; a busy result does not delay it.
 The old sizes remain visible during the measure.
 An unsuccessful read shows Failed with the read error while the measure runs.
 Old sizes alone do not make Disks Late because the page measures on demand.
@@ -142,6 +147,7 @@ Other pages use their data timestamp for Late.
 A completed measure returns Disks to Live with the new size age.
 A measure that exceeds `wait_seconds` clears the measure state even when reads fail.
 The status shows Failed with **The measure did not finish.** or the read error.
+If a read remains pending past the age limit, the status shows Late with the retained data age.
 AWS reads its published page when shown; its hourly publisher sets the data time and render time.
 Images reads its rendered page when shown.
 The Changes and Questions pages show Paused while text or an active save holds a replacement.

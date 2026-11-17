@@ -137,29 +137,21 @@ class DisksPageTests(unittest.TestCase):
             page = disks_page.publish(Path(directory), SETTINGS).read_text()
         self.assertIn('</h1><p class="page-status"', page)
         self.assertIn(page_frame.REFRESH_SCRIPT, page)
-        self.assertIn("createPageRefresh(loadDisks,()=>settings.poll_seconds,()=>measuring && !readFailed && Date.now()/1000-measuring.since<=settings.wait_seconds ? 'Measuring…' : '')", page)
+        self.assertIn("createPageRefresh(loadDisks,()=>settings.poll_seconds)", page)
         self.assertIn('readAt:data.measured_at,renderSeconds:data.render_seconds', page)
         self.assertIn('throw new Error("The measure did not finish.")', page)
-        match = re.search(r'data-status-options="([^"]+)"', page)
-        assert match is not None
-        environment = test_page_frame.PageStatusTests.environment(html.unescape(match[1])) + """
-const settingsText=SETTINGS;
-document.getElementById=()=>({textContent:JSON.stringify(settingsText)});
-const localStorage={getItem:()=>null};
-""".replace("SETTINGS", json.dumps(SETTINGS))
-        functions = page[page.index("const GIB ="):page.index("const updateSessions =")]
-        start = re.search(r'const pageRefresh=createPageRefresh[^\n]+', page)
-        assert start is not None
         scenario = r"""
 const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
-let fileAt=now/1000-4200,measureState='current',stalled=false,failedReads=false,release;
+let fileAt=now/1000-4200,measureState='current',stalled=false,failedReads=false;
+const pendingReads=[];
+const release=()=>pendingReads.splice(0).forEach(resolve=>resolve({ok:true,json:async()=>payload()}));
 function render(){}
 function renderCards(){}
 const payload=()=>({measured_at:fileAt,render_seconds:.03,drives:[]});
 const fetch=async(url)=>{
  if(url==='measure') return {ok:true,json:async()=>({state:measureState})};
  if(failedReads) return {ok:false,status:502};
- if(stalled) return new Promise(resolve=>release=()=>resolve({ok:true,json:async()=>payload()}));
+ if(stalled) return new Promise(resolve=>pendingReads.push(resolve));
  return {ok:true,json:async()=>payload()};
 };
 START
@@ -208,7 +200,8 @@ START
   'The next measure must start before its reads stop answering.');
  stalled=true;void pageRefresh.refresh();
  now+=settings.wait_seconds*1000;pageRefresh.changed();
- check(line.dataset.state==='Paused','The measure hold must last through the wait limit.');
+ check(line.dataset.state==='Late' && !parts.age.hidden,
+  'A pending read at the wait limit must show Late with the data age.');
  now+=1000;pageRefresh.changed();
  check(line.dataset.state!=='Paused' && parts.reason.textContent!=='Measuring…',
   'A pending read must not retain Paused or Measuring after 3601 seconds.');
@@ -216,7 +209,55 @@ START
  if(failures.length) throw new Error(failures.join('\n'));
  console.log('PASS');
 })().catch(error=>{console.error(error);process.exitCode=1;});
-""".replace("START", start[0])
+"""
+        self.assert_status_scenario(scenario)
+
+    def test_the_first_measure_keeps_its_data_age_when_the_next_read_stalls(self) -> None:
+        self.assert_status_scenario(r"""
+const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+const fileAt=now/1000-4200,pendingReads=[];
+let stalled=false;
+function render(){}
+function renderCards(){}
+const fetch=async(url)=>{
+ if(url==='measure') return {ok:true,json:async()=>({state:'started'})};
+ if(stalled) return new Promise(resolve=>pendingReads.push(resolve));
+ return {ok:true,json:async()=>({measured_at:fileAt,render_seconds:.03,drives:[]})};
+};
+START
+(async()=>{
+ await pageRefresh.refresh();
+ check(line.dataset.state==='Paused' && parts.reason.textContent==='Measuring…',
+  'The first measure must show Paused and Measuring.');
+ check(!parts.age.hidden && parts.age.textContent==='70 min ago',
+  'The first measure must record the old data age.');
+ stalled=true;void pageRefresh.refresh();
+ check(pendingReads.length===2,'The Disks and Builds reads must have separate pending resolvers.');
+ const ageLimit=JSON.parse(line.dataset.statusOptions).ageLimit;
+ now+=(Math.max(settings.wait_seconds,ageLimit)+1)*1000;pageRefresh.changed();
+ check(line.dataset.state==='Late' && parts.reason.textContent==='The feed has stopped.',
+  'The first measure must show Late after the wait and age limits.');
+ check(!parts.age.hidden && parts.age.textContent===Math.floor((now/1000-fileAt)/60)+' min ago',
+  'The stalled first measure must keep the data age.');
+ if(failures.length) throw new Error(failures.join('\n'));
+ console.log('PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
+
+    def assert_status_scenario(self, scenario: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            page = disks_page.publish(Path(directory), SETTINGS).read_text()
+        match = re.search(r'data-status-options="([^"]+)"', page)
+        assert match is not None
+        environment = test_page_frame.PageStatusTests.environment(html.unescape(match[1])) + """
+const settingsText=SETTINGS;
+document.getElementById=()=>({textContent:JSON.stringify(settingsText)});
+const localStorage={getItem:()=>null};
+""".replace("SETTINGS", json.dumps(SETTINGS))
+        functions = page[page.index("const GIB ="):page.index("const updateSessions =")]
+        start = re.search(r'const pageRefresh=createPageRefresh[^\n]+', page)
+        assert start is not None
+        scenario = scenario.replace("START", start[0])
         node = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
         done = subprocess.run([node, "--unhandled-rejections=strict", "-e",
                                environment + functions + page_frame.REFRESH_SCRIPT + scenario],

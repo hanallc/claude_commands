@@ -75,14 +75,14 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
   const reason=held(),age=last ? Math.max(0,Math.floor(Date.now()/1000-last.readAt)) : 0;
   // An on-demand page can report a server answer separately from the data time.
   const unanswered=last ? Math.max(0,Math.floor(Date.now()/1000-(last.answeredAt ?? last.readAt))) : 0;
-  const next=reason ? 'Paused' : failure ? 'Failed' : last && unanswered>options.ageLimit ? 'Late' : reading || !last ? 'Reading' : 'Live';
+  const next=reason ? 'Paused' : failure ? 'Failed' : last && unanswered>options.ageLimit ? 'Late' : last?.busy ? 'Paused' : reading || !last ? 'Reading' : 'Live';
   line.dataset.state=next;
   line.querySelectorAll('[data-status-icon]').forEach(icon=>icon.hidden=icon.dataset.statusIcon!==next);
   line.querySelector('[data-status-word]').textContent=next==='Reading' ? 'Reading…' : next;
   if(next!==state){line.querySelector('[data-status-announcement]').textContent=next;state=next;}
   const part=(key,text)=>{const node=line.querySelector('[data-status-'+key+']');node.hidden=!text;node.textContent=text;return node;};
   part('age',last ? age<60 ? age+' s ago' : Math.floor(age/60)+' min ago' : '');
-  const why=next==='Paused' ? reason : next==='Failed' ? failure : next==='Late' ? 'The feed has stopped.' : '';
+  const why=next==='Paused' ? reason || last.busy : next==='Failed' ? failure : next==='Late' ? 'The feed has stopped.' : '';
   part('reason',why);
   const timings=last && !why;
   const round=part('trip',timings && trip!==null ? 'round trip '+duration(trip)+' s' : '');
