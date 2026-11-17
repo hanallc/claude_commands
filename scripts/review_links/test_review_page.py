@@ -40,6 +40,14 @@ class ReviewPageTests(unittest.TestCase):
     root: Path = Path()
     status: change_page.DeliveryStatus = change_page.DeliveryStatus(Path())
 
+    def test_review_ids_use_the_shared_no_wrap_cell(self) -> None:
+        _ = self.question()
+        body = review_page.render(self.root).decode()
+        self.assertIn('<td class="record-id" data-label="Id">', body)
+        self.assertIn('.list-table .record-id{white-space:nowrap;overflow-wrap:normal;width:1%}', body)
+        self.assertIn('.list-toggle{white-space:nowrap}', body)
+        self.assertIn('<col style="width:17%">', body)
+
     def test_staff_owners_sources_and_log_names_have_role_colors(self) -> None:
         _ = self.question()
         body = review_page.render(self.root).decode()
