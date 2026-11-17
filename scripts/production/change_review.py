@@ -779,7 +779,8 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
             raise ChangeReviewError(f"{held} already holds that change from merge {merged}; no row added")
         added = f"{day.isoformat()} {added_at:%H:%M}" if added_at is not None else day.isoformat()
         when = f"{added} · {_cell(merged)}" if merged else added
-        rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(items[index].change), "Merged": when,
+        rows = [_row(path, columns, {**dict.fromkeys(columns, ""),
+                                     "#": f"C{number + offset}", "Change": _cell(items[index].change), "Merged": when,
                                      "On the Mac build": NOT_YET, CHECK: _cell(items[index].how()), URGENCY: _cell(rank),
                                      KIND: "", PRODUCER: str(row_producers[index]) if isinstance(row_producers[index], str) else "",
                                      PRODUCTION: _cell(identities[index]),
