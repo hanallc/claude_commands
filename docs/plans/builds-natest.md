@@ -4642,31 +4642,8 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 ### Phase 330 — Test runs start no Git auto maintenance  · status: done
 **Depends on:** Phase 329
 
-#### Work Order
+#### As-built
 
-**Goal:** each gate test module runs Git with auto maintenance and auto gc off, so fixture commits start no `git maintenance` work.
-
-**Decision:** builds approved the change on Phase 329's paired natedev results. Measured savings ship.
-
-**Spec:**
-1. In `test_module_environment`, set `GIT_CONFIG_PARAMETERS` to the inherited value followed by `'maintenance.auto=false' 'gc.auto=0'`. Keep the inherited entries; do not replace them.
-2. Keep the settings in one module constant. Update the function docstring.
-3. Add a row to the existing module environment test: an inherited value stays first and the two settings follow it.
-4. Run the gate tests and the Git-heavy modules on natedev. Run an aws pair over 18 Git-heavy modules, 3 rounds.
-
-**Files:**
-- `scripts/production/gate.py`
-- `scripts/production/test_gate.py`
-
-**Workers:** 1 writer; the director writes it (no worker capacity).
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 329: paired natedev median savings with maintenance off: `test_models_conf_publish` 6.06 CPU s, `test_fast_track` 1.75, `test_style_footprint` 1.02.
-- `gate_box.py`, `module_cost.py` and `fast_track.py` call `test_module_environment`, so the change reaches aws runs and module cost probes.
-- No test checks that auto maintenance runs.
-
-**Acceptance gate:**
-- basedpyright reports no errors or warnings on both files.
-- `production/test_gate.py`, `production/test_staff.py` and the Git-heavy modules pass.
-- The aws pair shows the CPU change over the Git-heavy modules.
+- `gate.py` `test_module_environment` appends `TEST_GIT_CONFIG` (`'maintenance.auto=false' 'gc.auto=0'`) to any inherited `GIT_CONFIG_PARAMETERS`. The gate, `gate_box.py` on aws, `fast_track.py` and `module_cost.py` share it.
+- `test_gate.py` checks that an inherited value stays first and the two settings follow it.
+- natedev: 20 Git-heavy and gate modules pass; fixture process starts drop (for example `test_models_conf_publish` 4,928 to 4,598). Every behavior check stays. Checkpoint ea4c5c8aa.
