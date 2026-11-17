@@ -2709,6 +2709,7 @@ Goal: no queue fixture calls bare `mkdtemp`, `git clone` or `git worktree add`. 
 **Proof:** tests for each item; one dark desktop shot of the Disks page where a waiting run holds no slot.
 **Restart:** none expected: the change is in the client (`copies.py`, `verify.sh`).
 **Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44ax/work_order.md`. Clone `/session/queue/slotorder`, branch `builds-queue-slotorder`.
+**Built:** checkpoint 654dcfcf0 on origin branch `builds-queue-slotorder-cp`, sent to builds 2026-11-17. A private source copy keeps the repository identity and writes no objects into the source. Three review passes closed five findings. Proof image c1b4e8f2ddc5.
 
 ### Phase 44ay — The other slot users take their slot after admission too  · status: todo
 **Depends on:** 44ax. builds asked for it at once after 44ax, so two orders do not stay in place.
@@ -2724,6 +2725,11 @@ Move the other `copies.standing` callers to the 44ax order with the same code: m
 3. A test shows that a true AnyEligibleTarget step still moves to a free Mac past a dead kept claim.
 
 **Built:** checkpoint ab6bfb6e5 on origin branch `builds-queue-macidle-cp2`, sent to builds 2026-11-17 12:20 EST. It replaces db645f5c0, whose proof image named a "final" step that does not exist. Five readers of running work share `mac_test.run_holds_work`. The review found two minor defects: two more readers counted a kept claim as busy. Proof image 444f6e564073 shows a waiting cargo-liner check step from a `verify.sh final` run. The admission_service.py diagnostic takes effect at the next service reload.
+
+### Phase 44ba — The admission loop does not stop when a placement ends during its own pass
+**Depends on:** nothing; urgent outage risk. Found by natest's gaterename bisect on 2026-11-17: "dictionary changed size during iteration" in the admission service.
+**Cause:** `_prepare_placements` walked `placement_requests` while `_close_placement` -> `persist` -> `_prune_ended_placements` removed entries. The error ended the service process.
+**Built:** checkpoint 7ed14c03d on origin branch `builds-queue-loopfix-cp`, sent to builds 2026-11-17. Four loops walk a snapshot and skip an entry removed during the pass. The review audited every service loop that removes entries. The fix takes effect when the admission service reloads after the merge.
 
 ### Phase 45 — Merge gates take their route from the queue  · status: todo
 **Depends on:** 44 and aws-unit's repair of the uncertain cloud launch. Checkpoint 3 of section 8 in `docs/plans/builds-queue-placement.md`. `merge_gate --tests-only` takes the same queue route as a full gate and keeps its exit codes. Tell the sdlc showrunner before this phase edits `merge_gate.py`, because natest phase 119 changed `run_gate_suites`. Phase 119 is at 14581684f on builds-natest: merge builds first, keep its selection lines before the `cloud.route` call, and keep its empty-selection result. Tell the sdlc showrunner when this phase is on main. The Work Order follows at phase start.
