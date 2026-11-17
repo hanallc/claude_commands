@@ -513,6 +513,13 @@ try{
  check(new Set(requestIds).size===4,'each new action uses a fresh request');
  location.hash=new URLSearchParams({show:'closed',sort:'#',dir:'desc'});await flush();
  check(visible().length===1 && visible()[0].dataset.number==='54','hash navigation restores the filters');
+
+ for(const target of rows().filter(row=>['Done','Closed'].includes(row.dataset.state) || row.dataset.parked==='true')){
+  location.hash=new URLSearchParams({item:target.dataset.key,owner:'missing',show:'open',q:'missing'});await flush();
+  check(!target.hidden && !target.querySelector('[data-detail]').hidden,'an item link shows '+target.dataset.state);
+  check(document.getElementById('list-show').value==='all' && document.getElementById('list-owner').value==='' &&
+    document.getElementById('list-search').value==='','an item link clears filters');
+ }
  check(document.querySelectorAll('[data-feedback-form]').length===6,'each row has feedback controls');
  check(document.documentElement.scrollWidth<=innerWidth,'the page has no horizontal overflow');
  if(innerWidth<960){check(getComputedStyle(visible()[0]).display==='block','a phone row is a card');}

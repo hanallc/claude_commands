@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 from scripts.production import change_review
+from scripts.review_links.review_items import NoEfficiencyLedger
 from scripts.lib import conf
 from scripts.production import change_routing, staff
 from scripts.production import proposals_folder
@@ -46,25 +47,26 @@ def unrouted_changes(doc: Path) -> int:
 
 
 def proposals(doc: Path, *, source: str = "", sources: list[Path] | None = None,
-              own: list[Issue] | None = None) -> int:
+              own: list[Issue] | None = None, record: staff.StaffSnapshot | None = None) -> int:
     """Read proposal counts through the shared review reader."""
     from scripts.review_links import review_items
-    return review_items.proposals(doc, source=source, sources=sources, own=own)
+    return review_items.proposals(doc, source=source, sources=sources, own=own, record=record)
 
 def open_efficiency(line: str, *, source: str = "") -> bool:
     """Read an efficiency line through the shared review reader."""
     from scripts.review_links import review_items
     return review_items.open_efficiency(line, source=source)
 
-def efficiency_ledger(doc: Path) -> Path | None:
+def efficiency_ledger(doc: Path) -> Path | NoEfficiencyLedger:
     """Find the ledger through the shared review reader."""
     from scripts.review_links import review_items
     return review_items.efficiency_ledger(doc)
 
-def efficiency(doc: Path, *, source: str = "", sources: list[Path] | None = None) -> int:
+def efficiency(doc: Path, *, source: str = "", sources: list[Path] | None = None,
+               record: staff.StaffSnapshot | None = None) -> int:
     """Read efficiency counts through the shared review reader."""
     from scripts.review_links import review_items
-    return review_items.efficiency(doc, source=source, sources=sources)
+    return review_items.efficiency(doc, source=source, sources=sources, record=record)
 
 def read_counts(doc: Path, *, questions: int = 0, record: staff.StaffSnapshot | None = None,
                 source: str = "", sources: list[Path] | None = None,
@@ -77,8 +79,8 @@ def read_counts(doc: Path, *, questions: int = 0, record: staff.StaffSnapshot | 
         record = record if record is not None else staff.snapshot()
         investigation_count = investigations(doc, record, source=source, sources=sources)
         change_count, unrouted_count = change_counts(doc, record, source=source, sources=sources)
-        return FooterCounts(change_count, proposals(doc, source=source, sources=sources, own=own), questions,
-                            efficiency(doc, source=source, sources=sources), unrouted_count, investigation_count)
+        return FooterCounts(change_count, proposals(doc, source=source, sources=sources, own=own, record=record), questions,
+                            efficiency(doc, source=source, sources=sources, record=record), unrouted_count, investigation_count)
     except OSError:
         if sources is not None:
             raise
@@ -138,8 +140,8 @@ def sources(doc: Path, *, identities: QuestionStaff | None = None,
     except OSError:
         if read_sources is not None:
             raise
-        efficiency_queue = None
-    if efficiency_queue is not None:
+        efficiency_queue = NoEfficiencyLedger()
+    if isinstance(efficiency_queue, Path):
         found.append(efficiency_queue)
     if own is not None:
         found.extend(issue.path for issue in own)

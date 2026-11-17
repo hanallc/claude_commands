@@ -673,7 +673,7 @@ class DemoteShowrunnerTests(StaffTestCase):
         self.assertEqual(self.run_command()[0], 1)
         self.assertEqual(update_registration.open_entries(child, identities), [reminder])
         moved = update_registration.open_entries(parent, identities)
-        self.assertEqual(moved, [question])
+        self.assertEqual(moved, [question | {"review_id": "Q1"}])
         self.assertEqual(self.run_command()[0], 1)
         self.assertEqual(update_registration.open_entries(parent, identities), moved)
         self.detach.assert_called_once()

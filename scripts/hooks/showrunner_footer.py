@@ -92,8 +92,7 @@ def open_questions(productions: list[Production], *, identities: QuestionStaff |
                    source: str = "") -> int | None:
     """Count due questions, with an optional fixed source staff id."""
     from scripts.review_links import review_items
-    from scripts.production.update_registration import (InputError, RegistrationFailure,
-                                                        read_open_items)
+    from scripts.production.update_registration import InputError, RegistrationFailure
 
     try:
         identities = identities if identities is not None else QuestionStaff.read()
@@ -107,10 +106,8 @@ def open_questions(productions: list[Production], *, identities: QuestionStaff |
             print(f"questions: unavailable — {production.doc}: no showrunner staff row", file=sys.stderr)
             continue
         try:
-            items = read_open_items(outstanding_path(owner.id, identities=identities),
-                                    document=production.doc, identities=identities)
-            now = datetime.now(ZoneInfo(production.zone)).replace(tzinfo=None)
-            count += review_items.count_due(items, now, source)
+            items = review_items.read_kind(review_items.ReviewType.QUESTION, owner, identities.record)
+            count += review_items.count_items(items, datetime.now(ZoneInfo(production.zone)), source)
         except (InputError, OSError, ValueError, RegistrationFailure, staff.StaffRefused) as error:
             print(f"questions: unavailable — {error}", file=sys.stderr)
             return None

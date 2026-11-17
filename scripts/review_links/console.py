@@ -411,7 +411,11 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     if (['changes','questions','investigations'].includes(identity) && entries.some(entry=>entry.dataset.page==='review')) {
       const kind={changes:'change',questions:'question',investigations:'investigation'}[identity];
       const url=new URL(location.href);
-      url.searchParams.set('at.review','/console/review.html#'+new URLSearchParams({type:kind}));
+      const previous=new URL(url.searchParams.get('at.'+identity) || '/console/changes.html',location.origin);
+      const filters=new URLSearchParams(previous.hash.slice(1));
+      const owner=filters.get('owner') || filters.get('showrunner');
+      filters.delete('showrunner');filters.set('type',kind);if(owner) filters.set('owner',owner);
+      url.searchParams.set('at.review','/console/review.html#'+filters);
       history.replaceState(null,'',url);identity='review';
     }
     const selected = pages.find(entry => entry.dataset.page === identity) || entries[0];

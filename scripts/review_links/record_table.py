@@ -73,7 +73,10 @@ function place(){
  type=params.get('type') || '';
  if(!options.shows.includes(show)) show='open';
  if(!columns.includes(sort)) sort='';
- const item=params.get('item');if(item){if(options.single) opened.clear();opened.add(item);}
+ const item=params.get('item');if(item){
+  owner='';show='all';query='';type='';if(options.single) opened.clear();opened.add(item);
+ }
+ owner=options.resolveOwner?.(owner) ?? owner;
 }
 function compare(a,b){
  if(Array.isArray(a)) return a[0]-b[0] || compare(a[1],b[1]);

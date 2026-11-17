@@ -39,8 +39,6 @@ from pathlib import Path
 from typing import NamedTuple, TypeVar, cast
 
 from scripts.production import change_review
-from scripts.production import proposals_folder
-from scripts.production.footer_counts import efficiency_ledger
 from scripts.production.store_owner import document_id
 from scripts.production import staff
 from scripts.production.production_doc import Refusal
@@ -49,7 +47,6 @@ from scripts.production.update_registration import RegistrationFailure
 from scripts.lib import urgency  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
-from scripts.nightly_review import candidates
 
 CHANGE = "change"
 PROPOSAL = "proposal"
@@ -104,10 +101,7 @@ def change_queue(doc: Path, below: bool = False, *,
 
 def efficiency_queue(doc: Path, below: bool = False) -> Queue:
     """The open candidates of the production's Efficiency ledger, and with `below` of each one below it."""
-    ledgers = dict.fromkeys(ledger for each in proposals_folder.scope_docs(doc, below)
-                            if (ledger := efficiency_ledger(each)) is not None)
-    lines = [line for ledger in ledgers for line in candidates.read_lines(ledger)]
-    return Queue(urgency.scope_queue(candidates.QUEUE, below), _as_text(candidates.entries(lines), lambda entry: entry.item.line))
+    return read_queue(EFFICIENCY, doc, below)
 
 
 def read_queue(kind: str, production: Path | None, below: bool = False, *,
