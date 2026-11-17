@@ -1,5 +1,9 @@
 """Publish the AWS page: the spend totals and the spot_table tables as data for the admin console."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -171,7 +175,8 @@ def quota_help() -> str:
             link = escape(url)
             text = text.replace(link, f'<a href="{link}">{link}</a>')
         steps.append(f'<li>{text}</li>')
-    return '<ol>' + ''.join(steps) + '</ol>\n<p>' + escape(console_help.WRONG_ACCOUNT) + '</p>'
+    notes = ''.join(f'\n<p>{escape(note)}</p>' for note in (console_help.WRONG_ACCOUNT, console_help.PASSKEY_NOTE))
+    return '<ol>' + ''.join(steps) + '</ol>' + notes
 
 
 def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | None = None) -> Path:
