@@ -1,8 +1,9 @@
-"""Show questions, changes and investigations in one review table."""
+"""Show questions, changes, investigations, proposals and efficiencies in one review table."""
 from __future__ import annotations
 
 import html
 import json
+import re
 import secrets
 import time
 from datetime import datetime
@@ -11,7 +12,7 @@ from urllib.parse import parse_qs, parse_qsl, urlencode
 
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
-from scripts.production import change_review, staff
+from scripts.production import change_review, proposal_issue, staff
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_link
 from scripts.review_links import review_legacy
 from scripts.review_links import review_actions
@@ -19,10 +20,13 @@ from scripts.review_links.review_items import ReviewItem, ReviewState, ReviewTyp
 
 PAGE_PATH = '/console/review.html'
 HEADERS = ('Id', 'Type', 'Owner', 'Item', 'State', 'Age')
-TYPES = (ReviewType.QUESTION, ReviewType.CHANGE, ReviewType.INVESTIGATION)
-ICONS = {ReviewType.QUESTION: 'circle-help', ReviewType.CHANGE: 'diff', ReviewType.INVESTIGATION: 'microscope'}
+TYPES = tuple(ReviewType)
+ICONS = {ReviewType.QUESTION: 'circle-help', ReviewType.CHANGE: 'diff', ReviewType.INVESTIGATION: 'microscope',
+         ReviewType.PROPOSAL: 'lamp', ReviewType.EFFICIENCY: 'zap'}
 SHOWS = (('open', 'Open'), ('For you', 'For you'), ('Waiting', 'Waiting'), ('Done', 'Done'), ('all', 'All'))
-LABELS = {ReviewType.QUESTION: 'Questions', ReviewType.CHANGE: 'Changes', ReviewType.INVESTIGATION: 'Investigations'}
+LABELS = {ReviewType.QUESTION: 'Questions', ReviewType.CHANGE: 'Changes', ReviewType.INVESTIGATION: 'Investigations',
+          ReviewType.PROPOSAL: 'Proposals', ReviewType.EFFICIENCY: 'Efficiencies'}
+FRONT_MATTER = re.compile(r'\A\ufeff?---[ \t]*\r?\n.*?\r?\n---[ \t]*(?:\r?\n|\Z)', re.DOTALL)
 
 
 def page_url() -> str:
@@ -33,7 +37,7 @@ def page_url() -> str:
 def waiting_items(request: console.NewsRequest) -> frozenset[str]:
     now = datetime.now(user_zone())
     return frozenset(item.key+'/'+item.times.updated.isoformat() for item in request.shared(review_items.read_open)
-                     if item.type in TYPES and item.for_you(now))
+                     if item.for_you(now))
 
 
 def legacy_url(path: str, query: str) -> str:
@@ -59,11 +63,12 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser) -> str:
     closes: list[str] = []
     returns: list[str] = []
     labels = {'answer': 'Answer', 'works': 'Works', 'not works': 'Does not work', 'validate': 'Ask showrunner to check',
-              'question': 'Ask question', 'feedback': 'Send feedback', 'read': 'Mark read'}
+              'question': 'Ask question', 'feedback': 'Send feedback', 'read': 'Mark read',
+              'approve': 'Approve', 'decline': 'Decline'}
     for index, action in enumerate(item.actions):
         button = f'<button name="outcome" value="{action}"'+(' class="primary"' if index == 0 else '')+'>'+labels[action]+'</button>'
         (returns if action == 'question' else closes).append(button)
-    groups = '<div class="review-action-group"><span>Closes the item</span><div>'+''.join(closes)+'</div></div>'
+    groups = '<div class="review-action-group"><span>Closes the item</span><div>'+''.join(closes)+'</div></div>' if closes else ''
     if returns:
         groups += '<div class="review-action-group"><span>The item returns to you</span><div>'+''.join(returns)+'</div></div>'
     groups += ('<div class="review-action-group review-later"><span>Hides it until</span><div>'
@@ -97,6 +102,12 @@ def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff
         body = section('You asked', source.record.question)
         if source.record.answer:
             body += section('Answer', source.record.answer)
+    elif isinstance(source, review_items.ProposalSource):
+        # The issue text loads when the card opens, so the Open view does not carry every proposal body.
+        body = ('<section><h3>Proposal</h3><div data-proposal-body>'
+                +'<p>'+html.escape(source.record.path.name)+'</p></div></section>')
+    elif isinstance(source, review_items.EfficiencySource):
+        body = section('Proposal', item.title)
     else:
         body = ''
     logs = ''.join('<li><time datetime="'+entry.time.isoformat()+'">'
@@ -183,6 +194,15 @@ def render(root: Path, *, show: str = 'open') -> bytes:
     return page_frame.rendered(change_page.document(content, 'Review'), started, read_at)
 
 
+def proposal_body(root: Path, key: str) -> bytes:
+    """Render one proposal's issue text for its open card."""
+    item = next((item for item in review_items.read(root, kinds=(ReviewType.PROPOSAL,)) if item.key == key), None)
+    if item is None or not isinstance(item.source, review_items.ProposalSource):
+        raise LookupError('this proposal is not on the page')
+    text = FRONT_MATTER.sub('', proposal_issue.read_issue(item.source.record.path), count=1)
+    return change_page.review_text_html(text.strip(), inline=True).encode()
+
+
 def submit(root: Path, body: str, status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) not in ({'row','token','outcome','feedback'},{'row','token','outcome','feedback','later'}) or any(len(values)!=1 for values in fields.values()):
@@ -193,7 +213,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus) -> tuple[c
     if not secrets.compare_digest(fields['token'][0],change_browser.row_token(browser,key)):
         raise change_page.AnswerRefused('row or page token does not match this page')
     outcome, words = fields['outcome'][0], fields['feedback'][0]
-    if outcome == 'later' or key.startswith('investigation/'):
+    if outcome == 'later' or key.startswith(('investigation/', 'proposal/', 'efficiency/')):
         item = next((item for item in review_items.read(root) if item.key == key),None)
         if item is None:
             raise change_page.AnswerRefused('this item is not on the page')
@@ -201,7 +221,9 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus) -> tuple[c
             return change_page.NoMessageDelivery(),review_actions.later(item,fields.get('later',[''])[0],words)
         if outcome not in item.actions:
             raise change_page.AnswerRefused('choose an action on this card')
-        return review_actions.investigation_action(item,outcome,words,status)
+        if item.type == ReviewType.INVESTIGATION:
+            return review_actions.investigation_action(item,outcome,words,status)
+        return review_actions.decision_action(item,outcome,words,status)
     _ = fields.pop('later',None)
     delivery, answer = change_browser.submit(browser, urlencode({key:values[0] for key,values in fields.items()}), status,
                                                feedback_closes=True)
@@ -220,6 +242,7 @@ background:var(--card);border:1px solid var(--line);border-radius:999px;color:va
 .review-types button[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
 .review-icon{display:inline-flex;vertical-align:middle;margin-right:5px}.review-icon svg{width:18px;height:18px}
 .question{--type-color:#b99aff}.change{--type-color:#62b7ef}.investigation{--type-color:#30c1ad}
+.proposal{--type-color:#f27ab8}.efficiency{--type-color:#a3d63a}
 .review-icon{color:var(--type-color)}.review-panel{border-left-color:var(--type-color);grid-template-columns:1.25fr 1fr;padding:0 20px 18px 58px;gap:4px 28px}
 .review-panel [data-review-form]{grid-column:1/-1;border-top:1px solid var(--line);padding-top:12px;margin-top:10px}
 [data-review-form] label{display:block;font-weight:600;margin-bottom:6px}
@@ -242,7 +265,7 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + review_legacy.SCRIPT + r'''(() => {
 let content=document.querySelector('[data-review]'),saving=0;
 let selectedShow=content.dataset.show,requestedShow=selectedShow;
-const drafts=new Map(),saved=new Map();
+const drafts=new Map(),saved=new Map(),bodies=new Map();
 const view=createRecordTable({content:()=>content,single:true,
  place:reviewPlace,
  resolveOwner:owner=>{
@@ -263,7 +286,7 @@ const view=createRecordTable({content:()=>content,single:true,
   return states.map(state=>items.filter(item=>!saved.has(item.dataset.key) && item.dataset.state===state && item.dataset.parked!=='true').length+' '+state.toLowerCase()).join(' · ');
  },
  applied:(items,{type,show})=>{
-  selectedShow=show;
+  selectedShow=show;loadBodies();
   const shown=items.filter(item=>!saved.has(item.dataset.key) && item.dataset.parked!=='true' &&
    !(show==='open' && item.dataset.state==='Waiting' && item.dataset.checking==='true') &&
    (show==='all' || (show==='open' ? item.dataset.state!=='Done' : item.dataset.state===show)));
@@ -279,6 +302,18 @@ const view=createRecordTable({content:()=>content,single:true,
   if(show!==requestedShow){requestedShow=show;queueMicrotask(()=>pageRefresh.refresh(true));}
  }
 });
+function loadBodies(){
+ view.opened.forEach(key=>{
+  const target=content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"] [data-proposal-body]');
+  if(!target || target.dataset.loaded) return;
+  target.dataset.loaded='true';
+  if(bodies.has(key)){target.innerHTML=bodies.get(key);return;}
+  fetch(location.pathname+'?'+new URLSearchParams({body:key}),{cache:'no-store'})
+   .then(response=>response.ok ? response.text() : Promise.reject(new Error('HTTP '+response.status)))
+   .then(text=>{bodies.set(key,text);if(target.isConnected) target.innerHTML=text;})
+   .catch(error=>{target.textContent='The proposal text is not available: '+error.message;});
+ });
+}
 function bind(){
  view.replace();
  content.querySelectorAll('[data-review-form]').forEach(form=>{
