@@ -67,7 +67,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
-from typing import Literal, Protocol, TextIO, cast
+from typing import Literal, Protocol, TextIO, cast, override
 
 from scripts.lib import process_group
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
@@ -176,6 +176,23 @@ class SuiteMode(Enum):
     MERGE_GATE = "gate"
     TARGETED = "test-affected"
     TARGETED_TEST = "test-affected"
+
+    @classmethod
+    @override
+    def _missing_(cls, value: object) -> SuiteMode | None:
+        # Box requests and older checkouts name the steps merge-gate and targeted-test.
+        return {"merge-gate": cls.GATE, "targeted-test": cls.TARGETED}.get(str(value))
+
+    @property
+    def wire(self) -> str:
+        """Name the step on a box request with the value that old and new box code both read."""
+        return "merge-gate" if self is SuiteMode.GATE else "targeted-test"
+
+    @classmethod
+    def step(cls, value: str) -> str:
+        """Name a recorded step by its new value; a step that is not a suite mode keeps its name."""
+        mode = cls._missing_(value)
+        return mode.value if mode is not None else value
 
 
 class GateJobKind(Enum):

@@ -203,6 +203,11 @@ class GateBoxTests(unittest.TestCase):
     def test_candidate_accepts_the_affected_suite_mode(self) -> None:
         self.production_boot_stubs(('',), mode=gate.SuiteMode.TARGETED)
 
+    def test_candidate_accepts_the_new_suite_mode_values(self) -> None:
+        for mode in gate.SuiteMode:
+            with self.subTest(mode=mode):
+                self.production_boot_stubs(('',), mode=mode, wire=False)
+
     def test_candidate_without_entry_point_publishes_named_refusal(self) -> None:
         self.production_boot_stubs(('',), candidate_change='missing')
 
@@ -220,7 +225,7 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
         self.assertEqual(reply.returncode, 0, reply.stdout + reply.stderr)
 
     def production_boot_stubs(self, failures: tuple[str, ...], *, candidate_change: str = '',
-                              mode: gate.SuiteMode = gate.SuiteMode.GATE) -> None:
+                              mode: gate.SuiteMode = gate.SuiteMode.GATE, wire: bool = True) -> None:
         stages = ['boot', 'tools ready', 'tools checked', 'source ready', 'tests start']
         for failure in failures:
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
@@ -238,7 +243,7 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
                 self.assertFalse((library / 'python_startup/sitecustomize.py').exists())
                 _ = (library / 'cancellation.py').write_bytes((ROOT / 'scripts/lib/cancellation.py').read_bytes())
                 _ = (repo / 'scripts/production/merge_gate.py').write_text(
-                    'from types import SimpleNamespace\nfrom enum import Enum\nimport os\n'
+                    'from __future__ import annotations\nfrom types import SimpleNamespace\nfrom enum import Enum\nfrom typing import override\nimport os\n'
                     + inspect.getsource(gate.SuiteMode)
                     + 'WholeMachine = lambda times: times\nSelectedModules = tuple\n'
                     + 'gate_record = SimpleNamespace(GateTimeLimit=lambda seconds: seconds, NoGateTimeLimit=lambda reason: reason)\n'
@@ -324,7 +329,7 @@ else:
                     command.chmod(0o700)
                 (tools / 'python3').symlink_to(sys.executable)
                 links = {'production': 'true', 'gate_time_limit_s': '2.5', 'expires': '1800000000', 'step': 'size', 'region': 'us-west-2',
-                         'attempt': 'attempt', 'commit': 'a' * 40, 'tree': 'c' * 40, 'mode': mode.value,
+                         'attempt': 'attempt', 'commit': 'a' * 40, 'tree': 'c' * 40, 'mode': mode.wire if wire else mode.value,
                          'origin': 'https://example.invalid/repo.git', 'guest': 'https://fixture.invalid/requests/attempt.guest.py',
                          'source': 'https://fixture.invalid/source/snapshot.bundle',
                          'request': 'https://fixture.invalid/requests/attempt.json',
