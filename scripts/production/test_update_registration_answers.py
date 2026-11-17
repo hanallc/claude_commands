@@ -27,6 +27,128 @@ from scripts.production.staff_test_support import fixture_member
 
 
 class RegistrationTests(RegistrationFixture):
+    def test_native_reply_selects_the_open_followup_among_same_title_records(self) -> None:
+        for earlier_status in ('closed', 'open'):
+            with self.subTest(earlier_status=earlier_status):
+                self.write_open_for('example', {'since': '2026-10-06T08:00', 'text': 'retry?',
+                                               'question': 'Retry it?', 'asked_by': 'alpha'})
+                current_path = self.question_record_path('retry?')
+                earlier_text = current_path.read_text().replace('status: open\n', 'status: '+earlier_status+'\n', 1)
+                with mock.patch.dict(os.environ, self.env):
+                    scope = read_production('example')
+                    identities = registration.QuestionStaff.read()
+                    _ = registration.followup(scope, 'retry?', 'Check the current case.', identities=identities)
+                earlier_path = current_path.with_name('question-000-earlier.md')
+                _ = earlier_path.write_text(earlier_text)
+                before = earlier_path.read_bytes()
+                result = self.run_command('reply', '--item', 'retry?', '--text', 'The current case passes.',
+                                          env={**self.env, 'REVIEW_LINKS_ROOT': str(self.state/'reviews')})
+                self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+                self.assertIn('reply: ok', result.stdout)
+                self.assertEqual(earlier_path.read_bytes(), before)
+                current = registration.selected_question_records([current_path], (), None)[0]
+                self.assertEqual(current.status, 'open')
+                self.assertNotIn('followup', current.item)
+                self.assertEqual(current.item.get('followups', [])[-1],
+                                 {'followup': 'Check the current case.', 'reply': 'The current case passes.'})
+
+    def test_native_followup_accepts_a_reply_after_a_completed_review_exchange(self) -> None:
+        from scripts.review_links import change_page, review_items, review_page, test_review_page
+        case = test_review_page.ReviewPageTests('runTest')
+        case.setUp()
+        try:
+            key = case.question()
+            delivery, _ = review_page.submit(case.root, case.body(key, 'question', 'Check the Review case.'), case.status)
+            assert isinstance(delivery, change_page.MessageDelivery)
+            request = case.status.slots(delivery.page, delivery.row).question
+            assert isinstance(request, change_page.OpenQuestion)
+            change_page.deliver(delivery, case.status)
+            self.assertTrue(change_page.answer_item(key, 'The Review case passes.', request.question_id, case.status))
+            completed = case.status.slots(delivery.page, delivery.row).question
+            self.assertIsInstance(completed, change_page.AnsweredQuestion)
+            item = next(item for item in review_items.read(case.root) if item.key == key)
+            identities = registration.QuestionStaff.read()
+            scope = read_production('page-owner', identities.record)
+            _ = registration.followup(scope, item.title, 'Check the new native case.', identities=identities)
+            args = ['update_registration.py', 'reply', '--production', 'page-owner',
+                    '--item', item.title, '--text', 'The new native case passes.']
+            output = io.StringIO()
+            with mock.patch.object(sys, 'argv', args), mock.patch('sys.stdout', output):
+                result = registration.main()
+            self.assertEqual(result, 0, output.getvalue())
+            current = next(item for item in review_items.read(case.root) if item.key == key)
+            assert isinstance(current.source, review_items.QuestionSource)
+            self.assertEqual(current.state, review_items.ReviewState.FOR_YOU)
+            self.assertNotIn('followup', current.source.record.item)
+            self.assertEqual(current.source.record.item.get('followups', [])[-1],
+                             {'followup': 'Check the new native case.', 'reply': 'The new native case passes.'})
+            self.assertEqual(case.status.slots(delivery.page, delivery.row).question, completed)
+        finally:
+            case.doCleanups()
+
+    def test_native_reply_refuses_a_superseded_review_exchange(self) -> None:
+        from scripts.review_links import change_page, review_items, review_page, test_review_page
+        case = test_review_page.ReviewPageTests('runTest')
+        case.setUp()
+        try:
+            key = case.question()
+            old, _ = review_page.submit(case.root, case.body(key, 'question', 'Check the old case.'), case.status)
+            assert isinstance(old, change_page.MessageDelivery)
+            old_request = case.status.slots(old.page, old.row).question
+            assert isinstance(old_request, change_page.OpenQuestion)
+            change_page.deliver(old, case.status)
+            new, _ = review_page.submit(case.root, case.body(key, 'question', 'Check the new case.'), case.status)
+            assert isinstance(new, change_page.MessageDelivery)
+            new_request = case.status.slots(new.page, new.row).question
+            assert isinstance(new_request, change_page.OpenQuestion)
+            change_page.deliver(new, case.status)
+            item = next(item for item in review_items.read(case.root) if item.key == key)
+            assert isinstance(item.source, review_items.QuestionSource)
+            path = item.source.record.path
+            before = path.read_bytes()
+            args = ['update_registration.py', 'reply', '--production', 'page-owner',
+                    '--item', item.title, '--text', 'The old case passes.']
+            output = io.StringIO()
+            with mock.patch.object(sys, 'argv', args), mock.patch('sys.stdout', output):
+                result = registration.main()
+            self.assertEqual(result, 1, output.getvalue())
+            self.assertIn('this question id does not match the current question', output.getvalue())
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(case.status.slots(new.page, new.row).question, new_request)
+            with self.assertRaisesRegex(registration.StaleQuestionExchange,
+                                       'this question id does not match the current question'):
+                registration.reply_record(item.source.record, 'The old case passes.', 'page-owner',
+                    identities=registration.QuestionStaff.read(), question_id=old_request.question_id)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertTrue(change_page.answer_item(key, 'The new case passes.', new_request.question_id, case.status))
+            self.assertIsInstance(case.status.slots(new.page, new.row).question, change_page.AnsweredQuestion)
+            current = next(item for item in review_items.read(case.root) if item.key == key)
+            self.assertEqual(current.state, review_items.ReviewState.FOR_YOU)
+            self.assertNotIn('The old case passes.', path.read_text())
+            self.assertIn('The new case passes.', path.read_text())
+        finally:
+            case.doCleanups()
+
+    def test_reply_record_refuses_a_superseded_review_exchange(self) -> None:
+        from scripts.review_links import change_page, review_items, review_page, test_review_page
+        case = test_review_page.ReviewPageTests('runTest')
+        case.setUp()
+        try:
+            key = case.question()
+            for words in ('Check the old case.', 'Check the new case.'):
+                delivery, _ = review_page.submit(case.root, case.body(key, 'question', words), case.status)
+                change_page.deliver(delivery, case.status)
+            item = next(item for item in review_items.read(case.root) if item.key == key)
+            assert isinstance(item.source, review_items.QuestionSource)
+            before = item.source.record.path.read_bytes()
+            identities = registration.QuestionStaff.read()
+            with self.assertRaisesRegex(registration.StaleQuestionExchange,
+                                       'this question id does not match the current question'):
+                registration.reply_record(item.source.record, 'The old case passes.', 'page-owner', identities=identities)
+            self.assertEqual(item.source.record.path.read_bytes(), before)
+        finally:
+            case.doCleanups()
+
     def test_withdraw_removes_one_open_item_without_an_answer_or_relay_and_retains_its_history(self) -> None:
         self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "sync decision",
                                         "question": "Sync the document?", "asked_by": "alpha"},

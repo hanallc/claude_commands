@@ -4092,8 +4092,9 @@ class ChangePageTests(unittest.TestCase):
                         RuntimeError("interrupted before verdict")):
             interruption = isinstance(failure, RuntimeError)
             with self.subTest(failure=failure):
-                def fail_verdict(path: Path, row: str, verdict: str, production: Path) -> change_review.VerdictRefused:
-                    del path, row, verdict, production
+                def fail_verdict(path: Path, row: str, verdict: str, production: Path, *,
+                                 validation_id: str = '') -> change_review.VerdictRefused:
+                    del path, row, verdict, production, validation_id
                     if isinstance(failure, Exception):
                         raise failure
                     return failure
@@ -4119,10 +4120,11 @@ class ChangePageTests(unittest.TestCase):
         validation = status.slots(self.page, "C1").validation
         save = change_review.save_verdict
 
-        def interrupt_after_save(path: Path, row: str, verdict: str, production: Path) -> change_review.VerdictSaved | change_review.VerdictRefused:
+        def interrupt_after_save(path: Path, row: str, verdict: str, production: Path, *,
+                                 validation_id: str = '') -> change_review.VerdictSaved | change_review.VerdictRefused:
             self.assertEqual(status.slots(self.page, "C1").validation, validation)
             self.assertIsInstance(status.slots(self.page, "C1").verdict, change_page.DeliveryIntent)
-            result = save(path, row, verdict, production)
+            result = save(path, row, verdict, production, validation_id=validation_id)
             if isinstance(result, change_review.VerdictSaved):
                 raise RuntimeError("interrupted after verdict")
             return result
