@@ -816,8 +816,12 @@ class ReviewLinksServer(ThreadingHTTPServer):
         super().__init__(address, ReviewLinksHandler)
         recover_changes = change_page.recover_pending
         recover_list = list_page.recover_pending
+        self.delivery_status.startup_recovery_pending.set()
         def recover_pending() -> None:
-            recover_changes(self.delivery_status)
+            try:
+                recover_changes(self.delivery_status)
+            finally:
+                self.delivery_status.startup_recovery_pending.clear()
             recover_list()
         threading.Thread(target=recover_pending, daemon=True).start()
 
