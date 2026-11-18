@@ -29,6 +29,7 @@ class FakeAws:
     state: str = 'stopped'
     userdata: str = ''
     failure: str = ''
+    failure_stderr: str = 'private-provider-id signed-secret'
     lose_response: str = ''
     puts_before_timeout: int = -1
     spot_read_seconds: int = 0
@@ -49,7 +50,7 @@ class FakeAws:
             self.environments.append(env)
         value: dict[str, object] = {}
         if self.failure == operation:
-            return subprocess.CompletedProcess(list(arguments), 1, '', 'private-provider-id signed-secret')
+            return subprocess.CompletedProcess(list(arguments), 1, '', self.failure_stderr)
         if operation == 'describe-instances':
             if self.stop_during_instance_read_seconds:
                 self.clock.advance(self.stop_during_instance_read_seconds)
@@ -385,6 +386,79 @@ class HanaProviderTests(CostFixture):
         self.fake.failure = 'stop-instances'
         with self.assertRaisesRegex(provider.ProviderPending, '^Hana provider call failed: ec2:StopInstances$'):
             _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.STOP))
+
+    def test_cli_failure_reports_only_the_aws_error_code(self) -> None:
+        self.fake.failure = 'modify-instance-attribute'
+        self.fake.failure_stderr = (
+            'An error occurred (UnauthorizedOperation) when calling the ModifyInstanceAttribute operation: '
+            + 'You are not authorized to perform this operation. User: arn:aws:sts::000000000000:assumed-role/x '
+            + 'Encoded authorization failure message: abcDEF'
+        )
+        with self.assertRaises(provider.ProviderPending) as pending:
+            _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.BOOTSTRAP))
+        self.assertEqual(str(pending.exception), 'Hana provider call failed: ec2:ModifyInstanceAttribute (UnauthorizedOperation)')
+
+    def test_cli_failure_reports_a_code_after_the_error_prefix(self) -> None:
+        self.fake.failure = 'modify-instance-attribute'
+        self.fake.failure_stderr = (
+            '\naws: [ERROR]: An error occurred (UnauthorizedOperation) when calling the '
+            + 'ModifyInstanceAttribute operation: Fixture access is denied'
+        )
+        with self.assertRaises(provider.ProviderPending) as pending:
+            _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.BOOTSTRAP))
+        self.assertEqual(str(pending.exception), 'Hana provider call failed: ec2:ModifyInstanceAttribute (UnauthorizedOperation)')
+
+    def test_cli_failure_reports_a_code_when_retries_are_exhausted(self) -> None:
+        self.fake.failure = 'describe-instances'
+        self.fake.failure_stderr = (
+            'aws: [ERROR]: An error occurred (RequestLimitExceeded) when calling the '
+            + 'DescribeInstances operation (reached max retries: 2): Fixture request limit is exceeded'
+        )
+        with self.assertRaises(provider.ProviderPending) as pending:
+            _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.OBSERVE))
+        self.assertEqual(str(pending.exception), 'Hana provider call failed: ec2:DescribeInstances (RequestLimitExceeded)')
+
+    def test_cli_failure_omits_a_code_with_invalid_characters(self) -> None:
+        self.fake.failure = 'modify-instance-attribute'
+        self.fake.failure_stderr = 'An error occurred (unexpected/private) when calling the ModifyInstanceAttribute operation'
+        with self.assertRaises(provider.ProviderPending) as pending:
+            _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.BOOTSTRAP))
+        self.assertEqual(str(pending.exception), 'Hana provider call failed: ec2:ModifyInstanceAttribute')
+
+    def test_cli_failure_omits_key_and_account_like_codes(self) -> None:
+        self.fake.failure = 'describe-instances'
+        for token in ('AKIAFAKEFAKEFAKE', '000000000000', 'Client.AKIAFAKEFAKEFAKE'):
+            with self.subTest(token=token):
+                self.fake.failure_stderr = f'An error occurred ({token}) when calling the DescribeInstances operation'
+                with self.assertRaises(provider.ProviderPending) as pending:
+                    _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.OBSERVE))
+                self.assertEqual(str(pending.exception), 'Hana provider call failed: ec2:DescribeInstances')
+
+    def test_cli_failure_omits_a_header_after_other_text(self) -> None:
+        self.fake.failure = 'describe-instances'
+        self.fake.failure_stderr = (
+            'Fixture diagnostic\n'
+            + 'An error occurred (UnauthorizedOperation) when calling the DescribeInstances operation'
+        )
+        with self.assertRaises(provider.ProviderPending) as pending:
+            _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.OBSERVE))
+        self.assertEqual(str(pending.exception), 'Hana provider call failed: ec2:DescribeInstances')
+
+    def test_cli_failure_reports_a_dotted_aws_code(self) -> None:
+        self.fake.failure = 'describe-instances'
+        self.fake.failure_stderr = (
+            '\n  An error occurred (InvalidInstanceID.NotFound) when calling the DescribeInstances operation: '
+            + 'Fixture instance is missing'
+        )
+        with self.assertRaises(provider.ProviderPending) as pending:
+            _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.OBSERVE))
+        self.assertEqual(str(pending.exception), 'Hana provider call failed: ec2:DescribeInstances (InvalidInstanceID.NotFound)')
+
+    def test_cli_timeout_reports_only_the_action(self) -> None:
+        self.fake.lose_response = 'modify-instance-attribute'
+        with self.assertRaises(provider.ProviderPending) as pending:
+            _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.BOOTSTRAP))
+        self.assertEqual(str(pending.exception), 'Hana provider call failed: ec2:ModifyInstanceAttribute')
 
     def test_scaler_environment_removes_inherited_admin_credentials(self) -> None:
         with mock.patch.dict('os.environ', {'AWS_ACCESS_KEY_ID': 'inherited-admin', 'AWS_SESSION_TOKEN': 'inherited-token'}):
