@@ -251,7 +251,9 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .wrow.wait .row-memory { align-self: start; margin-top: 6px; }
 .wrow.room::after { content: ""; position: absolute; bottom: 0; left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
 .walk-chart .queue-head { display: flex; align-items: flex-end; padding-bottom: 3px; box-sizing: border-box; }
-.queue-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.queue-title { display: flex; min-width: 0; white-space: nowrap; }
+.queue-title > :first-child { overflow: hidden; text-overflow: ellipsis; }
+.queue-title > :last-child { flex: none; white-space: pre; }
 .wrow.room::before { content: ""; position: absolute; top: var(--divider-top, 0px); left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
 .walk-table tr.wait { color: var(--ink-2); }
 .walk-table { min-width: 0; width: max-content; max-width: 100%; }
@@ -437,7 +439,7 @@ body.queue-unavailable .card { display: none; }
   </section>
 
   <section class="card">
-    <div class="walk-head"><span class="section-head" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span><div class="walk-tokens num" data-tip="tokens"><span>Tokens</span><dl id="walk-tokens"></dl></div></div>
+    <div class="walk-head"><span class="section-head" id="walk-title" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span><div class="walk-tokens num" data-tip="tokens"><span>Tokens</span><dl id="walk-tokens"></dl></div></div>
     <div class="walk-scroll"><div class="walk" id="walk"></div></div>
     <p class="pressure-reason" id="cap-reason"></p>
     <div class="walk-key">
@@ -1330,6 +1332,8 @@ function renderWalk(d) {
         `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) + '</tr>');
   };
   const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
+  const runningCount = ordered.filter(row => row.kind !== "mac-unavailable").length;
+  $("walk-title").textContent = `Running, in start order (${runningCount})`;
   const rows = [];
   if (d.ram.build_tools_bytes > 0) {
     cells("", "Build tools", "", "", null, "", null, "tools", "tools");
@@ -1346,16 +1350,15 @@ function renderWalk(d) {
   const columnClasses = ["place", "done", "step", "duration", "unit", "pid", "machine", "vcpus", "slot", "tokens"];
   tableRows.push(`<tr class="room" data-tip="room">${columnClasses.map(column => `<td class="${column}"></td>`).join("")}</tr>`);
   rows.push(`<div class="wrow room">${rowLabel("Free")}` + rowMemory("room") + `</div>`);
-  if (d.waiters.length) {
-    const units = d.queued_priority_units || [];
-    const title = !units.length ? "Queued, in order of submission"
-      : units.length === 1 ? `Queued, ${units[0]} first, then in submission order`
-      : `Queued, ${units.join(" followed by ")} and then in submission order`;
-    tableRows.push(`<tr class="queue-head">${columns("#", STEP_TABLE_HEADERS.waiting)}</tr>`);
-    const titleHtml = !units.length ? esc(title) : units.length === 1 ? `Queued, ${roleName(units[0])} first, then in submission order`
-      : `Queued, ${units.map(unit=>roleName(unit)).join(' followed by ')} and then in submission order`;
-    rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}">${titleHtml}</span></div>`);
-  }
+  const waitingCount = d.waiters.length;
+  if (waitingCount) tableRows.push(`<tr class="queue-head">${columns("#", STEP_TABLE_HEADERS.waiting)}</tr>`);
+  const units = waitingCount ? d.queued_priority_units || [] : [];
+  const title = !units.length ? "Queued, in order of submission"
+    : units.length === 1 ? `Queued, ${units[0]} first, then in submission order`
+    : `Queued, ${units.join(" followed by ")} and then in submission order`;
+  const titleHtml = !units.length ? esc(title) : units.length === 1 ? `Queued, ${roleName(units[0])} first, then in submission order`
+    : `Queued, ${units.map(unit=>roleName(unit)).join(' followed by ')} and then in submission order`;
+  rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}"><span>${titleHtml}</span><span> (${waitingCount})</span></span></div>`);
   let localPosition = 0;
   d.waiters.forEach((w, i) => {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
@@ -1555,7 +1558,7 @@ function placeMemoryBars(d) {
   const box = (left, size, className, tip = "") => size > 0
     ? `<div class="b ${className}" ${tip ? `data-tip="${tip}"` : ""} style="left:${left}px;width:${size}px"></div>` : "";
   // A local bar stops at the cap line; a bar that the cap cuts shows a cap-colored end.
-  const chartEdge = !hasCap(d) ? width : progressEnd;
+  const chartEdge = hasCap(d) ? width * capEnd(d) : width;
   const capBox = (left, size, className) => {
     const drawn = Math.min(size, chartEdge - left);
     return box(left, drawn, drawn < size ? `${className} over-cap` : className);

@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import base64
 import fcntl
 from io import StringIO
 import json
 from pathlib import Path
 import subprocess
+import time
 from typing import cast, override
 from unittest import mock
 from urllib.parse import urlsplit
@@ -16,7 +17,7 @@ from urllib.parse import urlsplit
 from scripts.aws_target import aws_target, hana_box as box, hana_guest, hana_provider as provider, hana_receiver, deploy, ledger
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture
-from scripts.aws_target.test_hana_box import write_lifecycle_configuration
+from scripts.aws_target.test_hana_box import record_lifecycle_image, write_lifecycle_configuration
 from scripts.lib import conf
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -31,6 +32,7 @@ class FakeAws:
     failure: str = ''
     failure_stderr: str = 'private-provider-id signed-secret'
     lose_response: str = ''
+    put_error_after_save: str = ''
     puts_before_timeout: int = -1
     spot_read_seconds: int = 0
     stop_during_instance_read_seconds: int = 0
@@ -60,6 +62,7 @@ class FakeAws:
                 self.clock.advance(self.stop_during_instance_read_seconds)
                 self.state = 'stopped'
             value = {'Reservations': [{'Instances': [{'InstanceId': IDENTITY.instance, 'SpotInstanceRequestId': IDENTITY.spot_request,
+                'ImageId': 'fixture-image',
                 'State': {'Name': self.state}, 'LaunchTime': 'fixture-launch',
                 'Tags': [{'Key': 'HanaDeployment', 'Value': self.ownership}, {'Key': 'Workload', 'Value': 'hana'}]}]}]}
         elif operation == 'describe-spot-instance-requests':
@@ -84,6 +87,8 @@ class FakeAws:
                     raise subprocess.TimeoutExpired('fixture put', timeout)
                 self.puts_before_timeout -= 1
                 self.objects[key] = ledger.mapping(cast(object, json.loads(Path(arguments[arguments.index('--body') + 1]).read_text())))
+                if self.put_error_after_save:
+                    return subprocess.CompletedProcess(list(arguments), 1, '', self.put_error_after_save)
             elif key in self.objects:
                 _ = Path(arguments[-3]).write_text(json.dumps(self.objects[key]))
             else:
@@ -103,7 +108,8 @@ class HanaProviderTests(CostFixture):
     def __init__(self, methodName: str = 'runTest') -> None:
         super().__init__(methodName)
         self.fake: FakeAws = FakeAws(self.clock)
-        self.provider: provider.AwsHanaProvider = provider.AwsHanaProvider(aws_target.AwsCli('', '', 1, self.fake), Path(), '', 1)
+        self.provider: provider.AwsHanaProvider = provider.AwsHanaProvider(aws_target.AwsCli('', '', 1, self.fake),
+            Path(), '', 1, result_transfer_timeout_s=83)
 
     @override
     def setUp(self) -> None:
@@ -115,7 +121,7 @@ class HanaProviderTests(CostFixture):
         settings = conf.read(self.workload)
         self.provider = provider.AwsHanaProvider(aws_target.AwsCli('fixture-scaler', IDENTITY.region,
             settings.whole('aws_timeout_s'), self.fake), self.state, 'fixture-bucket',
-            settings.whole('control_url_seconds'), clock=self.clock)
+            settings.whole('control_url_seconds'), result_transfer_timeout_s=83, clock=self.clock)
 
     def operation(self, action: box.Action) -> box.PendingOperation:
         return box.PendingOperation(action, 'fixture-' + action.value, self.clock.now, 1)
@@ -130,6 +136,11 @@ class HanaProviderTests(CostFixture):
             self.assertIsInstance(result, box.OperationAccepted)
         descriptor = ledger.mapping(cast(object, json.loads(base64.b64decode(self.fake.userdata))))
         self.assertEqual(descriptor['start_token'], start.token)
+        from scripts.aws_target import test_hana_execution
+
+        key = test_hana_execution.HanaExecutionTests().key
+        key = replace(key, generation=replace(key.generation, deployment=IDENTITY.deployment, start_token=start.token))
+        self.assertEqual(self.provider.boot_control_deadline(key), descriptor['expires'])
         prefix = 'control/' + IDENTITY.deployment + '/' + start.token
         self.fake.objects[prefix + '/report.json'] = {'deployment': IDENTITY.deployment,
             'start_token': start.token, 'boot_id': 'fixture-boot', 'at': self.clock.now}
@@ -186,9 +197,92 @@ class HanaProviderTests(CostFixture):
         observation = fixture.objects.observe_execution(request.key)
         observation_key = urlsplit(access.observation_url).path.lstrip('/')
         self.fake.objects[observation_key] = ledger.mapping(cast(object, json.loads(hana_execution.encode_observation(observation))))
-        self.assertEqual(self.provider.observe_execution(request.key), observation)
+        for timeout in (3, 15):
+            with self.subTest(timeout=timeout):
+                self.assertEqual(self.provider.observe_execution(request.key, timeout_s=timeout), observation)
+                self.assertEqual(self.fake.calls[-1], ('s3api', 'get-object', min(timeout, 10)))
         self.assertTrue(all(operation in provider.PROVIDER_OPERATIONS or operation == 'export-credentials'
                             for _, operation, _ in self.fake.calls))
+
+    def test_result_download_uses_its_own_limit_and_reports_a_timeout(self) -> None:
+        from scripts.aws_target import hana_result, test_hana_execution as fixtures
+
+        _ = (self.state / 'hana').mkdir()
+        _ = (self.state / 'hana' / 'setup.json').write_text('{"bucket":"fixture-bucket"}')
+        subject = provider.AwsHanaProvider.from_settings(self.settings, self.state, self.workload, execute=self.fake,
+            credentials_file=lambda: self.root / 'private-credentials')
+        fixture = fixtures.HanaExecutionTests()
+        access = subject.execution_access(fixture.key)
+        result_key = urlsplit(access.result_url).path.lstrip('/')
+        document = hana_result.encode_result(fixture.command_result())
+        self.fake.objects[result_key] = ledger.mapping(cast(object, json.loads(document)))
+        self.assertEqual(hana_result.decode_result(subject.execution_result(fixture.key)), fixture.command_result())
+        for name, expected_error, seconds in (
+                ('result', hana_result.HanaResultDownloadTimedOut, 83), ('observation', provider.ProviderPending, 10)):
+            with self.subTest(name=name):
+                if name == 'observation':
+                    observation_key = urlsplit(access.observation_url).path.lstrip('/')
+                    self.fake.objects[observation_key] = {}
+                self.fake.lose_response = 'get-object'
+                with self.assertRaises(expected_error) as failure:
+                    if name == 'result':
+                        _ = subject.execution_result(fixture.key)
+                    else:
+                        _ = subject.observe_execution(fixture.key)
+                self.assertEqual(self.fake.calls[-1], ('s3api', 'get-object', seconds))
+                self.assertNotIn('private-provider-id', str(failure.exception))
+                if name == 'result':
+                    self.assertIn('83 s (result_transfer_timeout_s)', str(failure.exception))
+
+    def test_fence_put_errors_require_acknowledgement_or_window_expiry(self) -> None:
+        from scripts.aws_target import hana_execution as execution, test_hana_execution as fixtures
+
+        for response, saved in (('timeout', True), ('403', False), ('AccessDenied', False), ('AccessDenied', True)):
+            with self.subTest(response=response, saved=saved):
+                fixture = fixtures.HanaExecutionTests()
+                fixture.root = self.root / f'{response}-{saved}'
+                _ = fixture.dispatch()
+                access = self.provider.execution_access(fixture.key)
+                observation_key = urlsplit(access.observation_url).path.lstrip('/')
+                generation = fixture.key.generation
+                fence_key = f'control/{generation.deployment}/{generation.start_token}/fence.json'
+                self.fake.objects.clear()
+                self.fake.calls.clear()
+                self.fake.failure = '' if saved else 'put-object'
+                self.fake.lose_response = 'put-object' if response == 'timeout' else ''
+                retries = ' (reached max retries: 1)' if saved else ''
+                self.fake.failure_stderr = (
+                    f'aws: [ERROR]: An error occurred ({response}) when calling the PutObject operation{retries}: fixture')
+                self.fake.put_error_after_save = self.fake.failure_stderr if saved and response != 'timeout' else ''
+                current = 1000.0
+                observation = replace(fixture.objects.observe_execution(fixture.key),
+                                      fenced=True, terminated=True, lease_free=True)
+
+                def advance(seconds: float) -> None:
+                    nonlocal current
+                    current += seconds
+                    if saved:
+                        self.assertEqual(self.fake.objects[fence_key]['action'], 'fence')
+                        self.fake.objects[observation_key] = ledger.mapping(
+                            cast(object, json.loads(execution.encode_observation(observation))))
+
+                window = execution.FenceAcknowledgementWindow(1002.5, 1)
+                with (mock.patch.object(time, 'monotonic', side_effect=lambda: current),
+                      mock.patch.object(time, 'sleep', side_effect=advance)):
+                    settled = execution.settle_execution(fixture.root, fixture.request, self.provider,
+                        release_claim=fixture.release, reason='The remote attempt ended', fence_window=window)
+                operations = [operation for service, operation, _ in self.fake.calls if service == 's3api']
+                if saved:
+                    self.assertIsInstance(settled, execution.HanaSettled)
+                    self.assertEqual(current, 1001)
+                    self.assertEqual(fixture.releases, 1)
+                    self.assertEqual(operations, ['put-object', 'get-object', 'get-object'])
+                else:
+                    self.assertIsInstance(settled, execution.HanaSettlementPending)
+                    self.assertEqual(current, window.deadline)
+                    self.assertEqual(fixture.releases, 0)
+                    self.assertEqual(operations, ['put-object', 'get-object', 'get-object', 'get-object'])
+                    self.assertTrue(execution.claim_dispatch_pending(fixture.root, fixture.reference))
 
     def test_execution_observation_rejects_oversized_objects(self) -> None:
         from scripts.aws_target import hana_execution, test_hana_execution as fixtures
@@ -213,6 +307,7 @@ class HanaProviderTests(CostFixture):
         book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'fixture inventory', True))
         book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'fixture account inventory'))
         controller.register(IDENTITY)
+        _ = record_lifecycle_image(self.state, self.workload)
         _ = controller.request('fixture-execution')
         self.assertEqual(controller.tick(), box.Lifecycle.STARTING)
         self.fake.lose_response = 'start-instances'
@@ -241,6 +336,7 @@ class HanaProviderTests(CostFixture):
         book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'fixture inventory', True))
         book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'fixture account inventory'))
         controller.register(IDENTITY)
+        _ = record_lifecycle_image(self.state, self.workload)
         _ = controller.request('fixture-execution')
         self.assertEqual(controller.tick(), box.Lifecycle.STARTING)
         self.clock.advance(1)
@@ -276,6 +372,7 @@ class HanaProviderTests(CostFixture):
         book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'fixture inventory', True))
         book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'fixture account inventory'))
         controller.register(IDENTITY)
+        _ = record_lifecycle_image(self.state, self.workload)
         _ = controller.request('fixture-execution')
         self.fake.failure = 'put-object'
         self.fake.userdata = 'fixture-old-data'
