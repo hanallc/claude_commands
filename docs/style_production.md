@@ -243,9 +243,13 @@ One ticket per phase:
   Structure tickets opened before this change keep their crate cells until
   they merge.
 
-Run tier D first. Structure crates are taken in order of the other-family
-pending cells they block inside a unit's pilot scope, most first, so a crate
-blocking a pilot unit comes first. A repair phase always precedes a new ticket.
+Refill starts with tier D structure work. After a structure ticket, refill
+selects one ready build ticket for approved findings. If no build ticket is
+ready, refill continues with structure work. A build waits while any file it
+edits has pending or open structure work.
+Refill ranks structure crates by the number of pending cells they block in
+other families within the unit's pilot scope. A repair phase always precedes a
+new ticket.
 After an interruption, read assigned tickets with
 `style_ledger.py ticket open --repo <checkout> --unit <unit>`.
 Run `next-phase --session-dir <run folder>` to restore each ticket's phase and worker.
@@ -330,7 +334,8 @@ Refill only the unit worktree's own plan copy:
 ```
 
 Refill selects only from the unit's configured families.
-It takes tier D work first, then crates that block the most cells.
+Refill alternates tier D structure tickets with ready build tickets for approved findings.
+Structure work continues when no build is ready.
 Family rank orders the remaining work. A unit never borrows another owner's family.
 Selection checks rule versions, pilot scope, busy files, sync state and open-ticket footprints.
 When the owned families have no available work, refill reports their hold reasons and waits.
