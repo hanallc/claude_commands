@@ -22,7 +22,8 @@ import subprocess
 import sys
 import time
 import threading
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping
+from contextlib import contextmanager
 from enum import Enum
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -34,7 +35,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 STARTED_NS = time.time_ns()
 
 from scripts.disks import disks_page, sessions, slots
-from scripts.lib import conf
+from scripts.lib import conf, scratch
 from scripts.production import change_routing, change_review
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_page
 from scripts.review_links import question_record
@@ -116,6 +117,15 @@ class TailscaleAddressLost(RuntimeError):
 
 class CodeChanged(RuntimeError):
     """A loaded module changed and the server must restart."""
+
+
+class FixtureStoreRemoved(Exception):
+    """The List fixture folder was removed."""
+
+
+class ServerMode(Enum):
+    LIVE = "live console"
+    LIST_FIXTURE = "List fixture"
 
 
 class ModuleStampUnavailable(Enum):
@@ -251,8 +261,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
 
     @override
     def send_head(self) -> BinaryIO | None:
-        root = cast(ReviewLinksServer, self.server).root
+        server = cast(ReviewLinksServer, self.server)
+        root = server.root
         route = urlsplit(self.path)
+        if server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH:
+            self.send_error(404)
+            return None
         if route.path == f"/{change_page.CONSOLE_FOLDER}":
             self.redirect(f"/{change_page.CONSOLE_FOLDER}/" + (f"?{route.query}" if route.query else ""))
             return None
@@ -319,7 +333,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         if route.path == list_page.PAGE_PATH:
             try:
-                content = list_page.render(root)
+                with server.list_store_access():
+                    content = list_page.render(root, include_counts=server.mode is ServerMode.LIVE)
             except (OSError, ValueError) as error:
                 print(f"review-links list: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The List page is not available.</p>"))
@@ -469,6 +484,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         server = cast(ReviewLinksServer, self.server)
+        if server.mode is ServerMode.LIST_FIXTURE and urlsplit(self.path).path != list_page.PAGE_PATH:
+            self.send_error(404)
+            return
         try:
             if server.bound_address != tailscale_ip():
                 self.html_response(403, change_page.document("<p>Open this page through this machine's Tailscale address.</p>"))
@@ -677,15 +695,24 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if not 0 < length <= 100000:
                 raise ValueError("invalid List request size")
             body = self.rfile.read(length).decode("utf-8")
-            delivery = list_page.submit(server.root, body, server.delivery_status)
+            fields = parse_qs(body)
+            if server.mode is ServerMode.LIST_FIXTURE and fields.get("action") != ["remove"]:
+                raise ValueError("Only Remove is available in this demo.")
+            with server.list_store_access():
+                delivery = list_page.submit(server.root, body, server.delivery_status)
+                fixture_reply = ({"state": "saved",
+                    **list_page.saved_action_state(fields["keeper"][0], fields["id"][0])}
+                    if server.mode is ServerMode.LIST_FIXTURE else None)
         except ValueError as error:
             self.browser_failure(400, str(error), error)
             return
         except OSError as error:
             self.browser_failure(503, "The List request could not be saved. Try again.", error)
             return
+        if fixture_reply is not None:
+            self.json_response(200, fixture_reply)
+            return
         try:
-            fields = parse_qs(body)
             state = {"read": "read", "question": "saved"}.get(fields["action"][0], "sent")
             self.json_response(200, {"state": state,
                 **list_page.saved_action_state(fields["keeper"][0], fields["id"][0])})
@@ -817,9 +844,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
 
 
 class ReviewLinksServer(ThreadingHTTPServer):
-    def __init__(self, address: tuple[str, int], root: Path) -> None:
+    def __init__(self, address: tuple[str, int], root: Path, *, mode: ServerMode = ServerMode.LIVE) -> None:
         settings = conf.read("review_links")
-        self.root: Path = root.resolve()
+        self.mode: ServerMode = mode
+        self.store_folder: Path = root.resolve()
+        # Use relative paths in the fixture process so a request cannot recreate the store after removal.
+        self.root: Path = Path(".") if mode is ServerMode.LIST_FIXTURE else self.store_folder
         self.bound_address: str = address[0]
         self.delivery_status: change_page.DeliveryStatus = change_page.DeliveryStatus(self.root)
         self.branch_deletions: set[Path] = set()
@@ -829,8 +859,11 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.next_sweep: float = time.monotonic() + settings.number("snapshot_sweep_seconds")
         self.next_code_check: float = time.monotonic() + settings.number("code_check_seconds")
         self.module_stamps: dict[Path, tuple[int, int] | ModuleStampUnavailable] = loaded_module_stamps()
-        _ = sweep_snapshots(self.root, time.time())
+        if mode is ServerMode.LIVE:
+            _ = sweep_snapshots(self.root, time.time())
         super().__init__(address, ReviewLinksHandler)
+        if mode is ServerMode.LIST_FIXTURE:
+            return
         recover_changes = change_page.recover_pending
         recover_list = list_page.recover_pending
         self.delivery_status.startup_recovery_pending.set()
@@ -841,6 +874,20 @@ class ReviewLinksServer(ThreadingHTTPServer):
                 self.delivery_status.startup_recovery_pending.clear()
             recover_list()
         threading.Thread(target=recover_pending, daemon=True).start()
+
+    @contextmanager
+    def list_store_access(self) -> Generator[None]:
+        """Keep fixture file access separate from scratch removal."""
+        if self.mode is ServerMode.LIVE:
+            yield
+            return
+        try:
+            with scratch.directory_record_lock(self.store_folder, wait=False) as locked:
+                if not locked or not self.root.samefile(self.store_folder):
+                    raise OSError("The List fixture folder is unavailable.")
+                yield
+        except scratch.ScratchError as error:
+            raise OSError(str(error)) from error
 
     @override
     def server_bind(self) -> None:
@@ -857,6 +904,14 @@ class ReviewLinksServer(ThreadingHTTPServer):
 
     @override
     def service_actions(self) -> None:
+        if self.mode is ServerMode.LIST_FIXTURE:
+            try:
+                present = self.root.samefile(self.store_folder)
+            except FileNotFoundError:
+                present = False
+            if not present:
+                raise FixtureStoreRemoved()
+            return
         now = time.monotonic()
         if now >= self.next_tailscale_check:
             settings = conf.read("review_links")
@@ -894,19 +949,34 @@ class ReviewLinksServer(ThreadingHTTPServer):
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--port", type=int, default=conf.read("review_links").whole("server_port"), help="override the configured server port")
+    _ = parser.add_argument("--list-fixture", type=Path, help="serve a private List store and exit when its folder is removed")
     args = parser.parse_args(arguments)
+    fixture = cast(Path | None, args.list_fixture)
     try:
-        address = tailscale_ip()
-        root = change_routing.review_root()
-        root.mkdir(parents=True, exist_ok=True)
-        with ReviewLinksServer((address, cast(int, args.port)), root) as server:
-            print(f"review-links: serving {root} on {address}:{server.server_port}", flush=True)
+        if fixture is not None:
+            fixture = fixture.expanduser().absolute()
+            if not fixture.is_dir():
+                raise ValueError(f"List fixture folder is missing or is not a directory: {fixture}")
+            fixture = fixture.resolve(strict=True)
+        address = tailscale_ip(), cast(int, args.port)
+        if fixture is None:
+            root = change_routing.review_root()
+            root.mkdir(parents=True, exist_ok=True)
+            service = ReviewLinksServer(address, root)
+        else:
+            root = fixture
+            os.chdir(root)
+            os.environ.update(REVIEW_LINKS_ROOT=".", SHOWRUNNER_STATE_DIR="records", STAFF_FILE="staff.json",
+                              CHANGE_REVIEW_DIR="reviews", REBUILD_NEEDS_DIR="rebuild-needs")
+            service = ReviewLinksServer(address, root, mode=ServerMode.LIST_FIXTURE)
+        with service as server:
+            print(f"review-links: serving {root} on {address[0]}:{server.server_port}", flush=True)
             try:
                 server.serve_forever()
             except CodeChanged as error:
                 print(f"review-links: {error}", file=sys.stderr)
                 restart(server)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, FixtureStoreRemoved):
         return 0
     except (OSError, ValueError, subprocess.SubprocessError, TailscaleAddressLost) as error:
         print(f"review-links: {error}", file=sys.stderr)

@@ -88,6 +88,95 @@ class ListPageTests(unittest.TestCase):
         self.assertIn('.list-table .record-id{white-space:nowrap;overflow-wrap:normal;width:1%}', body)
         self.assertIn('.list-toggle{white-space:nowrap}', body)
 
+    def test_bulk_controls_show_lucide_icons_and_accessible_labels(self) -> None:
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        header = markup.split('data-record-filters>', 1)[1].split('<span data-list-count', 1)[0]
+        for label, icon in (("Expand all", "chevrons-up-down"), ("Collapse all", "chevrons-down-up")):
+            with self.subTest(label=label):
+                self.assertRegex(header, rf'<button\b[^>]*aria-label="{label}"[^>]*>\s*<svg\b')
+                control = header.split(f'aria-label="{label}"', 1)[1].split('</button>', 1)[0]
+                self.assertIn(f'title="{label}"', control)
+                self.assertIn(f'class="lucide lucide-{icon}"', control)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_expands_only_items_that_match_show_chips_and_words(self) -> None:
+        for title in ("Deploy alpha", "Deploy beta", "Inspect logs"):
+            _ = self.add(title, the_list.ItemState.WAITING_FOR_NATE)
+        _ = self.add("Deploy gamma", the_list.ItemState.WAITING_FOR_NATE, owner=OTHER.id)
+        _ = self.add("Deploy delta")
+        self.browser_bulk_expansion(r'''
+ chip('show','needs-me').click();
+ chip('owner',OWNER).click();
+ const words=document.querySelector('#list-search');
+ const filtered=new Promise(resolve=>words.addEventListener('filterchange',resolve,{once:true}));
+ words.value='deploy';words.dispatchEvent(new Event('input'));
+ await filtered;
+ check(rows.filter(row=>!row.hidden).length===2,'Two items match all filters.');
+ document.querySelector('[aria-label="Expand all"]').click();
+ for(const row of rows) check(isExpanded(row,!row.hidden),'Expand all leaves hidden items closed.');
+'''.replace('OWNER', json.dumps(OWNER.id)))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_collapses_shown_items_and_preserves_hidden_items(self) -> None:
+        _ = self.add("Deploy alpha")
+        _ = self.add("Deploy beta")
+        _ = self.add("Deploy gamma", owner=OTHER.id)
+        self.browser_bulk_expansion(r'''
+ for(const row of rows) row.querySelector('.list-toggle').click();
+ check(rows.every(row=>isExpanded(row,true)),'All items start open.');
+ chip('owner',OWNER).click();
+ check(rows.filter(row=>!row.hidden).length===2,'Two items match the owner filter.');
+ document.querySelector('[aria-label="Collapse all"]').click();
+ for(const row of rows) check(isExpanded(row,row.hidden),'Collapse all leaves hidden items open.');
+ chip('owner','all').click();
+ check(rows.find(row=>row.dataset.owner!==OWNER).querySelector('[data-detail]').hidden===false,
+  'The hidden item remains open after the filter clears.');
+'''.replace('OWNER', json.dumps(OWNER.id)))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_bulk_controls_apply_words_before_the_search_timer_ends(self) -> None:
+        _ = self.add("Deploy alpha", number=1)
+        _ = self.add("Deploy beta", number=2)
+        self.browser_bulk_expansion(r'''
+ const alpha=rows.find(row=>row.dataset.number==='1'),beta=rows.find(row=>row.dataset.number==='2');
+ const words=document.querySelector('#list-search');
+ let changes=0;
+ words.addEventListener('filterchange',()=>changes++);
+ const search=value=>{words.value=value;words.dispatchEvent(new Event('input'));};
+ search('alpha');
+ document.querySelector('[aria-label="Expand all"]').click();
+ check(changes===0,'Expand all runs before the search timer fires.');
+ check(!alpha.hidden && isExpanded(alpha,true) && beta.hidden && isExpanded(beta,false),
+  'Expand all opens only the match for the new search.');
+ const cleared=new Promise(resolve=>words.addEventListener('filterchange',resolve,{once:true}));
+ search('');await cleared;
+ beta.querySelector('.list-toggle').click();
+ const beforeCollapse=changes;
+ search('beta');
+ document.querySelector('[aria-label="Collapse all"]').click();
+ check(changes===beforeCollapse,'Collapse all runs before the search timer fires.');
+ check(alpha.hidden && isExpanded(alpha,true) && !beta.hidden && isExpanded(beta,false),
+  'Collapse all closes only the match for the new search.');
+''')
+
+    def browser_bulk_expansion(self, steps: str) -> None:
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        probe = r'''<script>
+(async()=>{
+const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+const rows=[...document.querySelectorAll('[data-list-item]')];
+const chip=(group,value)=>document.querySelector('[data-filter-row="'+group+'"] [data-filter-value="'+value+'"]');
+const isExpanded=(row,expanded)=>row.querySelector('[data-detail]').hidden===!expanded &&
+ row.querySelector('.list-toggle').getAttribute('aria-expanded')===String(expanded);
+try{
+''' + steps + '''
+}catch(error){failures.push(String(error));}
+const result=document.createElement('p');
+result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
+})();
+</script>'''
+        self.browser_actions(markup, "", probe)
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_review_links_jump_inside_the_full_review_list(self) -> None:
         source = review_items.ChangeSource(self.root / "changes.md", {"#": "C1830", "How to check": "Read the card."},
@@ -818,10 +907,10 @@ frame.addEventListener('load',async()=>{
         _ = the_list.park(MORTY.id, item.id, the_list.time_value("2026-11-18T02:00:00+00:00"), source="nate")
         with self.subTest(view="table"):
             body = list_page.render(root).decode()
-            self.assertIn("Parked until 2026-11-17</small>", body)
-            self.assertIn("Parked until</dt><dd>2026-11-17</dd>", body)
+            self.assertIn("Parked until 2026-11-17 21:00 EST</small>", body)
+            self.assertIn("Parked until</dt><dd>2026-11-17 21:00 EST</dd>", body)
         with self.subTest(view="response"):
-            self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "2026-11-17")
+            self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "2026-11-17 21:00 EST")
 
     def test_old_closed_log_uses_the_closing_words_renderer(self) -> None:
         log = self.legacy_log("- 2026-11-16 18:10:00+00:00 Closed: The **check** passed. — nate")
@@ -841,6 +930,158 @@ frame.addEventListener('load',async()=>{
         self.assertIn("next_step: invalid", log)
         self.assertEqual(log.count("<dl>"), 1)
         self.assertIn("State</dt><dd>Done</dd>", log)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_list_log_fits_the_left_column_and_keeps_each_scroll_position(self) -> None:
+        for number in (1, 2):
+            item = self.add(f"Log for item {number}", number=number)
+            for update in range(18):
+                _ = the_list.update(MORTY.id, item.id, {"next_step": f"Check result {update}."}, source="morty")
+        _ = the_list.add(MORTY.id, "Short log", number=3, owner=OWNER.id, source="nate", changes={})
+        with patch.object(list_page, "counts_strip", return_value=""):
+            markup = list_page.render(self.root / "reviews").decode()
+        setup = r'''<script>
+const freshList=MARKUP;
+let reads=0;
+window.fetch=async()=>{reads++;return {ok:true,text:async()=>freshList};};
+</script>'''.replace('MARKUP', json.dumps(markup).replace('</', '<\\/'))
+        probe = r'''<script>
+(async()=>{
+const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
+const panel=number=>document.querySelector('[data-number="'+number+'"] .list-panel');
+const open=number=>document.querySelector('[data-number="'+number+'"] .list-toggle').click();
+const scrollArea=right=>right.querySelector('.list-log-scroll') ?? right.querySelector('.list-log');
+const height=node=>node.getBoundingClientRect().height;
+try{
+ for(const number of [1,2,3]) open(number);
+ const [left,right]=panel(1).children,log=scrollArea(right),heading=right.querySelector('h3');
+ right.style.display='none';
+ const naturalHeight=height(left);
+ right.style.display='';
+ check(height(right)===naturalHeight && height(left)===naturalHeight,'The left column sets the height of a long log.');
+ const headingTop=heading.getBoundingClientRect().top;
+ log.scrollTop=90;
+ check(log.scrollTop===90 && log.scrollHeight>log.clientHeight &&
+  heading.getBoundingClientRect().top===headingTop,'The long log scrolls below its fixed heading.');
+ const secondLog=scrollArea(panel(2).lastElementChild);
+ secondLog.scrollTop=45;
+ const shortLog=scrollArea(panel(3).lastElementChild);
+ check(shortLog.scrollHeight===shortLog.clientHeight && getComputedStyle(shortLog).overflowY==='auto',
+  'The short log fits without a scroll bar.');
+ const original=document.querySelector('[data-list]');
+ const replaced=new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{if(!original.isConnected){observer.disconnect();resolve();}});
+  observer.observe(original.parentNode,{childList:true});
+ });
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await replaced;
+ check(reads===1 && scrollArea(panel(1).lastElementChild).scrollTop===90 &&
+  scrollArea(panel(2).lastElementChild).scrollTop===45 && scrollArea(panel(3).lastElementChild).scrollTop===0,
+  'The shared refresh restores each open log position.');
+}catch(error){failures.push(String(error));}
+const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
+document.body.append(result);
+})();</script>'''
+        self.browser_actions(markup, setup, probe, window_size=(1440, 900))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_log_refresh_preserves_the_visible_entry_and_keeps_the_top_at_zero(self) -> None:
+        self.browser_log_refresh('''
+ open(1);open(2);
+ log(1).scrollTop=239;
+ const before=firstVisible(log(1));
+ check(before.offset<0 && log(1).scrollTop>0,'The first item starts partway through an entry.');
+ check(log(2).scrollTop===0,'The second item starts at the top.');
+ await refresh();
+ const after=firstVisible(log(1));
+ check(after.text===before.text && Math.abs(after.offset-before.offset)<=1,
+  'The first item keeps the same entry and offset after the new entry arrives.');
+ check(log(2).scrollTop===0 && firstVisible(log(2)).text.includes('New result for item 2.'),
+  'The second item stays at the top and shows the new entry.');
+''')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_log_refresh_restores_the_position_when_a_filter_reveals_the_item(self) -> None:
+        self.browser_log_refresh('''
+ open(1);
+ log(1).scrollTop=239;
+ const before=firstVisible(log(1));
+ const show=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]').click();
+ show('closed');
+ check(row(1).hidden,'The filter hides the expanded row.');
+ await refresh();
+ await refresh();
+ check(row(1).hidden,'The row stays hidden after both refreshes.');
+ show('open');
+ check(!row(1).hidden && !row(1).querySelector('[data-detail]').hidden,'The filter reveals the expanded row.');
+ const after=firstVisible(log(1));
+ check(after.text===before.text && Math.abs(after.offset-before.offset)<=1,
+  'The revealed log restores its entry and offset after two hidden refreshes.');
+''')
+
+    def browser_log_refresh(self, steps: str) -> None:
+        for number in (1, 2):
+            item = self.add(f"Log for item {number}", number=number)
+            for update in range(18):
+                _ = the_list.update(MORTY.id, item.id, {"next_step": f"Check result {update}."}, source="morty")
+        with patch.object(list_page, "counts_strip", return_value=""):
+            markup = list_page.render(self.root / "reviews").decode()
+            for number in (1, 2):
+                _ = the_list.update(MORTY.id, f"L{number}", {"next_step": f"New result for item {number}."}, source="morty")
+            fresh = list_page.render(self.root / "reviews").decode()
+        setup = r'''<script>
+const freshList=MARKUP;
+window.fetch=async()=>({ok:true,text:async()=>freshList});
+</script>'''.replace('MARKUP', json.dumps(fresh).replace('</', '<\\/'))
+        probe = r'''<script>
+(async()=>{
+const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
+const row=number=>document.querySelector('[data-number="'+number+'"]');
+const open=number=>row(number).querySelector('.list-toggle').click();
+const log=number=>row(number).querySelector('.list-log-scroll');
+function firstVisible(log){
+ const top=log.getBoundingClientRect().top;
+ const entry=[...log.querySelector('.list-log').children].find(entry=>entry.getBoundingClientRect().bottom>top);
+ return {text:entry.textContent,offset:entry.getBoundingClientRect().top-top};
+}
+function refresh(){
+ const original=document.querySelector('[data-list]');
+ return new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{if(!original.isConnected){observer.disconnect();resolve();}});
+  observer.observe(original.parentNode,{childList:true});
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ });
+}
+try{
+''' + steps + '''
+}catch(error){failures.push(String(error));}
+const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
+document.body.append(result);
+})();</script>'''
+        self.browser_actions(markup, setup, probe, window_size=(1440, 900))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_list_log_uses_the_configured_height_at_narrow_width(self) -> None:
+        item = self.add("Long log for a narrow view", number=1)
+        for update in range(18):
+            _ = the_list.update(MORTY.id, item.id, {"next_step": f"Check result {update}."}, source="morty")
+        for limit in (8, 12):
+            with self.subTest(limit=limit):
+                _ = write_config_fixture(self.root / "config/review_links.conf", f"list_log_max_height_rem={limit}\n")
+                with patch.object(list_page, "counts_strip", return_value=""):
+                    markup = list_page.render(self.root / "reviews").decode()
+                probe = r'''<script>
+document.querySelector('.list-toggle').click();
+const [left,right]=document.querySelector('.list-panel').children;
+const log=right.querySelector('.list-log-scroll') ?? right.querySelector('.list-log');
+const expected=LIMIT*parseFloat(getComputedStyle(document.documentElement).fontSize);
+const fits=right.getBoundingClientRect().top>=left.getBoundingClientRect().bottom &&
+ log.clientHeight===expected && log.scrollHeight>log.clientHeight;
+const result=document.createElement('p');result.id='probe-results';
+result.textContent=JSON.stringify(fits ? [] : ['The narrow log uses the configured height.']);
+document.body.append(result);
+</script>'''.replace('LIMIT', str(limit))
+                self.browser_actions(markup, "", probe, window_size=(500, 900))
 
     def test_log_entries_share_one_label_column(self) -> None:
         self.assertIn(".list-log dl{display:grid;grid-template-columns:min(7rem,42%) minmax(0,1fr)", list_page.STYLE)
@@ -922,11 +1163,12 @@ frame.addEventListener('load',async()=>{
         self.assertNotIn('<h3>Evidence</h3>', body)
         self.assertEqual(the_list.load(MORTY.id, items[0].id).evidence, items[0].evidence)
         self.assertEqual(body.count('<form method="post" data-feedback-form>'), 6)
-        self.assertEqual(body.count('value="read">Mark read</button>'), 6)
+        self.assertEqual(body.count('value="read">Mark read</button>'), 5)
         self.assertEqual([entry.item.number for entry in list_page.records()],
                          [item.number for item in sorted(the_list.records(MORTY.id, include_closed=True), key=the_list.order)])
         closed = body.split(f'data-key="{MORTY.id}/L54"', 1)[1].split('</tbody>', 1)[0]
         self.assertNotIn('Check overdue', closed)
+        self.assertNotIn('value="read">Mark read</button>', closed)
         with patch.dict(list_page.FIELD_LABELS, {"closing_words": "Recorded closing words"}):
             renamed = list_page.render(self.root / "reviews").decode()
         self.assertIn("<h3>Recorded closing words</h3>", renamed)
@@ -1095,7 +1337,7 @@ frame.addEventListener('load',async()=>{
         _ = the_list.close(MORTY.id, item.id, "## Closing\n\n**Closing field:** Closed.\n1. First\n2. Second", source="nate")
         body = list_page.render(self.root / "reviews").decode()
         next_step = body.split('<td data-label="Next step">', 1)[1].split('</td>', 1)[0]
-        details = body.split('<div class="list-panel"><div>', 1)[1].split('<section><h3>Log · newest first', 1)[0]
+        details = body.split('<div class="list-panel"><div>', 1)[1].split('<section class="list-log-panel"><h3>Log · newest first', 1)[0]
         self.assertNotIn('<h3>Evidence</h3>', details)
         self.assertNotIn('<h2>Evidence</h2>', details)
         self.assertEqual(the_list.load(MORTY.id, item.id).evidence, text("Evidence"))
@@ -1136,6 +1378,40 @@ frame.addEventListener('load',async()=>{
         self.assertEqual(console.news(root, pages, "changes"), ("list",))
         _ = the_list.mark_read(MORTY.id, item.id, source="nate")
         self.assertEqual(console.news(root, pages, "changes"), ())
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_unread_excludes_legacy_closed_records(self) -> None:
+        open_item = self.add("Open with an unread update", number=1)
+        closed = self.add("Closed with a stored unread time", number=2)
+        _ = the_list.close(MORTY.id, closed.id, "The report is retired.", source="nate")
+        _ = the_list.mark_read(MORTY.id, closed.id, source="nate")
+        path = the_list.folder(MORTY.id) / f"{closed.id}.md"
+        field = f'unread_since: {json.dumps(NOW.isoformat())}\n'
+        stored = path.read_text().replace('unread_since: ""\n', field, 1)
+        self.assertIn(field, stored)
+        _ = path.write_text(stored)
+        with patch.object(list_page, "counts_strip", return_value=""):
+            markup = list_page.render(self.root / "reviews").decode()
+        probe = '''<script>
+const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
+const chip=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]');
+const visible=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')];
+chip('unread').click();
+check(chip('unread').querySelector('b').textContent==='1','the Unread chip counts only the open item');
+check(visible().map(row=>row.dataset.number).join() === '1','the Unread view shows only the open item');
+check(document.querySelector('[data-list-count]').textContent.endsWith(' · 1 unread'),'the page total counts one unread item');
+chip('closed').click();
+const closed=visible()[0];
+check(closed?.dataset.number==='2','the closed record remains in Closed');
+check(closed?.querySelector('[aria-label="No unread update"]'),'the closed record has no unread dot');
+check(!closed?.querySelector('[value="read"]'),'the closed record has no Mark read button');
+const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
+document.body.append(result);
+</script>'''
+        self.browser_actions(markup, "", probe)
+        self.assertEqual(list_page.waiting_updates(console.NewsRequest(self.root)),
+                         frozenset({f"{MORTY.id}/{open_item.id}/{NOW.isoformat()}"}))
+        self.assertEqual(list_page.saved_action_state(MORTY.id, closed.id)["unread"], "false")
 
     def test_count_strip_colors_its_showrunner_with_the_page_name_reading(self) -> None:
         members = staff.StaffSnapshot((replace(OWNER, doc=staff.LiveDoc(local_machine(), self.root / "sdlc.md")),))
@@ -1307,6 +1583,75 @@ frame.addEventListener('load',async()=>{
             send.assert_called_once()
         self.assertEqual(the_list.load(MORTY.id, item.id), saved)
 
+    def test_park_saves_the_picked_instant_in_the_user_zone(self) -> None:
+        item = self.add("Park until a time")
+        root = self.root / "reviews"
+        until = "2026-12-04T00:30:00.000Z"
+        _ = list_page.submit(root, urlencode(self.fields(item, "park", until=until)))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved.parked_until, datetime(2026, 12, 4, 0, 30, tzinfo=UTC))
+        self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "2026-12-03 19:30 EST")
+        body = list_page.render(root).decode()
+        self.assertIn("Parked until 2026-12-03 19:30 EST</small>", body)
+        self.assertIn("Parked until</dt><dd>2026-12-03 19:30 EST</dd>", body)
+
+    def test_park_retry_compares_the_saved_instant_to_the_second(self) -> None:
+        item = self.add("Retry the exact parking time")
+        root = self.root / "reviews"
+        fields = self.fields(item, "park", until="2026-12-04T00:30:05Z")
+        with patch.object(change_page, "send_to_staff") as send:
+            list_page.deliver(list_page.submit(root, urlencode(fields)))
+            saved = the_list.load(MORTY.id, item.id)
+            with self.assertRaisesRegex(the_list.ListError, "different parking time"):
+                _ = list_page.submit(root, urlencode({**fields, "until": "2026-12-04T00:30:55Z"}))
+            same_time = {**fields, "until": "2026-12-03T19:30:05-05:00"}
+            list_page.deliver(list_page.submit(root, urlencode(same_time)))
+            send.assert_called_once()
+        self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+
+    def test_park_retry_accepts_a_legacy_date_only_record(self) -> None:
+        item = self.add("Retry a Park saved by the old page")
+        root = self.root / "reviews"
+        fields = self.fields(item, "park", until="2026-12-03")
+        request_fields = the_list._request_fields  # pyright: ignore[reportPrivateUsage]
+
+        def legacy_fields(request: the_list.PageRequest) -> dict[str, str]:
+            return {key: value for key, value in request_fields(request).items() if key != "parked_until"}
+
+        with (patch.object(the_list, "_request_fields", side_effect=legacy_fields),
+              patch.object(change_page, "send_to_staff") as send):
+            list_page.deliver(list_page.submit(root, urlencode(fields)))
+            later = datetime(2026, 12, 6, 5, tzinfo=UTC)
+            saved = the_list.park(MORTY.id, item.id, later, source="morty")
+            with patch.object(the_list, "now", return_value=datetime(2026, 12, 3, 5, tzinfo=UTC)):
+                list_page.deliver(list_page.submit(root, urlencode(fields)))
+            send.assert_called_once()
+        self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+
+    def test_park_retry_refuses_an_earlier_park_when_its_own_event_is_missing(self) -> None:
+        item = self.add("Retry a Park with missing evidence")
+        root = self.root / "reviews"
+        earlier = self.fields(item, "park", until="2026-12-03")
+        original = {**earlier, "request": earlier["request"] + "." + "a" * 32, "until": "2026-12-04"}
+        request_fields = the_list._request_fields  # pyright: ignore[reportPrivateUsage]
+
+        def legacy_fields(request: the_list.PageRequest) -> dict[str, str]:
+            return {key: value for key, value in request_fields(request).items() if key != "parked_until"}
+
+        with patch.object(the_list, "_request_fields", side_effect=legacy_fields):
+            _ = list_page.submit(root, urlencode(earlier))
+            _ = list_page.submit(root, urlencode(original))
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        body, marker, log = path.read_text().partition("## Log\n\n")
+        lines = log.splitlines()
+        self.assertIn('"action": "Parked"', lines[-2])
+        del lines[-2]
+        _ = path.write_text(body + marker + "\n".join(lines) + "\n")
+        saved = the_list.load(MORTY.id, item.id)
+        with self.assertRaisesRegex(the_list.ListError, "different parking time"):
+            _ = list_page.submit(root, urlencode({**original, "until": earlier["until"]}))
+        self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+
     def test_new_park_checks_the_date_at_the_locked_write(self) -> None:
         item = self.add("Refuse a Park that reaches the writer at midnight")
         root = self.root / "reviews"
@@ -1358,6 +1703,8 @@ window.fetch=async(_path,options={})=>{
   await choose('open','106');row('106').querySelector('.list-toggle').click();
   const removed=submit('106','remove');
   check(row('106').hidden,'Remove hides the row before the response');
+  check(row('106').dataset.unread==='false' && !row('106').querySelector('.list-dot') &&
+   !removed.querySelector('[value="read"]'),'Remove clears the unread controls before the response');
   check([...row('106').querySelectorAll('button')].every(button=>button.disabled),'Remove disables the row buttons');
   submit('106','remove');check(requests.length===1,'a second Remove press sends nothing');
   finishPost({item_state:'Closed',parked:'false'});await flush();await flush();
@@ -1368,6 +1715,8 @@ window.fetch=async(_path,options={})=>{
   const refused=submit('105','remove');check(row('105').hidden,'a refused Remove hides the row while pending');
   finishPost({ok:false,reason:'The fixture refuses this close.'});await flush();await flush();
   check(!row('105').hidden && row('105').dataset.state==='Working','a refused Remove restores the row');
+  check(row('105').dataset.unread==='true' && row('105').querySelector('.list-dot') &&
+   refused.querySelector('[value="read"]'),'a refused Remove restores the unread controls');
   check(refused.querySelector('[data-send-status]').textContent==='Not saved: The fixture refuses this close.','a refused Remove shows its reason');
   check(!refused.querySelector('[value="remove"]').disabled,'a refused Remove enables another attempt');
   refused.elements.until.value='2026-12-03';const parked=submit('105','park');
@@ -1400,6 +1749,139 @@ window.fetch=async(_path,options={})=>{
         self.browser_actions(markup, setup, probe, virtual_time_ms=3000)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_opens_the_shared_picker_and_submits_the_chosen_time(self) -> None:
+        self.browser_action_sequence(r"""
+ Date.now=()=>Date.parse('2026-12-02T13:00:00Z');
+ const toggle=form.querySelector('[data-later-toggle]');
+ check(!form.querySelector('input[type=date]'),'Park has no native date input');
+ toggle.click();
+ const sheet=form.querySelector('[data-later-custom]');
+ check(!sheet.hidden && !sheet.closest('[data-later-menu]').hidden,'Park opens the shared sheet');
+ check(document.activeElement.dataset.date==='2026-12-03','Focus starts on the selected date');
+ sheet.querySelector('[data-date="2026-12-03"]').click();
+ const field=sheet.querySelector('[data-later-time]');
+ field.value='1930';field.dispatchEvent(new Event('input',{bubbles:true}));
+ check(sheet.querySelector('[data-later-summary]').textContent==='Parks until Thu 3 Dec 19:30',
+  'The shared sheet shows the 24-hour time in the user zone');
+ check(!requests.length,'Changing the selection does not submit the form');
+ sheet.querySelector('[value="park"]').click();
+ check(sheet.hidden && requests.length===1,'Save closes the shared sheet and submits once');
+ check(requests[0]?.get('action')==='park' && requests[0].get('until')==='2026-12-04T00:30:00.000Z',
+  'Save sends the selected instant');
+ finishPost({item_state:'Working',parked:'true',parked_until:'2026-12-03 19:30 EST'});
+ await flush();
+ check(row.querySelector('[data-parked-note]').textContent==='Parked until 2026-12-03 19:30 EST',
+  'The row shows the saved time');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_focus_moves_to_the_calendar_when_previous_month_disables(self) -> None:
+        self.browser_action_sequence(r"""
+ Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
+ form.querySelector('[data-later-toggle]').click();
+ const previous=form.querySelector('[data-later-month-step="-1"]');
+ const grid=form.querySelector('[data-later-grid]');
+ previous.focus();
+ check(document.activeElement===previous,'Previous month has focus in December');
+ previous.click();
+ const day=grid.querySelector('button:not(:disabled)[tabindex="0"]');
+ check(previous.disabled && day?.dataset.date==='2026-11-30','November has an enabled day');
+ check(document.activeElement===day,'Focus moves from Previous month to the enabled day');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_retries_the_same_parking_time_after_it_passes(self) -> None:
+        self.browser_action_sequence(r"""
+ let now=Date.parse('2026-12-02T13:00:00Z');
+ Date.now=()=>now;
+ show('all');
+ const toggle=form.querySelector('[data-later-toggle]');
+ toggle.click();
+ const time=form.querySelector('[data-later-time]'),save=form.querySelector('[value="park"]');
+ time.value='1930';time.dispatchEvent(new Event('input',{bubbles:true}));
+ save.click();
+ const first=requests[0];
+ check(first?.get('until')==='2026-12-04T00:30:00.000Z','The first save sends the chosen instant');
+ losePost();await flush();
+ now=Date.parse('2026-12-05T13:00:00Z');
+ toggle.click();
+ check(time.value==='19:30' && !save.disabled,'The picker retains and enables the expired retry');
+ save.click();
+ check(requests.length===2 && requests[1].get('request')===first.get('request') &&
+  requests[1].get('until')===first.get('until'),'Save retries the same ID and instant');
+ if(requests.length===2){finishPost({parked:'false',parked_until:''});await flush();}
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_refusal_from_enter_restores_focus(self) -> None:
+        self.browser_action_sequence(r"""
+ Date.now=()=>Date.parse('2026-12-02T13:00:00Z');
+ const toggle=form.querySelector('[data-later-toggle]');
+ toggle.click();
+ const time=form.querySelector('[data-later-time]');
+ time.focus();
+ time.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+ check(requests.length===1 && row.hidden,'Enter submits Park and hides the row from Open');
+ finishPost({reason:'The fixture refuses Park'});
+ await flush();
+ for(const animation of document.getAnimations()) animation.finish();
+ await flush();
+ check(!row.hidden && !toggle.disabled && document.activeElement===toggle,
+  'The restored row returns focus to Park until');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_expired_park_retry_keeps_the_calendar_in_the_tab_order(self) -> None:
+        self.browser_action_sequence(r"""
+ let now=Date.parse('2026-12-02T13:00:00Z');
+ Date.now=()=>now;
+ show('all');
+ const toggle=form.querySelector('[data-later-toggle]'),grid=form.querySelector('[data-later-grid]');
+ const save=form.querySelector('[value="park"]');
+ toggle.click();
+ save.click();
+ const first=requests[0];
+ losePost();await flush();
+ now=Date.parse('2026-12-15T13:00:00Z');
+ toggle.click();
+ const entry=grid.querySelector('button:not(:disabled)[tabindex="0"]');
+ check(entry?.dataset.date==='2026-12-15','The calendar has an enabled day in the Tab order');
+ check(entry===document.activeElement && !save.disabled,'The calendar has focus and Save can retry');
+ document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+ now=Date.parse('2027-01-02T13:00:00Z');
+ toggle.click();
+ const nextMonth=grid.querySelector('button:not(:disabled)[tabindex="0"]');
+ check(nextMonth?.dataset.date==='2027-01-02','The calendar opens on an enabled month');
+ if(nextMonth){
+  nextMonth.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true,cancelable:true}));
+  check(document.activeElement.dataset.date==='2027-01-03','ArrowRight selects a new date from the focused day');
+  save.click();
+  check(requests[1]?.get('request')!==first.get('request') && requests[1]?.get('until')?.startsWith('2027-01-03'),
+   'The new date sends a new request');
+  if(requests.length===2){finishPost({parked:'true'});await flush();}
+ }
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_refusal_keeps_focus_on_search(self) -> None:
+        self.browser_action_sequence(r"""
+ Date.now=()=>Date.parse('2026-12-02T13:00:00Z');
+ form.querySelector('[data-later-toggle]').click();
+ const time=form.querySelector('[data-later-time]');
+ time.focus();
+ time.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+ check(requests.length===1 && row.hidden,'Enter submits Park and hides the row from Open');
+ finishPost({reason:'The fixture refuses Park'});
+ await flush();
+ const search=document.getElementById('list-search');
+ search.focus();
+ check(document.activeElement===search,'Search receives focus while the row returns');
+ for(const animation of document.getAnimations()) animation.finish();
+ await flush();
+ check(!row.hidden && document.activeElement===search,'A refused Park keeps focus on Search');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_reserves_a_lost_park_id_and_updates_the_saved_date_label(self) -> None:
         item = self.add("Change the parking date")
         _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
@@ -1428,7 +1910,7 @@ window.fetch=async(_path,options={})=>{
  const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
  const labels=()=>[...row.querySelectorAll('[data-label="State"] small')].map(note=>note.textContent);
  try{
-  check(labels().join() === 'Parked until 2026-11-18','starts with one saved date label');
+  check(labels().join() === 'Parked until 2026-11-18 13:00 EST','The row starts with one saved time label');
   form.elements.until.value='2026-12-03';
   const park=submit('park');losePost();await flush();
   check(submit('park')===park,'an exact Park retry keeps its request ID');
@@ -1476,12 +1958,12 @@ window.fetch=async(_path,options={})=>{
  check(first.id!==second.id,'each Park date gets its own request ID');
  const remove=submit('remove');
  check(remove.id!==second.id,'Remove uses its own request ID');
- finishPost({item_state:'Closed',parked:'true'});await flush();
+ finishPost({item_state:'Closed',parked:'true',unread:'false'});await flush();
  for(const [date,original] of [['2026-12-03',first],['2026-12-04',second]]){
   form.elements.until.value=date;
   const retry=submit('park');
   check(retry.id===original.id && retry.token===original.token,'Park retains the signed ID for '+date);
-  finishPost({item_state:'Closed',parked:'true'});await flush();
+  finishPost({item_state:'Closed',parked:'true',unread:'false'});await flush();
  }
 ''')
 
@@ -1494,6 +1976,7 @@ window.fetch=async(_path,options={})=>{
  row.querySelector('.list-row').click();
  check(row.querySelector('[data-detail]').hidden,'the user can close the details while waiting');
  losePost();await flush();
+ check(row.dataset.unread==='false' && !row.querySelector('.list-dot'),'a lost Remove keeps the row read');
  const hiddenStatus=document.querySelector('[data-hidden-action-status]');
  check(!hiddenStatus.hidden && hiddenStatus.textContent==='Item 1: Save not confirmed: Fixture lost response',
   'the table shows the lost response while the details are closed');
@@ -1502,6 +1985,30 @@ window.fetch=async(_path,options={})=>{
   'opening the details shows the inline notice only');
  row.querySelector('.list-toggle').click();
  check(!hiddenStatus.hidden,'closing the details restores the notice above the table');
+ submit('remove');finishPost({reason:'Fixture refuses Remove'});await flush();
+ check(row.dataset.state==='Working' && row.dataset.unread==='true' && row.querySelector('.list-dot'),
+  'a refused Remove retry restores the last saved unread state');
+''')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_bulk_controls_move_a_lost_remove_notice(self) -> None:
+        self.browser_action_sequence('''
+ show('all');
+ submit('remove');
+ losePost();await flush();
+ const above=document.querySelector('[data-hidden-action-status]');
+ const inline=form.querySelector('[data-send-status]');
+ const message='Save not confirmed: Fixture lost response';
+ const inlineOnly=()=>above.hidden && inline.textContent===message && inline.getClientRects().length>0;
+ const aboveOnly=()=>!above.hidden && above.textContent==='Item 1: '+message && !inline.getClientRects().length;
+ check(inlineOnly(),'The open row shows the warning only in its details.');
+ document.querySelector('[aria-label="Collapse all"]').click();
+ check(aboveOnly(),'Collapse all moves the warning above the table.');
+ const toggle=row.querySelector('.list-toggle');
+ toggle.click();toggle.click();
+ check(aboveOnly(),'Closing the row also moves the warning above the table.');
+ document.querySelector('[aria-label="Expand all"]').click();
+ check(inlineOnly(),'Expand all shows the warning only in the row details.');
 ''')
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -1643,6 +2150,83 @@ window.fetch=async(_path,options={})=>{
 ''')
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_remove_updates_the_unread_sort_before_refresh(self) -> None:
+        with patch.object(the_list, "now", return_value=NOW - timedelta(minutes=1)):
+            _ = self.add("An older unread update", number=2)
+        self.browser_action_sequence("""
+ show('all');
+ const sort=document.querySelector('[data-sort="7"]');sort.click();sort.click();
+ const first=()=>document.querySelector('[data-list-item]').dataset.number;
+ const updateKey=()=>JSON.parse(row.dataset.sortValues)[7];
+ const original=updateKey();
+ check(original>0 && first()==='1','the newest unread item sorts first');
+ submit('remove');
+ check(updateKey()===0 && first()==='2','a pending Remove sorts as read');
+ finishPost({reason:'Fixture refuses Remove'});await flush();
+ check(updateKey()===original && first()==='1','a refusal restores the exact Update sort key');
+ submit('remove');
+ finishPost({item_state:'Closed',parked:'false',unread:'false'});await flush();
+ check(updateKey()===0 && first()==='2','a confirmed Remove sorts as read without a refresh');
+""", reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_remove_refusal_restores_update_order_during_motion(self) -> None:
+        with patch.object(the_list, "now", return_value=NOW - timedelta(minutes=1)):
+            _ = self.add("An older unread update", number=2)
+        self.browser_action_sequence(r"""
+ const sort=document.querySelector('[data-sort="7"]');sort.click();sort.click();
+ const first=()=>document.querySelector('[data-list-item]:not([hidden])').dataset.number;
+ const animation=()=>document.querySelector('[data-record-motion]')?.getAnimations({subtree:true})[0];
+ const updateKey=()=>JSON.parse(row.dataset.sortValues)[7];
+ const original=updateKey();
+ check(original>0 && first()==='1','the newest unread item starts first');
+ submit('remove');
+ const exit=animation();
+ if(!exit) throw new Error('Remove must animate the exit.');
+ exit.pause();exit.currentTime=100;
+ check(row.hidden && updateKey()===0 && first()==='2','Remove clears the Update key during the exit');
+ finishPost({reason:'Fixture refuses Remove'});await flush();
+ const restore=animation();
+ check(!row.hidden && restore && restore!==exit,'the refusal reverses the exit animation');
+ check(updateKey()===original && first()==='1','the restored Update key puts the row first');
+ restore?.finish();await flush();
+ check(!animation() && first()==='1','the correct order remains after the animation');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_closed_response_clears_unread_without_a_sort_key(self) -> None:
+        self.browser_action_sequence(r"""
+ show('all');
+ const updateKey=()=>JSON.parse(row.dataset.sortValues)[7];
+ check(updateKey()>0 && row.querySelector('.list-dot'),'the item starts unread');
+ submit('remove');
+ finishPost({item_state:'Closed',unread:'true'});await flush();
+ check(row.dataset.state==='Closed' && row.dataset.unread==='false','the Closed item is read');
+ check(updateKey()===0,'the Closed item has a zero Update key');
+ check(!row.querySelector('.list-dot') && !form.querySelector('[value="read"]'),
+  'the Closed item has no unread controls');
+ show('unread');
+ check(row.hidden,'the Closed item stays out of Unread');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_refusal_restores_unread_after_a_lost_remove(self) -> None:
+        self.browser_action_sequence("""
+ const original=JSON.parse(row.dataset.sortValues)[7];
+ submit('remove');losePost();await flush();
+ show('closed');
+ check(!row.hidden && row.dataset.unread==='false','the unconfirmed Closed row is read');
+ form.elements.until.value='2026-12-03';
+ submit('park');
+ finishPost({reason:'Fixture refuses Park'});await flush();
+ show('unread');
+ check(!row.hidden && row.dataset.state==='Working','the refusal returns the Working row to Unread');
+ check(row.querySelector('.list-dot') && form.querySelector('[value="read"]'),
+  'the refusal restores the unread controls');
+ check(JSON.parse(row.dataset.sortValues)[7]===original,'the refusal restores the Update sort key');
+""", reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_collapses_and_refusal_restores_the_row(self) -> None:
         _ = self.add("Next item", number=2)
         self.browser_action_sequence(r"""
@@ -1676,7 +2260,7 @@ window.fetch=async(_path,options={})=>{
  check(row.hidden && secondExit && secondExit!==restored,'a second Remove reverses the restore');
  secondExit?.finish();await flush();
  check(!motion() && Math.abs(top(next)-first)<2,'the second Remove leaves the final layout intact');
- finishPost({item_state:'Closed'});await flush();
+ finishPost({item_state:'Closed',unread:'false'});await flush();
  show('closed');
  check(!row.hidden && !motion(),'a filter change shows the row at once');
 """)
@@ -1854,6 +2438,7 @@ const change=async path=>{
             _ = self.add("Test List action retries", number=1)
         with patch.object(list_page, "counts_strip", return_value=""):
             markup = list_page.render(self.root / "reviews").decode()
+        markup = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', markup, count=1)
         setup = '''<script>
 const requests=[];let finishPost,losePost;
 window.fetch=async(_path,options={})=>{
@@ -1889,11 +2474,13 @@ window.fetch=async(_path,options={})=>{
         self.browser_actions(markup, setup, probe, reduced_motion=reduced_motion)
 
     def browser_actions(self, markup: str, setup: str, probe: str, *,
-                        reduced_motion: bool = False, virtual_time_ms: int = 1500) -> None:
+                        reduced_motion: bool = False, virtual_time_ms: int = 1500,
+                        window_size: tuple[int, int] | None = None) -> None:
         page = self.root / 'actions.html'
         _ = page.write_text(markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>'))
         result = subprocess.run(['google-chrome', '--headless', '--no-sandbox', '--disable-gpu',
             *(['--force-prefers-reduced-motion'] if reduced_motion else []),
+            *([f'--window-size={window_size[0]},{window_size[1]}'] if window_size else []),
             '--user-data-dir=' + str(self.root / 'chrome-actions'), f'--virtual-time-budget={virtual_time_ms}',
             '--dump-dom', page.as_uri()], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -2165,8 +2752,8 @@ window.fetch=async(_path,options={})=>{
             latest = tuple(the_list.feedback_requests(alerted).values())[-1]
             self.assertEqual((latest.state, latest.alerted_to), ("alerted", "sdlc"))
             self.assertIn("not sent; sdlc told", without_role_colors(list_page.render(root).decode()))
-            _ = the_list.mark_read(MORTY.id, item.id, source="morty")
-            self.assertNotIn("not sent; sdlc told", without_role_colors(list_page.render(root).decode()))
+            self.assertEqual(the_list.mark_read(MORTY.id, item.id, source="morty"), alerted)
+            self.assertIn("not sent; sdlc told", without_role_colors(list_page.render(root).decode()))
         self.assertEqual(the_list.load(MORTY.id, item.id).state, the_list.ItemState.CLOSED)
 
     def test_failed_alert_keeps_feedback_pending_for_post_and_startup_retries(self) -> None:
@@ -2337,7 +2924,8 @@ try{
   check(document.querySelector('[data-sort="'+column+'"]').parentElement.getAttribute('aria-sort')==='ascending','sort column '+column);
  }
  select('show','needs-me');check(visible().length===1 && visible()[0].dataset.number==='58','Needs me');
- select('show','unread');check(visible().length===5,'Unread includes the saved unread updates');
+ select('show','unread');
+ check(visible().map(row=>row.dataset.number).sort().join() === '105,106,41,63','Unread excludes the closed item');
  select('show','done');check(visible().length===1 && visible()[0].dataset.number==='63','Done');
  select('show','parked');check(visible().length===1 && visible()[0].dataset.number==='41','Parked');
  select('show','closed');check(visible().length===1 && visible()[0].dataset.number==='54','Closed');
@@ -2442,6 +3030,14 @@ try{
  check(refreshed.querySelector('textarea').value==='Keep my draft','refresh keeps feedback words');
  check(!refreshed.querySelector('[value="tell"]').disabled,'a restored draft enables Tell morty');
  check(scrollY===100,'refresh keeps scroll');
+ check(refreshed!==selected,'refresh replaces the row');
+ document.querySelector('[aria-label="Expand all"]').click();
+ check(visible().length===2 && visible().every(row=>!row.querySelector('[data-detail]').hidden),
+  'Expand all opens both matching rows after refresh');
+ document.querySelector('[aria-label="Collapse all"]').click();
+ check(visible().length===2 && visible().every(row=>row.querySelector('[data-detail]').hidden),
+  'Collapse all closes both matching rows after refresh');
+ refreshed.querySelector('.list-toggle').click();
  realFeedback=true;loseResponse=true;
  const tellRow=rows().find(row=>row.dataset.number==='105');tellRow.querySelector('.list-toggle').click();
  check(tellRow.dataset.unread==='true' && tellRow.querySelector('[value="read"]'),'Tell starts with a fresh unread row');
