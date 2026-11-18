@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -100,9 +101,17 @@ def record_path(folder: Path) -> Path | None:
 
 def read_record(path: Path) -> Registered | NotRegistered | UnreadableRecord:
     try:
-        raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
-    except FileNotFoundError:
-        return NotRegistered()
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return NotRegistered()
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                return UnreadableRecord(f"repair record {path}: expected a regular file")
+            with os.fdopen(descriptor, encoding="utf-8", closefd=False) as record:
+                raw = cast(object, json.load(record))
+        finally:
+            os.close(descriptor)
     except (OSError, UnicodeError, ValueError) as error:
         return UnreadableRecord(f"repair record {path}: {error}")
     fields = cast(dict[str, object], raw) if isinstance(raw, dict) else {}

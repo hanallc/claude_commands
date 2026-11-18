@@ -36,6 +36,7 @@ A damaged index is saved as `.rescue-index-*` with source edits in the rescue co
 Recovery rebuilds the index before reset.
 A failed rescue restores the damaged index.
 Incomplete slot recovery rescues linked worktrees before deletion.
+The allocator takes the source lock only to create or repair a slot checkout.
 Recovery retains a repository with a different object store.
 Acquisition removes a stale worktree index lock under the slot lease.
 Rust release trials retain Cargo mend output under `target/mend-target`.
@@ -51,6 +52,14 @@ When no local source remains, removal exports the rescue into a sibling bare rep
 Removal verifies the exported rescue before it deletes the workspace.
 Python callers pass slot lease descriptors to their build and test children.
 `clone()` keeps its task-owned return-a-path API and uses the maker outside the gate root.
+Its Git children inherit the destination lease and busy lock.
+Removal retries take the busy lock again, even if an earlier attempt removed the mark.
+Recovery ignores the timestamps of busy marks that the current attempt creates.
+A removal retry keeps the checkout when its `.git` file, its `commondir` or an external `HEAD` is unreadable.
+A retry does not yet check the other metadata files inside the checkout's Git directory, such as an internal `HEAD` or the `index`.
+Linked checkout creation refuses a source with a removal mark.
+Recursive removal checks the busy locks and recorded borrowers of existing descendant clones.
+Busy marks and copy records must be regular files.
 Task cleanup removes the clone and clears the removal marks before it tries to remove the lease file and lock file.
 Cleanup holds the lock and checks the identities of those two files before it removes either file.
 Recovery leaves the files if the clone is already absent when recovery starts.

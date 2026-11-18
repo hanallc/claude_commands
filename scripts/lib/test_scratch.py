@@ -16,7 +16,7 @@ import time
 import unittest
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import ExitStack, redirect_stdout, redirect_stderr
 from pathlib import Path
 from threading import Event, current_thread
 from typing import cast, override
@@ -522,6 +522,227 @@ class ScratchTests(unittest.TestCase):
                 self.assertFalse(mark.exists())
                 self.assertEqual(lease.is_file(), suffix == ".lease.json")
                 self.assertEqual(lock.is_file(), suffix == ".lock")
+
+    def test_ending_a_session_hold_keeps_a_busy_or_borrowed_descendant(self) -> None:
+        source = self.base / "source"
+        source.mkdir()
+        self.git(source, "init", "-q")
+        self.git(source, "commit", "--allow-empty", "-qm", "source")
+        session = self.base / "session" / "maker"
+        (session / session_folder.RUN).mkdir(parents=True)
+        child = copies.clone(source, "gate:descendant", "child")
+        self.assertEqual(child.parent, session)
+        task = scratch.hold(session, "gate:container", "Keep the session folder")
+        sibling = session / "keep.txt"
+        _ = sibling.write_text("keep")
+        with scratch.busy_locks(child, create=True) as idle:
+            self.assertTrue(idle)
+            result = scratch.end(task)
+        self.assertEqual(result, [])
+        self.assertEqual(result.kept, [scratch.KeptFolder(session, f"{child}: {scratch.BUSY_REASON}")])
+
+        linked = self.base / "outside-the-session"
+        self.git(child, "worktree", "add", "--detach", "-q", str(linked))
+        scratch.write_record(linked, "gate:borrower", time.time())
+        record = scratch.task_of(linked)
+        assert isinstance(record, copy_record.Registered)
+        scratch.atomic_record(linked / copy_record.RECORD, {**record.fields, "borrows_from": str(child / ".git")})
+        _ = scratch.hold(linked, "gate:borrower", "Keep the borrower")
+        result = scratch.end(task)
+        self.assertEqual(result, [])
+        self.assertEqual(result.kept, [scratch.KeptFolder(session, f"{child}: borrowed: {linked} still uses its git objects")])
+        self.git(linked, "cat-file", "-e", "HEAD^{commit}")
+        self.assertEqual(sibling.read_text(), "keep")
+        self.assertIn(str(session), scratch.holds())
+
+    def test_recursive_removal_keeps_a_fifo_record_and_closes_its_descriptor(self) -> None:
+        parent = self.base / "container"
+        clone = parent / "clone"
+        clone.mkdir(parents=True)
+        self.git(clone, "init", "-q")
+        task = scratch.hold(parent, "gate:container", "Keep the container")
+        program = """import errno, os, sys
+from pathlib import Path
+from unittest.mock import patch
+from scripts.lib import scratch
+
+parent, record = map(Path, sys.argv[1:3])
+task = sys.argv[3]
+open_path = os.open
+descriptors = []
+
+def track(path, flags, *args, **kwargs):
+    if path == record:
+        assert flags & os.O_NOFOLLOW
+        assert flags & os.O_NONBLOCK
+    descriptor = open_path(path, flags, *args, **kwargs)
+    if path == record:
+        descriptors.append(descriptor)
+    return descriptor
+
+with patch.object(os, "open", track):
+    result = scratch.end(task)
+assert result == [], result
+assert parent.is_dir()
+assert str(record) in result.kept[0].reason, result.kept
+assert "expected a regular file" in result.kept[0].reason, result.kept
+assert descriptors
+for descriptor in descriptors:
+    try:
+        os.fstat(descriptor)
+    except OSError as error:
+        assert error.errno == errno.EBADF
+    else:
+        raise AssertionError("The record descriptor is still open.")
+"""
+        for folder in (parent / "held", self.base / "other-hold"):
+            with self.subTest(folder=folder):
+                folder.mkdir()
+                _ = scratch.hold(folder, "gate:borrower", "Keep the folder")
+                record = folder / copy_record.RECORD
+                os.mkfifo(record)
+                run = subprocess.run([sys.executable, "-c", program, str(parent), str(record), task],
+                                     capture_output=True, text=True, timeout=10)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                record.unlink()
+                self.assertTrue(scratch.release(folder))
+
+    def test_retry_keeps_a_worktree_with_unreadable_external_metadata(self) -> None:
+        source = self.base / "source"
+        source.mkdir()
+        self.git(source, "init", "-q")
+        self.git(source, "commit", "-q", "--allow-empty", "-m", "Create the fixture")
+        worktree = self.base / "linked"
+        self.git(source, "worktree", "add", "-q", "-b", "side", str(worktree))
+        with (mock.patch.object(scratch, "remove", side_effect=OSError("stop after removal intent")),
+              self.assertRaisesRegex(OSError, "stop after removal intent")):
+            _ = scratch.remove_folder(worktree)
+
+        settings = conf.read("scratch")
+        pending = scratch.pending_removal(worktree, scratch_settings=settings)
+        self.assertIsInstance(pending, copy_record.Registered)
+        assert isinstance(pending, copy_record.Registered)
+        for name in ("commondir", "HEAD"):
+            with self.subTest(name=name):
+                metadata = source / ".git" / "worktrees" / worktree.name / name
+                contents = metadata.read_bytes()
+                metadata.unlink()
+                metadata.mkdir()
+                kept = scratch.KeptFolder(worktree, f"{metadata}: expected a regular file")
+                self.assertEqual(scratch.recovery_state(worktree, pending, scratch.BusyMarkScope(),
+                                                       scratch_settings=settings), kept)
+                self.assertEqual(scratch.remove_folder(worktree, source_deletion=scratch.SourceDeletion.RUN), kept)
+                self.assertTrue(worktree.is_dir())
+                self.assertTrue(scratch.removal_mark(worktree).is_file())
+                metadata.rmdir()
+                _ = metadata.write_bytes(contents)
+
+        self.assertEqual(scratch.remove_folder(worktree, source_deletion=scratch.SourceDeletion.RUN),
+                         scratch.RemovedCopy())
+        self.assertFalse(worktree.exists())
+
+    def test_retry_keeps_an_emptied_tracked_busy_mark(self) -> None:
+        repo = self.base / "checkout"
+        repo.mkdir()
+        self.git(repo, "init", "-q")
+        mark = repo / scratch.BUSY
+        _ = mark.write_text("Tracked work\n")
+        self.git(repo, "add", mark.name)
+        self.git(repo, "commit", "-qm", "Save the tracked file")
+        self.git(repo, "remote", "add", "origin", str(self.base / "origin"))
+        self.git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+        with (mock.patch.object(scratch, "remove", side_effect=OSError("stop after removal intent")),
+              self.assertRaisesRegex(OSError, "stop after removal intent")):
+            _ = scratch.remove_folder(repo)
+        self.assertTrue(scratch.removal_mark(repo).is_file())
+        _ = mark.write_bytes(b"")
+
+        result = scratch.remove_folder(repo)
+        self.assertEqual(result, scratch.KeptFolder(repo, f"{repo}: it has uncommitted changes"))
+        self.assertEqual(mark.read_bytes(), b"")
+        self.assertTrue(scratch.removal_mark(repo).is_file())
+
+    def test_descendant_check_returns_held_locks_or_a_kept_folder(self) -> None:
+        parent = self.base / "container"
+        child = parent / "checkout"
+        child.mkdir(parents=True)
+        self.git(child, "init", "-q")
+        settings = conf.read("scratch")
+        with ExitStack() as locks:
+            checked = scratch.lock_descendant_clones(parent, locks, scratch.BusyMarkScope(),
+                                                      create=True, scratch_settings=settings)
+            self.assertIsInstance(checked, scratch.DescendantLocksHeld)
+            with scratch.busy_locks(child, create=False) as idle:
+                self.assertFalse(idle)
+        with scratch.busy_locks(child, create=False) as idle, ExitStack() as locks:
+            self.assertTrue(idle)
+            checked = scratch.lock_descendant_clones(parent, locks, scratch.BusyMarkScope(),
+                                                      create=False, scratch_settings=settings)
+            self.assertEqual(checked, scratch.KeptFolder(parent, f"{child}: {scratch.BUSY_REASON}"))
+
+    def test_recursive_removal_keeps_nonregular_busy_marks(self) -> None:
+        parent = self.base / "container"
+        child = parent / "checkout"
+        child.mkdir(parents=True)
+        self.git(child, "init", "-q")
+        mark = scratch.busy_path(child)
+        target = self.base / "link-target"
+        target.touch()
+        for kind in ("pipe", "folder", "link"):
+            with self.subTest(kind=kind):
+                if kind == "pipe":
+                    os.mkfifo(mark)
+                elif kind == "folder":
+                    mark.mkdir()
+                else:
+                    mark.symlink_to(target)
+                program = (
+                    "import sys; from pathlib import Path; from scripts.lib import scratch; "
+                    "result = scratch.remove_folder(Path(sys.argv[1])); print(result)"
+                )
+                run = subprocess.run([sys.executable, "-c", program, str(parent)],
+                                     capture_output=True, text=True, timeout=10, check=True)
+                self.assertIn(scratch.BUSY_REASON, run.stdout)
+                self.assertIn(str(child), run.stdout)
+                self.assertTrue(child.is_dir())
+                if kind == "folder":
+                    mark.rmdir()
+                else:
+                    mark.unlink()
+        self.assertEqual(target.read_bytes(), b"")
+
+    def test_recursive_removal_accepts_a_linked_descendant_with_a_git_file(self) -> None:
+        source = self.base / "source"
+        source.mkdir()
+        self.git(source, "init", "-q")
+        self.git(source, "commit", "--allow-empty", "-qm", "source")
+        parent = self.base / "container"
+        parent.mkdir()
+        child = parent / "checkout"
+        self.git(source, "worktree", "add", "--detach", "-q", str(child))
+        self.assertTrue((child / ".git").is_file())
+        task = scratch.hold(parent, "gate:container", "Keep the container")
+        self.assertEqual(scratch.end(task), [parent])
+        self.assertFalse(parent.exists())
+        self.git(source, "cat-file", "-e", "HEAD^{commit}")
+
+    def test_busy_mark_scope_reuses_its_parent_lock_only_in_the_same_scope(self) -> None:
+        parent = self.base / "container"
+        child = parent / "checkout"
+        child.mkdir(parents=True)
+        scope = scratch.BusyMarkScope()
+        with scratch.busy_locks(parent, create=True, scope=scope) as idle:
+            self.assertTrue(idle)
+            with scratch.busy_locks(child, create=True) as independent:
+                self.assertFalse(independent)
+            with scratch.busy_locks(child, create=True, scope=scope) as shared:
+                self.assertTrue(shared)
+            with scratch.busy_locks(parent, create=False) as independent:
+                self.assertFalse(independent)
+        self.assertEqual(scope.held, {})
+        with scratch.busy_locks(child, create=False, scope=scope) as idle:
+            self.assertTrue(idle)
 
     def test_task_end_keeps_the_sidecars_and_record_in_a_replacement_parent(self) -> None:
         source = self.base / "source"
