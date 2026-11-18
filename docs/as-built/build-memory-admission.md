@@ -197,9 +197,15 @@ The adapter uses that grant without a second admission request.
 Restart requires fresh token confirmation for requests that need a token.
 A placement waiter holds no cargo token.
 `_placement_row` marks every `TokenRequired` row token-waiting, so `memory_admit.py` does not admit it.
-Verify sends `TokenNotRequired`. A local grant starts the step without a unit board token.
+The first routed probe sends `TokenRequired(TokenReadinessUnchecked)` to let a free remote target take the step.
+A repeat request for that episode sends `TokenNotRequired`.
+A request with `--local` starts with `TokenNotRequired`.
+A local grant starts the step without a unit board token.
 The placement request includes the resolved Cargo build folder for the local candidate.
+Verify refuses local-capable placement when Cargo cannot resolve the folder.
 The queue checks that folder together with memory before a local grant.
+Verify checks the folder again before launch and requests a new grant when the folder changes.
+On Linux, a process from the verify helper watches the caller and stops the step group if the caller dies.
 Remote candidates use their target slots.
 An older caller sends `--token required` (`TokenUnavailable`) and gets no local grant until it reports `TokenHeld`.
 

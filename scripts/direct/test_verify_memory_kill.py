@@ -33,7 +33,7 @@ WORKER_FREE_ENVIRONMENT.update({"VERIFY_START_DIR": str(VERIFY.parent), "PY": sy
 def classifier_functions() -> str:
     # Keep routing outside these classifier tests. Token tests cover admission.
     functions = [
-        'route_compiling_step() { STEP_RAN_ON_MAC=0; STEP_RUNS_ON=natedev_only; }',
+        'place_compiling_step() { STEP_RAN_ON_MAC=0; STEP_RUNS_ON=natedev_only; }',
         'step_state() { :; }',
         'step_stopped_by_hold() { return 1; }',
         'collect_hold_wait() { :; }',

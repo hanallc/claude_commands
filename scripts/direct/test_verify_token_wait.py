@@ -114,7 +114,7 @@ trap observe_admission DEBUG
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.records()), 1)
         self.assertEqual(self.records()[0]["token_wait_s"], 0)
-        self.assertEqual((self.root / "metadata-calls").read_text().splitlines(), ["metadata", "metadata"])
+        self.assertEqual((self.root / "metadata-calls").read_text().splitlines(), ["metadata"])
         self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
 
 if __name__ == "__main__":

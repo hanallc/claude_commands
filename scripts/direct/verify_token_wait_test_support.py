@@ -96,7 +96,7 @@ class VerifyTokenWaitFixture(unittest.TestCase):
         _ = cargo.write_text(r'''#!/bin/sh
 if [ "$1" = metadata ]; then
     printf "metadata\n" >> "$METADATA_CALLS"
-    printf '%s\n' '{"packages":[{"name":"sample","targets":[{"name":"sample","kind":["lib"],"test":true}]}]}'
+    printf '{"workspace_root":"%s","target_directory":"%s/target","packages":[{"name":"sample","targets":[{"name":"sample","kind":["lib"],"test":true}]}]}\n' "$PACKAGE_ROOT" "$PACKAGE_ROOT"
     exit 0
 fi
 printf "%s\n" "$*" >> "$CARGO_CALLS"
@@ -402,7 +402,7 @@ esac
     def build_stub(self, targets: list[dict[str, object]]) -> dict[str, str]:
         """A cargo whose metadata lists `targets` for sample and whose build makes each bin and example."""
         metadata = json.dumps({"packages": [{"name": "sample", "targets": targets, "features": {}}],
-                               "target_directory": str(self.root / "target")})
+                               "workspace_root": str(self.root), "target_directory": str(self.root / "target")})
         cargo = self.root / "stubs" / "cargo"
         _ = cargo.write_text("#!/bin/sh\n"
                              + 'if [ "$1" = metadata ]; then printf "%s\\n" "$TEST_METADATA"; exit 0; fi\n'

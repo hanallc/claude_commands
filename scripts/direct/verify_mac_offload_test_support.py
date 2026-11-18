@@ -306,6 +306,7 @@ class CargoPackageMetadata(TypedDict):
 
 class CargoMetadata(TypedDict):
     workspace_root: str
+    target_directory: str
     workspace_members: list[str]
     packages: list[CargoPackageMetadata]
 
@@ -1166,6 +1167,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                               + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n")
         metadata: CargoMetadata = {
             "workspace_root": str(self.root),
+            "target_directory": str(self.root / "target"),
             "workspace_members": ["sample-id"],
             "packages": [
                 {
@@ -1315,7 +1317,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "record_mac_pass", "cache_record", "user_clock", "finish_mac_pass", "note_event",
             "collect_hold_wait", "collect_routing_wait", "phase_wait_start", "phase_wait_holder_flags", "phase_wait_finish", "phase_wait_finish_all",
             "finish_hold_wait", "release_wait_claim", "step_can_retry", "remote_step_kind",
-            "placement_once", "local_cargo_build_folder", "start_routing_wait", "wait_for_placement", "buildlog_memory_event",
+            "placement_once", "placement_failed", "local_cargo_build_folder", "start_routing_wait", "wait_for_placement", "buildlog_memory_event",
             "route_compiling_step", "take_local_placement",
             "pinned_target_refuse",
             "try_reserved_target", "mac_only_refuse",

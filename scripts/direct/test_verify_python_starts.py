@@ -48,8 +48,15 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         # The dev features read also runs in the helper, so no inline Python starts for it.
         self.assertEqual(len(rows), 6, counts)
         # The per-run helper reads the dev features; no Python process of its own starts.
-        in_helper = Counter(line.split("\t")[0] for line in Path(str(trace) + ".calls").read_text().splitlines())
+        calls = [line.split("\t") for line in Path(str(trace) + ".calls").read_text().splitlines()]
+        in_helper = Counter(call[0] for call in calls)
         self.assertEqual((counts["dev_features.py"], in_helper["dev_features.py"]), (0, 1), rows)
+        clippy_repairs = [call for call in calls if call[:2] == ["admission_client.py", "place-step"]
+                          and "clippy" in call and "--fix" in call]
+        self.assertEqual(len(clippy_repairs), 1)
+        repair = clippy_repairs[0]
+        self.assertIn("--cargo-folder", repair)
+        self.assertEqual(repair[repair.index("--cargo-folder") + 1], str(self.root / "target"))
         for target, mode in (("unknown", "passed"), ("linux", "disk")):
             with self.subTest(target=target, mode=mode):
                 routing = VerifySshTargetsFixture()

@@ -861,7 +861,7 @@ run_step() {
         LINT_REPAIR_REUSED_GRANT=0
         if [[ -f "${HOLD_WAIT_DIR:-/nonexistent}/lint-held" ]]; then HOLD_LINT=1; fi
         if buildlog_step_compiles "$@"; then
-            route_compiling_step "$@" || { status=$?; rm -f "$step_log"; return "$status"; }
+            place_compiling_step "$@" || { status=$?; rm -f "$step_log"; return "$status"; }
             if [[ "$STEP_RAN_ON_MAC" == 1 ]]; then rm -f "$step_log"; return 0; fi
             if [[ "${LINT_MAC_FIX:-0}" == 1 ]]; then rm -f "$step_log"; return "$LINT_LEFT_QUEUE_STATUS"; fi
         fi
@@ -877,6 +877,12 @@ run_step() {
         set -m
         (
             set +m
+            if [[ "${OSTYPE:-}" == linux* && -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
+                if ! verify_helper "$VERIFY_START_DIR/verify_step_lifetime.py" "$$" "$BASHPID"; then
+                    build_check_stop 2 'cannot watch the local step for caller exit'
+                    exit 2
+                fi
+            fi
             if (
                 if (( LINT_REPAIR_REUSED_GRANT )) || [[ "${LINT_MEND_WAIT:-0}" == 1 ]]; then
                     BUILDLOG_PRELAUNCH_OUTCOME=abandon
@@ -2434,9 +2440,7 @@ route_compiling_step() {
         local reason
         take_local_placement
         LINT_REPAIR_PENDING_GRANT=0
-        if [[ "$(local_cargo_build_folder "$@")" != "${PLACEMENT_CARGO_FOLDER:-}" ]]; then
-            reason="the repair uses a different Cargo build folder"
-        elif reason=$(verify_helper "$VERIFY_START_DIR/../lint/lint_repair_grant.py" \
+        if reason=$(verify_helper "$VERIFY_START_DIR/../lint/lint_repair_grant.py" \
                 "$PLACEMENT_ASSIGNMENT_FILE" "$PLACEMENT_GRANT_FILE" "$PLACEMENT_EPISODE" "$$" "${LINT_COPY_TREE:-}" "$@"); then
             # Keep the sidecar that the grant uses to find its build scope.
             local grant_peak=$BUILDLOG_PEAK
@@ -2498,8 +2502,6 @@ route_compiling_step() {
     if [[ "$MAC_PASSED" == 1 ]]; then
         STEP_RAN_ON_MAC=1
         BUILDLOG_PLACEMENT_PREPARED=0
-    elif [[ "$CMD" == test && "${LOCAL_ONLY:-0}" == 0 && -z "${COPY_WATCH_PID:-}" ]]; then
-        start_copy_watch
     fi
 }
 
@@ -2637,14 +2639,53 @@ placement_failed() {
 }
 
 local_cargo_build_folder() {
-    [[ "${1:-}" == cargo ]] || return 0
     verify_helper "$VERIFY_START_DIR/verify_cargo_folder.py" "$@"
 }
 
+# Check the local grant against the current Cargo inputs before launch.
+place_compiling_step() {
+    local folder status BUILDLOG_MEM_WAIT_SINCE="${BUILDLOG_MEM_WAIT_SINCE:-}"
+    while :; do
+        LINT_REPAIR_REUSED_GRANT=0
+        route_compiling_step "$@" || return $?
+        [[ "$STEP_RAN_ON_MAC" == 0 && -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]] || return 0
+        status=0
+        folder=$(local_cargo_build_folder "$@") || status=$?
+        # A remote handoff keeps the parent's placement constraints.
+        if (( status == 0 )) && [[ "$PLACEMENT_OWNER_PID" == "$$" &&
+                -n "$folder" && "$folder" == "${PLACEMENT_CARGO_FOLDER:-}" ]]; then
+            if [[ "$CMD" == test && "${LOCAL_ONLY:-0}" == 0 && -z "${COPY_WATCH_PID:-}" ]]; then
+                start_copy_watch
+            fi
+            return 0
+        fi
+        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
+            --pid "$PLACEMENT_OWNER_PID" --reason "the local grant does not cover the current Cargo build folder" >/dev/null || return $?
+        BUILDLOG_MEM_WAIT_SINCE="$PLACEMENT_SINCE"
+        unset BUILDLOG_SELECTED_LOCAL_GRANT BUILDLOG_PLACEMENT_FILE
+        PLACEMENT_EPISODE="" BUILDLOG_PLACEMENT_EPISODE="" PLACEMENT_OUTCOME=""
+        if (( status != 0 )); then
+            placement_failed "$status"
+            return "$status"
+        fi
+    done
+}
+
 placement_once() {
-    local reply line route="" status=0 monitor=0 prerequisite=none
+    local reply line route="" status=0 monitor=0 prerequisite=none target="${PINNED_TARGET:-}"
     local LINT_QUEUE_LEAVE_HOOK="" BUILDLOG_MAC_IDLE_HOOK=""
+    if [[ -z "$target" && "${STEP_FORCE_MAC:-0}" != 0 ]]; then target=mac; fi
     if [[ -z "$PLACEMENT_EPISODE" ]]; then
+        PLACEMENT_CARGO_FOLDER=""
+        # Tree writes and --local take precedence over remote pins.
+        if [[ "${STEP_WRITES_TREE:-0}" == 1 || "${LOCAL_ONLY:-0}" == 1 ||
+                ( "${MAC_ONLY:-0}" == 0 && "${target:-natedev}" == natedev ) ]]; then
+            PLACEMENT_CARGO_FOLDER=$(local_cargo_build_folder "${PLACEMENT_COMMAND[@]}") || {
+                status=$?
+                placement_failed "$status"
+                return "$status"
+            }
+        fi
         PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
         PLACEMENT_EPISODE="${BUILDLOG_FIRST_STEP_EPISODE:-$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER}"
         PLACEMENT_OWNER_PID=$$
@@ -2652,11 +2693,6 @@ placement_once() {
         PLACEMENT_SOURCE_KEY=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "${MAC_SOURCE_ROOT:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}") || return $?
         PLACEMENT_ASSIGNMENT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.json"
         PLACEMENT_GRANT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.sh"
-        PLACEMENT_CARGO_FOLDER=""
-        if [[ "${MAC_ONLY:-0}" == 0 && "${STEP_FORCE_MAC:-0}" == 0 \
-                && "${PINNED_TARGET:-natedev}" == natedev ]]; then
-            PLACEMENT_CARGO_FOLDER="$(local_cargo_build_folder "${PLACEMENT_COMMAND[@]}")" || return $?
-        fi
         if [[ -n "${LINT_MEMORY_WAIT_FILE:-}" ]]; then
             mv "$LINT_MEMORY_WAIT_FILE" "$PLACEMENT_ASSIGNMENT_FILE.wait" || return $?
             LINT_MEMORY_WAIT_FILE=""
@@ -2682,11 +2718,7 @@ placement_once() {
     # This folder constrains the local candidate only. Remote candidates use their slots.
     [[ -z "${PLACEMENT_CARGO_FOLDER:-}" ]] || placement_args+=(--cargo-folder "$PLACEMENT_CARGO_FOLDER")
     [[ -z "${BUILDLOG_RUN:-}" ]] || placement_args+=(--run "$BUILDLOG_RUN")
-    if [[ -n "${PINNED_TARGET:-}" ]]; then
-        placement_args+=(--target "$PINNED_TARGET")
-    elif [[ "${STEP_FORCE_MAC:-0}" != 0 ]]; then
-        placement_args+=(--target mac)
-    fi
+    [[ -z "$target" ]] || placement_args+=(--target "$target")
     [[ "${LOCAL_ONLY:-0}" == 0 ]] || placement_args+=(--local-only --local-reason "$LOCAL_REASON")
     [[ "${STEP_WRITES_TREE:-0}" == 0 ]] || placement_args+=(--writes-tree)
     [[ "${MAC_ONLY:-0}" == 0 ]] || placement_args+=(--mac-only)

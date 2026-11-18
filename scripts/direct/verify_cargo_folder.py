@@ -17,7 +17,9 @@ def main(argv: list[str]) -> int:
     roots = step_output_roots(argv, os.getcwd())
     if isinstance(roots, CargoOutputRoots):
         print(roots.build_directory)
-    return 0
+        return 0
+    print(f"verify.sh: cannot resolve the Cargo build folder: {roots.reason}", file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

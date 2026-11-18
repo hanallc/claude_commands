@@ -131,7 +131,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
     ) -> subprocess.CompletedProcess[str]:
         functions = shell_functions(
             VERIFY, "verify_helper", "initialize_step_record", "publish_step_state", "step_state", "step_writes_tree",
-            "run", "run_step", "route_compiling_step",
+            "run", "run_step", "route_compiling_step", "place_compiling_step",
             "take_local_placement", "apply_placement_outcome",
             "build_hold_wait_local",
             "run_lint_sequence", "run_lint_held_sequence", "run_lint_judgment",

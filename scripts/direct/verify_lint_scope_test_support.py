@@ -55,6 +55,7 @@ class CargoPackageMetadata(TypedDict):
 
 class CargoWorkspaceMetadata(TypedDict):
     workspace_root: str
+    target_directory: str
     workspace_members: list[str]
     packages: list[CargoPackageMetadata]
 
@@ -271,6 +272,7 @@ if __name__ == "__main__":
         _ = source.write_text("pub fn value() -> u8 { 1 }\n", encoding="utf-8")
         metadata: CargoWorkspaceMetadata = {
             "workspace_root": str(self.root),
+            "target_directory": str(self.root / "target"),
             "workspace_members": ["sample-id"],
             "packages": [{
                 "name": "sample",
