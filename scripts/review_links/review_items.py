@@ -89,17 +89,18 @@ class ReviewSourceStamps(list[Path]):
 @contextmanager
 def guard_source(path: Path, sources: list[Path] | None, *,
                  skip: tuple[type[Exception], ...] = (), entry: str = '') -> Generator[None]:
-    """Track the source first and isolate its failure during snapshot reads."""
+    """Track the source and isolate read failures during Review scans."""
     if isinstance(sources, ReviewSourceStamps):
         sources.append(path)
     try:
         yield
     except Exception as error:
+        source = error.path if isinstance(error, change_routing.ProductionPathUnreadable) else path
         if isinstance(sources, ReviewSourceStamps):
-            source = error.path if isinstance(error, change_routing.ProductionPathUnreadable) else path
             sources.skipped(source, entry, error)
-        elif isinstance(error, skip):
-            logging.getLogger(__name__).warning('Review source %s: %s', path, error)
+        elif isinstance(error, skip) or sources is None and isinstance(error, (OSError, UnicodeError)):
+            label = f'{source} ({entry})' if entry else str(source)
+            logging.getLogger(__name__).warning('Review source %s: %s', label, error)
         else:
             raise
 
@@ -815,9 +816,10 @@ def proposal_store_folders(owner: staff.StaffId, member: staff.StaffRow | None, 
     current: tuple[Path, ...] = ()
     if member is not None and member.kind == 'producer' and isinstance(member.doc, staff.LiveDoc):
         with guard_source(member.doc.path, sources, skip=(FileNotFoundError,)):
-            folder = review_submissions.proposal_folder(member)
-            if isinstance(folder, Path):
-                current = (folder,)
+            if not member.doc.path.is_dir():
+                folder = review_submissions.proposal_folder(member)
+                if isinstance(folder, Path):
+                    current = (folder,)
     return record_store.known_folders(record_store.RecordKind.PROPOSAL, owner, current, document=doc,
                                       strict=sources is not None, sources=sources)
 
@@ -1212,7 +1214,13 @@ def with_later(items: list[ReviewItem], sources: list[Path] | None = None) -> li
         elif key in selected:
             raise error
 
-    times = review_later.times(sources, skipped=skip_time if sources is not None else None)
+    try:
+        times = review_later.times(sources, skipped=skip_time if sources is not None else None)
+    except (OSError, UnicodeError) as error:
+        if sources is not None:
+            raise
+        logging.getLogger(__name__).warning('Review source %s: %s', review_later.path(), error)
+        return items
     return [replace(item, times=replace(item.times, later=times.get(item.key, item.times.later)))
             if item.state != ReviewState.VALIDATING else item
             for item in items if item.key not in invalid or item.state == ReviewState.VALIDATING]
