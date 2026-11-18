@@ -412,6 +412,20 @@ Rerunning the same verdict prints `already has this verdict`, the first run's
 line and the scratch removal lines. A different verdict for a Reviewed row is
 refused; it still ends the row's scratch folders.
 
+## withdraw
+
+Use this action when the user withdraws an open or reviewed change.
+
+```sh
+… withdraw [--production <name>] --row <id> --reason "<the user's words>"
+```
+
+Pass the displayed ID, such as `hana/C386`.
+The row moves to Reviewed with the verdict `withdrawn`.
+The Review log keeps the user's words, the withdrawal time and any previous verdict.
+A repeat with the same words leaves the history unchanged.
+Wait for any pending verdict message before you withdraw the row.
+
 ## Validate
 
 The validation message asks the row's showrunner to check the change for the user.

@@ -2,39 +2,47 @@
 from __future__ import annotations
 
 import html
+import hashlib
+import gzip
+import threading
+import logging
+from dataclasses import dataclass, field, replace
 import json
 import re
 import secrets
 import time
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TypedDict, cast
+from collections.abc import Mapping
+from typing import NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, parse_qsl, urlencode
+from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
-from scripts.lib.user_zone import user_zone, user_zone_name
-from scripts.production import change_review, change_routing, proposal_issue, staff
+from scripts.lib.user_zone import CONF as USER_ZONE_CONF, user_zone
+from scripts.production import change_review, change_routing, proposal_issue, staff, update_registration
+from scripts.production.record_store import state_root
+from scripts.lib import urgency
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_link
-from scripts.review_links import question_record
 from scripts.review_links import review_legacy
-from scripts.review_links import review_actions
-from scripts.review_links import staff_names
-from scripts.review_links.review_items import ReviewItem, ReviewState, ReviewType
+from scripts.review_links import question_record, review_actions, staff_names
+from scripts.review_links.review_items import ReviewItem, ReviewSourceStamps, ReviewState, ReviewType, guard_source
+from scripts.review_links.review_items import source_stamp as source_stamp
 
 PAGE_PATH = '/console/review.html'
 HEADERS = ('Id', 'Type', 'Owner', 'Item', 'State', 'Age')
 TYPES = tuple(ReviewType)
 ICONS = {ReviewType.QUESTION: 'circle-help', ReviewType.CHANGE: 'diff', ReviewType.INVESTIGATION: 'microscope',
          ReviewType.PROPOSAL: 'lamp', ReviewType.EFFICIENCY: 'zap'}
+INDEX_STATES = (ReviewState.OPEN, ReviewState.WAITING, ReviewState.DONE, ReviewState.VALIDATING)
 SHOWS = (('open', 'Open'), (ReviewState.VALIDATING, ReviewState.VALIDATING), ('Done', 'Done'), ('all', 'All'))
 LABELS = {ReviewType.QUESTION: 'Questions', ReviewType.CHANGE: 'Changes', ReviewType.INVESTIGATION: 'Investigations',
           ReviewType.PROPOSAL: 'Proposals', ReviewType.EFFICIENCY: 'Efficiencies'}
-# The Later menu's presets, in menu order; the client resolves each time when the menu opens.
 LATER_PRESETS = (('soon', ''), ('evening', 'This evening'), ('morning', 'Tomorrow morning'), ('week', 'Next week'))
 # Weekday names in the order of the browser's getUTCDay.
 WEEKDAYS = ('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')
 FRONT_MATTER = re.compile(r'\A\ufeff?---[ \t]*\r?\n.*?\r?\n---[ \t]*(?:\r?\n|\Z)', re.DOTALL)
+CARD_ERROR = b'<p role="status">This card is not available.</p>'
 
 
 class ReviewIndexEntry(TypedDict):
@@ -50,28 +58,42 @@ class ReviewIndexEntry(TypedDict):
     filed: int
     updated: str
     hiddenUntil: float
+    sourceName: str
+    ownerHtml: str
+    sourceHtml: str
+    urgency: str
+    handoff: NotRequired[tuple[str, str]]
 
 
-def filter_index(records: list[ReviewItem], members: staff.StaffSnapshot, now: datetime) -> list[ReviewIndexEntry]:
-    """Build the one index for Review counts, filters and column sorting."""
-    return [ReviewIndexEntry(key=item.key, id=item.id, type=item.type, owner=str(item.owner),
-            sourceOwner=str(item.source_unit), ownerName=owner_name(item, members), title=item.title,
-            state=item.state, filed=int(item.times.filed.timestamp()), updated=item.times.updated.isoformat(),
-            hiddenUntil=item.times.later.timestamp() * 1000
-            if isinstance(item.times.later, datetime) and item.times.later > now else 0)
-            for item in records]
+def record_revision(item: ReviewItem, assets: Mapping[str, str]) -> str:
+    """Identify the complete retained record and its displayed assets."""
+    source = item.source
+    # A Change verdict follows the current production when staff move.
+    record = (source.path, source.row, source.slots, item.times.later) if isinstance(source, review_items.ChangeSource) else item
+    retained = (record, assets.get(item.key, ''), assets.get('image:'+item.key, ''))
+    return hashlib.sha256(repr(retained).encode()).hexdigest()[:16]
+
+
+def filter_index(records: list[ReviewItem], members: staff.StaffSnapshot) -> list[ReviewIndexEntry]:
+    """Build the index for the filters and columns."""
+    names = staff_names.StaffNames(members)
+    return [card_entry(item, members, names) for item in records]
 
 
 def index_json(entries: list[ReviewIndexEntry]) -> str:
-    """Encode the index for an HTML script element without executable text."""
-    return json.dumps(entries, ensure_ascii=False, separators=(',', ':')).replace('&', '\\u0026').replace('<', '\\u003c').replace('>', '\\u003e')
-
-
-@dataclass(frozen=True)
-class CardSettings:
-    """Settings that every Review card form shares in one render."""
-    words_rows: int
-    soon_label: str
+    """Share names and encode one compact row per item for the wire."""
+    names = dict.fromkeys(pair for entry in entries for pair in (
+        (entry['owner'], entry['ownerName'], entry['ownerHtml']),
+        (entry['sourceOwner'], entry['sourceName'], entry['sourceHtml'])))
+    references = {pair: at for at,pair in enumerate(names)}
+    rows = [[entry['key'], '' if entry['id']==entry['key'] else entry['id'], TYPES.index(entry['type']),
+             references[(entry['owner'],entry['ownerName'],entry['ownerHtml'])],
+             references[(entry['sourceOwner'],entry['sourceName'],entry['sourceHtml'])],
+             entry['title'], INDEX_STATES.index(entry['state']), entry['filed'], entry['updated'],
+             entry['hiddenUntil'], '' if entry['urgency']=='normal' else entry['urgency'],
+             *([entry['handoff']] if 'handoff' in entry else [])] for entry in entries]
+    return json.dumps({'n':list(names),'r':rows},ensure_ascii=False,separators=(',',':')).replace(
+        '&','\\u0026').replace('<','\\u003c').replace('>','\\u003e')
 
 
 def later_settings(settings: conf.ConfigRead) -> dict[str, int]:
@@ -89,14 +111,384 @@ def soon_label(minutes: int) -> str:
     return f'In {count} {unit}'+('s' if count > 1 else '')
 
 
+@dataclass(frozen=True)
+class ReviewBodyInputs:
+    """Keep the data required to render a card without reading its store."""
+    browser: change_page.ReviewBrowser
+    members: staff.StaffSnapshot
+    words_rows: int
+    soon_label: str
+    assets: Mapping[str, str]
+    zone: ZoneInfo
+    names: staff_names.StaffNames
+
+
+@dataclass(frozen=True)
+class ReviewSnapshot:
+    """Own the current records, compact index and shell until the next complete update."""
+    version: str
+    records: dict[str, ReviewItem]
+    entries: list[ReviewIndexEntry]
+    members: staff.StaffSnapshot
+    browser: change_page.ReviewBrowser
+    words_rows: int
+    refresh_seconds: float
+    assets: dict[str,str]
+    zone: ZoneInfo
+    source_stamps: dict[Path, tuple[int, int]]
+    later: Mapping[str, int]
+    names: staff_names.StaffNames
+    page: bytes = b''
+    payload: bytes = b''
+    page_gzip: bytes = b''
+    payload_gzip: bytes = b''
+    read_at: float = 0
+    render_seconds: float = 0
+    notices: tuple[str, ...] = ()
+    unavailable_cards: frozenset[str] = frozenset()
+    title_limit: int = 100
+
+    def facts(self) -> dict[str,float]:
+        return {'readAt':self.read_at,'renderSeconds':self.render_seconds,'answeredAt':time.time()}
+
+    def index_response(self) -> bytes:
+        return self.payload
+
+    def render(self, *, show: str = 'open') -> bytes:
+        selected = 'all' if show == 'Waiting' else show if show in dict(SHOWS) else 'open'
+        page = self.page.replace(b'data-show="open"', ('data-show="'+selected+'"').encode(), 1)
+        if selected != 'open':
+            page = page.replace(b'data-show-chip="open" aria-pressed="true"',b'data-show-chip="open" aria-pressed="false"',1)
+            page = page.replace(('data-show-chip="'+selected+'" aria-pressed="false"').encode(),
+                                ('data-show-chip="'+selected+'" aria-pressed="true"').encode(),1)
+        return page
+
+    def body(self, key: str) -> bytes:
+        """Render one retained record without a store read."""
+        item = self.records.get(key)
+        if item is None:
+            raise LookupError('This item is not in the current snapshot.')
+        if item.state == ReviewState.VALIDATING:
+            raise LookupError('This change is with the showrunner.')
+        if key in self.unavailable_cards:
+            return CARD_ERROR
+        try:
+            return details(item, ReviewBodyInputs(self.browser, self.members, self.words_rows, soon_label(self.later.get("soon", 60)), self.assets, self.zone, self.names)).encode()
+        except Exception as error:
+            logging.getLogger(__name__).warning('Review card %s: %s', key, error)
+            return CARD_ERROR
+
+
+def retain_asset(item: ReviewItem, assets: dict[str, str]) -> None:
+    source = item.source
+    if isinstance(source, review_items.ProposalSource):
+        try:
+            text = proposal_issue.read_issue(source.record.path)
+        except proposal_issue.Refusal:
+            try:
+                _ = source.record.path.stat()
+            except FileNotFoundError:
+                raise review_items.ReviewRecordMissing('This item is no longer on the list.') from None
+            raise
+        assets[item.key] = change_page.review_text_html(FRONT_MATTER.sub('', text, count=1).strip(), inline=True)
+    elif isinstance(source, review_items.ChangeSource) and source.row.get('Image'):
+        assets['image:'+item.key] = change_review.image_path(source.row['Image'])
+
+
+def card_entry(item: ReviewItem, members: staff.StaffSnapshot, names: staff_names.StaffNames, *,
+               root: Path | None = None) -> ReviewIndexEntry:
+    owner = owner_name(item, members)
+    source = review_items.name(item.source_unit, members)
+    entry = ReviewIndexEntry(key=item.key, id=item.id, type=item.type, owner=str(item.owner),
+        sourceOwner=str(item.source_unit), ownerName=owner, title=item.title, state=item.state,
+        filed=int(item.times.filed.timestamp()), updated=item.times.updated.isoformat(),
+        hiddenUntil=item.times.later.timestamp()*1000 if isinstance(item.times.later, datetime) else 0,
+        sourceName=source, urgency=item.urgency.level, ownerHtml=names.html(item.owner, owner),
+        sourceHtml=names.html(item.source_unit, source))
+    if item.state == ReviewState.VALIDATING and isinstance(item.source, review_items.ChangeSource):
+        requested = item.times.updated
+        if root is not None:
+            path = change_routing.delivery_path(root, item.source.path, item.source.row['#'])
+            requested = change_page.handoff_time(path, requested)
+        requested = requested.astimezone(user_zone())
+        entry['handoff'] = (requested.isoformat(), requested.strftime('%b %d %H:%M %Z'))
+    validate_text(entry['title'])
+    for value in entry.values():
+        if isinstance(value, str):
+            _ = value.encode('utf-8')
+    return entry
+
+
+def validate_body_inputs(item: ReviewItem, assets: Mapping[str, str]) -> None:
+    for event in item.log:
+        validate_text(event.who)
+        validate_text(event.words)
+    for text in assets.values():
+        validate_text(text)
+
+
+def validate_text(value: object) -> None:
+    if not isinstance(value, str):
+        raise TypeError('A card field must be text.')
+    _ = value.encode('utf-8')
+
+
+def pack_snapshot(snapshot: ReviewSnapshot, index: str, started: float) -> ReviewSnapshot:
+    snapshot = replace(snapshot, render_seconds=time.perf_counter()-started)
+    payload = ('{"version":'+json.dumps(snapshot.version)+',"index":'+index
+               +',"notices":'+json.dumps(snapshot.notices)
+               +',"presentation":'+json.dumps({'zone':snapshot.zone.key,'later':dict(snapshot.later),
+                                                'titleLimit':snapshot.title_limit})
+               +',"facts":'+json.dumps(snapshot.facts())+'}').encode()
+    page = render_shell(snapshot,index,started,snapshot.read_at)
+    return replace(snapshot,page=page,payload=payload,page_gzip=gzip.compress(page,compresslevel=1,mtime=0),
+                   payload_gzip=gzip.compress(payload,compresslevel=1,mtime=0))
+
+
+def build_snapshot(root: Path) -> ReviewSnapshot:
+    """Read the stores before publication and retain all request dependencies."""
+    started, read_at = time.perf_counter(), time.time()
+    folder = root / change_page.CONSOLE_FOLDER
+    sources = ReviewSourceStamps()
+    sources.extend((folder/change_browser.MANIFEST, staff.record_path(), state_root(),
+                    change_review.lists_directory(), urgency.state_dir(), conf.path('review_links'), conf.path('production'), conf.path('statusline'),
+                    Path(USER_ZONE_CONF)))
+    zone = user_zone()
+    token,initial = change_browser.browser_manifest(folder)
+    members = staff.snapshot()
+    names = staff_names.StaffNames(members)
+    sources.extend(urgency.state_dir().glob('*.json'))
+    records: dict[str, ReviewItem] = {}
+    entries: list[ReviewIndexEntry] = []
+    assets: dict[str, str] = {}
+    unavailable_cards: set[str] = set()
+    for item in review_items.read(root, members=members, sources=sources, assign_ids=False):
+        path = review_items.source_path(item)
+        with guard_source(path, sources, entry=item.id):
+            item = review_items.normalize_times(item, zone)
+            try:
+                record_assets: dict[str, str] = {}
+                retain_asset(item, record_assets)
+                validate_body_inputs(item, record_assets)
+                summary = card_entry(item, members, names, root=root)
+            except (UnicodeError, TypeError, ValueError, OSError, RuntimeError) as error:
+                sources.skipped(path, item.id, error)
+                unavailable_cards.add(item.key)
+                summary = card_entry(replace(item, title='Card unavailable'), members, names, root=root)
+            else:
+                assets.update(record_assets)
+            entries.append(summary)
+            records[item.key] = item
+    browser = change_page.ReviewBrowser(token, initial)
+    settings = conf.read('review_links')
+    words_rows = settings.whole('review_words_rows')
+    refresh_seconds = settings.number('page_refresh_seconds')
+    later = later_settings(settings)
+    title_limit = conf.read_or_repository('production').whole('question_title_max_chars')
+    index = index_json(entries)
+    notices = tuple(sources.notices.values())
+    retained = repr((records, assets, members.rows, browser, words_rows, refresh_seconds, zone.key, notices, unavailable_cards, later, title_limit, names.colors))
+    version = hashlib.sha256((index+retained).encode()).hexdigest()[:20]
+    snapshot = ReviewSnapshot(version,records,entries,members,
+        browser,words_rows,refresh_seconds,assets,zone,sources.before_read,later,names,read_at=read_at,
+        notices=notices, unavailable_cards=frozenset(unavailable_cards),
+        title_limit=title_limit)
+    return pack_snapshot(snapshot, index, started)
+
+
+@dataclass(frozen=True)
+class SnapshotUnavailable:
+    """No complete snapshot has passed its first read."""
+
+
+@dataclass(frozen=True)
+class ReviewRecordNotPublished:
+    """The response has no published record for this save."""
+
+
+@dataclass(frozen=True)
+class ReviewSave:
+    """The saved record, its published version and any message to deliver."""
+    delivery: change_page.MessageDelivery | change_page.NoMessageDelivery
+    answer: str
+    version: str
+    item: ReviewItem | ReviewRecordNotPublished
+
+
+@dataclass
+class ReviewSnapshotCache:
+    """Publish complete snapshots from one background worker and retain the last good snapshot."""
+    root: Path
+    interval: float = 0.5
+    start_worker: bool = True
+    _snapshot: ReviewSnapshot | SnapshotUnavailable = field(default_factory=SnapshotUnavailable,init=False)
+    _condition: threading.Condition = field(default_factory=threading.Condition,init=False)
+    _save_lock: threading.Lock = field(default_factory=threading.Lock,init=False)
+    _wake: threading.Event = field(default_factory=threading.Event,init=False)
+    _stop: threading.Event = field(default_factory=threading.Event,init=False)
+    _busy: bool = field(default=False,init=False)
+    _initialize: bool = field(default=False,init=False)
+    _generation: int = field(default=0,init=False)
+    _thread: threading.Thread = field(init=False)
+
+    def __post_init__(self) -> None:
+        if (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists():
+            try:
+                self._snapshot = build_snapshot(self.root)
+            except Exception as error:
+                logging.getLogger(__name__).warning('Review snapshot: %s',error)
+        self._thread = threading.Thread(target=self._update,name='review-snapshot',daemon=True)
+        if self.start_worker:
+            self.start()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def get(self) -> ReviewSnapshot:
+        with self._condition:
+            if isinstance(self._snapshot, SnapshotUnavailable) and self._thread.is_alive():
+                if not self._busy:
+                    self._initialize = True
+                    self._wake.set()
+                _ = self._condition.wait_for(
+                    lambda: not isinstance(self._snapshot, SnapshotUnavailable) or
+                    (not self._busy and not self._wake.is_set()), timeout=15)
+            current = self._snapshot
+        if isinstance(current,SnapshotUnavailable):
+            raise ValueError('The Review snapshot is not available.')
+        return current
+
+    def invalidate(self) -> None:
+        with self._condition:
+            self._generation += 1
+            self._wake.set()
+
+    def save(self, body: str, status: change_page.DeliveryStatus) -> ReviewSave:
+        """Serialize Review writes and publish the saved record before returning."""
+        _ = self.get()
+        fields = review_fields(body)
+        key = fields['row'][0]
+        with self._save_lock:
+            current = self.get()
+            try:
+                delivery, answer = submit_snapshot(self.root, current, fields, status)
+            except review_items.ReviewRecordChanged:
+                try:
+                    if key in current.records:
+                        _ = self.publish_record(current, key)
+                except Exception as error:
+                    logging.getLogger(__name__).warning('Review conflict publication for %s: %s', key, error)
+                finally:
+                    self.invalidate()
+                raise
+            try:
+                updated = self.publish_record(current, key)
+                item = updated.records.get(key, ReviewRecordNotPublished())
+                if (isinstance(item, ReviewItem) and isinstance(item.source, review_items.ChangeSource)
+                        and fields['outcome'][0] in ('works', 'not works')):
+                    answer = item.source.row.get('Verdict') or answer
+                return ReviewSave(delivery, answer, updated.version, item)
+            except Exception as error:
+                logging.getLogger(__name__).warning('Review saved %s. Publication will retry: %s', key, error)
+                return ReviewSave(delivery, answer, current.version, ReviewRecordNotPublished())
+            finally:
+                self.invalidate()
+
+    def publish_record(self, current: ReviewSnapshot, key: str) -> ReviewSnapshot:
+        """Replace or remove one record while serving the previous version to readers."""
+        started = time.perf_counter()
+        records = current.records.copy()
+        assets = current.assets.copy()
+        _ = assets.pop(key, None)
+        _ = assets.pop('image:'+key, None)
+        members = staff.snapshot()
+        names = staff_names.StaffNames(members)
+        try:
+            item = review_items.read_current(self.root, records[key], members)
+            item = review_items.normalize_times(item, current.zone)
+            retain_asset(item, assets)
+        except (FileNotFoundError, review_items.ReviewRecordMissing):
+            del records[key]
+            entries = [entry for entry in current.entries if entry['key'] != key]
+            record_version = key
+        else:
+            records[key] = item
+            validate_body_inputs(item, {name: assets[name] for name in (key, 'image:'+key) if name in assets})
+            updated_entry = card_entry(item, members, names, root=self.root)
+            entries = [updated_entry if entry['key'] == key else entry for entry in current.entries]
+            record_version = repr((item, assets.get(key), assets.get('image:'+key)))
+        version = hashlib.sha256((current.version+record_version).encode()).hexdigest()[:20]
+        fresh = pack_snapshot(replace(current, version=version, members=members, names=names, records=records, assets=assets, entries=entries,
+                                      unavailable_cards=current.unavailable_cards-{key}),
+                              index_json(entries), started)
+        with self._condition:
+            self._snapshot = fresh
+        return fresh
+
+    def synchronize(self) -> None:
+        """Let tests and shutdown observe completed background work."""
+        with self._condition:
+            _ = self._condition.wait_for(lambda:not self._busy and not self._wake.is_set(),timeout=30)
+
+    def close(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        if self._thread.ident is not None:
+            self._thread.join(5)
+
+    def _update(self) -> None:
+        checked = time.monotonic()
+        last_failure: str | None = None
+        while not self._stop.is_set():
+            _ = self._wake.wait(self.interval)
+            if self._stop.is_set():
+                return
+            try:
+                with self._condition:
+                    snapshot = self._snapshot
+                    generation = self._generation
+                unchanged = (isinstance(snapshot, ReviewSnapshot) and time.monotonic()-checked<30
+                             and all(source_stamp(path)==stamp for path, stamp in snapshot.source_stamps.items()))
+                with self._condition:
+                    if (isinstance(snapshot, SnapshotUnavailable) and not self._initialize
+                            and not (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists()):
+                        self._wake.clear()
+                        continue
+                    if unchanged and not self._wake.is_set():
+                        continue
+                    self._initialize = False
+                    self._wake.clear()
+                    self._busy = True
+                if not (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists():
+                    _ = change_page.console_folder(self.root)
+                fresh = build_snapshot(self.root)
+                with self._save_lock, self._condition:
+                    if self._snapshot is snapshot and self._generation == generation:
+                        self._snapshot = fresh
+                    else:
+                        self._wake.set()
+                checked = time.monotonic()
+                last_failure = None
+            except Exception as error:
+                failure = ' '.join(str(error).splitlines())
+                if failure != last_failure:
+                    logging.getLogger(__name__).warning('Review snapshot update: %s', failure)
+                    last_failure = failure
+            finally:
+                with self._condition:
+                    self._busy = False
+                    self._condition.notify_all()
+
+
 def page_url() -> str:
     _ = change_page.console_folder(review_link.review_root().resolve())
     return PAGE_PATH
 
 
-def waiting_items(request: console.NewsRequest) -> frozenset[str]:
+def waiting_items(request: console.NewsRequest, *, snapshot: ReviewSnapshot | None = None) -> frozenset[str]:
     now = datetime.now(user_zone())
-    return frozenset(item.key+'/'+item.times.updated.isoformat() for item in request.shared(review_items.read_open)
+    records = snapshot.records.values() if snapshot is not None else request.shared(review_items.read_open)
+    return frozenset(item.key+'/'+item.times.updated.isoformat() for item in records
                      if item.for_you(now))
 
 
@@ -117,20 +509,14 @@ def section(heading: str, text: str) -> str:
     return '<section><h3>'+heading+'</h3>'+change_browser.question_paragraphs(text)+'</section>'
 
 
-def short_title(title: str, limit: int) -> str:
-    first = title.splitlines()[0] if title else ''
-    visible = first[:limit]
-    return visible+'…' if visible != title else visible
-
-
 def answer_section(text: str) -> str:
     return '<section><h3>Answer</h3>'+change_browser.answer_html(text)+'</section>'
 
 
-def form(item: ReviewItem, browser: change_page.ReviewBrowser, settings: CardSettings) -> str:
+def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, revision: str, *, soon: str = "In 1 hour") -> str:
     if item.state == ReviewState.VALIDATING:
         return ''
-    fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key)}
+    fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key), 'revision': revision}
     hidden = ''.join(f'<input type="hidden" name="{key}" value="{html.escape(value, quote=True)}">' for key, value in fields.items())
     closes: list[str] = []
     returns: list[str] = []
@@ -144,21 +530,20 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, settings: CardSet
     heading = (page_frame.ReturningActionHeading.SENDS_TO_SHOWRUNNER if item.type == ReviewType.CHANGE
                else page_frame.ReturningActionHeading.ITEM_RETURNS)
     presets = ''.join(f'<button type="button" role="menuitem" tabindex="-1" data-later-preset="{key}">'
-                      +f'<span>{html.escape(label or settings.soon_label)}</span><small></small></button>' for key, label in LATER_PRESETS)
+                      +f'<span>{html.escape(label or soon)}</span><small></small></button>' for key, label in LATER_PRESETS)
     later = ('<button type="button" aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later <span aria-hidden="true">▾</span></button>'
                +'<div role="menu" aria-label="Hide until" data-later-menu hidden>'+presets+'<hr>'
                +'<button type="button" role="menuitem" tabindex="-1" data-later-choose><span>Choose a time…</span></button>'
                +record_table.date_time_picker(field='later', action='outcome', value='later')+'</div>')
     return ('<form method="post" data-review-form>'+hidden+f'<label for="words-{html.escape(item.key, quote=True)}">Your words</label>'
-            + f'<textarea id="words-{html.escape(item.key, quote=True)}" name="feedback" rows="{settings.words_rows}" '
+            + f'<textarea id="words-{html.escape(item.key, quote=True)}" name="feedback" rows="{words_rows}" '
             + 'placeholder="Type your words. They go with the button that you press."></textarea>'
             + page_frame.review_action_groups(''.join(closes), ''.join(returns), later, returning_heading=heading)
             + '<span role="status" data-send-status></span></form>')
 
 
-def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, settings: CardSettings,
-            names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
-    names = staff_names.for_page(names, members)
+def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
+    names = inputs.names
     source = item.source
     if isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
         question = source.record.item
@@ -177,112 +562,54 @@ def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff
         body = section('How to check', row.get('How to check', ''))+section('Proof', row.get('What you see', '') or row.get('Proof', ''))
         if isinstance(source.slots.question, change_page.AnsweredQuestion):
             body += answer_section(source.slots.question.answer)
-        image_id = row.get('Image', '')
-        if image_id:
-            body = change_page.change_content(row, body)
+        if path := inputs.assets.get('image:'+item.key):
+            alt = html.escape('Screenshot: '+item.title,quote=True)
+            body = ('<div class="change-text">'+body+'</div><a data-image-zoom class="change-image" href="'
+                    +html.escape(path,quote=True)+'" target="_blank" rel="noopener"><img src="'
+                    +html.escape(path,quote=True)+'" alt="'+alt+'"></a>')
     elif isinstance(source, review_items.InvestigationSource):
         body = section('You asked', source.record.question)
         if source.record.answer:
             body += answer_section(source.record.answer)
     elif isinstance(source, review_items.ProposalSource):
-        # The issue text loads when the card opens, so the Open view does not carry every proposal body.
         body = ('<section><h3>Proposal</h3><div data-proposal-body>'
-                +'<p data-title-ignore>Loading proposal…</p></div></section>')
+                +inputs.assets[item.key]+'</div></section>')
     elif isinstance(source, review_items.EfficiencySource):
         body = section('Proposal', item.title)
     else:
         body = ''
-    fallback = '<section data-title-fallback hidden><h3>Item</h3><p>'+html.escape(item.title)+'</p></section>'
     logs = ''.join('<li><time datetime="'+entry.time.isoformat()+'">'
-        +entry.time.astimezone(user_zone()).strftime('%b %d %H:%M')+'</time><span>'+html.escape(entry.words)
+        +entry.time.astimezone(inputs.zone).strftime('%b %d %H:%M')+'</time><span>'+html.escape(entry.words)
         +' <small>— '+names.html(entry.who)+'</small></span></li>' for entry in reversed(item.log))
-    owner = owner_name(item, members)
-    return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+'<div data-review-body>'+body
-            +'</div></div><section><h3>Log · newest first</h3>'
-            +'<ol class="list-log">'+logs+'</ol></section>'+form(item, browser, settings)
+    owner = owner_name(item, inputs.members)
+    fallback = '<section data-title-fallback hidden><h3>Item</h3><p>'+html.escape(item.title)+'</p></section>'
+    return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+'<div data-review-body>'+body+'</div></div><section><h3>Log · newest first</h3>'
+            +'<ol class="list-log">'+logs+'</ol></section>'+form(item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets), soon=inputs.soon_label)
             +'<p class="review-source">Owner: '+names.html(item.owner, owner)+' · Source: '
-            +names.html(item.source_unit, review_items.name(item.source_unit, members))+'</p></div>')
+            +names.html(item.source_unit, review_items.name(item.source_unit, inputs.members))+'</p></div>')
 
 
 def owner_name(item: ReviewItem, members: staff.StaffSnapshot) -> str:
     return 'Owner unavailable' if isinstance(item.source, review_items.UnownedQuestionSource) else review_items.name(item.owner, members)
 
 
-def age(filed: datetime, now: datetime) -> str:
-    seconds = max(0, int((now-filed).total_seconds()))
-    return f'{seconds//86400} d' if seconds >= 86400 else f'{seconds//3600} h' if seconds >= 3600 else f'{seconds//60} min'
-
-
-def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, now: datetime, index: int,
-              title_limit: int, settings: CardSettings,
-              names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT, *, root: Path) -> str:
-    names = staff_names.for_page(names, members)
-    owner = owner_name(item, members)
-    source = review_items.name(item.source_unit, members)
-    title = ('<strong class="review-title" title="'+html.escape(item.title, quote=True)+'">'
-             +html.escape(short_title(item.title, title_limit))+'</strong>')
-    if item.urgency.level != 'normal':
-        title += '<small>'+html.escape({'user': 'Important', 'blocks': 'Blocks work', 'soon': 'Due soon', 'later': 'Later'}[item.urgency.level])+'</small>'
-    state_name = item.state
-    values = (item.id, item.type.value, owner, item.title, state_name, item.times.filed.timestamp())
-    attrs = {'key':item.key, 'number':item.id.casefold(), 'title':item.title.casefold(), 'owner':str(item.owner),
-             'source-owner':str(item.source_unit), 'source-name':source,
-             'state':state_name, 'type':item.type.value, 'order':str(index), 'sort-values':json.dumps(values),
-             'parked':str(item.hidden_until(now)).lower(), 'updated':item.times.updated.isoformat()}
-    attributes = ''.join(f' data-{key}="{html.escape(value, quote=True)}"' for key, value in attrs.items())
-    panel = 'review-detail-'+str(index)
-    toggle = (f'<button type="button" class="list-toggle" aria-expanded="false" aria-controls="{panel}">'
-              +'<span class="list-chevron" aria-hidden="true">›</span>'+html.escape(item.id)+'</button>')
-    state = '<span class="list-state '+('warning' if item.state == ReviewState.OPEN else 'muted')+'">'+state_name+'</span>'
-    detail = ''
-    validating = state_name == ReviewState.VALIDATING
-    if validating and isinstance(item.source, review_items.ChangeSource):
-        path = change_routing.delivery_path(root, item.source.path, item.source.row['#'])
-        requested = change_page.handoff_time(path, item.times.updated).astimezone(user_zone())
-        toggle = '<span class="list-toggle" tabindex="-1">'+html.escape(item.id)+'</span>'
-        showrunner = html.escape(owner, quote=True)
-        title += (f'<span class="review-handoff">With <span title="{showrunner}">{showrunner}</span> since '
-                  +f'<time datetime="{requested.isoformat()}">'
-                  +requested.strftime('%b %d %H:%M %Z')+'</time></span>')
-    else:
-        detail = details(item, browser, members, settings, names)
-    cells = (toggle, icon(item.type)+item.type.title(), names.html(item.owner, owner)+('<small>· '+names.html(item.source_unit, source)+'</small>' if source != owner else ''),
-             title, state, age(item.times.filed, now))
-    row = ''.join(f'<td' + (' class="record-id"' if label == 'Id' else '')
-                  + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
-    hidden = ' hidden' if item.state == ReviewState.DONE or item.hidden_until(now) else ''
-    marker = ' data-validating-change' if validating else ''
-    return ('<tbody data-list-item'+attributes+marker+hidden+'><tr class="list-row">'+row+'</tr>'
-            +f'<tr data-detail id="{panel}" hidden><td colspan="6">'+detail+'</td></tr></tbody>')
-
-
 def render(root: Path, *, show: str = 'open') -> bytes:
-    started, read_at = time.perf_counter(), time.time()
-    title_limit = conf.read_or_repository('production').whole('question_title_max_chars')
-    members = staff.snapshot()
-    names = staff_names.StaffNames(members)
-    now = datetime.fromtimestamp(read_at, user_zone())
-    if show == 'Waiting':
-        show = 'all'
-    if show not in dict(SHOWS):
-        show = 'open'
-    owners: dict[staff.StaffId, str] = {}
-    records = review_items.read(root, members=members, kinds=TYPES, owner_options=owners)
-    state = ReviewState.OPEN if show == 'open' else show
-    items = [item for item in records if show == 'all' or item.state == state]
-    items.sort(key=lambda item: (item.state != ReviewState.OPEN, item.state == ReviewState.DONE))
-    token, initial = change_browser.browser_manifest(change_page.console_folder(root))
-    browser = change_page.ReviewBrowser(token, initial)
-    settings = conf.read('review_links')
-    later = later_settings(settings)
-    cards = CardSettings(settings.whole('review_words_rows'), soon_label(later['soon']))
-    entries = filter_index(records, members, now)
+    """Build a standalone page; the HTTP server uses its retained snapshot."""
+    _ = change_page.console_folder(root)
+    return build_snapshot(root).render(show=show)
+
+
+def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: float) -> bytes:
+    """Build the controls and compact index without any card body."""
+    show = 'open'
+    entries = snapshot.entries
+    owners = {entry['owner']:entry['ownerName'] for entry in entries}
+    owners.update({entry['sourceOwner']:entry['sourceName'] for entry in entries if entry['type']==ReviewType.INVESTIGATION})
     owner_chips = '<button id="review-owner-all" type="button" data-owner-chip="" aria-pressed="true">All <b></b></button>'
-    for owner, name in sorted(owners.items(), key=lambda pair:pair[1].casefold()):
-        identity = html.escape(owner, quote=True)
-        owner_chips += (f'<button id="review-owner-id-{identity}" type="button" data-owner-chip="{identity}"'
-                        f' data-owner-name="{html.escape(name, quote=True)}" aria-pressed="false">'
-                        f'{names.html(owner, name)} <b></b></button>')
+    for owner, name in sorted(owners.items(), key=lambda pair: pair[1].casefold()):
+        identity, label = html.escape(owner, quote=True), html.escape(name, quote=True)
+        owner_chips += (f'<button id="review-owner-{identity}" type="button" data-owner-chip="{identity}" '
+                        +f'data-owner-name="{label}" aria-pressed="false">{label} <b></b></button>')
     chips = '<button id="review-type-all" type="button" data-type-chip="" aria-pressed="true">All <b></b></button>'
     chips += ''.join('<button id="review-type-'+kind+'" type="button" data-type-chip="'+kind+'" aria-pressed="false">'+icon(kind)+LABELS[kind]
                      +' <b></b></button>' for kind in TYPES)
@@ -292,8 +619,9 @@ def render(root: Path, *, show: str = 'open') -> bytes:
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       +'<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
     content = (record_table.STYLE+record_table.DATE_TIME_STYLE+STYLE+page_frame.title('Review', 'review')
-        +f'<div data-review data-show="{show}" data-refresh-seconds="{settings.number("page_refresh_seconds")}"'
-        +f' data-zone="{html.escape(user_zone_name(), quote=True)}" data-later="{html.escape(json.dumps(later), quote=True)}">'
+        +f'<div data-review data-version="{snapshot.version}" data-show="{show}" data-refresh-seconds="{snapshot.refresh_seconds}" '
+        +f'data-title-limit="{snapshot.title_limit}" data-zone="{html.escape(snapshot.zone.key, quote=True)}" '
+        +f'data-later="{html.escape(json.dumps(dict(snapshot.later)), quote=True)}">'
         +'<div class="review-types" role="group" aria-label="Type">'+chips+'</div>'
         +'<div class="review-types review-shows" id="list-show" role="group" aria-label="Show">'+shows+'</div>'
         +'<div class="review-types" id="list-owner" role="group" aria-label="Owner">'+owner_chips+'</div>'
@@ -301,38 +629,102 @@ def render(root: Path, *, show: str = 'open') -> bytes:
         +'<button type="button" data-clear-linked-reviews aria-label="Clear linked reviews filter"'
         +' aria-pressed="true" hidden>Linked reviews <span aria-hidden="true">×</span></button>'
         +'<label class="list-search-label" for="list-search">Search</label><input type="search" id="list-search" placeholder="Filter by id or words">'
-        +'</div><p data-missing-item role="status" hidden></p>'
-        +'<p data-hidden-action-status role="status" hidden></p>'
-        +'<script type="application/json" data-review-index>'+index_json(entries)+'</script>'
+        +'</div><p data-missing-item role="status" hidden></p><p role="status" data-review-notice hidden></p><p data-hidden-action-status role="status" hidden></p>'
+        +'<ul data-review-source-notices'+('' if snapshot.notices else ' hidden')+'>'
+        +''.join('<li>'+html.escape(notice)+'</li>' for notice in snapshot.notices)+'</ul>'
+        +'<script>'+CARD_REQUEST_SCRIPT+'</script><script type="application/json" data-review-index>'+index+'</script>'
         +'<div class="list-table"><table aria-label="Review">'
         +'<colgroup><col style="width:17%"><col style="width:13%"><col style="width:14%"><col style="width:37%">'
         +'<col style="width:12%"><col style="width:7%"></colgroup><thead><tr>'+headers+'</tr></thead>'
-        +''.join(item_rows(item,browser,members,now,index,title_limit,cards,names,root=root) for index,item in enumerate(items))
+        +'<tbody data-window-before></tbody><tbody data-window-after></tbody>'
         +'</table><p data-empty hidden>No items in this view.</p></div></div><script>'+SCRIPT+'</script>')
     return page_frame.rendered(change_page.document(content, 'Review'), started, read_at)
 
 
-def proposal_body(root: Path, key: str) -> bytes:
-    """Render one proposal's issue text for its open card."""
-    item = next((item for item in review_items.read(root, kinds=(ReviewType.PROPOSAL,)) if item.key == key), None)
-    if item is None or not isinstance(item.source, review_items.ProposalSource):
-        raise LookupError('this proposal is not on the page')
-    text = FRONT_MATTER.sub('', proposal_issue.read_issue(item.source.record.path), count=1)
-    return change_page.review_text_html(text.strip(), inline=True).encode()
-
-
-def submit(root: Path, body: str, status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
+def review_fields(body: str) -> dict[str, list[str]]:
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
-    if set(fields) not in ({'row','token','outcome','feedback'},{'row','token','outcome','feedback','later'}) or any(len(values)!=1 for values in fields.values()):
+    required = {'row', 'token', 'outcome', 'feedback'}
+    if not required <= fields.keys() <= required | {'later', 'revision'} or any(len(values)!=1 for values in fields.values()):
         raise question_record.AnswerRefused('use the answer form on this page')
-    token, initial = change_browser.browser_manifest(change_page.console_folder(root))
-    browser = change_page.ReviewBrowser(token,initial)
+    return fields
+
+
+def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list[str]],
+                    status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
+    key, token, outcome, words = (fields[field][0] for field in ('row', 'token', 'outcome', 'feedback'))
+    if not secrets.compare_digest(token, change_browser.row_token(snapshot.browser, key)):
+        raise question_record.AnswerRefused('row or page token does not match this page')
+    retained = snapshot.records.get(key)
+    if retained is None:
+        raise review_items.ReviewRecordMissing('This item is no longer on the list.')
+    def validate() -> ReviewItem:
+        current = review_items.read_current(root, retained, staff.snapshot())
+        assets: dict[str, str] = {}
+        try:
+            retain_asset(current, assets)
+        except FileNotFoundError:
+            raise review_items.ReviewRecordMissing('This item is no longer on the list.') from None
+        if fields.get('revision', [''])[0] != record_revision(current, assets):
+            raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
+        return current
+
+    item = validate()
+    if item.state == ReviewState.VALIDATING:
+        raise change_page.ChangeHandoffRefused(change_page.WITH_SHOWRUNNER)
+    if outcome == 'later':
+        return change_page.NoMessageDelivery(), review_actions.later(
+            item, fields.get('later', [''])[0], words, verify_revision=validate, root=root)
+    if outcome not in item.actions:
+        raise question_record.AnswerRefused('choose an action on this card')
+    source = item.source
+    if isinstance(source, review_items.ChangeSource):
+        with change_review.checked_review_write(source.path, root, validate) as current:
+            delivery = change_browser.submit_review_change(current, snapshot.browser, outcome, words, status)
+        if isinstance(delivery, change_page.MessageDelivery) and outcome not in ('validate', 'feedback'):
+            label = outcome
+            with review_items.after_store_write(item.key):
+                change_review.record_review_log(delivery.page.review_list, delivery.row,
+                                                label+(': '+words if words else ''), delivery.page.production)
+        return delivery, {'validate':'asked the showrunner to check', 'question':'question sent',
+                          'feedback':'feedback sent'}.get(outcome, outcome)
+    if isinstance(source, review_items.QuestionSource):
+        if not words.strip():
+            raise question_record.AnswerRefused('enter an answer')
+        members = staff.snapshot()
+        scope = update_registration.question_scope(item.owner, members)
+        question = change_browser.WaitingQuestion(key, review_items.name(item.owner, members), source.record,
+            update_registration.question_source(scope), item.owner, review_items.name(source.record.asker, members))
+        if 'review_submission' in source.record.item:
+            delivery, answer = review_actions.sent_question_action(
+                item, source.record, scope, cast(change_page.QuestionOutcome, outcome), words, status,
+                verify_revision=validate)
+        else:
+            delivery, answer = change_browser.submit_question(
+                question, cast(change_page.QuestionOutcome, outcome), words, status, exact_record=True,
+                verify_revision=validate)
+    elif isinstance(source, review_items.InvestigationSource):
+        delivery, answer = review_actions.investigation_action(item, outcome, words, status, verify_revision=validate)
+    else:
+        delivery, answer = review_actions.decision_action(item, outcome, words, status, verify_revision=validate)
+    if outcome == 'question' and isinstance(delivery, change_page.MessageDelivery) and item.type == ReviewType.QUESTION:
+        with review_items.after_store_write(item.key):
+            delivery = review_actions.track_question(delivery, key, words, status)
+        answer = 'question sent'
+    return delivery, 'feedback sent' if outcome == 'feedback' else answer
+
+
+def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
+           snapshot: ReviewSnapshot | None = None) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
+    fields = review_fields(body)
+    if snapshot is not None:
+        return submit_snapshot(root, snapshot, fields, status)
+    browser = change_page.ReviewBrowser(*change_browser.browser_manifest(change_page.console_folder(root)))
     key = fields['row'][0]
     if not secrets.compare_digest(fields['token'][0],change_browser.row_token(browser,key)):
         raise question_record.AnswerRefused('row or page token does not match this page')
     outcome, words = fields['outcome'][0], fields['feedback'][0]
     if outcome == 'later' or key.startswith(('investigation/', 'proposal/', 'efficiency/')):
-        item = next((item for item in review_items.read(root) if item.key == key),None)
+        item = next((item for item in review_items.read(root) if item.key == key), None)
         if item is None:
             raise question_record.AnswerRefused('this item is not on the page')
         if outcome == 'later':
@@ -352,7 +744,10 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus) -> tuple[c
             delivery = review_actions.track_question(delivery, key, words, status)
         return delivery, answer
     _ = fields.pop('later',None)
-    item = next((item for item in review_items.read(root, kinds=(ReviewType.QUESTION,)) if item.key == key), None) if key.startswith('question/') else None
+    _ = fields.pop('revision',None)
+    item = None
+    if key.startswith('question/'):
+        item = next((item for item in review_items.read(root, kinds=(ReviewType.QUESTION,)) if item.key == key), None)
     if item is not None and item.state == ReviewState.WAITING:
         if outcome not in item.actions:
             raise question_record.AnswerRefused('choose an action on this card')
@@ -409,38 +804,83 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 .review-panel{grid-template-columns:1fr;padding:0 14px 16px}}
 </style>'''
 
-SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + record_table.DATE_TIME_SCRIPT + review_legacy.SCRIPT + r'''(() => {
-let content=document.querySelector('[data-review]'),saving=0;
-let selectedShow=content.dataset.show,requestedShow=selectedShow;
-let entryJump=new URLSearchParams(location.hash.slice(1)).get('jump');
-const drafts=new Map(),departures=new Map(),bodies=new Map();
-let index=readIndex();
-function readIndex(){
- return new Map(JSON.parse(content.querySelector('[data-review-index]').textContent).map(entry=>[entry.key,entry]));
+CARD_REQUEST_SCRIPT = r'''
+function requestReviewCard(key,version){
+ return fetch(location.pathname+'?'+new URLSearchParams({body:key,version}),{cache:'no-store'})
+  .then(async response=>({response,text:response.ok ? await response.text() : ''}));
 }
-function matchesOwner(entry,owner){
- return !owner || entry.owner===owner || entry.type==='investigation' && entry.sourceOwner===owner;
+const firstReviewCard=(()=>{
+ const fragment=new URLSearchParams(location.hash.slice(1));
+ const key=fragment.get('jump') || fragment.get('item') || new URLSearchParams(location.search).get('item');
+ if(!key) return null;
+ const version=document.querySelector('[data-review]').dataset.version;
+ const result=requestReviewCard(key,version);
+ void result.catch(()=>{});
+ return {key,version,result};
+})();
+'''
+
+SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + record_table.DATE_TIME_SCRIPT + review_legacy.SCRIPT + r'''(() => {
+let content=document.querySelector('[data-review]');
+let selectedShow=content.dataset.show;
+const drafts=new Map(),saved=new Map(),bodies=new Map(),bodyRequests=new Map();
+const pendingSaves=new Map();
+const kinds=['question','change','investigation','proposal','efficiency'],states=['Open','Waiting','Done','Validating'];
+let index=readIndex(JSON.parse(content.querySelector('[data-review-index]').textContent));
+let focusAfterLoad=null,conflictKey='',firstRequest=firstReviewCard;
+function indexEntry(payload,row,at){
+ const owner=payload.n[row[3]],source=payload.n[row[4]];
+ return {key:row[0],id:row[1] || row[0],type:kinds[row[2]],owner:owner[0],sourceOwner:source[0],
+  ownerName:owner[1],sourceName:source[1],title:row[5],state:states[row[6]],filed:row[7],updated:row[8],
+   hiddenUntil:row[9],ownerHtml:owner[2],sourceHtml:source[2],urgency:row[10] || 'normal',handoff:row[11],order:at+row[6]*payload.r.length};
+}
+function readIndex(payload){
+ return new Map(payload.r.map((row,at)=>[row[0],indexEntry(payload,row,at)]));
+}
+function allEntries(){return [...index.values()];}
+const escapeText=value=>String(value).replace(/[&<>"']/g,letter=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[letter]));
+function summary(entry){
+ const node=document.createElement('tbody'),panel='review-detail-'+encodeURIComponent(entry.key);
+ Object.assign(node.dataset,{listItem:'',key:entry.key,number:entry.id.toLowerCase(),title:entry.title.toLowerCase(),
+  owner:entry.owner,sourceOwner:entry.sourceOwner,sourceName:entry.sourceName,state:entry.state,type:entry.type,
+  order:entry.order,updated:entry.updated,parked:'false'});
+ const limit=Number(content.dataset.titleLimit),first=entry.title.split(/\r?\n/)[0],short=first.slice(0,limit);
+ const colored=(name,markup)=>markup || escapeText(name);
+ const age=Math.max(0,Math.floor(Date.now()/1000-entry.filed));
+ const stamp=age>=86400 ? Math.floor(age/86400)+' d' : age>=3600 ? Math.floor(age/3600)+' h' : Math.floor(age/60)+' min';
+ const icon=content.querySelector('[data-type-chip="'+entry.type+'"] .review-icon').outerHTML;
+ const validating=entry.state==='Validating' && entry.type==='change';
+ if(validating) node.dataset.validatingChange='';
+ const handoff=entry.handoff;
+ const handoffLine=validating && handoff ? '<span class="review-handoff">With <span title="'+escapeText(entry.ownerName)+
+  '">'+escapeText(entry.ownerName)+'</span> since <time datetime="'+escapeText(handoff[0])+'">'+escapeText(handoff[1])+'</time></span>' : '';
+ const cells=[validating ? '<span class="list-toggle" tabindex="-1">'+escapeText(entry.id)+'</span>' : '<button type="button" class="list-toggle" aria-expanded="false" aria-controls="'+panel+'">'
+  +'<span class="list-chevron" aria-hidden="true">›</span>'+escapeText(entry.id)+'</button>',
+  icon+entry.type[0].toUpperCase()+entry.type.slice(1),colored(entry.ownerName,entry.ownerHtml)
+  +(entry.sourceName!==entry.ownerName ? '<small>· '+colored(entry.sourceName,entry.sourceHtml)+'</small>' : ''),
+  '<strong class="review-title" title="'+escapeText(entry.title)+'">'+escapeText(short===entry.title ? short : short+'…')+'</strong>'+handoffLine+(entry.urgency!=='normal' ? '<small>'+escapeText({user:'Important',blocks:'Blocks work',soon:'Due soon',later:'Later'}[entry.urgency])+'</small>' : ''),
+  '<span class="list-state '+(entry.state==='Open' ? 'warning' : 'muted')+'">'+entry.state+'</span>',stamp];
+ node.innerHTML='<tr class="list-row">'+cells.map((cell,at)=>'<td'+(at===0 ? ' class="record-id"' : '')+' data-label="'+['Id','Type','Owner','Item','State','Age'][at]+'">'+cell+'</td>').join('')
+  +'</tr><tr data-detail id="'+panel+'" hidden><td colspan="6"><p role="status">Loading the item…</p></td></tr>';
+ return node;
 }
 function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys}){
- const linked=keys.has(entry.key);
- return (!keys.size || linked) && (linked || view.linkedItem===entry.key || entry.hiddenUntil<=Date.now()) &&
-  matchesOwner(entry,owner) &&
+ const linked=keys?.has(entry.key);
+ return (!keys?.size || linked) && (linked || view.linkedItem===entry.key || entry.hiddenUntil<=Date.now()) &&
+  (!owner || entry.owner===owner || entry.type==='investigation' && entry.sourceOwner===owner) &&
   (!type || entry.type===type) && (!sourceOwner || entry.sourceOwner===sourceOwner) &&
   (!query || entry.id.toLowerCase().includes(query) || entry.title.toLowerCase().includes(query)) &&
   (show==='all' || entry.state===(show==='open' ? 'Open' : show));
 }
-function matching(filters,{forOwnerMenu=false,countValidating=false}={}){
- return [...index.values()].filter(entry=>{
-  const departure=departures.get(entry.key);
-  if(departure?.kind==='pending' && !forOwnerMenu) return false;
-  const projected=departure?.kind==='saved'
-   ? {...entry,state:departure.state,hiddenUntil:departure.hiddenUntil}
-   : entry;
-  if(!forOwnerMenu && !countValidating && projected.state==='Validating') return false;
-  return matches(projected,filters);
- });
+function matching(filters){return allEntries().filter(entry=>!pendingSaves.has(entry.key) && matches(entry,filters));}
+function savedEntry(key,result){
+ const entry=index.get(key);if(!entry) return;
+ entry.state=result.state;entry.hiddenUntil=result.later;
 }
 const view=createRecordTable({content:()=>content,single:true,
+ entries:allEntries,mount:summary,mounted:()=>loadBodies(),
+ focusKey:()=>focusAfterLoad?.key,
+ unmount:row=>{if(!saved.has(row.dataset.key)) rememberForm(row.querySelector('[data-review-form]'));},
  place:params=>{
   reviewPlace(params);
   if(params.get('show')==='Waiting') params.set('show','all');
@@ -452,29 +892,32 @@ const view=createRecordTable({content:()=>content,single:true,
    button.dataset.ownerChip===owner || button.dataset.ownerName===owner);
   return button ? button.dataset.ownerChip : owner;
  },
- selectOwner:({owner,type,query,keys})=>matching({owner,type,query,keys},{forOwnerMenu:true}).length ? owner : '',
- shows:[...content.querySelectorAll('[data-show-chip]')].map(button=>button.dataset.showChip),
- hasKey:key=>index.has(key),
+ selectOwner:({owner,type,query,keys})=>!owner || allEntries().some(entry=>matches(entry,{owner,type,query,keys})) ? owner : '',
+ hasKey:key=>allEntries().some(entry=>entry.key===key),
+ shows:['open','Validating','Done','all'],
  visible:(data,filters)=>{
-  const entry=index.get(data.key);
-  return Boolean(entry && !departures.has(data.key) && matches(entry,filters));
+  const key=data.key,entry=index.get(key),departure=saved.get(key);
+  if(!entry || pendingSaves.get(key)?.departing) return false;
+  const reopened=departure?.closes && view.linkedItem===key && view.opened.has(key);
+  return (!departure || entry.handoff || reopened) && matches(entry,filters);
  },
  sortValues:data=>{
   const entry=index.get(data.key);
-  return entry && [entry.id,entry.type,entry.ownerName,entry.title,entry.state,entry.filed];
+  return [entry.id,entry.type,entry.ownerName,entry.title,entry.state,entry.filed];
  },
  applied:(_items,{type,show,owner,query,sourceOwner,keys})=>{
-  selectedShow=show;loadBodies();
-  const eligibleOwners=matching({type,query,keys},{forOwnerMenu:true});
+  selectedShow=show;content.dataset.show=show;loadBodies();
+  const eligibleOwners=allEntries().filter(entry=>matches(entry,{type,query,keys}));
   const shownOwners=matching({show,type,query,keys});
+  const matchesOwner=(entry,id)=>!id || entry.owner===id || entry.type==='investigation' && entry.sourceOwner===id;
   content.querySelectorAll('[data-owner-chip]').forEach(button=>{
-   const value=button.dataset.ownerChip;
-   button.hidden=Boolean(value) && !eligibleOwners.some(entry=>matchesOwner(entry,value));
-   button.querySelector('b').textContent=shownOwners.filter(entry=>matchesOwner(entry,value)).length;
+   const id=button.dataset.ownerChip;
+   button.hidden=Boolean(id) && !eligibleOwners.some(entry=>matchesOwner(entry,id));
+   button.querySelector('b').textContent=shownOwners.filter(entry=>matchesOwner(entry,id)).length;
   });
   content.querySelectorAll('[data-show-chip]').forEach(button=>{
    const show=button.dataset.showChip;
-   const count=matching({type,owner,query,sourceOwner,keys,show},{countValidating:show==='Validating'}).length;
+   const count=matching({type,owner,query,sourceOwner,keys,show}).length;
    button.querySelector('b').textContent=count;
    button.toggleAttribute('data-empty-count',count===0);
   });
@@ -482,12 +925,32 @@ const view=createRecordTable({content:()=>content,single:true,
    button.setAttribute('aria-pressed',String(button.dataset.typeChip===type));
    button.querySelector('b').textContent=matching({owner,show,query,sourceOwner,keys,type:button.dataset.typeChip}).length;
   });
-  if(show!==requestedShow){
-   requestedShow=show;
-   if(!entryJump) queueMicrotask(()=>pageRefresh.refresh(true));
-  }
  }
 });
+addEventListener('scroll',()=>{
+ const departing=[...pendingSaves.values()].filter(save=>save.departing && Math.abs(scrollY-save.top)>=innerHeight);
+ if(!departing.length) return;
+ for(const save of departing) save.departing=false;
+ view.apply(false);
+},{passive:true});
+function mountedRow(key){return content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');}
+function rememberFocus(){
+ const field=document.activeElement,row=field?.closest('[data-list-item]');
+ if(!row) return null;
+ const selector=field.id ? '#'+CSS.escape(field.id) : field.localName+['name','value','href','class'].map(name=>
+  field.hasAttribute(name) ? '['+name+'="'+CSS.escape(field.getAttribute(name))+'"]' : '').join('');
+ return {key:row.dataset.key,selector,position:[...row.querySelectorAll(selector)].indexOf(field),
+  start:field.selectionStart,end:field.selectionEnd,direction:field.selectionDirection};
+}
+function restoreFocus(key){
+ if(focusAfterLoad?.key!==key) return;
+ if(document.activeElement!==document.body){focusAfterLoad=null;return;}
+ const field=mountedRow(key)?.querySelectorAll(focusAfterLoad.selector)[focusAfterLoad.position];
+ if(!field) return;
+ const {start,end,direction}=focusAfterLoad;focusAfterLoad=null;
+ field.focus({preventScroll:true});
+ if(typeof field.setSelectionRange==='function' && typeof start==='number') field.setSelectionRange(start,end,direction);
+}
 function updateTitleFallback(panel){
  const fallback=panel.querySelector('[data-title-fallback]');
  const body=panel.querySelector('[data-review-body]').cloneNode(true);
@@ -504,68 +967,116 @@ function updateTitleFallback(panel){
 }
 function loadBodies(){
  view.opened.forEach(key=>{
-  const target=content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"] [data-proposal-body]');
-  if(!target || target.dataset.loaded) return;
-  target.dataset.loaded='true';
-  const panel=target.closest('.review-panel');
-  if(bodies.has(key)){target.innerHTML=bodies.get(key);updateTitleFallback(panel);return;}
-  fetch(location.pathname+'?'+new URLSearchParams({body:key}),{cache:'no-store'})
-   .then(response=>response.ok ? response.text() : Promise.reject(new Error('HTTP '+response.status)))
-   .then(text=>{bodies.set(key,text);if(target.isConnected){target.innerHTML=text;updateTitleFallback(panel);}})
-   .catch(error=>{
-    target.textContent='The proposal text is not available: '+error.message;
-    target.dataset.titleIgnore='';updateTitleFallback(panel);
-   });
+  const row=mountedRow(key);
+  if(!row || row.hasAttribute('data-validating-change') || row.dataset.bodyLoaded) return;
+  const install=text=>{
+   const current=mountedRow(key);
+   if(!current || current.dataset.bodyLoaded) return;
+   current.dataset.bodyLoaded='true';current.querySelector('[data-detail]>td').innerHTML=text;
+   const departure=saved.get(key);
+   if(departure?.closes && departure.awaitingSnapshot)
+    current.querySelector('[data-review-form]')?.remove();
+   const panel=current.querySelector('.review-panel');if(panel) updateTitleFallback(panel);
+   bindForm(current);restoreFocus(key);view.drawWindow();
+  };
+  if(bodies.has(key)){install(bodies.get(key));return;}
+  if(bodyRequests.has(key)) return;
+  const version=content.dataset.version;
+  const prefetched=firstRequest?.key===key && firstRequest.version===version;
+  const result=prefetched ? firstRequest.result : requestReviewCard(key,version);
+  if(prefetched) firstRequest=null;
+  const request=result
+   .then(({response,text})=>{
+    if(bodyRequests.get(key)!==request || content.dataset.version!==version) return;
+    const bodyVersion=response.headers.get('X-Review-Version');
+    if(bodyVersion && bodyVersion!==version){
+     bodyRequests.delete(key);
+     void pageRefresh.refresh(true);
+     return;
+    }
+    if(!response.ok) throw new Error('HTTP '+response.status);
+    if(bodyVersion!==version) throw new Error('The item has no snapshot version.');
+    bodies.set(key,text);install(text);
+   }).catch(error=>{
+    const target=mountedRow(key)?.querySelector('[data-detail]>td');
+    if(target && bodyRequests.get(key)===request){
+     target.closest('[data-list-item]').dataset.bodyLoaded='failed';
+     target.innerHTML='<p role="status">The item is not available: '+escapeText(error.message)+'</p>';
+    }
+   })
+   .finally(()=>{if(bodyRequests.get(key)===request) bodyRequests.delete(key);});
+  bodyRequests.set(key,request);
  });
 }
-function bind(){
- content.addEventListener('click',event=>{
-  if(event.target.closest('[data-validating-change] .list-row')) event.stopPropagation();
- },true);
- content.querySelectorAll('.review-panel').forEach(updateTitleFallback);
- view.replace();
- content.querySelectorAll('[data-review-form]').forEach(form=>{
-  const row=form.closest('[data-list-item]'),key=row.dataset.key,words=form.elements.feedback,later=form.elements.later;
-  const notice=form.querySelector('[data-send-status]');
-  notice.textContent=view.actionNotice(row);
-  const choices=[...row.querySelectorAll('input[name=choice]')];
-  if(drafts.has(key)){
-   const draft=drafts.get(key);words.value=draft.feedback;later.value=draft.later;
-   choices.forEach(choice=>choice.checked=choice.value===draft.choice);
-  }
-  const remember=()=>drafts.set(key,{feedback:words.value,later:later.value,choice:choices.find(choice=>choice.checked)?.value || ''});
-  choices.forEach(choice=>choice.addEventListener('change',()=>{words.value=choice.value;remember();words.focus();}));
-  [words,later].forEach(field=>{field.addEventListener('input',remember);field.addEventListener('change',remember);});
-  const send=async(outcome,until)=>{
-   if(form.dataset.sending) return;
+function rememberForm(form){
+ if(!form) return;
+ const row=form.closest('[data-list-item]');
+ if(pendingSaves.get(row.dataset.key)?.saved) return;
+ const choices=[...row.querySelectorAll('input[name=choice]')];
+ drafts.set(row.dataset.key,{feedback:form.elements.feedback.value,later:form.elements.later.value,
+  choice:choices.find(choice=>choice.checked)?.value || ''});
+}
+function drawSaveState(key,form=mountedRow(key)?.querySelector('[data-review-form]')){
+ if(!form) return;
+ const pending=pendingSaves.get(key);
+ if(pending) form.dataset.sending='true';else delete form.dataset.sending;
+ form.querySelectorAll('button').forEach(button=>button.disabled=Boolean(pending));
+ form.querySelector('[data-send-status]').textContent=pending?.notice || view.actionNotice(form.closest('[data-list-item]'));
+}
+function bindForm(row){
+ const form=row.querySelector('[data-review-form]');if(!form || form.dataset.bound) return;
+ form.dataset.bound='true';
+ const key=row.dataset.key,words=form.elements.feedback,later=form.elements.later;
+ drawSaveState(key,form);
+ const choices=[...row.querySelectorAll('input[name=choice]')];
+ if(drafts.has(key)){
+  const draft=drafts.get(key);words.value=draft.feedback;later.value=draft.later;
+  choices.forEach(choice=>choice.checked=choice.value===draft.choice);
+ }
+ const remember=()=>rememberForm(form);
+ choices.forEach(choice=>choice.addEventListener('change',()=>{words.value=choice.value;remember();words.focus();}));
+ [words,later].forEach(field=>{field.addEventListener('input',remember);field.addEventListener('change',remember);});
+ const send=async(outcome,until)=>{
+   if(pendingSaves.has(key)) return;
    const data=new URLSearchParams(new FormData(form));data.set('outcome',outcome);
    if(outcome==='later') data.set('later',until);
-   form.dataset.sending='true';saving++;pageRefresh.abandon();
-   const buttons=[...form.querySelectorAll('button')];
-   buttons.forEach(button=>button.disabled=true);notice.textContent='';
-   departures.set(key,{kind:'pending'});
+   remember();
+   const notice=content.querySelector('[data-review-notice]');
+   notice.hidden=true;notice.textContent='';
+   const pending={notice:'Saving…',saved:false,departing:true,top:scrollY};
+   pendingSaves.set(key,pending);pageRefresh.abandon();drawSaveState(key);
    const submission=view.startAction(row);
    try{
     const response=await fetch(location.pathname,{method:'POST',body:data});
-    const result=await response.json();if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
+    const result=await response.json();
+    if(!response.ok){
+     const reason=result.reason || 'HTTP '+response.status;
+     if(response.status===409){
+      conflictKey=key;notice.textContent='Not saved: '+reason;notice.hidden=false;
+     }
+     throw new Error(reason);
+    }
+    pending.saved=true;
     drafts.delete(key);
     const handed=row.dataset.type==='change' && ['validate','question','feedback'].includes(outcome);
-    departures.set(key,{kind:'saved',outcome,updated:row.dataset.updated,previousState:row.dataset.state,
-     handed,
-     state:handed ? 'Validating' : outcome==='question' ? 'Waiting' : outcome==='later' ? row.dataset.state : 'Done',
-     hiddenUntil:outcome==='later' ? Date.parse(until) : 0});
+    saved.set(key,{updated:row.dataset.updated,previousState:row.dataset.state,
+     handed,state:result.state ?? (handed ? 'Validating' : outcome==='question' ? 'Waiting' : outcome==='later' ? row.dataset.state : 'Done'),
+     later:result.later ?? (outcome==='later' ? Date.parse(data.get('later')) : 0),
+     question:data.get('outcome')==='question',
+     closes:!handed && !['question','later'].includes(outcome),awaitingSnapshot:true});
+    savedEntry(key,saved.get(key));
+    pendingSaves.delete(key);
     view.closeCard(key);
-    view.showActionResult(row,submission,form.elements.row.value,{kind:'success',message:'Saved: '+result.answer});
+    view.showActionResult(row,submission,key,{kind:'success',message:'Saved: '+result.answer});
     if(handed && parent!==window) parent.postMessage('for-you-completed',location.origin);
    }catch(error){
-    departures.delete(key);
-    view.showActionResult(row,submission,form.elements.row.value,{kind:'failure',message:'Not saved: '+error.message});
-    buttons.forEach(button=>button.disabled=false);
+    pendingSaves.delete(key);
+    view.showActionResult(row,submission,key,{kind:'failure',message:'Not saved: '+error.message});
    }
    finally{
-    delete form.dataset.sending;saving--;
-    if(!saving && (selectedShow!==content.dataset.show ||
-       ['all','Validating'].includes(selectedShow) && [...departures.values()].some(result=>result.handed))) void pageRefresh.refresh(true);
+    pendingSaves.delete(key);delete form.dataset.sending;drawSaveState(key);
+    followItemLink({inheritFilters:true,unappliedOnly:true});
+    if(!pendingSaves.size) void pageRefresh.refresh(true);
    }
   };
   form.addEventListener('submit',event=>{
@@ -580,7 +1091,6 @@ function bind(){
    void send(outcome,later.value);
   });
   bindLater(form,until=>void send('later',until));
- });
 }
 function laterTimes(now){
  const settings=JSON.parse(content.dataset.later),today=zoneParts(content.dataset.zone,now);
@@ -607,46 +1117,102 @@ function bindLater(form,pick){
  bindDateTimePicker(form,{zone:content.dataset.zone,defaultMinutes:()=>JSON.parse(content.dataset.later).morning,
   summaryPrefix:'Hides until ',prepareMenu});
 }
-async function refresh(_supersede=false,current=()=>true){
- // An open Later menu holds the page, so a refresh does not close it under the pointer.
- if(saving || dateTimePickerOpen(content)) return;
- const show=selectedShow;
- const response=await fetch(location.pathname+'?'+new URLSearchParams({show}),{cache:'no-store'});
- if(!response.ok) throw new Error('HTTP '+response.status);
- const page=new DOMParser().parseFromString(await response.text(),'text/html'),fresh=page.querySelector('[data-review]');
- if(!fresh) throw new Error('The page has no review table.');
- await view.settled();
- if(saving || !current() || show!==selectedShow) return;
- const top=scrollY,restoreFocus=restoreFocusAfterRefresh();
- const active=document.activeElement;
- const focusedOwnerId=active?.hasAttribute('data-owner-chip') ? active.id : '';
- content.replaceWith(fresh);content=fresh;index=readIndex();
- for(const [key,result] of departures){
-  if(result.kind==='pending') continue;
-  const entry=index.get(key);
-  if(!entry || (result.outcome==='later' && Date.now()>=result.hiddenUntil)) {departures.delete(key);continue;}
-  // The index includes the state and revision of rows outside this Show.
-  const submitted=entry.state===result.previousState && entry.updated===result.updated;
-  if(!submitted && (result.handed || entry.state!==result.state)){
-   departures.delete(key);
-  }
- }
- bind();view.apply(false);
- const ownerChip=focusedOwnerId ? document.getElementById(focusedOwnerId) : null;
- if(focusedOwnerId && (!ownerChip || ownerChip.hidden)){
-  content.querySelector('[data-owner-chip][aria-pressed="true"]')?.focus({preventScroll:true});
- }else restoreFocus();
- scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
+function bind(){view.replace(false);}
+content.addEventListener('click',event=>{
+ if(event.target.closest('[data-validating-change] .list-row')) event.stopPropagation();
+},true);
+function revealConflict(){
+ const key=conflictKey;conflictKey='';
+ const entry=index.get(key);
+ if(!entry || !view.opened.has(key) || matches(entry,{show:selectedShow})) return false;
+ const params=new URLSearchParams(location.hash.slice(1));
+ params.set('show',entry.state==='Open' ? 'open' : entry.state);params.set('item',key);
+ history.replaceState(null,'',location.pathname+'#'+params);
+ view.place();
+ return true;
 }
-view.place();
-if(entryJump) view.jump(entryJump,{pushPlace:false});
+async function refresh(_supersede=false,current=()=>true){
+ if(pendingSaves.size || dateTimePickerOpen(content)) return;
+ const response=await fetch(location.pathname+'?'+new URLSearchParams({version:'1'}),{cache:'no-store'});
+ if(!response.ok) throw new Error('HTTP '+response.status);
+ const version=await response.json();
+ if(pendingSaves.size || dateTimePickerOpen(content) || !current()) return;
+ if(version.version===content.dataset.version){
+  await view.settled();
+  if(pendingSaves.size || !current()) return;
+  for(const [key,result] of saved) if(result.later && Date.now()>=result.later) saved.delete(key);
+  content.querySelectorAll('[data-body-loaded="failed"]').forEach(row=>delete row.dataset.bodyLoaded);
+  revealConflict();view.apply(false);content.dispatchEvent(new Event('review-refreshed'));return version.facts;
+ }
+ const fresh=await fetch(location.pathname+'?'+new URLSearchParams({index:'1',version:version.version}),{cache:'no-store'});
+ if(!fresh.ok) throw new Error('HTTP '+fresh.status);
+ const payload=await fresh.json();
+ if(pendingSaves.size || dateTimePickerOpen(content) || !current()) return;
+ await view.settled();
+ if(pendingSaves.size || !current()) return;
+ const top=scrollY;focusAfterLoad=rememberFocus();
+ content.querySelectorAll('[data-review-form]').forEach(rememberForm);
+ index=readIndex(payload.index);content.dataset.version=payload.version;
+ if(payload.presentation){
+  content.dataset.zone=payload.presentation.zone;
+  content.dataset.later=JSON.stringify(payload.presentation.later);
+  content.dataset.titleLimit=payload.presentation.titleLimit;
+ }
+ content.querySelector('[data-review-index]').textContent=JSON.stringify(payload.index);
+ const notices=content.querySelector('[data-review-source-notices]');
+ notices.replaceChildren(...(payload.notices || []).map(text=>{
+  const line=document.createElement('li');line.textContent=text;return line;
+ }));
+ notices.hidden=!notices.children.length;
+ bodies.clear();bodyRequests.clear();
+ const menu=content.querySelector('#list-owner'),pairs=new Map();
+ const focusedOwner=document.activeElement?.dataset.ownerChip;
+ for(const entry of index.values()){
+  pairs.set(entry.owner,entry.ownerName);
+  if(entry.type==='investigation') pairs.set(entry.sourceOwner,entry.sourceName);
+ }
+ for(const button of menu.querySelectorAll('[data-owner-chip]')){
+  const id=button.dataset.ownerChip;
+  if(id && !pairs.has(id)) button.remove();
+ }
+ for(const [id,name] of [...pairs].sort((a,b)=>a[1].localeCompare(b[1]))){
+  if(menu.querySelector('[data-owner-chip="'+CSS.escape(id)+'"]')) continue;
+  const button=document.createElement('button');button.type='button';
+  button.id='review-owner-'+id;button.dataset.ownerChip=id;button.dataset.ownerName=name;
+  button.append(name+' ',document.createElement('b'));menu.append(button);
+ }
+ for(const [key,result] of saved){
+  const entry=index.get(key);
+  if(!entry || (result.later && Date.now()>=result.later)) {saved.delete(key);continue;}
+  // The index supplies the state and update time for each row.
+  const submitted=entry.state===result.previousState && entry.updated===result.updated;
+  if(!submitted && (result.handed || entry.state!==result.state)){saved.delete(key);continue;}
+  if(!result.closes && !result.question && !result.later && !submitted) saved.delete(key);
+  else result.awaitingSnapshot=submitted;
+ }
+ for(const [key,result] of saved) savedEntry(key,result);
+ const revealed=revealConflict();bind();view.apply(false);
+ if(focusAfterLoad) restoreFocus(focusAfterLoad.key);
+ if(focusedOwner!==undefined && (!document.activeElement?.hasAttribute('data-owner-chip') || document.activeElement.hidden))
+  menu.querySelector('[aria-pressed="true"]')?.focus({preventScroll:true});
+ content.dataset.loaded='true';content.dispatchEvent(new Event('review-refreshed'));
+ if(!revealed) scrollTo({top,behavior:'instant'});
+ return {...payload.facts,answeredAt:version.facts.answeredAt};
+}
 bind();
-if(entryJump) entryJump=null;
-else view.apply();
-addEventListener('hashchange',()=>{
- const item=new URLSearchParams(location.hash.slice(1)).get('item'),departure=departures.get(item);
- if(departure?.kind==='saved' && departure.outcome==='later') departures.delete(item);
- view.place();view.apply(false);
-});
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
+function followItemLink(options){
+ return view.followItemLink({...options,beforeJump:key=>{
+  if(pendingSaves.has(key)) return false;
+  if(!saved.get(key)?.closes && !saved.get(key)?.question) saved.delete(key);
+  return true;
+ }});
+}
+if(!followItemLink()){view.place();view.apply();}
+function restorePlace(event){
+ if(event.type==='hashchange' && !history.state?.recordTable && followItemLink({inheritFilters:true})) return;
+ view.restorePlace(event);
+}
+addEventListener('popstate',restorePlace);
+addEventListener('hashchange',restorePlace);
 })();'''

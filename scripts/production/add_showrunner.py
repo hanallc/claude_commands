@@ -122,7 +122,9 @@ def launch_place(identity: ShowrunnerLaunch) -> herdr.HerdrPlace | herdr.NotInHe
         raise Refusal(f"cannot locate session {identity.session_id}: {observed.reason}")
     if isinstance(observed, sessions.SessionNotLive):
         return herdr.NotInHerdr()
-    place = herdr.herdr_place_of(observed.pid)
+    place = herdr.process_placement(observed.pid)
+    if isinstance(place, herdr.UnprovedHerdrPlacement):
+        raise Refusal(place.reason)
     if isinstance(place, herdr.NotInHerdr):
         raise Refusal(f"session {identity.session_id} runs outside herdr")
     return place
@@ -320,8 +322,13 @@ def _main(argv: list[str]) -> int:
         checked(child, caller, ending=ending, start_in=cwd, config_dir=account_directory(selected))
         if resume and isinstance(place, herdr.NotInHerdr):
             from scripts.message import sessions
-            if any(item["sessionId"] == resume for item in sessions.live_sessions()):
-                raise Refusal(f"session {resume} is still live")
+            match sessions.session_liveness(resume):
+                case sessions.LiveSessionProcess():
+                    raise Refusal(f"session {resume} is still live")
+                case sessions.SessionLivenessUnknown(reason=reason):
+                    raise Refusal(reason)
+                case sessions.SessionNotLive():
+                    pass
     except (Refusal, OSError, herdr_types.HerdrFailure) as refusal:
         print(f"add_showrunner: {refusal}", file=sys.stderr)
         return 2
