@@ -10,6 +10,7 @@ import argparse
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
+from functools import partial
 import html
 import gzip
 import ipaddress
@@ -22,7 +23,8 @@ import subprocess
 import sys
 import time
 import threading
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping
+from contextlib import contextmanager
 from enum import Enum
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -34,9 +36,10 @@ from urllib.parse import parse_qs, unquote, urlsplit
 STARTED_NS = time.time_ns()
 
 from scripts.disks import disks_page, sessions, slots
-from scripts.lib import conf
+from scripts.lib import conf, scratch
 from scripts.production import change_routing, change_review
-from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, image_store, images, investigations_page, list_page, review_items, review_page
+from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
+from scripts.review_links import question_record
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
@@ -115,6 +118,15 @@ class TailscaleAddressLost(RuntimeError):
 
 class CodeChanged(RuntimeError):
     """A loaded module changed and the server must restart."""
+
+
+class FixtureStoreRemoved(Exception):
+    """The List fixture folder was removed."""
+
+
+class ServerMode(Enum):
+    LIVE = "live console"
+    LIST_FIXTURE = "List fixture"
 
 
 class ModuleStampUnavailable(Enum):
@@ -274,8 +286,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
 
     @override
     def send_head(self) -> BinaryIO | None:
-        root = cast(ReviewLinksServer, self.server).root
+        server = cast(ReviewLinksServer, self.server)
+        root = server.root
         route = urlsplit(self.path)
+        if server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH:
+            self.send_error(404)
+            return None
         if route.path == f"/{change_page.CONSOLE_FOLDER}":
             self.redirect(f"/{change_page.CONSOLE_FOLDER}/" + (f"?{route.query}" if route.query else ""))
             return None
@@ -295,6 +311,18 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                              + "style-src 'unsafe-inline'; frame-src 'self'; frame-ancestors 'self'; base-uri 'none'")
             self.end_headers()
             return BytesIO(content)
+        if route.path == "/console/for-you.json":
+            try:
+                if route.query == "view=count":
+                    payload = console.for_you_count(for_you.read())
+                else:
+                    payload = console.for_you_payload()
+            except (OSError, ValueError) as error:
+                print(f"review-links actions: {error}", file=sys.stderr)
+                self.json_response(503, {"available": False})
+            else:
+                self.json_response(200, payload)
+            return None
         if route.path == accounts_page.PAGE_PATH:
             try:
                 content = cast(ReviewLinksServer, self.server).accounts_cache.get()
@@ -338,7 +366,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         if route.path == list_page.PAGE_PATH:
             try:
-                content = list_page.render(root)
+                with server.list_store_access():
+                    content = list_page.render(root, include_counts=server.mode is ServerMode.LIVE)
             except (OSError, ValueError) as error:
                 print(f"review-links list: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The List page is not available.</p>"))
@@ -347,7 +376,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         if route.path == images.PAGE_PATH:
             try:
-                content = images.render(root)
+                content = images.render(cast(ReviewLinksServer, self.server).delivery_status)
             except (OSError, ValueError) as error:
                 print(f"review-links images: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Images page is not available.</p>"))
@@ -508,6 +537,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         server = cast(ReviewLinksServer, self.server)
+        if server.mode is ServerMode.LIST_FIXTURE and urlsplit(self.path).path != list_page.PAGE_PATH:
+            self.send_error(404)
+            return
         try:
             if server.bound_address != tailscale_ip():
                 self.html_response(403, change_page.document("<p>Open this page through this machine's Tailscale address.</p>"))
@@ -741,13 +773,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if not 0 < length <= 4096:
                 raise ValueError("Invalid accounts request size.")
             fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
-            if (set(fields) not in ({"key", "value"}, {"group", "to"})
-                    or any(len(values) != 1 for values in fields.values())):
-                raise ValueError("Use one color key and one color value, or one group and one account.")
+            if (set(fields) not in ({"key", "value"}, {"group", "to"}, {"group", "clear"})
+                    or any(len(values) != 1 for values in fields.values())
+                    or ("clear" in fields and fields["clear"] != ["first"])):
+                raise ValueError("Use one color key and one color value, one group and one account, or one group and clear=first.")
         except (ValueError, UnicodeError) as error:
             self.json_response(400, {"reason": str(error)})
             return
         result = (accounts_page.save_color(fields["key"][0], fields["value"][0]) if "key" in fields
+                  else accounts_page.clear_next_move(fields["group"][0]) if "clear" in fields
                   else accounts_page.save_next_move(fields["group"][0], fields["to"][0]))
         if isinstance(result, accounts_page.Refused):
             self.json_response(400, {"reason": result.reason})
@@ -765,17 +799,27 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if not 0 < length <= 100000:
                 raise ValueError("invalid List request size")
             body = self.rfile.read(length).decode("utf-8")
-            delivery = list_page.submit(server.root, body)
+            fields = parse_qs(body)
+            if server.mode is ServerMode.LIST_FIXTURE and fields.get("action") != ["remove"]:
+                raise ValueError("Only Remove is available in this demo.")
+            with server.list_store_access():
+                delivery = list_page.submit(server.root, body, server.delivery_status)
+                fixture_reply = ({"state": "saved",
+                    **list_page.saved_action_state(fields["keeper"][0], fields["id"][0])}
+                    if server.mode is ServerMode.LIST_FIXTURE else None)
         except ValueError as error:
             self.browser_failure(400, str(error), error)
             return
         except OSError as error:
             self.browser_failure(503, "The List request could not be saved. Try again.", error)
             return
+        if fixture_reply is not None:
+            self.json_response(200, fixture_reply)
+            return
         try:
-            fields = parse_qs(body)
-            self.json_response(200, {"state": "read" if fields["action"] == ["read"] else "sent",
-                **list_page.fresh_request(server.root, fields["keeper"][0], fields["id"][0])})
+            state = {"read": "read", "question": "saved"}.get(fields["action"][0], "sent")
+            self.json_response(200, {"state": state,
+                **list_page.saved_action_state(fields["keeper"][0], fields["id"][0])})
         finally:
             try:
                 list_page.deliver(delivery)
@@ -799,14 +843,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         self.json_response(200, {"state": "read"})
 
     def image_post(self) -> None:
-        """Delete an image or send its feedback; the page shows the reason of a failure on the card."""
-        root = cast(ReviewLinksServer, self.server).root
+        """Answer the browser before the shared sender delivers an image question."""
+        server = cast(ReviewLinksServer, self.server)
+        root = server.root
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0:
                 raise ValueError("empty image request")
-            images.submit(root, self.rfile.read(length).decode("utf-8"))
-        except change_page.AnswerRefused as error:
+            delivery = images.submit(root, self.rfile.read(length).decode("utf-8"), server.delivery_status)
+        except question_record.AnswerRefused as error:
             self.browser_failure(400, str(error), error)
             return
         except images.AnswerNotSent as error:
@@ -818,7 +863,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except OSError as error:
             self.browser_failure(503, "The image could not be changed. Try again.", error)
             return
-        self.json_response(200, {"state": "done"})
+        try:
+            self.json_response(200, {"state": "done"})
+        finally:
+            change_page.deliver(delivery, server.delivery_status)
 
     def news_post(self) -> None:
         """Record the page the console shows, and name the other pages that hold new items."""
@@ -834,8 +882,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             # An empty name means the open page is not a navigation entry, such as the Rebuilds page.
             if len(opened) != 1 or opened[0] not in {"", *(page.identity for page in pages)}:
                 raise ValueError("name one console page or none")
-            pages = tuple(replace(page, items=waiting_review) if page.items is review_page.waiting_items else page
-                          for page in pages)
+            pages = tuple(
+                replace(page, items=waiting_review) if page.items is review_page.waiting_items
+                else replace(page, items=partial(images.waiting_images, status=server.delivery_status))
+                if page.items is images.waiting_images else page
+                for page in pages
+            )
             fresh = console.news(server.root, pages, opened[0])
         except ValueError as error:
             self.browser_failure(400, "Name one console page.", error)
@@ -860,7 +912,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         """Start a Disks page measure in the background and answer at once with the slots and sessions in use now."""
         now = time.time()
         try:
-            started = disks_page.start_measure(now)
+            length = int(self.headers.get("Content-Length", "0"))
+            fields = parse_qs(self.rfile.read(length).decode("utf-8"))
+            started = disks_page.start_measure(now, force=fields.get("force") == ["1"])
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             self.browser_failure(503, "The measure could not start.", error)
             return
@@ -874,7 +928,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except (OSError, ValueError) as error:
             print(f"review-links disks sessions: {error}", file=sys.stderr)
             folders = None
-        self.json_response(200, {"state": started.value, "slots": report, "sessions": folders})
+        self.json_response(200, {"state": started.state.value, "target": started.target, "slots": report, "sessions": folders})
 
     def browser_failure(self, status: int, reason: str, error: Exception) -> None:
         print(f"review-links browser answer: {error}", file=sys.stderr)
@@ -902,9 +956,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
 
 
 class ReviewLinksServer(ThreadingHTTPServer):
-    def __init__(self, address: tuple[str, int], root: Path) -> None:
+    def __init__(self, address: tuple[str, int], root: Path, *, mode: ServerMode = ServerMode.LIVE) -> None:
         settings = conf.read("review_links")
-        self.root: Path = root.resolve()
+        self.mode: ServerMode = mode
+        self.store_folder: Path = root.resolve()
+        # Use relative paths in the fixture process so a request cannot recreate the store after removal.
+        self.root: Path = Path(".") if mode is ServerMode.LIST_FIXTURE else self.store_folder
         self.bound_address: str = address[0]
         self.delivery_status: change_page.DeliveryStatus = change_page.DeliveryStatus(self.root)
         self.branch_deletions: set[Path] = set()
@@ -915,12 +972,19 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.next_sweep: float = time.monotonic() + settings.number("snapshot_sweep_seconds")
         self.next_code_check: float = time.monotonic() + settings.number("code_check_seconds")
         self.module_stamps: dict[Path, tuple[int, int] | ModuleStampUnavailable] = loaded_module_stamps()
-        _ = sweep_snapshots(self.root, time.time())
+        if mode is ServerMode.LIVE:
+            _ = sweep_snapshots(self.root, time.time())
         super().__init__(address, ReviewLinksHandler)
+        if mode is ServerMode.LIST_FIXTURE:
+            return
         recover_changes = change_page.recover_pending
         recover_list = list_page.recover_pending
+        self.delivery_status.startup_recovery_pending.set()
         def recover_pending() -> None:
-            recover_changes(self.delivery_status)
+            try:
+                recover_changes(self.delivery_status)
+            finally:
+                self.delivery_status.startup_recovery_pending.clear()
             recover_list()
         threading.Thread(target=recover_pending, daemon=True).start()
         self.review_cache.start()
@@ -929,6 +993,20 @@ class ReviewLinksServer(ThreadingHTTPServer):
     def server_close(self) -> None:
         self.review_cache.close()
         super().server_close()
+
+    @contextmanager
+    def list_store_access(self) -> Generator[None]:
+        """Keep fixture file access separate from scratch removal."""
+        if self.mode is ServerMode.LIVE:
+            yield
+            return
+        try:
+            with scratch.directory_record_lock(self.store_folder, wait=False) as locked:
+                if not locked or not self.root.samefile(self.store_folder):
+                    raise OSError("The List fixture folder is unavailable.")
+                yield
+        except scratch.ScratchError as error:
+            raise OSError(str(error)) from error
 
     @override
     def server_bind(self) -> None:
@@ -945,6 +1023,14 @@ class ReviewLinksServer(ThreadingHTTPServer):
 
     @override
     def service_actions(self) -> None:
+        if self.mode is ServerMode.LIST_FIXTURE:
+            try:
+                present = self.root.samefile(self.store_folder)
+            except FileNotFoundError:
+                present = False
+            if not present:
+                raise FixtureStoreRemoved()
+            return
         now = time.monotonic()
         if now >= self.next_tailscale_check:
             settings = conf.read("review_links")
@@ -982,19 +1068,34 @@ class ReviewLinksServer(ThreadingHTTPServer):
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--port", type=int, default=conf.read("review_links").whole("server_port"), help="override the configured server port")
+    _ = parser.add_argument("--list-fixture", type=Path, help="serve a private List store and exit when its folder is removed")
     args = parser.parse_args(arguments)
+    fixture = cast(Path | None, args.list_fixture)
     try:
-        address = tailscale_ip()
-        root = change_routing.review_root()
-        root.mkdir(parents=True, exist_ok=True)
-        with ReviewLinksServer((address, cast(int, args.port)), root) as server:
-            print(f"review-links: serving {root} on {address}:{server.server_port}", flush=True)
+        if fixture is not None:
+            fixture = fixture.expanduser().absolute()
+            if not fixture.is_dir():
+                raise ValueError(f"List fixture folder is missing or is not a directory: {fixture}")
+            fixture = fixture.resolve(strict=True)
+        address = tailscale_ip(), cast(int, args.port)
+        if fixture is None:
+            root = change_routing.review_root()
+            root.mkdir(parents=True, exist_ok=True)
+            service = ReviewLinksServer(address, root)
+        else:
+            root = fixture
+            os.chdir(root)
+            os.environ.update(REVIEW_LINKS_ROOT=".", SHOWRUNNER_STATE_DIR="records", STAFF_FILE="staff.json",
+                              CHANGE_REVIEW_DIR="reviews", REBUILD_NEEDS_DIR="rebuild-needs")
+            service = ReviewLinksServer(address, root, mode=ServerMode.LIST_FIXTURE)
+        with service as server:
+            print(f"review-links: serving {root} on {address[0]}:{server.server_port}", flush=True)
             try:
                 server.serve_forever()
             except CodeChanged as error:
                 print(f"review-links: {error}", file=sys.stderr)
                 restart(server)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, FixtureStoreRemoved):
         return 0
     except (OSError, ValueError, subprocess.SubprocessError, TailscaleAddressLost) as error:
         print(f"review-links: {error}", file=sys.stderr)

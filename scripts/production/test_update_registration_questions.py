@@ -9,11 +9,12 @@ import os
 import unittest
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 from unittest import mock
 
 from scripts.production import proposal_issue, proposals_folder, staff
 from scripts.production.issues import Issue, frontmatter
+from scripts.production.production_doc import read_production
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import fixture_member
 from scripts.production.update_registration_test_support import RegistrationFixture, QuestionRegistration, registration, review
@@ -22,6 +23,126 @@ from scripts.production.update_registration_test_support import setUpModule as s
 
 
 class RegistrationTests(RegistrationFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        config = self.root / "title-config"
+        config.mkdir()
+        _ = (config / "production.conf").write_text("# whole: 20..\nquestion_title_max_chars=100\n")
+        self.env["CONF_DIR"] = str(config)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)})))
+
+    def test_ask_checks_both_titles_before_review_and_reads_the_current_limit(self) -> None:
+        config = Path(self.env["CONF_DIR"]) / "production.conf"
+        for limit in (40, 48):
+            _ = config.write_text(f"# whole: 20..\nquestion_title_max_chars={limit}\n")
+            for option in ("--text", "--ask"):
+                with self.subTest(limit=limit, option=option), mock.patch.object(review, "review_question") as reviewer:
+                    titles = {"--text": "Choose the layout", "--ask": "Keep the layout?"}
+                    titles[option] = "x" * (limit + 1)
+                    result = self.run_command("ask", "--text", titles["--text"], "--ask", titles["--ask"])
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    for words in (option, str(limit), str(limit + 1), "--context", "--item"):
+                        self.assertIn(words, result.stdout)
+                    reviewer.assert_not_called()
+                    self.assertEqual(self.open_rows(), [])
+            title = "t" * limit
+            with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(title)):
+                result = self.run_command("ask", "--text", title, "--ask", title)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(title, [row["text"] for row in self.open_rows()])
+            result = self.run_command("answer", "--item", title)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_replacement_refuses_new_and_changed_invalid_titles_before_review(self) -> None:
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep the layout?")):
+            _ = self.run_ask("Choose the layout", "Keep the layout?")
+        before = self.question_record_path("Choose the layout").read_bytes()
+        for title in ("x" * 101, "Choose the layout\nFull context", "Choose the layout\rFull context"):
+            for entry in (title, {"text": title, "question": "Keep the layout?"}):
+                with self.subTest(entry=entry), mock.patch.object(review, "review_question") as reviewer:
+                    state = self.question_state([entry])
+                    result = self.run_command("questions", "--state", str(state))
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("--context and --item", result.stdout)
+                    reviewer.assert_not_called()
+                    self.assertEqual(self.question_record_path("Choose the layout").read_bytes(), before)
+                    self.assertEqual([row["text"] for row in self.open_rows()], ["Choose the layout"])
+
+    def test_replacement_names_legacy_invalid_titles_and_keeps_their_records(self) -> None:
+        for title in ("x" * 101, "Choose the layout\nFull context"):
+            with self.subTest(title=title):
+                with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep the layout?")):
+                    _ = self.run_ask("Choose the layout", "Keep the layout?")
+                path = self.question_record_path("Choose the layout")
+                raw = path.read_text()
+                registration_line = next(line for line in raw.splitlines() if line.startswith("registration: "))
+                item = cast(registration.OutstandingItem, json.loads(registration_line.removeprefix("registration: ")))
+                item["text"] = title
+                _ = path.write_text(raw.replace(registration_line, "registration: " + json.dumps(item))
+                                    .replace("# Choose the layout\n", "# " + title + "\n"))
+                before = path.read_bytes()
+                state = self.question_state([{"text": title}])
+                with mock.patch.object(review, "review_question") as reviewer:
+                    result = self.run_command("questions", "--state", str(state))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("questions: reword", result.stdout)
+                self.assertIn(title, result.stdout)
+                reviewer.assert_not_called()
+                self.assertEqual(path.read_bytes(), before)
+                result = self.run_command("answer", "--item", title)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_record_writer_refuses_changed_title_and_ask_without_changing_the_file(self) -> None:
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep the layout?")):
+            _ = self.run_ask("Choose the layout", "Keep the layout?")
+        path = self.question_record_path("Choose the layout")
+        with mock.patch.dict(os.environ, self.env):
+            identities = registration.QuestionStaff.read()
+            record = registration.question_records(read_production("example"), identities)[0]
+        before = path.read_bytes()
+        for field in ("text", "ask"):
+            with self.subTest(field=field):
+                item = record.item.copy()
+                if field == "text":
+                    item["text"] = "x" * 101
+                else:
+                    assert "parts" in item
+                    item["parts"] = {**item["parts"], "ask": "x" * 101}
+                changed = registration.QuestionRecord(path, record.owner, record.asker, item, "open")
+                with self.assertRaisesRegex(registration.RegistrationFailure, "limit is 100"):
+                    registration.write_question_record(changed)
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_record_writer_keeps_a_legacy_title_but_refuses_a_changed_long_ask(self) -> None:
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep the layout?")):
+            _ = self.run_ask("Choose the layout", "Keep the layout?")
+        path = self.question_record_path("Choose the layout")
+        original = path.read_text()
+        line = next(line for line in original.splitlines() if line.startswith("registration: "))
+        item = cast(registration.OutstandingItem, json.loads(line.removeprefix("registration: ")))
+        title = "A legacy title " + "x" * 100
+        item["text"] = title
+        assert "parts" in item
+        item["parts"]["ask"] = title
+        _ = path.write_text(original.replace(line, "registration: " + json.dumps(item)))
+        with mock.patch.dict(os.environ, self.env):
+            identities = registration.QuestionStaff.read()
+            record = registration.question_records(read_production("example"), identities)[0]
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        registration.write_question_record(record)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        record.item["parts"] = {**item["parts"], "ask": title + " changed"}
+        with self.assertRaisesRegex(registration.RegistrationFailure, "ask: .*limit is 100"):
+            registration.write_question_record(record)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        record.item["parts"] = {**item["parts"], "ask": "Keep the layout?"}
+        registration.write_question_record(record)
+        saved = cast(registration.OutstandingItem, json.loads(frontmatter(path)["registration"][0]))
+        self.assertEqual(saved["text"], title)
+        assert "parts" in saved
+        self.assertEqual(saved["parts"]["ask"], "Keep the layout?")
+
     def test_closed_review_questions_keep_answer_words_after_replay_history_expires(self) -> None:
         _ = self.run_ask('Choose the layout','Which layout should we use?')
         path = self.question_record_path('Choose the layout')
@@ -57,7 +178,8 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual({frontmatter(path)["asked_by"][0] for path in questions}, {owner_id, unit_id})
         before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in [proposal, *questions]}
         _ = staff.rename(owner_id, "renamed-owner")
-        _ = staff.rename(unit_id, "renamed-unit")
+        new_unit_name = "renamed"
+        _ = staff.rename(unit_id, new_unit_name)
         for transferred in (False, True):
             with self.subTest(transferred=transferred):
                 if transferred:
@@ -66,10 +188,10 @@ class RegistrationTests(RegistrationFixture):
                                  [] if transferred else [proposal])
                 self.assertEqual([issue.path for issue in proposals_folder.open_proposals(destination_doc)],
                                  [proposal] if transferred else [])
-                self.assertEqual(proposal_issue.proposal_unit(Issue(proposal, frontmatter(proposal))), "renamed-unit")
+                self.assertEqual(proposal_issue.proposal_unit(Issue(proposal, frontmatter(proposal))), new_unit_name)
                 listed = self.run_command("questions-table")
                 self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
-                for text in ("Choose the layout", "Choose the colors", "renamed-unit", "renamed-owner"):
+                for text in ("Choose the layout", "Choose the colors", new_unit_name, "renamed-owner"):
                     self.assertIn(text, listed.stdout)
                 self.assertNotIn("A separate proposal", listed.stdout)
                 other = invoke_cli(registration, registration.main,

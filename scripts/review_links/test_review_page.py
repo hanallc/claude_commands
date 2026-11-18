@@ -1,7 +1,11 @@
 """Check the shared review records, signed actions and table behavior."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
+
+from scripts.production.change_review_test_support import pictured_changes
 
 import shutil
+import html
 import json
 import os
 import re
@@ -32,9 +36,12 @@ from scripts.production import issues as issue_store
 from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, record_table, review_items, review_page
-from scripts.review_links import list_page, test_change_page
+from scripts.review_links import question_record
+from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, review_actions, review_later
+from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.test_record_table import save_notice_failures
 from scripts.statusline import counts_row
 
 
@@ -49,7 +56,8 @@ def unpack_index(payload: str) -> list[review_page.ReviewIndexEntry]:
         entries.append(review_page.ReviewIndexEntry(key=str(key), id=str(item_id or key),
             type=tuple(review_items.ReviewType)[int(kind)], owner=owner[0], sourceOwner=source[0],
             ownerName=owner[1], sourceName=source[1], title=str(title), state=tuple(review_items.ReviewState)[int(state)],
-            filed=int(filed), updated=str(updated), hiddenUntil=float(hidden_until), urgency=str(urgency or 'normal')))
+            filed=int(filed), updated=str(updated), hiddenUntil=float(hidden_until), urgency=str(urgency or 'normal'),
+            ownerHtml=owner[2], sourceHtml=source[2]))
     return entries
 
 
@@ -98,6 +106,36 @@ class ReviewPageTests(unittest.TestCase):
     root: Path = Path()
     status: change_page.DeliveryStatus = change_page.DeliveryStatus(Path())
 
+    def test_review_ids_use_the_shared_no_wrap_cell(self) -> None:
+        _ = self.question()
+        body = review_page.render(self.root).decode()
+        self.assertIn('class="record-id"', body)
+        self.assertIn('.list-table .record-id{white-space:nowrap;overflow-wrap:normal;width:1%}', body)
+        self.assertIn('.list-toggle{white-space:nowrap}', body)
+        self.assertIn('<col style="width:17%">', body)
+
+    def test_staff_owners_sources_and_log_names_have_role_colors(self) -> None:
+        _ = self.question()
+        snapshot = review_page.build_snapshot(self.root)
+        body = ''.join(snapshot.body(item.key).decode() for item in snapshot.records.values())
+        self.assertRegex(body, r'data-color-text="role.showrunner"[^>]*>page-owner</span>')
+        self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>builder-unit</span>')
+        self.assertNotRegex(body, r'class="staff-name"[^>]*>nate</span>')
+        item = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.QUESTION)
+        unknown = replace(item, owner=staff.StaffId('nate'), source_unit=staff.StaffId('unknown-source'))
+        plain = self.card_details(unknown)
+        self.assertIn('Owner: nate · Source: unknown-source</p>', plain)
+        entry, = review_page.filter_index([unknown], staff.snapshot())
+        self.assertEqual((entry['ownerHtml'], entry['sourceHtml']), ('nate', 'unknown-source'))
+
+    def card_details(self, item: review_items.ReviewItem) -> str:
+        snapshot = review_page.build_snapshot(self.root)
+        assets: dict[str, str] = {}
+        review_page.retain_asset(item, assets)
+        inputs = review_page.ReviewBodyInputs(snapshot.browser, snapshot.members, snapshot.words_rows,
+            'In 1 hour', assets, snapshot.zone, snapshot.names)
+        return review_page.details(item, inputs)
+
     @override
     def setUp(self) -> None:
         self.fixture = test_change_page.ChangePageTests('runTest')
@@ -107,7 +145,16 @@ class ReviewPageTests(unittest.TestCase):
 
     def configure_review(self) -> None:
         config = self.fixture.temporary / 'config'
-        _ = shutil.copyfile(Path(__file__).resolve().parents[2]/'config/console.conf',config/'console.conf')
+        _ = write_config_fixture(config / "production.conf", "question_title_max_chars=100\n")
+        _ = write_config_fixture(config / "console.conf",
+            "page.review.url=python:scripts.review_links.review_page:page_url\n"
+            + "page.review.items=python:scripts.review_links.review_page:waiting_items\n"
+            + "page.review.icon=inbox\npage.review.title=Review\n"
+            + "status.round_trip_limit_seconds=1\nstatus.render_limit_seconds=1\n"
+            + "status.reading_delay_seconds=1\nstatus.review.age_limit_seconds=45\n")
+        _ = write_config_fixture(config / "review_links.conf",
+            "review_words_rows=4\nlater_soon_minutes=60\nlater_evening=18:00\n"
+            + "later_evening_until=17:00\nlater_morning=09:00\nlater_week_day=Monday\nlater_week_time=09:00\n")
         self.root = self.fixture.root
         _ = change_page.console_folder(self.root)
         self.status = change_page.DeliveryStatus(self.root)
@@ -117,8 +164,138 @@ class ReviewPageTests(unittest.TestCase):
     def question(self, title: str = 'Which layout should the page use?') -> str:
         return self.fixture.file_user_question(title)
 
+    def assert_index_title(self, item: review_items.ReviewItem, title: str) -> None:
+        entry, = review_page.filter_index([item], staff.snapshot())
+        self.assertEqual(entry['title'], title)
+        self.assertEqual(unpack_index(review_page.index_json([entry]))[0]['title'], title)
+
+    def test_legacy_question_titles_are_short_but_search_and_details_keep_the_full_text(self) -> None:
+        key = self.question()
+        source = next(item.source for item in review_items.read(self.root) if item.key == key)
+        assert isinstance(source, review_items.QuestionSource)
+        path = source.record.path
+        original = path.read_text()
+        for title in ('Long <title> '+ 'x'*100, 'Short <title>\nThe full question follows.'):
+            with self.subTest(title=title):
+                item = source.record.item.copy()
+                item['text'] = title
+                item['parts'] = update_registration.QuestionParts(ask=title, context='Context remains visible.',
+                    items=[], choices=[], recommend='')
+                registration_line = next(line for line in original.splitlines() if line.startswith('registration: '))
+                _ = path.write_text(original.replace(registration_line, 'registration: '+json.dumps(item)))
+                snapshot = review_page.build_snapshot(self.root)
+                self.assert_index_title(snapshot.records[key], title)
+                self.assertEqual(snapshot.title_limit, 100)
+                detail = snapshot.body(key).decode()
+                for line in title.splitlines():
+                    self.assertIn(html.escape(line), detail)
+                self.assertIn('Context remains visible.', detail)
+
+    def test_question_at_the_title_limit_shows_its_full_text_once_in_details(self) -> None:
+        key = self.question()
+        source = next(item.source for item in review_items.read(self.root) if item.key == key)
+        assert isinstance(source, review_items.QuestionSource)
+        title = 'W'*100
+        for structured in (False, True):
+            with self.subTest(structured=structured):
+                source.record.item['text'] = title
+                source.record.item['question'] = title
+                if structured:
+                    source.record.item['parts'] = update_registration.QuestionParts(
+                        ask=title, context='', items=[], choices=[], recommend='')
+                else:
+                    _ = source.record.item.pop('parts', None)
+                update_registration.write_question_record(source.record)
+                snapshot = review_page.build_snapshot(self.root)
+                self.assert_index_title(snapshot.records[key], title)
+                self.assertEqual(snapshot.title_limit, len(title))
+                detail = snapshot.body(key).decode().split('data-review-body>', 1)[1]
+                self.assertEqual(detail.count(title), 1)
+                self.assertNotIn('<h3>Item</h3>', detail)
+
+    def test_short_change_title_appears_in_the_item_section(self) -> None:
+        item = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        title = 'Check the spacing'
+        detail = self.card_details(replace(item, title=title))
+        self.assertIn('<h3>Item</h3><p>'+title+'</p>', detail)
+        self.assertEqual(detail.split('<div data-review-body>', 1)[0].count(title), 1)
+
+    def test_question_with_a_distinct_ask_shows_title_and_ask_once_in_details(self) -> None:
+        key = self.question()
+        source = next(item.source for item in review_items.read(self.root) if item.key == key)
+        assert isinstance(source, review_items.QuestionSource)
+        title, ask = 'Layout choice', 'Which width should the page use?'
+        source.record.item['text'] = title
+        source.record.item['parts'] = update_registration.QuestionParts(
+            ask=ask, context='Choose the width.', items=[], choices=[], recommend='')
+        update_registration.write_question_record(source.record)
+        detail = review_page.build_snapshot(self.root).body(key).decode()
+        self.assertIn('<h3>Item</h3><p>'+title+'</p>', detail)
+        self.assertEqual(detail.count(title), 1)
+        self.assertEqual(detail.count(ask), 1)
+        self.assertIn('Choose the width.', detail)
+
+    def test_investigation_shows_its_question_title_once_in_details(self) -> None:
+        title = 'Why did the gate stop?'
+        filed = investigation.file(self.fixture.unit.id, title, title, waiting_why='The owner must complete the investigation.')
+        investigation_record = investigation.answer(filed.owner, filed.id, 'The test failed. The repair is ready.')
+        item = next(item for item in review_items.read(self.root)
+                    if item.key == f'investigation/{investigation_record.owner}/{investigation_record.id}')
+        self.assertEqual(item.title, investigation_record.question)
+        detail = self.card_details(item).split('data-review-body>', 1)[1]
+        self.assertIn('<h3>You asked</h3>', detail)
+        self.assertEqual(detail.count(html.escape(item.title)), 1)
+        self.assertNotIn('<h3>Item</h3>', detail)
+        self.assertIn(html.escape(investigation_record.answer), detail)
+
+    def test_change_shows_its_title_once_when_the_proof_contains_it(self) -> None:
+        item = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        assert isinstance(item.source, review_items.ChangeSource)
+        title = 'The spacing agrees'
+        source = replace(item.source, row={**item.source.row, 'What you see': title})
+        detail = self.card_details(replace(item, title=title, source=source)).split('data-review-body>', 1)[1]
+        self.assertIn('<h3>Proof</h3><p>'+title+'</p>', detail)
+        self.assertEqual(detail.split('<img ', 1)[0].count(title), 1)
+        self.assertNotIn('<h3>Item</h3>', detail)
+
+    def test_each_review_type_limits_the_title_and_keeps_it_in_details(self) -> None:
+        _ = self.question()
+        title = 'A full <title> '+ 'x'*100+'\nMore facts.'
+        _ = self.investigation()
+        _ = self.decisions()
+        for item in review_items.read(self.root):
+            with self.subTest(kind=item.type):
+                item = replace(item, title=title)
+                self.assert_index_title(item, title)
+                detail = self.card_details(item)
+                for line in title.splitlines():
+                    self.assertIn(html.escape(line), detail)
+
+    def test_render_reads_the_title_limit_once_for_all_rows_and_details(self) -> None:
+        title = 'A title '+ 'x'*70
+        _ = self.question(title)
+        _ = self.investigation()
+        reads: list[str] = []
+        read_config = conf.read_or_repository
+
+        class TitleLimit:
+            def whole(self, key: str) -> int:
+                return {'question_title_max_chars':40}[key]
+
+        def config(stem: str) -> conf.ConfigRead | TitleLimit:
+            if stem == 'production':
+                reads.append(stem)
+                return TitleLimit()
+            return read_config(stem)
+
+        with patch.object(conf, 'read_or_repository', side_effect=config):
+            rendered = review_page.render(self.root).decode()
+        self.assertEqual(reads, ['production'])
+        self.assertIn('data-title-limit="40"', rendered)
+        self.assertIn(title, rendered.split('data-review-index>', 1)[1].split('</script>', 1)[0])
+
     def investigation(self, ready: bool = True) -> investigation.Investigation:
-        item = investigation.file(self.fixture.unit.id, 'Why did the gate stop?', 'Read the gate log.')
+        item = investigation.file(self.fixture.unit.id, 'Why did the gate stop?', 'Read the gate log.', waiting_why='The owner must complete the investigation.')
         return investigation.answer(item.owner,item.id,'The test failed. The repair is ready.') if ready else item
 
     def decisions(self) -> tuple[str, str]:
@@ -206,7 +383,7 @@ class ReviewPageTests(unittest.TestCase):
 
         for label in ('unrouted-a', 'unrouted-b'):
             target = change_review.list_file(label)
-            _ = change_review.append_rows(target, [change_review.Visible(label, 'Check it', 'Proof')],
+            _ = change_review.append_rows(target, pictured_changes([change_review.Visible(label, 'Check it', 'Proof')]),
                 datetime(2026, 11, 1).date(), '', doc,
                 producers=[staff.StaffId('missing-'+label)], record=staff.snapshot())
         snapshot = review_page.build_snapshot(self.root)
@@ -306,7 +483,7 @@ class ReviewPageTests(unittest.TestCase):
         listing = change_review.list_file('unreadable')
         _ = doc.write_text(f'# Unreadable\n- **Change review:** `{listing}`\n')
         runner = fixture_member('showrunner', name='unreadable', doc=staff.LiveDoc(local_machine(), doc))
-        _ = change_review.append_rows(listing, [change_review.Visible('Another Change', 'Check it', 'Proof')],
+        _ = change_review.append_rows(listing, pictured_changes([change_review.Visible('Another Change', 'Check it', 'Proof')]),
             datetime(2026, 11, 1).date(), '', doc, producers=[runner.id], record=staff.snapshot())
         before = review_page.build_snapshot(self.root)
         key = 'page-owner/C1'
@@ -933,7 +1110,8 @@ class ReviewPageTests(unittest.TestCase):
   pending.elements.later.value='2030-12-03T18:30';
   pending.elements.later.dispatchEvent(new Event('input'));
   pending.elements.later.blur();
-  scrollTo(0,document.documentElement.scrollHeight);await until(()=>!row('page-owner/C2'),'the saving row to unmount');
+  scrollTo(0,document.documentElement.scrollHeight);await frame();
+  await until(()=>!row('page-owner/C2'),'the saving row to unmount');
   scrollTo(0,top);await until(()=>form('page-owner/C2'),'the saving row to mount');
   const replacement=form('page-owner/C2');
   const laterButton=replacement.querySelector('button[value=later]');
@@ -964,8 +1142,10 @@ class ReviewPageTests(unittest.TestCase):
   conflict='/remove-conflict';
   const removed=form('page-owner/C4');
   removed.elements.later.value='2030-12-02T18:30';
+  const removalVersion=document.querySelector('[data-review]').dataset.version;
   removed.requestSubmit(removed.querySelector('button[value=later]'));
-  await until(()=>!row('page-owner/C4'),'the removed conflict row');
+  await until(()=>!row('page-owner/C4') && document.querySelector('[data-review]').dataset.version!==removalVersion,
+   'the refreshed view without the removed row');
   const notice=document.querySelector('[data-review-notice]');
   check(notice && !notice.hidden && notice.textContent.includes('This item is no longer on the list.'),
    'F029: the page retains the conflict reason when refresh removes the card.');
@@ -1284,7 +1464,7 @@ requestAnimationFrame(focusRow);
         cards = ''.join(review_page.build_snapshot(self.root).body(item.key).decode() for item in review_items.read(self.root))
         for action in ('Answer','Works','Does not work','Ask showrunner to check','Ask question','Send feedback','Mark read'):
             self.assertIn('>'+action+'</button>',cards)
-        self.assertIn('>Later</button>',cards)
+        self.assertIn('data-later-toggle>Later <span',cards)
         self.assertIn('createPageRefresh(refresh,()=>content.dataset.refreshSeconds)',source)
         self.assertIn('class="lucide lucide-microscope"',source)
         self.assertIn('data-refresh-seconds="15.0"',source)
@@ -1377,7 +1557,7 @@ requestAnimationFrame(focusRow);
         self.assertEqual({entry['state'] for entry in entries}, {'Open', 'Waiting', 'Done'})
         self.assertIn(f'investigation/{waiting.owner}/{waiting.id}', {entry['key'] for entry in entries})
         self.assertEqual(set(entries[0]), {'key', 'id', 'type', 'owner', 'sourceOwner', 'ownerName',
-                                        'title', 'state', 'filed', 'updated', 'hiddenUntil', 'sourceName', 'urgency'})
+                                        'title', 'state', 'filed', 'updated', 'hiddenUntil', 'sourceName', 'urgency', 'ownerHtml', 'sourceHtml'})
         self.assertEqual([entry['updated'] for entry in entries], [item.times.updated.isoformat() for item in records])
         encoded = review_page.index_json(entries)
         self.assertNotIn('<', encoded)
@@ -1498,8 +1678,9 @@ window.fetch=async(url,options)=>{
     [...document.querySelectorAll('[data-show-chip] b')].every(number=>!number.hidden),
     'All supplies the count for every Show chip');
   const groups=[...document.querySelectorAll('.review-types')],buttons=[...document.querySelectorAll('[data-show-chip]')];
-  check(groups.length===2 && groups[1].getBoundingClientRect().top>=groups[0].getBoundingClientRect().bottom,
-    'Show chips appear below the type chips');
+  check(groups.length===3 && groups[1].getBoundingClientRect().top>=groups[0].getBoundingClientRect().bottom &&
+    groups[2].getBoundingClientRect().top>=groups[1].getBoundingClientRect().bottom,
+    'Show follows Type and Owner follows Show');
   check(buttons.length===4 && buttons.every(button=>button.type==='button' && button.tabIndex===0),
     'Show chips use native keyboard buttons in tab order');
   chip('Waiting')?.focus();
@@ -1507,7 +1688,7 @@ window.fetch=async(url,options)=>{
   check(document.documentElement.scrollWidth<=innerWidth && groups.every(group=>
     getComputedStyle(group).gap==='8px' && [...group.querySelectorAll('button')].every(button=>{
      const box=button.getBoundingClientRect();return box.left>=0 && box.right<=innerWidth;
-    })),'both chip rows wrap with even spacing and no clipping');
+    })),'the three chip rows wrap with even spacing and no clipping');
 
   for(const spelling of ['For you','for-you','for you','FOR YOU']){
    const legacyShow=document.createElement('iframe');
@@ -1521,45 +1702,46 @@ window.fetch=async(url,options)=>{
     'the legacy Show spelling opens Open: '+spelling);
    legacyShow.remove();
   }
-  const menu=()=>document.querySelector('#list-owner');
-  const options=()=>[...menu().options];
-  const chooseOwner=value=>{menu().value=value;menu().dispatchEvent(new Event('change'));};
+  const ownerChip=(value,doc=document)=>doc.querySelector('[data-owner-chip="'+value+'"]');
+  const ownerChips=()=>[...document.querySelectorAll('[data-owner-chip]:not([hidden])')];
+  const selectedOwner=(doc=document)=>doc.querySelector('[data-owner-chip][aria-pressed="true"]');
+  const chooseOwner=value=>ownerChip(value).click();
   const chooseType=value=>document.querySelector('[data-type-chip="'+value+'"]').click();
-  const builder=document.querySelector('[data-type="investigation"]').dataset.sourceOwner;
   chip('open').click();await flush();await flush();
+  const builder=document.querySelector('[data-type="investigation"]').dataset.sourceOwner;
   chooseOwner(builder);chooseType('question');
-  check(options().length===2 && options()[0].textContent==='All (1)' &&
-    options().some(option=>option.textContent==='page-owner (1)') &&
-    !options().some(option=>option.value===builder),
+  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 1' &&
+    ownerChips().some(button=>button.textContent==='page-owner 1') &&
+    ownerChip(builder).hidden,
     'F007: Owner lists only owners with the selected type and words in any Show.');
-  check(menu().value==='' && !new URLSearchParams(location.hash.slice(1)).get('owner') &&
+  check(selectedOwner().dataset.ownerChip==='' && !new URLSearchParams(location.hash.slice(1)).get('owner') &&
     ['open','Waiting','Done','all'].map(value=>count(value)?.textContent).join('|')==='1|0|0|1',
     'F007: an owner without the selected type resets to All with matching counts.');
   check([...document.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1,
     'F007: the question appears after the owner resets.');
   chooseType('investigation');
-  check(options().some(option=>option.value===builder) && options()[0].textContent==='All (1)',
+  check(ownerChips().some(button=>button.dataset.ownerChip===builder) && ownerChips()[0].textContent==='All 1',
     'a type change restores owners and counts');
   chooseOwner(builder);chip('Done').click();await flush();await flush();
-  check(options()[0].textContent==='All (1)' && menu().value===builder,
+  check(ownerChips()[0].textContent==='All 1' && selectedOwner().dataset.ownerChip===builder,
     'Show limits Owner counts and retains an owner with matching loaded rows');
   chip('open').click();await flush();await flush();
-  chooseType('question');chooseOwner(options().find(option=>option.dataset.ownerName==='page-owner')?.value);
+  chooseType('question');chooseOwner(ownerChips().find(button=>button.dataset.ownerName==='page-owner')?.dataset.ownerChip);
   chip('Waiting').click();await flush();await flush();
-  check(options().length===2 && options()[0].textContent==='All (0)' && menu().value!=='' &&
-    options()[1].textContent==='page-owner (0)',
+  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 0' && selectedOwner().dataset.ownerChip!=='' &&
+    ownerChips()[1].textContent==='page-owner 0',
     'Show retains the selected owner with a zero count.');
   chip('open').click();await flush();await flush();
-  check(options().length===2 && options()[0].textContent==='All (1)','Show restores matching owners');
+  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 1','Show restores matching owners');
   chooseType('investigation');chooseOwner(builder);
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
-  check(menu().value===builder && options()[0].textContent==='All (1)' &&
-    options().every(option=>!option.textContent.endsWith('(0)')),'refresh retains the matching owner list and selection');
+  check(selectedOwner().dataset.ownerChip===builder && ownerChips()[0].textContent==='All 1' &&
+    ownerChips().every(button=>button.querySelector('b').textContent!=='0'),'refresh retains the matching owner list and selection');
   const legacy=document.createElement('iframe');
   legacy.src='/reload#'+new URLSearchParams({owner:builder,type:'question',show:'open'});
   const legacyLoaded=new Promise(resolve=>legacy.addEventListener('load',resolve,{once:true}));document.body.append(legacy);
   await legacyLoaded;await flush();await flush();
-  check(legacy.contentDocument.querySelector('#list-owner').value==='' &&
+  check(selectedOwner(legacy.contentDocument).dataset.ownerChip==='' &&
     [...legacy.contentDocument.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1 &&
     !new URLSearchParams(legacy.contentWindow.location.hash.slice(1)).get('owner'),
     'F007: a legacy owner without the selected type resets to All.');legacy.remove();
@@ -1567,31 +1749,31 @@ window.fetch=async(url,options)=>{
   const navigated=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
   location.hash=new URLSearchParams({owner:'builder-unit',type:'investigation',show:'open'});
   await navigated;await flush();await flush();
-  check(menu().value===builder && [...document.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1,
-    'F004: hash navigation resolves an owner name whose option was hidden by Questions');
+  check(selectedOwner().dataset.ownerChip===builder && [...document.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1,
+    'F004: hash navigation resolves an owner name whose chip was hidden by Questions');
   const translated=document.createElement('iframe');
   translated.src='/reload#'+new URLSearchParams({legacy:'investigation',owner:'no-investigations',type:'investigation',show:'not-read'});
   const translatedLoaded=new Promise(resolve=>translated.addEventListener('load',resolve,{once:true}));
   document.body.append(translated);await translatedLoaded;await flush();await flush();
   const translatedPage=translated.contentDocument,translatedAddress=new URLSearchParams(translated.contentWindow.location.hash.slice(1));
-  check(translatedPage.querySelector('#list-owner').value==='' &&
-    translatedPage.querySelector('#list-owner').selectedOptions[0].textContent==='All (1)' &&
+  check(selectedOwner(translatedPage).dataset.ownerChip==='' &&
+    selectedOwner(translatedPage).textContent==='All 1' &&
     !translatedAddress.get('owner') && !translatedAddress.has('source-owner') &&
     [...translatedPage.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1 &&
     count('open',translatedPage)?.textContent==='1',
     'F003: a legacy investigation reset clears both owner constraints and shows the All rows');
   translated.remove();
-  chooseType('question');chooseOwner(options().find(option=>option.dataset.ownerName==='page-owner')?.value);
+  chooseType('question');chooseOwner(ownerChips().find(button=>button.dataset.ownerName==='page-owner')?.dataset.ownerChip);
   const question=document.querySelector('[data-type="question"]');question.querySelector('.list-toggle').click();await readyReviewCard(question);
   const form=question.querySelector('[data-review-form]');form.elements.feedback.value='Use this layout.';
   form.querySelector('[value="answer"]').click();await new Promise(resolve=>nativeTimeout(resolve,1100));
-  check(options().length===2 && options()[0].textContent==='All (0)' && menu().value!=='' && question.hidden &&
+  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 0' && selectedOwner().dataset.ownerChip!=='' && !question.isConnected &&
     count('Done').textContent==='1',
     'A save retains the selected owner and moves its count to Done.');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
-  check(options().length===2 && options()[0].textContent==='All (0)' && menu().value!=='' &&
+  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 0' && selectedOwner().dataset.ownerChip!=='' &&
     count('Done').textContent==='1',
-    'Refresh retains the zero option for the selected owner.');
+    'Refresh retains the zero count for the selected owner.');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>""".replace('EXPECTED', json.dumps(expected))
@@ -1669,26 +1851,27 @@ window.fetch=async(url,options)=>{
   await flush();
   check(!document.querySelector('[data-list-count]'),'The Show chips replace the right count text.');
   check(counts('[data-show-chip]')==='3|1|1|5','The index counts states outside the rendered view.');
-  const owner=()=>document.querySelector('#list-owner');
+  const ownerChip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
+  const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
   const builder=document.querySelector('[data-type="change"]').dataset.sourceOwner;
-  const chooseOwner=value=>{owner().value=value;owner().dispatchEvent(new Event('change'));};
+  const chooseOwner=value=>ownerChip(value).click();
   show('all').click();await flush();await flush();
   chooseOwner(builder);
   check(counts('[data-show-chip]')==='0|1|0|1','Show counts use the selected owner.');
   check(type('change').querySelector('b').textContent==='0' && type('investigation').querySelector('b').textContent==='1',
    'Type counts use the selected owner.');
   type('change').click();
-  check(owner().value==='' && counts('[data-show-chip]')==='2|0|1|3',
+  check(selectedOwner().dataset.ownerChip==='' && counts('[data-show-chip]')==='2|0|1|3',
    'F007: an owner without the selected type resets to All.');
   type('investigation').click();
   chooseOwner(builder);show('open').click();await flush();await flush();
-  check(owner().value===builder && counts('[data-show-chip]')==='0|1|0|1' &&
+  check(selectedOwner().dataset.ownerChip===builder && counts('[data-show-chip]')==='0|1|0|1' &&
    [...document.querySelectorAll('[data-list-item]')].every(row=>row.hidden),
    'F007: the user case keeps an owner with rows in another Show.');
   show('all').click();await flush();await flush();
   check(counts('[data-show-chip]')==='0|1|0|1','Show counts combine the type and owner.');
   search('gate');
-  check(counts('[data-show-chip]')==='0|1|0|1' && owner().options[0].textContent==='All (1)',
+  check(counts('[data-show-chip]')==='0|1|0|1' && ownerChip('').textContent==='All 1',
    'All counts combine the words, owner, type and Show filters.');
   search('');chooseOwner('');type('').click();show('open').click();await flush();await flush();
   type('change').click();
@@ -1697,11 +1880,11 @@ window.fetch=async(url,options)=>{
   check(counts('[data-show-chip]')==='1|0|1|2','Show counts use the words filter.');
   check(type('change').querySelector('b').textContent==='1' && type('question').querySelector('b').textContent==='0',
    'Type counts use the words filter and Show.');
-  check(document.querySelector('#list-owner').selectedOptions[0].textContent==='All (1)',
+  check(selectedOwner().textContent==='All 1',
    'Owner counts use the type, Show and words.');
   search('no matching title');
   check(counts('[data-show-chip]')==='0|0|0|0' && [...document.querySelectorAll('[data-type-chip] b')].every(n=>n.textContent==='0') &&
-   document.querySelector('#list-owner').selectedOptions[0].textContent==='All (0)',
+   selectedOwner().textContent==='All 0',
    'An empty filtered view has zero in every applicable count.');
   search('');show('all').click();await flush();await flush();
   check(type('change').querySelector('b').textContent==='3','Type counts include the selected Show.');
@@ -1762,6 +1945,102 @@ window.fetch=async(url,options)=>{
                         thread.join(TEST_HANG_GUARD_SECS)
                 self.assertEqual(results, [[]])
 
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_owner_counts_follow_the_type_and_show_chips(self) -> None:
+        _ = self.decisions()
+        _ = self.question()
+        _ = self.investigation()
+        examples = {item.type: item for item in review_items.read(self.root)}
+        owners = {fixture_member('showrunner', name=name).id: name
+                  for name in ('natedev', 'second-owner', 'third-owner')}
+        states = review_items.REVIEW_STATES
+        records: list[review_items.ReviewItem] = []
+        for owner_index, owner in enumerate(owners):
+            for type_index, kind in enumerate(review_items.REVIEW_TYPES):
+                record_states = list(states)
+                for offset in range(owner_index + type_index):
+                    record_states.append(states[(type_index + offset) % len(states)])
+                for number, state in enumerate(record_states, 1):
+                    key = f'{kind}/{owner}/{number}'
+                    records.append(replace(examples[kind], key=key, id=key, owner=owner, source_unit=owner,
+                                           state=state, actions=()))
+
+        show_states = {'open': (review_items.ReviewState.OPEN,), 'Waiting': (review_items.ReviewState.WAITING,),
+                       'Done': (review_items.ReviewState.DONE,), 'all': states}
+        expected: dict[str, dict[str, dict[str, int]]] = {}
+        for show, selected_states in show_states.items():
+            expected[show] = {}
+            for kind in ('', *review_items.REVIEW_TYPES):
+                counts = {str(owner): sum(item.owner == owner and item.state in selected_states and
+                                          (not kind or item.type == kind) for item in records)
+                          for owner in owners}
+                expected[show][kind] = {'': sum(counts.values()), **counts}
+
+        with patch.object(review_items, 'read', return_value=records):
+            page = review_page.render(self.root).decode()
+
+        setup = r"""<script>
+const nativeFetch=fetch;
+let reads=0;
+window.setInterval=()=>0;window.clearInterval=()=>{};
+window.fetch=async()=>{reads++;throw new Error('An index filter requested the server.');};
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const expected=EXPECTED;
+ const chip=(group,value)=>document.querySelector('[data-'+group+'-chip="'+value+'"]');
+ const selected=group=>document.querySelector('[data-'+group+'-chip][aria-pressed="true"]')
+  ?.getAttribute('data-'+group+'-chip');
+ const count=owner=>chip('owner',owner)?.querySelector('b')?.textContent;
+ const counts=()=>Object.keys(expected.open['']).map(count).join('|');
+ const checkCounts=(show,type)=>{
+  const wanted=expected[show][type];
+  const visible=[...document.querySelectorAll('[data-owner-chip]:not([hidden])')];
+  check(visible.length===Object.keys(wanted).length && visible.every(button=>Object.hasOwn(wanted,button.dataset.ownerChip)),
+   show+' / '+(type || 'All types')+': the Owner chips match the fixture owners.');
+  for(const [owner,total] of Object.entries(wanted)){
+   const label=chip('owner',owner)?.dataset.ownerName || owner || 'All';
+   check(count(owner)===String(total),
+    show+' / '+(type || 'All types')+' / '+label+': expected '+total+', got '+count(owner));
+  }
+ };
+ const changeShow=show=>{
+  chip('show',show).click();
+  check(document.querySelector('[data-review]').dataset.show===show,'Show updates the current index to '+show+'.');
+ };
+ try{
+  const beforeType=counts();
+  chip('type','change').click();
+  check(selected('type')==='change' && selected('show')==='open' && counts()!==beforeType,
+   'The Owner counts change when only Type changes.');
+  const beforeShow=counts();
+  changeShow('all');
+  check(selected('type')==='change' && selected('show')==='all' && counts()!==beforeShow,
+   'The Owner counts change when only Show changes.');
+  checkCounts('all','change');
+  chip('type','').click();checkCounts('all','');
+  const allTypes=counts();
+  chip('type','change').click();checkCounts('all','change');
+  check(counts()!==allTypes,'Type alone changes the Owner counts in Show All.');
+  const allStates=counts();
+  changeShow('Waiting');checkCounts('Waiting','change');
+  check(counts()!==allStates,'Show alone changes the Owner counts for Changes.');
+  for(const [show,types] of Object.entries(expected)){
+   if(selected('show')!==show) changeShow(show);
+   for(const type of Object.keys(types)){
+    chip('type',type).click();
+    checkCounts(show,type);
+   }
+  }
+  await new Promise(resolve=>requestAnimationFrame(resolve));
+  check(reads===0,'Owner counts update without a server request.');
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>""".replace('EXPECTED', json.dumps(expected))
+        markup = page.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
     def test_server_supplies_the_selected_show_and_complete_index(self) -> None:
         ready = self.investigation()
         waiting = self.investigation(False)
@@ -1777,8 +2056,8 @@ window.fetch=async(url,options)=>{
             with self.subTest(show=show):
                 source = review_page.render(self.root, show=show).decode()
                 self.assertIn(f'data-show="{show}"', source)
-                owner_menu = source.partition('<select id="list-owner">')[2].partition('</select>')[0]
-                self.assertIn(f'value="{waiting.owner}"', owner_menu,
+                owner_menu = source.partition('id="list-owner"')[2].partition('</div>')[0]
+                self.assertIn(f'data-owner-chip="{waiting.owner}"', owner_menu,
                               'F002: the unit Owner option remains when its Show view has no rows')
 
     def test_open_read_skips_done_payloads_and_retains_full_selected_records(self) -> None:
@@ -1928,7 +2207,7 @@ window.fetch=async(url,options)=>{
             questions = counts_row.question_counts(owner, user_zone(), identities, None)
             queues = [next_item.read_queue(kind, self.fixture.production)
                       for kind in ('question', 'change', 'investigation', 'proposal', 'efficiency')]
-            return counts, questions, queues, list_page.counts_strip(members)
+            return counts, questions, queues, list_page.counts_strip(members, staff_names.StaffNames(members))
 
         with patch.object(review_items, 'read_kind', side_effect=all_states):
             before = results()
@@ -1977,9 +2256,33 @@ window.fetch=async(url,options)=>{
                 form = review_page.form(item,change_page.ReviewBrowser(token,initial),4,'fixture-revision')
                 self.assertIn('Closes the item',form)
                 self.assertIn('The item returns to you',form)
-                self.assertIn('type="datetime-local"',form)
-                self.assertIn('value="later">Later',form)
+                self.assertIn('aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later',form)
+                for label in ('In 1 hour','This evening','Tomorrow morning','Next week','Choose a time…'):
+                    self.assertIn('<span>'+label+'</span>',form)
+                self.assertNotIn('type="datetime-local"',form)
+                self.assertIn('type="hidden" name="later"',form)
+                self.assertIn('role="grid"',form)
+                self.assertIn('<label class="later-time">Time<input type="text" inputmode="numeric" autocomplete="off" data-later-time></label>',form)
+                self.assertIn('value="later">Save',form)
                 self.assertNotIn('value="skip"',form)
+
+    def test_later_presets_read_their_settings(self) -> None:
+        for minutes, label in ((1,'In 1 minute'),(90,'In 90 minutes'),(60,'In 1 hour'),(120,'In 2 hours')):
+            with self.subTest(minutes=minutes):
+                self.assertEqual(review_page.soon_label(minutes),label)
+        lines = ('# whole: 1..1440','later_soon_minutes=60','later_evening=18:00','later_evening_until=17:00','later_morning=09:00',
+                 'later_week_day=Monday','later_week_time=09:30')
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'review_links.conf'
+            _ = path.write_text('\n'.join(lines)+'\n',encoding='utf-8')
+            self.assertEqual(review_page.later_settings(conf.read(path)),
+                             {'soon':60,'evening':1080,'eveningUntil':1020,'morning':540,'weekDay':1,'weekTime':570})
+            for bad in ('later_week_day=Mon','later_morning=9:00'):
+                with self.subTest(bad=bad):
+                    key = bad.split('=')[0]
+                    _ = path.write_text('\n'.join(line for line in lines if not line.startswith(key+'='))+'\n'+bad+'\n',encoding='utf-8')
+                    with self.assertRaisesRegex(ValueError,key):
+                        _ = review_page.later_settings(conf.read(path))
 
     def test_ask_question_and_one_owner_answer_command_for_each_type(self) -> None:
         decisions = self.decisions()
@@ -2081,8 +2384,8 @@ window.fetch=async(url,options)=>{
                     else:
                         proposal, efficiency = case.decisions()
                         key = proposal if kind == review_items.ReviewType.PROPOSAL else efficiency
-                        _ = shutil.copyfile(Path(__file__).resolve().parents[2]/'config/nightly_review.conf',
-                                            case.fixture.temporary/'config/nightly_review.conf')
+                        _ = write_config_fixture(case.fixture.temporary / 'config/nightly_review.conf',
+                            'state_folder=nightly-review\n')
                     old_id = ''
                     if wait in ('question', 'validate'):
                         delivery, _ = review_page.submit(case.root, case.body(key, wait, 'Check the old case.'), case.status)
@@ -2176,7 +2479,7 @@ window.fetch=async(url,options)=>{
 
     def test_later_hides_each_type_from_the_shared_queue_and_then_returns(self) -> None:
         _ = change_review.append_rows(self.fixture.review_list,
-            [change_review.Visible('Unrouted change', 'Read the log.', 'The result is present.')],
+            pictured_changes([change_review.Visible('Unrouted change', 'Read the log.', 'The result is present.')]),
             datetime.now(user_zone()).date(), '', self.fixture.production,
             producers=[staff.StaffId('missing-producer')], record=staff.snapshot())
         decisions = self.decisions()
@@ -2219,7 +2522,7 @@ window.fetch=async(url,options)=>{
             body = self.body(key, 'later', 'Keep these words.')+'&'+urlencode({'later':until.isoformat()})
             with patch.object(review_items, 'read', return_value=[unavailable]), \
                     patch.object(change_review, 'record_review_log') as log:
-                with self.assertRaisesRegex(change_page.AnswerRefused, '^the production document is not available$'):
+                with self.assertRaisesRegex(question_record.AnswerRefused, '^the production document is not available$'):
                     _ = review_page.submit(self.root, body, self.status)
                 log.assert_not_called()
             self.assertNotIn(key, review_later.times())
@@ -2258,8 +2561,7 @@ window.fetch=async(url,options)=>{
             self.assertEqual(review_later.times()[key], until)
 
     def test_approve_and_decline_close_proposals_and_efficiencies(self) -> None:
-        _ = shutil.copyfile(Path(__file__).resolve().parents[2]/'config/nightly_review.conf',
-                            self.fixture.temporary/'config/nightly_review.conf')
+        _ = write_config_fixture(self.fixture.temporary / 'config/nightly_review.conf', 'state_folder=nightly-review\n')
         proposal, efficiency = self.decisions()
         folder = self.fixture.temporary / 'decision-proposals'
         ledger = self.fixture.temporary / 'decision-efficiency.md'
@@ -2282,7 +2584,7 @@ window.fetch=async(url,options)=>{
                 approved = next(item for item in review_items.read(self.root) if item.key == key)
                 self.assertEqual(approved.state, review_items.ReviewState.DONE, 'Approve makes the item Done at once.')
                 self.assertEqual(approved.log[-1].words, 'Approve: Use it.')
-                with self.assertRaisesRegex(change_page.AnswerRefused, 'choose an action'):
+                with self.assertRaisesRegex(question_record.AnswerRefused, 'choose an action'):
                     _ = review_page.submit(self.root, self.body(key, 'decline'), self.status)
         with self.subTest(action='decline', kind='proposal'):
             delivery, result = review_page.submit(self.root, self.body(items['page-owner/P2'].key, 'decline', 'Not now.'),
@@ -2361,6 +2663,207 @@ window.fetch=async(url,options)=>{
                 self.assertEqual(len(review_items.next_queue('proposal', doc, False, staff.snapshot())[1]), 1)
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_title_fallback_checks_rendered_text_and_proposal_loads(self) -> None:
+        key = self.question()
+        question = next(item for item in review_items.read(self.root) if item.key == key)
+        _ = self.investigation()
+        _ = self.decisions()
+        records = review_items.read(self.root)
+        assert isinstance(question.source, review_items.QuestionSource)
+        question_source = question.source
+
+        def question_case(name: str, title: str, ask: str, context: str = '') -> review_items.ReviewItem:
+            fields = question_source.record.item.copy()
+            fields['text'] = title
+            fields['parts'] = update_registration.QuestionParts(
+                ask=ask, context=context, items=[], choices=[], recommend='')
+            source = replace(question_source, record=replace(question_source.record, item=fields))
+            return replace(question, key='question/'+name, title=title, source=source,
+                           log=(replace(question.log[0], words=title),))
+
+        equal = question_case('equal', 'W'*100, 'W'*100)
+        code = question_case('code', 'rust', 'Read the code.')
+        assert isinstance(code.source, review_items.QuestionSource)
+        assert 'parts' in code.source.record.item
+        code.source.record.item['parts']['items'] = ['```rust\nlet x = 1;\n```']
+        formatted = question_case('formatted', 'Use wide layout', 'Use **wide** layout')
+        investigation_item = next(item for item in records if isinstance(item.source, review_items.InvestigationSource))
+        assert isinstance(investigation_item.source, review_items.InvestigationSource)
+        investigation_source = investigation_item.source
+        same_title = 'Why did the gate stop?'
+        same = replace(investigation_item, key='investigation/equal', title=same_title,
+                       source=replace(investigation_source, record=replace(investigation_source.record, question=same_title)))
+        distinct = replace(investigation_item, key='investigation/distinct', title='Gate report')
+        paragraphs = replace(investigation_item, key='investigation/paragraphs',
+                             title='Which check failed? Which repair works?',
+                             source=replace(investigation_source, record=replace(
+                                 investigation_source.record, question='Which check failed?\n\nWhich repair works?')))
+        spaced = replace(investigation_item, key='investigation/spaced', title='Run a b',
+                         source=replace(investigation_source, record=replace(
+                             investigation_source.record, question='Run ab')))
+        change = next(item for item in records if isinstance(item.source, review_items.ChangeSource))
+        assert isinstance(change.source, review_items.ChangeSource)
+        image_title = 'Check the blue marker'
+        image = replace(change, key='change/image', title=image_title,
+                        source=replace(change.source, row={**change.source.row, 'Change': image_title, 'Image': 'fixture-image'}))
+        proposal = next(item for item in records if isinstance(item.source, review_items.ProposalSource))
+        proposals = [replace(proposal, key='proposal/'+name, title=title)
+                     for name, title in (('with-title', 'P1'), ('without-title', 'Other proposal'),
+                                         ('empty', 'Empty proposal'), ('failure', 'Failed proposal'))]
+        cases = [equal, code, formatted, same, distinct, paragraphs, spaced, image, *proposals]
+        with patch.object(review_items, 'read', return_value=cases), patch.object(
+                change_review, 'image_path', return_value='/fixture-image.svg'):
+            snapshot = review_page.build_snapshot(self.root)
+        source = snapshot.render().decode()
+        cards = {key:snapshot.body(key).decode() for key in snapshot.records}
+        self.assertTrue(all('<section data-title-fallback hidden>' in card for card in cards.values()))
+        setup = r'''<script>
+const nativeFetch=fetch,nativeTimeout=setTimeout,cards=CARDS;
+window.setInterval=()=>0;window.clearInterval=()=>{};
+window.bodyRequests=[];window.pendingBodies=new Map();
+const version=()=>document.querySelector('[data-review]').dataset.version;
+const response=text=>({ok:true,headers:new Headers({'X-Review-Version':version()}),text:async()=>text});
+window.fetch=async(url)=>{
+ const key=new URL(url,location.href).searchParams.get('body');
+ if(!key) return {ok:true,json:async()=>({version:version()})};
+ window.bodyRequests.push(key);
+ if(!key.startsWith('proposal/')) return response(cards[key]);
+ return new Promise(resolve=>window.pendingBodies.set(key,body=>{
+  if(body===null){resolve({ok:false,status:503,headers:new Headers(),text:async()=>''});return;}
+  const panel=document.createElement('div');panel.innerHTML=cards[key];
+  panel.querySelector('[data-proposal-body]').innerHTML=body;
+  resolve(response(panel.innerHTML));
+ }));
+};
+</script>'''.replace('CARDS', json.dumps(cards).replace('</', '<\\/'))
+        probe = r'''<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const flush=()=>new Promise(resolve=>nativeTimeout(resolve,80));
+ const row=key=>[...document.querySelectorAll('[data-list-item]')].find(row=>row.dataset.key===key);
+ const panel=key=>row(key).querySelector('.review-panel');
+ const fallback=key=>panel(key).querySelector('[data-title-fallback]');
+ const open=key=>{const button=row(key).querySelector('.list-toggle');if(button.getAttribute('aria-expanded')!=='true') button.click();};
+ const visibleText=key=>{
+  const copy=panel(key).cloneNode(true);
+  copy.querySelectorAll('[hidden],.list-log,form,.review-source').forEach(node=>node.remove());
+  return copy.textContent.replace(/\s+/g,' ').trim();
+ };
+ const refresh=async()=>{
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  await flush();await flush();await flush();
+ };
+ try{
+  await flush();
+  for(const [key,hidden,title] of [
+   ['question/equal',true,'W'.repeat(100)],['question/code',false,'rust'],
+   ['question/formatted',true,'Use wide layout'],
+   ['investigation/equal',true,'Why did the gate stop?'],['investigation/distinct',false,'Gate report'],
+   ['change/image',false,'Check the blue marker']]){
+   open(key);await flush();
+   check(fallback(key).hidden===hidden,key+': fallback follows rendered text');
+   check(visibleText(key).split(title).length-1===1,key+': one visible title');
+  }
+  check(panel('question/code').querySelector('code').textContent.includes('let x = 1;'),'the code block renders');
+  check(row('question/equal').querySelector('.review-title').textContent==='W'.repeat(100),'the title limit preserves a full title');
+  check(panel('question/formatted').querySelector('strong').textContent==='wide','the ask formatting renders');
+  check(panel('change/image').querySelector('img').alt.includes('Check the blue marker'),'the image alt contains the title');
+  open('investigation/paragraphs');await flush();
+  const paragraphs=[...panel('investigation/paragraphs').querySelectorAll('[data-review-body] p')];
+  check(paragraphs.some(p=>p.textContent==='Which check failed?'),'the first question paragraph renders');
+  check(paragraphs.some(p=>p.textContent==='Which repair works?'),'the second question paragraph renders');
+  check(fallback('investigation/paragraphs').hidden,'paragraph boundaries preserve the title');
+  open('investigation/spaced');await flush();
+  check([...panel('investigation/spaced').querySelectorAll('[data-review-body] p')]
+   .some(p=>p.textContent==='Run ab'),'the body keeps the joined word');
+  check(!fallback('investigation/spaced').hidden,'different word spacing keeps the fallback visible');
+  const outcomes=[
+   ['proposal/with-title','<h2>P1</h2><p>Use fewer checks.</p>',true],
+   ['proposal/without-title','<p>Use fewer checks.</p>',false],
+   ['proposal/empty','',false],['proposal/failure',null,false]];
+  for(const [key,body,hidden] of outcomes){
+   open(key);
+   check(row(key).querySelector('[data-detail]').textContent.includes('Loading the item'),key+': loading text');
+   check(row(key).querySelector('.review-title').textContent.length>0,key+': the title remains visible while loading');
+   const resolve=window.pendingBodies.get(key);
+   check(typeof resolve==='function',key+': a body request starts');
+   resolve(body);
+   await flush();await flush();
+   if(body===null) check(row(key).querySelector('[data-detail]').textContent.includes('not available'),key+': failure stays visible');
+   else{
+    check(fallback(key).hidden===hidden,key+': fallback follows the loaded body');
+    check(visibleText(key).split(row(key).querySelector('.review-title').textContent).length-1===1,key+': one title after loading');
+   }
+  }
+  for(const [key,body,hidden] of outcomes){
+   open('question/equal');
+   const count=()=>window.bodyRequests.filter(requested=>requested===key).length;
+   const before=count();
+   await refresh();open(key);await flush();
+   if(body===null){
+    check(count()===before+1,key+': refresh retries the failed load');
+    check(row(key).querySelector('.review-title').textContent.length>0,key+': the title shows during the retry');
+    window.pendingBodies.get(key)(null);await flush();
+   }else{
+    check(count()===before,key+': refresh uses the cached body');
+    check(panel(key).querySelector('[data-proposal-body]').innerHTML===body,key+': cache replaces the loading text');
+   }
+   if(body!==null) check(fallback(key).hidden===hidden,key+': fallback follows the refreshed body');
+  }
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        body = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>').encode()
+        results: list[list[str]] = []
+        complete = threading.Event()
+
+        class Probe(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                if self.path == '/complete':
+                    _ = complete.wait(20)
+                elif self.path == '/fixture-image.svg':
+                    _ = self.wfile.write(b'<svg xmlns="http://www.w3.org/2000/svg"/>')
+                else:
+                    _ = self.wfile.write(body if self.path == '/page' else
+                        b'<iframe src="/page" style="width:100vw;height:100vh"></iframe><img hidden src="/complete">')
+
+            def do_POST(self) -> None:
+                results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                complete.set()
+                self.send_response(204)
+                self.end_headers()
+
+            @override
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
+                    done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
+                        '--window-size', '390,900', '--screenshot', str(self.fixture.temporary/'review-titles.png'),
+                        f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                self.assertEqual(done.returncode, 0, done.stderr)
+            finally:
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
+        self.assertEqual(results, [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_clears_the_review_save_notice(self) -> None:
+        fixture = self.fixture
+        _ = change_review.append_rows(fixture.review_list, pictured_changes([
+            change_review.Visible(f'Change {number}', 'Read the diff', 'Check the result')
+            for number in range(4, 9)
+        ]), datetime.now(user_zone()).date(), '', fixture.production, record=staff.snapshot())
+        self.assertEqual(save_notice_failures(browser_markup(self.root).encode(), 'works'), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_filters_single_card_refresh_drafts_and_saved_row_removal(self) -> None:
         question_key = self.question()
         question_item = next(item for item in review_items.read(self.root) if item.key == question_key)
@@ -2390,8 +2893,14 @@ window.transformFixtureBody=(text,key)=>{
  return panel.innerHTML;
 };
 window.refreshRequests=[];
+window.posts=[];
+let nextPost;
 window.fetch=async(_url,options={})=>{
- if(options.method==='POST') return {ok:true,json:async()=>({answer:'works'})};
+ if(options.method==='POST'){
+  window.posts.push(new URLSearchParams(options.body));
+  if(nextPost){const post=nextPost;nextPost=null;return post;}
+  return {ok:true,json:async()=>({answer:'works'})};
+ }
  window.refreshRequests.push(_url);return {ok:true,text:async()=>new URL(_url,location.href).searchParams.get('show')==='Waiting' ? window.waitingMarkup : window.refreshMarkup};
 };
 </script>""".replace('WAITING_MARKUP',json.dumps(browser_markup(self.root, show='Waiting')).replace('</','<\\/')).replace('DONE_MARKUP',json.dumps(done_source).replace('</','<\\/')).replace('MARKUP',json.dumps(source).replace('</','<\\/'))
@@ -2401,7 +2910,17 @@ window.fetch=async(_url,options={})=>{
  const flush=()=>new Promise(resolve=>nativeTimeout(resolve,60));
  const rows=()=>[...document.querySelectorAll('[data-list-item]')];
  const shown=()=>rows().filter(row=>!row.hidden);
+ const holdPost=()=>{
+  let finish;nextPost=new Promise(resolve=>{finish=resolve;});
+  return {save:()=>finish({ok:true,json:async()=>({answer:'works'})}),
+   refuse:reason=>finish({ok:false,json:async()=>({reason})})};
+ };
+ const visibleStatus=text=>[...document.querySelectorAll('[data-send-status],[data-hidden-action-status]')]
+   .some(node=>node.textContent.includes(text) && node.getClientRects().length);
+ const leavingNow=row=>!row.isConnected && Boolean(document.querySelector('[data-record-motion]'));
+ const selectedOwner=(doc=document)=>doc.querySelector('[data-owner-chip][aria-pressed="true"]');
  const choose=(id,value,event='change')=>{
+  if(id==='list-owner'){document.querySelector('[data-owner-chip="'+value+'"]').click();return;}
   if(id==='list-show'){document.querySelector('[data-show-chip="'+value+'"]').click();return;}
   const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event(event,{bubbles:true}));
  };
@@ -2423,19 +2942,45 @@ window.fetch=async(_url,options={})=>{
   const draftLater=question.querySelector('[name="later"]');draftLater.value='2098-12-31T16:30';
   draftLater.dispatchEvent(new Event('change',{bubbles:true}));
   const picked=question.querySelector('input[name=choice]');picked.click();
-  question.querySelector('textarea').value='Keep this draft';question.querySelector('textarea').dispatchEvent(new Event('input'));
+  const draft=question.querySelector('textarea');draft.value='Keep this draft';draft.dispatchEvent(new Event('input'));
+  draft.focus();draft.setSelectionRange(2,7,'backward');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
   let fresh=rows().find(row=>row.dataset.type==='question');
   check(!fresh.querySelector('[data-detail]').hidden && fresh.querySelector('textarea').value==='Keep this draft','refresh keeps the card and draft');
+  const refreshedDraft=fresh.querySelector('textarea');
+  check(document.activeElement===refreshedDraft && refreshedDraft.selectionStart===2 &&
+    refreshedDraft.selectionEnd===7 && refreshedDraft.selectionDirection==='backward','refresh keeps focus and selection');
   check(fresh.querySelector('[name="later"]').value==='2098-12-31T16:30','F018: refresh keeps the picked Later date and time');
   check(fresh.querySelector('input[name=choice]:checked')?.value===picked.value,'F018: refresh keeps the selected choice');
   check(fresh.querySelector('form').elements.row.value===fresh.dataset.key+'-refreshed' &&
     fresh.querySelector('form').elements.token.value.endsWith('-refreshed'),'F018: refresh supplies the row and token');
-  const target=rows().find(row=>row.dataset.type==='change');target.querySelector('.list-toggle').click();await readyReviewCard(target);
-  const form=target.querySelector('form');form.requestSubmit(form.querySelector('[value="works"]'));
+  const [initialTarget,other]=rows().filter(row=>row.dataset.type==='change');
+  const afterRefresh=()=>new Promise(resolve=>
+   document.querySelector('[data-review]').addEventListener('review-refreshed',resolve,{once:true}));
+  const liveRow=key=>rows().find(row=>row.dataset.key===key);
+  other.querySelector('.list-toggle').click();
+  let otherForm=await readyReviewCard(other);
+  let rejected=holdPost();
+  otherForm.requestSubmit(otherForm.querySelector('[value="works"]'));
+  check(leavingNow(other),'The row starts to leave before the response.');
+  let refreshed=afterRefresh();rejected.refuse('Fixture older refusal');await refreshed;
+  const returnedOther=liveRow(other.dataset.key);
+  otherForm=await readyReviewCard(returnedOther);
+  check(visibleStatus('Not saved: Fixture older refusal'),'A refused row shows the reason.');
+  rejected=holdPost();otherForm.requestSubmit(otherForm.querySelector('[value="works"]'));
+  refreshed=afterRefresh();rejected.refuse('Fixture newer refusal');await refreshed;
+  check(!visibleStatus('Not saved: Fixture older refusal'),'A later refusal replaces the previous reason.');
+  const target=liveRow(initialTarget.dataset.key);target.querySelector('.list-toggle').click();await readyReviewCard(target);
+  const form=target.querySelector('form'),savedResponse=holdPost();
+  form.requestSubmit(form.querySelector('[value="works"]'));
+  check(leavingNow(target),'A save starts the departure before the response.');
+  savedResponse.save();
   await flush();check(form.querySelector('[data-send-status]').textContent==='Saved: works','the row shows the saved result');
+  check(!visibleStatus('Saved: works'),'a successful save adds no notice above the table');
+  check(!visibleStatus('Not saved: Fixture newer refusal'),'saving another card clears the failure notice');
   await new Promise(resolve=>nativeTimeout(resolve,950));
   check(target.hidden,'the saved row leaves the view');
+  check(!visibleStatus('Saved: works'),'no save notice appears after the animation');
   check(document.querySelector('[data-show-chip="open"] b').textContent==='4','the count excludes the saved row');
   check(rows().every(row=>row.querySelector('[data-detail]').hidden),'no next card opens');
   choose('list-show','all');
@@ -2449,13 +2994,13 @@ window.fetch=async(_url,options={})=>{
   const reloadComplete=new Promise(resolve=>reloaded.addEventListener('load',resolve,{once:true}));document.body.append(reloaded);await reloadComplete;
   const linkedTarget=reloaded.contentDocument.querySelector('[data-key="'+target.dataset.key+'"]');
   check(!linkedTarget.hidden && !linkedTarget.querySelector('[data-detail]').hidden,'a Review item link shows the saved row');
-  check(showValue(reloaded.contentDocument)==='all' && reloaded.contentDocument.getElementById('list-owner').value==='' &&
+  check(showValue(reloaded.contentDocument)==='all' && selectedOwner(reloaded.contentDocument).dataset.ownerChip==='' &&
     reloaded.contentDocument.getElementById('list-search').value==='','a Review item link clears filters');
   reloaded.remove();
   const retained={item:fresh.dataset.key,type:'question',owner:fresh.dataset.owner,show:'open',q:'Q1',sort:'Age',dir:'desc'};
   location.hash=new URLSearchParams(retained);await flush();
   fresh=rows().find(row=>row.dataset.type==='question');
-  check(document.getElementById('list-owner').value===retained.owner && showValue()==='open' &&
+  check(selectedOwner().dataset.ownerChip===retained.owner && showValue()==='open' &&
     document.getElementById('list-search').value==='Q1' && document.querySelector('[data-type-chip="question"]').getAttribute('aria-pressed')==='true',
     'F014: restore the filters with an open row');
   check(!fresh.hidden && !fresh.querySelector('[data-detail]').hidden,'F014: restore the open row');
@@ -2466,7 +3011,7 @@ window.fetch=async(_url,options={})=>{
   const loaded=new Promise(resolve=>legacy.addEventListener('load',resolve,{once:true}));document.body.append(legacy);await loaded;
   await flush();await flush();
   const restored=legacy.contentDocument;
-  check(restored.getElementById('list-owner').selectedOptions[0].textContent==='page-owner (0)' && showValue(restored)==='Waiting' &&
+  check(selectedOwner(restored).textContent==='page-owner 0' && showValue(restored)==='Waiting' &&
     restored.getElementById('list-search').value==='layout' && restored.querySelector('[data-type-chip="question"]').getAttribute('aria-pressed')==='true',
     'F012: a legacy link retains the zero owner and its other filters.');
   check(restored.querySelector('[data-sort="5"]').parentElement.getAttribute('aria-sort')==='descending','F012: the legacy link keeps its sort');
@@ -2474,9 +3019,74 @@ window.fetch=async(_url,options={})=>{
 
   check(document.documentElement.scrollWidth<=innerWidth,'no horizontal overflow');
   if(innerWidth<960) check(getComputedStyle(shown()[0]).display==='block','phone rows are cards');
-  const laterForm=fresh.querySelector('form');laterForm.elements.later.value='2099-01-01T09:00';
-  laterForm.requestSubmit(laterForm.querySelector('[value="later"]'));
+  await readyReviewCard(fresh);
+  const laterToggle=fresh.querySelector('[data-later-toggle]'),laterMenu=fresh.querySelector('[data-later-menu]');
+  laterToggle.click();
+  const menuItems=()=>[...laterMenu.querySelectorAll('[role=menuitem]')].filter(item=>!item.hidden);
+  const presetTime=name=>laterMenu.querySelector('[data-later-preset="'+name+'"] small').textContent;
+  check(!laterMenu.hidden && laterToggle.getAttribute('aria-expanded')==='true' && document.activeElement===menuItems()[0],
+    'Later opens its menu with the first preset in focus');
+  check(/^[A-Z][a-z]{2} [0-9]{2}:[0-9]{2}$/.test(presetTime('soon')) && /^[A-Z][a-z]{2} 09:00$/.test(presetTime('morning')) &&
+    /^Mon 09:00$/.test(presetTime('week')),'each preset shows its resolved time in the user zone');
+  menuItems()[0].dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowUp',bubbles:true}));
+  check(document.activeElement===menuItems().at(-1),'ArrowUp moves from the first item to the last');
+  menuItems().at(-1).dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true}));
+  check(document.activeElement===menuItems()[0],'ArrowDown moves from the last item to the first');
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();
+  check(fresh.isConnected && !laterMenu.hidden,'an open Later menu holds the page refresh');
+  const chooserDraft=fresh.querySelector('[name="later"]');chooserDraft.value='';
+  chooserDraft.dispatchEvent(new Event('input',{bubbles:true}));
+  const chooserNow=Date.now;Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
+  laterMenu.querySelector('[data-later-choose]').click();
+  const calendar=laterMenu.querySelector('[role=grid]'),timeField=laterMenu.querySelector('[data-later-time]');
+  check(!laterMenu.querySelector('[data-later-custom]').hidden && document.activeElement===calendar?.querySelector('[tabindex="0"]'),
+    'Choose a time shows the calendar with the selected day in focus');
+  const chooserChecks=['the grid opens on tomorrow in the user zone','arrows move the selected day across months',
+    'a past day cannot be picked','Save is disabled for a time before now','the summary shows the selected wall time',
+    'the chooser fits within the menu and viewport'];
+  let submitter='';const watch=event=>{submitter=event.submitter.value;event.preventDefault();event.stopImmediatePropagation();};
+  fresh.querySelector('form').addEventListener('submit',watch,{capture:true});
+  if(calendar){
+   const wall=()=>fresh.querySelector('[name="later"]').value;
+   const selected=()=>calendar.querySelector('[tabindex="0"]');
+   check(wall()==='2026-12-01T09:00' && timeField.value==='09:00',chooserChecks[0]);
+   selected().dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowLeft',bubbles:true,cancelable:true}));
+   check(wall()==='2026-11-30T09:00' && laterMenu.querySelector('[data-later-month]').textContent==='November 2026',chooserChecks[1]);
+   const past=calendar.querySelector('[data-date="2026-11-29"]');past.click();
+   check(past.disabled && wall()==='2026-11-30T09:00',chooserChecks[2]);
+   check(laterMenu.querySelector('[value="later"]').disabled,chooserChecks[3]);
+   selected().dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true,cancelable:true}));
+   selected().dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}));
+   check(wall()==='2026-12-08T09:00','ArrowDown moves the selected day by one week');
+   selected().dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowUp',bubbles:true,cancelable:true}));
+   timeField.value='10:15';timeField.dispatchEvent(new Event('input',{bubbles:true}));
+   check(wall()==='2026-12-01T10:15' && laterMenu.querySelector('[data-later-summary]').textContent==='Hides until Tue 1 Dec 10:15',chooserChecks[4]);
+   const box=laterMenu.getBoundingClientRect(),grid=calendar.getBoundingClientRect();
+   check(box.left>=0 && box.right<=innerWidth && grid.left>=box.left && grid.right<=box.right &&
+     laterMenu.scrollWidth<=laterMenu.clientWidth,chooserChecks[5]);
+   selected().dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  }else{
+   chooserChecks.forEach(label=>check(false,label));
+   check(false,'ArrowDown moves the selected day by one week');
+   document.activeElement.value='2099-01-01T09:00';
+   document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  }
+  fresh.querySelector('form').removeEventListener('submit',watch,{capture:true});
+  check(submitter==='later','Enter in the chooser saves it as Later');
+  document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+  check(laterMenu.hidden && laterMenu.querySelector('[data-later-custom]').hidden && document.activeElement===laterToggle,
+    'Escape closes the menu and returns focus to Later');
+  Date.now=chooserNow;
+  laterToggle.click();const week=laterMenu.querySelector('[data-later-preset="week"]'),weekAt=Number(week.dataset.at);
+  const laterResponse=holdPost();
+  week.click();
+  check(leavingNow(fresh),'Later starts the departure before the response');
+  check(document.querySelector('[data-show-chip="open"] b').textContent==='0' &&
+    selectedOwner().dataset.ownerChip===retained.owner,'Later updates the count and keeps the owner while the request runs');
+  laterResponse.save();
   await new Promise(resolve=>nativeTimeout(resolve,1000));
+  check(window.posts.at(-1).get('outcome')==='later' && window.posts.at(-1).get('later')===new Date(weekAt).toISOString(),
+    'a preset sends its time at once');
   check(fresh.hidden,'Later removes the question from the page');
   check(document.querySelector('[data-show-chip="open"] b').textContent==='0','Later removes the question from the filtered count');
   const nativeNow=Date.now;Date.now=()=>new Date('2099-01-01T09:00').getTime()+1000;
@@ -2500,7 +3110,12 @@ window.fetch=async(_url,options={})=>{
   pending.querySelector('.list-toggle').click();await readyReviewCard(pending);
   const pendingForm=pending.querySelector('form');pendingForm.elements.feedback.value='Wait for a new answer.';
   const initialCount=Number(document.querySelector('[data-show-chip="open"] b').textContent);
+  const questionResponse=holdPost();
   pendingForm.requestSubmit(pendingForm.querySelector('[value="question"]'));
+  check(window.posts.at(-1).get('outcome')==='question' && leavingNow(pending) &&
+    Number(document.querySelector('[data-show-chip="open"] b').textContent)===initialCount-1,
+    'Ask question starts the departure and updates the count before the response');
+  questionResponse.save();
   await new Promise(resolve=>nativeTimeout(resolve,1000));
   const revision=pending.dataset.updated;
   for(const [state,updated,revealed] of [
@@ -2573,6 +3188,254 @@ window.fetch=async(_url,options={})=>{
                         server.shutdown()
                         thread.join(TEST_HANG_GUARD_SECS)
                 self.assertEqual(results,[[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_later_focus_moves_to_the_calendar_when_previous_month_disables(self) -> None:
+        _ = self.question()
+        with patch.dict(os.environ, {'USER_ZONE': 'UTC'}):
+            source = browser_markup(self.root)
+        setup = r"""<script>
+window.setInterval=()=>0;
+Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ try{
+  const row=document.querySelector('[data-type="question"]');
+  row.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row);
+  form.querySelector('[data-later-toggle]').click();
+  form.querySelector('[data-later-choose]').click();
+  const previous=form.querySelector('[data-later-month-step="-1"]');
+  const grid=form.querySelector('[data-later-grid]');
+  previous.focus();
+  check(document.activeElement===previous,'Previous month has focus in December');
+  previous.click();
+  const day=grid.querySelector('button:not(:disabled)[tabindex="0"]');
+  check(previous.disabled && day?.dataset.date==='2026-11-30','November has an enabled day');
+  check(document.activeElement===day,'Focus moves from Previous month to the enabled day');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_later_time_displays_and_saves_24_hour_time(self) -> None:
+        _ = self.question()
+        with patch.dict(os.environ, {'USER_ZONE': 'UTC'}):
+            source = browser_markup(self.root)
+        setup = r"""<script>
+const nativeFetch=fetch,posts=[];
+window.setInterval=()=>0;
+Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
+window.fetch=async(_url,options={})=>{
+ if(options.method==='POST') posts.push(new URLSearchParams(options.body));
+ return {ok:true,json:async()=>({answer:'later'})};
+};
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ try{
+  const row=document.querySelector('[data-type="question"]');
+  row.querySelector('.list-toggle').click();await readyReviewCard(row);
+  const form=row.querySelector('form');
+  const field=form.querySelector('[data-later-time]'),save=form.querySelector('[value="later"]');
+  form.elements.later.value='2026-12-01T17:30';
+  form.querySelector('[data-later-toggle]').click();form.querySelector('[data-later-choose]').click();
+  check(field.type==='text' && field.value==='17:30',
+   'The 17:30 draft shows 17:30 without AM or PM (input type: '+field.type+')');
+  const key=name=>field.dispatchEvent(new KeyboardEvent('keydown',{key:name,bubbles:true,cancelable:true}));
+  const type=value=>{field.value=value;field.dispatchEvent(new Event('input',{bubbles:true}));};
+  field.focus();key('ArrowUp');
+  check(field.value==='17:45' && form.elements.later.value==='2026-12-01T17:45','ArrowUp adds 15 minutes');
+  key('ArrowDown');check(field.value==='17:30','ArrowDown subtracts 15 minutes');
+  type('23:45');key('ArrowUp');
+  check(field.value==='00:00' && form.elements.later.value==='2026-12-01T00:00','ArrowUp wraps at midnight');
+  key('ArrowDown');
+  check(field.value==='23:45' && form.elements.later.value==='2026-12-01T23:45','ArrowDown wraps at midnight');
+  for(const value of ['9:00','0900','09:00']){
+   field.focus();type(value);
+   check(field.getAttribute('aria-invalid')==='false' && !save.disabled &&
+    form.elements.later.value==='2026-12-01T09:00','The draft accepts '+value);
+   field.dispatchEvent(new FocusEvent('blur'));
+   check(field.value==='09:00','Blur shows 09:00 for '+value);
+  }
+  field.focus();
+  for(const value of ['','24:00','12:60','9:00 AM','17:30:00']){
+   type(value);key('Enter');
+   check(field.getAttribute('aria-invalid')==='true' && save.disabled && !form.elements.later.value && !posts.length,
+    'An invalid time blocks Save and Enter: '+JSON.stringify(value));
+  }
+  const error=document.createElement('span');error.style.color='var(--error)';form.append(error);
+  const errorColor=getComputedStyle(error).color,style=getComputedStyle(field);
+  check(style.color===errorColor && style.borderTopColor===errorColor,'An invalid time uses the console error color');
+  type('1730');
+  let submitted=false;
+  form.addEventListener('submit',event=>{
+   event.preventDefault();event.stopImmediatePropagation();submitted=event.submitter===save;
+  },{capture:true,once:true});
+  key('Enter');
+  check(field.value==='17:30' && field.getAttribute('aria-invalid')==='false' && !save.disabled && submitted,
+   'Enter shows 17:30 and submits Save');
+  save.click();
+  check(posts.at(-1)?.get('later')==='2026-12-01T17:30:00.000Z','Save sends T17:30 in UTC');
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_later_retains_drafts_and_resolves_daylight_saving_times(self) -> None:
+        _ = self.question()
+        with patch.dict(os.environ, {'USER_ZONE': 'America/New_York'}):
+            source = browser_markup(self.root)
+        setup = r"""<script>
+const nativeFetch=fetch,nativeTimeout=setTimeout;
+window.setInterval=()=>0;window.clearInterval=()=>{};
+window.posts=[];
+window.fetch=async(_url,options={})=>{
+ if(options.method==='POST'){
+  window.posts.push(new URLSearchParams(options.body));return {ok:true,json:async()=>({answer:'later'})};
+ }
+ return {ok:true,text:async()=>MARKUP};
+};
+Date.now=()=>Date.parse(SCENARIO==='gap' ? '2027-03-13T15:00:00Z' :
+ SCENARIO==='repeat' ? '2027-11-06T14:00:00Z' : '2026-11-30T15:00:00Z');
+</script>""".replace('MARKUP', json.dumps(source).replace('</', '<\\/'))
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const flush=()=>new Promise(resolve=>nativeTimeout(resolve,60));
+ const form=()=>document.querySelector('[data-type="question"] form');
+ const open=()=>{form().querySelector('[data-later-toggle]').click();form().querySelector('[data-later-choose]').click();};
+ const close=()=>form().querySelector('[data-later-time]').dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+ const time=value=>{const field=form().querySelector('[data-later-time]');field.value=value;field.dispatchEvent(new Event('input',{bubbles:true}));};
+ const selected=()=>form().querySelector('[role=grid] [aria-selected="true"]')?.dataset.date;
+ try{
+  const question=document.querySelector('[data-type="question"]');question.querySelector('.list-toggle').click();await readyReviewCard(question);
+  check(document.querySelector('[data-review]').dataset.zone==='America/New_York','the fixture sets America/New_York');
+  if(SCENARIO==='draft'){
+   open();
+   form().querySelector('[role=grid] [tabindex="0"]').dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true,cancelable:true}));
+   time('10:15');close();open();
+   check(form().elements.later.value==='2026-12-02T10:15' && selected()==='2026-12-02' &&
+    form().querySelector('[data-later-time]').value==='10:15','F004: Escape and reopen retain the selected day and time');
+   time('11:45');
+   const restored=form().elements.later.value;
+   close();
+   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+   await readyReviewCard(document.querySelector('[data-type="question"]'));
+   check(form().elements.later.value===restored,'F004: refresh restores the Later draft');
+   open();
+   check(form().elements.later.value===restored && selected()===restored.slice(0,10) &&
+    form().querySelector('[data-later-time]').value==='11:45','F004: opening the chooser retains the restored draft');
+  }else{
+   const gap=SCENARIO==='gap',clock=gap ? '02:30' : '01:30';
+   const expected=gap ? '2027-03-14T07:30:00.000Z' : '2027-11-07T05:30:00.000Z';
+   const content=document.querySelector('[data-review]'),settings=JSON.parse(content.dataset.later);
+   settings.morning=gap ? 150 : 90;content.dataset.later=JSON.stringify(settings);
+   form().querySelector('[data-later-toggle]').click();
+   const preset=form().querySelector('[data-later-preset="morning"]');
+   check(new Date(Number(preset.dataset.at)).toISOString()===expected,'F005: '+SCENARIO+' preset uses compatible resolution');
+   form().querySelector('[data-later-choose]').click();time(clock);
+   check(form().querySelector('[data-later-summary]').textContent===
+    (gap ? 'Hides until Sun 14 Mar 03:30' : 'Hides until Sun 7 Nov 01:30'),
+    'F005: '+SCENARIO+' summary shows the saved instant');
+   form().requestSubmit(form().querySelector('[value="later"]'));await flush();
+   check(window.posts.at(-1)?.get('later')===expected,'F005: '+SCENARIO+' Save sends the compatible instant');
+  }
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        for scenario in ('draft', 'gap', 'repeat'):
+            with self.subTest(scenario=scenario):
+                page = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+                body = page.replace('SCENARIO', json.dumps(scenario)).encode()
+                results: list[list[str]] = []
+                complete = threading.Event()
+
+                class Probe(BaseHTTPRequestHandler):
+                    def do_GET(self) -> None:
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'text/html; charset=utf-8')
+                        self.end_headers()
+                        if self.path == '/complete':
+                            _ = complete.wait(20)
+                        else:
+                            _ = self.wfile.write(body if self.path == '/page' else
+                                b'<iframe src="/page" style="width:100vw;height:100vh"></iframe><img hidden src="/complete">')
+
+                    def do_POST(self) -> None:
+                        results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                        complete.set()
+                        self.send_response(204)
+                        self.end_headers()
+
+                    @override
+                    def log_message(self, format: str, *args: object) -> None:
+                        pass
+
+                with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    try:
+                        with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
+                            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
+                                '--window-size', '1440,900', '--screenshot', str(self.fixture.temporary/'later-time.png'),
+                                f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                        self.assertEqual(done.returncode, 0, done.stderr)
+                    finally:
+                        server.shutdown()
+                        thread.join(TEST_HANG_GUARD_SECS)
+                self.assertEqual(results, [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_later_chooser_validates_restored_drafts(self) -> None:
+        _ = self.question()
+        with patch.dict(os.environ, {'USER_ZONE': 'UTC'}):
+            source = browser_markup(self.root)
+        setup = r"""<script>
+const nativeFetch=fetch;
+window.setInterval=()=>0;
+Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
+window.fetch=async()=>({ok:true,text:async()=>MARKUP});
+</script>""".replace('MARKUP', json.dumps(source).replace('</', '<\\/'))
+        probe = r"""<script>
+(async()=>{
+ const failures=[],errors=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const row=()=>document.querySelector('[data-type="question"]');
+ addEventListener('error',event=>errors.push(event.error?.name || event.message));
+ try{
+  row().querySelector('.list-toggle').click();await readyReviewCard(row());
+  const fallback='2026-12-01T09:00';
+  for(const [draft,expected] of [
+   ['2026-12-08T7',fallback],['2026-12-08T24:00',fallback],['2026-12-08T23:60',fallback],
+   ['2026-12-08T',fallback],['2027-02-29T09:00',fallback],['2026-12-08T1730','2026-12-08T17:30']
+  ]){
+   const original=row(),wall=original.querySelector('[name="later"]');
+   wall.value=draft;wall.dispatchEvent(new Event('input',{bubbles:true}));
+   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+   await new Promise(resolve=>setTimeout(resolve,60));
+   const current=row(),form=await readyReviewCard(current);
+   check(current!==original && form.elements.later.value===draft,'Refresh restores '+draft);
+   const toggle=form.querySelector('[data-later-toggle]'),chooser=form.querySelector('[data-later-custom]');
+   toggle.click();form.querySelector('[data-later-choose]').click();
+   const selected=chooser.querySelector('[aria-selected="true"]')?.dataset.date;
+   const field=chooser.querySelector('[data-later-time]'),save=chooser.querySelector('[value="later"]');
+   check(!errors.length,'Opening '+draft+' raises '+errors.join(', '));errors.length=0;
+   check(!chooser.hidden && selected===expected.slice(0,10) && field.value===expected.slice(11) &&
+    form.elements.later.value===expected && !save.disabled,'Opening '+draft+' selects '+expected);
+   toggle.click();
+  }
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_uses_the_shared_status_with_the_real_loader(self) -> None:

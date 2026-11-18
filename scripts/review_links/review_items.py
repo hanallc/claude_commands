@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import sys
 from zoneinfo import ZoneInfo
-from typing import TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, Literal, cast, override
 
 from scripts.production import unit_lookup, showrunner_tree
 from scripts.agents.remote import local_machine
@@ -208,6 +208,7 @@ class ReviewItem:
     queue_after: str = ''
     value: tuple[float, ...] = ()
     text: str = ''
+    waiting_why: str = ''
 
     def for_you(self, now: datetime) -> bool:
         """Count Open records whose next action belongs to the user."""
@@ -346,7 +347,8 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
         ('works', 'not works', 'validate', 'feedback', 'question') if state != ReviewState.DONE else (),
         ChangeSource(path, row, assignment, slots), entry.urgency, after, queue,
         row['#'] if local else prefix+'/'+row['#'], change_review.prerequisite_key(entry.after, path, current),
-        entry.value, change_review.describe(row | {'#':shown},record=members))
+        entry.value, change_review.describe(row | {'#':shown},record=members),
+        review_events.waiting_why(slots.waiting_why))
 
 
 def change_queue_name(doc: Path, members: staff.StaffSnapshot, current: Path, below: bool = False) -> str:
@@ -463,7 +465,8 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
     return ReviewItem(key, identity, ReviewType.QUESTION, owner, asker, fields['text'], state,
         ReviewTimes(filed, logs[-1].time, later), tuple(logs),
         ('answer', 'feedback', 'question') if state != ReviewState.DONE and not unowned else (), source, entry.urgency, '',
-        update_registration.question_queue_name(owner), entry.key, entry.after, entry.value, opened.line())
+        update_registration.question_queue_name(owner), entry.key, entry.after, entry.value, opened.line(),
+        review_events.waiting_why(fields.get('waiting_why', '')))
 
 
 def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
@@ -605,7 +608,8 @@ def investigation_item(record: investigation.Investigation, members: staff.Staff
         ReviewTimes(filed, logs[-1].time), tuple(logs),
         ('read', 'feedback', 'question') if state != ReviewState.DONE else (), InvestigationSource(record),
         queue='investigation-'+owner, queue_key=key,
-        text=identity_text+' '+record.title+'\n'+record.question+'\n\nAnswer\n'+record.answer)
+        text=identity_text+' '+record.title+'\n'+record.question+'\n\nAnswer\n'+record.answer,
+        waiting_why=review_events.waiting_why(record.waiting_why))
 
 
 def proposal_state(issue: Issue) -> ReviewState:
@@ -627,10 +631,11 @@ def proposal_item(key: str, issue: Issue, owner: staff.StaffId, who: staff.Staff
     actions = DECISION_ACTIONS if state != ReviewState.DONE else ()
     if entry is None:
         return ReviewItem(key,identity,ReviewType.PROPOSAL,owner,who,title,state,ReviewTimes(filed,logs[-1].time),logs,
-                          actions,ProposalSource(issue))
+                          actions,ProposalSource(issue),waiting_why=review_events.waiting_why(issue.value('waiting_why')))
     return ReviewItem(key,identity,ReviewType.PROPOSAL,owner,who,title,state,ReviewTimes(filed,logs[-1].time),logs,
                       actions,ProposalSource(issue),entry.urgency,'proposal/'+entry.after if entry.after else '',queue,
-                      entry.key,entry.after,entry.value,proposals_table.proposal_text(entry))
+                      entry.key,entry.after,entry.value,proposals_table.proposal_text(entry),
+                      review_events.waiting_why(issue.value('waiting_why')))
 
 
 
@@ -871,7 +876,7 @@ def efficiency_item(path: Path, index: int, line: str, review: efficiency_review
         head[13:],state,ReviewTimes(filed,logs[-1].time),logs,
         DECISION_ACTIONS if state != ReviewState.DONE else (),
         EfficiencySource(path,line),entry.urgency,queue=candidates.QUEUE,queue_key=entry.key,
-        value=entry.value,text=line)
+        value=entry.value,text=line,waiting_why=review_events.waiting_why(review.waiting_why))
 
 
 class ReviewRecordChanged(ValueError):
@@ -950,9 +955,10 @@ def ordered(items: list[ReviewItem], sources: list[Path] | None = None) -> list[
 def read(root: Path, *, members: staff.StaffSnapshot | None = None,
          kinds: tuple[ReviewType, ...] = REVIEW_TYPES, show: str = 'all',
          owner_options: dict[staff.StaffId, str] | None = None,
-         sources: list[Path] | None = None) -> list[ReviewItem]:
+         sources: list[Path] | None = None, assign_ids: Literal[False] = False) -> list[ReviewItem]:
     """Read each record from its existing store without another stored copy."""
     members = staff.snapshot() if members is None else members
+    _ = assign_ids
     return project(root, members, kinds, selected_states(show), owner_options, sources, ALL_RECORDS)
 
 

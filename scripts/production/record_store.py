@@ -92,7 +92,7 @@ class NumberedRecords:
                 raise ValueError("missing frontmatter")
             header, body = text[4:].split("\n---\n\n", 1)
             fields: dict[str, str] = {}
-            for line in header.splitlines():
+            for line in header.split("\n"):
                 key, value = line.split(": ", 1)
                 decoded = cast(object, json.loads(value))
                 if not isinstance(decoded, str) or key in fields:

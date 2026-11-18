@@ -26,7 +26,7 @@ from scripts.aws_target import aws_trial, cloud_gate, gate_box, ledger, s3_presi
 from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli, AwsUnavailable, largest_gate_vcpus
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant, numeric_settings, text_setting
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.buildlog import index, store
 from scripts.build_targets import target_config
@@ -172,11 +172,10 @@ class CloudGateTests(CostFixture):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root / "buildlog")})))
         _ = write_config_fixture(self.root / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
         _ = write_config_fixture(self.root / "test_times.conf", "TOP_RUNS=3\nGATE_FAILURE_LOG_KIB=4")
-        repository = Path(__file__).resolve().parents[2]
         # The fixture keeps two sizes, so the shipped type list can change without these cases.
-        shipped = (repository / 'config/cloud_gate.conf').read_text()
-        _ = (self.root / 'cloud_gate.conf').write_text(
-            re.sub(r'(?m)^instance_types=.*$', 'instance_types=m7a.8xlarge m7a.4xlarge', shipped))
+        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+            'instance_types=m7a.8xlarge m7a.4xlarge\nspot_max_usd_per_hour=0.8\n'
+            + 'attempt_allowance_usd=0.02\nlaunch_reply_tries=2\n')
         self.now = float(instant('2026-01-15T01:00:00+00:00'))
         self.book = ledger.CostLedger(self.state)
         self.book.record_inventory(ledger.ResourceInventory(int(self.now) - 1,
@@ -1646,6 +1645,76 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertNotIn('result', cloud_gate.read(self.folder / 'imported.json'))
         reported.assert_called_once()
 
+    def test_first_import_skips_existing_rows(self) -> None:
+        destination = store.host_file('aws', self.now)
+        destination.parent.mkdir(parents=True)
+        prefix = b'{"id":"older-record"}\n' * 10000 + b'invalid JSON\n'
+        _ = destination.write_bytes(prefix)
+
+        cloud_gate.import_record(self.folder, self.result())
+
+        saved = cloud_gate.read(self.folder / 'import-boundary.json')
+        self.assertEqual(saved, {'id': 'gate-attempt', 'destination': str(destination), 'offset': len(prefix)})
+        contents = destination.read_bytes()
+        self.assertEqual(contents[:len(prefix)], prefix)
+        self.assertEqual(len(contents[len(prefix):].splitlines()), 1)
+        self.assertEqual(ledger.mapping(cast(object, json.loads(contents[len(prefix):])))['id'], 'gate-attempt')
+
+    def test_import_retries_after_append_without_appending_again(self) -> None:
+        destination = store.host_file('aws', self.now)
+        result_path = self.folder / cloud_gate.RESULT_FILE
+        imported = self.folder / 'imported.json'
+        result = self.result()
+        cloud_gate.save(result_path, result)
+        save = cloud_gate.save
+
+        def interrupt_imported_save(path: Path, row: dict[str, object]) -> None:
+            if path == imported:
+                raise OSError('fixture interrupted the import')
+            save(path, row)
+
+        with mock.patch('scripts.test_times.gate_record.keep_failure_logs') as keep_failure_logs:
+            with mock.patch.object(cloud_gate, 'save', side_effect=interrupt_imported_save):
+                with self.assertRaisesRegex(OSError, 'fixture interrupted'):
+                    cloud_gate.import_record(self.folder, result)
+            self.assertFalse(imported.exists())
+            store.append_line(destination, {'id': 'another-record'})
+            contents = destination.read_bytes()
+            cloud_gate.import_record(self.folder, cloud_gate.read(result_path))
+
+        keep_failure_logs.assert_called_once()
+        self.assertEqual(destination.read_bytes(), contents)
+        self.assertEqual(cloud_gate.read(imported)['id'], 'gate-attempt')
+        self.assertFalse(result_path.exists())
+
+    def test_reused_import_folder_ignores_the_previous_record_marker(self) -> None:
+        destination = store.host_file('aws', self.now)
+        cloud_gate.import_record(self.folder, self.result())
+        first_end = destination.stat().st_size
+        result = self.result()
+        result['attempt'] = 'next-attempt'
+        ledger.mapping(result['record'])['id'] = 'gate-next-attempt'
+
+        cloud_gate.import_record(self.folder, result)
+
+        self.assertEqual([row['id'] for row in store.locked_rows(destination)], ['gate-attempt', 'gate-next-attempt'])
+        self.assertEqual(cloud_gate.read(self.folder / 'import-boundary.json'),
+                         {'id': 'gate-next-attempt', 'destination': str(destination), 'offset': first_end})
+
+    def test_import_saves_the_offset_after_tail_repair(self) -> None:
+        destination = store.host_file('aws', self.now)
+        store.append_line(destination, {'id': 'older-record'})
+        whole_end = destination.stat().st_size
+        with destination.open('ab') as handle:
+            _ = handle.write(b'{"id":"unfinished')
+
+        cloud_gate.import_record(self.folder, self.result())
+        cloud_gate.import_record(self.folder, self.result())
+
+        self.assertEqual(cloud_gate.read(self.folder / 'import-boundary.json')['offset'], whole_end)
+        rows = [ledger.mapping(cast(object, json.loads(line))) for line in destination.read_bytes().splitlines()]
+        self.assertEqual([row['id'] for row in rows], ['older-record', 'gate-attempt'])
+
     def test_remote_red_never_calls_the_local_runner(self) -> None:
         remote = gate.GateRun((gate.GateJobResult('fixture', 'test_ok.py', 1, 1, ''),), 1, 1)
         for mode, full in ((gate.SuiteMode.MERGE_GATE, False), (gate.SuiteMode.TARGETED_TEST, True)):
@@ -2124,9 +2193,9 @@ class CloudRouteTests(CostFixture):
         super().setUp()
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
         _ = self.enterContext(mock.patch.object(cloud_gate, 'account_settings_path', side_effect=lambda: Path(os.environ.get('AWS_TARGET_CONFIG', str(self.settings)))))
-        repository = Path(__file__).resolve().parents[2]
-        for name in ('merge_gate', 'cloud_gate'):
-            _ = (self.root / (name + '.conf')).write_bytes((repository / 'config' / (name + '.conf')).read_bytes())
+        _ = write_config_fixture(self.root / 'merge_gate.conf')
+        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+            'credential_file=~/.config/aws-build/credentials\n')
         self.repo = self.root / 'repo'
         folder = self.repo / 'scripts/fixture'
         folder.mkdir(parents=True)
@@ -2350,13 +2419,15 @@ class CloudRouteTests(CostFixture):
         self.assertFalse((pending / 'launch.json').exists())
 
     def test_main_commit_needs_no_bundle(self) -> None:
+        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+            'clone_url=https://example.invalid/fixture-source.git\n')
         folder = self.root / 'attempt'
         request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.MERGE_GATE, 1800)
         self.assertEqual(request['tree'], gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}'))
         self.assertEqual(request['commit'], gate.checked_git(self.repo, 'rev-parse', 'HEAD'))
         self.assertEqual(request['head'], request['commit'])
         self.assertEqual(request['origin_main'], request['commit'])
-        self.assertEqual(request['clone_url'], 'https://github.com/natepiano/claude_commands.git')
+        self.assertEqual(request['clone_url'], 'https://example.invalid/fixture-source.git')
         self.assertEqual(request['source_key'], '')
         self.assertFalse((folder / 'source.bundle').exists())
         self.assertEqual(request['modules'], ['scripts/fixture/test_one.py', 'scripts/fixture/test_two.py'])
@@ -2515,6 +2586,173 @@ class CloudRouteTests(CostFixture):
         self.assertNotEqual(folders[0], folders[1])
         self.assertFalse(any((folder / 'outcome.json').exists() for folder in folders))
 
+    def _run_gate_for_resume(self, service: Callable[[Sequence[str]], int]) -> cloud_gate.LocalFallback | cloud_gate.CloudCompleted:
+        with mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('The controller must not call AWS')):
+            return cloud_gate.run_cloud(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
+                module_time_limit_s=1800, service=service, attempt=cloud_gate.CloudAttempt(self.state, gate.SuiteMode.MERGE_GATE))
+
+    def _finish_gate_for_resume(self, command: Sequence[str], *, status: int = 0) -> int:
+        folder = Path(command[command.index('--worker') + 1])
+        request = cloud_gate.read(folder / 'request.json')
+        run = gate.GateRun(tuple(gate.GateJobResult(suite, path.name, status, 1, '') for suite, path in self.modules), 1, 1)
+        result = {key: request[key] for key in ('attempt', 'commit', 'tree')}
+        result.update(host='fixture-guest', verdict='pass' if run.passed else 'fail', gate=gate_box.encode_run(run),
+            record=gate_box.completion_record(run, folder.name, ledger.text(request, 'commit'),
+                ledger.text(request, 'tree'), 'fixture-guest', 0, 1, 'merge-gate'))
+        book = ledger.CostLedger(self.state)
+        now = int(time.time())
+        booked = book.reserve_gate(self.settings, ledger.GateReservation(
+            folder.name, now, ledger.instant(request, 'expires'), Decimal('.8'), Decimal('.02')))
+        self.assertIsInstance(booked, ledger.GateReserved)
+        book.resolve_gate(folder.name, ledger.GateTerminated(now, 'fixture-guest'))
+        cloud_gate.save(folder / cloud_gate.RESULT_FILE, result)
+        _ = (folder / 'gate.log').write_text('fixture gate log\n')
+        cloud_gate.save(folder / 'outcome.json', {'status': 'complete', 'result_file': cloud_gate.RESULT_FILE})
+        return 0
+
+    def _unimported_gate(self, *, status: int = 0) -> Path:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        book = ledger.CostLedger(self.state)
+        now = int(time.time())
+        book.record_inventory(ledger.ResourceInventory(now, (), 'fixture', builder_removed=True))
+
+        def interrupt_after_completion(command: Sequence[str]) -> int:
+            _ = self._finish_gate_for_resume(command, status=status)
+            raise SystemExit('fixture controller crash')
+
+        with self.assertRaisesRegex(SystemExit, 'fixture controller crash'):
+            _ = self._run_gate_for_resume(interrupt_after_completion)
+        root = Path(gate.checked_git(self.repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
+        return root / ledger.text(cloud_gate.read(root / 'current.json'), 'attempt')
+
+    def test_complete_unimported_gate_resumes_without_a_service(self) -> None:
+        folder = self._unimported_gate(status=1)
+        (self.state / 'gate-deployment.json').unlink()
+        service = mock.Mock(side_effect=AssertionError('A completed gate needs no service'))
+        with (mock.patch.object(cloud_gate, 'service_command', side_effect=AssertionError('A completed gate needs no command')),
+              mock.patch.object(queue_place, 'release_place', wraps=queue_place.release_place) as release,
+              redirect_stdout(StringIO()) as output):
+            outcome = self._run_gate_for_resume(service)
+
+        assert isinstance(outcome, cloud_gate.CloudCompleted)
+        self.assertFalse(outcome.run.passed)
+        self.assertIn('fixture gate log', output.getvalue())
+        service.assert_not_called()
+        self.assertEqual(release.call_args.args[1], 1)
+        self.assertTrue(self.admission.callers_released())
+        self.assertEqual([path for path in folder.parent.iterdir() if path.is_dir()], [folder])
+        self.assertEqual([row['id'] for row in store.locked_rows(store.host_file('aws', 0))], ['gate-' + folder.name])
+        self.assertEqual(cloud_gate.read(folder / 'imported.json')['id'], 'gate-' + folder.name)
+
+    def test_complete_imported_gate_starts_a_new_attempt(self) -> None:
+        folder = self._unimported_gate()
+        cloud_gate.import_record(folder, cloud_gate.read(folder / cloud_gate.RESULT_FILE))
+        self.assertFalse((folder / cloud_gate.RESULT_FILE).exists())
+
+        with redirect_stdout(StringIO()):
+            outcome = self._run_gate_for_resume(self._finish_gate_for_resume)
+
+        self.assertIsInstance(outcome, cloud_gate.CloudCompleted)
+        current = cloud_gate.read(folder.parent / 'current.json')
+        self.assertNotEqual(current['attempt'], folder.name)
+        self.assertEqual([row['id'] for row in store.locked_rows(store.host_file('aws', 0))],
+                         ['gate-' + folder.name, 'gate-' + ledger.text(current, 'attempt')])
+
+    def test_complete_gate_for_a_different_tree_starts_a_new_attempt(self) -> None:
+        folder = self._unimported_gate()
+        request = cloud_gate.read(folder / 'request.json')
+        result = cloud_gate.read(folder / cloud_gate.RESULT_FILE)
+        request['tree'] = result['tree'] = 'different-tree'
+        ledger.mapping(result['record'])['tree'] = 'different-tree'
+        cloud_gate.save(folder / 'request.json', request)
+        cloud_gate.save(folder / cloud_gate.RESULT_FILE, result)
+
+        service = mock.Mock(wraps=self._finish_gate_for_resume)
+        with redirect_stdout(StringIO()):
+            outcome = self._run_gate_for_resume(service)
+
+        self.assertIsInstance(outcome, cloud_gate.CloudCompleted)
+        current = cloud_gate.read(folder.parent / 'current.json')
+        self.assertNotEqual(current['attempt'], folder.name)
+        service.assert_called_once()
+        self.assertFalse((folder / 'imported.json').exists())
+        self.assertEqual([row['id'] for row in store.locked_rows(store.host_file('aws', 0))],
+                         ['gate-' + ledger.text(current, 'attempt')])
+
+    def test_complete_gate_with_a_missing_result_starts_a_new_attempt(self) -> None:
+        folder = self._unimported_gate()
+        (folder / cloud_gate.RESULT_FILE).unlink()
+
+        service = mock.Mock(wraps=self._finish_gate_for_resume)
+        with redirect_stdout(StringIO()):
+            outcome = self._run_gate_for_resume(service)
+
+        self.assertIsInstance(outcome, cloud_gate.CloudCompleted)
+        current = cloud_gate.read(folder.parent / 'current.json')
+        self.assertNotEqual(current['attempt'], folder.name)
+        service.assert_called_once()
+        self.assertFalse((folder / 'imported.json').exists())
+        self.assertEqual([row['id'] for row in store.locked_rows(store.host_file('aws', 0))],
+                         ['gate-' + ledger.text(current, 'attempt')])
+
+    def test_resume_after_gate_record_append_keeps_one_record(self) -> None:
+        folder = self._unimported_gate()
+        imported = folder / 'imported.json'
+        save = cloud_gate.save
+
+        def interrupt_before_receipt(path: Path, row: dict[str, object]) -> None:
+            if path == imported:
+                raise SystemExit('fixture controller crash after append')
+            save(path, row)
+
+        with mock.patch.object(cloud_gate, 'save', side_effect=interrupt_before_receipt):
+            with self.assertRaisesRegex(SystemExit, 'fixture controller crash after append'):
+                cloud_gate.import_record(folder, cloud_gate.read(folder / cloud_gate.RESULT_FILE))
+        self.assertFalse(imported.exists())
+        service = mock.Mock(side_effect=AssertionError('A completed gate needs no service'))
+        destination = store.host_file('aws', 0)
+        previous = destination.read_bytes()
+        with redirect_stdout(StringIO()):
+            outcome = self._run_gate_for_resume(service)
+
+        self.assertIsInstance(outcome, cloud_gate.CloudCompleted)
+        self.assertEqual(destination.read_bytes(), previous)
+        self.assertEqual(cloud_gate.read(imported)['id'], 'gate-' + folder.name)
+        service.assert_not_called()
+
+    def test_head_change_during_gate_resume_falls_back(self) -> None:
+        folder = self._unimported_gate()
+        reserve = cloud_gate.cloud_reservation
+
+        @contextmanager
+        def change_head(repo: Path, sidecar: Path, mode: gate.SuiteMode) -> Generator[cloud_gate.CloudReservation]:
+            with reserve(repo, sidecar, mode) as reservation:
+                _ = gate.checked_git(repo, 'commit', '--allow-empty', '-qm', 'Fixture changed HEAD')
+                yield reservation
+
+        service = mock.Mock(side_effect=AssertionError('A completed gate needs no service'))
+        with mock.patch.object(cloud_gate, 'cloud_reservation', side_effect=change_head):
+            outcome = self._run_gate_for_resume(service)
+
+        self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed during the cloud attempt'))
+        self.assertFalse((folder / 'imported.json').exists())
+        self.assertFalse(store.host_file('aws', 0).exists())
+        service.assert_not_called()
+
+    def test_invalid_unimported_gate_result_falls_back(self) -> None:
+        folder = self._unimported_gate()
+        result = cloud_gate.read(folder / cloud_gate.RESULT_FILE)
+        result['tree'] = 'different-tree'
+        cloud_gate.save(folder / cloud_gate.RESULT_FILE, result)
+        cloud_gate.save(folder / 'imported.json', {'id': 'gate-previous-attempt'})
+
+        service = mock.Mock(side_effect=AssertionError('A completed gate needs no service'))
+        outcome = self._run_gate_for_resume(service)
+
+        self.assertEqual(outcome, cloud_gate.LocalFallback('The result differs from the current tree'))
+        self.assertFalse(store.host_file('aws', 0).exists())
+        service.assert_not_called()
+
     def test_pending_attempt_reuses_only_the_same_working_tree(self) -> None:
         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
         folders: list[Path] = []
@@ -2599,6 +2837,7 @@ class CloudRouteTests(CostFixture):
                     self.assertIn('--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE', command)
 
     def test_forwarded_worker_records_keep_the_callers_labels_and_unit(self) -> None:
+        _ = write_config_fixture(self.root / 'build_steps.conf', 'owned.merge-gate={unit} merge\n')
         owner = UnitLabels('fixture caller', 'fixture-production', 'fixture-unit', OwnerRole.UNIT)
         for paired in (False, True):
             for session_key in ('CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):

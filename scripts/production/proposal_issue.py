@@ -153,18 +153,21 @@ def review_mark(issue: Issue) -> ReviewMark | NoMark:
 
 
 def record_review(path: Path, words: str | tuple[str, ...], change: MarkChange, today: date, who: str = "nate",
-                  *, check: Callable[[], object] | None = None) -> bool:
+                  *, check: Callable[[], object] | None = None, waiting_why: str = "",
+                  check_state: Callable[[], None] = lambda: None) -> bool:
     """Append one Review page log line and change its mark. Returns False for an exact repeat."""
+    reason = review_events.require_waiting_why(waiting_why) if change == ReviewMark.WAITING or waiting_why else ""
     with issue_lock(path):
         if check is not None:
             _ = check()
         issue = Issue(path, frontmatter(path))
+        check_state()
         before = review_log(issue)
         events = before
         for line in (words,) if isinstance(words, str) else words:
             events = review_events.append(events, ReviewLog(datetime.now(timezone.utc), who, line))
         mark = review_events.changed_mark(review_mark(issue), change)
-        if events == before and mark == review_mark(issue):
+        if events == before and mark == review_mark(issue) and (not reason or reason == issue.value("waiting_why")):
             return False
         lines = read_issue(path).splitlines(keepends=True)
         end = _closing_fence(lines, path)
@@ -174,7 +177,8 @@ def record_review(path: Path, words: str | tuple[str, ...], change: MarkChange, 
                              *(f"  - {json.dumps(row, ensure_ascii=False)}{newline}" for row in review_events.rows(events))]
         text, _ = remove_fields("".join(lines), (REVIEW_MARK_FIELD,), path)
         marked = {REVIEW_MARK_FIELD: mark.value} if isinstance(mark, ReviewMark) else {}
-        text, _ = set_fields(text, {**marked, "date_modified": _vault_date(today)}, path)
+        why = {"waiting_why": reason} if reason else {}
+        text, _ = set_fields(text, {**marked, **why, "date_modified": _vault_date(today)}, path)
         write_issue(path, text)
         return True
 

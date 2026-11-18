@@ -479,6 +479,22 @@ let latest = null;
 function field(label, value, kind = 'field', group = false) {
   return {kind, label, value: String(value ?? ''), group};
 }
+function staffField(label, names) {
+  return {...field(label, names.join(', ')), valueStaffNames: names};
+}
+function staffTitle(name, value, suffix = '') {
+  return {...field(name + suffix, value, 'title'), labelStaffName: name, labelSuffix: suffix};
+}
+function staffName(text) {
+  return globalThis.staffNames?.html(text) ?? esc(text);
+}
+function roleName(text) {
+  return globalThis.staffNames?.parts(text) ?? esc(text);
+}
+function nameParts(parts) {
+  return parts.map(part => part.kind === 'staff' ? staffName(part.text) : esc(part.text)).join('');
+}
+function partsText(parts) { return parts.map(part => part.text).join(''); }
 function groupRows(rows) {
   return rows.filter(row => row.value !== '').map((row, index) => ({...row, group: index === 0}));
 }
@@ -693,7 +709,8 @@ function signedSwap(bytes) { return `${bytes < 0 ? "−" : "+"}${swapAmount(Math
 function swapTip(row) {
   const captions = {total:'Swap across this machine', difference:'Group readings above the host total',
     unattributed:'Swap without a matching group', ungrouped:'Swap without a program name', smaller:'Swap of the smaller named groups'};
-  return [field(row.name, row.kind === 'difference' ? signedSwap(row.bytes) : swapAmount(row.bytes), 'title'),
+  const amount = row.kind === 'difference' ? signedSwap(row.bytes) : swapAmount(row.bytes);
+  return [row.title_kind === 'staff' ? staffTitle(row.name, amount) : field(row.name, amount, 'title'),
     field('', captions[row.kind] || 'Swap charged to this program', 'caption'),
     ...(row.owner_count === 1 ? groupRows(ownerFields(row)) : [])];
 }
@@ -744,8 +761,8 @@ function doneText(row) {
   return recorded(percent) ? formatPercent(percent, progress.done === progress.total) : "—";
 }
 function ownerFields(row) {
-  const fields = [field('Showrunner', ownerText(row.showrunner))];
-  if (row.runner === 'worker') fields.push(field('Worker', ownerText(row.worker)));
+  const fields = [staffField('Showrunner', [ownerText(row.showrunner)])];
+  if (row.runner === 'worker') fields.push(staffField('Worker', [ownerText(row.worker)]));
   return fields.filter(row => row.value);
 }
 function rowTitle(row) {
@@ -755,13 +772,18 @@ function rowTitle(row) {
   return unit && !name.startsWith(unit+' ') && !name.startsWith(unit+' · ') ? `${unit} · ${name}`
     : unit && name.startsWith(unit+' ') ? `${unit} · ${name.slice(unit.length+1)}` : name;
 }
-function becauseRows(reason) {
+function stepTitle(row, value) {
+  const title = rowTitle(row), unit = ownerText(row.unit);
+  return unit && !ciRow(row) ? staffTitle(unit, value, title.slice(unit.length)) : field(title, value, 'title');
+}
+function becauseRows(reason, parts) {
   if (!reason) return [];
-  return reason.length <= 30 ? [field('Because', reason)] : [field('Because', ''), field('', reason, 'long')];
+  return reason.length <= 30 ? [{...field('Because', reason), valueParts:parts}]
+    : [field('Because', ''), {...field('', reason, 'long'), valueParts:parts}];
 }
 function routeFields(row) {
   return [field('Runs on', row.kind === 'cloud' ? 'AWS' : row.runs_on || ''),
-    ...(row.runs_on === 'natedev or Mac' ? [] : becauseRows(row.because || ''))];
+    ...(row.runs_on === 'natedev or Mac' ? [] : becauseRows(row.because || '', row.because_parts))];
 }
 function progressRows(row) {
   const progress = row.progress;
@@ -779,21 +801,25 @@ function stepTooltip(key, data) {
   const duration = tipDuration(key, row, data);
   const state = waiting ? 'waiting' : row.between_steps ? 'between steps' : 'running';
   if (row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used)))
-    return [field(rowTitle(row), 'unavailable', 'title')];
-  const rows = [field(rowTitle(row), [state, duration].filter(Boolean).join(' '), 'title')];
+    return [stepTitle(row, 'unavailable')];
+  const rows = [stepTitle(row, [state, duration].filter(Boolean).join(' '))];
   // A gate job says what it does and what it changes (#109).
-  if (row.about) rows.push(field('', row.about, 'caption'), field('Changes', row.changes));
+  if (row.about) rows.push({...field('', row.about, 'caption'), valueParts:row.about_parts}, field('Changes', row.changes));
   if (row.group) return [field(row.name, ramAmount(row.used * GIB), 'title'), field('Started by', 'not the queue'),
-    ...groupRows(memoryRows((row.parts || []).map(part => [[part.who, recorded(part.pid) ? part.pid : '',
-      part.started_at > 0 ? ago(part.started_at, data.read_at) : ''].filter(Boolean).join(' · '), part.gib * GIB])))];
+    ...groupRows((row.parts || []).map(part => {
+      const suffix = [recorded(part.pid) ? part.pid : '', part.started_at > 0 ? ago(part.started_at, data.read_at) : '']
+        .filter(Boolean).join(' · ');
+      const parts = [...(part.who_parts || [{kind:'text',text:part.who}]), ...(suffix ? [{kind:'text',text:' · '+suffix}] : [])];
+      return {...field(partsText(parts), ramAmount(part.gib * GIB)), labelParts:parts};
+    }))];
   rows.push(...ownerFields(row));
-  if (row.priority_entries?.length) rows.push(field('Priority', row.priority_entries.map(entry => entry.unit).join(', ')));
+  if (row.priority_entries?.length) rows.push(staffField('Priority', row.priority_entries.map(entry => entry.unit)));
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));
     rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' :
       row.kind === 'repository-slot' ? 'build slot' : row.why || 'its turn'), ...routeFields(row));
     if (!['cloud', 'repository-slot'].includes(row.kind)) {
-      if (row.head_room?.unavailable) return [field(rowTitle(row), 'unavailable', 'title')];
+      if (row.head_room?.unavailable) return [stepTitle(row, 'unavailable')];
       let free = row.free ?? queueCapMemory(data).free / GIB;
       if (row.head_room?.rows?.length) {
         const terms = row.head_room.rows, result = terms.at(-1);
@@ -861,7 +887,7 @@ function tooltipRows(key, data) {
   if (kind === 'swap-pool') return poolTip(index, data);
   const rows = TIPS[key](data);
   if (key === 'walkhead' && data.unmatched_priority_entries?.length)
-    rows.push(field('Priority', data.unmatched_priority_entries.map(entry => entry.unit).join(', ')));
+    rows.push(staffField('Priority', data.unmatched_priority_entries.map(entry => entry.unit)));
   return rows;
 }
 function tooltipHtml(key, data) {
@@ -871,8 +897,9 @@ function tipRowsHtml(rows) {
   return '<dl class="tip">'+rows.map(row => {
     const classes=[row.kind === 'field' ? '' : row.kind, row.group ? 'group' : ''].filter(Boolean).join(' ');
     const attr=classes ? ` class="${classes}"` : '';
-    return ['caption','long'].includes(row.kind) ? `<dd${attr}>${esc(row.value)}</dd>`
-      : `<dt${attr}>${esc(row.label)}</dt><dd${attr}>${esc(row.value)}</dd>`;
+    return ['caption','long'].includes(row.kind) ? `<dd${attr}>${row.valueParts ? nameParts(row.valueParts) : esc(row.value)}</dd>`
+      : `<dt${attr}>${row.labelParts ? nameParts(row.labelParts) : row.labelStaffName ? staffName(row.labelStaffName) + esc(row.labelSuffix) : esc(row.label)}</dt>` +
+        `<dd${attr}>${row.valueParts ? nameParts(row.valueParts) : row.valueStaffNames ? row.valueStaffNames.map(staffName).join(', ') : esc(row.value)}</dd>`;
   }).join('')+'</dl>';
 }
 function tipText(key, data) {
@@ -882,20 +909,21 @@ function tipText(key, data) {
 }
 function sentence(text) { return text ? text[0].toUpperCase() + text.slice(1) : ""; }
 function targetOwner(row) {
-  return [["Unit", row.unit], ["Showrunner", row.showrunner]]
-    .filter(([, name]) => name && name !== "—").map(([label, name]) => `${label} ${publicText(name)}`).join(" · ");
+  const roles = [["Unit", row.unit], ["Showrunner", row.showrunner]]
+    .filter(([, name]) => name && name !== "—");
+  if (roles.length) return roles.map(([label, name]) => label + ' ' + staffName(publicText(name))).join(' · ');
+  return row.holder ? 'Holder ' + staffName(publicText(row.holder)) : 'Owner not recorded';
 }
 function renderTargets(rows) {
   const box = $("targets");
   box.hidden = !rows.length;
   box.innerHTML = !rows.length ? "" : `<div class="section-head">Target availability</div>` + rows.map(row => {
-    const owner = row.state === "Unavailable" ? "" :
-      targetOwner(row) || (row.holder ? `Holder ${publicText(row.holder)}` : "Owner not recorded");
+    const owner = row.state === "Unavailable" ? "" : targetOwner(row);
     return `<div class="target-row"><div class="target-head"><span class="machine" data-machine="${esc(row.target)}">${esc(row.target)}</span>` +
       `<span class="target-state ${esc(row.state.toLowerCase())}">${esc(row.state)}</span></div>` +
       `<div class="target-until">${esc(sentence(row.until))}</div>` +
       `<div class="target-reason">${esc(row.reason || "No reason recorded")}</div>` +
-      `<div class="target-owner">${esc(owner)}</div><div class="target-since">${esc(sentence(row.since))}</div></div>`;
+      `<div class="target-owner">${owner}</div><div class="target-since">${esc(sentence(row.since))}</div></div>`;
   }).join("");
 }
 function recorded(value) { return typeof value === "number"; }
@@ -917,6 +945,23 @@ function visibleDetail(row) {
 function publicText(text) {
   return memoryText(text.split(" · ").filter(part => part.trim() && part.trim() !== "—" && !/\.(slice|service)\b/.test(part)).join(" · "));
 }
+function publicParts(parts) {
+  const shown = [];
+  let start = 0;
+  for (const segment of partsText(parts).split(' · ')) {
+    if (publicText(segment)) {
+      if (shown.length) shown.push({kind:'text', text:' · '});
+      let offset = 0;
+      for (const part of parts) {
+        const from = Math.max(0, start - offset), to = Math.min(part.text.length, start + segment.length - offset);
+        if (to > from) shown.push({...part, text:memoryText(part.text.slice(from, to))});
+        offset += part.text.length;
+      }
+    }
+    start += segment.length + 3;
+  }
+  return shown;
+}
 function rowUnit(row) {
   return ciRow(row) ? "CI" : /\.(slice|service)\b/.test(row.unit || "") ? row.name : row.unit || "";
 }
@@ -931,7 +976,7 @@ function rowOwner(row, waiting = false) {
 }
 function rowLabel(name, owner = "") {
   return `<span class="row-label"><span class="row-heading"><span class="name">${esc(name)}</span></span>` +
-    `<span class="owner">${esc(owner)}</span></span>`;
+    `<span class="owner">${roleName(owner)}</span></span>`;
 }
 function rowMemory(tip, bars = "") {
   return `<div class="row-memory" data-tip="${tip}"><div class="track" data-tip="${tip}">${bars}</div>` +
@@ -1043,6 +1088,7 @@ function restoreReportView(view) {
   }
 }
 function render(d) {
+  if (d.staff_names) globalThis.staffNames?.set(d.staff_names);
   if (d.error || !d.ok) {
     throw new Error("The queue did not answer.");
   }
@@ -1163,9 +1209,11 @@ function renderSwap(d) {
   $("gf-swap").style.width = `${Math.min(100, swap).toFixed(2)}%`;
   $("gv-swap").textContent = formatPercent(swap);
   placeLimitLabels();
+  const titleHtml = row => row.title_kind === "staff" ? staffName(row.name) : esc(row.name);
+  const detailHtml = row => row.detail_parts ? nameParts(publicParts(row.detail_parts)) : esc(visibleDetail(row));
   const rowHtml = ({row, index}) => `<div class="row ${row.kind}" data-tip="swap:${index}" data-pool="${row.pool}" data-bytes="${row.bytes}"><span class="name">${row.kind === "smaller"
-    ? `<details data-owner-key="smaller:${esc(row.pool)}"><summary><span class="chev">▶</span>${esc(row.name)}</summary><div class="swap-members">${row.members.map(member => `<div>${esc(member.name)}: ${swapAmount(member.bytes)}</div>`).join("")}</div></details>`
-    : esc(row.name)}</span><span class="v">${row.kind === "difference" ? signedSwap(row.bytes) : swapAmount(row.bytes)}</span><small>${row.kind === "owner" && visibleDetail(row) !== row.name ? esc(visibleDetail(row)) : ""}</small></div>`;
+    ? `<details data-owner-key="smaller:${esc(row.pool)}"><summary><span class="chev">▶</span>${esc(row.name)}</summary><div class="swap-members">${row.members.map(member => `<div>${titleHtml(member)}: ${swapAmount(member.bytes)}</div>`).join("")}</div></details>`
+    : titleHtml(row)}</span><span class="v">${row.kind === "difference" ? signedSwap(row.bytes) : swapAmount(row.bytes)}</span><small>${row.kind === "owner" && visibleDetail(row) !== row.name ? detailHtml(row) : ""}</small></div>`;
   const indexed = d.swap_by.map((row, index) => ({row, index}));
   const pools = [["outside", "Outside builds and CI", d.swap.outside_bytes], ["builds_ci", "Builds and CI", d.swap.builds_ci_bytes]];
   $("swaprows").innerHTML = pools.map(([pool, name, bytes]) => {
@@ -1187,7 +1235,7 @@ document.addEventListener("click", (e) => {
 
 function renderLeftovers(d) {
   const rows = (d.leftovers || []).flatMap(scope => scope.members.map((member, index) =>
-    `<div class="leftover-row"><span class="detail">${esc(scope.owner)} · ${esc(member.program)}${typeof member.pid === "number" ? ` · pid ${member.pid}` : ""}</span><span class="age">${index === 0 ? esc(scope.age) : ""}</span><span class="num">${index === 0 ? memoryAmount(scope.used) : ""}</span></div>`));
+    `<div class="leftover-row"><span class="detail">${roleName(scope.owner)} · ${esc(member.program)}${typeof member.pid === "number" ? ` · pid ${member.pid}` : ""}</span><span class="age">${index === 0 ? esc(scope.age) : ""}</span><span class="num">${index === 0 ? memoryAmount(scope.used) : ""}</span></div>`));
   $("leftovers").hidden = rows.length === 0;
   $("leftover-rows").innerHTML = rows.join("");
 }
@@ -1267,7 +1315,7 @@ function renderWalk(d) {
     (running ? '<th scope="col" class="slot">Slot</th><th scope="col" class="tokens">Tokens</th>' : "");
   const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—", slot = "—", tokens = "—") => {
     tableRows.push(`<tr class="${className}" data-tip="${tip}" tabindex="0"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
-      `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${esc(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
+      `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${roleName(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
       (Array.isArray(machine)
         // A waiting step lists the machines that can take it, each in its machine color.
         ? `<td class="machine" data-machine="${esc(machine.join(" or "))}"><span class="wait-target">${machine.map(target => `<span class="machine" data-machine="${esc(target)}">${esc(target)}</span>`).join(" or ") || "—"}</span></td>`
@@ -1298,7 +1346,9 @@ function renderWalk(d) {
       : units.length === 1 ? `Queued, ${units[0]} first, then in submission order`
       : `Queued, ${units.join(" followed by ")} and then in submission order`;
     tableRows.push(`<tr class="queue-head">${columns("#", STEP_TABLE_HEADERS.waiting)}</tr>`);
-    rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}">${esc(title)}</span></div>`);
+    const titleHtml = !units.length ? esc(title) : units.length === 1 ? `Queued, ${roleName(units[0])} first, then in submission order`
+      : `Queued, ${units.map(unit=>roleName(unit)).join(' followed by ')} and then in submission order`;
+    rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}">${titleHtml}</span></div>`);
   }
   let localPosition = 0;
   d.waiters.forEach((w, i) => {

@@ -10,6 +10,7 @@ the notice, and the next assign of a unit director starts its worker.
 
 A live detached run of a stopped worker continues. Its result goes to the
 director, because delivery to a stopped or closed worker goes to the holder.
+That run keeps the stopped worker's pane open; the run end closes the pane.
 """
 from __future__ import annotations
 try:
@@ -42,6 +43,14 @@ class PassesNotCanceled:
 
 
 @dataclass(frozen=True)
+class PaneOpen:
+    """The stopped worker's pane did not close. A pane kept by a live detached run closes when the run ends."""
+
+    close: Literal["kept", "uncertain"]
+    reason: str
+
+
+@dataclass(frozen=True)
 class WorkerStopped:
     """The worker process is proved absent."""
 
@@ -49,6 +58,7 @@ class WorkerStopped:
     process: Literal["stopped", "absent"]
     canceled_passes: int | PassesNotCanceled
     detached_runs: tuple[str, ...] = ()
+    pane: PaneOpen | None = None
 
 
 @dataclass(frozen=True)
@@ -95,14 +105,19 @@ def stop_worker(parent: staff.StaffRow, row: staff.StaffRow, client: herdr.Herdr
         runs = run / detached_runs.DETACHED_RUNS_DIR
         detached = tuple(f"{record['run_id']}: result {runs / (record['run_id'] + '.json')}; log {record['log']}"
                          for record in detached_runs.live_runs_for_staff(runs, frozenset({row.id})))
+        pane: PaneOpen | None = None
         if isinstance(state, worker_panes.StoppedWorker):
             # The stop is complete here. The pane closes only when the close checks permit it.
             try:
-                _ = worker_panes.close(parent.id, name, lock=hold)
+                closed = worker_panes.close(parent.id, name, lock=hold)
             except (herdr_types.HerdrFailure, OSError, ValueError) as error:
-                print(f"worker-capacity: {row.name}: pane not closed: {' '.join(str(error).split())}", file=sys.stderr)
+                closed = worker_panes.UncertainWorker(row, " ".join(str(error).split()))
+            if isinstance(closed, worker_panes.Kept):
+                pane = PaneOpen("kept", closed.blocker)
+            elif isinstance(closed, worker_panes.UncertainWorker):
+                pane = PaneOpen("uncertain", closed.reason)
         worker_panes.forget_restart(row)
-        return WorkerStopped(row.name, process, canceled, detached)
+        return WorkerStopped(row.name, process, canceled, detached, pane)
 
 
 def report_text(outcomes: list[WorkerStopped | WorkerNotStopped]) -> str:
@@ -117,6 +132,8 @@ def report_text(outcomes: list[WorkerStopped | WorkerNotStopped]) -> str:
         if isinstance(item.canceled_passes, PassesNotCanceled):
             lines.append(f"Pass stays open: {item.name}: {item.canceled_passes.reason}.")
         lines.extend(f"Detached run of {item.name} continues: {run}." for run in item.detached_runs)
+        if item.pane is not None:
+            lines.append(_pane_line(item, item.pane) + ".")
     lines.extend(f"Not proved stopped: {item.name}: {item.reason}. Send it no work."
                  for item in outcomes if isinstance(item, WorkerNotStopped))
     if not lines:
@@ -124,11 +141,20 @@ def report_text(outcomes: list[WorkerStopped | WorkerNotStopped]) -> str:
     return "\n".join(["Codex workers have no capacity. This is the stop report for your Codex workers.", *lines])
 
 
+def _pane_line(item: WorkerStopped, pane: PaneOpen) -> str:
+    if pane.close == "uncertain":
+        return f"Pane close is uncertain: {item.name}: {pane.reason}"
+    end = "; it closes when its detached run ends" if item.detached_runs else ""
+    return f"Pane stays open: {item.name}: {pane.reason}{end}"
+
+
 def _fault_lines(parent: staff.StaffRow, outcomes: list[WorkerStopped | WorkerNotStopped]) -> list[str]:
+    stopped = [item for item in outcomes if isinstance(item, WorkerStopped)]
     return ([f"{parent.name}: {item.name}: not proved stopped: {item.reason}"
              for item in outcomes if isinstance(item, WorkerNotStopped)]
             + [f"{parent.name}: {item.name}: pass not canceled: {item.canceled_passes.reason}"
-               for item in outcomes if isinstance(item, WorkerStopped) and isinstance(item.canceled_passes, PassesNotCanceled)])
+               for item in stopped if isinstance(item.canceled_passes, PassesNotCanceled)]
+            + [f"{parent.name}: {_pane_line(item, item.pane)}" for item in stopped if item.pane is not None])
 
 
 def _send(recipient: str, text: str) -> bool:

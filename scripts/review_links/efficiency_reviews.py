@@ -1,7 +1,7 @@
 """Keep the Review page's log and mark for each efficiency in one file beside its ledger.
 
 The file holds only what the ledger line has no room for, keyed by the E<n> id:
-the log of the user's actions and answers, and the mark that sets the item's turn.
+the log, the mark that sets the item's turn, and its Waiting reason.
 It never holds a copy of the ledger line.
 """
 from __future__ import annotations
@@ -24,12 +24,14 @@ from scripts.review_links.review_events import MarkChange, NoMark, ReviewLog, Re
 class StoredReview(TypedDict):
     log: list[StoredReviewLog]
     mark: NotRequired[str]
+    waiting_why: NotRequired[str]
 
 
 @dataclass(frozen=True)
 class EfficiencyReview:
     log: tuple[ReviewLog, ...] = ()
     mark: ReviewMark | NoMark = NoMark()
+    waiting_why: str = ''
 
 
 def path(ledger: Path) -> Path:
@@ -59,7 +61,8 @@ def decode(entry: object) -> EfficiencyReview:
     log = review_events.from_rows(entry['log'])
     for event in log:
         _ = event.who.encode('utf-8'), event.words.encode('utf-8')
-    return EfficiencyReview(log, ReviewMark(entry['mark']) if 'mark' in entry else NoMark())
+    return EfficiencyReview(log, ReviewMark(entry['mark']) if 'mark' in entry else NoMark(),
+                            review_events.waiting_why(entry.get('waiting_why', '')))
 
 
 def read(ledger: Path, sources: list[Path] | None = None, *,
@@ -80,21 +83,26 @@ def read(ledger: Path, sources: list[Path] | None = None, *,
 
 
 def record(ledger: Path, identity: str, words: str | tuple[str, ...], change: MarkChange, who: str = 'nate',
-           *, check: Callable[[], object] | None = None) -> bool:
+           *, check: Callable[[], object] | None = None, waiting_why: str = '',
+           check_state: Callable[[], None] = lambda: None) -> bool:
     """Append one log line and change the mark. Returns False for an exact repeat."""
+    reason = review_events.require_waiting_why(waiting_why) if change == ReviewMark.WAITING or waiting_why else ''
     target = path(ledger)
     with ledger_lock(ledger, check=check):
         stored = stored_reviews(target)
         before = decode(stored[identity]) if identity in stored else EfficiencyReview()
+        check_state()
         log = before.log
         for line in (words,) if isinstance(words, str) else words:
             log = review_events.append(log, ReviewLog(datetime.now(timezone.utc), who, line))
-        after = EfficiencyReview(log, review_events.changed_mark(before.mark, change))
+        after = EfficiencyReview(log, review_events.changed_mark(before.mark, change), reason or before.waiting_why)
         if after == before:
             return False
         entry: StoredReview = {'log': review_events.rows(after.log)}
         if isinstance(after.mark, ReviewMark):
             entry['mark'] = after.mark.value
+        if after.waiting_why:
+            entry['waiting_why'] = after.waiting_why
         stored[identity] = entry
         write_text_atomic(target, json.dumps(stored, indent=1)+'\n')
         return True

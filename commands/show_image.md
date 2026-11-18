@@ -35,4 +35,5 @@ The page shows the oldest image first, and a new image goes to the end.
 The user answers on an image or pair with **Approved**, **Not Approved** or **Send Feedback**, and any of them can carry feedback.
 The answer arrives as a message that starts `From the user (via the Images page):`.
 Act on it as on the user's words. Then delete the image with the command in the message.
+Answer **Ask question** with `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py answer --id <image> --question Q<n> --text "<answer>"`; keep the image for the user.
 To remove your own image, run `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id <id>`.

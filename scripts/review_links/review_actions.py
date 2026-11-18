@@ -15,6 +15,7 @@ from scripts.nightly_review import candidates
 from scripts.production import change_review, change_routing, investigation, proposal_issue, record_store, staff, update_registration
 from scripts.production.production_doc import Production
 from scripts.review_links import change_page, decision_store, efficiency_reviews, review_items, review_later
+from scripts.review_links import question_record
 from scripts.review_links import review_events
 from scripts.review_links.review_events import KeepMark, MarkChange, NoMark, ReviewMark
 
@@ -112,7 +113,7 @@ def question_action(item: review_items.ReviewItem, action: change_page.QuestionO
     source = item.source
     assert isinstance(source, review_items.QuestionSource)
     if not words.strip():
-        raise change_page.AnswerRefused('enter an answer')
+        raise question_record.AnswerRefused('enter an answer')
     identities = update_registration.QuestionStaff.read()
     scope = update_registration.question_scope(item.owner, identities.record)
     with update_registration.outstanding_lock(update_registration.outstanding_path(scope)):
@@ -173,10 +174,9 @@ def later(item: review_items.ReviewItem, value: str, words: str, *,
           verify_revision: Callable[[], object] | None = None, root: Path | None = None) -> str:
     if isinstance(item.source, review_items.ChangeSource) and isinstance(
             item.source.assignment.production, change_routing.UnavailableProduction):
-        raise change_page.AnswerRefused("the production document is not available")
+        raise question_record.AnswerRefused("the production document is not available")
     until = datetime.fromisoformat(value)
-    if until.tzinfo is None:
-        until = until.replace(tzinfo=user_zone())
+    until = until.replace(tzinfo=user_zone()) if until.tzinfo is None else until.astimezone(user_zone())
     event = 'Later until '+until.isoformat()+(': '+words if words else '')
     review_later.save(item.key, until, check=lambda: record_action(item, event, root=root, check=verify_revision))
     return 'later until '+until.strftime('%Y-%m-%d %H:%M %Z')
@@ -257,7 +257,7 @@ def decision_action(item: review_items.ReviewItem, action: str, words: str,
     """Apply Approve, Decline, Send feedback or Ask question to a proposal or an efficiency."""
     source = item.source
     if action in ('feedback','question') and not words.strip():
-        raise change_page.AnswerRefused('enter your words')
+        raise question_record.AnswerRefused('enter your words')
     waiting = item.state == review_items.ReviewState.WAITING
     answer = ('approved, sent to '+review_items.name(item.owner,staff.snapshot()) if action == 'approve' else
               {'decline':'declined','feedback':'feedback sent','question':'question sent'}[action])
@@ -273,7 +273,7 @@ def decision_action(item: review_items.ReviewItem, action: str, words: str,
                 with efficiency_reviews.ledger_lock(source.path, check=verify_revision):
                     _ = candidates.record_outcome(identity,'declined','',source.path)
             except candidates.OutcomeRefused as error:
-                raise change_page.AnswerRefused(str(error)) from error
+                raise question_record.AnswerRefused(str(error)) from error
             with review_items.after_store_write(item.key):
                 _ = efficiency_reviews.record(source.path, identity, events, NoMark())
             if waiting:
@@ -287,7 +287,8 @@ def decision_action(item: review_items.ReviewItem, action: str, words: str,
                         +PY+f"nightly_review/candidates.py outcome {identity} accepted --applied '<repo> <sha>' "
                         +'--ledger '+shlex.quote(str(source.path)))
         def save_efficiency() -> None:
-            _ = efficiency_reviews.record(source.path, identity, events, mark, check=verify_revision)
+            _ = efficiency_reviews.record(source.path, identity, events, mark, check=verify_revision,
+                                          waiting_why=words if action == 'question' else '')
             if waiting:
                 with review_items.after_store_write(item.key):
                     resume_efficiency(item)
@@ -312,7 +313,8 @@ def decision_action(item: review_items.ReviewItem, action: str, words: str,
                 with review_items.after_store_write(item.key):
                     _ = proposal_issue.record_review(issue, events, NoMark(), day)
             else:
-                _ = proposal_issue.record_review(issue, events, mark, day, check=verify_revision)
+                _ = proposal_issue.record_review(issue, events, mark, day, check=verify_revision,
+                                                 waiting_why=words if action == 'question' else '')
             if waiting:
                 with review_items.after_store_write(item.key):
                     log_superseded(item, events[0])
