@@ -1,4 +1,5 @@
-// Run with node scripts/build_queue/memory_page_proof.mjs [temporary-output-folder].
+// Run with node scripts/build_queue/memory_page_proof.mjs [--gate] [temporary-output-folder].
+// Use --gate to check the dark desktop view.
 // The optional third argument names the previous page for comparison images.
 // Add --queued as the fourth argument for the queued-section comparison.
 // Add --console as the fourth argument for the Builds title comparison.
@@ -12,17 +13,42 @@
 // Use --headcount to compare the Running and Queued headers.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
+import {accessSync, constants, statSync} from 'node:fs';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
 import {createServer} from 'node:http';
 import {spawn, execFileSync} from 'node:child_process';
 import {once} from 'node:events';
 import {inflateSync} from 'node:zlib';
-import {join, dirname, resolve} from 'node:path';
+import {delimiter, join, dirname, resolve} from 'node:path';
 import {tmpdir} from 'node:os';
 import {fileURLToPath} from 'node:url';
 
+function chromeExecutable() {
+  if (process.env.CHROME) return process.env.CHROME;
+  const directories = (process.env.PATH ?? '').split(delimiter);
+  for (const name of ['google-chrome-stable', 'google-chrome', 'chromium']) {
+    for (const directory of directories) {
+      const path = resolve(directory, name);
+      try {
+        if (!statSync(path, {throwIfNoEntry:false})?.isFile()) continue;
+        accessSync(path, constants.X_OK);
+        return path;
+      } catch (error) {
+        if (!['EACCES', 'ENOTDIR', 'EPERM'].includes(error.code)) throw error;
+      }
+    }
+  }
+  throw new Error('No Chrome browser found. Set CHROME or put google-chrome-stable, google-chrome, or chromium on PATH.');
+}
+
+const chromePath = chromeExecutable();
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-const callerFolder = process.argv[2];
+const args = process.argv.slice(2);
+const gateMode = args[0] === '--gate';
+if (gateMode) args.shift();
+const [callerFolder, previousPage, comparison] = args;
+const themes = gateMode ? ['dark'] : ['light','dark'];
+const widths = gateMode ? [1400] : [1400,900,390];
 const folder = callerFolder ? resolve(callerFolder) : await mkdtemp(join(tmpdir(), 'memory-page-proof-'));
 try {
   await mkdir(folder, {recursive:true});
@@ -30,31 +56,32 @@ try {
     'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE)); from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())', folder],
     {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
   const page = await readFile(join(folder, 'memory_live.html'));
-  const beforePage = process.argv[3] ? (await readFile(process.argv[3], 'utf8'))
+  const beforePage = previousPage ? (await readFile(previousPage, 'utf8'))
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
   const swapBeforePage = process.env.SWAP_BEFORE_PAGE
     ? (await readFile(process.env.SWAP_BEFORE_PAGE, 'utf8')).replace('__MEMORY_FEED_INTERVAL_SECONDS__','0.125') : null;
-  const queuedComparison = process.argv[4] === '--queued';
-  const consoleComparison = process.argv[4] === '--console';
-  const stepNamesComparison = process.argv[4] === '--step-names';
-  const ownersComparison = process.argv[4] === '--owners';
-  const cloudOwnerComparison = process.argv[4] === '--cloud-owner';
-  const blocksComparison = process.argv[4] === '--blocks';
-  const identityComparison = process.argv[4] === '--identity';
-  const waitTipComparison = process.argv[4] === '--wait-tip';
-  const macrouteComparison = process.argv[4] === '--macroute';
-  const headcountComparison = process.argv[4] === '--headcount';
+  const queuedComparison = comparison === '--queued';
+  const consoleComparison = comparison === '--console';
+  const stepNamesComparison = comparison === '--step-names';
+  const ownersComparison = comparison === '--owners';
+  const cloudOwnerComparison = comparison === '--cloud-owner';
+  const blocksComparison = comparison === '--blocks';
+  const identityComparison = comparison === '--identity';
+  const waitTipComparison = comparison === '--wait-tip';
+  const macrouteComparison = comparison === '--macroute';
+  const headcountComparison = comparison === '--headcount';
+  const comparisonImages = Boolean(comparison || beforePage || swapBeforePage || process.env.MEMORY_PAGE_SHOT);
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
-  const now = Date.now() / 1000;
+  const fixtureTime = readings.good.read_at;
   for (const reading of Object.values(readings)) {
-    const shift = now - reading.read_at;
+    const shift = fixtureTime - reading.read_at;
     for (const row of reading.walk) {
       if (row.started_at) row.started_at += shift;
       if (row.read_at) row.read_at += shift;
       for(const part of row.parts || []) if(part.started_at) part.started_at += shift;
     }
     for (const waiter of reading.waiters) waiter.since += shift;
-    reading.read_at = now;
+    reading.read_at = fixtureTime;
   }
   const base = readings.good;
   base.waiters = structuredClone(readings.spacing.waiters);
@@ -121,7 +148,7 @@ try {
   const server = createServer((req, res) => {
     const isData = req.url.startsWith('/memory.json'), isReport = req.url.startsWith('/report.json');
     res.writeHead(200, {'Content-Type':isData || isReport ? 'application/json' : 'text/html; charset=utf-8'});
-    res.end(isData ? JSON.stringify({...servedReading,read_at:Date.now()/1000}) : isReport ? JSON.stringify(base.report)
+    res.end(isData ? JSON.stringify(servedReading) : isReport ? JSON.stringify(base.report)
       : req.url === '/before.html' ? beforePage : req.url === '/swap-before.html' ? swapBeforePage : page);
   });
   try {
@@ -132,7 +159,7 @@ try {
     try {
       const temporary = join(profile, 'tmp');
       await mkdir(temporary);
-      const chrome = spawn(process.env.CHROME || '/run/current-system/sw/bin/google-chrome-stable', [
+      const chrome = spawn(chromePath, [
         '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--hide-scrollbars',
         '--no-first-run', '--disable-extensions', '--disable-background-networking',
         '--remote-debugging-port=0', '--user-data-dir=' + profile, 'about:blank',
@@ -198,9 +225,10 @@ try {
         };
         await call('Page.enable');
         await call('Page.addScriptToEvaluateOnNewDocument', {
-          source:'window.proofSetInterval = window.setInterval; window.setInterval = () => 0;'});
+          source:'window.proofSetInterval = window.setInterval; window.setInterval = () => 0;'
+            + 'Date.now = () => ' + fixtureTime * 1000 + ';'});
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
-        await call('Emulation.setDeviceMetricsOverride', {width:1600,height:1200,deviceScaleFactor:1,mobile:false});
+        await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});
         const navigate = async path => {
           currentFixture = servedReading;
           const loaded = new Promise((resolve, reject) => events.set(`${sessionId}:Page.loadEventFired`, {resolve,reject}));
@@ -263,7 +291,7 @@ try {
           await writeFile(join(folder,`${name}-dark.png`),Buffer.from(shot.data,'base64'));
         };
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
-        await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+        await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1440,height:1100,deviceScaleFactor:1,mobile:false});
         servedReading = headingReading;
         if (headcountComparison) {
           assert.ok(beforePage, 'The header comparison needs the previous page.');
@@ -308,6 +336,16 @@ try {
       }
 
       async function checkPage(navigate, evaluate, call) {
+        const readPixel = async (x, y) => {
+          const clip = {x:Math.floor(x),y:Math.floor(y),width:1,height:1,scale:1};
+          const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip});
+          return pngPixels(Buffer.from(shot.data,'base64'))(0,0);
+        };
+        const saveScreenshot = async (name, options = {}) => {
+          if (!comparisonImages) return;
+          const shot = await call('Page.captureScreenshot', {format:'png', ...options});
+          await writeFile(join(folder,name+'.png'),Buffer.from(shot.data,'base64'));
+        };
         await navigate('memory_live.html');
         // The user, 11-16: space pauses every update, a tooltip still opens, and space again resumes.
         const pressSpace = async () => {
@@ -359,14 +397,15 @@ try {
         await call('Input.dispatchMouseEvent',{type:'mouseMoved',x:pausedPage.pill.x,y:pausedPage.pill.y});
         const pausedTip = await evaluate(`(()=>{
           const tip=document.querySelector('#tip');
+          const on=tip.classList.contains('on');
+          if (!${comparisonImages}) return {on};
           const boxes=[tip,document.querySelector('#paused'),document.querySelector('[data-page-status]')].map(item=>item.getBoundingClientRect());
           const left=Math.min(...boxes.map(box=>box.left))-12, top=Math.min(...boxes.map(box=>box.top))-12;
           const right=Math.max(...boxes.map(box=>box.right))+12, bottom=Math.max(...boxes.map(box=>box.bottom))+12;
-          return {on:tip.classList.contains('on'),clip:{x:Math.max(0,left),y:Math.max(0,top),width:right-Math.max(0,left),height:bottom-Math.max(0,top),scale:1}};
+          return {on,clip:{x:Math.max(0,left),y:Math.max(0,top),width:right-Math.max(0,left),height:bottom-Math.max(0,top),scale:1}};
         })()`);
         assert.ok(pausedTip.on,'A paused page opens no tooltip.');
-        const pausedShot=await call('Page.captureScreenshot',{format:'png',clip:pausedTip.clip});
-        await writeFile(join(folder,'paused-tooltip-dark-desktop.png'),Buffer.from(pausedShot.data,'base64'));
+        await saveScreenshot('paused-tooltip-dark-desktop',{clip:pausedTip.clip});
         await call('Input.dispatchMouseEvent',{type:'mouseMoved',x:4,y:4});
         await pressSpace();
         const resumedPage = await evaluate(`(async()=>{
@@ -394,7 +433,6 @@ try {
           ${clearTip ? "hideTip();" : ""}
           document.body.classList.remove('queue-unavailable');
           const data = ${JSON.stringify(reading)};
-          data.read_at = Date.now()/1000;
           latest = data;
           window.renderReading(data);
           renderReport(data.report);
@@ -434,7 +472,7 @@ try {
           document.querySelector('#swaprows .smaller details').open = true;
           showTip(key, 700, 500);
           window.render = window.renderReading;
-          return {top:row.getBoundingClientRect().top, key, tip:document.querySelector('#tip').innerText,
+          return {top:row.getBoundingClientRect().top, key, readAt:latest.read_at, tip:document.querySelector('#tip').innerText,
             tipTop:document.querySelector('#tip').style.top,tipLeft:document.querySelector('#tip').style.left};
         })()`);
         const changedSteady = structuredClone(steady);
@@ -446,12 +484,14 @@ try {
           await tick();
           await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
           const row=[...document.querySelectorAll('.wrow.wait')].find(row=>row.querySelector('.name').textContent==='steady waiting 3');
-          return {top:row.getBoundingClientRect().top,key:row.dataset.tip,tip:document.querySelector('#tip').innerText,
+          return {top:row.getBoundingClientRect().top,key:row.dataset.tip,readAt:latest.read_at,tip:document.querySelector('#tip').innerText,
             tipTop:document.querySelector('#tip').style.top,tipLeft:document.querySelector('#tip').style.left,
             focus:document.activeElement.dataset.tip,details:document.querySelector('#swaprows .smaller details').open};
         })()`);
         const steadyResult = {before:beforeSteady,after:afterSteady,delta:afterSteady.top-beforeSteady.top};
-        await writeFile(join(folder,'steady-refresh.json'),JSON.stringify(steadyResult,null,2)+'\n');
+        assert.equal(beforeSteady.readAt,steady.read_at);
+        assert.equal(afterSteady.readAt,changedSteady.read_at);
+        if (comparisonImages) await writeFile(join(folder,'steady-refresh.json'),JSON.stringify(steadyResult,null,2)+'\n');
         assert.ok(Math.abs(steadyResult.delta)<1,'The viewed waiting step moves during refresh: '+JSON.stringify(steadyResult));
         assert.equal(afterSteady.key,beforeSteady.key);
         assert.equal(afterSteady.tip,beforeSteady.tip,'The open hover changes to another step.');
@@ -488,9 +528,9 @@ try {
         await navigate('memory_live.html');
         // A reload of the same page keeps its scroll; the pixel checks below read the page from its top.
         await evaluate('scrollTo(0,0)');
-        for (const theme of ['light','dark']) {
+        for (const theme of themes) {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
-          for (const width of [1400,900,390]) {
+          for (const width of widths) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
             await show(base);
             // A render keeps the viewed row in place, so the scroll of the last width stays; the pixel checks read from the top.
@@ -592,7 +632,7 @@ try {
                 charts:document.querySelectorAll('#history-charts svg').length,
                 progress:progress?rect(progress):null, capLine:rect(cap),
                 progressColor:progress?getComputedStyle(progress).backgroundColor:null,
-                cardColor:color('--card'), reservedColors:[color('--res-a'),color('--res-b')],
+                reservedColors:[color('--res-a'),color('--res-b')],
                 reservedRatios:['--res-a','--res-b'].map(name=>contrast(color(name),color('--card'))),
                 swapRows:swap.length, swapText:swap.map(e=>e.textContent),
                 swapBytes:swap.filter(e=>e.dataset.bytes).map(e=>Number(e.dataset.bytes)),
@@ -665,32 +705,18 @@ try {
             assert.ok(Math.abs(roomLegend.labelBox.top-roomLegend.value.top)<2, 'The room value uses a second line.');
             assert.ok(roomLegend.value.left-roomLegend.labelBox.right<80, 'The legend value is too far from its label.');
             for (const gauge of proof.gauges) assert.equal(gauge.nowrap, 'nowrap');
-            const metrics = await call('Page.getLayoutMetrics');
-            const shot = await call('Page.captureScreenshot', {format:'png', captureBeyondViewport:true,
-              clip:{x:0,y:0,width,height:Math.ceil(metrics.cssContentSize.height),scale:1}});
-            const pixels = Buffer.from(shot.data,'base64');
-            const pixel=pngPixels(pixels);
-            const expected=proof.progressColor.match(/[0-9.]+/g).slice(0,3).map(Number);
-            const x=Math.floor(proof.progress.left+proof.progress.width/2);
-            const y=Math.floor((proof.progress.top+proof.progress.bottom)/2);
-            assert.ok(pixel(x,y).every((value,index)=>Math.abs(value-expected[index])<=1),
-              'The progress pixels differ: '+JSON.stringify({x,y,pixel:pixel(x,y),expected}));
-            const checkPixel=(x,y,color,label,antialiased=false)=>{
-              const expected=color.match(/[0-9.]+/g).slice(0,3).map(Number);
-              const actual=pixel(Math.floor(x),Math.floor(y));
-              let matches=actual.every((value,index)=>Math.abs(value-expected[index])<=1);
-              if(antialiased) {
-                const background=proof.cardColor.match(/[0-9.]+/g).slice(0,3).map(Number);
-                const delta=expected.map((value,index)=>value-background[index]);
-                const coverage=delta.reduce((sum,value,index)=>sum+value*(actual[index]-background[index]),0)/delta.reduce((sum,value)=>sum+value*value,0);
-                const residual=Math.max(...actual.map((value,index)=>Math.abs(value-background[index]-coverage*delta[index])));
-                matches=coverage>=0.1&&residual<=10;
-              }
-              assert.ok(matches,label+' '+JSON.stringify({x,y,actual,expected}));
+            const checkPixel = async (x,y,color,label) => {
+              const expected = color.match(/[0-9.]+/g).slice(0,3).map(Number);
+              const actual = await readPixel(x,y);
+              assert.ok(actual.every((value,index)=>Math.abs(value-expected[index])<=1),
+                label+' '+JSON.stringify({x,y,actual,expected}));
             };
-            // The room value label sits at the bar's middle, so read the bar color above it.
-            checkPixel(proof.roomBar.left+5,proof.roomBar.top+4,proof.roomColor,'The room pixels differ at '+theme+' '+width+' px, bar '+JSON.stringify(proof.roomBar)+'.');
-            proofs.push({theme,width,metrics:proof});
+            await checkPixel(proof.progress.left+proof.progress.width/2,
+              (proof.progress.top+proof.progress.bottom)/2,proof.progressColor,'The progress pixels differ.');
+            // Read the room bar above its label.
+            await checkPixel(proof.roomBar.left+5,proof.roomBar.top+4,proof.roomColor,
+              'The room pixels differ at '+theme+' '+width+' px.');
+            if (comparisonImages) proofs.push({theme,width,metrics:proof});
             const slotReview=structuredClone(base);
             const running=slotReview.walk.find(row=>row.queued&&!row.ci);
             slotReview.walk=[
@@ -705,16 +731,16 @@ try {
             const slotColumn=await evaluate(`(()=>{
               const table=document.querySelector('.walk-table');
               const rows=[...table.querySelectorAll('tr[data-tip^="row:"]')];
-              const box=table.getBoundingClientRect();
-              const bottom=rows.at(-1).getBoundingClientRect().bottom;
+              const box=${comparisonImages} ? table.getBoundingClientRect() : null;
+              const bottom=box ? rows.at(-1).getBoundingClientRect().bottom : 0;
               return {slots:rows.map(row=>row.querySelector('.slot').textContent),
                 tokens:rows.map(row=>row.querySelector('.tokens').textContent),
                 pool:[...document.querySelectorAll('#walk-tokens dt')].map(label=>[label.textContent,label.nextElementSibling.textContent]),
                 poolAlignment:[...document.querySelectorAll('#walk-tokens dd')].map(value=>getComputedStyle(value).textAlign),
                 lastColumns:rows.map(row=>[...row.children].slice(-3).map(cell=>cell.className)),
                 overflow:document.documentElement.scrollWidth>document.documentElement.clientWidth,
-                clip:{x:Math.floor(box.left)-4,y:Math.floor(box.top+scrollY)-4,
-                  width:Math.ceil(box.width)+8,height:Math.ceil(bottom-box.top)+8,scale:1}};
+                clip:box ? {x:Math.floor(box.left)-4,y:Math.floor(box.top+scrollY)-4,
+                  width:Math.ceil(box.width)+8,height:Math.ceil(bottom-box.top)+8,scale:1} : undefined};
             })()`);
             assert.deepEqual(slotColumn.slots,['2','—']);
             assert.deepEqual(slotColumn.tokens,['6','—']);
@@ -722,9 +748,8 @@ try {
             assert.deepEqual(slotColumn.poolAlignment,['right','right']);
             assert.deepEqual(slotColumn.lastColumns,[['vcpus','slot','tokens'],['vcpus','slot','tokens']]);
             assert.equal(slotColumn.overflow,false);
-            if(theme==='dark'&&width===1400) {
-              const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:slotColumn.clip});
-              await writeFile(join(folder,'slot-column-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+            if(comparisonImages&&theme==='dark'&&width===1400) {
+              await saveScreenshot('slot-column-dark-desktop',{captureBeyondViewport:true,clip:slotColumn.clip});
             }
             for(const state of ['active','paused','unavailable']) {
               const tokenReading=structuredClone(slotReview);
@@ -759,11 +784,10 @@ try {
                 assert.equal(fields['Per-build counts'],state==='paused'?'unavailable':'known');
                 if(state==='paused') assert.equal(fields.Because,'steve cannot be asked');
               }
-              comparisons.push({tokenTooltip:true,theme,width,state,...tokenView});
-              if(theme==='dark'&&width===1400) {
+              if (comparisonImages) comparisons.push({tokenTooltip:true,theme,width,state,...tokenView});
+              if(comparisonImages&&theme==='dark'&&width===1400) {
                 const box=await evaluate("(() => {const r=document.querySelector('#tip').getBoundingClientRect();return {x:Math.floor(r.left)-2,y:Math.floor(r.top+scrollY)-2,width:Math.ceil(r.width)+4,height:Math.ceil(r.height)+4,scale:1};})()");
-                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:box});
-                await writeFile(join(folder,`tokens-${state}-dark-desktop.png`),Buffer.from(shot.data,'base64'));
+                await saveScreenshot(`tokens-${state}-dark-desktop`,{captureBeyondViewport:true,clip:box});
               }
             }
             await show(base);
@@ -853,8 +877,7 @@ try {
                   const r=document.querySelector('#walk').closest('.card').getBoundingClientRect();
                   return {x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1};
                 })()`);
-                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
-                await writeFile(join(folder,`${theme}-${width}-${name==='cloud_region'?'aws':'aws-disagree'}.png`),Buffer.from(shot.data,'base64'));
+                await saveScreenshot(`${theme}-${width}-${name==='cloud_region'?'aws':'aws-disagree'}`,{captureBeyondViewport:true,clip});
               }
             }
 
@@ -1020,7 +1043,8 @@ try {
               const memoryTools=document.querySelector('#s-tools').getBoundingClientRect();
               const memoryBar=document.querySelector('#barwrap .bar').getBoundingClientRect();
               const memoryCap=document.querySelector('#b-cap').getBoundingClientRect();
-              const box=line?.getBoundingClientRect(), card=document.querySelector('#walk').closest('.card').getBoundingClientRect();
+              const box=line?.getBoundingClientRect();
+              const card=${comparisonImages} ? document.querySelector('#walk').closest('.card').getBoundingClientRect() : null;
               // The line stops at chart text, so the pixel check reads the longest part of it.
               const drawn=[...(line?.querySelectorAll('.cap-part')||[])];
               const part=(drawn.length?drawn:line?[line]:[]).map(element=>({element,box:element.getBoundingClientRect()}))
@@ -1031,7 +1055,7 @@ try {
                 memoryTools:{left:memoryTools.left,right:memoryTools.right,width:memoryTools.width,
                   barLeft:memoryBar.left,capRight:memoryCap.right},
                 expected:track.left+track.width*latest.cap*${gib}/latest.ram.total_bytes,color:part?getComputedStyle(part.element).borderLeftColor:'',
-                scrollY,card:{x:Math.floor(card.left),y:Math.floor(card.top+scrollY),width:Math.ceil(card.width)+1,height:Math.ceil(card.height)+1}};
+                scrollY,card:card ? {x:Math.floor(card.left),y:Math.floor(card.top+scrollY),width:Math.ceil(card.width)+1,height:Math.ceil(card.height)+1} : undefined};
             })()`);
             assert.ok(capLine.present,'The Running chart has no cap line.');
             assert.ok(capLine.tools.width>0 && capLine.memoryTools.width>0);
@@ -1042,28 +1066,24 @@ try {
             if(width===1400) assert.equal(capLine.layout,'beside','The Running chart stays stacked after a narrow page.');
             assert.ok(Math.abs(capLine.left-capLine.expected)<=1.5,'The cap line is off the cap value. '+JSON.stringify(capLine));
             assert.ok(Math.abs(capLine.roomRight-capLine.expected)<=1.5,'The room bar does not end at the cap. '+JSON.stringify(capLine));
-            const capClip={...capLine.card,scale:1};
-            const capShot=Buffer.from((await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:capClip})).data,'base64');
-            const capPixel=pngPixels(capShot)(Math.floor(capLine.left-capLine.card.x),Math.floor((capLine.top+capLine.bottom)/2+capLine.scrollY-capLine.card.y));
-            const capColor=capLine.color.match(/[0-9.]+/g).slice(0,3).map(Number);
-            assert.ok(capPixel.every((value,index)=>Math.abs(value-capColor[index])<=1),
-              'The cap line pixels differ. '+JSON.stringify({capPixel,capColor}));
-            if(width===1400) await writeFile(join(folder,`${theme}-${width}-cap-line.png`),capShot);
-            if(theme==='dark'&&width===1400) {
+            await checkPixel(capLine.left,(capLine.top+capLine.bottom)/2+capLine.scrollY,
+              capLine.color,'The cap line pixels differ.');
+            if (comparisonImages && width===1400) {
+              await saveScreenshot(`${theme}-${width}-cap-line`,{captureBeyondViewport:true,clip:{...capLine.card,scale:1}});
+            }
+            if(comparisonImages&&theme==='dark'&&width===1400) {
               const clip=await evaluate(`(()=>{
                 const memory=document.querySelector('#barwrap').getBoundingClientRect();
                 const running=document.querySelector('#walk').closest('.card').getBoundingClientRect();
                 return {x:running.left,y:memory.top+scrollY,width:running.width,height:running.bottom-memory.top,scale:1};
               })()`);
-              const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
-              await writeFile(join(folder,'build-tools-inside-cap-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+              await saveScreenshot('build-tools-inside-cap-dark-desktop',{captureBeyondViewport:true,clip});
               const legendClip=await evaluate(`(()=>{
                 const box=document.querySelector('.legend-box .legend').getBoundingClientRect();
                 return {x:Math.floor(box.left)-4,y:Math.floor(box.top+scrollY)-4,
                   width:Math.ceil(box.width)+8,height:Math.ceil(box.height)+8,scale:1};
               })()`);
-              const legendShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:legendClip});
-              await writeFile(join(folder,'legend-totals-dark-desktop.png'),Buffer.from(legendShot.data,'base64'));
+              await saveScreenshot('legend-totals-dark-desktop',{captureBeyondViewport:true,clip:legendClip});
               // The user, 11-16: the legend starts collapsed under the memory bar.
               const closedClip=await evaluate(`(()=>{
                 const legend=document.querySelector('.legend-box');
@@ -1071,8 +1091,7 @@ try {
                 const card=legend.closest('.card').getBoundingClientRect();
                 return {x:card.left,y:card.top+scrollY,width:card.width,height:card.height,scale:1};
               })()`);
-              const closedShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:closedClip});
-              await writeFile(join(folder,'legend-closed-dark-desktop.png'),Buffer.from(closedShot.data,'base64'));
+              await saveScreenshot('legend-closed-dark-desktop',{captureBeyondViewport:true,clip:closedClip});
               await evaluate(`document.querySelector('.legend-box').open=true`);
             }
             proof.capLine=capLine;
@@ -1108,14 +1127,13 @@ try {
             Object.assign(shortReading.ram,{build_target_bytes:shortReading.ram.build_covered_bytes+4*gib,build_missing_bytes:4*gib,shortfall_bytes:4*gib});
             Object.assign(shortReading,{room:0,taken:shortReading.cap,shortfall:4});
             await show(shortReading);
-            if(theme==='dark'&&width===1400) {
+            if(comparisonImages&&theme==='dark'&&width===1400) {
               const shortClip=await evaluate(`(()=>{
                 const memory=document.querySelector('#barwrap').getBoundingClientRect();
                 const running=document.querySelector('#walk').closest('.card').getBoundingClientRect();
                 return {x:running.left,y:memory.top+scrollY,width:running.width,height:running.bottom-memory.top,scale:1};
               })()`);
-              const shortShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:shortClip});
-              await writeFile(join(folder,'over-cap-dark-desktop.png'),Buffer.from(shortShot.data,'base64'));
+              await saveScreenshot('over-cap-dark-desktop',{captureBeyondViewport:true,clip:shortClip});
             }
             // The bar draws the uncovered reserve past the cap line, with a dashed brace and a tooltip.
             const overBar=await evaluate(`(() => {
@@ -1197,13 +1215,13 @@ try {
             const barMark=await evaluate(`(() => {
               const cap=document.querySelector('#barwrap #b-cap'), free=document.querySelector('#barwrap #b-room');
               const bar=document.querySelector('#barwrap .bar').getBoundingClientRect(), box=cap?.getBoundingClientRect();
-              const card=document.querySelector('#barwrap').closest('.card').getBoundingClientRect();
+              const card=${comparisonImages} ? document.querySelector('#barwrap').closest('.card').getBoundingClientRect() : null;
               return {present:!!cap&&!cap.hidden&&getComputedStyle(cap).display!=='none'&&box.height>0,
                 label:cap?cap.querySelector('.brace-label').textContent:'',left:box?.left,right:box?.right,
                 freeRight:free?.getBoundingClientRect().right,barLeft:bar.left,below:box?box.top>=bar.bottom-1:false,
                 expected:bar.left+bar.width*latest.cap*${gib}/latest.ram.total_bytes,bottom:box?.bottom,
                 color:cap?getComputedStyle(cap).borderBottomColor:'',scrollY,
-                card:{x:Math.floor(card.left),y:Math.floor(card.top+scrollY),width:Math.ceil(card.width)+1,height:Math.ceil(card.height)+1}};
+                card:card ? {x:Math.floor(card.left),y:Math.floor(card.top+scrollY),width:Math.ceil(card.width)+1,height:Math.ceil(card.height)+1} : undefined};
             })()`);
             assert.ok(barMark.present,'The memory bar has no queue cap brace.');
             assert.match(barMark.label,new RegExp(capReading.cap.toFixed(1).replace('.','\\.')+'$'));
@@ -1211,14 +1229,11 @@ try {
             assert.ok(Math.abs(barMark.left-barMark.barLeft)<=1.5,'The queue cap does not start at 0. '+JSON.stringify(barMark));
             assert.ok(Math.abs(barMark.right-barMark.expected)<=1.5,'The queue cap brace is off the cap value. '+JSON.stringify(barMark));
             assert.ok(Math.abs(barMark.freeRight-barMark.expected)<=1.5,'Free does not end at the queue cap. '+JSON.stringify(barMark));
-            const barShot=Buffer.from((await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,
-              clip:{...barMark.card,scale:1}})).data,'base64');
-            const barPixel=pngPixels(barShot)(Math.floor((barMark.left+barMark.right)/2-barMark.card.x),
-              Math.floor(barMark.bottom-1+barMark.scrollY-barMark.card.y));
-            const barColor=barMark.color.match(/[0-9.]+/g).slice(0,3).map(Number);
-            assert.ok(barPixel.every((value,index)=>Math.abs(value-barColor[index])<=1),
-              'The queue cap brace pixels differ. '+JSON.stringify({barPixel,barColor}));
-            if(width===1400) await writeFile(join(folder,`${theme}-${width}-bar-cap.png`),barShot);
+            await checkPixel((barMark.left+barMark.right)/2,barMark.bottom-1+barMark.scrollY,
+              barMark.color,'The queue cap brace pixels differ.');
+            if (comparisonImages && width===1400) {
+              await saveScreenshot(`${theme}-${width}-bar-cap`,{captureBeyondViewport:true,clip:{...barMark.card,scale:1}});
+            }
             proof.barMark=barMark;
             for(const [name,expected] of [['priority',"queue priority: research (the user's bump)"],
               ['priority_unmatched',''],['good','']]) {
@@ -1242,11 +1257,11 @@ try {
                   const tip=document.querySelector('#tip');
                   if(!tip.classList.contains('on') || !tip.textContent.includes('research'))
                     throw new Error('The heading click loses the unmatched priority.');
+                  if (!${comparisonImages}) return;
                   const r=heading.closest('.card').getBoundingClientRect();
                   return {x:0,y:r.top+scrollY,width:document.documentElement.clientWidth,height:r.height,scale:1};
                 })()`);
-                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
-                await writeFile(join(folder,'unmatched-priority-1400.png'),Buffer.from(shot.data,'base64'));
+                await saveScreenshot('unmatched-priority-1400',{captureBeyondViewport:true,clip});
                 await evaluate("hideTip();window.scrollTo(0,0)");
               }
             }
@@ -1255,7 +1270,7 @@ try {
             for (const state of ['idle','waiting','unmatched','busy']) {
               const ciReading=structuredClone(base);
               ciReading.walk.push({name:'hana CI',ci:true,admitted:state==='busy',queued:false,used:0.125,reserved:0,
-                counted:0,started_at:now-60,unit:'hana-ci.slice',machine:'fixture',pid:701,vcpus:4,
+                counted:0,started_at:fixtureTime-60,unit:'hana-ci.slice',machine:'fixture',pid:701,vcpus:4,
                 progress:{kind:'NoProgress',reason:'no admission counter'},ci_runners:[{state:state==='waiting'||state==='unmatched'?'busy':state}]});
               ciReading.ci_ram=0.125;
               ciReading.ram.ci_bytes=known(ciReading.ram.ci_bytes)+gib/8;
@@ -1371,6 +1386,7 @@ try {
                   const box=row.getBoundingClientRect();
                   showTip(proofTip('wait', 0),(box.left+box.right)/2,box.top);
                   const tooltip=document.querySelector('#tip');
+                  if (!${comparisonImages}) return {text:tooltip.textContent};
                   const tipBox=tooltip.getBoundingClientRect();
                   const left=Math.min(box.left,tipBox.left)-4,top=Math.min(box.top,tipBox.top)-4;
                   return {text:tooltip.textContent,clip:{x:left+scrollX,y:top+scrollY,
@@ -1378,8 +1394,7 @@ try {
                     height:Math.max(box.bottom,tipBox.bottom)-top+4,scale:1}};
                 })()`);
                 assert.ok(clip.text.includes(expected),'The waiting tooltip omits the explanation.');
-                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:clip.clip});
-                await writeFile(join(folder,'start-spacing-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+                await saveScreenshot('start-spacing-dark-desktop',{captureBeyondViewport:true,clip:clip.clip});
                 await evaluate("hideTip();window.scrollTo(0,0)");
               }
             }
@@ -1387,18 +1402,16 @@ try {
             const folderWait = await evaluate(`(() => {
               const tip = proofTip('wait', 0);
               const row = document.querySelector('.wrow.wait[data-tip="' + tip + '"]');
+              const result={note:row.querySelector('.wait-note')?.textContent,reason:tipText(tip,latest)[1]};
+              if (!${comparisonImages}) return result;
               row.scrollIntoView({block:'center'});
               const box = row.getBoundingClientRect();
-              return {note:row.querySelector('.wait-note')?.textContent,
-                reason:tipText(tip,latest)[1],
-                clip:{x:box.x+scrollX,y:box.y+scrollY,width:box.width,height:box.height,scale:1}};
+              return {...result,clip:{x:box.x+scrollX,y:box.y+scrollY,width:box.width,height:box.height,scale:1}};
             })()`);
             assert.equal(folderWait.note, 'waits for the build in the same Cargo folder');
             assert.match(folderWait.reason, /the build in the same Cargo folder/);
             if (theme === 'dark' && width === 1400) {
-              const shot = await call('Page.captureScreenshot',
-                {format:'png',captureBeyondViewport:true,clip:folderWait.clip});
-              await writeFile(join(folder,'cargo-folder-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+              await saveScreenshot('cargo-folder-dark-desktop',{captureBeyondViewport:true,clip:folderWait.clip});
             }
             for(const name of ['head_memory','head_shortfall','head_swap_shortfall']) {
               await show(readings[name]);
@@ -1450,11 +1463,11 @@ try {
                   if(groups.some(group=>group.left<tip.right&&group.right>tip.left&&group.top<tip.bottom&&group.bottom>tip.top)) {
                     throw new Error('The head tooltip covers a legend group.');
                   }
+                  if (!${comparisonImages}) return;
                   return {x:card.left,y:card.top+scrollY,width:Math.max(card.right,tip.right+8)-card.left,
                     height:Math.max(row.bottom,tip.bottom)-card.top+8,scale:1};
                 })()`);
-                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
-                await writeFile(join(folder,'head-tooltip-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+                await saveScreenshot('head-tooltip-dark-desktop',{captureBeyondViewport:true,clip});
               }
               proof[name]=headProof;
             }
@@ -1575,13 +1588,13 @@ try {
           assert.ok(!states[name].ageHidden && states[name].reason==='');
         }
         const capture = async (name, selector) => {
+          if (!comparisonImages) return;
           await evaluate(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({block:'center'})`);
           const clip=await evaluate(`(() => {
             const r=document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
             return {x:Math.max(0,r.left+scrollX),y:r.top+scrollY,width:r.width,height:r.height,scale:1};
           })()`);
-          const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
-          await writeFile(join(folder,`${name}.png`),Buffer.from(shot.data,'base64'));
+          await saveScreenshot(name,{captureBeyondViewport:true,clip});
         };
         if (cloudOwnerComparison) {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
@@ -1616,7 +1629,7 @@ try {
               assert.match(tooltip,/unit\s*:?\s*research/);
             } else assert.match(tooltip,/owner not recorded/);
             await capture(version+'-aws-tooltip','#tip');
-            comparisons.push({version,...row,tooltip});
+            if (comparisonImages) comparisons.push({version,...row,tooltip});
           }
         }
         if (ownersComparison) {
@@ -1689,7 +1702,7 @@ try {
               assert.match(swap,/hana/);assert.match(swap,/research/);
             }
             await capture(version+'-owner-tooltip','#tip');
-            comparisons.push({version,...state});
+            if (comparisonImages) comparisons.push({version,...state});
           }
           for(const width of [600,800,1200,1600]) {
             await call('Emulation.setDeviceMetricsOverride',{width,height:1200,deviceScaleFactor:1,mobile:false});
@@ -1742,7 +1755,7 @@ try {
             assert.deepEqual(names.running,expected);
             assert.deepEqual(names.waiting,expected);
             await capture(version+'-running-step-names','#walk');
-            comparisons.push({version,...names});
+            if (comparisonImages) comparisons.push({version,...names});
           }
         }
         if (consoleComparison) {
@@ -1772,7 +1785,7 @@ try {
             })()`);
             const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
             await writeFile(join(folder,`${version}-dark-title.png`),Buffer.from(shot.data,'base64'));
-            comparisons.push({version,...state});
+            if (comparisonImages) comparisons.push({version,...state});
           }
         }
         if (queuedComparison) {
@@ -1850,7 +1863,7 @@ try {
                   assert.ok(Math.abs(state.headerOffset)<=1,'The title and columns use different rows.');
                   assert.ok(Math.abs(state.bottomOffset)<=2,'The title and columns have different text bottoms.');
                 }
-                comparisons.push({theme,width,name,...state});
+                if (comparisonImages) comparisons.push({theme,width,name,...state});
               }
             }
             await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
@@ -1941,7 +1954,7 @@ try {
               if(version==='after') assert.ok(tooltip.includes(blockLine),tooltip);
               else assert.ok(!tooltip.includes('Mac:'),tooltip);
               await capture(`${version}-${theme}-waiter-tooltip`,'#tip');
-              comparisons.push({version,theme,...state,tooltip});
+              if (comparisonImages) comparisons.push({version,theme,...state,tooltip});
             }
             await call('Emulation.setDeviceMetricsOverride',{width:390,height:1200,deviceScaleFactor:1,mobile:false});
             await navigate('memory_live.html');
@@ -1958,7 +1971,7 @@ try {
             for(const row of narrow.rows) assert.ok(row.reason<row.owner && row.owner<row.since && row.since<row.until,
               'The narrow row order is wrong: '+JSON.stringify(row));
             await capture(`after-${theme}-narrow-targets`,'#targets');
-            comparisons.push({version:'after',theme,width:390,...narrow});
+            if (comparisonImages) comparisons.push({version:'after',theme,width:390,...narrow});
           }
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
           await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1200,deviceScaleFactor:1,mobile:false});
@@ -1971,14 +1984,14 @@ try {
             const tooltip=await evaluate(`document.querySelector('#tip').innerText`);
             assert.ok(tooltip.includes(line),tooltip);
             await capture(`after-mac-line-${index+1}`,'#tip');
-            comparisons.push({line,tooltip});
+            if (comparisonImages) comparisons.push({line,tooltip});
           }
         }
         if (waitTipComparison) {
           assert.ok(beforePage, 'The wait hover comparison needs the previous page.');
           await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1200,deviceScaleFactor:1,mobile:false});
           const owner={name:'hana nextest',showrunner:'hana',unit:'research',runner:'unit director',worker:'',detail:'research',
-            pid:4242,need:16.3,since:now-16*60,reason:'free memory',fits:false};
+            pid:4242,need:16.3,since:fixtureTime-16*60,reason:'free memory',fits:false};
           const priority="queue priority: research (the user's bump)";
           const note='Other programs have 9.8 GiB of memory in swap. It comes back into RAM when they run, so the queue holds RAM for it.';
           const oldRoom={rows:[{label:'free RAM',gib:28.4},{label:'− safety net',gib:3.0},
@@ -1992,7 +2005,7 @@ try {
           const head={...owner,place:1,first_in_line:true,why:'only 7.1 GiB is free for builds. It starts when 16.3 GiB is free.'};
           const second={...behind,place:2,why:'it is behind the first build in line, which gets memory first.'};
           const cloud=structuredClone(readings.cloud.waiters.find(row=>row.kind==='cloud')||readings.step_owners.waiters.find(row=>row.kind==='cloud'));
-          Object.assign(cloud,{since:now-3*60,name:'claude gate',unit:'builds',reason:'waits for a cloud slot: 9 of 9 in use',
+          Object.assign(cloud,{since:fixtureTime-3*60,name:'claude gate',unit:'builds',reason:'waits for a cloud slot: 9 of 9 in use',
             runs_on:'AWS (natedev only when AWS cannot start the gate)'});
           const cases=[['before','before.html',[{...owner,priority_text:priority,priority_entries:[{unit:'research'}],runs_on:'natedev only',head_room:oldRoom},behind,cloud]],
             ['after','memory_live.html',[{...head,priority_text:priority,priority_entries:[{unit:'research'}],runs_on:'natedev only',head_room:room},second,cloud]]];
@@ -2013,7 +2026,7 @@ try {
                   assert.ok(!/needs\s/.test(tooltip),tooltip);
                 }
                 await capture(`${version}-${theme}-wait-${index+1}`,'#tip');
-                comparisons.push({version,theme,index,tooltip});
+                if (comparisonImages) comparisons.push({version,theme,index,tooltip});
               }
             }
           }
@@ -2065,7 +2078,7 @@ try {
               assert.deepEqual(state.fields.map(([field,value])=>[field,value]),expected);
               if(version==='after') assert.equal(lefts(state).length,1,`The colons do not align: ${lefts(state)}`);
               await capture(`${version}-colons-${name}`,'#tip');
-              comparisons.push({version,row:name,colonLefts:lefts(state),...state});
+              if (comparisonImages) comparisons.push({version,row:name,colonLefts:lefts(state),...state});
             }
           }
           await navigate('memory_live.html');
@@ -2087,7 +2100,7 @@ try {
           const aws = structuredClone(readings.cloud.walk.find(row => row.kind === 'cloud'));
           Object.assign(aws, {machine:'aws',used:1.5});
           const ci = {name:'hana CI',ci:true,admitted:false,queued:false,used:0.125,reserved:0,counted:0,
-            started_at:now-60,unit:'hana CI',machine:'natedev',pid:701,vcpus:32,
+            started_at:fixtureTime-60,unit:'hana CI',machine:'natedev',pid:701,vcpus:32,
             progress:{kind:'NoProgress',reason:'no counter'},ci_runners:[{state:'busy',job:'doctests'}]};
           review.walk = [local, mac, aws, ci];
           review.waiters = [{...review.waiters[0],name:'CI doctests',unit:'',showrunner:'',
@@ -2177,7 +2190,7 @@ try {
                   responsive.push({width,...layout});
                 }
               }
-              comparisons.push({version,theme,...comparison,note,responsive});
+              if (comparisonImages) comparisons.push({version,theme,...comparison,note,responsive});
             }
           }
         }
@@ -2205,10 +2218,9 @@ try {
             assert.ok(state.width<=24*16+22,JSON.stringify(state));
             assert.ok(state.scroll<=state.client,JSON.stringify(state));
           }
-          const desktop=await call('Page.captureScreenshot',{format:'png'});
-          await writeFile(join(folder,`macroute-${version}-running-desktop.png`),Buffer.from(desktop.data,'base64'));
+          await saveScreenshot(`macroute-${version}-running-desktop`);
           await capture(`macroute-${version}-running-tip`,'#tip');
-          comparisons.push({version,...state});
+          if (comparisonImages) comparisons.push({version,...state});
         }
         await navigate('memory_live.html');
         await show(readings.macroute);
@@ -2219,32 +2231,36 @@ try {
         const routeTips = [];
         for (const [index,line] of routeLines.entries()) {
           await evaluate(`showTip(proofTip('wait',${index}),700,420)`);
-          const tip = await evaluate(`({text:document.querySelector('#tip').innerText,html:document.querySelector('#tip').innerHTML})`);
+          const tip = await evaluate(`(() => {
+            const node=document.querySelector('#tip');
+            return {text:node.innerText,html:${comparisonImages} ? node.innerHTML : undefined};
+          })()`);
           assert.ok(tip.text.includes(line),tip.text);
           if(index>0) assert.ok(!tip.text.includes("Mac: no,"),tip.text);
-          routeTips.push(tip.html);
+          if (comparisonImages) routeTips.push(tip.html);
         }
-        await evaluate(`(() => {
-          document.querySelector('#tip').style.display='none';
-          const panel=document.createElement('div');
-          panel.style.cssText='position:fixed;left:24px;right:24px;top:250px;display:flex;align-items:flex-start;gap:18px;z-index:10000';
-          for(const html of ${JSON.stringify(routeTips)}) {
-            const tip=document.createElement('div');
-            tip.id='tip';
-            tip.className='on';
-            tip.style.cssText='position:relative;left:auto;top:auto;opacity:1;flex:0 1 auto;min-width:0';
-            tip.innerHTML=html;
-            panel.append(tip);
-          }
-          document.body.append(panel);
-        })()`);
-        const routeShot=await call('Page.captureScreenshot',{format:'png'});
-        await writeFile(join(folder,'macroute-dark-desktop.png'),Buffer.from(routeShot.data,'base64'));
-        comparisons.push({routeLines});
+        if (comparisonImages) {
+          await evaluate(`(() => {
+            document.querySelector('#tip').style.display='none';
+            const panel=document.createElement('div');
+            panel.style.cssText='position:fixed;left:24px;right:24px;top:250px;display:flex;align-items:flex-start;gap:18px;z-index:10000';
+            for(const html of ${JSON.stringify(routeTips)}) {
+              const tip=document.createElement('div');
+              tip.id='tip';
+              tip.className='on';
+              tip.style.cssText='position:relative;left:auto;top:auto;opacity:1;flex:0 1 auto;min-width:0';
+              tip.innerHTML=html;
+              panel.append(tip);
+            }
+            document.body.append(panel);
+          })()`);
+          await saveScreenshot('macroute-dark-desktop');
+        }
+        if (comparisonImages) comparisons.push({routeLines});
 
-        for (const theme of ['light','dark']) {
+        for (const theme of themes) {
           await call('Emulation.setEmulatedMedia',{features:[{name:'prefers-color-scheme',value:theme}]});
-          for (const width of [390,900,1400]) {
+          for (const width of [...widths].reverse()) {
             await call('Emulation.setDeviceMetricsOverride',{width,height:1100,deviceScaleFactor:1,mobile:false});
             await navigate('memory_live.html');
             const review = await evaluate(`(() => {
@@ -2335,17 +2351,17 @@ try {
             assert.equal(leafProof.tips['g-else'][0].value,'9.0 GiB');
             assert.equal(leafProof.legend.unattributed,'-1.0 GiB');
             assert.equal(leafProof.tips.tools[0].value,amounts(leafProof.tips['g-builds'])['Build tools']);
-            comparisons.push({leafRounding:true,theme,width,...leafProof});
-            comparisons.push({reviewFindings:true,theme,width,rows:review});
+            if (comparisonImages) comparisons.push({leafRounding:true,theme,width,...leafProof});
+            if (comparisonImages) comparisons.push({reviewFindings:true,theme,width,rows:review});
           }
         }
 
         const localReason = 'edits the merged checkout on natedev with mend and fmt, and the push goes from there';
         const legendReading={...structuredClone(base),cap:31,
           ram:JSON.parse(await readFile(join(folder,'legend_ram.json'),'utf8'))};
-        for (const theme of ['light','dark']) {
+        for (const theme of themes) {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
-          for (const width of [390,900,1400]) {
+          for (const width of [...widths].reverse()) {
             await call('Emulation.setDeviceMetricsOverride',{width,height:1100,deviceScaleFactor:1,mobile:false});
             await navigate('memory_live.html');
             for (const [kind,reading,key] of [
@@ -2391,7 +2407,7 @@ try {
               }
               assert.ok(alignment.left>=0 && alignment.right<=width && alignment.scroll<=alignment.client,
                 `${kind} ${key}: `+JSON.stringify(alignment));
-              comparisons.push({tooltipAlignment:true,kind,key,theme,width,...alignment});
+              if (comparisonImages) comparisons.push({tooltipAlignment:true,kind,key,theme,width,...alignment});
             }
             await show(readings.macroute_reason);
             await evaluate(`showTip(proofTip('wait', 2),${width/2},420)`);
@@ -2406,18 +2422,17 @@ try {
             // The queue admits one step at a time, so a step after the first shows only what it needs.
             assert.ok(memory.Needs && !('Free' in memory) && !('Short by' in memory),`A later step shows its room: ${tip.text}`);
             assert.ok(tip.left>=0 && tip.right<=width && tip.scroll<=tip.client,JSON.stringify(tip));
-            comparisons.push({localReason:true,theme,width,...tip});
+            if (comparisonImages) comparisons.push({localReason:true,theme,width,...tip});
           }
         }
-        const reasonShot=await call('Page.captureScreenshot',{format:'png'});
-        await writeFile(join(folder,'direct-cargo-local-reason-dark-desktop.png'),Buffer.from(reasonShot.data,'base64'));
+        await saveScreenshot('direct-cargo-local-reason-dark-desktop');
         await capture('direct-cargo-local-reason-dark-tooltip','#tip');
 
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
         await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1100,deviceScaleFactor:1,mobile:false});
         await navigate('memory_live.html');
-        const shotAt = Date.now()/1000;
         const mockState = structuredClone(legendReading);
+        const shotAt = mockState.read_at;
         const bytes = gib => gib * 1024**3;
         Object.assign(mockState,{cap:11.3,total:44.4,taken:11.3,used:3.2,reserved:8.1,room:0,shortfall:0});
         Object.assign(mockState.ram,{queued_builds_bytes:bytes(3.2),build_tools_bytes:0,ci_bytes:0,
@@ -2463,7 +2478,7 @@ try {
             .map(key=>({key,rows:tooltipRows(key,latest)})).filter(tip=>tip.rows.some(row=>row.label==='Queue cap'))`);
           for(const tip of capSums) assert.ok(!tip.rows.some(row=>/Safety net|Swap coming back/.test(row.label)),
             'A cap sum includes a system reserve: '+tip.key);
-          comparisons.push({legendReferences:references});
+          if (comparisonImages) comparisons.push({legendReferences:references});
         }
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
         for(const [name,key] of [['waiting',proofTip('wait',1,mockState)],['first-in-line',proofTip('wait',0,mockState)],
@@ -2482,7 +2497,7 @@ try {
           if(name==='running') assert.equal(tenths(amounts['= In queue cap']),tenths(amounts.Uses)+tenths(amounts['+ Build reserved']));
           if(name==='queue-cap') assert.equal(tenths(amounts['Queue cap']),
             tenths(amounts.Builds)+tenths(amounts['+ Build reserved'])+tenths(amounts['+ Free']));
-          comparisons.push({mock:name,rows});
+          if (comparisonImages) comparisons.push({mock:name,rows});
         }
 
         // Both swap images use the same current reading and dark desktop viewport.
@@ -2503,7 +2518,7 @@ try {
             assert.equal(alignment,'right');
           }
           await capture('swap-'+version,'#tip');
-          comparisons.push({swapShare:version,rows});
+          if (comparisonImages) comparisons.push({swapShare:version,rows});
         }
 
         // A gate job's tooltip says what the job does and what it changes, below its title (#109).
@@ -2531,19 +2546,22 @@ try {
           && document.querySelector('#tip .tip').scrollWidth<=document.querySelector('#tip .tip').clientWidth`);
         assert.ok(gateFit,'The gate tooltip clips its text.');
         await capture('gate-tooltip-dark-desktop','#tip');
-        await show(base);
-        await evaluate('hideTip()');
-        const endClip=await evaluate(`(() => {
-          const start=document.querySelector('#swap').getBoundingClientRect();
-          const bottom=document.querySelector('main').getBoundingClientRect().bottom;
-          return {x:0,y:start.top+scrollY,width:innerWidth,height:bottom-start.top+24,scale:1};
-        })()`);
-        const endShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:endClip});
-        await writeFile(join(folder,'after-dark-desktop.png'),Buffer.from(endShot.data,'base64'));
+        if (comparisonImages) {
+          await show(base);
+          await evaluate('hideTip()');
+          const endClip=await evaluate(`(() => {
+            const start=document.querySelector('#swap').getBoundingClientRect();
+            const bottom=document.querySelector('main').getBoundingClientRect().bottom;
+            return {x:0,y:start.top+scrollY,width:innerWidth,height:bottom-start.top+24,scale:1};
+          })()`);
+          await saveScreenshot('after-dark-desktop',{captureBeyondViewport:true,clip:endClip});
+        }
 
-        await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,
-          failures:failures.map(({cards,...state})=>state)},null,2)+'\n');
-        console.log(JSON.stringify({pass:true,views:proofs.length,...(callerFolder ? {output:folder} : {})}));
+        if (comparisonImages) {
+          await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,
+            failures:failures.map(({cards,...state})=>state)},null,2)+'\n');
+        }
+        console.log(JSON.stringify({pass:true,views:themes.length*widths.length,...(callerFolder ? {output:folder} : {})}));
       }
     } finally {
       await rm(profile,{recursive:true,force:true,maxRetries:3});
