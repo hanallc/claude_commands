@@ -7575,7 +7575,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
         sender = self.fixture.worker("sender")
         location = self.fixture.world.locations["w1:p1"]
         location.update({"label": "changed", "workspace_id": "w2", "tab_id": "w2:t2"})
-        location["agent_status"] = "working"
+        location["agent_status"] = "idle"
         observed = roster.Roster([roster.RosterEntry(
             "fixture", "claude", "worker", sibling.name, "working",
             roster.Messageable(f"session:{sibling.current_session}"), str(self.fixture.root),
@@ -7606,6 +7606,28 @@ class PaneWorkerMessageTests(unittest.TestCase):
                 self.assertEqual(self.fixture.world.processes[self.fixture.world.foreground[pane][0]].identity.id,
                                  recipient.current_session)
         self.assertNotEqual(self.row.id, self.row.current_session)
+
+    def test_fixed_worker_result_checks_the_current_session_after_waiting_for_idle(self) -> None:
+        from scripts.herdr import herdr
+
+        pane = "w1:p1"
+        row = self.row
+        self.fixture.world.locations[pane]["agent_status"] = "working"
+
+        def move_worker(target: str, _timeout: int) -> herdr.ObservedAgentState:
+            self.assertEqual(target, pane)
+            _ = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("replacement-worker-session")))
+            self.fixture.world.locations[pane]["agent_status"] = "idle"
+            return herdr.ObservedAgentState(herdr.AgentStatus.IDLE)
+
+        with mock.patch.object(self.fixture.world, "wait_turn_end", side_effect=move_worker):
+            result = send.deliver_worker_text(row, staff.snapshot(), "Detached run: fixture",
+                sender="fixture", timeout=send.delivery_timeout(),
+                receipt=send.WorkerResultReceipt("Detached run: fixture", wait_for_idle=True),
+                selection=send.FixedStaffLookup(row.id, "worker"))
+        self.assertEqual(result, send.Result("failed", f"the session changed for staff ID {row.id}"))
+        self.assertFalse(any(command[:2] == ("agent", "prompt") for command in self.fixture.world.commands))
+        self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
 
     def test_full_worker_path_accepts_an_outside_sender_and_a_showrunner_holder(self) -> None:
         root = staff.snapshot().parent_of(self.fixture.parent)
@@ -7648,14 +7670,14 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertEqual(self.fixture.world.commands, [])
 
     def test_unavailable_workers_route_the_original_message_and_one_reason_to_the_holder(self) -> None:
-        for state in ("blocked", "stopped", "closed", "unknown", "uncertain"):
+        for state in ("blocked", "working", "stopped", "closed", "unknown", "uncertain"):
             with self.subTest(state=state):
                 row = self.fixture.worker(state)
                 pane = "w1:p" + str(10 + len(self.fixture.world.locations))
                 if state != "closed":
                     self.fixture.world.add(row, pane, live=state != "stopped")
-                if state == "blocked":
-                    self.fixture.world.locations[pane]["agent_status"] = "blocked"
+                if state in ("blocked", "working"):
+                    self.fixture.world.locations[pane]["agent_status"] = state
                 elif state == "unknown":
                     self.fixture.world.unknown[pane] = "process read unavailable"
                 elif state == "uncertain":
