@@ -1523,6 +1523,9 @@ class HanaSetupFailureTests(CostFixture):
             ('prepare --workload hana', subject.prepare_hana),
             ('prepare', subject.prepare),
             ('apply', lambda: subject.apply(approve_resources=True)),
+            ('up --workload merge-gates', lambda: subject.gate_up(approve_resources=True)),
+            ('up --workload merge-gates --plan', planned.gate_plan),
+            ('remove-images', lambda: subject.remove_images(approve_destroy=True)),
             ('down', lambda: subject.down(approve_destroy=True)),
         )
 

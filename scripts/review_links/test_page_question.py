@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
+import threading
 import tempfile
 import unittest
 from dataclasses import replace
@@ -9,9 +11,28 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.production import staff
+from scripts.lib import atomic_file, process_start
+from scripts.message import send_result
+from scripts.production import delivery_state, staff
 from scripts.review_links import change_page, page_question
 from scripts.review_links import question_record
+
+
+def question_outcome(outcome: send_result.Outcome = "sent", detail: str = "fixture receipt"
+                     ) -> tuple[send_result.ConfirmedSendOutcome, str]:
+    return send_result.ConfirmedSendOutcome(send_result.OutcomeHeader(outcome, detail, "")), detail
+
+
+class FakeQuestionTransport:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.receipts: set[str] = set()
+
+    def send(self, _recipient: staff.StaffId, _message: str, message_id: str
+             ) -> tuple[send_result.ConfirmedSendOutcome, str]:
+        self.calls.append(message_id)
+        self.receipts.add(message_id)
+        return question_outcome()
 
 
 class FixtureStore:
@@ -51,15 +72,17 @@ class PageQuestionTests(unittest.TestCase):
         self.store = FixtureStore()
         self.status = change_page.DeliveryStatus(self.root / 'delivery')
         self.sent = []
-        _ = self.enterContext(patch.object(change_page, 'send_to_staff', side_effect=self.capture))
+        _ = self.enterContext(patch.object(change_page, "send_question", side_effect=self.capture))
 
-    def capture(self, recipient: staff.StaffId, sender: str, message: str) -> None:
-        self.sent.append((recipient, sender, message))
+    def capture(self, recipient: staff.StaffId, message: str, message_id: str
+                ) -> tuple[send_result.ConfirmedSendOutcome, str]:
+        self.sent.append((recipient, message_id, message))
+        return question_outcome()
 
     def ask(self, item: str = 'image-1', words: str = 'Which check passed?') -> change_page.MessageDelivery:
-        return page_question.ask(self.store, item, staff.StaffId('fixture-owner'), self.root / item,
-            'Images '+item, 'The gate', words,
-            'images.py answer --id {item} --question {question_id} --text "<answer>"', self.status)
+        target = change_page.QuestionDeliveryTarget(self.root / item, item, staff.StaffId('fixture-owner'),
+            'Images '+item, 'The gate', 'images.py answer --id {item} --question {question_id} --text "<answer>"')
+        return page_question.ask(self.store, target, words, self.status)
 
     def test_question_ids_start_at_one_for_each_item_and_increase_after_answers(self) -> None:
         _ = self.ask()
@@ -71,12 +94,13 @@ class PageQuestionTests(unittest.TestCase):
         self.assertEqual([question.question_id for question in self.store.questions('image-2')], ['Q1'])
 
     def test_ask_saves_before_sending_and_a_repeat_sends_only_once(self) -> None:
-        def capture(recipient: staff.StaffId, sender: str, message: str) -> None:
-            self.assertEqual(self.store.questions('image-1')[0].words, 'Which check passed?')
-            self.assertEqual([ownership.state for ownership in self.status.request_attempts.values()], ['sending'])
-            self.capture(recipient, sender, message)
+        def capture(recipient: staff.StaffId, message: str, message_id: str
+                    ) -> tuple[send_result.ConfirmedSendOutcome, str]:
+            self.assertEqual(self.store.questions("image-1")[0].words, "Which check passed?")
+            self.assertEqual(self.attempt(delivery).state, delivery_state.QuestionSendState.SENDING)
+            return self.capture(recipient, message, message_id)
 
-        with patch.object(change_page, 'send_to_staff', side_effect=capture):
+        with patch.object(change_page, "send_question", side_effect=capture):
             delivery = self.ask()
             self.assertEqual(self.sent, [])
             change_page.deliver(delivery, self.status)
@@ -89,37 +113,64 @@ class PageQuestionTests(unittest.TestCase):
             +'Answer with this command: images.py answer --id image-1 --question Q1 --text "<answer>"')
         self.assertEqual(self.status.slots(delivery.page, delivery.row).intents(), ())
 
+    def attempt(self, delivery: change_page.MessageDelivery) -> delivery_state.QuestionAttempt:
+        return change_page.read_question_attempt(self.status.path(delivery.page, delivery.row))
+
+    def effective(self, delivery: change_page.MessageDelivery) -> delivery_state.QuestionSendState:
+        with self.status.locked():
+            return change_page.question_delivery_view(self.status, self.job(delivery).delivery.saved).state
+
+    def job(self, delivery: change_page.MessageDelivery) -> change_page.QuestionJob:
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        return delivery.job
+
     def test_failed_delivery_keeps_the_question_for_a_retry(self) -> None:
-        with patch.object(change_page, 'send_to_staff', side_effect=RuntimeError('owner offline')) as sender:
+        with (patch.object(change_page, "send_question", return_value=question_outcome("refused", "owner offline")) as sender,
+              patch.object(change_page, "alert_delivery_failures")):
             delivery = self.ask()
             change_page.deliver(delivery, self.status)
-        self.assertEqual(sender.call_count, 3)
-        self.assertEqual(len(self.store.questions('image-1')), 1)
-        self.assertIsNone(self.store.questions('image-1')[0].answer)
-        self.assertEqual(self.status.request_attempts, {})
+        self.assertEqual(sender.call_count, 2)
+        self.assertEqual(len(self.store.questions("image-1")), 1)
+        self.assertIsNone(self.store.questions("image-1")[0].answer)
+        self.assertFalse(self.status.question_jobs)
         self.status = change_page.DeliveryStatus(self.status.root)
-        failed = self.status.failed_delivery(delivery.page, delivery.row)
-        self.assertEqual(failed, change_page.FailedDelivery(delivery.attempt, delivery.page.review_list,
-                                                          delivery.row, 'owner offline'))
-        previous_attempt = delivery.attempt
-        delivery = self.ask()
-        self.assertNotEqual(delivery.attempt, previous_attempt)
-        self.assertEqual(self.status.failed_delivery(delivery.page, delivery.row), failed)
-        change_page.deliver(delivery, self.status)
+        failed = self.attempt(delivery)
+        self.assertEqual((failed.state, failed.attempt_id, failed.error),
+                         (delivery_state.QuestionSendState.FAILED, delivery.attempt, "owner offline"))
+        retry = self.ask()
+        self.assertNotEqual(retry.attempt, delivery.attempt)
+        self.assertEqual(self.attempt(retry).message_id, failed.message_id)
+        change_page.deliver(retry, self.status)
         self.assertEqual(len(self.sent), 1)
-        self.assertEqual(len(self.store.questions('image-1')), 1)
+        self.assertEqual(len(self.store.questions("image-1")), 1)
         self.assertEqual(self.status.slots(delivery.page, delivery.row).intents(), ())
-        self.assertIsInstance(self.status.failed_delivery(delivery.page, delivery.row), change_page.NoFailedDelivery)
+        self.assertEqual(self.attempt(retry).state, delivery_state.QuestionSendState.SENT)
 
     def test_a_live_claim_prevents_a_second_sender(self) -> None:
-        def capture(recipient: staff.StaffId, sender: str, message: str) -> None:
-            change_page.deliver(self.ask(), self.status)
-            self.capture(recipient, sender, message)
+        started, release = threading.Event(), threading.Event()
+        transport = FakeQuestionTransport()
 
-        with patch.object(change_page, 'send_to_staff', side_effect=capture):
-            change_page.deliver(self.ask(), self.status)
-        self.assertEqual(len(self.sent), 1)
-        self.assertEqual(len(self.store.questions('image-1')), 1)
+        def capture(recipient: staff.StaffId, message: str, message_id: str
+                    ) -> tuple[send_result.ConfirmedSendOutcome, str]:
+            started.set()
+            self.assertTrue(release.wait(5))
+            return transport.send(recipient, message, message_id)
+
+        first = self.ask()
+        status = self.status
+        with patch.object(change_page, "send_question", side_effect=capture), ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(change_page.deliver, first, status)
+            try:
+                self.assertTrue(started.wait(5))
+                self.status = change_page.DeliveryStatus(status.root)
+                change_page.deliver(self.ask(), self.status)
+                self.assertEqual(self.effective(first), delivery_state.QuestionSendState.SENDING)
+            finally:
+                release.set()
+            result.result(5)
+        self.assertEqual(transport.calls, [self.attempt(first).message_id])
+        self.assertEqual(transport.receipts, set(transport.calls))
 
     def test_a_retry_finishes_a_save_that_stops_after_the_question_write(self) -> None:
         original = self.store.add
@@ -139,18 +190,15 @@ class PageQuestionTests(unittest.TestCase):
         self.assertEqual(len(self.store.questions('image-1')), 1)
 
     def test_retry_sends_the_saved_question_after_the_intent_update_fails(self) -> None:
-        write = self.status.write_slots
-        failed = False
+        publish = change_page.publish_question_attempt
 
-        def fail_after_question_save(page: change_page.ReviewPage, row: str, slots: change_page.DeliverySlots) -> None:
-            nonlocal failed
-            if not failed and self.store.questions('image-1'):
-                failed = True
-                raise OSError('Cannot update the delivery intent.')
-            write(page, row, slots)
+        def fail_after_question_save(path: Path, attempt: delivery_state.QuestionAttempt) -> None:
+            if attempt.state is delivery_state.QuestionSendState.READY:
+                raise OSError("Cannot update the delivery intent.")
+            publish(path, attempt)
 
-        with patch.object(self.status, 'write_slots', side_effect=fail_after_question_save):
-            with self.assertRaisesRegex(OSError, 'Cannot update the delivery intent'):
+        with patch.object(change_page, "publish_question_attempt", side_effect=fail_after_question_save):
+            with self.assertRaisesRegex(OSError, "Cannot update the delivery intent"):
                 _ = self.ask()
         self.status = change_page.DeliveryStatus(self.status.root)
         change_page.recover_review_messages(self.status)
@@ -161,6 +209,118 @@ class PageQuestionTests(unittest.TestCase):
         self.assertEqual(len(self.sent), 1)
         self.assertIn('--question Q1', self.sent[0][2])
         self.assertEqual([question.question_id for question in self.store.questions('image-1')], ['Q1'])
+
+    def test_a_held_lock_blocks_resend_for_an_unverified_claim(self) -> None:
+        first = self.ask()
+        for identity in (
+            process_start.Started("reused"), process_start.Zombie("zombie"),
+            process_start.Unreadable("cannot read"),
+        ):
+            with self.subTest(identity=identity), patch.object(process_start, "process_start", return_value=identity):
+                self.assertEqual(self.effective(first), delivery_state.QuestionSendState.UNKNOWN)
+                with self.status.locked():
+                    view = change_page.question_delivery_view(self.status, self.job(first).delivery.saved)
+                self.assertIsInstance(view, change_page.ResendBlocked)
+        _ = self.job(first).release()
+        self.assertEqual(self.effective(first), delivery_state.QuestionSendState.READY)
+        retry = self.ask()
+        change_page.deliver(retry, self.status)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_stop_after_the_send_marker_stays_unknown_with_or_without_a_receipt(self) -> None:
+        transport = FakeQuestionTransport()
+        for number, accepted in enumerate((False, True)):
+            with self.subTest(accepted=accepted):
+                item = f"image-{number}"
+                first = self.ask(item)
+                path = self.status.path(first.page, first.row)
+                attempt = self.attempt(first)
+                with self.status.locked():
+                    change_page.advance_question_attempt(path, attempt,
+                                                         replace(attempt, state=delivery_state.QuestionSendState.SENDING))
+                if accepted:
+                    _ = transport.send(attempt.recipient_id, attempt.message, attempt.message_id)
+                _ = self.job(first).release()
+                self.status = change_page.DeliveryStatus(self.status.root)
+                self.assertEqual(self.effective(first), delivery_state.QuestionSendState.UNKNOWN)
+                with patch.object(change_page, "send_question", side_effect=transport.send):
+                    change_page.recover_review_messages(self.status)
+                    change_page.deliver(self.ask(item), self.status)
+                self.assertEqual(len(transport.calls), int(accepted))
+                self.assertEqual(len(transport.receipts), int(accepted))
+
+    def test_stale_job_cannot_replace_the_new_result(self) -> None:
+        first = self.ask()
+        old = self.attempt(first)
+        _ = self.job(first).release()
+        second = self.ask()
+        change_page.deliver(second, self.status)
+        sent = self.attempt(second)
+        with self.status.locked(), self.assertRaisesRegex(ValueError, "stale"):
+            change_page.advance_question_attempt(self.status.path(first.page, first.row), old,
+                                                 replace(old, state=delivery_state.QuestionSendState.FAILED))
+        self.assertEqual(self.attempt(second), sent)
+
+    def test_result_publication_after_rename_keeps_acceptance(self) -> None:
+        first = self.ask()
+        path = self.status.path(first.page, first.row)
+        transport = FakeQuestionTransport()
+        sync = atomic_file.sync_folder
+
+        def fail_after_result(folder: Path) -> None:
+            if self.attempt(first).state is delivery_state.QuestionSendState.SENT:
+                raise OSError("Cannot sync the receipt.")
+            sync(folder)
+
+        with (patch.object(change_page, "send_question", side_effect=transport.send),
+              patch.object(atomic_file, "sync_folder", side_effect=fail_after_result)):
+            change_page.deliver(first, self.status)
+            self.status = change_page.DeliveryStatus(self.status.root)
+            change_page.recover_review_messages(self.status)
+            change_page.deliver(self.ask(), self.status)
+        self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(len(transport.receipts), 1)
+
+    def test_failed_rename_keeps_the_published_send_marker(self) -> None:
+        first = self.ask()
+        path = self.status.path(first.page, first.row)
+        transport = FakeQuestionTransport()
+        replace_file = os.replace
+
+        def fail_result_rename(source: Path, destination: Path) -> None:
+            candidate = change_page.read_question_attempt(source)
+            if candidate.state is delivery_state.QuestionSendState.SENT:
+                raise OSError("Cannot replace the delivery record.")
+            replace_file(source, destination)
+
+        with (patch.object(change_page, "send_question", side_effect=transport.send),
+              patch.object(os, "replace", side_effect=fail_result_rename)):
+            with self.assertRaises(atomic_file.AtomicPublicationFailed):
+                change_page.deliver(first, self.status)
+        self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENDING)
+        self.assertEqual(self.effective(first), delivery_state.QuestionSendState.UNKNOWN)
+        with patch.object(change_page, "send_question", side_effect=transport.send):
+            change_page.recover_review_messages(change_page.DeliveryStatus(self.status.root))
+            change_page.deliver(self.ask(), self.status)
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(len(transport.receipts), 1)
+
+    def test_typed_transport_results_set_the_delivery_state(self) -> None:
+        state = delivery_state.QuestionSendState
+        cases: tuple[tuple[send_result.Outcome, delivery_state.QuestionSendState], ...] = (
+            ("sent", state.SENT), ("kept", state.SENT), ("queued", state.QUEUED),
+            ("failed", state.FAILED), ("refused", state.FAILED), ("skipped", state.FAILED),
+            ("replaced", state.FAILED), ("held", state.UNKNOWN), ("pending", state.UNKNOWN),
+            ("retry", state.UNKNOWN),
+        )
+        for outcome, expected in cases:
+            with (self.subTest(outcome=outcome), patch.object(change_page, "alert_delivery_failures"),
+                  patch.object(change_page, "send_question", return_value=question_outcome(outcome)) as send):
+                delivery = self.ask(outcome)
+                change_page.deliver(delivery, self.status)
+                self.assertEqual(self.attempt(delivery).state, expected)
+                self.assertEqual(send.call_count, 2 if expected is state.FAILED else 1)
 
     def test_an_empty_question_does_not_write_or_claim(self) -> None:
         with self.assertRaisesRegex(question_record.AnswerRefused, 'Enter a question first'):
