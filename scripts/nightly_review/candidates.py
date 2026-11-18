@@ -5,11 +5,13 @@ Usage: candidates.py                   print the table
        candidates.py next              print the one candidate /next efficiency shows, and pin it
        candidates.py record <report>   add a night's report to the ledger: its proposal and each
                                        Also found and Noted item, one line each
-       candidates.py outcome E<n> <state> [--applied '<repo> <sha>'] [--ledger <path>]
+       candidates.py outcome E<n> <state> [--applied '<repo> <sha>'] [--ledger <path>] [--waiting-why '<reason>']
                                        write the outcome on ledger line n: accepted (with
                                        --applied), declined, deferred, done or relayed
 
 The ledger is the one record, and every candidate is a line of its own:
+
+Deferred outcomes require --waiting-why. The existing review file beside the ledger stores the reason.
 
     - <night> <scope>: <title> [gain/week: <gain>] — <state>
     - <night> <scope>, also found: <title> [gain/week: <gain>] — <state>
@@ -313,21 +315,27 @@ class OutcomeRefused(ValueError):
     """The ledger line is not an open candidate."""
 
 
-def record_outcome(identity: str, state: str, applied: str, ledger: Path) -> tuple[bool, str]:
+def record_outcome(identity: str, state: str, applied: str, ledger: Path, *, waiting_why: str = "") -> tuple[bool, str]:
     """Write one candidate's outcome on its own ledger line; E<n> is the line's number.
 
     Returns whether the line changed, and the line.
     """
+    from scripts.review_links import efficiency_reviews, review_events
+    reason = review_events.require_waiting_why(waiting_why) if state == "deferred" else ""
     found = EFFICIENCY_ID.match(identity)
     assert found is not None
     lines = read_lines(ledger)
     index = int(found["number"]) - 1
     line = lines[index] if index < len(lines) else ""
     words = outcome_words(state, applied, now().astimezone(user_zone()).strftime("%Y-%m-%d"))
-    if line.endswith(" — " + words):
-        return False, line
-    if open_candidate(line) is None:
+    unchanged = line.endswith(" — " + words)
+    if not unchanged and open_candidate(line) is None:
         raise OutcomeRefused(f"E{index + 1} is not an open candidate in {ledger}")
+    if reason:
+        _ = efficiency_reviews.record(ledger, f"E{found['number']}", "Deferred: " + reason, review_events.KeepMark(),
+                                       who="filer", waiting_why=reason)
+    if unchanged:
+        return False, line
     lines[index] = OPEN_END.sub(" — " + words, lines[index])
     write_text_atomic(ledger, "\n".join(lines) + "\n")
     if ledger == state_root() / "ledger.md":
@@ -336,14 +344,14 @@ def record_outcome(identity: str, state: str, applied: str, ledger: Path) -> tup
     return True, lines[index]
 
 
-def outcome(identity: str, state: str, applied: str, ledger: Path) -> int:
+def outcome(identity: str, state: str, applied: str, ledger: Path, *, waiting_why: str = "") -> int:
     found = EFFICIENCY_ID.match(identity)
     if found is None or state not in OUTCOMES or (state == "accepted") != bool(applied):
         print(USAGE, file=sys.stderr)
         return 2
     try:
-        changed, line = record_outcome(identity, state, applied, ledger)
-    except (OutcomeRefused, OSError) as error:
+        changed, line = record_outcome(identity, state, applied, ledger, waiting_why=waiting_why)
+    except (ValueError, OSError) as error:
         print(f"candidates: {error}", file=sys.stderr)
         return 1
     print(f"E{found['number']}: {line}" if changed else f"E{found['number']} unchanged: {line}")
@@ -351,18 +359,19 @@ def outcome(identity: str, state: str, applied: str, ledger: Path) -> int:
 
 
 USAGE = ("usage: candidates.py [next | record <report> | outcome <E<n>> "
-         "(accepted --applied '<repo> <sha>' | declined | deferred | done | relayed) [--ledger <path>]]")
+         "(accepted --applied '<repo> <sha>' | declined | deferred --waiting-why '<reason>' | done | relayed) [--ledger <path>]]")
 
 
 def main(arguments: list[str]) -> int:
     match arguments:
         case ["outcome", identity, state, *options]:
             settings = dict(zip(options[::2], options[1::2]))
-            if len(options) % 2 or set(settings) - {"--applied", "--ledger"}:
+            if len(options) % 2 or set(settings) - {"--applied", "--ledger", "--waiting-why"}:
                 print(USAGE, file=sys.stderr)
                 return 2
             ledger = Path(settings["--ledger"]).expanduser() if "--ledger" in settings else state_root() / "ledger.md"
-            return outcome(identity, state, settings.get("--applied", ""), ledger)
+            return outcome(identity, state, settings.get("--applied", ""), ledger,
+                           waiting_why=settings.get("--waiting-why", ""))
         case []:
             candidates = ordered(read_lines(state_root() / "ledger.md"))
             body = table(candidates) if candidates else "no open candidates"

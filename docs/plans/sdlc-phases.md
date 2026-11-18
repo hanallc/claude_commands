@@ -338,7 +338,19 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 
 - `_commit(paths, what)` in `change_review.py` commits one or more lists of one repository by plumbing only. It runs from the repository top level: `hash-object -w --path` for each list, then `read-tree` of HEAD (or `--empty`), `update-index --cacheinfo` and `write-tree` in a temporary `GIT_INDEX_FILE`. It sets each list's entry in the real index, then runs `commit-tree` and `update-ref HEAD <new> <old HEAD>`. A moved HEAD retries up to 5 times. A tree equal to HEAD's makes no commit. No command refreshes the index, so clean filters on other modified files never run. A write in a repository shaped like hanadocs takes 0.01-0.06 s, down from about 3.1 s.
 - A failure warns "written but not committed: <reason>; the next write commits it" and moves no ref.
-- `change_review.py batch --file <json>` takes an array of `edit` and `verdict` items (`op`, `production`, `row`, optional `list`; `change`, `check`, `see`, `image`, `output` for `edit`; `verdict` for `verdict`). It checks every item and registers images before the lock. All lists must be in one folder, and a row named twice is refused. Under one lock it writes every list, then makes one commit over every target list, changed or not: subject `change-review: batch <N> writes (<owner> <count>, ...)`. Any error exits 1 and names the item index. A rerun after a stopped batch finishes the remaining writes and commits every list.
+- `change_review.py batch --file <json>` accepts an array of `edit` and `verdict` items.
+  Each item requires `op`, `production` and `row`; `list` is optional.
+  Edit items accept `change`, `check`, `see`, `image` and `output`.
+  Verdict items require `verdict`.
+  A showrunner check also requires `validation` with the ID from its validation message.
+  The command checks item fields and registers images before it takes the locks.
+  All lists must share one folder; the command refuses a repeated row.
+  It takes the delivery lock before the list lock.
+  It checks exchange IDs and stages each verdict while it holds both locks.
+  Every item must pass before the command writes a list.
+  One commit includes every target list, with subject `change-review: batch <N> writes (<owner> <count>, ...)`.
+  An error exits 1 and names the item index.
+  A rerun after a stopped batch completes the remaining writes and commits every list.
 - `edit_row` and `record_verdict` share `_edit_write` and `_verdict_write` (a `RowWrite` with `write` and `after`) with `batch`.
 - `add`, `edit` and batch `edit` items accept `--output` like the `image` action; `--image` with `--output` is refused.
 - `show --row <id>` prints that row with `describe`; a row not on the list exits 1.
@@ -502,6 +514,261 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 **Ruled out:**
 - A du fan-out over subfolders: each du process counts a hard link again, so the Nix store and cargo `deps/` count twice.
 - A threaded Python walker: the GIL holds it near 130k entries/s (/ 58–68 s).
+
+### Phase 45 — A refresh button on the Disks page measures the drives at once  · status: done
+
+#### As-built
+
+**Measure now** uses the Lucide `refresh-cw` icon and posts `force=1`. The page shows `Paused · Measuring…` and disables the button until the data reaches its target, the wait expires, or the request fails.
+`start_measure(now, launch=launch_measure, *, force=False) -> MeasureRequest` skips the cache when forced and returns the active target if a measure holds the lock.
+`disks.coord` protects reservation and publication, and `disks.active` records the active generation. The launcher passes the locked descriptor to the child, which holds it through publication. The child sets `measured_at` at publication and removes `disks.active` before it releases the lock.
+
+**Files:**
+- `scripts/disks/disks_page.py` and `scripts/disks/disks.html` — measure reservation, button rendering, and generation checks.
+- `scripts/disks/measure.py` and `scripts/lib/file_lock.py` — child reservation and `ExclusiveLock` ownership.
+- `scripts/review_links/serve.py` and `scripts/review_links/page_frame.py` — the POST returns `state`, `target`, `slots`, and `sessions`. `createPageRefresh()` exposes `setStatus()`.
+- `scripts/disks/test_disks_page.py`, `scripts/disks/test_measure.py`, `scripts/lib/test_file_lock.py`, `scripts/review_links/test_page_frame.py`, and `scripts/review_links/test_serve.py` — generation, lock handoff, and browser or route tests.
+- `docs/plans/builds-report.md` — the Disks generation completion rule.
+
+**Gotchas:** `ExclusiveLock.close()` closes one handle. `release()` unlocks the inherited lock for both processes. Legacy data has generation zero.
+
+**Ruled out:** Retrying a measure request with an unknown target.
+
+### Phase 46 — A question title is one short line, and the Review page never shows a long one  · status: done
+
+#### As-built
+
+`check_question_title(text) -> ValidQuestionTitle | RefusedQuestionTitle` requires one nonempty line within `question_title_max_chars`, which is 100 by default. `ask` checks `--text` and `--ask` before review, and `write_question_record()` checks new or changed titles.
+`questions --state` refuses invalid new titles and reports `reword` for stored titles that it keeps.
+The Review table clips the first line by character count and available width. Search and the tooltip retain the full title. The details panel shows its hidden Item fallback when the rendered body lacks the full title.
+
+**Files:**
+- `config/production.conf` and `scripts/production/update_registration.py` — the limit and title validation.
+- `scripts/review_links/review_page.py` — one-line rows and the full-title fallback.
+- `docs/question_template.md` and `commands/showrunner/produce.md` — the title rule and the use of `--context` and `--item`.
+- `scripts/production/test_update_registration_questions.py` and `scripts/review_links/test_review_page.py` — filing and rendering tests.
+
+**Gotchas:** CLI help names the setting. The CLI reads its value when it checks a title. The details check preserves block boundaries in the text.
+
+### Phase 47 — A rename of a unit to its own name keeps bare worker names quiet  · status: done
+
+#### As-built
+
+`rename_qualified_workers(owner)` matches a prefix equal to the current owner name or ending in `-<owner>`. It keeps other names without per-row output or rename hints.
+`rename_plan()` treats the current unit name plus `-unit` as a same-name rename. `rename_apply_unit()` can remove an unstarted pending rename under the staff row lock.
+`rename_unstarted(record, row, pending) -> bool` requires the staff path and checkout at the original source, the original branch, and an absent destination. Any native Git worktree lock makes that test fail.
+
+**Files:**
+- `scripts/agents/shutdown.py` — name matching, summary output, and pending rename replacement.
+- `scripts/production/unit_move.py` — the unstarted move check.
+- `scripts/agents/test_shutdown_cli.py` and `scripts/production/test_unit_move.py` — rename and move fixtures.
+
+**Binds later work:** `rename_qualified_workers()` in `scripts/agents/shutdown.py` prints `<N> worker names unchanged: no qualified prefix for <owner>` once on stderr after the scan when the count is positive. **A rename summary for one worker says "1 worker name unchanged"** uses this summary.
+
+**Gotchas:** Staff rows store no former names. The session record’s `formerNames` is process-specific, so qualification uses the current owner name.
+
+### Phase 48 — An image can carry a question, and its answer comes back to the user  · status: done
+
+#### As-built
+
+**Ask question** uses the image card’s feedback field and sends the image owner the question and an answer command. The card stays visible while any question is open, and the image leaves the console’s waiting set.
+`images.py answer --id <image> --question Q<n> --text "<answer>"` saves the answer and clears `feedback_at` in one write. The console marks the image new after the last answer.
+Each item assigns its own `Q<n>` IDs. The store refuses unknown or already answered IDs and reads older records without a `questions` field.
+Images refreshes after each action and polls during question delivery. Images and Review restore focus, caret, and selection after a refresh.
+
+**Files:**
+- `scripts/review_links/page_question.py` — `QuestionStore` defines `questions(item)`, `add(item, question)`, and `set_answer(item, question_id, answer)`. `ask(store, item, owner, source_path, row, title, words, answer_command, status) -> MessageDelivery` saves and claims delivery. `answer(store, item, question_id, text) -> Answered | AnswerRefused` records a reply for the page renderers.
+- `scripts/review_links/question_record.py` and `scripts/review_links/image_store.py` — typed question records, optional image questions, and locked image writes.
+- `scripts/review_links/images.py`, `scripts/review_links/serve.py`, and `scripts/review_links/change_page.py` — image actions and the delivery claim. The POST responds before delivery.
+- `scripts/review_links/page_frame.py` and `scripts/review_links/review_page.py` — shared focus restoration.
+- `commands/show_image.md` — the answer command.
+- `scripts/review_links/test_page_question.py`, `scripts/review_links/test_images.py`, `scripts/review_links/test_review_page.py`, `scripts/review_links/test_change_page.py`, and `scripts/review_links/test_serve.py` — storage, delivery, route, and refresh fixtures.
+
+**Gotchas:** An answer that arrives during an earlier feedback send takes priority. An open question keeps the card visible even when an older feedback mark exists.
+
+### Phase 49 — The fast-track recovery reads each Git object once, in one batch  · status: dropped
+**Result (2026-11-17):** dropped with no code change. test_fast_track makes 7,185 Git starts, and only 112 are cat-file. The batch saved no CPU (61.934 s to 61.910 s). No single call shape dominates.
+
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the showrunner (2026-11-17, fasttrackcost): "production/test_fast_track.py costs 55.6 aws CPU s ... most of the cost is about 6700 git calls from GitRunner recovery reads in fast_track.py. Batch the immutable object reads; keep the mutable ref reads and all writes as they are. ... Measure aws CPU before and after, and put both in the checkpoint."
+
+**Spec:**
+1. In `scripts/production/fast_track.py`, find which recovery reads make the Git calls in `test_fast_track.py`. Count them by command with `module_cost.py --commands`.
+2. Batch the reads of immutable objects (an object addressed by its full hash: `cat-file -e <hash>^{commit}`, blob and tree reads by hash). Use one `git cat-file --batch-check` or `--batch` process for each recovery pass, through `GitRunner`. Keep the `GitRunner.reconcile_reads` cache rules: no cached failed read, and no cache outside one pass.
+3. Keep each read of a mutable ref (`rev-parse HEAD`, `rev-parse origin/main`, `merge-base --is-ancestor`, ref lists) as one fresh call. Keep every write as it is.
+4. The behavior of `reconcile`, `push_patch` and `restore_prepared` does not change. No existing assertion changes.
+
+**Files:**
+- `scripts/production/fast_track.py`
+- `scripts/production/test_fast_track.py` — only a new test of the batch
+
+**Workers:** 1 writer (`repo-fix4`).
+
+**State:** none.
+
+**Constraints from prior phases:** tests write a fixture config; no test reads a tunable value.
+
+**Acceptance gate:**
+1. `scripts.production.test_fast_track` passes, with a test that one recovery pass starts one batch process for its object reads.
+2. basedpyright reports 0 errors and 0 warnings on the changed Python files.
+3. `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> production/test_fast_track.py --commands 10` before and after the change: CPU seconds and Git process starts. Both go in the checkpoint.
+
+### Phase 50 — A new change row fills an empty cell for each optional column  · status: done
+
+#### As-built
+
+On `origin/main`, `append_rows()` seeds each `To review` column with an empty string before it applies the new row’s values.
+The rule covers `add`, `list-ready`, and `live`, including tables with `Review log` or other optional columns.
+`_row(path, columns, values)` rejects a missing table value and writes only columns present in the table.
+
+**Files:**
+- `scripts/production/change_review.py` — row defaults and strict column formatting.
+- `scripts/production/test_change_review.py` — insertion with extra columns and without an Image column.
+
+**Gotchas:** The phases checkout lacks the `To review` defaults present on `origin/main`.
+
+### Phase 51 — An image question never reads as unsent when it was sent  · status: done
+
+#### As-built
+
+`ReviewLinksServer` sets the startup recovery flag before recovery starts and clears it when the delivery scan finishes. Images shows that a pending question is sending and polls before recovery claims it.
+The sender replaces the intent with a `started` mark before sending. It saves `accepted` before it writes the delivery result.
+An unknown result offers a deliberate resend with the same words and question ID. If the intent update fails after the question saves, cleanup clears the intent and leaves the question eligible for retry.
+
+**Files:**
+- `scripts/review_links/change_page.py` — dispatch marks and the live attempt check.
+- `scripts/review_links/serve.py` and `scripts/review_links/images.py` — the recovery flag, delivery notices, and polling.
+- `scripts/review_links/page_question.py` — retry claims and cleanup after an intent write failure.
+- `scripts/review_links/test_images.py` and `scripts/review_links/test_page_question.py` — startup, write failure, and resend fixtures.
+
+**Gotchas:** Legacy intents without a send mark still use startup recovery. An intent from an older sender can be ambiguous after a failed result write.
+
+### Phase 52 — A rename to a name the folder and branch already carry prints no anomaly  · status: done
+
+#### As-built
+
+`_unit_rename_target(value, old_name, new_name) -> str | None` uses `unit_names.swap_stem()` to replace a trailing old-name suffix first.
+If only the new-name suffix matches, the folder or branch keeps its value without an anomaly. Any value with neither suffix still produces its own anomaly.
+
+**Files:**
+- `scripts/agents/shutdown.py` — the shared target rule for implicit folder and branch names.
+- `scripts/agents/test_shutdown_cli.py` and `scripts/production/test_unit_move.py` — already-matching targets and anomaly tests.
+
+### Phase 53 — The image question code has no import cycle, and page_question has its staff accessor row  · status: done
+
+#### As-built
+
+`question_record.py` defines `Question(question_id, asked_at, words, answer=None)`, `Answer(text, answered_at)`, their stored JSON forms, and the `AnswerRefused` exception. `stored(question) -> StoredQuestion` encodes the record. `read(value) -> Question` validates the ID, timestamp, words, and optional answer.
+`image_store.py` imports those types from the page-independent module. `page_question.py` retains the store protocol, delivery API, renderers, and answer result types.
+The staff accessor table records `page_question.py` as a read accessor for the recipient’s `StaffId`.
+`change_review.py` checks question exchanges through `delivery_state.py`, which keeps delivery checks below the page layer.
+
+**Files:**
+- `scripts/review_links/question_record.py` — the shared record types, exception, and JSON conversion.
+- `scripts/review_links/image_store.py` and `scripts/review_links/page_question.py` — the store and page operations.
+- `scripts/review_links/change_page.py`, `scripts/review_links/change_browser.py`, `scripts/review_links/images.py`, `scripts/review_links/investigations_page.py`, `scripts/review_links/list_page.py`, `scripts/review_links/review_actions.py`, `scripts/review_links/review_page.py`, and `scripts/review_links/serve.py` — direct exception or record imports.
+- `scripts/production/change_review.py` and `scripts/production/delivery_state.py` — question exchange checks and their shared location.
+- `docs/as-built/staff-accessors.md` — the `StaffId` accessor entry.
+
+### Phase 54 — One fast-track call finds each path and ref once  · status: dropped
+**Result (2026-11-17):** dropped with no code change. One fetch under the landing lock and a reused worktree root cut Git starts by 2.62 percent (7,185 to 6,997); CPU rose from 56.4 s to 60.2 s. Below the 20 percent rule.
+
+**Depends on:** phase 53, phase 51 (order only); natest phase 323 (a0463a3b9) merged to main if test_fast_track.py changes
+
+#### Work Order
+
+**Goal:** the showrunner with builds (2026-11-17 14:40 EST): "remove repeated path and ref discovery inside one fast-track call (the gain counts for each real fast-track call too)." test_fast_track makes 7,185 Git starts on bab921f45. The top shapes are `rev-parse --path-format=absolute` 476, `fetch origin` 383, `rev-parse --show-toplevel` 350, `rev-parse HEAD` 303, `remote get-url` 156.
+
+**Spec:**
+1. Measure first with a PATH `git` shim that logs argv: Git starts by shape, CPU and wall time of `production/test_fast_track.py`, on the base.
+2. In one fast-track call, find the top-level folder, the common Git folder and the `origin` URL once, and pass them down. Fetch `origin` once for each step that needs a fresh ref.
+3. Keep each read of a mutable ref where its value can change inside the call. Keep every write as it is.
+4. The behavior of `reconcile`, `push_patch`, `restore_prepared` and `land_main.land` does not change.
+5. Out of scope: which tests need the full merge flow.
+6. natest owns `test_fast_track.py`. Change no line of it unless the base is main after natest phase 323 merges.
+
+**Files:**
+- `scripts/production/fast_track.py`
+- `scripts/lib/land_main.py` and the copy and slot helpers only where they repeat the same discovery inside one call
+
+**Workers:** 1 writer.
+
+**State:** none.
+
+**Acceptance gate:**
+1. `scripts.production.test_fast_track` passes.
+2. basedpyright reports 0 errors and 0 warnings on `scripts/production` and `scripts/lib`.
+3. The shim measure before and after shows 20 percent or more fewer Git starts and a CPU gain. If not, close with no change.
+4. The checkpoint carries the measured numbers in one line for builds.
+
+### Phase 55 — An image question card always says when a resend is needed  · status: done
+
+#### As-built
+
+`ImageQuestionDispatchState` records `started`, `started_after_unconfirmed`, or `accepted`. A refused resend after an unknown result keeps the earlier result unknown. Acceptance clears the notice.
+An explicit `saved: false` on a valid delivery record supplies the retry notice when the question has no active intent. An invalid saved-message record gives no resend notice and leaves the Images page available.
+
+**Files:**
+- `scripts/review_links/change_page.py` — dispatch state, failure selection, and validated reads of image question metadata.
+- `scripts/review_links/images.py` — the resend notice for an explicit unsaved intent.
+- `scripts/review_links/test_images.py` — refused resends, intent write failure, and invalid metadata fixtures.
+
+### Phase 56 — The timed-refresh browser tests pass under load  · status: done
+
+#### As-built
+
+The Images browser probes run the refresh callback scheduled by the page and wait for a named DOM condition through `MutationObserver`. `controlRefresh()` captures only the delivery refresh interval and advances the probe clock by its configured period.
+A tick that meets an active refresh tries again on the next animation frame.
+The test server joins its request handlers before fixture cleanup and gives each handler socket a five-second timeout.
+
+**Files:**
+- `scripts/review_links/test_images.py` — `question_probe()` and `run_question_browser()` cover focus, selection, and recovery after a failed refresh.
+
+**Gotchas:** The fixture uses a five-second refresh period and a 12-second limit per condition. A delayed refresh timer reproduces the timeout. CPU load alone does not establish the cause. Shared worktrees can cause separate fixture config and socket errors.
+
+### Phase 57 — A rename summary for one worker says "1 worker name unchanged"  · status: done
+
+#### As-built
+
+`rename_qualified_workers(owner)` in `scripts/agents/shutdown.py` prints `<N> worker name unchanged: no qualified prefix for <owner>` on stderr for a count of one, and `worker names` for any other positive count.
+
+**Files:**
+- `scripts/agents/shutdown.py` — the summary line.
+- `scripts/agents/test_shutdown_cli.py`, `scripts/production/test_unit_move.py` — the singular and plural summary assertions.
+
+### Phase 58 — Every validate message carries its validation id and command  · status: done
+**Result (2026-11-17):** the C368–C370 validate messages came at 10:55 EST from a server that ran code from before de367d2b2, whose formatter had no id line. C368 and C369 saved before the id check shipped; C370's verdict came after it. de367d2b2 already sends the id and the full command on the first send and on recovery. This phase adds the test assertions for both, which fail on the old formatter, and the Validate section of `commands/change_review.md` points to the command in the message.
+
+**Depends on:** Phase 57 (order only)
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-17), from the cargo-liner showrunner: the C370 verdict was refused with "this question id does not match the current question". It needed `--validation <attempt>`, but its "the user asks you to validate this" message did not carry the id. C368 and C369, from the same minute, saved without `--validation`. The sdlc validate messages C1839 and C1844 did carry "Validation id:" and the command.
+
+**Spec:**
+1. Find the code path that sent C370's validate message without "Validation id:" and the command (`scripts/review_links/change_page.py:1216-1218` builds the id line).
+2. Find why C368 and C369 saved without `--validation`, and state whether that is right.
+3. Every validate message carries the validation id and the full verdict command with `--validation`.
+4. The existing validate message test covers the case.
+5. `commands/change_review.md` (Validate) names `--validation <id>` and says the id is in the validate message.
+
+**Files:**
+- `scripts/review_links/change_page.py`
+- `scripts/review_links/test_change_page.py`
+- `scripts/production/change_review.py`, `scripts/production/test_change_review.py` if the cause is there
+- `commands/change_review.md`
+
+**Workers:** 1 writer (`design`).
+
+**State:** the delivery slots and validation records the change writes.
+
+**Acceptance gate:**
+1. basedpyright on every changed Python file: 0 errors, 0 warnings.
+2. The changed modules' suites pass.
+3. The new check fails without the fix.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3

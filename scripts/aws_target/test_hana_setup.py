@@ -157,7 +157,7 @@ class HanaSetupTests(CostFixture):
 
     def built_image(self) -> Path:
         result = self.root / 'store/0123456789abcdefghij-nixos-image-amazon'
-        (result / 'nix-support').mkdir(parents=True)
+        (result / 'nix-support').mkdir(parents=True, exist_ok=True)
         disk = result / 'nixos-image-amazon.vhd'
         _ = disk.write_bytes(b'fixture disk')
         _ = (result / 'nix-support/image-info.json').write_text(json.dumps({
@@ -173,7 +173,8 @@ class HanaSetupTests(CostFixture):
         with self.assertRaises(hana_image.ImageRefused):
             _ = hana_image.read_built(self.root / 'missing')
 
-    def image_aws(self, existing: bool) -> tuple[list[tuple[str, tuple[str, ...]]], object]:
+    def image_aws(self, existing: bool, *, registration_failure: bool = False,
+                  snapshot_states: tuple[str, ...] = ()) -> tuple[list[tuple[str, tuple[str, ...]]], object]:
         calls: list[tuple[str, tuple[str, ...]]] = []
         def api_call(operation: str, *arguments: str, service: str = 'ec2', timeout_s: float | None = None) -> dict[str, object]:
             _ = service, timeout_s
@@ -188,13 +189,20 @@ class HanaSetupTests(CostFixture):
                 if '--image-ids' in arguments or existing:
                     return {'Images': [{'ImageId': 'fixture-hana-image', 'OwnerId': 'fixture-owner', 'State': 'available'}]}
                 return {'Images': []}
+            if operation == 'describe-snapshots':
+                return {'Snapshots': [{'SnapshotId': 'fixture-snapshot' if index == 0 else f'fixture-snapshot-{index}',
+                                       'State': state} for index, state in enumerate(snapshot_states)]}
             if operation == 'register-image':
+                if registration_failure:
+                    raise deploy.DeploymentRefused('fixture registration failure')
                 return {'ImageId': 'fixture-hana-image'}
             return {}
         return calls, api_call
 
-    def run_image(self, existing: bool) -> tuple[list[tuple[str, tuple[str, ...]]], list[list[str]], list[list[str]]]:
-        calls, api_call = self.image_aws(existing)
+    def run_image(self, existing: bool, *, wait_failure: bool = False,
+                  registration_failure: bool = False,
+                  snapshot_states: tuple[str, ...] = ()) -> tuple[list[tuple[str, tuple[str, ...]]], list[list[str]], list[list[str]]]:
+        calls, api_call = self.image_aws(existing, registration_failure=registration_failure, snapshot_states=snapshot_states)
         local: list[list[str]] = []
         uploads: list[list[str]] = []
         def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float, check: bool,
@@ -207,6 +215,15 @@ class HanaSetupTests(CostFixture):
         def admin(_execute: object) -> object:
             def authorized(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
                 uploads.append(list(arguments))
+                if snapshot_states:
+                    self.assertNotIn('upload', arguments)
+                if 'upload' in arguments:
+                    self.assertIn('describe-snapshots', dict(calls))
+                if 'wait' in arguments:
+                    self.assertEqual(hana_image.saved(self.state), hana_image.PendingImageRegistration(
+                        'nixos-hana-26.05.fixture-0123456789ab', 'fixture-snapshot'))
+                    if wait_failure:
+                        return subprocess.CompletedProcess(list(arguments), 1, '', 'fixture wait failure')
                 return subprocess.CompletedProcess(list(arguments), 0, 'fixture-snapshot\n', '')
             return authorized
         subject = deploy.Deployment(self.settings, self.state, self.root / 'output', execute=execute,
@@ -231,17 +248,121 @@ class HanaSetupTests(CostFixture):
         calls, local, uploads = self.run_image(existing=False)
         self.assertEqual(local[0][:5], ['qemu-img', 'convert', '-f', 'vpc', '-O'])
         self.assertEqual(uploads[0][0], '/nix/store/fixture-coldsnap/bin/coldsnap')
+        self.assertNotIn('--wait', uploads[0])
+        tag = conf.read(self.settings)
+        cost_tag = f"Key={tag.text('cost_explorer_tag_key')},Value={tag.text('cost_explorer_tag_value')}"
+        self.assertEqual(uploads[0][uploads[0].index('--tag') + 1], cost_tag)
+        self.assertEqual(uploads[1][3:], ['wait', '--seconds-between-attempts', '15',
+                                        '--max-attempts', '240', 'fixture-snapshot'])
+        self.assertLessEqual(int(uploads[1][uploads[1].index('--max-attempts') + 1]), 255)
         register = dict(calls)['register-image']
+        self.assertEqual(register[register.index('--tag-specifications') + 1:],
+                         (f'ResourceType=image,Tags=[{{{cost_tag}}}]',))
         self.assertIn('v2.0', register)
         self.assertIn('DeviceName=/dev/xvda,Ebs={SnapshotId=fixture-snapshot,VolumeType=gp3,DeleteOnTermination=true}', register)
         self.assertEqual(hana_image.saved(self.state), hana_image.RegisteredImage(
             'nixos-hana-26.05.fixture-0123456789ab', 'fixture-hana-image', 'fixture-owner', 'fixture-vpc', 'fixture-subnet-b'))
 
     def test_image_with_the_same_name_is_not_uploaded_again(self) -> None:
+        _ = hana_image.save(self.state, hana_image.PendingImageRegistration(
+            'nixos-hana-26.05.fixture-0123456789ab', 'fixture-snapshot'))
         calls, local, uploads = self.run_image(existing=True)
         self.assertEqual((local, uploads), ([], []))
         self.assertNotIn('register-image', dict(calls))
         self.assertIsInstance(hana_image.saved(self.state), hana_image.RegisteredImage)
+
+    def test_completed_snapshot_with_the_image_description_is_registered_without_upload(self) -> None:
+        calls, local, uploads = self.run_image(existing=False, snapshot_states=('completed',))
+        self.assertEqual(dict(calls)['describe-snapshots'], ('--owner-ids', 'self', '--filters',
+                         'Name=description,Values=nixos-hana-26.05.fixture-0123456789ab'))
+        self.assertEqual([call[0] for call in local], ['nix'])
+        self.assertEqual([call[3:] for call in uploads], [['wait', '--seconds-between-attempts', '15',
+                                                        '--max-attempts', '240', 'fixture-snapshot']])
+        self.assertIn('SnapshotId=fixture-snapshot', ' '.join(dict(calls)['register-image']))
+        self.assertIsInstance(hana_image.saved(self.state), hana_image.RegisteredImage)
+
+    def test_pending_snapshot_with_the_image_description_is_saved_before_wait(self) -> None:
+        with self.assertRaisesRegex(deploy.DeploymentRefused, 'fixture wait failure'):
+            _ = self.run_image(existing=False, snapshot_states=('pending',), wait_failure=True)
+        self.assertEqual(hana_image.saved(self.state), hana_image.PendingImageRegistration(
+            'nixos-hana-26.05.fixture-0123456789ab', 'fixture-snapshot'))
+        calls, local, uploads = self.run_image(existing=False)
+        self.assertNotIn('describe-snapshots', dict(calls))
+        self.assertEqual([call[0] for call in local], ['nix'])
+        self.assertEqual([call[3:] for call in uploads], [['wait', '--seconds-between-attempts', '15',
+                                                        '--max-attempts', '240', 'fixture-snapshot']])
+        self.assertIn('register-image', dict(calls))
+
+    def test_multiple_snapshots_or_error_snapshot_refuse_without_upload(self) -> None:
+        subject = self.subject(FakeAws(self.clock))
+        result = self.built_image()
+        for states in (('completed', 'pending'), ('error',)):
+            with self.subTest(states=states):
+                calls, api_call = self.image_aws(existing=False, snapshot_states=states)
+                authorized = mock.Mock()
+                with mock.patch.object(deploy, 'read_deployment_settings', return_value=self.base_settings()), \
+                        mock.patch.object(subject, '_authorize'), mock.patch.object(subject, '_guard'), \
+                        mock.patch.object(subject, 'execute') as execute, \
+                        mock.patch.object(subject.admin, 'executor', return_value=authorized), \
+                        mock.patch.object(aws_cli.AwsCli, 'call', side_effect=api_call), \
+                        mock.patch('sys.stdout', new_callable=StringIO):
+                    with self.assertRaisesRegex(deploy.DeploymentRefused,
+                            f'{len(states)} matching snapshots; states: ' + ', '.join(states)):
+                        _ = subject.hana_image(result, approve_resources=True)
+                execute.assert_not_called()
+                authorized.assert_not_called()
+                self.assertNotIn('register-image', dict(calls))
+                self.assertIsInstance(hana_image.saved(self.state), hana_image.NoRegisteredImage)
+
+    def test_no_matching_snapshot_uploads_with_the_image_description(self) -> None:
+        calls, _, uploads = self.run_image(existing=False)
+        operations = [operation for operation, _ in calls]
+        self.assertLess(operations.index('describe-images'), operations.index('describe-snapshots'))
+        self.assertLess(operations.index('describe-snapshots'), operations.index('register-image'))
+        self.assertEqual(uploads[0][3], 'upload')
+        self.assertEqual(uploads[0][uploads[0].index('--description') + 1],
+                         'nixos-hana-26.05.fixture-0123456789ab')
+
+    def test_image_wait_failure_keeps_the_snapshot_and_retry_does_not_upload(self) -> None:
+        with self.assertRaisesRegex(deploy.DeploymentRefused, 'fixture wait failure'):
+            _ = self.run_image(existing=False, wait_failure=True)
+        self.assertEqual(hana_image.saved(self.state), hana_image.PendingImageRegistration(
+            'nixos-hana-26.05.fixture-0123456789ab', 'fixture-snapshot'))
+        self.assertFalse((self.root / 'output/hana/image.raw').exists())
+        calls, local, uploads = self.run_image(existing=False)
+        self.assertEqual([call[0] for call in local], ['nix'])
+        self.assertEqual([call[3:] for call in uploads], [['wait', '--seconds-between-attempts', '15',
+                                                        '--max-attempts', '240', 'fixture-snapshot']])
+        self.assertIn('SnapshotId=fixture-snapshot', ' '.join(dict(calls)['register-image']))
+        self.assertIsInstance(hana_image.saved(self.state), hana_image.RegisteredImage)
+
+    def test_image_registration_failure_keeps_the_pending_snapshot(self) -> None:
+        with self.assertRaisesRegex(deploy.DeploymentRefused, 'fixture registration failure'):
+            _ = self.run_image(existing=False, registration_failure=True)
+        self.assertEqual(hana_image.saved(self.state), hana_image.PendingImageRegistration(
+            'nixos-hana-26.05.fixture-0123456789ab', 'fixture-snapshot'))
+        self.assertFalse((self.root / 'output/hana/image.raw').exists())
+        calls, _, uploads = self.run_image(existing=False)
+        self.assertEqual([call[3:] for call in uploads], [['wait', '--seconds-between-attempts', '15',
+                                                        '--max-attempts', '240', 'fixture-snapshot']])
+        self.assertIn('register-image', dict(calls))
+        self.assertIsInstance(hana_image.saved(self.state), hana_image.RegisteredImage)
+
+    def test_pending_snapshot_for_another_image_does_not_skip_upload(self) -> None:
+        _ = hana_image.save(self.state, hana_image.PendingImageRegistration('another-image', 'another-snapshot'))
+        _, _, uploads = self.run_image(existing=False)
+        self.assertEqual(uploads[0][3], 'upload')
+        self.assertEqual(uploads[1][3:], ['wait', '--seconds-between-attempts', '15',
+                                        '--max-attempts', '240', 'fixture-snapshot'])
+
+    def test_pending_snapshot_does_not_supply_hana_inputs(self) -> None:
+        _ = hana_image.save(self.state, hana_image.PendingImageRegistration('fixture-name', 'fixture-snapshot'))
+        text_setting(self.workload, 'ami_id', '')
+        text_setting(self.workload, 'ami_owner_id', '')
+        subject = self.subject(FakeAws(self.clock))
+        with mock.patch.object(deploy, 'read_deployment_settings', return_value=self.base_settings()):
+            with self.assertRaisesRegex(deploy.DeploymentRefused, 'Configure the reviewed Hana image'):
+                _ = subject._hana_inputs()  # pyright: ignore[reportPrivateUsage]
 
     def test_saved_image_fills_only_empty_configuration_values(self) -> None:
         _ = hana_image.save(self.state, hana_image.RegisteredImage('fixture-name', 'saved-image', 'saved-owner',

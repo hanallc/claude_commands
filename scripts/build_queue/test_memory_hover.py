@@ -16,6 +16,8 @@ from scripts.lint.memory_test_support import admission_policy_fixture
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import test_hang_guard
 from scripts.review_links import page_frame
+from scripts.production import staff
+from scripts.review_links import staff_names
 GIB = admission_records.GIB
 MIB = 1024 ** 2
 RAM_FIXTURE: dict[str, object] = {
@@ -36,6 +38,62 @@ SWAP_FIXTURE: dict[str, object] = {"used_bytes": 3 * GIB, "capacity_bytes": 8 * 
 
 
 class MemoryHoverTests(unittest.TestCase):
+    def test_row_staff_names_have_role_colors_and_free_names_stay_plain(self) -> None:
+        unit = staff.StaffRow(staff.StaffId("builder"), "unit", "builder", staff.StaffRoot(), current_session=staff.StaffId("builder"))
+        names = staff_names.StaffNames(staff.StaffSnapshot((unit,)))
+        setup = "globalThis.window=globalThis;" + staff_names.script(names.registry())[8:-9]
+        body = str(self.page_expression("(()=>{" + setup + "return rowLabel('Compile', 'builder')+rowLabel('Compile', 'nate');})()", {}, walk=True))
+        self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>builder</span>')
+        self.assertIn('<span class="owner">nate</span>', body)
+
+    def role_setup(self) -> str:
+        members = tuple(staff.StaffRow(staff.StaffId(name), "unit", name, staff.StaffRoot(),
+                        current_session=staff.StaffId(name)) for name in ("builder", "helper"))
+        names = staff_names.StaffNames(staff.StaffSnapshot(members))
+        return "globalThis.window=globalThis;" + staff_names.script(names.registry())[8:-9]
+
+    def test_target_fallback_keeps_holder_text_and_colors_only_staff_names(self) -> None:
+        for holder in ("nate", "builder", "<unknown>"):
+            for role_label in ("", "—"):
+                with self.subTest(holder=holder, role_label=role_label):
+                    rows = [{"target": "Mac", "state": "Held", "until": "", "since": "",
+                             "holder": holder, "unit": role_label, "showrunner": role_label}]
+                    body = str(self.page_expression("(()=>{" + self.role_setup()
+                        + "renderTargets(data.targets);return $('targets').innerHTML;})()", {"targets": rows}, walk=True))
+                    owner = ElementTree.fromstring("<root>" + body + "</root>").find(".//div[@class='target-owner']")
+                    assert owner is not None
+                    self.assertEqual("".join(owner.itertext()), "Holder " + holder)
+                    self.assertEqual(len(owner.findall("span")), int(holder == "builder"))
+
+    def test_priority_tooltips_color_each_name_before_joining(self) -> None:
+        entries = [{"unit": name} for name in ("builder", "helper", "<unknown>")]
+        data = {"unmatched_priority_entries": entries,
+                "walk": [{"name": "Compile", "priority_entries": entries, "queued": True}]}
+        for key in ("walkhead", "row:fixture-run-0"):
+            with self.subTest(key=key):
+                body = str(self.page_expression("(()=>{" + self.role_setup()
+                    + "return tooltipHtml(" + json.dumps(key) + ",data);})()", data, walk=True))
+                grid = ElementTree.fromstring(body)
+                priority = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == "Priority")
+                self.assertEqual("".join(priority.itertext()), "builder, helper, <unknown>")
+                self.assertEqual([span.text for span in priority.findall("span")], ["builder", "helper"])
+
+    def test_tooltip_colors_only_fields_that_name_staff(self) -> None:
+        data = {"waiters": [{"name": "Compile", "unit": "builder", "showrunner": "helper",
+                "runner": "worker", "worker": "builder", "kind": "repository-slot",
+                "because": "builder", "runs_on": "builder", "why": "builder"}]}
+        body = str(self.page_expression("(()=>{" + self.role_setup()
+            + "return tooltipHtml('wait:fixture-wait-0',data);})()", data, walk=True))
+        grid = ElementTree.fromstring(body)
+        for label in ("Because", "Runs on"):
+            value = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == label)
+            self.assertEqual(value.text, "builder")
+            self.assertEqual(list(value), [])
+        for label, name in (("Showrunner", "helper"), ("Worker", "builder")):
+            value = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == label)
+            self.assertEqual(value.findtext("span"), name)
+        self.assertEqual(grid[0].findtext("span"), "builder")
+
     def test_builds_page_has_no_navigation_or_framing_restriction(self) -> None:
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         self.assertIn("<title>Builds</title>", page)
@@ -761,7 +819,7 @@ process.stdout.write(JSON.stringify(steps));
             ["ignored", 2, False], ["foreign", 2, False], ["resumed", 4, True],
             ["input, textarea, select, button, summary, [contenteditable]"]])
 
-    def page_expression(self, expression: str, data: object, *, walk: bool = False) -> object:
+    def page_expression(self, expression: str, data: object, *, walk: bool = False, swap: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("function field("):html.index("const tip =")]
         constants = ""
@@ -776,6 +834,10 @@ const $ = id => {
 };
 function fitLabels() {}
 """
+        if swap:
+            start = html.index("const swapView =")
+            functions += html[start:html.index('document.addEventListener("click", (e) => {', start)]
+            constants += "function placeLimitLabels() {}\nconst document = {querySelectorAll: () => []};\n"
         javascript = functions + constants + "\nconst data = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n" + (
             "process.stdout.write(JSON.stringify(" + expression + "));\n")
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
@@ -932,6 +994,112 @@ function fitLabels() {}
         fits = {"code": "gpu_slot", "active_local_build_count": 1, "next_need_bytes": 2 * GIB, "check_room_bytes": 9 * GIB}
         self.assertEqual(self.page_expression("statusLine(data)", {"ram": RAM_FIXTURE, "memory_status": fits}),
                          "A GPU test waits: another GPU test holds the GPU test slot.")
+
+    def test_swap_titles_color_marked_staff_and_keep_program_titles_plain(self) -> None:
+        for title_kind, name, expected in (("staff", "builder", ["builder"]),
+                ("program", "builder", []), ("staff", "<unknown>", [])):
+            with self.subTest(title_kind=title_kind, name=name):
+                data = {"swap_by": [{"name": name, "title_kind": title_kind, "kind": "owner",
+                                     "bytes": GIB, "owner_count": 0}]}
+                body = str(self.page_expression("(()=>{" + self.role_setup()
+                    + "return tooltipHtml('swap:0',data);})()", data, walk=True))
+                grid = ElementTree.fromstring(body)
+                self.assertEqual(''.join(grid[0].itertext()), name)
+                self.assertEqual(grid[1].text, "1.0 GiB")
+                self.assertEqual([span.text for span in grid[0].findall('span')], expected)
+
+    def test_swap_chart_colors_only_marked_staff_titles_and_members(self) -> None:
+        for title_kind, name, expected in (("staff", "builder", ["builder"]),
+                ("program", "builder", []), ("staff", "<unknown>", []), ("", "builder", [])):
+            for grouped in (False, True):
+                with self.subTest(title_kind=title_kind, name=name, grouped=grouped):
+                    owner = {"name": name, "title_kind": title_kind, "kind": "owner", "pool": "outside",
+                             "bytes": GIB, "detail": "helper", "owner_count": 0}
+                    row = {"name": "1 smaller groups", "kind": "smaller", "pool": "outside", "bytes": GIB,
+                           "members": [owner]} if grouped else owner
+                    data = {"swap_by": [row], "psi": {"some": 0, "full": 0},
+                            "limits": {"some": 10, "full": 10}, "pressure": "none"}
+                    body = str(self.page_expression("(()=>{" + self.role_setup()
+                        + "renderSwap(data);return $('swaprows').innerHTML;})()", data, walk=True, swap=True))
+                    root = ElementTree.fromstring("<root>" + body + "</root>")
+                    chart_row = root.find(".//div[@data-tip='swap:0']")
+                    assert chart_row is not None
+                    self.assertEqual([span.text for span in chart_row.findall(".//span[@class='staff-name']")], expected)
+                    if grouped:
+                        member = chart_row.find(".//div[@class='swap-members']/div")
+                        assert member is not None
+                        self.assertEqual("".join(member.itertext()), name + ": 1.0 GiB")
+                    else:
+                        title = chart_row.find("span[@class='name']")
+                        assert title is not None
+                        self.assertEqual("".join(title.itertext()), name)
+                        self.assertEqual(chart_row.findtext("small"), "helper")
+
+    def test_swap_detail_staff_parts_keep_paths_and_matching_free_text_plain(self) -> None:
+        for owner, expected in (("builder", ["builder"]), ("<unknown>", [])):
+            with self.subTest(owner=owner):
+                data = {"swap_by": [{"name": "Compile", "kind": "owner", "pool": "outside", "bytes": GIB,
+                    "detail": owner + " · /fixture/path · helper", "detail_parts": [
+                        {"kind": "staff", "text": owner}, {"kind": "text", "text": " · /fixture/path · helper"}]}],
+                    "psi": {"some": 0, "full": 0}, "limits": {"some": 10, "full": 10}, "pressure": "none"}
+                body = str(self.page_expression("(()=>{" + self.role_setup()
+                    + "renderSwap(data);return $('swaprows').innerHTML;})()", data, walk=True, swap=True))
+                detail = ElementTree.fromstring("<root>" + body + "</root>").find(".//div[@data-tip='swap:0']/small")
+                assert detail is not None
+                self.assertEqual("".join(detail.itertext()), owner + " · /fixture/path · helper")
+                self.assertEqual([span.text for span in detail.findall("span")], expected)
+
+    def test_swap_detail_parts_keep_the_existing_public_text_filter(self) -> None:
+        for path in ("builds.slice/fixture.scope", "user.slice/fixture.service", "—", "/fixture/path"):
+            with self.subTest(path=path):
+                row: dict[str, object] = {"name": "Compile", "kind": "owner", "pool": "outside", "bytes": GIB,
+                    "detail": "builder · " + path + " · helper · 512 MiB"}
+                data = {"swap_by": [row], "psi": {"some": 0, "full": 0},
+                        "limits": {"some": 10, "full": 10}, "pressure": "none"}
+                expression = "(()=>{" + self.role_setup() + "renderSwap(data);return $('swaprows').innerHTML;})()"
+                old = str(self.page_expression(expression, data, walk=True, swap=True))
+                row["detail_parts"] = [{"kind": "staff", "text": "builder"},
+                    {"kind": "text", "text": " · " + path + " · helper · 512 MiB"}]
+                new = str(self.page_expression(expression, data, walk=True, swap=True))
+                old_detail = ElementTree.fromstring("<root>" + old + "</root>").find(".//div[@data-tip='swap:0']/small")
+                new_detail = ElementTree.fromstring("<root>" + new + "</root>").find(".//div[@data-tip='swap:0']/small")
+                assert old_detail is not None and new_detail is not None
+                self.assertEqual("".join(new_detail.itertext()), "".join(old_detail.itertext()))
+                self.assertEqual([span.text for span in new_detail.findall("span")], ["builder"])
+
+    def test_grouped_process_tooltips_color_staff_parts_and_keep_programs_plain(self) -> None:
+        data = {"walk": [{"name": "unowned processes (1)", "group": "unowned processes", "used": 0.2,
+            "parts": [{"who": "builder · helper", "who_parts": [{"kind": "staff", "text": "builder"},
+                {"kind": "text", "text": " · helper"}], "pid": 123, "started_at": 0, "gib": 0.2}]}]}
+        body = str(self.page_expression("(()=>{" + self.role_setup()
+            + "return tooltipHtml('row:fixture-run-0',data);})()", data, walk=True))
+        grid = ElementTree.fromstring(body)
+        label = next(cell for cell in grid if "builder" in "".join(cell.itertext()))
+        self.assertEqual("".join(label.itertext()), "builder · helper · 123")
+        self.assertEqual([span.text for span in label.findall("span")], ["builder"])
+        walk = cast(list[dict[str, object]], data["walk"])
+        parts = cast(list[dict[str, object]], walk[0]["parts"])
+        del parts[0]["who_parts"]
+        plain = str(self.page_expression("tooltipHtml('row:fixture-run-0',data)", data, walk=True))
+        self.assertEqual("".join(grid.itertext()), "".join(ElementTree.fromstring(plain).itertext()))
+
+    def test_gate_and_route_text_color_only_marked_staff_parts(self) -> None:
+        data = {"waiters": [{"name": "Compile", "unit": "", "about": "Tests builder; helper stays plain",
+            "about_parts": [{"kind": "text", "text": "Tests "}, {"kind": "staff", "text": "builder"},
+                {"kind": "text", "text": "; helper stays plain"}], "runs_on": "Mac", "kind": "repository-slot",
+            "because": "Held by builder; helper stays plain", "because_parts": [
+                {"kind": "text", "text": "Held by "}, {"kind": "staff", "text": "builder"},
+                {"kind": "text", "text": "; helper stays plain"}]}]}
+        body = str(self.page_expression("(()=>{" + self.role_setup()
+            + "return tooltipHtml('wait:fixture-wait-0',data);})()", data, walk=True))
+        grid = ElementTree.fromstring(body)
+        values = [cell for cell in grid if cell.tag == "dd" and "helper stays plain" in "".join(cell.itertext())]
+        self.assertEqual(len(values), 2)
+        self.assertTrue(all([span.text for span in cell.findall("span")] == ["builder"] for cell in values))
+        for field in ("about_parts", "because_parts"):
+            del data["waiters"][0][field]
+        plain = str(self.page_expression("tooltipHtml('wait:fixture-wait-0',data)", data, walk=True))
+        self.assertEqual("".join(grid.itertext()), "".join(ElementTree.fromstring(plain).itertext()))
 
     def test_swap_rows_use_their_own_text_and_show_one_owner_only(self) -> None:
         def row(name: str, kind: str, amount: int, **extra: object) -> dict[str, object]:
