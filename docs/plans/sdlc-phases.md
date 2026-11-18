@@ -984,8 +984,10 @@ The test server joins its request handlers before fixture cleanup and gives each
 2. Tests: Ask question removes the card and its counts; an answer brings it back with the question, the answer and all buttons; a direct link to a waiting image shows the one line and no buttons. Each fails on main.
 3. The Images and Review page suites pass. basedpyright: 0 errors, 0 warnings.
 
-### Phase 67 — A unit name that ends in -unit is refused  · status: todo
+### Phase 67 — A unit name that ends in -unit is refused  · status: done
 **Depends on:** none
+
+**Result:** `staff.validate_unit_name_for_write` holds the rule. Staff row creation, `staff.rename` and `staff.change_director` call it, and `add_unit`, `agents rename` (plan and apply), retired resume, `promote_showrunner`, `demote_showrunner` and `producer_transfer` check it before they change files or sessions. A refusal prints `StaffRefused: unit name '<name>' must not end in -unit` and exits 2. Alias lookups of the `-unit` form and old records that hold such a name still work. Tests use fixture staff files only.
 
 #### Work Order
 

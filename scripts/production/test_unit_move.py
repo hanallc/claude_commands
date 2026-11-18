@@ -27,7 +27,7 @@ from scripts.production.add_unit_test_support import AddUnitTestCase
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_unit_test_support import FolderRenameFixture, FolderSessionFixture
 from scripts.production.rename_rerun_test_support import file_versions, saved_fixture
-from scripts.production.staff_test_support import fixture_member, fixture_worker
+from scripts.production.staff_test_support import fixture_member, fixture_unit_saved_name, fixture_worker
 from scripts.agents import pane_record, restart, shutdown_record
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.herdr import herdr
@@ -1057,7 +1057,7 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
                                  expected=self.owner.worktree)
         row = staff.rename(row.id, "startup")
         _ = unit_move.prepare_rename(row, destination, "tool-based-ui-startup-unit", "startup-unit")
-        row = staff.rename(row.id, "startup-unit")
+        row = fixture_unit_saved_name(row, "startup-unit")
         path = unit_move.rename_move_path(row.id)
         before = path.read_bytes()
         plan = shutdown.rename_plan(str(row.id), "startup")

@@ -331,9 +331,10 @@ def _main(argv: list[str]) -> int:
     _ = parser.add_argument("--effort", required=True, help="pass your own effort level")
     _ = parser.add_argument("--check", action="store_true", help="run every refusal and stop nothing")
     args = parser.parse_args(argv)
-    record = staff.snapshot()
     unit_name = cast(str, args.unit)
     child_name = cast(str, args.production) or unit_name
+    staff.validate_unit_name_for_write(child_name)
+    record = staff.snapshot()
     document = cast(Path | ProductionDocumentDefault, args.doc)
     model = cast(str, args.model)
     effort = cast(str, args.effort)

@@ -248,6 +248,23 @@ with patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(row.curr
 '''
 
 
+def fixture_unit_saved_name(row: staff.StaffRow, name: str) -> staff.StaffRow:
+    """Seed an old unit name in the private staff file."""
+    configured = os.environ.get("STAFF_TEST_OWNER_FILE") or os.environ.get("STAFF_FILE")
+    if row.kind != "unit" or not configured:
+        raise AssertionError("A saved unit name requires a private staff fixture.")
+    path = Path(configured).resolve()
+    if not any(path.is_relative_to(root.resolve()) for root in (Path(tempfile.gettempdir()), Path("/tmp"))):
+        raise AssertionError("The staff fixture must be in a temporary directory.")
+    with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        document = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+        fields = next(value for value in cast(list[dict[str, object]], document["rows"]) if value["id"] == row.id)
+        fields["name"] = name
+        write_text_atomic(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+    return replace(row, name=name)
+
+
 def fixture_member(kind: staff.Kind, *, name: str,
                    parent: staff.StaffId | staff.ReportsTo | staff.StaffRoot | None = None,
                    worktree: staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled = UNFILLED_WORKTREE,
@@ -268,6 +285,14 @@ def fixture_member(kind: staff.Kind, *, name: str,
         row = staff.ensure_worker(staff.native_id(identity), name, parent_id)
         fixture_session(identity, backend)
         return staff.by_id(row.id) or row
+    if kind == "unit" and not existing:
+        try:
+            staff.validate_unit_name_for_write(name)
+        except staff.StaffRefused:
+            # Keep legacy test inputs while the real writer refuses new rows with these names.
+            row = staff.ensure(kind, name=f"fixture-{identity}", parent=relationship,
+                               worktree=worktree, doc=doc, runtime_id=identity)
+            return fixture_unit_saved_name(row, name)
     return staff.ensure(kind, name=name, parent=relationship,
                         worktree=worktree, doc=doc, runtime_id=identity)
 
