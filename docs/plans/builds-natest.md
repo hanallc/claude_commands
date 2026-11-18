@@ -4848,3 +4848,50 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The token and Mac fixture environments drop inherited `GIT_*` variables.
 - AWS pair (3 rounds, c7a.4xlarge): 43.57 -> 26.50 CPU s, a saving of 17.03 s; 26 tests pass.
 - Floor: ten live tests use 25.1 CPU s on natedev. Architecture proposal: move the placement and repair decisions in `verify.sh` into a callable Python coordinator.
+
+### Phase 349 — the verify Mac-only tests use less aws CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `direct/test_verify_mac_only.py` costs at most half its AWS CPU (46.0 s median, 21 tests) with every assertion kept.
+
+**Spec:**
+1. Base: origin/main f22102f37, worktree `~/worktrees/claude-natedev-natest-maconly`, branch `natest-maconly349`.
+2. Profile first: `python3 scripts/test_times/module_cost.py --tree <worktree> direct/test_verify_mac_only.py --tests 20 --commands 20`. Name the costs by test and by command.
+3. The slowest kept test is `VerifyMacOnlyTests.test_runner_refusals_never_fall_back_or_retry` (6.0 s).
+4. Cut repeated process starts and Git calls: share one fixture build per class, call Python in process where the test checks Python output, and keep real subprocess runs only where the test proves process behavior.
+5. Tests read no value /tune can change. Fixtures drop inherited `GIT_*` variables. No signal handlers, no lazy imports, no test-count goals.
+6. If the floor stays above half, name the architecture change that would cut it.
+
+**Files:** `scripts/direct/test_verify_mac_only.py` and its test support; production code only where a defect lives.
+
+**Acceptance gate:** the module passes; AWS pair (3 rounds) shows the saving; basedpyright clean on changed files.
+
+### Phase 350 — the list page tests share one browser for each class  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `review_links/test_list_page.py` costs at most half its AWS CPU (49.2 s median) with every assertion kept.
+
+**Spec:**
+1. Base: origin/main f22102f37, worktree `~/worktrees/claude-natedev-natest-listpage`, branch `natest-listpage350`. Merge unit-board's listwait from main before the hash goes to builds (about 09:55 EST).
+2. Profile first: `python3 scripts/test_times/module_cost.py --tree <worktree> review_links/test_list_page.py --tests 20 --commands 20`. Name the costs by test and by command.
+3. Each browser test starts its own headless Chrome or Firefox (lines 524, 774, 2426, 2481, 2715, 3173). Start one headless browser for each test class and open a new page for each test. Keep a fresh browser only where a test proves browser start behavior.
+4. Screenshot proofs keep their output files and checks.
+5. Tests read no value /tune can change. Fixtures drop inherited `GIT_*` variables. No signal handlers, no lazy imports, no test-count goals.
+6. If the floor stays above half, name the architecture change that would cut it.
+
+**Files:** `scripts/review_links/test_list_page.py` and its test support; production code only where a defect lives.
+
+**Acceptance gate:** the module passes; AWS pair (3 rounds) shows the saving; basedpyright clean on changed files.
+
+### Phase 351 — the status line change passes the merge gate  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Hash aa398e529e6186138c6d56c30b5c0550e19f8718 on branch `natest-statusline345`; it replaces 2954b844c and holds main 64a123c5f.
+- `status_lines` moved to `scripts/statusline/statusline_test_support.py`. Each call makes its own private zone file and pane folder, so `review_links/test_accounts_page.py` calls it without the `test_statusline` module setup. Both modules import it at the top.
+- Full suite: 858 modules pass. `test_statusline` keeps the 345 saving (38.8 CPU s on natedev).
