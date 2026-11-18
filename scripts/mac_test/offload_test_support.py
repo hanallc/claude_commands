@@ -27,7 +27,6 @@ from scripts.copies.copies_test_support import copies_environment
 from scripts.lint.memory_test_support import write_config_fixture, config_environment
 
 from scripts.mac_test import eligibility, offload, mac_test
-from scripts.lib import conf
 from scripts.buildlog import treekey
 from scripts.buildlog import sync as buildlog_sync
 from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
@@ -148,7 +147,7 @@ class RemoteClaimRecord(TypedDict):
 
 HANA = eligibility.KnownRepository("hana")
 
-FIXTURE_MIRROR_ROOT = conf.read(Path(__file__).resolve().parents[2] / "config/mac_test.conf").text("mirror_root").removeprefix("~/")
+FIXTURE_MIRROR_ROOT = ".local/state/mac-test/test-mirror"
 
 HANA_COMMAND_PATTERN = offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/hana([/'\"[:space:]]|$)"
 
@@ -294,6 +293,7 @@ class OffloadCommandFixture(unittest.TestCase):
         for name in ("ssh", "rsync", "gh", "systemd-run"):
             (self.bin_directory / name).symlink_to(stub)
         self.config = {
+            "mirror_root": "~/" + FIXTURE_MIRROR_ROOT,
             "offload": "on",
             "host": "mac",
             "connect_timeout_s": "6",
@@ -341,6 +341,8 @@ class OffloadCommandFixture(unittest.TestCase):
             self.addCleanup(os.close, descriptor)
         self.sync_config()
         self.sync_fixture()
+        _ = write_config_fixture(self.root / "build_targets.conf", "platform.mac=macos\n")
+        _ = write_config_fixture(self.root / "config/copies.conf", "owner.verify=verify\n")
         self.environment = {
             **os.environ, **interpreter_cache_environment(self.root / "cache"),
             **config_environment(self.root),

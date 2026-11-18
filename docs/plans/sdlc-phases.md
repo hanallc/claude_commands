@@ -770,6 +770,36 @@ The test server joins its request handlers before fixture cleanup and gives each
 2. The changed modules' suites pass.
 3. The new check fails without the fix.
 
+### Phase 59 — A short-lived vault index lock retries and asks no question  · status: done
+**Depends on:** none
+
+**Result:** a held vault index lock retries each hour and files the vault_locked question only after the same lock stays past `vault.lock_question_age_s` (new key, 7200 s). The Mac `stat` gives device, inode and birth time; a new lock starts a new age, and a lock with no identity ages from its first stop. 47 vault tests pass; basedpyright clean.
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-17), from a natedev finding: `scripts/buildlog/vault_pull.py` on the Mac hit "index.lock: File exists" on 11-16 16:11 EST and 11-17 16:17 EST and filed a user question each time. The lock was transient: another Git process in the vault held it. When the index lock is held, wait and retry. File the vault_locked question only when the same lock stays past a set age.
+
+**Spec:**
+1. Find why both runs filed a question: the in-script retry (`vault.lock_retries`, `vault.lock_retry_delay_s`) and the second-stop rule in `_vault_locked`. Use the vault state and the message log; read only.
+2. A held index lock gives a retry, not a question. The run reports the lock and the next run tries again.
+3. File the vault_locked question only when the same lock (the same index.lock file, by its modification time or another stable identity the remote script can print) stays past a set age. A new lock starts a new age.
+4. The age is a new key in `config/build_targets.conf`, with a range comment like its neighbours. The retry pause uses the existing `vault.lock_retry_delay_s`, or a new key if its meaning changes; do not change an existing key's meaning or range.
+5. Tests write a fixture config; no test reads the live value. Add the cases to the existing vault lock tests.
+
+**Files:**
+- `scripts/buildlog/vault_pull.py`
+- `scripts/buildlog/test_vault_pull.py`
+- `config/build_targets.conf`
+
+**Workers:** 1 writer (`design`).
+
+**State:** the vault state file and its outage record.
+
+**Acceptance gate:**
+1. basedpyright on the changed Python files: 0 errors, 0 warnings.
+2. `scripts.buildlog.test_vault_pull` passes.
+3. The new checks fail without the fix.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 

@@ -17,13 +17,14 @@ from unittest import mock
 
 from scripts.aws_target import hana_box as box, hana_placement as hana, hana_placement_adapter as adapter, hana_spend, ledger
 from scripts.aws_target.control_test_support import TestClock
-from scripts.aws_target.ledger_test_support import CostFixture, git_only, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, text_setting
 from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY
 from scripts.build_targets import build_targets, target_config
 from scripts.build_queue import admission_protocol as wire, admission_records as records, placement
 from scripts.buildlog import store
 from scripts.lib import conf, process_start
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility
 from scripts.build_hold.owning_session import OwningSession
 
@@ -31,48 +32,6 @@ from scripts.build_hold.owning_session import OwningSession
 REPOSITORY = Path(__file__).resolve().parents[2]
 KEY = 'https://github.com/natepiano/hana'
 PREVIEW_SECONDS = 2
-HANA_SETTINGS = f"""\
-enabled=on
-execution_transport=hana-control
-host=fixture-hana
-repository_identity={KEY}
-kinds=check,lint
-region=us-east-2
-instance_type=m7a.2xlarge
-spot_max_usd_per_hour=0.25
-daily_budget_usd=6
-gp3_usd_per_gib_month=0.08
-# whole: 1..5
-preview_max_age_s={PREVIEW_SECONDS}
-# whole: 1..
-max_steps=1
-# whole: 1..
-free_floor_gib=30
-# whole: 1..
-root_gib=40
-# whole: 1..
-data_gib=300
-# whole: 1..
-guard_grace_seconds=60
-# whole: 1..
-watchdog_check_seconds=1
-# whole: 1..
-permit_max_seconds=1800
-# whole: 1..
-step_cpu_limit=4
-# whole: 1..
-step_memory_gib=24
-# whole: 1..
-mount_timeout_seconds=15
-# whole: 1..
-idle_stop_seconds=600
-# whole: 1..
-start_timeout_seconds=120
-# whole: 1..
-tick_interval_s=5
-# whole: 1..
-controller_tick_timeout_s=45
-"""
 
 
 class HanaPlacementTests(CostFixture):
@@ -97,7 +56,12 @@ class HanaPlacementTests(CostFixture):
         super().setUp()
         _ = self.enterContext(mock.patch.object(subprocess, 'run', side_effect=git_only))
         self.workload = self.root / 'hana_aws.conf'
-        _ = self.workload.write_text(HANA_SETTINGS)
+        install_hana_spending_settings(self.workload)
+        _ = write_config_fixture(self.workload,
+            f'host=fixture-hana\nexecution_transport=hana-control\nrepository_identity={KEY}\nkinds=check,lint\n'
+            + f'# whole: 1..5\npreview_max_age_s={PREVIEW_SECONDS}\n'
+            + 'max_steps=1\nfree_floor_gib=30\nidle_stop_seconds=600\nstart_timeout_seconds=120\n'
+            + 'tick_interval_s=5\ncontroller_tick_timeout_s=45\n')
         self.clock = TestClock()
         book = ledger.CostLedger(self.state)
         book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'private inventory', True))
@@ -346,7 +310,8 @@ class HanaPlacementTests(CostFixture):
             self.assertEqual(len(calls), 3)
 
     def test_preview_does_not_cache_a_budget_recovered_from_git(self) -> None:
-        _ = self.workload.write_text(HANA_SETTINGS.replace('daily_budget_usd=6\n', ''))
+        lines = self.workload.read_text().splitlines(keepends=True)
+        _ = self.workload.write_text(''.join(line for line in lines if not line.startswith('daily_budget_usd=')))
         recovered = [iter(('daily_budget_usd=0.01\n',)), iter(('daily_budget_usd=6\n',))]
         with self.preview_calls() as calls, redirect_stderr(StringIO()):
             with mock.patch.object(conf, '_committed_files', side_effect=recovered) as history:

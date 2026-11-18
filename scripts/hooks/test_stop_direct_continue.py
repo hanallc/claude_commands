@@ -76,6 +76,19 @@ class DirectorStopFixture:
         _ = self.staff_file.write_text(json.dumps(document))
         return worker_id
 
+    @contextmanager
+    def live_runner(self, owner: staff.StaffId) -> Generator[None]:
+        record = self.run / "detached_runs" / f"{owner}.json"
+        record.parent.mkdir(exist_ok=True)
+        supervisor = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
+                                       "detached_runs.py", "supervise", str(record.resolve())], stdin=subprocess.PIPE)
+        _ = record.write_text(json.dumps({"run_id": str(owner), "status": "running", "staff_id": owner,
+                                          "worker": "fixture-runner", "pid": supervisor.pid}))
+        try:
+            yield
+        finally:
+            _ = supervisor.communicate(timeout=TEST_HANG_GUARD_SECS)
+
     def call(self, **fields: object) -> subprocess.CompletedProcess[str]:
         payload: dict[str, object] = {
             "session_id": SESSION, "transcript_path": str(self.transcript),
@@ -230,47 +243,84 @@ class DirectorStopTests(unittest.TestCase):
             self.assert_allowed(fixture.call(last_assistant_message="The merge unit waits for an order."))
             self.assertFalse((fixture.run / "compaction_wake_line").exists())
 
-    def test_merge_unit_with_a_runner_still_gets_a_wake(self) -> None:
+    def test_merge_unit_with_its_own_runner_stops_without_a_wake(self) -> None:
         with director_stop_fixture() as fixture:
             fixture.set_unit_type("merge")
             state_path = fixture.run / "progress_history_state.json"
             state = cast(dict[str, object], json.loads(state_path.read_text()))
             state["phase"] = {"status": "completed"}
             _ = state_path.write_text(json.dumps(state))
-            record = fixture.run / "detached_runs/land.json"
-            record.parent.mkdir()
-            supervisor = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
-                                           "detached_runs.py", "supervise", str(record.resolve())], stdin=subprocess.PIPE)
-            _ = record.write_text(json.dumps({"run_id": "land", "status": "running", "staff_id": SESSION,
-                                              "worker": "fixture-director", "pid": supervisor.pid}))
-            try:
+            with fixture.live_runner(staff.StaffId(SESSION)):
+                for status in ("The runner is live.", "The runner has no result yet."):
+                    with self.subTest(status=status):
+                        self.assert_allowed(fixture.call(last_assistant_message=status))
+                        self.assertFalse((fixture.run / "compaction_wake_line").exists())
+            self.assert_allowed(fixture.call(last_assistant_message="The merge runner stopped."))
+
+    def test_merge_unit_with_a_worker_runner_still_gets_a_wake(self) -> None:
+        with director_stop_fixture() as fixture:
+            fixture.set_unit_type("merge")
+            worker_id = fixture.add_merge_worker()
+            with fixture.live_runner(worker_id):
                 result = fixture.call()
-            finally:
-                _ = supervisor.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 2)
             self.assertIn("/unit:merge run active", result.stderr)
-            self.assert_allowed(fixture.call(last_assistant_message="The merge runner stopped."))
+
+    def test_own_runner_does_not_hide_other_merge_work(self) -> None:
+        for work in ("worker_runner", "worker_dispatch", "background_task", "queued_message"):
+            with self.subTest(work=work), director_stop_fixture() as fixture:
+                fixture.set_unit_type("merge")
+                with fixture.live_runner(staff.StaffId(SESSION)):
+                    fields: dict[str, object] = {}
+                    if work == "queued_message":
+                        _ = fixture.queue_order(f"staff:{SESSION}")
+                    elif work == "background_task":
+                        fields["background_tasks"] = [{"id": "fixture", "status": "running"}]
+                    elif work == "worker_dispatch":
+                        worker_id = fixture.add_merge_worker()
+                        path = fixture.run / "progress_history_state.json"
+                        state = cast(dict[str, object], json.loads(path.read_text()))
+                        state["pass"] = {"test": {"status": "active", "worker_id": worker_id,
+                                                 "instance_id": "fixture-dispatch", "launcher_command": ["assign.sh"]}}
+                        _ = path.write_text(json.dumps(state))
+                    else:
+                        worker_id = fixture.add_merge_worker()
+                        with fixture.live_runner(worker_id):
+                            result = fixture.call()
+                        self.assertEqual(result.returncode, 2)
+                        self.assertIn("/unit:merge run active", result.stderr)
+                        continue
+                    result = fixture.call(**fields)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("/unit:merge run active", result.stderr)
 
     def test_damaged_record_does_not_hide_a_live_merge_runner(self) -> None:
         with director_stop_fixture() as fixture:
             fixture.set_unit_type("merge")
+            worker_id = fixture.add_merge_worker()
             runs = fixture.run / "detached_runs"
             runs.mkdir()
             damaged = runs / "000-damaged.json"
             _ = damaged.write_text("{", encoding="utf-8")
-            record = runs / "land.json"
-            supervisor = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
-                                           "detached_runs.py", "supervise", str(record.resolve())], stdin=subprocess.PIPE)
-            _ = record.write_text(json.dumps({"run_id": "land", "status": "running", "staff_id": SESSION,
-                                              "worker": "fixture-director", "pid": supervisor.pid}))
-            try:
+            with fixture.live_runner(worker_id):
                 result = fixture.call()
-            finally:
-                _ = supervisor.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 2)
             self.assertIn("/unit:merge run active", result.stderr)
             self.assertEqual(sum(line.startswith("anomaly:") for line in result.stderr.splitlines()), 1)
             self.assertIn(str(damaged), result.stderr)
+
+    def test_own_runner_with_a_damaged_record_allows_stop_with_one_anomaly(self) -> None:
+        with director_stop_fixture() as fixture:
+            fixture.set_unit_type("merge")
+            with fixture.live_runner(staff.StaffId(SESSION)):
+                damaged = fixture.run / "detached_runs/000-damaged.json"
+                _ = damaged.write_text("{", encoding="utf-8")
+                result = fixture.call()
+            self.assertEqual((result.returncode, result.stdout), (0, ""))
+            self.assertEqual(len(result.stderr.splitlines()), 1)
+            self.assertIn("anomaly:", result.stderr)
+            self.assertIn(str(damaged), result.stderr)
+            self.assertFalse((fixture.run / "compaction_wake_line").exists())
 
     def test_damaged_record_without_work_reports_one_anomaly_and_allows_stop(self) -> None:
         with director_stop_fixture() as fixture:
