@@ -71,6 +71,8 @@ SCENARIOS = {
         'test_hana_down_recovers_the_request_and_disk_from_a_saved_instance',
     ),
     'test_hana_setup.HanaSetupTests': (
+        'test_root_replacement_installs_the_scaler_policy_before_starting',
+        'test_root_replacement_replays_the_token_and_polls_the_returned_task_id',
         'test_setup_reserves_costs_before_creating_resources_and_registers_only_after_stop',
         'test_existing_data_attachment_only_waits_for_the_volume',
         'test_image_upload_registers_imds_v2_root_disk_and_saves_the_zone_subnet',

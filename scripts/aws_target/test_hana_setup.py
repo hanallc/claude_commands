@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime
 from decimal import Decimal
 from io import StringIO
@@ -11,13 +11,14 @@ from pathlib import Path
 import re
 import subprocess
 import time
-from typing import cast, override
+from typing import cast, final, override
 from unittest import mock
 
-from scripts.aws_target import aws_cli, deploy, hana_box, hana_image, hana_render, hana_spend, ledger, remote
+from scripts.aws_target import aws_cli, deploy, hana_box, hana_image, hana_render, hana_replacement, hana_replacement_record, hana_spend, ledger, plan_run, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.config import DeploymentSettings
 from scripts.aws_target.ledger_test_support import CostFixture, text_setting, write_hana_config
+from scripts.aws_target.test_hana_box import FakeProvider
 from scripts.aws_target.test_hana_provider import FakeAws, IDENTITY
 from scripts.lib import conf
 
@@ -43,6 +44,161 @@ def fake_aws_calls(response: Callable[..., dict[str, object]]) -> Generator[None
 
     with mock.patch.object(aws_cli.AwsCli, 'call', new=call):
         yield
+
+
+@final
+class RootReplacementAws:
+    def __init__(self, directory: Path, digest: hana_render.GuestDigest) -> None:
+        self.directory = directory
+        self.digest = digest
+        self.calls: list[str] = []
+        self.state = 'stopped'
+        self.image = 'ami-fixture-original'
+        self.root = 'vol-fixture-original'
+        self.boot = 'uefi'
+        self.data_retained = True
+        self.attached_at = '2026-01-15T11:00:00Z'
+        self.tasks: dict[str, dict[str, object]] = {}
+        self.initial_task_states: list[str] = []
+        self.tokens: list[str] = []
+        self.die_after = ''
+        self.create_refusal = ''
+        self.interrupted = False
+        self.attachment_changes = False
+        self.stop_deferred = False
+        self.root_gib = 20
+        self.policy_installed = False
+
+    def cloudformation(self, operation: str, arguments: tuple[str, ...]) -> dict[str, object]:
+        saved = remote.read_record(self.directory / 'hana/setup.json')
+        template = ledger.mapping(cast(object, json.loads(deploy.HANA_TEMPLATE.read_bytes())))
+        resources = ledger.mapping(template['Resources'])
+        outputs = {'ControlBucket': 'fixture-bucket', 'LaunchTemplate': 'fixture-template'}
+        if saved['version'] == 1:
+            outputs.update(Instance=IDENTITY.instance, DataVolume='vol-fixture-data')
+            resources.update(Instance={'Type': 'AWS::EC2::Instance'}, DataVolume={'Type': 'AWS::EC2::Volume'},
+                             DataAttachment={'Type': 'AWS::EC2::VolumeAttachment'})
+        else:
+            outputs.update(LaunchTemplateVersion='3', SecurityGroup='fixture-group')
+        parameters = {key: 'fixture' for key in ledger.mapping(template['Parameters'])}
+        parameters.update(DeploymentId=IDENTITY.deployment, ScalerUser='fixture-scaler')
+        rows = [{'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items()]
+        if operation == 'describe-stacks':
+            return {'Stacks': [{'StackId': 'fixture-stack', 'StackStatus': 'UPDATE_COMPLETE', 'Parameters': rows,
+                'Outputs': [{'OutputKey': key, 'OutputValue': value} for key, value in outputs.items()]}]}
+        if operation == 'get-template':
+            return {'TemplateBody': template}
+        if operation == 'create-change-set':
+            path = Path(arguments[arguments.index('--template-body') + 1].removeprefix('file://'))
+            proposed = ledger.mapping(cast(object, json.loads(path.read_text())))
+            proposed_resources = ledger.mapping(proposed['Resources'])
+            policy = ledger.mapping(ledger.mapping(proposed_resources.pop('ScalerPolicy'))['Properties'])
+            statements = ledger.rows(ledger.mapping(policy['PolicyDocument']), 'Statement')
+            actions = tuple(row['Action'] for row in statements)
+            if (proposed_resources != {key: value for key, value in resources.items() if key != 'ScalerPolicy'}
+                    or actions.count('ec2:CreateReplaceRootVolumeTask') != 3 or 'ec2:CreateTags' in actions):
+                raise AssertionError('The change set must install the scoped grants in ScalerPolicy.')
+            return {}
+        if operation == 'describe-change-set':
+            return {'Status': 'CREATE_COMPLETE', 'Parameters': rows, 'Changes': [{'ResourceChange': {
+                'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+                'Action': 'Modify', 'Replacement': 'False'}}]}
+        if operation == 'execute-change-set':
+            self.policy_installed = True
+            return {}
+        if operation == 'wait':
+            return {}
+        raise AssertionError(operation)
+
+    def _mutation(self, operation: str) -> dict[str, object]:
+        if operation == self.die_after:
+            self.die_after = ''
+            raise KeyboardInterrupt
+        return {}
+
+    def complete(self, task: dict[str, object]) -> None:
+        task['TaskState'] = 'succeeded'
+        self.image, self.root = 'ami-fixture-reviewed', 'vol-fixture-replacement'
+        if self.attachment_changes:
+            self.attached_at = '2026-01-15T11:01:00Z'
+
+    def call(self, operation: str, *arguments: str, service: str = 'ec2', timeout_s: float | None = None
+             ) -> dict[str, object]:
+        _ = timeout_s
+        self.calls.append(operation)
+        if service == 'cloudformation':
+            return self.cloudformation(operation, arguments)
+        if operation == 'describe-instances':
+            return {'Reservations': [{'Instances': [{
+                'InstanceId': IDENTITY.instance, 'SpotInstanceRequestId': IDENTITY.spot_request,
+                'InstanceLifecycle': 'spot', 'State': {'Name': self.state}, 'ImageId': self.image,
+                'RootDeviceName': '/dev/xvda', 'RootDeviceType': 'ebs', 'CurrentInstanceBootMode': 'uefi',
+                'Architecture': 'x86_64', 'VirtualizationType': 'hvm', 'PlatformDetails': 'Linux/UNIX',
+                'UsageOperation': 'RunInstances', 'BlockDeviceMappings': [
+                    {'DeviceName': '/dev/xvda', 'Ebs': {'VolumeId': self.root, 'DeleteOnTermination': True}},
+                    {'DeviceName': '/dev/sdf', 'Ebs': {'VolumeId': 'vol-fixture-data',
+                                                      'DeleteOnTermination': self.data_retained is False}},
+                ],
+            }]}]}
+        if operation == 'describe-volumes':
+            if arguments[-1] != 'vol-fixture-data':
+                raise AssertionError(arguments)
+            return {'Volumes': [{'VolumeId': 'vol-fixture-data', 'Attachments': [{
+                'InstanceId': IDENTITY.instance, 'Device': '/dev/sdf', 'State': 'attached',
+                'DeleteOnTermination': not self.data_retained, 'AttachTime': self.attached_at,
+            }]}]}
+        if operation == 'describe-images':
+            return {'Images': [{'ImageId': 'ami-fixture-reviewed', 'OwnerId': '000000000000',
+                'Name': 'nixos-hana-fixture', 'State': 'available', 'RootDeviceType': 'ebs',
+                'Description': 'Hana guest digest ' + self.digest.value,
+                'BootMode': self.boot, 'Architecture': 'x86_64', 'VirtualizationType': 'hvm',
+                'PlatformDetails': 'Linux/UNIX', 'UsageOperation': 'RunInstances', 'RootDeviceName': '/dev/xvda',
+                'BlockDeviceMappings': [{'DeviceName': '/dev/xvda', 'Ebs': {
+                    'VolumeSize': self.root_gib, 'SnapshotId': 'snap-fixture-image'}}]}]}
+        if operation == 'describe-spot-instance-requests':
+            return {'SpotInstanceRequests': [{'SpotInstanceRequestId': IDENTITY.spot_request,
+                'InstanceId': IDENTITY.instance, 'Type': 'persistent', 'InstanceInterruptionBehavior': 'stop',
+                'State': 'disabled' if self.state == 'stopped' else 'active', 'Status': {
+                    'Code': 'instance-stopped-no-capacity' if self.interrupted else 'instance-stopped-by-user'}}]}
+        if operation == 'describe-replace-root-volume-tasks':
+            if len(arguments) != 2 or arguments[0] != '--replace-root-volume-task-ids':
+                raise AssertionError('Describe must select one task by ID.')
+            match = [task for task in self.tasks.values() if task['ReplaceRootVolumeTaskId'] == arguments[1]]
+            return {'ReplaceRootVolumeTasks': match}
+
+        record = hana_replacement_record.read(self.directory)
+        if isinstance(record, hana_replacement_record.NoReplacement):
+            raise AssertionError('An AWS mutation requires the saved replacement.')
+        if operation == 'start-instances':
+            if self.interrupted:
+                raise AssertionError('EC2 refuses to start an interrupted Spot instance.')
+            self.state = 'running'
+            return self._mutation(operation)
+        if operation == 'stop-instances':
+            if not self.stop_deferred:
+                self.state = 'stopped'
+            return self._mutation(operation)
+        if operation == 'create-replace-root-volume-task':
+            token = arguments[arguments.index('--client-token') + 1]
+            self.tokens.append(token)
+            if token != record.token or '--delete-replaced-root-volume' not in arguments or '--tag-specifications' in arguments:
+                raise AssertionError('The task must use the saved token and delete the old root.')
+            if self.state != 'running':
+                raise AssertionError('EC2 needs a running instance to create the root task.')
+            if self.create_refusal:
+                raise aws_cli.AwsUnavailable(self.create_refusal)
+            if token in self.tasks:
+                return {'ReplaceRootVolumeTask': self.tasks[token]}
+            state = self.initial_task_states.pop(0) if self.initial_task_states else 'succeeded'
+            task: dict[str, object] = {'ReplaceRootVolumeTaskId': 'replacevol-fixture-' + str(len(self.tasks)),
+                    'InstanceId': IDENTITY.instance, 'ImageId': 'ami-fixture-reviewed', 'TaskState': state,
+                    'DeleteReplacedRootVolume': True}
+            self.tasks[token] = task
+            if state == 'succeeded':
+                self.complete(task)
+            _ = self._mutation(operation)
+            return {'ReplaceRootVolumeTask': task}
+        raise AssertionError(operation)
 
 
 class HanaSetupTests(CostFixture):
@@ -96,6 +252,427 @@ class HanaSetupTests(CostFixture):
             with self.assertRaisesRegex(deploy.DeploymentRefused, 'preparation expired|inputs changed'):
                 _ = subject.hana_setup(approve_resources=True)
         self.assertEqual(fake.calls, [])
+
+    @contextmanager
+    def root_replacement(self, *, version: int = 2, plan: bool = False, install_policy: bool = False
+                         ) -> Generator[tuple[deploy.Deployment, RootReplacementAws, StringIO]]:
+        aws = RootReplacementAws(self.state, hana_render.guest_digest(self.workload))
+        workload = conf.read(self.workload)
+        mode = plan_run.PlanRun(mock.Mock(), mock.Mock(), mock.Mock()) if plan else plan_run.APPROVED_SETUP
+        subject = deploy.Deployment(self.settings, self.state, self.root / 'output', clock=self.clock, mode=mode)
+        path = self.state / 'hana/setup.json'
+        path.parent.mkdir(exist_ok=True)
+        setup = {'version': version, 'requested': True, 'generation': 0, 'region': IDENTITY.region,
+                 'stack': workload.text('stack_name'), 'instance': IDENTITY.instance, 'spot_request': IDENTITY.spot_request,
+                 'deployment': IDENTITY.deployment, 'data_volume': 'vol-fixture-data', 'bucket': 'fixture-bucket',
+                 'parameters_sha256': 'fixture', 'template_sha256': 'fixture'}
+        if version == 2:
+            setup.update(launch_template='LaunchTemplateId=fixture-template,Version=3', security_group='fixture-group')
+        _ = path.write_text(json.dumps(setup))
+        path.with_name('lifecycle.json').unlink(missing_ok=True)
+        hana_box.HanaController(self.state, self.settings, self.workload, hana_box.ProviderNotInstalled()).register(IDENTITY)
+        _ = hana_image.save(self.state, hana_image.RegisteredImage('nixos-hana-fixture', 'ami-fixture-reviewed',
+            '000000000000', 'vpc-fixture', 'subnet-fixture', aws.digest))
+
+        def checks(_timeout: int, _interval: int) -> Generator[float]:
+            for _ in range(12):
+                self.clock.advance(1)
+                yield self.clock()
+
+        api = aws_cli.AwsCli('fixture-admin', IDENTITY.region, 1, mock.Mock(side_effect=AssertionError))
+        provider = mock.Mock()
+        provider.api = api
+        with (fake_aws_calls(aws.call),
+              mock.patch.object(api, 'in_region', return_value=api),
+              mock.patch.object(deploy, 'read_deployment_settings', return_value=self.base_settings()),
+              mock.patch.object(subject, '_authorize'), mock.patch.object(subject, '_check_credentials'),
+              mock.patch.object(subject, '_api', return_value=api),
+              mock.patch.object(subject, '_hana_provider', return_value=provider),
+              nullcontext() if install_policy else mock.patch.object(subject, '_hana_policy_stack'),
+              nullcontext() if install_policy else mock.patch.object(subject, '_install_hana_policy'),
+              mock.patch.object(subject, '_preview_hana_policy'),
+              mock.patch.object(subject, '_hana_check_times', side_effect=checks),
+              mock.patch.object(plan_run.PlanRun, 'confirm_account'),
+              mock.patch('sys.stdout', new_callable=StringIO) as output):
+            yield subject, aws, output
+
+    def assert_root_replaced(self, aws: RootReplacementAws, output: StringIO) -> None:
+        self.assertIn('Hana image replacement complete. The box is stopped.', output.getvalue())
+        self.assertFalse(hana_replacement_record.held(self.state))
+        setup = remote.read_record(self.state / 'hana/setup.json')
+        self.assertEqual((setup['image'], setup['instance'], setup['spot_request'], setup['data_volume']),
+                         ('ami-fixture-reviewed', IDENTITY.instance, IDENTITY.spot_request, 'vol-fixture-data'))
+        self.assertEqual(setup['guest_digest'], aws.digest.value)
+        controller = hana_box.HanaController(self.state, self.settings, self.workload, hana_box.ProviderNotInstalled())
+        self.assertTrue(controller.image_is_current(IDENTITY))
+        self.assertEqual(aws.state, 'stopped')
+        self.assertEqual(aws.attached_at, '2026-01-15T11:00:00Z')
+        lifecycle = remote.read_record(self.state / 'hana/lifecycle.json')
+        self.assertEqual(lifecycle['state'], 'idle-stopped')
+        self.assertEqual(lifecycle['claims'], [])
+        self.assertIsNone(lifecycle['delivered'])
+        self.assertNotIn('run-instances', aws.calls)
+        self.assertNotIn('create-change-set', aws.calls)
+
+    def test_root_replacement_preserves_both_ownership_versions_and_reports_current(self) -> None:
+        for version in (1, 2):
+            with self.subTest(version=version), self.root_replacement(version=version) as (subject, aws, output):
+                self.assertTrue(subject.hana_setup(approve_resources=True))
+                self.assert_root_replaced(aws, output)
+                self.assertEqual(remote.read_record(self.state / 'hana/setup.json')['version'], version)
+                aws.calls.clear()
+                self.assertTrue(subject.hana_setup(approve_resources=True))
+                self.assertTrue(output.getvalue().endswith('Hana image is current.\n'))
+                self.assertTrue(all(call.startswith('describe-') for call in aws.calls))
+
+    def test_same_image_without_a_setup_digest_records_the_digest(self) -> None:
+        with self.root_replacement() as (subject, aws, output):
+            path = self.state / 'hana/setup.json'
+            saved = remote.read_record(path)
+            aws.image = 'ami-fixture-reviewed'
+            saved['image'] = aws.image
+            _ = path.write_text(json.dumps(saved))
+            controller = hana_box.HanaController(self.state, self.settings, self.workload,
+                                                 hana_box.ProviderNotInstalled())
+            self.assertFalse(controller.image_is_current(IDENTITY))
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+            self.assertEqual(output.getvalue(), 'Hana image is current.\n')
+            self.assertEqual(remote.read_record(path)['guest_digest'], aws.digest.value)
+            self.assertTrue(controller.image_is_current(IDENTITY))
+            self.assertFalse(hana_replacement_record.held(self.state))
+            self.assertTrue(all(call.startswith('describe-') for call in aws.calls))
+
+    def test_root_replacement_installs_the_scaler_policy_before_starting(self) -> None:
+        for version in (1, 2):
+            with self.subTest(version=version), self.root_replacement(version=version, install_policy=True) as (subject, aws, _output):
+                self.assertTrue(subject.hana_setup(approve_resources=True))
+                self.assertTrue(aws.policy_installed)
+                self.assertLess(aws.calls.index('execute-change-set'), aws.calls.index('start-instances'))
+
+    def test_root_replacement_does_not_start_an_interrupted_box(self) -> None:
+        with self.root_replacement() as (subject, aws, _output):
+            aws.interrupted = True
+            with self.assertRaisesRegex(hana_replacement.ReplacementRefused, '^' + re.escape(hana_replacement.INTERRUPTED) + '$'):
+                _ = subject.hana_setup(approve_resources=True)
+            self.assertNotIn('start-instances', aws.calls)
+            self.assertTrue(hana_replacement_record.held(self.state))
+
+    def test_root_replacement_replays_the_token_and_polls_the_returned_task_id(self) -> None:
+        with self.root_replacement() as (subject, aws, output):
+            aws.initial_task_states = ['in-progress']
+            aws.die_after = 'create-replace-root-volume-task'
+            with self.assertRaises(KeyboardInterrupt):
+                _ = subject.hana_setup(approve_resources=True)
+            with self.assertRaisesRegex(hana_replacement.ReplacementRefused, 'has not finished'):
+                _ = subject.hana_setup(approve_resources=True)
+            self.assertEqual(aws.tokens, [aws.tokens[0], aws.tokens[0]])
+            self.assertIn('describe-replace-root-volume-tasks', aws.calls)
+            aws.complete(aws.tasks[aws.tokens[0]])
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+            self.assert_root_replaced(aws, output)
+
+    def test_root_replacement_publishes_when_aws_stops_the_done_box(self) -> None:
+        with self.root_replacement() as (subject, aws, output):
+            aws.initial_task_states = ['in-progress']
+            with self.assertRaisesRegex(hana_replacement.ReplacementRefused, 'has not finished'):
+                _ = subject.hana_setup(approve_resources=True)
+            aws.complete(aws.tasks[aws.tokens[0]])
+            aws.interrupted = True
+            aws.calls.clear()
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+            self.assert_root_replaced(aws, output)
+            self.assertNotIn('start-instances', aws.calls)
+            self.assertNotIn('describe-replace-root-volume-tasks', aws.calls)
+            self.assertEqual(aws.calls.count('stop-instances'), 1)
+
+    def test_root_replacement_hands_an_unconfirmed_stop_to_the_controller(self) -> None:
+        with self.root_replacement() as (subject, aws, output):
+            aws.stop_deferred = True
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+            self.assertIn('Hana image replacement complete. The controller stops the box.', output.getvalue())
+            self.assertEqual(aws.calls.count('stop-instances'), 1)
+            self.assertEqual(remote.read_record(self.state / 'hana/lifecycle.json')['state'], 'stopping')
+            self.assertFalse(hana_replacement_record.held(self.state))
+            compute, = ledger.CostLedger(self.state).read_snapshot().hana_compute
+            self.assertIsInstance(compute.state, ledger.HanaExposureClosed)
+
+    def test_root_replacement_stops_when_the_attachment_timestamp_changes(self) -> None:
+        with self.root_replacement() as (subject, aws, _output):
+            aws.attachment_changes = True
+            with self.assertRaisesRegex(hana_replacement.ReplacementRefused, 'data attachment changed'):
+                _ = subject.hana_setup(approve_resources=True)
+            self.assertEqual(aws.calls.count('stop-instances'), 1)
+            self.assertNotIn('image', remote.read_record(self.state / 'hana/setup.json'))
+            self.assertTrue(hana_replacement_record.held(self.state))
+            compute, = ledger.CostLedger(self.state).read_snapshot().hana_compute
+            self.assertIsInstance(compute.state, ledger.HanaExposureOpen)
+
+    def test_the_controller_stops_the_held_box_even_without_a_saved_digest(self) -> None:
+        with self.root_replacement() as (subject, aws, _output):
+            aws.initial_task_states = ['in-progress']
+            aws.stop_deferred = True
+            with self.assertRaisesRegex(hana_replacement.ReplacementRefused, 'has not finished'):
+                _ = subject.hana_setup(approve_resources=True)
+            self.assertEqual(aws.state, 'running')
+            path = hana_replacement_record.record_path(self.state)
+            row = remote.read_record(path)
+            self.assertEqual(row.pop('guest_digest'), aws.digest.value)
+            _ = path.write_text(json.dumps(row))
+            exposure, = ledger.CostLedger(self.state).read_snapshot().hana_compute
+            self.assertEqual(exposure.expires - exposure.at, conf.read(self.workload).whole('stop_wait_timeout_s'))
+            provider = FakeProvider(self.state, self.clock, state='running')
+            controller = hana_box.HanaController(self.state, self.settings, self.workload, provider, clock=self.clock)
+            self.assertEqual(controller.request('fixture'), hana_box.ClaimRefused(hana_replacement_record.HELD))
+            self.assertEqual(controller.permission('fixture', 'fixture-boot', 1),
+                             hana_box.ClaimRefused(hana_replacement_record.HELD))
+            self.assertEqual(controller.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+            self.clock.advance(exposure.expires - self.clock.now)
+            self.assertEqual(controller.tick(), hana_box.Lifecycle.STOPPING)
+            self.assertEqual(controller.tick(), hana_box.Lifecycle.STOPPING)
+            self.assertEqual(controller.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+            self.assertEqual(provider.state, 'stopped')
+            self.assertTrue(hana_replacement_record.held(self.state))
+
+    def test_stopped_observation_leaves_the_renewed_replacement_reservation_open(self) -> None:
+        with self.root_replacement() as (subject, aws, _output):
+            aws.initial_task_states = ['in-progress']
+            with self.assertRaisesRegex(hana_replacement.ReplacementRefused, 'has not finished'):
+                _ = subject.hana_setup(approve_resources=True)
+
+            book = ledger.CostLedger(self.state)
+            original, = book.read_snapshot().hana_compute
+            self.clock.advance(original.expires - self.clock.now)
+            spending = hana_spend.HanaSpending(book, self.settings, hana_spend.read_settings(conf.read(self.workload)))
+            deadline = self.clock.now + 60
+
+            def renew() -> None:
+                result = spending.reserve_setup(self.clock.now, deadline, expected_generation=original.generation)
+                self.assertIsInstance(result, hana_spend.StartReserved)
+
+            provider = FakeProvider(self.state, self.clock, during_call=renew)
+            controller = hana_box.HanaController(self.state, self.settings, self.workload, provider, clock=self.clock)
+            self.assertEqual(controller.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+            self.assertEqual([call.action for call in provider.calls], [hana_box.Action.OBSERVE])
+            renewed, = book.read_snapshot().hana_compute
+            self.assertEqual((renewed.generation, renewed.expires), (original.generation, deadline))
+            self.assertIsInstance(renewed.state, ledger.HanaExposureOpen)
+            self.assertTrue(hana_replacement_record.held(self.state))
+
+    def test_root_replacement_reports_a_failed_task_then_uses_a_new_token(self) -> None:
+        for state in ('failed', 'failed-detached'):
+            with self.subTest(state=state), self.root_replacement() as (subject, aws, output):
+                aws.initial_task_states = [state]
+                message = f'The Hana root task {state}. AWS returned no status message.'
+                if state == 'failed-detached':
+                    message += (' EC2 detached the root volume. The data volume is intact.'
+                                ' Run deploy.py hana-setup --approve-resources again.')
+                with self.assertRaisesRegex(hana_replacement.ReplacementRefused, '^' + re.escape(message) + '$'):
+                    _ = subject.hana_setup(approve_resources=True)
+                self.assertEqual(output.getvalue(), '')
+                self.assertEqual(len(aws.tokens), 1)
+                self.assertEqual(aws.calls[-1], 'stop-instances')
+                self.assertTrue(hana_replacement_record.held(self.state))
+                if state == 'failed-detached':
+                    aws.create_refusal = 'An error occurred (IncorrectInstanceState) when calling the CreateReplaceRootVolumeTask operation: The instance has no root volume.'
+                    with self.assertRaisesRegex(hana_replacement.ReplacementRefused, '^' + re.escape(aws.create_refusal) + '$'):
+                        _ = subject.hana_setup(approve_resources=True)
+                    self.assertEqual(len(set(aws.tokens)), 2)
+                    self.assertEqual(aws.calls[-1], 'stop-instances')
+                    self.assertEqual(output.getvalue(), '')
+                    aws.create_refusal = ''
+                self.assertTrue(subject.hana_setup(approve_resources=True))
+                self.assert_root_replaced(aws, output)
+                self.assertEqual(len(set(aws.tokens)), 2)
+
+    def test_root_replacement_renews_a_running_attempt_only_within_the_cap(self) -> None:
+        with self.root_replacement() as (subject, aws, _output):
+            book = ledger.CostLedger(self.state)
+            aws.initial_task_states = ['in-progress']
+            aws.stop_deferred = True
+            with self.assertRaisesRegex(hana_replacement.ReplacementRefused, 'has not finished'):
+                _ = subject.hana_setup(approve_resources=True)
+            original, = book.read_snapshot().hana_compute
+            self.clock.advance(original.expires - self.clock.now - 2)
+            with self.assertRaisesRegex(hana_replacement.ReplacementRefused, 'has not finished'):
+                _ = subject.hana_setup(approve_resources=True)
+            extended, = book.read_snapshot().hana_compute
+            self.assertEqual((extended.at, extended.generation), (original.at, original.generation))
+            timeout = original.expires - original.at
+            self.assertEqual(extended.expires, original.expires - 1 + timeout)
+            self.assertIsInstance(extended.state, ledger.HanaExposureOpen)
+
+            self.clock.advance(extended.expires - self.clock.now - 2)
+            minimum = conf.read(self.settings).whole('box_minimum_seconds')
+            reserved = ledger.hana_intervals(book.read_snapshot(), self.clock.now, minimum, reserve=True)
+            cost = sum((interval.usd for interval in reserved), Decimal(0))
+            text_setting(self.workload, 'daily_budget_usd', str(cost + Decimal('.001')))
+            aws.calls.clear()
+            aws.stop_deferred = False
+            with self.assertRaisesRegex(hana_replacement.ReplacementRefused, 'hana_daily_budget_usd'):
+                _ = subject.hana_setup(approve_resources=True)
+            self.assertEqual(book.read_snapshot().hana_compute, [extended])
+            self.assertEqual(aws.state, 'stopped')
+            self.assertEqual(aws.calls[-1], 'stop-instances')
+            self.assertNotIn('start-instances', aws.calls)
+            self.assertNotIn('create-replace-root-volume-task', aws.calls)
+
+    def test_existing_box_requires_a_registration(self) -> None:
+        for plan in (False, True):
+            for stop_pending in (False, True):
+                with self.subTest(plan=plan, stop_pending=stop_pending), self.root_replacement(plan=plan) as (subject, aws, output):
+                    (self.state / hana_image.RECORD).unlink()
+                    path = self.state / 'hana/setup.json'
+                    if stop_pending:
+                        row = remote.read_record(path)
+                        row['stop_pending'] = True
+                        _ = path.write_text(json.dumps(row))
+                    before = path.read_bytes()
+                    with self.assertRaisesRegex(deploy.DeploymentRefused, re.escape(hana_replacement.REGISTER_IMAGE)):
+                        _ = subject.hana_setup(approve_resources=not plan)
+                    if plan:
+                        self.assertEqual(output.getvalue(), hana_box.HANA_IMAGE_STALE + '\n')
+                    self.assertEqual(aws.calls, [])
+                    self.assertEqual(path.read_bytes(), before)
+
+    def test_existing_box_refuses_a_registration_with_an_old_digest(self) -> None:
+        for plan in (False, True):
+            for same_image in (False, True):
+                with self.subTest(plan=plan, same_image=same_image), self.root_replacement(plan=plan) as (subject, aws, output):
+                    aws.digest = FIXTURE_GUEST_DIGEST
+                    _ = hana_image.save(self.state, hana_image.RegisteredImage('nixos-hana-fixture', 'ami-fixture-reviewed',
+                        '000000000000', 'vpc-fixture', 'subnet-fixture', aws.digest))
+                    if same_image:
+                        aws.image = 'ami-fixture-reviewed'
+                    path = self.state / 'hana/setup.json'
+                    before = path.read_bytes()
+                    with self.assertRaisesRegex(deploy.DeploymentRefused,
+                            'registered Hana image is older than the current guest files.*Build the Hana image.*'
+                            + re.escape(hana_replacement.REGISTER_IMAGE)):
+                        _ = subject.hana_setup(approve_resources=not plan)
+                    self.assertEqual(output.getvalue(), hana_box.HANA_IMAGE_STALE + '\n' if plan else '')
+                    self.assertEqual(aws.calls, [])
+                    self.assertEqual(path.read_bytes(), before)
+                    self.assertFalse(hana_replacement_record.held(self.state))
+
+    def test_setup_requires_a_valid_registration_digest(self) -> None:
+        for plan in (False, True):
+            for malformed in (False, True):
+                with self.subTest(plan=plan, malformed=malformed), self.root_replacement(plan=plan) as (subject, aws, output):
+                    path = self.state / hana_image.RECORD
+                    row = remote.read_record(path)
+                    if malformed:
+                        row['guest_digest'] = 'fixture-invalid-digest'
+                    else:
+                        del row['guest_digest']
+                    _ = path.write_text(json.dumps(row))
+                    with self.assertRaisesRegex(hana_image.ImageRefused, 'registration has no valid guest digest'):
+                        _ = subject.hana_setup(approve_resources=not plan)
+                    self.assertEqual(aws.calls, [])
+                    self.assertFalse(hana_replacement_record.held(self.state))
+                    self.assertEqual(output.getvalue(), hana_box.HANA_IMAGE_STALE + '\n' if plan else '')
+
+    def test_pending_replacement_refuses_a_changed_registration_digest(self) -> None:
+        for plan in (False, True):
+            with self.subTest(plan=plan), self.root_replacement(plan=plan) as (subject, aws, _output):
+                hana_replacement_record.save(self.state, hana_replacement_record.ReplacementAttempt(
+                    'ami-fixture-reviewed', aws.attached_at, 'fixture-token', 0, FIXTURE_GUEST_DIGEST.value))
+                path = hana_replacement_record.record_path(self.state)
+                before = path.read_bytes()
+                with self.assertRaisesRegex(deploy.DeploymentRefused, 'replacement inputs differ'):
+                    _ = subject.hana_setup(approve_resources=not plan)
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(aws.calls, [])
+
+    def test_root_replacement_plan_checks_the_instance_during_a_pending_attempt(self) -> None:
+        with self.root_replacement(version=1, plan=True) as (subject, aws, output):
+            hana_replacement_record.save(self.state, hana_replacement_record.ReplacementAttempt(
+                'ami-fixture-reviewed', aws.attached_at, 'fixture-token', 0, aws.digest.value))
+            self.assertTrue(subject.hana_setup())
+            self.assertIn('Resume the pending root replacement.', output.getvalue())
+            self.assertIn('describe-instances', aws.calls)
+
+    def test_root_replacement_plan_refuses_a_terminated_box_with_a_pending_attempt(self) -> None:
+        with self.root_replacement(plan=True) as (subject, aws, output):
+            hana_replacement_record.save(self.state, hana_replacement_record.ReplacementAttempt(
+                'ami-fixture-reviewed', aws.attached_at, 'fixture-token', 0, aws.digest.value))
+            aws.state = 'terminated'
+            with self.assertRaisesRegex(hana_replacement.ReplacementRefused, 'cannot resume root replacement'):
+                _ = subject.hana_setup()
+            self.assertEqual(output.getvalue(), hana_box.HANA_IMAGE_STALE + '\n')
+            self.assertEqual(aws.calls, ['describe-instances'])
+
+    def test_root_replacement_rerun_checks_the_current_root_size_before_any_write(self) -> None:
+        with self.root_replacement() as (subject, aws, output):
+            aws.initial_task_states = ['in-progress']
+            with self.assertRaisesRegex(hana_replacement.ReplacementRefused, 'has not finished'):
+                _ = subject.hana_setup(approve_resources=True)
+            record = hana_replacement_record.record_path(self.state).read_bytes()
+            snapshot = ledger.CostLedger(self.state).read_snapshot()
+            size = conf.read(self.workload).whole('root_gib')
+            _ = self.workload.write_text(self.workload.read_text().replace(f'root_gib={size}\n',
+                                                                          f'root_gib={aws.root_gib - 1}\n'))
+            aws.calls.clear()
+            with self.assertRaisesRegex(hana_replacement.ReplacementRefused, 'registered Hana image root is'):
+                _ = subject.hana_setup(approve_resources=True)
+            self.assertEqual(aws.calls, ['describe-instances', 'describe-images'])
+            self.assertEqual(hana_replacement_record.record_path(self.state).read_bytes(), record)
+            self.assertEqual(ledger.CostLedger(self.state).read_snapshot(), snapshot)
+            self.assertEqual(output.getvalue(), '')
+
+    def test_root_replacement_refuses_an_image_larger_than_the_configured_root(self) -> None:
+        with self.root_replacement() as (subject, aws, output):
+            size = conf.read(self.workload).whole('root_gib')
+            aws.root_gib = size + 1
+            with self.assertRaisesRegex(hana_replacement.ReplacementRefused,
+                                        f'{size + 1} GiB.*{size} GiB'):
+                _ = subject.hana_setup(approve_resources=True)
+            self.assertEqual(output.getvalue(), '')
+            self.assertEqual(aws.calls, ['describe-instances', 'describe-images'])
+            self.assertFalse(hana_replacement_record.held(self.state))
+
+    def test_root_replacement_plan_has_no_provider_or_local_writes(self) -> None:
+        for version in (1, 2):
+            with self.subTest(version=version), self.root_replacement(version=version, plan=True) as (subject, aws, output):
+                def snapshot() -> dict[Path, bytes]:
+                    return {path: path.read_bytes() for path in self.state.rglob('*') if path.is_file()}
+
+                before = snapshot()
+                self.assertTrue(subject.hana_setup())
+                self.assertEqual(snapshot(), before)
+                self.assertEqual(output.getvalue(), hana_box.HANA_IMAGE_STALE + '\n' +
+                                 'Plan Hana: Replace the root volume of the box with the registered image.\n' +
+                                 'Plan Hana: Keep the instance and the data volume.\n')
+                self.assertTrue(all(call.startswith('describe-') for call in aws.calls))
+
+    def test_root_replacement_preflight_refuses_without_a_mutation(self) -> None:
+        for case, message in (
+                ('busy', 'must be stopped'), ('claim', 'lifecycle is busy'), ('registration', 'no verified image'),
+                ('boot', 'incompatible'), ('digest', 'did not confirm the registered Hana guest digest'),
+                ('volume', 'retained Hana data attachment'), ('identity', 'registration differs')):
+            with self.subTest(case=case), self.root_replacement() as (subject, aws, output):
+                lifecycle = self.state / 'hana/lifecycle.json'
+                row = remote.read_record(lifecycle)
+                if case == 'busy':
+                    aws.state = 'running'
+                elif case == 'claim':
+                    row['claims'] = [{'execution': 'fixture-active', 'token': 'fixture-claim',
+                                      'requested_at': self.clock.now, 'active': True}]
+                elif case == 'registration':
+                    _ = hana_image.save(self.state, hana_image.PendingImageRegistration('fixture', 'snap-fixture'))
+                elif case == 'boot':
+                    aws.boot = 'legacy-bios'
+                elif case == 'digest':
+                    aws.digest = FIXTURE_GUEST_DIGEST
+                elif case == 'volume':
+                    aws.data_retained = False
+                else:
+                    ledger.mapping(row['identity'])['instance'] = 'i-fixture-mismatch'
+                _ = lifecycle.write_text(json.dumps(row))
+                with self.assertRaisesRegex(ValueError, message):
+                    _ = subject.hana_setup(approve_resources=True)
+                self.assertEqual(output.getvalue(), '')
+                self.assertFalse(hana_replacement_record.held(self.state))
+                self.assertTrue(all(call.startswith('describe-') for call in aws.calls))
 
     def setup_api(self, fake: FakeAws, calls: list[str], spot_price: Callable[[], Decimal], *, stop_state: str = '',
                   launch: Callable[[tuple[str, ...]], None] = lambda _arguments: None,
@@ -206,6 +783,12 @@ class HanaSetupTests(CostFixture):
     def stop_progress(self, output: StringIO) -> list[str]:
         return [line for line in output.getvalue().splitlines() if line.startswith('waiting for the Hana box to stop:')]
 
+    def register_fixture_image(self) -> hana_render.GuestDigest:
+        digest = hana_render.guest_digest(self.workload)
+        _ = hana_image.save(self.state, hana_image.RegisteredImage(
+            'fixture-name', 'fixture-image', '000000000000', 'fixture-vpc', 'fixture-subnet', digest))
+        return digest
+
     def test_setup_reserves_costs_before_creating_resources_and_registers_only_after_stop(self) -> None:
         fake = FakeAws(self.clock, state='pending')
         subject = self.subject(fake)
@@ -215,9 +798,7 @@ class HanaSetupTests(CostFixture):
         pauses: list[float] = []
         other_zone = 'us-east-2c'
         saved_path = self.state / 'hana/setup.json'
-        digest = hana_render.guest_digest(self.workload)
-        _ = hana_image.save(self.state, hana_image.RegisteredImage(
-            'fixture-name', 'fixture-image', '000000000000', 'fixture-vpc', 'fixture-subnet', digest))
+        digest = self.register_fixture_image()
 
         def launch(arguments: tuple[str, ...]) -> None:
             attempts.append(arguments)
@@ -311,6 +892,7 @@ class HanaSetupTests(CostFixture):
         fake = FakeAws(self.clock, state='running')
         calls: list[str] = []
         pauses: list[float] = []
+        _ = self.register_fixture_image()
 
         def pause(seconds: float) -> None:
             pauses.append(seconds)
@@ -449,7 +1031,7 @@ class HanaSetupTests(CostFixture):
                           ledger.rows({'parameters': parameters}, 'parameters'))
             _ = self.workload.write_text(self.workload.read_text().replace(f'{key}=0.13\n', f'{key}=0.14\n'))
             _ = subject.prepare_hana()
-            with self.assertRaisesRegex(deploy.DeploymentRefused, 'The approved Hana parameters changed'):
+            with self.assertRaisesRegex(deploy.DeploymentRefused, re.escape(hana_replacement.REGISTER_IMAGE)):
                 _ = subject.hana_setup(approve_resources=True)
         self.assertEqual(calls.count('create-change-set'), 2)
         self.assertEqual(len(attempts), 2)
@@ -460,6 +1042,7 @@ class HanaSetupTests(CostFixture):
         limits = hana_spend.read_settings(conf.read(self.workload))
         calls: list[str] = []
         recovering = False
+        _ = self.register_fixture_image()
 
         def spot_price() -> Decimal:
             return retry_price() if recovering else limits.spot_max_usd_per_hour
@@ -800,7 +1383,7 @@ class HanaSetupTests(CostFixture):
 
     def test_saved_image_fills_only_empty_configuration_values(self) -> None:
         _ = hana_image.save(self.state, hana_image.RegisteredImage('fixture-name', 'saved-image', 'saved-owner',
-                                                                   'saved-vpc', 'saved-subnet'))
+                                                                   'saved-vpc', 'saved-subnet', FIXTURE_GUEST_DIGEST))
         text_setting(self.workload, 'ami_id', '')
         text_setting(self.workload, 'ami_owner_id', '')
         subject = self.subject(FakeAws(self.clock))

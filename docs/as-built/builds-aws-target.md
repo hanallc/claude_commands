@@ -99,15 +99,16 @@ Run this command in a terminal on natedev.
 deploy.py hana-setup --plan
 ```
 
-The plan reports whether the deployed Hana image is current or stale.
-It refuses first-time Hana setup and setup with pending instance or volume work.
-It can preview one policy update for an idle, stopped, stack-owned Hana box.
+The plan checks root replacement for an existing Hana box with a registered image.
+It accepts stack-owned and direct-owned boxes.
+It refuses first-time setup and pending instance or data volume work.
+It reports whether the deployed guest digest matches the current guest files.
 
+For a pending replacement, the plan checks the instance, original data attachment, and registered image.
+For a new replacement, the plan also checks that the instance is stopped.
 The policy preview checks the local credential file and reads the scaler identity with STS.
-It uses the same stack, instance, disk, and parameter checks as approved setup.
-It previews one modification to `ScalerPolicy` without resource replacement.
-The plan deletes the change set and confirms its removal with CloudFormation.
-If removal stays unconfirmed, the plan prints the change set name and refuses.
+It reads the live stack and previews one modification to `ScalerPolicy` through IAM simulation.
+The plan makes read calls only.
 
 The IAM simulation excludes the live `ScalerPolicy` and includes the proposed document.
 The plan simulates the EC2 probes without reading user data or starting the box.
@@ -490,29 +491,7 @@ After it saves an effective guest setting, `tune.py` reports this message.
 
 > The Hana image is now stale. Build and register a current Hana image.
 
-### Replace a Hana image
-
-The NixOS configuration builds the guest files from its pinned `claude-commands` input.
-Use a reviewed pin that contains the current rendered guest files.
-Use the following sequence only when deletion of the Hana data disk is approved.
-
-1. Build the image with `nix build /etc/nixos#nixosConfigurations.aws-hana.config.system.build.images.amazon --out-link RESULT`.
-2. Register it with `scripts/aws_target/deploy.py hana-image --image RESULT --approve-resources`.
-3. Delete the saved deployment with `scripts/aws_target/deploy.py down --workload hana --approve-destroy`.
-4. Prepare the new deployment with `scripts/aws_target/deploy.py prepare --workload hana`.
-5. Provision the new box with `scripts/aws_target/deploy.py hana-setup --approve-resources`.
-
-The third command deletes the data disk and its data.
-Direct setup refuses changed image parameters on a saved box.
-The stack update also refuses replacement of an instance, volume, or attachment.
-
-A replacement that keeps the disk requires a separate setup procedure.
-It must hold the box idle, journal the replacement intent, and launch the replacement in the disk's zone.
-It must detach the same disk, attach it to the replacement, then verify the attachment and stopped state.
-It must persist the new lifecycle identity before it ends the old Spot request.
-Each rerun must confirm the saved intent and resume its last unfinished step.
-Stack-owned boxes also need a separate change that retains the disk and replaces the attachment.
-A combined build and registration command needs an explicit source pin and the local build evidence that registration checks.
+The root replacement procedure keeps the same instance and data volume. [Replace the Hana root image](#replace-the-hana-root-image)
 
 ## Ending persistent Spot boxes
 
@@ -825,6 +804,16 @@ Allow every region in `regions` and `spot_candidate_regions` in the `RegionFloor
 No other statement in that policy may deny EC2 in these regions.
 Keep the existing home and US region permissions.
 The runbook gives the preparation steps.
+
+`deploy.py up` always checks and updates the home stack.
+For each additional region, it hashes the rendered template, stack name, and parameters passed to CloudFormation.
+The deployment state folder stores each successful regional digest with the live stack ID and last update time in `regional-stack-digests.json`.
+Deployment skips a stack when all three fields match and the live status is `CREATE_COMPLETE` or `UPDATE_COMPLETE`.
+Deployment reads the outputs from that status reply and records the elapsed time for the region.
+Deployment warns once if it cannot read the digest file or finds an invalid record.
+It then deploys every region.
+Each deployment call uses a private template file that it removes after the call.
+Run one `deploy.py up` at a time. Two runs from different state folders can save a digest for the other run's stack revision, and a later run can then skip that region.
 
 `buildlog.timer` runs the hourly Spot snapshot through `buildlog hourly` on natedev.
 The existing timer uses `OnUnitInactiveSec=3600s` and calls the installed scripts.
@@ -1322,6 +1311,58 @@ Existing configuration values remain unchanged.
 | `control_url_seconds` | `3600` | Bound signed access for one boot. |
 | `control_poll_seconds` | `1` | Read current permission before the watchdog interval ends. |
 
+
+### Replace the Hana root image
+
+The NixOS configuration builds the guest files from its pinned `claude-commands` input.
+Use a reviewed pin that contains the current rendered guest files.
+
+1. Build the image with `nix build /etc/nixos#nixosConfigurations.aws-hana.config.system.build.images.amazon --out-link RESULT`.
+2. Register the image with `scripts/aws_target/deploy.py hana-image --image RESULT --approve-resources`.
+3. Check the registered image with `scripts/aws_target/deploy.py hana-setup --plan`.
+4. Apply the root replacement with `scripts/aws_target/deploy.py hana-setup --approve-resources`.
+
+The plan reports the deployed image freshness before it checks the registration or simulates the policy.
+The replacement plan reads AWS through the plan identity and does not write local state.
+Setup replaces the root volume on the same instance and keeps the data volume.
+
+Before the first attempt, setup checks that the box is stopped and has no claims.
+It checks the lifecycle identity and the retained data attachment.
+Setup requires an image registration for an existing box.
+The registered guest digest must match the current guest files and the EC2 image description.
+A pending attempt requires the same image and guest digest as its saved record.
+On each invocation, setup checks the registered image owner, architecture, virtualization, boot mode, billing platform, and product codes.
+If the image root exceeds `root_gib`, setup refuses before it makes any change.
+
+Approved setup installs the replacement grants in the existing Hana `ScalerPolicy`.
+Setup uses the scaler credentials for EC2 replacement calls.
+Start and stop use the existing Hana deployment and workload tag conditions.
+Task creation grants access to the exact Hana instance, registered AMI, and source snapshot.
+The task and new volume grants cover resources in the Hana account and region.
+EC2 requires wildcard resource scope for describe calls.
+The new describe grants apply only in the Hana region.
+[EC2 IAM actions and resources](https://docs.aws.amazon.com/service-authorization/latest/reference/list_ec2.html)
+
+The replacement record blocks claims, work starts, and permits.
+The controller keeps its stop duty when the compute reservation expires.
+Setup reserves compute through its time limit before it starts the box or continues on a running box.
+It gives the root replacement task a saved client token.
+EC2 deletes the previous root when the task completes.
+An EC2 stop and start can change an automatically assigned public IPv4 address.
+[EC2 root replacement](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/replace-root.html), [EC2 stop and start](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Stop_Start.html)
+
+If setup stops early, run the approved command again.
+Setup sends the saved token again and polls the task ID that EC2 returns.
+It waits for an active task and refuses to start an interrupted Spot instance.
+A failed task reports its state and the AWS message when one exists.
+The next invocation uses a new token after either task failure state.
+
+Setup completes when EC2 reports the registered image and the same data attachment.
+It requests a stop, closes the reservation, saves the image and guest digest, and removes the hold.
+If the box already uses the registered image, approved setup records its verified digest without replacing the root volume.
+The controller completes the stop if EC2 still reports a running box.
+If replacement execution exits early, setup requests a stop and leaves the reservation open.
+If preflight refuses a rerun, only the controller can request a stop.
 
 ## Hana source transport
 

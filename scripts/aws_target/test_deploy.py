@@ -26,7 +26,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 
-from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_box, hana_spend, ledger, remote
+from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_box, hana_image, hana_render, hana_spend, ledger, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, numeric_settings, text_setting, write_hana_config
 from scripts.aws_target.measurement_test_support import DAY, narrow
@@ -779,6 +779,11 @@ class HanaSetupFailureTests(CostFixture):
         fake = FakeEc2(raise_once='create-volume')
         subject = self.subject(fake, volume_errors=(
             'aws: [ERROR]: An error occurred (UnauthorizedOperation) when calling the CreateVolume operation: denied',))
+        workload = conf.read(self.workload)
+        fake.image = workload.text('ami_id')
+        _ = hana_image.save(self.state, hana_image.RegisteredImage('fixture', fake.image,
+            workload.text('ami_owner_id'), workload.text('vpc_id'), workload.text('subnet_id'),
+            hana_render.guest_digest(self.workload)))
         _ = subject.prepare_hana()
         with redirect_stdout(StringIO()), self.assertRaises(subprocess.TimeoutExpired):
             _ = subject.hana_setup(approve_resources=True)
@@ -1033,6 +1038,8 @@ class HanaSetupFailureTests(CostFixture):
 
         subject = deploy.Deployment(self.settings, self.state, self.root / 'output',
                                     execute=scaler, clock=self.clock, notify=lambda _event: True)
+        # Exercise the policy update path separately from the existing box preflight.
+        _ = self.enterContext(mock.patch.object(subject, '_hana_root_replacement', return_value=False))
         prepared = subject.prepare_hana()
         outputs = {'ControlBucket': 'fixture-bucket', 'LaunchTemplate': 'fixture-template',
                    'LaunchTemplateVersion': '3', 'SecurityGroup': 'fixture-group'}
@@ -1073,13 +1080,16 @@ class HanaSetupFailureTests(CostFixture):
                 self.instance_reads.append(list(arguments))
                 self.assertEqual(arguments[offset + 2:offset + 4], ['--instance-ids', instance])
                 reply = {'Reservations': [{'Instances': [{'InstanceId': instance,
-                    'LaunchTime': 'fixture-launch', 'State': {'Name': live_state},
+                    'LaunchTime': 'fixture-launch', 'State': {'Name': live_state}, 'InstanceLifecycle': 'spot',
+                    'BlockDeviceMappings': [{'DeviceName': '/dev/sdf', 'Ebs': {
+                        'VolumeId': volume, 'DeleteOnTermination': False}}],
                     'SpotInstanceRequestId': saved['spot_request']}]}]}
                 return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
             if service == 'ec2' and operation == 'describe-volumes':
                 self.assertEqual(arguments[offset + 2:offset + 4], ['--volume-ids', volume])
                 reply = {'Volumes': [{'VolumeId': volume, 'Attachments': [
-                    {'InstanceId': instance, 'Device': volume_device, 'State': 'attached'}]}]}
+                    {'InstanceId': instance, 'Device': volume_device, 'State': 'attached',
+                     'AttachTime': '2026-01-15T11:00:00Z', 'DeleteOnTermination': False}]}]}
                 return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
             if admin_spot_error and (service, operation, arguments[offset + 2]) == ('ec2', 'wait', 'instance-exists'):
                 return subprocess.CompletedProcess(arguments, 0, '{}', '')
@@ -1508,7 +1518,7 @@ class HanaSetupFailureTests(CostFixture):
         subject, _parameters = self.policy_update_fixture([], volume_device='/dev/sdg')
         saved = self.setup_path.read_bytes()
 
-        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'resource identities changed'):
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'retained Hana data attachment'):
             _ = subject.hana_setup(approve_resources=True)
 
         self.assertEqual(self.scaler_calls, [])
@@ -1851,6 +1861,10 @@ class HanaSetupFailureTests(CostFixture):
         instance = fake.launch(tagged=True)
         subject = self.subject(fake)
         _ = self.write_leftover(subject, instance=instance)
+        workload = conf.read(self.workload)
+        _ = hana_image.save(self.state, hana_image.RegisteredImage('fixture', workload.text('ami_id'),
+            workload.text('ami_owner_id'), workload.text('vpc_id'), workload.text('subnet_id'),
+            hana_render.guest_digest(self.workload)))
         saved = self.setup_path.read_bytes()
         evidence = self.book.read_snapshot()
 
@@ -2361,7 +2375,8 @@ sys.exit(7)
                      has_gpu_target: bool = True, unoffered_gpu_type: str = '',
                      termination_decision: str = 'allowed', denied_region: str = '',
                      resource_specific_simulation: bool = False,
-                     scaler_arn: str = 'arn:aws:iam::fixture-account:user/fixture-scaler'
+                     scaler_arn: str = 'arn:aws:iam::fixture-account:user/fixture-scaler',
+                     regional_stacks: dict[str, dict[str, str]] | None = None
                      ) -> tuple[deploy.Deployment, list[list[str]]]:
         subject = self.update_fixture()
         self.set_clock(self.now + 1)
@@ -2375,7 +2390,7 @@ sys.exit(7)
         commands: list[list[str]] = []
         outputs = {'GateBucket': 'fixture-bucket', 'GateLaunchTemplate': 'fixture-template',
                    'GateLaunchVersion': '1', 'GateSecurityGroup': 'fixture-group', 'GateRoleId': 'fixture-role',
-                   'ScalerUserName': 'fixture-scaler'}
+                   'GateProfileArn': 'fixture-profile', 'ScalerUserName': 'fixture-scaler'}
         faults = probe_faults or {}
         fault_attempts: dict[str, int] = {}
         probe_bodies: dict[str, bytes] = {}
@@ -2386,9 +2401,27 @@ sys.exit(7)
         def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
             args = list(arguments)
             commands.append(args)
-            operation = args[args.index('--region') + 3]
+            region_index = args.index('--region')
+            region = args[region_index + 1]
+            operation = args[region_index + 3]
             reply: dict[str, object] = {}
-            if operation == 'describe-stacks':
+            if regional_stacks is not None and region in regional_stacks and operation == 'describe-stacks':
+                regional_stack = regional_stacks[region]
+                if not regional_stack.get('StackStatus'):
+                    return subprocess.CompletedProcess(args, 255, '', 'An error occurred (ValidationError): Stack does not exist')
+                regional_outputs = {'GateLaunchTemplate': 'fixture-' + region, 'GateSecurityGroup': 'fixture-group',
+                                    'GateLaunchVersion': regional_stack.get('launch_version', '1')}
+                reply = {'Stacks': [{**regional_stack, 'Outputs': [
+                    {'OutputKey': key, 'OutputValue': value} for key, value in regional_outputs.items()]}]}
+            elif regional_stacks is not None and region in regional_stacks and operation == 'deploy':
+                regional_stack = regional_stacks[region]
+                if regional_stack.get('StackStatus'):
+                    regional_stack['StackStatus'] = 'UPDATE_COMPLETE'
+                    _ = regional_stack.setdefault('LastUpdatedTime', '2026-01-15T12:00:00Z')
+                else:
+                    regional_stack['StackStatus'] = 'CREATE_COMPLETE'
+                _ = regional_stack.setdefault('StackId', 'fixture-stack-' + region)
+            elif operation == 'describe-stacks':
                 reply = {'Stacks': [{'Parameters': [{'ParameterKey': key} for key in
                     ('VpcId', 'NotificationEmail')]}]}
             elif operation == 'describe-route-tables':
@@ -2584,7 +2617,8 @@ sys.exit(7)
             'template': 'lt-west', 'version': '1', 'security_group': 'sg-west', 'stack': 'fixture-west'}
         network = deploy.RegionalNetwork('us-west-2', 'vpc-fixture-west', [], 'ami-west')
         def regional(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, _home: dict[str, str],
-                     _parameters: dict[str, str], given: deploy.RegionalNetwork) -> dict[str, object]:
+                     _parameters: dict[str, str], given: deploy.RegionalNetwork,
+                     _digests: deploy.RegionalStackDigests) -> dict[str, object]:
             self.assertTrue(any('execute-change-set' in command for command in commands))
             self.assertEqual(given, network)
             return west
@@ -2605,6 +2639,157 @@ sys.exit(7)
         self.assertEqual([row['region'] for row in ledger.rows(saved, 'regions')], ['us-east-2', 'us-west-2'])
         self.assertEqual(ledger.rows(saved, 'regions')[1], west)
         self.assertEqual(saved['instance_types'], ['m7a.8xlarge', 'm7a.4xlarge'])
+
+    def test_gate_up_deploys_regions_without_digests_and_reads_live_outputs_on_skip(self) -> None:
+        stacks = {region: {'StackStatus': 'UPDATE_COMPLETE'} for region in ('us-west-2', 'eu-north-1')}
+        subject, commands = self.gate_fixture(regional_stacks=stacks)
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 ' + ' '.join(stacks))
+        settings = aws_config.read_deployment_settings(self.settings)
+        names = {region: settings.stack_name + '-gates-' + region for region in stacks}
+        write_text_atomic(self.state / 'regional-stacks.json', json.dumps(names))
+
+        def network(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, region: str) -> deploy.RegionalNetwork:
+            return deploy.RegionalNetwork(region, 'fixture-vpc', [], 'fixture-image')
+
+        with mock.patch.object(subject, 'regional_network', side_effect=network), redirect_stdout(StringIO()) as output:
+            self.assertTrue(subject.gate_up(approve_resources=True))
+            self.assertEqual([command[command.index('--stack-name') + 1] for command in commands if 'deploy' in command],
+                             list(names.values()))
+            digests = remote.read_record(self.state / 'regional-stack-digests.json')
+            self.assertEqual(set(digests), set(stacks))
+            for region, stack in stacks.items():
+                entry = ledger.mapping(digests[region])
+                self.assertRegex(ledger.text(entry, 'digest'), r'^[0-9a-f]{64}$')
+                self.assertEqual(entry['StackId'], stack['StackId'])
+                self.assertEqual(entry['LastUpdatedTime'], stack['LastUpdatedTime'])
+            self.assertEqual(remote.read_record(self.state / 'regional-stacks.json'), names)
+            commands.clear()
+            _ = output.seek(0)
+            _ = output.truncate()
+            for stack in stacks.values():
+                stack['launch_version'] = '2'
+            self.assertTrue(subject.gate_up(approve_resources=True))
+
+        self.assertFalse(any('deploy' in command for command in commands))
+        for name in names.values():
+            self.assertEqual(sum('describe-stacks' in command and name in command for command in commands), 1)
+        regions = ledger.rows(remote.read_record(self.state / 'gate-deployment.json'), 'regions')
+        self.assertEqual([row['version'] for row in regions[1:]], ['2', '2'])
+        for region in stacks:
+            self.assertEqual(output.getvalue().count(f'cloud-gate: {region}: gate stack unchanged; skipped'), 1)
+            self.assertRegex(output.getvalue(), rf'cloud-gate: {region}: updating the gate stack done in \d+ s')
+        timings = ledger.mapping(remote.read_record(self.state / 'gate-region-times.json')['seconds'])
+        self.assertEqual(set(ledger.mapping(timings['stack'])), set(stacks))
+
+    def test_gate_up_deploys_only_regions_whose_inputs_change(self) -> None:
+        stacks: dict[str, dict[str, str]] = {'us-west-2': {}, 'eu-north-1': {}}
+        subject, commands = self.gate_fixture('GateGpuTrialScalerPolicy', regional_stacks=stacks)
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 ' + ' '.join(stacks))
+        images = {region: 'fixture-image' for region in stacks}
+        template = self.root / 'cloudformation.json'
+        source = deploy.TEMPLATE.read_text()
+        write_text_atomic(template, source)
+
+        def network(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, region: str) -> deploy.RegionalNetwork:
+            return deploy.RegionalNetwork(region, 'fixture-vpc', [], images[region])
+
+        def deployed() -> list[str]:
+            return [command[command.index('--region') + 1] for command in commands if 'deploy' in command]
+
+        with (mock.patch.object(subject, 'regional_network', side_effect=network),
+              mock.patch.object(deploy, 'TEMPLATE', template), redirect_stdout(StringIO())):
+            self.assertTrue(subject.gate_up(approve_resources=True))
+            self.assertEqual(deployed(), list(stacks))
+
+            commands.clear()
+            home_change = source.replace('"ec2:DescribeInstanceTypeOfferings",',
+                                         '"ec2:DescribeInstanceTypeOfferings", "ec2:DescribeInstanceTypes",', 1)
+            self.assertNotEqual(home_change, source)
+            write_text_atomic(template, home_change)
+            self.assertTrue(subject.gate_up(approve_resources=True))
+            self.assertTrue(any('execute-change-set' in command for command in commands))
+            self.assertEqual(deployed(), [])
+
+            commands.clear()
+            images['us-west-2'] = 'fixture-new-image'
+            self.assertTrue(subject.gate_up(approve_resources=True))
+            self.assertEqual(deployed(), ['us-west-2'])
+            self.assertIn('GateImage=fixture-new-image', next(command for command in commands if 'deploy' in command))
+
+            commands.clear()
+            regional_change = home_change.replace('"GateExpiryFunction": {',
+                '"GateExpiryFunction": {"Metadata": {"Fixture": "regional change"},', 1)
+            self.assertNotEqual(regional_change, home_change)
+            write_text_atomic(template, regional_change)
+            self.assertTrue(subject.gate_up(approve_resources=True))
+            self.assertEqual(deployed(), list(stacks))
+
+    def test_gate_up_redeploys_when_the_stack_is_missing_or_ineligible(self) -> None:
+        region = 'us-west-2'
+        stack: dict[str, str] = {}
+        subject, commands = self.gate_fixture(regional_stacks={region: stack})
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 ' + region)
+        network = deploy.RegionalNetwork(region, 'fixture-vpc', [], 'fixture-image')
+        with mock.patch.object(subject, 'regional_network', return_value=network), redirect_stdout(StringIO()):
+            self.assertTrue(subject.gate_up(approve_resources=True))
+            for status in ('UPDATE_ROLLBACK_COMPLETE', 'UPDATE_IN_PROGRESS', ''):
+                with self.subTest(status=status):
+                    stack['StackStatus'] = status
+                    commands.clear()
+                    self.assertTrue(subject.gate_up(approve_resources=True))
+                    self.assertEqual(sum('deploy' in command for command in commands), 1)
+
+    def test_gate_up_redeploys_when_the_stack_id_or_update_time_changes(self) -> None:
+        region = 'us-west-2'
+        stack = {'StackStatus': 'UPDATE_COMPLETE'}
+        subject, commands = self.gate_fixture(regional_stacks={region: stack})
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 ' + region)
+        network = deploy.RegionalNetwork(region, 'fixture-vpc', [], 'fixture-image')
+        path = self.state / 'regional-stack-digests.json'
+        with mock.patch.object(subject, 'regional_network', return_value=network), redirect_stdout(StringIO()):
+            self.assertTrue(subject.gate_up(approve_resources=True))
+            previous = ledger.mapping(remote.read_record(path)[region])
+            for key, value in (('StackId', 'fixture-replaced-stack'), ('LastUpdatedTime', '2026-01-16T12:00:00Z')):
+                with self.subTest(key=key):
+                    stack[key] = value
+                    commands.clear()
+                    self.assertTrue(subject.gate_up(approve_resources=True))
+                    self.assertEqual(sum('deploy' in command for command in commands), 1)
+                    saved = ledger.mapping(remote.read_record(path)[region])
+                    self.assertEqual(saved, {**previous, key: value})
+                    previous = saved
+            commands.clear()
+            self.assertTrue(subject.gate_up(approve_resources=True))
+            self.assertFalse(any('deploy' in command for command in commands))
+
+    def test_gate_up_warns_once_and_deploys_all_regions_when_the_digest_file_is_unusable(self) -> None:
+        stacks: dict[str, dict[str, str]] = {'us-west-2': {}, 'eu-north-1': {}}
+        subject, commands = self.gate_fixture(regional_stacks=stacks)
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 ' + ' '.join(stacks))
+        path = self.state / 'regional-stack-digests.json'
+
+        def network(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, region: str) -> deploy.RegionalNetwork:
+            return deploy.RegionalNetwork(region, 'fixture-vpc', [], 'fixture-image')
+
+        with mock.patch.object(subject, 'regional_network', side_effect=network), redirect_stdout(StringIO()):
+            self.assertTrue(subject.gate_up(approve_resources=True))
+            partly_invalid = remote.read_record(path)
+            partly_invalid['eu-north-1'] = {'digest': 'broken'}
+            for contents in (json.dumps(partly_invalid), '', '[]', None):
+                with self.subTest(contents=contents):
+                    if contents is None:
+                        path.unlink()
+                        path.mkdir()
+                    else:
+                        write_text_atomic(path, contents)
+                    commands.clear()
+                    with redirect_stdout(StringIO()) as output:
+                        self.assertTrue(subject.gate_up(approve_resources=True))
+                    deployed = [command[command.index('--region') + 1] for command in commands if 'deploy' in command]
+                    self.assertEqual(deployed, list(stacks))
+                    self.assertEqual(output.getvalue().count('regional-stack-digests.json'), 1)
+                    if contents is not None:
+                        self.assertEqual(set(remote.read_record(path)), set(stacks))
 
     def test_gate_up_prints_regional_progress_and_uses_saved_times(self) -> None:
         subject, _commands = self.gate_fixture()
@@ -2631,7 +2816,8 @@ sys.exit(7)
             return deploy.RegionalNetwork(region, 'fixture-vpc', [], 'fixture-image')
 
         def stack(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, _home: dict[str, str],
-                  _parameters: dict[str, str], given: deploy.RegionalNetwork) -> dict[str, object]:
+                  _parameters: dict[str, str], given: deploy.RegionalNetwork,
+                  _digests: deploy.RegionalStackDigests) -> dict[str, object]:
             completed('stack', stack_action, given.region, stack_seconds)
             return {'region': given.region}
 
@@ -2709,7 +2895,8 @@ sys.exit(7)
         def network(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, region: str) -> deploy.RegionalNetwork:
             return deploy.RegionalNetwork(region, 'fixture-vpc', [], 'fixture-image')
         def stack(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, _home: dict[str, str],
-                  _parameters: dict[str, str], given: deploy.RegionalNetwork) -> dict[str, object]:
+                  _parameters: dict[str, str], given: deploy.RegionalNetwork,
+                  _digests: deploy.RegionalStackDigests) -> dict[str, object]:
             if given.region == 'eu-north-1':
                 raise aws_target.AwsUnavailable('fixture regional failure')
             return {'region': given.region}
@@ -3436,7 +3623,8 @@ sys.exit(7)
                 copied = True
                 reply = {'ImageId': 'ami-fixture-west'}
             elif operation == 'describe-stacks' and region == 'us-west-2':
-                reply = {'Stacks': [{'Outputs': [{'OutputKey': key, 'OutputValue': value} for key, value in
+                reply = {'Stacks': [{'StackStatus': 'CREATE_COMPLETE', 'StackId': 'fixture-stack-west',
+                    'Outputs': [{'OutputKey': key, 'OutputValue': value} for key, value in
                     {'GateLaunchTemplate': 'lt-west', 'GateLaunchVersion': '2', 'GateSecurityGroup': 'sg-west'}.items()]}]}
             elif operation not in ('deploy', 'wait'):
                 return original(arguments, capture_output=True, text=True, timeout=1, check=False)
@@ -3445,13 +3633,15 @@ sys.exit(7)
         api = aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)
         settings = aws_config.read_deployment_settings(self.settings)
         home = {'GateProfileArn': 'fixture-profile', 'GateRoleArn': 'fixture-role'}
-        result = subject.regional_gate_stack(api, settings, home, {}, subject.regional_network(api, settings, 'us-west-2'))
+        digests = deploy.RegionalStackDigests.read(subject.directory)
+        result = subject.regional_gate_stack(api, settings, home, {}, subject.regional_network(api, settings, 'us-west-2'), digests)
         self.assertTrue(copied)
         self.assertEqual(result['image'], 'ami-fixture-west')
         self.assertEqual(result['region'], 'us-west-2')
-        self.assertEqual(subject.regional_gate_stack(api, settings, home, {}, subject.regional_network(api, settings, 'us-west-2')), result)
+        self.assertEqual(subject.regional_gate_stack(api, settings, home, {},
+            subject.regional_network(api, settings, 'us-west-2'), digests), result)
         self.assertEqual(sum('copy-image' in command for command in commands), 1)
-        self.assertTrue(any('deploy' in command and settings.stack_name + '-gates-us-west-2' in command for command in commands))
+        self.assertEqual(sum('deploy' in command and settings.stack_name + '-gates-us-west-2' in command for command in commands), 1)
         query = next(command for command in commands if 'describe-images' in command and '--owners' in command)
         self.assertIn('fixture-owner', query)
         self.assertIn('Name=name,Values=fixture-nixos', query)
@@ -3473,6 +3663,45 @@ sys.exit(7)
                 with self.subTest(name=name, region=region):
                     named = value.replace('${DeploymentId}', 'f' * 32).replace('${AWS::Region}', region)
                     self.assertLessEqual(len(named), limit)
+
+    def test_concurrent_regional_deploys_read_private_templates(self) -> None:
+        first, _commands = self.gate_fixture()
+        other_state = self.root / 'other-state'
+        other_state.mkdir()
+        _ = (other_state / 'deployment.json').write_bytes((first.directory / 'deployment.json').read_bytes())
+        settings = aws_config.read_deployment_settings(self.settings)
+        home = {'GateProfileArn': 'fixture-profile'}
+        network = deploy.RegionalNetwork('us-west-2', 'fixture-vpc', [], 'fixture-image')
+        definition = deploy.region_gate_template()
+        templates = ({**definition, 'Description': 'first template'}, {**definition, 'Description': 'second template'})
+        paths: list[Path] = []
+        outputs = {'GateLaunchTemplate': 'lt-west', 'GateLaunchVersion': '1', 'GateSecurityGroup': 'sg-west'}
+
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            args = list(arguments)
+            if 'describe-stacks' in args:
+                reply = {'Stacks': [{'StackStatus': 'CREATE_COMPLETE', 'StackId': 'fixture-stack',
+                    'Outputs': [{'OutputKey': key, 'OutputValue': value} for key, value in outputs.items()]}]}
+                return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
+            self.assertIn('deploy', args)
+            path = Path(args[args.index('--template-file') + 1])
+            index = len(paths)
+            paths.append(path)
+            if index == 0:
+                # Start the second deploy before the first CLI reads its template.
+                _ = second.regional_gate_stack(api, settings, home, {}, network,
+                    deploy.RegionalStackDigests.read(second.directory))
+            self.assertEqual(cast(object, json.loads(path.read_text())), templates[index])
+            return subprocess.CompletedProcess(args, 0, '', '')
+
+        second = deploy.Deployment(self.settings, other_state, first.output, execute=execute, clock=first.clock)
+        api = aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)
+        with mock.patch.object(deploy, 'region_gate_template', side_effect=templates):
+            _ = first.regional_gate_stack(api, settings, home, {}, network,
+                deploy.RegionalStackDigests.read(first.directory))
+        self.assertEqual(len(set(paths)), 2)
+        for path in paths:
+            self.assertFalse(path.parent.exists())
 
     def regional_stack_fixture(self, stack: dict[str, str]) -> tuple[deploy.Deployment, list[list[str]], aws_target.AwsCli]:
         """A regional stack in the state stack['status']; an empty status means the stack does not exist yet.
@@ -3520,26 +3749,32 @@ sys.exit(7)
         return subject, commands, aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)
 
     def test_regional_stack_failure_names_the_region_and_the_failed_resources_of_this_run(self) -> None:
-        subject, _commands, api = self.regional_stack_fixture({'status': '', 'deploy': 'fails'})
+        subject, commands, api = self.regional_stack_fixture({'status': '', 'deploy': 'fails'})
         settings = aws_config.read_deployment_settings(self.settings)
+        path = self.state / 'regional-stack-digests.json'
+        prior = {'digest': 'a' * 64, 'StackId': 'fixture-stack', 'LastUpdatedTime': None}
+        write_text_atomic(path, json.dumps({'us-west-1': prior, 'us-west-2': prior}))
         with self.assertRaises(aws_target.AwsUnavailable) as raised:
             _ = subject.regional_gate_stack(api, settings, {'GateProfileArn': 'p', 'GateRoleArn': 'r'}, {},
-                                            subject.regional_network(api, settings, 'us-west-1'))
+                subject.regional_network(api, settings, 'us-west-1'), deploy.RegionalStackDigests.read(self.state))
         lines = str(raised.exception).splitlines()
         self.assertEqual(lines[0], 'us-west-1: aws: [ERROR]: Failed to create/update the stack.')
         self.assertEqual(lines[1:], ['GateExpiryFunction (AWS::Lambda::Function): CREATE_FAILED: fixture runtime is not offered here'])
+        self.assertEqual(remote.read_record(path), {'us-west-2': prior})
+        command = next(command for command in commands if 'deploy' in command)
+        self.assertFalse(Path(command[command.index('--template-file') + 1]).parent.exists())
 
     def test_regional_stack_whose_first_create_failed_is_removed_before_the_new_deploy(self) -> None:
         stack = {'status': '', 'deploy': 'passes'}
         subject, commands, api = self.regional_stack_fixture(stack)
         settings = aws_config.read_deployment_settings(self.settings)
-        for status, removed in (('ROLLBACK_COMPLETE', True), ('', False), ('UPDATE_COMPLETE', False)):
+        for status, removed in (('ROLLBACK_COMPLETE', True), ('', False)):
             with self.subTest(status=status or 'no stack'):
                 stack.update(status=status, deploy='passes')
                 commands.clear()
                 with redirect_stdout(StringIO()) as output:
                     result = subject.regional_gate_stack(api, settings, {'GateProfileArn': 'p', 'GateRoleArn': 'r'}, {},
-                                            subject.regional_network(api, settings, 'us-west-1'))
+                        subject.regional_network(api, settings, 'us-west-1'), deploy.RegionalStackDigests.read(self.state))
                 self.assertEqual(result['template'], 'lt-west')
                 operations = [command[command.index('--region') + 3] for command in commands
                               if command[command.index('--region') + 1] == 'us-west-1'
@@ -3979,7 +4214,8 @@ sys.exit(7)
             return deploy.RegionalNetwork(region, 'fixture-vpc', [], 'ami-fixture')
 
         def stack(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, _outputs: dict[str, str],
-                  _parameters: dict[str, str], given: deploy.RegionalNetwork) -> dict[str, object]:
+                  _parameters: dict[str, str], given: deploy.RegionalNetwork,
+                  _digests: deploy.RegionalStackDigests) -> dict[str, object]:
             subnets = [] if given.region == 'eu-west-2' else [{'id': 'fixture-other-subnet', 'zone': given.region + 'a'}]
             return {'region': given.region, 'subnets': subnets}
 

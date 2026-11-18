@@ -259,10 +259,13 @@ class AwsHanaProvider:
                 if saved:
                     recovered = self._recover(identity, start, operation, path, saved)
                     if isinstance(recovered, box.MutationUnresolved):
-                        if (operation.action != box.Action.BOOTSTRAP or recovered.observed.state != 'stopped'
-                                or not isinstance(start, box.DemandStart)):
+                        if operation.action == box.Action.STOP:
+                            self._dispatch(identity, start, operation, path, saved)
+                        elif (operation.action == box.Action.BOOTSTRAP and recovered.observed.state == 'stopped'
+                              and isinstance(start, box.DemandStart)):
+                            self._write_bootstrap(identity, start, path, saved)
+                        else:
                             raise ProviderPending('The Hana ' + operation.action.value + ' operation remains unresolved')
-                        self._write_bootstrap(identity, start, path, saved)
                     elif operation.action != box.Action.BOOTSTRAP:
                         return self._accepted(identity, start, operation)
                 else:

@@ -76,6 +76,7 @@ class FakeEc2:
     launch_tokens: dict[str, str] = field(default_factory=dict)
     hidden_launch_reads: int = 0
     hidden_volume_reads: int = 0
+    image: str = 'fixture-image'
 
     def launch(self, *, tagged: bool, request: str = '') -> str:
         self.count += 1
@@ -135,7 +136,7 @@ class FakeEc2:
                 self.hidden_launch_reads -= 1
                 return subprocess.CompletedProcess(list(arguments), 0, '{"Reservations":[]}', '')
             value = {'Reservations': [{'Instances': [
-                {'InstanceId': key, 'SpotInstanceRequestId': row.request, 'State': {'Name': row.state},
+                {'InstanceId': key, 'ImageId': self.image, 'SpotInstanceRequestId': row.request, 'State': {'Name': row.state},
                  'Tags': [{'Key': name, 'Value': tag} for name, tag in row.tags.items()]}
                 for key, row in self.boxes.items() if self.matches(rest, key, row)]}]}
         elif operation == 'describe-spot-instance-requests':
