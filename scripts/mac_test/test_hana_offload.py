@@ -125,6 +125,54 @@ control_poll_seconds=1
         self.assertIsInstance(self.controller.pending, offload.SettledDispatchOperations)
         self.assertEqual(self.controller.attempt_evidence.cleanup, 'confirmed')
 
+    def test_stale_image_before_publication_reports_the_box_fault(self) -> None:
+        with (self.context(), mock.patch.object(self.lifecycle, 'permission',
+                    return_value=box.ClaimRefused(placement.HANA_IMAGE_STALE)),
+                mock.patch.object(hana, 'release_assigned', return_value=False) as release,
+                mock.patch.object(admission_client, 'report_execution') as report):
+            outcome = self.run_claimed()
+            offload.report_placement_result(self.controller, self.request, outcome)
+        release.assert_not_called()
+        report.assert_called_once()
+        sent = cast(wire.ExecutionReport, report.call_args.args[0])
+        self.assertEqual(sent.outcome, placement.HanaCommandAdmissionRefused(placement.HANA_IMAGE_STALE))
+        self.assertIsInstance(sent.path, placement.DispatchPathSettled)
+        self.assertIsInstance(sent.evidence, placement.ExecutionNotStarted)
+        self.assertTrue(execution.claim_admission_refused(self.root, self.fixture.reference))
+        assert isinstance(outcome, offload.HanaCommandAdmissionRefused)
+        self.assertEqual(outcome.reason, placement.HANA_IMAGE_STALE)
+        settled = self.controller.hana_settlement
+        assert isinstance(settled, execution.HanaSettled)
+        self.assertEqual(settled.outcome, placement.HanaCommandAdmissionRefused(placement.HANA_IMAGE_STALE))
+        self.assertEqual(self.fixture.objects.envelopes, [])
+        result_path = self.root / 'result'
+        with (mock.patch.dict(os.environ, {'BUILDLOG_PINNED_TARGET': self.request.target}),
+                mock.patch.object(eligibility, 'configured_ssh_target', return_value=target_config.SshTarget(
+                    self.request.target, 'linux', self.transport.settings)),
+                mock.patch('sys.stdout', new_callable=StringIO) as output):
+            self.assertEqual(offload.write_result(outcome, offload.ResultFile(result_path), target=self.request.target), 75)
+        self.assertEqual(output.getvalue(), '')
+        self.assertIn(f'reason={placement.HANA_IMAGE_STALE}\n', result_path.read_text())
+
+    def test_stale_image_at_claim_reports_a_settled_refusal(self) -> None:
+        cause = placement.HANA_IMAGE_STALE
+        with (self.context(), mock.patch.object(hana, 'claim_assigned', return_value=hana.HanaClaimRefused(cause)),
+                mock.patch.object(hana, 'release_assigned') as release,
+                mock.patch.object(admission_client, 'report_execution') as report):
+            outcome = self.run_claimed()
+            offload.report_placement_result(self.controller, self.request, outcome)
+        assert isinstance(outcome, offload.HanaCommandAdmissionRefused)
+        self.assertEqual(outcome.reason, cause)
+        report.assert_called_once()
+        sent = cast(wire.ExecutionReport, report.call_args.args[0])
+        self.assertEqual(sent.claim, self.fixture.reference)
+        self.assertEqual(sent.outcome, placement.HanaCommandAdmissionRefused(cause))
+        self.assertIsInstance(sent.evidence, placement.ExecutionNotStarted)
+        self.assertIsInstance(sent.path, placement.DispatchPathSettled)
+        self.assertTrue(execution.claim_admission_refused(self.root, self.fixture.reference))
+        release.assert_not_called()
+        self.assertEqual(self.fixture.objects.envelopes, [])
+
     def test_nonzero_compiler_status_remains_a_terminal_failure(self) -> None:
         with self.context(), mock.patch.object(self.fixture.objects, 'execution_result',
                 return_value=hana_result.encode_result(self.fixture.command_result(1))), \
@@ -150,7 +198,9 @@ control_poll_seconds=1
             with self.subTest(request=request.placement):
                 output = StringIO()
                 controller = offload.ProcessController()
+                directory = Path(self.enterContext(tempfile.TemporaryDirectory(dir=self.root)))
                 with self.context(), ExitStack() as patches:
+                    _ = patches.enter_context(mock.patch.object(self.lifecycle, 'directory', directory))
                     _ = patches.enter_context(mock.patch.object(sys, 'stdout', output))
                     _ = patches.enter_context(mock.patch.object(sys, 'argv',
                         ['offload', 'run', '--repo-root', str(self.root), '--call-id', 'call']))
@@ -178,7 +228,7 @@ control_poll_seconds=1
                 self.assertEqual(sent.outcome, placement.PrelaunchRefused(cause))
                 self.assertIsInstance(sent.path, placement.DispatchPathSettled)
                 self.assertIsInstance(sent.evidence, placement.ExecutionNotStarted)
-                self.assertFalse(execution.claim_dispatch_pending(self.root, self.fixture.reference))
+                self.assertFalse(execution.claim_dispatch_pending(directory, self.fixture.reference))
                 self.assertEqual(self.fixture.objects.envelopes, [])
                 self.assertEqual(output.getvalue().splitlines(), [
                     'mac_test: The build did not run on configured-target. '
@@ -455,7 +505,7 @@ control_poll_seconds=1
         self.assertEqual(status, 75)
         decoded = runner_result.read_result(result.path, status, selected_is_mac=False)
         assert isinstance(decoded, runner_result.UsableRunnerResult)
-        self.assertEqual((decoded.word, decoded.reason), (placement.HANA_COMMAND_ADMISSION_REFUSED, reason))
+        self.assertEqual((decoded.word, decoded.reason), ('hana_command_admission_refused', reason))
         self.assertIsInstance(self.controller.pending, offload.PendingHanaOperation)
         self.assertTrue(execution.execution_command_settled(self.root, self.fixture.key.claim_id))
         self.assertTrue(execution.claim_admission_refused(self.root, self.fixture.reference))

@@ -1736,20 +1736,27 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertEqual(self.questions(), [])
         self.assertEqual(self.proposals(), [])
 
-    def test_f026_send_retry_and_reply_find_the_bug_in_the_filing_owners_archive(self) -> None:
+    def test_f026_send_retry_and_reply_find_the_bug_in_the_parent_showrunners_archive(self) -> None:
         payload = request()
         saved = submissions.submit(payload)
         token = saved.reply_token
         wrapped = self.wrap_fixture()
         self.assertEqual(self.tidy_fixture(wrapped), (0, ''))
-        archive = saved.path.parent / 'archive' / '2026'
+        moved = investigation.folder(PRODUCER) / saved.path.name
+        receipt = submissions.image_folder(saved).parent / 'receipt.json'
+        location = cast(dict[str, str], json.loads(receipt.read_text()))
+        self.assertEqual((location['id'], location['owner'], location['path'], location['original_path']),
+                         (saved.id, PRODUCER, str(moved), str(saved.path)))
+        self.assertFalse(saved.path.exists())
+        archive = moved.parent / 'archive' / '2026'
         archive.mkdir(parents=True)
-        archived = saved.path.rename(archive / saved.path.name)
+        archived = moved.rename(archive / moved.name)
         with patch.object(investigation, 'review_record_paths', wraps=investigation.review_record_paths) as search:
             self.assertTrue(submissions.answer(saved.key, 'Answer in the archive', token, members=wrapped))
             retry = submissions.submit(payload, members=wrapped)
-        self.assertEqual(search.call_args_list, [((OWNER,), {"strict": True})] * 2)
-        self.assertEqual((retry.id, retry.path), (saved.id, archived))
+        self.assertEqual(search.call_args_list, [((PRODUCER,), {"strict": True})] * 2)
+        self.assertEqual((retry.id, retry.owner, retry.path), (saved.id, PRODUCER, archived))
+        self.assertEqual((retry.key, retry.reply_token), (saved.key, token))
         self.assertTrue(archived.exists())
         self.assertEqual(investigation.read_review_record(archived).answer, 'Answer in the archive')
 
@@ -1806,7 +1813,7 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertEqual(saved.path.parent, investigation.folder(PRODUCER))
         self.assertEqual(investigation.load(PRODUCER, saved.id).owner, PRODUCER)
 
-    def test_f035_missing_receipt_finds_the_bug_in_the_original_store(self) -> None:
+    def test_f035_missing_receipt_finds_the_bug_in_the_parent_showrunners_store(self) -> None:
         payload = request()
         saved = submissions.submit(payload)
         token = saved.reply_token
@@ -1816,10 +1823,13 @@ class ReviewSubmissionTests(unittest.TestCase):
         receipt.unlink()
         self.assertTrue(submissions.answer(saved.key, 'Reply without a receipt', token, members=wrapped))
         retry = submissions.submit(payload, members=wrapped)
-        self.assertEqual(retry.key, saved.key)
-        self.assertEqual(retry.path, saved.path)
-        self.assertEqual(investigation.load(OWNER, saved.id).answer, 'Reply without a receipt')
-        self.assertEqual(investigation.records(PRODUCER, include_read=True), [])
+        self.assertEqual((retry.id, retry.key, retry.reply_token), (saved.id, saved.key, token))
+        self.assertEqual((retry.owner, retry.path), (PRODUCER, investigation.folder(PRODUCER) / saved.path.name))
+        self.assertEqual(investigation.load(PRODUCER, saved.id).answer, 'Reply without a receipt')
+        self.assertEqual(investigation.records(OWNER, include_read=True), [])
+        location = cast(dict[str, str], json.loads(receipt.read_text()))
+        self.assertEqual((location['id'], location['owner'], location['path']),
+                         (saved.id, PRODUCER, str(retry.path)))
 
     def test_f021_and_f035_answer_key_survives_a_folder_change(self) -> None:
         payload = request(submissions.SubmissionKind.QUESTION)

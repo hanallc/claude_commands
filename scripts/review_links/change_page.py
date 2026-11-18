@@ -178,6 +178,8 @@ class StoredReviewMessage(TypedDict):
     # A record saved before efficiencies has no row; its row is the source's stem.
     row: NotRequired[str]
     image_question_dispatch: NotRequired[ImageQuestionDispatch]
+    submission_request: NotRequired[str]
+    submission_delivered: NotRequired[bool]
 
 
 class StoredDeliveryCloseout(TypedDict):
@@ -880,12 +882,15 @@ class DeliveryStatus:
         fields = self.closeout_fields(page, row)
         dispatch = fields.get("review_dispatch")
         if dispatch is not None and dispatch["attempt"] == intent.attempt:
-            if dispatch["state"] == "finished":
-                self.finish_intent_locked(delivery, slots, intent)
-            else:
+            if dispatch["state"] != "finished":
                 print(f"review-links delivery {row}: send result unknown for attempt {intent.attempt}; message kept",
                       file=sys.stderr)
-            return False
+                return False
+            failed = fields.get("failed_delivery")
+            if not (isinstance(page, ReviewMessagePage) and page.saved.get("submission_request")
+                    and failed is not None and failed["attempt"] == intent.attempt):
+                self.finish_intent_locked(delivery, slots, intent)
+                return False
         path = self.closeout_path(page, row)
         started: StoredDeliveryCloseout = {**fields, "review_dispatch": {"attempt": intent.attempt, "state": "started"}}
         try:
@@ -1054,6 +1059,9 @@ class DeliveryStatus:
             for current in slots.intents():
                 if current.attempt == delivery.attempt:
                     self.record_result_locked(delivery, result, alerts)
+                    if (isinstance(result, FailedDelivery) and isinstance(page, ReviewMessagePage)
+                            and page.saved.get("submission_request")):
+                        return
                     self.finish_intent_locked(delivery, slots, current)
                     return
 
@@ -1063,6 +1071,8 @@ class DeliveryStatus:
             updated = replace(slots, validation=ValidationRequested(intent.attempt, intent.feedback))
         else:
             updated = slots.updated(intent.kind, NoDelivery())
+        if intent.kind == "verdict" and isinstance(page, ReviewMessagePage) and page.saved.get("submission_request"):
+            page = replace(page, saved={**page.saved, "submission_delivered": True})
         self.write_slots(page, row, updated)
         if intent.kind == "verdict" and isinstance(page, (ReviewMessagePage, UserQuestionPage)):
             try:
@@ -2164,6 +2174,8 @@ def recover_review_messages(status: DeliveryStatus) -> None:
                 fields = cast(StoredDeliverySlots,json.loads(path.read_text()))
                 saved = fields.get('review_message')
                 if saved is None:
+                    continue
+                if saved.get('submission_delivered'):
                     continue
                 source = Path(saved['source'])
                 row = saved.get('row',source.stem)

@@ -4,15 +4,16 @@ from __future__ import annotations
 from dataclasses import replace
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr
 from importlib import import_module
+from io import StringIO
 import os
 import threading
-import time
 from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service, placement
+from scripts.build_queue import admission_client, admission_protocol as wire, admission_records as records, admission_service as service, placement
 from scripts.build_queue.test_placement import (
     PlacementFixture, ManualEvidenceWorker, placement_request, publish_candidate, assignment_for, adopt_assignment,
     consume_permission, local_candidate,
@@ -21,7 +22,7 @@ from scripts.build_queue.admission_test_support import only_admitted
 from scripts.aws_target import hana_box, hana_execution, hana_placement, hana_placement_adapter, ledger
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import install_hana_spending_settings
-from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY
+from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY, record_lifecycle_image
 from scripts.aws_target.controller_lock import control_lock
 from scripts.build_targets import target_config
 from scripts.buildlog import store
@@ -44,6 +45,52 @@ class HanaQueueTests(unittest.TestCase):
         super().setUpClass()
         # Load the target helpers before a test replaces the configuration reader.
         _ = import_module('scripts.build_targets.build_targets')
+
+    def test_stale_image_refusal_keeps_the_same_episode_off_hana(self) -> None:
+        with PlacementFixture() as fixture:
+            target = hana_target(fixture)
+            request = placement_request(fixture)
+            remote = replace(request.constraints.candidates[0], destination=replace(
+                request.constraints.candidates[0].destination, provider='ssh', target=target.name, host='fixture-hana'))
+            request = replace(request, prerequisite=placement.TokenNotRequired(),
+                constraints=replace(request.constraints, candidates=(remote, local_candidate(fixture))))
+            with mock.patch.object(target_config, 'read_targets', return_value=(target,)):
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                cause = placement.HANA_IMAGE_STALE
+                claim = adopt_assignment(fixture, request, assignment)
+                _ = fixture.connect(wire.ExecutionReport('image-refusal', assignment, claim,
+                    placement.ExecutionNotStarted(), placement.HanaCommandAdmissionRefused(cause),
+                    placement.DispatchPathSettled())).replies()
+                key = placement.attempt_key(assignment.episode, assignment.attempt)
+                closed = fixture.server.assignments[key]
+                self.assertEqual(closed.retry, placement.DoNotRetry(cause))
+                assert isinstance(closed.terminal_report, placement.TerminalAttemptReport)
+                self.assertEqual(closed.terminal_report.outcome, placement.HanaCommandAdmissionRefused(cause))
+                _ = publish_candidate(fixture, request)
+                fallback = fixture.connect(request).replies()[-1]
+                assert isinstance(fallback, wire.LocalPlacementGranted)
+                self.assertFalse(fallback.hana_image_stale)
+
+    def test_routed_fallback_prints_the_stale_hana_image_once(self) -> None:
+        with PlacementFixture() as fixture:
+            target = hana_target(fixture)
+            request = placement_request(fixture)
+            remote = replace(request.constraints.candidates[0], destination=replace(
+                request.constraints.candidates[0].destination, provider='ssh', target=target.name, host='fixture-hana'))
+            request = replace(request, prerequisite=placement.TokenNotRequired(),
+                constraints=replace(request.constraints, candidates=(remote, local_candidate(fixture))))
+            with mock.patch.object(target_config, 'read_targets', return_value=(target,)):
+                _ = publish_candidate(fixture, request, placement.FixedExclusion(placement.HANA_IMAGE_STALE))
+                reply = fixture.connect(request).replies()[-1]
+            assert isinstance(reply, wire.LocalPlacementGranted)
+            with (mock.patch.dict(os.environ, {'BUILDLOG_HOLD_WAIT_FILE': str(fixture.root / 'seconds')}),
+                    redirect_stderr(StringIO()) as output):
+                client = admission_client.WaitOutput()
+                client.placement_notices(reply, placement_events=True)
+                client.placement_notices(reply, placement_events=True)
+                admission_client.WaitOutput().placement_notices(reply, placement_events=True)
+            self.assertEqual(output.getvalue(), placement.HANA_IMAGE_STALE + '\n')
 
     def test_failed_boot_reports_terminal_outcome_before_capacity_and_fallback_release(self) -> None:
         with PlacementFixture() as fixture:
@@ -83,9 +130,10 @@ class HanaQueueTests(unittest.TestCase):
                 self.assertEqual(fallback.assignment.episode, assignment.episode)
 
     def test_command_admission_refusal_excludes_hana_from_the_same_build(self) -> None:
-        for next_target, stale_absence in (('natedev', False), ('mac', False), ('natedev', True)):
-            with (self.subTest(next_target=next_target, stale_absence=stale_absence), PlacementFixture() as fixture,
-                  mock.patch.object(service, 'HostEvidenceWorker', ManualEvidenceWorker)):
+        for next_target, stale_absence, stale_image in (
+                ('natedev', False, False), ('mac', False, False), ('natedev', True, False), ('natedev', False, True)):
+            with (self.subTest(next_target=next_target, stale_absence=stale_absence, stale_image=stale_image),
+                  PlacementFixture() as fixture, mock.patch.object(service, 'HostEvidenceWorker', ManualEvidenceWorker)):
                 target = hana_target(fixture)
                 request = placement_request(fixture)
                 mac = request.constraints.candidates[0]
@@ -108,7 +156,12 @@ class HanaQueueTests(unittest.TestCase):
                     if stale_absence:
                         _ = publish_candidate(fixture, other)
                         fixture.clock.advance(1)
-                    cause = 'The data mount and a fresh permit are required'
+                    cause = placement.HANA_IMAGE_STALE if stale_image else 'The data mount and a fresh permit are required'
+                    if stale_image:
+                        provider = placement.AdoptedProviderClaim(claim, placement.ClaimHolderIdentity(
+                            assignment.owner.host, assignment.owner.pid, assignment.owner.start_time),
+                            assignment.session, assignment.destination.host, 'host-generation-a')
+                        _ = publish_candidate(fixture, other, claims=(provider,))
                     report = wire.ExecutionReport('admission-refused', assignment, claim,
                         placement.ExecutionNotStarted(), placement.HanaCommandAdmissionRefused(cause),
                         placement.DispatchPathSettled())
@@ -123,7 +176,7 @@ class HanaQueueTests(unittest.TestCase):
                     self.assertEqual(fallback.assignment.destination.target, next_target)
                     self.assertEqual(fallback.assignment.episode, assignment.episode)
                     self.assertNotEqual(fallback.assignment.attempt, assignment.attempt)
-                    if stale_absence:
+                    if stale_absence or stale_image:
                         self.assertIsInstance(fixture.connect(other).replies()[-1], wire.PlacementWait)
                         _ = publish_candidate(fixture, other)
                         self.assertEqual(assignment_for(fixture, other).destination, remote.destination)
@@ -218,10 +271,9 @@ class HanaQueueTests(unittest.TestCase):
                     queue_pass = workers.submit(fixture.run_pass)
                     _ = queue_pass.result(timeout=1)
                     self.assertTrue(reading.wait(1))
-                    began = time.monotonic()
                     reply = fixture.connect(wire.ReleaseRequest('release-with-controller-lock', grant.reservation, 0)).replies()
                     self.assertEqual(reply, [wire.Ok()])
-                    self.assertLess(time.monotonic() - began, 1)
+                    self.assertFalse(lock_owner.done())
                     key = placement.attempt_key(assignment.episode, assignment.attempt)
                     self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
                 finally:
@@ -283,7 +335,7 @@ class HanaQueueTests(unittest.TestCase):
             repo_key = 'https://github.com/natepiano/hana'
             with target.settings.open('a') as settings:
                 _ = settings.write(f'execution_transport=hana-control\nrepository_identity={repo_key}\nkinds=check,lint\n'
-                                   + '# whole: 1..\nmax_steps=1\n# whole: 1..\nfree_floor_gib=30\n')
+                                   + '# whole: 1..\nmax_steps=1\n')
             original = placement_request(fixture)
             assert isinstance(original.profile, records.StepProfile)
             destination = placement.PlacementDestination('ssh', target.name, 'fixture-hana',
@@ -301,6 +353,7 @@ class HanaQueueTests(unittest.TestCase):
             book.record_inventory(ledger.ResourceInventory(clock.now, (), 'private inventory', True))
             book.observe(ledger.InstanceObservation(clock.now, 'terminated', 'private account inventory'))
             controller.register(IDENTITY)
+            _ = record_lifecycle_image(directory, target.settings)
 
             _ = fixture.enter_context(mock.patch.object(target_config, 'read_targets', return_value=(target,)))
             _ = fixture.enter_context(mock.patch.object(hana_placement, 'controller_for', return_value=controller))
