@@ -20,6 +20,7 @@ MAX_REQUEST_ID_LENGTH = 192
 MAX_IMAGES = 4
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 12 * 1024 * 1024
+BUILD_EVIDENCE_LIMITS = {"title": 300, "label": 200, "text": 4_000, "tipEntries": 64}
 IMAGE_FORMATS = {"image/png": "png", "image/jpeg": "jpeg", "image/gif": "gif", "image/webp": "webp"}
 
 
@@ -272,12 +273,12 @@ def _tip_entry(value: object) -> TipEntry:
     row = _mapping(value, "Tooltip entry")
     match row.get("kind"):
         case "caption":
-            return TipCaption(_text(row.get("text"), "Tooltip caption", 4000))
+            return TipCaption(_text(row.get("text"), "Tooltip caption", BUILD_EVIDENCE_LIMITS["text"]))
         case "field":
-            return TipField(_text(row.get("label"), "Tooltip label", 200),
-                            _text(row.get("value"), "Tooltip value", 4000, allow_empty=True))
+            return TipField(_text(row.get("label"), "Tooltip label", BUILD_EVIDENCE_LIMITS["label"]),
+                            _text(row.get("value"), "Tooltip value", BUILD_EVIDENCE_LIMITS["text"], allow_empty=True))
         case "detail":
-            return TipDetail(_text(row.get("text"), "Tooltip detail", 4000))
+            return TipDetail(_text(row.get("text"), "Tooltip detail", BUILD_EVIDENCE_LIMITS["text"]))
         case _:
             raise SubmissionError("Select a valid tooltip entry type.")
 
@@ -292,26 +293,26 @@ def read_evidence(value: object) -> Evidence:
             captured_at = _text(data.get("captured_at"), "Capture time", 80)
             _ = _time(captured_at)
             cells = tuple(
-                BuildCell(_text(cell.get("label"), "Cell label", 200),
-                          _text(cell.get("value"), "Cell value", 4000, allow_empty=True))
+                BuildCell(_text(cell.get("label"), "Cell label", BUILD_EVIDENCE_LIMITS["label"]),
+                          _text(cell.get("value"), "Cell value", BUILD_EVIDENCE_LIMITS["text"], allow_empty=True))
                 for entry in _entries(data.get("cells"), "Row cells", 32)
                 for cell in (_mapping(entry, "Row cell"),))
             memory = _mapping(data.get("memory"), "Memory reading")
             segments = tuple(
-                MemorySegment(_text(segment.get("label"), "Memory label", 200),
+                MemorySegment(_text(segment.get("label"), "Memory label", BUILD_EVIDENCE_LIMITS["label"]),
                               _gib(segment.get("gib")), MemoryTone(segment.get("tone")))
                 for entry in _entries(memory.get("segments"), "Memory segments", 32)
                 for segment in (_mapping(entry, "Memory segment"),))
             return BuildStepEvidence(
-                captured_at, _text(data.get("step_id"), "Step ID", 300),
-                _text(data.get("title"), "Step title", 300),
-                _text(data.get("owner"), "Step owner", 300, allow_empty=True), cells,
+                captured_at, _text(data.get("step_id"), "Step ID", BUILD_EVIDENCE_LIMITS["title"]),
+                _text(data.get("title"), "Step title", BUILD_EVIDENCE_LIMITS["title"]),
+                _text(data.get("owner"), "Step owner", BUILD_EVIDENCE_LIMITS["title"], allow_empty=True), cells,
                 MemoryReading(_optional_gib(memory.get("free_for_next_gib", "")),
                               _optional_gib(memory.get("queue_cap_gib", "")),
                               segments),
-                _text(data.get("tip_title"), "Tooltip title", 300),
-                _text(data.get("tip_status"), "Tooltip status", 300, allow_empty=True),
-                tuple(_tip_entry(entry) for entry in _entries(data.get("tip"), "Tooltip entries", 64)))
+                _text(data.get("tip_title"), "Tooltip title", BUILD_EVIDENCE_LIMITS["title"]),
+                _text(data.get("tip_status"), "Tooltip status", BUILD_EVIDENCE_LIMITS["title"], allow_empty=True),
+                tuple(_tip_entry(entry) for entry in _entries(data.get("tip"), "Tooltip entries", BUILD_EVIDENCE_LIMITS["tipEntries"])))
         case _:
             raise SubmissionError("Select a valid evidence type.")
 
@@ -400,7 +401,8 @@ def render() -> str:
         for kind, label, icon in KINDS)
     limits = json.dumps({"types": list(IMAGE_FORMATS), "images": MAX_IMAGES,
                          "imageBytes": MAX_IMAGE_BYTES,
-                         "totalImageBytes": MAX_TOTAL_IMAGE_BYTES})
+                         "totalImageBytes": MAX_TOTAL_IMAGE_BYTES,
+                         "buildEvidence": BUILD_EVIDENCE_LIMITS})
     return f'''<style>{STYLE}</style>
 <dialog id="review-new-item" aria-labelledby="new-item-title">
  <form>
@@ -574,7 +576,8 @@ SCRIPT = r'''(() => {
  const send = dialog.querySelector('[type="submit"]'), error = dialog.querySelector('.new-item-error');
  const fields = [...form.querySelectorAll('fieldset'), words, dialog.querySelector('[data-close]'),
                  dialog.querySelector('[data-cancel]')];
- let launcher, opening, evidence, token, recipients, images = [], sending = false;
+ const failedDrafts = new Map();
+ let launcher, opening, evidence, tipPreview, draftKey, token, recipients, images = [], sending = false;
  let draftRevision = 0, sentRevision = -1, requestId, keepDraft = false;
 
  function node(tag, text = '', css = '') {
@@ -649,10 +652,10 @@ SCRIPT = r'''(() => {
                   !words.value.trim() || words.value.length > words.maxLength;
  }
 
- function showRecipients(recipientName) {
+ function showRecipients(recipientName, previousRecipient) {
   if (!recipients) return;
   const available = recipients.filter(recipient => form.elements.kind.value !== 'proposal' || recipient.proposal);
-  const selected = recipientChips.querySelector('input:checked')?.value ??
+  const selected = recipientChips.querySelector('input:checked')?.value ?? previousRecipient ??
                    available.find(recipient => recipient.name === recipientName)?.id;
   recipientChips.replaceChildren();
   for (const recipient of available) {
@@ -755,12 +758,16 @@ SCRIPT = r'''(() => {
   if (!dialog.open || sending) return;
   opening.abort();
   dialog.close();
-  if (!keepDraft) {
+  if (keepDraft) {
+   failedDrafts.set(draftKey, {evidence, tipPreview, images, draftRevision, sentRevision, requestId,
+    words: words.value, kind: form.elements.kind.value, error: error.textContent,
+    recipient: recipientChips.querySelector('input:checked')?.value});
+  } else {
    for (const image of images) URL.revokeObjectURL(image.url);
-   images = [];
-   previews.replaceChildren();
-   previews.hidden = true;
   }
+  images = [];
+  previews.replaceChildren();
+  previews.hidden = true;
   if (launcher?.isConnected) launcher.focus({preventScroll: true});
   launcher = null;
  }
@@ -773,21 +780,30 @@ SCRIPT = r'''(() => {
   updateSend();
  }
 
- async function open({trigger, kind = 'question', recipientName, evidence: capture = {kind: 'none'}, tipPreview} = {}) {
+ async function open({trigger, kind = 'question', recipientName, evidence: capture = {kind: 'none'}, tipPreview: preview} = {}) {
   if (dialog.open || sending) return;
   launcher = trigger || document.activeElement;
   token = '';
-  if (!keepDraft) {
-   evidence = structuredClone(capture);
-   recipients = null;
-   sentRevision = -1;
-   form.reset();
-   setError('');
-   recipientChips.replaceChildren();
-   const kinds = [...form.querySelectorAll('input[name="kind"]')];
-   (kinds.find(input => input.value === kind) || kinds[0]).checked = true;
-   showEvidence(tipPreview);
-  }
+  draftKey = capture.kind === 'build-step' ? capture.step_id : null;
+  const draft = failedDrafts.get(draftKey);
+  failedDrafts.delete(draftKey);
+  keepDraft = !!draft;
+  evidence = draft?.evidence ?? structuredClone(capture);
+  tipPreview = draft ? draft.tipPreview : preview;
+  recipients = null;
+  draftRevision = draft?.draftRevision ?? 0;
+  sentRevision = draft?.sentRevision ?? -1;
+  requestId = draft?.requestId;
+  form.reset();
+  words.value = draft?.words ?? '';
+  setError(draft?.error ?? '');
+  recipientChips.replaceChildren();
+  const kinds = [...form.querySelectorAll('input[name="kind"]')];
+  (kinds.find(input => input.value === (draft?.kind ?? kind)) || kinds[0]).checked = true;
+  images = draft?.images ?? [];
+  previews.replaceChildren(...images.map(image => image.row));
+  previews.hidden = !images.length;
+  showEvidence(tipPreview);
   recipientStatus.textContent = 'Loading recipients…';
   recipientStatus.hidden = false;
   updateSend();
@@ -802,7 +818,7 @@ SCRIPT = r'''(() => {
    if (controller.signal.aborted) return;
    token = data.token;
    recipients = data.recipients;
-   showRecipients(keepDraft ? undefined : recipientName);
+   showRecipients(draft ? undefined : recipientName, draft?.recipient);
    updateSend();
   } catch (failure) {
    if (!controller.signal.aborted) recipientStatus.textContent = failure.message;
@@ -860,5 +876,5 @@ SCRIPT = r'''(() => {
   }
  });
 
- window.reviewNewItem = {open};
+ window.reviewNewItem = {open, evidenceLimits: Object.freeze(limits.buildEvidence)};
 })();'''

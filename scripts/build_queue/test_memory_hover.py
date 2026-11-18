@@ -223,26 +223,39 @@ class MemoryHoverTests(unittest.TestCase):
             self.assertEqual(icon.get("class"), "lucide lucide-plus")
 
     def test_new_item_evidence_uses_the_readings_memory_and_tooltip(self) -> None:
-        step = {"name": "Builds gate", "queued": True, "showrunner": "builds", "started_at": 100,
-                "used": 3, "reserved": 2, "about": "Test all modules", "changes": "main"}
-        for cap, expected in ((31, 31.0), ("unavailable", None)):
-            with self.subTest(cap=cap):
-                raw = self.page_expression(
-                    "buildStepEvidence('row:fixture-run-0', data, data.walk[0], [{label:'Pid',value:'123'}], "
-                    + "tooltipRows('row:fixture-run-0', data))", {"cap": cap, "read_at": 200, "walk": [step]}, walk=True)
-                evidence = new_item_dialog.read_evidence(raw)
+        limits = new_item_dialog.BUILD_EVIDENCE_LIMITS
+        long_title = "t" * (limits["title"] - 1) + "🚀 shortened"
+        long_caption = "c" * (limits["text"] - 1) + "🚀 shortened"
+        cases = ((31, 31.0, "Builds gate", "Test all modules"),
+                 ("unavailable", None, "Builds gate", "Test all modules"),
+                 (31, 31.0, long_title, long_caption))
+        for cap, expected, title, caption in cases:
+            with self.subTest(cap=cap, title_length=len(title)):
+                step = {"name": title, "queued": True, "showrunner": "builds", "started_at": 100,
+                        "used": 3, "reserved": 2, "about": caption, "changes": "main",
+                        "about_parts": [{"kind": "text", "text": caption}]}
+                rendered = cast(dict[str, object], self.page_expression(
+                    "(() => {const capture = buildStepEvidence('row:fixture-run-0', data, data.walk[0], "
+                    + "[{label:'Pid',value:'123'}], tooltipRows('row:fixture-run-0', data), "
+                    + json.dumps(limits) + "); return {evidence:capture.evidence, preview:tipRowsHtml(capture.clippedTip)};})()",
+                    {"cap": cap, "read_at": 200, "walk": [step]}, walk=True))
+                evidence = new_item_dialog.read_evidence(rendered["evidence"])
                 assert isinstance(evidence, new_item_dialog.BuildStepEvidence)
                 self.assertEqual(evidence.step_id, "fixture-run-0")
                 self.assertEqual(evidence.owner, "builds")
                 self.assertEqual(evidence.captured_at, "1970-01-01T00:03:20.000Z")
+                self.assertEqual(evidence.title, title[:limits["title"]])
+                self.assertEqual(evidence.tip_title, evidence.title)
                 self.assertEqual(evidence.cells, (new_item_dialog.BuildCell("Pid", "123"),))
                 self.assertEqual(evidence.memory.queue_cap_gib, expected)
                 self.assertEqual(evidence.memory.free_for_next_gib, 18.0)
                 self.assertIn(new_item_dialog.MemorySegment("Build tools", 2, new_item_dialog.MemoryTone.TOOLS),
                               evidence.memory.segments)
-                self.assertIn(new_item_dialog.TipCaption("Test all modules"), evidence.tip)
+                self.assertIn(new_item_dialog.TipCaption(caption[:limits["text"]]), evidence.tip)
                 self.assertIn(new_item_dialog.TipField("Changes", "main"), evidence.tip)
                 self.assertIn(new_item_dialog.TipField("Uses", "3.0 GiB"), evidence.tip)
+                preview = ElementTree.fromstring(cast(str, rendered["preview"]))
+                self.assertEqual(preview.findtext("dd[@class='caption']"), caption[:limits["text"]])
 
     def test_a_token_wait_is_the_stage_of_its_running_row(self) -> None:
         row = memory_tests.ProgressKeepAsideTests.reservation("nextest", need=4 * GIB)

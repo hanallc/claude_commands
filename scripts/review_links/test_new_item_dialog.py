@@ -57,7 +57,7 @@ SHELL = '''
   <table><thead><tr><th>Step</th><th>Stage</th><th class="fixture-extra">Target</th><th></th></tr></thead>
    <tbody><tr class="fixture-active"><td>hana nextest</td><td>testing</td>
     <td class="fixture-extra">natedev</td><td><button id="launcher" aria-label="New item for hana nextest">+</button></td></tr>
-    <tr><td>cargo test</td><td>building</td><td class="fixture-extra">mac</td><td></td></tr></tbody></table>
+    <tr><td>cargo test</td><td>building</td><td class="fixture-extra">mac</td><td><button id="other-launcher" aria-label="New item for cargo test">+</button></td></tr></tbody></table>
  </section>
  <section class="card fixture-secondary">
   <h2>Recent steps</h2>
@@ -90,6 +90,11 @@ function paste() {
  const event = new ClipboardEvent('paste', {cancelable:true});
  Object.defineProperty(event, 'clipboardData', {value: input});
  textarea.dispatchEvent(event);
+}
+async function sendAndReadId() {
+ const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
+ send.click();
+ return (await created).detail.id;
 }
 function untilError() {
  return new Promise(resolve => {
@@ -156,15 +161,24 @@ function untilError() {
    check(textarea.value === 'Check <index>\nAgain' && dialog.querySelectorAll('[data-previews] img').length === 1,
          'A failed send keeps words and images.');
    check(document.activeElement === send, 'Focus returns to Send on failure.');
-   dialog.requestClose();
-   await open({kind:'question', evidence:{kind:'none'}});
+   dialog.querySelector('[data-cancel]').click();
+   const other = document.querySelector('#other-launcher');
+   const otherCapture = {...capture, step_id:'other-step', title:'cargo test',
+                         tip_title:'cargo test', tip:[]};
+   await open({trigger:other, kind:'investigation', evidence:otherCapture, recipientName:'builds'});
+   check(!textarea.value && error.hidden && dialog.querySelector('[data-previews]').hidden &&
+         evidence.querySelector('h4').textContent === 'cargo test',
+         'Another row opens with its own evidence and an empty draft.');
+   type('Check the other step');
+   check(await sendAndReadId() === 'I2', 'Send saves the new item for the other row.');
+   check(!dialog.open && document.activeElement === other, 'Send returns focus to the other row.');
+
+   await open({kind:'question', evidence:{...capture, title:'A newer reading'}});
    check(textarea.value === 'Check <index>\nAgain' && !evidence.hidden && recipient().checked &&
          dialog.querySelectorAll('[data-previews] img').length === 1 &&
          error.textContent === 'Fixture rejected the first send.' && !send.disabled,
          'Reopen keeps the failed draft and its error.');
-   const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
-   send.click();
-   check((await created).detail.id === 'I1', 'The event reports the saved item ID.');
+   check(await sendAndReadId() === 'I1', 'The event reports the saved item ID.');
    check(closeToLauncher(), 'A successful send closes the dialog and returns focus.');
 
    await open({kind:'question', evidence:{kind:'none'}, recipientName:'builds'});
@@ -403,15 +417,22 @@ class NewItemDialogTests(unittest.TestCase):
         for width, fixture in fixtures.items():
             with self.subTest(width=width), patch.dict(os.environ, fixture.environment()):
                 self.assertEqual(fixture.results, [])
-                self.assertEqual(fixture.recipient_reads, 6)
-                expired, refreshed, reopened = fixture.wire_posts
+                self.assertEqual(fixture.recipient_reads, 7)
+                expired, refreshed, other_wire, reopened = fixture.wire_posts
                 self.assertEqual(expired["token"], FORM_TOKEN)
                 self.assertEqual(refreshed, {**expired, "token": RESTARTED_TOKEN})
                 self.assertEqual(reopened, refreshed)
-                first, retry = fixture.posts
+                first, other, retry = fixture.posts
+                self.assertNotEqual(other_wire["request_id"], refreshed["request_id"])
+                self.assertEqual(other.recipient_id, OWNER)
+                self.assertEqual(other.words, "Check the other step")
+                self.assertEqual(other.images, ())
+                assert isinstance(other.evidence, review_submissions.BuildStepEvidence)
+                self.assertEqual(other.evidence.step_id, "other-step")
+                self.assertEqual(other.evidence.title, "cargo test")
                 self.assertEqual(first, retry)
                 self.assertEqual(first.kind, review_submissions.SubmissionKind.BUG)
                 self.assertEqual(first.recipient_id, OWNER)
                 self.assertEqual(first.evidence.kind, "build-step")
                 self.assertEqual(first.images, (review_submissions.PastedImage("image/png", PNG),))
-                self.assertEqual([item.id for item in investigation.records(OWNER)], ["I1"])
+                self.assertCountEqual([item.id for item in investigation.records(OWNER)], ["I1", "I2"])

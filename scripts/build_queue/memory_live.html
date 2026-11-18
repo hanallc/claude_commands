@@ -264,7 +264,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-table .step { display: none; }
 .walk-table th, .walk-table td { padding: 3px var(--column-gap, 12px) 3px 0; border-bottom: 0; white-space: nowrap; text-align: left; }
 .walk-table :is(.tokens, .action-spacer, .row-action), .walk-table :is(.queue-head, .wait) .vcpus { padding-right: 0; }
-.walk-table .row-action { padding-left: var(--column-gap, 12px); }
+.walk-table .row-action { padding-left: var(--column-gap, 12px); padding-right: 4px; }
 .walk-table tbody th { color: inherit; font-weight: 400; }
 .walk-table tr.queue-head th { color: var(--ink-2); font-weight: 600; vertical-align: bottom; }
 .walk-table .duration { width: var(--duration); min-width: var(--duration); }
@@ -1327,14 +1327,23 @@ window.addEventListener("resize", placeLimitLabels);
 function rowAdd(name) {
   return `<button type="button" class="row-add" aria-label="New item for ${esc(name)}"><svg class="lucide lucide-plus" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg></button>`;
 }
-function buildStepEvidence(key, data, row, cells, tooltip) {
+function buildStepEvidence(key, data, row, cells, tooltip, limits) {
   const shown = shownReading(data);
   const memory = queueCapMemory(shown);
   const gib = bytes => recorded(bytes) ? shownBytes(bytes) / GIB : null;
-  const [title, ...entries] = tooltip;
-  return {
+  const clip = (text, limit) => text.length <= limit ? text : [...text].slice(0, limit).join('');
+  const clippedTip = tooltip.slice(0, limits.tipEntries + 1).map((entry, index) => {
+    const label = clip(entry.label, index ? limits.label : limits.title);
+    const value = clip(entry.value, index ? limits.text : limits.title);
+    return {...entry, label, value,
+      ...(label === entry.label ? {} : {labelParts: undefined, labelStaffName: undefined}),
+      ...(value === entry.value ? {} : {valueParts: undefined, valueStaffNames: undefined})};
+  });
+  const [title, ...entries] = clippedTip;
+  const evidence = {
     kind: 'build-step', captured_at: new Date(data.read_at * 1000).toISOString(), step_id: row.key,
-    title: row.name, owner: rowOwner(row, key.startsWith('wait:')), cells,
+    title: clip(row.name, limits.title), owner: clip(rowOwner(row, key.startsWith('wait:')), limits.title),
+    cells: cells.map(cell => ({label: clip(cell.label, limits.label), value: clip(cell.value, limits.text)})),
     memory: {
       free_for_next_gib: gib(memory.free), queue_cap_gib: hasCap(shown) ? shown.cap : null,
       segments: RAM_BLOCKS.flatMap(([block, label, amount, group]) => {
@@ -1349,6 +1358,7 @@ function buildStepEvidence(key, data, row, cells, tooltip) {
       ? {kind: entry.kind === 'caption' ? 'caption' : 'detail', text: entry.value}
       : {kind: 'field', label: entry.label, value: entry.value}),
   };
+  return {evidence, clippedTip};
 }
 function renderWalk(d) {
   const scale = d.total;
@@ -1444,15 +1454,15 @@ document.addEventListener('click', event => {
     : tableRow.closest('table').tHead.rows[0];
   const cells = Array.from(tableRow.cells).flatMap((cell, i) => cell.matches('.step, .action-spacer, .row-action') ? []
     : [{label: headers.cells[i].textContent, value: cell.textContent.trim()}]);
-  const tooltip = tooltipRows(key, latest);
+  const {open, evidenceLimits} = window.reviewNewItem;
+  const {evidence, clippedTip} = buildStepEvidence(key, latest, row, cells, tooltipRows(key, latest), evidenceLimits);
   const preview = document.createElement('template');
-  preview.innerHTML = tipRowsHtml(tooltip);
-  const evidence = buildStepEvidence(key, latest, row, cells, tooltip);
+  preview.innerHTML = tipRowsHtml(clippedTip);
   hideTip();
   dialog.addEventListener('close', () => {
     if (!button.isConnected) document.querySelector(`tr[data-tip="${CSS.escape(key)}"] .row-add`)?.focus({preventScroll: true});
   }, {once: true});
-  window.reviewNewItem.open({trigger: button, recipientName: 'builds', evidence, tipPreview: preview.content.firstElementChild});
+  open({trigger: button, recipientName: 'builds', evidence, tipPreview: preview.content.firstElementChild});
 });
 
 function fitAxisLabels() {
