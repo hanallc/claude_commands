@@ -1019,6 +1019,145 @@ The test server joins its request handlers before fixture cleanup and gives each
 3. The staff, add_unit, shutdown and transfer suites pass. basedpyright: 0 errors, 0 warnings.
 4. Change-Review: none, unless a visible result exists.
 
+### Phase 68 — A producer can answer and withdraw its own question  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-18). dwight filed a question with the producer form (no `--production`, as `commands/showrunner/question.md` says). The user answered it in the dwight session at 08:45 EST. `update_registration.py answer` requires `--production`, so the producer could not record the answer, and the question still shows on the user's Questions page.
+
+**Spec:**
+1. `answer` and `withdraw` accept the producer form with no `--production`, as `ask` does. The producer's fixed staff id selects its question folder.
+2. Add a row to the existing answer tests: a producer asks, then answers its own question with no `--production`, and the question leaves the open list. Do the same for withdraw.
+3. Update `commands/showrunner/question.md` in the same commit.
+
+**Files:**
+- `scripts/production/update_registration.py`, `scripts/production/test_update_registration_questions.py`, `commands/showrunner/question.md`
+
+**Workers:** 1 writer (`design`).
+
+**Order:** after phases 60 and 65 in the queue; it shares no file with them.
+
+**Acceptance gate:**
+1. The new rows fail on main.
+2. basedpyright: 0 errors, 0 warnings. The update_registration suites pass. Full gate green.
+
+**Result:** `update_registration.py answer` and `withdraw` accept the producer form with no `--production`; the producer's fixed staff id selects its question folder. On main 3515c9470 (hash 3ce1c5a6d).
+
+### Phase 69 — Park in /recall only hides an item from the user list  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the user (2026-11-18, via the sdlc showrunner): "recall is ONLY FOR MORTY - park is a MORTY specific directive to not show it to me on the list". Park never means a showrunner or unit director parks the work.
+
+**Spec:** two edits to `commands/recall.md`, as the showrunner gave them: step 2 says park only hides the item until morty unparks it and never stops, delays or reorders work; the last line says `/recall` never changes the work, its owner or its timing.
+
+**Files:** `commands/recall.md`
+
+**Result:** `commands/recall.md` says park only hides the item until morty unparks it, and `/recall` never changes the work, its owner or its timing. On main 3515c9470 (hash 1d074db29).
+
+### Phase 70 — A worker with an unknown run state does not break the census  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-18). The board showed the anomaly "census: workers[8].runs is not a list". Two faults sit behind it.
+
+**Spec:**
+1. Reader: `cargo-handler census --json` gives `runs: null` with `unknown.reason` for a worker. That is the handler's `Observed::unknown` form (cargo-handler `src/census/mod.rs` about lines 412 and 424). `scripts/production/census.py` about line 153 calls `_list(fields, "runs")` and rejects null. Accept the unknown form as an unknown run state for that worker, as the handler means it. Add a row to the existing census tests.
+2. Writer: the handler's reason names a detached run record that holds only `{}`; its `.log` and `.scope` are gone, and its `.record.lock` stays. Find what wrote `{}` there, and fix that writer at the source. Read only in that run folder.
+
+**Files:** `scripts/production/census.py`, its tests, and the writer that the cause names.
+
+**Workers:** 1 writer.
+
+**Order:** after phase 68.
+
+**Acceptance gate:**
+1. The new census row fails on main. The writer has a test that fails on main.
+2. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+### Phase 71 — Producer docs name the live accounts and models  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-18), from the producers plan. Docs match current reality.
+
+**Spec:**
+1. The producer skills in `commands/producer/` say Claude producers use the showrunners account. The live rule is the producers account, with the showrunners account as the fallback (`accounts.group_label`, `docs/accounts.md`). Correct the skills.
+2. `docs/as-built/shutdown-and-restart.md` shows morty and brain on Codex. `config/models.conf` has all three producers on `claude:fable:high`. Correct the doc.
+
+**Files:** `commands/producer/morty.md`, `commands/producer/brain.md`, `commands/producer/dwight.md`, `docs/as-built/shutdown-and-restart.md`
+
+**Workers:** none; a doc fix by the director.
+
+**Acceptance gate:**
+1. A blind review finds no remaining mismatch. The full gate is green.
+
+**Result:** the producer commands and the as-built docs say Claude producers use the producers account, with the showrunners account as the fallback, and show the live models from `config/models.conf`. On main 3515c9470 (hash 287f9256c).
+
+### Phase 72 — One common producer command  · status: todo
+**Depends on:** phases 65 and 70 (queue order).
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-18), producers plan phase 2 (`~/rust/hanadocs/morty/producers-plan.md`, "Decisions from the review with nate" is final). The user named the command.
+
+**Spec:**
+1. Add `/producer:produce`. It holds the management text that each producer shares: the role, questions, investigations, transfer, messaging, and work with showrunners and morty.
+2. Add `templates/producer/README.md` with the `{name}` and `{job}` fields only, and two sections: "Job" and "Current work". Agreed with devtools (2026-11-18): `agents add-producer NAME --job TEXT` reads this file, fills both fields and writes `~/rust/hanadocs/<name>/README.md`. It never overwrites a README. Send devtools any field change, and the hash when this phase lands.
+3. Move morty, dwight and brain onto the common command. Remove the dwight and brain skills. The morty skill keeps only the List rules.
+4. dwight helps with the text.
+
+**Files:** `commands/producer/`, the template, and the start and resume code that names the producer skill.
+
+**Workers:** 1 writer.
+
+**Acceptance gate:**
+1. dwight and brain start from the common command. Two skills are gone. brain has a folder and a README.
+2. Full gate green.
+
+### Phase 73 — A change row can be withdrawn  · status: todo
+**Depends on:** phase 72 (queue order).
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-18), queue item rowwithdraw, from hana. hana/C386 (merge 8dcdeb04) was marked works, then reverted (efed8fe08b) and removed. The user agreed to record it as withdrawn.
+
+**Spec:**
+1. `change_review.py` gets one supported action: withdraw a row, open or reviewed. The row history keeps the user's words and the time. No hand edit of the list.
+2. Removed (showrunner agreed 2026-11-18): the `list-ready` revert scan. Its skip shifted which row matched which checkpoint, it gave false and missed matches, and it cost 0.74 s of Git per scan. Withdraw covers a reverted change.
+3. Add rows to the existing change_review tests. Update `commands/change_review.md` in the same commit.
+
+**Files:** `scripts/production/change_review.py`, its tests, `commands/change_review.md`.
+
+**Workers:** 1 writer.
+
+**Acceptance gate:**
+1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+### Phase 74 — A unit's worktree repo selects its merge repo  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-18). `merge_checkpoint.py --production <p>` merges into the production's own repo. The style unit (staff parent cargo-liner) has a `~/.claude` commit 9d636482f. Under cargo-liner it merges into `~/rust/cargo-liner` and fails at ancestry. Under sdlc it is refused: "staff parent is cargo-liner; use that production".
+
+**Spec:**
+1. The unit's worktree repo selects the merge repo. The staff parent selects only the authority.
+2. Add rows to the existing merge_checkpoint tests: a unit whose staff parent owns another repo merges into its worktree repo, under its parent's authority.
+
+**Files:** `scripts/production/merge_checkpoint.py`, its tests.
+
+**Workers:** 1 writer.
+
+**Order:** after phases 65 and 70, before other queue work.
+
+**Acceptance gate:**
+1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
