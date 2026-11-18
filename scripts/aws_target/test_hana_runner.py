@@ -1,15 +1,22 @@
 """Test leased guest commands and root fences with private source and process state."""
 from __future__ import annotations
 
+from contextlib import ExitStack, suppress
 from dataclasses import replace
+import fcntl
 import json
 import os
 from pathlib import Path
 import select
+import selectors
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import time
+import traceback
+from types import SimpleNamespace
 from typing import NamedTuple, cast, override
 import unittest
 from unittest import mock
@@ -22,9 +29,13 @@ from scripts.aws_target.hana_result import HanaAttemptKey, LogicalStepLink
 from scripts.aws_target import test_hana_source as source_tests
 from scripts.build_queue import placement
 from scripts.lib import build_folders, build_slots
-from scripts.mac_test import linux_runner
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.mac_test import linux_runner
 from scripts.lint.memory_test_support import write_config_fixture
+
+
+DEADLINE_TEST_GUARD_S = 10
 
 
 class DiskReading(NamedTuple):
@@ -190,23 +201,115 @@ class HanaRunnerTests(unittest.TestCase):
         self.assertIsInstance(outcome, runner.HanaExecutionLost)
 
     def test_silent_command_deadline_kills_its_descendants_and_releases_the_slot(self) -> None:
-        pids = self.root / 'hung-pids'
-        code = ('import os, pathlib, subprocess, sys, threading; '
-            + 'child = subprocess.Popen([sys.executable, "-c", "import threading; threading.Event().wait(60)"]); '
-            + f'pathlib.Path({str(pids)!r}).write_text(str(os.getpid()) + " " + str(child.pid)); '
-            + 'threading.Event().wait(60)')
+        ready = self.root / 'hung-pids'
+        failure = self.root / 'deadline-worker-error'
+        os.mkfifo(ready, mode=0o600)
+        # The command and its descendant keep the exit pipe open until they depart.
+        stop_read, stop_write = os.pipe()
+        exit_read, exit_write = os.pipe()
+        with (os.fdopen(stop_read, 'rb') as stop_input, os.fdopen(stop_write, 'wb') as stop,
+              os.fdopen(exit_read, 'rb') as exits, os.fdopen(exit_write, 'wb') as exit_output):
+            worker = os.fork()
+            if worker == 0:
+                try:
+                    os.setsid()
+                    stop.close()
+                    exits.close()
+                    self._check_silent_command_deadline(ready, stop_input.fileno(), exit_output.fileno())
+                except BaseException:
+                    _ = failure.write_text(traceback.format_exc())
+                    os._exit(1)
+                os._exit(0)
+
+            stop_input.close()
+            exit_output.close()
+            with os.fdopen(os.pidfd_open(worker), 'rb') as worker_exit:
+                try:
+                    self.assertTrue(select.select([worker_exit], [], [], DEADLINE_TEST_GUARD_S)[0],
+                        'The Hana runner exceeded the test hang guard')
+                finally:
+                    # EOF stops the fixture even if the runner never sends the group signal.
+                    stop.close()
+                    if not select.select([worker_exit], [], [], 0)[0]:
+                        with suppress(ProcessLookupError):
+                            send_process_group(worker, signal.SIGKILL)
+                        with suppress(ProcessLookupError):
+                            signal.pidfd_send_signal(worker_exit.fileno(), signal.SIGKILL)
+                    _, status = os.waitpid(worker, 0)
+                    self.assertTrue(select.select([exits], [], [], DEADLINE_TEST_GUARD_S)[0],
+                        'A fixture process kept its exit descriptor')
+                    self.assertEqual(exits.read(1), b'')
+            if os.waitstatus_to_exitcode(status) != 0:
+                self.fail(failure.read_text() if failure.is_file() else 'The Hana deadline worker failed')
+
+    def _check_silent_command_deadline(self, ready: Path, stop_fd: int, exit_fd: int) -> None:
+        descendant_code = f'import os; os.read({stop_fd}, 1)'
+        code = ('import os, subprocess, sys\n'
+            'lease = int(os.environ["BUILD_FOLDER_LOCK_FD"])\n'
+            f'child = subprocess.Popen([sys.executable, "-c", {descendant_code!r}], '
+            f'pass_fds=(lease, {stop_fd}, {exit_fd}))\n'
+            f'with open({str(ready)!r}, "w") as pids:\n'
+            '    print(os.getpid(), child.pid, file=pids)\n'
+            f'os.read({stop_fd}, 1)\n')
         self.tool('cargo', 'exec ' + shlex.join([sys.executable, '-c', code]) + '\n')
-        _ = write_config_fixture(self.fixture.configuration.source.with_name('build_targets.conf'),
-            '# range: 0.001..\nloopback.command_timeout_s=0.25\n')
-        outcome = self.run_request(self.request)
-        assert isinstance(outcome, runner.HanaExecutionLost)
-        self.assertIn('execution deadline', outcome.reason)
-        for value in pids.read_text().split():
-            try:
-                self.assertIn(linux_runner.process_fields(int(value))[0], ('Z', 'X'))
-            except FileNotFoundError:
-                pass
-        self.assertEqual(build_folders.build_folder_state(self.root / 'guest-slots/hana-slot1'), 'free')
+        _ = self.fixture.configuration.source.with_name('build_targets.conf').write_text(
+            'loopback.shell_timeout_s=120\nloopback.command_timeout_s=0.25\n')
+
+        with ExitStack() as resources:
+            ready_fd = os.open(ready, os.O_RDWR)
+            _ = resources.callback(os.close, ready_fd)
+            streams = resources.enter_context(selectors.DefaultSelector())
+            select_streams = streams.select
+            _ = resources.enter_context(mock.patch.object(linux_runner, 'selectors',
+                SimpleNamespace(DefaultSelector=lambda: streams, EVENT_READ=selectors.EVENT_READ)))
+            command_time = 0.0
+            _ = resources.enter_context(mock.patch.object(linux_runner, 'time',
+                SimpleNamespace(monotonic=lambda: command_time, time=time.time)))
+            descriptors = linux_runner.execution_descriptors
+            _ = resources.enter_context(mock.patch.object(linux_runner, 'execution_descriptors',
+                side_effect=lambda: (*descriptors(), stop_fd, exit_fd)))
+            pidfds: list[int] = []
+            slot = self.root / 'guest-slots/hana-slot1'
+
+            def reach_deadline(timeout: float) -> list[tuple[selectors.SelectorKey, int]]:
+                nonlocal command_time
+                self.assertEqual(timeout, 0.25)
+                self.assertTrue(select.select([ready_fd], [], [], DEADLINE_TEST_GUARD_S)[0],
+                    'The fixture did not report both PIDs')
+                leader, descendant = map(int, os.read(ready_fd, 128).split())
+                lease_fd = build_folders.build_folder_lock_fd(slot)
+                for pid in (leader, descendant):
+                    pidfd = os.pidfd_open(pid)
+                    _ = resources.callback(os.close, pidfd)
+                    pidfds.append(pidfd)
+                    self.assertTrue(os.path.samestat(os.fstat(lease_fd), Path(f'/proc/{pid}/fd/{lease_fd}').stat()),
+                        'A fixture process did not inherit the slot lock')
+                command_time = 0.25
+                events = select_streams(0)
+                self.assertFalse(events, 'The fixture must stay silent')
+                return events
+
+            def stop_group(pid: int, signum: int) -> None:
+                try:
+                    if pidfds:
+                        self.assertFalse(select.select(pidfds, [], [], 0)[0], 'A fixture process ended before the signal')
+                        with (slot.with_suffix('.lock').open('rb') as probe,
+                              self.assertRaises(BlockingIOError, msg='The slot became free before the command group ended')):
+                            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    send_process_group(pid, signum)
+
+            with (mock.patch.object(streams, 'select', side_effect=reach_deadline) as selection,
+                  mock.patch.object(linux_runner, 'send_process_group', side_effect=stop_group) as group_signal):
+                outcome = self.run_request(self.request)
+            assert isinstance(outcome, runner.HanaExecutionLost), outcome
+            selection.assert_called_once_with(0.25)
+            group_signal.assert_called_once()
+            self.assertIn('execution deadline', outcome.reason)
+            for pidfd in pidfds:
+                self.assertTrue(select.select([pidfd], [], [], DEADLINE_TEST_GUARD_S)[0],
+                    'A fixture process did not exit after the deadline')
+        self.assertEqual(build_folders.build_folder_state(slot), 'free')
 
     def test_command_deadline_also_bounds_the_wait_after_output_closes(self) -> None:
         self.tool('cargo', 'exec >/dev/null 2>&1\nexec sleep 60\n')
