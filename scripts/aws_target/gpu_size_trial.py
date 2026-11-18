@@ -29,7 +29,7 @@ import tomllib
 from typing import cast, final
 from uuid import uuid4
 
-from scripts.aws_target import cloud_gate, gate_box, ledger
+from scripts.aws_target import cloud_gate, ledger, s3_presign
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, largest_gate_vcpus
 from scripts.aws_target.config import gate_deployment, read_settings
 from scripts.lib import conf
@@ -961,12 +961,12 @@ class GpuTrialWorker:
 
     def signed_links(self, folder: Path, online: dict[str, object], request: dict[str, object]) -> dict[str, str]:
         reply = self.gates.api.call('export-credentials', '--format', 'process', service='configure')
-        signing = gate_box.SigningKey(str(reply['AccessKeyId']), str(reply['SecretAccessKey']), str(reply.get('SessionToken', '')))
+        signing = s3_presign.SigningKey(str(reply['AccessKeyId']), str(reply['SecretAccessKey']), str(reply.get('SessionToken', '')))
         now = int(self.gates.clock())
         home = self.gates.api.region
         prefix = 'requests/gpu-size-trial/' + str(online['trial'])
         def url(method: str, key: str) -> str:
-            return gate_box.presign(method, str(online['bucket']) + '.s3.' + home + '.amazonaws.com', key,
+            return s3_presign.presign(method, str(online['bucket']) + '.s3.' + home + '.amazonaws.com', key,
                                     home, signing, datetime.fromtimestamp(now, UTC), max(1, int(str(request['expires'])) - now))
         result_prefix = 'artifacts/gpu-size-trial/' + str(request['attempt'])
         hashes = mapping(read_json(folder / 'manifest.json')['sha256'])

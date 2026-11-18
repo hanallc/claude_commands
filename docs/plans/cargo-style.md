@@ -119,7 +119,7 @@ Recommendation: A until S8. If nate picks N1-B or N1-C, B follows.
 
 1. Delete `Cargo.toml`, `Cargo.lock`, `rust/` and `taplo.toml` at the repo root. The generic gate code then finds no Rust: `hooks/checkpoint_gate.py:883`, `production/checkpoint_gate.py:83-109`, `merge_checkpoint.py:827-834`. No code change there.
 2. Docs: `config/mac_test.conf:56-57` and `docs/direct/final_gate_commit.md:11-15` are true again with no edit. Mark the old reader plan as replaced by this plan.
-3. Config, with nate's go: delete `install_folder` in `config/style_reader.conf`, then delete `~/.local/state/style/reader` (7.2 MiB).
+3. Config, with nate's go: delete `install_folder`, `build_limit_seconds` and `build_stop_grace_seconds` in `config/style_reader.conf`, then delete `~/.local/state/style/reader` (7.2 MiB).
 4. Leftovers: delete the two scratch copies `reader-start-716d7d` and `reader-store-62d7e7` and their outputs under `/build/cargo/scratch` (1.3 GiB) through `scratch.py`. Clean the reader target in the Mac mirror of `.claude` through the Mac queue only.
 5. Not in this phase: `config/cloud_gate.conf:111` keeps cargo and rustc on the AWS box. builds removes them only after a `gate_trial.py` pass without them, with nate's go.
 
@@ -133,25 +133,43 @@ Recommendation: A until S8. If nate picks N1-B or N1-C, B follows.
 
 **Repo:** `~/.claude` (the measure tool), then cargo-liner for `cargo-style` times. **Depends on:** the phase 6 checkpoint (the capture, replay and stage-measure tool, done and waiting).
 
-Uses of a style production, each timed cold and warm with `refill_measure.py` on a frozen capture of cargo-liner-style:
+Result, 2026-11-16 (done). Measured on a frozen capture of cargo-liner-style at main `8abb0f0b5`, Rust reader, three runs each, under `MemoryMax=2G`. Evidence: `/session/style/s1-measure/.s1/` (`results.json`, `commands.txt`, `limitations.txt`).
 
-| Use | Today | Target |
-| --- | ---: | ---: |
-| Cold refill (no saved results, new process) | 494 s (Rust facts, Python selection) | under 10 s |
-| Warm refill, no change | 132 s | under 3 s (95th percentile) |
-| Refill after one commit | not measured | under 3 s |
-| Ticket assignment (`next-phase`) | not measured | under 3 s |
-| Each other `cargo-style` call | not measured | measured in S1 |
+| Use | Today (median, spread) | Floor sum without selection | Target |
+| --- | ---: | ---: | ---: |
+| Cold refill | 334 s (326–374) | 1.6 s | under 10 s (provisional) |
+| Warm refill, no change | 154 s (138–171) | 0.42 s | under 1 s |
+| Refill after one commit | 183 s (161–234) | 0.43 s | under 3 s |
+| Ticket assignment (COUNT part of `next-phase`) | 35 s (33–35) | 1.2 s | under 3 s |
 
-The use that matters most: the refill after one commit. A style unit and its workers pay it at each ticket. S1 states where the time goes, by stage, with the phase 6 counters.
+Where the time goes (refill after one commit, median s, with the floor of each stage):
 
-The targets in the table are the old plan's targets and are provisional. S1 replaces them:
+| Stage | Today | Floor | How the floor was measured |
+| --- | ---: | ---: | --- |
+| Process start | 1.6 | 0.9 Python, about 0.01 Rust | an empty Python start with the same imports |
+| Cache read | 37.6 | 0.41 | a scan of the 373,524 derived rows |
+| Git comparison | 6.7 | 0.001 | `git diff --name-only` of parent and commit |
+| Reader facts and transfer | 41.9 | 0.004 | facts for the one changed blob; the refill asks for 4,637 blobs |
+| Selection (Python) | 88.1 | not known | no native selector exists yet |
+| Other (external reads, encode, write) | 6.5 | 5.8 | observed minimum |
 
-1. For each use, measure the floor of each stage: process start, cache read, Git comparison, parse of the changed files, selection.
-2. Set each target as a stated multiple of the sum of its floors.
-3. For the refill after one commit, give the floor sum and say why the target is not under 1 s if it is not.
+Targets. A target is a stated multiple of the floor sum of its use. Floor sums use a Rust process start. S2 holds each target for the full call, with the Python adapter included (`docs/plans/cargo-style-api.md`, "The cost of each call").
 
-Open fact: the reader plan measured 37 s warm on 2026-11-14 with the Python reader; this table says 132 s. S1 states whether that is a different measure (the `refill_measure.py` warm run starts a new process on a cleared derived cache) or a slower warm path.
+1. Warm refill, no change: 2.5 times its floor sum (0.42 s), rounded to 1 s. Nothing changed, so no selection runs.
+2. Refill after one commit: 3 s, which is 7 times its floor sum without selection. The multiple is larger because the native selection floor is not known. S7 sets the final multiple from the S3 to S6 selection floor.
+3. Why not under 1 s: the cache read floor (0.41 s, a scan of all derived rows) is already almost half of 1 s. Under 1 s needs the partitioned cache of S6 so that a refill reads only the changed partitions. S6 measures it and can lower the target.
+4. Ticket assignment: 3 s, 2.5 times its floor sum without selection (1.2 s). Native selection must fit in the rest. The proxy leaves out the ticket writes, the dispatch and the capacity loop.
+5. Cold refill: under 10 s stays provisional. Its floor sum without selection is 1.6 s. Python selection takes 228 s, and no native floor exists. S7 sets it.
+
+The three largest costs and their phases:
+
+1. Facts for unchanged blobs: each refill asks the reader for about 4,600 blobs when one changed (42 s against 0.004 s). S2 (one request per refill) and S6 (source changes).
+2. Selection in Python: 76 to 228 s, about half of each use. S3 to S5.
+3. Cache read: 37 s against a 0.41 s scan, about 90 times the floor. S6 (compact cache).
+
+Open fact, answered: the 37 s warm result (2026-11-14, commit `48e089541`) came before `refill_measure.py` existed and measured other work. The 132 s and today's 154 s use Rust facts with Python selection and include candidates, cells and declaration proofs. A full Python warm run today takes 111 s with the same result digest. The records do not show a warm regression of the same work.
+
+Measurement notes: the old stage timer charged idle Git process time, and its Git time was more than the wall time. The table uses an exclusive stage timer. Peak RSS (sum of process RSS) was 2.34 GiB cold, 1.76 GiB warm, 1.98 GiB one commit, 0.85 GiB assignment; no run hit the 2 GiB charge limit. The one-commit case replays the captured reservation board and leaves out the board command start.
 
 **Milestone 2** when the times and the targets are set.
 
@@ -163,6 +181,8 @@ Open fact: the reader plan measured 37 s warm on 2026-11-14 with the Python read
 2. One request per refill. Facts stay inside the process. No caller reads or parses the same file content two times.
 3. Name each cost that the API adds: process start, request decode, reply encode, and the cache read.
 4. Subcommand names go to nate in the S2 review. Field names are style-unit's decision.
+
+Design: `docs/plans/cargo-style-api.md` (2026-11-16). dwight reviewed it; all six points are answered. nate approved the five subcommand names on 2026-11-16.
 
 **Milestone 6** when the design is ready for review.
 

@@ -11,10 +11,12 @@ from pathlib import Path
 import subprocess
 from typing import cast, override
 from unittest import mock
+from urllib.parse import urlsplit
 
 from scripts.aws_target import aws_target, hana_box as box, hana_guest, hana_provider as provider, hana_receiver, deploy, ledger
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture
+from scripts.aws_target.test_hana_box import write_lifecycle_configuration
 from scripts.lib import conf
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -27,7 +29,11 @@ class FakeAws:
     state: str = 'stopped'
     userdata: str = ''
     failure: str = ''
+    failure_stderr: str = 'private-provider-id signed-secret'
     lose_response: str = ''
+    puts_before_timeout: int = -1
+    spot_read_seconds: int = 0
+    stop_during_instance_read_seconds: int = 0
     status: str = 'instance-stopped-by-user'
     ownership: str = IDENTITY.deployment
     objects: dict[str, dict[str, object]] = field(default_factory=dict)
@@ -44,12 +50,16 @@ class FakeAws:
             self.environments.append(env)
         value: dict[str, object] = {}
         if self.failure == operation:
-            return subprocess.CompletedProcess(list(arguments), 1, '', 'private-provider-id signed-secret')
+            return subprocess.CompletedProcess(list(arguments), 1, '', self.failure_stderr)
         if operation == 'describe-instances':
+            if self.stop_during_instance_read_seconds:
+                self.clock.advance(self.stop_during_instance_read_seconds)
+                self.state = 'stopped'
             value = {'Reservations': [{'Instances': [{'InstanceId': IDENTITY.instance, 'SpotInstanceRequestId': IDENTITY.spot_request,
                 'State': {'Name': self.state}, 'LaunchTime': 'fixture-launch',
                 'Tags': [{'Key': 'HanaDeployment', 'Value': self.ownership}, {'Key': 'Workload', 'Value': 'hana'}]}]}]}
         elif operation == 'describe-spot-instance-requests':
+            self.clock.advance(self.spot_read_seconds)
             value = {'SpotInstanceRequests': [{'SpotInstanceRequestId': IDENTITY.spot_request, 'InstanceId': IDENTITY.instance,
                 'Type': 'persistent', 'InstanceInterruptionBehavior': 'stop', 'Status': {'Code': self.status}}]}
         elif operation == 'export-credentials':
@@ -66,9 +76,12 @@ class FakeAws:
         elif operation in ('put-object', 'get-object'):
             key = arguments[arguments.index('--key') + 1]
             if operation == 'put-object':
+                if self.puts_before_timeout == 0:
+                    raise subprocess.TimeoutExpired('fixture put', timeout)
+                self.puts_before_timeout -= 1
                 self.objects[key] = ledger.mapping(cast(object, json.loads(Path(arguments[arguments.index('--body') + 1]).read_text())))
             elif key in self.objects:
-                _ = Path(arguments[arguments.index('--key') + 2]).write_text(json.dumps(self.objects[key]))
+                _ = Path(arguments[-3]).write_text(json.dumps(self.objects[key]))
             else:
                 return subprocess.CompletedProcess(list(arguments), 1, '', 'NoSuchKey')
         else:
@@ -93,7 +106,7 @@ class HanaProviderTests(CostFixture):
         super().setUp()
         self.clock = TestClock()
         self.workload = self.root / 'hana_aws.conf'
-        _ = self.workload.write_text((REPOSITORY / 'config/hana_aws.conf').read_text())
+        write_lifecycle_configuration(self.workload)
         self.fake = FakeAws(self.clock)
         settings = conf.read(self.workload)
         self.provider = provider.AwsHanaProvider(aws_target.AwsCli('fixture-scaler', IDENTITY.region,
@@ -142,7 +155,9 @@ class HanaProviderTests(CostFixture):
         self.assertTrue(actions <= granted)
         self.assertEqual(set(provider.PROVIDER_OPERATIONS.values()), granted)
         self.assertTrue(all(timeout == conf.read(self.workload).whole('aws_timeout_s') for _, _, timeout in self.fake.calls))
-        self.assertEqual([op for _, op, _ in self.fake.calls].count('put-object'), 2)
+        self.assertEqual([op for _, op, _ in self.fake.calls].count('put-object'), 4)
+        self.assertIn('command_url', descriptor)
+        self.assertIn('fence_url', descriptor)
 
     def test_lost_start_response_recovers_without_another_start(self) -> None:
         operation, start = self.operation(box.Action.START), self.start()
@@ -153,6 +168,33 @@ class HanaProviderTests(CostFixture):
         _ = self.provider.step(IDENTITY, start, operation)
         self.assertEqual([op for _, op, _ in self.fake.calls].count('start-instances'), 1)
 
+    def test_execution_objects_use_the_exact_boot_and_scoped_policy(self) -> None:
+        from scripts.aws_target import hana_execution, test_hana_execution as fixtures
+
+        fixture = fixtures.HanaExecutionTests()
+        request = fixture.request
+        access = self.provider.execution_access(request.key)
+        envelope = hana_execution.HanaCommandEnvelope(request,
+            hana_guest.WorkPermit(access.expires_at, '3', request.key.generation.boot_id), access)
+        self.provider.publish_execution(envelope)
+        prefix = 'control/' + request.key.generation.deployment + '/' + request.key.generation.start_token
+        self.assertEqual(self.fake.objects[prefix + '/command.json']['action'], 'execute')
+        observation = fixture.objects.observe_execution(request.key)
+        observation_key = urlsplit(access.observation_url).path.lstrip('/')
+        self.fake.objects[observation_key] = ledger.mapping(cast(object, json.loads(hana_execution.encode_observation(observation))))
+        self.assertEqual(self.provider.observe_execution(request.key), observation)
+        self.assertTrue(all(operation in provider.PROVIDER_OPERATIONS or operation == 'export-credentials'
+                            for _, operation, _ in self.fake.calls))
+
+    def test_execution_observation_rejects_oversized_objects(self) -> None:
+        from scripts.aws_target import hana_execution, test_hana_execution as fixtures
+
+        fixture = fixtures.HanaExecutionTests()
+        key = urlsplit(self.provider.execution_access(fixture.key).observation_url).path.lstrip('/')
+        self.fake.objects[key] = {'oversized': 'x' * (hana_execution.CONTROL_MAX_BYTES + 1)}
+        with self.assertRaises(provider.ProviderPending):
+            _ = self.provider.observe_execution(fixture.key)
+
     def test_uncertain_stopped_start_remains_unresolved(self) -> None:
         operation, start = self.operation(box.Action.START), self.start()
         self.fake.failure = 'start-instances'
@@ -160,6 +202,54 @@ class HanaProviderTests(CostFixture):
             _ = self.provider.step(IDENTITY, start, operation)
         self.fake.failure = ''
         self.assertIsInstance(self.provider.recover(IDENTITY, start, operation), box.MutationUnresolved)
+
+    def test_abandoned_start_with_a_lost_reply_keeps_exposure_until_a_later_stop(self) -> None:
+        controller = box.HanaController(self.state, self.settings, self.workload, self.provider, clock=self.clock)
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'fixture inventory', True))
+        book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'fixture account inventory'))
+        controller.register(IDENTITY)
+        _ = controller.request('fixture-execution')
+        self.assertEqual(controller.tick(), box.Lifecycle.STARTING)
+        self.fake.lose_response = 'start-instances'
+        with self.assertRaises(provider.ProviderPending):
+            _ = controller.tick()
+        self.fake.state = 'stopped'
+        settings = conf.read(self.workload)
+        self.clock.advance(settings.whole('start_timeout_seconds'))
+        fraction = 0.95
+        self.provider.clock = lambda: self.clock() + fraction
+        self.fake.spot_read_seconds = 2
+        self.assertEqual(controller.tick(), box.Lifecycle.STARTING)
+        self.assertIsInstance(book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureOpen)
+        self.clock.advance(settings.whole('aws_timeout_s'))
+        fraction = 0.05
+        self.assertEqual(controller.tick(), box.Lifecycle.STARTING)
+        self.assertIsInstance(book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureOpen)
+        self.fake.spot_read_seconds = 0
+        self.assertEqual(controller.tick(), box.Lifecycle.IDLE_STOPPED)
+        self.assertIsInstance(book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureClosed)
+        self.assertEqual([op for _, op, _ in self.fake.calls].count('start-instances'), 1)
+
+    def test_stop_during_instance_read_closes_exposure_at_observation_completion(self) -> None:
+        controller = box.HanaController(self.state, self.settings, self.workload, self.provider, clock=self.clock)
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'fixture inventory', True))
+        book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'fixture account inventory'))
+        controller.register(IDENTITY)
+        _ = controller.request('fixture-execution')
+        self.assertEqual(controller.tick(), box.Lifecycle.STARTING)
+        self.clock.advance(1)
+        self.assertEqual(controller.tick(), box.Lifecycle.STARTING)
+        self.assertEqual(self.fake.state, 'running')
+        self.assertIsInstance(book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureOpen)
+
+        self.clock.advance(1)
+        self.fake.stop_during_instance_read_seconds = 2
+        self.fake.spot_read_seconds = 1
+        completed_at = self.clock.now + 3
+        self.assertEqual(controller.tick(), box.Lifecycle.STOPPED_UNKNOWN)
+        self.assertEqual(book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureClosed(completed_at))
 
     def test_recovery_fences_a_call_that_has_not_started(self) -> None:
         operation, start = self.operation(box.Action.START), self.start()
@@ -176,13 +266,118 @@ class HanaProviderTests(CostFixture):
             fcntl.flock(lock, fcntl.LOCK_EX)
             self.assertIsInstance(self.provider.recover(IDENTITY, self.start(), operation), box.MutationUnresolved)
 
+    def test_stopped_bootstrap_reuses_the_saved_descriptor_before_start(self) -> None:
+        controller = box.HanaController(self.state, self.settings, self.workload, self.provider, clock=self.clock)
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'fixture inventory', True))
+        book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'fixture account inventory'))
+        controller.register(IDENTITY)
+        _ = controller.request('fixture-execution')
+        self.fake.failure = 'put-object'
+        self.fake.userdata = 'fixture-old-data'
+        with self.assertRaises(provider.ProviderPending):
+            _ = controller.tick()
+        pending = controller.inspect()
+        assert isinstance(pending, box.HanaLifecycleEvidence) and isinstance(pending.operation, box.PendingOperation)
+        self.assertEqual(pending.operation.action, box.Action.BOOTSTRAP)
+        saved_path = self.state / 'hana/provider' / (pending.operation.token + '.json')
+        saved = ledger.mapping(cast(object, json.loads(saved_path.read_text())))
+        self.assertEqual(saved['dispatched'], True)
+        self.fake.failure = ''
+        self.clock.advance(1)
+        self.assertEqual(controller.tick(), box.Lifecycle.STARTING)
+        accepted = ledger.mapping(cast(object, json.loads(saved_path.read_text())))
+        self.assertEqual(accepted['accepted'], True)
+        self.assertEqual(accepted['descriptor'], saved['descriptor'])
+        self.assertEqual(accepted['token'], pending.operation.token)
+        self.assertEqual(cast(object, json.loads(base64.b64decode(self.fake.userdata))), saved['descriptor'])
+        self.assertEqual(len(self.fake.objects), 3)
+        operations = [op for _, op, _ in self.fake.calls]
+        self.assertEqual(operations.count('export-credentials'), 1)
+        self.assertNotIn('start-instances', operations)
+        ready_to_start = controller.inspect()
+        assert isinstance(ready_to_start, box.HanaLifecycleEvidence)
+        assert isinstance(ready_to_start.operation, box.PendingOperation)
+        self.assertEqual(ready_to_start.operation.action, box.Action.START)
+
+    def test_bootstrap_restarts_at_the_next_unconfirmed_put(self) -> None:
+        operation, start = self.operation(box.Action.BOOTSTRAP), self.start()
+        for _step in range(2):
+            self.fake.puts_before_timeout = 1
+            with self.assertRaises(provider.ProviderPending):
+                _ = self.provider.step(IDENTITY, start, operation)
+            self.assertEqual(self.fake.userdata, '')
+        self.fake.puts_before_timeout = 1
+        self.assertEqual(self.provider.step(IDENTITY, start, operation), box.OperationAccepted(operation.token))
+        self.assertEqual(len(self.fake.objects), 3)
+        operations = [op for _, op, _ in self.fake.calls]
+        self.assertEqual(operations.count('export-credentials'), 1)
+        self.assertEqual(operations.count('put-object'), 5)
+        self.assertEqual(operations.count('modify-instance-attribute'), 1)
+
+    def test_resumed_bootstrap_uses_the_tick_for_the_next_unconfirmed_write(self) -> None:
+        operation, start = self.operation(box.Action.BOOTSTRAP), self.start()
+        self.fake.puts_before_timeout = 1
+        with self.assertRaises(provider.ProviderPending):
+            _ = self.provider.step(IDENTITY, start, operation)
+        before = len(self.fake.calls)
+        self.fake.failure = 'describe-instance-attribute'
+        self.fake.puts_before_timeout = 2
+        self.assertEqual(self.provider.step(IDENTITY, start, operation), box.OperationAccepted(operation.token))
+        self.assertEqual([op for _, op, _ in self.fake.calls[before:]], [
+            'describe-instances', 'describe-spot-instance-requests', 'put-object', 'put-object',
+            'modify-instance-attribute'])
+        self.assertEqual(len(self.fake.objects), 3)
+
     def test_bootstrap_recovery_reads_the_saved_user_data(self) -> None:
         operation, start = self.operation(box.Action.BOOTSTRAP), self.start()
         self.fake.lose_response = 'modify-instance-attribute'
         with self.assertRaises(provider.ProviderPending):
             _ = self.provider.step(IDENTITY, start, operation)
         self.assertIsInstance(self.provider.recover(IDENTITY, start, operation), box.MutationSettled)
-        self.assertIn('describe-instance-attribute', [op for _, op, _ in self.fake.calls])
+        before = len(self.fake.calls)
+        self.assertEqual(self.provider.step(IDENTITY, start, operation), box.OperationAccepted(operation.token))
+        operations = [op for _, op, _ in self.fake.calls[before:]]
+        self.assertIn('describe-instance-attribute', operations)
+        self.assertNotIn('modify-instance-attribute', operations)
+        self.assertNotIn('put-object', operations)
+
+    def test_bootstrap_recovery_leaves_a_running_box_unchanged(self) -> None:
+        operation, start = self.operation(box.Action.BOOTSTRAP), self.start()
+        self.fake.failure = 'put-object'
+        with self.assertRaises(provider.ProviderPending):
+            _ = self.provider.step(IDENTITY, start, operation)
+        self.fake.failure, self.fake.state = '', 'running'
+        before = len(self.fake.calls)
+        with self.assertRaisesRegex(provider.ProviderPending, 'bootstrap operation remains unresolved'):
+            _ = self.provider.step(IDENTITY, start, operation)
+        self.assertNotIn('put-object', [op for _, op, _ in self.fake.calls[before:]])
+        self.assertEqual(self.fake.userdata, '')
+
+    def test_abandoned_stopped_mutations_refuse_a_late_dispatch(self) -> None:
+        for action, failure in ((box.Action.BOOTSTRAP, 'put-object'), (box.Action.START, 'start-instances')):
+            with self.subTest(action=action):
+                operation, start = self.operation(action), self.start()
+                self.fake.failure = failure
+                with self.assertRaises(provider.ProviderPending):
+                    _ = self.provider.step(IDENTITY, start, operation)
+                self.fake.failure = ''
+                reply = self.provider.recover(IDENTITY, start, operation, abandon_start=True)
+                if action == box.Action.START:
+                    self.assertIsInstance(reply, box.MutationUnresolved)
+                else:
+                    self.assertIsInstance(reply, box.MutationSettled)
+                before = len(self.fake.calls)
+                with self.assertRaisesRegex(provider.ProviderPending, 'operation is cancelled'):
+                    _ = self.provider.step(IDENTITY, start, operation)
+                self.assertEqual(len(self.fake.calls), before)
+                self.assertEqual(self.fake.state, 'stopped')
+
+    def test_abandoned_accepted_start_can_still_need_a_stop(self) -> None:
+        operation, start = self.operation(box.Action.START), self.start()
+        _ = self.provider.step(IDENTITY, start, operation)
+        self.fake.state = 'stopped'
+        self.assertIsInstance(self.provider.recover(IDENTITY, start, operation, abandon_start=True), box.StartMayBeRunning)
 
     def test_ownership_mismatch_and_errors_reveal_no_private_data(self) -> None:
         self.fake.ownership = 'other-deployment'
@@ -191,6 +386,79 @@ class HanaProviderTests(CostFixture):
         self.fake.failure = 'stop-instances'
         with self.assertRaisesRegex(provider.ProviderPending, '^Hana provider call failed: ec2:StopInstances$'):
             _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.STOP))
+
+    def test_cli_failure_reports_only_the_aws_error_code(self) -> None:
+        self.fake.failure = 'modify-instance-attribute'
+        self.fake.failure_stderr = (
+            'An error occurred (UnauthorizedOperation) when calling the ModifyInstanceAttribute operation: '
+            + 'You are not authorized to perform this operation. User: arn:aws:sts::000000000000:assumed-role/x '
+            + 'Encoded authorization failure message: abcDEF'
+        )
+        with self.assertRaises(provider.ProviderPending) as pending:
+            _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.BOOTSTRAP))
+        self.assertEqual(str(pending.exception), 'Hana provider call failed: ec2:ModifyInstanceAttribute (UnauthorizedOperation)')
+
+    def test_cli_failure_reports_a_code_after_the_error_prefix(self) -> None:
+        self.fake.failure = 'modify-instance-attribute'
+        self.fake.failure_stderr = (
+            '\naws: [ERROR]: An error occurred (UnauthorizedOperation) when calling the '
+            + 'ModifyInstanceAttribute operation: Fixture access is denied'
+        )
+        with self.assertRaises(provider.ProviderPending) as pending:
+            _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.BOOTSTRAP))
+        self.assertEqual(str(pending.exception), 'Hana provider call failed: ec2:ModifyInstanceAttribute (UnauthorizedOperation)')
+
+    def test_cli_failure_reports_a_code_when_retries_are_exhausted(self) -> None:
+        self.fake.failure = 'describe-instances'
+        self.fake.failure_stderr = (
+            'aws: [ERROR]: An error occurred (RequestLimitExceeded) when calling the '
+            + 'DescribeInstances operation (reached max retries: 2): Fixture request limit is exceeded'
+        )
+        with self.assertRaises(provider.ProviderPending) as pending:
+            _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.OBSERVE))
+        self.assertEqual(str(pending.exception), 'Hana provider call failed: ec2:DescribeInstances (RequestLimitExceeded)')
+
+    def test_cli_failure_omits_a_code_with_invalid_characters(self) -> None:
+        self.fake.failure = 'modify-instance-attribute'
+        self.fake.failure_stderr = 'An error occurred (unexpected/private) when calling the ModifyInstanceAttribute operation'
+        with self.assertRaises(provider.ProviderPending) as pending:
+            _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.BOOTSTRAP))
+        self.assertEqual(str(pending.exception), 'Hana provider call failed: ec2:ModifyInstanceAttribute')
+
+    def test_cli_failure_omits_key_and_account_like_codes(self) -> None:
+        self.fake.failure = 'describe-instances'
+        for token in ('AKIAFAKEFAKEFAKE', '000000000000', 'Client.AKIAFAKEFAKEFAKE'):
+            with self.subTest(token=token):
+                self.fake.failure_stderr = f'An error occurred ({token}) when calling the DescribeInstances operation'
+                with self.assertRaises(provider.ProviderPending) as pending:
+                    _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.OBSERVE))
+                self.assertEqual(str(pending.exception), 'Hana provider call failed: ec2:DescribeInstances')
+
+    def test_cli_failure_omits_a_header_after_other_text(self) -> None:
+        self.fake.failure = 'describe-instances'
+        self.fake.failure_stderr = (
+            'Fixture diagnostic\n'
+            + 'An error occurred (UnauthorizedOperation) when calling the DescribeInstances operation'
+        )
+        with self.assertRaises(provider.ProviderPending) as pending:
+            _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.OBSERVE))
+        self.assertEqual(str(pending.exception), 'Hana provider call failed: ec2:DescribeInstances')
+
+    def test_cli_failure_reports_a_dotted_aws_code(self) -> None:
+        self.fake.failure = 'describe-instances'
+        self.fake.failure_stderr = (
+            '\n  An error occurred (InvalidInstanceID.NotFound) when calling the DescribeInstances operation: '
+            + 'Fixture instance is missing'
+        )
+        with self.assertRaises(provider.ProviderPending) as pending:
+            _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.OBSERVE))
+        self.assertEqual(str(pending.exception), 'Hana provider call failed: ec2:DescribeInstances (InvalidInstanceID.NotFound)')
+
+    def test_cli_timeout_reports_only_the_action(self) -> None:
+        self.fake.lose_response = 'modify-instance-attribute'
+        with self.assertRaises(provider.ProviderPending) as pending:
+            _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.BOOTSTRAP))
+        self.assertEqual(str(pending.exception), 'Hana provider call failed: ec2:ModifyInstanceAttribute')
 
     def test_scaler_environment_removes_inherited_admin_credentials(self) -> None:
         with mock.patch.dict('os.environ', {'AWS_ACCESS_KEY_ID': 'inherited-admin', 'AWS_SESSION_TOKEN': 'inherited-token'}):
@@ -220,10 +488,10 @@ class HanaProviderTests(CostFixture):
         with self.assertRaisesRegex(ValueError, 'shutdown is fenced'):
             _ = hana_receiver.receive(settings, descriptor, control, paths=paths, clock=self.clock)
 
-    def test_receiver_program_compiles_without_repository_imports(self) -> None:
+    def test_receiver_program_compiles_with_the_reviewed_runtime_entry_point(self) -> None:
         rendered = hana_receiver.receiver_program()
         _ = compile(rendered, '<hana receiver>', 'exec')
-        self.assertNotIn('scripts.', rendered)
+        self.assertIn('from scripts.aws_target.hana_receiver import installed_main', rendered)
 
     def test_no_approval_prints_only_the_plan_and_makes_no_external_call(self) -> None:
         subject = deploy.Deployment(self.settings, self.state, self.root / 'output', execute=self.fake)

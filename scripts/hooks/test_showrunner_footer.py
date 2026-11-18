@@ -87,7 +87,7 @@ class QuestionLibraryTests(unittest.TestCase):
                     "---\nrecord_type: question\nstatus: open\n"
                     + f"production_id: {production.owner.id}\nasked_by: {source}\n"
                     + f"registration: {json.dumps(fields)}\n---\n")
-            for source, expected in (("", 6), (own.id, 2), (other.id, 1), (empty.id, 0)):
+            for source, expected in (("", 5), (own.id, 2), (other.id, 1), (empty.id, 0)):
                 with self.subTest(source=source):
                     self.assertEqual(showrunner_footer.open_questions([production], source=source), expected)
 
@@ -184,7 +184,7 @@ class QuestionLibraryTests(unittest.TestCase):
                 paths: list[Path] = []
                 with contextlib.redirect_stderr(errors):
                     line, due = counts_row.row(instance, paths, identities=identities)
-                self.assertEqual(line, "For you: 1 efficiency")
+                self.assertEqual(line, "Review: 1 efficiency")
                 self.assertEqual(due, "")
                 self.assertIn(document, paths)
                 self.assertIn(ledger, paths)
@@ -272,7 +272,7 @@ class QuestionLibraryTests(unittest.TestCase):
                 self.assertTrue(outstanding.call_args_list)
                 for call in outstanding.call_args_list:
                     self.assertIs(cast(object, call.kwargs["identities"]), identities)
-                self.assertEqual(line, "For you: 1 question")
+                self.assertEqual(line, "Review: 1 question")
                 self.assertEqual(due, str(int(datetime(2099, 1, 2, 8, tzinfo=UTC).timestamp())))
                 self.assertIn(doc, sources)
                 for record in folder.glob("*.md"):
@@ -317,7 +317,7 @@ class QuestionLibraryTests(unittest.TestCase):
                     return datetime.fromisoformat(AT).replace(tzinfo=zone)
 
             with mock.patch.object(showrunner_footer, "datetime", FooterClock):
-                self.assertEqual(showrunner_footer.open_questions([production]), 3)
+                self.assertEqual(showrunner_footer.open_questions([production]), 2)
             output = showrunner_footer.counts_line([production], 3)
             self.assertIsNotNone(output)
             assert output is not None

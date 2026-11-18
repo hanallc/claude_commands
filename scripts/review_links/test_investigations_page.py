@@ -1,5 +1,6 @@
 """Test investigation cards with private staff records and state folders."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
 
 import io
 import json
@@ -14,6 +15,7 @@ from unittest.mock import patch
 from urllib.parse import urlencode
 
 from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.test_staff_names import without_role_colors
 from scripts.production import investigation, staff
 from scripts.review_links import console, investigations_page
 
@@ -27,13 +29,22 @@ ORPHAN = staff.StaffId("f5636030-6745-4ff4-aeda-4c2773d18da8")
 class InvestigationsPageTests(unittest.TestCase):
     root: Path = Path()
 
+    def test_staff_sources_have_separate_role_colors_and_missing_sources_stay_plain(self) -> None:
+        _ = self.file(UNIT.id, "Known source", "2026-11-16T12:00:00+00:00")
+        _ = self.file(ORPHAN, "Missing source", "2026-11-16T12:01:00+00:00")
+        body = investigations_page.render(self.root / "reviews").decode()
+        self.assertRegex(body, r'data-color-text="role.showrunner"[^>]*>Alpha</span>')
+        self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>Builder</span>')
+        self.assertIn('<dd>' + ORPHAN + '</dd>', body)
+
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="investigations-page-test-")))
         config = self.root / "config"
         config.mkdir()
-        for name in ("review_links", "console", "change_review"):
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{name}.conf", config / f"{name}.conf")
+        for name in ("console", "change_review"):
+            _ = write_config_fixture(config / f"{name}.conf")
+        _ = write_config_fixture(config / "review_links.conf", "page_refresh_seconds=15\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.root / "state"),
             "STAFF_FILE": str(self.root / "staff.json"), "USER_ZONE": "America/New_York",
@@ -42,7 +53,40 @@ class InvestigationsPageTests(unittest.TestCase):
 
     def file(self, owner: staff.StaffId, title: str, moment: str) -> investigation.Investigation:
         with patch.object(investigation, "_now", return_value=moment):
-            return investigation.file(owner, title, "Read the report.\n\n1. Check the first result.\n2. Check the second result.")
+            return investigation.file(owner, title, "Read the report.\n\n1. Check the first result.\n2. Check the second result.", waiting_why='The owner must complete the investigation.')
+
+    def test_review_question_returns_the_answer_and_feedback_keeps_each_exchange(self) -> None:
+        for legacy in (False, True):
+            with self.subTest(finding="F019", legacy=legacy):
+                record = self.file(UNIT.id,'Check both cases','2026-11-16T13:05:00+00:00')
+                _ = investigation.answer(UNIT.id,record.id,'The first case passes.')
+                if legacy:
+                    path = investigation.folder(UNIT.id) / (record.id+'.md')
+                    _ = path.write_text(''.join(line for line in path.read_text().splitlines(keepends=True)
+                                              if not line.startswith('review_log: ')))
+                waiting = investigation.review_action(UNIT.id,record.id,'question','Check the second case.')
+                self.assertEqual(waiting.state,investigation.InvestigationState.OPEN)
+                returned = investigation.answer(UNIT.id,record.id,'The second case passes.')
+                self.assertEqual(returned.state,investigation.InvestigationState.ANSWER_READY)
+                done = investigation.review_action(UNIT.id,record.id,'feedback','Keep both checks.')
+                self.assertEqual(done.state,investigation.InvestigationState.READ)
+                self.assertEqual([entry.words for entry in done.log],['Answer: The first case passes.',
+                    'question: Check the second case.','Answer: The second case passes.','feedback sent: Keep both checks.'])
+
+        with self.subTest(finding='F019', legacy='Later before question'):
+            first_time = '2026-11-16T13:10:00+00:00'
+            legacy_record = self.file(UNIT.id,'Keep the earlier answer','2026-11-16T13:05:00+00:00')
+            with patch.object(investigation,'_now',return_value=first_time):
+                _ = investigation.answer(UNIT.id,legacy_record.id,'Legacy answer A.')
+            path = investigation.folder(UNIT.id) / (legacy_record.id+'.md')
+            _ = path.write_text(''.join(line for line in path.read_text().splitlines(keepends=True)
+                                      if not line.startswith('review_log: ')))
+            investigation.record_review_log(UNIT.id,legacy_record.id,'Later until tomorrow')
+            _ = investigation.review_action(UNIT.id,legacy_record.id,'question','Check answer B.')
+            returned = investigation.answer(UNIT.id,legacy_record.id,'Answer B.')
+            self.assertEqual([entry.words for entry in returned.log],['Answer: Legacy answer A.',
+                'Later until tomorrow','question: Check answer B.','Answer: Answer B.'])
+            self.assertEqual(returned.log[0].time.isoformat(),first_time,'F019: keep the original answer time')
 
     def test_cards_show_the_state_text_footer_and_owner_filters(self) -> None:
         ready = self.file(UNIT.id, "Find the cause <now>", "2026-11-16T13:05:00+00:00")
@@ -51,7 +95,7 @@ class InvestigationsPageTests(unittest.TestCase):
         read = self.file(ORPHAN, "Read answer", "2026-11-16T12:00:00+00:00")
         _ = investigation.answer(ORPHAN, read.id, "An answer.")
         _ = investigation.mark_read(ORPHAN, read.id)
-        body = investigations_page.render(self.root / "reviews").decode()
+        body = without_role_colors(investigations_page.render(self.root / "reviews").decode())
         self.assertIn('</h1><p class="page-status"', body)
         self.assertLess(body.index('data-page-status '), body.index('<div data-investigations'))
         self.assertEqual(body.count("<article "), 3)

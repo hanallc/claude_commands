@@ -19,6 +19,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Callable
 from datetime import date, datetime
 from dataclasses import replace
 from pathlib import Path
@@ -27,7 +28,8 @@ from unittest import mock
 
 
 from scripts.production import change_review
-from scripts.lib import copy_record
+from scripts.lib import copy_record, file_lock
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.checkout_test_support import write_python_tool
 from scripts.production import (
     showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc, unit_config, unit_lookup,
@@ -38,6 +40,9 @@ from zoneinfo import ZoneInfo
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, recorded_showrunner, recorded_unit
 from scripts.production import showrunner_tree
 from scripts.production.change_review import Invisible, Malformed, Visible
+from scripts.production.change_review_test_support import (
+    fixture_image, fixture_row_image, pictured_changes, pictured_publication, pictured_review_lines,
+)
 from scripts.review_links import image_store
 
 # Importable once change_review has put scripts/lib on the path.
@@ -86,6 +91,7 @@ def setUpModule() -> None:
     unittest.addModuleCleanup(folder.cleanup)
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
         "STAFF_FILE": str(Path(folder.name) / "staff.json"), "NEXT_STATE_DIR": folder.name,
+        "REVIEW_LINKS_ROOT": str(Path(folder.name) / "links"), "CHANGE_REVIEW_DIR": folder.name,
         "UNIT_HISTORY_DIR": f"{folder.name}/history", copy_record.ROOT_ENV: f"{folder.name}/scratch",
         scratch.VISIBLE_ROOT_ENV: f"{folder.name}/repro"}))
     _ = fixture_member("showrunner", name="fixture")
@@ -164,7 +170,8 @@ class ProducerFixture(unittest.TestCase):
         self.listing = self.root / "change-review - top.md"
         self.enterContext(mock.patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json"),
             "CHANGE_REVIEW_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"),
-            "NEXT_STATE_DIR": str(self.root / "next"), "UNIT_HISTORY_DIR": str(self.root / "history")}))
+            "NEXT_STATE_DIR": str(self.root / "next"), "UNIT_HISTORY_DIR": str(self.root / "history"),
+            "GIT_AUTHOR_DATE": "2026-11-13T12:00:00Z", "GIT_COMMITTER_DATE": "2026-11-13T12:00:00Z"}))
         _ = self.git("init", "-b", "main")
         _ = self.git("config", "user.name", "Producer fixture")
         _ = self.git("config", "user.email", "producer@example.invalid")
@@ -204,7 +211,7 @@ class ProducerFixture(unittest.TestCase):
     def merge(self, name: str = "old-branch", change: str = "A visible change") -> str:
         _ = self.git("checkout", "-b", name)
         _ = self.git("commit", "--allow-empty", "-m",
-            f"checkpoint({name}): change\n\nChange-Review: {change} | Read | Proof")
+            pictured_review_lines(f"checkpoint({name}): change\n\nChange-Review: {change} | Read | Proof"))
         self.record_unit_commit(self.git("rev-parse", "HEAD"), name)
         _ = self.git("checkout", "main")
         _ = self.git("merge", "--no-ff", name, "-m", f"Merge {name} into main")
@@ -212,6 +219,161 @@ class ProducerFixture(unittest.TestCase):
         return self.git("rev-parse", "HEAD")
 
 class ProducerWriterTests(ProducerFixture):
+    def test_add_refuses_a_visible_row_without_an_image(self) -> None:
+        code, output, error = run("add", "--production", "top", "--change", "No image", "--check", "Read", "--see", "Proof")
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("change_review.py image --image <png>", error)
+        self.assertIn("--output <text file>", error)
+        self.assertFalse(self.listing.exists())
+
+    def test_edit_requires_an_image_and_never_clears_an_existing_image(self) -> None:
+        _ = self.listing.write_text(LIST)
+        before = self.listing.read_bytes()
+        arguments = ("edit", "--production", "top", "--list", str(self.listing), "--row", "C76",
+                     "--change", "Edited", "--check", "Read", "--see", "Proof")
+        code, output, error = run(*arguments)
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("C76", error)
+        self.assertIn("change_review.py image --image <png>", error)
+        self.assertEqual(self.listing.read_bytes(), before)
+        image = fixture_image()
+        self.assertEqual(run(*arguments, "--image", image)[0], 0)
+        self.assertEqual(run(*arguments)[0], 0)
+        self.assertEqual(change_review.pending(self.listing)[0][change_review.IMAGE], image)
+
+    def test_batch_names_every_imageless_row_and_writes_nothing(self) -> None:
+        _ = self.listing.write_text(LIST)
+        before = self.listing.read_bytes(), self.listing.stat().st_mtime_ns
+        batch_file = self.root / "batch.json"
+        _ = batch_file.write_text(json.dumps([
+            {"op": "edit", "production": "top", "list": str(self.listing), "row": row,
+             "change": "Edited", "check": "Read", "see": "Proof"}
+            for row in ("C76", "C77")]))
+        with mock.patch.object(change_review, "write_text_atomic") as write:
+            code, output, error = run("batch", "--file", str(batch_file))
+        self.assertEqual((code, output), (1, ""))
+        for index, row in enumerate(("C76", "C77")):
+            self.assertIn(f"batch item {index}: {row}:", error)
+        self.assertIn("change_review.py image --image <png>", error)
+        self.assertEqual((self.listing.read_bytes(), self.listing.stat().st_mtime_ns), before)
+        write.assert_not_called()
+
+    def test_native_verdict_keeps_the_exchange_locked_until_the_list_save(self) -> None:
+        from scripts.review_links import change_page, review_page, test_review_page
+
+        case = test_review_page.ReviewPageTests('runTest')
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        delivery, _ = review_page.submit(case.root, case.body('page-owner/C1', 'validate', 'Check the current case.'), case.status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        change_page.deliver(delivery, case.status)
+        lock = case.root/'.review-link-delivery.lock'
+        record_verdict = change_review.record_verdict
+        blocked: list[bool] = []
+
+        def replace_before_write(path: Path, row: str, verdict: str, day: date, production: Path, *,
+                                 report_warning: Callable[[str], None]) -> change_review.VerdictRecorded | change_review.VerdictAlreadyRecorded | change_review.VerdictConflict:
+            with file_lock.exclusive(lock, wait=False) as held:
+                blocked.append(held == file_lock.LockResult.BUSY)
+                if held == file_lock.LockResult.ACQUIRED:
+                    case.status.write_slots(delivery.page, delivery.row,
+                        change_page.DeliverySlots(change_page.NoDelivery(), change_page.NoDelivery(),
+                            change_page.OpenQuestion('replacement', 'A newer question.', change_page.NoDelivery())))
+            return record_verdict(path, row, verdict, day, production, report_warning=report_warning)
+
+        with mock.patch.object(change_review, 'record_verdict', side_effect=replace_before_write):
+            result = change_review.save_verdict(delivery.page.review_list, delivery.row, 'works', case.fixture.production,
+                                                validation_id=delivery.attempt)
+        self.assertEqual(blocked, [True], 'The replacement cannot enter between the exchange check and the list save.')
+        self.assertIsInstance(result, change_review.VerdictSaved)
+        self.assertIsInstance(case.status.slots(delivery.page, delivery.row).question, change_page.NoQuestion)
+        self.assertEqual(next(row['Verdict'] for row in change_review.review_rows(delivery.page.review_list)
+                              if row['#'] == delivery.row), 'works')
+
+    def test_native_verdict_uses_the_current_validation_id(self) -> None:
+        from scripts.review_links import change_page, review_items, review_page, test_review_page
+
+        for verdict in ('works', 'not works: the spacing differs'):
+            for supplied in ('missing', 'old', 'current'):
+                with self.subTest(verdict=verdict, supplied=supplied):
+                    case = test_review_page.ReviewPageTests('runTest')
+                    case.setUp()
+                    try:
+                        key = 'page-owner/C1'
+                        old, _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the old case.'), case.status)
+                        assert isinstance(old, change_page.MessageDelivery)
+                        change_page.deliver(old, case.status)
+                        current, _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the new case.'), case.status)
+                        assert isinstance(current, change_page.MessageDelivery)
+                        change_page.deliver(current, case.status)
+                        listing = current.page.review_list
+                        record = case.status.path(current.page, current.row)
+                        before = listing.read_bytes(), record.read_bytes()
+                        identity = '' if supplied == 'missing' else old.attempt if supplied == 'old' else current.attempt
+                        arguments = ('verdict', '--production', 'page-owner', '--list', str(listing),
+                                     '--row', 'C1', '--verdict', verdict)
+                        if supplied != 'current':
+                            result = (change_review.save_verdict(listing, 'C1', verdict, case.fixture.production)
+                                      if supplied == 'missing' else
+                                      change_review.save_verdict(listing, 'C1', verdict, case.fixture.production, validation_id=identity))
+                            self.assertIsInstance(result, change_review.VerdictRefused)
+                            assert isinstance(result, change_review.VerdictRefused)
+                            reason = 'this question id does not match the current question'
+                            self.assertEqual((result.lines, result.reason), ([], reason))
+                            args = arguments+('--validation', identity) if identity else arguments
+                            code, output, errors = run(*args)
+                            self.assertEqual((code, output, errors.strip()), (1, '', reason))
+                            self.assertEqual((listing.read_bytes(), record.read_bytes()), before)
+                            continue
+                        if verdict == 'works':
+                            result = change_review.save_verdict(listing, 'C1', verdict, case.fixture.production, validation_id=identity)
+                            self.assertIsInstance(result, change_review.VerdictSaved)
+                        else:
+                            code, _, errors = run(*arguments, '--validation', identity)
+                            self.assertEqual((code, errors), (0, ''))
+                        updated = next(item for item in review_items.read(case.root) if item.key == key)
+                        self.assertEqual(updated.state, review_items.ReviewState.DONE if verdict == 'works' else review_items.ReviewState.OPEN)
+                        if verdict != 'works':
+                            before = listing.read_bytes(), record.read_bytes()
+                            stale = change_review.save_verdict(listing, 'C1', 'works', case.fixture.production, validation_id=identity)
+                            self.assertIsInstance(stale, change_review.VerdictRefused)
+                            assert isinstance(stale, change_review.VerdictRefused)
+                            self.assertEqual(stale.reason, 'this row has no open question')
+                            code, output, errors = run(*arguments, '--validation', identity)
+                            self.assertEqual((code, output, errors.strip()), (1, '', 'this row has no open question'))
+                            self.assertEqual((listing.read_bytes(), record.read_bytes()), before)
+                    finally:
+                        case.doCleanups()
+
+    def test_native_verdict_refuses_a_superseded_validation(self) -> None:
+        from scripts.review_links import change_page, review_page, test_review_page
+
+        case = test_review_page.ReviewPageTests('runTest')
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        key = 'page-owner/C1'
+        old, _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the old case.'), case.status)
+        change_page.deliver(old, case.status)
+        current, _ = review_page.submit(case.root, case.body(key, 'question', 'Check the new case.'), case.status)
+        assert isinstance(current, change_page.MessageDelivery)
+        change_page.deliver(current, case.status)
+        listing = current.page.review_list
+        record = case.status.path(current.page, current.row)
+        before = listing.read_bytes(), record.read_bytes()
+        reason = 'this question id does not match the current question'
+        result = change_review.save_verdict(listing, 'C1', 'works', case.fixture.production)
+        self.assertIsInstance(result, change_review.VerdictRefused)
+        assert isinstance(result, change_review.VerdictRefused)
+        self.assertEqual(result.reason, reason)
+        self.assertEqual(result.lines, [])
+        code, output, errors = run('verdict', '--production', 'page-owner', '--list', str(listing),
+                                   '--row', 'C1', '--verdict', 'works')
+        self.assertEqual((code, output, errors.strip()), (1, '', reason))
+        self.assertEqual((listing.read_bytes(), record.read_bytes()), before)
+        request = case.status.slots(current.page, current.row).question
+        assert isinstance(request, change_page.OpenQuestion)
+        self.assertTrue(change_page.answer_item(key, 'The new case passes.', request.question_id, case.status))
+
     def test_output_capture_adds_an_image_to_add_edit_and_batch_rows(self) -> None:
         output = self.root / "output.txt"
         _ = output.write_text("All checks passed\n", encoding="utf-8")
@@ -324,6 +486,146 @@ class ProducerWriterTests(ProducerFixture):
         self.assertFalse((self.root / "links" / image_store.CHANGE_FOLDER / old).exists())
         self.assertTrue(image_store.change_image(self.root / "links", after[change_review.IMAGE]))
 
+    def test_edit_and_verdict_keep_an_image_named_by_another_review_row(self) -> None:
+        for action in ("edit", "verdict"):
+            for location in ("same", "sibling", "configured", "declared"):
+                with self.subTest(action=action, location=location):
+                    folder = self.root / f"{action}-{location}"
+                    folder.mkdir()
+                    configured = folder / "configured"
+                    configured.mkdir()
+                    first = folder / "change-review - first.md"
+                    second = (first if location == "same" else configured / "change-review - second.md"
+                              if location == "configured" else folder / "other" / "custom.md"
+                              if location == "declared" else folder / "change-review - second.md")
+                    document = self.root / "top.md"
+                    if location == "declared":
+                        _ = document.write_text(f"# Top\n- **Change review:** `{second}`\n")
+                    else:
+                        _ = document.write_text(f"# Top\n- **Change review:** `{first}`\n")
+                    shared = fixture_image()
+                    with mock.patch.dict(os.environ, {"CHANGE_REVIEW_DIR": str(configured)}):
+                        for path, title in ((first, "First"), (second, "Second")):
+                            _ = change_review.append_rows(path, [Visible(title, "Read", "Proof", image=shared)],
+                                date(2026, 11, 17), "", self.doc, record=staff.snapshot())
+                        second_row = "C2" if second == first else "C1"
+                        if action == "edit":
+                            _ = change_review.edit_row(first, "C1", change_review.KeepRowText(), date(2026, 11, 17),
+                                                       self.doc, image=fixture_image())
+                        else:
+                            _ = change_review.record_verdict(first, "C1", "works", date(2026, 11, 17), self.doc)
+                        remaining = next(row for row in change_review.pending(second) if row["#"] == second_row)
+                        self.assertEqual(remaining[change_review.IMAGE], shared)
+                        self.assertTrue(image_store.change_image(self.root / "links", shared))
+                        _ = change_review.record_verdict(second, second_row, "works", date(2026, 11, 17), self.doc)
+                        self.assertEqual(image_store.change_image(self.root / "links", shared), "")
+
+    def test_image_cleanup_and_row_writers_share_one_lock(self) -> None:
+        for operation in ("add", "edit", "batch"):
+            for first_operation in ("cleanup", "writer"):
+                with self.subTest(operation=operation, first=first_operation):
+                    folder = self.root / f"race-{operation}-{first_operation}"
+                    first = folder / "cleanup" / "change-review - first.md"
+                    second = folder / "writer" / "change-review - second.md"
+                    day = date(2026, 11, 17)
+                    shared = fixture_image()
+                    other = fixture_image()
+                    _ = self.doc.write_text(f"# Top\n- **Change review:** `{first}`\n")
+                    with mock.patch.dict(os.environ, {"CHANGE_REVIEW_DIR": str(second.parent)}):
+                        _ = change_review.append_rows(first, [Visible("First", "Read", "Proof", image=shared)],
+                            day, "", self.doc, record=staff.snapshot())
+                        _ = change_review.append_rows(second, [Visible("Second", "Read", "Proof", image=other)],
+                            day, "", self.doc, record=staff.snapshot())
+                        target = "C2" if operation == "add" else "C1"
+                        batch_file = folder / "batch.json"
+                        _ = batch_file.write_text(json.dumps([{"op": "edit", "production": "top",
+                            "list": str(second), "row": target, "image": shared}]))
+                        reached = threading.Event()
+                        writer_errors: list[Exception] = []
+                        cleanup_errors: list[Exception] = []
+
+                        def write_row() -> None:
+                            try:
+                                if operation == "add":
+                                    _ = change_review.append_rows(second,
+                                        [Visible("Concurrent", "Read", "Proof", image=shared)],
+                                        day, "", self.doc, record=staff.snapshot())
+                                elif operation == "edit":
+                                    _ = change_review.edit_row(second, target, change_review.KeepRowText(),
+                                                              day, self.doc, image=shared)
+                                else:
+                                    _ = change_review.batch(batch_file)
+                            except Exception as error:
+                                writer_errors.append(error)
+                            finally:
+                                if threading.current_thread() is contender:
+                                    reached.set()
+
+                        def cleanup() -> None:
+                            try:
+                                _ = change_review.record_verdict(first, "C1", "works", day, self.doc)
+                            except Exception as error:
+                                cleanup_errors.append(error)
+                            finally:
+                                if threading.current_thread() is contender:
+                                    reached.set()
+
+                        contender = threading.Thread(target=write_row if first_operation == "cleanup" else cleanup)
+                        flock = fcntl.flock
+                        remove = image_store.remove_change
+                        publish = write_text_atomic
+
+                        def observe_lock(descriptor: int, operation: int) -> None:
+                            if threading.current_thread() is contender and operation == fcntl.LOCK_EX:
+                                try:
+                                    flock(descriptor, operation | fcntl.LOCK_NB)
+                                except BlockingIOError:
+                                    reached.set()
+                                else:
+                                    return
+                            flock(descriptor, operation)
+
+                        def start_contender() -> None:
+                            contender.start()
+                            self.assertTrue(reached.wait(TEST_HANG_GUARD_SECS),
+                                            "The concurrent operation did not reach its lock or finish.")
+
+                        def remove_after_scan(root: Path, identity: str) -> None:
+                            if first_operation == "cleanup" and identity == shared:
+                                start_contender()
+                            remove(root, identity)
+
+                        def publish_after_check(path: Path, text: str) -> None:
+                            if first_operation == "writer" and path == second:
+                                start_contender()
+                            publish(path, text)
+
+                        with (mock.patch.object(fcntl, "flock", side_effect=observe_lock),
+                              mock.patch.object(image_store, "remove_change", side_effect=remove_after_scan),
+                              mock.patch.object(change_review, "write_text_atomic", side_effect=publish_after_check)):
+                            try:
+                                if first_operation == "cleanup":
+                                    cleanup()
+                                else:
+                                    write_row()
+                            finally:
+                                if contender.ident is not None:
+                                    contender.join(TEST_HANG_GUARD_SECS)
+                        self.assertFalse(contender.is_alive(), "The concurrent operation did not release its locks.")
+                        self.assertEqual(cleanup_errors, [])
+                        rows = change_review.pending(second)
+                        for row in rows:
+                            self.assertTrue(image_store.change_image(self.root / "links", row[change_review.IMAGE]),
+                                            f"{row['#']} names a deleted image.")
+                        if first_operation == "cleanup":
+                            self.assertEqual(len(writer_errors), 1)
+                            self.assertIsInstance(writer_errors[0], change_review.ChangeReviewError)
+                            self.assertIn(target, str(writer_errors[0]))
+                            self.assertIn(f"image {shared} is unavailable", str(writer_errors[0]))
+                        else:
+                            self.assertEqual(writer_errors, [])
+                            self.assertEqual(next(row for row in rows if row["#"] == target)[change_review.IMAGE], shared)
+
     def test_edit_image_keeps_text_validation_and_accepts_a_complete_text_edit(self) -> None:
         _ = self.listing.write_text(LIST, encoding="utf-8")
         shot = self.root / "shot.png"
@@ -341,12 +643,10 @@ class ProducerWriterTests(ProducerFixture):
         self.assertTrue(image_store.change_image(self.root / "links", row[change_review.IMAGE]))
 
     def test_a_missing_image_does_not_add_an_empty_image_column(self) -> None:
-        output = io.StringIO()
-        with redirect_stdout(output):
+        with self.assertRaisesRegex(change_review.ChangeReviewError, "image abcdef012345 is unavailable"):
             _ = change_review.append_rows(self.listing, [Visible("Preview", "Read", "Proof", image="abcdef012345")],
                 date(2026, 11, 15), "", self.doc, producers=[self.unit.id], record=staff.snapshot())
-        self.assertEqual(output.getvalue(), "change review: no image abcdef012345; row C1 has no image\n")
-        self.assertNotIn(change_review.IMAGE, change_review.pending(self.listing)[0])
+        self.assertFalse(self.listing.exists())
 
     def test_add_image_and_both_verdicts_remove_only_the_change_image(self) -> None:
         shot = self.root / "shot.png"
@@ -367,8 +667,8 @@ class ProducerWriterTests(ProducerFixture):
                 self.assertEqual(reviewed.get(change_review.IMAGE, ""), "")
 
     def test_open_cells_follow_staff_changes_without_rewriting_review_history(self) -> None:
-        _ = change_review.append_rows(self.listing, [Visible("Unit", "Read", "Proof"),
-            Visible("Production", "Read", "Proof"), Visible("Reviewed", "Read", "Proof")],
+        _ = change_review.append_rows(self.listing, pictured_changes([Visible("Unit", "Read", "Proof"),
+            Visible("Production", "Read", "Proof"), Visible("Reviewed", "Read", "Proof")]),
             date(2026, 11, 4), "", self.doc,
             producers=[self.unit.id, change_review.UnknownProducer(), self.unit.id], record=staff.snapshot())
         _ = change_review.record_verdict(self.listing, "C3", "works", date(2026, 11, 4), self.doc)
@@ -419,7 +719,7 @@ class ProducerWriterTests(ProducerFixture):
         _ = self.git("checkout", "-b", "checkpoints")
         for name in ("branch-b", "branch-a"):
             _ = self.git("commit", "--allow-empty", "-m",
-                         f"checkpoint({name}): change\n\nChange-Review: {name} | Read | Proof")
+                         pictured_review_lines(f"checkpoint({name}): change\n\nChange-Review: {name} | Read | Proof"))
             self.record_unit_commit(self.git("rev-parse", "HEAD"), name)
         _ = self.git("checkout", "main")
         _ = self.git("merge", "--no-ff", "checkpoints", "-m", "Merge checkpoints into main")
@@ -474,7 +774,7 @@ class ProducerWriterTests(ProducerFixture):
                                   expected=retired.worktree)
             _ = self.git("checkout", "-b", "legacy-owner")
             _ = self.git("commit", "--allow-empty", "-m",
-                         "checkpoint(legacy): change\n\nChange-Review: Legacy owner | Read | Live unit")
+                         pictured_review_lines("checkpoint(legacy): change\n\nChange-Review: Legacy owner | Read | Live unit"))
             checkpoint = self.git("rev-parse", "HEAD")
             history = self.root / "history/runs/legacy.jsonl"
             _ = history.write_text(json.dumps({"schema_version": 1, "event_type": "checkpoint",
@@ -510,7 +810,7 @@ class ProducerWriterTests(ProducerFixture):
         _ = self.git("checkout", "-b", "checkpoints")
         for name in ("external-branch", "old-plan", "old"):
             _ = self.git("commit", "--allow-empty", "-m",
-                         f"checkpoint({name}): change\n\nChange-Review: {name} | Read | Proof")
+                         pictured_review_lines(f"checkpoint({name}): change\n\nChange-Review: {name} | Read | Proof"))
             self.record_unit_commit(self.git("rev-parse", "HEAD"), name)
         _ = self.git("checkout", "main")
         _ = self.git("merge", "--no-ff", "checkpoints", "-m", "Merge checkpoints into main")
@@ -529,7 +829,7 @@ class ProducerWriterTests(ProducerFixture):
         _ = self.git("checkout", "-b", "old-branch")
         for name, change in (("old-branch", "First"), ("a (b)", "Unmatched"), ("old-branch", "Last")):
             _ = self.git("commit", "--allow-empty", "-m",
-                         f"checkpoint({name}): change\n\nChange-Review: {change} | Read | Proof")
+                         pictured_review_lines(f"checkpoint({name}): change\n\nChange-Review: {change} | Read | Proof"))
             self.record_unit_commit(self.git("rev-parse", "HEAD"), name)
         _ = self.git("checkout", "main")
         _ = self.git("merge", "--no-ff", "old-branch", "-m", "Merge all into main")
@@ -544,7 +844,7 @@ class ProducerWriterTests(ProducerFixture):
 
 
     def test_a_verdict_preserves_the_producer_for_a_returning_row(self) -> None:
-        _ = change_review.append_rows(self.listing, [change_review.Visible("Return", "Read", "Proof")],
+        _ = change_review.append_rows(self.listing, pictured_changes([change_review.Visible("Return", "Read", "Proof")]),
             date(2026, 11, 2), "", self.doc, producers=[self.unit.id], record=staff.snapshot())
         _ = change_review.record_verdict(self.listing, "C1", "not works", date(2026, 11, 2), self.doc)
         row = change_review.review_snapshot(self.listing).reviewed[0]
@@ -588,7 +888,7 @@ class ProducerWriterTests(ProducerFixture):
         with self.subTest(subject="queue(7): queued change"):
             _ = self.git("checkout", "-b", "queue-unit")
             _ = self.git("commit", "--allow-empty", "-m",
-                         "queue(7): queued change\n\nChange-Review: Queued change | Read | Queue result")
+                         pictured_review_lines("queue(7): queued change\n\nChange-Review: Queued change | Read | Queue result"))
             _ = self.git("checkout", "main")
             _ = self.git("merge", "--no-ff", "queue-unit", "-m", "Merge queue-unit into main")
             _ = self.git("push", "origin", "main")
@@ -603,11 +903,11 @@ class ProducerWriterTests(ProducerFixture):
         with self.subTest(subject="checkpoint(old-branch): final change"):
             _ = self.git("checkout", "-b", "draft-unit")
             _ = self.git("commit", "--allow-empty", "-m",
-                         "fix(unit): draft change\n\nChange-Review: Draft change | Draft check | Draft result")
+                         pictured_review_lines("fix(unit): draft change\n\nChange-Review: Draft change | Draft check | Draft result"))
             _ = self.git("commit", "--allow-empty", "-m",
-                         "checkpoint(old-branch): final change\n\nChange-Review: Final change | Read | Final result")
+                         pictured_review_lines("checkpoint(old-branch): final change\n\nChange-Review: Final change | Read | Final result"))
             _ = self.git("commit", "--allow-empty", "-m",
-                         "queue(7): later change\n\nChange-Review: Queued later | Read | Later result")
+                         pictured_review_lines("queue(7): later change\n\nChange-Review: Queued later | Read | Later result"))
             _ = self.git("checkout", "main")
             _ = self.git("merge", "--no-ff", "draft-unit", "-m", "Merge draft-unit into main")
             _ = self.git("push", "origin", "main")
@@ -622,7 +922,7 @@ class ProducerWriterTests(ProducerFixture):
             with self.subTest(location=location):
                 _ = self.git("checkout", "-b", f"producer-{location}")
                 _ = self.git("commit", "--allow-empty", "-m",
-                             f"queue(8): delivery\n\nChange-Review: {location} | Read | Fixed producer")
+                             pictured_review_lines(f"queue(8): delivery\n\nChange-Review: {location} | Read | Fixed producer"))
                 _ = self.git("checkout", "main")
                 _ = self.git("merge", "--no-ff", f"producer-{location}", "-m", "Merge delivery")
                 _ = self.git("push", "origin", "main")
@@ -660,7 +960,7 @@ class ProducerWriterTests(ProducerFixture):
                                     (self.root / "unit" / "src", self.unit.id), (self.repo, ""), (self.root, "")):
             with self.subTest(directory=directory), redirect_stdout(io.StringIO()):
                 result = change_review.main(["add", "--repo", str(directory), "--production", "top",
-                    "--list", str(self.listing), "--change", str(directory), "--check", "Read", "--see", "Proof"])
+                    "--list", str(self.listing), "--change", str(directory), "--check", "Read", "--see", "Proof", "--image", fixture_image()])
                 self.assertEqual(result, 0)
                 self.assertEqual(change_review.pending(self.listing)[-1]["Producer"], expected)
 
@@ -669,7 +969,7 @@ class ReviewKindTest(unittest.TestCase):
     def test_set_kind_is_recorded_once_and_survives_the_verdict_with_its_proof(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "change-review - sample.md"
-            _ = change_review.append_rows(path, [GRID], date(2026, 11, 1), "abc12345", PRODUCTION, record=staff.snapshot())
+            _ = change_review.append_rows(path, pictured_changes([GRID]), date(2026, 11, 1), "abc12345", PRODUCTION, record=staff.snapshot())
             self.assertEqual(run("set-kind", "--production", DOC, "--list", str(path), "--row", "C1",
                                  "--kind", "Read only")[0], 0)
             row = change_review.review_rows(path)[0]
@@ -788,17 +1088,18 @@ class ListTest(unittest.TestCase):
         _ = self.path.write_text(LIST, encoding="utf-8")
 
     def test_rows_take_the_next_number_in_the_whole_file_and_end_the_table(self) -> None:
-        rows = change_review.append_rows(self.path, [Visible("A | B", "Look", "It"), Visible("C", "D.", "E")],
+        rows = change_review.append_rows(self.path, pictured_changes([Visible("A | B", "Look", "It"), Visible("C", "D.", "E")]),
                                          date(2026, 10, 14), "61b65bbf", PRODUCTION, record=staff.snapshot())
-        self.assertEqual(rows, [f"| C81 | A \\| B | 2026-10-14 · 61b65bbf | not yet | Look. You see: It | {DEMO_ID} |  |",
-                                f"| C82 | C | 2026-10-14 · 61b65bbf | not yet | D. You see: E | {DEMO_ID} |  |"])
+        images = [row[change_review.IMAGE] for row in change_review.pending(self.path)[-2:]]
+        self.assertEqual(rows, [f"| C81 | A \\| B | 2026-10-14 · 61b65bbf | not yet | Look. You see: It | {DEMO_ID} |  | {images[0]} |",
+                                f"| C82 | C | 2026-10-14 · 61b65bbf | not yet | D. You see: E | {DEMO_ID} |  | {images[1]} |"])
         lines = self.path.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(lines[lines.index("| C77 | Fonts redraw | 2026-10-14 | not yet | Change a font | | |") + 1], rows[0])
+        self.assertEqual(lines[lines.index("| C77 | Fonts redraw | 2026-10-14 | not yet | Change a font | | | |") + 1], rows[0])
 
     def test_a_list_without_the_section_is_refused_and_left_alone(self) -> None:
         _ = self.path.write_text("# list\n", encoding="utf-8")
         self.assertRaises(change_review.ChangeReviewError, change_review.append_rows, self.path,
-                          [Visible("A", "B", "C")], date(2026, 10, 14), "abc", PRODUCTION, record=staff.snapshot())
+                          pictured_changes([Visible("A", "B", "C")]), date(2026, 10, 14), "abc", PRODUCTION, record=staff.snapshot())
         self.assertEqual(self.path.read_text(encoding="utf-8"), "# list\n")
 
     def test_a_row_with_only_a_separator_raises_a_named_review_error(self) -> None:
@@ -964,17 +1265,18 @@ class AttachedListTest(unittest.TestCase):
         self.assertIn(str(self.current), errors.getvalue())
 
     def test_a_collector_retains_unreadable_lists_while_default_readers_skip_them(self) -> None:
-        read_text = Path.read_text
+        open_path = Path.open
 
-        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        def read(path: Path, mode: str = "r", buffering: int = -1, encoding: str | None = None,
+                 errors: str | None = None, newline: str | None = None) -> TextIO:
             if path == self.current:
                 raise PermissionError(f"{path}: unreadable")
-            return read_text(path, encoding=encoding, errors=errors)
+            return cast(TextIO, open_path(path, mode, buffering, encoding, errors, newline))
 
         record = staff.snapshot()
         errors = io.StringIO()
         sources: list[Path] = []
-        with mock.patch.object(Path, "read_text", read), redirect_stderr(errors):
+        with mock.patch.object(Path, "open", read), redirect_stderr(errors):
             routed = change_review.routed_review_entries(self.current, self.doc, record=record)
             with self.assertRaises(ValueError) as raised:
                 _ = change_review.routed_review_entries(self.current, self.doc, record=record, sources=sources)
@@ -1036,12 +1338,12 @@ class StampTest(unittest.TestCase):
 
     def test_every_row_writer_preserves_pipes_through_sorting_and_the_saved_verdict(self) -> None:
         item = Visible("Use A | B", "Print A | B", "A | B appears")
-        _ = change_review.append_rows(self.path, [item], date(2026, 11, 2), "abc12345", PRODUCTION, record=staff.snapshot())
+        _ = change_review.append_rows(self.path, pictured_changes([item]), date(2026, 11, 2), "abc12345", PRODUCTION, record=staff.snapshot())
         _ = change_review.set_row_kind(self.path, "C1", "See in action", PRODUCTION)
         edited = Visible("Use C | D", r"grep 'C\|D'", "C | D appears")
-        _ = change_review.edit_row(self.path, "C1", edited, date(2026, 11, 2), PRODUCTION)
+        _ = change_review.edit_row(self.path, "C1", edited, date(2026, 11, 2), PRODUCTION, image=fixture_row_image(self.path, "C1"))
         _ = change_review.mark_row(self.path, "C1", datetime(2026, 11, 2, 12), PRODUCTION)
-        _ = change_review.append_rows(self.path, [item], date(2026, 11, 2), "def12345", PRODUCTION, record=staff.snapshot())
+        _ = change_review.append_rows(self.path, pictured_changes([item]), date(2026, 11, 2), "def12345", PRODUCTION, record=staff.snapshot())
         before = change_review.review_snapshot(self.path)
         self.assertEqual(before.pending[0]["Change"], edited.change)
         self.assertEqual(before.pending[0][change_review.CHECK], edited.how())
@@ -1052,14 +1354,14 @@ class StampTest(unittest.TestCase):
         self.assertEqual(after.pending[0]["Change"], item.change)
 
     def test_a_malformed_cell_count_is_refused_before_a_snapshot_can_misroute_a_row(self) -> None:
-        _ = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 11, 2), "", PRODUCTION, record=staff.snapshot())
+        _ = change_review.append_rows(self.path, pictured_changes([Visible("A", "B", "C")]), date(2026, 11, 2), "", PRODUCTION, record=staff.snapshot())
         text = self.path.read_text().replace("| A |", "| A | extra |")
         _ = self.path.write_text(text)
         with self.assertRaisesRegex(change_review.ChangeReviewError, "C1 has the wrong number of cells"):
             _ = change_review.review_snapshot(self.path)
 
     def test_page_and_save_readers_refuse_the_same_malformed_review_rows(self) -> None:
-        _ = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 11, 2), "", PRODUCTION, record=staff.snapshot())
+        _ = change_review.append_rows(self.path, pictured_changes([Visible("A", "B", "C")]), date(2026, 11, 2), "", PRODUCTION, record=staff.snapshot())
         for reviewed in (False, True):
             with self.subTest(reviewed=reviewed):
                 if reviewed:
@@ -1075,7 +1377,7 @@ class StampTest(unittest.TestCase):
                 _ = self.path.write_text(original)
 
     def test_a_write_moves_date_modified_and_keeps_a_listed_production_in_either_form(self) -> None:
-        _ = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 10, 15), "",
+        _ = change_review.append_rows(self.path, pictured_changes([Visible("A", "B", "C")]), date(2026, 10, 15), "",
                                       Path("~/worktrees/demo-trunk/docs/plans/demo-production.md"), record=staff.snapshot())
         self.assertEqual(self.frontmatter(), [
             "---", 'date_created: "[[2026-10-14]]"', 'date_modified: "[[2026-10-15]]"', "productions:",
@@ -1084,7 +1386,7 @@ class StampTest(unittest.TestCase):
     def test_a_new_production_is_added_after_the_listed_ones(self) -> None:
         other = Path.home() / "rust/cargo-liner/docs/child-production.md"
         _ = fixture_member("showrunner", name="child", doc=staff.LiveDoc(remote.local_machine(), other))
-        _ = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 10, 15), "", other, record=staff.snapshot())
+        _ = change_review.append_rows(self.path, pictured_changes([Visible("A", "B", "C")]), date(2026, 10, 15), "", other, record=staff.snapshot())
         _ = change_review.record_verdict(self.path, "C1", "works", date(2026, 10, 16), other)
         self.assertEqual(self.frontmatter()[2:6], [
             'date_modified: "[[2026-10-16]]"', "productions:", f'  - "{PRODUCTION}"',
@@ -1092,7 +1394,7 @@ class StampTest(unittest.TestCase):
 
     def test_a_list_without_frontmatter_gains_it_on_its_next_write(self) -> None:
         _ = self.path.write_text(change_review.BODY, encoding="utf-8")
-        _ = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 10, 15), "", PRODUCTION, record=staff.snapshot())
+        _ = change_review.append_rows(self.path, pictured_changes([Visible("A", "B", "C")]), date(2026, 10, 15), "", PRODUCTION, record=staff.snapshot())
         self.assertEqual(self.frontmatter(), [
             "---", 'date_created: "[[2026-10-15]]"', 'date_modified: "[[2026-10-15]]"', "productions:",
             '  - "~/worktrees/demo-trunk/docs/plans/demo-production.md"', "showrunner: natedev", "---"])
@@ -1108,6 +1410,25 @@ def run(*arguments: str) -> tuple[int, str, str]:
     with redirect_stdout(output), redirect_stderr(error):
         code = change_review.main(list(arguments))
     return code, output.getvalue(), error.getvalue()
+
+
+def run_with_image(*arguments: str) -> tuple[int, str, str]:
+    """Supply an image explicitly for existing add and edit fixtures."""
+    if arguments[0] not in ("add", "edit"):
+        return run(*arguments)
+    image = ""
+    if arguments[0] == "edit":
+        options = change_review.CommandLine()
+        for flag, attribute in (("--production", "production"), ("--list", "list"), ("--row", "row")):
+            if flag in arguments:
+                setattr(options, attribute, arguments[arguments.index(flag) + 1])
+        try:
+            target = change_review.resolve_row(options.row, production=options.production,
+                                               review_list=Path(options.list) if options.list else None)
+            image = fixture_row_image(target.path, target.row)
+        except (change_review.ChangeReviewError, OSError):
+            return run(*arguments)
+    return run(*arguments, "--image", image or fixture_image())
 
 
 def run_review_child(arguments: list[str], environment: dict[str, str]) -> int:
@@ -1165,10 +1486,10 @@ class ReadyListTests(ProducerFixture):
         _ = self.git("push", "origin", "integration")
         _ = self.doc.write_text(self.doc.read_text().replace("`main`", "`integration`"))
 
-    def merge_change(self, lines: str, *, branch: str = "old-branch", day: str = "2099-01-01T12:00:00Z") -> str:
+    def merge_change(self, lines: str, *, branch: str = "old-branch", day: str = "2026-11-13T12:00:00Z") -> str:
         _ = self.git("checkout", "-b", branch)
         environment = {**os.environ, "GIT_AUTHOR_DATE": day, "GIT_COMMITTER_DATE": day}
-        message = f"checkpoint({branch}): visible change\n\n{lines}"
+        message = pictured_review_lines(f"checkpoint({branch}): visible change\n\n{lines}")
         for arguments in (("commit", "--allow-empty", "-m", message),
                           ("checkout", "integration"), ("merge", "--no-ff", branch, "-m", f"Merge {branch} into integration")):
             result = subprocess.run(["git", "-C", str(self.repo), *arguments], env=environment,
@@ -1191,6 +1512,41 @@ class ReadyListTests(ProducerFixture):
     def live(self, merged: str, step: str = "restart") -> tuple[int, str, str]:
         return run("live", "--repo", str(self.repo), "--production", "top", "--merged", merged, "--step", step)
 
+    def test_add_list_ready_and_live_fill_optional_cells_in_the_pending_table(self) -> None:
+        _ = self.listing.write_text("""## To review
+
+| # | Change | Merged | Review log | How to check | Notes |
+| --- | --- | --- | --- | --- | --- |
+| C1 | Earlier change | 2026-11-13 | Earlier review | Read | Earlier note |
+""", encoding="utf-8")
+        merged = self.merge_change("Change-Review: Ready change | Read | Ready\n"
+                                   + "Change-Review: Held change | Read | Live | after restart")
+        self.promote()
+        image = fixture_image()
+
+        with self.subTest(command="add"):
+            result = run("add", "--production", "top", "--repo", str(self.repo),
+                         "--change", "Manual change", "--check", "Read", "--see", "Manual", "--image", image)
+            self.assertEqual(result, (0, "C2\n", ""))
+        with self.subTest(command="list-ready"):
+            code, output, error = self.ready()
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("Ready change", output)
+        with self.subTest(command="live"):
+            code, output, error = self.live(merged)
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("Held change", output)
+
+        rows = change_review.pending(self.listing)
+        self.assertEqual([(row["Change"], row["Review log"], row["Notes"], row[change_review.CHECK])
+                          for row in rows], [
+            ("Earlier change", "Earlier review", "Earlier note", "Read"),
+            ("Manual change", "", "", "Read. You see: Manual"),
+            ("Ready change", "", "", "Read. You see: Ready"),
+            ("Held change", "", "", "Read. You see: Live"),
+        ])
+        self.assertEqual(rows[1][change_review.IMAGE], image)
+
     def test_list_ready_and_live_keep_images_and_report_a_missing_image(self) -> None:
         shot = self.root / "shot.png"
         _ = shot.write_bytes(b"fixture image")
@@ -1200,9 +1556,10 @@ class ReadyListTests(ProducerFixture):
             + "Change-Review: Missing | Read | Missing result | image abcdef012345")
         self.promote()
         code, output, errors = self.ready()
-        self.assertEqual((code, errors), (0, ""))
-        self.assertIn("change review: no image abcdef012345; row C2 has no image", output)
-        self.assertEqual([row.get(change_review.IMAGE, "") for row in change_review.pending(self.listing)], [identity, ""])
+        self.assertEqual(code, 0)
+        self.assertIn("image abcdef012345 is unavailable", errors)
+        self.assertEqual(output.count("| C"), 1)
+        self.assertEqual([row[change_review.IMAGE] for row in change_review.pending(self.listing)], [identity])
         self.assertEqual(self.live(merged)[0], 0)
         self.assertEqual(change_review.pending(self.listing)[-1][change_review.IMAGE], identity)
 
@@ -1279,7 +1636,7 @@ class ReadyListTests(ProducerFixture):
             queued = recorded_unit("other", "queued", self.root / "queued", other_doc)
             _ = self.git("checkout", "-b", "queued-change")
             _ = self.git("commit", "--allow-empty", "-m",
-                         "queue(7): queued change\n\nChange-Review: Queued | Read | Queue result")
+                         pictured_review_lines("queue(7): queued change\n\nChange-Review: Queued | Read | Queue result"))
             checkpoint = self.git("rev-parse", "HEAD")
             history = self.root / "history/runs/queued.jsonl"
             history.parent.mkdir(parents=True, exist_ok=True)
@@ -1303,7 +1660,7 @@ class ReadyListTests(ProducerFixture):
         with self.subTest(identity="recorded during publication"):
             _ = self.git("checkout", "-b", "queued-again")
             _ = self.git("commit", "--allow-empty", "-m",
-                         "queue(7): another change\n\nChange-Review: Queued again | Read | Queue result")
+                         pictured_review_lines("queue(7): another change\n\nChange-Review: Queued again | Read | Queue result"))
             _ = self.git("checkout", "integration")
             _ = self.git("merge", "--no-ff", "queued-again", "-m", "Merge old-branch into integration")
             merged = self.git("rev-parse", "HEAD")
@@ -1333,14 +1690,15 @@ class ReadyListTests(ProducerFixture):
                 branch = f"repair-{owner_record}"
                 _ = self.git("checkout", "-b", branch)
                 _ = self.git("commit", "--allow-empty", "-m",
-                             f"checkpoint(unrelated-slug): visible change\n\nChange-Review: {branch} | Read | Proof")
+                             pictured_review_lines(f"checkpoint(unrelated-slug): visible change\n\nChange-Review: {branch} | Read | Proof"))
                 if owner_record == "inner-unrecorded":
                     _ = self.git("checkout", "-b", f"side-{branch}")
                     _ = self.git("commit", "--allow-empty", "-m",
-                                 f"checkpoint(other): visible change\n\nChange-Review: side-{branch} | Read | Other result")
+                                 pictured_review_lines(f"checkpoint(other): visible change\n\nChange-Review: side-{branch} | Read | Other result"))
                     _ = self.git("checkout", branch)
                     _ = self.git("merge", "--no-ff", f"side-{branch}", "-m", "Merge another unit")
-                _ = self.git("commit", "--allow-empty", "-m", "fix: repair\n\nChange-Review: none — fixture repair")
+                _ = self.git("commit", "--allow-empty", "-m", pictured_review_lines("fix: repair\n\nChange-Review: none — fixture repair"))
+
                 tip = self.git("rev-parse", "HEAD")
                 history = self.root / f"history/runs/{branch}.jsonl"
                 owner = ({"main_agent": {"session_id": self.unit.current_session}} if owner_record == "legacy-session"
@@ -1383,7 +1741,7 @@ class ReadyListTests(ProducerFixture):
         self.promote()
         self.assertEqual(self.ready()[0], 0)
         _ = change_review.edit_row(self.listing, "C1", Visible("Edited words", "Read", "Result"),
-                                   date(2026, 11, 7), self.doc)
+                                   date(2026, 11, 7), self.doc, image=fixture_row_image(self.listing, "C1"))
         written = self.listing.read_bytes()
         self.assertEqual(self.ready(), (0, "", ""))
         self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Edited words"])
@@ -1394,14 +1752,14 @@ class ReadyListTests(ProducerFixture):
         _ = self.git("checkout", "-b", "old-branch")
         for branch, words in (("other-branch", "Other change"), ("old-branch", "Original words")):
             _ = self.git("commit", "--allow-empty", "-m",
-                         f"checkpoint({branch}): visible change\n\nChange-Review: {words} | Read | Result")
+                         pictured_review_lines(f"checkpoint({branch}): visible change\n\nChange-Review: {words} | Read | Result"))
             self.record_unit_commit(self.git("rev-parse", "HEAD"), branch)
         _ = self.git("checkout", "integration")
         _ = self.git("merge", "--no-ff", "old-branch", "-m", "Merge both units into integration")
         merged = self.git("rev-parse", "HEAD")
         _ = self.git("push", "origin", "integration")
         self.promote()
-        _ = change_review.append_rows(self.listing, [Visible("Edited words", "Read", "Result")],
+        _ = change_review.append_rows(self.listing, pictured_changes([Visible("Edited words", "Read", "Result")]),
                                       date(2026, 11, 7), merged[:8], self.doc,
                                       producers=[self.unit.id], record=staff.snapshot())
         code, output, error = self.ready()
@@ -1417,7 +1775,7 @@ class ReadyListTests(ProducerFixture):
         other = staff.StaffId("other-producer")
         for second_step in ("restart", "deploy"):
             with self.subTest(second_step=second_step):
-                changes = [change_review.PublicationChange(item, change_review.UnresolvedSource(), producer, "checkpoint", "")
+                changes = [pictured_publication(change_review.PublicationChange(item, change_review.UnresolvedSource(), producer, "checkpoint", ""))
                            for producer, item in (
                                (self.unit.id, Visible("First held", "Read", "Result", change_review.AfterStep("restart"))),
                                (other, Visible("Other held", "Read", "Result", change_review.AfterStep("deploy"))),
@@ -1428,9 +1786,9 @@ class ReadyListTests(ProducerFixture):
                 self.listing.unlink(missing_ok=True)
                 edited = [Visible(f"Edited words {index}", "Read", "Result") for index in range(4)]
                 record = staff.snapshot()
-                _ = change_review.append_rows(self.listing, edited, date(2026, 11, 7), "abcdef12", self.doc,
+                _ = change_review.append_rows(self.listing, pictured_changes(edited), date(2026, 11, 7), "abcdef12", self.doc,
                                               producers=[other, self.unit.id, self.unit.id, self.unit.id], record=record)
-                _ = change_review.append_rows(self.listing, changes, date(2026, 11, 7), "abcdef123456", self.doc,
+                _ = change_review.append_rows(self.listing, pictured_changes(changes), date(2026, 11, 7), "abcdef123456", self.doc,
                                               record=record, repo=self.repo, merge_changes=changes)
                 expected = ["Second held"] if second_step == "restart" else ["First held", "Second held"]
                 self.assertEqual([row["Change"] for row in change_review.pending(self.listing)],
@@ -1440,19 +1798,19 @@ class ReadyListTests(ProducerFixture):
         for producer, row_producer in ((self.unit.id, ""), (change_review.UnknownProducer(), self.unit.id),
                                       (change_review.UnknownProducer(), "")):
             with self.subTest(producer=producer, row_producer=row_producer):
-                change = change_review.PublicationChange(Visible("Original words", "Read", "Result"),
-                    change_review.UnresolvedSource(), producer, "checkpoint", "")
+                change = pictured_publication(change_review.PublicationChange(Visible("Original words", "Read", "Result"),
+                    change_review.UnresolvedSource(), producer, "checkpoint", ""))
                 self.listing.unlink(missing_ok=True)
                 record = staff.snapshot()
-                _ = change_review.append_rows(self.listing, [Visible("Edited words", "Read", "Result")],
+                _ = change_review.append_rows(self.listing, pictured_changes([Visible("Edited words", "Read", "Result")]),
                                               date(2026, 11, 7), "abcdef12", self.doc,
                                               producers=[staff.StaffId(row_producer)], record=record)
-                added = change_review.append_rows(self.listing, [change], date(2026, 11, 7), "abcdef12", self.doc,
+                added = change_review.append_rows(self.listing, pictured_changes([change]), date(2026, 11, 7), "abcdef12", self.doc,
                                                   record=record, repo=self.repo, merge_changes=[change])
                 self.assertEqual(len(added), 1)
                 self.assertEqual([row["Change"] for row in change_review.pending(self.listing)],
                                  ["Edited words", "Original words"])
-                self.assertEqual(change_review.append_rows(self.listing, [change], date(2026, 11, 7), "abcdef12", self.doc,
+                self.assertEqual(change_review.append_rows(self.listing, pictured_changes([change]), date(2026, 11, 7), "abcdef12", self.doc,
                                                           record=record, repo=self.repo, merge_changes=[change]), [])
 
     def test_text_matching_reserves_its_row_before_an_edited_row_covers_another_change(self) -> None:
@@ -1461,7 +1819,7 @@ class ReadyListTests(ProducerFixture):
         self.promote()
         self.assertEqual(self.ready()[0], 0)
         _ = change_review.edit_row(self.listing, "C1", Visible("Edited first", "Read", "First result"),
-                                   date(2026, 11, 7), self.doc)
+                                   date(2026, 11, 7), self.doc, image=fixture_row_image(self.listing, "C1"))
         written = self.listing.read_bytes()
         self.assertEqual(self.ready(), (0, "", ""))
         self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Edited first", "Second"])
@@ -1471,11 +1829,11 @@ class ReadyListTests(ProducerFixture):
         merged = self.merge_change("Change-Review: First | Read | First result\n"
                                    + "Change-Review: Second | Read | Second result")
         self.promote()
-        _ = change_review.append_rows(self.listing, [Visible("First", "Read", "First result")],
+        _ = change_review.append_rows(self.listing, pictured_changes([Visible("First", "Read", "First result")]),
                                       date(2026, 11, 7), merged[:8], self.doc,
                                       producers=[self.unit.id], record=staff.snapshot())
         _ = change_review.edit_row(self.listing, "C1", Visible("Edited first", "Read", "First result"),
-                                   date(2026, 11, 7), self.doc)
+                                   date(2026, 11, 7), self.doc, image=fixture_row_image(self.listing, "C1"))
         code, output, error = self.ready()
         self.assertEqual((code, error), (0, ""))
         self.assertIn("C2", output)
@@ -1492,14 +1850,14 @@ class ReadyListTests(ProducerFixture):
         self.assertEqual(self.ready()[0], 0)
         self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Plain"])
         _ = change_review.edit_row(self.listing, "C1", Visible("Edited plain", "Read", "Ready"),
-                                   date(2026, 11, 7), self.doc)
+                                   date(2026, 11, 7), self.doc, image=fixture_row_image(self.listing, "C1"))
         code, output, error = self.live(merged)
         self.assertEqual((code, error), (0, ""))
         self.assertIn("C2", output)
         self.assertEqual([(row["#"], row["Change"]) for row in change_review.pending(self.listing)],
                          [("C1", "Edited plain"), ("C2", "Restarted")])
         _ = change_review.edit_row(self.listing, "C2", Visible("Edited restart", "Open", "New service"),
-                                   date(2026, 11, 7), self.doc)
+                                   date(2026, 11, 7), self.doc, image=fixture_row_image(self.listing, "C2"))
         written = self.listing.read_bytes()
         self.assertEqual(self.live(merged), (0, "", ""))
         self.assertEqual(self.ready(), (0, "", ""))
@@ -1512,7 +1870,7 @@ class ReadyListTests(ProducerFixture):
         self.assertEqual(self.live(merged, "deploy")[0], 0)
         self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Deployed"])
         _ = change_review.edit_row(self.listing, "C1", Visible("Edited deploy", "Open", "New build"),
-                                   date(2026, 11, 7), self.doc)
+                                   date(2026, 11, 7), self.doc, image=fixture_row_image(self.listing, "C1"))
         code, output, error = self.live(merged, "restart")
         self.assertEqual((code, error), (0, ""))
         self.assertIn("C2", output)
@@ -1526,7 +1884,7 @@ class ReadyListTests(ProducerFixture):
         for merged in ("", earlier[:8]):
             with self.subTest(merged=merged):
                 self.listing.unlink(missing_ok=True)
-                _ = change_review.append_rows(self.listing, [Visible("Unrelated words", "Read", "Old result")],
+                _ = change_review.append_rows(self.listing, pictured_changes([Visible("Unrelated words", "Read", "Old result")]),
                                               date(2026, 11, 7), merged, self.doc, record=staff.snapshot())
                 self.assertEqual(self.ready()[0], 0)
                 self.assertEqual([row["Change"] for row in change_review.pending(self.listing)],
@@ -1552,7 +1910,7 @@ class ReadyListTests(ProducerFixture):
                 elif layout == "later-side-checkpoint":
                     _ = self.git("checkout", "-b", "later-side", "old-branch")
                     _ = self.git("commit", "--allow-empty", "-m",
-                                 "checkpoint(old-branch): later phase\n\nChange-Review: none — fixture continuation")
+                                 pictured_review_lines("checkpoint(old-branch): later phase\n\nChange-Review: none — fixture continuation"))
                     _ = self.git("checkout", "outside-integration")
                     _ = self.git("merge", "--no-ff", "later-side", "-m", "Merge later phase")
                     _ = self.git("push", "origin", "outside-integration")
@@ -1638,6 +1996,201 @@ class ReadyListTests(ProducerFixture):
         self.assertEqual(row["Producer"], child_unit.id)
         self.assertIn("  Production: child\n", change_review.describe(row) + "\n")
 
+    def hand_merged_base(self) -> tuple[Path, dict[str, staff.StaffRow]]:
+        """Two hand merges on integration, then a child production that branches from them."""
+        units: dict[str, staff.StaffRow] = {}
+        child_doc = self.root / "child.md"
+        _ = child_doc.write_text(f"# Child\n- **Repository:** `{self.repo}`\n"
+            + f"- **Showrunner checkout:** `{self.repo}`\n- **Merge branch:** `child-integration`\n"
+            + f"- **Change review:** `{self.listing}`\n")
+        units["praxis"] = recorded_unit("child", "praxis", self.root / "praxis", child_doc, plan="praxis.md")
+        units["top"] = recorded_showrunner("top", self.doc)
+        units["child"] = recorded_showrunner("child", child_doc, parent="top")
+        _ = self.enterContext(mock.patch.object(showrunners, "timer_docs",
+                                                return_value={"top": self.doc, "child": child_doc}))
+        base = (("cables-fix", "fix(cables): draw the cable\n\nChange-Review: Cable | Read | Drawn",
+                 "merge(cables): a cable stays drawn (1234567)"),
+                ("chain-b", "checkpoint(triggers): phase 2\n\nChange-Review: Fires | Read | Fired",
+                 "merge(chain-b): trigger fires survive (7654321)"))
+        for branch, message, subject in base:
+            _ = self.git("checkout", "-b", branch, "integration")
+            _ = self.git("commit", "--allow-empty", "-m", pictured_review_lines(message))
+            _ = self.git("checkout", "integration")
+            _ = self.git("merge", "--no-ff", branch, "-m", subject)
+        _ = self.git("checkout", "-b", "praxis", "integration")
+        _ = self.git("commit", "--allow-empty", "-m", pictured_review_lines("checkpoint(praxis): phase 1\n\nChange-Review: Door | Read | Opened"))
+        _ = self.git("checkout", "-b", "child-integration", "integration")
+        _ = self.git("merge", "--no-ff", "praxis", "-m", "Merge praxis phase 1 (abcdef0) into child-integration")
+        change_review.record_merge_producer(change_review.KnownMergeProducer(self.git("rev-parse", "HEAD"),
+                                                                             units["praxis"].id))
+        _ = self.git("push", "origin", "integration", "child-integration", "child-integration:main")
+        return child_doc, units
+
+    def test_a_child_scan_skips_the_merges_its_parent_made_before_the_fork(self) -> None:
+        child_doc, units = self.hand_merged_base()
+        _ = change_review.list_ready(self.repo, child_doc, "child-integration")
+        rows = change_review.pending(self.listing)
+        self.assertEqual([(row["Change"], row["Producer"], row["Production"]) for row in rows],
+                         [("Door", units["praxis"].id, units["child"].id)])
+
+    def test_a_hand_merge_row_names_the_merging_production_and_no_producer(self) -> None:
+        _, units = self.hand_merged_base()
+        _ = change_review.list_ready(self.repo, self.doc, "integration")
+        rows = change_review.pending(self.listing)
+        self.assertEqual([(row["Change"], row["Producer"], row["Production"]) for row in rows],
+                         [("Cable", "", units["top"].id), ("Fires", "", units["top"].id)])
+
+    def test_the_parent_scan_adds_its_own_merges_after_a_child_scan(self) -> None:
+        child_doc, _ = self.hand_merged_base()
+        _ = change_review.list_ready(self.repo, child_doc, "child-integration")
+        added = change_review.list_ready(self.repo, self.doc, "integration")
+        self.assertEqual([change_review.row_id(row) for row in added], ["C2", "C3"])
+        self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Door", "Cable", "Fires"])
+        before = self.listing.read_bytes()
+        self.assertEqual(change_review.list_ready(self.repo, self.doc, "integration"), [])
+        self.assertEqual(self.listing.read_bytes(), before)
+
+    def test_a_parent_scan_keeps_an_unreadable_descendant_document_in_scope(self) -> None:
+        child_doc = self.root / "unreadable-child.md"
+        _ = recorded_showrunner("unreadable-child", child_doc, parent="top")
+        _ = self.merge_change("Change-Review: Parent result | Read | Ready")
+        self.promote()
+        for state in ("missing", "invalid UTF-8"):
+            with self.subTest(state=state):
+                if state == "invalid UTF-8":
+                    _ = child_doc.write_bytes(b"\xff")
+                if self.listing.exists():
+                    self.listing.unlink()
+                code, _, error = self.ready()
+                self.assertEqual((code, error), (0, ""))
+                self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Parent result"])
+
+    def test_a_parent_keeps_its_merges_before_a_descendant_with_a_separate_list_forks(self) -> None:
+        child_doc, units = self.hand_merged_base()
+        child_list = self.root / "change-review - child.md"
+        _ = child_doc.write_text(child_doc.read_text().replace(str(self.listing), str(child_list)))
+        middle_doc = self.root / "middle.md"
+        _ = middle_doc.write_text("# Middle\n")
+        middle = recorded_showrunner("middle", middle_doc, parent="top")
+        original = staff.snapshot()
+        for depth in ("child", "grandchild"):
+            for wrapped in (False, True):
+                with self.subTest(depth=depth, wrapped=wrapped):
+                    child = replace(units["child"],
+                        parent=staff.ReportsTo(middle.id if depth == "grandchild" else units["top"].id),
+                        doc=(staff.WrappedDoc(remote.local_machine(), child_doc) if wrapped
+                             else staff.LiveDoc(remote.local_machine(), child_doc)))
+                    record = replace(original, rows=tuple(child if row.id == child.id else row for row in original.rows))
+                    _ = self.listing.write_text(change_review.skeleton(self.listing, self.doc, change_review.today()))
+                    _ = child_list.write_text(change_review.skeleton(child_list, child_doc, change_review.today()))
+                    _ = change_review.list_ready(self.repo, self.doc, "integration", record=record)
+                    self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Cable", "Fires"])
+                    _ = change_review.list_ready(self.repo, child_doc, "child-integration",
+                                                 review_list=child_list, record=record)
+                    self.assertEqual([row["Change"] for row in change_review.pending(child_list)], ["Door"])
+
+    def test_a_child_scan_excludes_parent_and_sibling_merges(self) -> None:
+        child_doc, _ = self.hand_merged_base()
+        child_list = self.root / "change-review - child.md"
+        sibling_doc = self.root / "sibling.md"
+        sibling_list = self.root / "change-review - sibling.md"
+        _ = child_doc.write_text(child_doc.read_text().replace(str(self.listing), str(child_list)))
+        _ = sibling_doc.write_text(f"# Sibling\n- **Repository:** `{self.repo}`\n"
+            + "- **Merge branch:** `sibling-integration`\n"
+            + f"- **Change review:** `{sibling_list}`\n")
+        _ = recorded_showrunner("sibling", sibling_doc, parent="top")
+        _ = self.git("checkout", "-b", "sibling-unit", "integration")
+        _ = self.git("commit", "--allow-empty", "-m", pictured_review_lines("review(sibling): result\n\nChange-Review: Sibling | Read | Separate"))
+        _ = self.git("checkout", "-b", "sibling-integration", "integration")
+        _ = self.git("merge", "--no-ff", "sibling-unit", "-m", "Hand merge sibling")
+        _ = self.git("push", "origin", "sibling-integration")
+        _ = self.git("checkout", "child-integration")
+        _ = self.git("merge", "--no-ff", "sibling-integration", "-m", "Hand merge a sibling import")
+        _ = self.git("push", "origin", "child-integration", "child-integration:main")
+        _ = change_review.list_ready(self.repo, child_doc, "child-integration", review_list=child_list)
+        self.assertEqual([row["Change"] for row in change_review.pending(child_list)], ["Door"])
+        self.assertFalse(self.listing.exists())
+        self.assertFalse(sibling_list.exists())
+
+    def hand_review_merge(self, line: str, *, covered: bool = False, day: str = "2026-11-17T12:00:00Z") -> tuple[str, str, str]:
+        """Merge a review commit with an optional repair into the private production."""
+        _ = self.git("checkout", "-b", "review-unit", "integration")
+        subject = "review(rear_patch_panel): fit the panel"
+        environment = {"GIT_AUTHOR_DATE": day, "GIT_COMMITTER_DATE": day}
+        with mock.patch.dict(os.environ, environment):
+            _ = self.git("commit", "--allow-empty", "-m", f"{subject}\n\n{line}")
+            commit = self.git("rev-parse", "HEAD")
+            if covered:
+                _ = self.git("commit", "--allow-empty", "-m", "review(rear_patch_panel): repair\n\n"
+                    + f"Change-Review: Repaired | Read | Fits | image {self.review_image()}\nChange-Review-Covers: {commit}")
+            _ = self.git("checkout", "integration")
+            _ = self.git("merge", "--no-ff", "review-unit", "-m", "Hand merge a panel review")
+            merged = self.git("rev-parse", "HEAD")
+            _ = self.git("push", "origin", "integration")
+            self.promote()
+        return merged, commit, subject
+
+    def review_image(self) -> str:
+        """Register an image in the private review store."""
+        return fixture_image()
+
+    def test_list_ready_refuses_an_imageless_historical_visible_line(self) -> None:
+        merged, commit, subject = self.hand_review_merge("Change-Review: Historical | Read | Proof",
+                                                        day="2026-11-13T12:00:00Z")
+        code, output, error = self.ready()
+        self.assertEqual((code, output), (0, ""))
+        self.assertEqual(len(error.splitlines()), 1)
+        self.assertIn(f"{merged[:8]}: {commit[:8]} {subject}:", error)
+        self.assertIn("has no image", error)
+        self.assertFalse(self.listing.exists())
+
+    def test_live_refuses_an_imageless_historical_visible_line(self) -> None:
+        merged, commit, subject = self.hand_review_merge("Change-Review: Historical | Read | Proof | after restart",
+                                                        day="2026-11-13T12:00:00Z")
+        code, output, error = self.live(merged)
+        self.assertEqual((code, output), (0, ""))
+        self.assertEqual(len(error.splitlines()), 1)
+        self.assertIn(f"{merged[:8]}: {commit[:8]} {subject}:", error)
+        self.assertIn("has no image", error)
+        self.assertFalse(self.listing.exists())
+
+    def test_a_hand_merged_review_subject_adds_its_valid_line(self) -> None:
+        _ = self.hand_review_merge(f"Change-Review: Panel | Read | Fits | image {self.review_image()}")
+        code, _, error = self.ready()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Panel"])
+
+    def test_a_scan_reports_a_malformed_review_line_without_a_row(self) -> None:
+        line = ("Change-Review: A closed Rounded Box jack panel is exactly as wide as its content, "
+                + "with no empty space at the right | image 441ca2002a27")
+        merged, commit, subject = self.hand_review_merge(line)
+        code, output, error = self.ready()
+        self.assertEqual((code, output), (0, ""))
+        self.assertEqual(len(error.splitlines()), 1)
+        self.assertIn(f"{merged[:8]}: {commit[:8]} {subject}:", error)
+        self.assertIn("needs three parts", error)
+        self.assertFalse(self.listing.exists())
+
+    def test_a_scan_reports_a_missing_review_image_without_a_row(self) -> None:
+        merged, commit, subject = self.hand_review_merge("Change-Review: Panel | Read | Fits")
+        code, output, error = self.ready()
+        self.assertEqual((code, output), (0, ""))
+        self.assertEqual(len(error.splitlines()), 1)
+        self.assertIn(f"{merged[:8]}: {commit[:8]} {subject}:", error)
+        self.assertIn("has no image", error)
+        self.assertFalse(self.listing.exists())
+
+    def test_a_scan_silences_a_covered_bad_review_line(self) -> None:
+        _ = self.hand_review_merge("Change-Review: Panel | image 441ca2002a27", covered=True)
+        code, _, error = self.ready()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Repaired"])
+
+    def test_a_scan_does_not_report_a_commit_without_a_review_line(self) -> None:
+        _ = self.hand_review_merge("")
+        self.assertEqual(self.ready(), (0, "", ""))
+        self.assertFalse(self.listing.exists())
+
     def test_a_returned_change_gets_a_new_row_for_a_later_checkpoint_with_the_same_words(self) -> None:
         first = self.merge_change("Change-Review: Same words | Read | First result")
         self.promote()
@@ -1681,7 +2234,7 @@ class ReadyListTests(ProducerFixture):
         merged = self.merge_change("Change-Review: Already checked | Read | Seen\n"
                                    + "Change-Review: Still new | Read | New")
         self.promote()
-        _ = change_review.append_rows(self.listing, [Visible("Already checked", "Read", "Seen")],
+        _ = change_review.append_rows(self.listing, pictured_changes([Visible("Already checked", "Read", "Seen")]),
                                       date(2026, 11, 6), merged[:8], self.doc, record=staff.snapshot())
         _ = change_review.record_verdict(self.listing, "C1", "works", date(2026, 11, 6), self.doc)
         self.assertEqual(self.ready()[0], 0)
@@ -1789,7 +2342,7 @@ class ReadyListTests(ProducerFixture):
                             "\nChange-Review: Foreign held | Read | Restarted other | after restart"))
         for branch, change, held in foreign_changes:
             _ = self.git("commit", "--allow-empty", "-m",
-                         f"checkpoint({branch}): other\n\nChange-Review: {change} | Read | Other{held}")
+                         pictured_review_lines(f"checkpoint({branch}): other\n\nChange-Review: {change} | Read | Other{held}"))
             self.record_unit_commit(self.git("rev-parse", "HEAD"), branch)
         _ = self.git("checkout", "-b", "other-integration", "integration")
         _ = self.git("merge", "--no-ff", "foreign", "-m", "Merge foreign into other-integration")
@@ -1820,7 +2373,7 @@ class ReadyListTests(ProducerFixture):
         child_unit = recorded_unit("child", "child-unit", self.root / "child-unit", child_doc, plan="child-unit.md")
         child = recorded_showrunner("child", child_doc, parent="top")
         _ = self.git("checkout", "-b", "child-unit")
-        _ = self.git("commit", "--allow-empty", "-m", "checkpoint(child-unit): handoff\n\nChange-Review: Child | Read | Attached")
+        _ = self.git("commit", "--allow-empty", "-m", pictured_review_lines("checkpoint(child-unit): handoff\n\nChange-Review: Child | Read | Attached"))
         self.record_unit_commit(self.git("rev-parse", "HEAD"), "child-unit")
         _ = self.git("checkout", "-b", "child-integration", "integration")
         _ = self.git("merge", "--no-ff", "child-unit", "-m", "Merge child unit into child-integration")
@@ -1873,7 +2426,7 @@ class ReadyListTests(ProducerFixture):
         with self.subTest(checkpoint="queue commit in a child hand-off"):
             _ = self.git("checkout", "child-unit")
             _ = self.git("commit", "--allow-empty", "-m",
-                         "queue(7): child change\n\nChange-Review: Child queued | Read | Attached queue")
+                         pictured_review_lines("queue(7): child change\n\nChange-Review: Child queued | Read | Attached queue"))
             _ = self.git("checkout", "child-integration")
             _ = self.git("merge", "--no-ff", "child-unit", "-m", "Merge delivery")
             inner = self.git("rev-parse", "HEAD")
@@ -1910,8 +2463,8 @@ class MergedAddTests(unittest.TestCase):
                            capture_output=True, text=True, check=True)
 
     def add(self, *options: str) -> tuple[int, str, str]:
-        return run("add", "--repo", str(self.repo), "--production", DOC, "--list", str(self.path),
-                   "--change", "Ready change", "--check", "Read", "--see", "The change", *options)
+        return run_with_image("add", "--repo", str(self.repo), "--production", DOC, "--list", str(self.path),
+                   "--change", "Ready change", "--check", "Read", "--see", "The change", "--image", fixture_image(), *options)
 
     def test_add_accepts_an_ancestor_of_origin_main(self) -> None:
         with mock.patch.object(change_review, "now", return_value=ADD_TIME):
@@ -2051,7 +2604,7 @@ class ChangeIdentityTests(unittest.TestCase):
         _ = self.path.write_text(rows)
         _ = legacy.write_text(rows)
         _ = self.doc.write_text(f"- **Change review:** `{legacy}`\n")
-        code, output, error = run("add", "--production", "sdlc", "--repo", str(self.root),
+        code, output, error = run_with_image("add", "--production", "sdlc", "--repo", str(self.root),
                                   "--change", "After the legacy row", "--check", "Read", "--see", "Text",
                                   "--urgency", "blocks", "--after", "sdlc/C41")
         self.assertEqual((code, output), (0, "C42\n"), error)
@@ -2070,12 +2623,12 @@ class ChangeIdentityTests(unittest.TestCase):
         for action, arguments in (("edit", ("--change", "Edited", "--check", "Read", "--see", "Text")),
                                   ("mark-important", ()), ("set-kind", ("--kind", "Read only"))):
             with self.subTest(action=action):
-                code, _, error = run(action, "--production", "sdlc", "--list", str(self.path),
+                code, _, error = run_with_image(action, "--production", "sdlc", "--list", str(self.path),
                                      "--row", "sdlc/C1", *arguments)
                 self.assertEqual((code, error), (0, ""))
                 self.assertIn("C1", [row["#"] for row in change_review.pending(self.path)])
                 self.assertNotIn("sdlc/C1", self.path.read_text())
-        code, output, error = run("add", "--production", "sdlc", "--list", str(self.path),
+        code, output, error = run_with_image("add", "--production", "sdlc", "--list", str(self.path),
                                   "--change", "After it", "--check", "Read", "--see", "Text", "--after", "sdlc/C1")
         self.assertEqual((code, output, error), (0, "C3\n", ""))
         self.assertIn("after C1", change_review.pending(self.path)[-1]["Urgency"])
@@ -2095,44 +2648,67 @@ class ActionTest(unittest.TestCase):
         _ = self.path.write_text(LIST, encoding="utf-8")
         self.fresh = Path(directory.name) / "change-review" / "change-review - natedev.md"
 
+    def test_add_requires_an_image_and_adds_the_image_column_to_a_list(self) -> None:
+        original = """## To review
+
+| # | Change | Merged |
+| --- | --- | --- |
+"""
+        _ = self.path.write_text(original, encoding="utf-8")
+        arguments = ("add", "--production", DOC, "--repo", str(self.path.parent), "--list", str(self.path),
+                     "--change", "Manual change", "--check", "Read", "--see", "Result")
+        code, output, error = run(*arguments)
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("a visible row requires an image", error)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), original)
+
+        image = fixture_image()
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            self.assertEqual(run(*arguments, "--image", image), (0, "C1\n", ""))
+        row, = change_review.pending(self.path)
+        self.assertEqual(row, {"#": "C1", "Change": "Manual change", "Merged": "2026-11-13 16:20",
+                               change_review.PRODUCTION: DEMO_ID, change_review.PRODUCER: "", change_review.IMAGE: image})
+
     def test_the_first_row_creates_a_missing_list_from_the_skeleton(self) -> None:
-        rows = change_review.append_rows(self.fresh, [Visible("A", "B", "C")], date(2026, 10, 15), "", PRODUCTION, record=staff.snapshot())
-        self.assertEqual(rows, [f"| C1 | A | 2026-10-15 | B. You see: C | {DEMO_ID} |  |"])
+        rows = change_review.append_rows(self.fresh, pictured_changes([Visible("A", "B", "C")]), date(2026, 10, 15), "", PRODUCTION, record=staff.snapshot())
+        image = change_review.pending(self.fresh)[0][change_review.IMAGE]
+        self.assertEqual(rows, [f"| C1 | A | 2026-10-15 | B. You see: C | {DEMO_ID} |  | {image} |"])
         self.assertEqual(self.fresh.read_text(encoding="utf-8").split("\n\n## To review")[0], "\n".join([
             "---", 'date_created: "[[2026-10-15]]"', 'date_modified: "[[2026-10-15]]"', "productions:",
             '  - "~/worktrees/demo-trunk/docs/plans/demo-production.md"', "showrunner: natedev", "---", "",
             "# natedev showrunner: changes to review", "",
             'Ask for "change review" any time to walk it one change at a time. A reviewed row moves to Reviewed '
             + "with your verdict."]))
-        self.assertIn(f"| --- | --- | --- | --- | --- | --- |\n| C1 | A | 2026-10-15 | B. You see: C | {DEMO_ID} |  |\n\n## Reviewed", self.fresh.read_text(encoding="utf-8"))
+        self.assertIn(f"| --- | --- | --- | --- | --- | --- | --- |\n| C1 | A | 2026-10-15 | B. You see: C | {DEMO_ID} |  | {image} |\n\n## Reviewed", self.fresh.read_text(encoding="utf-8"))
 
     def test_add_takes_the_next_number_and_fills_the_mac_build_column_only_where_the_table_has_one(self) -> None:
         repo, *commits = origin_commits(self.path.parent)
         merged = commits[-1][:8]
         with mock.patch.object(change_review, "now", return_value=ADD_TIME):
-            self.assertEqual(run("add", "--repo", str(repo), "--production", DOC, "--list", str(self.path), "--change", "Tabs | spaces", "--check", "Look",
+            self.assertEqual(run_with_image("add", "--repo", str(repo), "--production", DOC, "--list", str(self.path), "--change", "Tabs | spaces", "--check", "Look",
                                  "--see", "It", "--merged", merged), (0, "C81\n", ""))
-        self.assertIn(f"| C81 | Tabs \\| spaces | 2026-11-13 16:20 · {merged} | not yet | Look. You see: It | {DEMO_ID} |  |\n\n## Questions",
+        image = change_review.pending(self.path)[-1][change_review.IMAGE]
+        self.assertIn(f"| C81 | Tabs \\| spaces | 2026-11-13 16:20 · {merged} | not yet | Look. You see: It | {DEMO_ID} |  | {image} |\n\n## Questions",
                       self.path.read_text(encoding="utf-8"))
         with mock.patch.object(change_review, "now", return_value=ADD_TIME):
-            self.assertEqual(run("add", "--production", DOC, "--list", str(self.fresh), "--change", "A", "--check", "B", "--see", "C")[1], "C1\n")
+            self.assertEqual(run_with_image("add", "--production", DOC, "--list", str(self.fresh), "--change", "A", "--check", "B", "--see", "C")[1], "C1\n")
         self.assertIn("| C1 | A | 2026-11-13 16:20 | B. You see: C |", self.fresh.read_text(encoding="utf-8"))
 
     def test_add_refuses_a_second_row_for_the_same_merge_and_change_in_a_short_or_long_hash(self) -> None:
         repo, first, second = origin_commits(self.path.parent)
         short, long_hash, other = first[:7], first[:8], second[:8]
         add = ("add", "--repo", str(repo), "--production", DOC, "--list", str(self.path), "--change", "Tabs", "--check", "Look", "--see", "It")
-        self.assertEqual(run(*add, "--merged", short)[:2], (0, "C81\n"))
+        self.assertEqual(run_with_image(*add, "--merged", short)[:2], (0, "C81\n"))
         before = self.path.read_text(encoding="utf-8")
         for merged in (long_hash, short):
             with self.subTest(merged=merged):
-                code, output, error = run(*add, "--merged", merged)
+                code, output, error = run_with_image(*add, "--merged", merged)
                 self.assertEqual((code, output), (1, ""))
                 self.assertIn(f"C81 already holds that change from merge {merged}", error)
                 self.assertEqual(self.path.read_text(encoding="utf-8"), before)
         # A different merge or change receives a new row.
-        self.assertEqual(run(*add, "--merged", other)[:2], (0, "C82\n"))
-        self.assertEqual(run(*add[:-6], "--change", "Spaces", "--check", "Look", "--see", "It", "--merged", long_hash)[:2],
+        self.assertEqual(run_with_image(*add, "--merged", other)[:2], (0, "C82\n"))
+        self.assertEqual(run_with_image(*add[:-6], "--change", "Spaces", "--check", "Look", "--see", "It", "--merged", long_hash)[:2],
                          (0, "C83\n"))
 
     def test_a_style_productions_change_is_credited_to_its_parent(self) -> None:
@@ -2146,11 +2722,11 @@ class ActionTest(unittest.TestCase):
         record = staff.snapshot()
         self.assertEqual(change_review.credited(style, record), parent)
         self.assertEqual(change_review.credited(parent, record), parent)
-        rows = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 10, 27), "216c4e1d", style,
+        rows = change_review.append_rows(self.path, pictured_changes([Visible("A", "B", "C")]), date(2026, 10, 27), "216c4e1d", style,
                                          owners=[style], record=staff.snapshot())
         self.assertEqual(next(row for row in change_review.pending(self.path)
                               if row["#"] == rows[0].split()[1])["Production"], owner.id)
-        rows = change_review.append_rows(self.path, [Visible("D", "B", "C")], date(2026, 10, 27), "", style, record=staff.snapshot())
+        rows = change_review.append_rows(self.path, pictured_changes([Visible("D", "B", "C")]), date(2026, 10, 27), "", style, record=staff.snapshot())
         self.assertEqual(next(row for row in change_review.pending(self.path)
                               if row["#"] == rows[0].split()[1])["Production"], owner.id)
 
@@ -2158,7 +2734,7 @@ class ActionTest(unittest.TestCase):
         held = self.path.parent / "shown-repo"
         held.mkdir()
         with mock.patch.dict(os.environ, {scratch.HOLDS_ENV: str(self.path.parent / "holds.json")}):
-            code, output, _ = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B",
+            code, output, _ = run_with_image("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B",
                                   "--see", "C", "--hold", str(held))
             self.assertEqual(code, 0)
             row = output.splitlines()[0]
@@ -2183,7 +2759,7 @@ class ActionTest(unittest.TestCase):
                 for item in changes:
                     arguments = ["add", "--repo", str(repo), "--production", DOC, "--list", str(path),
                                  "--change", item.change, "--check", item.check, "--see", item.see,
-                                 "--merged", commits[-1][:8]]
+                                 "--merged", commits[-1][:8], "--image", fixture_image()]
                     if path == self.fresh and not numbers:
                         result = subprocess.run([python, script, *arguments], capture_output=True,
                                                 text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
@@ -2199,34 +2775,36 @@ class ActionTest(unittest.TestCase):
 
     def test_add_refuses_an_empty_or_multi_line_part_and_writes_nothing(self) -> None:
         for change, check, see in (("", "Look", "It"), ("A", " ", "It"), ("A\nB", "Look", "It"), ("A", "Look", "")):
-            code, _, error = run("add", "--production", DOC, "--list", str(self.path), "--change", change, "--check", check,
+            code, _, error = run_with_image("add", "--production", DOC, "--list", str(self.path), "--change", change, "--check", check,
                                  "--see", see)
             self.assertEqual(code, 1)
             self.assertIn("needs one line of words", error)
         self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
 
     def test_add_without_see_is_refused_and_writes_nothing(self) -> None:
-        code, output, error = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "Look")
+        code, output, error = run_with_image("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "Look")
         self.assertEqual((code, output), (1, ""))
         self.assertIn("--see needs one line of words", error)
         self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
 
     def test_edit_rewrites_one_row_in_place_and_keeps_its_id_merged_cell_and_place(self) -> None:
+        image = fixture_image()
+        written = ("| C76 | Panels \\| shields stay | 2026-10-14 | not yet | Run `hana` in a natedev terminal. "
+                   + f"You see: Each panel keeps its shield | {image} |")
         self.assertEqual(run("edit", "--production", DOC, "--list", str(self.path), "--row", "C76",
                              "--change", "Panels | shields stay", "--check", "Run `hana` in a natedev terminal",
-                             "--see", "Each panel keeps its shield"),
-                         (0, "| C76 | Panels \\| shields stay | 2026-10-14 | not yet | Run `hana` in a natedev terminal. "
-                          + "You see: Each panel keeps its shield |\n", ""))
-        # The write stamps frontmatter above the list; every line below it is the list with the one row changed.
-        self.assertEqual(self.path.read_text(encoding="utf-8").split("\n---\n\n", 1)[1], LIST.replace(
-            "| C76 | Panels keep shields | 2026-10-14 | not yet | Launch Hana |",
-            "| C76 | Panels \\| shields stay | 2026-10-14 | not yet | Run `hana` in a natedev terminal. "
-            + "You see: Each panel keeps its shield |"))
+                             "--see", "Each panel keeps its shield", "--image", image), (0, written + "\n", ""))
+        expected = LIST.replace("How to check |\n", "How to check | Image |\n")
+        expected = expected.replace("| --- | --- | --- | --- | --- |\n", "| --- | --- | --- | --- | --- | --- |\n", 1)
+        expected = expected.replace("| C76 | Panels keep shields | 2026-10-14 | not yet | Launch Hana |", written)
+        expected = expected.replace("| C77 | Fonts redraw | 2026-10-14 | not yet | Change a font |",
+                                    "| C77 | Fonts redraw | 2026-10-14 | not yet | Change a font | |")
+        self.assertEqual(self.path.read_text(encoding="utf-8").split("\n---\n\n", 1)[1], expected)
 
     def test_edit_keeps_check_line_breaks_and_pipes_in_one_table_row(self) -> None:
         check = 'Steps:\r\n- Run A | B\r\n- Run C'
         see = 'Results:\n1. One\n2. Two | three'
-        code, output, error = run('edit', '--production', DOC, '--list', str(self.path), '--row', 'C76',
+        code, output, error = run_with_image('edit', '--production', DOC, '--list', str(self.path), '--row', 'C76',
                                   '--change', 'Panels keep shields', '--check', check, '--see', see)
         self.assertEqual((code, error), (0, ''))
         expected = 'Steps:\n- Run A | B\n- Run C. You see: Results:\n1. One\n2. Two | three'
@@ -2241,7 +2819,7 @@ class ActionTest(unittest.TestCase):
         for separator in ('\n', '\r\n', '\r', '\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\x85', '\u2028', '\u2029'):
             with self.subTest(separator=repr(separator)):
                 _ = self.path.write_text(LIST, encoding='utf-8')
-                code, output, error = run('edit', '--production', DOC, '--list', str(self.path), '--row', 'C76',
+                code, output, error = run_with_image('edit', '--production', DOC, '--list', str(self.path), '--row', 'C76',
                                           '--change', 'Panels keep shields', '--check', f'First{separator}- Second',
                                           '--see', 'Both remain')
                 self.assertEqual((code, error), (0, ''))
@@ -2267,7 +2845,7 @@ class ActionTest(unittest.TestCase):
 
     def test_a_multiline_check_stays_with_a_classified_row_after_a_verdict(self) -> None:
         item = Visible('Panels keep shields', '- Run A\n- Run B', 'Both remain')
-        _ = change_review.edit_row(self.path, 'C76', item, date(2026, 11, 5), PRODUCTION)
+        _ = change_review.edit_row(self.path, 'C76', item, date(2026, 11, 5), PRODUCTION, image=fixture_row_image(self.path, 'C76'))
         _ = change_review.set_row_kind(self.path, 'C76', 'See in action', PRODUCTION)
         _ = change_review.record_verdict(self.path, 'C76', 'not works', date(2026, 11, 5), PRODUCTION)
         saved = next(row for row in change_review.review_rows(self.path) if row['#'] == 'C76')
@@ -2276,14 +2854,14 @@ class ActionTest(unittest.TestCase):
 
     def test_edit_refuses_a_row_not_to_review_and_a_missing_part(self) -> None:
         for row in ("C70", "C99", "76"):
-            code, output, error = run("edit", "--production", DOC, "--list", str(self.path), "--row", row,
+            code, output, error = run_with_image("edit", "--production", DOC, "--list", str(self.path), "--row", row,
                                       "--change", "A", "--check", "B", "--see", "C")
             self.assertEqual((code, output), (1, ""), row)
             self.assertEqual(len(error.splitlines()), 1, row)
-        self.assertIn("C99 is not on the list to review", run("edit", "--production", DOC, "--list", str(self.path),
+        self.assertIn("C99 is not on the list to review", run_with_image("edit", "--production", DOC, "--list", str(self.path),
                                                               "--row", "C99", "--change", "A", "--check", "B",
                                                               "--see", "C")[2])
-        self.assertIn("--see needs one line of words", run("edit", "--production", DOC, "--list", str(self.path),
+        self.assertIn("--see needs one line of words", run_with_image("edit", "--production", DOC, "--list", str(self.path),
                                                            "--row", "C76", "--change", "A", "--check", "B")[2])
         self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
 
@@ -2311,7 +2889,7 @@ class ActionTest(unittest.TestCase):
 
     def test_the_most_urgent_row_shows_first_and_the_shown_row_stays_until_its_verdict(self) -> None:
         def add(*rank: str) -> str:
-            code, out, error = run("add", "--production", DOC, "--list", str(self.fresh), "--change", f"change {len(rank)}",
+            code, out, error = run_with_image("add", "--production", DOC, "--list", str(self.fresh), "--change", f"change {len(rank)}",
                                    "--check", "B", "--see", "C", *rank)
             self.assertEqual((code, error), (0, ""))
             return out.strip()
@@ -2342,16 +2920,16 @@ class ActionTest(unittest.TestCase):
         self.assertEqual(shown(), soon)
 
     def test_a_row_waits_for_its_prerequisite_and_a_bad_level_is_refused(self) -> None:
-        _ = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C",
+        _ = run_with_image("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C",
                 "--urgency", "blocks", "--after", "C77")
         text = self.path.read_text(encoding="utf-8")
         self.assertLess(text.index("| C77 |"), text.index("| C81 |"))
         self.assertLess(text.index("| C81 |"), text.index("| C76 |"))
-        self.assertIn("| Urgency | Production | Producer |\n| --- | --- | --- | --- | --- | --- | --- | --- |", text)
+        self.assertIn("| Urgency | Production | Producer | Image |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |", text)
         self.assertIn("| C76 | Panels keep shields | 2026-10-14 | not yet | Launch Hana | |", text)
-        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B",
+        self.assertEqual(run_with_image("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B",
                              "--see", "C", "--urgency", "soon")[0], 1)
-        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B",
+        self.assertEqual(run_with_image("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B",
                              "--see", "C", "--after", "later")[0], 1)
 
     def test_a_verdict_moves_the_row_to_the_top_of_reviewed(self) -> None:
@@ -2378,11 +2956,11 @@ class ActionTest(unittest.TestCase):
                     real_replace(source, destination)
 
                 with mock.patch.object(os, "replace", side_effect=interrupted):
-                    code, _, error = run(*command)
+                    code, _, error = run_with_image(*command)
                 self.assertEqual(code, 1)
                 self.assertIn("list replacement stopped", error)
                 self.assertEqual(self.path.read_bytes(), before)
-                self.assertEqual(run(*command)[0], 0)
+                self.assertEqual(run_with_image(*command)[0], 0)
                 self.assertEqual(self.path.read_text().count("| C76 |"), 1)
                 self.assertEqual([row["#"] for row in change_review.pending(self.path)],
                                  ["C76", "C77"] if action == "edit" else ["C77"])
@@ -2483,7 +3061,7 @@ class ActionTest(unittest.TestCase):
         demo = scratch.new("row:natedev-C1", "demo", visible=True)
         copy = scratch.new("row:natedev-C2", "copy")
         kept = scratch.new("row:natedev-C3")
-        _ = change_review.append_rows(self.fresh, [Visible(name, "B", "C") for name in "XYZ"], date(2026, 10, 15), "",
+        _ = change_review.append_rows(self.fresh, pictured_changes([Visible(name, "B", "C") for name in "XYZ"]), date(2026, 10, 15), "",
                                       PRODUCTION, record=staff.snapshot())
         self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.fresh), "--row", "C1", "--verdict", "works"),
                          (0, f"demo/C1 landed\nremoved {demo}\n", ""))
@@ -2544,7 +3122,7 @@ class ActionTest(unittest.TestCase):
     def test_list_named_edit_accepts_a_matching_list_and_keeps_local_row_text(self) -> None:
         earlier = self.attached_lists()
         before = self.path.read_bytes()
-        code, output, error = run("edit", "--production", DOC, "--list", str(earlier), "--row", "child/C9",
+        code, output, error = run_with_image("edit", "--production", DOC, "--list", str(earlier), "--row", "child/C9",
                                   "--change", "Revised change", "--check", "Run it", "--see", "Revised result")
         self.assertEqual((code, error), (0, ""))
         self.assertTrue(output.startswith("| C9 | Revised change |"))
@@ -2570,7 +3148,7 @@ class ActionTest(unittest.TestCase):
         held = os.open(self.path.parent, os.O_RDONLY)
         fcntl.flock(held, fcntl.LOCK_EX)
         writers = [threading.Thread(target=change_review.append_rows,
-                                    args=(self.path, [Visible(f"Row {index}", "Look", "It")], date(2026, 10, 15), "", PRODUCTION),
+                                    args=(self.path, pictured_changes([Visible(f"Row {index}", "Look", "It")]), date(2026, 10, 15), "", PRODUCTION),
                                     kwargs={"record": staff.snapshot()})
                    for index in range(8)]
         blocked = threading.Event()
@@ -2672,12 +3250,12 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
         }))
         source, *commits = origin_commits(self.repo.parent)
         merged = commits[-1][:8]
-        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C"), (0, "C1\n", ""))
+        self.assertEqual(run_with_image("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C"), (0, "C1\n", ""))
         self.assertEqual(self.last(), ("change-review: hana add C1", ["change-review/change-review - hana.md"]))
-        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "C", "--check", "D", "--see", "E", "--repo", str(source), "--merged", merged),
+        self.assertEqual(run_with_image("add", "--production", DOC, "--list", str(self.path), "--change", "C", "--check", "D", "--see", "E", "--repo", str(source), "--merged", merged),
                          (0, "C2\n", ""))
         self.assertEqual(self.last(), (f"change-review: hana row C2 from {merged}", ["change-review/change-review - hana.md"]))
-        _ = change_review.append_rows(self.path, [Visible("E", "F", "S"), Visible("G", "H", "S")], date(2026, 10, 15), "61b65bbf", PRODUCTION, record=staff.snapshot())
+        _ = change_review.append_rows(self.path, pictured_changes([Visible("E", "F", "S"), Visible("G", "H", "S")]), date(2026, 10, 15), "61b65bbf", PRODUCTION, record=staff.snapshot())
         self.assertEqual(self.last(), ("change-review: hana rows C3–C4 from 61b65bbf", ["change-review/change-review - hana.md"]))
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertEqual(set(log.read_text().splitlines()), {"held"})
@@ -2685,7 +3263,7 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
     def test_a_verdict_commits_the_list(self) -> None:
         for row, held in (("C1", False), ("C2", True)):
             with self.subTest(held=held):
-                _ = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C")
+                _ = run_with_image("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C")
                 command = ("verdict", "--production", DOC, "--list", str(self.path), "--row", row, "--verdict", "works")
                 lock = self.repo / ".git/index.lock"
                 if held:
@@ -2704,7 +3282,7 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
                 self.assertIn(f"| {row} | A | works |", self.git("show", "HEAD:change-review/change-review - hana.md"))
 
     def test_unchanged_edit_keeps_list_bytes_timestamp_and_git_history(self) -> None:
-        _ = change_review.append_rows(self.path, [GRID], date(2026, 10, 15), "216c4e1d", PRODUCTION, record=staff.snapshot())
+        _ = change_review.append_rows(self.path, pictured_changes([GRID]), date(2026, 10, 15), "216c4e1d", PRODUCTION, record=staff.snapshot())
         before = self.path.read_bytes(), self.path.stat().st_mtime_ns, self.git("rev-parse", "HEAD")
         _ = change_review._edit(self.path, PRODUCTION, date(2026, 10, 20),  # pyright: ignore[reportPrivateUsage]
                                lambda lines: len(lines), lambda count: f"unchanged {count}")
@@ -2712,7 +3290,7 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
         self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_verdict_rerun_commits_the_list_saved_before_the_first_commit_stopped(self) -> None:
-        _ = change_review.append_rows(self.path, [GRID], date(2026, 10, 15), "216c4e1d", PRODUCTION, record=staff.snapshot())
+        _ = change_review.append_rows(self.path, pictured_changes([GRID]), date(2026, 10, 15), "216c4e1d", PRODUCTION, record=staff.snapshot())
         previous = self.git("rev-parse", "HEAD")
         with (mock.patch.object(change_review, "_commit", side_effect=KeyboardInterrupt),
               self.assertRaises(KeyboardInterrupt)):
@@ -2731,15 +3309,15 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
         self.assertIn("| C1 | " + GRID.change + " | works |", self.git("show", "HEAD:change-review/change-review - hana.md"))
 
     def test_an_edit_commits_the_list(self) -> None:
-        _ = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C")
-        _ = run("edit", "--production", DOC, "--list", str(self.path), "--row", "C1", "--change", "D", "--check", "E",
+        _ = run_with_image("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C")
+        _ = run_with_image("edit", "--production", DOC, "--list", str(self.path), "--row", "C1", "--change", "D", "--check", "E",
                 "--see", "F")
         self.assertEqual(self.last(), ("change-review: hana edit C1", ["change-review/change-review - hana.md"]))
         self.assertIn("| C1 | D |", self.git("show", "HEAD:change-review/change-review - hana.md"))
         self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_an_edit_does_not_filter_other_modified_files(self) -> None:
-        _ = change_review.append_rows(self.path, [GRID], date(2026, 11, 15), "", PRODUCTION,
+        _ = change_review.append_rows(self.path, pictured_changes([GRID]), date(2026, 11, 15), "", PRODUCTION,
                                       record=staff.snapshot())
         calls = self.repo.parent / "filter-calls"
         script = self.repo.parent / "count-filter.py"
@@ -2766,7 +3344,7 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
             _ = path.write_text("before\nuser edit\n", encoding="utf-8")
         _ = calls.write_text("", encoding="utf-8")
 
-        result = run("edit", "--production", DOC, "--list", str(self.path), "--row", "C1",
+        result = run_with_image("edit", "--production", DOC, "--list", str(self.path), "--row", "C1",
                      "--change", "Changed", "--check", "Read", "--see", "Proof")
 
         self.assertEqual((result[0], result[2]), (0, ""))
@@ -2790,7 +3368,7 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
         )
         _ = self.git("add", ".gitattributes")
         _ = self.git("commit", "-m", "Configure the list filter")
-        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path),
+        self.assertEqual(run_with_image("add", "--production", DOC, "--list", str(self.path),
                              "--change", "Unclean fixture", "--check", "Read", "--see", "Proof"),
                          (0, "C1\n", ""))
         saved = self.path.read_text(encoding="utf-8")
@@ -2799,7 +3377,7 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
         self.assertEqual(committed, saved.replace("Unclean fixture", "Clean fixture").strip())
 
     def test_an_edit_retries_on_the_new_head_after_a_ref_race(self) -> None:
-        _ = change_review.append_rows(self.path, [GRID], date(2026, 11, 15), "", PRODUCTION,
+        _ = change_review.append_rows(self.path, pictured_changes([GRID]), date(2026, 11, 15), "", PRODUCTION,
                                       record=staff.snapshot())
         previous = self.git("rev-parse", "HEAD")
         tree = self.git("rev-parse", "HEAD^{tree}")
@@ -2818,7 +3396,7 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
             return real_run(command, capture_output=capture_output, text=text, check=check, env=env, pass_fds=pass_fds)
 
         with mock.patch.object(subprocess, "run", side_effect=move_head):
-            result = run("edit", "--production", DOC, "--list", str(self.path), "--row", "C1",
+            result = run_with_image("edit", "--production", DOC, "--list", str(self.path), "--row", "C1",
                          "--change", "After the timer", "--check", "Read", "--see", "Proof")
 
         self.assertEqual((result[0], result[2]), (0, ""))
@@ -2833,7 +3411,7 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
         _ = self.git("checkout", "--orphan", "first-list")
         _ = self.git("rm", "--cached", "note.md")
 
-        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path),
+        self.assertEqual(run_with_image("add", "--production", DOC, "--list", str(self.path),
                              "--change", "First", "--check", "Read", "--see", "Proof"), (0, "C1\n", ""))
 
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
@@ -2844,14 +3422,76 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
     def batch_lists(self) -> tuple[Path, Path]:
         paths = self.path, self.path.with_name("change-review - natedev.md")
         for path in paths:
-            _ = change_review.append_rows(path, [Visible(f"Original {index}", "Read", "Proof")
-                for index in range(1, 16)], date(2026, 11, 15), "", PRODUCTION, record=staff.snapshot())
+            _ = change_review.append_rows(path, pictured_changes([Visible(f"Original {index}", "Read", "Proof")
+                for index in range(1, 16)]), date(2026, 11, 15), "", PRODUCTION, record=staff.snapshot())
         return paths
 
     def run_batch(self, items: list[object]) -> tuple[int, str, str]:
         path = self.repo.parent / "batch.json"
         _ = path.write_text(json.dumps(items), encoding="utf-8")
         return run("batch", "--file", str(path))
+
+    def test_batch_verdicts_refuse_stale_exchanges_before_any_list_write(self) -> None:
+        from scripts.review_links import change_page
+
+        root = self.repo.parent/'links'
+        with mock.patch.dict(os.environ, {'REVIEW_LINKS_ROOT': str(root)}):
+            paths = self.batch_lists()
+            status = change_page.DeliveryStatus(root)
+            for index, state in enumerate(('question', 'old validation', 'missing validation', 'completed validation'), 1):
+                with self.subTest(state=state):
+                    row = f'C{index}'
+                    page = change_page.ReviewPage(paths[1], PRODUCTION, (row,), '')
+                    old = status.begin(page, row, 'validation', 'The old check.')
+                    current = status.begin(page, row, 'validation', 'The current check.')
+                    identity = '' if state == 'missing validation' else old
+                    if state == 'question':
+                        _ = status.ask(page, row, 'A newer question.')
+                    elif state == 'completed validation':
+                        status.clear(page, row, 'validation')
+                    before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+                    record = status.path(page, row)
+                    before_record = record.read_bytes() if record.exists() else b''
+                    head = self.git('rev-parse', 'HEAD')
+                    code, output, errors = self.run_batch([
+                        {'op': 'edit', 'production': DOC, 'list': str(paths[0]), 'row': row,
+                         'change': 'This edit must stay in memory', 'check': 'Read', 'see': 'Proof'},
+                        {'op': 'verdict', 'production': DOC, 'list': str(paths[1]), 'row': row,
+                         'verdict': 'works', 'validation': identity},
+                    ])
+                    reason = ('this row has no open question' if state == 'completed validation' else
+                              'this question id does not match the current question')
+                    self.assertEqual((code, output, errors.strip()), (1, '', 'batch item 1: '+reason))
+                    self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+                    self.assertEqual(record.read_bytes() if record.exists() else b'', before_record)
+                    self.assertEqual(self.git('rev-parse', 'HEAD'), head)
+                    self.assertEqual(self.git('diff', '--cached', '--name-only'), '')
+                    if state == 'old validation':
+                        self.assertEqual(status.slots(page, row).validation,
+                                         change_page.DeliveryIntent(current, 'validation', 'The current check.'))
+
+    def test_batch_verdict_accepts_the_current_validation_id_with_one_commit(self) -> None:
+        from scripts.review_links import change_page
+
+        root = self.repo.parent/'links'
+        with mock.patch.dict(os.environ, {'REVIEW_LINKS_ROOT': str(root)}):
+            paths = self.batch_lists()
+            status = change_page.DeliveryStatus(root)
+            page = change_page.ReviewPage(paths[1], PRODUCTION, ('C1',), '')
+            identity = status.begin(page, 'C1', 'validation', 'The current check.')
+            head = self.git('rev-parse', 'HEAD')
+            code, output, errors = self.run_batch([
+                {'op': 'edit', 'production': DOC, 'list': str(paths[0]), 'row': 'C1',
+                 'change': 'The accepted edit', 'check': 'Read', 'see': 'Proof'},
+                {'op': 'verdict', 'production': DOC, 'list': str(paths[1]), 'row': 'C1',
+                 'verdict': 'works', 'validation': identity},
+            ])
+        self.assertEqual((code, errors), (0, ''))
+        self.assertIn('The accepted edit', output)
+        self.assertIn('C1 landed', output)
+        self.assertEqual(self.git('rev-list', '--count', f'{head}..HEAD'), '1')
+        self.assertEqual(next(row['Change'] for row in change_review.pending(paths[0]) if row['#'] == 'C1'), 'The accepted edit')
+        self.assertEqual(next(row['Verdict'] for row in change_review.review_rows(paths[1]) if row['#'] == 'C1'), 'works')
 
     def test_a_batch_writes_two_lists_with_one_lock_and_commit(self) -> None:
         with mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.repo.parent / "links")}):
@@ -2963,6 +3603,24 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
                 self.assertEqual(self.git("rev-parse", "HEAD"), head)
                 self.assertEqual(self.git("diff", "--cached", "--name-only"), "")
 
+    def test_a_batch_edit_of_a_missing_row_refuses_before_any_write(self) -> None:
+        paths = self.batch_lists()
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        head = self.git("rev-parse", "HEAD")
+        with mock.patch.object(image_store, "register_change") as register:
+            code, output, errors = self.run_batch([
+                {"op": "edit", "production": DOC, "list": str(paths[0]), "row": "C1",
+                 "change": "Must not write", "check": "Read", "see": "Proof", "image": "unused.png"},
+                {"op": "edit", "production": DOC, "list": str(paths[1]), "row": "C999",
+                 "change": "Missing", "check": "Read", "see": "Proof"},
+            ])
+            register.assert_not_called()
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("batch item 1: C999 is not on the list to review", errors)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertEqual(self.git("diff", "--cached", "--name-only"), "")
+
     def test_a_batch_rerun_finishes_after_the_second_list_write_stops(self) -> None:
         paths = self.batch_lists()
         before = {path: path.read_bytes() for path in paths}
@@ -3018,7 +3676,7 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
         _ = (self.repo / "note.md").write_text("staged edit\n", encoding="utf-8")
         _ = (self.repo / "draft.md").write_text("new\n", encoding="utf-8")
         _ = self.git("add", "note.md", "draft.md")
-        _ = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C")
+        _ = run_with_image("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C")
         self.assertEqual(self.last(), ("change-review: hana add C1", ["change-review/change-review - hana.md"]))
         self.assertEqual(self.git("diff", "--cached", "--name-only").splitlines(), ["draft.md", "note.md"])
         self.assertEqual(self.git("show", ":note.md"), "staged edit")
@@ -3027,14 +3685,14 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         outside = Path(directory.name) / "change-review" / "hana.md"
-        self.assertEqual(run("add", "--production", DOC, "--list", str(outside), "--change", "A", "--check", "B", "--see", "C"), (0, "C1\n", ""))
+        self.assertEqual(run_with_image("add", "--production", DOC, "--list", str(outside), "--change", "A", "--check", "B", "--see", "C"), (0, "C1\n", ""))
         self.assertIn("| C1 | A |", outside.read_text(encoding="utf-8"))
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
 
     def test_a_held_index_lock_warns_writes_and_the_next_add_commits_both_rows(self) -> None:
         lock = self.repo / ".git" / "index.lock"
         _ = lock.write_text("", encoding="utf-8")
-        code, output, error = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C")
+        code, output, error = run_with_image("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C")
         self.assertEqual((code, output), (0, "C1\n"))
         self.assertEqual(len(error.splitlines()), 1)
         self.assertIn(f"change review: {self.path} written but not committed: ", error)
@@ -3042,7 +3700,7 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
         self.assertIn("| C1 | A |", self.path.read_text(encoding="utf-8"))
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
         lock.unlink()
-        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "C", "--check", "D", "--see", "E"), (0, "C2\n", ""))
+        self.assertEqual(run_with_image("add", "--production", DOC, "--list", str(self.path), "--change", "C", "--check", "D", "--see", "E"), (0, "C2\n", ""))
         self.assertEqual(self.last(), ("change-review: hana add C2", ["change-review/change-review - hana.md"]))
         committed = self.git("show", "HEAD:change-review/change-review - hana.md")
         self.assertIn("| C1 | A |", committed)

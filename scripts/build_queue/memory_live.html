@@ -56,8 +56,8 @@ __PAGE_FRAME_STYLE__
 .ram-disagree, .ram-missing { margin: 10px 0 0; font-weight: 600; }
 .swap-reserve { margin: 10px 0 0; font-weight: 600; cursor: help; }
 .hatch { background: repeating-linear-gradient(135deg, var(--res-a) 0 3px, var(--res-b) 3px 6px); }
-:root { --amt: 7rem; --gap: 10px; --details: 0px; }
-.bar-wrap { position: relative; padding: 52px 0 26px; margin-top: 10px; margin-left: calc(var(--amt) + var(--gap)); margin-right: var(--details); }
+:root { --amt: 7rem; --gap: 10px; --details: 0px; --bar-details: 0px; }
+.bar-wrap { position: relative; padding: 52px 0 26px; margin-top: 10px; margin-left: calc(var(--amt) + var(--gap)); margin-right: var(--bar-details); }
 .bar { display: flex; gap: 0; height: 44px; }
 .bar > div { height: 100%; border-radius: 2px; min-width: 0; transition: flex-basis 0.6s ease; position: relative; display: flex; align-items: center; justify-content: center; overflow: hidden; }
 .lbl { flex: none; font-size: 0.85rem; font-weight: 700; font-variant-numeric: tabular-nums; padding: 1px 6px; border-radius: 5px; background: color-mix(in srgb, var(--card) 82%, transparent); color: var(--ink); white-space: nowrap; pointer-events: none; transition: opacity 0.2s ease; }
@@ -130,7 +130,7 @@ __PAGE_FRAME_STYLE__
 .machine[data-machine="natedev"] { color: var(--machine-natedev); }
 .machine[data-machine="mac"] { color: var(--machine-mac); }
 .machine[data-machine="aws"] { color: var(--machine-aws); }
-.scale { margin-right: var(--details); margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
+.scale { margin-right: var(--bar-details); margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
 .ticks { position: relative; height: 16px; }
 .ticks span { position: absolute; transform: translateX(-50%); }
 .legend { margin: 10px 0 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 17rem), 1fr)); gap: 14px 28px; align-items: start; }
@@ -237,6 +237,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .row-heading { display: flex; min-width: 0; gap: 4px; align-items: baseline; }
 .row-label .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-label .owner { overflow-wrap: anywhere; color: var(--ink-2); }
+.wrow.wait .row-label .name { white-space: normal; }
 .row-label .owner, .cloud-status .amounts { font-size: 0.75rem; }
 .row-memory { min-width: 0; }
 .cloud-status .cap { color: var(--cap); }
@@ -282,32 +283,16 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
   border-top: 1px solid var(--line); pointer-events: none;
 }
 .walk.beside .wrow.room::before, .walk.beside .wrow.wait-first::before { top: var(--divider-top, 0px); }
-.walk.stacked .step { display: table-cell; }
-/* The stacked chart above the table shows free, so the table leaves out its empty row. */
-.walk.stacked .walk-table tr.room { display: none; }
-.walk.stacked .walk-table tr.queue-head > * { border-top: 1px solid var(--line); }
-.walk.stacked .walk-table { width: 100%; overflow-x: auto; }
-.walk.stacked .walk-table .cell-text, .walk.measuring .walk-table .unit .cell-text { max-width: none; }
-.walk.stacked .row-label .name { white-space: normal; overflow-wrap: anywhere; }
+/* The table never moves under the chart: a pane too narrow for both scrolls the step chart sideways. */
+.walk-scroll { overflow-x: auto; }
+/* The table is measured at its own width, not cut to the walk. */
+.walk.measuring .walk-table, .walk.measuring .walk-table table { max-width: none; }
+.walk.measuring .walk-table .unit .cell-text { max-width: none; }
 .walk.measuring .step { display: none; }
 .walk.measuring .walk-table .cell-text { max-width: 8rem; }
-/* A stacked table wider than the card shows each step on two lines: Step, Stage and Done, then the other columns. */
-.walk.compact .walk-table table { display: grid; grid-template-columns: auto auto auto minmax(auto, 1fr) auto auto auto; column-gap: 12px; width: 100%; }
-.walk.compact .walk-table thead, .walk.compact .walk-table tbody { display: contents; }
-.walk.compact .walk-table tr { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-content: center; row-gap: 2px; height: auto; padding: 4px 0; }
-.walk.compact .walk-table th, .walk.compact .walk-table td { width: auto; padding: 0; white-space: normal; overflow-wrap: break-word; }
-.walk.compact .walk-table .step { grid-area: 1 / 1 / 2 / 3; contain: inline-size; }
-.walk.compact .walk-table .place { grid-area: 1 / 3 / 2 / 7; contain: inline-size; }
-.walk.compact .walk-table .done { grid-area: 1 / 7; }
-.walk.compact .walk-table .duration { grid-area: 2 / 1; min-width: var(--duration); text-align: left; }
-.walk.compact .walk-table .unit { grid-area: 2 / 2; }
-.walk.compact .walk-table .pid { grid-area: 2 / 3; text-align: left; }
-.walk.compact .walk-table .machine { grid-area: 2 / 4; }
-.walk.compact .walk-table .vcpus { grid-area: 2 / 5; }
-.walk.compact .walk-table .slot { grid-area: 2 / 6; }
-.walk.compact .walk-table .tokens { grid-area: 2 / 7; }
-.walk.compact .walk-table tr.wait-first > *, .walk.compact .walk-table tr.queue-head > * { border-top: 0; }
-.walk.compact .walk-table tr.wait-first, .walk.compact .walk-table tr.queue-head { border-top: 1px solid var(--line); }
+/* A narrow pane cuts long unit names and narrows the column gaps, so the chart keeps its room beside the table. */
+.walk.tight .walk-table .unit .cell-text { max-width: 6rem; }
+.walk.tight .walk-table th:not(:last-child), .walk.tight .walk-table td:not(:last-child) { padding-right: 8px; }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
 body.queue-unavailable .queue-error { display: flex; }
 body.queue-unavailable .card { display: none; }
@@ -363,7 +348,7 @@ body.queue-unavailable .card { display: none; }
 </style>
 </head>
 <body>
-<main>
+<main class="page-wide">
   <p class="error" id="mac-idle-alert" role="status" hidden></p>
   __PAGE_TITLE__
   <div class="queue-error" id="queue-error" role="status"></div>
@@ -453,7 +438,7 @@ body.queue-unavailable .card { display: none; }
 
   <section class="card">
     <div class="walk-head"><span class="section-head" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span><div class="walk-tokens num" data-tip="tokens"><span>Tokens</span><dl id="walk-tokens"></dl></div></div>
-    <div class="walk" id="walk"></div>
+    <div class="walk-scroll"><div class="walk" id="walk"></div></div>
     <p class="pressure-reason" id="cap-reason"></p>
     <div class="walk-key">
       <span class="key" data-tip="waiting"><span class="sw waiting"></span>Waiting step, memory it needs</span>
@@ -494,6 +479,22 @@ let latest = null;
 function field(label, value, kind = 'field', group = false) {
   return {kind, label, value: String(value ?? ''), group};
 }
+function staffField(label, names) {
+  return {...field(label, names.join(', ')), valueStaffNames: names};
+}
+function staffTitle(name, value, suffix = '') {
+  return {...field(name + suffix, value, 'title'), labelStaffName: name, labelSuffix: suffix};
+}
+function staffName(text) {
+  return globalThis.staffNames?.html(text) ?? esc(text);
+}
+function roleName(text) {
+  return globalThis.staffNames?.parts(text) ?? esc(text);
+}
+function nameParts(parts) {
+  return parts.map(part => part.kind === 'staff' ? staffName(part.text) : esc(part.text)).join('');
+}
+function partsText(parts) { return parts.map(part => part.text).join(''); }
 function groupRows(rows) {
   return rows.filter(row => row.value !== '').map((row, index) => ({...row, group: index === 0}));
 }
@@ -534,7 +535,7 @@ function shownReading(data) {
   ram.total_bytes = recorded(source.total_bytes)
     ? sum([builds,ram.available_bytes,legendBytes(ram,'else')]) : source.total_bytes;
   const rowMemory = row => {
-    const parts = row.parts?.map(part => ({...part,gib:leaf(part.gib*GIB)/GIB}));
+    const parts = row.parts?.length ? row.parts.map(part => ({...part,gib:leaf(part.gib*GIB)/GIB})) : null;
     const used = parts ? sum(parts.map(part => part.gib*GIB))/GIB
       : recorded(row.used) ? leaf(row.used*GIB)/GIB : row.used;
     const reserved = recorded(row.reserved) ? leaf(row.reserved*GIB)/GIB : 0;
@@ -708,7 +709,8 @@ function signedSwap(bytes) { return `${bytes < 0 ? "−" : "+"}${swapAmount(Math
 function swapTip(row) {
   const captions = {total:'Swap across this machine', difference:'Group readings above the host total',
     unattributed:'Swap without a matching group', ungrouped:'Swap without a program name', smaller:'Swap of the smaller named groups'};
-  return [field(row.name, row.kind === 'difference' ? signedSwap(row.bytes) : swapAmount(row.bytes), 'title'),
+  const amount = row.kind === 'difference' ? signedSwap(row.bytes) : swapAmount(row.bytes);
+  return [row.title_kind === 'staff' ? staffTitle(row.name, amount) : field(row.name, amount, 'title'),
     field('', captions[row.kind] || 'Swap charged to this program', 'caption'),
     ...(row.owner_count === 1 ? groupRows(ownerFields(row)) : [])];
 }
@@ -749,7 +751,7 @@ function ownerText(text) {
 function stageText(row) {
   if (macRow(row)) return ["MacTesting", "MacTestingCounter"].includes(row.stage?.kind) ? "testing" : row.stage?.kind === "MacBuilding" ? "building" : "—";
   return row.progress?.kind === "RowProgress" ? row.progress.phase
-    : row.progress?.kind === "TokenWaitProgress" ? row.progress.stage : "—";
+    : row.progress?.kind === "TokenWaitProgress" ? "waiting" : "—";
 }
 function doneText(row) {
   const progress = row.progress;
@@ -759,8 +761,8 @@ function doneText(row) {
   return recorded(percent) ? formatPercent(percent, progress.done === progress.total) : "—";
 }
 function ownerFields(row) {
-  const fields = [field('Showrunner', ownerText(row.showrunner))];
-  if (row.runner === 'worker') fields.push(field('Worker', ownerText(row.worker)));
+  const fields = [staffField('Showrunner', [ownerText(row.showrunner)])];
+  if (row.runner === 'worker') fields.push(staffField('Worker', [ownerText(row.worker)]));
   return fields.filter(row => row.value);
 }
 function rowTitle(row) {
@@ -770,16 +772,23 @@ function rowTitle(row) {
   return unit && !name.startsWith(unit+' ') && !name.startsWith(unit+' · ') ? `${unit} · ${name}`
     : unit && name.startsWith(unit+' ') ? `${unit} · ${name.slice(unit.length+1)}` : name;
 }
-function becauseRows(reason) {
+function stepTitle(row, value) {
+  const title = rowTitle(row), unit = ownerText(row.unit);
+  return unit && !ciRow(row) ? staffTitle(unit, value, title.slice(unit.length)) : field(title, value, 'title');
+}
+function becauseRows(reason, parts) {
   if (!reason) return [];
-  return reason.length <= 30 ? [field('Because', reason)] : [field('Because', ''), field('', reason, 'long')];
+  return reason.length <= 30 ? [{...field('Because', reason), valueParts:parts}]
+    : [field('Because', ''), {...field('', reason, 'long'), valueParts:parts}];
 }
 function routeFields(row) {
   return [field('Runs on', row.kind === 'cloud' ? 'AWS' : row.runs_on || ''),
-    ...(row.runs_on === 'natedev or Mac' ? [] : becauseRows(row.because || ''))];
+    ...(row.runs_on === 'natedev or Mac' ? [] : becauseRows(row.because || '', row.because_parts))];
 }
 function progressRows(row) {
   const progress = row.progress;
+  // The Stage column shows only "waiting"; the tooltip gives the full reason.
+  if (progress?.kind === 'TokenWaitProgress') return [field('Stage', sentence(progress.stage))];
   if (!progress || progress.kind !== 'RowProgress') return [];
   return groupRows([field(sentence(progress.phase), `${progress.done} of ${progress.total} ${progress.unit}`),
     field('Done', formatPercent(progress.percent ?? 100 * progress.done / progress.total, progress.done === progress.total)),
@@ -792,21 +801,25 @@ function stepTooltip(key, data) {
   const duration = tipDuration(key, row, data);
   const state = waiting ? 'waiting' : row.between_steps ? 'between steps' : 'running';
   if (row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used)))
-    return [field(rowTitle(row), 'unavailable', 'title')];
-  const rows = [field(rowTitle(row), [state, duration].filter(Boolean).join(' '), 'title')];
+    return [stepTitle(row, 'unavailable')];
+  const rows = [stepTitle(row, [state, duration].filter(Boolean).join(' '))];
   // A gate job says what it does and what it changes (#109).
-  if (row.about) rows.push(field('', row.about, 'caption'), field('Changes', row.changes));
+  if (row.about) rows.push({...field('', row.about, 'caption'), valueParts:row.about_parts}, field('Changes', row.changes));
   if (row.group) return [field(row.name, ramAmount(row.used * GIB), 'title'), field('Started by', 'not the queue'),
-    ...groupRows(memoryRows((row.parts || []).map(part => [[part.who, recorded(part.pid) ? part.pid : '',
-      part.started_at > 0 ? ago(part.started_at, data.read_at) : ''].filter(Boolean).join(' · '), part.gib * GIB])))];
+    ...groupRows((row.parts || []).map(part => {
+      const suffix = [recorded(part.pid) ? part.pid : '', part.started_at > 0 ? ago(part.started_at, data.read_at) : '']
+        .filter(Boolean).join(' · ');
+      const parts = [...(part.who_parts || [{kind:'text',text:part.who}]), ...(suffix ? [{kind:'text',text:' · '+suffix}] : [])];
+      return {...field(partsText(parts), ramAmount(part.gib * GIB)), labelParts:parts};
+    }))];
   rows.push(...ownerFields(row));
-  if (row.priority_entries?.length) rows.push(field('Priority', row.priority_entries.map(entry => entry.unit).join(', ')));
+  if (row.priority_entries?.length) rows.push(staffField('Priority', row.priority_entries.map(entry => entry.unit)));
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));
     rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' :
       row.kind === 'repository-slot' ? 'build slot' : row.why || 'its turn'), ...routeFields(row));
     if (!['cloud', 'repository-slot'].includes(row.kind)) {
-      if (row.head_room?.unavailable) return [field(rowTitle(row), 'unavailable', 'title')];
+      if (row.head_room?.unavailable) return [stepTitle(row, 'unavailable')];
       let free = row.free ?? queueCapMemory(data).free / GIB;
       if (row.head_room?.rows?.length) {
         const terms = row.head_room.rows, result = terms.at(-1);
@@ -874,7 +887,7 @@ function tooltipRows(key, data) {
   if (kind === 'swap-pool') return poolTip(index, data);
   const rows = TIPS[key](data);
   if (key === 'walkhead' && data.unmatched_priority_entries?.length)
-    rows.push(field('Priority', data.unmatched_priority_entries.map(entry => entry.unit).join(', ')));
+    rows.push(staffField('Priority', data.unmatched_priority_entries.map(entry => entry.unit)));
   return rows;
 }
 function tooltipHtml(key, data) {
@@ -884,8 +897,9 @@ function tipRowsHtml(rows) {
   return '<dl class="tip">'+rows.map(row => {
     const classes=[row.kind === 'field' ? '' : row.kind, row.group ? 'group' : ''].filter(Boolean).join(' ');
     const attr=classes ? ` class="${classes}"` : '';
-    return ['caption','long'].includes(row.kind) ? `<dd${attr}>${esc(row.value)}</dd>`
-      : `<dt${attr}>${esc(row.label)}</dt><dd${attr}>${esc(row.value)}</dd>`;
+    return ['caption','long'].includes(row.kind) ? `<dd${attr}>${row.valueParts ? nameParts(row.valueParts) : esc(row.value)}</dd>`
+      : `<dt${attr}>${row.labelParts ? nameParts(row.labelParts) : row.labelStaffName ? staffName(row.labelStaffName) + esc(row.labelSuffix) : esc(row.label)}</dt>` +
+        `<dd${attr}>${row.valueParts ? nameParts(row.valueParts) : row.valueStaffNames ? row.valueStaffNames.map(staffName).join(', ') : esc(row.value)}</dd>`;
   }).join('')+'</dl>';
 }
 function tipText(key, data) {
@@ -895,20 +909,21 @@ function tipText(key, data) {
 }
 function sentence(text) { return text ? text[0].toUpperCase() + text.slice(1) : ""; }
 function targetOwner(row) {
-  return [["Unit", row.unit], ["Showrunner", row.showrunner]]
-    .filter(([, name]) => name && name !== "—").map(([label, name]) => `${label} ${publicText(name)}`).join(" · ");
+  const roles = [["Unit", row.unit], ["Showrunner", row.showrunner]]
+    .filter(([, name]) => name && name !== "—");
+  if (roles.length) return roles.map(([label, name]) => label + ' ' + staffName(publicText(name))).join(' · ');
+  return row.holder ? 'Holder ' + staffName(publicText(row.holder)) : 'Owner not recorded';
 }
 function renderTargets(rows) {
   const box = $("targets");
   box.hidden = !rows.length;
   box.innerHTML = !rows.length ? "" : `<div class="section-head">Target availability</div>` + rows.map(row => {
-    const owner = row.state === "Unavailable" ? "" :
-      targetOwner(row) || (row.holder ? `Holder ${publicText(row.holder)}` : "Owner not recorded");
+    const owner = row.state === "Unavailable" ? "" : targetOwner(row);
     return `<div class="target-row"><div class="target-head"><span class="machine" data-machine="${esc(row.target)}">${esc(row.target)}</span>` +
       `<span class="target-state ${esc(row.state.toLowerCase())}">${esc(row.state)}</span></div>` +
       `<div class="target-until">${esc(sentence(row.until))}</div>` +
       `<div class="target-reason">${esc(row.reason || "No reason recorded")}</div>` +
-      `<div class="target-owner">${esc(owner)}</div><div class="target-since">${esc(sentence(row.since))}</div></div>`;
+      `<div class="target-owner">${owner}</div><div class="target-since">${esc(sentence(row.since))}</div></div>`;
   }).join("");
 }
 function recorded(value) { return typeof value === "number"; }
@@ -930,6 +945,23 @@ function visibleDetail(row) {
 function publicText(text) {
   return memoryText(text.split(" · ").filter(part => part.trim() && part.trim() !== "—" && !/\.(slice|service)\b/.test(part)).join(" · "));
 }
+function publicParts(parts) {
+  const shown = [];
+  let start = 0;
+  for (const segment of partsText(parts).split(' · ')) {
+    if (publicText(segment)) {
+      if (shown.length) shown.push({kind:'text', text:' · '});
+      let offset = 0;
+      for (const part of parts) {
+        const from = Math.max(0, start - offset), to = Math.min(part.text.length, start + segment.length - offset);
+        if (to > from) shown.push({...part, text:memoryText(part.text.slice(from, to))});
+        offset += part.text.length;
+      }
+    }
+    start += segment.length + 3;
+  }
+  return shown;
+}
 function rowUnit(row) {
   return ciRow(row) ? "CI" : /\.(slice|service)\b/.test(row.unit || "") ? row.name : row.unit || "";
 }
@@ -944,7 +976,7 @@ function rowOwner(row, waiting = false) {
 }
 function rowLabel(name, owner = "") {
   return `<span class="row-label"><span class="row-heading"><span class="name">${esc(name)}</span></span>` +
-    `<span class="owner">${esc(owner)}</span></span>`;
+    `<span class="owner">${roleName(owner)}</span></span>`;
 }
 function rowMemory(tip, bars = "") {
   return `<div class="row-memory" data-tip="${tip}"><div class="track" data-tip="${tip}">${bars}</div>` +
@@ -1056,6 +1088,7 @@ function restoreReportView(view) {
   }
 }
 function render(d) {
+  if (d.staff_names) globalThis.staffNames?.set(d.staff_names);
   if (d.error || !d.ok) {
     throw new Error("The queue did not answer.");
   }
@@ -1176,9 +1209,11 @@ function renderSwap(d) {
   $("gf-swap").style.width = `${Math.min(100, swap).toFixed(2)}%`;
   $("gv-swap").textContent = formatPercent(swap);
   placeLimitLabels();
+  const titleHtml = row => row.title_kind === "staff" ? staffName(row.name) : esc(row.name);
+  const detailHtml = row => row.detail_parts ? nameParts(publicParts(row.detail_parts)) : esc(visibleDetail(row));
   const rowHtml = ({row, index}) => `<div class="row ${row.kind}" data-tip="swap:${index}" data-pool="${row.pool}" data-bytes="${row.bytes}"><span class="name">${row.kind === "smaller"
-    ? `<details data-owner-key="smaller:${esc(row.pool)}"><summary><span class="chev">▶</span>${esc(row.name)}</summary><div class="swap-members">${row.members.map(member => `<div>${esc(member.name)}: ${swapAmount(member.bytes)}</div>`).join("")}</div></details>`
-    : esc(row.name)}</span><span class="v">${row.kind === "difference" ? signedSwap(row.bytes) : swapAmount(row.bytes)}</span><small>${row.kind === "owner" && visibleDetail(row) !== row.name ? esc(visibleDetail(row)) : ""}</small></div>`;
+    ? `<details data-owner-key="smaller:${esc(row.pool)}"><summary><span class="chev">▶</span>${esc(row.name)}</summary><div class="swap-members">${row.members.map(member => `<div>${titleHtml(member)}: ${swapAmount(member.bytes)}</div>`).join("")}</div></details>`
+    : titleHtml(row)}</span><span class="v">${row.kind === "difference" ? signedSwap(row.bytes) : swapAmount(row.bytes)}</span><small>${row.kind === "owner" && visibleDetail(row) !== row.name ? detailHtml(row) : ""}</small></div>`;
   const indexed = d.swap_by.map((row, index) => ({row, index}));
   const pools = [["outside", "Outside builds and CI", d.swap.outside_bytes], ["builds_ci", "Builds and CI", d.swap.builds_ci_bytes]];
   $("swaprows").innerHTML = pools.map(([pool, name, bytes]) => {
@@ -1200,7 +1235,7 @@ document.addEventListener("click", (e) => {
 
 function renderLeftovers(d) {
   const rows = (d.leftovers || []).flatMap(scope => scope.members.map((member, index) =>
-    `<div class="leftover-row"><span class="detail">${esc(scope.owner)} · ${esc(member.program)}${typeof member.pid === "number" ? ` · pid ${member.pid}` : ""}</span><span class="age">${index === 0 ? esc(scope.age) : ""}</span><span class="num">${index === 0 ? memoryAmount(scope.used) : ""}</span></div>`));
+    `<div class="leftover-row"><span class="detail">${roleName(scope.owner)} · ${esc(member.program)}${typeof member.pid === "number" ? ` · pid ${member.pid}` : ""}</span><span class="age">${index === 0 ? esc(scope.age) : ""}</span><span class="num">${index === 0 ? memoryAmount(scope.used) : ""}</span></div>`));
   $("leftovers").hidden = rows.length === 0;
   $("leftover-rows").innerHTML = rows.join("");
 }
@@ -1280,7 +1315,7 @@ function renderWalk(d) {
     (running ? '<th scope="col" class="slot">Slot</th><th scope="col" class="tokens">Tokens</th>' : "");
   const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—", slot = "—", tokens = "—") => {
     tableRows.push(`<tr class="${className}" data-tip="${tip}" tabindex="0"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
-      `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${esc(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
+      `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${roleName(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
       (Array.isArray(machine)
         // A waiting step lists the machines that can take it, each in its machine color.
         ? `<td class="machine" data-machine="${esc(machine.join(" or "))}"><span class="wait-target">${machine.map(target => `<span class="machine" data-machine="${esc(target)}">${esc(target)}</span>`).join(" or ") || "—"}</span></td>`
@@ -1311,7 +1346,9 @@ function renderWalk(d) {
       : units.length === 1 ? `Queued, ${units[0]} first, then in submission order`
       : `Queued, ${units.join(" followed by ")} and then in submission order`;
     tableRows.push(`<tr class="queue-head">${columns("#", STEP_TABLE_HEADERS.waiting)}</tr>`);
-    rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}">${esc(title)}</span></div>`);
+    const titleHtml = !units.length ? esc(title) : units.length === 1 ? `Queued, ${roleName(units[0])} first, then in submission order`
+      : `Queued, ${units.map(unit=>roleName(unit)).join(' followed by ')} and then in submission order`;
+    rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}">${titleHtml}</span></div>`);
   }
   let localPosition = 0;
   d.waiters.forEach((w, i) => {
@@ -1378,8 +1415,9 @@ function fitWalkDetails() {
   const track = walk.querySelector(".track");
   if (!latest || !table || !track || document.body.classList.contains("queue-unavailable")) return;
   const root = document.documentElement;
-  // Measure without the last layout: a stacked table is full width, so the chart would stay stacked on a wider page.
-  walk.classList.remove("beside", "stacked", "compact");
+  // Measure the table in the page flow, at the page width.
+  walk.classList.remove("beside", "tight");
+  walk.style.minWidth = "";
   walk.classList.add("measuring");
   const capFraction = capEnd(latest);
   function measure(labelWidth) {
@@ -1423,13 +1461,15 @@ function fitWalkDetails() {
       context.measureText(words.slice(index).join(" ")).width)));
   }));
   const minimumTrackWidth = Math.max(MIN_TRACK_WIDTH, (Math.max(amountWidth + LABEL_GAP, statusWidth) + 1) / (capFraction || 1));
-  const labels = [...walk.querySelectorAll(".row-label .name, .row-label .owner")];
+  // Running rows set the label column. A longer queued name wraps at a space, so only its widest word counts.
+  const labels = [...walk.querySelectorAll(".row-label .name, .row-label .owner")].flatMap(label =>
+    label.closest(".wrow.wait") ? label.textContent.split(/\s+/).map(word => [label, word]) : [[label, label.textContent]]);
   const roomHeading = walk.querySelector(".wrow.room .row-heading");
   context.font = canvasFont(roomHeading);
   const roomWidth = context.measureText(`Free ${memoryAmount(latest.room)}`).width + 8;
-  const textWidth = Math.ceil(Math.max(roomWidth, ...labels.map(label => {
+  const textWidth = Math.ceil(Math.max(roomWidth, ...labels.map(([label, text]) => {
     context.font = canvasFont(label);
-    return context.measureText(label.textContent).width;
+    return context.measureText(text).width;
   }))) + 1;
   const rem = parseFloat(getComputedStyle(root).fontSize);
   let labelWidth = `${Math.min(textWidth, 12 * rem)}px`;
@@ -1438,31 +1478,40 @@ function fitWalkDetails() {
     labelWidth = `${Math.min(textWidth, 9 * rem)}px`;
     fit = measure(labelWidth);
   }
-  const beside = fit.remainingWidth >= minimumTrackWidth;
+  if (fit.remainingWidth < minimumTrackWidth) {
+    walk.classList.add("tight");
+    fit = measure(labelWidth);
+  }
   root.classList.remove("layout-measuring");
   fit = measure(labelWidth);
+  const shortBy = minimumTrackWidth - fit.remainingWidth;
+  if (shortBy > 0) {
+    // Beyond the cap the track runs under the table, so a wider walk gives the chart only the cap share.
+    // With no cap the table width is fixed, so the chart takes all of the added width.
+    const added = fit.reservedWidth > 0 && capFraction > 0 ? shortBy * capFraction : shortBy;
+    walk.style.minWidth = `${Math.ceil(walk.getBoundingClientRect().width + added)}px`;
+    fit = measure(labelWidth);
+  }
   const naturalWidth = table.getBoundingClientRect().width;
-  root.style.setProperty("--details", `${beside ? fit.reservedWidth : 0}px`);
-  walk.classList.toggle("beside", beside);
-  walk.classList.toggle("stacked", !beside);
+  root.style.setProperty("--details", `${fit.reservedWidth}px`);
+  // The top bar shares the chart scale; in a pane where the chart scrolls sideways it uses the card width.
+  root.style.setProperty("--bar-details", `${shortBy > 0 ? 0 : fit.reservedWidth}px`);
+  walk.classList.add("beside");
   walk.classList.remove("measuring");
-  walk.classList.toggle("compact", !beside && table.scrollWidth > table.clientWidth);
   measureColumn("duration");
   measureColumn("machine");
-  if (beside) {
-    // The chart takes its scale from its own track: the memory bar is hidden when RAM readings disagree.
-    const range = track.getBoundingClientRect();
-    const tableLeft = !hasCap(latest)
-      ? walk.getBoundingClientRect().right - naturalWidth
-      : range.left + range.width * capFraction + 0.5 + TABLE_CAP_GAP;
-    walk.style.setProperty("--table-left", `${tableLeft - walk.getBoundingClientRect().left}px`);
-  }
+  // The chart takes its scale from its own track: the memory bar is hidden when RAM readings disagree.
+  const range = track.getBoundingClientRect();
+  const tableLeft = !hasCap(latest)
+    ? walk.getBoundingClientRect().right - naturalWidth
+    : range.left + range.width * capFraction + 0.5 + TABLE_CAP_GAP;
+  walk.style.setProperty("--table-left", `${tableLeft - walk.getBoundingClientRect().left}px`);
   for (const row of walk.querySelectorAll(".wrow[data-tip], .wrow.room")) {
     const metadata = table.querySelector(row.dataset.tip ? `tr[data-tip="${row.dataset.tip}"]` : "tr.room");
     if (!metadata) continue;
     const detail = row.querySelector(".amounts");
-    if (row.classList.contains("cloud-work")) detail.style.maxWidth = beside
-      ? `${Math.max(0, table.getBoundingClientRect().left - detail.getBoundingClientRect().left - TABLE_CAP_GAP)}px` : "";
+    if (row.classList.contains("cloud-work"))
+      detail.style.maxWidth = `${Math.max(0, table.getBoundingClientRect().left - detail.getBoundingClientRect().left - TABLE_CAP_GAP)}px`;
     row.style.minHeight = "44px";
     metadata.style.height = "";
     const height = Math.ceil(Math.max(row.getBoundingClientRect().height, metadata.getBoundingClientRect().height));

@@ -418,13 +418,63 @@ A second schedule caller prints `already claimed by <id>` and exits with code 0.
 `StatusDocument` carries account rows, the board, problems, and session input paths.
 The `board` is `accounts.status_board()`: the table the console Accounts page draws.
 `config/statusline.conf` holds each account color under `account.<label>`.
+`ROLE_COLOR_KEYS` maps each role group to its color key:
+
+1. Units use `role.unit-director`.
+2. Showrunners use `role.showrunner`.
+3. Workers use `role.worker`.
+4. Producers use `role.producer`.
+
+The producers role has a separate row under each account it uses.
+Producer rows follow the other role rows for that account.
+`account_details_in_row_order` accepts the complete rows in display order.
+It shows account details only on the first row of each consecutive account run.
+The account details include the dot, label, swatch, allowance, reset, credits, and credits setting.
+A separated row shows the account details again.
+A lone producer row shows all account details.
+The helper preserves the complete input rows for later sorts.
+The Accounts page sorts through four focusable column headers:
+
+1. Account sorts by label and then by role order.
+2. Left sorts by the full quota value, least first, then by account and role order.
+3. Role sorts by role name and then by account.
+4. Busy sorts by count, most first, then by account.
+
+The role order is units, showrunners, workers, producers, spare, and no role.
+The default sort uses account order.
+Missing values stay last in both directions.
+Clicking the selected header reverses its order.
+Enter performs the same action on a focused header.
+Each sortable header reserves space for its arrow.
+`account_board_sort_orders` prepares both directions and uses `account_details_in_row_order` for each order.
+The browser moves the existing rows and restores the account details for each consecutive account run.
+The total row stays last.
+Sorting preserves the total values and upcoming moves.
+Browser storage keeps each viewer's choice through refreshes and page visits.
+Failed storage reads use the default sort.
+Failed storage writes keep the current choice for the open page.
+The shipped value of `role.producer` is `pink`.
+`role_colors` reads the current settings for the Accounts board and the console name renderer.
+`staff_role_color` maps a staff row through those keys and `account_color`.
+Unknown or invalid colors use the normal text color.
 The value accepts a color name or a six-digit hex color.
-Configured accounts have a color swatch on the console Accounts page.
+A board span with a valid configured color carries its key as `color_key`; the role check mark is a separate span.
+Configured accounts and role groups have a color swatch on the console Accounts page.
 The swatch opens a color chooser with Try, Save, and Cancel.
-Try changes the label and swatch locally without a request.
+Try changes every label and swatch of that key locally without a request.
 Cancel or Escape restores the saved color.
 Save publishes the color through this checkout's `scripts/lib/tune.py` and refreshes the board.
 The page pauses refresh while the chooser is open.
+A board line of a selected Claude group (`units` or `showrunners`) carries `group`: its account and group.
+The Accounts page adds a `next` column after the role color swatch.
+Each next cell belongs to its role row and moves with that row when sorted.
+A selected Claude group shows its first target, or `none`, and an arrow button opens its move menu.
+A selected Codex workers line shows its first target, or `auto`, without a button.
+Other lines show a minus icon; the total cell stays empty.
+`StatusReading.first_next_moves` distinguishes first targets from an unavailable read with its reason.
+One queue read supplies both the first targets and the unchanged upcoming list.
+Off the role-map host, first targets are unavailable.
+The menu marks the current target and can remove the group's first entry.
 Its `stale_at` is the next local midnight, when its reset text changes.
 The text table appends `Login ends` in the user's zone, with the same date format as `Weekly resets`.
 Each JSON account exports `login_ends_at` as an ISO 8601 UTC string, or null for an unknown date or Codex.
@@ -457,8 +507,12 @@ The accounts board has no activity column, the same as the cargo-handler account
 The activity of each session shows only in the cargo-handler tiles, from `cargo-handler census --json`.
 An older peer's document holds waiting within busy and starting within idle, with separate `starting` and `waiting` fields.
 The decoder moves that peer's `starting` count from idle to busy.
-Claude producers count under `showrunners` with the same hold and activity rules.
-Without a live session, they count on the selected showrunners account.
+Claude and Codex producers count under `producers` with the same hold and activity rules.
+A live producer counts on the account from its process environment.
+Without a live Claude session, producers count on the selected showrunners account.
+Without a live Codex session, producers count on their recorded home or the selected workers account.
+Claude producers retain their showrunners move group.
+Codex producers retain their workers move group.
 `session-counts-read` prints the same live count document without publishing a file.
 Peer counts use the shared role-map transport in a detached fetch.
 One claim prevents concurrent fetches.

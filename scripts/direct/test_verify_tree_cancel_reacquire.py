@@ -25,7 +25,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         _ = seed.write_text(json.dumps({"holder": "hana", "since": datetime.now(UTC).isoformat(),
                                        "for": "reacquisition test", "release_eta": "unknown"}))
         shell = self.root / "hold-at-local-step.sh"
-        _ = shell.write_text('set -T\nhold_at_local_step() {\n    if [[ "$BASH_COMMAND" == check_routing_hold && "${TOKEN_HELD:-0}" == 1 && ! -e "$TEST_HOLD_READY" ]]; then\n        cp "$TEST_HOLD_SEED" "$BUILD_HOLD_DIR/hana"\n        printf \'%s\\n%s\\n\' "$BUILDLOG_PLACEMENT_EPISODE" "$(< "$BOARD_DIR/locks/cargo.d/holder_pid")" > "$TEST_HOLD_READY"\n    fi\n}\ntrap hold_at_local_step DEBUG\n')
+        _ = shell.write_text('set -T\nhold_at_local_step() {\n    if [[ "$BASH_COMMAND" == build_hold_check_local && "${TOKEN_HELD:-0}" == 1 && ! -e "$TEST_HOLD_READY" ]]; then\n        cp "$TEST_HOLD_SEED" "$BUILD_HOLD_DIR/hana"\n        printf \'%s\\n%s\\n\' "$BUILDLOG_PLACEMENT_EPISODE" "$(< "$BOARD_DIR/locks/cargo.d/holder_pid")" > "$TEST_HOLD_READY"\n    fi\n}\ntrap hold_at_local_step DEBUG\n')
         process = self.start_verify("test", BASH_ENV=str(shell),
             TEST_HOLD_SEED=str(seed), TEST_HOLD_READY=str(ready))
         lock = self.board / "locks/cargo.d"
@@ -92,15 +92,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
                                 "--pid", str(holder.pid), "--hold", "3600", "--wait", "0"],
                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(taken.returncode, 0, taken.stdout + taken.stderr)
-        shell = self.root / "local-attempt.sh"
-        _ = shell.write_text('''set -T
-probe_local_attempt() {
-    if [[ "$BASH_COMMAND" == '[[ "$STEP_DEFER_LOCAL" == 0 ]]' ]]; then STEP_DEFER_LOCAL=1; fi
-}
-trap probe_local_attempt DEBUG
-''')
-        # Defer acquisition until the local step starts with its tree watcher.
-        process = self.start_verify("test", BASH_ENV=str(shell))
+        process = self.start_verify("test")
         lock = self.board / "locks/cargo.d"
         waiters = self.board / "token_waiters"
         wait_until(lambda: bool(list(waiters.glob(f"*.{process.pid}")))
@@ -108,7 +100,8 @@ trap probe_local_attempt DEBUG
         self.assertIsNone(process.poll(), "verify never entered the token wait")
         own_entries = list(waiters.glob(f"*.{process.pid}"))
         self.assertEqual(len(own_entries), 1, "fixture never reached the local token wait")
-        self.assertEqual(self.admission.server.reservations, {})
+        # The token wait follows the local grant, so the grant keeps its reservation.
+        self.assertEqual(len(self.admission.server.reservations), 1)
         self.assertEqual(self.admission.server.waiters, {})
         # Keep a peer's entry present too: cancellation must remove only its own files.
         peer_entry = waiters / f"peer.0123456789abcdef.9999999999.{holder.pid}.again"

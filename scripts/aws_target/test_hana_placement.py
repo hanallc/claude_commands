@@ -1,0 +1,435 @@
+"""Check inactive Hana placement with private journals and fake provider evidence."""
+from __future__ import annotations
+
+from collections.abc import Generator
+from contextlib import contextmanager, redirect_stderr
+from dataclasses import replace
+from datetime import UTC, datetime
+from decimal import Decimal
+from io import StringIO
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+from typing import cast, override
+from unittest import mock
+
+from scripts.aws_target import hana_box as box, hana_placement as hana, hana_placement_adapter as adapter, hana_spend, ledger
+from scripts.aws_target.control_test_support import TestClock
+from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, text_setting
+from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY
+from scripts.build_targets import build_targets, target_config
+from scripts.build_queue import admission_protocol as wire, admission_records as records, placement
+from scripts.buildlog import store
+from scripts.lib import conf, process_start
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.mac_test import claim_state, eligibility
+from scripts.build_hold.owning_session import OwningSession
+
+
+REPOSITORY = Path(__file__).resolve().parents[2]
+KEY = 'https://github.com/natepiano/hana'
+PREVIEW_SECONDS = 2
+
+
+class HanaPlacementTests(CostFixture):
+    workload: Path = Path()
+    target: target_config.SshTarget = target_config.SshTarget('fixture', 'linux', Path())
+    clock: TestClock = TestClock()
+    controller: box.HanaController
+    provider: FakeProvider
+    holder: placement.ClaimHolderIdentity = placement.ClaimHolderIdentity('', 0, '')
+    assignment: placement.PlacementAssignment
+
+    def __init__(self, methodName: str = 'runTest') -> None:
+        super().__init__(methodName)
+        self.provider = FakeProvider(Path(), TestClock())
+        self.controller = box.HanaController(Path(), Path(), Path(), self.provider)
+        self.assignment = placement.PlacementAssignment('', '', placement.PlacementDestination(
+            'ssh', 'fixture', 'fixture-hana', claim_state.RepositoryScope('hana', KEY, 1), 1),
+            placement.SourceKeyKnown('source'), placement.SubmittingOwner('', 0, ''), OwningSession('fixture-session'), 0)
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(mock.patch.object(subprocess, 'run', side_effect=git_only))
+        self.workload = self.root / 'hana_aws.conf'
+        install_hana_spending_settings(self.workload)
+        _ = write_config_fixture(self.workload,
+            f'host=fixture-hana\nexecution_transport=hana-control\nrepository_identity={KEY}\nkinds=check,lint\n'
+            + f'# whole: 1..5\npreview_max_age_s={PREVIEW_SECONDS}\n'
+            + 'max_steps=1\nfree_floor_gib=30\nidle_stop_seconds=600\nstart_timeout_seconds=120\n'
+            + 'tick_interval_s=5\ncontroller_tick_timeout_s=45\n')
+        self.clock = TestClock()
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'private inventory', True))
+        book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'private account inventory'))
+        self.provider = FakeProvider(self.state, self.clock)
+        self.controller = box.HanaController(self.state, self.settings, self.workload, self.provider, clock=self.clock)
+        self.controller.register(IDENTITY)
+        self.target = target_config.SshTarget('fixture', 'linux', self.workload)
+        targets = (self.target, target_config.LocalTarget('natedev', 'linux'))
+        _ = self.enterContext(mock.patch.object(target_config, 'read_targets', return_value=targets))
+        _ = self.enterContext(mock.patch.object(build_targets, 'read_targets', return_value=targets))
+        _ = self.enterContext(mock.patch.object(eligibility, 'repository_identity',
+            return_value=eligibility.KnownRepository('hana', KEY)))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {'BUILD_TARGETS_STATE_DIR': str(self.root / 'targets')})))
+        _ = cast(object, self.enterContext(mock.patch.object(adapter, 'controller_for', return_value=self.controller)))
+        start = process_start.process_start(os.getpid())
+        assert isinstance(start, process_start.Started)
+        self.holder = placement.ClaimHolderIdentity(store.host_name(), os.getpid(), start.start)
+        self.assignment = replace(self.assignment, episode='fixture-episode', attempt='fixture-attempt',
+            owner=placement.SubmittingOwner(self.holder.host, self.holder.pid, self.holder.start_time), since=float(self.clock.now))
+
+    def claim(self) -> hana.HanaClaimResult:
+        return hana.claim_assigned(self.assignment, self.holder, self.controller, worktree=str(self.root))
+
+    def ready(self) -> hana.HanaClaimAdopted:
+        self.assertIsInstance(self.claim(), hana.HanaClaimPending)
+        for _step in range(4):
+            self.clock.advance(1)
+            _ = self.controller.tick()
+        result = self.claim()
+        assert isinstance(result, hana.HanaClaimAdopted), result
+        return result
+
+    def request(self, *, step: str = 'check', command: tuple[str, ...] = ('cargo', 'check')) -> wire.PlacementRequest:
+        constraints = placement.PlacementConstraints(self.assignment.source_key, command, str(self.root), 'hana',
+            self.assignment.session, (placement.PlacementCandidate(self.assignment.destination),), command_kind='check')
+        profile = records.StepProfile('hana', step, str(self.root), records.ExpectedPeak(1024, 'fallback', 0))
+        return wire.PlacementRequest(self.assignment.episode, self.assignment.owner, self.assignment.since, profile, constraints)
+
+    def evidence(self, request: wire.PlacementRequest) -> placement.HostEvidence:
+        key = placement.HostEvidenceKey(self.assignment.destination, request.constraints.session,
+            request.constraints.command, 'fixture-config', str(self.root), 'hana', request.profile.step, command_kind='check')
+        with mock.patch('time.time', self.clock), mock.patch('time.monotonic', self.clock):
+            return hana.read_evidence(key, request)
+
+    def eligibility(self) -> placement.HostEligibility:
+        evidence = self.evidence(self.request())
+        assert isinstance(evidence, placement.FreshHostEvidence)
+        return evidence.eligibility
+
+    @contextmanager
+    def preview_calls(self) -> Generator[list[int]]:
+        calls: list[int] = []
+        preview = hana_spend.HanaSpending.preview_start
+
+        def count(spending: hana_spend.HanaSpending, now: int, expires: int
+                  ) -> hana_spend.StartAffordable | hana_spend.PermitRefused:
+            calls.append(now)
+            return preview(spending, now, expires)
+
+        with mock.patch.object(hana_spend.HanaSpending, 'preview_start', count):
+            yield calls
+
+    def test_transport_selects_hana_without_ssh_settings(self) -> None:
+        self.assertEqual(target_config.read_execution_transport(self.target), hana.HanaControlTransport(self.workload, 'fixture-hana'))
+        text_setting(self.workload, 'execution_transport', 'ssh')
+        self.assertEqual(target_config.read_execution_transport(self.target), hana.SshCommandTransport(self.workload))
+
+    def test_unknown_transport_and_mac_hana_refuse(self) -> None:
+        with self.assertRaises(conf.Unusable):
+            _ = target_config.read_execution_transport(replace(self.target, platform='macos'))
+        text_setting(self.workload, 'execution_transport', 'unknown')
+        with self.assertRaises(conf.Unusable):
+            _ = target_config.read_execution_transport(self.target)
+
+    def test_disabled_and_wrong_repository_create_no_provider_calls(self) -> None:
+        text_setting(self.workload, 'enabled', 'off')
+        self.assertEqual(hana.fixed_policy(hana.HanaControlTransport(self.workload, 'fixture-hana'), str(self.root), 'check'),
+            hana.HanaStepRefused('off'))
+        text_setting(self.workload, 'enabled', 'on')
+        with mock.patch.object(eligibility, 'repository_identity', return_value=eligibility.KnownRepository('hana', 'wrong-origin')):
+            self.assertEqual(hana.fixed_policy(hana.HanaControlTransport(self.workload, 'fixture-hana'), str(self.root), 'check'),
+                hana.HanaStepRefused('repo'))
+        self.assertEqual(self.provider.calls, [])
+
+    def test_only_judgments_pass_original_profile_and_command_checks(self) -> None:
+        cases = [('mend', 'lint', ('cargo', 'clippy')), ('clippy', 'lint', ('cargo', 'clippy', '--fix')),
+            ('clippy', 'lint', ('cargo', 'clippy', '--fix=true')), ('check', 'check', ('sh', '-c', 'cargo check')),
+            ('check', 'check', ('cargo', 'check', '--config=x')), ('final', 'final', ('cargo', 'check')),
+            ('nextest', 'test', ('cargo', 'nextest', 'run')), ('build', 'build', ('cargo', 'build'))]
+        for step, kind, command in cases:
+            with self.subTest(step=step, command=command):
+                self.assertIsInstance(hana.classify_command(step, kind, command), hana.HanaStepRefused)
+        self.assertIsInstance(hana.classify_command('check', 'check', ('cargo', '+nightly', 'check')), hana.HanaCheck)
+        self.assertIsInstance(hana.classify_command('clippy', 'lint', ('cargo', 'clippy', '--', '-Dwarnings')), hana.HanaClippyJudgment)
+
+    def test_fixed_candidates_preserve_order_and_use_one_slot_without_ssh(self) -> None:
+        with mock.patch.object(eligibility, 'read_config', side_effect=AssertionError('No SSH settings')):
+            constraints = build_targets.fixed_placement_constraints(self.root, 'hana', 'check', ('cargo', 'check'),
+                self.assignment.session, 'source')
+        self.assertEqual([item.destination.target for item in constraints.candidates], ['fixture', 'natedev'])
+        self.assertEqual(constraints.candidates[0].destination, self.assignment.destination)
+        self.assertIsInstance(constraints.candidates[0].eligibility, placement.AllowedHost)
+
+    def test_disallowed_workloads_remain_excluded_when_pinned(self) -> None:
+        from scripts.direct.step_selection import Pinned
+        for kind in ('test', 'build', 'final'):
+            with self.subTest(kind=kind):
+                constraints = build_targets.fixed_placement_constraints(self.root, 'hana', cast(placement.CommandKind, kind),
+                    ('cargo', 'check'), self.assignment.session, 'source', selection=Pinned('fixture'))
+                self.assertIsInstance(constraints.candidates[0].eligibility, placement.FixedExclusion)
+                self.assertEqual(constraints.candidates[0].eligibility, placement.FixedExclusion('command'))
+                self.assertIsInstance(placement.retry_decision(constraints.candidates[0].destination, 'command', 0), placement.DoNotRetry)
+
+    def test_claim_is_exact_and_busy_across_worktrees(self) -> None:
+        first = self.claim()
+        self.assertIsInstance(first, hana.HanaClaimPending)
+        self.assertEqual(self.claim(), first)
+        second = replace(self.assignment, episode='other', attempt='other')
+        self.assertEqual(hana.claim_assigned(second, self.holder, self.controller), hana.HanaClaimRefused('Hana is busy'))
+        self.assertEqual(self.provider.calls, [])
+
+    def test_claim_rejects_wrong_slot_source_session_and_holder(self) -> None:
+        variants = [replace(self.assignment, destination=replace(self.assignment.destination, slot=2)),
+            replace(self.assignment, source_key=placement.SourceKeyUnavailable('missing')),
+            replace(self.assignment, destination=replace(self.assignment.destination, host='other'))]
+        for assignment in variants:
+            self.assertIsInstance(hana.claim_assigned(assignment, self.holder, self.controller), hana.HanaClaimRefused)
+        self.assertIsInstance(hana.claim_assigned(self.assignment, replace(self.holder, start_time='wrong'), self.controller), hana.HanaClaimRefused)
+        _ = self.claim()
+        self.assertIsInstance(hana.claim_assigned(replace(self.assignment, session=OwningSession('other')), self.holder, self.controller), hana.HanaClaimRefused)
+
+    def test_start_timeout_retains_exact_capacity(self) -> None:
+        pending = self.claim()
+        assert isinstance(pending, hana.HanaClaimPending)
+        self.clock.advance(121)
+        self.assertFalse(self.controller.release(pending.reference.claim_id))
+        self.assertEqual(self.claim(), pending)
+
+    def test_placement_releases_only_a_dead_claim_after_lifecycle_abandonment(self) -> None:
+        from scripts.aws_target import hana_execution
+
+        pending = self.claim()
+        assert isinstance(pending, hana.HanaClaimPending)
+        other = replace(self.request(), episode='other')
+        self.clock.advance(1)
+        self.assertEqual(self.controller.tick(), box.Lifecycle.STARTING)
+        with mock.patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+            evidence = self.evidence(other)
+            assert isinstance(evidence, placement.FreshHostEvidence)
+            self.assertEqual(evidence.eligibility, placement.TemporaryExclusion('busy'))
+            self.clock.advance(1)
+            self.assertEqual(self.controller.tick(), box.Lifecycle.IDLE_STOPPED)
+        evidence = self.evidence(other)
+        assert isinstance(evidence, placement.FreshHostEvidence)
+        self.assertEqual(evidence.eligibility, placement.TemporaryExclusion('busy'))
+        with mock.patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+            evidence = self.evidence(other)
+        assert isinstance(evidence, placement.FreshHostEvidence)
+        self.assertIsInstance(evidence.eligibility, placement.AllowedHost)
+        self.assertEqual(claim_state.read_claims(claim_state.state_paths('fixture')), ())
+        self.assertIsInstance(hana_execution.read_claim_execution(self.state, pending.reference),
+                              placement.ExecutionNotStarted)
+
+    def test_failed_boot_never_recommits_demand_for_the_same_assignment(self) -> None:
+        pending = self.claim()
+        assert isinstance(pending, hana.HanaClaimPending)
+        with (mock.patch.object(self.controller, 'claim_status', return_value=box.ClaimRefused('boot failed')),
+                mock.patch.object(self.controller, 'request', side_effect=AssertionError('Do not restart the failed boot'))):
+            self.assertEqual(self.claim(), hana.HanaClaimRefused('boot failed'))
+
+    def test_settled_attempt_cannot_commit_another_lifecycle_claim(self) -> None:
+        from scripts.aws_target import hana_execution
+        with (mock.patch.object(hana_execution, 'execution_command_settled', return_value=True),
+                mock.patch.object(self.controller, 'request', side_effect=AssertionError('Do not reuse a settled attempt'))):
+            self.assertIsInstance(self.claim(), hana.HanaClaimRefused)
+
+    def test_refused_assignment_release_preserves_another_worktree_claim(self) -> None:
+        _ = self.claim()
+        second = replace(self.assignment, episode='other', attempt='other')
+        from scripts.aws_target import hana_execution
+        before = self.controller.path.read_bytes()
+        with mock.patch.object(hana_execution, 'execution_command_settled', return_value=True):
+            self.assertTrue(hana.release_assigned(second, self.holder, self.controller))
+        self.assertEqual(self.controller.path.read_bytes(), before)
+        self.assertEqual(len(claim_state.read_claims(claim_state.state_paths('fixture'))), 1)
+
+    def test_adoption_and_renewal_keep_the_boot_generation(self) -> None:
+        adopted = self.ready()
+        self.clock.advance(1)
+        _ = self.controller.tick()
+        repeated = self.claim()
+        assert isinstance(repeated, hana.HanaClaimAdopted)
+        self.assertEqual(repeated.generation, adopted.generation)
+        self.assertEqual(repeated.reserved.claim.generation, hana.generation_text(adopted.generation))
+        self.assertNotEqual(hana.generation_text(replace(adopted.generation, boot_id='another')), repeated.reserved.claim.generation)
+
+    def test_evidence_never_calls_provider_or_ssh(self) -> None:
+        adopted = self.ready()
+        before = len(self.provider.calls)
+        with mock.patch.object(eligibility, 'read_config', side_effect=AssertionError('No SSH settings')):
+            evidence = self.evidence(self.request())
+        assert isinstance(evidence, placement.FreshHostEvidence)
+        self.assertIn(adopted.reserved.claim, evidence.claims)
+        snapshot = self.controller.inspect()
+        assert isinstance(snapshot, hana.HanaLifecycleEvidence)
+        self.assertEqual(evidence.observed_at, snapshot.observed_at)
+        self.assertEqual(len(self.provider.calls), before)
+
+    def test_mend_and_unreadable_journals_refuse_evidence(self) -> None:
+        mend = self.evidence(self.request(step='mend'))
+        assert isinstance(mend, placement.FreshHostEvidence)
+        self.assertEqual(mend.eligibility, placement.FixedExclusion('command'))
+        _ = self.controller.path.write_text('{')
+        self.assertIsInstance(self.evidence(self.request()), placement.HostEvidenceUnavailable)
+
+    def test_spending_preview_matches_reservation_without_saving(self) -> None:
+        book = ledger.CostLedger(self.state)
+        spending = hana_spend.HanaSpending(book, self.settings, hana_spend.read_settings(conf.read(self.workload)))
+        before = book.path.read_bytes()
+        launches = book.launches
+        history_reads: list[int] = []
+
+        def count_launches() -> tuple[dict[str, object], ...]:
+            history_reads.append(1)
+            return launches()
+
+        with mock.patch.object(book, 'launches', count_launches):
+            preview = spending.preview_start(self.clock.now, self.clock.now + 1800)
+        self.assertEqual(history_reads, [1])
+        self.assertIsInstance(preview, hana_spend.StartAffordable)
+        self.assertEqual(book.path.read_bytes(), before)
+        self.assertIsInstance(spending.reserve_start(self.clock.now, self.clock.now + 1800), hana_spend.StartReserved)
+        self.assertIsInstance(spending.preview_start(self.clock.now, self.clock.now + 1800), hana_spend.PermitRefused)
+
+    def test_distinct_probes_share_one_preview_until_it_expires(self) -> None:
+        first = self.clock.now
+        with self.preview_calls() as calls:
+            for index in range(10):
+                evidence = self.evidence(replace(self.request(), episode=f'fixture-episode-{index}'))
+                assert isinstance(evidence, placement.FreshHostEvidence)
+                self.assertEqual(evidence.eligibility, placement.AllowedHost())
+            self.clock.advance(PREVIEW_SECONDS - 1)
+            self.assertEqual(self.eligibility(), placement.AllowedHost())
+            self.assertEqual(calls, [first])
+            self.clock.advance(1)
+            self.assertEqual(self.eligibility(), placement.AllowedHost())
+            self.assertEqual(calls, [first, first + PREVIEW_SECONDS])
+
+    def test_ledger_change_refreshes_an_allowed_preview(self) -> None:
+        book = ledger.CostLedger(self.state)
+        settings = hana_spend.read_settings(conf.read(self.workload))
+        spending = hana_spend.HanaSpending(book, self.settings, settings)
+        with self.preview_calls() as calls:
+            self.assertEqual(self.eligibility(), placement.AllowedHost())
+            self.assertIsInstance(spending.reserve_start(self.clock.now, self.clock.now + settings.permit_max_seconds),
+                                  hana_spend.StartReserved)
+            self.assertEqual(self.eligibility(), placement.TemporaryExclusion('Confirm the previous stop before another start'))
+            self.assertEqual(len(calls), 2)
+
+    def test_refusal_is_shared_until_spending_configuration_changes(self) -> None:
+        text_setting(self.workload, 'daily_budget_usd', '0.01')
+        with self.preview_calls() as calls:
+            for _probe in range(3):
+                self.assertEqual(self.eligibility(), placement.TemporaryExclusion('hana_daily_budget_usd'))
+            self.assertEqual(len(calls), 1)
+            text_setting(self.workload, 'daily_budget_usd', '6')
+            self.assertEqual(self.eligibility(), placement.AllowedHost())
+            self.costs({'daily_limit_usd': '0.01', 'limit_reserve_usd': '0'})
+            self.assertEqual(self.eligibility(), placement.TemporaryExclusion('daily_limit'))
+            self.assertEqual(len(calls), 3)
+
+    def test_preview_does_not_cache_a_budget_recovered_from_git(self) -> None:
+        lines = self.workload.read_text().splitlines(keepends=True)
+        _ = self.workload.write_text(''.join(line for line in lines if not line.startswith('daily_budget_usd=')))
+        recovered = [iter(('daily_budget_usd=0.01\n',)), iter(('daily_budget_usd=6\n',))]
+        with self.preview_calls() as calls, redirect_stderr(StringIO()):
+            with mock.patch.object(conf, '_committed_files', side_effect=recovered) as history:
+                self.assertEqual(self.eligibility(), placement.TemporaryExclusion('hana_daily_budget_usd'))
+                self.assertEqual(self.eligibility(), placement.AllowedHost())
+        self.assertEqual(history.call_args_list, [mock.call(self.workload)] * 2)
+        self.assertEqual(calls, [self.clock.now] * 2)
+
+    def test_history_and_lifecycle_writes_refresh_the_preview(self) -> None:
+        history = ledger.CostLedger(self.state).launch_history_path
+        with self.preview_calls() as calls:
+            self.assertEqual(self.eligibility(), placement.AllowedHost())
+            _ = history.write_text('{}\n')
+            self.assertEqual(self.eligibility(), placement.AllowedHost())
+            write_text_atomic(self.controller.path, self.controller.path.read_text())
+            self.assertEqual(self.eligibility(), placement.AllowedHost())
+            self.assertEqual(len(calls), 3)
+
+    def test_bill_creation_and_update_refresh_the_preview(self) -> None:
+        end = self.clock.now // 86400 * 86400
+        day = datetime.fromtimestamp(end - 86400, UTC).date().isoformat()
+        bill = ledger.ChargeRead(day, self.clock.now, end - 86400, end, Decimal(0), Decimal(0), Decimal(0))
+        directory = self.state / 'charges'
+        directory.mkdir()
+        path = directory / f'{day}.json'
+        with self.preview_calls() as calls:
+            self.assertEqual(self.eligibility(), placement.AllowedHost())
+            _ = path.write_text(json.dumps(ledger.charge_record(bill)))
+            self.assertEqual(self.eligibility(), placement.AllowedHost())
+            _ = path.write_text(json.dumps(ledger.charge_record(replace(bill, actual_usd=Decimal(1)))))
+            self.assertEqual(self.eligibility(), placement.AllowedHost())
+            self.assertEqual(len(calls), 3)
+
+    def test_provider_start_rechecks_spending_after_an_allowed_preview(self) -> None:
+        self.assertEqual(self.eligibility(), placement.AllowedHost())
+        self.assertIsInstance(self.claim(), hana.HanaClaimPending)
+        check_start = hana_spend.HanaSpending.check_start
+        checked: list[hana_spend.StartReserved | hana_spend.PermitRefused] = []
+
+        def check(spending: hana_spend.HanaSpending, now: int, generation: int
+                  ) -> hana_spend.StartReserved | hana_spend.PermitRefused:
+            self.assertEqual(spending.book.read_snapshot().hana_compute[0].generation, generation)
+            self.costs({'daily_limit_usd': '0.01', 'limit_reserve_usd': '0'})
+            result = check_start(spending, now, generation)
+            checked.append(result)
+            return result
+
+        with mock.patch.object(hana_spend.HanaSpending, 'check_start', check):
+            _ = self.controller.tick()
+        self.assertEqual(checked, [hana_spend.PermitRefused('daily_limit')])
+        self.assertEqual(self.provider.calls, [])
+
+    def test_inspection_keeps_unreadable_and_unprovisioned_distinct(self) -> None:
+        self.controller.path.unlink()
+        self.assertIsInstance(self.controller.inspect(), hana.HanaUnprovisioned)
+        _ = self.controller.path.write_text('{}')
+        self.assertIsInstance(self.controller.inspect(), hana.HanaLifecycleUnavailable)
+
+    def test_release_requires_durable_fence_and_exact_holder(self) -> None:
+        adopted = self.ready()
+        self.assertFalse(hana.release_assigned(self.assignment, self.holder, self.controller))
+        from scripts.aws_target import hana_execution
+        with mock.patch.object(hana_execution, 'execution_command_settled', return_value=True):
+            self.assertFalse(hana.release_assigned(self.assignment, replace(self.holder, start_time='wrong'), self.controller))
+            self.assertTrue(hana.release_assigned(self.assignment, self.holder, self.controller))
+            self.assertTrue(hana.release_assigned(self.assignment, self.holder, self.controller))
+        self.assertEqual(claim_state.read_claims(claim_state.state_paths('fixture')), ())
+        self.assertEqual(adopted.reserved.claim.reference.claim_id, placement.assigned_claim_id('fixture-episode', 'fixture-attempt'))
+
+    def test_generation_import_is_guest_safe(self) -> None:
+        code = "import sys; from scripts.aws_target.hana_placement import HanaHostGeneration; assert 'scripts.aws_target.hana_provider' not in sys.modules"
+        result = subprocess.CompletedProcess[str]([], 0)
+        # Use the real interpreter because the fixture refuses non-Git commands.
+        from scripts.aws_target.ledger_test_support import REAL_RUN
+        result = REAL_RUN([sys.executable, '-E', '-c', code], cwd=REPOSITORY, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_only_an_exact_current_assignment_establishes_a_remote_waiter(self) -> None:
+        from scripts.build_hold import build_hold, hold_enforcer
+        from scripts.build_queue import admission_service
+        _ = self.ready()
+        key = placement.attempt_key(self.assignment.episode, self.assignment.attempt)
+        saved = records.SavedPlacementAssignment(self.assignment)
+        state = admission_service.ServiceState({}, {}, {}, records.ReadyToStart(),
+            assignments={key: saved}, current_assignments={self.assignment.episode: key})
+        with (mock.patch.object(admission_service, 'read_state', return_value=state),
+                mock.patch.object(hold_enforcer, 'remote_step_callers', return_value=frozenset()),
+                mock.patch.object(build_hold, 'process_start_time', return_value=self.holder.start_time)):
+            claims = hold_enforcer.claimed_processes(self.root / 'proc')
+            assert isinstance(claims, build_hold.LiveClaims)
+            self.assertEqual(claims.remote_waiters, frozenset({build_hold.ProcessIdentity(self.holder.pid, self.holder.start_time)}))
+            state.assignments[key] = replace(saved, state=placement.ClosedAssignment('completed'))
+            claims = hold_enforcer.claimed_processes(self.root / 'proc')
+            assert isinstance(claims, build_hold.LiveClaims)
+            self.assertEqual(claims.remote_waiters, frozenset())
+            self.assertEqual(claims.identities, frozenset({build_hold.ProcessIdentity(self.holder.pid, self.holder.start_time)}))

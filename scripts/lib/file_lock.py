@@ -5,8 +5,10 @@ import fcntl
 import os
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 
 PROC_LOCKS = "/proc/locks"
@@ -17,6 +19,38 @@ PROC_LOCKS_READS = 3
 class LockResult(Enum):
     ACQUIRED = "acquired"
     BUSY = "busy"
+
+
+@dataclass(frozen=True)
+class ExclusiveLock:
+    """Own a locked descriptor that a child can inherit."""
+
+    descriptor: int
+
+    def close(self) -> None:
+        """Close this handle without releasing a child's inherited lock."""
+        os.close(self.descriptor)
+
+    def release(self) -> None:
+        """Release the shared lock and close this handle."""
+        try:
+            fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+        finally:
+            self.close()
+
+
+def take_exclusive(path: Path) -> ExclusiveLock | Literal[LockResult.BUSY]:
+    """Acquire a lock without waiting; transfer its ownership to the caller."""
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        return LockResult.BUSY
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return ExclusiveLock(descriptor)
 
 
 @contextmanager

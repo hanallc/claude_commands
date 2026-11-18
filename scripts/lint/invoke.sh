@@ -163,6 +163,12 @@ buildlog_step_compiles() {
 }
 
 buildlog_exec() {
+    local BUILDLOG_RESERVED_STEP="${BUILDLOG_RESERVED_STEP:-}"
+    if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" ]]; then
+        printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
+            "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}"
+        export BUILDLOG_RESERVED_STEP
+    fi
     if [[ -z "${BUILDLOG_PEAK:-}" ]]; then
         "$@"
         return
@@ -384,9 +390,15 @@ cargo_seed_before_step() {
 }
 
 run_step_attempt() {
+    buildlog_check_nested_step || return $?
     if [[ -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
         build_check_stop 2 'a prior admission or hold check failed'
         return 2
+    fi
+    # The dev shell's programs reach this step only; the next step starts from the caller's PATH.
+    local PATH=$PATH
+    if [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then
+        lint_dev_shell_path || return $?
     fi
     printf '+ %s\n' "$*"
     if buildlog_step_compiles "$@"; then
@@ -737,6 +749,23 @@ lint_prebuild_prefix() {
             return 0
         fi
     done < "$manifest"
+}
+
+# A test can need a program that the workspace's flake development shell
+# declares (SpacetimeDB for hana_catalyst). verify.sh on natedev runs inside
+# that shell; the Mac route and a bare lint call do not. Outside a nix shell,
+# dev_shell.py prints the shell's program folders, and the step adds them to
+# the END of PATH, so every tool the host has stays first. A workspace without
+# flake.nix, or a step inside a nix shell, starts no process. The evaluation
+# is cached per flake input change; a failed one fails the step.
+lint_dev_shell_path() {
+    local root=${LINT_WORKSPACE_MANIFEST:-$PWD/Cargo.toml} folders
+    root=${root%/*}
+    [[ -z "${IN_NIX_SHELL:-}" && -f "$root/flake.nix" ]] || return 0
+    # On a failure the helper prints the one line that names the cause.
+    folders=$("${BUILD_FOLDERS_SCRIPT%/*}/py" "${BUILD_FOLDERS_SCRIPT%/*}/dev_shell.py" path --root "$root") ||
+        return 1
+    [[ -z "$folders" ]] || PATH="$PATH:$folders"
 }
 
 run_nextest() {

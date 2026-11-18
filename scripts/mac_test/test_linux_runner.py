@@ -1689,7 +1689,8 @@ class LinuxProcessTests(unittest.TestCase):
         fields = ["S", "1", "900", *(["0"] * 16), "123"]
         marker = self.mirror / ".linux-run.json"
 
-        def fail_shell(*_arguments: object) -> linux_runner.ShellEnvironment:
+        def fail_shell(*_arguments: object, pass_fds: tuple[int, ...]) -> linux_runner.ShellEnvironment:
+            self.assertEqual(pass_fds, linux_runner.execution_descriptors())
             lease = linux_runner.read_slot_run(marker)
             self.assertNotIsInstance(lease, linux_runner.UnmarkedSlot)
             if not isinstance(lease, linux_runner.UnmarkedSlot):

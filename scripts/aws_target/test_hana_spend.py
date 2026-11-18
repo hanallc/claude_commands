@@ -3,43 +3,33 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
 import json
-from pathlib import Path
 import subprocess
 from typing import cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.aws_target import config, hana_spend, ledger
-from scripts.aws_target.ledger_test_support import CostFixture, git_only, instant, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, instant
 from scripts.lib import conf
 
 
-REPOSITORY = Path(__file__).resolve().parents[2]
-
-
 class HanaSpendTests(CostFixture):
-    book: ledger.CostLedger = ledger.CostLedger(Path())
-    controller: hana_spend.HanaSpending
-    workload: hana_spend.PermitSettings
+    book: ledger.CostLedger  # pyright: ignore[reportUninitializedInstanceVariable]
+    controller: hana_spend.HanaSpending  # pyright: ignore[reportUninitializedInstanceVariable]
+    workload: hana_spend.PermitSettings  # pyright: ignore[reportUninitializedInstanceVariable]
     start: int = instant('2026-01-15T00:00:00+00:00')
-
-    def __init__(self, methodName: str = 'runTest'):
-        super().__init__(methodName)
-        self.workload = hana_spend.read_settings(conf.read(REPOSITORY / 'config/hana_aws.conf'))
-        self.controller = hana_spend.HanaSpending(self.book, Path(), self.workload)
 
     @override
     def setUp(self) -> None:
         super().setUp()
         _ = self.enterContext(mock.patch.object(subprocess, 'run', side_effect=git_only))
         private = self.root / 'hana_aws.conf'
-        _ = private.write_text((REPOSITORY / 'config/hana_aws.conf').read_text())
-        text_setting(private, 'enabled', 'on')
+        install_hana_spending_settings(private)
         self.workload = hana_spend.read_settings(conf.read(private))
-        account = conf.read(REPOSITORY / 'config/aws_target.conf')
-        self.costs({'daily_limit_usd': account.text('daily_limit_usd'), 'limit_reserve_usd': '0'})
+        self.costs({'daily_limit_usd': '35', 'limit_reserve_usd': '0'})
         self.book = ledger.CostLedger(self.state)
         self.book.record_inventory(ledger.ResourceInventory(self.start, (), 'private inventory', builder_removed=True))
         self.book.observe(ledger.InstanceObservation(self.start, 'terminated', 'private account inventory'))
@@ -71,13 +61,42 @@ class HanaSpendTests(CostFixture):
 
     def test_gate_spend_and_hana_share_the_unchanged_account_limit(self) -> None:
         account = config.read_settings(self.settings)
-        self.assertEqual(account.daily_limit_usd, conf.decimal(conf.read(REPOSITORY / 'config/aws_target.conf').text('daily_limit_usd')))
+        self.assertEqual(account.daily_limit_usd, Decimal('35'))
         storage = self.workload.storage_usd_per_month / 30
         gate = ledger.GateReservation('private-gate', self.start, self.start + 3600,
             account.daily_limit_usd - storage / 2, Decimal(0), instance_type=account.instance_type, region=self.workload.region)
         self.assertIsInstance(self.book.reserve_gate(self.settings, gate), ledger.GateReserved)
         self.assertEqual(self.issue(self.start), hana_spend.PermitRefused('daily_limit'))
         self.assertEqual(self.book.read_snapshot().hana_compute, [])
+        self.assertEqual(config.read_settings(self.settings).daily_limit_usd, account.daily_limit_usd)
+
+    def test_check_start_refuses_after_a_gate_launch_appears_during_pricing(self) -> None:
+        self.costs({'daily_limit_usd': '5', 'limit_reserve_usd': '0'})
+        day = self.start - 86400
+        bill = ledger.ChargeRead(datetime.fromtimestamp(day, UTC).date().isoformat(), self.start,
+            day, self.start, Decimal(10), Decimal(0), Decimal(0),
+            (ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal(10), Decimal(1), 'Hrs'),))
+        charges = self.state / 'charges'
+        charges.mkdir()
+        _ = (charges / f'{bill.day}.json').write_text(json.dumps(ledger.charge_record(bill)))
+        gate = ledger.GateReservation('private-gate', self.start, self.start + 3600,
+            Decimal(1), Decimal(0), instance_type='m7a.4xlarge', region='us-east-2')
+        self.assertIsInstance(self.book.reserve_gate(self.settings, gate), ledger.GateReserved)
+        generation = self.issued(self.start).exposure.generation
+        self.assertIsInstance(self.controller.check_start(self.start, generation), hana_spend.StartReserved)
+        history = self.state / 'cloud-gate-launches.jsonl'
+        launches = self.book.launches
+
+        def read_launches() -> tuple[dict[str, object], ...]:
+            rows = launches()
+            if not rows:
+                _ = history.write_text(json.dumps({'attempt': gate.attempt, 'time': self.start,
+                    'instance_type': 'm7a.8xlarge', 'result': 'launched'}) + '\n')
+            return rows
+
+        with mock.patch.object(self.book, 'launches', side_effect=read_launches) as pricing_reads:
+            self.assertEqual(self.controller.check_start(self.start, generation), hana_spend.PermitRefused('daily_limit'))
+        self.assertEqual(pricing_reads.call_count, 2)
 
     def test_renewal_extends_exposure_then_refusal_preserves_the_old_deadline(self) -> None:
         first = self.issued(self.start)
@@ -89,6 +108,14 @@ class HanaSpendTests(CostFixture):
         result = self.issue(self.start + 2, generation=renewed.exposure.generation)
         self.assertEqual(result, hana_spend.PermitRefused('hana_daily_budget_usd'))
         self.assertEqual(self.book.read_snapshot().hana_compute, [renewed.exposure])
+
+    def test_renewal_retains_the_original_machine_type_and_region(self) -> None:
+        first = self.issued(self.start)
+        self.controller.settings = replace(self.workload, region='us-west-2', instance_type='fixture-other-type')
+        renewed = self.issued(self.start + 1, generation=first.exposure.generation)
+        self.assertEqual(first.exposure.region, self.workload.region)
+        self.assertEqual(renewed.exposure.region, first.exposure.region)
+        self.assertEqual(renewed.exposure.instance_type, first.exposure.instance_type)
 
     def test_unconfirmed_stop_retains_full_exposure_after_expiry(self) -> None:
         issued = self.issued(self.start)

@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from typing import ContextManager
 
 from scripts.lib import build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository
 
@@ -46,6 +46,15 @@ class BuildFolderTests(unittest.TestCase):
             "STAFF_FILE": str(self.root / "staff.json"),
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "",
         })))
+        _ = write_config_fixture(config / "build_folders.conf",
+            "patterns.temporary={repository}/{owner}-{purpose}-{suffix}\npatterns.gate={purpose}-{suffix}\n"
+            + "patterns.standing={repository}/{owner}-gate{suffix}\npatterns.editable={repository}-{owner}/{purpose}\n"
+            + "patterns.mirror={repository}/{owner}-s{slot}\npatterns.target={purpose}\npatterns.shell-cache={repository}\n"
+            + "patterns.scratch={purpose}-{suffix}\npatterns.legacy-unique={purpose}{suffix}\n"
+            + "patterns.legacy-stable={purpose}\nnames.repository_key_length=8\n"
+            + "patterns.tool={purpose}{suffix}\npatterns.named={showrunner}-{unit}/{work}-{purpose}\n"
+            + "prefixes.verify-hold=verify-hold.{owner}.\nprefixes.admit-test=admit-test-\n")
+        _ = write_config_fixture(config / "scratch.conf", "suffix_length=6\n")
 
     def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(Path(folders.__file__)), *arguments],
@@ -996,6 +1005,22 @@ print('signals')
         self.assertFalse(path.with_name(path.name + ".lock").exists())
         self.assertFalse(path.with_name(path.name + ".lease.json").exists())
 
+    def test_removal_calls_cleanup_without_creating_an_absent_parent(self) -> None:
+        path = self.root / "absent-parent" / "tree"
+        for result in (True, False, None):
+            with self.subTest(result=result):
+                cleanup = mock.Mock(return_value=result)
+
+                self.assertEqual(folders.remove_build_folder(path, cleanup), result is not False)
+
+                cleanup.assert_called_once_with()
+                self.assertFalse(path.parent.exists())
+        cleanup = mock.Mock(side_effect=FileNotFoundError("cleanup failed"))
+        with self.assertRaisesRegex(FileNotFoundError, "cleanup failed"):
+            _ = folders.remove_build_folder(path, cleanup)
+        cleanup.assert_called_once_with()
+        self.assertFalse(path.parent.exists())
+
     def test_explicit_names_and_attribution_do_not_use_session_names(self) -> None:
         spec = folders.BuildFolderSpec(kind="temporary", parent=self.root, suffix_length=8,
                                        showrunner="builds", unit="queue", work="bf1", purpose="proof")
@@ -1158,6 +1183,7 @@ assert not loaded, loaded
         self.assertEqual(result.stderr, "")
 
     def test_tmpfs_parent_uses_only_inherited_tmpfs_paths(self) -> None:
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "build_folders.conf", "roots.gate=/dev/shm\n")
         for value, expected in (("/dev/shm/outer/module", Path("/dev/shm/outer/module")),
                                 ("/dev/shm-other", Path("/dev/shm"))):
             with self.subTest(value=value), mock.patch.dict(os.environ, {"TMPDIR": value}):
@@ -1571,15 +1597,24 @@ assert not loaded, loaded
         self.assertRegex(path.name, r"^gate-proof-tree-[a-z0-9]{6}$")
 
     def test_configuration_helper_supplies_missing_files_and_preserves_overrides(self) -> None:
-        config = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
-        original = config.read_text()
+        copied = self.root / "copied-config"
+        _ = config_environment(copied)
+        config = copied / "build_folders.conf"
         config.unlink()
         environment = config_environment(config.parent)
-        self.assertEqual(environment, {"CONF_DIR": str(config.parent)})
+        self.assertEqual(environment, {"CONF_DIR": str(config.parent),
+                                       "BUILD_TARGETS_CONFIG": str(config.parent / "build_targets.conf")})
         sources = Path(__file__).resolve().parents[2] / "config"
         for source in sources.glob("*.conf"):
-            if source.name != "build_admission.conf":
-                self.assertEqual((config.parent / source.name).read_bytes(), source.read_bytes())
+            private = config.parent / source.name
+            if source.name == "build_admission.conf":
+                shipped = conf.read(source).values()
+                self.assertEqual(conf.read(private).values(), shipped | {"min_pass_gap_seconds": "0"})
+            else:
+                self.assertEqual(private.read_bytes(), source.read_bytes())
+        _ = write_config_fixture(config, "prefixes.admit-test=admit-test-\nroots.system=/tmp\n")
+        original = config.read_text()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         self.assertEqual(folders.FOLDER_PREFIXES["admit-test"], "admit-test-")
         with folders.temporary_build_folder(folders.UniqueBuildFolder("probe-", folders.SystemTemporaryParent())) as path:
             self.assertEqual(path.parent, Path("/tmp"))
@@ -1607,8 +1642,16 @@ assert not loaded, loaded
     def test_private_config_without_folder_rules_uses_repository_without_git(self) -> None:
         config = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
         original = config.read_text()
+        fallback = self.root / "fallback/build_folders.conf"
+        _ = write_config_fixture(fallback, "prefixes.verify-hold=verify-hold.{owner}.\n", template="build_folders")
         config.unlink()
-        with mock.patch("scripts.lib.conf.subprocess.run", side_effect=AssertionError("Git must not run")):
+        original_path = cast(Callable[[str], Path], getattr(conf, "_repository_path"))
+
+        def repository_path(stem: str) -> Path:
+            return fallback if stem == "build_folders" else original_path(stem)
+
+        with (mock.patch.object(conf, "_repository_path", side_effect=repository_path),
+              mock.patch("scripts.lib.conf.subprocess.run", side_effect=AssertionError("Git must not run"))):
             self.assertEqual(folders.FOLDER_PREFIXES["verify-hold"], "verify-hold.{owner}.")
             path = folders.create_build_folder(folders.UniqueBuildFolder("private-"))
         self.assertTrue(path.is_dir())

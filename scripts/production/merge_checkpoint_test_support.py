@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.change_review_test_support import registered_fixture_image
+
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.production import checkpoint_gate
 
@@ -17,6 +19,7 @@ import fcntl
 import json
 import os
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -316,7 +319,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         home = self.root / "home"
         private = copies_environment(root, repository="origin")
         _ = shutil.copyfile(Path(private["CONF_DIR"]) / "build_folders.conf", root / "build_folders.conf")
-        self.env = {**os.environ, **private, **interpreter_cache_environment(root.parent / "interpreter-cache"), "CONF_DIR": str(self.root), "HOME": str(home), "STAFF_FILE": str(home / ".local/state/staff/staff.json"),
+        self.env = {**os.environ, **private, **interpreter_cache_environment(root.parent / "interpreter-cache"), "CONF_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"), "HOME": str(home), "STAFF_FILE": str(home / ".local/state/staff/staff.json"),
                     "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(root.parent)), "GIT_CONFIG_NOSYSTEM": "1",
                     "MERGE_CHECKPOINT_STYLE_SYNC": str(self.bin / "style_sync.py"),
                     "MERGE_CHECKPOINT_STYLE_LEDGER": str(self.bin / "style_ledger.py"),
@@ -367,12 +370,17 @@ class MergeCheckpointFixture(unittest.TestCase):
             self.executable(self.bin / name, STUB)
         home = self.root / "home"
         (home / "rust/hanadocs/change-review").mkdir(parents=True)
+        home_stubs = self.root / "home-stubs"
+        home_stubs.mkdir()
         for relative, name in ((".claude/scripts/direct", "verify.sh"),
                                (".claude/scripts/validate_and_push", "validate_and_push.sh"),
                                (".claude/scripts/production", "review_regime.py")):
             directory = home / relative
             directory.mkdir(parents=True)
-            self.executable(directory / name, STUB)
+            # Callers start some of these with bash. A Python stub run by bash ran "import json" (ImageMagick),
+            # which waited for a screen click after the test ended. A shell script starts the Python stub.
+            self.executable(home_stubs / name, STUB)
+            self.executable(directory / name, f'#!/bin/sh\nexec {shlex.quote(str(home_stubs / name))} "$@"\n')
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
             _ = fixture_member("showrunner", name="example")
         self.production_doc()
@@ -429,6 +437,8 @@ class MergeCheckpointFixture(unittest.TestCase):
 
     def checkpoint(self, relative: str = "src/alpha.txt", content: str = "alpha change\n",
                    *, subject: str = "alpha work", push: bool = True) -> str:
+        if "image 012345abcdef" in subject:
+            _ = registered_fixture_image(Path(self.env["REVIEW_LINKS_ROOT"]), "012345abcdef")
         self.write(self.unit, relative, content)
         _ = self.git("add", relative, cwd=self.unit)
         _ = self.git("commit", "-m", subject, cwd=self.unit)
@@ -727,6 +737,7 @@ class MergeCheckpointFixture(unittest.TestCase):
 
     def dated_checkpoint(self, message: str) -> str:
         """A checkpoint(...) commit on the unit branch, dated after the Change-Review rule landed."""
+        _ = registered_fixture_image(Path(self.env["REVIEW_LINKS_ROOT"]), "012345abcdef")
         self.write(self.unit, "src/alpha.txt", message)
         _ = self.git("add", "src/alpha.txt", cwd=self.unit)
         _ = subprocess.run(["git", "commit", "-q", "-m", message], cwd=self.unit, check=True,

@@ -238,6 +238,9 @@ Both paths compare the current terminal and process with the identities saved af
 A replacement process remains open. Cleanup prints one anomaly with the pane id.
 
 A new slot takes the parent/name lock before the row lock.
+If a sibling split fails with `pane_not_found`, the start retries once from the parent pane.
+If all siblings disappear before the layout read, the start uses the parent pane when the layout confirms it.
+Other errors and a failed parent split keep the current failure path.
 An existing slot takes the row lock.
 `worker_operation` locks the admitted row.
 For a new slot, it first checks membership under the parent/name lock.
@@ -731,6 +734,8 @@ Detached command records retain their own process and working directory checks.
 The completion hook closes a worker pane after DONE.
 An immediate repair or phase dispatch can retain the pane.
 A live detached run keeps the pass active, so the hook closes no pane until that run ends.
+A live detached run also keeps a stopped worker's pane at the shell, so the Codex capacity stop cannot close it.
+When that run ends, its run-end event closes the stopped pane. The stop report names each pane that stays open.
 The close reads no process. It closes the pane at once.
 Closure keeps the staff row and thread.
 The next assign resumes that thread in a new pane.

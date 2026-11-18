@@ -1,6 +1,7 @@
 """Registration behavior against a private seeded fixture."""
 
 from __future__ import annotations
+from scripts.lint.memory_test_support import config_environment, copy_config_fixture
 
 import json
 import io
@@ -32,6 +33,7 @@ from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.review_links import change_browser, change_page
 from scripts.statusline import counts_row
 from scripts.lib import urgency
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class ProducerQuestionTests(RegistrationFixture):
@@ -44,9 +46,9 @@ class ProducerQuestionTests(RegistrationFixture):
         listing = self.root / "reviews/change-review - example.md"
         _ = self.doc.write_text(self.doc.read_text() + f"- **Change review:** `{listing}`\n")
         config = self.root / "config"
-        _ = shutil.copytree(Path(__file__).parents[2] / "config", config)
+        _ = copy_config_fixture(Path(__file__).parents[2] / 'config', config)
         settings = config / "review_links.conf"
-        _ = settings.write_text(settings.read_text().replace("delivery_pause_seconds=5", "delivery_pause_seconds=0"))
+        _ = write_config_fixture(settings, "delivery_pause_seconds=0\ndelivery_tries=3\n")
         self.env.update({"CLAUDE_CODE_SESSION_ID": self.producer.current_session, "CODEX_THREAD_ID": "",
                          "CHANGE_REVIEW_DIR": str(self.root / "reviews"), "REVIEW_LINKS_ROOT": str(self.root / "links"),
                          "CONF_DIR": str(config)})
@@ -104,7 +106,7 @@ class ProducerQuestionTests(RegistrationFixture):
         self.assertNotIn("No showrunner owns this question.", body)
         instance = self.state / "notifier" / f"showrunner-{self.producer.id}"
         sources: list[Path] = []
-        self.assertEqual(counts_row.row(instance, sources, require_complete=True), ("For you: 1 question", ""))
+        self.assertEqual(counts_row.row(instance, sources, require_complete=True), ("Review: 1 question", ""))
         question = prepared.questions[0].record
         self.assertIn(question.path, sources)
         self.assertIn("Choose the next project?", next_item.show("question", urgency.URGENT, None))
@@ -317,6 +319,8 @@ class QuestionIdentityTests(RegistrationFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.env.update(config_environment(self.root / "fixture-config"))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env)))
         self.issues = self.root / "issues"
         self.issues.mkdir(exist_ok=True)
         self.timer("example")
@@ -404,7 +408,7 @@ class QuestionIdentityTests(RegistrationFixture):
                                                 questions=len(registration.read_open_items(self.outstanding())))
             sources = footer_counts.sources(self.doc)
         self.assertEqual(counts.questions, 1)
-        self.assertEqual(footer_counts.counts_line(counts), "For you: 1 question")
+        self.assertEqual(footer_counts.counts_line(counts), "Review: 1 question")
         for record in self.issues.glob("*.md"):
             self.assertIn(record, sources)
 
@@ -474,7 +478,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(self.outstanding().read_bytes(), original)
         self.migrate()
         rows = self.question_rows()
-        self.assertEqual(rows, [{**legacy, "asked_by": self.asker_id}])
+        self.assertEqual(rows, [{**legacy, "asked_by": self.asker_id, "review_id": "Q1"}])
         remaining: object = cast(object, json.loads(self.outstanding().read_text())) if self.outstanding().exists() else []
         self.assertEqual(remaining, [])
         before = self.store_snapshot()
@@ -534,7 +538,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(self.store_snapshot(), before)
 
     def test_next_keeps_local_items_when_a_remote_child_has_a_local_reminder(self) -> None:
-        self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "Choose the layout"})
+        self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "Choose the layout", "question": "Choose the layout?"})
         parent = staff.by_id(self.asker_id)
         assert parent is not None
         child = fixture_member("showrunner", name="remote-child", parent=parent.parent,

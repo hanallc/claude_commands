@@ -58,6 +58,29 @@ class WaitNotice(io.StringIO):
         return count
 
 
+class ImportTests(unittest.TestCase):
+    def test_import_loads_no_modules_from_unit_labels(self) -> None:
+        program = dedent("""
+            import sys
+            import scripts.copies.copies
+
+            forbidden = {
+                "scripts.message.unit_labels",
+                "scripts.production.showrunners",
+                "scripts.production.session_staff",
+                "scripts.lib.unit_runs",
+            }
+            unwanted = sorted(forbidden.intersection(sys.modules))
+            if unwanted:
+                raise SystemExit("Unexpected imports: " + ", ".join(unwanted))
+        """)
+        result = subprocess.run(
+            [sys.executable, "-c", program], cwd=Path(__file__).resolve().parents[2],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 class StandingTests(unittest.TestCase):
     source_seed: ClassVar[ImmutableGitSeed]
     base: Path = Path()
@@ -104,16 +127,23 @@ class StandingTests(unittest.TestCase):
         temporary.mkdir()
         _ = self.enterContext(mock.patch.object(tempfile, "tempdir", str(temporary)))
         slot_configuration = private_slot_config(self.base, repository="origin", maximum=2, default_maximum=2)
+        configuration = Path(slot_configuration.environment["CONF_DIR"])
+        _ = write_config_fixture(configuration / "build_folders.conf",
+            "patterns.target={purpose}\npatterns.legacy-stable={purpose}\n"
+            + "patterns.editable={repository}-{owner}/{purpose}\n")
+        _ = write_config_fixture(configuration / "build_steps.conf", "names.integrate=integrate\n")
         home = self.base / "home"
         home.mkdir()
         self.configuration = self.base / "copies.conf"
         self.settings = {"root": str(self.base / "configured-gates"),
+                         "owner.verify": "verify",
                          "remote_registry": str(self.base / "remote-mirrors"),
                          "wait_seconds": "0.01", "git_timeout_seconds": "10",
                          "guard_timeout_seconds": "10"}
         self.write_config(self.settings)
+        # A run inside a build slot carries that slot's Cargo cache; the test's gates lease their own.
         environment = {key: value for key, value in os.environ.items()
-                       if not key.startswith("GIT_") and key != "UNIT_RUN_DIR"}
+                       if not key.startswith("GIT_") and key not in ("UNIT_RUN_DIR", "CARGO_BUILD_BUILD_DIR")}
         environment.update({
             **slot_configuration.environment,
             "HOME": str(home), "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
@@ -380,6 +410,12 @@ class StandingTests(unittest.TestCase):
         self.assertEqual(os.environ.get('CARGO_BUILD_BUILD_DIR'), previous)
         self.assertEqual(build_folders.build_folder_state(first), 'free')
         self.assertEqual(build_folders.build_folder_state(second), 'free')
+        # A command inside a build slot inherits that slot's cache; a gate it opens builds in its own slot's cache.
+        outer = str(self.base / "cargo" / "outer-slot1")
+        with mock.patch.dict(os.environ, {"CARGO_BUILD_BUILD_DIR": outer}):
+            with copies.standing(self.owner_id, self.source, copies.CommittedSource('HEAD')) as first:
+                self.assertEqual(os.environ['CARGO_BUILD_BUILD_DIR'], str(self.base / 'cargo' / first.name))
+            self.assertEqual(os.environ['CARGO_BUILD_BUILD_DIR'], outer)
         for output in (str(self.base / "explicit-output"), "relative-output"):
             with self.subTest(output=output), mock.patch.dict(os.environ, {"CARGO_BUILD_BUILD_DIR": output}):
                 with copies.standing(self.owner_id, self.source, copies.CommittedSource('HEAD')) as first:
@@ -1349,7 +1385,7 @@ class StandingTests(unittest.TestCase):
                                ("guard_timeout_seconds", "inf"))
         ]
         variants.extend({key: value for key, value in self.settings.items() if key != missing}
-                        for missing in self.settings if missing != "root")
+                        for missing in ("remote_registry", "wait_seconds", "git_timeout_seconds", "guard_timeout_seconds"))
         for settings in variants:
             with self.subTest(settings=settings):
                 self.write_config(settings)

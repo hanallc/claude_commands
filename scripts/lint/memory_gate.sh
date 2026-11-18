@@ -22,6 +22,11 @@ buildlog_memory_python() {
     "$BUILDLOG_MEM_PY" "$@"
 }
 
+buildlog_check_nested_step() {
+    [[ -n "${BUILDLOG_RESERVED_STEP:-}" ]] || return 0
+    buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" check-nested
+}
+
 # Status 0 when the holder directory is missing or readable with no entry.
 # This shell must expand patterns unfiltered; any doubt starts Python.
 build_hold_nothing_held() {
@@ -160,6 +165,7 @@ buildlog_memory_refuse() {
 buildlog_memory_event() { :; }
 
 buildlog_wait_for_memory() {
+    buildlog_check_nested_step || return $?
     BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=MeminfoUnavailable BUILDLOG_MEM_RESERVATION=""
     if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
         source "$BUILDLOG_SELECTED_LOCAL_GRANT" || return $?
@@ -202,23 +208,40 @@ buildlog_wait_for_memory() {
 }
 
 buildlog_release_memory() {
-    local reservation="${BUILDLOG_MEM_RESERVATION:-}"
+    local reservation="${BUILDLOG_MEM_RESERVATION:-}" prelaunch_outcome="${2:-${BUILDLOG_PRELAUNCH_OUTCOME:-retry}}"
     BUILDLOG_MEM_RESERVATION=""
     export BUILDLOG_MEM_CLEANUP_TIMING
-    [[ -n "$reservation" ]] || return 0
+    [[ -n "$reservation" || "$prelaunch_outcome" == abandon ]] || return 0
     if [[ -n "${BUILDLOG_PLACEMENT_FILE:-}" ]]; then
+        local outcome=done episode="${BUILDLOG_PLACEMENT_EPISODE:-}" cancel_reason=""
+        local prelaunch_reason="${BUILDLOG_MEM_PRELAUNCH_REASON:-}"
         local finish_args=(finish-step --assignment-file "$BUILDLOG_PLACEMENT_FILE" --status "${1:-0}")
-        if [[ -n "${BUILDLOG_MEM_PRELAUNCH_REASON:-}" ]]; then
-            finish_args+=(--reason "$BUILDLOG_MEM_PRELAUNCH_REASON")
-        elif [[ -s "${HOLD_WAIT_DIR:-/nonexistent}/token-lost" ]]; then
-            finish_args+=(--reason "execution token ownership changed")
-        fi
         if [[ -s "${HOLD_WAIT_DIR:-/nonexistent}/token-lost" ]]; then
-            finish_args+=(--token required)
+            prelaunch_reason="${prelaunch_reason:-execution token ownership changed}"
+            finish_args+=(--token after-grant)
         fi
-        buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" "${finish_args[@]}" >/dev/null 2>&1 || true
+        if [[ -n "$prelaunch_reason" ]]; then
+            outcome=$prelaunch_outcome
+            finish_args+=(--reason "$prelaunch_reason")
+        fi
+        if [[ "$outcome" == abandon ]]; then
+            cancel_reason=$prelaunch_reason
+        elif ! buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" "${finish_args[@]}" >/dev/null 2>&1; then
+            cancel_reason="finish-step failed"
+        fi
+        if [[ -n "$cancel_reason" ]]; then
+            if buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$episode" \
+                    --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "$cancel_reason" >/dev/null 2>&1; then
+                outcome=abandon
+            else
+                outcome=unresolved
+            fi
+        fi
+        if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
+            printf '%s\t%s\n' "$episode" "$outcome" > "$BUILDLOG_SELECTED_LOCAL_GRANT.outcome" || true
+        fi
         BUILDLOG_MEM_PRELAUNCH_REASON=""
-        rm -f "${BUILDLOG_SELECTED_LOCAL_GRANT:-/nonexistent}"
+        rm -f "${BUILDLOG_SELECTED_LOCAL_GRANT:-/nonexistent}" || true
         BUILDLOG_SELECTED_LOCAL_GRANT="" BUILDLOG_PLACEMENT_FILE=""
     else
         buildlog_memory_python "$BUILDLOG_QUEUE_PLACE_SCRIPT" release "$reservation" "${1:-0}" >/dev/null 2>&1 || true

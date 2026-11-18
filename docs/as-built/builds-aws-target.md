@@ -242,15 +242,30 @@ It reserves setup costs within both account and workload limits before the stack
 It does not permit demand starts or guest command admission.
 Setup resumes an existing stack through reads before another mutation.
 It refuses changed resource inputs or an expired reservation before another stack request.
+If AWS confirms that the stack is missing, setup checks the local record for resource identities.
+If the record names an instance, data disk, or bucket, setup asks the user to run `down --workload hana --approve-destroy`.
+If the record names none of these resources, setup searches the deleted stack history for the saved stack name.
+It uses stacks that AWS created at or after the saved reservation time.
+Setup reads the events of each matching stack by ID to find retained disks and buckets.
+It ends Spot boxes with the saved deployment tag and deletes the retained resources before it clears the reservation and record.
+If it cannot verify cleanup, setup keeps the record and asks the user to run `down --workload hana --approve-destroy`.
 It registers the deployment only after the Spot request and stopped state match.
 Setup adds no route, target, or slot capacity.
-Setup changes the stack through a change set, never through `cloudformation deploy`.
-It refuses an Instance, Volume or VolumeAttachment replace or remove before it executes the change set.
-A failed create or update calls `spot_end.end_boxes` before it reports the error.
-That call keeps only the box that `hana/setup.json` records.
-It then deletes, through `retained.delete`, the disks and buckets that the rollback kept (`DELETE_SKIPPED`).
-A failed create also deletes the failed stack.
-The launch template sets `DeleteOnTermination` true on the root disk, so AWS deletes each root disk with its box.
+Setup uses a change set to change the stack.
+It refuses changes that replace or remove an instance, volume, or volume attachment.
+When a create or update fails, setup reads failed stack events from the current change before cleanup.
+The error gives the name, type, status, and AWS reason for each failed resource.
+If setup cannot read the events, it reports that they are unavailable and continues cleanup.
+Setup ends the Spot boxes other than the box in `hana/setup.json`.
+After a failed create, setup requires `ROLLBACK_COMPLETE` or `ROLLBACK_FAILED` before it deletes the stack.
+It waits for stack deletion and reads events by stack ID for disks and buckets marked `DELETE_SKIPPED`.
+It deletes these resources before it closes the spending reservation and removes `hana/setup.json`.
+If the rollback or cleanup is incomplete, setup keeps the record and reservation for `down`.
+For an incomplete setup, `down` also checks deleted stack history for retained resources.
+If that history has no match, `down` reports it and continues with any disk or bucket in the saved record.
+After a failed update, setup deletes resources retained during rollback and keeps the stack and record.
+Run `prepare --workload hana` again before retrying with changed inputs.
+The launch template sets `DeleteOnTermination` on the root disk. AWS deletes each root disk with its box.
 
 ## Ending persistent Spot boxes
 
@@ -263,9 +278,11 @@ The request then launches a new box with no tags.
 4. Terminate the boxes and wait until they are terminated.
 5. Read again. `SpotEndIncomplete` names any request or box that stays live.
 A failed cancel raises before any terminate.
-`deploy.py down --workload hana --approve-destroy` ends the Hana boxes, records the Hana spending end, and deletes the Hana stack.
-It then deletes the data disk and the control bucket, and removes the local Hana records.
-The data on those disks and in the bucket is lost; `--approve-destroy` is the approval.
+`deploy.py down --workload hana --approve-destroy` ends Hana boxes before and after it deletes the Hana stack.
+The second check ends any box that CloudFormation kept during deletion.
+The command then deletes the data disk and the control bucket.
+It closes the compute and storage charges before it removes the local Hana records.
+The `--approve-destroy` flag authorizes deletion of the disk and bucket data.
 `test_spot_end.py` uses a fake EC2 that relaunches a box when a box under an active persistent request is terminated.
 It shows that a failed create and the Hana `down` each leave no request, box, disk, bucket or stack.
 A failed update keeps only the recorded box and its root disk.
@@ -1068,3 +1085,41 @@ Admission requires `roots.slots.aws-hana`, `slots.aws-hana.hana.max`, and `slots
 Those values remain unset until the user approves them.
 The guest image needs Git, curl, Python, `hana_source`, and the shared maker, slot, rescue, and configuration modules.
 Phase F2 will deliver manifests and execute commands with inherited slot locks.
+
+## Hana placement adapter
+
+Hana retains the configured SSH target family and uses signed control instead of an SSH connection.
+`target_config.read_execution_transport()` selects the transport before any connection settings or provider probes.
+`hana_placement.py` exports the shared transport, generation, claim, and waiter types.
+`hana_placement_adapter.py` implements configuration policy, lifecycle evidence, exact claims, and release.
+`hana_generation.py` keeps the canonical boot identity safe for guest imports.
+
+The inactive target registration permits only the normalized Hana repository and check or clippy judgments.
+The command policy rejects repairs, builds, nextest, final steps, path overrides, and unknown wrappers.
+The active target order remains unchanged, and `enabled=off` still prevents placement.
+
+Provider evidence reads lifecycle and execution records through the existing background worker.
+The stopped Hana target shares one spending preview across placement probes in the admission process.
+The preview expires after `preview_max_age_s` seconds, which defaults to two.
+Changes to the ledger, launch history, lifecycle journal, bills, or spending configuration invalidate the preview.
+The cache skips previews that use configuration recovered from Git.
+A full preview uses the account ledger lock and reads the launch history once.
+The preview gives placement evidence only.
+The controller still performs its full reservation and start checks.
+The controller alone owns demand starts, spending reservations, and idle-stop serialization.
+One exact lifecycle claim excludes all other Hana worktrees.
+Boot generations include the deployment, demand-start token, and verified boot identity.
+Permit renewals retain that generation.
+
+F1 receives `HanaClaimPending`, `HanaClaimAdopted`, `HanaClaimRefused`, or `HanaClaimRetained` from `claim_assigned()`.
+Only an adopted claim can request the queue's first launch authorization.
+`release_assigned()` requires F1's durable command settlement before lifecycle and target claim release.
+An ended local holder cannot settle an unresolved Hana dispatch.
+A failed boot needs a terminal `ExecutionReport`; pending settlement retains capacity and the live retry deadline.
+The queue permits fallback only after settlement.
+
+The queue applies worker evidence on its loop thread and invalidates stale read snapshots.
+An exact current assignment and live holder establish the `remote_waiter` hold classification.
+A drain preserves that waiter without granting local memory or a Cargo token.
+Unassigned callers retain the existing drain behavior.
+Phase E adds no stored shape or queue wire field.

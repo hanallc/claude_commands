@@ -21,6 +21,7 @@ import tempfile
 import time
 import unittest.mock
 from pathlib import Path
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.script_envelope import script_prompt
 from scripts.herdr import herdr_types
 from types import SimpleNamespace
@@ -940,7 +941,8 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertGreaterEqual(cast(Mock, self.read).call_count, 2)
 
     def test_start_waits_for_a_changing_native_registry_before_checking_the_prompt_target(self) -> None:
-        for registry in ("ready after two reads", "identity changes after two reads", "changing until deadline", "unavailable"):
+        for registry in ("ready after two reads", "identity changes after two reads", "target unknown once",
+                         "changing until deadline", "unavailable"):
             with self.subTest(registry=registry):
                 self.elapsed = 0
                 self.typed.clear()
@@ -959,6 +961,8 @@ class PromptSubmissionTests(unittest.TestCase):
                     events.append("native")
                     if registry in {"ready after two reads", "identity changes after two reads"} and events.count("native") == 3:
                         return self.transcript.session_id
+                    if registry == "target unknown once":
+                        return self.transcript.session_id
                     try:
                         if registry == "unavailable":
                             raise herdr.NativeRegistryUnavailable("fixture registry unavailable")
@@ -967,8 +971,10 @@ class PromptSubmissionTests(unittest.TestCase):
                         raise herdr_types.HerdrFailure("fixture native identity unavailable") from error
 
                 def check_target(*_args: object, **_kwargs: object) -> object:
-                    self.assertEqual(events.count("native"), 3)
                     events.append("target")
+                    if registry == "target unknown once" and events.count("target") == 1:
+                        return False
+                    self.assertEqual(events.count("native"), 2 if registry == "target unknown once" else 3)
                     return cast(object, unittest.mock.DEFAULT)
 
                 with (patch.object(self.client, "native_session", side_effect=native_session) as native,
@@ -976,11 +982,14 @@ class PromptSubmissionTests(unittest.TestCase):
                       redirect_stderr(io.StringIO()) as errors):
                     outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
                         ["--resume", requested.session_id],
-                        herdr.OpeningPrompt("resume the saved work", requested, publications.append), 300)
-                if registry in {"ready after two reads", "identity changes after two reads"}:
+                        herdr.OpeningPrompt("resume the saved work", requested, publications.append), 1000)
+                if registry in {"ready after two reads", "identity changes after two reads", "target unknown once"}:
                     self.assertIsInstance(outcome, herdr.PromptSubmitted)
-                    self.assertEqual(native.call_count, 3)
-                    self.assertEqual(events[:4], ["native", "native", "native", "target"])
+                    if registry == "target unknown once":
+                        self.assertEqual(events[:4], ["native", "target", "native", "target"])
+                    else:
+                        self.assertEqual(native.call_count, 3)
+                        self.assertEqual(events[:4], ["native", "native", "native", "target"])
                     self.assertEqual(target.call_args_list[0], call(self.transcript.session_id,
                         action="keys", place=herdr.HerdrPlace(self.client.session, "destination:p1")))
                     self.assertEqual(publications, [self.transcript])
@@ -992,11 +1001,9 @@ class PromptSubmissionTests(unittest.TestCase):
                     target.assert_not_called()
                     self.assertEqual(self.typed, [])
                     self.assertIn("native session is unavailable", errors.getvalue())
-                    if registry == "changing until deadline":
-                        self.assertAlmostEqual(self.elapsed, 0.3)
-                    else:
-                        self.assertEqual(native.call_count, 1)
-                        self.assertEqual(self.elapsed, 0)
+                    self.assertAlmostEqual(self.elapsed, 1.0)
+                    self.assertEqual(native.call_count, 5)
+                    self.assertEqual(errors.getvalue().count("native session is unavailable"), 1)
 
     def test_slash_command_recorded_as_command_tags_is_submitted_once(self) -> None:
         text = "/showrunner:produce /x/doc.md resume"
@@ -2800,7 +2807,11 @@ class HerdrTests(unittest.TestCase):
         self.proc = self.root / "proc"
         self.proc.mkdir()
         (self.root / "home/.claude/sessions").mkdir(parents=True)
+        configuration = self.root / "fixture-config"
+        environment = config_environment(configuration)
+        _ = write_config_fixture(configuration / "codex_daemon.conf", "agents_slice=app-agents.slice\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            **environment,
             "HERDR_BIN": str(self.fake), "SYSTEMD_RUN": str(self.fake), "SYSTEMCTL": str(self.fake),
             "HERDR_PROC": str(self.proc), "FAKE_HERDR_LOG": str(self.log),
             "FAKE_HERDR_RESPONSES": str(self.responses_path), "PATH": str(self.root / "no-tools"),
@@ -2988,6 +2999,7 @@ class HerdrTests(unittest.TestCase):
         for case, births, record, notice in (
                 ("starting", ["birth", "birth"], False, ""),
                 ("exits during the check", ["birth", ValueError("pid 992001: process start is unavailable")], True, ""),
+                ("exits before the read", [herdr.NativeRegistryChanging("pid 992001: process exited")], True, ""),
                 ("steady", ["birth", "birth"], True,
                  f"herdr fixture:w1:p1 tab w1:t1: pane evidence is unknown: {unavailable}; row placement retained\n")):
             with (self.subTest(case=case),
@@ -3004,6 +3016,17 @@ class HerdrTests(unittest.TestCase):
             reason = unavailable if notice else "starting or exiting"
             self.assertEqual(scan, herdr.RowPaneScan({}, [herdr.UnknownPane("w1:p1", "w1:t1", reason)]))
             self.assertEqual(errors.getvalue(), notice)
+
+    def test_process_birth_names_an_exited_process_as_changing(self) -> None:
+        for case, present, expected in (("exited", False, herdr.NativeRegistryChanging),
+                                        ("unreadable", True, ValueError)):
+            with (self.subTest(case=case), patch.dict(os.environ, {"HERDR_PLATFORM": "linux"}),
+                  patch.object(sessions, "process_start", return_value=None),
+                  patch.object(Path, "exists", autospec=True, return_value=present) as exists,
+                  self.assertRaises(ValueError) as raised):
+                _ = herdr._process_birth(992001)  # pyright: ignore[reportPrivateUsage]
+            self.assertIs(type(raised.exception), expected)
+            exists.assert_called_once_with(Path("/proc/992001"))
 
     def test_unreadable_pane_session_reports_one_anomaly_and_keeps_the_pane(self) -> None:
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [{
@@ -3728,8 +3751,8 @@ class HerdrTests(unittest.TestCase):
         self.configure(["--session", "writing", "pane", "list"], json.dumps({"result": {"panes": [{'pane_id': 'w1:p1', 'workspace_id': 'w1'}, {'pane_id': 'w1:p2', 'workspace_id': 'w1'}]}}))
         self.darwin_environment(71, "claude", "HERDR_PANE_ID=w1:p1 TMUX_PANE=%1")
         self.darwin_environment(72, "claude", "HERDR_PANE_ID=w1:p2 TMUX_PANE=")
-        for pid in (71, 72):
-            self.configure(["-a", "-p", str(pid), "-d", "cwd", "-Fn"], f"p{pid}\nfcwd\nn{self.root}\n")
+        self.configure(["-a", "-p", "71,72", "-d", "cwd", "-Fpn"],
+                       "".join(f"p{pid}\nfcwd\nn{self.root}\n" for pid in (71, 72)))
         self.assertEqual(herdr.herdr_place_of(71), herdr.NotInHerdr())
         self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p2"))
         self.assertEqual([row.pid for row in herdr.herdr_processes()], [72])
@@ -3740,7 +3763,7 @@ class HerdrTests(unittest.TestCase):
         self.darwin_process_table(
             f"70 1 {uid} herdr server\n71 70 {uid} zsh\n72 71 {uid} claude\n" +
             f"73 71 {uid + 1} claude\n74 71 {uid} claude HERDR_PANE_ID=forged\n" +
-            f"75 71 {uid} codex\n76 71 {uid} claude\n77 1 {uid} unrelated\n")
+            f"75 71 {uid} codex\n76 71 {uid} claude\n77 1 {uid} unrelated 'outside-herdr\n")
         self.darwin_sockets(f"p70\nf3\nn{self.root}/config/herdr/sessions/writing/herdr.sock\n")
         self.configure(["--session", "writing", "pane", "list"], json.dumps({"result": {"panes": [{'pane_id': 'w1:p1', 'workspace_id': 'w1'}, {'pane_id': 'w1:p2', 'workspace_id': 'w1'}]}}))
         self.darwin_environment(71, "zsh", "HERDR_PANE_ID=w1:p1 CODEX_THREAD_ID=unit")
@@ -3748,15 +3771,20 @@ class HerdrTests(unittest.TestCase):
         self.darwin_environment(74, "claude HERDR_PANE_ID=forged", "")
         self.configure(["-o", "command=", "-p", "75"], code=1, stderr="vanished")
         self.darwin_environment(76, "claude", "HERDR_PANE_ID=w1:p2")
-        self.configure(["-a", "-p", "71", "-d", "cwd", "-Fn"], "p71\nfcwd\nn/work folder\n")
-        self.configure(["-a", "-p", "72", "-d", "cwd", "-Fn"], "p72\nfcwd\nn/work folder\n")
-        self.configure(["-a", "-p", "76", "-d", "cwd", "-Fn"], code=1, stderr="gone")
-        rows = herdr.herdr_processes()
+        cwd_command = ["-a", "-p", "71,72,74,75,76", "-d", "cwd", "-Fpn"]
+        self.configure(cwd_command, "p72\nfcwd\nn/work folder\np71\nfcwd\nn/work folder\n", code=1, stderr="gone")
+        with patch.object(shlex, "split", wraps=shlex.split) as split:
+            rows = herdr.herdr_processes()
+        self.assertNotIn(call(" 'outside-herdr"), split.call_args_list)
         self.assertCountEqual(rows, [
             herdr.HerdrProcess(71, herdr.HerdrPlace("writing", "w1:p1"), {"CODEX_THREAD_ID": "unit"}, "zsh", "/work folder"),
             herdr.HerdrProcess(72, herdr.HerdrPlace("writing", "w1:p1"), {}, "claude", "/work folder"),
             herdr.HerdrProcess(76, herdr.HerdrPlace("writing", "w1:p2"), {}, "claude",
                                herdr.UnreadableCwd("process 76 cwd: stderr: gone"))])
+        self.assertEqual([command for command in self.commands() if "cwd" in command], [cwd_command])
+        self.configure(cwd_command, "p72\nfcwd\nn/second folder\np71\nfcwd\nn/first folder\np76\nfcwd\nn/third folder\n")
+        self.assertEqual({row.pid: row.working_directory for row in herdr.herdr_processes()},
+                         {71: "/first folder", 72: "/second folder", 76: "/third folder"})
         self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p1"))
         self.assertEqual(herdr.herdr_place_of(74), herdr.NotInHerdr())
         for pid in (73, 77):
@@ -3774,8 +3802,7 @@ class HerdrTests(unittest.TestCase):
         for output, code, error in (("", 1, "permission denied"), ("p72\nfcwd\n", 0, ""),
                                     ("n/one\nn/two\n", 0, "")):
             with self.subTest(output=output, code=code):
-                for pid in (71, 72):
-                    self.configure(["-a", "-p", str(pid), "-d", "cwd", "-Fn"], output, code, error)
+                self.configure(["-a", "-p", "71,72", "-d", "cwd", "-Fpn"], output, code, error)
                 processes = {process.pid: process for process in herdr.herdr_processes()}
                 self.assertCountEqual(processes, [71, 72])
                 self.assertEqual(processes[71].marks, {"CODEX_THREAD_ID": "unit"})
@@ -3878,7 +3905,8 @@ class HerdrTests(unittest.TestCase):
                        json.dumps({"result": {"process_info": {"shell_pid": 71}}}))
         for pid, command in ((71, "zsh"), (72, "claude")):
             self.darwin_environment(pid, command, "HERDR_PANE_ID=w1:p1")
-            self.configure(["-a", "-p", str(pid), "-d", "cwd", "-Fn"], f"p{pid}\nfcwd\nn/work\n")
+        self.configure(["-a", "-p", "71,72", "-d", "cwd", "-Fpn"],
+                       "".join(f"p{pid}\nfcwd\nn/work\n" for pid in (71, 72)))
         self.assertCountEqual([row.pid for row in herdr.herdr_processes()], [71, 72])
         self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p1"))
 
@@ -5193,6 +5221,17 @@ class HerdrTests(unittest.TestCase):
                 self.assertEqual({row.pid: row.place for row in herdr.herdr_processes()}, expected)
                 self.assertEqual(next(row.marks for row in herdr.herdr_processes() if row.pid == 12), {})
 
+        _ = self.process(14, 11, ["codex"], {"HERDR_PANE_ID": "w1:p1"})
+        self.configure_herdr(["pane", "process-info", "--pane", pane],
+                             json.dumps({"result": {"process_info": {"shell_pid": 11,
+                                 "foreground_processes": [{"pid": 14, "argv": ["codex"]}]}}}))
+        self.log.unlink()
+        self.assertEqual({row.pid: row.place for row in herdr.herdr_processes()},
+                         {**expected, 14: herdr.HerdrPlace("fixture", pane)})
+        self.assertEqual(self.commands().count(["--session", "fixture", "pane", "list"]), 1)
+        self.assertEqual(self.commands().count(
+            ["--session", "fixture", "pane", "process-info", "--pane", pane]), 1)
+
     def test_missing_live_pane_never_returns_the_launch_environment_place(self) -> None:
         server = self.process(10, 1, ["herdr", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
@@ -5231,8 +5270,28 @@ class HerdrTests(unittest.TestCase):
                 pane = f"w1:p{pid}"
                 _ = self.process(pid, server_pid, ["claude"], {"HERDR_PANE_ID": pane})
                 expected[pid] = herdr.HerdrPlace(session, pane)
+        unrelated = [self.process(pid, parent, ["unrelated"], {"HERDR_PANE_ID": "w1:p11"})
+                     for pid, parent in ((30, 1), (31, 30))]
+        contents_read: list[Path] = []
+        paths_resolved: list[Path] = []
+        read_bytes = Path.read_bytes
+        resolve = Path.resolve
+
+        def read_contents(path: Path) -> bytes:
+            contents_read.append(path)
+            return read_bytes(path)
+
+        def resolve_path(path: Path, strict: bool = False) -> Path:
+            paths_resolved.append(path)
+            return resolve(path, strict=strict)
+
         self.log.unlink(missing_ok=True)
-        self.assertEqual({row.pid: row.place for row in herdr.herdr_processes()}, expected)
+        with (patch.object(Path, "read_bytes", read_contents),
+              patch.object(Path, "resolve", resolve_path)):
+            self.assertEqual({row.pid: row.place for row in herdr.herdr_processes()}, expected)
+        for process in unrelated:
+            self.assertNotIn(process / "environ", contents_read)
+            self.assertNotIn(process / "cwd", paths_resolved)
         self.assertCountEqual(self.commands(), [
             ["--session", "fixture", "pane", "list"],
             ["--session", "writing", "pane", "list"],
@@ -5285,7 +5344,8 @@ class HerdrTests(unittest.TestCase):
                        json.dumps({"result": {"process_info": {"shell_pid": 71}}}))
         for pid, command in ((71, "zsh"), (72, "claude")):
             self.darwin_environment(pid, command, "HERDR_PANE_ID=w1:p1")
-            self.configure(["-a", "-p", str(pid), "-d", "cwd", "-Fn"], f"p{pid}\nfcwd\nn{self.root}\n")
+        self.configure(["-a", "-p", "71,72", "-d", "cwd", "-Fpn"],
+                       "".join(f"p{pid}\nfcwd\nn{self.root}\n" for pid in (71, 72)))
         expected = {pid: herdr.HerdrPlace("writing", "w2:p9") for pid in (71, 72)}
         self.assertEqual(herdr.herdr_places(), expected)
         self.assertEqual(self.commands().count(["--session", "writing", "pane", "list"]), 1)
@@ -5809,6 +5869,16 @@ class HerdrTests(unittest.TestCase):
         self.configure(["-o", "lstart=,tty=", "-p", "42"], code=1, stderr="process vanished")
         with self.assertRaisesRegex(herdr_types.HerdrFailure, "process vanished"):
             _ = herdr.darwin_process_identity(42)
+
+    def test_darwin_process_birth_names_an_exited_process_as_changing(self) -> None:
+        self.darwin()
+        self.configure(["-o", "lstart=,tty=", "-p", "42"], code=1)
+        with self.assertRaises(herdr.NativeRegistryChanging) as raised:
+            _ = herdr._process_birth(42)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(str(raised.exception), "pid 42: process exited")
+        self.configure(["-o", "lstart=,tty=", "-p", "42"], code=1, stderr="ps refused")
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "ps refused"):
+            _ = herdr._process_birth(42)  # pyright: ignore[reportPrivateUsage]
 
 
     def test_darwin_environment_refuses_a_changed_command_or_failed_ps(self) -> None:

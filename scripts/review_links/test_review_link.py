@@ -1,11 +1,11 @@
 """Exercise snapshot creation through the CLI without contacting Tailscale."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
 
 import html
 import fcntl
 import json
 import os
-import shutil
 import secrets
 import subprocess
 import sys
@@ -34,8 +34,10 @@ TAILSCALE_IP = "100.103.14.30"
 
 def setUpModule() -> None:
     configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
-    for stem in ("review_links", "change_review"):
-        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf", configuration / f"{stem}.conf")
+    _ = write_config_fixture(configuration / "review_links.conf",
+        "server_port=8765\nsnapshot_allocation_tries=10\n")
+    _ = write_config_fixture(configuration / "change_review.conf",
+        "review_links_directory=~/.local/share/review-links\n")
     _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
 

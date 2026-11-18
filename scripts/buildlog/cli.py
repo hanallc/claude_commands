@@ -359,6 +359,12 @@ def main(argv: list[str]) -> int:
                 mac_idle.watch_once(mac_idle.watch_paths(), taken.at)
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"buildlog sample: Mac idle check failed: {error}", file=sys.stderr)
+            from scripts.build_queue import head_stall
+
+            try:
+                _ = head_stall.watch_once(head_stall.default_paths(), taken.at)
+            except (OSError, ValueError) as error:
+                print(f"buildlog sample: head-stall check failed: {error}", file=sys.stderr)
         return 0
     if command == "snapshot":
         from scripts.buildlog import memory

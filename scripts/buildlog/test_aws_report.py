@@ -1,5 +1,6 @@
 """Render AWS costs, wait estimates, and peer exchange evidence."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
 
 from contextlib import closing
 from datetime import UTC, date, datetime
@@ -165,8 +166,7 @@ class AwsReportTests(MeasurementFixture):
         self.assertEqual([row[0] for row in token.waits], [60.0])
 
     def test_mixed_host_report_uses_the_required_lead_and_preserves_negative_run_savings(self) -> None:
-        shipped = Path(__file__).resolve().parents[2] / 'config/build_targets.conf'
-        _ = (self.root / 'build_targets.conf').write_bytes(shipped.read_bytes())
+        _ = write_config_fixture(self.root / 'build_targets.conf', 'sync.hosts.aws=aws-build\n')
         self.comparison_rows()
         self.write_records(self.attempt(), self.call("fallback-call"), self.remote_step(target=""))
         output = self.render()
@@ -232,8 +232,8 @@ class AwsReportTests(MeasurementFixture):
             output = self.render()
         section = output.split('### AWS\n', 1)[1].split('Mac copies:', 1)[0]
         self.assertTrue(section.startswith('\n**Today (UTC 2026-01-15, estimate): $0.35 of the $20.00 daily limit. 2 gate runs.**\n\n'))
-        today = '| 2026-01-15 | $0.35 | $0.10 | $0.00 | $0.20 | $0.05 | 2 | estimate |'
-        bill = '| 2026-01-14 | $1.10 | $0.30 | $0.20 | $0.40 | $0.20 | 2 | bill |'
+        today = '| 2026-01-15 | $0.35 | $0.10 | $0.00 | $0.00 | $0.20 | $0.05 | 2 | estimate |'
+        bill = '| 2026-01-14 | $1.10 | $0.30 | $0.20 | $0.00 | $0.40 | $0.20 | 2 | bill |'
         self.assertIn(today, section)
         self.assertIn(bill, section)
         self.assertLess(section.index(today), section.index(bill))
@@ -250,7 +250,7 @@ class AwsReportTests(MeasurementFixture):
         with mock.patch.object(ledger, 'SPEND_GROUPS', ('renamed compute', *ledger.SPEND_GROUPS[1:])):
             renamed = ledger.DailySpend(DAY, 'AWS bill', (
                 ledger.SpendGroupCost(ledger.SPEND_GROUPS[0], Decimal('.30')),), 1)
-            self.assertIn('| 2026-01-15 | $0.30 | $0.30 | $0.00 | $0.00 | $0.00 | 1 | bill |',
+            self.assertIn('| 2026-01-15 | $0.30 | $0.30 | $0.00 | $0.00 | $0.00 | $0.00 | 1 | bill |',
                           aws_report.daily_spend_lines([renamed], Decimal(20), DAY))
         print('AWS layout fixture:\n### AWS\n' + section)
 
@@ -287,7 +287,7 @@ class AwsReportTests(MeasurementFixture):
                     table = output.split('| Source |\n', 1)[1].split('\n\n', 1)[0]
                     rows = [line for line in table.splitlines() if line.startswith('| 2026-')]
                     self.assertEqual(rows, [
-                        f'| {at} | $1.00 | $0.00 | $0.00 | $1.00 | $0.00 | 1 | '
+                        f'| {at} | $1.00 | $0.00 | $0.00 | $0.00 | $1.00 | $0.00 | 1 | '
                         + ('estimate' if at > '2026-01-13' else 'bill') + ' |'
                         for at in expected_days])
                     self.assertNotIn('2026-01-10', table)
@@ -445,8 +445,7 @@ class AwsReportTests(MeasurementFixture):
                 self.assertIn('$22.00 of the $20.00 daily limit', output)
 
     def test_daily_charge_reconciliation_changes_cost_once_and_shows_its_difference(self) -> None:
-        shipped = Path(__file__).resolve().parents[2] / 'config/build_targets.conf'
-        _ = (self.root / 'build_targets.conf').write_bytes(shipped.read_bytes())
+        _ = write_config_fixture(self.root / 'build_targets.conf', 'sync.hosts.aws=aws-build\n')
         at = NOW + 86400
         result = measurement.read_charges(self.settings, self.state, at, self.charge_fetch(Decimal(3)))
         reading = narrow(self, result, measurement.ChargeRead)
@@ -476,7 +475,7 @@ class AwsReportTests(MeasurementFixture):
                     output = self.render()
                 read_at = datetime.fromtimestamp(at, UTC).strftime('%Y-%m-%d %H:%M UTC')
                 self.assertIn(f'- Bill read {read_at}. Ledger query fees for these days: $0.00.', output)
-                self.assertIn(f'| 2026-01-15 | $3.00 | $0.08 | $0.03 | $2.29 | $0.60 | 3 | {label} |', output)
+                self.assertIn(f'| 2026-01-15 | $3.00 | $0.08 | $0.03 | $0.00 | $2.29 | $0.60 | 3 | {label} |', output)
                 self.assertIn(f'**Latest day (UTC 2026-01-15, {label}): $3.00 of the $20.00 daily limit. 3 gate runs.**', output)
                 self.assertEqual(output.count('- Spot compute can include the older Spot builder.'), 1)
                 self.assertNotIn('| Spend group |', output)
@@ -485,7 +484,7 @@ class AwsReportTests(MeasurementFixture):
                 with mock.patch.object(time, 'time', return_value=float(at)):
                     current = self.render('2026-01-16')
                 self.assertIn('**Today (UTC 2026-01-16, estimate): $2.89 of the $20.00 daily limit. 1 gate runs.**', current)
-                self.assertIn(f'| 2026-01-15 | $3.00 | $0.08 | $0.03 | $2.29 | $0.60 | 3 | {label} |', current)
+                self.assertIn(f'| 2026-01-15 | $3.00 | $0.08 | $0.03 | $0.00 | $2.29 | $0.60 | 3 | {label} |', current)
         for amount in (Decimal('-0.0000036'), Decimal('0.0000036')):
             with self.subTest(amount=amount):
                 dust = ledger.ChargeRead(reading.day, at, reading.period_start, reading.period_end,

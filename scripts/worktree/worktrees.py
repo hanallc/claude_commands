@@ -352,8 +352,9 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
         registered = path in worktree_branches(repo)
         if local_branch_tip(repo, record.branch) != local:
             return Kept(path, "the local branch changed after the cleanup check; the worktree stays")
-        if path.exists() or registered:
-            _ = git(repo, "worktree", "remove", str(path))
+        if not build_folders.remove_build_folder(
+                path, lambda: git(repo, "worktree", "remove", str(path)) if path.exists() or registered else True):
+            return Kept(path, "the build folder lock is held; the worktree stays")
         cargo_mark.unlink(missing_ok=True)
     if isinstance(local, CheckedLocalTip):
         deletion = git(repo, "update-ref", "-d", f"refs/heads/{record.branch}", local.sha, check=False)

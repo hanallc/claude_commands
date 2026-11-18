@@ -71,6 +71,7 @@ class ControlTests(CostFixture):
         text_setting(values_path, 'instance_types', 'c7a.4xlarge m7a.2xlarge')
         text_setting(values_path, 'price_compare_instance_types', 'm7a.8xlarge c7a.4xlarge')
         text_setting(values_path, 'gpu_instance_types', 'g6.2xlarge g4dn.xlarge')
+        text_setting(values_path, 'gate_wait_usd_per_minute', '0')
         values = conf.read(values_path)
         self.regions = tuple(dict.fromkeys(values.words('spot_candidate_regions')))
         self.standard = values.words('instance_types')

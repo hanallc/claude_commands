@@ -18,10 +18,10 @@ import os
 import re
 import sys
 import tempfile
-from collections.abc import Generator, Iterator, Mapping
+from collections.abc import Callable, Generator, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import cast
@@ -31,6 +31,8 @@ from scripts.lib import urgency  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production.issues import PROPOSAL_TAG, Issue, frontmatter, open_issues
 from scripts.production import staff, unit_names
+from scripts.review_links import review_events
+from scripts.review_links.review_events import MarkChange, NoMark, ReviewLog, ReviewMark, StoredReviewLog
 
 FENCE = "---"
 # Values the vault writes bare; every other value is written double-quoted.
@@ -134,6 +136,46 @@ def set_list_fields(text: str, fields: dict[str, list[str]], path: Path) -> tupl
             lines[start:stop] = [replacement]
             changed.append(key)
     return "".join(lines), changed
+
+
+REVIEW_LOG_FIELD = "review_log"
+REVIEW_MARK_FIELD = "review_state"
+
+
+def review_log(issue: Issue) -> tuple[ReviewLog, ...]:
+    """The Review page log: one JSON object for each item of the block list."""
+    return review_events.from_rows([cast(StoredReviewLog, json.loads(item)) for item in issue.fields.get(REVIEW_LOG_FIELD, [])])
+
+
+def review_mark(issue: Issue) -> ReviewMark | NoMark:
+    value = issue.value(REVIEW_MARK_FIELD)
+    return ReviewMark(value) if value else NoMark()
+
+
+def record_review(path: Path, words: str, change: MarkChange, today: date, who: str = "nate", *,
+                  waiting_why: str = "", check_state: Callable[[], None] = lambda: None) -> bool:
+    """Append one Review page log line and change its mark. Returns False for an exact repeat."""
+    reason = review_events.require_waiting_why(waiting_why) if change == ReviewMark.WAITING or waiting_why else ""
+    with issue_lock(path):
+        issue = Issue(path, frontmatter(path))
+        check_state()
+        before = review_log(issue)
+        events = review_events.append(before, ReviewLog(datetime.now(timezone.utc), who, words))
+        mark = review_events.changed_mark(review_mark(issue), change)
+        if events == before and mark == review_mark(issue) and (not reason or reason == issue.value("waiting_why")):
+            return False
+        lines = read_issue(path).splitlines(keepends=True)
+        end = _closing_fence(lines, path)
+        start, stop = _key_span(lines, end, REVIEW_LOG_FIELD) or (end, end)
+        newline = lines[start][len(lines[start].rstrip("\r\n")):] or "\n"
+        lines[start:stop] = [f"{REVIEW_LOG_FIELD}:{newline}",
+                             *(f"  - {json.dumps(row, ensure_ascii=False)}{newline}" for row in review_events.rows(events))]
+        text, _ = remove_fields("".join(lines), (REVIEW_MARK_FIELD,), path)
+        marked = {REVIEW_MARK_FIELD: mark.value} if isinstance(mark, ReviewMark) else {}
+        why = {"waiting_why": reason} if reason else {}
+        text, _ = set_fields(text, {**marked, **why, "date_modified": _vault_date(today)}, path)
+        write_issue(path, text)
+        return True
 
 
 @contextmanager
@@ -279,9 +321,9 @@ def staff_reference(reference: str, kind: staff.Kind) -> staff.StaffRow:
     return row
 
 
-def staff_name(identity: str) -> str:
-    """Read the current name for a stored staff id."""
-    row = staff.snapshot().by_id(staff.StaffId(identity))
+def staff_name(identity: str, record: staff.StaffSnapshot | None = None) -> str:
+    """Read the current name for a stored staff id; a caller with many ids gives one snapshot."""
+    row = (staff.snapshot() if record is None else record).by_id(staff.StaffId(identity))
     return row.name if row is not None else f"unavailable staff {identity}"
 
 

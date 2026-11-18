@@ -28,6 +28,21 @@ else:
 
 
 class VerifyAdmissionSignalsTests(VerifyDocFixture):
+    def test_nested_verify_refuses_before_a_token_or_admission_wait(self) -> None:
+        admission = caller_admission(self, self.root, self.environment)
+        grant = admission.occupy_host()
+        with admission.loop_turn():
+            outer = next(row for row in admission.server.reservations.values()
+                         if row.reservation_id == grant.reservation)
+        self.environment["BUILDLOG_RESERVED_STEP"] = (
+            f"{grant.reservation}\t{outer.owner.pid}\t{admission.state_dir.resolve()}")
+        result = subprocess.run(["bash", str(VERIFY), "doc"], cwd=self.repo,
+                                env=self.environment, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(f"{grant.reservation} (pid {outer.owner.pid})", result.stderr)
+        self.assertNotIn("waiting for", result.stdout + result.stderr)
+        self.assertEqual(self.cargo_calls() if self.events.exists() else [], [])
+
     def test_sigterm_ends_admission_and_reaps_the_doc_step(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
         _ = admission.occupy_host()

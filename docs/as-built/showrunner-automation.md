@@ -371,10 +371,24 @@ Each local Promote checkout must exist before the command pushes.
   It scans first-parent merges on the production's merge branch from 2026-11-06.
   Older merges add no rows.
   It excludes foreign history through origin merge refs and `_publication_exclusions`.
+  A descendant with a separate review list has its own scan scope.
+  An unreadable descendant document remains in scope and shares the parent's list.
+  The scan reads staff parents to identify descendants, including grandchildren.
+  It excludes a descendant's first-parent merges only when the scanning branch does not share them.
+  For other outside productions, it excludes their complete first-parent merge chains.
+  The parent scan retains its merges before a descendant's fork.
+  The child scan excludes its parent's merges and its siblings' merges.
   A local gate branch remains eligible when its name differs from the production merge branch.
   `review_commits` keeps every checkpoint and other commits without a descendant checkpoint in that merge range.
   The count includes only selected commits with review lines that parse.
   The row writer uses the same selection and reads its visible lines.
+  `list-ready` reports each commit with an invalid supplied `Change-Review` line on stderr.
+  Each message names the short merge hash, short commit hash, subject, and reason from `problem()`.
+  Invalid lines include malformed forms and missing required images.
+  A passing commit's `Change-Review-Covers` line silences the covered commit, as in `missing()`.
+  A commit without a review line prints no message here.
+  Invalid commits add no rows and do not change the exit code.
+  Valid lines on non-checkpoint subjects remain eligible.
   `checkpoint_producers` reads recorded owners through `progress_history.load_events`, using the held staff snapshot.
   Legacy records use `StaffSnapshot.unit_by_worktree`.
   Merge writers record the known producer when they make the merge.
@@ -437,11 +451,30 @@ Each local Promote checkout must exist before the command pushes.
   A failed commit prints `written but not committed`; the next write commits the complete list.
   The vault's Templater must exclude the change-review folder to prevent concurrent changes to new lists.
 
-  `add` records ready changes that have no checkpoint line.
+  Every new or edited visible row requires a registered image.
+  Metadata changes and verdicts can update existing imageless rows; the image rule applies only to new rows and visible content edits.
+  This write rule has no date exception; `problem()` retains its date rule for commit checks.
+  `add` requires `--image` or `--output` and records ready changes that have no checkpoint line.
+  `--image` accepts a PNG path or a registered image id.
+  `batch` checks all edits before any list write and names every row without an image.
+  `edit` keeps an existing image and requires an image when the row has none.
+  Edit and verdict cleanup remove an image only when no row in any known review list names it.
+  An image reference lock protects the reference scan and image removal.
+  Row writers hold the same lock from the image check through the list write.
+  Writers take the directory lock before the image reference lock.
+  Image rendering and Git commits run outside the image reference lock.
+  Unknown image ids produce refusals and never produce empty image cells.
+  `list-ready` and `live` report imageless visible lines and add no rows, including for historical commits.
+  Register an image with `change_review.py image --image <png>` or `--output <text file>`.
+  Then pass the returned id with `--image`.
+  Invisible `Change-Review: none — <reason>` lines need no image.
   `edit` retains the row id, merge, other cells and position.
   `show` displays the next row only when the user asks.
   `verdict` moves a row to Reviewed; `works` or `fine` accepts it.
   Other verdicts return the change to its unit.
+  A showrunner check requires `verdict --validation <id>` with the validation ID from its request message.
+  The single verdict command returns a check problem to For you.
+  A batch verdict uses the same ID in its `validation` field.
   `list-path` and `showrunner` resolve the list and its root owner.
   `backfill-production [--list L] [--write]` retains its older owner-cell repair.
   It traces an empty cell through the merge's checkpoint, production ownership, then first-parent history.
@@ -550,7 +583,7 @@ An explicit number must name an unused path.
 Exact repeated operations change nothing.
 Other updates append a log line and mark the item unread; mark-read clears the unread time without sending a message.
 Update and park refuse Closed items until reopen restores them.
-The table uses `# | Owner | Item | State | Next step | ETA | Update`.
+The table uses `# | Owner | Producer | Item | State | Next step | ETA | Update`; Producer shows the producer's name.
 It sorts Waiting for nate first, unread items second, and next check times third.
 State cells include the check time and identify overdue checks.
 Future parked items and Closed items remain hidden by default.
@@ -585,28 +618,36 @@ Atomic replacement keeps each record complete.
 Frontmatter stores the id, fixed owner id, title, state, and filed, answered, and read times.
 The body contains the question and an `## Answer` section.
 A question length field preserves text that contains an Answer heading.
-The states are `open`, `answer ready`, and `read`, in that order.
+The states are `open`, `answer ready` and `read`.
+Review maps them to Waiting, For you and Done.
+Ask question returns an answered investigation to Waiting and preserves its previous answer in the log.
+Send feedback finishes it with the result **feedback sent**.
+The owner answers a Review question with `change_page.py answer-question --item investigation/<staff id>/I<n> --question <id> --text "<answer>"`.
+The request message supplies the question ID.
+The answer returns the record to For you.
 An exact repeat of an answer-ready or read operation changes nothing.
 Other state changes receive one refusal line.
 
-1. File an investigation with `investigation.py file --title "<one line>" --question "<full question>"`.
+1. File an investigation with `investigation.py file --title "<one line>" --question "<full question>" --waiting-why "<reason>"`.
 2. Save its answer with `investigation.py answer --id I<n> --text "<answer>"`.
 3. Mark its answer read with `investigation.py read --id I<n>`.
 4. List waiting investigations with `investigation.py list`.
 5. Include read investigations with `investigation.py list --all`.
 
 Answer and read commands accept `--owner <staff id>` to select another owner's record.
+The native answer command accepts an initial investigation answer without a Review exchange.
+An open Review exchange requires the shared answer command and its current question ID.
 `records`, `load`, and `mark_read` provide the same store operations for console callers.
 `records` skips invalid records, reports each path and cause on stderr, and watches those paths for cache refresh.
 Invalid UTF-8 receives the same refusal as invalid record fields.
 
-The status line counts open and answer-ready investigations immediately after questions.
+The status line counts only answer-ready investigations after questions.
 A unit or producer counts only its own investigations.
 A showrunner counts its own investigations and its units' investigations through the existing production unit scope.
 A showrunner without a production document counts its own investigations and watches its investigation folder.
 Child showrunners retain their own counts.
 Read investigations do not count.
-The console's Investigations page shows questions and answers with Owner and Show filters.
+The console's Review page shows investigations with Owner and Show filters.
 The user selects Mark read on an answer-ready card to remove it from the default view and the status line count.
 New answers mark the navigation entry until the user visits the page.
 The count cache watches each folder and record that it reads.
@@ -631,7 +672,7 @@ A missing folder uses its nearest existing parent until the folder appears.
 
 - `ask --ask "<one line>" [--context "<why now>"] [--item "<entry>" ...] [--recommend "<choice and why>"] [--choice "<answer>" ...] [--unit <unit>]` files a reviewed question without a reply to the user.
   The record keeps the parts in `parts` and the joined full text in `question`, so `/next`, messages and the review read one text.
-  The Questions page shows the parts as sections: the items as a numbered list, links as links, and each choice as a radio item that fills the answer box.
+  The Review page shows question parts as sections: the items as a numbered list, links as links, and each choice as a radio item that fills the answer box.
   `--ask` is required and holds one line; `--text` defaults to it. There is no `--question` option.
   A question with `--choice` needs at least two of them and a `--recommend`; otherwise `ask` refuses before the review.
   A question stored as one text before the parts form keeps its `question` text, and the page still shows it.
@@ -645,8 +686,12 @@ A missing folder uses its nearest existing parent until the folder appears.
   A producer runs `update_registration.py ask --ask "<question>" --context "<why now>"` without `--production` or `--unit`.
   `ProducerQuestions` retains its staff owner and user time zone without a production document.
   Its records use `<SHOWRUNNER_STATE_DIR>/<producer staff id>/questions` and pass the same question review.
-  Its status count, `/next question`, and Questions page filter read those records.
-  Answers and follow-ups use the existing retry, alert, and recovery paths to the producer's current session.
+  Its status count, `/next question`, and Review page filter read those records.
+  Answers, Send feedback and Ask question use the existing retry, alert and recovery paths.
+  Send feedback closes the question; Ask question waits for the owner's answer.
+  The owner runs `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"` to return it to For you.
+  The request message supplies the question ID.
+  The canonical question log keeps the user's words after the 48-hour replay archive expires.
   A missing showrunner owner gives `QuestionOwnerUnavailable`.
   A unit rename rewrites no question record.
   `questions-table` lists the open questions for `/showrunner:questions`.
@@ -657,10 +702,12 @@ A missing folder uses its nearest existing parent until the folder appears.
   More or fewer than one match exits 2.
   It prints `relay: to <unit>`, `relay: to the showrunner of <showrunner name>, for <unit>`, or `relay: none; …`.
   It then prints `answer: ok — <showrunner name>: <text>`.
-- `reply --item <text> --text <reply>` records the asker's reply to the user's follow-up from the Questions page.
+- `reply --item <text> --text <reply>` answers a native followup without a tracked Review exchange.
+  An open Review exchange requires the shared answer command and its question ID from the request message.
   A question with a follow-up that waits for its reply is not due: `open` lists it as `waiting for the asker's reply since <time>`, and `/next` and the page leave it out.
   `reply` finds the one question with exactly that text and a waiting follow-up, in this production or a production below it.
   It keeps the follow-up and the reply in `followups`, and the question is due again with both shown.
+  The Python `followup` API requires `waiting_why`; the Review action uses the user's question text automatically.
   It prints `reply: ok — <showrunner name>: <text>: back on the open-questions list with the reply`.
 - `withdraw --item <text>` removes one open item with exactly that text from this production or a production below it.
   Use `update_registration.py withdraw --item <text>` when the cause of a filed item is gone.
@@ -1043,6 +1090,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
   - **Settings.** `config/nightly_review.conf` holds the nightly review's tunables: the state folders, the session and unit names, the review modes, the message sample size and history window, the table cell width, the note path and the command path. Each value is read when it is used. `XDG_STATE_HOME` and `NIGHTLY_REVIEW_NOTE` still override the state base and the note path.
   - **Vault note.** `write_note(body)` rewrites `~/rust/hanadocs/nightly improvement list.md` after the table prints and after every `record` that exits 0; `NIGHTLY_REVIEW_NOTE`, read at each write, replaces the path. The note is the line `Read <YYYY-MM-DD HH:MM> <zone label> from the nightly review's ledger on <short host>. The nightly review rewrites this note; edits made here are lost.`, a blank line, then the table as printed or `no open candidates`. The read time is in the user's zone, and the host is `socket.gethostname()` up to its first dot. The write is a dot-named temp file in the note's folder, mode `0o644`, then `os.replace`. The ledger stays the one record and the note is a copy: nothing is written when the note's folder is missing or this machine holds no `ledger.md`, so a machine without the ledger never replaces natedev's note. Every step after the path is chosen sits in one `OSError` handler, the two existence checks included, because `Path.is_dir` and `Path.is_file` can raise: a failure prints `candidates: cannot write <path>: <error>` to stderr and leaves stdout and the exit status as they were. The note sits at the vault root, outside the excluded `showrunners/` folder, so the vault's Git sees every rewrite. A test keeps `NIGHTLY_REVIEW_NOTE` on a temp path, because the default is the live vault.
   - **`record <report>`.** The watcher runs it on `Nightly proposal ready: <path>`; the night is the report's folder name. It appends the proposal (`# <title>`, `**Target:**`, `**Gain per week:**`) and each item under `**Also found:**` or `**Noted:**`: a `- ` or numbered line, whose bold lead is its title and whose closing tag is its gain. A paragraph closes the item list, so a list of what was denied that night is no candidate. A line whose start (`- <night> <area>: <title>`) the ledger already holds is not written again: a second run adds nothing, and a decided line keeps its outcome. A report with no title or target exits 1 and writes nothing.
+  - **`outcome E<n> <state>`.** Writes one outcome on ledger line n, the `E<n>` id that the Review page and `/next efficiency` show; an `<owner>/` prefix is allowed. The states are `accepted --applied '<repo> <sha>'` (`accepted <date>, applied (<repo> <sha>)`), `declined`, `deferred`, `done` (`done <date>`) and `relayed` (`relayed <date>`). Only an open line takes an outcome; the same outcome again prints `unchanged`. `--ledger <path>` selects another production's ledger; only the nightly review's own ledger rewrites the vault note. No session edits the ledger by hand.
   - **Earlier lines.** Before 2026-10-12 a smaller item's outcome was written on its night's line as `; from Also found: <title> — <outcome>`. Those stay as written; every item still open then got a line of its own.
 
 - **Queued messages.** `sessions.addressed` resolves a staff name through its fixed staff ID and `current_session`. Explicit `session:` and `uds:` addresses select native records. Registry names and former names do not select recipients. A named recipient uses `STATE/queue/staff_<staff id>.jsonl`. An explicit session address uses `session-<session id>.jsonl`. A session drains its native keys, its socket key, and its fixed staff key. Queue entries retain their stable owner across session changes. A delivered keyed message removes its queued copy. `send.py retire` removes the selected queued messages. The one-off `convert_queue_keys.py` program moves current staff-name queue files into their staff ID files. Its default mode only prints the moves.

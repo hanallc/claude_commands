@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.message.test_send_budget import write_configs
+from scripts.lint.memory_test_support import write_config_fixture
+
 from scripts.lib.checkout_test_support import python_tool_source
 
 import io
@@ -64,7 +67,7 @@ from scripts.message.codex_test_support import FakeDaemon, daemon_session_row, r
 from scripts.message import roster
 from scripts.message import sessions, session_records
 from scripts.accounts import accounts
-from scripts.agents.test_support import ShutdownTestCase
+from scripts.agents.test_support import ShutdownTestCase, write_machine_config
 from scripts.lib.user_zone import user_zone
 from scripts.notify.user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -114,10 +117,10 @@ REAL_OPEN_CASE = rca.open_case
 
 def write_send_config(path: Path, values: str) -> int:
     """Keep timing settings when a test writes its own send settings."""
-    defaults = Path(send.__file__).resolve().parents[2] / "config"
     for name in ("postmaster", "codex_daemon", "send_repeat_guard", "rca", "machines", "production"):
-        _ = (path.parent / f"{name}.conf").write_text((defaults / f"{name}.conf").read_text())
-    return path.write_text((defaults / "send.conf").read_text() + "\n" + values)
+        _ = write_config_fixture(path.parent / f"{name}.conf")
+    write_configs(path.parent)
+    return write_config_fixture(path, values)
 
 class RelayAccountTests(unittest.TestCase):
     def test_relay_imports_only_its_temporary_checkout(self) -> None:
@@ -955,15 +958,31 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(self.relayed, [])
         self.assertFalse((self.root / "queue").exists())
 
-    def test_missing_staff_row_refuses_a_live_registry_name_without_queue(self) -> None:
-        self.session("unregistered", "resources")
+    def test_missing_staff_row_delivers_a_live_registry_name_without_queue(self) -> None:
+        entry = replace(self.claude_row("unregistered", "resources"), name="",
+                        registry_name=roster.RegistryName("resources"))
         self.staff_rows.clear()
         errors = io.StringIO()
+        with mock.patch.object(roster, "roster", return_value=roster.Roster([entry], [])), redirect_stderr(errors):
+            for target in ("resources", "RESOURCES"):
+                route = send.resolve_recipient(target, send.LocalOnly(), roster.Roster([entry], []))
+                self.assertEqual(route, send.ClaudeRecipient("session:unregistered"))
+                result = send.send(local_options(["--to", target, "--text", "hello"]))
+                self.assertEqual(result.outcome, "sent")
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual([message.to for message in self.relayed], [f"uds:{self.root / 'unregistered.sock'}"] * 2)
+        duplicate = replace(entry, session=roster.ClaudeSession("duplicate"), reach=roster.Messageable("session:duplicate"))
         with redirect_stderr(errors), self.assertRaises(SystemExit) as stopped:
-            _ = send.send(local_options(["--to", "resources", "--text", "hello"]))
+            _ = send.resolve_recipient("resources", send.LocalOnly(), roster.Roster([entry, duplicate], []))
         self.assertEqual(stopped.exception.code, 2)
-        self.assertEqual(errors.getvalue(), "send.py: no staff row or live session for 'resources'\n")
-        self.assertEqual(self.relayed, [])
+        self.assertIn("resources matches 2 sessions:", errors.getvalue())
+        for address in ("session:unregistered", "session:duplicate"):
+            self.assertIn(address, errors.getvalue())
+        self.staff_member("staff-current", "resources")
+        preferred = replace(entry, session=roster.ClaudeSession("staff-current"),
+                            reach=roster.Messageable("session:staff-current"), registry_name=roster.RegistryName("different"))
+        self.assertEqual(send.resolve_recipient("resources", send.LocalOnly(), roster.Roster([entry, preferred], [])),
+                         send.ClaudeRecipient("session:staff-current"))
         self.assertFalse((self.root / "queue").exists())
 
     def test_nonstaff_live_names_refuse_and_native_addresses_deliver(self) -> None:
@@ -1078,6 +1097,18 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                         send.QueuedStaffRecipient(f"session:{expected.current_session}", expected.name,
                                                   str(expected.current_session)),
                     )
+
+        collision = replace(self.claude_row("registry-collision", "queue-unit"), name="",
+                            registry_name=roster.RegistryName("queue-unit"))
+        for scope, local_rows in ((send.LocalOnly(), [collision]),
+                                  (send.LocalThenPeer(), [collision]), (send.LocalThenPeer(), [])):
+            with (self.subTest(scope=scope, local_rows=local_rows),
+                  mock.patch.object(roster, "peer_roster", return_value=roster.Roster([collision], []))):
+                self.assertEqual(
+                    send.resolve_recipient("queue-unit", scope, roster.Roster(local_rows, []),
+                                           membership=record, records=[]),
+                    send.QueuedStaffRecipient("session:queue-current", "queue", "queue-current"),
+                )
 
         native = "00000000-0000-4000-8000-000000000002"
         for target, staff_name in (
@@ -3239,19 +3270,32 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("kept before the change", send.pending("new"))
         self.assertEqual(path.read_bytes(), original)
 
-    def test_a_send_without_a_staff_row_is_refused_without_a_named_queue(self) -> None:
+    def test_a_send_without_a_staff_row_uses_only_a_live_registry_name_without_a_named_queue(self) -> None:
         self.session("unowned", "registry-only", "former-only")
         self.staff_rows.clear()
+        entry = roster.RosterEntry("machine", "claude", "freestanding", "", "running",
+            roster.Messageable("session:unowned"), "/work", roster.NoShowrunner(), roster.NoDirector(),
+            roster.NotAWorker(), session=roster.ClaudeSession("unowned"),
+            registry_name=roster.RegistryName("registry-only"))
+        _ = self.enterContext(mock.patch.object(roster, "roster", return_value=roster.Roster([entry], [])))
         before = {path: path.read_bytes() for path in (self.root / "queue").glob("*.jsonl")}
         for target in ("unknown-claude", "registry-only", "former-only"):
             with self.subTest(target=target):
                 errors = io.StringIO()
+                if target == "registry-only":
+                    with redirect_stderr(errors):
+                        result = send.send(local_options(["--to", target, "--text", "anyone there"]))
+                    self.assertEqual(result.outcome, "sent")
+                    self.assertEqual(errors.getvalue(), "")
+                    self.assertEqual(self.relayed[-1].to, f"uds:{self.root / 'unowned.sock'}")
+                    self.assertEqual({path: path.read_bytes() for path in (self.root / "queue").glob("*.jsonl")}, before)
+                    continue
                 with self.assertRaises(SystemExit) as stopped, redirect_stderr(errors):
                     _ = send.send(local_options(["--to", target, "--text", "anyone there"]))
                 self.assertEqual(stopped.exception.code, 2)
                 self.assertEqual(errors.getvalue(), f"send.py: no staff row or live session for {target!r}\n")
                 self.assertEqual({path: path.read_bytes() for path in (self.root / "queue").glob("*.jsonl")}, before)
-        self.assertEqual(self.relayed, [])
+        self.assertEqual([message.to for message in self.relayed], [f"uds:{self.root / 'unowned.sock'}"])
         self.assertFalse(send.queue_path("unknown-claude").exists())
 
     def relay_record(self, pid: int, name: str, *, stale: bool = False) -> str:
@@ -4195,9 +4239,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                                     sent=send.now().isoformat(), expires=send.now().isoformat())
             budgets: list[tuple[float, float]] = []
             for allowance in (30, 90):
-                source = Path(__file__).resolve().parents[2] / "config/send.conf"
-                _ = config.write_text(source.read_text().replace("remote_transport_seconds=30",
-                                                               f"remote_transport_seconds={allowance}"))
+                _ = write_config_fixture(config, f"remote_transport_seconds={allowance}\n")
                 with mock.patch.object(send, "run", return_value=(0, "SENT: fixture\n", "")) as run:
                     self.assertEqual(send.remote(message, "fixture-peer", options).outcome, "sent")
                     delivery = cast(float, run.call_args.args[2])
@@ -5278,6 +5320,7 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         _ = self.enterContext(mock.patch.object(staff, "snapshot", side_effect=lambda: staff.StaffSnapshot(tuple(self.staff_rows.values()))))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         (self.root / "config").mkdir()
+        write_machine_config(self.root / "config")
         _ = write_send_config(self.root / "config/send.conf", "")
         binaries = self.root / "bin"
         binaries.mkdir()
@@ -5412,6 +5455,19 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(len(self.forwarded()), 3)
         self.assertEqual(self.relayed, [])
         self.assertEqual(self.daemon_calls, [])
+        peer = replace(self.row("", "session:registry-peer"), registry_name=roster.RegistryName("mac"))
+        self.peer([peer])
+        self.staff_rows.clear()
+        status, output, errors = self.run_main("mac")
+        self.assertEqual((status, errors), (0, ""), output)
+        forwarded = self.forwarded()[-1]
+        self.assertEqual(forwarded[forwarded.index("--to") + 1], "session:registry-peer")
+        self.assertTrue(all(cast(list[str], call["args"])[2] == "mac" for call in self.ssh_calls()))
+        self.assertEqual(self.relayed + self.daemon_calls, [])
+        status, output, errors = self.run_main("mac", "--machine", "mac", text="Explicit machine")
+        self.assertEqual((status, errors), (0, ""), output)
+        forwarded = self.forwarded()[-1]
+        self.assertEqual(forwarded[forwarded.index("--to") + 1], "mac")
 
     def test_remote_only_addresses_are_looked_up_before_local_transport_fallback(self) -> None:
         for address in ("session:peer", "worker:peer-run/impl", "codex:peer-thread"):

@@ -673,7 +673,7 @@ FIX_RETURN_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../mac_test/fix
 # fix_return.py places the lint copy, and that place can decide whether lint passes.
 lint_code_files() {
     LINT_CODE_FILES=("${BASH_SOURCE[0]}" "$BUILD_HELPER_ROOT/lint/invoke.sh"
-        "$BUILD_HELPER_ROOT/lint/prebuild.py" "${FIX_RETURN_SCRIPT:-}"
+        "$BUILD_HELPER_ROOT/lint/prebuild.py" "$BUILD_HELPER_ROOT/lib/dev_shell.py" "${FIX_RETURN_SCRIPT:-}"
         "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}")
 }
 
@@ -731,7 +731,6 @@ STEP_MAC_DISK_EXCLUSIONS=""
 STEP_RUNS_ON=natedev_only
 STEP_TARGET_TABLE=""
 HOLD_LINT=0
-STEP_DEFER_LOCAL=0
 
 # Status 101 permits repairs for lint findings and compile errors.
 # A kill or a lint hold prevents repairs.
@@ -831,12 +830,25 @@ run() {
 }
 
 run_step() {
+    if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
+        if buildlog_step_compiles "$@"; then
+            local STEP_WRITES_TREE=0
+            if step_writes_tree "$@"; then STEP_WRITES_TREE=1; fi
+            route_compiling_step "$@"
+            exit $?
+        fi
+        return 0
+    fi
     # A reservation for this call must not cover the next step's local waits.
     if [[ -n "${HOLD_WAIT_DIR:-}" && -s "$HOLD_WAIT_DIR/ssh-reservation" ]]; then
         release_wait_claim
     fi
-    local attempt status started ended step_log monitor=0
+    local attempt status started ended step_log monitor=0 LINT_REPAIR_REUSED_GRANT=0
     local STEP_WRITES_TREE=0
+    if [[ "${PLACEMENT_OUTCOME:-}" == unresolved ]] && buildlog_step_compiles "$@"; then
+        build_check_record_failure "$PLACEMENT_CLEANUP_ERROR"
+        return 2
+    fi
     if step_writes_tree "$@"; then
         STEP_WRITES_TREE=1
         # Keep the call's decision for the next step.
@@ -861,6 +873,7 @@ run_step() {
     RUN_LAST_ATTEMPT_KILLED=0
     step_log="$(mktemp "${HOLD_WAIT_DIR:-${TMPDIR:-/tmp}}/step-output.XXXXXX")"
     for attempt in 1 2; do
+        LINT_REPAIR_REUSED_GRANT=0
         if [[ -f "${HOLD_WAIT_DIR:-/nonexistent}/lint-held" ]]; then HOLD_LINT=1; fi
         if buildlog_step_compiles "$@"; then
             route_compiling_step "$@" || { status=$?; rm -f "$step_log"; return "$status"; }
@@ -883,6 +896,9 @@ run_step() {
             set +m
             if (
                 step_token_before=${TOKEN_HELD:-0}
+                if (( LINT_REPAIR_REUSED_GRANT )) || [[ "${LINT_MEND_WAIT:-0}" == 1 ]]; then
+                    BUILDLOG_PRELAUNCH_OUTCOME=abandon
+                fi
                 # The pipeline shell owns tokens taken during memory admission.
                 trap 'status=$?; finish_step_token "$step_token_before" "$status"; exit $?' EXIT
                 run_once "$@"
@@ -905,12 +921,17 @@ run_step() {
             status=$?
         fi
         RUN_STEP_PID=""
+        if [[ -n "${PLACEMENT_GRANT_FILE:-}" && -e "$PLACEMENT_GRANT_FILE.outcome" ]]; then apply_placement_outcome; fi
         if [[ -n "${TREE_WATCH_DIR:-}" ]]; then cancel_tree_run; fi
         step_state local_noncompiling
         if [[ "$status" == 0 ]]; then
             RUN_LAST_ATTEMPT_KILLED=0
             rm -f "$step_log"
             return 0
+        fi
+        if [[ "${PLACEMENT_OUTCOME:-}" == unresolved ]]; then
+            rm -f "$step_log"
+            return "$status"
         fi
         # A repairable tool failure may continue a lint pass. A failed check
         # must end the call even when that tool's caller handles failures.
@@ -930,9 +951,7 @@ run_step() {
             return "$status"
         fi
         if buildlog_step_compiles "$@" && { [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" ]] || step_stopped_by_hold; }; then
-            if [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" ]]; then
-                PLACEMENT_RETRY=1
-            else
+            if [[ "$status" != "$LINT_LEFT_QUEUE_STATUS" ]]; then
                 echo 'verify.sh: natedev hold stopped this step; choosing its target again.' >&2
             fi
             status=0
@@ -1935,6 +1954,7 @@ cancel_tree_run() {
 }
 
 start_tree_watch() {
+    [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || return 0
     [[ -z "$TREE_WATCH_PID" ]] || return 0
     TREE_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" tool --tool verify-tree --owner-pid "$$")"
     set_verdict_keys --watch-start "$TREE_WATCH_DIR/start"
@@ -1967,6 +1987,16 @@ PYDOC
 
 # The copy owner holds the lease until this shell closes descriptor 8.
 doc_checkout() {
+    if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
+        DOC_CHECKOUT="$DOC_REPO_TOP"
+        DOC_TREE=""
+        return 0
+    fi
+    if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$DOC_REPO_TOP" ]]; then
+        DOC_CHECKOUT="$DOC_REPO_TOP"
+        DOC_TREE=$(doc_tree) || return $?
+        return 0
+    fi
     local copy_script
     copy_script="$(dirname "$BUILD_FOLDERS_SCRIPT")/../copies/copies.py"
     coproc DOC_COPY { "$PY" "$copy_script" hold --repo "$DOC_REPO_TOP"; }
@@ -2030,6 +2060,7 @@ PYDOC
 # record.py adds the repo, worktree, branch and commit. A record that cannot be
 # written is lost, never the result.
 note_event() {
+    [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || return 0
     [[ "${CALL_NOTED}" -eq 0 ]] || return 0
     CALL_NOTED=1
     collect_hold_wait
@@ -2417,10 +2448,6 @@ initialize_step_record() {
     STEP_TARGET_TABLE=$table
     STEP_MAC_DISK_EXCLUSIONS=$mac_disk_exclusions
     if step_can_retry; then
-        case "$CMD" in
-            check|doc|example|build|final) STEP_DEFER_LOCAL=1 ;;
-            lint) [[ "${COMMAND_ARGS[0]:-}" != --check ]] || STEP_DEFER_LOCAL=1 ;;
-        esac
         while IFS=$'\t' read -r name eligibility reason settings platform; do
             if [[ "$settings" != - && "$eligibility" == eligible ]]; then
                 MAC_LEAVE_SETTINGS="$settings"
@@ -2462,23 +2489,39 @@ initialize_step_record() {
 route_compiling_step() {
     local command=$1
     STEP_RAN_ON_MAC=0 MAC_PASSED=0
-    if [[ "${PLACEMENT_RETRY:-0}" != 1 ]]; then
-        PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
-        PLACEMENT_EPISODE="$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER"
-        PLACEMENT_SINCE="${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHREALTIME:-$(date +%s)}}"
-        PLACEMENT_SOURCE_KEY=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "${MAC_SOURCE_ROOT:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}") || return $?
+    if [[ "${LINT_REPAIR_PENDING_GRANT:-0}" == 1 ]]; then
+        local token_status=0 reason
+        take_local_placement || token_status=$?
+        LINT_REPAIR_PENDING_GRANT=0
+        if (( token_status == 0 )); then
+            if reason=$(verify_helper "$VERIFY_START_DIR/../lint/lint_repair_grant.py" \
+                    "$PLACEMENT_ASSIGNMENT_FILE" "$PLACEMENT_GRANT_FILE" "$PLACEMENT_EPISODE" "$$" "${LINT_COPY_TREE:-}" "$@"); then
+                # Keep the sidecar that the grant uses to find its build scope.
+                local grant_peak=$BUILDLOG_PEAK
+                buildlog_begin "$@" || true
+                BUILDLOG_PEAK=$grant_peak
+                BUILDLOG_PLACEMENT_PREPARED=1
+                LINT_REPAIR_REUSED_GRANT=1
+                return 0
+            fi
+            echo "verify.sh: cannot reuse the judgment grant: ${reason:-grant check failed}. Requesting placement again." >&2
+            verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
+                --pid "$PLACEMENT_OWNER_PID" --reason "the judgment grant cannot cover the lint repair" >/dev/null || return $?
+        elif (( token_status != 10 )); then
+            return "$token_status"
+        fi
+        unset BUILDLOG_SELECTED_LOCAL_GRANT BUILDLOG_PLACEMENT_FILE
     fi
-    PLACEMENT_RETRY=0
-    export BUILDLOG_PLACEMENT_EPISODE="$PLACEMENT_EPISODE"
+    if [[ "${PLACEMENT_OUTCOME:-}" != retry ]]; then PLACEMENT_EPISODE=""; fi
     PLACEMENT_COMMAND=("$@")
-    PLACEMENT_ASSIGNMENT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.json"
-    PLACEMENT_GRANT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.sh"
-    if [[ -n "${LINT_MEMORY_WAIT_FILE:-}" ]]; then
-        mv "$LINT_MEMORY_WAIT_FILE" "$PLACEMENT_ASSIGNMENT_FILE.wait" || return $?
-        LINT_MEMORY_WAIT_FILE=""
-    fi
     PLACEMENT_SESSION=$(verify_helper "$BUILD_TARGETS_SCRIPT" submitting-session) || return $?
     export PLACEMENT_SESSION
+    if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
+        local request_status=0
+        placement_once || request_status=$?
+        PLACEMENT_EPISODE=""
+        exit "$request_status"
+    fi
     buildlog_begin "$@" || true
     BUILDLOG_PLACEMENT_PREPARED=1
     if [[ "${STEP_WRITES_TREE:-0}" == 0 ]]; then
@@ -2512,10 +2555,7 @@ route_compiling_step() {
     fi
     MAC_FINISH_CALL=0
     if [[ "$CMD" == test ]]; then MAC_FINISH_CALL=1; fi
-    if ! step_can_retry || [[ -z "$MAC_LEAVE_SETTINGS" ]]; then
-        acquire_token local || return $?
-        record_token_wait
-    fi
+    # Placement and memory waits hold no cargo token; a local grant takes it in route_test.
     route_test || return $?
     if [[ "$MAC_PASSED" == 1 ]]; then
         STEP_RAN_ON_MAC=1
@@ -2616,12 +2656,35 @@ mac_only_refuse() {
 
 PLACEMENT_STEP_NUMBER=0
 PLACEMENT_EPISODE=""
+PLACEMENT_OWNER_PID=$$
 PLACEMENT_EVIDENCE_EPISODE=""
 PLACEMENT_COMMAND=()
 PLACEMENT_ASSIGNMENT_FILE=""
 PLACEMENT_GRANT_FILE=""
 PLACEMENT_PROVIDER=""
+PLACEMENT_OUTCOME=""
 MAC_BACKOFF_PROBED=0
+
+apply_placement_outcome() {
+    [[ -n "${PLACEMENT_GRANT_FILE:-}" && -e "$PLACEMENT_GRANT_FILE.outcome" ]] || return 0
+    local episode="" outcome=""
+    IFS=$'\t' read -r episode outcome < "$PLACEMENT_GRANT_FILE.outcome" || true
+    rm -f -- "$PLACEMENT_GRANT_FILE.outcome" || true
+    unset BUILDLOG_SELECTED_LOCAL_GRANT BUILDLOG_PLACEMENT_FILE
+    if [[ "$episode" != "$PLACEMENT_EPISODE" ]]; then outcome=unresolved; fi
+    case "$outcome" in
+        done|abandon)
+            PLACEMENT_EPISODE="" BUILDLOG_PLACEMENT_EPISODE=""
+            ;;
+        retry) ;;
+        *)
+            outcome=unresolved
+            PLACEMENT_CLEANUP_ERROR="could not cancel placement episode $PLACEMENT_EPISODE during step cleanup"
+            printf 'verify.sh: %s\n' "$PLACEMENT_CLEANUP_ERROR" >&2
+            ;;
+    esac
+    PLACEMENT_OUTCOME=$outcome
+}
 
 # A placement that fails before its step starts leaves the run without a
 # verdict. 78 (wait) and the left-queue status are not failures. A refusal (2)
@@ -2638,20 +2701,26 @@ placement_failed() {
 placement_once() {
     local token=none reply line route="" status=0 monitor=0
     local LINT_QUEUE_LEAVE_HOOK="" BUILDLOG_MAC_IDLE_HOOK=""
-    sync_token_state
-    if [[ "${TOKEN_USED:-0}" == 1 ]]; then
-        token=required
-        [[ "${TOKEN_HELD:-0}" == 0 ]] || token=held
+    if [[ -z "$PLACEMENT_EPISODE" ]]; then
+        PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
+        PLACEMENT_EPISODE="${BUILDLOG_FIRST_STEP_EPISODE:-$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER}"
+        PLACEMENT_OWNER_PID=$$
+        PLACEMENT_SINCE="${BUILDLOG_FIRST_STEP_SINCE:-${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHREALTIME:-$(date +%s)}}}"
+        PLACEMENT_SOURCE_KEY=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "${MAC_SOURCE_ROOT:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}") || return $?
+        PLACEMENT_ASSIGNMENT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.json"
+        PLACEMENT_GRANT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.sh"
+        if [[ -n "${LINT_MEMORY_WAIT_FILE:-}" ]]; then
+            mv "$LINT_MEMORY_WAIT_FILE" "$PLACEMENT_ASSIGNMENT_FILE.wait" || return $?
+            LINT_MEMORY_WAIT_FILE=""
+        fi
+        export BUILDLOG_PLACEMENT_EPISODE="$PLACEMENT_EPISODE"
     fi
-    if [[ "$token" == held ]]; then
-        renew_token || true
-        printf -v LINT_QUEUE_LEAVE_HOOK 'bash -c %q verify-token %q %q %q %q %q' \
-            '[[ "$(<"$1/locks/cargo.d/holder_pid")" == "$4" ]] && bash "$2" renew "$1" "$3" cargo --pid "$4" --hold "$5" >/dev/null; exit 1' \
-            "$BOARD_DIR" "$BOARD_HELPER" "$BOARD_SLOT" "$$" "$TOKEN_HOLD_S"
-    fi
+    PLACEMENT_OUTCOME=""
+    # route_test released any token before placement; a local grant takes it.
+    if [[ "${TOKEN_USED:-0}" == 1 ]]; then token=after-grant; fi
     export LINT_QUEUE_LEAVE_HOOK BUILDLOG_MAC_IDLE_HOOK
     local placement_args=(place-step --once --wait-events --episode "$PLACEMENT_EPISODE" --since "$PLACEMENT_SINCE"
-        --pid $$ --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
+        --pid "${BUILDLOG_FIRST_STEP_PID:-${PLACEMENT_OWNER_PID:-$$}}" --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
         --kind "$CMD" --source-key "$PLACEMENT_SOURCE_KEY" --session-id "$PLACEMENT_SESSION"
         --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" --token "$token"
         --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" --shell-state "$PLACEMENT_GRANT_FILE")
@@ -2664,6 +2733,24 @@ placement_once() {
     [[ "${LOCAL_ONLY:-0}" == 0 ]] || placement_args+=(--local-only --local-reason "$LOCAL_REASON")
     [[ "${STEP_WRITES_TREE:-0}" == 0 ]] || placement_args+=(--writes-tree)
     [[ "${MAC_ONLY:-0}" == 0 ]] || placement_args+=(--mac-only)
+    if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
+        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" "${placement_args[@]}" \
+            --token none --request-file "$BUILDLOG_FIRST_STEP_REQUEST" -- "${PLACEMENT_COMMAND[@]}"
+        return $?
+    fi
+    if [[ -n "${BUILDLOG_FIRST_STEP_ASSIGNMENT:-}" ]]; then
+        PLACEMENT_ASSIGNMENT_FILE="$BUILDLOG_FIRST_STEP_ASSIGNMENT"
+        IFS=$'\t' read -r PLACEMENT_PROVIDER STEP_ASSIGNED_TARGET STEP_ASSIGNED_HOST STEP_ASSIGNED_SLOT \
+            PLACEMENT_EPISODE PLACEMENT_ATTEMPT <<< "$BUILDLOG_FIRST_STEP_ROUTE"
+        PLACEMENT_OWNER_PID="${BUILDLOG_RUN%%:*}"
+        PLACEMENT_SINCE="$BUILDLOG_FIRST_STEP_SINCE"
+        export BUILDLOG_PLACEMENT_EPISODE="$PLACEMENT_EPISODE"
+        unset BUILDLOG_FIRST_STEP_ASSIGNMENT BUILDLOG_FIRST_STEP_ROUTE BUILDLOG_FIRST_STEP_SINCE
+        local metadata
+        metadata=$(verify_helper "$BUILD_TARGETS_SCRIPT" assigned-info --assignment-file "$PLACEMENT_ASSIGNMENT_FILE") || return $?
+        IFS=$'\t' read -r STEP_ASSIGNED_SETTINGS STEP_ASSIGNED_PLATFORM PLACEMENT_SESSION <<< "$metadata"
+        return 0
+    fi
     # A builtin wait lets the parent handle TERM during a service outage.
     PLACEMENT_CLIENT_ACTIVE=1
     [[ $- != *m* ]] || monitor=1
@@ -2758,6 +2845,43 @@ wait_for_claim_recovery() {
     HOLD_WAITER_PID=""
 }
 
+take_local_placement() {
+    # The grant keeps its reservation while the call takes its unit's cargo token.
+    local token_status=0
+    TOKEN_WAIT_HOLD_CHECK=build_hold_check_local
+    acquire_token local || token_status=$?
+    TOKEN_WAIT_HOLD_CHECK=""
+    if (( token_status == 10 )); then
+        # A natedev hold started before the token came: give back the grant and place again.
+        record_token_wait
+        export BUILDLOG_SELECTED_LOCAL_GRANT="$PLACEMENT_GRANT_FILE"
+        export BUILDLOG_PLACEMENT_FILE="$PLACEMENT_ASSIGNMENT_FILE"
+        BUILDLOG_MEM_PRELAUNCH_REASON="local hold changed before execution"
+        if [[ "${LINT_REPAIR_PENDING_GRANT:-0}" == 1 ]]; then
+            buildlog_release_memory 10 abandon
+        else
+            source "$PLACEMENT_GRANT_FILE" || return $?
+            buildlog_release_memory 10
+        fi
+        apply_placement_outcome
+        if [[ "$PLACEMENT_OUTCOME" == unresolved ]]; then
+            build_check_record_failure "$PLACEMENT_CLEANUP_ERROR"
+            return 2
+        fi
+        echo 'verify.sh: natedev hold started during the cargo token wait; choosing its target again.' >&2
+        return 10
+    fi
+    if (( token_status != 0 )); then
+        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
+            --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "the cargo token wait ended" >/dev/null || true
+        return "$token_status"
+    fi
+    record_token_wait
+    if [[ "$CMD" == test ]]; then echo 'verify.sh: running on natedev'; fi
+    export BUILDLOG_SELECTED_LOCAL_GRANT="$PLACEMENT_GRANT_FILE"
+    export BUILDLOG_PLACEMENT_FILE="$PLACEMENT_ASSIGNMENT_FILE"
+}
+
 route_test() {
     local last_decline="" wait_reason="" name eligibility reason settings platform
     while IFS=$'\t' read -r name eligibility reason settings platform; do
@@ -2769,18 +2893,19 @@ route_test() {
             fi
         fi
     done <<< "$STEP_TARGET_TABLE"
+    # A placement wait holds no cargo token, also after an earlier step; a local grant takes it again.
+    release_token || return $?
     while :; do
         local placement_status=0 admission=0
         check_routing_hold || admission=$?
         (( admission == 0 || admission == 10 )) || return "$admission"
-        if (( admission == 10 )); then release_token || return $?; fi
         placement_once || placement_status=$?
         if (( placement_status == 78 )); then
             if [[ "${LINT_MEND_WAIT:-0}" == 1 && "$STEP_WRITES_TREE" == 1 \
                     && "$PLACEMENT_WAIT_MEMORY" == 1 && -n "$MAC_LEAVE_SETTINGS" ]] \
                     && STEP_WRITES_TREE=0 step_can_retry; then
                 verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                    --pid $$ --reason "judge lint before local repair" >/dev/null || return $?
+                    --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "judge lint before local repair" >/dev/null || return $?
                 LINT_MEMORY_WAIT_FILE="$PLACEMENT_ASSIGNMENT_FILE.wait"
                 LINT_MEMORY_JUDGMENT=1
                 BUILDLOG_PLACEMENT_PREPARED=0
@@ -2792,16 +2917,13 @@ route_test() {
                 step_state waiting_ssh "$PINNED_TARGET"
             fi
             if [[ "${PLACEMENT_WAIT_MEMORY:-0}" == 0 ]]; then start_routing_wait; fi
-            if (( admission == 0 )) && [[ "${TOKEN_USED:-0}" == 1 && "${TOKEN_HELD:-0}" == 0 ]]; then
-                acquire_token placement || placement_status=$?
-                if (( placement_status != 0 && placement_status != LINT_LEFT_QUEUE_STATUS && placement_status != 78 )); then
-                    return "$placement_status"
-                fi
-                record_token_wait
-                start_token_renewer || true
-            else
-                wait_for_placement
+            # The first pass of an episode starts nothing on natedev, so a free remote target
+            # can take the step. The next pass can grant natedev at once.
+            if [[ "${TOKEN_USED:-0}" == 1 && "${PLACEMENT_TOKEN_CHECK_EPISODE:-}" != "$PLACEMENT_EPISODE" ]]; then
+                PLACEMENT_TOKEN_CHECK_EPISODE=$PLACEMENT_EPISODE
+                continue
             fi
+            wait_for_placement
             continue
         fi
         (( placement_status == 0 )) || return "$placement_status"
@@ -2815,23 +2937,21 @@ route_test() {
         if [[ "$PLACEMENT_PROVIDER" == local ]]; then
             if [[ "${LINT_MAC_FIX:-0}" == 1 ]]; then
                 verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                    --pid $$ --reason "the Mac fix pass runs only on the Mac" >/dev/null || return $?
+                    --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "the Mac fix pass runs only on the Mac" >/dev/null || return $?
                 return "$LINT_LEFT_QUEUE_STATUS"
             fi
             if [[ "${LINT_MEMORY_JUDGMENT:-0}" == 1 ]]; then
-                verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                    --pid $$ --reason "local memory permits lint repair" >/dev/null || return $?
+                LINT_REPAIR_PENDING_GRANT=1
                 return "$LINT_LEFT_QUEUE_STATUS"
             fi
-            if [[ "$CMD" == test ]]; then echo 'verify.sh: running on natedev'; fi
-            export BUILDLOG_SELECTED_LOCAL_GRANT="$PLACEMENT_GRANT_FILE"
-            export BUILDLOG_PLACEMENT_FILE="$PLACEMENT_ASSIGNMENT_FILE"
-            return 0
+            local token_status=0
+            take_local_placement || token_status=$?
+            if (( token_status == 10 )); then continue; fi
+            return "$token_status"
         fi
-        release_token || return $?
         if [[ "${TOKEN_USED:-0}" == 1 ]]; then
             verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" report-prerequisite --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
-                --token required >/dev/null || return $?
+                --token after-grant >/dev/null || return $?
         fi
         local claim_status=0
         # reserve and recover-reservation take the same words.
@@ -2871,7 +2991,7 @@ route_test() {
         [[ "$MAC_PASSED" != 1 ]] || return 0
         if [[ "${LINT_MAC_FIX:-0}" == 1 && "${LAST_TARGET_REASON:-}" != busy && "${LAST_TARGET_REASON:-}" != blocked ]]; then
             verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                --pid $$ --reason "the Mac fix pass did not run" >/dev/null 2>&1 || true
+                --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "the Mac fix pass did not run" >/dev/null 2>&1 || true
             return "$LINT_LEFT_QUEUE_STATUS"
         fi
         last_decline=${LAST_TARGET_REASON:-}
@@ -2889,9 +3009,10 @@ route_test() {
         fi
         if [[ "${LAST_TARGET_REASON:-}" == source_changed ]]; then
             verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                --pid $$ --reason "source changed before dispatch" >/dev/null || return $?
+                --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "source changed before dispatch" >/dev/null || return $?
             PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
             PLACEMENT_EPISODE="$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER"
+            PLACEMENT_OWNER_PID=$$
             export BUILDLOG_PLACEMENT_EPISODE="$PLACEMENT_EPISODE"
             PLACEMENT_SOURCE_KEY=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key \
                 --repo-root "${MAC_SOURCE_ROOT:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}") || return $?
@@ -3005,6 +3126,7 @@ run_local_test() {
 # tree, or (lint) already failed on it; LOOKUP_STATUS is the status to exit
 # with. Sets LOOKUP_KEY either way, --no-cache included.
 cache_lookup() {
+    [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || return 1
     local record outcome="" word
     [[ -n "${CACHE_DIR}" ]] || return 1
     LOOKUP_KEY="$(tree_key)"
@@ -3208,7 +3330,6 @@ if [[ "$MAC_ONLY" == 0 ]] && cache_lookup; then
     exit "${LOOKUP_STATUS}"
 fi
 if [[ "$CMD" == test ]]; then compose_nextest_args; fi
-STEP_DEFER_LOCAL=1
 
 trap - INT TERM HUP
 
@@ -3246,6 +3367,8 @@ TOKEN_HELD=0
 # A step routed to the Mac skips its first token acquisition.
 TOKEN_WAITED=0
 TOKEN_WAITER_PID=""
+# A local grant sets this to its hold check: a hold that starts during the token wait ends it.
+TOKEN_WAIT_HOLD_CHECK=""
 # shellcheck source=/dev/null
 source "${BASH_SOURCE[0]%/*}/../lib/conf.sh"
 TOKEN_HOLD_S="$(conf_value direct VERIFY_TOKEN_HOLD_SECONDS)" || exit 2
@@ -3264,6 +3387,15 @@ token_wait_clock() {
 # A run ended during its token wait stops the waiting acquire, gives back a
 # token that acquire took in the last instant, then ends by its caller's trap,
 # or by the signal itself when the caller has none.
+# A hold check ended the wait before the token came; this call holds no token.
+token_wait_left() {
+    phase_wait_finish token
+    [[ -z "$TOKEN_WAIT_ENTRY" ]] || rm -f "$TOKEN_WAIT_ENTRY"
+    TOKEN_WAIT_ENTRY=""
+    trap - INT TERM HUP
+    eval "$TOKEN_CALLER_TRAPS"
+}
+
 token_wait_interrupted() {
     local signal_name=$1
     trap - INT TERM HUP
@@ -3433,6 +3565,7 @@ record_token_wait() {
 }
 
 acquire_token() {
+    buildlog_check_nested_step || return $?
     sync_token_state
     TOKEN_WAITED=0
     [[ "${TOKEN_USED}" -eq 1 && "${TOKEN_HELD}" -eq 0 ]] || return 0
@@ -3462,6 +3595,16 @@ acquire_token() {
             token_wait_superseded
         fi
         kill -0 "$$" 2>/dev/null || token_wait_orphaned
+        if [[ -n "$TOKEN_WAIT_HOLD_CHECK" ]]; then
+            local hold_status=0
+            "$TOKEN_WAIT_HOLD_CHECK" || hold_status=$?
+            if (( hold_status != 0 )); then
+                token_wait_clock
+                TOKEN_WAITED=$(( TOKEN_CLOCK_NOW - started ))
+                token_wait_left
+                return "$hold_status"
+            fi
+        fi
         count_token_waiters_ahead
         if (( noted >= 0 )); then phase_wait_start token "cargo token"; fi
         # The line goes out before the first try when the token is not free.
@@ -3492,15 +3635,6 @@ acquire_token() {
             fi
             TOKEN_WAITER_PID=""
             (( status != 4 )) || token_wait_orphaned
-        fi
-        if [[ "${1:-}" == placement && -n "${PLACEMENT_EPISODE:-}" ]]; then
-            local placement_status=0
-            placement_once || placement_status=$?
-            if (( placement_status == 0 )) && [[ "$PLACEMENT_PROVIDER" != local ]]; then
-                phase_wait_finish token
-                return "$LINT_LEFT_QUEUE_STATUS"
-            fi
-            if (( placement_status != 0 && placement_status != 78 )); then return "$placement_status"; fi
         fi
         token_wait_clock
         waited=$(( (TOKEN_CLOCK_NOW - started) / 60 ))
@@ -3537,16 +3671,6 @@ if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
     TOKEN_WAITER_FILE="${TOKEN_WAITERS_DIR}/${TOKEN_WAITER_PREFIX}.${TOKEN_WAITER_OWN_STAMP}.$$"
     trap 'TOKEN_SUPERSEDED=1' USR1
     supersede_older_waiters
-    if [[ "$STEP_DEFER_LOCAL" == 0 ]]; then
-        initial_token_status=0
-        acquire_token || initial_token_status=$?
-        if [[ "$initial_token_status" == "$LINT_LEFT_QUEUE_STATUS" ]]; then
-            STEP_DEFER_LOCAL=1
-        elif [[ "$initial_token_status" != 0 ]]; then
-            exit "$initial_token_status"
-        fi
-    fi
-    TOKEN_WAIT_S=$TOKEN_WAITED
 fi
 
 # Fork before starting each step. The child creates its own session, records
@@ -3598,7 +3722,7 @@ if child:
 os.setsid()
 with (lock.parent / "cargo.guard").open("a+") as guard:
     fcntl.flock(guard, fcntl.LOCK_EX)
-    # A token released or reclaimed during the memory wait leaves no holder_pid,
+    # A token released or reclaimed after the grant leaves no holder_pid,
     # or a holder that recorded none: either way this run no longer holds it.
     try:
         recorded = (lock / "holder_pid").read_text()
@@ -3629,8 +3753,7 @@ renew_token() {
     (( status == 0 || status == 2 ))
 }
 
-# Each span owns one renewer. Nested spans use the same renewer.
-# Release stops the renewer before ownership changes.
+# Each step command owns one renewer. Release stops the renewer before ownership changes.
 start_token_renewer() {
     [[ "${TOKEN_HELD:-0}" -eq 1 ]] || return 0
     renew_token || return 1
@@ -3668,26 +3791,6 @@ stop_token_renewer() {
     [[ -n "${TOKEN_RENEWER_PID:-}" ]] || return 0
     collect_child "$TOKEN_RENEWER_PID" TERM
     TOKEN_RENEWER_PID=""
-}
-
-with_token_renewal() {
-    # A nested call must keep its caller's renewer.
-    if [[ -n "${TOKEN_RENEWER_PID:-}" ]] && kill -0 "$TOKEN_RENEWER_PID" 2>/dev/null; then
-        "$@"
-        return $?
-    fi
-    local TOKEN_RENEWER_PID="" status=0
-    # Admission or the command guard handles confirmed ownership loss.
-    start_token_renewer || true
-    "$@" || status=$?
-    stop_token_renewer
-    return "$status"
-}
-
-# Routing can retain the token during remote waits. Renew it during those waits.
-eval "$(declare -f route_test | sed '1s/route_test/route_test_without_renewal/')"
-route_test() {
-    with_token_renewal route_test_without_renewal
 }
 
 buildlog_exec() {
@@ -3752,26 +3855,30 @@ release_token() {
     fi
 }
 
-# A local attempt takes its token before it requests memory.
-# The periodic admission hook renews the token throughout the memory wait.
+# A local attempt waits for memory without its cargo token, so the unit's other
+# calls keep building. After the grant it takes the token; the grant keeps its
+# reservation during that wait. A grant from placement already holds the token.
 eval "$(declare -f buildlog_wait_for_memory | sed '1s/buildlog_wait_for_memory/buildlog_wait_for_memory_only/')"
 buildlog_wait_for_memory() {
     if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
         buildlog_wait_for_memory_only "$@"
         return $?
     fi
-    local status=0 cleanup_status=0
+    local status=0
     BUILDLOG_MEM_WAIT_S=0
     step_state waiting_hold
     sync_token_state
-    acquire_token local || return $?
-    record_token_wait
-    with_token_renewal buildlog_wait_for_memory_only "$@" || status=$?
+    release_token || return $?
+    buildlog_wait_for_memory_only "$@" || status=$?
     if (( status != 0 )) || [[ "$BUILDLOG_MEM_OUTCOME" != Granted ]]; then
-        release_token || cleanup_status=$?
-        (( status != 0 )) || status=$cleanup_status
         return "$status"
     fi
+    acquire_token local || status=$?
+    if (( status != 0 )); then
+        buildlog_release_memory "$status"
+        return "$status"
+    fi
+    record_token_wait
     step_state on_natedev
 }
 
@@ -3825,8 +3932,8 @@ build_hold_wait_local() {
     return "$status"
 }
 
-# Again with the token held: a peer running this same call on this tree held
-# the token until its result was recorded.
+# Again before the first step: a peer running this same call on this tree may
+# have recorded its result since the first lookup.
 if [[ "$MAC_ONLY" == 0 ]] && cache_lookup; then
     if ! release_token && (( LOOKUP_STATUS == 0 )); then
         LOOKUP_STATUS=1
@@ -3928,6 +4035,7 @@ verify_cleanup() {
         interrupted) outcome=interrupted ;;
     esac
     note_event "${outcome}" "${RUN_STARTED}" $(( SECONDS - RUN_STARTED )) "" 0 "${code}" || true
+    apply_placement_outcome
     finish_hold_wait
     [[ -z "${MEM_KILL_FILE:-}" ]] || rm -f "$MEM_KILL_FILE"
     [[ -z "${MEM_KILL_FILE:-}" ]] || rm -f "${MEM_KILL_FILE}.stopped"
@@ -3939,8 +4047,8 @@ verify_cleanup() {
     fi
     [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "$TOKEN_WAIT_FILE" "${TOKEN_WAIT_FILE}.given_back"
     release_wait_claim
-    if [[ -n "${PLACEMENT_EPISODE:-}" ]]; then
-        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" --pid $$ \
+    if [[ -n "${PLACEMENT_EPISODE:-}" && "$PLACEMENT_OUTCOME" != unresolved ]]; then
+        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" --pid "${PLACEMENT_OWNER_PID:-$$}" \
             --reason "verify ended" >/dev/null 2>&1 || true
     fi
     remove_step_record
@@ -4240,7 +4348,7 @@ run_lint_sequence() {
         MEND_LOG="$(mktemp)"
         # run_step() records diagnostics through its tee.
         # Keep this call in the parent so cleanup can stop the step.
-        local LINT_MEND_WAIT=1 LINT_MEMORY_JUDGMENT=0 LINT_MEMORY_WAIT_FILE=""
+        local LINT_MEND_WAIT=1 LINT_MEMORY_JUDGMENT=0 LINT_MEMORY_WAIT_FILE="" LINT_REPAIR_PENDING_GRANT=0
         lint_copy_begin
         while true; do
             if lint_rewrite invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}"; then

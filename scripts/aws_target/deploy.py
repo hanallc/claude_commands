@@ -14,21 +14,24 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from enum import StrEnum
 from hashlib import sha256
 import json
+import math
 import os
 from pathlib import Path
 import re
 import stat
+from statistics import median
 import subprocess
 import sys
 import threading
 import time
-from typing import cast, final
+from typing import ClassVar, cast, final
 from uuid import uuid4
 
 
-from scripts.aws_target import admin_secrets, box, hana_box, hana_spend, ledger, remote, retained, spot_end, teardown
+from scripts.aws_target import admin_secrets, box, hana_box, hana_image, hana_spend, ledger, remote, retained, spot_end, teardown
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
@@ -61,17 +64,88 @@ def step(command: str, text: str, settings: Path, *, hint: str = '') -> Generato
 
     worker = threading.Thread(target=heartbeat, name='deployment-progress', daemon=True)
     worker.start()
+    completed = False
     try:
         yield
+        completed = True
     finally:
         stopped.set()
         worker.join()
         elapsed = time.monotonic() - started
-        print(f'{command}: {text} done in {elapsed:.0f} s', file=stream, flush=True)
+        outcome = 'done in' if completed else 'failed after'
+        print(f'{command}: {text} {outcome} {elapsed:.0f} s', file=stream, flush=True)
 
 
 class DeploymentRefused(ValueError):
     """Current evidence does not permit a resource request."""
+
+
+class HanaCreateRolledBack(AwsUnavailable):
+    """The create failed and cleanup removed its resources."""
+
+
+class GateRegionOperation(StrEnum):
+    NETWORK = 'network'
+    STACK = 'stack'
+
+
+@dataclass
+class GateRegionTimings:
+    """Keep successful regional durations for the next deployment estimate."""
+
+    _LABELS: ClassVar[dict[GateRegionOperation, str]] = {
+        GateRegionOperation.NETWORK: 'preparing the network and image',
+        GateRegionOperation.STACK: 'updating the gate stack',
+    }
+    _path: Path
+    _seconds: dict[GateRegionOperation, dict[str, float]]
+
+    @classmethod
+    def read(cls, directory: Path) -> GateRegionTimings:
+        path = directory / 'gate-region-times.json'
+        try:
+            saved = remote.read_record(path)
+            if saved.get('version') != 1:
+                raise ValueError('Unsupported regional timing version')
+            operations = ledger.mapping(saved['seconds'])
+            seconds: dict[GateRegionOperation, dict[str, float]] = {}
+            for operation in GateRegionOperation:
+                if operation not in operations:
+                    continue
+                seconds[operation] = {}
+                for region, value in ledger.mapping(operations[operation]).items():
+                    if (isinstance(value, bool) or not isinstance(value, (int, float))
+                            or not math.isfinite(value) or value < 0):
+                        raise ValueError('Invalid regional duration')
+                    seconds[operation][region] = float(value)
+            return cls(path, seconds)
+        except (OSError, ValueError, KeyError, OverflowError):
+            return cls(path, {})
+
+    def announce(self, operation: GateRegionOperation, regions: Sequence[str]) -> None:
+        if not regions:
+            return
+        saved = self._seconds.get(operation, {})
+        if saved:
+            typical = median(saved.values())
+            total = sum(saved.get(region, typical) for region in regions)
+            estimate = f'expected total {total:.0f} s from saved regional times'
+        else:
+            estimate = 'expected total is not yet measured'
+        print(f'cloud-gate: {self._LABELS[operation]} in {len(regions)} regions: {estimate}', flush=True)
+
+    @contextmanager
+    def measure(self, operation: GateRegionOperation, region: str, position: int, total: int,
+                settings: Path) -> Generator[None]:
+        started = time.monotonic()
+        with step(f'cloud-gate: {region}', self._LABELS[operation], settings, hint=f'{position} of {total}'):
+            yield
+        self._seconds.setdefault(operation, {})[region] = time.monotonic() - started
+        record = json.dumps({'version': 1, 'seconds': self._seconds}, sort_keys=True) + '\n'
+        try:
+            write_text_atomic(self._path, record)
+        except OSError:
+            print(f'cloud-gate: warning: could not write {self._path.name}', flush=True)
 
 
 def quota_targets(home: str) -> tuple[tuple[tuple[str, ...], str, int, str], ...]:
@@ -357,31 +431,58 @@ class Deployment:
         self._authorize(True)
         child = self._hana_output()
         with control_lock(self.directory):
+            path = self.directory / 'hana' / 'setup.json'
+            saved = remote.read_record(path) if path.exists() else {}
             settings, parameters, template = self._hana_inputs()
-            now = int(self.clock())
+            if not saved:
+                prepared = cast(object, json.loads((child.output / 'parameters.json').read_text()))
+                prepared_parameters = {ledger.text(row, 'ParameterKey'): row.get('ParameterValue')
+                                       for row in ledger.rows({'parameters': prepared}, 'parameters')}
+                parameters['DeploymentId'] = ledger.text(prepared_parameters, 'DeploymentId')
             child.confirm_preparation_evidence(settings, parameters, template)
+            book = ledger.CostLedger(self.directory)
+            spending = hana_spend.HanaSpending(book, self.settings_path, limits)
+            outputs: dict[str, str] = {}
+            if saved.get('requested'):
+                saved_settings = replace(settings, region=ledger.text(saved, 'region'))
+                outputs = child._stack(saved_settings, require_outputs=True)
+                if not outputs:
+                    if any(saved.get(key) for key in ('instance', 'data_volume', 'bucket')):
+                        raise DeploymentRefused('The Hana stack is missing and the setup record names resources. '
+                                                + 'Run down --workload hana --approve-destroy before setup.')
+                    try:
+                        saved_api = self._api(saved_settings)
+                        started = self._hana_setup_started(book, saved)
+                        kept = retained.deleted_since(saved_api, saved_settings.stack_name, started)
+                        if kept is None:
+                            raise AwsUnavailable('No deleted stack matches the saved setup.')
+                        _ = spot_end.end_boxes(saved_api, ('HanaDeployment', ledger.text(saved, 'deployment')))
+                        retained.delete(saved_api, kept, wait_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
+                        self._clear_hana_setup(spending, path, saved)
+                    except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError, spot_end.SpotEndIncomplete) as error:
+                        raise DeploymentRefused(f'The saved Hana setup remains. {error}\n'
+                                                + 'Run down --workload hana --approve-destroy before setup.') from None
+                    print('hana-setup: cleared the saved setup for the missing stack')
+                    saved = {}
             _ = self._guard()
             api = self._api(settings)
             with step('hana-setup', 'checking the image and subnet', self.settings_path):
                 self._validate_inputs(settings)
-            path = self.directory / 'hana' / 'setup.json'
-            saved = remote.read_record(path)
-            book = ledger.CostLedger(self.directory)
-            spending = hana_spend.HanaSpending(book, self.settings_path, limits)
             if 'generation' not in saved:
                 # Explicit setup approval reserves resources without enabling command admission.
+                now = int(self.clock())
                 reservation = spending.reserve_setup(now, now + limits.permit_max_seconds)
                 if isinstance(reservation, hana_spend.PermitRefused):
                     raise DeploymentRefused(reservation.reason)
-                saved['generation'] = reservation.exposure.generation
+                saved.update(version=1, deployment=parameters['DeploymentId'], stack=settings.stack_name,
+                             region=settings.region, generation=reservation.exposure.generation)
                 saved['template_sha256'] = sha256(template).hexdigest()
                 saved['parameters_sha256'] = sha256(json.dumps(parameters, sort_keys=True).encode()).hexdigest()
                 write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
-            elif (saved.get('template_sha256') != sha256(template).hexdigest()
+            elif (saved.get('region') != settings.region
+                    or saved.get('template_sha256') != sha256(template).hexdigest()
                     or saved.get('parameters_sha256') != sha256(json.dumps(parameters, sort_keys=True).encode()).hexdigest()):
                 raise DeploymentRefused('The approved Hana template changed; review the saved deployment')
-            # Resume existing resources through reads before another stack mutation.
-            outputs = child._stack(settings) if 'generation' in saved and saved.get('requested') else {}
             if not outputs:
                 active = [row for row in book.read_snapshot().hana_compute
                     if row.generation == saved['generation'] and isinstance(row.state, ledger.HanaExposureOpen)]
@@ -390,8 +491,15 @@ class Deployment:
                 saved['requested'] = True
                 write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
                 with step('hana-setup', 'updating the separate Hana stack', self.settings_path):
-                    self._hana_stack_change(api, settings, child.output / 'template.json', parameters,
-                                            keep=str(saved.get('instance', '')))
+                    try:
+                        self._hana_stack_change(api, settings, child.output / 'template.json', parameters,
+                                                keep=str(saved.get('instance', '')))
+                    except HanaCreateRolledBack as error:
+                        try:
+                            self._clear_hana_setup(spending, path, saved)
+                        except (OSError, ValueError) as cleanup_error:
+                            raise AwsUnavailable(f'{error}\nThe saved Hana setup remains: {cleanup_error}') from None
+                        raise
                 outputs = child._stack(settings)
             instance, bucket = outputs['Instance'], outputs['ControlBucket']
             if saved.get('instance', instance) != instance or saved.get('data_volume', outputs['DataVolume']) != outputs['DataVolume']:
@@ -423,13 +531,121 @@ class Deployment:
         print('Hana setup complete: the box is stopped; placement remains disabled')
         return True
 
+    @staticmethod
+    def _hana_setup_started(book: ledger.CostLedger, saved: dict[str, object]) -> int:
+        generation = ledger.instant(saved, 'generation')
+        for row in book.read_snapshot().hana_compute:
+            if row.generation == generation:
+                return row.at
+        raise DeploymentRefused('The saved Hana setup has no reservation time.')
+
+    def _clear_hana_setup(self, spending: hana_spend.HanaSpending, path: Path, saved: dict[str, object]) -> None:
+        generation = ledger.instant(saved, 'generation')
+        now = int(self.clock())
+        spending.reconcile(now, 'terminated', generation=generation)
+        if any(row.generation == generation and isinstance(row.state, ledger.HanaExposureOpen)
+               for row in spending.book.read_snapshot().hana_compute):
+            raise DeploymentRefused('The Hana setup reservation is still open. Repeat approved setup.')
+        spending.confirm_storage_deleted(now)
+        path.unlink()
+
+    def hana_image(self, result: Path, *, approve_resources: bool = False) -> bool:
+        """Upload the built Hana image to one snapshot, register it, and save the image and network identity."""
+        built = hana_image.read_built(result)
+        workload = conf.read_or_repository('hana_aws')
+        print(f'Hana image plan: {built.name}; {built.logical_bytes / 2**30:.1f} GiB; boot {built.boot_mode}')
+        print('Hana image resources: one EBS snapshot and one registered image; no instance')
+        print('Hana placement remains disabled')
+        if not approve_resources:
+            return False
+        self._authorize(True)
+        limits = hana_spend.read_settings(workload)
+        settings = replace(read_deployment_settings(self.settings_path), region=limits.region,
+                           timeout_s=workload.whole('aws_timeout_s'))
+        zone = workload.text('availability_zone')
+        upload_timeout = workload.whole('image_upload_timeout_s')
+        wait_interval = max(workload.whole('image_wait_interval_s'),
+                            (upload_timeout + hana_image.COLDSNAP_MAX_WAIT_ATTEMPTS - 1)
+                            // hana_image.COLDSNAP_MAX_WAIT_ATTEMPTS)
+        wait_attempts = upload_timeout // wait_interval
+        api = self._api(settings)
+        with control_lock(self.directory):
+            _ = self._guard()
+            subnets = [row for row in gate_subnets(api, settings.vpc_id) if row['zone'] == zone]
+            if not subnets:
+                raise DeploymentRefused(f'The gate VPC has no available public subnet in {zone}')
+            images = ledger.rows(api.call('describe-images', '--owners', 'self',
+                                          '--filters', 'Name=name,Values=' + built.name), 'Images')
+            if not images:
+                tag = conf.read(self.settings_path)
+                cost_tag = 'Key=%s,Value=%s' % (tag.text('cost_explorer_tag_key'), tag.text('cost_explorer_tag_value'))
+                pending = hana_image.saved(self.directory)
+                resume = isinstance(pending, hana_image.PendingImageRegistration) and pending.name == built.name
+                if not resume:
+                    snapshots = ledger.rows(api.call('describe-snapshots', '--owner-ids', 'self', '--filters',
+                                                     'Name=description,Values=' + built.name), 'Snapshots')
+                    if snapshots:
+                        states = ', '.join(ledger.text(row, 'State') for row in snapshots)
+                        if len(snapshots) != 1 or snapshots[0].get('State') not in ('completed', 'pending'):
+                            raise DeploymentRefused(
+                                f'Hana snapshot adoption refused: {len(snapshots)} matching snapshots; states: {states}')
+                        pending = hana_image.PendingImageRegistration(built.name, ledger.text(snapshots[0], 'SnapshotId'))
+                        _ = hana_image.save(self.directory, pending)
+                        resume = True
+                raw = self.output / 'hana' / 'image.raw'
+                try:
+                    if not resume:
+                        raw.parent.mkdir(parents=True, exist_ok=True)
+                        with step('hana-image', 'converting the image to a raw disk', self.settings_path):
+                            _ = self.execute(['qemu-img', 'convert', '-f', built.source_format, '-O', 'raw',
+                                              str(built.file), str(raw)], capture_output=True, text=True,
+                                             timeout=upload_timeout, check=True)
+                    tool = self.execute(['nix', 'build', '--no-link', '--print-out-paths',
+                                         workload.text('image_upload_tool')], capture_output=True, text=True,
+                                        timeout=upload_timeout, check=True).stdout.strip().splitlines()[-1]
+                    if resume and isinstance(pending, hana_image.PendingImageRegistration):
+                        snapshot = pending.snapshot
+                    else:
+                        with step('hana-image', 'uploading the snapshot', self.settings_path, hint='can take several minutes'):
+                            upload = self.admin.executor(self.execute)(
+                                [tool + '/bin/coldsnap', '--region', settings.region, 'upload', '--no-progress',
+                                 '--omit-zero-blocks', '--description', built.name, '--tag', cost_tag, str(raw)],
+                                capture_output=True, text=True, timeout=upload_timeout, check=False)
+                        if upload.returncode or not upload.stdout.strip():
+                            raise DeploymentRefused('the Hana snapshot upload failed: ' + upload.stderr.strip())
+                        snapshot = upload.stdout.strip().splitlines()[-1]
+                        _ = hana_image.save(self.directory, hana_image.PendingImageRegistration(built.name, snapshot))
+                finally:
+                    raw.unlink(missing_ok=True)
+                with step('hana-image', 'waiting for the snapshot', self.settings_path):
+                    waited = self.admin.executor(self.execute)(
+                        [tool + '/bin/coldsnap', '--region', settings.region, 'wait',
+                         '--seconds-between-attempts', str(wait_interval),
+                         '--max-attempts', str(wait_attempts), snapshot],
+                        capture_output=True, text=True, timeout=upload_timeout, check=False)
+                    if waited.returncode:
+                        raise DeploymentRefused('the Hana snapshot wait failed: ' + waited.stderr.strip())
+                with step('hana-image', 'registering the image', self.settings_path):
+                    image = ledger.text(api.call(
+                        'register-image', '--name', built.name, '--architecture', 'x86_64',
+                        '--virtualization-type', 'hvm', '--ena-support', '--sriov-net-support', 'simple',
+                        '--boot-mode', built.boot_mode, '--imds-support', 'v2.0',
+                        '--root-device-name', settings.root_device_name, '--block-device-mappings',
+                        f'DeviceName={settings.root_device_name},Ebs={{SnapshotId={snapshot},VolumeType=gp3,DeleteOnTermination=true}}',
+                        '--tag-specifications', f'ResourceType=image,Tags=[{{{cost_tag}}}]'), 'ImageId')
+                    _ = api.call('wait', 'image-available', '--image-ids', image, timeout_s=upload_timeout)
+                images = ledger.rows(api.call('describe-images', '--image-ids', image), 'Images')
+            if len(images) != 1 or images[0].get('State') != 'available':
+                raise DeploymentRefused('the registered Hana image is not available')
+            path = hana_image.save(self.directory, hana_image.RegisteredImage(
+                built.name, ledger.text(images[0], 'ImageId'), ledger.text(images[0], 'OwnerId'),
+                settings.vpc_id, str(subnets[0]['id'])))
+        print(f'Hana image ready: saved in {path}; placement remains disabled')
+        return True
+
     def _hana_stack_change(self, api: AwsCli, settings: DeploymentSettings, template: Path, parameters: dict[str, str],
                            *, keep: str) -> None:
-        """Change the Hana stack through a change set that refuses a box or disk replacement.
-
-        The Hana box, disks and bucket are retained, so CloudFormation never deletes them. A failed change
-        ends every Hana box except the kept one, then deletes what the rollback kept.
-        A failed create also deletes the failed stack and every unattached Hana disk."""
+        """Change the Hana stack without replacing its box or disk."""
         timeout = conf.read(self.settings_path).whole('stack_wait_timeout_s')
         started = self.clock()
         try:
@@ -476,22 +692,35 @@ class Deployment:
                          '--stack-name', settings.stack_name, service='cloudformation', timeout_s=timeout)
         except (AwsUnavailable, subprocess.SubprocessError) as error:
             tag = ('HanaDeployment', parameters['DeploymentId'])
+            lines = [str(error), *failed_stack_events(api, settings.stack_name, started)]
             try:
-                ended = spot_end.end_boxes(api, tag, keep=keep)
-                # Read the rollback events before a stack delete makes them unreadable by name.
-                kept = retained.skipped_since(api, settings.stack_name, started)
+                stack_id = ''
                 if kind == 'CREATE':
-                    _ = api.call('delete-stack', '--stack-name', settings.stack_name, service='cloudformation')
-                    _ = api.call('wait', 'stack-delete-complete', '--stack-name', settings.stack_name,
+                    stacks = ledger.rows(api.call('describe-stacks', '--stack-name', settings.stack_name,
+                                                  service='cloudformation'), 'Stacks')
+                    if len(stacks) != 1 or stacks[0].get('StackStatus') not in ('ROLLBACK_COMPLETE', 'ROLLBACK_FAILED'):
+                        raise AwsUnavailable('CloudFormation did not confirm a terminal rollback. The saved setup remains.')
+                    stack_id = ledger.text(stacks[0], 'StackId')
+                ended = spot_end.end_boxes(api, tag, keep=keep)
+                if stack_id:
+                    _ = api.call('delete-stack', '--stack-name', stack_id, service='cloudformation')
+                    _ = api.call('wait', 'stack-delete-complete', '--stack-name', stack_id,
                                  service='cloudformation', timeout_s=timeout)
+                    kept = retained.skipped_since(api, stack_id, started)
+                else:
+                    kept = retained.skipped_since(api, settings.stack_name, started, missing_ok=True)
                 retained.delete(api, kept, wait_s=timeout)
-            except (AwsUnavailable, subprocess.SubprocessError, spot_end.SpotEndIncomplete) as end_error:
-                raise AwsUnavailable(f'{error}\nthe failed Hana change did not remove what it made: {end_error}') from None
-            raise AwsUnavailable(f'{error}\nthe failed Hana change ended {ended} Spot boxes and their requests, '
-                                 + f'and deleted {len(kept.volumes)} disks and {len(kept.buckets)} buckets') from None
+            except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError, spot_end.SpotEndIncomplete) as end_error:
+                lines.append(f'The failed Hana change did not remove what it made. {end_error}')
+                raise AwsUnavailable('\n'.join(lines)) from None
+            lines.append(f'the failed Hana change ended {ended} Spot boxes and their requests, '
+                         + f'and deleted {len(kept.volumes)} disks and {len(kept.buckets)} buckets')
+            if kind == 'CREATE':
+                raise HanaCreateRolledBack('\n'.join(lines)) from None
+            raise AwsUnavailable('\n'.join(lines)) from None
 
     def hana_down(self, *, approve_destroy: bool = False) -> bool:
-        """Cancel every Hana Spot request, terminate its boxes, delete the Hana stack, then its data disk and bucket."""
+        """Delete Hana resources and close their charges."""
         print('down --workload hana cancels each Hana Spot request, then terminates its boxes and deletes the Hana stack.')
         print('down --workload hana then deletes the Hana data disk and control bucket; their data is lost.')
         if not approve_destroy:
@@ -499,31 +728,46 @@ class Deployment:
             return True
         self._check_credentials()
         path = self.directory / 'hana' / 'setup.json'
-        if not path.exists():
-            print('down --workload hana: no Hana deployment is saved')
-            return True
-        saved = remote.read_record(path)
-        settings, _, _ = self._hana_inputs()
-        api = self._api(settings)
-        timeout = conf.read(self.settings_path).whole('stack_wait_timeout_s')
-        tag = ('HanaDeployment', ledger.text(saved, 'deployment'))
         with control_lock(self.directory):
+            if not path.exists():
+                print('down --workload hana: no Hana deployment is saved')
+                return True
+            saved = remote.read_record(path)
+            settings, _, _ = self._hana_inputs()
+            if 'region' in saved:
+                settings = replace(settings, region=ledger.text(saved, 'region'))
+            api = self._api(settings)
+            timeout = conf.read(self.settings_path).whole('stack_wait_timeout_s')
+            tag = ('HanaDeployment', ledger.text(saved, 'deployment'))
             # Read the stack's disk and bucket before the stack delete removes the record of them.
             kept = retained.in_stack(api, settings.stack_name) | retained.Retained(
                 frozenset([str(saved['data_volume'])] if saved.get('data_volume') else []),
                 frozenset([str(saved['bucket'])] if saved.get('bucket') else []))
+            book = ledger.CostLedger(self.directory)
+            started = self._hana_setup_started(book, saved) if saved.get('requested') and not saved.get('instance') else None
             with step('hana-down', 'ending the Hana Spot boxes', self.settings_path):
                 ended = spot_end.end_boxes(api, tag)
-            if 'generation' in saved:
-                hana_spend.HanaSpending(ledger.CostLedger(self.directory), self.settings_path,
-                    hana_spend.read_settings(conf.read_or_repository('hana_aws'))).reconcile(
-                        int(self.clock()), 'terminated', generation=ledger.instant(saved, 'generation'))
             with step('hana-down', 'deleting the Hana stack', self.settings_path, hint='can take several minutes'):
                 _ = api.call('delete-stack', '--stack-name', settings.stack_name, service='cloudformation')
                 _ = api.call('wait', 'stack-delete-complete', '--stack-name', settings.stack_name,
                              service='cloudformation', timeout_s=timeout)
+            with step('hana-down', 'checking for Spot boxes that the stack kept', self.settings_path):
+                ended += spot_end.end_boxes(api, tag)
             with step('hana-down', 'deleting the Hana data disk and control bucket', self.settings_path):
+                if started is not None:
+                    deleted = retained.deleted_since(api, settings.stack_name, started)
+                    if deleted is None:
+                        print('down --workload hana: no deleted Hana stack since setup started')
+                    else:
+                        kept |= deleted
                 retained.delete(api, kept, wait_s=timeout)
+            spending = hana_spend.HanaSpending(book, self.settings_path,
+                hana_spend.read_settings(conf.read_or_repository('hana_aws')))
+            now = int(self.clock())
+            compute = book.read_snapshot().hana_compute if book.path.exists() else []
+            if compute:
+                spending.reconcile(now, 'terminated', generation=max(row.generation for row in compute))
+            spending.confirm_storage_deleted(now)
             for name in ('lifecycle.json', 'setup.json'):
                 (self.directory / 'hana' / name).unlink(missing_ok=True)
         print(f'down --workload hana: done; {ended} Spot boxes ended; '
@@ -534,7 +778,16 @@ class Deployment:
         """Share the existing deployment validation and use only Hana sizes and prices."""
         workload = conf.read_or_repository('hana_aws')
         limits = hana_spend.read_settings(workload)
-        names = {key: workload.text(key) for key in ('stack_name', 'availability_zone', 'ami_id', 'ami_owner_id', 'vpc_id', 'subnet_id')}
+        # Empty identity values are allowed here; text() refuses an empty value.
+        present = workload.values()
+        names = {key: workload.text(key) for key in ('stack_name', 'availability_zone')}
+        names.update({key: present.get(key, '') for key in ('ami_id', 'ami_owner_id', 'vpc_id', 'subnet_id')})
+        registered = hana_image.saved(self.directory)
+        if isinstance(registered, hana_image.RegisteredImage):
+            # Configured values win; the saved registration keeps cloud identities out of the repository.
+            for key, value in (('ami_id', registered.image), ('ami_owner_id', registered.owner),
+                               ('vpc_id', registered.vpc), ('subnet_id', registered.subnet)):
+                names[key] = names[key] or value
         if not all(names.values()):
             raise DeploymentRefused('Configure the reviewed Hana image, owner, VPC, and subnet before prepare')
         settings = replace(read_deployment_settings(self.settings_path), **names,
@@ -594,7 +847,7 @@ class Deployment:
             template = TEMPLATE.read_bytes()
             return self._write_preparation(settings, parameters, template, decision, resources)
 
-    def _stack(self, settings: DeploymentSettings) -> dict[str, str]:
+    def _stack(self, settings: DeploymentSettings, *, require_outputs: bool = False) -> dict[str, str]:
         try:
             row = self._api(settings).call('describe-stacks', '--stack-name', settings.stack_name, service='cloudformation')
         except AwsUnavailable as error:
@@ -610,7 +863,7 @@ class Deployment:
                 and stack.get('StackId') != saved['stack_id']):
             raise DeploymentRefused('the live StackId differs from the deployment record')
         status = ledger.text(stack, 'StackStatus')
-        if status == 'REVIEW_IN_PROGRESS':
+        if status == 'REVIEW_IN_PROGRESS' and not require_outputs:
             return {}
         if status not in ('CREATE_COMPLETE', 'UPDATE_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE'):
             raise DeploymentRefused(f'reconcile the stack before deployment: {status}')
@@ -620,6 +873,8 @@ class Deployment:
             if not isinstance(value, str):
                 raise DeploymentRefused('stack output values must contain text')
             outputs[ledger.text(item, 'OutputKey')] = value
+        if require_outputs and not outputs:
+            raise DeploymentRefused('The existing Hana stack has no outputs. Reconcile it before setup.')
         return outputs
 
     def _validate_inputs(self, settings: DeploymentSettings) -> None:
@@ -1245,7 +1500,13 @@ class Deployment:
             prefix = f'arn:{partition}:ec2:{settings.region}:{account}:'
             values = cloud_gate.settings()
             # The home scaler policies cover every gate region, so the scaler user's policy count stays fixed.
-            networks = [self.regional_network(api, settings, region) for region in regions[1:]]
+            timings = GateRegionTimings.read(self.directory)
+            additional = regions[1:]
+            timings.announce(GateRegionOperation.NETWORK, additional)
+            networks: list[RegionalNetwork] = []
+            for position, region in enumerate(additional, 1):
+                with timings.measure(GateRegionOperation.NETWORK, region, position, len(additional), self.settings_path):
+                    networks.append(self.regional_network(api, settings, region))
             parameters = {
                 'EnableGates': 'true', 'GateImage': settings.ami_id,
                 'GateVpcs': ','.join([prefix + 'vpc/' + settings.vpc_id,
@@ -1289,10 +1550,12 @@ class Deployment:
             }
             cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             regional = list(ledger.rows(manifest, 'regions'))
-            for network in networks:
-                regional.append(self.regional_gate_stack(api, settings, outputs, parameters, network))
-                manifest['regions'] = regional
-                cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
+            timings.announce(GateRegionOperation.STACK, additional)
+            for position, network in enumerate(networks, 1):
+                with timings.measure(GateRegionOperation.STACK, network.region, position, len(networks), self.settings_path):
+                    regional.append(self.regional_gate_stack(api, settings, outputs, parameters, network))
+                    manifest['regions'] = regional
+                    cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             print('cloud-gate: deployed')
         self._fill_prices()
         return True
@@ -1391,7 +1654,7 @@ def failed_stack_events(api: AwsCli, stack: str, started: float) -> list[str]:
                 lines.append(f"{ledger.text(event, 'LogicalResourceId')} ({ledger.text(event, 'ResourceType')}): "
                              + f"{status}: {event.get('ResourceStatusReason', '')}")
         return lines
-    except (ValueError, AwsUnavailable, subprocess.SubprocessError):
+    except (ValueError, OSError, AwsUnavailable, subprocess.SubprocessError):
         return ['stack events are unavailable']
 
 
@@ -1443,6 +1706,7 @@ class DeploymentArguments(argparse.Namespace):
         self.approve_destroy: bool = False
         self.trial_action: str | None = None
         self.trial_folder: Path = Path()
+        self.image: Path | None = None
 
 
 def main() -> int:
@@ -1453,9 +1717,10 @@ def main() -> int:
         with step('aws-trial', 'running the trial', settings_path):
             return aws_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'apply'))
+    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'hana-image', 'apply'))
     _ = parser.add_argument('trial_action', nargs='?', choices=('run',))
     _ = parser.add_argument('--trial-folder', type=Path)
+    _ = parser.add_argument('--image', type=Path)
     _ = parser.add_argument('--workload', choices=('merge-gates', 'hana'), default='merge-gates')
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
@@ -1486,6 +1751,10 @@ def main() -> int:
             return 0 if deploy.quota_request() else 1
         elif args.command == 'quota-status':
             return 0 if deploy.quota_status() else 1
+        elif args.command == 'hana-image':
+            if args.image is None:
+                raise DeploymentRefused('Use hana-image --image RESULT [--approve-resources]')
+            return 0 if deploy.hana_image(args.image, approve_resources=args.approve_resources) else 1
         elif args.command == 'hana-setup':
             return 0 if deploy.hana_setup(approve_resources=args.approve_resources) else 1
         elif args.command == 'prepare':

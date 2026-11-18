@@ -9,7 +9,9 @@ from contextvars import ContextVar
 from enum import Enum, auto
 from pathlib import Path
 import os
-from typing import Literal
+from typing import Literal, cast
+from collections.abc import Callable
+from scripts.build_targets.execution_transport import ExecutionTransport
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
@@ -209,6 +211,14 @@ def configured_ssh_target(target: str) -> SshTarget:
             require_target_name(target)
             return configured
     raise ConfigError(f"unknown SSH target: {target}")
+
+
+def read_execution_transport(target: SshTarget) -> ExecutionTransport:
+    """Select the transport before reading connection settings."""
+    from importlib import import_module
+    read_transport = cast(Callable[[SshTarget], ExecutionTransport],
+        getattr(import_module('scripts.aws_target.hana_placement'), 'read_execution_transport'))
+    return read_transport(target)
 
 
 def command_target_name(given: str | None) -> str:

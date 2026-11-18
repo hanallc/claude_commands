@@ -576,6 +576,59 @@ class PlacementStatusTests(unittest.TestCase):
 
 
 class EndedPlacementPruneTests(unittest.TestCase):
+    def test_a_dead_owner_close_prunes_other_episodes_without_stopping_the_pass(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+
+        for close_is_old in (False, True):
+            with self.subTest(close_is_old=close_is_old), AdmissionFixture() as fixture:
+                server = fixture.server
+                config = records.read_memory_config()
+                old = fixture.clock.now() - config.ended_placement_seconds - 1
+                closing = replace(placement_request(fixture, since=old if close_is_old else None), episode="closing")
+                ended = replace(placement_request(fixture, since=old), episode="ended")
+                for request in (closing, ended):
+                    server.placement_requests[request.episode] = request
+                    assignment = placement.PlacementAssignment(request.episode, "attempt",
+                        request.constraints.candidates[0].destination, request.constraints.source_key,
+                        request.owner, request.constraints.session, request.since)
+                    key = placement.attempt_key(request.episode, assignment.attempt)
+                    state = placement.ClosedAssignment("busy") if request is ended else placement.CurrentAssignment()
+                    server.assignments[key] = records.SavedPlacementAssignment(assignment, state)
+                    if request is closing:
+                        server.current_assignments[request.episode] = key
+                    fixture.proc.kill(wire.Owner(request.owner.pid, request.owner.start_time))
+
+                self.assertIsInstance(fixture.run_pass(), gate.PassResult)
+                self.assertNotIn(ended.episode, server.placement_requests)
+                self.assertNotIn(closing.episode, server.current_assignments)
+                if close_is_old:
+                    self.assertNotIn(closing.episode, server.placement_requests)
+                else:
+                    saved = next(saved for saved in server.assignments.values()
+                                 if saved.assignment.episode == closing.episode)
+                    self.assertEqual(saved.state, placement.ClosedAssignment("cancelled"))
+                state = service.read_state(fixture.state_dir)
+                self.assertNotIn(ended.episode, state.placement_requests)
+                self.assertFalse(any(saved.assignment.episode == ended.episode for saved in state.assignments.values()))
+                self.assertEqual(fixture.connect(wire.BuildHistoryRequest()).replies(),
+                                 [wire.BuildHistoryReply(server.build_history_generation)])
+                self.assertFalse(server.stopped)
+
+    def test_configuration_refusal_skips_waiters_removed_by_a_shared_connection(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.hold_starts()
+            first, second = fixture.request(), fixture.request()
+            for request in (first, second):
+                self.assertIsInstance(fixture.connect(request).replies()[0], wire.Wait)
+            connection = fixture.server.waiters[first.episode].connection
+            assert isinstance(connection, service.Connection)
+            fixture.server.waiters[second.episode].connection = connection
+            refused = gate.UnusableAdmissionConfiguration("fixture configuration failure")
+            with mock.patch.object(fixture.server, "_take_configuration", return_value=refused):
+                self.assertEqual(fixture.server.run_pass(), refused)
+            self.assertFalse(fixture.server.waiters)
+            self.assertEqual(connection.sending.count(b'"type":"refused"'), 1)
+
     def test_persist_removes_an_ended_episode_after_its_retention_and_keeps_the_rest(self) -> None:
         from scripts.build_queue import placement
         from scripts.build_queue.test_placement import placement_request

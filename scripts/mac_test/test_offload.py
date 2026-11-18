@@ -419,7 +419,11 @@ class OffloadSettingsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.settings = self.root / "mac_test.conf"
-        _ = write_config_fixture(self.settings, "", template="mac_test")
+        _ = write_config_fixture(self.settings,
+            "offload=on\nhost=mac\nmirror_root=~/.local/state/mac-test/test-mirror\n"
+            + "linux_only.cargo-liner=\nmac_budget_gib=24\nconnect_timeout_s=6\n"
+            + "probe_timeout_s=15\nleftover_timeout_s=10\nunreachable_backoff_s=300\nfree_floor_gib=100\n")
+        _ = write_config_fixture(self.root / "build_targets.conf", "platform.mac=macos\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
             **copies_environment(self.root),
@@ -639,7 +643,7 @@ class OffloadSettingsTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], 0.125)
         self.assertEqual(result, offload.LeftoverCheckFailed("SSH leftover check timed out after 0.125 s"))
         self.settings.unlink()
-        _ = write_config_fixture(self.settings, template="mac_test")
+        _ = write_config_fixture(self.settings, "leftover_timeout_s=10\n")
         commit_config_fixture(self.settings)
         for value in ("bad", "0", "-1", "nan", "inf"):
             with self.subTest(value=value):
@@ -705,8 +709,8 @@ class OffloadSettingsTests(unittest.TestCase):
         self.assertEqual(destination.read_text().splitlines()[:2], ["mac=declined", "reason=unreachable"])
         self.assertTrue((self.root / "state" / "unreachable_until").exists())
 
-    def test_checked_in_settings_send_every_cargo_liner_member_to_the_mac(self) -> None:
-        config = eligibility.read_config(Path(__file__).resolve().parents[2] / "config" / "mac_test.conf")
+    def test_fixture_settings_send_every_cargo_liner_member_to_the_mac(self) -> None:
+        config = eligibility.read_config(self.settings)
         self.assertEqual(config.values["linux_only.cargo-liner"], "")
         self.assertEqual(config.default_target_budget_gib, "24")
         self.assertNotIn("mac_budget_gib.cargo-liner", config.values)
@@ -937,7 +941,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                     self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
                     self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
                     self.assertEqual(remote_words[lint_index + 1 :], ["nextest"])
-                    self.assertIn("alternate-mac:.local/state/mac-test/mirror/hana/", self.events_for("rsync")[0]["args"])
+                    self.assertIn("alternate-mac:.local/state/mac-test/test-mirror/hana/", self.events_for("rsync")[0]["args"])
                     continue
                 observed: list[tuple[eligibility.OffloadConfig, offload.OffloadRequest]] = []
 
@@ -967,7 +971,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                 self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
                 self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
                 self.assertEqual(remote_words[lint_index + 1 :], ["nextest"])
-                self.assertIn("alternate-mac:.local/state/mac-test/mirror/hana/", copied)
+                self.assertIn("alternate-mac:.local/state/mac-test/test-mirror/hana/", copied)
 
     def test_low_disk_declines_after_probe(self) -> None:
         self.fixture["probe_lines"] = ["free_gib=59", "host=Mac", "rc=0"]
@@ -1092,6 +1096,8 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(self.events(), [])
 
     def test_copy_failure_releases_claim(self) -> None:
+        self.config["mirror_busy_backoff_s"] = "120"
+        self.sync_config()
         self.fixture["rsync_status"] = 23
         self.sync_fixture()
         self.assert_declined(self.command(), "copy")
@@ -1496,7 +1502,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(probe[: len(ssh_arguments)], ssh_arguments)
         probe_script = probe[len(ssh_arguments)]
         for fragment in (
-            ".local/state/mac-test/mirror/hana",
+            ".local/state/mac-test/test-mirror/hana",
             'df -g "$HOME"',
             "hostname -s",
         ):
@@ -1516,7 +1522,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                    or self.environment.get("CODEX_THREAD_ID") or f"pid-{os.getpid()}")
         receiver_argument = (
             "--rsync-path=~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py mirror-receive "
-            + shlex.join(["--path", ".local/state/mac-test/mirror/hana", "--owner", "verify",
+            + shlex.join(["--path", ".local/state/mac-test/test-mirror/hana", "--owner", "verify",
                           "--repository", "hana", "--session", session, "--", "rsync"])
         )
         self.assertEqual(
@@ -1535,7 +1541,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                 "ssh -o BatchMode=yes -o ConnectTimeout=6 "
                 + "-o ServerAliveInterval=15 -o ServerAliveCountMax=3",
                 f"{self.repository}/",
-                "mac:.local/state/mac-test/mirror/hana/",
+                "mac:.local/state/mac-test/test-mirror/hana/",
             ],
         )
         self.assertEqual(copy.get("exclude"), "/.git\n/target\n/generated/\n")

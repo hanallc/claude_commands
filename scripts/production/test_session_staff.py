@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr
 from dataclasses import replace
 import os
+import subprocess
 from typing import cast
 import json
 from io import StringIO
@@ -56,6 +57,20 @@ class StatusDiscoveryTests(StaffTestCase):
                 self.assertEqual(labels.worker_directory(staff.StaffSnapshot(rows), row.id), expected)
                 self.assertEqual(lines, [f"anomaly: {row.id}: {anomaly}"] if anomaly else [])
         self.assertEqual(self.staff_state(), before)
+
+        record = staff.snapshot()
+        expected = labels.RowResolver(record).production_doc(fixture.unit)
+        facts = labels.RowResolver(record).production_document_facts()
+        with (self.machine("mac"), labels.supplied_production_facts(facts),
+              mock.patch.object(subprocess, "run", side_effect=AssertionError("document fact ssh"))):
+            for row in (fixture.runner, fixture.unit, fixture.worker):
+                with self.subTest(kind=row.kind):
+                    self.assertEqual(labels.RowResolver(record).production_doc(row), expected)
+        write_text_atomic(fixture.doc, "# Changed production\n")
+        current = labels.RowResolver(record).production_doc(fixture.unit)
+        self.assertIsInstance(current, labels.ProductionDoc)
+        assert isinstance(current, labels.ProductionDoc)
+        self.assertEqual(current.text, "# Changed production\n")
 
     def test_run_workers_follow_the_staff_owner_without_a_roster(self) -> None:
         fixture = self.row_production()

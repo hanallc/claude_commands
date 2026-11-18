@@ -38,11 +38,11 @@ from scripts.message import session_send
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.buildlog import record, store
-from scripts.build_targets.test_targets import END, NOW, SHIPPED_CONFIG, SINCE, IsolatedTargetTest
+from scripts.build_targets.test_targets import END, NOW, SINCE, IsolatedTargetTest
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import test_hang_guard
 
-SHIPPED_STATUS = "\n".join((
+FIXTURE_STATUS = "\n".join((
     "mac: free",
     "natedev: free",
     "",
@@ -311,6 +311,7 @@ class StatusTests(IsolatedBuildTargetTest):
     def test_stale_mac_reading_prints_before_target_status(self) -> None:
         _ = write_idle_alert(self.root / "mac-idle", NOW.timestamp(), written_age=301)
         config = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+        _ = write_config_fixture(config.parent / "mac_test.conf", "stale_seconds=300\n")
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
              mock.patch.object(time, "time", return_value=NOW.timestamp()):
             code, output, errors = self.capture_status()
@@ -577,10 +578,10 @@ class StatusTests(IsolatedBuildTargetTest):
         instant = datetime(2026, 12, 11, 21, 5, tzinfo=timezone.utc)
         self.assertEqual(build_targets.local_time(instant), "13:05 PST")
 
-    def test_shipped_config_prints_one_line_per_target_without_probe(self) -> None:
-        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(SHIPPED_CONFIG).parent)}):
+    def test_fixture_config_prints_one_line_per_target_without_probe(self) -> None:
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}):
             with mock.patch.object(build_targets, "probe_target", side_effect=AssertionError("Probe not requested")):
-                self.assertEqual(self.capture_status(), (0, SHIPPED_STATUS, ""))
+                self.assertEqual(self.capture_status(), (0, FIXTURE_STATUS, ""))
 
     def test_command_uses_config_order_and_recorded_hold(self) -> None:
         config = self.write_config(
@@ -605,7 +606,7 @@ class StatusTests(IsolatedBuildTargetTest):
         self.write_holder()
         output = io.StringIO()
         errors = io.StringIO()
-        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(SHIPPED_CONFIG).parent)}):
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}):
             with mock.patch.object(build_targets, "probe_target", side_effect=unavailable):
                 with mock.patch.object(sys, "argv", ["build_targets.py", "status", "--probe"]):
                     with redirect_stdout(output), redirect_stderr(errors):
@@ -616,17 +617,17 @@ class StatusTests(IsolatedBuildTargetTest):
             "natedev: held by hana since 13:05 PDT — render checks\n"
         ))
         self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(probed, [targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf"))])
+        self.assertEqual(probed, [targets.SshTarget("mac", "macos", self.settings)])
 
     def test_status_argument_defaults_to_recorded_state(self) -> None:
         output = io.StringIO()
         errors = io.StringIO()
-        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(SHIPPED_CONFIG).parent)}):
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}):
             with mock.patch.object(build_targets, "probe_target", side_effect=AssertionError("Probe not requested")):
                 with mock.patch.object(sys, "argv", ["build_targets.py", "status"]):
                     with redirect_stdout(output), redirect_stderr(errors):
                         code = build_targets.main()
-        self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, SHIPPED_STATUS, ""))
+        self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, FIXTURE_STATUS, ""))
 
     def test_failed_mac_probe_becomes_unreachable_status(self) -> None:
         calls: list[str] = []
@@ -927,6 +928,8 @@ class WaitLocalTests(IsolatedBuildTargetTest):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = write_config_fixture(self.root / "build_targets.conf", "hold_sender_timeout_seconds=30\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(self.root))))
         self.sleeps = 0
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
