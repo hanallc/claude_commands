@@ -61,6 +61,12 @@ EVIDENCE = submissions.BuildStepEvidence(
          submissions.TipDetail("Run 18 · Test shard 2 of 4")))
 
 
+def identify_fixture_image(extension: str, data: bytes) -> subprocess.CompletedProcess[bytes]:
+    if data != base64.b64decode(PNG):
+        raise AssertionError("Add the image to the test fixtures.")
+    return subprocess.CompletedProcess(["identify", extension], 0, stdout=b"PNG\n")
+
+
 def request(kind: submissions.SubmissionKind = submissions.SubmissionKind.BUG,
             seed: str = "request-1", *, recipient: staff.StaffId = OWNER) -> submissions.NewItemRequest:
     nonce = hashlib.sha256(seed.encode()).hexdigest()[:32]
@@ -94,6 +100,8 @@ class ReviewSubmissionTests(unittest.TestCase):
                            current_session=OWNER, doc=staff.LiveDoc(local_machine(), self.doc)),
             staff.StaffRow(PRODUCER, "producer", "producer", staff.StaffRoot(), current_session=PRODUCER)))
         self.members = members
+        _ = self.enterContext(patch.object(submissions, "_identify_image", autospec=True,
+                                           side_effect=identify_fixture_image))
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=members))
         _ = self.enterContext(patch.object(change_review, "lists_directory", side_effect=AssertionError("Use fixture change lists.")))
         _ = self.enterContext(patch.object(Path, "home", return_value=self.root))

@@ -66,9 +66,12 @@ def proposal_issues(doc: Path, *, sources: list[Path] | None = None,
     try:
         row = staff.snapshot().by_doc(local_machine(), doc.resolve())
     except (staff.StaffUnreadable, staff.StaffRefused, OSError):
+        if sources is not None:
+            raise
         row = None
     owner = row.id if row is not None else staff.StaffId("")
-    roots = record_store.known_folders(record_store.RecordKind.PROPOSAL, owner, document=doc)
+    roots = record_store.known_folders(record_store.RecordKind.PROPOSAL, owner, document=doc,
+                                       strict=sources is not None)
 
     def wanted(issue: Issue) -> bool:
         return (issue.value("status") == "open" and PROPOSAL_TAG in issue.fields.get("tags", [])
@@ -77,7 +80,7 @@ def proposal_issues(doc: Path, *, sources: list[Path] | None = None,
                 and (select is None or select(issue)))
 
     found: list[Issue] = []
-    for path in sorted(record_store.stored_paths(roots, sources=sources)):
+    for path in sorted(record_store.stored_paths(roots, sources=sources, strict=sources is not None)):
         fields = record_store.read_header(path, sources=sources, keys=keys | {"status", "tags", "record_type", "production_id"}, select=wanted)
         if fields:
             found.append(Issue(path, fields))

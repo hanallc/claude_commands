@@ -1039,7 +1039,7 @@ def question_records_for_document(doc: Path | staff.StaffRow, identities: Questi
     try:
         folder = question_folder(doc, identities, lines=lines)
     except (OSError, UnicodeError):
-        if strict:
+        if strict or sources is not None:
             raise
         assert isinstance(doc, Path)
         row = identities.record.by_doc(local_machine(), doc)
@@ -1055,10 +1055,15 @@ def question_records_for_document(doc: Path | staff.StaffRow, identities: Questi
     else:
         source = folder.path
     owner = folder.owner if isinstance(folder, QuestionFolder) else staff.StaffId("")
+    require_complete = strict or sources is not None
     roots = record_store.known_folders(record_store.RecordKind.QUESTION, owner, (source,),
-                                       document=doc if isinstance(doc, Path) else None, strict=strict)
-    paths = sorted(record_store.stored_paths(roots, sources=sources, strict=strict))
-    return selected_question_records(paths, statuses, owner_ids, sources, owner, strict=strict)
+                                       document=doc if isinstance(doc, Path) else None, strict=require_complete)
+    paths = record_store.stored_paths(roots, sources=sources, strict=require_complete)
+    if sources is not None:
+        # Use the Question filename in the shared current folder. The proposal reader reads its other headers.
+        shared = source.resolve() if isinstance(doc, Path) and owner and source != record_store.default_question_folder(owner) else None
+        paths = (path for path in paths if path.parent != shared or path.name.startswith("question-"))
+    return selected_question_records(sorted(paths), statuses, owner_ids, sources, owner, strict=strict)
 
 
 def _review_question_path(folder: QuestionFolder, request_id: str) -> Path:
@@ -1110,16 +1115,12 @@ def selected_question_records(paths: list[Path], statuses: tuple[str, ...], owne
     issues: list[Issue] = []
     for path in paths:
         keys = frozenset(("record_type", "status", "production_id"))
-        watched = sources
-        if watched is not None and not path.name.startswith("question-"):
-            watched.append(path)
-            watched = None
         if strict:
-            fields = record_store.read_header(path, sources=watched, strict=True)
+            fields = record_store.read_header(path, sources=sources, strict=True)
             if not wanted(Issue(path, fields)):
                 continue
         else:
-            fields = record_store.read_header(path, sources=watched, keys=keys, select=wanted)
+            fields = record_store.read_header(path, sources=sources, keys=keys, select=wanted)
         if fields:
             issues.append(Issue(path, fields))
     return _question_records(issues, legacy_owner=owner)

@@ -476,11 +476,12 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
         for scope, owner in scopes.items():
             row = members.by_id(owner)
             doc = scope if isinstance(scope, Path) else record_store.local_document(row)
-            for folder in record_store.known_folders(record_store.RecordKind.PROPOSAL, owner, document=doc):
+            for folder in record_store.known_folders(record_store.RecordKind.PROPOSAL, owner, document=doc,
+                                                     strict=sources is not None):
                 scopes_by_folder.setdefault(folder, []).append(scope)
         scopes_by_path: dict[Path, set[Path | staff.StaffId]] = {}
         for folder, folder_scopes in scopes_by_folder.items():
-            for path in record_store.stored_paths((folder,), sources=sources):
+            for path in record_store.stored_paths((folder,), sources=sources, strict=sources is not None):
                 scopes_by_path.setdefault(path, set()).update(folder_scopes)
 
         def selected(issue: Issue) -> bool:
@@ -510,7 +511,8 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
             try:
                 waiting, _ = proposals_table.waiting_entries(scope, sources=sources, issues=issues, record=members)
             except (OSError, UnicodeError):
-                pass
+                if sources is not None:
+                    raise
         by_key = {str(issue.path):issue for issue in issues}
         queue = 'proposal-'+owner
         for entry in waiting:
