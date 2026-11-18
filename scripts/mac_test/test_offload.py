@@ -50,8 +50,11 @@ START_SUBPROCESS = subprocess.Popen
 
 class GeneratedSourceTests(unittest.TestCase):
     def test_no_envrc_source_requires_generated_source_outside_trusted_roots(self) -> None:
-        for live_session in (False, True):
-            with self.subTest(live_session=live_session), tempfile.TemporaryDirectory() as session_temporary:
+        for live_session, caller_suffix in ((False, 6), (True, 6), (False, 300)):
+            with (self.subTest(live_session=live_session, caller_suffix=caller_suffix),
+                  tempfile.TemporaryDirectory() as session_temporary):
+                caller_config = Path(session_temporary) / "caller-config"
+                _ = write_config_fixture(caller_config / "scratch.conf", f"suffix_length={caller_suffix}\n")
                 sessions = Path(session_temporary) / "sessions"
                 other_worker = sessions / "other-worker"
                 (other_worker / "proof").mkdir(parents=True)
@@ -62,13 +65,16 @@ class GeneratedSourceTests(unittest.TestCase):
                 (index / "offload-fixture").symlink_to(other_worker.name)
                 before = sorted(path.relative_to(sessions) for path in sessions.rglob("*"))
                 with mock.patch.dict(os.environ, {
+                    "CONF_DIR": str(caller_config),
                     "SESSION_TEMP_ROOT": str(sessions if live_session else sessions / "absent"),
                     "CODEX_THREAD_ID": "offload-fixture",
                 }):
                     self.assertEqual(session_folder.caller_folder(), other_worker if live_session else None)
                     with tempfile.TemporaryDirectory() as temporary:
                         root = Path(temporary)
+                        _ = write_config_fixture(root / "scratch.conf", "suffix_length=6\n")
                         with mock.patch.dict(os.environ, {
+                            **config_environment(root),
                             "SCRATCH_ROOT": str(root / "scratch"),
                             "SCRATCH_HOLDS": str(root / "holds.json"),
                             "SESSION_TEMP_ROOT": str(root / "absent-session"),
@@ -658,6 +664,26 @@ class OffloadSettingsTests(unittest.TestCase):
                                          owner="verify", holder_session="fixture-session")
         mirror = offload.request_mirror(eligibility.read_config(self.settings), request, eligibility.KnownRepository("hana"))
         self.assertTrue(copies.remote_lease_path(mirror).is_relative_to(self.root))
+
+        inherited = {
+            "NOTIFY_SOCKET": str(self.root / "stale-notify.sock"),
+            "LISTEN_FDS": "1",
+            "LISTEN_PID": str(os.getpid()),
+            "LISTEN_FDNAMES": "admission",
+        }
+        with (self.subTest(inherited_systemd=True), mock.patch.dict(os.environ, inherited),
+              mock.patch("subprocess.run", new=RUN_SUBPROCESS),
+              mock.patch("subprocess.Popen", new=START_SUBPROCESS)):
+            fixture = OffloadCommandFixture()
+            try:
+                fixture.setUp()
+                admission = caller_admission(fixture, fixture.root, fixture.environment)
+                with admission.loop_turn(), locked_environment(fixture.environment, admission.loop_access):
+                    admission.server.run_once(0)
+                    self.assertEqual(inherited.keys() & os.environ.keys(), set())
+                    self.assertTrue(copies.remote_lease_path(mirror).is_relative_to(fixture.root))
+            finally:
+                _ = fixture.doCleanups()
 
     def test_probe_that_cannot_start_reports_its_limit_through_run(self) -> None:
         from scripts.build_queue import admission_protocol as wire, placement

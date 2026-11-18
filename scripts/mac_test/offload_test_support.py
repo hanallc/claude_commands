@@ -363,6 +363,11 @@ class OffloadCommandFixture(unittest.TestCase):
         self.start_admission()
 
     def start_admission(self) -> None:
+        for name in ("NOTIFY_SOCKET", "LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES"):
+            _ = self.environment.pop(name, None)
+            inherited = os.environ.pop(name, None)
+            if inherited is not None:
+                self.addCleanup(os.environ.__setitem__, name, inherited)
         admission = caller_admission(self, self.root, self.environment)
         admission.configure(waiting_pass_seconds=0.25)
 
