@@ -2764,7 +2764,7 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 **Files:** `scripts/build_queue/admission_wire.py`, `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/first_step.py`, `scripts/build_queue/test_admission_service.py`, `scripts/build_queue/test_first_step.py`.
 
-### Phase 147 — Build queue and Mac tests write their own build_targets.conf  · status: todo
+### Phase 147 — Build queue and Mac tests write their own build_targets.conf  · status: done
 
 Builds assigned this on 11-18 (reported by accounts via natedev on main ce7733f59). `scripts/build_queue/test_target_availability.py` and `scripts/mac_test/test_offload_lifecycle.py` fail when the scratch home has no `build_targets.conf`: they read the live config. Rule: a test writes its own fixture config and never reads live or tunable config.
 
@@ -2785,3 +2785,13 @@ Builds assigned this on 11-18 (reported by accounts via natedev on main ce7733f5
 - Checkpoint `6f1e2452b`.
 
 **Files:** `scripts/lib/test_cargo_seed.py`.
+
+### Phase 149 — The queue-place scope test does not depend on load  · status: todo
+
+Builds 11-18: `scripts/build_queue/test_queue_place.py` `test_scope_is_published_at_popen_return_and_survives_holder_death` (line 1428, `assert_scope_survives_holder_death(leader_exits=False)`) is flaky on main `9021efe4b`: full module 3 times gave OK, FAILED (1), OK; the failed run took 66 s against 24 s.
+
+1. Reproduce under a CPU quota and name the exact wait or race that fails.
+2. If the wait is a real defect in `queue_place`, repair the code. Otherwise remove the timing dependence from the test.
+3. Prove with repeated full-module runs under a CPU quota.
+
+**Files:** to be named by the work order.
