@@ -699,6 +699,8 @@ The Producer menu beside it lists each producer that a record names.
 An address with a producer that no record names shows all producers.
 The Show menu contains Open, Needs me, Unread, Done, Parked, Closed, and All.
 Open excludes Done, Closed, and items with a future parking time.
+Unread excludes Closed items from the view and the counts.
+Closed items have no unread dot or Mark read button.
 The search field matches the item number, owner name, title, or state words.
 Numbers can include `L` or `#`.
 One match function ignores case for every field.
@@ -765,7 +767,7 @@ Equal words retry an open question. Different words create a new question.
 An exact request retry uses the same question ID, even after morty answers it.
 The expanded row shows each question and its answer when available.
 Morty runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
-The answer adds one log entry and marks the item unread.
+The answer adds one log entry and marks the item unread if it is not Closed.
 The command refuses an unknown ID, a second answer, and empty text.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
 Park writes the chosen date through `the_list.park` with the same source.
@@ -781,7 +783,7 @@ A delivery failure does not reverse the completed item action.
 Tell morty sends the user's words without changing the item's state or parking time.
 Remove leaves Open at once when the user presses the button.
 Park leaves Open and enters Parked at once.
-The row leaves Unread when the user presses Mark read, Ask question, or Tell morty.
+The row leaves Unread when the user presses Mark read, Ask question, Tell morty, or Remove.
 The row returns if the server reports an unread update.
 The shared table fades and collapses the row and its open details when an action hides them.
 The request starts without waiting for the animation.
@@ -789,8 +791,9 @@ The page disables all row buttons while the request runs.
 A second press sends no request.
 The page applies the saved state and parking status from the response.
 The page uses the saved date to update one parking label.
-A refusal restores the last state and parking status from the server.
-A failed Mark read, Ask question, or Tell morty request restores the unread state.
+A refusal restores the last confirmed item state, parking status, and unread state together.
+The unread state includes the Update sort key.
+If Mark read, Ask question, or Tell morty loses its response, the page restores the unread flag from before the request.
 The page opens the restored row and shows the reason there.
 The restored row slides back into view.
 Each row keeps its own inline failure notice.
