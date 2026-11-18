@@ -13,21 +13,29 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, cast
 from urllib.parse import parse_qs, urlencode
 
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, footer_counts, record_store, session_staff, staff, the_list
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
-from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_link
+from scripts.review_links import change_browser, change_page, console, page_frame, page_question, record_table, review_link
 from scripts.review_links import review_items, review_page
 from scripts.review_links import staff_names
 from scripts.review_links import question_record
 from scripts.statusline import counts_row, rebuild_row
 
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/list.html"
-HEADERS = ("#", "Owner", "Producer", "Item", "State", "Next step", "ETA", "Update")
+FIELD_LABELS = {
+    "title": "Title", "owner": "Owner", "producer": "Producer", "unit": "Unit", "state": "State",
+    "next_check": "Next check", "eta": "ETA", "blocked_by": "Blocked by", "related_to": "Related to",
+    "requested_by": "Requested by", "next_step": "Next step", "latest_status": "Latest status",
+    "evidence": "Evidence", "done_when": "Done when", "parked_until": "Parked until",
+    "closing_words": "Closing words",
+}
+HEADERS = ("#", FIELD_LABELS["owner"], FIELD_LABELS["producer"], "Item",
+           *(FIELD_LABELS[field] for field in ("state", "next_step", "eta")), "Update")
 SHOWS = (("open", "Open"), ("needs-me", "Needs me"), ("unread", "Unread"), ("done", "Done"),
          ("parked", "Parked"), ("closed", "Closed"), ("all", "All"))
 
@@ -84,6 +92,64 @@ def eta_text(eta: the_list.Eta, today: datetime) -> str:
     return the_list.eta_text(eta)
 
 
+def field_html(field: str, value: object, today: datetime, names: staff_names.StaffNames) -> str:
+    if field in ("owner", "producer"):
+        owner = cast(the_list.ItemOwner, value)
+        return names.html(owner, owner_name(names.members, owner))
+    if field == "eta":
+        return html.escape(eta_text(cast(the_list.Eta, value), today))
+    if field == "parked_until":
+        if not isinstance(value, datetime):
+            return "Not parked"
+        zone = today.tzinfo
+        assert zone is not None
+        return the_list.parking_date(value, zone)
+    if isinstance(value, datetime):
+        return html.escape(local_time(value, today))
+    if isinstance(value, the_list.CheckCondition):
+        return html.escape(value.text)
+    if field in ("next_step", "latest_status", "done_when", "closing_words"):
+        return change_browser.question_paragraphs(cast(str, value) or "Not recorded")
+    if field == "unit":
+        return names.html(cast(str, value)) or "Not recorded"
+    if field == "blocked_by":
+        dependencies = cast(tuple[the_list.ItemDependency, ...], value)
+        return html.escape(", ".join(f"L{entry.number} ({entry.condition})" for entry in dependencies)) or "None"
+    if field == "related_to":
+        return ", ".join(f"L{number}" for number in cast(tuple[int, ...], value)) or "None"
+    return html.escape(cast(str, value)) or "Not recorded"
+
+
+def log_entry_html(change: the_list.ItemChange, today: datetime, names: staff_names.StaffNames) -> str:
+    content = change.what
+    by = " <small>— " + names.html(change.source, owner_name(names.members, staff.StaffId(change.source))) + "</small>"
+    if isinstance(content, the_list.FieldChange):
+        heading = content.action + by
+        fields = ''.join(f'<dt>{FIELD_LABELS[field]}</dt><dd>{field_html(field, value, today, names)}</dd>'
+                         for field, value in content.fields.items())
+        body = f'<strong>{heading}</strong><dl>{fields}</dl>'
+    elif isinstance(content, the_list.PageFeedback):
+        label = {"pending": "Feedback for morty", "sent": "Feedback sent to morty",
+                 "alerted": "Feedback could not reach morty"}[content.state]
+        body = label + by + change_browser.question_paragraphs(content.words)
+    elif isinstance(content, the_list.QuestionAnswered):
+        body = "Answered question " + html.escape(content.question_id) + by
+    elif isinstance(content, the_list.MarkedRead):
+        body = "Marked read" + by
+    elif isinstance(content, the_list.Reopened):
+        body = "Reopened" + by
+    elif isinstance(content, the_list.ReviewLinksChanged):
+        body = content.action + ": " + html.escape(", ".join(content.keys)) + by
+    elif isinstance(content, the_list.EvidenceCopyRemoved):
+        body = f"Removed the migration copy of {content.copy} from {FIELD_LABELS['evidence']}" + by
+    elif isinstance(content, str):
+        body = html.escape(content) + by
+    else:
+        return ""
+    return ('<li><time datetime="' + change.time.isoformat() + '">' + html.escape(local_time(change.time, today))
+            + '</time><div>' + body + '</div></li>')
+
+
 def item_link(keeper: staff.StaffId, number: int) -> str:
     return '#' + urlencode({"item": f"{keeper}/L{number}"})
 
@@ -113,6 +179,7 @@ def feedback_form(entry: ListRecord, secret: str) -> str:
             + f'<textarea name="words" id="words-{key}" rows="2" maxlength="10000" '
             + 'placeholder="Your words for morty about this item" aria-label="Your words for morty about this item"></textarea>'
             + '<div class="list-tell"><span role="status" data-send-status></span>'
+            + '<button name="action" value="question" disabled>Ask question</button>'
             + '<button name="action" value="tell" disabled>Tell morty</button></div></form>')
 
 
@@ -155,23 +222,24 @@ def review_card(identity: str, reviews: Mapping[str, review_items.ReviewItem]) -
 def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[str, review_items.ReviewItem],
             names: staff_names.StaffNames) -> str:
     item = entry.item
-    sections = ''.join('<section><h3>' + heading + '</h3>'
-                       + change_browser.question_paragraphs(text or "Not recorded") + '</section>'
-                       for heading, text in (("Latest status", item.latest_status), ("Done when", item.done_when)))
-    links = [f'<li><a href="{html.escape(item_link(entry.keeper, link.number), quote=True)}">#{link.number}</a>'
+    sections = ''.join(f'<section><h3>{FIELD_LABELS[field]}</h3>{field_html(field, value, today, names)}</section>'
+                       for field, value in (("latest_status", item.latest_status), ("done_when", item.done_when)))
+    links = [f'<li><a data-record-jump href="{html.escape(item_link(entry.keeper, link.number), quote=True)}">#{link.number}</a>'
              + ' — ' + html.escape(link.condition) + '</li>' for link in item.blocked_by]
-    links.extend(f'<li>Related: <a href="{html.escape(item_link(entry.keeper, number), quote=True)}">#{number}</a></li>'
+    links.extend(f'<li>Related: <a data-record-jump href="{html.escape(item_link(entry.keeper, number), quote=True)}">#{number}</a></li>'
                  for number in item.related_to)
     if links:
         sections += '<section><h3>Links</h3><ul>' + ''.join(links) + '</ul></section>'
     if item.state == the_list.ItemState.CLOSED:
-        sections += '<section><h3>Closing words</h3>' + change_browser.question_paragraphs(item.closing_words) + '</section>'
+        sections += (f'<section><h3>{FIELD_LABELS["closing_words"]}</h3>'
+                     + field_html("closing_words", item.closing_words, today, names) + '</section>')
     if item.reviews:
         cards = (review_card(identity, reviews) for identity in item.reviews)
         sections += '<p>' + review_summary(item, reviews, today) + '</p><p>' + ' · '.join(cards) + '</p>'
-    log = ''.join('<li><time datetime="' + change.time.isoformat() + '">' + html.escape(local_time(change.time, today))
-                  + '</time><span>' + html.escape(change.what) + ' <small>— ' + names.html(change.source)
-                  + '</small></span></li>' for change in reversed(item.log) if not the_list.is_page_request_receipt(change))
+    sections += ''.join(page_question.open_question_html(question) if question.answer is None
+                        else page_question.answered_question_html(question) for question in item.questions)
+    log = ''.join(log_entry_html(change, today, names) for change in reversed(item.log)
+                  if not the_list.is_page_request_receipt(change))
     return ('<div class="list-panel"><div>' + sections + feedback_form(entry, secret)
             + '</div><section><h3>Log · newest first</h3><ol class="list-log">' + log + '</ol></section></div>')
 
@@ -200,19 +268,19 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
               + f'aria-label="Show item {item.number}"><span class="list-chevron" aria-hidden="true">›</span>{item.number}</button>')
     title = '<strong>' + html.escape(item.title) + '</strong>'
     if item.unit:
-        title += '<small>' + names.html(item.unit) + '</small>'
+        title += '<small>' + field_html("unit", item.unit, today, names) + '</small>'
     tone = {the_list.ItemState.WAITING_FOR_NATE: "warning", the_list.ItemState.BLOCKED: "error",
             the_list.ItemState.WORKING: "accent", the_list.ItemState.DELIVERED: "room",
             the_list.ItemState.DONE: "room"}.get(item.state, "muted")
-    state = f'<span class="list-state {tone}">{html.escape(item.state.value)}</span>'
+    state = f'<span class="list-state {tone}">' + field_html("state", item.state, today, names) + '</span>'
     if item.state != the_list.ItemState.CLOSED:
         if isinstance(item.next_check, datetime):
             label = "Check overdue " if item.next_check < today else "Check "
-            state += '<small>' + label + html.escape(local_time(item.next_check, today)) + '</small>'
+            state += '<small>' + label + field_html("next_check", item.next_check, today, names) + '</small>'
         elif isinstance(item.next_check, the_list.CheckCondition):
-            state += '<small>Check: ' + html.escape(item.next_check.text) + '</small>'
+            state += '<small>Check: ' + field_html("next_check", item.next_check, today, names) + '</small>'
     if parked and isinstance(item.parked_until, datetime):
-        state += '<small data-parked-note>Parked until ' + html.escape(local_time(item.parked_until, today)) + '</small>'
+        state += '<small data-parked-note>Parked until ' + field_html("parked_until", item.parked_until, today, names) + '</small>'
     if item.reviews:
         state += '<small>' + review_summary(item, reviews, today) + '</small>'
     update = '<span class="list-dot" role="img" aria-label="Unread update"></span>' if unread else '<span aria-label="No unread update">—</span>'
@@ -224,8 +292,8 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
             notice = ("not sent; " + names.html(feedback.alerted_to) + " told" if feedback.alerted_to
                       else "not sent; no showrunner for alert")
         update += '<small>' + notice + ", " + html.escape(local_time(sent, today)) + '</small>'
-    cells = (number, names.html(item.owner, owner), names.html(item.producer, producer), title, state, change_browser.question_paragraphs(item.next_step or "Not recorded"),
-             html.escape(eta_text(item.eta, today)), update)
+    cells = (number, field_html("owner", item.owner, today, names), field_html("producer", item.producer, today, names),
+             title, state, field_html("next_step", item.next_step, today, names), field_html("eta", item.eta, today, names), update)
     row = ''.join(f'<td' + (' class="record-id"' if label == '#' else '')
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden = ' hidden' if parked or item.state in (the_list.ItemState.DONE, the_list.ItemState.CLOSED) else ''
@@ -240,17 +308,26 @@ class ListFeedbackDelivery:
     request: str
 
 
+@dataclass(frozen=True)
+class ListQuestionDelivery:
+    delivery: change_page.MessageDelivery
+    status: change_page.DeliveryStatus
+
+
 def fresh_request(root: Path, keeper: str, identity: str) -> dict[str, str]:
     request = secrets.token_hex(16)
     item = the_list.load(staff.StaffId(keeper), identity)
-    today = the_list.now().astimezone(user_zone())
-    parked_until = local_time(item.parked_until, today) if isinstance(item.parked_until, datetime) and item.parked_until > today else ""
+    zone = user_zone()
+    today = the_list.now()
+    parked_until = (the_list.parking_date(item.parked_until, zone)
+                    if isinstance(item.parked_until, datetime) and item.parked_until > today else "")
     return {"request": request, "token": request_token(root, keeper, identity, request),
             "unread": str(isinstance(item.unread_since, datetime)).lower(), "item_state": item.state.value,
             "parked": str(bool(parked_until)).lower(), "parked_until": parked_until}
 
 
-def submit(root: Path, body: str) -> ListFeedbackDelivery | change_page.NoMessageDelivery:
+def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = None
+           ) -> ListFeedbackDelivery | ListQuestionDelivery | change_page.NoMessageDelivery:
     """Accept signed item actions and save their notices for morty."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) != {"keeper", "id", "request", "token", "action", "words", "until"} or any(len(values) != 1 for values in fields.values()):
@@ -265,6 +342,10 @@ def submit(root: Path, body: str) -> ListFeedbackDelivery | change_page.NoMessag
     if morty is None or morty.kind != "producer" or morty.name != "morty":
         raise question_record.AnswerRefused("the item has no morty producer")
     action, words, until = fields["action"][0], fields["words"][0].strip(), fields["until"][0]
+    if action == "question":
+        status = change_page.DeliveryStatus(root) if status is None else status
+        question = the_list.ask_question(morty.id, identity, the_list.PageRequest(request, "question", words), status)
+        return ListQuestionDelivery(question, status) if isinstance(question, change_page.MessageDelivery) else question
     if action == "read":
         _ = the_list.mark_read(morty.id, identity, source=the_list.PAGE_SOURCE,
                                page_request=the_list.PageRequest(request, "read", words))
@@ -307,9 +388,12 @@ def alert_showrunners(item: the_list.ListItem, members: staff.StaffSnapshot) -> 
     return ()
 
 
-def deliver(delivery: ListFeedbackDelivery | change_page.NoMessageDelivery) -> None:
+def deliver(delivery: ListFeedbackDelivery | ListQuestionDelivery | change_page.NoMessageDelivery) -> None:
     """Send saved List words with the shared retry and alert helpers."""
     if isinstance(delivery, change_page.NoMessageDelivery):
+        return
+    if isinstance(delivery, ListQuestionDelivery):
+        change_page.deliver(delivery.delivery, delivery.status)
         return
     def send(item: the_list.ListItem, feedback: the_list.PageFeedback) -> the_list.PageFeedback:
         settings = conf.read("review_links")
@@ -427,6 +511,7 @@ def render(root: Path) -> bytes:
                + '<label class="list-search-label" for="list-search">Search</label>'
                + '<input type="search" id="list-search" placeholder="Filter by number, owner, item or state">'
                + '<span data-list-count role="status" aria-live="polite"></span></div>'
+               + '<p data-missing-item role="status" hidden></p>'
                + '<p data-hidden-action-status role="status" hidden></p>'
                + '<div class="list-table"><table aria-label="The List"><colgroup><col style="width:6%"><col style="width:8%">'
                + '<col style="width:10%"><col style="width:17%"><col style="width:14%"><col style="width:23%"><col style="width:14%">'
@@ -439,8 +524,13 @@ def render(root: Path) -> bytes:
 STYLE = record_table.STYLE + '''<style>
 .list-table td[data-label="Next step"]>:first-child{margin-top:0}.list-table td[data-label="Next step"]>:last-child{margin-bottom:0}
 .list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
-.list-tell button{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.list-tell [value="tell"]{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
 .list-tell button:disabled{opacity:.45;cursor:default}.list-tell [data-send-status]{margin-left:0}
+.list-log dl{display:grid;grid-template-columns:min(7rem,42%) minmax(0,1fr);gap:2px 12px;margin:4px 0 0}
+.list-log dt{color:var(--ink-3)}.list-log dd{margin:0;overflow-wrap:anywhere}
+.list-log dd>:last-child{margin-bottom:0}
+.list-log dl li{display:list-item;padding:0;border:0}
+.page-question p{white-space:pre-wrap;overflow-wrap:anywhere}
 .list-table td[data-label="State"]{color:var(--ink)}
 .list-table td[data-label="Producer"],.list-table td[data-label="ETA"]{color:var(--ink-2)}
 @media(max-width:960px){
@@ -481,6 +571,10 @@ function syncUnread(item,form,unread){
 const tableView=createRecordTable({content:()=>content,
  shows:['open','needs-me','unread','done','parked','closed','all'],
  filters:['producer'],
+ missingItem:key=>{
+  const number=key.match(/\/L([1-9]\d*)$/)?.[1];
+  return number ? 'Item #'+number+' is not on the List' : '';
+ },
  visible:(data,{owner,show,query:search,filters})=>{
   if(owner && data.owner!==owner) return false;
   if(filters.producer && data.producer!==filters.producer) return false;
@@ -498,21 +592,18 @@ const tableView=createRecordTable({content:()=>content,
  counts:(items,count)=>count+' of '+items.length+' items shown · '+
   items.filter(item=>item.dataset.state==='Waiting for nate' && item.dataset.parked!=='true').length+' need you · '+
   items.filter(item=>item.dataset.unread==='true').length+' unread',
- applied:items=>{
-  const status=content.querySelector('[data-hidden-action-status]');
-  if(status.dataset.key) status.hidden=!items.find(item=>item.dataset.key===status.dataset.key)?.hidden;
- }
 });
 const apply=(write=true)=>tableView.apply(write),place=()=>tableView.place();
 function bind(){
  tableView.replace();
- const hiddenStatus=content.querySelector('[data-hidden-action-status]');
  content.querySelectorAll('[data-feedback-form]').forEach(form=>{
   const item=form.closest('[data-list-item]'),key=item.dataset.key;
+  const notice=form.querySelector('[data-send-status]');
+  notice.textContent=tableView.actionNotice(item);
   const confirmed={state:item.dataset.state,parked:item.dataset.parked};
   const words=form.elements.words,until=form.elements.until;
-  const tell=form.querySelector('[value="tell"]');
-  const syncTell=()=>{tell.disabled=Boolean(form.dataset.sending) || !words.value.trim();};
+  const tell=form.querySelector('[value="tell"]'),ask=form.querySelector('[value="question"]');
+  const syncTell=()=>{ask.disabled=tell.disabled=Boolean(form.dataset.sending) || !words.value.trim();};
   const signed={request:form.elements.request.value,token:form.elements.token.value};
   let fresh=signed;
   const newRequest=()=>({
@@ -531,7 +622,8 @@ function bind(){
   form.addEventListener('submit',async event=>{
    event.preventDefault();if(form.dataset.sending) return;
    const action=event.submitter?.value || 'tell';
-   if(action==='tell' && !words.value.trim()) return;
+   const usesWords=action==='tell' || action==='question';
+   if(usesWords && !words.value.trim()) return;
    if(action==='park' && !until.value){form.querySelector('[data-send-status]').textContent='Choose a parking date.';return;}
    const retry=matching(action);
    const attempt=retry ?? {...fresh,action,words:words.value,until:until.value};
@@ -541,23 +633,25 @@ function bind(){
    retainDraft();
    form.dataset.sending='true';saving++;pageRefresh.abandon();
    let buttons=[...item.querySelectorAll('button')],saved=false,refused=false;
-   const notice=form.querySelector('[data-send-status]');
-   if(hiddenStatus.dataset.key===key){delete hiddenStatus.dataset.key;hiddenStatus.hidden=true;hiddenStatus.textContent='';}
    buttons.forEach(button=>button.disabled=true);notice.textContent=action==='read' ? 'Saving…' : 'Sending…';
+   const clearsUnread=action==='read' || action==='tell',unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
    if(action==='remove') item.dataset.state='Closed';
    if(action==='park') item.dataset.parked='true';
-   if(action==='remove' || action==='park') apply(false);
+   if(clearsUnread) item.dataset.unread='false';
+   tableView.startAction(item);
+   const hidUnread=clearsUnread && wasVisible && item.hidden;
    try{
     const response=await fetch(location.pathname,{method:'POST',body:data});
-    refused=!response.ok;
+    refused=!response.ok && (action!=='question' || response.status<500);
     const result=await response.json();
-    if(refused) throw new Error(result.reason || 'HTTP '+response.status);
+    if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
     saved=true;
     const unread=result.unread==='true';
     notice.textContent=action==='remove' ? 'Removed' : action==='park' ? 'Parked' : action==='read' ? 'Marked read' :
+     action==='question' ? 'Question saved' :
      action==='tell' && unread ? 'sent to morty; update remains unread' : 'sent to morty';
     signed.request=result.request;signed.token=result.token;fresh=signed;
-    if(action==='tell' && words.value===data.get('words')) words.value='';
+    if(usesWords && words.value===data.get('words')) words.value='';
     if(typeof result.item_state==='string') confirmed.state=result.item_state;
     if(['true','false'].includes(result.parked)) confirmed.parked=result.parked;
     Object.assign(item.dataset,confirmed);
@@ -565,6 +659,7 @@ function bind(){
     state.className='list-state '+({'Waiting for nate':'warning',Blocked:'error',Working:'accent',Delivered:'room',Done:'room'}[item.dataset.state] || 'muted');
     const sortValues=JSON.parse(item.dataset.sortValues);sortValues[3]=item.dataset.state.toLowerCase();item.dataset.sortValues=JSON.stringify(sortValues);
     if(['true','false'].includes(result.unread)) syncUnread(item,form,unread);
+    else if(clearsUnread) item.dataset.unread=unreadBefore;
     if(typeof result.parked_until==='string'){
      let note=item.querySelector('[data-parked-note]');
      if(result.parked_until){
@@ -572,17 +667,13 @@ function bind(){
       note.textContent='Parked until '+result.parked_until;
      }else note?.remove();
     }
-    apply(false);
+    tableView.applyAction();
    }catch(error){
-    if(refused){
-     Object.assign(item.dataset,confirmed);
-     tableView.opened.add(key);
-     apply(false);
-    }
-    notice.textContent=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
-    hiddenStatus.dataset.key=key;
-    hiddenStatus.textContent='Item '+item.dataset.number+': '+notice.textContent;
-    hiddenStatus.hidden=!item.hidden;
+    if(clearsUnread) item.dataset.unread=unreadBefore;
+    if(refused) Object.assign(item.dataset,confirmed);
+    if(refused || hidUnread) tableView.opened.add(key);
+    const message=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
+    tableView.showActionResult(item,'Item '+item.dataset.number,message);
    }
    finally{
     if(saved || refused) unconfirmed.delete(attempt);
@@ -601,6 +692,7 @@ async function refresh(_supersede=false,current=()=>true){
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
  const fresh=page.querySelector('[data-list]');
  if(!fresh) throw new Error('The page has no list.');
+ await tableView.settled();
  if(saving || !current()) return;
  const top=scrollY,focus=document.activeElement?.id;
  const field=document.activeElement,start=field?.selectionStart,end=field?.selectionEnd;
@@ -610,6 +702,7 @@ async function refresh(_supersede=false,current=()=>true){
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
 }
 place();bind();apply();
-addEventListener('hashchange',()=>{place();apply(false);});
+addEventListener('popstate',tableView.restorePlace);
+addEventListener('hashchange',tableView.restorePlace);
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
 })();'''
