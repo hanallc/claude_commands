@@ -1850,6 +1850,10 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
         entries = open_entries(production, identities)
         if any(stored["text"] == text for stored in entries):
             raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
+        if any("question" in stored and stored["text"] == text
+               and question_member(production, stored, identities).id == asker.id
+               for stored in legacy_entries(outstanding)):
+            raise RegistrationFailure("ask", f"{text}: a legacy question from this asker is already open")
         entries.append(entry)
         with record_store.keep_file_on_error(outstanding.with_suffix(".history.jsonl")):
             write_open_entries(production, entries, identities, last=(entry,),
