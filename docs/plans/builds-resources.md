@@ -2821,3 +2821,12 @@ Builds 11-18 09:04: the paired workers of trial 0bcb636d held 5 AWS cloud slots 
 4. Measure how long paired workers held slots before launch.
 
 **Files:** `scripts/aws_target/aws_trial.py`, `scripts/aws_target/cloud_gate.py`, `scripts/build_queue/admission_wire.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/memory_feed.py`, `scripts/build_queue/queue_view.py`, and their tests.
+
+### Phase 152 — A date-boundary AWS test passes in any environment  · status: done
+
+Builds 11-18 11:5x: `scripts/aws_target` `test_measurement.MeasurementTests.test_wait_estimate_uses_the_report_local_day_instead_of_the_accounting_day` fails with `0 != 1` on unmodified main e436afeac and later. Its result changes with the time of day.
+
+1. Find the clock read that the test does not control.
+2. Give the test a fixed clock. No skip.
+
+**Files:** `scripts/aws_target/test_measurement.py`, and the code under test only if the clock read is a code defect.
