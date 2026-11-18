@@ -4749,7 +4749,9 @@ try{
    'an address restores the producer filter');
  location.hash=new URLSearchParams({show:'all',producer:'missing'});await flush();
  check(menu('producer').value==='' && visible().length===6,'an unknown producer shows all items');
- location.hash=new URLSearchParams({show:'unread',state:'Working',owner:OWNER,q:'106'});await flush();
+ const restoredOldAddress=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+ location.hash=new URLSearchParams({show:'unread',state:'Working',owner:OWNER,q:'106'});
+ await restoredOldAddress;
  check(selectedShow()==='working' && menu('owner').value===OWNER && unread().checked &&
   visible().map(row=>row.dataset.number).join(',')==='106','An old address restores the Working chip, switch, menu and search.');
 
