@@ -1164,6 +1164,94 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
 
+### Phase 75 — Review page follow-ups  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-18) made four add-ons current. This one closes phase 65 F005, F008 and F009 and the Done card defect (on main 3515c9470).
+
+**Spec:**
+1. F005: a reload during a snapshot publication retry keeps the browser save marker until the snapshot confirms the verdict. The server does not return the old verdict form (review_page.py ~391, ~826, ~985).
+2. F008: a reload after a Show change restores the saved browser state. The jump applies only to a new link (review_page.py ~1208).
+3. F009: a link restored by Back during a save applies after the save ends, for Changes and Questions. The save does not clear the other card or its link (review_page.py ~1212, ~1067; record_table.py ~388).
+4. Done card: the Proof heading shows only when proof text exists (~562). A Done card has no Later button (~516).
+5. Add rows to the existing review_page and record_table tests.
+
+**Files:** `scripts/review_links/review_page.py`, `scripts/review_links/record_table.py`, their tests.
+
+**Workers:** 1 writer.
+
+**Order:** merge unit-board's reviewfade tip before the hash. It also changes the Review page.
+
+**Acceptance gate:**
+1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+### Phase 76 — Detached run hardening  · status: todo
+**Depends on:** phase 70
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-18). Close phase 70 F016-F019, four rare races. Use the smallest fix for each.
+
+**Spec:**
+1. A stop request stays pending until the signal is delivered. A failed rollback after a failed sync leaves no stop reason (detached_runs.py ~245).
+2. The shared record reader checks the run id against the file name. Reap never queues a completion for the wrong run (~223).
+3. Reap does not keep a dead run pending when another group reuses its id (~354).
+4. The process check tells an absent process from a failed ps call. A failed check stays pending (detached_run_process.py ~32).
+5. Add rows to the existing detached_runs tests.
+
+**Files:** `scripts/agents/detached_runs.py`, `scripts/agents/detached_run_process.py`, `scripts/agents/test_detached_runs.py`.
+
+**Workers:** 1 writer.
+
+**Order:** on the phase 70 tip. Merge unit-board's panestop and panedone2 tips before the hash; they change detached_runs.py.
+
+**Acceptance gate:**
+1. Each new test row fails on the phase 70 tip. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+### Phase 77 — Change review hardening  · status: todo
+**Depends on:** phase 73
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-18). Close phase 73 F010 and F011.
+
+**Spec:**
+1. The strict delivery read rejects a pending verdict slot with no attempt id (change_routing.py:338, delivery_state.py:123).
+2. `end_row_scratch` reports a `conf.Unusable` scratch config and lets a retry finish the cleanup, for every caller (change_review.py:1978).
+3. Add rows to the existing change_routing, delivery_state and change_review tests.
+
+**Files:** `scripts/production/change_routing.py`, `scripts/production/delivery_state.py`, `scripts/production/change_review.py`, their tests.
+
+**Workers:** 1 writer.
+
+**Order:** on the phase 73 tip.
+
+**Acceptance gate:**
+1. Each new test row fails on the phase 73 tip. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+### Phase 78 — Cross-repo units  · status: todo
+**Depends on:** phase 74
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-18). Close phase 74 F010 and F011.
+
+**Spec:**
+1. The unit board reads dependency evidence from the unit's own repo. It labels a failure by the land destination (unit_phases.py:1454).
+2. A batch review report returns each row with its own list path (merge_checkpoint.py:549).
+3. Add rows to the existing unit_phases and merge_checkpoint tests.
+
+**Files:** `scripts/production/unit_phases.py`, `scripts/production/merge_checkpoint.py`, their tests.
+
+**Workers:** 1 writer.
+
+**Order:** on the phase 74 tip.
+
+**Acceptance gate:**
+1. Each new test row fails on the phase 74 tip. basedpyright: 0 errors, 0 warnings. Full gate green.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
