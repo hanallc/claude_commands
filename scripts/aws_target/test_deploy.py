@@ -71,7 +71,7 @@ if override.exists():
     reply(json.loads(override.read_text()))
     sys.exit(0)
 keys_path = root / 'fake-keys.json'
-keys = json.loads(keys_path.read_text()) if keys_path.exists() else ['old-key']
+keys = json.loads(keys_path.read_text()) if keys_path.exists() else ['FIXTUREOLDKEY0000000']
 if service == 'sts' and operation == 'get-caller-identity':
     if '--profile' not in args:
         reply({'Account': '123456789012'})
@@ -80,7 +80,7 @@ if service == 'sts' and operation == 'get-caller-identity':
     credentials = configparser.ConfigParser()
     credentials.read(os.environ['AWS_SHARED_CREDENTIALS_FILE'])
     profile = args[args.index('--profile') + 1]
-    valid = credentials.get(profile, 'aws_access_key_id', fallback='') == 'new-key'
+    valid = credentials.get(profile, 'aws_access_key_id', fallback='') == 'FIXTURENEWKEY0000000'
     if not valid or (root / 'fail-scaler').exists():
         print('The profile is not ready', file=sys.stderr)
         sys.exit(1)
@@ -135,9 +135,9 @@ elif service == 'cloudformation' and operation == 'create-change-set':
         print('lost CREATE response', file=sys.stderr); sys.exit(1)
     reply({'StackId': stack_id})
 elif service == 'iam' and operation == 'create-access-key':
-    keys.append('new-key')
+    keys.append('FIXTURENEWKEY0000000')
     keys_path.write_text(json.dumps(keys))
-    reply({'AccessKey': {'AccessKeyId': 'new-key', 'SecretAccessKey': 'fixture-secret-only-in-credentials'}})
+    reply({'AccessKey': {'AccessKeyId': 'FIXTURENEWKEY0000000', 'SecretAccessKey': 'fixture-secret-only-in-credentials'}})
 elif service == 'iam' and operation == 'list-access-keys':
     if (root / 'deleted-stack').exists():
         print('NoSuchEntity', file=sys.stderr); sys.exit(1)
@@ -892,6 +892,21 @@ class HanaSetupFailureTests(CostFixture):
                 self.assertTrue(fake.stack)
                 self.assertEqual(remote.read_record(self.setup_path), record)
                 self.assertEqual(self.book.read_snapshot(), evidence)
+
+    def test_hana_down_recovers_the_request_and_disk_from_a_saved_instance(self) -> None:
+        fake = FakeEc2(stack=True)
+        instance = fake.launch(tagged=False)
+        fake.disks['fixture-data'] = Disk('available', {'HanaDeployment': HANA_TAG[1], 'HanaData': 'true'})
+        subject = self.subject(fake)
+        _ = self.write_leftover(subject)
+        saved = remote.read_record(self.setup_path)
+        saved.update(version=2, instance=instance)
+        write_text_atomic(self.setup_path, json.dumps(saved))
+        with redirect_stdout(StringIO()):
+            self.assertTrue(subject.hana_down(approve_destroy=True))
+        self.assertIn('cancel-spot-instance-requests', fake.operations)
+        self.assertIn('delete-volume', fake.operations)
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
 
     def test_hana_down_reports_missing_direct_ids_and_continues(self) -> None:
         fake = FakeEc2(stack=True)
@@ -2120,6 +2135,23 @@ sys.exit(7)
         self.assertEqual(self.previous_output(output.getvalue(), 'up'), '')
         self.assertFalse(any(worker.name == 'deployment-progress' for worker in threading.enumerate()))
 
+    def test_scaler_key_cleans_stale_and_unconfirmed_keys(self) -> None:
+        subject = self.deployment()
+        checkpoint = self.state / 'scaler-key.json'
+        old_key = 'FIXTUREOLDKEY0000000'
+        _ = checkpoint.write_text(json.dumps({'access_key_id': old_key}))
+        with mock.patch.object(subject, '_scaler_present', return_value=False), \
+                mock.patch.object(time, 'sleep', return_value=None):
+            with self.assertRaisesRegex(deploy.DeploymentRefused, 'the new key was removed'):
+                subject.scaler_key()
+        deletes = [cast(list[str], row['args']) for row in self.commands('delete-access-key')]
+        removed = [words[words.index('--access-key-id') + 1] for words in deletes]
+        self.assertEqual(len(removed), 2)
+        self.assertEqual(removed[0], old_key)
+        self.assertNotEqual(removed[1], old_key)
+        self.assertFalse(checkpoint.exists())
+        self.assertEqual(self.credentials.read_text(), '')
+
     def test_stack_wait_uses_its_own_timeout_through_the_admin_executor(self) -> None:
         self.replace('stack_wait_timeout_s', '3600')
         calls: list[tuple[tuple[str, ...], float]] = []
@@ -2310,6 +2342,14 @@ sys.exit(7)
         self.assertEqual(ledger.rows(remote.read_record(fake.manifest), 'regions')[1], regional)
         self.assertEqual({name: (subject.directory / name).read_bytes() for name in records}, before)
         self.assertTrue(all(command[command.index('--region') + 1] == 'us-east-1' for command in fake.commands))
+
+    def test_remove_gate_image_reads_events_when_the_update_wait_fails(self) -> None:
+        subject, fake = self.gate_image_fixture('waiter')
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(aws_target.AwsUnavailable, 'fixture stack waiter failure'):
+            _ = subject.remove_images(approve_destroy=True)
+        operations = [command[command.index('--region') + 3] for command in fake.commands]
+        self.assertEqual(operations[-2:], ['wait', 'describe-stack-events'])
+        self.assertIn('snap-old', fake.snapshots)
 
     def test_remove_gate_image_keeps_the_selected_image_launchable_when_a_step_fails(self) -> None:
         for failure in ('activate', 'waiter', 'manifest', 'narrow waiter'):
@@ -3930,12 +3970,16 @@ sys.exit(7)
             args = list(arguments)
             calls.append(args)
             reply: dict[str, object] = {'Reservations': []}
+            if 'describe-instances' in args and args[args.index('--region') + 1] == 'us-west-2':
+                reply = {'Reservations': [{'Instances': [{'InstanceId': 'i-fixture-west'}]}]}
             if 'describe-images' in args:
                 reply = {'Images': [{'BlockDeviceMappings': [{'Ebs': {'SnapshotId': 'snap-west'}}]}]}
             return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
         api = aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)
         self.assertTrue(teardown.remove_regional_gates(api, self.state))
         operations = [command[command.index('--region') + 3] for command in calls]
+        self.assertLess(operations.index('terminate-instances'), operations.index('wait'))
+        self.assertLess(operations.index('wait'), operations.index('delete-stack'))
         self.assertLess(operations.index('delete-stack'), operations.index('deregister-image'))
         self.assertLess(operations.index('deregister-image'), operations.index('delete-snapshot'))
         sweeps = [command for command in calls if 'describe-instances' in command]
@@ -4553,6 +4597,14 @@ sys.exit(7)
         _ = (self.state / 'image.json').write_text(json.dumps({'image_id': 'ami-cache', 'system': SYSTEM}))
         with mock.patch.object(aws_target.AwsCli, 'call', side_effect=aws_target.AwsUnavailable('InvalidAMIID.NotFound')):
             self.assertEqual(box.saved_image(subject._api(aws_config.read_deployment_settings(self.settings)), self.state), {})  # pyright: ignore[reportPrivateUsage]
+
+    def test_create_saved_image_tags_the_image_and_snapshot(self) -> None:
+        subject = self.deployment()
+        api = subject._api(aws_config.read_deployment_settings(self.settings))  # pyright: ignore[reportPrivateUsage]
+        image = box.create_saved_image(api, self.state, 'i-fixture', name='fixture-image',
+            tags=[{'Key': box.IMAGE_OWNER_TAG, 'Value': 'true'}], identity={}, exclude_devices=('/dev/sdf',))
+        self.assertEqual(image, {'image_id': 'ami-cache'})
+        self.assertEqual(box.saved_image(api, self.state)['ImageId'], 'ami-cache')
 
 
     def test_down_keeps_and_reports_the_saved_image(self) -> None:
