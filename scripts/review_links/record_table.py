@@ -47,7 +47,7 @@ def labelled_chip_row(name: str, buttons: str, *, filter_key: str = '', chip_cla
 
 
 def words_box(element_id: str, placeholder: str) -> str:
-    """Render the words box above the filter rows."""
+    """Render the words box for the filters."""
     identity = html.escape(element_id, quote=True)
     words = html.escape(placeholder, quote=True)
     return (f'<div class="record-filter-words"><input type="search" id="{identity}" data-filter-words'
@@ -85,7 +85,7 @@ STYLE = '''<style>
 main{font-size:15px;line-height:1.5}
 .list-filters{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
 .list-filters label{display:inline;color:var(--ink-2)}
-.list-filters select,.list-filters input{font:inherit;min-height:44px;padding:7px 10px;border:1px solid var(--line);
+.list-filters input{font:inherit;min-height:44px;padding:7px 10px;border:1px solid var(--line);
 background:var(--card);color:var(--ink);border-radius:8px;max-width:100%;min-width:0}
 .list-filters input{width:260px}
 .list-search-label{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
@@ -352,25 +352,20 @@ const sortValues=data=>options.sortValues?.(data) ?? JSON.parse(data.sortValues)
 const words=()=>content.querySelector('[data-filter-words]') ?? content.querySelector('#list-search');
 const sharedWords=()=>words().hasAttribute?.('data-filter-words');
 const chipRow=name=>content.querySelector('[data-filter-row="'+name+'"]');
+const staffChipPrefix='staff:';
+const isStaffChipFilter=name=>options.staffChipFilters?.includes(name);
+const filterChipValue=(name,value)=>value ? (isStaffChipFilter(name) ? staffChipPrefix+value : value) : 'all';
 function filterSelection(name){
  const row=chipRow(name),all=name==='show' ? 'all' : '';
- if(row) return {
-  set(value){const selected=filterControl.select(row,value || 'all');return selected==='all' ? all : selected;},
-  bind(change){filterControl.bind(row,value=>change(value==='all' ? all : value));},
-  setCounts(counts){filterControl.setCounts(row,counts);}
- };
+ if(row){
+  const filterValue=value=>value==='all' ? all : isStaffChipFilter(name) ? value.slice(staffChipPrefix.length) : value;
+  return {
+   set(value){return filterValue(filterControl.select(row,filterChipValue(name,value)));},
+   bind(change){filterControl.bind(row,value=>change(filterValue(value)));},
+   setCounts(counts){filterControl.setCounts(row,counts);}
+  };
+ }
  const control=content.querySelector('#list-'+name);
- if(control?.matches('select')) return {
-  set(value){control.value=value;if(control.selectedIndex<0) control.value='';return control.value;},
-  bind(change){control.addEventListener('change',()=>change(control.value));},
-  setCounts(counts){
-   for(const option of control.options){
-    const count=String(counts[option.value || 'all'] ?? 0);
-    option.dataset.filterCount=count;
-    option.textContent=option.dataset.filterLabel+' ('+count+')';
-   }
-  }
- };
  if(control?.matches('input[type="checkbox"]')) return {
   set(value){control.checked=value===control.value;return control.checked ? control.value : '';},
   bind(change){control.addEventListener('change',()=>change(control.checked ? control.value : ''));}
@@ -536,12 +531,13 @@ function matches(item,selection,counts){
  if(!values) return false;
  const selected={show:selection.show,owner:selection.owner,...selection.filters};
  const excluded=Object.entries(values).filter(([name,choices])=>
-  selected[name] && selected[name]!=='all' && !choices.includes(selected[name]));
+  filterChipValue(name,selected[name])!=='all' && !choices.includes(selected[name]));
  // A record counts for a row when it matches every other row.
  if(counts && excluded.length<2){
   for(const [name,choices] of Object.entries(values)){
    if(excluded.length && excluded[0][0]!==name) continue;
-   for(const value of ['all',...choices]) counts[name][value]=(counts[name][value] ?? 0)+1;
+   for(const value of ['all',...choices.map(choice=>filterChipValue(name,choice))])
+    counts[name][value]=(counts[name][value] ?? 0)+1;
   }
  }
  return excluded.length===0;
@@ -772,7 +768,7 @@ function bind(){
  filterSelection('owner').bind(value=>{if(value===owner) return;owner=value;sourceOwner='';changeFilter();});
  filterSelection('show').bind(value=>{if(value===show) return;show=value;changeFilter();});
  for(const name of filterNames)
-  filterSelection(name).bind(value=>{filters[name]=value;changeFilter();});
+  filterSelection(name).bind(value=>{if(value===filters[name]) return;filters[name]=value;changeFilter();});
  if(sharedWords()) filterControl.bind(words(),value=>{if(value!==query){query=value;changePlace();}});
  else words().addEventListener('input',event=>{query=event.target.value;changePlace();});
  content.querySelectorAll('[data-sort]').forEach(button=>button.addEventListener('click',()=>{
