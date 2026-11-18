@@ -1193,7 +1193,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
 
-### Phase 76 — Detached run hardening  · status: todo
+### Phase 76 — Detached run hardening  · status: done
 **Depends on:** phase 70
 
 #### Work Order
@@ -1215,6 +1215,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Acceptance gate:**
 1. Each new test row fails on the phase 70 tip. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+**Result:** A stop request stays pending until its signal is delivered, through a `.stop-staged` file that a failed rollback cannot leave behind. The shared record reader checks the run id against the file name, reap never queues a completion for the wrong run or keeps a reused id pending, and the process check tells an absent process from a failed ps call. Merged with panestop and panedone2: staged pane stops survive the supervisor retry, and the reaper completes each pending record once. F009 (a crashed pane stopper plus a concurrent hold stop) moved to a follow-up. On main 51d3608ad (hash a2c3d583d).
 
 ### Phase 77 — Change review hardening  · status: done
 **Depends on:** phase 73
