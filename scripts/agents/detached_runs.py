@@ -211,6 +211,8 @@ def stop_with_reason(
     """Save the reason and complete the stop decision under one record lock."""
     with record_lock(path):
         record = worker_lifecycle.read_json_object(path)
+        if not record.get("run_id"):
+            return False
         record["stop_reason"] = reason
         write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
         sent = False
@@ -460,8 +462,8 @@ def _complete_worker_dispatch(record: RunRecord) -> None:
         complete(str(member.current_session))
 
 
-# The files each run keeps beside its record; the record goes last.
-_RUN_FILES = ("{}.log", "{}.scope", "{}.reap", "{}.record.lock", "{}.completion.lock", ".{}.delivery.lock", "{}.json")
+# Keep the record lock at its path until the record is gone.
+_RUN_FILES = ("{}.log", "{}.scope", "{}.reap", "{}.completion.lock", ".{}.delivery.lock", "{}.json", "{}.record.lock")
 
 
 def prune_finished(runs: Path) -> list[str]:
@@ -507,8 +509,12 @@ def _prune_finished_locked(runs: Path) -> list[str]:
                 continue
         elif (member is not None or not staff_id) and started >= newest[str(raw.get("worker", ""))]:
             continue
-        for name in _RUN_FILES:
-            (runs / name.format(run_id)).unlink(missing_ok=True)
+        with record_lock(path):
+            current = worker_lifecycle.read_json_object(path)
+            if current.get("status") != "finished" or current.get("completion_pending"):
+                continue
+            for name in _RUN_FILES:
+                (runs / name.format(run_id)).unlink(missing_ok=True)
         removed.append(run_id)
     return removed
 

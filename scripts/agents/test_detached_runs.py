@@ -1082,6 +1082,14 @@ sys.exit(status)
                 send.assert_not_called()
                 self.assertNotIn("stop_reason", cast(dict[str, object], json.loads(path.read_text())))
 
+    def test_stop_does_not_recreate_a_pruned_record(self) -> None:
+        path = self.finished_run("pruned-before-stop")
+        self.assertEqual(detached_runs.prune_finished(path.parent), [path.stem])
+        with patch.object(process_group, "send_process_group") as send:
+            self.assertFalse(detached_runs.stop_command(path, "fixture stop"))
+        send.assert_not_called()
+        self.assertFalse(path.exists())
+
     def test_command_receives_the_recorded_staff_owner_without_a_session_environment(self) -> None:
         command = [sys.executable, "-c", "import os; print(os.environ['BUILDLOG_OWNER_STAFF_ID'])"]
         path = self.record(command)
