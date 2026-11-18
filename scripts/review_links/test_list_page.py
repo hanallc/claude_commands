@@ -6,6 +6,7 @@ import html
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -18,7 +19,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import cast, override
+from typing import BinaryIO, cast, override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
@@ -30,11 +31,12 @@ from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import change_review, change_routing, delivery_state, investigation, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
-from scripts.review_links import console, list_page, staff_names
+from scripts.review_links import console, list_page, serve, staff_names
 from scripts.review_links import change_browser, change_page, question_record
 from scripts.review_links import review_items, review_page
 from scripts.review_links.test_change_page import BrowserForms
 from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.test_record_table import save_notice_failures
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.statusline import counts_row, rebuild_row
 
@@ -52,7 +54,7 @@ NOW = datetime(2026, 11, 16, 18, tzinfo=UTC)
 class ListPageTests(unittest.TestCase):
     root: Path = Path()
 
-    def test_review_links_keep_the_console_and_select_exact_cards_in_every_state(self) -> None:
+    def test_review_links_keep_the_console_and_jump_to_cards_in_every_state(self) -> None:
         source = review_items.ProposalLedgerSource(self.root / "proposals.md")
         ready = review_items.ReviewItem("proposal/sdlc/P10", "sdlc/P10", review_items.ReviewType.PROPOSAL,
             OWNER.id, OWNER.id, "Check this proposal", review_items.ReviewState.OPEN,
@@ -66,7 +68,7 @@ class ListPageTests(unittest.TestCase):
                 place = urlsplit(query["at.review"][0])
                 self.assertEqual(place.path, review_page.PAGE_PATH)
                 self.assertEqual(parse_qs(place.query), {"show": ["all"]})
-                self.assertEqual(parse_qs(place.fragment), {"key": [review.key], "item": [review.key]})
+                self.assertEqual(parse_qs(place.fragment), {"show": ["open"], "jump": [review.key]})
                 self.assertEqual(link.attrib["target"], "_top")
         item = replace(self.add("Linked work"), reviews=("proposal/sdlc/P10", "change/sdlc/C1830"))
         for state in review_items.ReviewState:
@@ -87,7 +89,7 @@ class ListPageTests(unittest.TestCase):
         self.assertIn('.list-toggle{white-space:nowrap}', body)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
-    def test_browser_review_links_open_exact_cards_inside_the_console(self) -> None:
+    def test_browser_review_links_jump_inside_the_full_review_list(self) -> None:
         source = review_items.ChangeSource(self.root / "changes.md", {"#": "C1830", "How to check": "Read the card."},
             change_routing.ChangeAssignment(change_routing.ShowrunnerOwnChange(OWNER.id, OWNER.name), self.root / "sdlc.md"),
             delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery()))
@@ -97,20 +99,45 @@ class ListPageTests(unittest.TestCase):
         reviews = [ready, replace(ready, key="change/hana/P10", id="hana/P10", state=review_items.ReviewState.DONE),
                    replace(ready, key="change/sdlc/C1831", id="sdlc/C1831", state=review_items.ReviewState.WAITING),
                    replace(ready, key="change/sdlc/C1832", id="sdlc/C1832",
-                           times=review_items.ReviewTimes(NOW, NOW, NOW + timedelta(days=1)))]
+                           times=review_items.ReviewTimes(NOW, NOW, datetime.now(UTC) + timedelta(days=1)))]
         item = self.add("Linked review cards", number=111)
-        _ = the_list.link(MORTY.id, item.id, tuple(review.key for review in reviews), source="morty")
+        linked_keys = tuple(review.key for review in reviews)
+        _ = the_list.link(MORTY.id, item.id, linked_keys, source="morty")
+        missing = replace(ready, key="change/sdlc/C1833", id="sdlc/C1833")
+        missing_item = self.add("Review removed after rendering", number=112)
+        _ = the_list.link(MORTY.id, missing_item.id, (missing.key,), source="morty")
+        for number in range(1, 16):
+            _ = self.add(f"List fixture {number}", number=number)
         reviews.append(replace(ready, key="change/other/C9", id="other/C9", title="Unlinked review"))
-        with patch.object(review_items, "read", return_value=reviews), patch.object(list_page, "counts_strip", return_value=""):
+        reviews.append(replace(ready, key="change/other/C10", id="other/C10", title="Check another change"))
+        reviews.append(replace(ready, key="change/builds/C17", id="builds/C17", title="Check a build",
+                               owner=OTHER.id, source_unit=OTHER.id))
+
+        def read_reviews(*_args: object, **kwargs: object) -> list[review_items.ReviewItem]:
+            owners = cast(dict[staff.StaffId, str] | None, kwargs.get("owner_options"))
+            if owners is not None:
+                owners.update({OWNER.id: OWNER.name, OTHER.id: OTHER.name})
+            return reviews
+
+        with patch.object(review_items, "read", side_effect=read_reviews), patch.object(list_page, "counts_strip", return_value=""):
+            reviews.append(missing)
             listing = list_page.render(self.root / "reviews")
-            review = review_page.render(self.root / "reviews", show="all")
+            _ = reviews.pop()
+            review = {show: review_page.render(self.root / "reviews", show=show)
+                      for show in ("open", "Waiting", "Done", "all")}
+            reviews[0] = replace(ready, times=review_items.ReviewTimes(NOW, NOW, datetime.now(UTC) + timedelta(days=1)))
+            parked_review = {show: review_page.render(self.root / "reviews", show=show) for show in ("open", "all")}
         pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(list_page.PAGE_PATH)),
                  console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage(review_page.PAGE_PATH)))
         shell = console.render(pages, console.UnavailablePage()).decode()
         list_url = "/console/" + console.place_query("list", list_page.PAGE_PATH + '#' + urlencode({"item": f"{MORTY.id}/{item.id}"}))
         probe = r'''<script>
-const listUrl=LIST_URL,keys=KEYS,proof=new URLSearchParams(location.search).get('proof');
-let finished=false;
+const listUrl=LIST_URL,keys=KEYS,ownerId=OWNER_ID,otherId=OTHER_ID;
+const params=new URLSearchParams(location.search),proof=params.get('proof'),returnWords=params.get('pending') || '';
+let finished=false,inspected=false;
+const frames=win=>new Promise(done=>win.requestAnimationFrame(()=>win.requestAnimationFrame(done)));
+const nav=name=>document.querySelector('[data-page="'+name+'"]');
+const selected=(doc,name)=>doc.querySelector('[data-'+name+'-chip][aria-pressed="true"]').dataset[name+'Chip'];
 const failures=JSON.parse(sessionStorage.getItem('link-failures') || '[]');
 const check=(ok,text)=>{
  if(!ok){failures.push(text);sessionStorage.setItem('link-failures',JSON.stringify(failures));}
@@ -129,10 +156,44 @@ function ids(doc){
   check(range.getClientRects().length===1,'the ID text has one line');
  }
 }
+async function configureReview(show,words){
+ nav('review').click();
+ const frame=document.querySelector('iframe:not([hidden])');
+ const loaded=frame.contentDocument?.querySelector('[data-review]') ? frame.contentDocument :
+  await new Promise(resolve=>frame.addEventListener('load',()=>resolve(frame.contentDocument),{once:true}));
+
+ const doc=loaded,win=doc.defaultView;
+ if(doc.querySelector('[data-review]').dataset.show!==show){
+  await new Promise(resolve=>{
+   const observer=new win.MutationObserver(()=>{
+    if(doc.querySelector('[data-review]').dataset.show===show){observer.disconnect();resolve();}
+   });
+   observer.observe(doc.body,{childList:true,subtree:true});
+   doc.querySelector('[data-show-chip="'+show+'"]').click();
+  });
+ }
+ doc.querySelector('[data-type-chip="change"]').click();
+ doc.querySelector('[data-owner-chip="'+ownerId+'"]').click();
+ const sort=doc.querySelector('[data-sort="3"]');
+ if(sort.parentElement.getAttribute('aria-sort')==='none') sort.click();
+ const search=doc.querySelector('#list-search');
+ const recorded=new Promise(resolve=>{
+  const recordedPlace=event=>{
+   const at=new URL(location.href).searchParams.get('at.review');
+   if(event.source!==win || !at || new URLSearchParams(new URL(at,location.href).hash.slice(1)).get('q')!==words) return;
+   removeEventListener('message',recordedPlace);resolve();
+  };
+  addEventListener('message',recordedPlace);
+ });
+ search.value=words;search.dispatchEvent(new win.Event('input',{bubbles:true}));
+ await recorded;
+ nav('list').click();
+}
 async function inspect(frame){
  try{
   const doc=frame.contentDocument;
-  if(!doc?.querySelector('[data-list-item]')) return;
+  if(inspected || !doc?.querySelector('[data-list-item]')) return;
+  inspected=true;
   check(!!document.querySelector('.sidebar .nav-entry'),'the console navigator remains visible');
   const stage=proof==='review' ? keys.length : Number(sessionStorage.getItem('link-stage') || 0);
   if(doc.querySelector('[data-list]')){
@@ -140,50 +201,195 @@ async function inspect(frame){
    const row=doc.querySelector('[data-number="111"]');
    check(!row.hidden && !row.querySelector('[data-detail]').hidden,'List item 111 is open');
    if(proof==='list'){await finish();return;}
-   const links=[...row.querySelector('[data-detail]').querySelectorAll('a')];
-   const link=stage<keys.length ? links.find(link=>{
+   const win=doc.defaultView;
+   if(stage===0 && !proof){
+    await configureReview('all','Check');
+    const extra=doc.querySelector('[data-number="15"]');
+    extra.querySelector('.list-toggle').click();
+    check(!extra.querySelector('[data-detail]').hidden,'the extra List row is open before leaving');
+    const stale=new URL(win.location.href),filters=new URLSearchParams(stale.hash.slice(1));
+    filters.set('producer','unavailable');stale.hash=filters;
+    win.history.replaceState(win.history.state,'',stale);
+    const outer=new URL(location.href);outer.searchParams.set('at.list',stale.pathname+stale.hash);
+    history.replaceState(history.state,'',outer);
+    win.history.scrollRestoration='manual';
+    win.scrollTo({top:120,behavior:'instant'});
+    sessionStorage.setItem('list-top',String(win.scrollY));
+    check(win.scrollY>0,'the List has a scroll position to restore');
+   }
+   if(stage===1 && !proof){
+    await frames(win);
+    const restored=new URLSearchParams(win.location.hash.slice(1));
+    check(!restored.has('producer') && restored.get('item')===row.dataset.key,'Back normalizes the stale List filter and keeps the source');
+    check(!doc.querySelector('[data-number="15"] [data-detail]').hidden,'Back restores the extra open List row');
+    check(Math.abs(win.scrollY-Number(sessionStorage.getItem('list-top')))<=1,
+      'Back restores the List scroll from '+sessionStorage.getItem('list-top')+' to '+win.scrollY);
+    check(doc.querySelector('#list-search').value===returnWords,'Back restores words typed just before the link click');
+    const returns=Number(sessionStorage.getItem('list-returns') || 0)+1;
+    sessionStorage.setItem('list-returns',String(returns));
+    if(returns===1){
+     doc.body.dataset.firstReturn='';
+     history.forward();return;
+    }
+    check(!doc.body.hasAttribute('data-first-return'),'the second Back loads a new List document');
+    await configureReview('open','Unlinked review');
+   }
+   const source=stage===keys.length+1 ? doc.querySelector('[data-number="112"]') : row;
+   if(source!==row) source.querySelector('.list-toggle').click();
+   const links=[...source.querySelector('[data-detail]').querySelectorAll('a')];
+   const key=stage<keys.length ? keys[stage] : stage===keys.length+2 ? keys[0] : '';
+   const link=key ? links.find(link=>{
     const at=new URL(link.href).searchParams.get('at.review');
-    return at && new URLSearchParams(new URL(at,location.href).hash.slice(1)).get('item')===keys[stage];
-   }) : row.querySelector('[data-label="State"] a');
+    return at && new URLSearchParams(new URL(at,location.href).hash.slice(1)).get('jump')===key;
+   }) : source.querySelector('[data-label="State"] a');
    check(!!link,'the selected List link exists');
+   if(stage===0 && returnWords){
+    const search=doc.querySelector('#list-search');
+    search.value=returnWords;search.dispatchEvent(new win.Event('input',{bubbles:true}));
+   }
    if(link) link.click();else await finish();
   }else if(doc.querySelector('[data-review]')){
+   if(stage===1 && sessionStorage.getItem('list-returns')==='1'){history.back();return;}
    ids(doc);
-   const visible=[...doc.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
+   const visibleRows=()=>[...doc.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
+   const visible=visibleRows();
    if(stage<keys.length){
-    check(visible.length===1 && visible[0].dataset.key===keys[stage],'the exact linked card is shown');
-    check(visible[0]?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true','the linked card is expanded');
-    check(!visible[0]?.querySelector('[data-detail]').hidden,'the linked card detail is open');
-    sessionStorage.setItem('link-stage',String(stage+1));location.href=listUrl;
-   }else{
+    const target=visible.find(row=>row.dataset.key===keys[stage]);
+    check(!!target && visible.some(row=>row.dataset.key==='change/other/C10'),'the linked card and an unlinked card are shown');
+    check(target?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true','the linked card is expanded');
+    check(!target?.querySelector('[data-detail]').hidden,'the linked card detail is open');
+    const place=new URLSearchParams(doc.location.hash.slice(1)),search=doc.querySelector('#list-search');
+    check(!place.has('key') && !place.has('jump') && place.get('item')===keys[stage],'the address keeps only an open item target');
+    check(selected(doc,'show')===(stage<3 ? 'all' : 'open'),'Review keeps the selected All view or widens Show for a card outside Open');
+    const reloaded=sessionStorage.getItem('review-reload')===String(stage);
+    if(!reloaded){
+     const row=target?.querySelector('.list-row'),box=row?.getBoundingClientRect();
+     check(box?.top>=0 && box?.bottom<=doc.defaultView.innerHeight,'the linked row is in view');
+     check(row?.hasAttribute('data-record-highlight'),'the linked row has the shared highlight');
+     const reduced=doc.defaultView.matchMedia('(prefers-reduced-motion: reduce)').matches;
+     check(row?.getAnimations().some(animation=>animation.playState==='running')===!reduced,
+       'the highlight respects reduced motion');
+    }
+    if(stage===0){
+     check(selected(doc,'owner')===ownerId && selected(doc,'type')==='change' && search.value==='Check',
+       'the generated link keeps the Review filters selected in the controls');
+     check(doc.querySelector('[data-sort="3"]').parentElement.getAttribute('aria-sort')==='ascending',
+       'the generated link keeps the Review sort selected in the controls');
+    }
+    if(stage===1){
+     check(selected(doc,'owner')==='','the jump resets Owner to All when words or Show hide the card');
+     check(search.value==='' && selected(doc,'type')==='change','the jump clears conflicting words and keeps the matching type');
+    }
+    if(stage===0 && !reloaded){
+     const input=value=>{
+      search.value=value;search.dispatchEvent(new doc.defaultView.Event('input',{bubbles:true}));
+     };
+     input('Unlinked review');
+     check(visibleRows().length===1 && visibleRows()[0].dataset.key==='change/other/C9','the words box still filters');
+     input('');
+     doc.querySelector('[data-type-chip="question"]').click();
+     check(visibleRows().length===0,'the type chips still filter');
+     doc.querySelector('[data-type-chip=""]').click();
+     doc.querySelector('[data-owner-chip="'+otherId+'"]').click();
+     check(visibleRows().length===1 && visibleRows()[0].dataset.owner===otherId,'the owner chips still filter');
+     doc.querySelector('[data-owner-chip=""]').click();
+     doc.querySelector('[data-show-chip="open"]').click();
+     check(visibleRows().every(row=>row.dataset.state==='Open'),'the Show chips still filter');
+     doc.querySelector('[data-show-chip="all"]').click();
+     doc.querySelector('[data-owner-chip="'+ownerId+'"]').click();
+     doc.querySelector('[data-type-chip="change"]').click();
+     input('Check');
+     await frames(doc.defaultView);
+    }
+    if((stage===0 || stage===3) && !reloaded){
+     sessionStorage.setItem('review-reload',String(stage));
+     location.reload();return;
+    }
+    sessionStorage.setItem('link-stage',String(stage+1));
+    if(stage===0) history.back();else location.href=listUrl;
+   }else if(stage===keys.length){
     check(visible.length===keys.length && visible.every(row=>keys.includes(row.dataset.key)),'the summary shows only linked cards');
     const done=visible.find(row=>row.dataset.state==='Done');
     if(done?.querySelector('.list-toggle').getAttribute('aria-expanded')!=='true') done?.querySelector('.list-toggle').click();
     check(done?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true','the Done card can open in the linked view');
-    await finish();
+    if(proof){await finish();return;}
+    const group=doc.querySelector('[data-clear-linked-reviews]');
+    check(group && !group.hidden,'the linked group has one visible filter chip');
+    group?.click();
+    check(visibleRows().some(row=>row.dataset.key==='change/other/C9'),'one click restores the normal Review list');
+    check(group?.hidden && !new URLSearchParams(doc.location.hash.slice(1)).has('key'),'the group chip clears the selection');
+    sessionStorage.setItem('link-stage',String(stage+1));
+    location.href=listUrl;
+   }else if(stage===keys.length+1){
+    const notice=doc.querySelector('[data-missing-item]');
+    check(notice && !notice.hidden && notice.textContent==='This review is no longer on the Review page.',
+      'a removed linked review shows a missing-target notice');
+    check(visibleRows().some(row=>row.dataset.key==='change/other/C9'),'a missing link leaves the normal Review list visible');
+    sessionStorage.setItem('link-stage',String(stage+1));
+    location.href=listUrl;
+   }else{
+    const target=doc.querySelector('[data-key="'+keys[0]+'"]');
+    if(sessionStorage.getItem('later-reload')){
+     check(target.dataset.parked==='true' && target.hidden && target.querySelector('[data-detail]').hidden,
+       'a parked linked card stays hidden and closed after reload');
+     await finish();return;
+    }
+    check(!target.hidden && !target.querySelector('[data-detail]').hidden,'the card opens from List before Later');
+    const form=target.querySelector('form');
+    const settled=new Promise(resolve=>{
+     const observer=new doc.defaultView.MutationObserver(()=>{
+      if(!form.hasAttribute('data-sending')){observer.disconnect();resolve();}
+     });
+     observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+    });
+    form.querySelector('[data-later-toggle]').click();
+    form.querySelector('[data-later-preset="morning"]').click();
+    if(!form.hasAttribute('data-sending')) throw new Error('Later did not start.');
+    await settled;
+    check(form.querySelector('[data-send-status]').textContent==='Saved: parked','Later confirms the save on the card');
+    const status=doc.querySelector('[data-hidden-action-status]');
+    check(status.hidden && !status.textContent,'Later shows no success notice above the table');
+    const place=new URLSearchParams(doc.location.hash.slice(1));
+    check(!place.has('item') && !place.has('linked'),'Later removes the linked target from the Review address');
+    sessionStorage.setItem('later-reload','yes');
+    await frames(doc.defaultView);
+    location.reload();
    }
   }
  }catch(error){failures.push(String(error));await finish();}
 }
 for(const frame of document.querySelectorAll('iframe')) frame.addEventListener('load',()=>inspect(frame));
-</script><img hidden src="/complete">'''.replace('LIST_URL', json.dumps(list_url)).replace(
-            'KEYS', json.dumps([entry.key for entry in reviews[:-1]]))
+addEventListener('pageshow',event=>{
+ if(event.persisted){
+  inspected=false;
+  const active=document.querySelector('iframe:not([hidden])');
+  requestAnimationFrame(()=>requestAnimationFrame(()=>inspect(active)));
+ }
+});
+if(proof){const keepOpen=new Image();keepOpen.hidden=true;keepOpen.src='/complete';document.body.append(keepOpen);}
+</script>'''.replace('LIST_URL', json.dumps(list_url)).replace('KEYS', json.dumps(linked_keys)).replace(
+            'OWNER_ID', json.dumps(OWNER.id)).replace('OTHER_ID', json.dumps(OTHER.id))
         shell = shell.replace('</body>', probe + '</body>')
         output = Path(os.environ.get("LISTLINKS_PROOF_DIR", str(self.root)))
         output.mkdir(parents=True, exist_ok=True)
-        for shot in ("clicks", "review", "list"):
+        for shot in ("clicks", "reduced", "review", "list"):
             with self.subTest(shot=shot):
                 results: list[list[str]] = []
                 complete = threading.Event()
+                later_saved = threading.Event()
 
                 class Probe(BaseHTTPRequestHandler):
                     def do_GET(self) -> None:
-                        path = urlsplit(self.path).path
+                        route = urlsplit(self.path)
+                        path = route.path
                         if path == '/complete':
                             _ = complete.wait(30)
-                        body = (listing if path == list_page.PAGE_PATH else review if path == review_page.PAGE_PATH
+                        show = parse_qs(route.query).get("show", ["open"])[0]
+                        review_pages = parked_review if later_saved.is_set() else review
+                        body = (listing if path == list_page.PAGE_PATH else review_pages[show] if path == review_page.PAGE_PATH
                                 else b'{}' if path.endswith('.json') else shell.encode())
                         self.send_response(200)
+                        self.send_header('Cache-Control', 'no-store')
                         self.send_header('Content-Type', 'application/json' if path.endswith('.json') else 'text/html; charset=utf-8')
                         self.end_headers()
                         try:
@@ -192,8 +398,16 @@ for(const frame of document.querySelectorAll('iframe')) frame.addEventListener('
                             pass
 
                     def do_POST(self) -> None:
+                        body = self.rfile.read(int(self.headers['Content-Length']))
+                        if self.path == review_page.PAGE_PATH and parse_qs(body.decode()).get('outcome') == ['later']:
+                            later_saved.set()
+                            self.send_response(200)
+                            self.send_header('Content-Type', 'application/json')
+                            self.end_headers()
+                            _ = self.wfile.write(b'{"answer":"parked"}')
+                            return
                         if self.path == '/results':
-                            results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                            results.append(cast(list[str], json.loads(body)))
                             complete.set()
                         self.send_response(204)
                         self.end_headers()
@@ -208,14 +422,16 @@ for(const frame of document.querySelectorAll('iframe')) frame.addEventListener('
                     try:
                         profile = self.root / f'links-profile-{shot}'
                         profile.mkdir()
-                        _ = (profile / 'user.js').write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
-                        destination = list_url
+                        _ = (profile / 'user.js').write_text('user_pref("ui.systemUsesDarkTheme", 1);\n'
+                            + 'user_pref("browser.sessionhistory.max_total_viewers", 0);\n'
+                            + f'user_pref("ui.prefersReducedMotion", {int(shot == "reduced")});\n')
+                        destination = list_url + ('&pending=i' if shot == 'reduced' else '')
                         if shot == 'review':
                             destination = '/console/' + console.place_query('review', review_page.PAGE_PATH + '?show=all#'
-                                + urlencode([('key', entry.key) for entry in reviews[:-1]] + [('item', reviews[1].key)]))
+                                + urlencode([('key', key) for key in linked_keys] + [('item', reviews[1].key)]))
                         url = f'http://127.0.0.1:{server.server_port}' + destination
                         command = ['firefox', '--headless', '--no-remote', '--profile', str(profile), '--window-size', '1440,1100']
-                        if shot == 'clicks':
+                        if shot in ('clicks', 'reduced'):
                             with subprocess.Popen([*command, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as browser:
                                 try:
                                     self.assertTrue(complete.wait(35), "The browser must report its click results")
@@ -244,17 +460,22 @@ for(const frame of document.querySelectorAll('iframe')) frame.addEventListener('
         _ = the_list.update(MORTY.id, other_producer.id, {"producer": DWIGHT.id}, source="morty")
         _ = the_list.update(MORTY.id, source.id, {"related_to": (29,),
             "blocked_by": (the_list.ItemDependency(30, "The blocker is complete."),)}, source="morty")
-        records = [
-            list_page.ListRecord(entry.keeper, replace(entry.item, related_to=(2, 29, 31, 99)))
-            if entry.item.id == source.id else entry
-            for entry in list_page.records()
-        ]
+        records = list_page.records()
+        for index, entry in enumerate(records):
+            if entry.item.id == source.id:
+                records[index] = list_page.ListRecord(entry.keeper, replace(entry.item, related_to=(2, 29, 31, 99), unread_since=NOW))
+            elif entry.item.id == "L30":
+                records[index] = list_page.ListRecord(entry.keeper, replace(entry.item, unread_since=NOW))
         with patch.object(list_page, "records", return_value=records), patch.object(list_page, "counts_strip", return_value=""):
             listing = list_page.render(self.root / "reviews")
         listing = listing.replace(b'data-page-facts ', b'data-page-facts data-read-error="Test read failed" ', 1)
         listing = listing.replace(b'</body>', b'''<script>
 addEventListener('message',event=>{
  if(event.source!==parent || event.origin!==location.origin || !event.data.clickListLink) return;
+ if(event.data.pendingWords){
+  const search=document.querySelector('#list-search');
+  search.value=event.data.pendingWords;search.dispatchEvent(new Event('input'));
+ }
  const links=document.querySelectorAll('[data-number="1"] [data-detail] a');
  [...links].find(link=>link.textContent==='#'+event.data.clickListLink).click();
 });
@@ -273,35 +494,58 @@ frame.addEventListener('load',async()=>{
  try{
   const doc=frame.contentDocument,win=frame.contentWindow;
   const row=id=>doc.querySelector('[data-number="'+id+'"]');
-  const source=row(1),target=row(number),show=doc.querySelector('#list-show');
-  const owner=doc.querySelector('#list-owner'),producer=doc.querySelector('#list-producer'),search=doc.querySelector('#list-search');
-  const originalFilters=[owner.value,producer.value,search.value];
+  const source=row(1),target=row(number),search=doc.querySelector('#list-search');
+  const chip=(name,value)=>doc.querySelector('[data-filter-row="'+name+'"] [data-filter-value="'+value+'"]');
+  const selected=name=>doc.querySelector('[data-filter-row="'+name+'"] [aria-pressed="true"]').dataset.filterValue;
+  const filters=()=>[selected('owner'),selected('producer'),search.value,selected('state')];
+  const pendingWords=scenario==='pending-words' ? 'item' : '';
+  const originalFilters=filters();
+  if(pendingWords) originalFilters[2]=pendingWords;
   const link=[...source.querySelectorAll('a')].find(a=>a.textContent==='#'+number);
   const expanded=item=>item.querySelector('.list-toggle').getAttribute('aria-expanded')==='true';
   const inView=element=>{
    const rect=element.getBoundingClientRect();
    return rect.top>=0 && rect.bottom<=win.innerHeight;
   };
-  check(!source.hidden && expanded(source) && show.value==='open','the source starts open in the Open view');
+  const originalShow=scenario==='unread-words' ? 'unread' : 'open';
+  check(!source.hidden && expanded(source) && selected('show')===originalShow,'the source starts open in the selected view');
   check(!!document.querySelector('.sidebar .nav-entry'),'the console navigator is visible');
   link.scrollIntoView({block:'center'});
   if(scenario==='history') win.scrollTo(0,120);
+  const unavailableProducer=scenario==='unavailable-producer';
+  if(unavailableProducer){
+   const saved=new URL(win.location.href),params=new URLSearchParams(saved.hash.slice(1));
+   params.set('producer','unavailable');
+   saved.hash=String(params);
+   win.history.replaceState(win.history.state,'',saved);
+   win.history.scrollRestoration='manual';
+   win.scrollTo(0,270);
+   check(win.scrollY===270,'the previous page can scroll to 270');
+  }
   const banner=doc.querySelector('[data-page-status]');
   if(scenario==='banner') banner.style.minHeight='60px';
-  const originalTop=win.scrollY,originalPlace=win.location.href;
+  const originalTop=win.scrollY,beforeJump=win.location.href;
+  const original=new URL(beforeJump),params=new URLSearchParams(original.hash.slice(1));
+  if(pendingWords){params.set('q',pendingWords);original.hash=String(params);}
+  const originalPlace=original.href;
+  const debounced=pendingWords ? new Promise(done=>search.addEventListener('filterchange',done,{once:true})) : null;
   const consolePlace=()=>new URL(new URLSearchParams(location.search).get('at.list'),location.href).href;
   const updated=new Promise(resolve=>{
    const done=()=>{
     clearTimeout(timeout);removeEventListener('message',record);resolve();
    };
    const record=event=>{
-    if(event.source===win && event.data==='console-place' && win.location.href!==originalPlace &&
+    if(event.source===win && event.data==='console-place' && win.location.href!==beforeJump &&
        consolePlace()===win.location.href) done();
    };
    addEventListener('message',record);
    const timeout=setTimeout(done,1500);
   });
-  win.postMessage({clickListLink:number},location.origin);await updated;await frames(win);
+  win.postMessage({clickListLink:number,pendingWords},location.origin);await updated;await frames(win);
+  if(debounced){
+   await debounced;
+   check(!target.hidden && expanded(target) && search.value==='','the target stays open after the pending input settles');
+  }
   const missing=doc.querySelector('[data-missing-item]');
   check(doc===frame.contentDocument,'the click stays inside the same console frame');
   check(consolePlace()===win.location.href,'the console recorded '+consolePlace()+' instead of '+win.location.href);
@@ -309,7 +553,8 @@ frame.addEventListener('load',async()=>{
    check(!missing.hidden && missing.textContent==='Item #99 is not on the List' && inView(missing),'the missing message is in view');
   }else{
    const title=target.querySelector('.list-row');
-   check(show.value===(number==='29' ? 'all' : 'open'),'the view after the click is '+show.value);
+   const fallback=['closed','repeat','producer','open','pending-words','unread-words','proof'].includes(scenario);
+   check(selected('show')===(fallback ? 'all' : 'open'),'the view after the click is '+selected('show'));
    check(!target.hidden && expanded(target),'the target is visible and open');
    check(inView(title),'the target row is outside the viewport at '+title.getBoundingClientRect().top);
    check(title.getAnimations().some(animation=>animation.playState==='running'),'the target row has a short highlight');
@@ -319,9 +564,12 @@ frame.addEventListener('load',async()=>{
     check(top>=bottom+15,'the target top '+top+' leaves a gap below the banner bottom '+bottom);
    }
   }
-  const filters=[owner.value,producer.value,search.value];
-  const expected=originalFilters.map((value,index)=>index===['closed','producer','open'].indexOf(scenario) ? '' : value);
-  check(filters.every((value,index)=>value===expected[index]),'the jump keeps each matching filter: '+JSON.stringify(filters));
+  const expected=originalFilters.slice();
+  if(['closed','producer','open','pending-words'].includes(scenario)) expected[0]='all';
+  if(scenario==='closed') expected[3]='all';
+  if(scenario==='producer') expected[1]='all';
+  if(['open','unread-words'].includes(scenario) || pendingWords) expected[2]='';
+  check(filters().every((value,index)=>value===expected[index]),'the jump keeps each matching filter: '+JSON.stringify(filters()));
   if(scenario==='repeat'){
    const jumpPlace=win.location.href,jumpHistoryLength=win.history.length;
    link.click();await frames(win);
@@ -335,28 +583,40 @@ frame.addEventListener('load',async()=>{
   if(!proof){
    const back=scenario==='history' ? new Promise(done=>win.addEventListener('popstate',done,{once:true})) : changed(win);
    history.back();await back;await frames(win);
-   check(win.location.href===originalPlace,'Back restores the frame address');
-   check(show.value==='open' && !source.hidden && expanded(source),'Back restores the open source');
+   if(unavailableProducer){
+    const restored=new URLSearchParams(win.location.hash.slice(1));
+    check(!restored.has('producer'),'Back removes the unavailable Producer from the frame address');
+    check(win.history.state.recordTable.top===270,'the corrected history state keeps top: 270');
+    check(win.scrollY===270,'Back restores scroll to 270, got '+win.scrollY);
+   }else{
+    check(win.location.href===originalPlace,'Back restores the frame address');
+    check(inView(link) && Math.abs(win.scrollY-originalTop)<=1,'Back restored scroll '+win.scrollY+' instead of '+originalTop);
+   }
+   check(selected('show')===originalShow && !source.hidden && expanded(source),'Back restores the open source');
+   check(filters().every((value,index)=>value===originalFilters[index]),'Back restores the former chip selections');
    check(!target || !expanded(target),'Back collapses the target row');
    if(scenario==='history') check(!expanded(row(3)),'Back collapses the extra row even when the address stays the same');
-   check(inView(link) && Math.abs(win.scrollY-originalTop)<=1,'Back restored scroll '+win.scrollY+' instead of '+originalTop);
   }
   if(scenario==='missing'){
    const missingKey=new URLSearchParams(link.hash.slice(1)).get('item');
    const saved=new URLSearchParams(new URL(originalPlace).hash.slice(1));
    saved.set('key',source.dataset.key);saved.set('item',missingKey);
-   const change=(field,value,event)=>()=>{field.value=value;field.dispatchEvent(new win.Event(event));};
+   const clearSearch=()=>new Promise(done=>{
+    search.addEventListener('filterchange',done,{once:true});
+    search.value='';search.dispatchEvent(new win.Event('input'));
+   });
    const changes=[
-    ['Show',change(show,'all','change')],
-    ['Owner',change(owner,'','change')],
-    ['Producer',change(producer,'','change')],
-    ['Search',change(search,'','input')],
+    ['Show',()=>chip('show','all').click()],
+    ['State',()=>chip('state','all').click()],
+    ['Owner',()=>chip('owner','all').click()],
+    ['Producer',()=>chip('producer','all').click()],
+    ['Search',clearSearch],
     ['sort',()=>doc.querySelector('[data-sort]').click()],
    ];
    for(const [label,select] of changes){
     const restored=changed(win);win.location.hash=String(saved);await restored;
     check(!missing.hidden && doc.querySelector('[data-missing-keys]').hidden,'the restored missing item shows one notice');
-    select();
+    await select();
     const after=new URLSearchParams(win.location.hash.slice(1));
     check(missing.hidden && !doc.querySelector('[data-missing-keys]').textContent,label+' clears the missing item notice');
     check(after.get('item')!==missingKey && after.getAll('key').join()===source.dataset.key,label+' omits the missing item from the address');
@@ -401,7 +661,8 @@ frame.addEventListener('load',async()=>{
             try:
                 proof = os.environ.get("LIST_JUMP_PROOF")
                 cases = [(30, "open"), (29, "closed"), (31, "producer"), (99, "missing"), (29, "repeat"),
-                         (2, "history"), (2, "banner")]
+                         (2, "history"), (2, "banner"), (30, "pending-words"), (30, "unavailable-producer"),
+                         (30, "unread-words")]
                 if proof:
                     cases.append((29, "proof"))
                 for number, case in cases:
@@ -413,7 +674,9 @@ frame.addEventListener('load',async()=>{
                         _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
                         filters = {"sort": "#", "item": f"{MORTY.id}/{source.id}"}
                         if case in ("open", "closed", "producer", "missing"):
-                            filters.update(owner=OWNER.id, producer=MORTY.id, q="linked item")
+                            filters.update(owner=OWNER.id, producer=MORTY.id, state="Working", q="linked item")
+                        if case == "unread-words":
+                            filters.update(show="unread", q="item")
                         place = list_page.PAGE_PATH + "?show=open#" + urlencode(filters)
                         url = "/console/" + console.place_query("list", place)
                         destination = f'http://127.0.0.1:{server.server_port}{url}&number={number}&case={case}'
@@ -558,7 +821,7 @@ frame.addEventListener('load',async()=>{
             self.assertIn("Parked until 2026-11-17</small>", body)
             self.assertIn("Parked until</dt><dd>2026-11-17</dd>", body)
         with self.subTest(view="response"):
-            self.assertEqual(list_page.fresh_request(root, MORTY.id, item.id)["parked_until"], "2026-11-17")
+            self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "2026-11-17")
 
     def test_old_closed_log_uses_the_closing_words_renderer(self) -> None:
         log = self.legacy_log("- 2026-11-16 18:10:00+00:00 Closed: The **check** passed. — nate")
@@ -627,17 +890,29 @@ frame.addEventListener('load',async()=>{
         items = self.fixture_items()
         _ = the_list.update(MORTY.id, items[0].id, {"related_to": (106,),
             "blocked_by": (the_list.ItemDependency(105, "The status page reaches main"),)}, source="morty")
-        body = without_role_colors(list_page.render(self.root / "reviews").decode())
+        markup = list_page.render(self.root / "reviews").decode()
+        body = without_role_colors(markup)
         self.assertEqual(body.count('<tbody data-list-item'), 6)
         for label in list_page.HEADERS:
             self.assertIn(label + '<span data-sort-mark', body)
+        controls = body.split('data-record-filters>', 1)[1].split('<span data-list-count', 1)[0]
+        self.assertNotIn('<select', controls)
+        self.assertEqual(controls.count('type="search"'), 1)
+        self.assertEqual([part.split('"', 1)[0] for part in controls.split('data-filter-row="')[1:]],
+                         ['show', 'state', 'owner', 'producer'])
         for value, label in list_page.SHOWS:
-            self.assertIn(f'<option value="{value}">{label}</option>', body)
-        self.assertIn('<option value="' + OWNER.id + '">sdlc</option>', body)
-        self.assertIn('<option value="' + OTHER.id + '">builds</option>', body)
-        producers = body.split('<select id="list-producer">', 1)[1].split('</select>', 1)[0]
-        self.assertEqual(producers, '<option value="">All</option><option value="' + DWIGHT.id + '">dwight</option>'
-                         + '<option value="' + MORTY.id + '">morty</option>')
+            self.assertRegex(controls, f'data-filter-value="{value}"[^>]*>{label}<b>')
+        self.assertRegex(controls, f'data-filter-value="{OWNER.id}"[^>]*>sdlc<b>')
+        self.assertRegex(controls, f'data-filter-value="{OTHER.id}"[^>]*>builds<b>')
+        producers = markup.split('data-filter-row="producer"', 1)[1].split('<span data-list-count', 1)[0]
+        choices: list[tuple[str, str]] = []
+        for match in re.finditer(r'<button\b[^>]*>.*?</button>', producers, re.DOTALL):
+            button = ElementTree.fromstring(match.group())
+            count = button[-1]
+            self.assertEqual(count.tag, 'b')
+            button.remove(count)
+            choices.append((button.attrib["data-filter-value"], ''.join(button.itertext())))
+        self.assertEqual(choices, [('all', 'All'), (DWIGHT.id, 'dwight'), (MORTY.id, 'morty')])
         self.assertEqual(body.count('<td data-label="Producer">dwight</td>'), 1)
         self.assertEqual(body.count('<td data-label="Producer">morty</td>'), 5)
         self.assertIn(f'data-producer="{DWIGHT.id}"', body)
@@ -710,22 +985,28 @@ frame.addEventListener('load',async()=>{
                     continue
                 self.assertIn(expected, state)
                 self.assertEqual(row.count(expected), 2)
-                place = review_page.PAGE_PATH + '?show=all#' + urlencode(
-                    [('key', key) for key in identities] + ([('item', identities[0])] if len(identities) == 1 else []))
-                href = html.escape('/console/' + console.place_query('review', place), quote=True)
-                self.assertIn(f'href="{href}" target="_top">{expected}</a>', state)
+                found = [key for key in identities if any(review.key == key for review in reviews)]
+                if not found:
+                    self.assertNotIn('<a ', state)
+                else:
+                    target = ([('show', 'open'), ('jump', found[0])] if len(found) == 1
+                              else [('key', key) for key in found])
+                    place = review_page.PAGE_PATH + '?show=all#' + urlencode(target)
+                    href = html.escape('/console/' + console.place_query('review', place), quote=True)
+                    self.assertIn(f'href="{href}" target="_top" data-list-review-link="">{expected}</a>', state)
                 detail = row.split('<div class="list-panel"><div>', 1)[1]
                 self.assertLess(detail.index(expected), detail.index('<form'))
                 positions: list[int] = []
                 for identity in identities:
                     matching = [review for review in reviews if review.key == identity]
+                    place = review_page.PAGE_PATH + '?show=all#' + urlencode({'show': 'open', 'jump': identity})
+                    href = html.escape('/console/' + console.place_query('review', place), quote=True)
+                    anchor = f'<a href="{href}" target="_top" data-list-review-link="">'
                     if matching:
-                        place = review_page.PAGE_PATH + '?show=all#' + urlencode({'key': identity, 'item': identity})
-                        href = html.escape('/console/' + console.place_query('review', place), quote=True)
-                        card = f'<a href="{href}" target="_top">{html.escape(matching[0].id)}</a>'
+                        card = f'{anchor}{html.escape(matching[0].id)}</a>'
                     else:
                         card = html.escape(identity)
-                        self.assertNotIn('#' + urlencode({"item": identity}), detail)
+                        self.assertNotIn(f'{anchor}{card}</a>', detail)
                     self.assertIn(card, detail)
                     positions.append(detail.index(card))
                 self.assertEqual(positions, sorted(positions))
@@ -768,10 +1049,10 @@ frame.addEventListener('load',async()=>{
                 read.assert_called_once()
                 row = body.split(f'data-key="{MORTY.id}/{item.id}"', 1)[1].split('</tbody>', 1)[0]
                 self.assertIn(expected, row)
-                place = review_page.PAGE_PATH + '?show=all#' + urlencode({'key': review.key, 'item': review.key})
+                place = review_page.PAGE_PATH + '?show=all#' + urlencode({'show': 'open', 'jump': review.key})
                 card = '/console/' + console.place_query('review', place)
                 if review.type in review_page.TYPES:
-                    self.assertIn(f'<a href="{html.escape(card, quote=True)}" target="_top">{review.id}</a>', row)
+                    self.assertIn(f'<a href="{html.escape(card, quote=True)}" target="_top" data-list-review-link="">{review.id}</a>', row)
                 else:
                     self.assertNotIn(card, row)
                     self.assertIn('<p>' + review.id + '</p>', row)
@@ -781,8 +1062,9 @@ frame.addEventListener('load',async()=>{
         for owner in (missing, the_list.UnassignedOwner.NATE, the_list.UnassignedOwner.NOT_RECORDED):
             _ = self.add("Work for " + owner, owner=owner)
         body = list_page.render(self.root / "reviews").decode()
+        owners = body.split('data-filter-row="owner"', 1)[1].split('data-filter-row="producer"', 1)[0]
         for label in (str(missing), "nate", "Not recorded"):
-            self.assertIn('>' + label + '</option>', body)
+            self.assertIn('>' + label + '<b></b></button>', owners)
         _ = (self.root / "staff.json").write_text('{"schema":1,"rows":[]}')
         self.assertEqual(len(list_page.records()), 3)
 
@@ -940,10 +1222,11 @@ frame.addEventListener('load',async()=>{
         self.assertNotIn("efficiencies", body)
 
     def fields(self, item: the_list.ListItem, action: str, **changes: str) -> dict[str, str]:
-        request = uuid4().hex
-        return {"keeper": MORTY.id, "id": item.id, "request": request,
-                "token": list_page.request_token(self.root / "reviews", MORTY.id, item.id, request),
-                "action": action, "words": "", "until": "", **changes}
+        folder = change_page.console_folder(self.root / "reviews")
+        secret = change_browser.browser_manifest(folder)[0]
+        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), secret)
+        fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', form))
+        return {**fields, "action": action, "words": "", "until": "", **changes}
 
     def test_remove_closes_before_delivery_and_repeated_requests_do_nothing(self) -> None:
         item = self.add("Remove this item now")
@@ -1052,7 +1335,7 @@ window.fetch=async(_path,options={})=>{
  if(options.method!=='POST') throw new Error('Fixture refresh refused');
  requests.push(new URLSearchParams(options.body));
  return new Promise(resolve=>finishPost=result=>resolve({ok:result.ok!==false,status:result.ok===false ? 400 : 200,
-  json:async()=>({request:String(requests.length).padStart(32,'0'),token:'b'.repeat(64),unread:'false',...result})}));
+  json:async()=>({unread:'false',...result})}));
 };
 </script>'''
         probe = '''<script>
@@ -1060,25 +1343,28 @@ window.fetch=async(_path,options={})=>{
  const failures=[],check=(ok,name)=>{if(!ok) failures.push(name);};
  const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
  const row=number=>document.querySelector('[data-number="'+number+'"]');
- const change=(id,value,event='change')=>{const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event(event));};
  const visible=()=>[...document.querySelectorAll('[data-list-item]')].filter(item=>!item.hidden).map(item=>item.dataset.number).sort().join(',');
- const choose=(show,query)=>{change('list-show',show);change('list-search',query,'input');};
+ const choose=(show,query)=>new Promise(done=>{
+  document.querySelector('[data-filter-row="show"] [data-filter-value="'+show+'"]').click();
+  const field=document.getElementById('list-search');
+  field.addEventListener('filterchange',done,{once:true});field.value=query;field.dispatchEvent(new Event('input'));
+ });
  const submit=(number,action)=>{const form=row(number).querySelector('form');form.requestSubmit(form.querySelector('[value="'+action+'"]'));return form;};
  try{
   for(const [query,expected] of [['105','105'],['L105','105'],['#105','105'],['BUILDS','105'],
     ['Straße','106'],['WORKING','105,106'],['Waiting','58'],['Parked','41'],['Closed','54']]){
-   choose('all',query);check(visible()===expected,'words filter: '+query);
+   await choose('all',query);check(visible()===expected,'words filter: '+query);
   }
-  choose('open','106');row('106').querySelector('.list-toggle').click();
+  await choose('open','106');row('106').querySelector('.list-toggle').click();
   const removed=submit('106','remove');
   check(row('106').hidden,'Remove hides the row before the response');
   check([...row('106').querySelectorAll('button')].every(button=>button.disabled),'Remove disables the row buttons');
   submit('106','remove');check(requests.length===1,'a second Remove press sends nothing');
   finishPost({item_state:'Closed',parked:'false'});await flush();await flush();
   check(row('106').hidden,'Remove stays outside Open after success');
-  choose('closed','106');check(visible()==='106','Remove updates the Closed view');
+  await choose('closed','106');check(visible()==='106','Remove updates the Closed view');
   check(row('106').querySelector('.list-state').textContent==='Closed','Remove updates the state text');
-  choose('open','105');row('105').querySelector('.list-toggle').click();
+  await choose('open','105');row('105').querySelector('.list-toggle').click();
   const refused=submit('105','remove');check(row('105').hidden,'a refused Remove hides the row while pending');
   finishPost({ok:false,reason:'The fixture refuses this close.'});await flush();await flush();
   check(!row('105').hidden && row('105').dataset.state==='Working','a refused Remove restores the row');
@@ -1091,9 +1377,9 @@ window.fetch=async(_path,options={})=>{
   submit('105','park');check(requests.length===3,'a second Park press sends nothing');
   finishPost({item_state:'Working',parked:'true'});await flush();await flush();
   check(row('105').hidden,'Park stays outside Open after success');
-  choose('parked','105');check(visible()==='105','Park updates the Parked view');
+  await choose('parked','105');check(visible()==='105','Park updates the Parked view');
   check(parked.querySelector('[data-send-status]').textContent==='Parked','Park shows its result');
-  choose('all','58');row('58').querySelector('.list-toggle').click();
+  await choose('all','58');row('58').querySelector('.list-toggle').click();
   const form=row('58').querySelector('form');
   check(row('58').dataset.unread==='false' && !form.querySelector('[value="read"]'),'the unread sync case starts read');
   form.elements.words.value='Keep this result.';form.elements.words.dispatchEvent(new Event('input'));
@@ -1101,7 +1387,7 @@ window.fetch=async(_path,options={})=>{
   check(row('58').dataset.unread==='true' && row('58').querySelector('.list-dot'),'an unread response restores the dot');
   check(Boolean(form.querySelector('[value="read"]')),'an unread response restores Mark read');
   if(form.querySelector('[value="read"]')){
-   choose('unread','58');
+   await choose('unread','58');
    submit('58','read');finishPost({item_state:'Waiting for nate',parked:'false',unread:'false'});await flush();await flush();
    check(!row('58').querySelector('.list-dot') && !form.querySelector('[value="read"]'),'the restored Mark read button works');
    check(row('58').hidden && document.querySelector('[data-record-motion]')?.getAnimations({subtree:true}).length,
@@ -1111,7 +1397,7 @@ window.fetch=async(_path,options={})=>{
  const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
 })();
 </script>'''
-        self.browser_actions(markup, setup, probe)
+        self.browser_actions(markup, setup, probe, virtual_time_ms=3000)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_reserves_a_lost_park_id_and_updates_the_saved_date_label(self) -> None:
@@ -1127,7 +1413,7 @@ window.fetch=async(_path,options={})=>{
  return new Promise((resolve,reject)=>{
   losePost=()=>reject(new Error('Fixture lost response'));
   finishPost=result=>resolve({ok:!result.reason,status:result.reason ? 400 : 200,
-   json:async()=>({request:'a'.repeat(32),token:'b'.repeat(64),unread:'true',...result})});
+   json:async()=>({unread:'true',...result})});
  });
 };
 </script>'''
@@ -1219,7 +1505,7 @@ window.fetch=async(_path,options={})=>{
 ''')
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_keeps_a_separate_notice_for_each_hidden_remove(self) -> None:
+    def test_browser_shows_only_the_latest_hidden_remove_notice(self) -> None:
         _ = self.add("Second List item", number=2)
         self.browser_action_sequence('''
  show('all');
@@ -1233,16 +1519,24 @@ window.fetch=async(_path,options={})=>{
  const status=document.querySelector('[data-hidden-action-status]');
  const message=number=>'Item '+number+': Save not confirmed: Fixture lost response';
  const shows=number=>!status.hidden && status.textContent.includes(message(number));
- check(shows(1) && shows(2),'both hidden notices appear above the table');
+ check(!shows(1) && shows(2),'only the latest hidden notice appears above the table');
  row.querySelector('.list-toggle').click();
- check(!shows(1) && shows(2),'opening row one removes only its banner notice');
+ check(!shows(1) && shows(2),'opening row one preserves the latest notice');
  check(form.querySelector('[data-send-status]').textContent==='Save not confirmed: Fixture lost response',
   'row one shows its notice inline');
  second.querySelector('.list-toggle').click();
- check(status.hidden,'opening both rows hides the banner');
+ check(status.hidden,'opening the latest failed row hides the notice above the table');
  row.querySelector('.list-toggle').click();
- check(shows(1) && !shows(2),'closing row one restores only its banner notice');
+ check(status.hidden,'closing row one does not restore the older notice');
 ''')
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_clears_the_list_save_notice(self) -> None:
+        for number in range(1, 9):
+            _ = self.add(f"List item {number}", number=number)
+        with patch.object(list_page, "counts_strip", return_value=""):
+            page = list_page.render(self.root / "reviews")
+        self.assertEqual(save_notice_failures(page, 'remove'), [[]])
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_keeps_the_question_request_after_a_service_failure(self) -> None:
@@ -1277,11 +1571,38 @@ window.fetch=async(_path,options={})=>{
  check(words.value==='' && ask.disabled,'a saved question clears the box');
 ''')
 
+    def test_ask_marks_the_seen_update_read_after_it_saves(self) -> None:
+        item = self.add("Read the update before asking")
+        root = self.root / "reviews"
+        fields = self.fields(item, "question", words="Which check passed?")
+        with patch.object(the_list, "mark_read", wraps=the_list.mark_read) as mark:
+            for _ in range(2):
+                _ = list_page.submit(root, urlencode(fields))
+        mark.assert_called_once_with(MORTY.id, item.id, source=the_list.PAGE_SOURCE, update=the_list.unread_update(item))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertIs(saved.unread_since, the_list.NoTimestamp.UNSET)
+        self.assertIsInstance(saved.log[-2].what, the_list.QuestionRequestReceipt)
+        self.assertEqual(saved.log[-1].what, the_list.MarkedRead())
+
+    def test_words_actions_keep_updates_that_arrive_after_render_unread(self) -> None:
+        root = self.root / "reviews"
+        for action in ("question", "tell"):
+            with self.subTest(action=action):
+                item = self.add("Keep the update that arrives after render")
+                fields = self.fields(item, action, words="Which check passed?")
+                newer = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result arrived."}, source="morty")
+                _ = list_page.submit(root, urlencode(fields))
+                saved = the_list.load(MORTY.id, item.id)
+                self.assertEqual(the_list.unread_update(saved), the_list.unread_update(newer))
+                self.assertFalse(any(isinstance(entry.what, the_list.MarkedRead) for entry in saved.log))
+                _ = list_page.submit(root, urlencode(self.fields(saved, action, words="Which check is next?")))
+                self.assertIs(the_list.load(MORTY.id, item.id).unread_since, the_list.NoTimestamp.UNSET)
+
     def test_saved_question_and_answer_appear_on_the_item_and_the_answer_is_unread(self) -> None:
         root = self.root / "reviews"
         item = self.add("Inspect the List", number=106)
-        _ = the_list.mark_read(MORTY.id, item.id, source="nate")
-        _ = list_page.submit(root, urlencode(self.fields(item, "question", words="What changed in <List>?")))
+        fields = self.fields(item, "question", words="What changed in <List>?")
+        _ = list_page.submit(root, urlencode(fields))
         opened = list_page.render(root).decode()
         self.assertIn("Question Q1 — waiting for an answer", opened)
         self.assertIn("What changed in &lt;List&gt;?", opened)
@@ -1289,6 +1610,7 @@ window.fetch=async(_path,options={})=>{
         with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": MORTY.current_session}),
               redirect_stdout(io.StringIO())):
             self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The <filter> changed."]), 0)
+        _ = list_page.submit(root, urlencode(fields))
         answered = list_page.render(root).decode()
         self.assertNotIn("<h3>Question Q1 — waiting for an answer</h3>", answered)
         self.assertIn("<h3>Answer</h3><p>The &lt;filter&gt; changed.</p>", answered)
@@ -1403,6 +1725,130 @@ window.fetch=async(_path,options={})=>{
  check(row.hidden,'Tell morty keeps the row outside Unread after confirmation');
 """, add_item=False)
 
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_ask_leaves_unread_and_clears_the_dot_after_saving(self) -> None:
+        self.browser_action_sequence(r"""
+ show('unread');
+ check(!row.hidden && row.querySelector('.list-dot'),'the item starts unread');
+ form.elements.words.value='Which check passed?';
+ form.elements.words.dispatchEvent(new Event('input'));
+ submit('question');
+ check(row.hidden,'Ask question starts the fade before the response in Unread');
+ finishPost({unread:'false'});await flush();
+ check(row.hidden && row.dataset.unread==='false','the saved question keeps the row outside Unread');
+ show('open');
+ check(!row.hidden && !row.querySelector('.list-dot') && !form.querySelector('[value="read"]'),
+  'the same row in Open has no unread controls');
+""")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_ask_saves_and_shows_the_newer_update_and_answer(self) -> None:
+        item = self.add("Check the current result")
+        root = self.root / "reviews"
+        results: list[list[str]] = []
+        complete = threading.Event()
+        probe = b"""<!doctype html><iframe></iframe><img hidden src="/complete"><script>
+const frame=document.querySelector('iframe'), errors=[];
+const check=(ok,message)=>{if(!ok) errors.push(message);};
+const open=show=>new Promise(resolve=>{
+ frame.onload=resolve;
+ frame.src='LIST_PATH?fixture='+show+'#show='+show;
+});
+const row=()=>frame.contentDocument.querySelector('[data-list-item]');
+const hasDot=()=>Boolean(row().querySelector('.list-dot'));
+const ask=async words=>{
+ const win=frame.contentWindow, current=row();
+ const form=current.querySelector('form'), input=form.elements.words;
+ const fetch=win.fetch.bind(win);
+ let post, observer;
+ const settled=new Promise(resolve=>{
+  observer=new win.MutationObserver(()=>{if(!form.dataset.sending) resolve();});
+  observer.observe(form,{attributeFilter:['data-sending']});
+ });
+ win.fetch=(url,options)=>options?.method==='POST'
+  ? (post=fetch(url,options))
+  : Promise.resolve(new win.Response('',{status:503}));
+ try{
+  current.querySelector('.list-toggle').click();
+  input.value=words;input.dispatchEvent(new win.Event('input'));
+  form.querySelector('[value="question"]').click();
+  if(!post || !(await post).ok) throw new Error('The question POST must succeed.');
+  await settled;
+  return form.querySelector('[data-send-status]').textContent;
+ }finally{observer.disconnect();win.fetch=fetch;}
+};
+const change=async path=>{
+ if(!(await fetch(path,{method:'POST'})).ok) throw new Error('Fixture update failed: '+path);
+};
+(async()=>{
+ try{
+  await open('unread');
+  check(!row().hidden && hasDot(),'the item starts in Unread');
+  check(await ask('Which check passed?')==='Question saved','the first question saves');
+  check(row().hidden && !hasDot(),'the saved question leaves Unread and clears the dot');
+  await open('open');
+  check(row().textContent.includes('Which check passed?'),'the saved question appears in the row');
+  await change('/newer');
+  check(await ask('Which check is next?')==='Question saved; update remains unread',
+   'the notice says the newer update remains unread');
+  check(hasDot() && row().querySelector('[value="read"]'),'the newer update shows both unread controls');
+  await change('/answer');
+  await open('unread');
+  check(!row().hidden && hasDot() && row().textContent.includes('The gate passed.'),
+   'the answer appears and the item returns to Unread');
+ }catch(error){errors.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(errors)});
+})();
+</script>""".replace(b'LIST_PATH', list_page.PAGE_PATH.encode())
+
+        class Probe(serve.ReviewLinksHandler):
+            @override
+            def send_head(self) -> BinaryIO | None:
+                if self.path == '/proof':
+                    self.html_response(200, probe)
+                elif self.path == '/complete':
+                    _ = complete.wait(TEST_HANG_GUARD_SECS)
+                    self.json_response(200, {})
+                else:
+                    return super().send_head()
+                return None
+
+            @override
+            def do_POST(self) -> None:
+                if self.path == '/newer':
+                    _ = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result arrived."}, source="morty")
+                    self.json_response(200, {})
+                elif self.path == '/answer':
+                    result = the_list.main(["answer", item.id, "--question", "Q1", "--text", "The gate passed."])
+                    self.json_response(200 if result == 0 else 500, {})
+                elif self.path == '/results':
+                    results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                    self.json_response(200, {})
+                    complete.set()
+                else:
+                    super().do_POST()
+
+        with (patch.object(serve, "ReviewLinksHandler", Probe),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(list_page, "counts_strip", return_value=""),
+              patch.object(staff, "caller_identity", return_value=MORTY.current_session),
+              patch.object(change_page, "send_to_staff"),
+              serve.ReviewLinksServer(("127.0.0.1", 0), root) as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                profile = self.root / "ask-profile"
+                profile.mkdir()
+                browser = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                    '--window-size', '1440,900', '--screenshot', str(self.root / 'ask.png'),
+                    f'http://127.0.0.1:{server.server_port}/proof'], capture_output=True, text=True, timeout=45)
+                self.assertEqual(browser.returncode, 0, browser.stderr)
+                self.assertEqual(results, [[]])
+            finally:
+                complete.set()
+                server.shutdown()
+                thread.join()
+
     def browser_action_sequence(self, steps: str, *, reduced_motion: bool = False, add_item: bool = True) -> None:
         if add_item:
             _ = self.add("Test List action retries", number=1)
@@ -1416,7 +1862,7 @@ window.fetch=async(_path,options={})=>{
  return new Promise((resolve,reject)=>{
   losePost=()=>reject(new Error('Fixture lost response'));
   finishPost=result=>resolve({ok:!result.reason,status:result.status ?? (result.reason ? 400 : 200),
-   json:async()=>({request:String(requests.length).padStart(32,'0'),token:'b'.repeat(64),unread:'true',...result})});
+   json:async()=>({unread:'true',...result})});
  });
 };
 </script>'''
@@ -1431,10 +1877,7 @@ window.fetch=async(_path,options={})=>{
   const request=requests.at(-1);
   return {id:request.get('request'),token:request.get('token')};
  };
- const show=value=>{
-  const filter=document.getElementById('list-show');
-  filter.value=value;filter.dispatchEvent(new Event('change'));
- };
+ const show=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]').click();
  const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
  try{
   row.querySelector('.list-toggle').click();
@@ -1445,12 +1888,13 @@ window.fetch=async(_path,options={})=>{
 </script>'''
         self.browser_actions(markup, setup, probe, reduced_motion=reduced_motion)
 
-    def browser_actions(self, markup: str, setup: str, probe: str, *, reduced_motion: bool = False) -> None:
+    def browser_actions(self, markup: str, setup: str, probe: str, *,
+                        reduced_motion: bool = False, virtual_time_ms: int = 1500) -> None:
         page = self.root / 'actions.html'
         _ = page.write_text(markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>'))
         result = subprocess.run(['google-chrome', '--headless', '--no-sandbox', '--disable-gpu',
             *(['--force-prefers-reduced-motion'] if reduced_motion else []),
-            '--user-data-dir=' + str(self.root / 'chrome-actions'), '--virtual-time-budget=1500',
+            '--user-data-dir=' + str(self.root / 'chrome-actions'), f'--virtual-time-budget={virtual_time_ms}',
             '--dump-dom', page.as_uri()], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
         marker = '<p id="probe-results">'
@@ -1582,7 +2026,7 @@ window.fetch=async(_path,options={})=>{
         self.assertEqual(saved.unread_since, item.unread_since)
         self.assertFalse(any(isinstance(entry.what, the_list.MarkedRead) for entry in saved.log))
         self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].words, "Keep this result.")
-        self.assertEqual(list_page.fresh_request(root, MORTY.id, item.id)["unread"], "true")
+        self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["unread"], "true")
         with patch.object(change_page, "send_to_staff") as send:
             list_page.deliver(delivery)
         send.assert_called_once()
@@ -1598,6 +2042,27 @@ window.fetch=async(_path,options={})=>{
         self.assertEqual(saved, newer)
         self.assertEqual(len(the_list.feedback_requests(saved)), 1)
         self.assertEqual(sum(isinstance(entry.what, the_list.MarkedRead) for entry in saved.log), 1)
+
+    def test_legacy_tell_retry_uses_only_its_saved_read_target(self) -> None:
+        root = self.root / "reviews"
+        for case in ("saved", "newer", "first_send"):
+            with self.subTest(case=case):
+                item = self.add("Keep the legacy read target")
+                request = uuid4().hex
+                words = "Keep this result."
+                token = list_page.request_token(root, MORTY.id, item.id, request)
+                body = urlencode(self.fields(item, "tell", request=request, token=token, words=words))
+                if case != "first_send":
+                    feedback = the_list.PageFeedback(request, words, read_update=the_list.unread_update(item))
+                    _ = the_list.save_feedback(MORTY.id, item.id, feedback)
+                if case == "newer":
+                    item = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result arrived."}, source="morty")
+                _ = list_page.submit(root, body)
+                saved = the_list.load(MORTY.id, item.id)
+                expected = the_list.NoTimestamp.UNSET if case == "saved" else item.unread_since
+                self.assertEqual(saved.unread_since, expected)
+                self.assertEqual(len(the_list.feedback_requests(saved)), 1)
+                self.assertEqual(sum(isinstance(entry.what, the_list.MarkedRead) for entry in saved.log), int(case == "saved"))
 
     def test_conflicting_tell_keeps_a_newer_update_unread(self) -> None:
         item = self.add("Refuse new words under the saved request")
@@ -1635,13 +2100,13 @@ window.fetch=async(_path,options={})=>{
         setup = '''<script>
 window.fetch=async(_path,options={})=>{
  if(options.method!=='POST') throw new Error('Fixture refresh refused');
- return {ok:true,json:async()=>({unread:'UNREAD',request:'a'.repeat(32),token:'b'.repeat(64)})};
+ return {ok:true,json:async()=>({unread:'UNREAD'})};
 };
 </script>'''
         probe = '''<script>
 (async()=>{
  const row=document.querySelector('[data-list-item]'),form=row.querySelector('form');
- const show=document.getElementById('list-show');show.value='unread';show.dispatchEvent(new Event('change'));
+ document.querySelector('[data-filter-row="show"] [data-filter-value="unread"]').click();
  const before=row.dataset.unread==='true' && row.querySelector('.list-dot') && form.querySelector('[value="read"]') && !row.hidden;
  form.elements.words.value='Keep this result.';form.elements.words.dispatchEvent(new Event('input'));
  form.requestSubmit(form.querySelector('[value="ACTION"]'));
@@ -1819,7 +2284,7 @@ window.fetch=async(_path,options={})=>{
    row.dataset.unread='false';row.querySelector('.list-dot')?.remove();row.querySelector('[value="read"]')?.remove();
    original=page.documentElement.outerHTML;
   }
-  const result={ok:true,status:200,json:async()=>({state:'sent',unread:'false',request:String(posts.length).padStart(32,'0'),token:'b'.repeat(64)})};
+  const result={ok:true,status:200,json:async()=>({state:'sent',unread:'false'})};
   if(holdPost) return await new Promise(resolve=>finishPost=()=>resolve(result));
   return result;
  }
@@ -1845,7 +2310,14 @@ const submitted=(form,button)=>new Promise((resolve,reject)=>{
 });
 const rows=()=>[...document.querySelectorAll('[data-list-item]')];
 const visible=()=>rows().filter(row=>!row.hidden);
-const change=(id,value,event='change')=>{const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event(event,{bubbles:true}));};
+const chip=(name,value)=>document.querySelector('[data-filter-row="'+name+'"] [data-filter-value="'+value+'"]');
+const select=(name,value)=>chip(name,value).click();
+const selectedChip=name=>document.querySelector('[data-filter-row="'+name+'"] [aria-pressed="true"]').dataset.filterValue;
+const count=(name,value)=>Number(chip(name,value).querySelector('b').textContent);
+const search=value=>new Promise(done=>{
+ const field=document.getElementById('list-search');
+ field.addEventListener('filterchange',done,{once:true});field.value=value;field.dispatchEvent(new Event('input'));
+});
 try{
  await flush();
  if(innerWidth>=960){
@@ -1864,27 +2336,84 @@ try{
   document.querySelector('[data-sort="'+column+'"]').click();
   check(document.querySelector('[data-sort="'+column+'"]').parentElement.getAttribute('aria-sort')==='ascending','sort column '+column);
  }
- change('list-show','needs-me');check(visible().length===1 && visible()[0].dataset.number==='58','Needs me');
- change('list-show','unread');check(visible().length===5,'Unread includes the saved unread updates');
- change('list-show','done');check(visible().length===1 && visible()[0].dataset.number==='63','Done');
- change('list-show','parked');check(visible().length===1 && visible()[0].dataset.number==='41','Parked');
- change('list-show','closed');check(visible().length===1 && visible()[0].dataset.number==='54','Closed');
- change('list-show','all');check(visible().length===6,'All');
- change('list-owner',OWNER);check(visible().length===5,'Owner');
- change('list-owner','');
- change('list-producer',DWIGHT);check(visible().map(row=>row.dataset.number).join(',')==='105','Producer');
+ select('show','needs-me');check(visible().length===1 && visible()[0].dataset.number==='58','Needs me');
+ select('show','unread');check(visible().length===5,'Unread includes the saved unread updates');
+ select('show','done');check(visible().length===1 && visible()[0].dataset.number==='63','Done');
+ select('show','parked');check(visible().length===1 && visible()[0].dataset.number==='41','Parked');
+ select('show','closed');check(visible().length===1 && visible()[0].dataset.number==='54','Closed');
+ select('show','all');check(visible().length===6,'All');
+ select('show','open');
+ const showRow=chip('show','open').closest('[data-filter-row]');
+ const showValues=filterControl.buttons(showRow).map(button=>button.dataset.filterValue);
+ filterControl.setVisible(showRow,showValues.filter(value=>value!=='open'));
+ dispatchEvent(new PopStateEvent('popstate'));
+ check(selectedChip('show')==='all' && visible().length===6,'hiding Open selects All and shows all six items');
+ check(new URLSearchParams(location.hash.slice(1)).get('show')==='all','the address records the fallback to All');
+ filterControl.setVisible(showRow,showValues);
+ const theme=document.documentElement.dataset.theme;
+ const pixel=document.createElement('canvas').getContext('2d',{willReadFrequently:true});
+ const luminance=color=>{
+  pixel.fillStyle=color;pixel.fillRect(0,0,1,1);
+  const [r,g,b]=[...pixel.getImageData(0,0,1,1).data].slice(0,3).map(byte=>{
+   const value=byte/255;
+   return value<=.04045 ? value/12.92 : ((value+.055)/1.055)**2.4;
+  });
+  return .2126*r+.7152*g+.0722*b;
+ };
+ select('show','open');select('owner',OWNER);select('producer',MORTY);
+ check(Boolean(chip('owner',OWNER).querySelector('.staff-name')) &&
+  Boolean(chip('producer',MORTY).querySelector('.staff-name')),'the contrast case includes staff labels');
+ for(const themeName of ['light','dark']){
+  document.documentElement.dataset.theme=themeName;
+  for(const state of ['Working','Done']){
+   select('state',state);
+   for(const button of document.querySelectorAll('[data-filter-row] button[aria-pressed="true"]')){
+    const background=luminance(getComputedStyle(button).backgroundColor);
+    for(const element of [button,...button.querySelectorAll('b,.staff-name')]){
+     const ink=luminance(getComputedStyle(element).color);
+     const contrast=(Math.max(ink,background)+.05)/(Math.min(ink,background)+.05);
+     check(getComputedStyle(button).opacity==='1' && contrast>=4.5,
+      themeName+' contrast for '+button.textContent+': '+contrast);
+    }
+   }
+  }
+ }
+ if(theme===undefined) delete document.documentElement.dataset.theme;
+ else document.documentElement.dataset.theme=theme;
+ select('state','all');select('producer','all');select('owner','all');select('show','all');
+ select('owner',OWNER);check(visible().length===5,'Owner');
+ select('owner','all');
+ select('producer',DWIGHT);check(visible().map(row=>row.dataset.number).join(',')==='105','Producer');
  check(new URLSearchParams(location.hash.slice(1)).get('producer')===DWIGHT,'the address keeps the producer');
- change('list-producer','');
+ select('producer','all');
  check(visible().length===6 && !new URLSearchParams(location.hash.slice(1)).has('producer'),'All producers');
- change('list-search','#106','input');
+ for(const name of ['show','state','owner','producer'])
+  check(document.querySelector('[data-filter-row="'+name+'"] button').dataset.filterValue==='all',name+' starts with All');
+ select('show','open');select('state','Working');
+ check(visible().length===2 && count('state','Waiting for nate')===1 && count('state','Done')===0,
+  'State filters within Open, and each State count follows Show');
+ const zero=chip('state','Done'),zeroPosition=zero.getBoundingClientRect();
+ check(!zero.hidden && !zero.disabled && Number(getComputedStyle(zero).opacity)<1 && zeroPosition.width>0,
+  'a zero chip stays in the row, dimmed and enabled');
+ select('state','Done');check(visible().length===0 && count('show','done')===1,'a zero chip can select an empty view');
+ select('show','done');check(visible().map(row=>row.dataset.number).join(',')==='63','Done Show and Done State match together');
+ select('show','all');select('state','Working');select('owner',OWNER);select('producer',DWIGHT);
+ check(visible().length===0 && count('owner','all')===1 && count('producer','all')===1 && count('state','all')===0,
+  'each count ignores only its own row');
+ select('producer','all');await search('console');
+ check(visible().map(row=>row.dataset.number).join(',')==='106' && count('show','open')===1 &&
+  count('producer',DWIGHT)===0 && count('owner','all')===2,'the words box and all four rows combine');
+ check(zero.getBoundingClientRect().left===zeroPosition.left,'a zero chip retains its place');
+ await search('');select('state','all');select('owner','all');
+ await search('#106');
  check(visible().length===1 && visible()[0].dataset.number==='106','number search');
- change('list-search','console','input');check(visible().length===2,'title search');
+ await search('console');check(visible().length===2,'title search');
  check(new URLSearchParams(location.hash.slice(1)).get('q')==='console','the address keeps the query');
  for(const title of ['Straße','STRAẞE']){
-  change('list-search',title,'input');
+  await search(title);
   check(visible().length===1 && visible()[0].dataset.number==='106','Unicode title search: '+title);
  }
- change('list-search','console','input');
+ await search('console');
  const selected=visible().find(row=>row.dataset.number==='106');selected.querySelector('.list-toggle').click();
  check(!selected.querySelector('[data-detail]').hidden,'a row opens');
  const words=selected.querySelector('textarea'),tell=selected.querySelector('[value="tell"]');
@@ -1959,20 +2488,23 @@ try{
  location.hash=new URLSearchParams({show:'closed',sort:'#',dir:'desc'});await flush();
  check(visible().length===1 && visible()[0].dataset.number==='54','hash navigation restores the filters');
  location.hash=new URLSearchParams({show:'all',producer:DWIGHT});await flush();
- check(document.getElementById('list-producer').value===DWIGHT && visible().map(row=>row.dataset.number).join(',')==='105',
+ check(selectedChip('producer')===DWIGHT && visible().map(row=>row.dataset.number).join(',')==='105',
    'an address restores the producer filter');
  location.hash=new URLSearchParams({show:'all',producer:'missing'});await flush();
- check(document.getElementById('list-producer').value==='' && visible().length===6,'an unknown producer shows all items');
+ check(selectedChip('producer')==='all' && visible().length===6,'an unknown producer shows all items');
+ location.hash=new URLSearchParams({show:'unread',state:'Working',owner:OWNER,q:'106'});await flush();
+ check(selectedChip('state')==='Working' && selectedChip('owner')===OWNER && selectedChip('show')==='unread' &&
+  visible().map(row=>row.dataset.number).join(',')==='106','an address restores Show, State, Owner and words together');
 
  for(const target of rows().filter(row=>['Done','Closed'].includes(row.dataset.state) || row.dataset.parked==='true')){
   location.hash=new URLSearchParams({item:target.dataset.key});await flush();
   check(!target.hidden && !target.querySelector('[data-detail]').hidden,'an item link shows '+target.dataset.state);
-  check(document.getElementById('list-show').value==='all' && document.getElementById('list-owner').value==='' &&
-    document.getElementById('list-producer').value==='' && document.getElementById('list-search').value==='','an item link clears filters');
+  check(selectedChip('show')==='all' && selectedChip('owner')==='all' &&
+    selectedChip('producer')==='all' && document.getElementById('list-search').value==='','an item link clears filters');
  }
  const retained=rows().find(row=>row.dataset.number==='106');
  location.hash=new URLSearchParams({item:retained.dataset.key,owner:retained.dataset.owner,show:'open',q:'106',sort:'#',dir:'desc'});await flush();
- check(document.getElementById('list-owner').value===retained.dataset.owner && document.getElementById('list-show').value==='open' &&
+ check(selectedChip('owner')===retained.dataset.owner && selectedChip('show')==='open' &&
    document.getElementById('list-search').value==='106','an address with an open item keeps its filters');
  check(!retained.hidden && !retained.querySelector('[data-detail]').hidden,'an address restores its open item');
  check(document.querySelectorAll('[data-feedback-form]').length===6,'each row has feedback controls');
@@ -1987,7 +2519,9 @@ try{
  }
 }catch(error){failed.push(String(error));}
 await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...errors])});
-})();</script>'''.replace('OWNER', json.dumps(OWNER.id)).replace('DWIGHT', json.dumps(DWIGHT.id))
+})();</script>'''
+        for name, identity in (("OWNER", OWNER.id), ("DWIGHT", DWIGHT.id), ("MORTY", MORTY.id)):
+            probe = probe.replace(name, json.dumps(identity))
         for width in (1440, 390):
             with self.subTest(width=width):
                 for identity in ("L105", "L106"):
@@ -2018,7 +2552,7 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
                             delivery = list_page.submit(root, body)
                             list_page.deliver(delivery)
                             fields = parse_qs(body)
-                            result = {"state": "sent", **list_page.fresh_request(root, fields["keeper"][0], fields["id"][0])}
+                            result = {"state": "sent", **list_page.saved_action_state(fields["keeper"][0], fields["id"][0])}
                             self.send_response(200)
                             self.send_header('Content-Type', 'application/json')
                             self.end_headers()
@@ -2043,12 +2577,12 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
                             done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
                                 '--window-size', f'{width},900', '--screenshot', str(self.root / f'page-{width}.png'),
                                 f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=45)
+                            self.assertEqual(done.returncode, 0, done.stderr)
+                            self.assertEqual(results, [[]])
                             sends.assert_called_once()
-                        self.assertEqual(done.returncode, 0, done.stderr)
                     finally:
                         server.shutdown()
                         thread.join(5)
-                self.assertEqual(results, [[]])
 
 
 if __name__ == '__main__':

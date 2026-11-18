@@ -207,8 +207,9 @@ class HanaSetupTests(CostFixture):
             'waiting for the Hana box to stop: stopping, 10 s of 600 s',
             'waiting for the Hana box to stop: stopped, 20 s of 600 s',
         ])
-        self.assertEqual(fake.calls[fake.calls.index(('ec2', 'stop-instances', 10)) + 1:],
-                         [('ec2', 'describe-instances', 10)] * 3)
+        stop = fake.calls.index(('ec2', 'stop-instances', 10))
+        probe = fake.calls.index(('configure', 'export-credentials', 10))
+        self.assertEqual(fake.calls[stop + 1:probe], [('ec2', 'describe-instances', 10)] * 3)
         self.assertLess(calls.index('describe-spot-price-history'), calls.index('create-change-set'))
         self.assertLess(calls.index('create-change-set'), calls.index('execute-change-set'))
         self.assertNotIn('deploy', calls)
@@ -257,7 +258,9 @@ class HanaSetupTests(CostFixture):
             saved = remote.read_record(saved_path)
             self.assertIs(saved['stop_pending'], True)
             self.assertEqual(saved['instance'], IDENTITY.instance)
-            self.assertIn('stop-instances', calls)
+            stop = fake.calls.index(('ec2', 'stop-instances', 10))
+            self.assertEqual(fake.calls[stop + 1:], [('ec2', 'describe-instances', 10)] * 3)
+            self.assertRegex(output.getvalue().splitlines()[-1], r'^hana-setup: confirming the idle stop failed after ')
             fake.state = 'stopped'
             calls.clear()
             self.assertTrue(subject.hana_setup(approve_resources=True))
@@ -274,7 +277,9 @@ class HanaSetupTests(CostFixture):
             pause.assert_not_called()
         self.assertNotIn('stop-instances', calls)
         self.assertEqual(self.stop_progress(output), ['waiting for the Hana box to stop: stopped, 0 s of 600 s'])
-        self.assertEqual(calls[calls.index('describe-spot-instance-requests') + 1:], ['describe-instances'])
+        spot_check = calls.index('describe-spot-instance-requests')
+        probe = calls.index('export-credentials')
+        self.assertEqual(calls[spot_check + 1:probe], ['describe-instances'])
 
     def assert_requested_setup_recovers(self, retry_price: Callable[[], Decimal]) -> None:
         fake = FakeAws(self.clock, state='running', lose_response='describe-instances')
