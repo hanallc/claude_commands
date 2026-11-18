@@ -2882,11 +2882,13 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 ### Phase 156 — The AWS page shows the gate-time price at which a 32-vCPU box wins  · status: done
 
-User via builds 11-18 10:04: per region, the price per minute of gate time at which the gate takes a 32-vCPU box.
+#### As-built
 
-1. Per region, compare the cheapest 32-vCPU variant with the cheapest 16-vCPU variant. Use the expected box USD of one run that `cloud_gate.rank_variants` uses, and the median gate minutes from the same run evidence.
-2. Break-even USD per minute = (USD 32 − USD 16) / (minutes 16 − minutes 32). Show "always" when the 32-vCPU box is cheaper and not slower, "never" when it is not faster, and "no measurement" when a median is missing.
-3. One AWS page table, a row per region: both prices, both median minutes, both run USD, and the break-even.
-4. Display only. No config change and no gate placement code change.
+- A table below the Spot placement scores has one row per configured gate region. It compares the cheapest eligible 16-vCPU and 32-vCPU merge gate boxes: type, Spot USD per hour, median box minutes, and run USD.
+- Break-even USD per minute of gate time = (USD32 − USD16) / (minutes16 − minutes32). Other outcomes are "always", "never", "no measurement" and "no current price".
+- `run_cost.GateRunPricing` holds the expected run USD of `cloud_gate.rank_variants`. One shared eligibility function (deployed subnets and zones, `max_gate_minutes`, current price) serves the gate and the page. The gate's ranking is unchanged: 128 comparisons match the old code.
+- A page refresh redraws the table. Display only; no config change.
+- Blind review: 4 findings, all fixed in 1 round.
+- Checkpoint `f194deaf1`; row `039bb9706` stacked on the Phase 155 row `76a31d93a`.
 
 **Files:** `scripts/aws_target/aws_page.py`, `scripts/aws_target/aws_prices.html`, `scripts/aws_target/run_cost.py`, `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/test_aws_page.py`, `scripts/aws_target/test_run_cost.py`.
