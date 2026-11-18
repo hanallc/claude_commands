@@ -24,6 +24,42 @@ use_test_log()
 
 
 class SavedAlertTests(unittest.TestCase):
+    def test_free_alert_names_kept_claims_and_uses_the_waiting_count(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_idle_config(Path(directory))
+            path = write_idle_alert(Path(directory), 1600)
+            row = cast(dict[str, object], json.loads(path.read_text()))
+            row["cause"] = "free"
+            for waiting, words in ((0, "0 steps wait"), (1, "1 step waits"), (2, "2 steps wait")):
+                for count in (0, 1, 2):
+                    with self.subTest(waiting=waiting, kept=count), \
+                         mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
+                        row["waiting"], row["kept_claims"] = waiting, count
+                        _ = path.write_text(json.dumps(row))
+                        line = mac_idle_alert.alert_line(path, 1600, ZoneInfo("UTC")) or ""
+                        if waiting == 0:
+                            self.assertEqual(line, "")
+                            continue
+                        self.assertIn(f"{words} for the Mac", line)
+                        if count:
+                            noun = "claim" if count == 1 else "claims"
+                            self.assertIn(f"{count} {noun} kept for cleanup", line)
+                            self.assertIn("Kept claims hold no work", line)
+                            self.assertNotIn("no claim", line)
+                        else:
+                            self.assertIn("No block and no claim", line)
+                            self.assertNotIn("kept for cleanup", line)
+
+    def test_invalid_kept_claim_counts_are_unreadable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_idle_alert(Path(directory), 1600)
+            row = cast(dict[str, object], json.loads(path.read_text()))
+            for count in (-1, True, "1", 1.5):
+                with self.subTest(count=count):
+                    row["kept_claims"] = count
+                    _ = path.write_text(json.dumps(row))
+                    self.assertEqual(mac_idle_alert.read_alert(path), mac_idle_alert.UnreadableAlert("invalid kept_claims"))
+
     def test_alert_without_cause_change_time_is_unreadable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = write_idle_alert(Path(directory), 1600)

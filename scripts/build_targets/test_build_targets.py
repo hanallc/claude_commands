@@ -445,6 +445,40 @@ class StatusTests(IsolatedBuildTargetTest):
             0, "mac: held by hana since 13:05 PDT (showrunner hana, unit inspectors) until 15:05 PDT — render checks\n", "",
         ))
 
+    def test_dead_remote_holder_is_free_without_deleting_its_cleanup_claim(self) -> None:
+        self.write_claim()
+        path = self.mac_state / "run.json"
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        record["remote_host"] = "test-mac"
+        _ = path.write_text(json.dumps(record))
+        before = path.read_bytes()
+        config = self.write_config(
+            "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            + "kind.natedev=local\nplatform.natedev=linux\n")
+        for start in (process_identity.Gone(), process_identity.Started("reused-pid-start")):
+            with self.subTest(start=start), mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
+                 mock.patch.object(process_identity, "process_start", return_value=start):
+                self.assertEqual(self.capture_status(), (0, "mac: free · 1 claim kept for cleanup\nnatedev: free\n", ""))
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_free_status_counts_kept_claims_without_changing_them(self) -> None:
+        config = self.write_config("targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+        before: dict[Path, bytes] = {}
+        (self.mac_state / "claims").mkdir(parents=True, exist_ok=True)
+        for count in (1, 2):
+            name = f"claims/repo-{count}.json"
+            self.write_claim(name)
+            path = self.mac_state / name
+            record = cast(dict[str, object], json.loads(path.read_text()))
+            record["remote_host"] = "test-mac"
+            _ = path.write_text(json.dumps(record))
+            before[path] = path.read_bytes()
+            with self.subTest(count=count), mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
+                 mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()):
+                noun = "claim" if count == 1 else "claims"
+                self.assertEqual(self.capture_status(), (0, f"mac: free · {count} {noun} kept for cleanup\n", ""))
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+
     def test_mac_running_status_adds_idle_since_from_claim(self) -> None:
         self.write_claim()
         path = self.mac_state / "run.json"
