@@ -140,7 +140,7 @@ def direct_route(repo: Path, unit: str = "") -> DirectUnitSync | NoDirectRoute:
 def sync_notice(address: str, target: str, branch: str, tip: str) -> None:
     caller = showrunners.own_name() or "style_sync"
     sent = subprocess.run(session_send.send_argv("--to", address, "--from", caller,
-        "--text", f"From {caller}: branch point {branch} moved to {tip[:7]}; sync.",
+        "--text", f"branch point {branch} moved to {tip[:7]}; sync.",
         "--key", f"style-sync:{target}",
         "--timeout", str(SEND_SECONDS), python_interpreter=PYTHON,
     ), capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))

@@ -568,16 +568,18 @@ notice to the unit director before any merge command runs:
    rule and the fix, and do not merge. Never ask the user whether a visible
    defect matters. User rule 2026-10-01 (nightly review): the unit judges its
    own shots before it moves on, so holds are not found after it has.
-4. **Run the checkpoint.** With a merge unit that serves this production, give the order to it under `commands/unit/merge.md`.
-   That unit is under this showrunner or under a showrunner above it. The order names this production.
+4. **Run the checkpoint.** Name the production whose repo holds the checkpoint as the destination.
+   Give the order to a merge unit that serves the destination under `commands/unit/merge.md`.
+   Use a merge unit under the destination's showrunner or one of its ancestors.
    Without a merge unit, run this command in the background:
    `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/merge_checkpoint.py --production
-   <showrunner name> <unit> <phase> <hash> --started <ISO>
+   <destination production> <unit> <phase> <hash> --started <ISO>
    --review-trial "<the complete review trial: line>"
    --delivers "<one line of what the phase delivers>"`.
-   When several checkpoint notices wait, land them in one batch, in arrival order.
+   Group pending notices by destination production.
+   Use one batch file per destination. Keep its notices in arrival order.
    Write each item's arguments after `--production` as shell words on a separate line in `<file>`.
-   Run `merge_checkpoint.py --production <showrunner name> --batch <file>` through the same Python launcher.
+   Run `merge_checkpoint.py --production <destination production> --batch <file>` through the same Python launcher.
    Keep each item's flags on its line.
    Use single commands for `--bump` and child handoffs.
    Add one `--trailer <line>` per attribution line this session requires, `--regime trial` if the broad
