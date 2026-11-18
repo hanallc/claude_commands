@@ -1324,6 +1324,7 @@ document.body.append(result);
         self.assertIn("!words.value.trim()", list_page.SCRIPT)
         self.assertIn("words.addEventListener('input',retain)", list_page.SCRIPT)
         self.assertIn("buttons.forEach(button=>button.disabled=false);syncTell()", list_page.SCRIPT)
+        self.assertIn('rows="4"', words)
 
     def test_record_fields_share_the_markdown_formatter(self) -> None:
         item = self.add("Formatted record")
@@ -1503,6 +1504,36 @@ document.body.append(result);
         form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), secret)
         fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', form))
         return {**fields, "action": action, "words": "", "until": "", **changes}
+
+    def test_unpark_saves_before_delivery_and_sends_one_notice(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Unpark this item", number=106)
+        _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
+        fields = self.fields(item, "unpark")
+        with patch.object(change_page, "send_to_staff") as send:
+            delivery = list_page.submit(root, urlencode(fields))
+            saved = the_list.load(MORTY.id, item.id)
+            self.assertIs(saved.parked_until, the_list.NoTimestamp.UNSET)
+            self.assertEqual(saved.state, item.state)
+            self.assertEqual(saved.log[-2].what, the_list.Unparked())
+            self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "")
+            send.assert_not_called()
+            list_page.deliver(delivery)
+            self.assertEqual(send.call_count, 1)
+            self.assertEqual((send.call_args.args[0], send.call_args.args[2]),
+                             (MORTY.id, "List page: nate unparked item 106."))
+            delivered = the_list.load(MORTY.id, item.id)
+            list_page.deliver(list_page.submit(root, urlencode(fields)))
+            self.assertEqual(the_list.load(MORTY.id, item.id), delivered)
+            fields = self.fields(delivered, "unpark")
+            list_page.deliver(list_page.submit(root, urlencode(fields)))
+            saved = the_list.load(MORTY.id, item.id)
+            receipt = the_list.UnparkNoChangeReceipt(
+                the_list.PageRequest(fields["request"], "unpark", "List page: nate unparked item 106."),
+                the_list.UnparkNoChangeReason.NO_ACTIVE_PARKING)
+            self.assertEqual(saved.log[-1].what, receipt)
+            self.assertEqual(replace(saved, log=saved.log[:-1]), delivered)
+            self.assertEqual(send.call_count, 1)
 
     def test_remove_closes_before_delivery_and_repeated_requests_do_nothing(self) -> None:
         item = self.add("Remove this item now")
@@ -1927,6 +1958,256 @@ window.fetch=async(_path,options={})=>{
 })();
 </script>'''
         self.browser_actions(markup, setup, probe)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_unpark_controls_layout_and_focus(self) -> None:
+        parked = self.add("Parked item", number=1)
+        _ = self.add("Unparked item", number=2)
+        _ = the_list.park(MORTY.id, parked.id, NOW + timedelta(days=2), source="nate")
+        self.browser_action_sequence(r"""
+ show('all');
+ const other=document.querySelector('[data-number="2"]');
+ other.querySelector('.list-toggle').click();
+ const rectangle=element=>element.getBoundingClientRect();
+ const near=(a,b)=>Math.abs(a-b)<1;
+ for(const item of [row,other]){
+  const pick=selector=>item.querySelector(selector);
+  const box=rectangle(pick('textarea'));
+  const remove=rectangle(pick('[value=remove]')),park=rectangle(pick('[data-later-toggle]'));
+  check(pick('textarea').rows===4 && remove.bottom<box.top,'four lines below the controls');
+  check(near(remove.left,box.left) && near(park.right,box.right) && near(remove.top,park.top),'one aligned control row');
+  check(pick('[value=unpark]').hidden===(item===other),'Unpark only shows on the parked item');
+  check(pick('[data-parked-detail]').hidden===(item===other),'parking line only shows on the parked item');
+  if(item===row){
+   check(near(park.left-rectangle(pick('[value=unpark]')).right,8),'parking controls are adjacent');
+   check(getComputedStyle(pick('[data-parked-note]')).display==='none','the expanded row shows one parking line');
+   pick('[data-later-toggle]').click();
+   check(near(rectangle(pick('[data-later-menu]')).right,box.right),'picker aligns with the text box');
+   pick('[data-later-toggle]').click();
+  }
+ }
+ const unpark=form.querySelector('[value=unpark]');
+ show('parked');
+ unpark.focus();
+ const first=submit('unpark');
+ losePost();await flush();
+ check(!row.hidden && !unpark.hidden,'a lost response leaves Unpark available');
+ check(document.activeElement===unpark,'a lost response returns focus to Unpark');
+ check(submit('unpark').id===first.id,'an exact Unpark retry keeps its request ID');
+ finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'});await flush();
+ check(row.hidden && document.activeElement===document.querySelector('#filter-show-parked'),'focus moves to Parked');
+ const status=document.querySelector('[data-hidden-action-status][role="status"]');
+ check(!status.hidden && status.getClientRects().length>0 && status.textContent==='Item #1 unparked.',
+       'Parked announces which item left');
+ show('all');
+ check(status.hidden,'All shows the confirmation in the row');
+ form.elements.words.value='Keep these words.';
+ form.elements.until.value='2026-12-03';
+ submit('park');
+ finishPost({item_state:'Working',parked:'true',parked_until:'2026-12-03'});await flush();
+ document.querySelector('[data-sort="3"]').click();
+ unpark.focus();
+ submit('unpark');
+ finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'});await flush();
+ check(!row.hidden && !row.querySelector('[data-detail]').hidden,'Unpark in All keeps the row open');
+ check(document.querySelector('[data-list-item]')===row,'Unpark preserves the item order by title');
+ check(document.activeElement===row.querySelector('.list-toggle'),'focus moves to the item number');
+ check(unpark.hidden && form.querySelector('[data-parked-detail]').hidden,'the parking controls update');
+ check(form.elements.until.value==='' && form.elements.words.value==='Keep these words.',
+       'Unpark clears the parking draft and keeps the words');
+ show('open');
+ check(!row.hidden && !row.querySelector('[data-detail]').hidden,'Open shows the expanded unparked row');
+""", reduced_motion=True, add_item=False, window_size=(1440, 1120))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_reports_expired_parking_and_keeps_the_parking_draft(self) -> None:
+        item = self.add("Parking expires before Unpark", number=1)
+        _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
+        self.browser_action_sequence('''
+ show('parked');
+ form.elements.until.value='2026-12-03';
+ submit('unpark');
+ finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'expired'});
+ await flush();
+ const status=document.querySelector('[data-hidden-action-status]');
+ check(row.hidden && !status.hidden && status.textContent==='Item #1: Parking time already expired.',
+       'Parked reports that the parking time already expired.');
+ show('all');
+ check(form.querySelector('[data-send-status]').textContent==='Parking time already expired',
+       'All reports that the parking time already expired.');
+ check(form.elements.until.value==='2026-12-03','An expired time leaves the parking draft intact.');
+''', reduced_motion=True, add_item=False)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_reports_unpark_replay_with_newer_parking(self) -> None:
+        item = self.add("Reparked before the retry", number=1)
+        _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
+        self.browser_action_sequence('''
+ show('parked');
+ const unpark=form.querySelector('[value=unpark]');
+ form.elements.until.value='2026-12-03';
+ unpark.focus();
+ const first=submit('unpark');
+ losePost();await flush();
+ check(submit('unpark').id===first.id,'The retry sends the original request ID.');
+ finishPost({item_state:'Working',parked:'true',parked_until:'2026-12-04',
+  unpark_outcome:'cleared_newer_parking_active'});
+ await flush();
+ const message=form.querySelector('[data-send-status]').textContent;
+ check(message==='The original Unpark cleared parking. A newer parking time is active',
+       'The replay reports the original result and the newer parking time.');
+ check(!row.hidden && !unpark.hidden && document.activeElement===unpark,
+       'The reparked row stays in view and Unpark keeps focus.');
+ check(form.querySelector('[data-parked-detail]').textContent==='Parked until 2026-12-04',
+       'The row shows the newer parking time.');
+ check(form.elements.until.value==='2026-12-03','The replay preserves the parking draft.');
+''', reduced_motion=True, add_item=False)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_reports_unpark_with_no_parking_time(self) -> None:
+        item = self.add("Parking cleared by another tab", number=1)
+        _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
+        self.browser_action_sequence('''
+ show('parked');
+ form.elements.until.value='2026-12-03';
+ submit('unpark');
+ finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'no_active_parking'});
+ await flush();
+ const status=document.querySelector('[data-hidden-action-status]');
+ check(row.hidden && !status.hidden && status.textContent==='Item #1: No active parking time to clear.',
+       'The result shows that there was no active parking time.');
+ check(form.elements.until.value==='2026-12-03','The request preserves the parking draft.');
+''', reduced_motion=True, add_item=False)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_preserves_both_overlapping_unpark_confirmations(self) -> None:
+        for number in (1, 2):
+            item = self.add(f"Parked item {number}", number=number)
+            _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
+        self.browser_action_sequence('''
+ show('parked');
+ const second=document.querySelector('[data-number="2"]');
+ second.querySelector('.list-toggle').click();
+ submit('unpark');
+ const finishFirst=finishPost;
+ submit('unpark',second.querySelector('form'));
+ const result={item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'};
+ const status=document.querySelector('[data-hidden-action-status]');
+ finishFirst(result);await flush();
+ check(row.hidden && !second.hidden && !status.hidden && status.textContent==='Item #1 unparked.',
+       'The first request shows its result while the second request runs.');
+ finishPost(result);await flush();
+ check(second.hidden && !status.hidden && status.textContent==='Item #1 unparked. Item #2 unparked.',
+       'Both results stay visible after both rows leave Parked.');
+ show('all');
+ check(status.hidden,'All shows the results in their expanded rows.');
+ show('parked');
+ check(!status.hidden && status.textContent==='Item #1 unparked. Item #2 unparked.',
+       'Parked shows both results again.');
+''', reduced_motion=True, add_item=False)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_brings_parked_filter_and_confirmation_into_view(self) -> None:
+        for number in range(1, 25):
+            item = self.add(f"Parked item {number}", number=number)
+            _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
+        steps = '''
+ show('parked');
+ const sort=document.querySelector('[data-sort="0"]');
+ sort.click();sort.click();
+ const filter=document.querySelector('#filter-show-parked');
+ if(SHORT_VIEWPORT){
+  const buttons=filter.closest('[data-filter-row="show"]').querySelectorAll('button');
+  check(innerHeight<=260 && new Set([...buttons].map(button=>button.offsetTop)).size>1,
+        'The Show filter wraps in the short viewport.');
+ }
+ const unpark=form.querySelector('[value=unpark]');
+ unpark.scrollIntoView({block:'center',behavior:'instant'});
+ unpark.focus({preventScroll:true});
+ check(filter.getBoundingClientRect().bottom<0,'The focused row is below the viewport with the filters.');
+ submit('unpark');
+ finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'});
+ await flush();
+ const withinViewport=element=>{
+  const {top,bottom}=element.getBoundingClientRect();
+  return !element.hidden && top>=0 && bottom<=innerHeight;
+ };
+ const status=document.querySelector('[data-hidden-action-status]');
+ const bounds=filter.getBoundingClientRect();
+ const hit=document.elementFromPoint(bounds.left+bounds.width/2,bounds.top+bounds.height/2);
+ const screen=JSON.stringify({innerWidth,innerHeight,scrollY,
+  focus:document.activeElement.id,top:bounds.top,statusBottom:status.getBoundingClientRect().bottom,
+  hit:hit?.outerHTML.slice(0,150),pageStatus:document.querySelector('[data-page-status]').getBoundingClientRect().height});
+ check(row.hidden && document.activeElement===filter && withinViewport(filter) && filter.contains(hit),
+       'Unpark moves focus and brings the Parked filter into view. '+screen);
+ check(withinViewport(status) && status.textContent==='Item #1 unparked.',
+       'Unpark brings the confirmation into the same viewport. '+screen);
+'''
+        for window_size in ((1440, 900), (500, 260)):
+            with self.subTest(window_size=window_size):
+                viewport_steps = steps.replace("SHORT_VIEWPORT", "true" if window_size[1] <= 260 else "false")
+                self.browser_action_sequence(viewport_steps, reduced_motion=True, add_item=False, window_size=window_size)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_hides_unpark_for_closed_items_and_updates_the_state_sort_key(self) -> None:
+        active = self.add("Active parked item", number=1)
+        closed = self.add("Closed parked item", number=2)
+        for item in (active, closed):
+            _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
+        _ = the_list.close(MORTY.id, closed.id, "Removed from the List.", source="nate")
+        self.browser_action_sequence('''
+ show('all');
+ const closed=document.querySelector('[data-number="2"]');
+ closed.querySelector('.list-toggle').click();
+ check(closed.dataset.parked==='true' && closed.querySelector('[value=unpark]').hidden,
+       'A rendered Closed row can have a parking time and hides Unpark.');
+ const unpark=form.querySelector('[value=unpark]');
+ submit('remove');
+ check(unpark.hidden,'Remove hides Unpark immediately.');
+ finishPost({reason:'Fixture refuses Remove'});await flush();
+ check(!unpark.hidden,'A refusal restores Unpark.');
+ submit('remove');
+ finishPost({item_state:'Closed',parked:'true',unread:'false'});await flush();
+ check(unpark.hidden && row.dataset.parked==='true','A confirmed Remove leaves Unpark hidden.');
+ const sortValues=JSON.parse(row.dataset.sortValues);
+ check(sortValues[3]==='active parked item' && sortValues[4]==='closed',
+       'Remove keeps the Item key and updates the State key.');
+''', add_item=False)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_preserves_unpark_focus_during_periodic_refresh(self) -> None:
+        item = self.add("Parked item", number=1)
+        _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
+        with patch.object(list_page, "counts_strip", return_value=""):
+            markup = list_page.render(self.root / "reviews").decode()
+            _ = the_list.update(MORTY.id, item.id, {"latest_status": "The refreshed status."}, source="morty")
+            fresh = list_page.render(self.root / "reviews").decode()
+        markup = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="1"', markup, count=1)
+        setup = r'''<script>
+window.fetch=async()=>new Response(FRESH);
+</script>'''.replace('FRESH', json.dumps(fresh).replace('</', '<\\/'))
+        probe = r'''<script>
+const original=document.querySelector('[data-list]');
+original.querySelector('#filter-show-parked').click();
+original.querySelector('.list-toggle').click();
+const button=original.querySelector('[value=unpark]');
+button.focus();
+const focusedBefore=document.activeElement===button;
+const observer=new MutationObserver(()=>{
+ if(original.isConnected) return;
+ observer.disconnect();
+ const fresh=document.querySelector('[data-list]');
+ const unpark=fresh.querySelector('[value=unpark]');
+ const failures=[];
+ if(!fresh.textContent.includes('The refreshed status.')) failures.push('The page renders the refreshed status.');
+ if(!focusedBefore || document.activeElement!==unpark || !button.id || unpark.id!==button.id)
+  failures.push('The refresh restores focus to Unpark with the same ID.');
+ const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
+ document.body.append(result);
+});
+observer.observe(original.parentNode,{childList:true});
+</script>'''
+        self.browser_actions(markup, setup, probe, virtual_time_ms=2000)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_retries_a_lost_tell_after_a_refused_park(self) -> None:
@@ -2433,7 +2714,8 @@ const change=async path=>{
                 server.shutdown()
                 thread.join()
 
-    def browser_action_sequence(self, steps: str, *, reduced_motion: bool = False, add_item: bool = True) -> None:
+    def browser_action_sequence(self, steps: str, *, reduced_motion: bool = False, add_item: bool = True,
+                                window_size: tuple[int, int] | None = None) -> None:
         if add_item:
             _ = self.add("Test List action retries", number=1)
         with patch.object(list_page, "counts_strip", return_value=""):
@@ -2471,7 +2753,7 @@ window.fetch=async(_path,options={})=>{
  const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
 })();
 </script>'''
-        self.browser_actions(markup, setup, probe, reduced_motion=reduced_motion)
+        self.browser_actions(markup, setup, probe, reduced_motion=reduced_motion, window_size=window_size)
 
     def browser_actions(self, markup: str, setup: str, probe: str, *,
                         reduced_motion: bool = False, virtual_time_ms: int = 1500,

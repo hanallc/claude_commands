@@ -829,7 +829,12 @@ Morty runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save a
 The answer adds one log entry and marks the item unread if it is not Closed.
 The command refuses an unknown ID, a second answer, and empty text.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
+Remove sits at the left edge of the row above the four-line text box.
+**Unpark** and **Park until** sit at the right edge of the row.
+An expanded parked item shows its parking time above the buttons.
+**Unpark** appears on items with a future parking time and a state other than Closed.
 **Park until** opens the shared calendar and 24-hour time field directly.
+The picker aligns with the right edge of the text box.
 The page refresh waits while the picker is open.
 **Save** sends the chosen time in UTC.
 Park writes the time through `the_list.park` with the same source.
@@ -840,7 +845,22 @@ The writer requires the instant in the receipt or in a parking change with the s
 The picker can resend the original request and instant after the parking time passes.
 When the saved date has passed, the picker gives focus to an enabled day.
 The page keeps the words for Tell morty.
-Morty does not perform these two button actions.
+**Unpark** clears the parking time through `the_list.unpark` and keeps the item state.
+It records one Unparked event and saves one notice for morty.
+If the item has no active parking time, the writer saves only a hidden request receipt.
+The receipt records whether the time expired or was absent.
+A replay of that request preserves any newer parking time.
+The response reports the saved request outcome and the current parking state.
+The page shows “Parking time already expired” for an expired time.
+It shows “No active parking time to clear” when the time is absent.
+Both results preserve the parking draft.
+A replay of a successful Unpark reports the original result and any newer active parking time.
+When Unpark clears parking and removes the row from Parked, the page shows “Item #N unparked.”
+The page shows confirmations for hidden rows next to the Show filter.
+It keeps one confirmation per hidden row after overlapping Unpark requests.
+Focus moves from **Unpark** to the Parked filter and brings the filter and confirmation into view.
+In All, the row stays expanded and focus moves from **Unpark** to its item number.
+After Unpark, Open includes items in states other than Done and Closed.
 The shared item writer saves the action and its pending notice in one locked write.
 The notice tells morty which action nate completed.
 The existing sender delivers the notice with its retry and alert rules.
@@ -855,7 +875,7 @@ The request starts without waiting for the animation.
 The page disables all row buttons while the request runs.
 A second press sends no request.
 The page applies the saved state and parking status from the response.
-The page uses the saved time to update one parking label.
+The page uses the saved time to update the parking labels for the expanded and collapsed row.
 A refusal restores the last confirmed item state, parking status, and unread state together.
 The unread state includes the Update sort key.
 If Mark read, Ask question, or Tell morty loses its response, the page restores the unread flag from before the request.
@@ -876,7 +896,7 @@ The row block requires the record's own number, a List state line, and field bul
 Only field bullets and their continuation lines belong to the block.
 A continuation line starts with at least two spaces or a tab.
 A second run changes nothing.
-The page can mark an item read, close it, park it, or append feedback and delivery states.
+The page can mark an item read, close it, park it, unpark it, or append feedback and delivery states.
 The page uses signed forms and rejects invalid fields or tokens with HTTP 400.
 The List record saves the request ID, action, and words with each change in one locked write.
 The same write saves a pending notice for actions that send one.

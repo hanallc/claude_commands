@@ -699,7 +699,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if server.mode is ServerMode.LIST_FIXTURE and fields.get("action") != ["remove"]:
                 raise ValueError("Only Remove is available in this demo.")
             with server.list_store_access():
-                delivery = list_page.submit(server.root, body, server.delivery_status)
+                submission = list_page.submit(server.root, body, server.delivery_status)
                 fixture_reply = ({"state": "saved",
                     **list_page.saved_action_state(fields["keeper"][0], fields["id"][0])}
                     if server.mode is ServerMode.LIST_FIXTURE else None)
@@ -714,11 +714,14 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         try:
             state = {"read": "read", "question": "saved"}.get(fields["action"][0], "sent")
-            self.json_response(200, {"state": state,
-                **list_page.saved_action_state(fields["keeper"][0], fields["id"][0])})
+            current = list_page.saved_action_state(fields["keeper"][0], fields["id"][0])
+            reply = {"state": state, **current}
+            if isinstance(submission, list_page.ListUnparkSubmission):
+                reply["unpark_outcome"] = submission.response_outcome(current).value
+            self.json_response(200, reply)
         finally:
             try:
-                list_page.deliver(delivery)
+                list_page.deliver(submission)
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
 

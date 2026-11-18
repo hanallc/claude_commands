@@ -12,6 +12,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, tzinfo
+from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 from urllib.parse import parse_qs, urlencode
@@ -145,6 +146,8 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
         body = "Marked read" + by
     elif isinstance(content, the_list.Reopened):
         body = "Reopened" + by
+    elif isinstance(content, the_list.Unparked):
+        body = "Unparked" + by
     elif isinstance(content, the_list.ReviewLinksChanged):
         body = content.action + ": " + html.escape(", ".join(content.keys)) + by
     elif isinstance(content, the_list.EvidenceCopyRemoved):
@@ -191,7 +194,7 @@ def request_token(root: Path, keeper: str, identity: str, prefix: str) -> str:
     return signed_token(secret, keeper, identity, prefix)
 
 
-def feedback_form(entry: ListRecord, secret: str) -> str:
+def feedback_form(entry: ListRecord, secret: str, *, parking_label: str = "") -> str:
     request = ListFormRequestPrefix(secrets.token_hex(16), the_list.unread_update(entry.item)).format()
     token = signed_token(secret, entry.keeper, entry.item.id, request)
     fields = {"keeper": entry.keeper, "id": entry.item.id, "request": request, "token": token}
@@ -199,12 +202,16 @@ def feedback_form(entry: ListRecord, secret: str) -> str:
                      for name, value in fields.items())
     read = '<button name="action" value="read">Mark read</button>' if isinstance(entry.item.unread_since, datetime) else ''
     key = html.escape(entry.key.replace('/', '-'), quote=True)
-    return ('<form method="post" data-feedback-form>' + hidden + '<div class="list-actions">' + read
-            + '<button name="action" value="remove">Remove</button>'
+    parked = '' if parking_label else ' hidden'
+    unpark = ' hidden' if entry.item.state == the_list.ItemState.CLOSED else parked
+    note = 'Parked until ' + parking_label if parking_label else ''
+    return ('<form method="post" data-feedback-form>' + hidden + f'<p data-parked-detail{parked}>{note}</p>'
+            + '<div class="list-actions"><button name="action" value="remove">Remove</button>' + read
+            + f'<div class="list-parking-actions"><button name="action" value="unpark" id="unpark-{key}"{unpark}>Unpark</button>'
             + f'<div class="list-park"><button type="button" id="park-{key}" aria-haspopup="dialog" aria-expanded="false" data-later-toggle>Park until</button>'
             + '<div role="dialog" aria-label="Park until" data-later-menu hidden>'
-            + record_table.date_time_picker(field="until", action="action", value="park") + '</div></div></div>'
-            + f'<textarea name="words" id="words-{key}" rows="2" maxlength="10000" '
+            + record_table.date_time_picker(field="until", action="action", value="park") + '</div></div></div></div>'
+            + f'<textarea name="words" id="words-{key}" rows="4" maxlength="10000" '
             + 'placeholder="Your words for morty about this item" aria-label="Your words for morty about this item"></textarea>'
             + '<div class="list-tell"><span role="status" data-send-status></span>'
             + '<button name="action" value="question" disabled>Ask question</button>'
@@ -248,7 +255,7 @@ def review_card(identity: str, reviews: Mapping[str, review_items.ReviewItem]) -
 
 
 def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[str, review_items.ReviewItem],
-            names: staff_names.StaffNames) -> str:
+            names: staff_names.StaffNames, *, parking_label: str) -> str:
     item = entry.item
     sections = ''.join(f'<section><h3>{FIELD_LABELS[field]}</h3>{field_html(field, value, today, names)}</section>'
                        for field, value in (("latest_status", item.latest_status), ("done_when", item.done_when)))
@@ -270,7 +277,7 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[st
     log = ''.join(reversed([log_entry_html(change, index, today, names) for index, change in enumerate(item.log)
                             if not the_list.is_page_request_receipt(change)]))
     log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
-    return ('<div class="list-panel"><div>' + sections + feedback_form(entry, secret)
+    return ('<div class="list-panel"><div>' + sections + feedback_form(entry, secret, parking_label=parking_label)
             + '</div><section class="list-log-panel"><h3>Log · newest first</h3>'
             + f'<div class="list-log-scroll" id="{log_id}" tabindex="0" role="region" aria-label="Log · newest first">'
             + '<ol class="list-log">' + log + '</ol></div></section></div>')
@@ -296,8 +303,10 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
                   "order": str(index), "sort-values": json.dumps(values, ensure_ascii=False)}
     attrs = ''.join(f' data-{key}="{html.escape(value, quote=True)}"' for key, value in attributes.items())
     panel = f'list-detail-{index}'
+    toggle_id = "list-toggle-" + html.escape(entry.key.replace("/", "-"), quote=True)
     number = (f'<button type="button" class="list-toggle" aria-expanded="false" aria-controls="{panel}" '
-              + f'aria-label="Show item {item.number}"><span class="list-chevron" aria-hidden="true">›</span>{item.number}</button>')
+              + f'aria-label="Show item {item.number}" id="{toggle_id}">'
+              + f'<span class="list-chevron" aria-hidden="true">›</span>{item.number}</button>')
     title = '<strong>' + html.escape(item.title) + '</strong>'
     if item.unit:
         title += '<small>' + field_html("unit", item.unit, today, names) + '</small>'
@@ -311,8 +320,9 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
             state += '<small>' + label + field_html("next_check", item.next_check, today, names) + '</small>'
         elif isinstance(item.next_check, the_list.CheckCondition):
             state += '<small>Check: ' + field_html("next_check", item.next_check, today, names) + '</small>'
-    if parked and isinstance(item.parked_until, datetime):
-        state += '<small data-parked-note>Parked until ' + field_html("parked_until", item.parked_until, today, names) + '</small>'
+    parking_label = field_html("parked_until", item.parked_until, today, names) if parked else ""
+    if parking_label:
+        state += '<small data-parked-note>Parked until ' + parking_label + '</small>'
     if item.reviews:
         state += '<small>' + review_summary(item, reviews, today) + '</small>'
     update = '<span class="list-dot" role="img" aria-label="Unread update"></span>' if unread else '<span aria-label="No unread update">—</span>'
@@ -330,7 +340,8 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden = ' hidden' if parked or item.state in (the_list.ItemState.DONE, the_list.ItemState.CLOSED) else ''
     return (f'<tbody data-list-item{attrs}{hidden}><tr class="list-row">' + row
-            + f'</tr><tr data-detail id="{panel}" hidden><td colspan="{len(HEADERS)}">' + details(entry, today, secret, reviews, names) + '</td></tr></tbody>')
+            + f'</tr><tr data-detail id="{panel}" hidden><td colspan="{len(HEADERS)}">'
+            + details(entry, today, secret, reviews, names, parking_label=parking_label) + '</td></tr></tbody>')
 
 
 @dataclass(frozen=True)
@@ -344,6 +355,29 @@ class ListFeedbackDelivery:
 class ListQuestionDelivery:
     delivery: change_page.MessageDelivery
     status: change_page.DeliveryStatus
+
+
+class UnparkOutcome(Enum):
+    """The Unpark result to report on the List page."""
+
+    CLEARED = "cleared"
+    CLEARED_NEWER_PARKING_ACTIVE = "cleared_newer_parking_active"
+    EXPIRED = the_list.UnparkNoChangeReason.EXPIRED.value
+    NO_ACTIVE_PARKING = the_list.UnparkNoChangeReason.NO_ACTIVE_PARKING.value
+
+
+@dataclass(frozen=True)
+class ListUnparkSubmission:
+    outcome: UnparkOutcome
+    delivery: ListFeedbackDelivery | change_page.NoMessageDelivery
+
+    def response_outcome(self, current: SavedActionState) -> UnparkOutcome:
+        if self.outcome is UnparkOutcome.CLEARED and current["parked"] == "true":
+            return UnparkOutcome.CLEARED_NEWER_PARKING_ACTIVE
+        return self.outcome
+
+
+ListActionSubmission = ListFeedbackDelivery | ListQuestionDelivery | ListUnparkSubmission | change_page.NoMessageDelivery
 
 
 class SavedActionState(TypedDict):
@@ -376,8 +410,7 @@ def _mark_seen_update_read(keeper: staff.StaffId, item: the_list.ListItem,
             pass
 
 
-def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = None
-           ) -> ListFeedbackDelivery | ListQuestionDelivery | change_page.NoMessageDelivery:
+def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = None) -> ListActionSubmission:
     """Accept signed item actions and save their notices for morty."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) != {"keeper", "id", "request", "token", "action", "words", "until"} or any(len(values) != 1 for values in fields.values()):
@@ -416,6 +449,9 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
         label = parked_label(parked_until, user_zone())
         notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} until {label}.", "park", words)
         changed = the_list.park(morty.id, identity, parked_until, source=the_list.PAGE_SOURCE, notice=notice)
+    elif action == "unpark":
+        notice = the_list.PageItemNotice(request, f"List page: nate unparked item {item.number}.", "unpark", words)
+        changed = the_list.unpark(morty.id, identity, source=the_list.PAGE_SOURCE, notice=notice)
     elif action == "tell" and words and len(words) <= 10000:
         saved = the_list.save_feedback(morty.id, identity,
                                        the_list.PageFeedback(request, words, read_update=prefix.seen_update))
@@ -424,9 +460,13 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
     else:
         raise question_record.AnswerRefused("enter words for morty")
     saved_notice = the_list.feedback_requests(changed).get(request)
-    if saved_notice is not None and saved_notice.state == "pending":
-        return ListFeedbackDelivery(morty.id, identity, request)
-    return change_page.NoMessageDelivery()
+    delivery = (ListFeedbackDelivery(morty.id, identity, request)
+                if saved_notice is not None and saved_notice.state == "pending" else change_page.NoMessageDelivery())
+    if action == "unpark":
+        outcome = (UnparkOutcome(the_list.unpark_no_change_reason(changed, request).value)
+                   if saved_notice is None else UnparkOutcome.CLEARED)
+        return ListUnparkSubmission(outcome, delivery)
+    return delivery
 
 
 def alert_showrunners(item: the_list.ListItem, members: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
@@ -441,8 +481,9 @@ def alert_showrunners(item: the_list.ListItem, members: staff.StaffSnapshot) -> 
     return ()
 
 
-def deliver(delivery: ListFeedbackDelivery | ListQuestionDelivery | change_page.NoMessageDelivery) -> None:
+def deliver(submission: ListActionSubmission) -> None:
     """Send saved List words with the shared retry and alert helpers."""
+    delivery = submission.delivery if isinstance(submission, ListUnparkSubmission) else submission
     if isinstance(delivery, change_page.NoMessageDelivery):
         return
     if isinstance(delivery, ListQuestionDelivery):
@@ -572,13 +613,13 @@ def render(root: Path, *, include_counts: bool = True) -> bytes:
                + '<div data-record-filters><div class="list-toolbar">'
                + record_table.words_box('list-search', 'Filter by number, owner, item or state')
                + '<div class="list-expansion">' + expansion + '</div></div>'
-               + record_table.chip_row('Show', shows, 'open')
+               + '<div class="list-show-filter">' + record_table.chip_row('Show', shows, 'open')
+               + '<p data-hidden-action-status role="status" hidden></p></div>'
                + record_table.chip_row('State', states, 'all')
                + record_table.chip_row('Owner', owners, 'all')
                + record_table.chip_row('Producer', producers, 'all')
                + '<span data-list-count role="status" aria-live="polite"></span></div>'
                + '<p data-missing-item role="status" hidden></p>'
-               + '<p data-hidden-action-status role="status" hidden></p>'
                + '<div class="list-table"><table aria-label="The List"><colgroup><col style="width:6%"><col style="width:8%">'
                + '<col style="width:10%"><col style="width:17%"><col style="width:14%"><col style="width:23%"><col style="width:14%">'
                + '<col style="width:8%"></colgroup><thead><tr>' + headers + '</tr></thead>'
@@ -590,11 +631,14 @@ def render(root: Path, *, include_counts: bool = True) -> bytes:
 STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '''<style>
 .list-toolbar{display:flex;justify-content:flex-end;align-items:center;gap:6px;margin-bottom:10px}
 .list-toolbar .record-filter-words{min-width:0;margin:0}
+.list-show-filter [data-hidden-action-status]{margin:0 0 8px calc(5rem + 8px)}
 .list-expansion{display:flex;gap:6px}
 .list-expansion button{justify-content:center;width:36px;padding:0;cursor:pointer}
 .list-expansion svg{width:18px;height:18px}
 .list-table td[data-label="Next step"]>:first-child{margin-top:0}.list-table td[data-label="Next step"]>:last-child{margin-bottom:0}
-.list-actions{position:relative}.list-park>[data-later-menu]{left:0;right:auto}
+.list-actions{position:relative}
+.list-parking-actions{display:flex;gap:inherit;margin-inline-start:auto}
+.list-row.open [data-parked-note]{display:none}
 .list-table:has(.list-park>[data-later-menu]:not([hidden])),
 .list-table tbody:has(.list-park>[data-later-menu]:not([hidden])){overflow:visible}
 .list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
@@ -620,6 +664,12 @@ SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + record_table.DATE_TIM
 let content=document.querySelector('[data-list]');
 let saving=0;
 const drafts=new Map();
+const unparkMessages={
+ cleared:'Unparked',
+ cleared_newer_parking_active:'The original Unpark cleared parking. A newer parking time is active',
+ expired:'Parking time already expired',
+ no_active_parking:'No active parking time to clear',
+};
 /** @type {Map<string, {index: string, offset: number}>} */
 const logPositions=new Map();
 function visibleLogs(){
@@ -666,7 +716,7 @@ function syncUnread(item,form,unread,unreadSort){
   if(!dot){const mark=document.createElement('span');mark.className='list-dot';mark.setAttribute('role','img');
    mark.setAttribute('aria-label','Unread update');update.prepend(mark);}
   if(!read){const button=document.createElement('button');button.name='action';button.value='read';
-   button.textContent='Mark read';button.disabled=Boolean(form.dataset.sending);form.querySelector('.list-actions').prepend(button);}
+   button.textContent='Mark read';button.disabled=Boolean(form.dataset.sending);form.querySelector('[value="remove"]').after(button);}
  }else{
   dot?.remove();read?.remove();
   if(!update.querySelector('[aria-label="No unread update"]')){const empty=document.createElement('span');
@@ -704,12 +754,14 @@ function bindListControls(){
  content.querySelectorAll('[data-feedback-form]').forEach(form=>{
   const item=form.closest('[data-list-item]'),key=item.dataset.key;
   const notice=form.querySelector('[data-send-status]');
+  const unpark=form.querySelector('[value="unpark"]'),parkedDetail=form.querySelector('[data-parked-detail]');
   notice.textContent=tableView.actionNotice(item);
   const confirmed={state:item.dataset.state,parked:item.dataset.parked,
    unread:item.dataset.unread==='true',unreadSort:JSON.parse(item.dataset.sortValues)[7]};
   const syncConfirmed=()=>{
    item.dataset.state=confirmed.state;
    item.dataset.parked=confirmed.parked;
+   unpark.hidden=confirmed.parked!=='true' || confirmed.state==='Closed';
    syncUnread(item,form,confirmed.unread,confirmed.unreadSort);
   };
   const words=form.elements.words,until=form.elements.until;
@@ -738,6 +790,7 @@ function bindListControls(){
   form.addEventListener('submit',async event=>{
    event.preventDefault();if(form.dataset.sending) return;
    const action=event.submitter?.value || 'tell';
+   const focusUnpark=action==='unpark' && document.activeElement===unpark;
    const usesWords=action==='tell' || action==='question';
    if(usesWords && !words.value.trim()) return;
    const retry=matching(action);
@@ -748,8 +801,8 @@ function bindListControls(){
      if(!(at>Date.now())){notice.textContent='Choose a future parking time.';return;}
      parkingTime=new Date(at).toISOString();
     }
-    closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
    }
+   if(action==='park' || action==='unpark') closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
    const attempt=retry ?? {...fresh,action,words:words.value,until:until.value,parkingTime};
    identity(attempt);
    const data=new URLSearchParams(new FormData(form));data.set('action',action);
@@ -762,6 +815,7 @@ function bindListControls(){
    const clearsUnread=action==='read' || usesWords,unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
    if(action==='remove'){
     item.dataset.state='Closed';
+    unpark.hidden=true;
     syncUnread(item,form,false,0);
    }
    if(action==='park') item.dataset.parked='true';
@@ -776,10 +830,13 @@ function bindListControls(){
     saved=true;
     if(typeof result.item_state==='string') confirmed.state=result.item_state;
     const closed=confirmed.state==='Closed',unread=!closed && result.unread==='true';
-    notice.textContent=action==='remove' ? 'Removed' : action==='park' ? 'Parked' : action==='read' ? 'Marked read' :
+    const unparked=action==='unpark' && result.unpark_outcome==='cleared';
+    const message=action==='remove' ? 'Removed' : action==='park' ? 'Parked' :
+     action==='unpark' ? (unparkMessages[result.unpark_outcome] ?? 'Unpark result unavailable') : action==='read' ? 'Marked read' :
      action==='question' ? (unread ? 'Question saved; update remains unread' : 'Question saved') :
      action==='tell' && unread ? 'sent to morty; update remains unread' : 'sent to morty';
     if(usesWords && words.value===data.get('words')) words.value='';
+    if(unparked) until.value='';
     if(['true','false'].includes(result.parked)) confirmed.parked=result.parked;
     if(closed || ['true','false'].includes(result.unread)){
      confirmed.unread=unread;
@@ -788,15 +845,24 @@ function bindListControls(){
     syncConfirmed();
     const state=item.querySelector('.list-state');state.textContent=item.dataset.state;
     state.className='list-state '+({'Waiting for nate':'warning',Blocked:'error',Working:'accent',Delivered:'room',Done:'room'}[item.dataset.state] || 'muted');
-    const sortValues=JSON.parse(item.dataset.sortValues);sortValues[3]=item.dataset.state.toLowerCase();item.dataset.sortValues=JSON.stringify(sortValues);
+    const sortValues=JSON.parse(item.dataset.sortValues);sortValues[4]=item.dataset.state.toLowerCase();item.dataset.sortValues=JSON.stringify(sortValues);
     if(typeof result.parked_until==='string'){
      let note=item.querySelector('[data-parked-note]');
+     parkedDetail.hidden=!result.parked_until;
+     parkedDetail.textContent=result.parked_until ? 'Parked until '+result.parked_until : '';
      if(result.parked_until){
       if(!note){note=document.createElement('small');note.dataset.parkedNote='';state.parentElement.append(note);}
-      note.textContent='Parked until '+result.parked_until;
+      note.textContent=parkedDetail.textContent;
      }else note?.remove();
     }
-    tableView.applyAction();
+    if(action==='unpark'){
+     const label='Item #'+item.dataset.number;
+     tableView.showActionResult(item,submission,label,
+      {kind:'success',message,hiddenMessage:unparked ? label+' unparked.' : label+': '+message+'.'});
+    }else{
+     notice.textContent=message;
+     tableView.applyAction();
+    }
    }catch(error){
     const wasHidden=item.hidden;
     if(refused) syncConfirmed();
@@ -812,6 +878,21 @@ function bindListControls(){
     buttons=[...item.querySelectorAll('button')];
     delete form.dataset.sending;saving--;buttons.forEach(button=>button.disabled=false);syncTell();
     retainDraft();
+    if(focusUnpark && document.hasFocus() &&
+       (document.activeElement===document.body || document.activeElement===unpark)){
+     const target=!saved || !unpark.hidden ? unpark : item.hidden ? content.querySelector('[data-filter-row="show"] [aria-pressed="true"]')
+      : item.querySelector('.list-toggle');
+     if(target?.getClientRects().length){
+      target.focus({preventScroll:true});
+      if(saved && item.hidden){
+       const status=content.querySelector('[data-hidden-action-status]');
+       const top=target.getBoundingClientRect().top;
+       const inset=document.querySelector('[data-page-status]').offsetHeight+12;
+       if(top<inset || status.getBoundingClientRect().bottom>innerHeight)
+        scrollBy({top:Math.floor(top-inset),behavior:'instant'});
+      }
+     }
+    }
     if(refused && action==='park'){
      await tableView.settled();
      if(document.activeElement===document.body && parkToggle.getClientRects().length && !parkToggle.disabled){
