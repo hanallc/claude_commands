@@ -787,6 +787,53 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(self.command("park", "--id", item.id, "--until", "", "--source", "nate"), (0, "", ""))
         self.assertIs(the_list.load(MORTY.id, item.id).parked_until, the_list.NoTimestamp.UNSET)
 
+    def test_unpark_clears_active_parking_and_saves_one_notice(self) -> None:
+        item = self.add(changes={"state": the_list.ItemState.WORKING})
+        parked = the_list.park(MORTY.id, item.id, START + timedelta(days=1), source="nate")
+        words = "List page: nate unparked item 1."
+        notice = the_list.PageItemNotice("unpark-1", words, "unpark")
+        with patch.object(record_store, "write_text_atomic", wraps=atomic_file.write_text_atomic) as save:
+            saved = the_list.unpark(MORTY.id, item.id, source=the_list.PAGE_SOURCE, notice=notice)
+        save.assert_called_once()
+        self.assertEqual(saved, the_list.load(MORTY.id, item.id))
+        self.assertIs(saved.parked_until, the_list.NoTimestamp.UNSET)
+        self.assertEqual(saved.state, parked.state)
+        self.assertEqual(saved.log[-2].what, the_list.Unparked())
+        self.assertEqual(saved.log[-1].what, the_list.PageFeedback("unpark-1", words, action="unpark"))
+        self.assertEqual(len(saved.log), len(parked.log) + 2)
+        self.assertEqual(the_list.unpark(MORTY.id, item.id, source=the_list.PAGE_SOURCE, notice=notice), saved)
+
+        parked_again = the_list.park(MORTY.id, item.id, START + timedelta(days=2), source="nate")
+        self.assertEqual(the_list.unpark(MORTY.id, item.id, source=the_list.PAGE_SOURCE, notice=notice), parked_again)
+
+    def test_unpark_without_active_parking_changes_nothing(self) -> None:
+        item = self.add()
+        expired = the_list.park(MORTY.id, item.id, START, source="nate")
+        plain = self.add()
+        with patch.object(record_store, "write_text_atomic", wraps=atomic_file.write_text_atomic) as save:
+            for current in (expired, plain):
+                with self.subTest(item=current.id):
+                    self.assertEqual(the_list.unpark(MORTY.id, current.id, source="nate"), current)
+                    self.assertEqual(the_list.load(MORTY.id, current.id), current)
+        save.assert_not_called()
+
+    def test_unpark_replays_a_receipt_without_a_saved_reason(self) -> None:
+        item = self.add()
+        _ = the_list.park(MORTY.id, item.id, START, source="nate")
+        notice = the_list.PageItemNotice("unpark-1", "List page: nate unparked item 1.", "unpark")
+        _ = the_list.unpark(MORTY.id, item.id, source=the_list.PAGE_SOURCE, notice=notice)
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        text = path.read_text()
+        reason = ', "unpark_no_change": "expired"'
+        self.assertIn(reason, text)
+        _ = path.write_text(text.replace(reason, "", 1))
+
+        parked = the_list.park(MORTY.id, item.id, START + timedelta(days=1), source="nate")
+        replayed = the_list.unpark(MORTY.id, item.id, source=the_list.PAGE_SOURCE, notice=notice)
+        self.assertEqual(replayed, parked)
+        self.assertEqual(the_list.unpark_no_change_reason(replayed, notice.request),
+                         the_list.UnparkNoChangeReason.NO_ACTIVE_PARKING)
+
     def test_default_order_uses_waiting_unread_then_next_check(self) -> None:
         first = self.add("Later check", changes={"next_check": START + timedelta(hours=2)})
         second = self.add("Earlier check", changes={"next_check": START + timedelta(hours=1)})
