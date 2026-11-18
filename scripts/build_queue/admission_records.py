@@ -36,22 +36,37 @@ class UnregisteredTarget:
     """The target name has no registration."""
 
 
-def effective_target(name: str, settings: placement.ProviderSettings) -> target_config.Target | UnregisteredTarget:
+def effective_target(name: str, settings: placement.ProviderSettings, *,
+                     configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                     ) -> target_config.Target | UnregisteredTarget:
     """Select the registered target with the settings supplied by the request."""
-    for target in target_config.read_targets(selected=name, purpose=target_config.RegistryRead.PLACEMENT):
-        if target.name != name:
-            continue
-        if isinstance(target, target_config.SshTarget):
-            target_config.require_target_name(name)
-            if isinstance(settings, placement.ExplicitProviderSettings):
-                return replace(target, settings=settings.path)
-        return target
+    for target in target_config.read_targets(selected=name, purpose=target_config.RegistryRead.PLACEMENT,
+                                              configuration=configuration):
+        return ssh_target_settings(target, settings) if isinstance(target, target_config.SshTarget) else target
     return UnregisteredTarget()
+
+
+def ssh_target_settings(target: target_config.SshTarget, settings: placement.ProviderSettings) -> target_config.SshTarget:
+    """Apply the settings supplied by the request to an SSH target."""
+    if isinstance(settings, placement.ExplicitProviderSettings):
+        return replace(target, settings=settings.path)
+    return target
+
+
+@dataclass(frozen=True)
+class RefusalSettings:
+    """The digest identifies the settings read immediately before a prelaunch refusal."""
+    digest: str
+
+
+@dataclass(frozen=True)
+class NoRefusalSettings:
+    """The report supplies no settings digest."""
 
 
 @dataclass(frozen=True)
 class SavedPlacementAssignment:
-    """The saved assignment holds its permission, claim, retry decision, and final report."""
+    """The saved assignment holds its settings generation and dispatch state."""
     assignment: placement.PlacementAssignment
     state: placement.AssignmentState = placement.CurrentAssignment()
     permission: placement.LaunchPermission = placement.PermissionAvailable()
@@ -59,6 +74,9 @@ class SavedPlacementAssignment:
     holder: placement.ClaimHolderIdentity | placement.ClaimHolderUnconfirmed = placement.ClaimHolderUnconfirmed("not consumed")
     retry: placement.RetryDecision = placement.DoNotRetry("attempt is not settled")
     terminal_report: placement.TerminalAttemptReport | placement.NoTerminalReport = placement.NoTerminalReport()
+    assigned_settings_generation: placement.AssignedSettingsGeneration | placement.UnknownAssignedSettingsGeneration = (
+        placement.UnknownAssignedSettingsGeneration())
+    refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
@@ -906,7 +924,7 @@ class NatedevHeld:
     purpose: str
 
 HeadCause = (MemoryPressure | PressureUnavailable | ReadingUnavailable | StartSpacingWait | NeedsMemory | EstimateExpired
-             | BehindHead | GpuSlotWait | ReadyForAdmission)
+             | BehindHead | GpuSlotWait | ReadyForAdmission | placement.CargoFolderWait)
 
 
 @dataclass(frozen=True)
@@ -919,7 +937,7 @@ class HeadAdmissionStatus:
 
 WaitReason = (StartSpacingWait | PressureUnavailable | EstimateExpired | NeedsMemory | BehindHead | GpuSlotWait
               | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure | TokenWaitingWaiter
-              | NatedevHeld)
+              | NatedevHeld | placement.CargoFolderWait)
 
 
 def held_text(wait: NatedevHeld) -> str:
@@ -946,6 +964,8 @@ def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
         return "head: " + gpu_slot_text(cause)
     if isinstance(cause, ReadyForAdmission):
         return "head: ready for admission"
+    if isinstance(cause, placement.CargoFolderWait):
+        return "head: " + placement.CARGO_FOLDER_WAIT_REASON
     return f"head: needs {reason.need / GIB:.1f} GiB; room {max(0, reason.decision.room.room) / GIB:.1f} GiB"
 
 
@@ -1178,6 +1198,8 @@ class QueueInputs:
     blockers_for: frozenset[str] = frozenset()
     waiter_orders: dict[str, PriorityUnit | NormalOrder] = field(default_factory=dict, kw_only=True)
     slots: tuple[RunSlot, ...] = field(default=(), kw_only=True)
+    cargo_folders: dict[str, placement.CargoFolder] = field(default_factory=dict, kw_only=True)
+    occupied_cargo_folders: frozenset[placement.CargoFolder] = field(default=frozenset(), kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))
@@ -1578,6 +1600,8 @@ def reason_phrase(reason: WaitReason, waiting: Sequence[WaitingStep]) -> str:
             return "another step just started; the queue waits a few seconds between starts"
         case NeedsMemory():
             return "free memory"
+        case placement.CargoFolderWait():
+            return placement.CARGO_FOLDER_WAIT_REASON
         case GpuSlotWait():
             return "GPU test slot"
         case BehindHead():

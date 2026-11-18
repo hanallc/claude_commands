@@ -16,6 +16,8 @@ from collections.abc import Callable
 from unittest import mock
 from pathlib import Path
 from typing import TypedDict, cast, final, override
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
@@ -32,6 +34,23 @@ from scripts.production.cli_fixture import ImmutableGitSeed
 SCRIPT = Path(__file__).with_name("mac_run.sh")
 MAC_TEST = SCRIPT.parent.parent / "mac_test" / "mac_test.py"
 SHA = "1234567890abcdef1234567890abcdef12345678"
+MAC_RUN_CONFIG = {
+    "mac_run_host": "natemccoy@mac",
+    "mac_run_port": "15710",
+    "mac_run_log": "/tmp/mac_run_hana.log",
+    "mac_run_launch": "/tmp/mac_run_hana.command",
+    "mac_run_status": "/tmp/mac_run_hana.status",
+    "mac_run_example_seconds": "20",
+    "mac_run_examples": "hana_diegetic typography;hana_lagrange showcase fit_overlay",
+    "mac_run_deployment_target": "14.0",
+    "mac_run_status_grace_seconds": "60",
+    "mac_run_poll_seconds": "1",
+    "mac_run_log_lines": "20",
+    "mac_run_example_log_lines": "10",
+    "mac_run_bundle": "/tmp/mac_run.bundle",
+    "mac_run_example_log_prefix": "/tmp/mac_run_",
+    "mac_run_source": "~/rust/hana",
+}
 # owning_session.owning_session() reads these; a Mac block admits the session they name.
 SESSION_SELECTORS = frozenset({
     "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "UNIT_RUN_DIR", "UNIT_SESSION_DIR",
@@ -190,11 +209,14 @@ exit 0
 
 
 QUEUE_STUB = r'''
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
+
+from scripts.mac_test import mac_test
 
 args = sys.argv[1:]
 state = Path(os.environ["MAC_RUN_STUB_STATE"])
@@ -203,16 +225,20 @@ with (state / "queue-events").open("a") as stream:
     stream.write(json.dumps(args) + "\n")
 def option(name):
     return args[args.index(name) + 1]
-mac_test = Path.home() / ".claude/scripts/mac_test/mac_test.py"
+
+def run_mac_test(*arguments):
+    sys.argv = [mac_test.__file__, *arguments]
+    return mac_test.main()
+
 if args[0] == "place-step":
-    result = subprocess.run([sys.executable, str(mac_test), "claim", "--identity", "--pid", option("--pid"),
-        "--what", "mac run " + os.environ["MAC_RUN_SHA"][:9], "--worktree", option("--repo-root"), "--wait", "0"],
-        capture_output=True, text=True)
-    if result.returncode:
-        print(result.stdout, end="")
-        print(result.stderr, end="", file=sys.stderr)
-        raise SystemExit(result.returncode)
-    identity = json.loads(next(line.removeprefix("claim_identity=") for line in result.stdout.splitlines()
+    with redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors:
+        status = run_mac_test("claim", "--identity", "--pid", option("--pid"),
+            "--what", "mac run " + os.environ["MAC_RUN_SHA"][:9], "--worktree", option("--repo-root"), "--wait", "0")
+    if status:
+        print(output.getvalue(), end="")
+        print(errors.getvalue(), end="", file=sys.stderr)
+        raise SystemExit(status)
+    identity = json.loads(next(line.removeprefix("claim_identity=") for line in output.getvalue().splitlines()
         if line.startswith("claim_identity=")))
     receipt.write_text(json.dumps({"identity": identity, "pid": option("--pid")}))
     assignment = json.dumps({"episode": option("--episode"), "attempt": identity["attempt"]})
@@ -222,10 +248,10 @@ if args[0] == "place-step":
 elif receipt.exists():
     saved = json.loads(receipt.read_text())
     identity = saved["identity"]
-    result = subprocess.run([sys.executable, str(mac_test), "release", "--pid", saved["pid"],
-        "--claim-id", identity["claim_id"], "--episode", identity["episode"], "--attempt", identity["attempt"]])
+    status = run_mac_test("release", "--pid", saved["pid"],
+        "--claim-id", identity["claim_id"], "--episode", identity["episode"], "--attempt", identity["attempt"])
     receipt.unlink()
-    raise SystemExit(result.returncode)
+    raise SystemExit(status)
 '''
 
 
@@ -277,9 +303,8 @@ class MacRunTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
         self.home.mkdir()
-        (self.home / ".claude").symlink_to(
-            SCRIPT.parent.parent.parent, target_is_directory=True
-        )
+        _ = copy_helpers(self.home, *COPY_HELPERS, "scripts/hana_instances", "scripts/accounts",
+                         "scripts/whoami", "scripts/notify", "scripts/maintenance", "config")
         self.state_directory = self.root / "mac-test-state"
         self.stub_state = self.root / "stub-state"
         self.stub_state.mkdir()
@@ -290,14 +315,18 @@ class MacRunTests(unittest.TestCase):
         self.config_path = self.root / "config/mac_test.conf"
         self.temp_directory = self.root / "tmp"
         self.temp_directory.mkdir()
-        _ = write_config_fixture(self.config_path, "ci_repo=\nconnect_timeout_s=6\n")
-        # Keep both example argument forms without repeating all configured examples.
-        _ = write_config_fixture(self.root / "config/production.conf",
-                                 "mac_run_examples=hana_diegetic typography;hana_lagrange showcase fit_overlay\n")
+        _ = write_config_fixture(self.config_path, "ci_repo=\nconnect_timeout_s=6\n"
+                                 + "block_hours=4\nblock_max_hours=48\nclaim_poll_seconds=60\n")
+        self.write_production_config()
         queue = self.root / "fake-queue.py"
         _ = queue.write_text(QUEUE_STUB)
         _ = write_config_fixture(self.root / "config/mac_gate.conf",
-            "admission_client_command=" + shlex.join([sys.executable, str(queue)]) + "\n")
+            "admission_client_command=" + shlex.join([str(SCRIPT.parents[1] / "lib/py"), str(queue)])
+            + "\nterminate_grace_seconds=3\n")
+        copies_config = self.config_path.parent / "copies.conf"
+        _ = write_config_fixture(copies_config, f"remote_registry={self.root / 'mirrors'}\n"
+                                 + "owner.verify=verify\nwait_seconds=0.01\n"
+                                 + "git_timeout_seconds=10\nguard_timeout_seconds=10\n")
         stub = self.bin_directory / "command-stub"
         self.write_executable(stub, COMMAND_STUB)
         for name in ("ssh", "scp", "git", "systemd-run", "gh", "rsync", "curl"):
@@ -316,6 +345,7 @@ class MacRunTests(unittest.TestCase):
             "__ETC_ZSHENV_SOURCED": "1",
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "PYTHONPATH": str(startup),
+            "COPIES_CONFIG": str(copies_config),
             "MAC_TEST_STATE_DIR": str(self.state_directory),
             **config_environment(self.config_path.parent),
             "MAC_RUN_STUB_STATE": str(self.stub_state),
@@ -327,6 +357,12 @@ class MacRunTests(unittest.TestCase):
         }
 
         _ = self.environment.pop("CLAUDE_PYTHON", None)
+
+    def write_production_config(self, **overrides: str) -> None:
+        settings = MAC_RUN_CONFIG | overrides
+        _ = (self.config_path.parent / "production.conf").write_text(
+            "".join(f"{name}={value}\n" for name, value in settings.items())
+        )
 
     def write_executable(self, path: Path, source: str) -> None:
         _ = path.write_text("#!/usr/bin/env zsh\n" + source, encoding="utf-8")
@@ -503,6 +539,10 @@ class MacRunTests(unittest.TestCase):
         self.assert_claim_released()
 
     def test_smoke_uses_the_shared_refused_port_and_host(self) -> None:
+        self.write_production_config(
+            smoke_ready_seconds="300", smoke_exit_seconds="30", smoke_connect_seconds="1",
+            smoke_call_seconds="5", smoke_signal_grace_seconds="2", smoke_poll_seconds="1",
+        )
         _ = write_config_fixture(self.root / "config/hana_shot.conf",
                                  "refused_port=17461\nhost=192.0.2.46\n")
         script = SCRIPT.with_name("smoke_launch.sh")
@@ -604,7 +644,7 @@ class MacRunTests(unittest.TestCase):
 
     def test_bundle_with_a_space_has_the_same_sftp_and_ssh_filename(self) -> None:
         remote_bundle = "/tmp/Hana test.bundle"
-        _ = write_config_fixture(self.root / "config/production.conf", f"mac_run_bundle={remote_bundle}\n")
+        self.write_production_config(mac_run_bundle=remote_bundle)
         result = self.mac_run()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         events = self.events()
@@ -761,8 +801,7 @@ cleanup_mac_run
                                          {"source.txt": "content\n"}).checkout
         head = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
                               capture_output=True, text=True, check=True).stdout.strip()
-        production = self.root / "config/production.conf"
-        _ = write_config_fixture(production, production.read_text() + f"mac_run_source={source}\n")
+        self.write_production_config(mac_run_source=str(source))
         local = self.root / "local-copies"
         remote = self.root / "remote-copies"
         local.mkdir()

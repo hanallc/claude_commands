@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from scripts.build_queue import admission_protocol as wire, admission_records as records, placement
     from scripts.build_targets.target_config import SshTarget
     from scripts.lib import conf
+    from scripts.mac_test import claim_state
 
 def read_execution_transport(target: SshTarget) -> ExecutionTransport:
     """Select the configured transport before reading SSH settings."""
@@ -199,7 +200,6 @@ def claim_assigned(assignment: placement.PlacementAssignment, holder: placement.
 def release_assigned(assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity,
                      controller: box.HanaController) -> bool:
     """Release the exact target claim after durable execution and lifecycle settlement."""
-    from scripts.aws_target import hana_box as box
     from scripts.aws_target.hana_execution import execution_command_settled
     from scripts.build_queue import placement
     from scripts.build_targets import target_config
@@ -217,27 +217,39 @@ def release_assigned(assignment: placement.PlacementAssignment, holder: placemen
     paths = claim_state.state_paths(destination.target)
     with claim_state.locked(paths.lock):
         held = claim_state.read_claims(paths)
-        matching = [claim for claim in held if claim.scope == destination.scope
+        matching = tuple(claim for claim in held if claim.scope == destination.scope
             and claim.record['claim_id'] == execution and claim.record['episode'] == assignment.episode
             and claim.record['attempt'] == assignment.attempt and claim.record['pid'] == holder.pid
             and claim.record['proc_start'] == holder.start_time
-            and claim.record['submitting_session'] == claim_state.session_id(assignment.session)]
+            and claim.record['submitting_session'] == claim_state.session_id(assignment.session))
         if held and not matching and any(claim.record['claim_id'] == execution for claim in held):
             return False
-        snapshot = controller.inspect()
-        if not isinstance(snapshot, HanaLifecycleEvidence):
+        return _release_claims(controller, execution, matching)
+
+
+def _release_claims(controller: box.HanaController, execution: str, matching: tuple[claim_state.HeldClaim, ...],
+                    *, detached_only: bool = False) -> bool:
+    from scripts.aws_target import hana_box as box
+
+    snapshot = controller.inspect()
+    if not isinstance(snapshot, HanaLifecycleEvidence):
+        return False
+    current = any(claim.execution == execution for claim in snapshot.claims)
+    pending = isinstance(snapshot.operation, box.PendingOperation) and snapshot.operation.execution == execution
+    if detached_only:
+        if current or pending or snapshot.state in (box.Lifecycle.STARTING, box.Lifecycle.STOPPING):
             return False
-        if not matching and not any(claim.execution == execution for claim in snapshot.claims):
-            return not (isinstance(snapshot.operation, box.PendingOperation) and snapshot.operation.execution == execution)
-        if snapshot.claims:
-            if len(snapshot.claims) != 1 or snapshot.claims[0].execution != execution or not controller.release(execution):
-                return False
-        elif (snapshot.state in (box.Lifecycle.STARTING, box.Lifecycle.STOPPING)
-                or isinstance(snapshot.operation, box.PendingOperation)):
+    elif not matching and not current:
+        return not pending
+    elif snapshot.claims:
+        if len(snapshot.claims) != 1 or not current or not controller.release(execution):
             return False
-        for claim in matching:
-            claim.path.unlink(missing_ok=True)
-        return True
+    elif (snapshot.state in (box.Lifecycle.STARTING, box.Lifecycle.STOPPING)
+            or isinstance(snapshot.operation, box.PendingOperation)):
+        return False
+    for claim in matching:
+        claim.path.unlink(missing_ok=True)
+    return True
 
 
 def fixed_policy(transport: HanaControlTransport, repository: str, kind: str) -> HanaStepRefused | EnabledHanaRoute:
@@ -262,12 +274,13 @@ def configured_route(configuration: conf.ConfigRead, repository: str, kind: str)
 
 def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest) -> placement.HostEvidence:
     """Project existing lifecycle and execution records without provider mutations."""
+    from functools import partial
     import time
     from scripts.aws_target import hana_box as box, hana_spend, ledger
-    from scripts.aws_target.hana_execution import read_claim_execution
+    from scripts.aws_target.hana_execution import HanaSettled, read_claim_execution, settle_unpublished_claim
     from scripts.build_queue import admission_records, placement
     from scripts.build_targets import target_config
-    from scripts.lib import conf
+    from scripts.lib import conf, process_start
     from scripts.mac_test import claim_state, mac_test
     from scripts.build_hold.owning_session import NoOwningSession, OwningSession
     from scripts.buildlog import store
@@ -288,14 +301,35 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
     if isinstance(step, HanaStepRefused):
         return placement.FreshHostEvidence(key, now, '', placement.FixedExclusion('command'))
     controller = controller_for(transport, read_only=True)
-    snapshot = controller.inspect()
-    if isinstance(snapshot, HanaUnprovisioned):
-        return placement.FreshHostEvidence(key, now, '', placement.TemporaryExclusion('unprovisioned'))
-    if isinstance(snapshot, HanaLifecycleUnavailable):
-        return placement.HostEvidenceUnavailable(key, snapshot.observed_at, snapshot.reason)
     paths = claim_state.state_paths(target.name)
     with claim_state.locked(paths.lock):
-        held = claim_state.read_claims(paths)
+        snapshot = controller.inspect()
+        if isinstance(snapshot, HanaUnprovisioned):
+            return placement.FreshHostEvidence(key, now, '', placement.TemporaryExclusion('unprovisioned'))
+        if isinstance(snapshot, HanaLifecycleUnavailable):
+            return placement.HostEvidenceUnavailable(key, snapshot.observed_at, snapshot.reason)
+        held: list[claim_state.HeldClaim] = []
+        for claim in claim_state.read_claims(paths):
+            record = claim.record
+            execution = record['claim_id']
+            if ('remote_host' not in record or record['remote_host'] != transport.host
+                    or execution != placement.assigned_claim_id(record['episode'], record['attempt'])
+                    or snapshot.state in (box.Lifecycle.STARTING, box.Lifecycle.STOPPING)
+                    or any(row.execution == execution for row in snapshot.claims)
+                    or isinstance(snapshot.operation, box.PendingOperation) and snapshot.operation.execution == execution):
+                held.append(claim)
+                continue
+            owner = process_start.process_start(record['pid'])
+            if isinstance(owner, (process_start.Gone, process_start.Zombie)) or (
+                    isinstance(owner, process_start.Started) and owner.start != record['proc_start']):
+                reference = placement.ProviderClaimReference('ssh', target.name, claim.scope,
+                    execution, record['episode'], record['attempt'])
+                closed = settle_unpublished_claim(controller.directory, reference,
+                    release_claim=partial(_release_claims, controller, execution, (claim,), detached_only=True),
+                    reason='The Hana start owner exited')
+                if isinstance(closed, HanaSettled):
+                    continue
+            held.append(claim)
         block = mac_test.blocking_claim_block(paths, key.session)
     adopted: list[placement.AdoptedProviderClaim] = []
     cleanup: list[placement.RetainedCleanupClaim] = []
@@ -339,9 +373,8 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
     elif snapshot.state == box.Lifecycle.READY and not generation:
         eligibility = placement.TemporaryExclusion('starting')
     elif snapshot.state == box.Lifecycle.IDLE_STOPPED:
-        permit = hana_spend.read_permit_settings(configuration)
-        spending = hana_spend.HanaSpending(ledger.CostLedger(controller.directory), controller.settings_path, permit)
-        preview = spending.preview_start(int(now), int(now) + permit.permit_max_seconds)
+        preview = hana_spend.preview_placement_start(ledger.CostLedger(controller.directory),
+            controller.settings_path, transport.settings, controller.path)
         if isinstance(preview, hana_spend.PermitRefused):
             eligibility = placement.TemporaryExclusion(preview.reason)
     return placement.FreshHostEvidence(key, snapshot.observed_at, generation, eligibility,

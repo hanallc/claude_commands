@@ -36,7 +36,7 @@ from urllib.parse import quote
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.mac_test import claim_state
 if TYPE_CHECKING:
-    from scripts.build_queue import placement
+    from scripts.build_queue import admission_records as records, placement
 else:
     class _DeferredPlacement:
         """Load placement types when an offload operation uses them."""
@@ -62,7 +62,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.buildlog import treekey
 from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.buildlog import store
-from scripts.buildlog import sync as buildlog_sync
+from scripts.buildlog import transfer_bytes
 from scripts.build_targets import target_config
 from scripts.mac_test import eligibility
 from scripts.mac_test.eligibility import (
@@ -211,6 +211,12 @@ class LostMacRun:
     detail: str = 'runner sent no final status'
 
 
+def _no_refusal_settings() -> records.NoRefusalSettings:
+    from scripts.build_queue import admission_records
+
+    return admission_records.NoRefusalSettings()
+
+
 @dataclass(frozen=True)
 class DeclinedMacRun:
     """An attempt declined before a Mac test command began."""
@@ -218,6 +224,7 @@ class DeclinedMacRun:
     reason: NonBusyMacDeclineReason
     seconds: float
     detail: str = ""
+    refusal_settings: records.RefusalSettings | records.NoRefusalSettings = field(default_factory=_no_refusal_settings)
 
 
 @dataclass(frozen=True)
@@ -303,7 +310,7 @@ class AttemptEvidence:
     cleanup: Literal["confirmed", "unconfirmed"] = "unconfirmed"
     unresolved_count: int | UnresolvedLeftoverCount = UnresolvedLeftoverCount()
     evidence_at: float = 0.0
-    traffic: buildlog_sync.TransferLedger = field(default_factory=buildlog_sync.TransferLedger)
+    traffic: transfer_bytes.TransferLedger = field(default_factory=transfer_bytes.TransferLedger)
     execution: placement.ExecutionEvidence = field(default_factory=lambda: placement.ExecutionNotStarted())
     launch_authorized: bool = False
     provider: placement.ProviderClaimReference | placement.NoProviderClaim = field(default_factory=lambda: placement.NoProviderClaim())
@@ -1443,7 +1450,7 @@ def release_claim(controller: ProcessController, target: str = "") -> ClaimRelea
             controller.claim_identity = claim_state.NO_CLAIM_IDENTITY
         for line in result.stdout.splitlines():
             if line.startswith("copy_bytes="):
-                transfers = cast(list[buildlog_sync.TransferBytes], json.loads(line.removeprefix("copy_bytes=")))
+                transfers = cast(list[transfer_bytes.TransferBytes], json.loads(line.removeprefix("copy_bytes=")))
                 controller.attempt_evidence.traffic.transfers.extend(transfers)
 
     if isinstance(result, CommandOutput) and result.status == 0:
@@ -2302,8 +2309,8 @@ def read_leftovers(config: SshConnectionSettings, host: str, script: str,
         return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check timed out after {config.leftover_timeout_s:g} s"), "")
     except OSError:
         return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check could not start (time limit {config.leftover_timeout_s:g} s)"), "")
-    ledger = buildlog_sync.active_transfers.get()
-    if isinstance(ledger, buildlog_sync.TransferLedger):
+    ledger = transfer_bytes.active_transfers.get()
+    if isinstance(ledger, transfer_bytes.TransferLedger):
         ledger.observe("ssh_cleanup", arguments, result.stdout, result.stderr)
     if result.returncode != 0:
         if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
@@ -2650,7 +2657,9 @@ def claimed_run(
         if release_allowed and isinstance(controller.pending, SettledDispatchOperations):
             _ = release_claim(controller, request.target)
             if sync_after_release:
-                with buildlog_sync.measure_transfers(evidence.traffic):
+                from scripts.buildlog import sync as buildlog_sync
+
+                with transfer_bytes.measure_transfers(evidence.traffic):
                     buildlog_sync.sync_target(request.target)
 
 
@@ -2663,9 +2672,9 @@ def hana_source_key(request: OffloadRequest) -> placement.SourceIdentity:
 
 class MeasuredHanaObjects:
     """Measure application bytes without changing execution or spending authority."""
-    def __init__(self, objects: hana_execution.ExecutionObjects, traffic: buildlog_sync.TransferLedger):
+    def __init__(self, objects: hana_execution.ExecutionObjects, traffic: transfer_bytes.TransferLedger):
         self.objects: hana_execution.ExecutionObjects = objects
-        self.traffic: buildlog_sync.TransferLedger = traffic
+        self.traffic: transfer_bytes.TransferLedger = traffic
 
     def execution_access(self, key: hana_result.HanaAttemptKey) -> hana_execution.HanaExecutionAccess:
         return self.objects.execution_access(key)
@@ -2673,7 +2682,7 @@ class MeasuredHanaObjects:
     def publish_execution(self, envelope: hana_execution.HanaExecutionEnvelope) -> None:
         from scripts.aws_target.hana_execution import encode_envelope
 
-        row: buildlog_sync.TransferBytes = {'operation': 'hana-control-put', 'sent_bytes': len(encode_envelope(envelope)),
+        row: transfer_bytes.TransferBytes = {'operation': 'hana-control-put', 'sent_bytes': len(encode_envelope(envelope)),
             'received_bytes': 0, 'complete': False}
         self.traffic.transfers.append(row)
         self.objects.publish_execution(envelope)
@@ -2682,7 +2691,7 @@ class MeasuredHanaObjects:
     def observe_execution(self, key: hana_result.HanaAttemptKey) -> hana_execution.HanaCommandObservation:
         from scripts.aws_target.hana_execution import encode_observation
 
-        row: buildlog_sync.TransferBytes = {'operation': 'hana-observation-get', 'sent_bytes': 0,
+        row: transfer_bytes.TransferBytes = {'operation': 'hana-observation-get', 'sent_bytes': 0,
             'received_bytes': 0, 'complete': False}
         self.traffic.transfers.append(row)
         observation = self.objects.observe_execution(key)
@@ -2690,7 +2699,7 @@ class MeasuredHanaObjects:
         return observation
 
     def execution_result(self, key: hana_result.HanaAttemptKey) -> bytes:
-        row: buildlog_sync.TransferBytes = {'operation': 'hana-result-get', 'sent_bytes': 0,
+        row: transfer_bytes.TransferBytes = {'operation': 'hana-result-get', 'sent_bytes': 0,
             'received_bytes': 0, 'complete': False}
         self.traffic.transfers.append(row)
         content = self.objects.execution_result(key)
@@ -2700,12 +2709,12 @@ class MeasuredHanaObjects:
 
 class MeasuredHanaSource:
     """Measure the immutable source body offered to the scoped source store."""
-    def __init__(self, objects: hana_transport.SourceObjects, traffic: buildlog_sync.TransferLedger):
+    def __init__(self, objects: hana_transport.SourceObjects, traffic: transfer_bytes.TransferLedger):
         self.objects: hana_transport.SourceObjects = objects
-        self.traffic: buildlog_sync.TransferLedger = traffic
+        self.traffic: transfer_bytes.TransferLedger = traffic
 
     def put_if_absent(self, sha256: str, source: Path) -> None:
-        row: buildlog_sync.TransferBytes = {'operation': 'hana-source-put', 'sent_bytes': source.stat().st_size,
+        row: transfer_bytes.TransferBytes = {'operation': 'hana-source-put', 'sent_bytes': source.stat().st_size,
             'received_bytes': 0, 'complete': False}
         self.traffic.transfers.append(row)
         self.objects.put_if_absent(sha256, source)
@@ -2719,14 +2728,26 @@ def run_hana_offload(controller: ProcessController, transport: hana_placement.Ha
                      request: OffloadRequest, started: float) -> MacOffloadResult:
     """Select Hana policy before any SSH probe, process scan, or mirror transfer."""
     from scripts.aws_target import hana_placement as hana
+    from scripts.build_queue import admission_records, admission_wire
 
     repository = eligibility.repository_identity(request.repo_root)
     if not isinstance(repository, KnownRepository):
         return declined('repo', started)
     kind = request.kind or eligibility.verb_kind(request.verb)
-    policy = hana.fixed_policy(transport, repository.key, kind)
+    refusal_settings: records.RefusalSettings | records.NoRefusalSettings = admission_records.NoRefusalSettings()
+    if isinstance(request.placement, AssignedOffloadRequest):
+        try:
+            # A settings edit between reads permits one retry if the new settings stay current.
+            refusal_settings = admission_records.RefusalSettings(admission_wire.placement_configuration_digest(
+                request.placement.assignment.destination.target, placement.ExplicitProviderSettings(transport.settings),
+                targets=target_config.read_targets(selected=request.placement.assignment.destination.target,
+                                                   purpose=target_config.RegistryRead.PLACEMENT),
+                transport_for=target_config.read_execution_transport, read_bytes=Path.read_bytes))
+        except (OSError, ValueError):
+            pass
+    policy = hana.fixed_policy(transport, str(request.repo_root), kind)
     if isinstance(policy, hana.HanaStepRefused):
-        return DeclinedMacRun('off', elapsed_seconds(started), policy.reason)
+        return DeclinedMacRun('off', elapsed_seconds(started), policy.reason, refusal_settings)
     command = ('cargo', request.verb, *request.nextest_words)
     step = hana.classify_command(request.verb, kind, command)
     if (isinstance(step, hana.HanaStepRefused) or request.copy or isinstance(request.fetch, FetchFolder)
@@ -3167,7 +3188,7 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
     from scripts.buildlog import record
 
     class MeasuredSshAttempt(record.SshAttempt):
-        transfers: list[buildlog_sync.TransferBytes]
+        transfers: list[transfer_bytes.TransferBytes]
         sent_bytes: int
         received_bytes: int
 
@@ -3252,7 +3273,7 @@ def submit_direct_placement(request: OffloadRequest, since: float,
 
 def report_placement_result(controller: ProcessController, request: OffloadRequest, result: MacOffloadResult) -> None:
     """Report a settled adapter path without inventing a remote process identity."""
-    from scripts.build_queue import admission_client, admission_protocol as wire
+    from scripts.build_queue import admission_client, admission_protocol as wire, admission_records
 
     if not isinstance(request.placement, AssignedOffloadRequest):
         return
@@ -3267,7 +3288,9 @@ def report_placement_result(controller: ProcessController, request: OffloadReque
         return
     if isinstance(provider, placement.NoProviderClaim):
         reason = result.reason if isinstance(result, (DeclinedMacRun, BusyMacDecline)) else "claim unavailable"
-        _ = admission_client.claim_failure(wire.ClaimFailure(uuid.uuid4().hex, assigned, reason))
+        refusal_settings = result.refusal_settings if isinstance(result, DeclinedMacRun) else admission_records.NoRefusalSettings()
+        _ = admission_client.claim_failure(wire.ClaimFailure(uuid.uuid4().hex, assigned, reason,
+            refusal_settings=refusal_settings))
         return
     if not isinstance(controller.hana_settlement, NoHanaSettlement):
         settled = controller.hana_settlement
@@ -3350,7 +3373,7 @@ def main() -> int:
         if direct:
             request = submit_direct_placement(request, since, config)
         while True:
-            with interrupt_handlers(controller), buildlog_sync.measure_transfers(controller.attempt_evidence.traffic):
+            with interrupt_handlers(controller), transfer_bytes.measure_transfers(controller.attempt_evidence.traffic):
                 result = run_offload(controller, config, request, started)
             if (not direct or not isinstance(result, DeclinedMacRun) or result.reason != "source_changed"
                     or isinstance(controller.pending, PendingHanaOperation)):

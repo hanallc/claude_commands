@@ -97,7 +97,7 @@ class PaneRecordTests(unittest.TestCase):
             if member_kind == "worker":
                 row = staff.ensure_worker(session, "TEST-worker", parent.id)
             else:
-                row = staff.ensure(cast(staff.Kind, member_kind), name="TEST-" + member_kind,
+                row = staff.ensure(cast(staff.Kind, member_kind), name=f"TEST-{member_kind}-director",
                     parent=staff.ReportsTo(parent.id), runtime_id=session)
             self.assertIsInstance(row.home, staff.HomeUnknown)
             row = pane_launch.staff_admitted(row)

@@ -244,17 +244,21 @@ def _read_target(config: conf.ConfigRead, name: str, purpose: RegistryRead) -> T
 
 
 def read_targets(path: Path | None = None, *, selected: str = "",
-                 purpose: RegistryRead = RegistryRead.REQUIRE_SETTINGS_FILES) -> tuple[Target, ...]:
+                 purpose: RegistryRead = RegistryRead.REQUIRE_SETTINGS_FILES,
+                 configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                 ) -> tuple[Target, ...]:
     registry = conf.path("build_targets") if path is None else path
     current = COMMAND_CONFIGURATION.get()
     complete = purpose is RegistryRead.REQUIRE_SETTINGS_FILES and not selected
-    if isinstance(current, CommandConfiguration) and registry in current.targets:
+    use_cache = isinstance(configuration, conf.UseConfiguredValue)
+    if use_cache and isinstance(current, CommandConfiguration) and registry in current.targets:
         registered = current.targets[registry]
         if selected:
             return tuple(target for target in registered if target.name == selected)
         if complete:
             return registered
-    configuration = conf.read(registry)
+    if isinstance(configuration, conf.UseConfiguredValue):
+        configuration = conf.read(registry)
     names = _registry_value(configuration, "targets", _target_names, purpose)
     targets: list[Target] = []
     for name in names:
@@ -266,7 +270,7 @@ def read_targets(path: Path | None = None, *, selected: str = "",
             if selected or purpose is RegistryRead.REQUIRE_SETTINGS_FILES:
                 raise
     result = tuple(targets)
-    if complete and isinstance(current, CommandConfiguration):
+    if complete and use_cache and isinstance(current, CommandConfiguration):
         current.targets[registry] = result
     return result
 

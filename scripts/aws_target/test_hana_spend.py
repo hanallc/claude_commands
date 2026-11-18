@@ -3,9 +3,9 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
 import json
-from pathlib import Path
 import subprocess
 from typing import cast, override
 from unittest import mock
@@ -16,14 +16,10 @@ from scripts.aws_target.ledger_test_support import CostFixture, git_only, instal
 from scripts.lib import conf
 
 
-REPOSITORY = Path(__file__).resolve().parents[2]
-
-
 class HanaSpendTests(CostFixture):
-    book: ledger.CostLedger = ledger.CostLedger(Path())
-    workload: hana_spend.PermitSettings = hana_spend.PermitSettings(
-        False, 'fixture', 'fixture', Decimal(1), 1, 1, Decimal(1), Decimal(1), 1, 1)
-    controller: hana_spend.HanaSpending = hana_spend.HanaSpending(book, Path(), workload)
+    book: ledger.CostLedger  # pyright: ignore[reportUninitializedInstanceVariable]
+    controller: hana_spend.HanaSpending  # pyright: ignore[reportUninitializedInstanceVariable]
+    workload: hana_spend.PermitSettings  # pyright: ignore[reportUninitializedInstanceVariable]
     start: int = instant('2026-01-15T00:00:00+00:00')
 
     @override
@@ -72,6 +68,35 @@ class HanaSpendTests(CostFixture):
         self.assertIsInstance(self.book.reserve_gate(self.settings, gate), ledger.GateReserved)
         self.assertEqual(self.issue(self.start), hana_spend.PermitRefused('daily_limit'))
         self.assertEqual(self.book.read_snapshot().hana_compute, [])
+        self.assertEqual(config.read_settings(self.settings).daily_limit_usd, account.daily_limit_usd)
+
+    def test_check_start_refuses_after_a_gate_launch_appears_during_pricing(self) -> None:
+        self.costs({'daily_limit_usd': '5', 'limit_reserve_usd': '0'})
+        day = self.start - 86400
+        bill = ledger.ChargeRead(datetime.fromtimestamp(day, UTC).date().isoformat(), self.start,
+            day, self.start, Decimal(10), Decimal(0), Decimal(0),
+            (ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal(10), Decimal(1), 'Hrs'),))
+        charges = self.state / 'charges'
+        charges.mkdir()
+        _ = (charges / f'{bill.day}.json').write_text(json.dumps(ledger.charge_record(bill)))
+        gate = ledger.GateReservation('private-gate', self.start, self.start + 3600,
+            Decimal(1), Decimal(0), instance_type='m7a.4xlarge', region='us-east-2')
+        self.assertIsInstance(self.book.reserve_gate(self.settings, gate), ledger.GateReserved)
+        generation = self.issued(self.start).exposure.generation
+        self.assertIsInstance(self.controller.check_start(self.start, generation), hana_spend.StartReserved)
+        history = self.state / 'cloud-gate-launches.jsonl'
+        launches = self.book.launches
+
+        def read_launches() -> tuple[dict[str, object], ...]:
+            rows = launches()
+            if not rows:
+                _ = history.write_text(json.dumps({'attempt': gate.attempt, 'time': self.start,
+                    'instance_type': 'm7a.8xlarge', 'result': 'launched'}) + '\n')
+            return rows
+
+        with mock.patch.object(self.book, 'launches', side_effect=read_launches) as pricing_reads:
+            self.assertEqual(self.controller.check_start(self.start, generation), hana_spend.PermitRefused('daily_limit'))
+        self.assertEqual(pricing_reads.call_count, 2)
 
     def test_renewal_extends_exposure_then_refusal_preserves_the_old_deadline(self) -> None:
         first = self.issued(self.start)

@@ -28,19 +28,19 @@ if TYPE_CHECKING:
     from decimal import Decimal
 
 
-_warning_sink: ContextVar[Callable[[str], None] | None] = ContextVar("configuration_warning_sink", default=None)
+_warning_sink: ContextVar[Callable[[str, bool], None] | None] = ContextVar("configuration_warning_sink", default=None)
 
 
 def _print_warning(message: str) -> None:
     print(message, file=sys.stderr)
 
 
-def _warning(message: str) -> None:
+def _warning(message: str, *, report: bool = True) -> None:
     sink = _warning_sink.get()
-    if sink is None:
+    if sink is not None:
+        sink(message, report)
+    elif report:
         _print_warning(message)
-    else:
-        sink(message)
 
 
 @contextmanager
@@ -48,9 +48,9 @@ def diagnostics(*, report: bool = True) -> Generator[list[str]]:
     """Collect reader warnings for a reply, with optional local output."""
     messages: list[str] = []
 
-    def collect(message: str) -> None:
+    def collect(message: str, new_warning: bool) -> None:
         messages.append(message)
-        if report:
+        if report and new_warning:
             _print_warning(message)
 
     token = _warning_sink.set(collect)
@@ -91,13 +91,13 @@ def report_key_changes() -> Generator[None]:
 
 def _key_warning(source: Path, key: str, reason: str, bad: str,
                  stamp: ConfigurationStamp | UnstampedConfiguration) -> None:
+    report = True
     if _report_changes.get():
         identity = (source, key, bad, stamp)
         with _bad_edits_lock:
-            if identity in _reported_bad_edits:
-                return
+            report = identity not in _reported_bad_edits
             _reported_bad_edits.add(identity)
-    _warning(f"warning: {reason}")
+    _warning(f"warning: {reason}", report=report)
 
 
 class Unusable(ValueError):
@@ -162,7 +162,8 @@ class ConfigRead:
     stamp: ConfigurationStamp | UnstampedConfiguration = UnstampedConfiguration.UNSTAMPED
 
     def _resolve(self, key: str, convert: Callable[[str], Result], *, warn: bool,
-                 default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False
+                 default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
+                 recover_invalid: bool = True
                  ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
         bad = "<missing>"
 
@@ -188,6 +189,8 @@ class ConfigRead:
         except (OSError, UnicodeError, ValueError, ArithmeticError) as error:
             repository_allowed = repository_allowed or isinstance(error, _MissingKey)
             reason = f"{self.source}: {key}={bad!r}: {error}"
+        if not recover_invalid and not repository_allowed:
+            return UnavailableValue(reason)
         if repository_allowed and self.repository_allowed and isinstance(self.file, str):
             repository = _repository_path(self.file)
             if repository != self.source:
@@ -211,15 +214,22 @@ class ConfigRead:
         return self._resolve(key, convert, warn=False)
 
     def value(self, key: str, convert: Callable[[str], Result], *,
-              default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False) -> Result:
+              default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
+              recover_invalid: bool = True) -> Result:
         """Read one key with a domain conversion and an optional default."""
-        result = self._resolve(key, convert, warn=True, default=default, allow_blank=allow_blank)
+        result = self._resolve(key, convert, warn=True, default=default, allow_blank=allow_blank,
+                               recover_invalid=recover_invalid)
         if isinstance(result, UnavailableValue):
-            raise Unusable(f"{result.reason}; no usable committed value")
+            raise Unusable(f"{result.reason}; no usable committed value" if recover_invalid else result.reason)
         return result.value
 
-    def text(self, key: str) -> str:
-        return self.value(key, str)
+    def text(self, key: str, *, recover_invalid: bool = True) -> str:
+        """Read text and allow defaults for missing values."""
+        return self.value(key, str, recover_invalid=recover_invalid)
+
+    def effective_key(self, key: str) -> str:
+        """Return the host override key when the live file has one."""
+        return _effective_key(self.settings, key) if isinstance(self.settings, dict) else key
 
     def number(self, key: str) -> float:
         return self.value(key, _number)
@@ -230,15 +240,23 @@ class ConfigRead:
     def words(self, key: str) -> tuple[str, ...]:
         return self.value(key, lambda value: tuple(value.split()))
 
-    def values(self) -> dict[str, str]:
-        """Return the map, including empty entries that have no limits."""
-        keys = self.settings
-        if isinstance(keys, _UnreadableFile):
-            fault = keys
-            keys = self._recover_file(fault)
+    def values(self, *keys: str, host_only_prefix: str = "") -> dict[str, str]:
+        """Return all values when no keys are given. Add base keys for host overrides that match the prefix."""
+        settings = self.settings
+        if isinstance(settings, _UnreadableFile):
+            settings = self._recover_file(settings)
+        selected = dict.fromkeys(keys or settings)
+        if host_only_prefix:
+            suffix = f".{_local_host_name()}"
+            for key in settings:
+                if key.startswith(host_only_prefix) and key.endswith(suffix):
+                    selected[key.removesuffix(suffix)] = None
         result: dict[str, str] = {}
-        for key in keys:
-            setting = _setting(keys, key)
+        for key in selected:
+            try:
+                setting = _setting(settings, key)
+            except _MissingKey:
+                continue
             if not setting.value and not setting.limit.startswith(("# whole:", "# range:", "# one of:")):
                 result[key] = setting.value
                 continue
@@ -262,19 +280,42 @@ class ConfigRead:
         raise Unusable(f"{self.source}: keys: {fault.reason}; no usable committed file")
 
 
-def read(file: str | Path) -> ConfigRead:
+@dataclass(frozen=True)
+class ConfigurationBytes:
+    """The file bytes and the stamp of the open file."""
+
+    data: bytes
+    stamp: ConfigurationStamp
+
+
+def _file_stamp(descriptor: int) -> ConfigurationStamp:
+    info = os.fstat(descriptor)
+    return ConfigurationStamp(info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def read_bytes(source: Path) -> ConfigurationBytes:
+    """Read bytes for a pass that also needs a configuration digest."""
+    with source.open("rb") as stream:
+        data = stream.read()
+        return ConfigurationBytes(data, _file_stamp(stream.fileno()))
+
+
+def read(file: str | Path, *, load: Callable[[Path], ConfigurationBytes] | None = None) -> ConfigRead:
     """Read and parse the live file once; resolve faults when a setting is used."""
     source = path(file)
     repository_allowed = "CONF_DIR" not in os.environ
     stamp: ConfigurationStamp | UnstampedConfiguration = UnstampedConfiguration.UNSTAMPED
     try:
-        if _report_changes.get():
+        if load is not None:
+            snapshot = load(source)
+            stamp = snapshot.stamp
+            contents = snapshot.data.decode("utf-8")
+        elif _report_changes.get():
             with source.open(encoding="utf-8") as stream:
                 try:
                     contents = stream.read()
                 finally:
-                    info = os.fstat(stream.fileno())
-                    stamp = ConfigurationStamp(info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+                    stamp = _file_stamp(stream.fileno())
         else:
             contents = source.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
@@ -328,12 +369,20 @@ def settings(source: str) -> dict[str, Setting]:
     return _parse(source)
 
 
+def _local_host_name() -> str:
+    return socket.gethostname().partition(".")[0]
+
+
+def _effective_key(settings: dict[str, Setting], key: str) -> str:
+    candidate = f"{key}.{_local_host_name()}"
+    return candidate if candidate in settings else key
+
+
 def _setting(settings: dict[str, Setting], key: str) -> Setting:
-    host = socket.gethostname().split(".", 1)[0]
-    for candidate in (f"{key}.{host}", key):
-        if candidate in settings:
-            return settings[candidate]
-    raise _MissingKey("key is missing")
+    try:
+        return settings[_effective_key(settings, key)]
+    except KeyError:
+        raise _MissingKey("key is missing") from None
 
 
 def _limits(setting: Setting) -> None:
@@ -439,6 +488,50 @@ def effective_line(file: str | Path, key: str) -> tuple[int, str]:
     return setting.line, setting.value
 
 
+def known_host_names() -> frozenset[str]:
+    """Return the local and configured short host names in lowercase."""
+    source = path("machines")
+    try:
+        machines = _parse(source.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        machines = _parse(_repository_path("machines").read_text(encoding="utf-8"))
+    aliases = machines.get("aliases")
+    hosts = {_local_host_name().casefold()}
+    if aliases is not None:
+        for alias in aliases.value.split():
+            hosts.add(alias.casefold())
+            names = machines.get(f"{alias}.hosts")
+            if names is not None:
+                hosts.update(name.partition(".")[0].casefold() for name in names.value.split())
+    return frozenset(hosts)
+
+
+def host_suffix(key: str, names: frozenset[str]) -> str:
+    """Return the known host suffix or an empty string."""
+    base, _, suffix = key.rpartition(".")
+    return suffix if base and suffix.casefold() in names else ""
+
+
+def full_model_color_key(file: str | Path, key: str) -> bool:
+    """Check for a full model ID in a statusline color key."""
+    is_statusline = file.name == "statusline.conf" if isinstance(file, Path) else file == "statusline"
+    return is_statusline and re.fullmatch(
+        r"model\.(?:gpt-[0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*|claude-[a-z][a-z0-9-]*-[0-9][a-z0-9-]*)", key,
+    ) is not None
+
+
+def host_override(file: str | Path, settings: dict[str, Setting], key: str) -> str | None:
+    """Find an override. Require a known host suffix for full model color keys."""
+    prefix = f"{key}."
+    candidates = [candidate for candidate in settings if candidate.startswith(prefix)]
+    if not candidates:
+        return None
+    if not full_model_color_key(file, key):
+        return candidates[0]
+    names = known_host_names()
+    return next((candidate for candidate in candidates if host_suffix(candidate, names) == candidate[len(prefix):]), None)
+
+
 def editable_line(file: str | Path, key: str) -> tuple[int, str]:
     """Return an exact stored key's line and value when no host override exists."""
     source = path(file)
@@ -447,12 +540,11 @@ def editable_line(file: str | Path, key: str) -> tuple[int, str]:
         if key not in settings:
             raise ValueError("exact stored key is missing")
         setting = settings[key]
-        for candidate, override in settings.items():
-            if candidate.startswith(f"{key}."):
-                raise ValueError(
-                    f"{key} at line {setting.line + 1} has host override "
-                    + f"{candidate} at line {override.line + 1}"
-                )
+        if (candidate := host_override(source, settings, key)) is not None:
+            raise ValueError(
+                f"{key} at line {setting.line + 1} has host override "
+                + f"{candidate} at line {settings[candidate].line + 1}"
+            )
     except (OSError, UnicodeError, ValueError) as error:
         raise Unusable(f"{source}: {key}: {error}") from error
     return setting.line, setting.value

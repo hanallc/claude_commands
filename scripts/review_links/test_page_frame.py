@@ -314,11 +314,21 @@ window.fetch=async(url,options={})=>{
  const part=name=>line.querySelector('[data-status-'+name+']');
  const age=()=>part('age').textContent;
  const state=()=>line.dataset.state;
+ const measure=line.querySelector('#measure-now');
+ const checkMeasure=()=>{
+  if(document.title!=='Disks') return;
+  const bar=line.getBoundingClientRect(),button=measure?.getBoundingClientRect();
+  check(measure===line.querySelector('#measure-now') && measure?.checkVisibility() &&
+   measure.innerText.trim()==='Measure now' && button && Math.abs(button.right-bar.right)<1 &&
+   button.top>=bar.top && button.bottom<=bar.bottom,
+   'the '+state()+' line shows the same labeled Measure now button at its right edge');
+ };
  const shown=()=>dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  const requestTimer=()=>[...intervals.values()].find(timer=>timer.ms===expectedPeriod);
  const clock=()=>[...intervals.values()].find(timer=>timer.ms===1000);
  const read=async()=>{if(expectedPeriod){perf+=expectedPeriod+1;requestTimer().run();}else shown();await flush();};
  try{
+  checkMeasure();
   if(document.readyState!=='complete') await new Promise(resolve=>addEventListener('load',resolve,{once:true}));
   await flush();
   if(mode==='retained' || measureFails){
@@ -328,6 +338,7 @@ window.fetch=async(url,options={})=>{
   }
   shown();await flush();
   check(reads>0 && state()==='Live','the real loader completes a good read');
+  checkMeasure();
   check(part('render').textContent==='render 0.42 s','the real loader supplies render time');
   check(!part('trip').hidden && /^round trip [\d.]+ s$/.test(part('trip').textContent),
    'the Live line shows round trip before render time');
@@ -362,10 +373,12 @@ window.fetch=async(url,options={})=>{
   const count=reads;
   wall+=(JSON.parse(line.dataset.statusOptions).ageLimit+65)*1000;clock().run();
   check(state()==='Late' && age().includes('min ago'),'the shown data becomes Late');
+  checkMeasure();
   check(reads===count,'the age clock does not read');
   mode='failed';await read();
   check(state()==='Failed' && !part('age').hidden && part('reason').textContent==='HTTP 502',
    'a real failed read retains the shown data time');
+  checkMeasure();
   mode='good';await read();
   check(state()==='Live','a later real read recovers');
   if(document.querySelector('[data-review-content]')){
@@ -435,6 +448,7 @@ window.fetch=async(url,options={})=>{
   }
   statusVisibility='hidden';document.dispatchEvent(new Event('visibilitychange'));await flush();
   check(state()==='Paused','a hidden page pauses');
+  checkMeasure();
  }catch(error){failures.push(String(error));}
  failures.push(...errors);
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
