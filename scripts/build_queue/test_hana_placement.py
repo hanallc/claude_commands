@@ -89,7 +89,7 @@ class HanaQueueTests(unittest.TestCase):
                 request = replace(request, prerequisite=placement.TokenNotRequired(),
                     constraints=replace(request.constraints, candidates=candidates))
                 _ = (fixture.root / 'build_targets.conf').write_text(
-                    f'targets={target.name} mac natedev\nkind.{target.name}=ssh\nplatform.{target.name}=linux\n'
+                    f'targets={target.name},mac,natedev\nkind.{target.name}=ssh\nplatform.{target.name}=linux\n'
                     + f'settings.{target.name}={target.settings.name}\n'
                     + 'kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n'
                     + 'kind.natedev=local\nplatform.natedev=linux\n')
