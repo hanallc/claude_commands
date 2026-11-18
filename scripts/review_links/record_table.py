@@ -817,6 +817,7 @@ return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDepar
  actionNotice(item){return actionNotices.get(item.dataset.key)?.message ?? '';},
  applyAction(){apply(false,{animate:true});},
  async rowSettled(item){while(rowMotion.has(item)) await rowMotion.get(item).finished;},
+ get hasActiveRowAnimations(){return rowMotion.size>0;},
  settled(){return Promise.all([...rowMotion.values()].map(motion=>motion.finished));},
  replace(draw=true){
   const previous=words(),previousQuery=query;
