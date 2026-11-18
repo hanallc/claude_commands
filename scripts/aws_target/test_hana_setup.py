@@ -236,8 +236,9 @@ class HanaSetupTests(CostFixture):
             'waiting for the Hana box to stop: stopping, 10 s of 600 s',
             'waiting for the Hana box to stop: stopped, 20 s of 600 s',
         ])
-        self.assertEqual(fake.calls[fake.calls.index(('ec2', 'stop-instances', 10)) + 1:],
-                         [('ec2', 'describe-instances', 10)] * 3)
+        stop = fake.calls.index(('ec2', 'stop-instances', 10))
+        probe = fake.calls.index(('configure', 'export-credentials', 10))
+        self.assertEqual(fake.calls[stop + 1:probe], [('ec2', 'describe-instances', 10)] * 3)
         self.assertLess(calls.index('describe-spot-price-history'), calls.index('create-change-set'))
         self.assertLess(calls.index('create-change-set'), calls.index('execute-change-set'))
         first_launch = calls.index('run-instances')
@@ -304,7 +305,9 @@ class HanaSetupTests(CostFixture):
             saved = remote.read_record(saved_path)
             self.assertIs(saved['stop_pending'], True)
             self.assertEqual(saved['instance'], IDENTITY.instance)
-            self.assertIn('stop-instances', calls)
+            stop = fake.calls.index(('ec2', 'stop-instances', 10))
+            self.assertEqual(fake.calls[stop + 1:], [('ec2', 'describe-instances', 10)] * 3)
+            self.assertRegex(output.getvalue().splitlines()[-1], r'^hana-setup: confirming the idle stop failed after ')
             fake.state = 'stopped'
             calls.clear()
             self.assertTrue(subject.hana_setup(approve_resources=True))
@@ -322,7 +325,8 @@ class HanaSetupTests(CostFixture):
         self.assertNotIn('stop-instances', calls)
         self.assertEqual(self.stop_progress(output), ['waiting for the Hana box to stop: stopped, 0 s of 600 s'])
         attachment = calls.index('attach-volume')
-        self.assertEqual(calls[attachment + 1:], ['wait', 'describe-instances', 'describe-instances'])
+        probe = calls.index('export-credentials')
+        self.assertEqual(calls[attachment + 1:probe], ['wait', 'describe-instances', 'describe-instances'])
 
     def test_setup_attaches_when_the_instance_stops_during_volume_creation(self) -> None:
         fake = FakeAws(self.clock, state='pending')
@@ -361,7 +365,7 @@ class HanaSetupTests(CostFixture):
             saved = remote.read_record(saved_path)
             if len(attempts) == 1:
                 self.assertEqual(saved['spot_max_price'], '0.09')
-                raise aws_cli.AwsUnavailable('An error occurred (SpotMaxPriceTooLow) when calling RunInstances')
+                raise aws_cli.AwsUnavailable('An error occurred (SpotMaxPriceTooLow) when calling the RunInstances operation')
             self.assertEqual(saved['spot_max_price'], '0.13')
             self.assertEqual(saved['launch_template'], 'LaunchTemplateId=fixture-template,Version=4')
             compute = ledger.CostLedger(self.state).read_snapshot().hana_compute

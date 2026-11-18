@@ -282,12 +282,31 @@ Each check reports the state and elapsed time and uses the `aws_timeout_s` comma
 Setup starts each check within `stop_wait_timeout_s` (600 seconds by default).
 A check can finish after the wait limit.
 If the wait expires, run `deploy.py hana-setup --approve-resources` again to resume the stop.
-Setup keeps the pending stop and accepts the saved preparation after its age limit if the inputs still match.
+Setup makes no further AWS calls after the stop wait fails.
+Setup keeps the pending stop and accepts expired preparation if the inputs still match.
 It registers the deployment after it confirms the stopped state.
+
+Setup then probes the scaler path with the same credential file and profile as `aws-target.service`.
+It checks credential export and reads the instance, Spot request, and user data.
+It uses EC2 `--dry-run` for the user data change, start, and stop commands.
+AWS confirms permission for these commands with `DryRunOperation`. [AWS CLI dry-run reference](https://docs.aws.amazon.com/cli/latest/reference/ec2/modify-instance-attribute.html#options)
+The user data dry run uses the value from the user data read, or an empty value if the read fails.
+Setup writes a fixed probe object under `control/<deployment>/setup-probe.json` and compares the bytes it reads back.
+It reports each operation as `hana-setup probe: <operation>: pass` or `hana-setup probe: <operation>: fail`.
+When AWS supplies an error code, the failure line includes it in parentheses.
+For a policy-only change, setup probes before and after the update.
+Setup requires an idle-stopped lifecycle with no claims or pending start for this change.
+It checks the saved stack outputs and confirms the instance is stopped and the disk is attached.
+Setup verifies the live and effective change set parameters against the approved stack parameters.
+The second run starts after CloudFormation confirms the update.
+Setup continues the update if the first probe run fails.
+Setup returns exit status 1 if any operation in the last probe run fails.
 Setup adds no route, target, or slot capacity.
 Setup uses a change set to change the stack.
-If the old stack owns the instance or data disk, setup tells the user to run approved Hana teardown first.
-When a create or update fails, setup reads failed stack events from the current change before cleanup.
+Setup refuses a stack that owns the instance or data disk. Run approved Hana teardown first.
+Setup refuses a change set that replaces or removes an instance, volume, or attachment.
+When a policy update fails, setup prints the failed step and the update error.
+When an ordinary stack change fails, setup reads failed stack events from the current change before cleanup.
 The error gives the name, type, status, and AWS reason for each failed resource.
 If setup cannot read the events, it reports that they are unavailable and continues cleanup.
 Setup ends the Spot boxes other than the box in `hana/setup.json`.
@@ -297,7 +316,7 @@ It deletes these resources before it closes the spending reservation and removes
 If the rollback or cleanup is incomplete, setup keeps the record and reservation for `down`.
 For an incomplete setup, `down` also checks deleted stack history for retained resources.
 If that history has no match, `down` reports it and continues with any disk or bucket in the saved record.
-After a failed update, setup deletes resources retained during rollback and keeps the stack and record.
+After a failed ordinary setup update, setup deletes resources retained during rollback and keeps the stack and record.
 Run `prepare --workload hana` again before retrying with changed inputs.
 The launch template sets `DeleteOnTermination` on the root disk. AWS deletes each root disk with its box.
 

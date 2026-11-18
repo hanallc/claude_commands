@@ -9,8 +9,10 @@ TOKENS_PLACEHOLDER = "/*__CONSOLE_TOKENS__*/"
 PLACEHOLDER = "/*__CONSOLE_THEME__*/"
 
 _LIGHT = ("--bg:#f6f5f2;--card:#fcfcfb;--line:#dcdad4;--hover:#efede8;--ink:#0b0b0b;--ink-2:#52514e;--ink-3:#66645f;"
+          "--filter-selected-bg:#19467f;--filter-selected-ink:#fcfcfb;"
           "--accent:#2a78d6;--room:#1baf7a;--error:#c22d2c;--warning:#8a5a00;--edge:rgb(0 0 0 / 0.18)")
 _DARK = ("--bg:#121211;--card:#1a1a19;--line:#34332f;--hover:#242422;--ink:#f0efec;--ink-2:#c3c2b7;--ink-3:#9a988f;"
+         "--filter-selected-bg:#24599a;--filter-selected-ink:#f0efec;"
          "--accent:#3987e5;--room:#199e70;--error:#ef7372;--warning:#e3a83f;--edge:rgb(0 0 0 / 0.6)")
 
 TOKENS = (f":root{{color-scheme:light;{_LIGHT}}}\n"
