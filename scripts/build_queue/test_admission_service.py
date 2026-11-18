@@ -3478,6 +3478,7 @@ class CloudAdmissionTests(unittest.TestCase):
     def test_tenth_cloud_gate_waits_and_starts_after_a_release(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
+            fixture.configure(cloud_gate_slots=9)
             requests = [self.cloud_request(fixture) for _ in range(11)]
             grants = [only_admitted(fixture.server.handle_request(request)) for request in requests[:9]]
             for request in requests[9:]:
