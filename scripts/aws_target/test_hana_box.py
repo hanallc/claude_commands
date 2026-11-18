@@ -58,6 +58,8 @@ mount_timeout_seconds=15
 # whole: 1..
 aws_timeout_s=10
 # whole: 1..
+result_transfer_timeout_s=83
+# whole: 1..
 control_url_seconds=3600
 """)
 

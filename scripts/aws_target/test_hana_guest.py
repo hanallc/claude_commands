@@ -209,7 +209,7 @@ class HanaGuestTests(unittest.TestCase):
         self.assertIn('ConditionPathIsMountPoint=' + str(guest.DATA), files['hana-tools.service'].content)
         self.assertEqual(files['safety.py'].mode, 0o600)
         self.assertEqual(files['safety.json'].mode, 0o600)
-        receiver = hana_receiver.render_files(hana_receiver.ReceiverSettings(10, 1))[-1].content
+        receiver = hana_receiver.render_files(hana_receiver.ReceiverSettings(10, 1, 83))[-1].content
         for unit in (guard, files['hana-watchdog.service'].content, receiver):
             self.assertIn('Environment=PATH=' + guest.SYSTEM_BIN + '\n', unit)
 
