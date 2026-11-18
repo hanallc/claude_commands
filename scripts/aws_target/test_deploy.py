@@ -26,7 +26,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 
-from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_box, hana_spend, ledger, remote
+from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_box, hana_image, hana_render, hana_spend, ledger, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, numeric_settings, text_setting, write_hana_config
 from scripts.aws_target.measurement_test_support import DAY, narrow
@@ -779,6 +779,11 @@ class HanaSetupFailureTests(CostFixture):
         fake = FakeEc2(raise_once='create-volume')
         subject = self.subject(fake, volume_errors=(
             'aws: [ERROR]: An error occurred (UnauthorizedOperation) when calling the CreateVolume operation: denied',))
+        workload = conf.read(self.workload)
+        fake.image = workload.text('ami_id')
+        _ = hana_image.save(self.state, hana_image.RegisteredImage('fixture', fake.image,
+            workload.text('ami_owner_id'), workload.text('vpc_id'), workload.text('subnet_id'),
+            hana_render.guest_digest(self.workload)))
         _ = subject.prepare_hana()
         with redirect_stdout(StringIO()), self.assertRaises(subprocess.TimeoutExpired):
             _ = subject.hana_setup(approve_resources=True)
@@ -1018,6 +1023,8 @@ class HanaSetupFailureTests(CostFixture):
 
         subject = deploy.Deployment(self.settings, self.state, self.root / 'output',
                                     execute=scaler, clock=self.clock, notify=lambda _event: True)
+        # Exercise the policy update path separately from the existing box preflight.
+        _ = self.enterContext(mock.patch.object(subject, '_hana_root_replacement', return_value=False))
         prepared = subject.prepare_hana()
         outputs = {'ControlBucket': 'fixture-bucket', 'LaunchTemplate': 'fixture-template',
                    'LaunchTemplateVersion': '3', 'SecurityGroup': 'fixture-group'}
@@ -1058,13 +1065,16 @@ class HanaSetupFailureTests(CostFixture):
                 self.instance_reads.append(list(arguments))
                 self.assertEqual(arguments[offset + 2:offset + 4], ['--instance-ids', instance])
                 reply = {'Reservations': [{'Instances': [{'InstanceId': instance,
-                    'LaunchTime': 'fixture-launch', 'State': {'Name': live_state},
+                    'LaunchTime': 'fixture-launch', 'State': {'Name': live_state}, 'InstanceLifecycle': 'spot',
+                    'BlockDeviceMappings': [{'DeviceName': '/dev/sdf', 'Ebs': {
+                        'VolumeId': volume, 'DeleteOnTermination': False}}],
                     'SpotInstanceRequestId': saved['spot_request']}]}]}
                 return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
             if service == 'ec2' and operation == 'describe-volumes':
                 self.assertEqual(arguments[offset + 2:offset + 4], ['--volume-ids', volume])
                 reply = {'Volumes': [{'VolumeId': volume, 'Attachments': [
-                    {'InstanceId': instance, 'Device': volume_device, 'State': 'attached'}]}]}
+                    {'InstanceId': instance, 'Device': volume_device, 'State': 'attached',
+                     'AttachTime': '2026-01-15T11:00:00Z', 'DeleteOnTermination': False}]}]}
                 return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
             if admin_spot_error and (service, operation, arguments[offset + 2]) == ('ec2', 'wait', 'instance-exists'):
                 return subprocess.CompletedProcess(arguments, 0, '{}', '')
@@ -1493,7 +1503,7 @@ class HanaSetupFailureTests(CostFixture):
         subject, _parameters = self.policy_update_fixture([], volume_device='/dev/sdg')
         saved = self.setup_path.read_bytes()
 
-        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'resource identities changed'):
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'retained Hana data attachment'):
             _ = subject.hana_setup(approve_resources=True)
 
         self.assertEqual(self.scaler_calls, [])
@@ -1836,6 +1846,10 @@ class HanaSetupFailureTests(CostFixture):
         instance = fake.launch(tagged=True)
         subject = self.subject(fake)
         _ = self.write_leftover(subject, instance=instance)
+        workload = conf.read(self.workload)
+        _ = hana_image.save(self.state, hana_image.RegisteredImage('fixture', workload.text('ami_id'),
+            workload.text('ami_owner_id'), workload.text('vpc_id'), workload.text('subnet_id'),
+            hana_render.guest_digest(self.workload)))
         saved = self.setup_path.read_bytes()
         evidence = self.book.read_snapshot()
 
