@@ -881,6 +881,9 @@ run_step() {
             if [[ "${LINT_MAC_FIX:-0}" == 1 ]]; then rm -f "$step_log"; return "$LINT_LEFT_QUEUE_STATUS"; fi
         fi
         if buildlog_step_compiles "$@"; then
+            if [[ "$CMD" == doc ]]; then
+                BUILDLOG_TREE="${DOC_SOURCE_KEY:-$BUILDLOG_TREE}"
+            fi
             step_state on_natedev
         else
             acquire_token local || { status=$?; rm -f "$step_log"; return "$status"; }
@@ -921,6 +924,7 @@ run_step() {
             status=$?
         fi
         RUN_STEP_PID=""
+        if [[ "$CMD" == doc ]]; then doc_close_checkout || status=$?; fi
         if [[ -n "${PLACEMENT_GRANT_FILE:-}" && -e "$PLACEMENT_GRANT_FILE.outcome" ]]; then apply_placement_outcome; fi
         if [[ -n "${TREE_WATCH_DIR:-}" ]]; then cancel_tree_run; fi
         step_state local_noncompiling
@@ -951,6 +955,10 @@ run_step() {
             return "$status"
         fi
         if buildlog_step_compiles "$@" && { [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" ]] || step_stopped_by_hold; }; then
+            if [[ "$CMD" == doc ]]; then
+                rm -f "$step_log"
+                return "$status"
+            fi
             if [[ "$status" != "$LINT_LEFT_QUEUE_STATUS" ]]; then
                 echo 'verify.sh: natedev hold stopped this step; choosing its target again.' >&2
             fi
@@ -1976,33 +1984,69 @@ finish_tree_watch() {
 
 # Read the staged tree through the copy owner's private index.
 doc_tree() {
-    VERIFY_PY_HELPER=DOC_TREE_PY "$PY" - "$BUILD_FOLDERS_SCRIPT" <<'PYDOC'
+    VERIFY_PY_HELPER=DOC_TREE_PY "$PY" - "$BUILD_FOLDERS_SCRIPT" "$DOC_REPO_TOP" "${1:-}" <<'PYDOC'
 from pathlib import Path
 import sys
 with open(Path(sys.argv[1]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+from scripts.buildlog.treekey import committed_tree_key
 from scripts.copies import copies
-print(copies.staged_tree(Path.cwd()))
+
+tree = copies.staged_tree(Path(sys.argv[2]))
+if sys.argv[3] == "with-key":
+    print(tree, committed_tree_key(tree.encode("ascii")))
+else:
+    print(tree)
 PYDOC
 }
 
-# The copy owner holds the lease until this shell closes descriptor 8.
+# The copy owner holds the lease until the last writer closes the pipe.
 doc_checkout() {
-    if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
-        DOC_CHECKOUT="$DOC_REPO_TOP"
-        DOC_TREE=""
-        return 0
+    local checkout="$DOC_REPO_TOP"
+    if [[ "${BUILDLOG_PREPARED_COPY:-}" != "$DOC_REPO_TOP" ]]; then
+        local copy_script writer checkout_tree current_tree status lease_fd=74
+        copy_script="$(dirname "$BUILD_FOLDERS_SCRIPT")/../copies/copies.py"
+        coproc DOC_COPY { exec "$PY" "$copy_script" hold --repo "$DOC_REPO_TOP"; }
+        DOC_COPY_OWNER_PID=$DOC_COPY_PID
+        writer=${DOC_COPY[1]}
+        # Start above verify's fixed descriptors.
+        while [[ -e "/dev/fd/$lease_fd" || -L "/dev/fd/$lease_fd" ]]; do
+            lease_fd=$((lease_fd + 1))
+        done
+        eval "exec $lease_fd>&$writer" || return $?
+        DOC_COPY_LEASE_FD=$lease_fd
+        eval "exec $writer>&-"
+        if ! IFS= read -r checkout_tree <&"${DOC_COPY[0]}" ||
+           ! IFS= read -r checkout <&"${DOC_COPY[0]}"; then
+            doc_close_checkout
+            return 1
+        fi
+        current_tree="$(doc_tree)" || { status=$?; doc_close_checkout; return "$status"; }
+        if [[ "$checkout_tree" != "$DOC_TREE" || "$current_tree" != "$DOC_TREE" ]]; then
+            doc_close_checkout
+            echo 'verify.sh: the staged tree changed before doc ran; no doc pass record was written.' >&2
+            return "$TREE_CHANGED_STATUS"
+        fi
     fi
-    if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$DOC_REPO_TOP" ]]; then
-        DOC_CHECKOUT="$DOC_REPO_TOP"
-        DOC_TREE=$(doc_tree) || return $?
-        return 0
+    cd "$checkout" || { doc_close_checkout; return 1; }
+    MAC_SOURCE_ROOT=$checkout
+}
+
+doc_close_checkout() {
+    local owner=${DOC_COPY_OWNER_PID:-${DOC_COPY_PID:-}}
+    if [[ -n "$owner" ]]; then
+        if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then
+            eval "exec $DOC_COPY_LEASE_FD>&-"
+            DOC_COPY_LEASE_FD=""
+        fi
+        if [[ "${1:-}" == stop ]]; then
+            collect_child "$owner" TERM
+        else
+            wait "$owner" || true
+        fi
+        DOC_COPY_OWNER_PID=""
     fi
-    local copy_script
-    copy_script="$(dirname "$BUILD_FOLDERS_SCRIPT")/../copies/copies.py"
-    coproc DOC_COPY { "$PY" "$copy_script" hold --repo "$DOC_REPO_TOP"; }
-    exec 8>&"${DOC_COPY[1]}"
-    IFS= read -r DOC_TREE <&"${DOC_COPY[0]}" || return 1
-    IFS= read -r DOC_CHECKOUT <&"${DOC_COPY[0]}" || return 1
+    MAC_SOURCE_ROOT=""
+    cd "$DOC_CALLER_DIR"
 }
 
 doc_record() {
@@ -2611,6 +2655,13 @@ try_reserved_target() {
         LAST_TARGET_OUTCOME=declined LAST_TARGET_REASON=runner
         return 0
     fi
+    if [[ "$CMD" == doc ]]; then
+        doc_checkout || return $?
+        local status=0
+        try_mac_test "$STEP_ASSIGNED_SETTINGS" "${1:-}" || status=$?
+        doc_close_checkout || return $?
+        return "$status"
+    fi
     try_mac_test "$STEP_ASSIGNED_SETTINGS" "${1:-}" || return $?
 }
 
@@ -2706,7 +2757,11 @@ placement_once() {
         PLACEMENT_EPISODE="${BUILDLOG_FIRST_STEP_EPISODE:-$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER}"
         PLACEMENT_OWNER_PID=$$
         PLACEMENT_SINCE="${BUILDLOG_FIRST_STEP_SINCE:-${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHREALTIME:-$(date +%s)}}}"
-        PLACEMENT_SOURCE_KEY=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "${MAC_SOURCE_ROOT:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}") || return $?
+        if [[ -n "${DOC_SOURCE_KEY:-}" ]]; then
+            PLACEMENT_SOURCE_KEY=$DOC_SOURCE_KEY
+        else
+            PLACEMENT_SOURCE_KEY=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "${MAC_SOURCE_ROOT:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}") || return $?
+        fi
         PLACEMENT_ASSIGNMENT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.json"
         PLACEMENT_GRANT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.sh"
         if [[ -n "${LINT_MEMORY_WAIT_FILE:-}" ]]; then
@@ -2944,8 +2999,13 @@ route_test() {
                 LINT_REPAIR_PENDING_GRANT=1
                 return "$LINT_LEFT_QUEUE_STATUS"
             fi
+            # Doc takes its copy slot before it takes the cargo token.
+            if [[ "$CMD" == doc ]]; then doc_checkout || return $?; fi
             local token_status=0
             take_local_placement || token_status=$?
+            if (( token_status != 0 )) && [[ "$CMD" == doc ]]; then
+                doc_close_checkout || return $?
+            fi
             if (( token_status == 10 )); then continue; fi
             return "$token_status"
         fi
@@ -3010,6 +3070,10 @@ route_test() {
         if [[ "${LAST_TARGET_REASON:-}" == source_changed ]]; then
             verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
                 --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "source changed before dispatch" >/dev/null || return $?
+            if [[ "$CMD" == doc ]]; then
+                echo 'verify.sh: the doc checkout changed before dispatch.' >&2
+                return "$TREE_CHANGED_STATUS"
+            fi
             PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
             PLACEMENT_EPISODE="$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER"
             PLACEMENT_OWNER_PID=$$
@@ -4017,6 +4081,7 @@ fi
 verify_cleanup() {
     local status=$1 outcome=ran code="${EXIT_STATUS}"
     if [[ "$EXIT_STATUS" == "$TREE_CHANGED_STATUS" ]]; then status=cancelled; fi
+    if [[ -n "${DOC_COPY_OWNER_PID:-${DOC_COPY_PID:-}}" ]]; then doc_close_checkout stop; fi
     stop_tree_watch
     [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
     TREE_WATCH_DIR=""
@@ -4508,16 +4573,21 @@ case "$CMD" in
         fi
         CARGO_TARGET_DIR="$(VERIFY_PY_HELPER=DOC_TARGET_PATH_PY "$PY" -c 'from pathlib import Path; import sys; print((Path(sys.argv[1]) / sys.argv[2]).resolve())' "$DOC_REPO_TOP" "$CARGO_TARGET_DIR")"
         export CARGO_TARGET_DIR
-        doc_checkout
+        DOC_CALLER_DIR=$PWD
+        DOC_COPY_LEASE_FD=""
+        DOC_SOURCE_KEY=""
+        if [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
+            if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$DOC_REPO_TOP" ]]; then
+                DOC_TREE=$(doc_tree)
+            else
+                DOC_SOURCE=$(doc_tree with-key)
+                read -r DOC_TREE DOC_SOURCE_KEY <<< "$DOC_SOURCE"
+            fi
+        fi
         if ! lint_config_enabled doc; then
             echo 'verify.sh: the phase rustdoc check cannot be switched off; ignoring doc=off.'
         fi
-        DOC_CALLER_DIR=$PWD
-        cd "$DOC_CHECKOUT"
-        # Keep the signal handlers and the active step PID in the caller shell.
-        MAC_SOURCE_ROOT="$DOC_CHECKOUT"
         LINT_CONFIG_FORCE=1 invoke_doc --workspace "${DOC_FEATURE_FLAGS[@]}"
-        cd "$DOC_CALLER_DIR"
         doc_record
         ;;
     example)
