@@ -1123,17 +1123,17 @@ def record_lifetime(path: Path, now: float, ending_task: str = "", *,
                 raise ValueError("expected progress object")
             state = cast(dict[str, object], raw)
             current = state.get("phase")
-            parked = state.get("open_phases", [])
-            if not isinstance(current, dict) or not isinstance(parked, list):
+            opened = state.get("open_phases", [])
+            if not isinstance(current, dict) or not isinstance(opened, list):
                 raise ValueError("invalid phase state")
-            phases: list[object] = [cast(object, current), *cast(list[object], parked)]
+            phases: list[object] = [*cast(list[object], opened), cast(object, current)]
             for item in phases:
                 if not isinstance(item, dict):
                     raise ValueError("invalid phase record")
                 fields = cast(dict[str, object], item)
                 if str(fields.get("id")) == phase:
                     status = fields.get("status")
-                    if status == "active" or item in parked:
+                    if status == "active" or item in opened:
                         return Live(f"open phase: {phase} in {run}")
                     # finish-phase's --status choices in progress_history.py; no shared constant exists.
                     if status not in ("completed", "stopped", "error", "finished", "complete", "ended"):

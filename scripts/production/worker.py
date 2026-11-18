@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 import subprocess
 import sys
+import uuid
 from typing import Literal, Protocol, cast, final
 
 from scripts.agents import detached_runs, pane_record, worker_lifecycle
@@ -530,6 +531,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
              on_submission: Callable[[], object] = lambda: None,
              lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
              notices: ExitStack | SendNoticesAfterDispatch = SEND_NOTICES_AFTER_DISPATCH,
+             new_pass_instance_id: uuid.UUID | None = None,
              ) -> DispatchSubmission | ExitCode:
     """Record the hook destinations, submit one prompt, and return at once."""
     prompt = prompt.resolve()
@@ -618,7 +620,8 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         try:
             instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
                 worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
-                fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, called=launched_agent(started.row))
+                fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, called=launched_agent(started.row),
+                new_pass_instance_id=new_pass_instance_id)
         except progress_history.DispatchPromptRefused as refused:
             return _prompt_conflict(refused.conflict)
         if dispatch_id and dispatch_id not in (instance, worker_panes.stage_two_completion_id(instance)):
@@ -942,7 +945,8 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
            reply: Path | ReplyBesidePrompt = REPLY_BESIDE_PROMPT, dispatch_id: str = "", fix_cause: str = "",
            fix_pass: int = 0, activity: str = "", early_ready: Path | SingleStageReview = SINGLE_STAGE_REVIEW,
            policy: worker_panes.UseRolePolicy | worker_panes.LaunchPolicy = worker_panes.UseRolePolicy.CURRENT,
-           completion_actions: progress_history.CompletionActions = progress_history.NO_COMPLETION_ACTIONS) -> DispatchSubmission | ExitCode:
+           completion_actions: progress_history.CompletionActions = progress_history.NO_COMPLETION_ACTIONS,
+           new_pass_instance_id: uuid.UUID | None = None) -> DispatchSubmission | ExitCode:
     with ExitStack() as cleanup:
         if not name:
             matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
@@ -996,7 +1000,7 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
         result = dispatch(parent, chosen, role, prompt, dispatch_id, session_dir=session_dir, slot=chosen.value,
             phase=phase, kind=kind, lens=lens, launcher_command=launcher_command, reply=reply,
             fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, early_ready=early_ready, policy=policy,
-            completion_actions=completion_actions, on_submission=cleanup.pop_all)
+            completion_actions=completion_actions, on_submission=cleanup.pop_all, new_pass_instance_id=new_pass_instance_id)
         if result is DispatchSubmission.SUBMITTED:
             _ = cleanup.pop_all()
         return result
@@ -1387,14 +1391,10 @@ def _finished_worker_results(holder: staff.StaffRow, record: staff.StaffSnapshot
             continue
         if unit_runs.run_owner(state, record) != holder:
             continue
-        open_ids = set(recorder_state.open_phase_ids(state))
-        if not open_ids:
+        open_instances = {str(phase["id"]): str(phase.get("instance_id", ""))
+                          for phase in recorder_state.open_phases(state) if isinstance(phase.get("id"), str)}
+        if not open_instances:
             continue
-        parked = state.get(recorder_state.OPEN_PHASES_KEY, [])
-        phases = [*(cast(list[object], parked) if isinstance(parked, list) else []), state.get("phase")]
-        open_instances = {str(phase.get("id")): str(phase.get("instance_id", ""))
-                          for raw in phases if isinstance(raw, dict)
-                          for phase in (cast(dict[str, object], raw),) if phase.get("id") in open_ids}
         history = state.get("history_file")
         entries = [*(_worker_history_events(Path(history), wanted, complete=True)
                      if isinstance(history, str) and history else ()), *_pass_records(state)]
@@ -1415,7 +1415,7 @@ def _finished_worker_results(holder: staff.StaffRow, record: staff.StaffSnapshot
                 continue
             fields = _dispatch_fields(str(run), entry)
             dispatch_id = fields["dispatch_id"]
-            if not isinstance(phase_id, str) or phase_id not in open_ids or not isinstance(dispatch_id, str) or not dispatch_id:
+            if not isinstance(phase_id, str) or phase_id not in open_instances or not isinstance(dispatch_id, str) or not dispatch_id:
                 continue
             stamp = entry.get("finished_at", entry.get("timestamp_epoch", 0))
             results[run, dispatch_id] = FinishedWorkerResult(row.name, phase_id, dispatch_id,
@@ -1744,6 +1744,7 @@ class Arguments(argparse.Namespace):
     completion_actions: str = ""
     json: bool = False
     all_parents: bool = False
+    new_pass_instance_id: uuid.UUID | None = None
     selection: WorkerFilter = WorkerFilter.OPEN
 
 
@@ -1780,6 +1781,7 @@ def main(arguments: list[str] | None = None) -> int:
     _ = assignment.add_argument("--fix-pass", "--pass", type=int, default=0)
     _ = assignment.add_argument("--launcher-command", required=True, help="JSON list of launcher arguments")
     _ = assignment.add_argument("--completion-actions", default="{}")
+    _ = assignment.add_argument("--new-pass-instance-id", type=uuid.UUID, help=argparse.SUPPRESS)
     finishing = commands.add_parser("finish-dispatch", help=argparse.SUPPRESS)
     for flag in ("parent", "worker-id", "session-dir", "dispatch-id"):
         _ = finishing.add_argument("--" + flag, required=True)
@@ -1834,7 +1836,8 @@ def main(arguments: list[str] | None = None) -> int:
                 launcher_command=_launcher_arguments(args.launcher_command), fix_cause=args.fix_cause,
                 fix_pass=args.fix_pass, activity=args.activity,
                 early_ready=Path(args.early_ready) if args.early_ready else SINGLE_STAGE_REVIEW, policy=policy,
-                completion_actions=progress_history.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions)
+                completion_actions=progress_history.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions,
+                new_pass_instance_id=args.new_pass_instance_id)
         if isinstance(code, DispatchSubmission):
             print("submitted")
         elif code == ExitCode.OK:

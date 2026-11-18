@@ -62,7 +62,12 @@ if (_fixture_os.environ.get("TEST_LEGACY_LAUNCH") == "1"
             _fixture_sys.argv[_fixture_sys.argv.index("--session-dir") + 1])
         _fixture_state = _fixture_json.loads(
             (_fixture_session / "progress_history_state.json").read_text())
-        _fixture_sys.argv.extend(["--phase-id", _fixture_state["phase"]["id"]])
+        _fixture_phases = _fixture_state.get("open_phases", [])
+        _fixture_previous = _fixture_state.get("phase") or {}
+        if _fixture_previous.get("status") == "active":
+            _fixture_phases.append(_fixture_previous)
+        if len(_fixture_phases) == 1:
+            _fixture_sys.argv.extend(["--phase-id", _fixture_phases[0]["id"]])
 
 """
 

@@ -502,7 +502,7 @@ class WorkerCommandTests(unittest.TestCase):
                     completed.append((dispatch_id, reply))
                 state_path = self.run_dir / unit_runs.STATE_FILE
                 state = cast(dict[str, object], json.loads(state_path.read_text()))
-                phase = cast(dict[str, object], state["phase"])
+                phase = cast(list[dict[str, object]], state["open_phases"])[0]
                 with (self.run_dir / "history.jsonl").open("a") as history:
                     _ = history.write(json.dumps({"padding": "x" * worker.WORKER_HISTORY_BYTES}) + "\n")
                 for placement in ("current", "parked", "closed", "reopened"):

@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 from typing import cast
 
+from scripts.direct import recorder_state
 from scripts.lib import unit_runs
 from scripts.direct.worker_state import worker_status_paths
 
@@ -68,10 +69,15 @@ def running_work(session_dir: Path) -> str | None:
         state = cast("dict[str, object]", json.loads(_text(session_dir / "progress_history_state.json")))
     except json.JSONDecodeError:
         return None
-    activity = state.get("activity")
-    if isinstance(activity, dict):
-        entry = cast("dict[str, object]", activity)
-        if entry.get("status") == "active":
-            label = entry.get("label")
-            return label if isinstance(label, str) and label else "an activity"
+    recorder_state.migrate_phases(state)
+    phases = [*recorder_state.open_phases(state), state.get("phase")]
+    for phase in phases:
+        if not isinstance(phase, dict):
+            continue
+        activity = cast("dict[str, object]", phase).get("activity")
+        if isinstance(activity, dict):
+            entry = cast("dict[str, object]", activity)
+            if entry.get("status") == "active":
+                label = entry.get("label")
+                return label if isinstance(label, str) and label else "an activity"
     return None

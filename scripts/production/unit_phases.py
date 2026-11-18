@@ -277,7 +277,8 @@ def status_rows(unit: str, status: str, machine: tuple[str, ...], record: object
                  eta_cell(eta_record, now=now, zone=zone, open_run_phases=phases), plan_eta),), show_plan_eta
     blank = (display_cells.NONE,) * len(machine)
     return tuple((unit, status if index == 0 else display_cells.NONE, *(machine if index == 0 else blank),
-                  progress_cell(record) if index == 0 else display_cells.NONE, phase.phase,
+                  progress_cell(record) if index == 0 else display_cells.NONE,
+                  f"{phase.phase} · {elapsed_text(now - phase.started.timestamp())} elapsed",
                   phase_eta_cell(phase, now=now, zone=zone), plan_eta if index == 0 else display_cells.NONE)
                  for index, phase in enumerate(phases)), show_plan_eta
 

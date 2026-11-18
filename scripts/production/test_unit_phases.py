@@ -2355,6 +2355,7 @@ class UnitPhasesTests(unittest.TestCase):
               patch.object(staff, "snapshot", wraps=staff.snapshot) as staff_reads,
               patch.object(census, "read", wraps=census.read) as census_reads,
               patch.object(io, "open", wraps=io.open) as opened,
+              patch.object(plan_history, "now_epoch", return_value=230),
               contextlib.redirect_stdout(output)):
             self.assertEqual(unit_phases.main(["--production", "show"]), 0)
         self.assertCountEqual([call.args[0] for call in headers.call_args_list], run_files)
@@ -2367,7 +2368,7 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertEqual(output.getvalue().splitlines(), [
             "working 0 · waiting to merge 0 · waiting on other work 0 · idle 0 · unknown 2 · 2 units", "",
             "| Unit | Director | Progress | Phase | ETA Next |", "| --- | --- | --- | --- | --- |",
-            "| one | exited | 🟨⬜ | 1 | no ETA stated |", "| two | exited | 🟨⬜ | 1 | no ETA stated |", "",
+            "| one | exited | 🟨⬜ | 1 · 2m elapsed | no ETA stated |", "| two | exited | 🟨⬜ | 1 · 2m elapsed | no ETA stated |", "",
             "Progress: 🟩 done · 🟨 open · ⬜ not started", "",
             "**one** — unknown", "",
             "| Item | Work | State |", "| --- | --- | --- |",

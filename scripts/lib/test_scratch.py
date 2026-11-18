@@ -1883,6 +1883,21 @@ print(scratch.target('gate:proof', 'tree', False))
         self.assertIsInstance(scratch.lifetime(path), scratch.Ended)
         self.assertEqual(scratch.end("phase:maker/21"), [path])
 
+    def test_a_reopened_phase_keeps_its_copy(self) -> None:
+        run = self.base / "run"
+        run.mkdir()
+        task = "phase:maker/21"
+        path = self.copy(task=task, run_dir=str(run), phase_id="21")
+        state = {
+            "phase": {"id": "21", "status": "completed", "instance_id": "old"},
+            "open_phases": [{"id": "21", "status": "active", "instance_id": "new"}],
+        }
+        _ = (run / "progress_history_state.json").write_text(json.dumps(state))
+
+        self.assertIsInstance(scratch.lifetime(path), scratch.Live)
+        self.assertEqual(scratch.end(task), [])
+        self.assertTrue(path.is_dir())
+
     def test_an_existing_unknown_phase_task_can_update_and_end(self) -> None:
         path = self.base / "scratch" / "legacy-phase"
         path.mkdir(parents=True)
