@@ -922,11 +922,12 @@ frame.addEventListener('load',async()=>{
         self.assertNotIn('<h3>Evidence</h3>', body)
         self.assertEqual(the_list.load(MORTY.id, items[0].id).evidence, items[0].evidence)
         self.assertEqual(body.count('<form method="post" data-feedback-form>'), 6)
-        self.assertEqual(body.count('value="read">Mark read</button>'), 6)
+        self.assertEqual(body.count('value="read">Mark read</button>'), 5)
         self.assertEqual([entry.item.number for entry in list_page.records()],
                          [item.number for item in sorted(the_list.records(MORTY.id, include_closed=True), key=the_list.order)])
         closed = body.split(f'data-key="{MORTY.id}/L54"', 1)[1].split('</tbody>', 1)[0]
         self.assertNotIn('Check overdue', closed)
+        self.assertNotIn('value="read">Mark read</button>', closed)
         with patch.dict(list_page.FIELD_LABELS, {"closing_words": "Recorded closing words"}):
             renamed = list_page.render(self.root / "reviews").decode()
         self.assertIn("<h3>Recorded closing words</h3>", renamed)
@@ -1136,6 +1137,40 @@ frame.addEventListener('load',async()=>{
         self.assertEqual(console.news(root, pages, "changes"), ("list",))
         _ = the_list.mark_read(MORTY.id, item.id, source="nate")
         self.assertEqual(console.news(root, pages, "changes"), ())
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_unread_excludes_legacy_closed_records(self) -> None:
+        open_item = self.add("Open with an unread update", number=1)
+        closed = self.add("Closed with a stored unread time", number=2)
+        _ = the_list.close(MORTY.id, closed.id, "The report is retired.", source="nate")
+        _ = the_list.mark_read(MORTY.id, closed.id, source="nate")
+        path = the_list.folder(MORTY.id) / f"{closed.id}.md"
+        field = f'unread_since: {json.dumps(NOW.isoformat())}\n'
+        stored = path.read_text().replace('unread_since: ""\n', field, 1)
+        self.assertIn(field, stored)
+        _ = path.write_text(stored)
+        with patch.object(list_page, "counts_strip", return_value=""):
+            markup = list_page.render(self.root / "reviews").decode()
+        probe = '''<script>
+const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
+const chip=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]');
+const visible=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')];
+chip('unread').click();
+check(chip('unread').querySelector('b').textContent==='1','the Unread chip counts only the open item');
+check(visible().map(row=>row.dataset.number).join() === '1','the Unread view shows only the open item');
+check(document.querySelector('[data-list-count]').textContent.endsWith(' · 1 unread'),'the page total counts one unread item');
+chip('closed').click();
+const closed=visible()[0];
+check(closed?.dataset.number==='2','the closed record remains in Closed');
+check(closed?.querySelector('[aria-label="No unread update"]'),'the closed record has no unread dot');
+check(!closed?.querySelector('[value="read"]'),'the closed record has no Mark read button');
+const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
+document.body.append(result);
+</script>'''
+        self.browser_actions(markup, "", probe)
+        self.assertEqual(list_page.waiting_updates(console.NewsRequest(self.root)),
+                         frozenset({f"{MORTY.id}/{open_item.id}/{NOW.isoformat()}"}))
+        self.assertEqual(list_page.saved_action_state(MORTY.id, closed.id)["unread"], "false")
 
     def test_count_strip_colors_its_showrunner_with_the_page_name_reading(self) -> None:
         members = staff.StaffSnapshot((replace(OWNER, doc=staff.LiveDoc(local_machine(), self.root / "sdlc.md")),))
@@ -1427,6 +1462,8 @@ window.fetch=async(_path,options={})=>{
   await choose('open','106');row('106').querySelector('.list-toggle').click();
   const removed=submit('106','remove');
   check(row('106').hidden,'Remove hides the row before the response');
+  check(row('106').dataset.unread==='false' && !row('106').querySelector('.list-dot') &&
+   !removed.querySelector('[value="read"]'),'Remove clears the unread controls before the response');
   check([...row('106').querySelectorAll('button')].every(button=>button.disabled),'Remove disables the row buttons');
   submit('106','remove');check(requests.length===1,'a second Remove press sends nothing');
   finishPost({item_state:'Closed',parked:'false'});await flush();await flush();
@@ -1437,6 +1474,8 @@ window.fetch=async(_path,options={})=>{
   const refused=submit('105','remove');check(row('105').hidden,'a refused Remove hides the row while pending');
   finishPost({ok:false,reason:'The fixture refuses this close.'});await flush();await flush();
   check(!row('105').hidden && row('105').dataset.state==='Working','a refused Remove restores the row');
+  check(row('105').dataset.unread==='true' && row('105').querySelector('.list-dot') &&
+   refused.querySelector('[value="read"]'),'a refused Remove restores the unread controls');
   check(refused.querySelector('[data-send-status]').textContent==='Not saved: The fixture refuses this close.','a refused Remove shows its reason');
   check(!refused.querySelector('[value="remove"]').disabled,'a refused Remove enables another attempt');
   refused.elements.until.value='2026-12-03';const parked=submit('105','park');
@@ -1678,12 +1717,12 @@ window.fetch=async(_path,options={})=>{
  check(first.id!==second.id,'each Park date gets its own request ID');
  const remove=submit('remove');
  check(remove.id!==second.id,'Remove uses its own request ID');
- finishPost({item_state:'Closed',parked:'true'});await flush();
+ finishPost({item_state:'Closed',parked:'true',unread:'false'});await flush();
  for(const [date,original] of [['2026-12-03',first],['2026-12-04',second]]){
   form.elements.until.value=date;
   const retry=submit('park');
   check(retry.id===original.id && retry.token===original.token,'Park retains the signed ID for '+date);
-  finishPost({item_state:'Closed',parked:'true'});await flush();
+  finishPost({item_state:'Closed',parked:'true',unread:'false'});await flush();
  }
 ''')
 
@@ -1696,6 +1735,7 @@ window.fetch=async(_path,options={})=>{
  row.querySelector('.list-row').click();
  check(row.querySelector('[data-detail]').hidden,'the user can close the details while waiting');
  losePost();await flush();
+ check(row.dataset.unread==='false' && !row.querySelector('.list-dot'),'a lost Remove keeps the row read');
  const hiddenStatus=document.querySelector('[data-hidden-action-status]');
  check(!hiddenStatus.hidden && hiddenStatus.textContent==='Item 1: Save not confirmed: Fixture lost response',
   'the table shows the lost response while the details are closed');
@@ -1704,6 +1744,9 @@ window.fetch=async(_path,options={})=>{
   'opening the details shows the inline notice only');
  row.querySelector('.list-toggle').click();
  check(!hiddenStatus.hidden,'closing the details restores the notice above the table');
+ submit('remove');finishPost({reason:'Fixture refuses Remove'});await flush();
+ check(row.dataset.state==='Working' && row.dataset.unread==='true' && row.querySelector('.list-dot'),
+  'a refused Remove retry restores the last saved unread state');
 ''')
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -1845,6 +1888,83 @@ window.fetch=async(_path,options={})=>{
 ''')
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_remove_updates_the_unread_sort_before_refresh(self) -> None:
+        with patch.object(the_list, "now", return_value=NOW - timedelta(minutes=1)):
+            _ = self.add("An older unread update", number=2)
+        self.browser_action_sequence("""
+ show('all');
+ const sort=document.querySelector('[data-sort="7"]');sort.click();sort.click();
+ const first=()=>document.querySelector('[data-list-item]').dataset.number;
+ const updateKey=()=>JSON.parse(row.dataset.sortValues)[7];
+ const original=updateKey();
+ check(original>0 && first()==='1','the newest unread item sorts first');
+ submit('remove');
+ check(updateKey()===0 && first()==='2','a pending Remove sorts as read');
+ finishPost({reason:'Fixture refuses Remove'});await flush();
+ check(updateKey()===original && first()==='1','a refusal restores the exact Update sort key');
+ submit('remove');
+ finishPost({item_state:'Closed',parked:'false',unread:'false'});await flush();
+ check(updateKey()===0 && first()==='2','a confirmed Remove sorts as read without a refresh');
+""", reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_remove_refusal_restores_update_order_during_motion(self) -> None:
+        with patch.object(the_list, "now", return_value=NOW - timedelta(minutes=1)):
+            _ = self.add("An older unread update", number=2)
+        self.browser_action_sequence(r"""
+ const sort=document.querySelector('[data-sort="7"]');sort.click();sort.click();
+ const first=()=>document.querySelector('[data-list-item]:not([hidden])').dataset.number;
+ const animation=()=>document.querySelector('[data-record-motion]')?.getAnimations({subtree:true})[0];
+ const updateKey=()=>JSON.parse(row.dataset.sortValues)[7];
+ const original=updateKey();
+ check(original>0 && first()==='1','the newest unread item starts first');
+ submit('remove');
+ const exit=animation();
+ if(!exit) throw new Error('Remove must animate the exit.');
+ exit.pause();exit.currentTime=100;
+ check(row.hidden && updateKey()===0 && first()==='2','Remove clears the Update key during the exit');
+ finishPost({reason:'Fixture refuses Remove'});await flush();
+ const restore=animation();
+ check(!row.hidden && restore && restore!==exit,'the refusal reverses the exit animation');
+ check(updateKey()===original && first()==='1','the restored Update key puts the row first');
+ restore?.finish();await flush();
+ check(!animation() && first()==='1','the correct order remains after the animation');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_closed_response_clears_unread_without_a_sort_key(self) -> None:
+        self.browser_action_sequence(r"""
+ show('all');
+ const updateKey=()=>JSON.parse(row.dataset.sortValues)[7];
+ check(updateKey()>0 && row.querySelector('.list-dot'),'the item starts unread');
+ submit('remove');
+ finishPost({item_state:'Closed',unread:'true'});await flush();
+ check(row.dataset.state==='Closed' && row.dataset.unread==='false','the Closed item is read');
+ check(updateKey()===0,'the Closed item has a zero Update key');
+ check(!row.querySelector('.list-dot') && !form.querySelector('[value="read"]'),
+  'the Closed item has no unread controls');
+ show('unread');
+ check(row.hidden,'the Closed item stays out of Unread');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_refusal_restores_unread_after_a_lost_remove(self) -> None:
+        self.browser_action_sequence("""
+ const original=JSON.parse(row.dataset.sortValues)[7];
+ submit('remove');losePost();await flush();
+ show('closed');
+ check(!row.hidden && row.dataset.unread==='false','the unconfirmed Closed row is read');
+ form.elements.until.value='2026-12-03';
+ submit('park');
+ finishPost({reason:'Fixture refuses Park'});await flush();
+ show('unread');
+ check(!row.hidden && row.dataset.state==='Working','the refusal returns the Working row to Unread');
+ check(row.querySelector('.list-dot') && form.querySelector('[value="read"]'),
+  'the refusal restores the unread controls');
+ check(JSON.parse(row.dataset.sortValues)[7]===original,'the refusal restores the Update sort key');
+""", reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_collapses_and_refusal_restores_the_row(self) -> None:
         _ = self.add("Next item", number=2)
         self.browser_action_sequence(r"""
@@ -1878,7 +1998,7 @@ window.fetch=async(_path,options={})=>{
  check(row.hidden && secondExit && secondExit!==restored,'a second Remove reverses the restore');
  secondExit?.finish();await flush();
  check(!motion() && Math.abs(top(next)-first)<2,'the second Remove leaves the final layout intact');
- finishPost({item_state:'Closed'});await flush();
+ finishPost({item_state:'Closed',unread:'false'});await flush();
  show('closed');
  check(!row.hidden && !motion(),'a filter change shows the row at once');
 """)
@@ -2056,6 +2176,7 @@ const change=async path=>{
             _ = self.add("Test List action retries", number=1)
         with patch.object(list_page, "counts_strip", return_value=""):
             markup = list_page.render(self.root / "reviews").decode()
+        markup = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', markup, count=1)
         setup = '''<script>
 const requests=[];let finishPost,losePost;
 window.fetch=async(_path,options={})=>{
@@ -2367,8 +2488,8 @@ window.fetch=async(_path,options={})=>{
             latest = tuple(the_list.feedback_requests(alerted).values())[-1]
             self.assertEqual((latest.state, latest.alerted_to), ("alerted", "sdlc"))
             self.assertIn("not sent; sdlc told", without_role_colors(list_page.render(root).decode()))
-            _ = the_list.mark_read(MORTY.id, item.id, source="morty")
-            self.assertNotIn("not sent; sdlc told", without_role_colors(list_page.render(root).decode()))
+            self.assertEqual(the_list.mark_read(MORTY.id, item.id, source="morty"), alerted)
+            self.assertIn("not sent; sdlc told", without_role_colors(list_page.render(root).decode()))
         self.assertEqual(the_list.load(MORTY.id, item.id).state, the_list.ItemState.CLOSED)
 
     def test_failed_alert_keeps_feedback_pending_for_post_and_startup_retries(self) -> None:
@@ -2539,7 +2660,8 @@ try{
   check(document.querySelector('[data-sort="'+column+'"]').parentElement.getAttribute('aria-sort')==='ascending','sort column '+column);
  }
  select('show','needs-me');check(visible().length===1 && visible()[0].dataset.number==='58','Needs me');
- select('show','unread');check(visible().length===5,'Unread includes the saved unread updates');
+ select('show','unread');
+ check(visible().map(row=>row.dataset.number).sort().join() === '105,106,41,63','Unread excludes the closed item');
  select('show','done');check(visible().length===1 && visible()[0].dataset.number==='63','Done');
  select('show','parked');check(visible().length===1 && visible()[0].dataset.number==='41','Parked');
  select('show','closed');check(visible().length===1 && visible()[0].dataset.number==='54','Closed');

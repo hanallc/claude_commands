@@ -581,7 +581,11 @@ Closed records remain on disk with their time and closing words.
 Automatic numbering includes invalid records and Closed records.
 An explicit number must name an unused path.
 Exact repeated operations change nothing.
-Other updates append a log line and mark the item unread; mark-read clears the unread time without sending a message.
+An update appends a log line and marks the item unread if it is not Closed.
+Closing clears the unread time.
+Loading a Closed record clears its unread time in memory.
+Reopening creates a new unread update.
+Mark-read clears the unread time without sending a message.
 Update and park refuse Closed items until reopen restores them.
 The table uses `# | Owner | Producer | Item | State | Next step | ETA | Update`; Producer shows the producer's name.
 It sorts Waiting for nate first, unread items second, and next check times third.
