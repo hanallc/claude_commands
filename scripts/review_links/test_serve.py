@@ -41,7 +41,7 @@ from scripts.agents.remote import local_machine
 from scripts.build_queue import memory_feed
 from scripts.message import send_result
 from scripts.review_links.test_page_question import question_outcome
-from scripts.production import change_review, change_routing, investigation, next_item, proposal_issue, staff, the_list, update_registration
+from scripts.production import change_review, change_routing, delivery_state, investigation, next_item, proposal_issue, staff, the_list, update_registration
 from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
@@ -1792,22 +1792,25 @@ class ReviewLinksServerTests(unittest.TestCase):
         words = "Which check passed?"
         started, release, finished = threading.Event(), threading.Event(), threading.Event()
         deliveries: list[tuple[staff.StaffId, str]] = []
+        saved_at_send: list[the_list.ListItem] = []
 
         def send(recipient: staff.StaffId, message: str, _message_id: str
                  ) -> tuple[send_result.ConfirmedSendOutcome, str]:
+            saved_at_send.append(the_list.load(morty.id, item.id))
             deliveries.append((recipient, message))
             started.set()
-            self.assertTrue(release.wait(TEST_HANG_GUARD_SECS))
+            if len(deliveries) == 1:
+                self.assertTrue(release.wait(TEST_HANG_GUARD_SECS))
             return question_outcome()
 
-        real_deliver = change_page.deliver
+        real_deliver = list_page.deliver
 
-        def deliver(message: change_page.MessageDelivery | change_page.NoMessageDelivery,
-                    status: change_page.DeliveryStatus) -> None:
+        def deliver(message: list_page.ListActionSubmission) -> None:
             try:
-                real_deliver(message, status)
+                real_deliver(message)
             finally:
-                finished.set()
+                if isinstance(message, list_page.ListQuestionDelivery) and message.status.root == self.root:
+                    finished.set()
 
         request = uuid4().hex
         fields = {"keeper": morty.id, "id": item.id, "request": request, "words": words, "until": "",
@@ -1815,7 +1818,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(change_page, "send_question", side_effect=send),
-              patch.object(change_page, "deliver", side_effect=deliver)):
+              patch.object(list_page, "deliver", side_effect=deliver)):
             try:
                 code, body = self.post(list_page.PAGE_PATH, urlencode(fields))
                 self.assertEqual(code, 200)
@@ -1824,7 +1827,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(json.loads(body)["open_question"], "true")
                 self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
                 self.assertFalse(finished.is_set())
-                opened = the_list.load(morty.id, item.id)
+                opened = saved_at_send[0]
                 self.assertEqual([(question.question_id, question.words) for question in opened.questions], [("Q1", words)])
                 self.assertEqual(len(deliveries), 1)
                 self.assertEqual(deliveries[0][0], morty.id)
@@ -1861,6 +1864,83 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
             self.assertEqual(len(deliveries), 2)
             self.assertEqual([question.question_id for question in the_list.load(morty.id, item.id).questions], ["Q1", "Q2"])
+
+            with self.subTest(recovery="live retry takes the claim"):
+                recovery_root = self.root.parent / "live-retry-recovery"
+                deliveries.clear()
+                started.clear()
+                release.clear()
+                request = uuid4().hex
+                body = urlencode({**fields, "request": request, "words": "Is the gate ready?",
+                    "token": list_page.request_token(recovery_root, morty.id, item.id, request)})
+                status = change_page.DeliveryStatus(recovery_root)
+                pending = list_page.submit(recovery_root, body, status)
+                assert isinstance(pending, list_page.ListQuestionDelivery)
+                original = pending.delivery
+                assert isinstance(original, change_page.PageQuestionSend)
+                assert isinstance(original.job, change_page.QuestionJob)
+                original.job.release()
+                attempt_read, resume_recovery = threading.Event(), threading.Event()
+                recover_question = change_page.recover_page_question
+
+                def recover_delivery(status: change_page.DeliveryStatus, path: Path,
+                                     record: delivery_state.QuestionAttempt) -> None:
+                    self.assertEqual(record.attempt_id, original.attempt)
+                    attempt_read.set()
+                    self.assertTrue(resume_recovery.wait(TEST_HANG_GUARD_SECS))
+                    recover_question(status, path, record)
+
+                def retry() -> None:
+                    delivery = list_page.submit(recovery_root, body, status)
+                    assert isinstance(delivery, list_page.ListQuestionDelivery)
+                    real_deliver(delivery)
+
+                with (patch.object(change_page, "recover_page_question", side_effect=recover_delivery),
+                      ThreadPoolExecutor(max_workers=2) as executor):
+                    recovery = executor.submit(change_page.recover_review_messages, status)
+                    try:
+                        self.assertTrue(attempt_read.wait(TEST_HANG_GUARD_SECS))
+                        first = executor.submit(retry)
+                        self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
+                        resume_recovery.set()
+                        recovery.result(TEST_HANG_GUARD_SECS)
+                        retry()
+                        self.assertEqual(len(deliveries), 1)
+                    finally:
+                        resume_recovery.set()
+                        release.set()
+                    first.result(TEST_HANG_GUARD_SECS)
+
+            with self.subTest(recovery="result lock fails"):
+                recovery_root = self.root.parent / "lock-failure-recovery"
+                previous = change_page.DeliveryStatus(recovery_root)
+                pending_question = the_list.ask_question(morty.id, item.id,
+                    the_list.PageRequest(uuid4().hex, "question", "Did the build finish?"), previous)
+                assert isinstance(pending_question, change_page.PageQuestionSend)
+                assert isinstance(pending_question.job, change_page.QuestionJob)
+                pending_question.job.release()
+                status = change_page.DeliveryStatus(recovery_root)
+                deliveries.clear()
+                release.set()
+                lock = status.locked
+
+                @contextmanager
+                def lock_before_send() -> Generator[None]:
+                    if deliveries:
+                        raise OSError("The result lock is unavailable.")
+                    with lock():
+                        yield
+
+                with (patch.object(status, "locked", side_effect=lock_before_send),
+                      redirect_stderr(StringIO()) as errors):
+                    change_page.recover_review_messages(status)
+                self.assertIn("The result lock is unavailable.", errors.getvalue())
+                path = status.path(pending_question.page, pending_question.row)
+                self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENDING)
+                self.assertFalse(status.question_jobs)
+                change_page.recover_review_messages(change_page.DeliveryStatus(recovery_root))
+                self.assertEqual(len(deliveries), 1)
+                self.assertEqual(status.request_attempts, {})
 
     def test_list_ask_preserves_unicode_separators(self) -> None:
         morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
